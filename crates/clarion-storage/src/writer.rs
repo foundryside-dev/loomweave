@@ -338,10 +338,16 @@ fn insert_entity(
     Ok(())
 }
 
-/// 8 ontology-defined edge kinds (ADR-026). Unknown kinds reaching the
+/// 9 ontology-defined edge kinds (ADR-026 + ADR-028). Unknown kinds reaching the
 /// writer are a manifest/wire-version drift bug — reject strictly.
 const STRUCTURAL_EDGE_KINDS: &[&str] = &["contains", "in_subsystem", "guides", "emits_finding"];
-const ANCHORED_EDGE_KINDS: &[&str] = &["calls", "imports", "decorates", "inherits_from"];
+const ANCHORED_EDGE_KINDS: &[&str] = &[
+    "calls",
+    "references",
+    "imports",
+    "decorates",
+    "inherits_from",
+];
 
 /// Enforce the per-kind confidence + source-range contract documented in
 /// `docs/implementation/sprint-2/b3-contains-edges.md` §3 Q5 and ADR-026
@@ -352,7 +358,9 @@ const ANCHORED_EDGE_KINDS: &[&str] = &["calls", "imports", "decorates", "inherit
 /// `CLA-INFRA-EDGE-UNKNOWN-KIND` (kind not in the ontology),
 /// so the surrounding `runs.stats.failure_reason` carries the code.
 fn enforce_edge_contract(edge: &EdgeRecord) -> Result<()> {
-    let has_range = edge.source_byte_start.is_some() || edge.source_byte_end.is_some();
+    let has_start = edge.source_byte_start.is_some();
+    let has_end = edge.source_byte_end.is_some();
+    let has_any_range = has_start || has_end;
     if STRUCTURAL_EDGE_KINDS.contains(&edge.kind.as_str()) {
         if edge.confidence != EdgeConfidence::Resolved {
             return Err(StorageError::WriterProtocol(format!(
@@ -365,7 +373,7 @@ fn enforce_edge_contract(edge: &EdgeRecord) -> Result<()> {
                 to = edge.to_id,
             )));
         }
-        if has_range {
+        if has_any_range {
             return Err(StorageError::WriterProtocol(format!(
                 "CLA-INFRA-EDGE-SOURCE-RANGE-CONTRACT: edge kind {kind:?} \
                  MUST have NULL source_byte_start/end; got start={start:?} end={end:?} \
@@ -388,19 +396,21 @@ fn enforce_edge_contract(edge: &EdgeRecord) -> Result<()> {
                 to = edge.to_id,
             )));
         }
-        if !has_range {
+        if !has_start || !has_end {
             return Err(StorageError::WriterProtocol(format!(
                 "CLA-INFRA-EDGE-SOURCE-RANGE-CONTRACT: edge kind {kind:?} \
-                 MUST have Some source_byte_start AND source_byte_end; got None \
-                 for ({from} -> {to})",
+                 MUST have Some source_byte_start AND source_byte_end; got \
+                 start={start:?} end={end:?} for ({from} -> {to})",
                 kind = edge.kind,
+                start = edge.source_byte_start,
+                end = edge.source_byte_end,
                 from = edge.from_id,
                 to = edge.to_id,
             )));
         }
     } else {
         return Err(StorageError::WriterProtocol(format!(
-            "CLA-INFRA-EDGE-UNKNOWN-KIND: edge kind {kind:?} not in the v0.3.0 \
+            "CLA-INFRA-EDGE-UNKNOWN-KIND: edge kind {kind:?} not in the writer \
              ontology; known kinds: {structural:?} + {anchored:?}",
             kind = edge.kind,
             structural = STRUCTURAL_EDGE_KINDS,

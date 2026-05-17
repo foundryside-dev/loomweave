@@ -2773,6 +2773,83 @@ ontology_version = "0.1.0"
         assert_eq!(result.edges[0].raw.confidence, EdgeConfidence::Ambiguous);
     }
 
+    #[test]
+    fn references_edge_is_rejected_until_manifest_declares_kind() {
+        let manifest = calls_manifest();
+        let mut mock = MockPlugin::new_compliant();
+        let (mut host, project_dir) = connect_and_handshake(manifest, &mut mock);
+
+        let sample = project_dir.path().join("demo.mock");
+        std::fs::write(&sample, b"").unwrap();
+
+        let response_id = host.next_request_id_test();
+        let sample_path = sample.to_string_lossy().into_owned();
+        let response_json = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": response_id,
+            "result": {
+                "entities": [
+                    {
+                        "id": "mock:module:demo",
+                        "kind": "module",
+                        "qualified_name": "demo",
+                        "source": { "file_path": sample_path }
+                    },
+                    {
+                        "id": "mock:function:demo.caller",
+                        "kind": "function",
+                        "qualified_name": "demo.caller",
+                        "source": { "file_path": sample_path },
+                        "parent_id": "mock:module:demo"
+                    },
+                    {
+                        "id": "mock:function:demo.callee",
+                        "kind": "function",
+                        "qualified_name": "demo.callee",
+                        "source": { "file_path": sample_path },
+                        "parent_id": "mock:module:demo"
+                    }
+                ],
+                "edges": [{
+                    "kind": "references",
+                    "from_id": "mock:function:demo.caller",
+                    "to_id": "mock:function:demo.callee",
+                    "source_byte_start": 12,
+                    "source_byte_end": 18,
+                    "confidence": "resolved"
+                }]
+            }
+        });
+        let body = serde_json::to_vec(&response_json).unwrap();
+        {
+            let reader = host.reader_mut_test();
+            let pos_before = reader.position();
+            let old_end = reader.get_ref().len() as u64;
+            let mut framed: Vec<u8> = Vec::new();
+            write_frame(&mut framed, &Frame { body }).unwrap();
+            reader.get_mut().extend_from_slice(&framed);
+            if pos_before == old_end {
+                reader.set_position(old_end);
+            }
+        }
+
+        let result = host.analyze_file(&sample).expect("must not error");
+        assert!(
+            result.edges.is_empty(),
+            "undeclared references edge must be dropped; got {:#?}",
+            result.edges
+        );
+        let findings = host.take_findings();
+        let count = findings
+            .iter()
+            .filter(|f| f.subcode == FINDING_UNDECLARED_EDGE_KIND)
+            .count();
+        assert_eq!(
+            count, 1,
+            "expected exactly one FINDING_UNDECLARED_EDGE_KIND; got {count} in {findings:?}"
+        );
+    }
+
     // ── Drain-until-match: stale frames discarded, matching accepted ─────────
 
     /// The drain-until-match helper (introduced for clarion-c08586a2da /

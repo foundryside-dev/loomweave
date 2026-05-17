@@ -105,6 +105,19 @@ fn make_calls_edge(from_id: &str, to_id: &str, confidence: EdgeConfidence) -> Ed
     }
 }
 
+fn make_references_edge(from_id: &str, to_id: &str, confidence: EdgeConfidence) -> EdgeRecord {
+    EdgeRecord {
+        kind: "references".to_owned(),
+        from_id: from_id.to_owned(),
+        to_id: to_id.to_owned(),
+        confidence,
+        properties_json: None,
+        source_file_id: Some("python:module:demo".to_owned()),
+        source_byte_start: Some(20),
+        source_byte_end: Some(25),
+    }
+}
+
 async fn begin_demo_run(tx: &tokio::sync::mpsc::Sender<WriterCmd>, run_id: &str) {
     send::<()>(tx, |ack| WriterCmd::BeginRun {
         run_id: run_id.into(),
@@ -1060,6 +1073,187 @@ async fn anchored_calls_inferred_confidence_rejected_at_scan_time() {
     drop(tx);
     drop(writer);
     handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anchored_references_missing_or_partial_byte_offsets_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-references-range-contract").await;
+    seed_module_and_functions(&tx).await;
+
+    let cases = [
+        ("missing", None, None),
+        ("start-only", Some(20), None),
+        ("end-only", None, Some(25)),
+    ];
+    for (idx, (label, start, end)) in cases.into_iter().enumerate() {
+        let mut edge = make_references_edge(
+            "python:function:demo.caller",
+            "python:function:demo.callee",
+            EdgeConfidence::Resolved,
+        );
+        edge.source_byte_start = start;
+        edge.source_byte_end = end;
+        let result = send::<()>(&tx, |ack| WriterCmd::InsertEdge {
+            edge: Box::new(edge),
+            ack,
+        })
+        .await;
+        let err = result.expect_err("references edge with incomplete range should be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("CLA-INFRA-EDGE-SOURCE-RANGE-CONTRACT"),
+            "{label}: expected CLA-INFRA-EDGE-SOURCE-RANGE-CONTRACT in error; got {msg}"
+        );
+        assert_eq!(
+            writer.dropped_edges_total.load(Ordering::Relaxed),
+            idx + 1,
+            "{label}: rejection should increment dropped_edges_total"
+        );
+    }
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anchored_references_inferred_confidence_rejected_at_scan_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-confidence-references-inferred").await;
+    seed_module_and_functions(&tx).await;
+
+    assert_edge_rejected_with_counter(
+        &writer,
+        &tx,
+        make_references_edge(
+            "python:function:demo.caller",
+            "python:function:demo.callee",
+            EdgeConfidence::Inferred,
+        ),
+        "CLA-INFRA-EDGE-CONFIDENCE-CONTRACT",
+    )
+    .await;
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anchored_references_ambiguous_confidence_is_accepted_and_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-confidence-references-ambiguous").await;
+    seed_module_and_functions(&tx).await;
+    seed_contains_edges_for_demo_functions(&tx).await;
+
+    send::<()>(&tx, |ack| WriterCmd::InsertEdge {
+        edge: Box::new(make_references_edge(
+            "python:function:demo.caller",
+            "python:function:demo.callee",
+            EdgeConfidence::Ambiguous,
+        )),
+        ack,
+    })
+    .await
+    .unwrap();
+    assert_eq!(writer.dropped_edges_total.load(Ordering::Relaxed), 0);
+    assert_eq!(writer.ambiguous_edges_total.load(Ordering::Relaxed), 1);
+
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-confidence-references-ambiguous".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let pool = ReaderPool::open(&path, 1).unwrap();
+    let (count, confidence): (i64, String) = pool
+        .with_reader(|conn| {
+            let row = conn.query_row(
+                "SELECT COUNT(*), max(confidence) FROM edges WHERE kind = 'references'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            Ok(row)
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(confidence, "ambiguous");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anchored_references_resolved_confidence_is_accepted_without_counters() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-confidence-references-resolved").await;
+    seed_module_and_functions(&tx).await;
+    seed_contains_edges_for_demo_functions(&tx).await;
+
+    send::<()>(&tx, |ack| WriterCmd::InsertEdge {
+        edge: Box::new(make_references_edge(
+            "python:function:demo.caller",
+            "python:function:demo.callee",
+            EdgeConfidence::Resolved,
+        )),
+        ack,
+    })
+    .await
+    .unwrap();
+    assert_eq!(writer.dropped_edges_total.load(Ordering::Relaxed), 0);
+    assert_eq!(writer.ambiguous_edges_total.load(Ordering::Relaxed), 0);
+
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-confidence-references-resolved".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let pool = ReaderPool::open(&path, 1).unwrap();
+    let (count, confidence): (i64, String) = pool
+        .with_reader(|conn| {
+            let row = conn.query_row(
+                "SELECT COUNT(*), max(confidence) FROM edges WHERE kind = 'references'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            Ok(row)
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(confidence, "resolved");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
