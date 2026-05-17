@@ -4,6 +4,7 @@ members = [
     "crates/clarion-core",
     "crates/clarion-storage",
     "crates/clarion-cli",
+    "crates/clarion-mcp",
     "crates/clarion-plugin-fixture",
 ]
 

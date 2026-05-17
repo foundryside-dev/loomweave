@@ -212,6 +212,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "clarion-mcp"
+version = "0.1.0-dev"
+dependencies = [
+ "clarion-core",
+ "clarion-storage",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "clarion-plugin-fixture"
 version = "0.1.0-dev"
 dependencies = [
