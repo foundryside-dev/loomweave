@@ -1,0 +1,3 @@
+slice=/tmp/clarion-b8-elspeth-tests-20260517T2156Z
+python_files=1037
+python_loc=429870
