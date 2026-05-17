@@ -5,6 +5,7 @@
 #   - `clarion install` creates `.clarion/clarion.db`
 #   - `clarion analyze .` spawns the Python plugin and persists at least one entity
 #   - `sqlite3 .clarion/clarion.db` returns Python module/function entities
+#   - Python function rows include source path, source line range, and content hash
 #   - resolved and ambiguous calls edges are persisted end-to-end
 #   - resolved references edges are persisted end-to-end
 #
@@ -107,7 +108,19 @@ if [ "$RESULT" != "$EXPECTED" ]; then
     fail "expected exactly:\n$EXPECTED\ngot:\n$RESULT"
 fi
 
-# ── 8. Verify contains edge via sqlite3 (B.3) ────────────────────────────────
+# ── 8. Verify source metadata for MCP entity_at/summary cache (B.6a) ─────────
+log "verifying persisted Python function source metadata ..."
+SOURCE_METADATA=$(sqlite3 "$DEMO_DIR/.clarion/clarion.db" \
+    "select source_file_path, source_line_start, source_line_end, length(content_hash) from entities where id = 'python:function:demo.hello';")
+SOURCE_METADATA_EXPECTED="$DEMO_DIR/demo.py|10|11|64"
+if [ "$SOURCE_METADATA" != "$SOURCE_METADATA_EXPECTED" ]; then
+    log "DB entity source metadata:"
+    sqlite3 "$DEMO_DIR/.clarion/clarion.db" \
+        "select id, source_file_path, source_line_start, source_line_end, content_hash from entities order by id;" >&2 || true
+    fail "expected Python function source metadata:\n$SOURCE_METADATA_EXPECTED\ngot:\n$SOURCE_METADATA"
+fi
+
+# ── 9. Verify contains edge via sqlite3 (B.3) ────────────────────────────────
 log "verifying persisted contains edge via sqlite3 ..."
 EDGE_RESULT=$(sqlite3 "$DEMO_DIR/.clarion/clarion.db" \
     "select kind, from_id, to_id from edges where kind = 'contains' order by from_id, to_id;")
@@ -124,7 +137,7 @@ if [ "$EDGE_RESULT" != "$EDGE_EXPECTED" ]; then
     fail "expected edge row:\n$EDGE_EXPECTED\ngot:\n$EDGE_RESULT"
 fi
 
-# ── 9. Verify run stats include B.3 + B.4* + B.5* edges ─────────────────────
+# ── 10. Verify run stats include B.3 + B.4* + B.5* edges ────────────────────
 log "verifying run stats include edges_inserted >= 10 ..."
 EDGES_INSERTED=$(sqlite3 "$DEMO_DIR/.clarion/clarion.db" \
     "select json_extract(stats, '\$.edges_inserted') from runs where status = 'completed';")
@@ -134,7 +147,7 @@ if [ "$EDGES_INSERTED" -lt 10 ]; then
     fail "expected runs.stats.edges_inserted >= 10; got $EDGES_INSERTED"
 fi
 
-# ── 10. Verify dropped_edges_total == 0 (B.3 §6 / §9 exit criterion 6) ───────
+# ── 11. Verify dropped_edges_total == 0 (B.3 §6 / §9 exit criterion 6) ──────
 log "verifying run stats include dropped_edges_total == 0 ..."
 DROPPED=$(sqlite3 "$DEMO_DIR/.clarion/clarion.db" \
     "select json_extract(stats, '\$.dropped_edges_total') from runs where status = 'completed';")
@@ -144,7 +157,7 @@ if [ "$DROPPED" != "0" ]; then
     fail "expected runs.stats.dropped_edges_total == 0; got $DROPPED"
 fi
 
-# ── 11. Verify resolved + ambiguous calls edges (B.4*) ───────────────────────
+# ── 12. Verify resolved + ambiguous calls edges (B.4*) ──────────────────────
 log "verifying persisted resolved calls edge ..."
 RESOLVED_CALLS=$(sqlite3 "$DEMO_DIR/.clarion/clarion.db" \
     "select count(*) from edges where kind = 'calls' and confidence = 'resolved';")
@@ -181,7 +194,7 @@ if [ "$UNRESOLVED_CALL_SITES" != "0" ]; then
     fail "expected runs.stats.unresolved_call_sites_total == 0; got $UNRESOLVED_CALL_SITES"
 fi
 
-# ── 12. Verify resolved references edges (B.5*) ──────────────────────────────
+# ── 13. Verify resolved references edges (B.5*) ─────────────────────────────
 log "verifying persisted resolved references edges ..."
 RESOLVED_REFERENCES=$(sqlite3 "$DEMO_DIR/.clarion/clarion.db" \
     "select count(*) from edges where kind = 'references' and confidence = 'resolved';")
@@ -202,4 +215,4 @@ if [ "$REFERENCE_SITES" -lt 2 ] || [ "$REFERENCES_RESOLVED" -lt 2 ]; then
     fail "expected reference_sites_total and references_resolved_total >= 2; got sites=$REFERENCE_SITES resolved=$REFERENCES_RESOLVED"
 fi
 
-log "PASS: walking skeleton persisted module + function/class entities + contains + calls + references edges"
+log "PASS: walking skeleton persisted module + function/class entities + source metadata + contains + calls + references edges"

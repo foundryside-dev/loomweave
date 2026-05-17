@@ -16,7 +16,12 @@ from typing import IO, TYPE_CHECKING, Any, Self
 from urllib.parse import unquote, urlparse
 
 from clarion_plugin_python import __version__
-from clarion_plugin_python.call_resolver import CallResolutionResult, CallsRawEdge, Finding
+from clarion_plugin_python.call_resolver import (
+    CallResolutionResult,
+    CallsRawEdge,
+    Finding,
+    UnresolvedCallSite,
+)
 from clarion_plugin_python.entity_id import entity_id
 from clarion_plugin_python.extractor import module_dotted_name
 from clarion_plugin_python.qualname import reconstruct_qualname
@@ -62,6 +67,7 @@ class _CallSite:
     character: int
     end_line: int
     end_character: int
+    callee_expr: str
 
 
 @dataclass(frozen=True)
@@ -194,7 +200,7 @@ class PyrightSession:
 
         latency_started = time.perf_counter()
         try:
-            edges, unresolved = self._resolve_with_pyright(path, index, requested)
+            edges, unresolved, unresolved_sites = self._resolve_with_pyright(path, index, requested)
         except LspTimeoutError as exc:
             self._record_finding(
                 FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT,
@@ -203,15 +209,18 @@ class PyrightSession:
             )
             edges = []
             unresolved = ast_call_sites_total
+            unresolved_sites = []
         except (LspTransportClosedError, BrokenPipeError, OSError) as exc:
             self._record_restart_or_poison(str(exc))
             edges = []
             unresolved = ast_call_sites_total
+            unresolved_sites = []
         latency_ms = max(1, math.ceil((time.perf_counter() - latency_started) * 1000))
 
         return CallResolutionResult(
             edges=edges,
             unresolved_call_sites_total=unresolved,
+            unresolved_call_sites=unresolved_sites,
             pyright_query_latency_ms=[latency_ms],
             findings=self._pop_findings(),
         )
@@ -286,7 +295,7 @@ class PyrightSession:
         path: Path,
         index: _FunctionIndex,
         functions: Sequence[_FunctionInfo],
-    ) -> tuple[list[CallsRawEdge], int]:
+    ) -> tuple[list[CallsRawEdge], int, list[UnresolvedCallSite]]:
         uri = path.as_uri()
         self._notify(
             "textDocument/didOpen",
@@ -302,6 +311,7 @@ class PyrightSession:
         try:
             edges: list[CallsRawEdge] = []
             unresolved_total = 0
+            unresolved_sites: list[UnresolvedCallSite] = []
             for function in functions:
                 grouped: dict[tuple[int, int, int, int], set[str]] = {}
                 prepared = self._request(
@@ -358,8 +368,14 @@ class PyrightSession:
                         edge["properties"] = {"candidates": candidate_ids}
                     edges.append(edge)
 
-                unresolved_total += max(len(function.call_sites) - len(grouped), 0)
-            return edges, unresolved_total
+                function_unresolved_sites = _unresolved_call_sites_for_function(
+                    index,
+                    function,
+                    set(grouped),
+                )
+                unresolved_total += len(function_unresolved_sites)
+                unresolved_sites.extend(function_unresolved_sites)
+            return edges, unresolved_total, unresolved_sites
         finally:
             self._notify("textDocument/didClose", {"textDocument": {"uri": uri}})
 
@@ -927,18 +943,49 @@ def _function_call_sites(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[_
     return visitor.call_sites
 
 
+def _unresolved_call_sites_for_function(
+    index: _FunctionIndex,
+    function: _FunctionInfo,
+    resolved_ranges: set[tuple[int, int, int, int]],
+) -> list[UnresolvedCallSite]:
+    unresolved: list[UnresolvedCallSite] = []
+    for site_ordinal, call_site in enumerate(function.call_sites):
+        range_key = (
+            call_site.line,
+            call_site.character,
+            call_site.end_line,
+            call_site.end_character,
+        )
+        if range_key in resolved_ranges:
+            continue
+        start_byte = _position_to_byte(index, call_site.line, call_site.character)
+        end_byte = _position_to_byte(index, call_site.end_line, call_site.end_character)
+        unresolved.append(
+            {
+                "caller_entity_id": function.entity_id,
+                "site_ordinal": site_ordinal,
+                "source_byte_start": start_byte,
+                "source_byte_end": end_byte,
+                "callee_expr": call_site.callee_expr,
+            },
+        )
+    return unresolved
+
+
 class _CallSiteVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.call_sites: list[_CallSite] = []
 
     def visit_Call(self, node: ast.Call) -> None:
         func = node.func
+        callee_expr = ast.unparse(func)
         self.call_sites.append(
             _CallSite(
                 func.lineno - 1,
                 func.col_offset,
                 (func.end_lineno or func.lineno) - 1,
                 func.end_col_offset or func.col_offset,
+                callee_expr,
             ),
         )
         self.generic_visit(node)

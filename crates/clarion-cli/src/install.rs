@@ -26,10 +26,30 @@ const CONFIG_JSON_STUB: &str = r#"{
 "#;
 
 const CLARION_YAML_STUB: &str = "# clarion.yaml — user-edited config.\n\
-# Full schema TBD; see docs/clarion/v0.1 design. Sprint 1 walking skeleton\n\
-# ignores most fields. Do not delete this file: later versions will require\n\
-# it for model-tier mappings and analysis knobs.\n\
-version: 1\n";
+# Do not delete this file: clarion serve reads MCP, LLM, and integration\n\
+# settings from here when present.\n\
+version: 1\n\
+llm_policy:\n\
+  enabled: false\n\
+  provider: openrouter\n\
+  allow_live_provider: false\n\
+  openrouter:\n\
+    endpoint_url: https://openrouter.ai/api/v1\n\
+    api_key_env: OPENROUTER_API_KEY\n\
+    attribution:\n\
+      referer: https://github.com/qacona/clarion\n\
+      title: Clarion\n\
+  model_id: anthropic/claude-sonnet-4.6\n\
+  session_token_ceiling: 1000000\n\
+  max_inferred_edges_per_caller: 8\n\
+  cache_max_age_days: 180\n\
+integrations:\n\
+  filigree:\n\
+    enabled: false\n\
+    base_url: http://127.0.0.1:8766\n\
+    actor: clarion-mcp\n\
+    token_env: FILIGREE_API_TOKEN\n\
+    timeout_seconds: 5\n";
 
 const GITIGNORE_CONTENTS: &str = "\
 # Clarion .gitignore — ADR-005 tracked-vs-excluded list.

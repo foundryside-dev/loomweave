@@ -29,6 +29,12 @@ pub enum StorageError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("invalid query: {0}")]
+    InvalidQuery(String),
+
+    #[error("invalid source path: {0}")]
+    InvalidSourcePath(String),
+
     #[error("channel closed — writer actor has exited")]
     WriterGone,
 

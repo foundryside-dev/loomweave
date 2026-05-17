@@ -27,7 +27,7 @@
 //! only calls `setrlimit(2)`, which is async-signal-safe per POSIX.1-2017
 //! §2.4.3. The `unsafe` block is the minimum required by the `pre_exec` API.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -45,7 +45,7 @@ use crate::plugin::manifest::{Manifest, ManifestError};
 use crate::plugin::protocol::{
     AnalyzeFileParams, AnalyzeFileResult, AnalyzeFileStats, EdgeConfidence, ExitNotification,
     InitializeParams, InitializeResult, InitializedNotification, ProtocolError, ResponseEnvelope,
-    ResponsePayload, ShutdownParams, make_notification, make_request,
+    ResponsePayload, ShutdownParams, UnresolvedCallSite, make_notification, make_request,
 };
 use crate::plugin::transport::{Frame, TransportError, read_frame, write_frame};
 
@@ -115,6 +115,12 @@ pub const FINDING_UNDECLARED_EDGE_KIND: &str = "CLA-INFRA-PLUGIN-UNDECLARED-EDGE
 /// Same rationale as [`FINDING_ENTITY_FIELD_OVERSIZE`] (RAM amplification).
 pub const FINDING_EDGE_FIELD_OVERSIZE: &str = "CLA-INFRA-PLUGIN-EDGE-FIELD-OVERSIZE";
 
+/// Emitted when `stats.unresolved_call_sites` contains a row that cannot be
+/// tied back to the accepted entities and source bytes for this `analyze_file`
+/// response. The row is dropped; aggregate counters are retained.
+pub const FINDING_MALFORMED_UNRESOLVED_CALL_SITE: &str =
+    "CLA-INFRA-PLUGIN-MALFORMED-UNRESOLVED-CALL-SITE";
+
 /// Per-string length cap applied to [`RawEntity::id`], [`RawEntity::kind`],
 /// [`RawEntity::qualified_name`], and [`RawSource::file_path`].
 ///
@@ -124,6 +130,10 @@ pub const FINDING_EDGE_FIELD_OVERSIZE: &str = "CLA-INFRA-PLUGIN-EDGE-FIELD-OVERS
 /// check, not a style constraint — pick a value that rejects `DoS` payloads
 /// without false-positing on pathological-but-legitimate inputs.
 pub const MAX_ENTITY_FIELD_BYTES: usize = 4 * 1024;
+
+/// Maximum UTF-8 byte length for one unresolved callee expression retained for
+/// query-time inferred dispatch.
+pub const MAX_UNRESOLVED_CALLEE_EXPR_BYTES: usize = 512;
 
 /// Per-entity cap on the total serialised size of the untyped passthrough
 /// maps [`RawEntity::extra`] and [`RawSource::extra`].
@@ -292,6 +302,39 @@ fn oversize_field(raw: &RawEntity) -> Option<(&'static str, usize)> {
         }
     }
 
+    None
+}
+
+fn invalid_unresolved_call_site_reason(
+    site: &UnresolvedCallSite,
+    accepted_ids: &BTreeSet<String>,
+    file_len: Option<i64>,
+) -> Option<String> {
+    if !accepted_ids.contains(&site.caller_entity_id) {
+        return Some("caller entity was not accepted for this file".to_owned());
+    }
+    if site.site_ordinal < 0 {
+        return Some("site_ordinal is negative".to_owned());
+    }
+    if site.source_byte_start < 0 {
+        return Some("source_byte_start is negative".to_owned());
+    }
+    if site.source_byte_end <= site.source_byte_start {
+        return Some("source byte range is empty or reversed".to_owned());
+    }
+    if let Some(file_len) = file_len
+        && site.source_byte_end > file_len
+    {
+        return Some("source byte range exceeds analyzed file length".to_owned());
+    }
+    if site.callee_expr.is_empty() {
+        return Some("callee_expr is empty".to_owned());
+    }
+    if site.callee_expr.len() > MAX_UNRESOLVED_CALLEE_EXPR_BYTES {
+        return Some(format!(
+            "callee_expr exceeds {MAX_UNRESOLVED_CALLEE_EXPR_BYTES} bytes"
+        ));
+    }
     None
 }
 
@@ -530,6 +573,26 @@ impl HostFinding {
             message: format!(
                 "edge field {field:?} is {actual_bytes} bytes, over the {MAX_ENTITY_FIELD_BYTES}-byte limit"
             ),
+            metadata,
+        }
+    }
+
+    fn malformed_unresolved_call_site(site: &UnresolvedCallSite, reason: &str) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("caller_entity_id".to_owned(), site.caller_entity_id.clone());
+        metadata.insert("site_ordinal".to_owned(), site.site_ordinal.to_string());
+        metadata.insert(
+            "source_byte_start".to_owned(),
+            site.source_byte_start.to_string(),
+        );
+        metadata.insert(
+            "source_byte_end".to_owned(),
+            site.source_byte_end.to_string(),
+        );
+        metadata.insert("reason".to_owned(), reason.to_owned());
+        Self {
+            subcode: FINDING_MALFORMED_UNRESOLVED_CALL_SITE,
+            message: format!("plugin emitted malformed unresolved call site: {reason}"),
             metadata,
         }
     }
@@ -1125,11 +1188,12 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
         }
 
         let accepted_edges = self.process_edges(afr.edges, &accepted);
+        let stats = self.process_stats(afr.stats, &accepted, path);
 
         Ok(AnalyzeFileOutcome {
             entities: accepted,
             edges: accepted_edges,
-            stats: afr.stats,
+            stats,
         })
     }
 
@@ -1187,6 +1251,35 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
             });
         }
         accepted_edges
+    }
+
+    fn process_stats(
+        &mut self,
+        mut stats: AnalyzeFileStats,
+        accepted_entities: &[AcceptedEntity],
+        analyzed_path: &Path,
+    ) -> AnalyzeFileStats {
+        let accepted_ids: BTreeSet<String> = accepted_entities
+            .iter()
+            .map(|entity| entity.id.as_str().to_owned())
+            .collect();
+        let file_len = std::fs::metadata(analyzed_path)
+            .ok()
+            .and_then(|metadata| i64::try_from(metadata.len()).ok());
+
+        let mut retained = Vec::with_capacity(stats.unresolved_call_sites.len());
+        for site in stats.unresolved_call_sites {
+            if let Some(reason) =
+                invalid_unresolved_call_site_reason(&site, &accepted_ids, file_len)
+            {
+                self.findings
+                    .push(HostFinding::malformed_unresolved_call_site(&site, &reason));
+                continue;
+            }
+            retained.push(site);
+        }
+        stats.unresolved_call_sites = retained;
+        stats
     }
 
     /// Send `shutdown` request followed by the `exit` notification.
@@ -2847,6 +2940,96 @@ ontology_version = "0.1.0"
         assert_eq!(
             count, 1,
             "expected exactly one FINDING_UNDECLARED_EDGE_KIND; got {count} in {findings:?}"
+        );
+    }
+
+    #[test]
+    fn unresolved_call_site_stats_are_validated_against_accepted_entities() {
+        let manifest = calls_manifest();
+        let mut mock = MockPlugin::new_compliant();
+        let (mut host, project_dir) = connect_and_handshake(manifest, &mut mock);
+
+        let sample = project_dir.path().join("demo.mock");
+        std::fs::write(&sample, b"dynamic_target()\n").unwrap();
+
+        let response_id = host.next_request_id_test();
+        let sample_path = sample.to_string_lossy().into_owned();
+        let response_json = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": response_id,
+            "result": {
+                "entities": [
+                    {
+                        "id": "mock:module:demo",
+                        "kind": "module",
+                        "qualified_name": "demo",
+                        "source": { "file_path": sample_path }
+                    },
+                    {
+                        "id": "mock:function:demo.caller",
+                        "kind": "function",
+                        "qualified_name": "demo.caller",
+                        "source": { "file_path": sample_path },
+                        "parent_id": "mock:module:demo"
+                    }
+                ],
+                "stats": {
+                    "unresolved_call_sites_total": 3,
+                    "unresolved_call_sites": [
+                        {
+                            "caller_entity_id": "mock:function:demo.caller",
+                            "site_ordinal": 0,
+                            "source_byte_start": 0,
+                            "source_byte_end": 14,
+                            "callee_expr": "dynamic_target"
+                        },
+                        {
+                            "caller_entity_id": "mock:function:demo.missing",
+                            "site_ordinal": 1,
+                            "source_byte_start": 0,
+                            "source_byte_end": 14,
+                            "callee_expr": "dynamic_target"
+                        },
+                        {
+                            "caller_entity_id": "mock:function:demo.caller",
+                            "site_ordinal": 2,
+                            "source_byte_start": 14,
+                            "source_byte_end": 14,
+                            "callee_expr": "dynamic_target"
+                        }
+                    ]
+                }
+            }
+        });
+        let body = serde_json::to_vec(&response_json).unwrap();
+        {
+            let reader = host.reader_mut_test();
+            let pos_before = reader.position();
+            let old_end = reader.get_ref().len() as u64;
+            let mut framed: Vec<u8> = Vec::new();
+            write_frame(&mut framed, &Frame { body }).unwrap();
+            reader.get_mut().extend_from_slice(&framed);
+            if pos_before == old_end {
+                reader.set_position(old_end);
+            }
+        }
+
+        let result = host.analyze_file(&sample).expect("must not error");
+
+        assert_eq!(result.stats.unresolved_call_sites_total, 3);
+        assert_eq!(result.stats.unresolved_call_sites.len(), 1);
+        assert_eq!(
+            result.stats.unresolved_call_sites[0].caller_entity_id,
+            "mock:function:demo.caller"
+        );
+        let findings = host.take_findings();
+        let count = findings
+            .iter()
+            .filter(|f| f.subcode == FINDING_MALFORMED_UNRESOLVED_CALL_SITE)
+            .count();
+        assert_eq!(
+            count, 2,
+            "expected two malformed unresolved-call-site findings; got {count} in {findings:?}"
         );
     }
 

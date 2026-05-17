@@ -356,6 +356,9 @@ pub struct AnalyzeFileStats {
     /// Call sites where the plugin found no in-project candidate.
     #[serde(default)]
     pub unresolved_call_sites_total: u64,
+    /// Concrete unresolved call sites available for query-time inference.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_call_sites: Vec<UnresolvedCallSite>,
     /// Reference sites enumerated by the plugin before resolver filtering.
     #[serde(default)]
     pub reference_sites_total: u64,
@@ -384,8 +387,19 @@ impl AnalyzeFileStats {
             && self.references_skipped_external_total == 0
             && self.references_skipped_cap_total == 0
             && self.unresolved_reference_sites_total == 0
+            && self.unresolved_call_sites.is_empty()
             && self.pyright_query_latency_ms.is_empty()
     }
+}
+
+/// One unresolved call site emitted by a plugin for lazy inferred-call dispatch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnresolvedCallSite {
+    pub caller_entity_id: String,
+    pub site_ordinal: i64,
+    pub source_byte_start: i64,
+    pub source_byte_end: i64,
+    pub callee_expr: String,
 }
 
 /// Result for `analyze_file` (plugin → core).
@@ -653,6 +667,13 @@ mod tests {
             })],
             stats: AnalyzeFileStats {
                 unresolved_call_sites_total: 2,
+                unresolved_call_sites: vec![UnresolvedCallSite {
+                    caller_entity_id: "python:function:m.main".to_owned(),
+                    site_ordinal: 1,
+                    source_byte_start: 10,
+                    source_byte_end: 14,
+                    callee_expr: "dynamic_target".to_owned(),
+                }],
                 reference_sites_total: 3,
                 references_resolved_total: 4,
                 references_skipped_external_total: 5,

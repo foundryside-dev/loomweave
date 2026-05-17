@@ -29,10 +29,19 @@ class Finding(TypedDict):
     metadata: dict[str, object]
 
 
+class UnresolvedCallSite(TypedDict):
+    caller_entity_id: str
+    site_ordinal: int
+    source_byte_start: int
+    source_byte_end: int
+    callee_expr: str
+
+
 @dataclass
 class CallResolutionResult:
     edges: list[CallsRawEdge] = field(default_factory=list)
     unresolved_call_sites_total: int = 0
+    unresolved_call_sites: list[UnresolvedCallSite] = field(default_factory=list)
     pyright_query_latency_ms: list[int] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
 

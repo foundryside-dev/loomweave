@@ -13,7 +13,9 @@ use tokio::sync::oneshot;
 
 pub use clarion_core::EdgeConfidence;
 
+use crate::cache::{InferredEdgeCacheEntry, SummaryCacheEntry, SummaryCacheKey};
 use crate::error::StorageError;
+use crate::unresolved::UnresolvedCallSiteRecord;
 
 pub type Ack<T> = oneshot::Sender<Result<T, StorageError>>;
 
@@ -51,6 +53,7 @@ pub struct EntityRecord {
     pub short_name: String,
     pub parent_id: Option<String>,
     pub source_file_id: Option<String>,
+    pub source_file_path: Option<String>,
     pub source_byte_start: Option<i64>,
     pub source_byte_end: Option<i64>,
     pub source_line_start: Option<i64>,
@@ -87,6 +90,22 @@ pub struct EdgeRecord {
     pub source_byte_end: Option<i64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct InferredCallEdgeRecord {
+    pub from_id: String,
+    pub to_id: String,
+    pub source_file_id: Option<String>,
+    pub source_byte_start: i64,
+    pub source_byte_end: i64,
+    pub properties_json: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InferredEdgeWriteStats {
+    pub inserted_edges: u64,
+    pub skipped_static_duplicates: u64,
+}
+
 /// All writer operations as a single enum so the actor loop exhausts
 /// everything via one match.
 #[derive(Debug)]
@@ -112,6 +131,37 @@ pub enum WriterCmd {
     /// `Writer::dropped_edges_total` on dedupe. Also advances the per-batch
     /// write counter — edges and entities share one batch boundary.
     InsertEdge { edge: Box<EdgeRecord>, ack: Ack<()> },
+    /// Upsert one inferred-edge cache row and materialize its current inferred
+    /// call edges. This query-time MCP write does not require an active
+    /// analyze run and does not use scan-time edge contracts.
+    InsertInferredEdges {
+        cache_entry: Box<InferredEdgeCacheEntry>,
+        edges: Vec<InferredCallEdgeRecord>,
+        ack: Ack<InferredEdgeWriteStats>,
+    },
+    /// Upsert one on-demand summary cache row. This query-time MCP write does
+    /// not require an active analyze run.
+    UpsertSummaryCache {
+        entry: Box<SummaryCacheEntry>,
+        ack: Ack<()>,
+    },
+    /// Touch one on-demand summary cache row. Returns whether a row was
+    /// updated. This query-time MCP write does not require an active analyze
+    /// run.
+    TouchSummaryCache {
+        key: SummaryCacheKey,
+        last_accessed_at: String,
+        ack: Ack<bool>,
+    },
+    /// Replace all unresolved call-site rows for one caller. This is an
+    /// analyze-time mapping command that requires an active run transaction so
+    /// stale rows from previous content hashes cannot survive re-analysis.
+    ReplaceUnresolvedCallSitesForCaller {
+        caller_entity_id: String,
+        caller_content_hash: String,
+        sites: Vec<UnresolvedCallSiteRecord>,
+        ack: Ack<()>,
+    },
     /// Commit the in-flight transaction, update the run row to the given
     /// terminal status + `completed_at` + `stats_json`, and clear per-run
     /// state.

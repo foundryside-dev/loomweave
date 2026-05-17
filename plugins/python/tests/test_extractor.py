@@ -49,6 +49,15 @@ class FakeCallResolver:
                 },
             ],
             unresolved_call_sites_total=2,
+            unresolved_call_sites=[
+                {
+                    "caller_entity_id": "python:function:demo.caller",
+                    "site_ordinal": 0,
+                    "source_byte_start": 42,
+                    "source_byte_end": 48,
+                    "callee_expr": "callee",
+                },
+            ],
             pyright_query_latency_ms=[17],
         )
 
@@ -261,6 +270,15 @@ def test_extractor_appends_calls_from_resolver_and_carries_stats() -> None:
         },
     ]
     assert result.stats.unresolved_call_sites_total == 2
+    assert result.stats.unresolved_call_sites == [
+        {
+            "caller_entity_id": "python:function:demo.caller",
+            "site_ordinal": 0,
+            "source_byte_start": 42,
+            "source_byte_end": 48,
+            "callee_expr": "callee",
+        },
+    ]
     assert result.stats.pyright_query_latency_ms == [17]
 
 

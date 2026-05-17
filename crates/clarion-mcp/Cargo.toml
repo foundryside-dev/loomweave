@@ -1,5 +1,5 @@
 [package]
-name = "clarion-core"
+name = "clarion-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,13 +10,15 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+clarion-core = { path = "../clarion-core", version = "0.1.0-dev" }
+clarion-storage = { path = "../clarion-storage", version = "0.1.0-dev" }
 reqwest.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_norway.workspace = true
 thiserror.workspace = true
-toml.workspace = true
-tracing.workspace = true
-nix = { workspace = true }
+tokio.workspace = true
 
 [dev-dependencies]
-tempfile = { workspace = true }
+tempfile.workspace = true

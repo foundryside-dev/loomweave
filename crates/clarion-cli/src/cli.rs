@@ -29,4 +29,15 @@ pub enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+
+    /// Run the MCP stdio server.
+    Serve {
+        /// Project directory containing .clarion/clarion.db.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Path to clarion.yaml (default: project-root/clarion.yaml if present).
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }

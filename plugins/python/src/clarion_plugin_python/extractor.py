@@ -67,6 +67,7 @@ from clarion_plugin_python.call_resolver import (
     CallsEdgeProperties,
     Finding,
     NoOpCallResolver,
+    UnresolvedCallSite,
 )
 from clarion_plugin_python.entity_id import entity_id
 from clarion_plugin_python.qualname import reconstruct_qualname
@@ -136,6 +137,7 @@ class RawEdge(TypedDict):
 @dataclass
 class ExtractionStats:
     unresolved_call_sites_total: int = 0
+    unresolved_call_sites: list[UnresolvedCallSite] = field(default_factory=list)
     reference_sites_total: int = 0
     references_resolved_total: int = 0
     references_skipped_external_total: int = 0
@@ -152,6 +154,7 @@ class ExtractionStats:
     ) -> ExtractionStats:
         return cls(
             unresolved_call_sites_total=calls.unresolved_call_sites_total,
+            unresolved_call_sites=calls.unresolved_call_sites,
             reference_sites_total=references.reference_sites_total,
             references_resolved_total=references.references_resolved_total,
             references_skipped_external_total=references.references_skipped_external_total,

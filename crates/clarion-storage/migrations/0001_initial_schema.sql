@@ -34,6 +34,7 @@ CREATE TABLE entities (
     short_name         TEXT NOT NULL,
     parent_id          TEXT REFERENCES entities(id),
     source_file_id     TEXT REFERENCES entities(id),
+    source_file_path   TEXT,
     source_byte_start  INTEGER,
     source_byte_end    INTEGER,
     source_line_start  INTEGER,
@@ -52,6 +53,7 @@ CREATE INDEX ix_entities_kind              ON entities(kind);
 CREATE INDEX ix_entities_plugin_kind       ON entities(plugin_id, kind);
 CREATE INDEX ix_entities_parent            ON entities(parent_id);
 CREATE INDEX ix_entities_source_file       ON entities(source_file_id);
+CREATE INDEX ix_entities_source_file_path  ON entities(source_file_path);
 CREATE INDEX ix_entities_content_hash      ON entities(content_hash);
 
 -- Tags (denormalised)
@@ -126,8 +128,44 @@ CREATE TABLE summary_cache (
     tokens_input          INTEGER NOT NULL,
     tokens_output         INTEGER NOT NULL,
     created_at            TEXT NOT NULL,
+    last_accessed_at      TEXT NOT NULL,
+    caller_count          INTEGER NOT NULL,
+    fan_out               INTEGER NOT NULL,
+    stale_semantic        INTEGER NOT NULL DEFAULT 0 CHECK (stale_semantic IN (0, 1)),
     PRIMARY KEY (entity_id, content_hash, prompt_template_id, model_tier, guidance_fingerprint)
 );
+
+-- Inferred edge cache
+CREATE TABLE inferred_edge_cache (
+    caller_entity_id     TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    caller_content_hash  TEXT NOT NULL,
+    model_id             TEXT NOT NULL,
+    prompt_version       TEXT NOT NULL,
+    result_json          TEXT NOT NULL,
+    cost_usd             REAL NOT NULL DEFAULT 0.0,
+    token_count          INTEGER NOT NULL DEFAULT 0,
+    created_at           TEXT NOT NULL,
+    last_accessed_at     TEXT NOT NULL,
+    PRIMARY KEY (caller_entity_id, caller_content_hash, model_id, prompt_version)
+);
+
+-- Unresolved call sites for query-time inferred dispatch
+CREATE TABLE entity_unresolved_call_sites (
+    caller_entity_id     TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    caller_content_hash  TEXT NOT NULL,
+    site_key             TEXT NOT NULL,
+    site_ordinal         INTEGER NOT NULL,
+    source_file_id       TEXT REFERENCES entities(id),
+    source_byte_start    INTEGER NOT NULL,
+    source_byte_end      INTEGER NOT NULL,
+    callee_expr          TEXT NOT NULL,
+    created_at           TEXT NOT NULL,
+    PRIMARY KEY (caller_entity_id, caller_content_hash, site_key)
+);
+CREATE INDEX ix_unresolved_call_sites_caller
+    ON entity_unresolved_call_sites(caller_entity_id);
+CREATE INDEX ix_unresolved_call_sites_expr
+    ON entity_unresolved_call_sites(callee_expr);
 
 -- Runs (provenance). Sprint 1 writes started_at/completed_at/config/stats/status;
 -- WP2 will populate plugin-invocation fields inside `config` JSON (per UQ-WP1-05).

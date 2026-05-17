@@ -121,6 +121,37 @@ def test_pyright_session_resolves_direct_call(tmp_path: Path, pyright_langserver
 
 
 @pytest.mark.pyright
+def test_pyright_session_emits_unresolved_call_site_details(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    source = textwrap.dedent(
+        """
+        import os
+
+        def caller():
+            os.getcwd()
+        """,
+    ).lstrip()
+    module = _write_module(tmp_path, source)
+
+    with PyrightSession(tmp_path, executable=pyright_langserver) as session:
+        result = session.resolve_calls(module, ["python:function:demo.caller"])
+
+    assert result.edges == []
+    assert result.unresolved_call_sites_total == 1
+    assert result.unresolved_call_sites == [
+        {
+            "caller_entity_id": "python:function:demo.caller",
+            "site_ordinal": 0,
+            "source_byte_start": source.encode().find(b"os.getcwd"),
+            "source_byte_end": source.encode().find(b"os.getcwd") + len(b"os.getcwd"),
+            "callee_expr": "os.getcwd",
+        },
+    ]
+
+
+@pytest.mark.pyright
 def test_pyright_session_resolves_module_name_reference(
     tmp_path: Path,
     pyright_langserver: str,
