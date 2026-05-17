@@ -12,10 +12,11 @@ pub mod plugin;
 
 pub use entity_id::{EntityId, EntityIdError, entity_id};
 pub use llm_provider::{
-    AnthropicProvider, AnthropicProviderConfig, CachingModel, INFERRED_CALLS_PROMPT_VERSION,
-    InferredCallsPromptInput, LEAF_SUMMARY_PROMPT_TEMPLATE_ID, LeafSummaryPromptInput, LlmProvider,
-    LlmProviderError, LlmPurpose, LlmRequest, LlmResponse, PromptTemplate, Recording,
-    RecordingProvider, build_inferred_calls_prompt, build_leaf_summary_prompt,
+    CachingModel, INFERRED_CALLS_PROMPT_VERSION, InferredCallsPromptInput,
+    LEAF_SUMMARY_PROMPT_TEMPLATE_ID, LeafSummaryPromptInput, LlmProvider, LlmProviderError,
+    LlmPurpose, LlmRequest, LlmResponse, OpenRouterProvider, OpenRouterProviderConfig,
+    PromptTemplate, Recording, RecordingProvider, build_inferred_calls_prompt,
+    build_leaf_summary_prompt,
 };
 pub use plugin::{
     // host (Task 6) — facade for callers that spawn/connect plugins

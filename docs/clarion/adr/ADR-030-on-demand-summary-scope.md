@@ -20,7 +20,7 @@ Three decisions:
 The original `v0.1-plan.md` WP6 scope:
 
 - `clarion.yaml` config loader for LLM policy.
-- `LlmProvider` trait with `AnthropicProvider` + `RecordingProvider` (the latter from WP1 §5.1).
+- `LlmProvider` trait with `OpenRouterProvider` + `RecordingProvider` (the latter from WP1 §5.1).
 - Prompt templates for leaf / module / subsystem tiers.
 - Five-tuple cache key (ADR-007) with TTL backstop and churn-eager invalidation.
 - **Phase 4** — leaf summarisation (per-entity Haiku calls).
@@ -60,7 +60,7 @@ None of these are MVP-blocking, but each is real design+implementation work. Sli
 ADR-028 introduces an `inferred edges` cache keyed on `(caller_entity_id, caller_content_hash, model_id, prompt_version)` — a 4-tuple. ADR-007's summary cache is the 5-tuple `(entity_id, content_hash, prompt_template_id, model_tier, guidance_fingerprint)`. The two are different shapes for different reasons:
 
 - **Summary cache** includes `guidance_fingerprint` because summaries are conditioned on the guidance sheets that apply to the entity (a guidance change can change the summary even if the code hasn't). Inferred edges are not guidance-conditioned.
-- **Summary cache** uses `model_tier` (Haiku / Sonnet / Opus, abstract); the operator picks the tier in config. Inferred-edge cache uses `model_id` (concrete Anthropic model name) because the inference-call dispatch path passes through the specific provider directly. Different abstraction layers, different cache keys.
+- **Summary cache** uses `model_tier`, which stores the concrete configured model ID. Under OpenRouter this is the `vendor/model` string (for example, `anthropic/claude-sonnet-4.6`). Inferred-edge cache uses `model_id` for the same concrete provider model. Different query paths, different cache keys.
 
 Keeping the two caches structurally distinct prevents a future bug-class: a summary cache hit returning content rendered under a different LLM than the inference call expects, or vice versa. The two MCP tool paths are independent; their caches are independent.
 
@@ -71,12 +71,12 @@ Keeping the two caches structurally distinct prevents a future bug-class: a summ
 WP6 ships:
 
 - The `LlmProvider` trait (per WP1 §5.1).
-- The `AnthropicProvider` implementation.
+- The `OpenRouterProvider` implementation.
 - The `RecordingProvider` test wrapper.
 - Prompt templates for the leaf tier (one template, versioned).
 - The 5-tuple cache (ADR-007), populated lazily.
 - The MCP `summary(entity_id)` tool dispatching through the cache + provider.
-- Cost-ceiling enforcement, retry-with-backoff, model-tier mapping (Haiku for leaves in MVP scope).
+- Token-ceiling enforcement, retryable provider errors, and one concrete configured model ID for v0.1.
 
 WP6 does NOT ship in the resumed Sprint 2:
 
@@ -117,25 +117,27 @@ If the consult-mode agent asks for `summary(module_id)` and expects an aggregate
 
 The v0.2 shape (Phase 4 / 5 / 6 hierarchical pass) is preserved in `system-design.md` §6 and `detailed-design.md` §4 as the target architecture; this ADR scopes only what ships in v0.1.
 
-### 2026-05-17 B.6 implementation resolution — session cost ceiling
+### 2026-05-18 OpenRouter swap amendment — session token ceiling
 
-B.6 resolves cost-ceiling granularity as an MCP server-session budget:
+The OpenRouter provider swap resolves provider accounting as an MCP
+server-session token budget:
 
-- `clarion.yaml` exposes `llm.session_cost_ceiling_usd`, defaulting to USD
-  10.00. The budget is process-local and resets when `clarion serve` restarts.
+- `clarion.yaml` exposes `llm_policy.session_token_ceiling`, defaulting to 1,000,000
+  tokens. The budget is process-local and resets when `clarion serve` restarts.
 - `summary()` and lazy inferred-edge dispatch share the same in-memory
   `BudgetLedger` with `spent`, `reserved`, and `blocked` state. Cache hits do
   not reserve or spend budget.
 - Before a provider call, the MCP server reserves the provider's estimated
-  request cost. If `spent + reserved + estimate` exceeds the configured
+  request tokens. If `spent + reserved + estimate` exceeds the configured
   ceiling, the tool returns an MCP error envelope with code
-  `cost-ceiling-exceeded` without calling the provider.
-- After a provider call, the reservation is released and actual reported cost
-  is debited. If the actual cost pushes the session over the ceiling, that
-  response returns `cost-ceiling-exceeded` and the session is blocked for
-  further live LLM dispatch. Provider failures release the reservation.
-- Ceiling responses emit `CLA-LLM-COST-CEILING-EXCEEDED` and
-  `cost_ceiling_exceeded_total: 1` in the MCP response envelope.
+  `token-ceiling-exceeded` without calling the provider.
+- After a provider call, the reservation is released and OpenRouter-reported
+  `usage.total_tokens` is debited. If the actual token total pushes the session
+  over the ceiling, that response returns `token-ceiling-exceeded` and the
+  session is blocked for further live LLM dispatch. Provider failures release
+  the reservation.
+- Ceiling responses emit `CLA-LLM-TOKEN-CEILING-EXCEEDED` and
+  `token_ceiling_exceeded_total: 1` in the MCP response envelope.
 
 ## Alternatives Considered
 
@@ -167,10 +169,11 @@ Add edge-vs-summary as a cache-key component; share one cache implementation.
 
 ### Positive
 
-- **MVP ships with $0 amortised LLM cost.** Operators who never call `summary()` pay nothing for LLM access. Operators who do pay per-query, bounded by their `clarion.yaml` cost ceiling.
+- **MVP ships with $0 amortised LLM cost.** Operators who never call `summary()` pay nothing for LLM access. Operators who do pay per-query, bounded by their `clarion.yaml` token ceiling and OpenRouter-side billing controls.
 - **WP6 scope shrinks dramatically.** From three pipeline phases plus aggregation prompts plus parallel rate-limit management to: trait + provider + one prompt template + lazy cache population + one MCP tool. Order-of-magnitude reduction in implementation surface.
 - **Cache shape locked early.** ADR-007's 5-tuple becomes battle-tested under the on-demand path before v0.2 adds the eager prewarming and hierarchical tiers. Cache bugs that would have been discovered in v0.2 under hierarchical load get found in v0.1 under interactive load.
 - **v0.2 path is additive, not migratory.** Module/subsystem tiers add new `prompt_template_id` values to the same cache. Hierarchical aggregation is new pipeline code that consumes the existing cache. Nothing in v0.1 has to be rewritten or migrated.
+- **The v0.1 provider is explicit.** Clarion ships an OpenRouter-specific provider implementation using OpenAI-compatible Chat Completions HTTP. The trait remains in place, and the common wire format keeps future providers or proxies additive rather than a call-site rewrite.
 
 ### Negative
 
@@ -181,14 +184,16 @@ Add edge-vs-summary as a cache-key component; share one cache implementation.
 
 ### Neutral
 
-- The `LlmProvider` trait shape is unchanged from WP1 §5.1. Same trait, same `RecordingProvider`, same `AnthropicProvider`. The narrowing is on what calls into the trait, not the trait itself.
+- The `LlmProvider` trait shape is unchanged from WP1 §5.1. Same trait, same `RecordingProvider`, new `OpenRouterProvider`. The narrowing is on what calls into the trait, not the trait itself.
 - The `--no-llm` mode (preserved from WP1) still works: with no LLM, `summary(id)` returns `{ available: false, reason: "llm-disabled" }` rather than blocking on an unreachable provider.
 
 ## Open Questions
 
-- **Cost-ceiling enforcement granularity** — RESOLVED by B.6: v0.1 uses a
-  per-MCP-server-session ceiling configured by `llm.session_cost_ceiling_usd`.
-  A daily or cross-process aggregate ceiling is deferred beyond v0.1.
+- **Token-ceiling enforcement granularity** — RESOLVED by the OpenRouter swap:
+  v0.1 uses a per-MCP-server-session ceiling configured by
+  `llm_policy.session_token_ceiling`. Dollar budgets are handled in OpenRouter's
+  operator-facing billing controls; a daily or cross-process aggregate ceiling
+  is deferred beyond v0.1.
 - **Cache eviction.** ADR-007 names a TTL backstop but no eviction policy for the lazy-populated case (the eager case naturally bounds cache size to entity count). Decision deferred; initial implementation can run unbounded with manual cache rotation, since v0.1 operators are the same humans who can `rm .clarion/cache/`.
 - **Multi-model cache coexistence.** If an operator changes `model_tier` in `clarion.yaml`, the cache key changes and prior entries become unreachable but not garbage-collected. Same TTL discipline applies. Acceptable for v0.1.
 

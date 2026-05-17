@@ -36,7 +36,7 @@ Each component:
 - **`entity_id`** — the target being summarised (e.g., `python:class:auth.tokens.TokenManager`). Flips on entity rename/move beyond the 80% case ADR-003 handles.
 - **`content_hash`** — BLAKE3 over the entity's source-slice bytes. Flips on any code edit.
 - **`prompt_template_id`** — e.g., `python:class:v1` (plugin-declared, ADR-022 manifest `prompt_templates`). Flips on template revision — a plugin bumping `v1` → `v2` forces re-summarisation of every entity of that kind.
-- **`model_tier`** — stores the concrete model ID (`claude-sonnet-4-6`), not the tier name (`sonnet`). The tier resolver compares on write and treats a tier-to-model remap as a miss. Handles model-identity drift without special casing.
+- **`model_tier`** — stores the concrete model ID (`claude-sonnet-4-6`), not the tier name (`sonnet`). Under OpenRouter, this is the configured `vendor/model` string verbatim (for example, `anthropic/claude-sonnet-4.6`). The tier resolver compares on write and treats a tier-to-model remap as a miss. Handles model-identity drift without special casing.
 - **`guidance_fingerprint`** — BLAKE3 over the sorted, concatenated content of all guidance sheets active for this entity's query context. Any guidance sheet edit flips the fingerprint.
 
 All five combined are the `summary_cache` table's PRIMARY KEY (`detailed-design.md:679-691`).

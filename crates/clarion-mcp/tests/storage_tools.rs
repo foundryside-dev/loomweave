@@ -260,7 +260,7 @@ fn expected_summary_request(project_root: &std::path::Path, entity_id: &str) -> 
     });
     LlmRequest {
         purpose: LlmPurpose::Summary,
-        model_id: "claude-haiku-4-5".to_owned(),
+        model_id: "anthropic/claude-sonnet-4.6".to_owned(),
         prompt_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
         prompt: prompt.body,
         max_output_tokens: 512,
@@ -271,11 +271,12 @@ fn summary_recording(project_root: &std::path::Path, entity_id: &str) -> Arc<Rec
     Arc::new(RecordingProvider::from_recordings(vec![Recording {
         request: expected_summary_request(project_root, entity_id),
         response: LlmResponse {
-            model_id: "claude-haiku-4-5".to_owned(),
+            model_id: "anthropic/claude-sonnet-4.6".to_owned(),
             output_json: r#"{"purpose":"cached demo"}"#.to_owned(),
             input_tokens: 120,
             output_tokens: 24,
-            cost_usd: 0.001,
+            total_tokens: 144,
+            cost_usd: 0.0,
         },
     }]))
 }
@@ -319,7 +320,7 @@ fn expected_inferred_request(
     });
     LlmRequest {
         purpose: LlmPurpose::InferredEdges,
-        model_id: "claude-haiku-4-5".to_owned(),
+        model_id: "anthropic/claude-sonnet-4.6".to_owned(),
         prompt_id: INFERRED_CALLS_PROMPT_VERSION.to_owned(),
         prompt: prompt.body,
         max_output_tokens: 512,
@@ -367,13 +368,14 @@ fn inferred_recording(
             target_id,
         ),
         response: LlmResponse {
-            model_id: "claude-haiku-4-5".to_owned(),
+            model_id: "anthropic/claude-sonnet-4.6".to_owned(),
             output_json: format!(
                 r#"{{"edges":[{{"site_key":"{site_key}","target_id":"{target_id}","confidence":0.91,"rationale":"name match"}}]}}"#
             ),
             input_tokens: 100,
             output_tokens: 20,
-            cost_usd: 0.002,
+            total_tokens: 120,
+            cost_usd: 0.0,
         },
     }]))
 }
@@ -414,17 +416,17 @@ impl AnyInferredProvider {
 struct AnySummaryProvider {
     invocations: Mutex<Vec<LlmRequest>>,
     delay_ms: u64,
-    estimate_usd: f64,
-    cost_usd: f64,
+    estimate_tokens: u64,
+    total_tokens: u32,
 }
 
 impl AnySummaryProvider {
-    fn new_slow(delay_ms: u64, estimate_usd: f64, cost_usd: f64) -> Self {
+    fn new_slow(delay_ms: u64, estimate_tokens: u64, total_tokens: u32) -> Self {
         Self {
             invocations: Mutex::new(Vec::new()),
             delay_ms,
-            estimate_usd,
-            cost_usd,
+            estimate_tokens,
+            total_tokens,
         }
     }
 
@@ -454,12 +456,13 @@ impl LlmProvider for AnySummaryProvider {
             output_json: r#"{"purpose":"concurrent"}"#.to_owned(),
             input_tokens: 100,
             output_tokens: 20,
-            cost_usd: self.cost_usd,
+            total_tokens: self.total_tokens,
+            cost_usd: 0.0,
         })
     }
 
-    fn estimate_cost_usd(&self, _request: &LlmRequest) -> f64 {
-        self.estimate_usd
+    fn estimate_tokens(&self, _request: &LlmRequest) -> u64 {
+        self.estimate_tokens
     }
 
     fn tier_to_model(&self, _tier: &str) -> Option<&str> {
@@ -467,7 +470,7 @@ impl LlmProvider for AnySummaryProvider {
     }
 
     fn caching_model(&self) -> CachingModel {
-        CachingModel::AnthropicPromptCache
+        CachingModel::OpenAiChatCompletions
     }
 }
 
@@ -489,12 +492,13 @@ impl LlmProvider for AnyInferredProvider {
             output_json: self.output_json.clone(),
             input_tokens: 100,
             output_tokens: 20,
-            cost_usd: 0.002,
+            total_tokens: 120,
+            cost_usd: 0.0,
         })
     }
 
-    fn estimate_cost_usd(&self, _request: &LlmRequest) -> f64 {
-        0.0
+    fn estimate_tokens(&self, _request: &LlmRequest) -> u64 {
+        0
     }
 
     fn tier_to_model(&self, _tier: &str) -> Option<&str> {
@@ -502,7 +506,7 @@ impl LlmProvider for AnyInferredProvider {
     }
 
     fn caching_model(&self) -> CachingModel {
-        CachingModel::AnthropicPromptCache
+        CachingModel::OpenAiChatCompletions
     }
 }
 
@@ -812,7 +816,7 @@ async fn summary_cold_miss_records_provider_response_then_hits_cache() {
 async fn summary_prompt_uses_entity_source_range_not_whole_file() {
     let (project, db_path) = open_project();
     let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
-    let provider = Arc::new(AnySummaryProvider::new_slow(0, 0.0, 0.001));
+    let provider = Arc::new(AnySummaryProvider::new_slow(0, 0, 120));
     let state = state_for_summary(
         project.path(),
         &db_path,
@@ -858,7 +862,7 @@ async fn summary_cache_hit_reports_stale_semantic_when_graph_counts_drift() {
                 entity_id: "python:function:demo.entry".to_owned(),
                 content_hash: "hash-python:function:demo.entry".to_owned(),
                 prompt_template_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
-                model_tier: "claude-haiku-4-5".to_owned(),
+                model_tier: "anthropic/claude-sonnet-4.6".to_owned(),
                 guidance_fingerprint: "guidance-empty".to_owned(),
             },
             summary_json: r#"{"purpose":"old"}"#.to_owned(),
@@ -906,7 +910,7 @@ async fn summary_expired_cache_row_is_refreshed_by_recording_provider() {
                 entity_id: "python:function:demo.entry".to_owned(),
                 content_hash: "hash-python:function:demo.entry".to_owned(),
                 prompt_template_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
-                model_tier: "claude-haiku-4-5".to_owned(),
+                model_tier: "anthropic/claude-sonnet-4.6".to_owned(),
                 guidance_fingerprint: "guidance-empty".to_owned(),
             },
             summary_json: r#"{"purpose":"old"}"#.to_owned(),
@@ -954,7 +958,7 @@ async fn summary_expired_cache_row_is_refreshed_by_recording_provider() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn summary_cost_ceiling_blocks_session_after_expensive_cold_call() {
+async fn summary_token_ceiling_blocks_session_after_expensive_cold_call() {
     let (project, db_path) = open_project();
     let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
     let provider = summary_recording(project.path(), "python:function:demo.entry");
@@ -964,7 +968,7 @@ async fn summary_cost_ceiling_blocks_session_after_expensive_cold_call() {
         &writer,
         provider.clone(),
         LlmConfig {
-            session_cost_ceiling_usd: 0.0005,
+            session_token_ceiling: 100,
             ..llm_config()
         },
     );
@@ -976,11 +980,11 @@ async fn summary_cost_ceiling_blocks_session_after_expensive_cold_call() {
     )
     .await;
     assert_eq!(first["ok"], false);
-    assert_eq!(first["error"]["code"], "cost-ceiling-exceeded");
-    assert_eq!(first["stats_delta"]["cost_ceiling_exceeded_total"], 1);
+    assert_eq!(first["error"]["code"], "token-ceiling-exceeded");
+    assert_eq!(first["stats_delta"]["token_ceiling_exceeded_total"], 1);
     assert_eq!(
         first["diagnostics"][0]["code"],
-        "CLA-LLM-COST-CEILING-EXCEEDED"
+        "CLA-LLM-TOKEN-CEILING-EXCEEDED"
     );
     assert_eq!(provider.invocations().len(), 1);
 
@@ -991,8 +995,8 @@ async fn summary_cost_ceiling_blocks_session_after_expensive_cold_call() {
     )
     .await;
     assert_eq!(second["ok"], false);
-    assert_eq!(second["error"]["code"], "cost-ceiling-exceeded");
-    assert_eq!(second["stats_delta"]["cost_ceiling_exceeded_total"], 1);
+    assert_eq!(second["error"]["code"], "token-ceiling-exceeded");
+    assert_eq!(second["stats_delta"]["token_ceiling_exceeded_total"], 1);
     assert_eq!(provider.invocations().len(), 1);
 
     drop(state);
@@ -1001,17 +1005,17 @@ async fn summary_cost_ceiling_blocks_session_after_expensive_cold_call() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn summary_cost_ceiling_reserves_concurrent_cold_misses() {
+async fn summary_token_ceiling_reserves_concurrent_cold_misses() {
     let (project, db_path) = open_project();
     let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
-    let provider = Arc::new(AnySummaryProvider::new_slow(100, 0.001, 0.001));
+    let provider = Arc::new(AnySummaryProvider::new_slow(100, 120, 120));
     let state = state_for_summary(
         project.path(),
         &db_path,
         &writer,
         provider.clone(),
         LlmConfig {
-            session_cost_ceiling_usd: 0.0015,
+            session_token_ceiling: 150,
             ..llm_config()
         },
     );
@@ -1034,7 +1038,7 @@ async fn summary_cost_ceiling_reserves_concurrent_cold_misses() {
         .count();
     let ceiling_count = [&first, &second]
         .into_iter()
-        .filter(|envelope| envelope["error"]["code"] == "cost-ceiling-exceeded")
+        .filter(|envelope| envelope["error"]["code"] == "token-ceiling-exceeded")
         .count();
     assert_eq!(
         ok_count, 1,
@@ -1059,14 +1063,14 @@ async fn summary_cost_ceiling_reserves_concurrent_cold_misses() {
 async fn summary_cache_hits_survive_blocked_budget() {
     let (project, db_path) = open_project();
     let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
-    let provider = Arc::new(AnySummaryProvider::new_slow(0, 0.001, 0.001));
+    let provider = Arc::new(AnySummaryProvider::new_slow(0, 120, 120));
     let state = state_for_summary(
         project.path(),
         &db_path,
         &writer,
         provider.clone(),
         LlmConfig {
-            session_cost_ceiling_usd: 0.0015,
+            session_token_ceiling: 150,
             ..llm_config()
         },
     );
@@ -1087,7 +1091,7 @@ async fn summary_cache_hits_survive_blocked_budget() {
     )
     .await;
     assert_eq!(blocked["ok"], false);
-    assert_eq!(blocked["error"]["code"], "cost-ceiling-exceeded");
+    assert_eq!(blocked["error"]["code"], "token-ceiling-exceeded");
 
     let cached = call_tool(
         &state,
