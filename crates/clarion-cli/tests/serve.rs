@@ -139,7 +139,7 @@ fn serve_wires_recording_llm_provider_and_writer_for_cached_summary_touches() {
             tokens_output, created_at, last_accessed_at, caller_count,
             fan_out, stale_semantic
          ) VALUES (
-            'python:function:demo.entry', 'hash-entry', ?1, 'claude-haiku-4-5',
+            'python:function:demo.entry', 'hash-entry', ?1, 'anthropic/claude-sonnet-4.6',
             'guidance-empty', '{\"purpose\":\"cached\"}', 0.001, 10,
             5, '2026-05-17T00:00:00.000Z', 'old-touch', 0, 0, 0
          )",

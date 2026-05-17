@@ -29,16 +29,20 @@ const CLARION_YAML_STUB: &str = "# clarion.yaml — user-edited config.\n\
 # Do not delete this file: clarion serve reads MCP, LLM, and integration\n\
 # settings from here when present.\n\
 version: 1\n\
-llm:\n\
+llm_policy:\n\
   enabled: false\n\
-  provider: anthropic\n\
+  provider: openrouter\n\
   allow_live_provider: false\n\
-  session_cost_ceiling_usd: 10.0\n\
-  summary_model_id: claude-haiku-4-5\n\
-  inferred_edges_model_id: claude-haiku-4-5\n\
+  openrouter:\n\
+    endpoint_url: https://openrouter.ai/api/v1\n\
+    api_key_env: OPENROUTER_API_KEY\n\
+    attribution:\n\
+      referer: https://github.com/qacona/clarion\n\
+      title: Clarion\n\
+  model_id: anthropic/claude-sonnet-4.6\n\
+  session_token_ceiling: 1000000\n\
   max_inferred_edges_per_caller: 8\n\
   cache_max_age_days: 180\n\
-  anthropic_api_key_env: ANTHROPIC_API_KEY\n\
 integrations:\n\
   filigree:\n\
     enabled: false\n\

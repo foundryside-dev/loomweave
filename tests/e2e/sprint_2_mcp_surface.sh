@@ -124,7 +124,57 @@ world_hash = conn.execute(
     "SELECT content_hash FROM entities WHERE id = ?",
     ("python:function:demo.world",),
 ).fetchone()[0]
+world_entity = conn.execute(
+    """
+    SELECT id, kind, name, source_file_path, source_line_start, source_line_end
+    FROM entities
+    WHERE id = ?
+    """,
+    ("python:function:demo.world",),
+).fetchone()
 conn.close()
+world_source = Path(world_entity[3]).read_text(encoding="utf-8")
+world_lines = world_source.splitlines(keepends=True)
+world_excerpt = "".join(world_lines[int(world_entity[4]) - 1 : int(world_entity[5])])
+world_prompt = (
+    "You are summarising one Clarion entity at leaf scope only.\n"
+    f"Entity id: {world_entity[0]}\n"
+    f"Kind: {world_entity[1]}\n"
+    f"Name: {world_entity[2]}\n"
+    f"Source excerpt:\n{world_excerpt}\n"
+    "Return JSON with purpose, behavior, relationships, and risks fields."
+)
+recording_fixture = [
+    {
+        "request": {
+            "purpose": "Summary",
+            "model_id": "anthropic/claude-sonnet-4.6",
+            "prompt_id": "leaf-v1",
+            "prompt": world_prompt,
+            "max_output_tokens": 512,
+        },
+        "response": {
+            "model_id": "anthropic/claude-sonnet-4.6",
+            "output_json": json.dumps(
+                {
+                    "purpose": "openrouter-recorded",
+                    "behavior": "Returns the demo constant.",
+                    "relationships": ["called by hello"],
+                    "risks": [],
+                },
+                separators=(",", ":"),
+            ),
+            "input_tokens": 21,
+            "output_tokens": 9,
+            "total_tokens": 30,
+            "cost_usd": 0.0,
+        },
+    }
+]
+(project_dir / ".clarion" / "openrouter-recording.json").write_text(
+    json.dumps(recording_fixture, separators=(",", ":")),
+    encoding="utf-8",
+)
 filigree_requests: list[str] = []
 
 
@@ -174,8 +224,12 @@ filigree_thread.start()
 (project_dir / "clarion.yaml").write_text(
     f"""
 version: 1
-llm:
-  enabled: false
+llm_policy:
+  enabled: true
+  provider: recording
+  model_id: anthropic/claude-sonnet-4.6
+  session_token_ceiling: 1000000
+  recording_fixture_path: .clarion/openrouter-recording.json
 integrations:
   filigree:
     enabled: true
@@ -288,6 +342,15 @@ requests: list[tuple[str, dict[str, object]]] = [
         },
     ),
     (
+        "summary",
+        {
+            "jsonrpc": "2.0",
+            "id": "summary",
+            "method": "tools/call",
+            "params": {"name": "summary", "arguments": {"id": "python:function:demo.world"}},
+        },
+    ),
+    (
         "issues",
         {
             "jsonrpc": "2.0",
@@ -356,6 +419,15 @@ neighborhood = assert_tool_ok(responses["neighborhood"])
 neighbor_callers = {item["entity"]["id"] for item in neighborhood["result"]["callers"]}
 assert "python:function:demo.hello" in neighbor_callers, neighborhood
 assert neighborhood["result"]["container"]["id"] == "python:module:demo", neighborhood
+
+summary = assert_tool_ok(responses["summary"])
+assert summary["result"]["cache"]["hit"] is False, summary
+assert summary["result"]["summary"]["purpose"] == "openrouter-recorded", summary
+assert summary["result"]["usage"]["tokens_input"] == 21, summary
+assert summary["result"]["usage"]["tokens_output"] == 9, summary
+assert summary["result"]["usage"]["tokens_total"] == 30, summary
+assert summary["stats_delta"]["summary_cache_misses_total"] == 1, summary
+assert summary["stats_delta"]["summary_tokens_total"] == 30, summary
 
 issues = assert_tool_ok(responses["issues"])
 assert issues["result"]["available"] is True, issues

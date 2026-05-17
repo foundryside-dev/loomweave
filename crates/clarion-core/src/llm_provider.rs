@@ -3,21 +3,20 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 pub const LEAF_SUMMARY_PROMPT_TEMPLATE_ID: &str = "leaf-v1";
 pub const INFERRED_CALLS_PROMPT_VERSION: &str = "inferred-calls-v1";
-const ANTHROPIC_MESSAGES_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_VERSION: &str = "2023-06-01";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LlmPurpose {
     Summary,
     InferredEdges,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlmRequest {
     pub purpose: LlmPurpose,
     pub model_id: String,
@@ -26,50 +25,71 @@ pub struct LlmRequest {
     pub max_output_tokens: u32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmResponse {
     pub model_id: String,
     pub output_json: String,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    pub total_tokens: u32,
     pub cost_usd: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CachingModel {
-    AnthropicPromptCache,
+    OpenAiChatCompletions,
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error, PartialEq)]
 pub enum LlmProviderError {
     #[error("recording fixture has no response for prompt {prompt_id:?} on model {model_id:?}")]
     MissingRecording { prompt_id: String, model_id: String },
 
-    #[error("live Anthropic provider requires explicit opt-in")]
+    #[error("live OpenRouter provider requires explicit opt-in")]
     LiveProviderNotAllowed,
 
-    #[error("live Anthropic provider requires an API key")]
+    #[error("live OpenRouter provider requires an API key")]
     MissingApiKey,
 
-    #[error("live Anthropic HTTP request failed: {0}")]
-    Http(String),
+    #[error("live OpenRouter HTTP request failed: {message}")]
+    Http { message: String, retryable: bool },
 
-    #[error("live Anthropic returned HTTP {status}: {body}")]
-    HttpStatus { status: u16, body: String },
+    #[error("live OpenRouter returned status {status}: {message}")]
+    Provider {
+        status: u16,
+        code: Option<Value>,
+        message: String,
+        metadata: Option<Value>,
+        retryable: bool,
+        retry_after_seconds: Option<u64>,
+    },
 
-    #[error("invalid live Anthropic response: {0}")]
-    InvalidResponse(String),
+    #[error("invalid live OpenRouter response: {message}")]
+    InvalidResponse { message: String, retryable: bool },
+}
+
+impl LlmProviderError {
+    pub fn retryable(&self) -> bool {
+        match self {
+            Self::MissingRecording { .. } | Self::LiveProviderNotAllowed | Self::MissingApiKey => {
+                false
+            }
+            Self::Http { retryable, .. }
+            | Self::Provider { retryable, .. }
+            | Self::InvalidResponse { retryable, .. } => *retryable,
+        }
+    }
 }
 
 pub trait LlmProvider: Send + Sync {
     fn name(&self) -> &'static str;
     fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError>;
-    fn estimate_cost_usd(&self, request: &LlmRequest) -> f64;
+    fn estimate_tokens(&self, request: &LlmRequest) -> u64;
     fn tier_to_model(&self, tier: &str) -> Option<&str>;
     fn caching_model(&self) -> CachingModel;
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Recording {
     pub request: LlmRequest,
     pub response: LlmResponse,
@@ -117,8 +137,8 @@ impl LlmProvider for RecordingProvider {
             })
     }
 
-    fn estimate_cost_usd(&self, _request: &LlmRequest) -> f64 {
-        0.0
+    fn estimate_tokens(&self, _request: &LlmRequest) -> u64 {
+        0
     }
 
     fn tier_to_model(&self, _tier: &str) -> Option<&str> {
@@ -126,36 +146,32 @@ impl LlmProvider for RecordingProvider {
     }
 
     fn caching_model(&self) -> CachingModel {
-        CachingModel::AnthropicPromptCache
+        CachingModel::OpenAiChatCompletions
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AnthropicProviderConfig {
+pub struct OpenRouterProviderConfig {
     pub api_key: Option<String>,
     pub allow_live_provider: bool,
-    pub summary_model_id: String,
-    pub inferred_edges_model_id: String,
+    pub model_id: String,
+    pub endpoint_url: String,
+    pub referer: String,
+    pub title: String,
 }
 
 #[derive(Debug, Clone)]
-pub struct AnthropicProvider {
-    summary_model_id: String,
-    inferred_edges_model_id: String,
+pub struct OpenRouterProvider {
+    model_id: String,
     api_key: String,
-    endpoint: String,
+    endpoint_url: String,
+    referer: String,
+    title: String,
     client: reqwest::blocking::Client,
 }
 
-impl AnthropicProvider {
-    pub fn from_config(config: AnthropicProviderConfig) -> Result<Self, LlmProviderError> {
-        Self::from_config_with_endpoint(config, ANTHROPIC_MESSAGES_ENDPOINT.to_owned())
-    }
-
-    pub fn from_config_with_endpoint(
-        config: AnthropicProviderConfig,
-        endpoint: String,
-    ) -> Result<Self, LlmProviderError> {
+impl OpenRouterProvider {
+    pub fn from_config(config: OpenRouterProviderConfig) -> Result<Self, LlmProviderError> {
         if !config.allow_live_provider {
             return Err(LlmProviderError::LiveProviderNotAllowed);
         }
@@ -165,26 +181,38 @@ impl AnthropicProvider {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(60))
             .build()
-            .map_err(|err| LlmProviderError::Http(err.to_string()))?;
+            .map_err(|err| LlmProviderError::Http {
+                message: err.to_string(),
+                retryable: false,
+            })?;
         Ok(Self {
-            summary_model_id: config.summary_model_id,
-            inferred_edges_model_id: config.inferred_edges_model_id,
+            model_id: config.model_id,
             api_key,
-            endpoint,
+            endpoint_url: config.endpoint_url,
+            referer: config.referer,
+            title: config.title,
             client,
         })
     }
+
+    fn chat_completions_url(&self) -> String {
+        format!(
+            "{}/chat/completions",
+            self.endpoint_url.trim_end_matches('/')
+        )
+    }
 }
 
-impl LlmProvider for AnthropicProvider {
+impl LlmProvider for OpenRouterProvider {
     fn name(&self) -> &'static str {
-        "anthropic"
+        "openrouter"
     }
 
     fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
         let payload = serde_json::json!({
             "model": request.model_id,
-            "max_tokens": request.max_output_tokens,
+            "max_completion_tokens": request.max_output_tokens,
+            "temperature": 0,
             "messages": [
                 {
                     "role": "user",
@@ -194,125 +222,204 @@ impl LlmProvider for AnthropicProvider {
         });
         let response = self
             .client
-            .post(&self.endpoint)
-            .header("x-api-key", self.api_key.as_str())
-            .header("anthropic-version", ANTHROPIC_VERSION)
+            .post(self.chat_completions_url())
+            .header("authorization", format!("Bearer {}", self.api_key))
+            .header("HTTP-Referer", self.referer.as_str())
+            .header("X-OpenRouter-Title", self.title.as_str())
             .header("content-type", "application/json")
             .json(&payload)
             .send()
-            .map_err(|err| LlmProviderError::Http(err.to_string()))?;
+            .map_err(|err| LlmProviderError::Http {
+                message: err.to_string(),
+                retryable: true,
+            })?;
         let status = response.status();
-        let body = response
-            .text()
-            .map_err(|err| LlmProviderError::Http(err.to_string()))?;
+        let retry_after_seconds = retry_after_seconds(response.headers());
+        let body = response.text().map_err(|err| LlmProviderError::Http {
+            message: err.to_string(),
+            retryable: true,
+        })?;
         if !status.is_success() {
-            return Err(LlmProviderError::HttpStatus {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(provider_error_from_body(
+                status.as_u16(),
+                retry_after_seconds,
+                &body,
+            ));
         }
-        let message: AnthropicMessageResponse = serde_json::from_str(&body)
-            .map_err(|err| LlmProviderError::InvalidResponse(err.to_string()))?;
-        let output_json = message.output_text()?;
-        let cost_usd = cost_for_usage(
-            &message.model,
-            message.usage.input_tokens,
-            message.usage.output_tokens,
-        );
+        if let Ok(envelope) = serde_json::from_str::<OpenRouterErrorEnvelope>(&body) {
+            return Err(provider_error_from_openrouter(
+                envelope.error.status_code(status.as_u16()),
+                Some(envelope.error.code.clone()),
+                envelope.error.message,
+                envelope.error.metadata,
+                retry_after_seconds,
+            ));
+        }
+        let completion: OpenRouterChatResponse =
+            serde_json::from_str(&body).map_err(|err| LlmProviderError::InvalidResponse {
+                message: err.to_string(),
+                retryable: true,
+            })?;
+        let output_json = completion.output_text()?;
+        let usage = completion
+            .usage
+            .ok_or_else(|| LlmProviderError::InvalidResponse {
+                message: "response missing usage".to_owned(),
+                retryable: true,
+            })?;
         Ok(LlmResponse {
-            model_id: message.model,
+            model_id: completion.model,
             output_json,
-            input_tokens: message.usage.input_tokens,
-            output_tokens: message.usage.output_tokens,
-            cost_usd,
+            input_tokens: usage.prompt,
+            output_tokens: usage.completion,
+            total_tokens: usage.total,
+            cost_usd: 0.0,
         })
     }
 
-    fn estimate_cost_usd(&self, request: &LlmRequest) -> f64 {
-        let estimated_input_tokens = estimate_tokens(&request.prompt);
-        cost_for_usage(
-            &request.model_id,
-            estimated_input_tokens,
-            request.max_output_tokens,
-        )
+    fn estimate_tokens(&self, request: &LlmRequest) -> u64 {
+        u64::from(estimate_text_tokens(&request.prompt)) + u64::from(request.max_output_tokens)
     }
 
     fn tier_to_model(&self, tier: &str) -> Option<&str> {
         match tier {
-            "summary" => Some(self.summary_model_id.as_str()),
-            "inferred_edges" => Some(self.inferred_edges_model_id.as_str()),
+            "summary" | "inferred_edges" => Some(self.model_id.as_str()),
             _ => None,
         }
     }
 
     fn caching_model(&self) -> CachingModel {
-        CachingModel::AnthropicPromptCache
+        CachingModel::OpenAiChatCompletions
     }
 }
 
 #[derive(Debug, Deserialize)]
-struct AnthropicMessageResponse {
+struct OpenRouterChatResponse {
     model: String,
-    content: Vec<AnthropicContentBlock>,
-    usage: AnthropicUsage,
+    choices: Vec<OpenRouterChoice>,
+    usage: Option<OpenRouterUsage>,
 }
 
-impl AnthropicMessageResponse {
+impl OpenRouterChatResponse {
     fn output_text(&self) -> Result<String, LlmProviderError> {
-        let text = self
-            .content
-            .iter()
-            .filter(|block| block.kind == "text")
-            .filter_map(|block| block.text.as_deref())
-            .collect::<Vec<_>>()
-            .join("");
-        if text.trim().is_empty() {
-            return Err(LlmProviderError::InvalidResponse(
-                "response contained no text blocks".to_owned(),
-            ));
+        for choice in &self.choices {
+            if let Some(error) = &choice.error {
+                return Err(provider_error_from_openrouter(
+                    error.status_code(200),
+                    Some(error.code.clone()),
+                    error.message.clone(),
+                    error.metadata.clone(),
+                    None,
+                ));
+            }
         }
-        Ok(text)
+        let text = self
+            .choices
+            .iter()
+            .filter_map(|choice| choice.message.as_ref())
+            .filter_map(|message| message.content.as_deref())
+            .find(|content| !content.trim().is_empty())
+            .ok_or_else(|| LlmProviderError::InvalidResponse {
+                message: "response contained no assistant message content".to_owned(),
+                retryable: true,
+            })?;
+        Ok(text.to_owned())
     }
 }
 
 #[derive(Debug, Deserialize)]
-struct AnthropicContentBlock {
-    #[serde(rename = "type")]
-    kind: String,
-    text: Option<String>,
+struct OpenRouterChoice {
+    message: Option<OpenRouterMessage>,
+    error: Option<OpenRouterErrorBody>,
 }
 
 #[derive(Debug, Deserialize)]
-struct AnthropicUsage {
-    input_tokens: u32,
-    output_tokens: u32,
+struct OpenRouterMessage {
+    content: Option<String>,
 }
 
-fn estimate_tokens(text: &str) -> u32 {
+#[derive(Debug, Deserialize)]
+struct OpenRouterUsage {
+    #[serde(rename = "prompt_tokens")]
+    prompt: u32,
+    #[serde(rename = "completion_tokens")]
+    completion: u32,
+    #[serde(rename = "total_tokens")]
+    total: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterErrorEnvelope {
+    error: OpenRouterErrorBody,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenRouterErrorBody {
+    code: Value,
+    message: String,
+    metadata: Option<Value>,
+}
+
+impl OpenRouterErrorBody {
+    fn status_code(&self, fallback: u16) -> u16 {
+        self.code
+            .as_u64()
+            .and_then(|code| u16::try_from(code).ok())
+            .unwrap_or(fallback)
+    }
+}
+
+fn provider_error_from_body(
+    status: u16,
+    retry_after_seconds: Option<u64>,
+    body: &str,
+) -> LlmProviderError {
+    match serde_json::from_str::<OpenRouterErrorEnvelope>(body) {
+        Ok(envelope) => provider_error_from_openrouter(
+            status,
+            Some(envelope.error.code),
+            envelope.error.message,
+            envelope.error.metadata,
+            retry_after_seconds,
+        ),
+        Err(_) => {
+            provider_error_from_openrouter(status, None, body.to_owned(), None, retry_after_seconds)
+        }
+    }
+}
+
+fn provider_error_from_openrouter(
+    status: u16,
+    code: Option<Value>,
+    message: String,
+    metadata: Option<Value>,
+    retry_after_seconds: Option<u64>,
+) -> LlmProviderError {
+    LlmProviderError::Provider {
+        status,
+        code,
+        message,
+        metadata,
+        retryable: retryable_status(status),
+        retry_after_seconds,
+    }
+}
+
+fn retryable_status(status: u16) -> bool {
+    status == 408 || status == 429 || status >= 500
+}
+
+fn retry_after_seconds(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn estimate_text_tokens(text: &str) -> u32 {
     u32::try_from(text.chars().count().div_ceil(4))
         .unwrap_or(u32::MAX)
         .max(1)
-}
-
-fn cost_for_usage(model_id: &str, input_tokens: u32, output_tokens: u32) -> f64 {
-    let (input_per_mtok, output_per_mtok) = model_pricing_usd_per_mtok(model_id);
-    (f64::from(input_tokens) * input_per_mtok + f64::from(output_tokens) * output_per_mtok)
-        / 1_000_000.0
-}
-
-fn model_pricing_usd_per_mtok(model_id: &str) -> (f64, f64) {
-    let model = model_id.to_ascii_lowercase();
-    if model.contains("haiku") {
-        (1.0, 5.0)
-    } else if model.contains("sonnet") {
-        (3.0, 15.0)
-    } else if model.contains("opus-4-1") || model.contains("opus-4-202") {
-        (15.0, 75.0)
-    } else if model.contains("opus") {
-        (5.0, 25.0)
-    } else {
-        (3.0, 15.0)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -381,17 +488,18 @@ mod tests {
     fn recording_provider_replays_exact_request_shape() {
         let request = LlmRequest {
             purpose: LlmPurpose::Summary,
-            model_id: "claude-haiku-4-5".to_owned(),
+            model_id: "anthropic/claude-sonnet-4.6".to_owned(),
             prompt_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
             prompt: "summarise python:function:demo.hello".to_owned(),
             max_output_tokens: 512,
         };
         let response = LlmResponse {
-            model_id: "claude-haiku-4-5".to_owned(),
+            model_id: "anthropic/claude-sonnet-4.6".to_owned(),
             output_json: r#"{"purpose":"demo"}"#.to_owned(),
             input_tokens: 120,
             output_tokens: 24,
-            cost_usd: 0.001,
+            total_tokens: 144,
+            cost_usd: 0.0,
         };
         let provider = RecordingProvider::from_recordings(vec![Recording {
             request: request.clone(),
@@ -434,44 +542,56 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_provider_requires_explicit_live_opt_in_and_api_key() {
-        let denied = AnthropicProvider::from_config(AnthropicProviderConfig {
+    fn openrouter_provider_requires_explicit_live_opt_in_and_api_key() {
+        let denied = OpenRouterProvider::from_config(OpenRouterProviderConfig {
             api_key: Some("secret".to_owned()),
             allow_live_provider: false,
-            summary_model_id: "claude-haiku-4-5".to_owned(),
-            inferred_edges_model_id: "claude-haiku-4-5".to_owned(),
+            model_id: "anthropic/claude-sonnet-4.6".to_owned(),
+            endpoint_url: "https://openrouter.ai/api/v1".to_owned(),
+            referer: "https://github.com/qacona/clarion".to_owned(),
+            title: "Clarion".to_owned(),
         })
         .expect_err("api key alone must not enable live calls");
         assert!(matches!(denied, LlmProviderError::LiveProviderNotAllowed));
 
-        let missing_key = AnthropicProvider::from_config(AnthropicProviderConfig {
+        let missing_key = OpenRouterProvider::from_config(OpenRouterProviderConfig {
             api_key: None,
             allow_live_provider: true,
-            summary_model_id: "claude-haiku-4-5".to_owned(),
-            inferred_edges_model_id: "claude-haiku-4-5".to_owned(),
+            model_id: "anthropic/claude-sonnet-4.6".to_owned(),
+            endpoint_url: "https://openrouter.ai/api/v1".to_owned(),
+            referer: "https://github.com/qacona/clarion".to_owned(),
+            title: "Clarion".to_owned(),
         })
         .expect_err("live opt-in without key should fail");
         assert!(matches!(missing_key, LlmProviderError::MissingApiKey));
 
-        let provider = AnthropicProvider::from_config(AnthropicProviderConfig {
+        let provider = OpenRouterProvider::from_config(OpenRouterProviderConfig {
             api_key: Some("secret".to_owned()),
             allow_live_provider: true,
-            summary_model_id: "claude-haiku-4-5".to_owned(),
-            inferred_edges_model_id: "claude-haiku-4-5".to_owned(),
+            model_id: "anthropic/claude-sonnet-4.6".to_owned(),
+            endpoint_url: "https://openrouter.ai/api/v1".to_owned(),
+            referer: "https://github.com/qacona/clarion".to_owned(),
+            title: "Clarion".to_owned(),
         })
         .expect("live opt-in and key should construct provider");
 
-        assert_eq!(provider.name(), "anthropic");
-        assert_eq!(provider.tier_to_model("summary"), Some("claude-haiku-4-5"));
+        assert_eq!(provider.name(), "openrouter");
+        assert_eq!(
+            provider.tier_to_model("summary"),
+            Some("anthropic/claude-sonnet-4.6")
+        );
         assert_eq!(
             provider.tier_to_model("inferred_edges"),
-            Some("claude-haiku-4-5")
+            Some("anthropic/claude-sonnet-4.6")
         );
-        assert_eq!(provider.caching_model(), CachingModel::AnthropicPromptCache);
+        assert_eq!(
+            provider.caching_model(),
+            CachingModel::OpenAiChatCompletions
+        );
     }
 
     #[test]
-    fn anthropic_provider_invokes_messages_api_and_prices_usage() {
+    fn openrouter_provider_invokes_chat_completions_and_extracts_usage_tokens() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -482,23 +602,27 @@ mod tests {
             let mut request = [0_u8; 8192];
             let read = stream.read(&mut request).expect("read request");
             let request = String::from_utf8_lossy(&request[..read]);
-            assert!(request.contains("POST /v1/messages HTTP/1.1"));
-            assert!(request.contains("x-api-key: secret"));
-            assert!(request.contains("anthropic-version: 2023-06-01"));
-            assert!(request.contains(r#""model":"claude-haiku-4-5""#));
-            assert!(request.contains(r#""max_tokens":512"#));
+            assert!(request.contains("POST /api/v1/chat/completions HTTP/1.1"));
+            assert!(request.contains("authorization: Bearer secret"));
+            assert!(request.contains("http-referer: https://github.com/qacona/clarion"));
+            assert!(request.contains("x-openrouter-title: Clarion"));
+            assert!(request.contains(r#""model":"anthropic/claude-sonnet-4.6""#));
+            assert!(request.contains(r#""max_completion_tokens":512"#));
             assert!(request.contains("Summarize this function"));
 
             let body = r#"{
-                "id": "msg_01",
-                "type": "message",
-                "role": "assistant",
-                "model": "claude-haiku-4-5",
-                "content": [
-                    {"type": "text", "text": "{\"purpose\":\"demo\"}"}
+                "id": "gen-01",
+                "object": "chat.completion",
+                "created": 1779000000,
+                "model": "anthropic/claude-sonnet-4.6",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "native_finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "{\"purpose\":\"demo\"}"}
+                    }
                 ],
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 1000, "output_tokens": 200}
+                "usage": {"prompt_tokens": 1000, "completion_tokens": 200, "total_tokens": 1200}
             }"#;
             write!(
                 stream,
@@ -508,32 +632,108 @@ mod tests {
             )
             .expect("write response");
         });
-        let provider = AnthropicProvider::from_config_with_endpoint(
-            AnthropicProviderConfig {
-                api_key: Some("secret".to_owned()),
-                allow_live_provider: true,
-                summary_model_id: "claude-haiku-4-5".to_owned(),
-                inferred_edges_model_id: "claude-haiku-4-5".to_owned(),
-            },
-            format!("http://{addr}/v1/messages"),
-        )
+        let provider = OpenRouterProvider::from_config(OpenRouterProviderConfig {
+            api_key: Some("secret".to_owned()),
+            allow_live_provider: true,
+            model_id: "anthropic/claude-sonnet-4.6".to_owned(),
+            endpoint_url: format!("http://{addr}/api/v1"),
+            referer: "https://github.com/qacona/clarion".to_owned(),
+            title: "Clarion".to_owned(),
+        })
         .expect("test provider");
 
         let response = provider
             .invoke(LlmRequest {
                 purpose: LlmPurpose::Summary,
-                model_id: "claude-haiku-4-5".to_owned(),
+                model_id: "anthropic/claude-sonnet-4.6".to_owned(),
                 prompt_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
                 prompt: "Summarize this function".to_owned(),
                 max_output_tokens: 512,
             })
-            .expect("invoke mocked Anthropic");
+            .expect("invoke mocked OpenRouter");
 
         assert_eq!(response.output_json, r#"{"purpose":"demo"}"#);
         assert_eq!(response.input_tokens, 1000);
         assert_eq!(response.output_tokens, 200);
-        assert!((response.cost_usd - 0.002).abs() < f64::EPSILON);
+        assert_eq!(response.total_tokens, 1200);
+        assert!((response.cost_usd - 0.0).abs() < f64::EPSILON);
         handle.join().expect("server thread");
+    }
+
+    #[test]
+    fn openrouter_provider_unwraps_error_envelope_with_retryability() {
+        let auth_error = invoke_openrouter_once(
+            "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"error\":{\"code\":401,\"message\":\"Invalid credentials\",\"metadata\":{}}}",
+        )
+        .expect_err("401 should return provider error");
+        assert!(matches!(
+            auth_error,
+            LlmProviderError::Provider {
+                status: 401,
+                retryable: false,
+                ..
+            }
+        ));
+        assert!(auth_error.to_string().contains("Invalid credentials"));
+
+        let retryable = invoke_openrouter_once(
+            "HTTP/1.1 503 Service Unavailable\r\nretry-after: 60\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"error\":{\"code\":503,\"message\":\"No provider available\",\"metadata\":{}}}",
+        )
+        .expect_err("503 should return provider error");
+        assert!(matches!(
+            retryable,
+            LlmProviderError::Provider {
+                status: 503,
+                retryable: true,
+                retry_after_seconds: Some(60),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn openrouter_provider_unwraps_choice_level_error() {
+        let err = invoke_openrouter_once(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"id\":\"gen-01\",\"object\":\"chat.completion\",\"created\":1779000000,\"model\":\"anthropic/claude-sonnet-4.6\",\"choices\":[{\"finish_reason\":\"error\",\"native_finish_reason\":\"error\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"error\":{\"code\":502,\"message\":\"Provider disconnected\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":0,\"total_tokens\":1}}",
+        )
+        .expect_err("choice error should return provider error");
+
+        assert!(matches!(
+            err,
+            LlmProviderError::Provider {
+                status: 502,
+                retryable: true,
+                ..
+            }
+        ));
+        assert!(err.to_string().contains("Provider disconnected"));
+    }
+
+    #[test]
+    fn openrouter_provider_connection_error_is_retryable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind unused port");
+        let addr = listener.local_addr().expect("unused port addr");
+        drop(listener);
+        let provider = OpenRouterProvider::from_config(OpenRouterProviderConfig {
+            api_key: Some("secret".to_owned()),
+            allow_live_provider: true,
+            model_id: "anthropic/claude-sonnet-4.6".to_owned(),
+            endpoint_url: format!("http://{addr}/api/v1"),
+            referer: "https://github.com/qacona/clarion".to_owned(),
+            title: "Clarion".to_owned(),
+        })
+        .expect("test provider");
+
+        let err = provider
+            .invoke(sample_request())
+            .expect_err("connection refused should be retryable");
+        assert!(matches!(
+            err,
+            LlmProviderError::Http {
+                retryable: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -542,17 +742,48 @@ mod tests {
         let provider = RecordingProvider::from_recordings(Vec::new());
         assert_trait(&provider);
         assert_eq!(provider.name(), "recording");
-        assert!((provider.estimate_cost_usd(&sample_request()) - 0.0).abs() < f64::EPSILON);
-        assert_eq!(provider.caching_model(), CachingModel::AnthropicPromptCache);
+        assert_eq!(provider.estimate_tokens(&sample_request()), 0);
+        assert_eq!(
+            provider.caching_model(),
+            CachingModel::OpenAiChatCompletions
+        );
     }
 
     fn sample_request() -> LlmRequest {
         LlmRequest {
             purpose: LlmPurpose::Summary,
-            model_id: "claude-haiku-4-5".to_owned(),
+            model_id: "anthropic/claude-sonnet-4.6".to_owned(),
             prompt_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
             prompt: "summary".to_owned(),
             max_output_tokens: 512,
         }
+    }
+
+    fn invoke_openrouter_once(raw_response: &'static str) -> Result<LlmResponse, LlmProviderError> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).expect("read request");
+            stream
+                .write_all(raw_response.as_bytes())
+                .expect("write response");
+        });
+        let provider = OpenRouterProvider::from_config(OpenRouterProviderConfig {
+            api_key: Some("secret".to_owned()),
+            allow_live_provider: true,
+            model_id: "anthropic/claude-sonnet-4.6".to_owned(),
+            endpoint_url: format!("http://{addr}/api/v1"),
+            referer: "https://github.com/qacona/clarion".to_owned(),
+            title: "Clarion".to_owned(),
+        })
+        .expect("test provider");
+        let result = provider.invoke(sample_request());
+        handle.join().expect("server thread");
+        result
     }
 }

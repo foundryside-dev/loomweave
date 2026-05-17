@@ -693,8 +693,8 @@ impl ServerState {
         }
 
         if self.summary_budget_blocked() {
-            return Ok(cost_ceiling_envelope(
-                "LLM session cost ceiling has been reached",
+            return Ok(token_ceiling_envelope(
+                "LLM session token ceiling has been reached",
             ));
         }
 
@@ -771,8 +771,8 @@ impl ServerState {
 
         if self.summary_budget_blocked() {
             return Err(InferredDispatchFailure::new(
-                "cost-ceiling-exceeded",
-                "LLM session cost ceiling has been reached",
+                "token-ceiling-exceeded",
+                "LLM session token ceiling has been reached",
                 false,
             ));
         }
@@ -926,22 +926,25 @@ impl ServerState {
             max_output_tokens: 512,
         };
         let Some(reservation) = self.reserve_budget(
-            llm.provider.estimate_cost_usd(&request),
-            llm.config.session_cost_ceiling_usd,
+            llm.provider.estimate_tokens(&request),
+            llm.config.session_token_ceiling,
         ) else {
             return Err(InferredDispatchFailure::new(
-                "cost-ceiling-exceeded",
-                "LLM session cost ceiling has been reached",
+                "token-ceiling-exceeded",
+                "LLM session token ceiling has been reached",
                 false,
             ));
         };
         let response = llm.provider.invoke(request).map_err(|err| {
-            InferredDispatchFailure::new("llm-provider-error", &err.to_string(), true)
+            InferredDispatchFailure::new("llm-provider-error", &err.to_string(), err.retryable())
         })?;
-        if !reservation.commit(response.cost_usd, llm.config.session_cost_ceiling_usd) {
+        if !reservation.commit(
+            u64::from(response.total_tokens),
+            llm.config.session_token_ceiling,
+        ) {
             return Err(InferredDispatchFailure::new(
-                "cost-ceiling-exceeded",
-                "LLM session cost ceiling has been reached",
+                "token-ceiling-exceeded",
+                "LLM session token ceiling has been reached",
                 false,
             ));
         }
@@ -955,7 +958,7 @@ impl ServerState {
             key: read.key,
             result_json: response.output_json,
             cost_usd: response.cost_usd,
-            token_count: i64::from(response.input_tokens) + i64::from(response.output_tokens),
+            token_count: i64::from(response.total_tokens),
             created_at: now.clone(),
             last_accessed_at: now,
         };
@@ -967,11 +970,7 @@ impl ServerState {
             })
             .await
             .map_err(|err| InferredDispatchFailure::from_storage(&err))?;
-        Ok(InferredDispatchStats::cache_miss(
-            write,
-            entry.cost_usd,
-            entry.token_count,
-        ))
+        Ok(InferredDispatchStats::cache_miss(write, entry.token_count))
     }
 
     async fn read_summary_inputs(
@@ -1060,23 +1059,27 @@ impl ServerState {
             max_output_tokens: 512,
         };
         let Some(reservation) = self.reserve_budget(
-            summary_llm.provider.estimate_cost_usd(&request),
-            summary_llm.config.session_cost_ceiling_usd,
+            summary_llm.provider.estimate_tokens(&request),
+            summary_llm.config.session_token_ceiling,
         ) else {
-            return cost_ceiling_envelope("LLM session cost ceiling has been reached");
+            return token_ceiling_envelope("LLM session token ceiling has been reached");
         };
         let response = match summary_llm.provider.invoke(request) {
             Ok(response) => response,
             Err(err) => {
-                return tool_error_envelope("llm-provider-error", &err.to_string(), true);
+                return tool_error_envelope(
+                    "llm-provider-error",
+                    &err.to_string(),
+                    err.retryable(),
+                );
             }
         };
 
         if !reservation.commit(
-            response.cost_usd,
-            summary_llm.config.session_cost_ceiling_usd,
+            u64::from(response.total_tokens),
+            summary_llm.config.session_token_ceiling,
         ) {
-            return cost_ceiling_envelope("LLM session cost ceiling has been reached");
+            return token_ceiling_envelope("LLM session token ceiling has been reached");
         }
 
         if serde_json::from_str::<Value>(&response.output_json).is_err() {
@@ -1116,9 +1119,9 @@ impl ServerState {
             false,
             json!({
                 "summary_cache_misses_total": 1,
-                "summary_llm_cost_usd": entry.cost_usd,
                 "summary_tokens_input": entry.tokens_input,
-                "summary_tokens_output": entry.tokens_output
+                "summary_tokens_output": entry.tokens_output,
+                "summary_tokens_total": entry.tokens_input + entry.tokens_output
             }),
         )
     }
@@ -1146,20 +1149,29 @@ impl ServerState {
             .blocked
     }
 
-    fn reserve_budget(&self, estimate_usd: f64, ceiling_usd: f64) -> Option<BudgetReservation> {
-        let estimate_usd = estimate_usd.max(0.0);
+    fn reserve_budget(
+        &self,
+        estimate_tokens: u64,
+        ceiling_tokens: u64,
+    ) -> Option<BudgetReservation> {
         let mut budget = self
             .budget
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if budget.blocked || budget.spent_usd + budget.reserved_usd + estimate_usd > ceiling_usd {
+        if budget.blocked
+            || budget
+                .spent_tokens
+                .saturating_add(budget.reserved_tokens)
+                .saturating_add(estimate_tokens)
+                > ceiling_tokens
+        {
             budget.blocked = true;
             return None;
         }
-        budget.reserved_usd += estimate_usd;
+        budget.reserved_tokens = budget.reserved_tokens.saturating_add(estimate_tokens);
         Some(BudgetReservation {
             budget: Arc::clone(&self.budget),
-            amount_usd: estimate_usd,
+            amount_tokens: estimate_tokens,
             active: true,
         })
     }
@@ -1180,12 +1192,12 @@ impl ServerState {
 
     fn summary_model_id(&self) -> String {
         self.summary_llm.as_ref().map_or_else(
-            || "claude-haiku-4-5".to_owned(),
+            || "anthropic/claude-sonnet-4.6".to_owned(),
             |summary| {
                 summary
                     .provider
                     .tier_to_model("summary")
-                    .unwrap_or(&summary.config.summary_model_id)
+                    .unwrap_or(&summary.config.model_id)
                     .to_owned()
             },
         )
@@ -1193,12 +1205,12 @@ impl ServerState {
 
     fn inferred_edges_model_id(&self) -> String {
         self.summary_llm.as_ref().map_or_else(
-            || "claude-haiku-4-5".to_owned(),
+            || "anthropic/claude-sonnet-4.6".to_owned(),
             |summary| {
                 summary
                     .provider
                     .tier_to_model("inferred_edges")
-                    .unwrap_or(&summary.config.inferred_edges_model_id)
+                    .unwrap_or(&summary.config.model_id)
                     .to_owned()
             },
         )
@@ -1219,33 +1231,32 @@ struct SummaryLlmState {
 
 #[derive(Default)]
 struct BudgetLedger {
-    spent_usd: f64,
-    reserved_usd: f64,
+    spent_tokens: u64,
+    reserved_tokens: u64,
     blocked: bool,
 }
 
 struct BudgetReservation {
     budget: Arc<Mutex<BudgetLedger>>,
-    amount_usd: f64,
+    amount_tokens: u64,
     active: bool,
 }
 
 impl BudgetReservation {
-    fn commit(mut self, actual_cost_usd: f64, ceiling_usd: f64) -> bool {
-        let actual_cost_usd = actual_cost_usd.max(0.0);
+    fn commit(mut self, actual_tokens: u64, ceiling_tokens: u64) -> bool {
         let mut budget = self
             .budget
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.active {
-            budget.reserved_usd = (budget.reserved_usd - self.amount_usd).max(0.0);
+            budget.reserved_tokens = budget.reserved_tokens.saturating_sub(self.amount_tokens);
             self.active = false;
         }
-        if budget.blocked || budget.spent_usd + actual_cost_usd > ceiling_usd {
+        if budget.blocked || budget.spent_tokens.saturating_add(actual_tokens) > ceiling_tokens {
             budget.blocked = true;
             return false;
         }
-        budget.spent_usd += actual_cost_usd;
+        budget.spent_tokens = budget.spent_tokens.saturating_add(actual_tokens);
         true
     }
 }
@@ -1259,7 +1270,7 @@ impl Drop for BudgetReservation {
             .budget
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        budget.reserved_usd = (budget.reserved_usd - self.amount_usd).max(0.0);
+        budget.reserved_tokens = budget.reserved_tokens.saturating_sub(self.amount_tokens);
         self.active = false;
     }
 }
@@ -1411,7 +1422,6 @@ struct InferredDispatchStats {
     edges_skipped_static_duplicates_total: u64,
     candidate_callers_considered: u64,
     coalesced_waits_total: u64,
-    llm_cost_usd: f64,
     tokens_total: i64,
 }
 
@@ -1425,12 +1435,11 @@ impl InferredDispatchStats {
         }
     }
 
-    fn cache_miss(write: InferredEdgeWriteStats, cost_usd: f64, tokens: i64) -> Self {
+    fn cache_miss(write: InferredEdgeWriteStats, tokens: i64) -> Self {
         Self {
             cache_misses_total: 1,
             edges_materialized_total: write.inserted_edges,
             edges_skipped_static_duplicates_total: write.skipped_static_duplicates,
-            llm_cost_usd: cost_usd,
             tokens_total: tokens,
             ..Self::default()
         }
@@ -1443,7 +1452,6 @@ impl InferredDispatchStats {
         self.edges_skipped_static_duplicates_total += other.edges_skipped_static_duplicates_total;
         self.candidate_callers_considered += other.candidate_callers_considered;
         self.coalesced_waits_total += other.coalesced_waits_total;
-        self.llm_cost_usd += other.llm_cost_usd;
         self.tokens_total += other.tokens_total;
     }
 
@@ -1455,7 +1463,6 @@ impl InferredDispatchStats {
             "inferred_edges_skipped_static_duplicates_total": self.edges_skipped_static_duplicates_total,
             "inferred_candidate_callers_considered": self.candidate_callers_considered,
             "inferred_dispatch_coalesced_total": self.coalesced_waits_total,
-            "inferred_llm_cost_usd": self.llm_cost_usd,
             "inferred_tokens_total": self.tokens_total
         })
     }
@@ -1486,8 +1493,8 @@ impl InferredDispatchFailure {
     }
 
     fn to_envelope(&self) -> Value {
-        if self.code == "cost-ceiling-exceeded" {
-            return cost_ceiling_envelope(&self.message);
+        if self.code == "token-ceiling-exceeded" {
+            return token_ceiling_envelope(&self.message);
         }
         tool_error_envelope(self.code, &self.message, self.retryable)
     }
@@ -1866,25 +1873,25 @@ fn tool_error_envelope(code: &str, message: &str, retryable: bool) -> Value {
     })
 }
 
-fn cost_ceiling_envelope(message: &str) -> Value {
+fn token_ceiling_envelope(message: &str) -> Value {
     json!({
         "ok": false,
         "result": null,
         "error": {
-            "code": "cost-ceiling-exceeded",
+            "code": "token-ceiling-exceeded",
             "message": message,
             "retryable": false
         },
         "diagnostics": [
             {
-                "code": "CLA-LLM-COST-CEILING-EXCEEDED",
+                "code": "CLA-LLM-TOKEN-CEILING-EXCEEDED",
                 "message": message
             }
         ],
         "truncated": false,
         "truncation_reason": null,
         "stats_delta": {
-            "cost_ceiling_exceeded_total": 1
+            "token_ceiling_exceeded_total": 1
         }
     })
 }
@@ -1961,9 +1968,9 @@ fn summary_success_envelope(
                 "last_accessed_at": entry.last_accessed_at
             },
             "usage": {
-                "cost_usd": entry.cost_usd,
                 "tokens_input": entry.tokens_input,
-                "tokens_output": entry.tokens_output
+                "tokens_output": entry.tokens_output,
+                "tokens_total": entry.tokens_input + entry.tokens_output
             }
         }),
         stats_delta,

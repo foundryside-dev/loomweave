@@ -1,9 +1,12 @@
+use std::fs;
 use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, ensure};
-use clarion_core::{AnthropicProvider, AnthropicProviderConfig, LlmProvider, RecordingProvider};
+use clarion_core::{
+    LlmProvider, OpenRouterProvider, OpenRouterProviderConfig, Recording, RecordingProvider,
+};
 use clarion_mcp::config::{McpConfig, ProviderSelection, select_provider_with_env};
 use clarion_mcp::filigree::FiligreeHttpClient;
 use clarion_storage::{DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, ReaderPool, Writer};
@@ -29,7 +32,7 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
         McpConfig::default()
     };
     let provider_selection = select_provider_with_env(&config, |name| std::env::var(name).ok())?;
-    let llm_provider = build_llm_provider(&config, provider_selection)?;
+    let llm_provider = build_llm_provider(&config, provider_selection, &project_root)?;
     let filigree_client = FiligreeHttpClient::from_config(&config.integrations.filigree, |name| {
         std::env::var(name).ok()
     })
@@ -90,22 +93,44 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
 fn build_llm_provider(
     config: &McpConfig,
     selection: ProviderSelection,
+    project_root: &Path,
 ) -> Result<Option<Arc<dyn LlmProvider>>> {
     match selection {
         ProviderSelection::Disabled => Ok(None),
-        ProviderSelection::Recording => Ok(Some(Arc::new(RecordingProvider::from_recordings(
-            Vec::new(),
-        )))),
-        ProviderSelection::Anthropic { api_key_env } => {
+        ProviderSelection::Recording => {
+            let recordings = load_recording_fixture(config, project_root)?;
+            Ok(Some(Arc::new(RecordingProvider::from_recordings(
+                recordings,
+            ))))
+        }
+        ProviderSelection::OpenRouter { api_key_env } => {
             let api_key = std::env::var(&api_key_env).ok();
-            let provider = AnthropicProvider::from_config(AnthropicProviderConfig {
+            let provider = OpenRouterProvider::from_config(OpenRouterProviderConfig {
                 api_key,
                 allow_live_provider: true,
-                summary_model_id: config.llm.summary_model_id.clone(),
-                inferred_edges_model_id: config.llm.inferred_edges_model_id.clone(),
+                model_id: config.llm.model_id.clone(),
+                endpoint_url: config.llm.openrouter.endpoint_url.clone(),
+                referer: config.llm.openrouter.attribution.referer.clone(),
+                title: config.llm.openrouter.attribution.title.clone(),
             })
-            .context("build Anthropic LLM provider")?;
+            .context("build OpenRouter LLM provider")?;
             Ok(Some(Arc::new(provider)))
         }
     }
+}
+
+fn load_recording_fixture(config: &McpConfig, project_root: &Path) -> Result<Vec<Recording>> {
+    let Some(path) = &config.llm.recording_fixture_path else {
+        return Ok(Vec::new());
+    };
+    let path = Path::new(path);
+    let path = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        project_root.join(path)
+    };
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("read RecordingProvider fixture {}", path.display()))?;
+    serde_json::from_str(&raw)
+        .with_context(|| format!("parse RecordingProvider fixture {}", path.display()))
 }
