@@ -4,6 +4,7 @@
 //! owning the sole write `rusqlite::Connection`). Readers come from a
 //! `deadpool-sqlite` pool. See ADR-011.
 
+pub mod cache;
 pub mod commands;
 pub mod error;
 pub mod pragma;
@@ -12,6 +13,11 @@ pub mod reader;
 pub mod schema;
 pub mod writer;
 
+pub use cache::{
+    InferredEdgeCacheEntry, InferredEdgeCacheKey, SummaryCacheEntry, SummaryCacheKey,
+    inferred_edge_cache_lookup, summary_cache_lookup, touch_inferred_edge_cache,
+    touch_summary_cache, upsert_inferred_edge_cache, upsert_summary_cache,
+};
 pub use commands::{EdgeRecord, EntityRecord, RunStatus, WriterCmd};
 pub use error::{Result, StorageError};
 pub use query::{

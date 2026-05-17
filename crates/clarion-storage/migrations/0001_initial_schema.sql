@@ -128,7 +128,25 @@ CREATE TABLE summary_cache (
     tokens_input          INTEGER NOT NULL,
     tokens_output         INTEGER NOT NULL,
     created_at            TEXT NOT NULL,
+    last_accessed_at      TEXT NOT NULL,
+    caller_count          INTEGER NOT NULL,
+    fan_out               INTEGER NOT NULL,
+    stale_semantic        INTEGER NOT NULL DEFAULT 0 CHECK (stale_semantic IN (0, 1)),
     PRIMARY KEY (entity_id, content_hash, prompt_template_id, model_tier, guidance_fingerprint)
+);
+
+-- Inferred edge cache
+CREATE TABLE inferred_edge_cache (
+    caller_entity_id     TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    caller_content_hash  TEXT NOT NULL,
+    model_id             TEXT NOT NULL,
+    prompt_version       TEXT NOT NULL,
+    result_json          TEXT NOT NULL,
+    cost_usd             REAL NOT NULL DEFAULT 0.0,
+    token_count          INTEGER NOT NULL DEFAULT 0,
+    created_at           TEXT NOT NULL,
+    last_accessed_at     TEXT NOT NULL,
+    PRIMARY KEY (caller_entity_id, caller_content_hash, model_id, prompt_version)
 );
 
 -- Runs (provenance). Sprint 1 writes started_at/completed_at/config/stats/status;
