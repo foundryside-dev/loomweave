@@ -5,7 +5,7 @@ import stat
 import sys
 import textwrap
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -14,11 +14,14 @@ from clarion_plugin_python.pyright_session import (
     FINDING_PYRIGHT_INIT_TIMEOUT,
     FINDING_PYRIGHT_INSTALL_FAILURE,
     FINDING_PYRIGHT_POISON_FRAME,
+    FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT,
+    FINDING_PYRIGHT_REFERENCE_SITE_CAP,
     FINDING_PYRIGHT_RESTART,
     FINDING_PYRIGHT_UNAVAILABLE,
     LspTimeoutError,
     PyrightSession,
 )
+from clarion_plugin_python.reference_resolver import ReferenceSite, ReferenceSiteKind
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -45,6 +48,42 @@ def _write_module(tmp_path: Path, source: str, name: str = "demo.py") -> Path:
 
 def _finding_codes(result_findings: Sequence[Finding]) -> set[str]:
     return {str(finding["subcode"]) for finding in result_findings}
+
+
+def _reference_site(
+    source: str,
+    *,
+    from_id: str,
+    needle: str,
+    kind: str = "name",
+    occurrence: int = 0,
+) -> ReferenceSite:
+    lines = source.splitlines(keepends=True)
+    seen = 0
+    byte_start = 0
+    for line_no, line in enumerate(lines):
+        start = 0
+        while True:
+            character = line.find(needle, start)
+            if character < 0:
+                break
+            if seen == occurrence:
+                line_byte_start = sum(len(prev.encode("utf-8")) for prev in lines[:line_no])
+                byte_start = line_byte_start + len(line[:character].encode("utf-8"))
+                return ReferenceSite(
+                    from_id=from_id,
+                    line=line_no,
+                    character=character,
+                    end_line=line_no,
+                    end_character=character + len(needle),
+                    source_byte_start=byte_start,
+                    source_byte_end=byte_start + len(needle.encode("utf-8")),
+                    kind=cast("ReferenceSiteKind", kind),
+                )
+            seen += 1
+            start = character + len(needle)
+    msg = f"needle {needle!r} occurrence {occurrence} not found"
+    raise AssertionError(msg)
 
 
 @pytest.mark.pyright
@@ -79,6 +118,202 @@ def test_pyright_session_resolves_direct_call(tmp_path: Path, pyright_langserver
     assert result.edges[0]["source_byte_start"] < result.edges[0]["source_byte_end"]
     assert result.pyright_query_latency_ms[0] > 0
     assert result.unresolved_call_sites_total == 0
+
+
+@pytest.mark.pyright
+def test_pyright_session_resolves_module_name_reference(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    source = textwrap.dedent(
+        """
+        def world() -> int:
+            return 42
+
+        CONST_REF = world
+        """,
+    ).lstrip()
+    module = _write_module(tmp_path, source)
+    site = _reference_site(
+        source,
+        from_id="python:module:demo",
+        needle="world",
+        occurrence=1,
+    )
+
+    with PyrightSession(tmp_path, executable=pyright_langserver) as session:
+        result = session.resolve_references(module, [site])
+
+    assert result.edges == [
+        {
+            "kind": "references",
+            "from_id": "python:module:demo",
+            "to_id": "python:function:demo.world",
+            "confidence": "resolved",
+            "source_byte_start": site.source_byte_start,
+            "source_byte_end": site.source_byte_end,
+        },
+    ]
+    assert result.reference_sites_total == 1
+    assert result.references_resolved_total == 1
+    assert result.unresolved_reference_sites_total == 0
+
+
+@pytest.mark.pyright
+def test_pyright_session_resolves_annotation_reference_to_class(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    source = textwrap.dedent(
+        """
+        class Foo:
+            pass
+
+        def annotated(x: Foo) -> Foo:
+            return x
+        """,
+    ).lstrip()
+    module = _write_module(tmp_path, source)
+    sites = [
+        _reference_site(
+            source,
+            from_id="python:function:demo.annotated",
+            needle="Foo",
+            kind="annotation",
+            occurrence=1,
+        ),
+        _reference_site(
+            source,
+            from_id="python:function:demo.annotated",
+            needle="Foo",
+            kind="annotation",
+            occurrence=2,
+        ),
+    ]
+
+    with PyrightSession(tmp_path, executable=pyright_langserver) as session:
+        result = session.resolve_references(module, sites)
+
+    assert result.reference_sites_total == 2
+    assert result.references_resolved_total == 2
+    assert result.edges == [
+        {
+            "kind": "references",
+            "from_id": "python:function:demo.annotated",
+            "to_id": "python:class:demo.Foo",
+            "confidence": "resolved",
+            "source_byte_start": sites[0].source_byte_start,
+            "source_byte_end": sites[0].source_byte_end,
+        },
+    ]
+
+
+@pytest.mark.pyright
+def test_pyright_session_skips_builtin_reference_target(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    source = "def annotated(x: int) -> int:\n    return x\n"
+    module = _write_module(tmp_path, source)
+    site = _reference_site(
+        source,
+        from_id="python:function:demo.annotated",
+        needle="int",
+        kind="annotation",
+    )
+
+    with PyrightSession(tmp_path, executable=pyright_langserver) as session:
+        result = session.resolve_references(module, [site])
+
+    assert result.edges == []
+    assert result.reference_sites_total == 1
+    assert result.references_skipped_external_total == 1
+    assert result.unresolved_reference_sites_total == 1
+
+
+@pytest.mark.pyright
+def test_pyright_session_references_dedup_to_earliest_range(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    source = textwrap.dedent(
+        """
+        class Foo:
+            pass
+
+        LATER = Foo
+        EARLIER = Foo
+        """,
+    ).lstrip()
+    module = _write_module(tmp_path, source)
+    later = _reference_site(source, from_id="python:module:demo", needle="Foo", occurrence=1)
+    earlier = _reference_site(source, from_id="python:module:demo", needle="Foo", occurrence=2)
+
+    with PyrightSession(tmp_path, executable=pyright_langserver) as session:
+        result = session.resolve_references(module, [later, earlier])
+
+    assert len(result.edges) == 1
+    assert result.edges[0]["to_id"] == "python:class:demo.Foo"
+    assert result.edges[0]["source_byte_start"] == later.source_byte_start
+    assert result.edges[0]["source_byte_end"] == later.source_byte_end
+
+
+def test_pyright_session_reference_unavailable_binary_missing(tmp_path: Path) -> None:
+    source = "def world():\n    pass\n\nCONST_REF = world\n"
+    module = _write_module(tmp_path, source)
+    site = _reference_site(source, from_id="python:module:demo", needle="world", occurrence=1)
+
+    with PyrightSession(tmp_path, executable="clarion-missing-pyright") as session:
+        result = session.resolve_references(module, [site])
+
+    assert result.edges == []
+    assert result.reference_sites_total == 1
+    assert result.unresolved_reference_sites_total == 1
+    assert FINDING_PYRIGHT_UNAVAILABLE in _finding_codes(result.findings)
+
+
+def test_pyright_session_reference_site_cap(tmp_path: Path) -> None:
+    source = "def world():\n    pass\n\nCONST_REF = world\n"
+    module = _write_module(tmp_path, source)
+    site = _reference_site(source, from_id="python:module:demo", needle="world", occurrence=1)
+
+    with PyrightSession(
+        tmp_path,
+        executable=sys.executable,
+        max_reference_sites_per_file=0,
+    ) as session:
+        result = session.resolve_references(module, [site])
+
+    assert result.edges == []
+    assert result.reference_sites_total == 1
+    assert result.references_skipped_cap_total == 1
+    assert result.unresolved_reference_sites_total == 1
+    assert FINDING_PYRIGHT_REFERENCE_SITE_CAP in _finding_codes(result.findings)
+
+
+class ReferenceTimeoutSession(PyrightSession):
+    def _request(self, method: str, params: dict[str, object], timeout_secs: float) -> object:
+        if method == "textDocument/definition":
+            raise LspTimeoutError(method)
+        return super()._request(method, params, timeout_secs)
+
+
+@pytest.mark.pyright
+def test_pyright_session_reference_resolution_timeout(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    source = "def world():\n    pass\n\nCONST_REF = world\n"
+    module = _write_module(tmp_path, source)
+    site = _reference_site(source, from_id="python:module:demo", needle="world", occurrence=1)
+
+    with ReferenceTimeoutSession(tmp_path, executable=pyright_langserver) as session:
+        result = session.resolve_references(module, [site])
+
+    assert result.edges == []
+    assert result.reference_sites_total == 1
+    assert result.unresolved_reference_sites_total == 1
+    assert FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT in _finding_codes(result.findings)
 
 
 @pytest.mark.pyright
