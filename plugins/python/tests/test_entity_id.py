@@ -178,6 +178,29 @@ def test_matches_shared_calls_edge_fixture() -> None:
 
         assert wire == row["expected_wire"], f"mismatch for calls edge row {row!r}"
         assert row["source_byte_start"] < row["source_byte_end"]
+
+
+def test_matches_shared_references_edge_fixture() -> None:
+    """B.5* cross-language parity for references-edge wire shape (ADR-028)."""
+    with _FIXTURE_PATH.open() as fh:
+        fixture = json.load(fh)
+    edges = fixture["references_edges"]
+    assert len(edges) >= 2, f"fixture must have >=2 references-edge rows, got {len(edges)}"
+    for row in edges:
+        wire: dict[str, object] = {
+            "kind": "references",
+            "from_id": row["from_id"],
+            "to_id": row["to_id"],
+            "source_byte_start": row["source_byte_start"],
+            "source_byte_end": row["source_byte_end"],
+            "confidence": row["confidence"],
+        }
+        candidate_ids = row.get("candidate_ids", [])
+        if candidate_ids:
+            wire["properties"] = {"candidates": candidate_ids}
+
+        assert wire == row["expected_wire"], f"mismatch for references edge row {row!r}"
+        assert row["source_byte_start"] < row["source_byte_end"]
         if row["confidence"] == "resolved":
             assert not candidate_ids
             assert "properties" not in wire

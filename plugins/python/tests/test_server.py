@@ -17,8 +17,10 @@ from typing import IO, TYPE_CHECKING, Any, cast
 
 from clarion_plugin_python import server as server_module
 from clarion_plugin_python.call_resolver import CallResolutionResult
+from clarion_plugin_python.reference_resolver import ReferenceResolutionResult, ReferenceSite
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
     import pytest
@@ -79,8 +81,8 @@ def test_initialize_roundtrip() -> None:
         assert response["id"] == 1
         result = response["result"]
         assert result["name"] == "clarion-plugin-python"
-        assert result["version"] == "0.1.3"
-        assert result["ontology_version"] == "0.4.0"
+        assert result["version"] == "0.1.4"
+        assert result["ontology_version"] == "0.5.0"
         # Capabilities carry the L8 Wardline probe result. We don't pin a
         # specific status here because the probe's output depends on whether
         # wardline is installed in the test environment — all three legal
@@ -276,6 +278,14 @@ def test_analyze_file_lazy_initializes_pyright(
             _ = (file_path, function_ids)
             return CallResolutionResult()
 
+        def resolve_references(
+            self,
+            file_path: str,
+            sites: Sequence[ReferenceSite],
+        ) -> ReferenceResolutionResult:
+            _ = (file_path, sites)
+            return ReferenceResolutionResult()
+
         def close(self) -> None:
             self.closed = True
 
@@ -306,7 +316,43 @@ def test_analyze_file_reports_call_resolver_stats(
             _ = (file_path, function_ids)
             return CallResolutionResult(
                 unresolved_call_sites_total=3,
+                unresolved_call_sites=[
+                    {
+                        "caller_entity_id": "python:function:demo.caller",
+                        "site_ordinal": 0,
+                        "source_byte_start": 12,
+                        "source_byte_end": 20,
+                        "callee_expr": "dynamic_target",
+                    },
+                ],
                 pyright_query_latency_ms=[11, 29],
+            )
+
+        def resolve_references(
+            self,
+            file_path: str,
+            sites: Sequence[ReferenceSite],
+        ) -> ReferenceResolutionResult:
+            _ = file_path
+            assert len(sites) == 1
+            site = sites[0]
+            return ReferenceResolutionResult(
+                edges=[
+                    {
+                        "kind": "references",
+                        "from_id": "python:module:demo",
+                        "to_id": "python:function:demo.world",
+                        "confidence": "resolved",
+                        "source_byte_start": site.source_byte_start,
+                        "source_byte_end": site.source_byte_end,
+                    },
+                ],
+                reference_sites_total=1,
+                references_resolved_total=1,
+                references_skipped_external_total=2,
+                references_skipped_cap_total=3,
+                unresolved_reference_sites_total=4,
+                pyright_query_latency_ms=[31],
             )
 
         def close(self) -> None:
@@ -314,15 +360,30 @@ def test_analyze_file_reports_call_resolver_stats(
 
     monkeypatch.setattr(server_module, "PyrightSession", FakePyrightSession, raising=False)
     demo = tmp_path / "demo.py"
-    demo.write_text("def caller():\n    print('x')\n", encoding="utf-8")
+    demo.write_text("def world():\n    return 42\n\nCONST_REF = world\n", encoding="utf-8")
     state = server_module.ServerState(initialized=True, project_root=tmp_path)
 
     response = server_module.handle_analyze_file({"file_path": str(demo)}, state)
 
     assert response["stats"] == {
         "unresolved_call_sites_total": 3,
-        "pyright_query_latency_ms": [11, 29],
+        "unresolved_call_sites": [
+            {
+                "caller_entity_id": "python:function:demo.caller",
+                "site_ordinal": 0,
+                "source_byte_start": 12,
+                "source_byte_end": 20,
+                "callee_expr": "dynamic_target",
+            },
+        ],
+        "reference_sites_total": 1,
+        "references_resolved_total": 1,
+        "references_skipped_external_total": 2,
+        "references_skipped_cap_total": 3,
+        "unresolved_reference_sites_total": 4,
+        "pyright_query_latency_ms": [11, 29, 31],
     }
+    assert any(edge["kind"] == "references" for edge in response["edges"])
 
 
 def test_shutdown_closes_pyright_session() -> None:

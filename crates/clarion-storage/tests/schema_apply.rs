@@ -59,6 +59,16 @@ fn index_names(conn: &Connection) -> Vec<String> {
         .collect()
 }
 
+fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap();
+    stmt.query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .map(std::result::Result::unwrap)
+        .collect()
+}
+
 #[test]
 fn migration_0001_creates_every_expected_table() {
     let tempdir = tempfile::tempdir().unwrap();
@@ -69,6 +79,8 @@ fn migration_0001_creates_every_expected_table() {
         "entities",
         "entity_tags",
         "findings",
+        "inferred_edge_cache",
+        "entity_unresolved_call_sites",
         "runs",
         "schema_migrations",
         "summary_cache",
@@ -94,6 +106,185 @@ fn migration_0001_creates_entity_fts_virtual_table() {
     assert!(sql.contains("CREATE VIRTUAL TABLE"), "sql was: {sql}");
     conn.execute_batch("SELECT entity_id, name FROM entity_fts LIMIT 0")
         .expect("entity_fts queryable");
+}
+
+#[test]
+fn migration_0001_creates_entity_source_file_path_column_and_index() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+
+    conn.execute_batch("SELECT source_file_path FROM entities LIMIT 0")
+        .expect("entities.source_file_path is queryable");
+
+    let indexes = index_names(&conn);
+    assert!(
+        indexes
+            .iter()
+            .any(|idx| idx == "ix_entities_source_file_path"),
+        "missing source-file path index in {indexes:?}"
+    );
+}
+
+#[test]
+fn migration_0001_extends_summary_cache_for_mcp_staleness_tracking() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    let columns = table_columns(&conn, "summary_cache");
+
+    for expected in &[
+        "last_accessed_at",
+        "caller_count",
+        "fan_out",
+        "stale_semantic",
+    ] {
+        assert!(
+            columns.iter().any(|column| column == expected),
+            "missing summary_cache.{expected} in {columns:?}"
+        );
+    }
+
+    conn.execute(
+        "INSERT INTO summary_cache ( \
+            entity_id, content_hash, prompt_template_id, model_tier, \
+            guidance_fingerprint, summary_json, cost_usd, tokens_input, \
+            tokens_output, created_at, last_accessed_at, caller_count, \
+            fan_out, stale_semantic \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            "python:function:demo.hello",
+            "hash-a",
+            "leaf-v1",
+            "claude-haiku-4-5",
+            "guidance-empty",
+            r#"{"purpose":"demo"}"#,
+            0.001_f64,
+            100_i64,
+            20_i64,
+            "2026-05-17T00:00:00.000Z",
+            "2026-05-17T00:00:01.000Z",
+            2_i64,
+            1_i64,
+            0_i64,
+        ],
+    )
+    .expect("summary_cache should accept ADR-007 MCP freshness columns");
+
+    let stale_semantic: i64 = conn
+        .query_row(
+            "SELECT stale_semantic FROM summary_cache WHERE entity_id = ?1",
+            params!["python:function:demo.hello"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale_semantic, 0);
+}
+
+#[test]
+fn migration_0001_creates_inferred_edge_cache_with_four_part_key() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    let columns = table_columns(&conn, "inferred_edge_cache");
+
+    for expected in &[
+        "caller_entity_id",
+        "caller_content_hash",
+        "model_id",
+        "prompt_version",
+        "result_json",
+        "last_accessed_at",
+    ] {
+        assert!(
+            columns.iter().any(|column| column == expected),
+            "missing inferred_edge_cache.{expected} in {columns:?}"
+        );
+    }
+
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
+         created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            "python:function:demo.caller",
+            "python",
+            "function",
+            "demo.caller",
+            "caller",
+            "{}",
+            "2026-05-17T00:00:00.000Z",
+            "2026-05-17T00:00:00.000Z",
+        ],
+    )
+    .expect("seed caller entity for inferred-edge cache FK");
+
+    conn.execute(
+        "INSERT INTO inferred_edge_cache ( \
+            caller_entity_id, caller_content_hash, model_id, prompt_version, \
+            result_json, cost_usd, token_count, created_at, last_accessed_at \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            "python:function:demo.caller",
+            "hash-caller",
+            "claude-haiku-4-5",
+            "inferred-calls-v1",
+            r#"{"edges":[]}"#,
+            0.002_f64,
+            80_i64,
+            "2026-05-17T00:00:00.000Z",
+            "2026-05-17T00:00:01.000Z",
+        ],
+    )
+    .expect("inferred_edge_cache should accept D5 cache rows");
+
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM inferred_edge_cache \
+             WHERE caller_entity_id = ?1 AND caller_content_hash = ?2 \
+               AND model_id = ?3 AND prompt_version = ?4",
+            params![
+                "python:function:demo.caller",
+                "hash-caller",
+                "claude-haiku-4-5",
+                "inferred-calls-v1",
+            ],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn migration_0001_creates_unresolved_call_sites_table_and_indexes() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    let columns = table_columns(&conn, "entity_unresolved_call_sites");
+
+    for expected in &[
+        "caller_entity_id",
+        "caller_content_hash",
+        "site_key",
+        "site_ordinal",
+        "source_file_id",
+        "source_byte_start",
+        "source_byte_end",
+        "callee_expr",
+        "created_at",
+    ] {
+        assert!(
+            columns.iter().any(|column| column == expected),
+            "missing entity_unresolved_call_sites.{expected} in {columns:?}"
+        );
+    }
+
+    let indexes = index_names(&conn);
+    for expected in &[
+        "ix_unresolved_call_sites_caller",
+        "ix_unresolved_call_sites_expr",
+    ] {
+        assert!(
+            indexes.iter().any(|index| index == expected),
+            "missing unresolved-call-site index {expected} in {indexes:?}"
+        );
+    }
 }
 
 #[test]

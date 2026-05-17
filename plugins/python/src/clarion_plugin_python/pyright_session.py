@@ -16,10 +16,20 @@ from typing import IO, TYPE_CHECKING, Any, Self
 from urllib.parse import unquote, urlparse
 
 from clarion_plugin_python import __version__
-from clarion_plugin_python.call_resolver import CallResolutionResult, CallsRawEdge, Finding
+from clarion_plugin_python.call_resolver import (
+    CallResolutionResult,
+    CallsRawEdge,
+    Finding,
+    UnresolvedCallSite,
+)
 from clarion_plugin_python.entity_id import entity_id
 from clarion_plugin_python.extractor import module_dotted_name
 from clarion_plugin_python.qualname import reconstruct_qualname
+from clarion_plugin_python.reference_resolver import (
+    ReferenceResolutionResult,
+    ReferenceSite,
+    ReferencesRawEdge,
+)
 
 FINDING_PYRIGHT_RESTART = "CLA-PY-PYRIGHT-RESTART"
 FINDING_PYRIGHT_POISON_FRAME = "CLA-PY-PYRIGHT-POISON-FRAME"
@@ -27,8 +37,11 @@ FINDING_PYRIGHT_INIT_TIMEOUT = "CLA-PY-PYRIGHT-INIT-TIMEOUT"
 FINDING_PYRIGHT_UNAVAILABLE = "CLA-PY-PYRIGHT-UNAVAILABLE"
 FINDING_PYRIGHT_INSTALL_FAILURE = "CLA-PY-PYRIGHT-INSTALL-FAILURE"
 FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT = "CLA-PY-CALL-RESOLUTION-TIMEOUT"
+FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT = "CLA-PY-REFERENCE-RESOLUTION-TIMEOUT"
+FINDING_PYRIGHT_REFERENCE_SITE_CAP = "CLA-PY-REFERENCE-SITE-CAP"
 
 MAX_PYRIGHT_RESTARTS_PER_RUN = 3
+MAX_REFERENCE_SITES_PER_FILE = 2000
 PYRIGHT_INIT_TIMEOUT_SECS = 30.0
 PYRIGHT_CALL_TIMEOUT_SECS = 5.0
 STDERR_TAIL_LIMIT = 65536
@@ -54,6 +67,7 @@ class _CallSite:
     character: int
     end_line: int
     end_character: int
+    callee_expr: str
 
 
 @dataclass(frozen=True)
@@ -70,15 +84,34 @@ class _FunctionInfo:
 
 
 @dataclass(frozen=True)
+class _EntityInfo:
+    entity_id: str
+    line: int
+    character: int
+
+
+@dataclass(frozen=True)
 class _FunctionIndex:
     source: str
     line_starts: tuple[int, ...]
+    module_id: str
     by_id: dict[str, _FunctionInfo]
     by_name_position: dict[tuple[int, int], _FunctionInfo]
+    entity_by_name_position: dict[tuple[int, int], str]
     by_short_name: dict[str, str]
     dunder_call_by_class: dict[str, str]
     functions: tuple[_FunctionInfo, ...]
+    entities: tuple[_EntityInfo, ...]
     tree: ast.Module
+
+
+@dataclass
+class _ReferenceEdgeAccumulator:
+    from_id: str
+    to_id: str
+    source_byte_start: int
+    source_byte_end: int
+    candidates: set[str]
 
 
 class PyrightSession:
@@ -92,6 +125,7 @@ class PyrightSession:
         init_timeout_secs: float = PYRIGHT_INIT_TIMEOUT_SECS,
         call_timeout_secs: float = PYRIGHT_CALL_TIMEOUT_SECS,
         max_restarts_per_run: int = MAX_PYRIGHT_RESTARTS_PER_RUN,
+        max_reference_sites_per_file: int = MAX_REFERENCE_SITES_PER_FILE,
     ) -> None:
         self.project_root = Path(project_root).resolve()
         self.executable = executable
@@ -100,6 +134,7 @@ class PyrightSession:
         self.init_timeout_secs = init_timeout_secs
         self.call_timeout_secs = call_timeout_secs
         self.max_restarts_per_run = max_restarts_per_run
+        self.max_reference_sites_per_file = max_reference_sites_per_file
         self._process: subprocess.Popen[bytes] | None = None
         self._stderr_thread: threading.Thread | None = None
         self._stderr_tail = bytearray()
@@ -165,7 +200,7 @@ class PyrightSession:
 
         latency_started = time.perf_counter()
         try:
-            edges, unresolved = self._resolve_with_pyright(path, index, requested)
+            edges, unresolved, unresolved_sites = self._resolve_with_pyright(path, index, requested)
         except LspTimeoutError as exc:
             self._record_finding(
                 FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT,
@@ -174,15 +209,83 @@ class PyrightSession:
             )
             edges = []
             unresolved = ast_call_sites_total
+            unresolved_sites = []
         except (LspTransportClosedError, BrokenPipeError, OSError) as exc:
             self._record_restart_or_poison(str(exc))
             edges = []
             unresolved = ast_call_sites_total
+            unresolved_sites = []
         latency_ms = max(1, math.ceil((time.perf_counter() - latency_started) * 1000))
 
         return CallResolutionResult(
             edges=edges,
             unresolved_call_sites_total=unresolved,
+            unresolved_call_sites=unresolved_sites,
+            pyright_query_latency_ms=[latency_ms],
+            findings=self._pop_findings(),
+        )
+
+    def resolve_references(
+        self,
+        file_path: str | Path,
+        sites: Sequence[ReferenceSite],
+    ) -> ReferenceResolutionResult:
+        path = Path(file_path).resolve()
+        index = self._function_index_for_path(path)
+        reference_sites_total = len(sites)
+        if not sites:
+            return ReferenceResolutionResult(findings=self._pop_findings())
+        if reference_sites_total > self.max_reference_sites_per_file:
+            self._record_finding(
+                FINDING_PYRIGHT_REFERENCE_SITE_CAP,
+                "reference site cap exceeded; skipping reference resolution for file",
+                reference_sites_total=reference_sites_total,
+                max_reference_sites_per_file=self.max_reference_sites_per_file,
+            )
+            return ReferenceResolutionResult(
+                reference_sites_total=reference_sites_total,
+                references_skipped_cap_total=reference_sites_total,
+                unresolved_reference_sites_total=reference_sites_total,
+                findings=self._pop_findings(),
+            )
+        if not self._ensure_process():
+            return ReferenceResolutionResult(
+                reference_sites_total=reference_sites_total,
+                unresolved_reference_sites_total=reference_sites_total,
+                findings=self._pop_findings(),
+            )
+
+        latency_started = time.perf_counter()
+        try:
+            edges, resolved, skipped_external, unresolved = self._resolve_references_with_pyright(
+                path,
+                index,
+                sites,
+            )
+        except LspTimeoutError as exc:
+            self._record_finding(
+                FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT,
+                f"pyright reference query timed out: {exc.method}",
+                method=exc.method,
+            )
+            edges = []
+            resolved = 0
+            skipped_external = 0
+            unresolved = reference_sites_total
+        except (LspTransportClosedError, BrokenPipeError, OSError) as exc:
+            self._record_restart_or_poison(str(exc))
+            edges = []
+            resolved = 0
+            skipped_external = 0
+            unresolved = reference_sites_total
+        latency_ms = max(1, math.ceil((time.perf_counter() - latency_started) * 1000))
+
+        return ReferenceResolutionResult(
+            edges=edges,
+            reference_sites_total=reference_sites_total,
+            references_resolved_total=resolved,
+            references_skipped_external_total=skipped_external,
+            unresolved_reference_sites_total=unresolved,
             pyright_query_latency_ms=[latency_ms],
             findings=self._pop_findings(),
         )
@@ -192,7 +295,7 @@ class PyrightSession:
         path: Path,
         index: _FunctionIndex,
         functions: Sequence[_FunctionInfo],
-    ) -> tuple[list[CallsRawEdge], int]:
+    ) -> tuple[list[CallsRawEdge], int, list[UnresolvedCallSite]]:
         uri = path.as_uri()
         self._notify(
             "textDocument/didOpen",
@@ -208,6 +311,7 @@ class PyrightSession:
         try:
             edges: list[CallsRawEdge] = []
             unresolved_total = 0
+            unresolved_sites: list[UnresolvedCallSite] = []
             for function in functions:
                 grouped: dict[tuple[int, int, int, int], set[str]] = {}
                 prepared = self._request(
@@ -264,10 +368,139 @@ class PyrightSession:
                         edge["properties"] = {"candidates": candidate_ids}
                     edges.append(edge)
 
-                unresolved_total += max(len(function.call_sites) - len(grouped), 0)
-            return edges, unresolved_total
+                function_unresolved_sites = _unresolved_call_sites_for_function(
+                    index,
+                    function,
+                    set(grouped),
+                )
+                unresolved_total += len(function_unresolved_sites)
+                unresolved_sites.extend(function_unresolved_sites)
+            return edges, unresolved_total, unresolved_sites
         finally:
             self._notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+
+    def _resolve_references_with_pyright(
+        self,
+        path: Path,
+        index: _FunctionIndex,
+        sites: Sequence[ReferenceSite],
+    ) -> tuple[list[ReferencesRawEdge], int, int, int]:
+        uri = path.as_uri()
+        self._notify(
+            "textDocument/didOpen",
+            {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "python",
+                    "version": 1,
+                    "text": index.source,
+                },
+            },
+        )
+        try:
+            accumulators: dict[tuple[str, str], _ReferenceEdgeAccumulator] = {}
+            lookup_cache: dict[tuple[str, str, str], tuple[list[str], bool]] = {}
+            source_bytes = index.source.encode("utf-8")
+            resolved_total = 0
+            skipped_external_total = 0
+            unresolved_total = 0
+            for site in sites:
+                cache_key = _reference_lookup_cache_key(site, source_bytes)
+                cached = lookup_cache.get(cache_key)
+                if cached is None:
+                    try:
+                        candidate_ids, saw_external = self._reference_target_ids(uri, site)
+                        if not candidate_ids and site.kind == "annotation" and not saw_external:
+                            candidate_ids, fallback_external = self._reference_target_ids(
+                                uri,
+                                site,
+                                method="textDocument/typeDefinition",
+                            )
+                            saw_external = saw_external or fallback_external
+                    except LspTimeoutError as exc:
+                        self._record_finding(
+                            FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT,
+                            f"pyright reference query timed out: {exc.method}",
+                            method=exc.method,
+                            line=site.line,
+                            character=site.character,
+                            source_byte_start=site.source_byte_start,
+                            source_byte_end=site.source_byte_end,
+                        )
+                        unresolved_total += 1
+                        continue
+                    lookup_cache[cache_key] = (candidate_ids, saw_external)
+                else:
+                    candidate_ids, saw_external = cached
+                if not candidate_ids:
+                    unresolved_total += 1
+                    if saw_external:
+                        skipped_external_total += 1
+                    continue
+                resolved_total += 1
+                _merge_reference_site(accumulators, site, candidate_ids)
+            return (
+                [
+                    _reference_accumulator_to_edge(acc)
+                    for acc in _sorted_reference_accumulators(accumulators)
+                ],
+                resolved_total,
+                skipped_external_total,
+                unresolved_total,
+            )
+        finally:
+            self._notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+
+    def _reference_target_ids(
+        self,
+        uri: str,
+        site: ReferenceSite,
+        *,
+        method: str = "textDocument/definition",
+    ) -> tuple[list[str], bool]:
+        result = self._request(
+            method,
+            {
+                "textDocument": {"uri": uri},
+                "position": {"line": site.line, "character": site.character},
+            },
+            self.call_timeout_secs,
+        )
+        return self._target_ids_from_locations(result)
+
+    def _target_ids_from_locations(self, result: object) -> tuple[list[str], bool]:
+        locations = result if isinstance(result, list) else [result]
+        candidate_ids: set[str] = set()
+        saw_external = False
+        for location in locations:
+            target_id, external = self._target_id_from_location(location)
+            if external:
+                saw_external = True
+            if target_id is not None:
+                candidate_ids.add(target_id)
+        return sorted(candidate_ids), saw_external
+
+    def _target_id_from_location(self, location: object) -> tuple[str | None, bool]:
+        if not isinstance(location, dict):
+            return None, False
+        raw_uri = location.get("uri")
+        raw_range = location.get("range")
+        if raw_uri is None:
+            raw_uri = location.get("targetUri")
+        if raw_range is None:
+            raw_range = location.get("targetSelectionRange") or location.get("targetRange")
+        if not isinstance(raw_uri, str) or not isinstance(raw_range, dict):
+            return None, False
+        target_path = _path_from_uri(raw_uri)
+        if target_path is None:
+            return None, False
+        if not target_path.is_relative_to(self.project_root):
+            return None, True
+        target_index = self._function_index_for_path(target_path)
+        key = _range_start_key(raw_range)
+        if key is not None and key in target_index.entity_by_name_position:
+            return target_index.entity_by_name_position[key], False
+        return target_index.module_id, False
 
     def _ensure_process(self) -> bool:
         if self._disabled:
@@ -529,31 +762,40 @@ def _build_function_index(project_root: Path, path: Path, source: str) -> _Funct
     dotted_module = module_dotted_name(relative.as_posix())
     tree = ast.parse(source)
     functions: list[_FunctionInfo] = []
+    entities: list[_EntityInfo] = []
     source_lines = source.splitlines()
-    _collect_functions(tree, [tree], dotted_module, source_lines, functions)
+    _collect_entities(tree, [tree], dotted_module, source_lines, functions, entities)
     line_starts = _line_starts(source)
+    module_id = entity_id("python", "module", dotted_module)
     by_id = {function.entity_id: function for function in functions}
     by_name_position = {(function.line, function.character): function for function in functions}
+    entity_by_name_position = {
+        (entity.line, entity.character): entity.entity_id for entity in entities
+    }
     by_short_name = {function.name: function.entity_id for function in functions}
     dunder_call_by_class = _dunder_call_targets(functions)
     return _FunctionIndex(
         source=source,
         line_starts=line_starts,
+        module_id=module_id,
         by_id=by_id,
         by_name_position=by_name_position,
+        entity_by_name_position=entity_by_name_position,
         by_short_name=by_short_name,
         dunder_call_by_class=dunder_call_by_class,
         functions=tuple(functions),
+        entities=tuple(entities),
         tree=tree,
     )
 
 
-def _collect_functions(
+def _collect_entities(  # noqa: PLR0913 - keeps function/class indexes in one traversal.
     node: ast.AST,
     parents: list[ast.AST],
     dotted_module: str,
     source_lines: list[str],
     out: list[_FunctionInfo],
+    out_entities: list[_EntityInfo],
 ) -> None:
     for child in ast.iter_child_nodes(node):
         match child:
@@ -566,9 +808,15 @@ def _collect_functions(
                 character = line_text.find(child.name)
                 if character < 0:
                     character = child.col_offset
+                entity = _EntityInfo(
+                    entity_id=entity_id("python", "function", qualified_name),
+                    line=child.lineno - 1,
+                    character=character,
+                )
+                out_entities.append(entity)
                 out.append(
                     _FunctionInfo(
-                        entity_id=entity_id("python", "function", qualified_name),
+                        entity_id=entity.entity_id,
                         qualified_name=qualified_name,
                         name=child.name,
                         line=child.lineno - 1,
@@ -579,11 +827,113 @@ def _collect_functions(
                         node=child,
                     ),
                 )
-                _collect_functions(child, [*parents, child], dotted_module, source_lines, out)
+                _collect_entities(
+                    child,
+                    [*parents, child],
+                    dotted_module,
+                    source_lines,
+                    out,
+                    out_entities,
+                )
             case ast.ClassDef():
-                _collect_functions(child, [*parents, child], dotted_module, source_lines, out)
+                python_qualname = reconstruct_qualname(child, parents)
+                qualified_name = f"{dotted_module}.{python_qualname}"
+                line_text = (
+                    source_lines[child.lineno - 1] if child.lineno <= len(source_lines) else ""
+                )
+                character = line_text.find(child.name)
+                if character < 0:
+                    character = child.col_offset
+                out_entities.append(
+                    _EntityInfo(
+                        entity_id=entity_id("python", "class", qualified_name),
+                        line=child.lineno - 1,
+                        character=character,
+                    ),
+                )
+                _collect_entities(
+                    child,
+                    [*parents, child],
+                    dotted_module,
+                    source_lines,
+                    out,
+                    out_entities,
+                )
             case _:
-                _collect_functions(child, [*parents, child], dotted_module, source_lines, out)
+                _collect_entities(
+                    child,
+                    [*parents, child],
+                    dotted_module,
+                    source_lines,
+                    out,
+                    out_entities,
+                )
+
+
+def _merge_reference_site(
+    accumulators: dict[tuple[str, str], _ReferenceEdgeAccumulator],
+    site: ReferenceSite,
+    candidate_ids: Sequence[str],
+) -> None:
+    sorted_candidates = sorted(set(candidate_ids))
+    to_id = sorted_candidates[0]
+    key = (site.from_id, to_id)
+    existing = accumulators.get(key)
+    if existing is None:
+        accumulators[key] = _ReferenceEdgeAccumulator(
+            from_id=site.from_id,
+            to_id=to_id,
+            source_byte_start=site.source_byte_start,
+            source_byte_end=site.source_byte_end,
+            candidates=set(sorted_candidates),
+        )
+        return
+    existing.candidates.update(sorted_candidates)
+    if (site.source_byte_start, site.source_byte_end) < (
+        existing.source_byte_start,
+        existing.source_byte_end,
+    ):
+        existing.source_byte_start = site.source_byte_start
+        existing.source_byte_end = site.source_byte_end
+
+
+def _reference_lookup_cache_key(
+    site: ReferenceSite,
+    source_bytes: bytes,
+) -> tuple[str, str, str]:
+    lexeme = source_bytes[site.source_byte_start : site.source_byte_end].decode("utf-8")
+    return site.from_id, site.kind, lexeme
+
+
+def _sorted_reference_accumulators(
+    accumulators: dict[tuple[str, str], _ReferenceEdgeAccumulator],
+) -> list[_ReferenceEdgeAccumulator]:
+    return sorted(
+        accumulators.values(),
+        key=lambda acc: (
+            acc.source_byte_start,
+            acc.source_byte_end,
+            acc.from_id,
+            acc.to_id,
+        ),
+    )
+
+
+def _reference_accumulator_to_edge(
+    accumulator: _ReferenceEdgeAccumulator,
+) -> ReferencesRawEdge:
+    candidates = sorted(accumulator.candidates)
+    edge: ReferencesRawEdge = {
+        "kind": "references",
+        "from_id": accumulator.from_id,
+        "to_id": accumulator.to_id,
+        "source_byte_start": accumulator.source_byte_start,
+        "source_byte_end": accumulator.source_byte_end,
+        "confidence": "resolved" if len(candidates) == 1 else "ambiguous",
+    }
+    if len(candidates) > 1:
+        edge["properties"] = {"candidates": candidates}
+    return edge
 
 
 def _function_call_sites(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[_CallSite]:
@@ -593,18 +943,49 @@ def _function_call_sites(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[_
     return visitor.call_sites
 
 
+def _unresolved_call_sites_for_function(
+    index: _FunctionIndex,
+    function: _FunctionInfo,
+    resolved_ranges: set[tuple[int, int, int, int]],
+) -> list[UnresolvedCallSite]:
+    unresolved: list[UnresolvedCallSite] = []
+    for site_ordinal, call_site in enumerate(function.call_sites):
+        range_key = (
+            call_site.line,
+            call_site.character,
+            call_site.end_line,
+            call_site.end_character,
+        )
+        if range_key in resolved_ranges:
+            continue
+        start_byte = _position_to_byte(index, call_site.line, call_site.character)
+        end_byte = _position_to_byte(index, call_site.end_line, call_site.end_character)
+        unresolved.append(
+            {
+                "caller_entity_id": function.entity_id,
+                "site_ordinal": site_ordinal,
+                "source_byte_start": start_byte,
+                "source_byte_end": end_byte,
+                "callee_expr": call_site.callee_expr,
+            },
+        )
+    return unresolved
+
+
 class _CallSiteVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.call_sites: list[_CallSite] = []
 
     def visit_Call(self, node: ast.Call) -> None:
         func = node.func
+        callee_expr = ast.unparse(func)
         self.call_sites.append(
             _CallSite(
                 func.lineno - 1,
                 func.col_offset,
                 (func.end_lineno or func.lineno) - 1,
                 func.end_col_offset or func.col_offset,
+                callee_expr,
             ),
         )
         self.generic_visit(node)
