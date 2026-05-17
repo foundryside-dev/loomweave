@@ -143,12 +143,16 @@ Traffic envelope:
   `PyrightSession` lifecycle.
 - One AST walk per file to collect `ReferenceSite` objects and call-callee
   suppression ranges.
-- One `definition` request per candidate reference site; at most one
-  `typeDefinition` fallback for annotation/type positions. Worst case is about
-  `2 * reference_sites_total` requests.
+- One `definition` request per unique `(from_id, site kind, source lexeme)`
+  lookup in the file; repeated same-owner references reuse the first result.
+- At most one `typeDefinition` fallback for annotation/type positions when
+  `definition` returns no target. If `definition` resolves only outside
+  `project_root`, the site is counted as external and the fallback is skipped.
 - B.4*'s gate result is not sufficient by itself because references can
   outnumber function entities. B.5* adds per-run reference counters and a
   B.5 reference scale smoke before close; B.8 remains the full-scale arbiter.
+  The recorded B.5 smoke result lives in
+  [b5-gate-results.md](./b5-gate-results.md).
 
 Target filter and mapping:
 
@@ -317,6 +321,9 @@ B.5 reference scale smoke:
 - Mitigations: per-file content-hash cache, lower source-site inclusion scope,
   or a target-first cross-reference redesign if per-site lookup proves too
   expensive.
+- The implemented mitigation is a per-file repeated-lookup cache keyed by
+  `(from_id, site kind, source lexeme)`, plus an external-definition
+  short-circuit for annotation fallback.
 
 ## 7. Implementation Task Ledger
 
@@ -436,7 +443,8 @@ RED tests:
   - `dropped_edges_total == 0`;
   - `unresolved_call_sites_total == 0`;
   - reference stats are nonzero where expected.
-- B.5 reference scale smoke records the counters from Section 6.
+- B.5 reference scale smoke records the counters from Section 6 in
+  [b5-gate-results.md](./b5-gate-results.md).
 
 GREEN: update versions, manifests, fixtures, tests, and e2e script.
 
@@ -506,4 +514,3 @@ ACCEPT-WITH-REVISION.
 
 This section is the authoritative panel record; raw reviewer transcripts live in
 the conversation log.
-

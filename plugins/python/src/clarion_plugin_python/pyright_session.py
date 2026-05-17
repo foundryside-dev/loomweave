@@ -383,18 +383,39 @@ class PyrightSession:
         )
         try:
             accumulators: dict[tuple[str, str], _ReferenceEdgeAccumulator] = {}
+            lookup_cache: dict[tuple[str, str, str], tuple[list[str], bool]] = {}
+            source_bytes = index.source.encode("utf-8")
             resolved_total = 0
             skipped_external_total = 0
             unresolved_total = 0
             for site in sites:
-                candidate_ids, saw_external = self._reference_target_ids(uri, site)
-                if not candidate_ids and site.kind == "annotation":
-                    candidate_ids, fallback_external = self._reference_target_ids(
-                        uri,
-                        site,
-                        method="textDocument/typeDefinition",
-                    )
-                    saw_external = saw_external or fallback_external
+                cache_key = _reference_lookup_cache_key(site, source_bytes)
+                cached = lookup_cache.get(cache_key)
+                if cached is None:
+                    try:
+                        candidate_ids, saw_external = self._reference_target_ids(uri, site)
+                        if not candidate_ids and site.kind == "annotation" and not saw_external:
+                            candidate_ids, fallback_external = self._reference_target_ids(
+                                uri,
+                                site,
+                                method="textDocument/typeDefinition",
+                            )
+                            saw_external = saw_external or fallback_external
+                    except LspTimeoutError as exc:
+                        self._record_finding(
+                            FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT,
+                            f"pyright reference query timed out: {exc.method}",
+                            method=exc.method,
+                            line=site.line,
+                            character=site.character,
+                            source_byte_start=site.source_byte_start,
+                            source_byte_end=site.source_byte_end,
+                        )
+                        unresolved_total += 1
+                        continue
+                    lookup_cache[cache_key] = (candidate_ids, saw_external)
+                else:
+                    candidate_ids, saw_external = cached
                 if not candidate_ids:
                     unresolved_total += 1
                     if saw_external:
@@ -858,6 +879,14 @@ def _merge_reference_site(
     ):
         existing.source_byte_start = site.source_byte_start
         existing.source_byte_end = site.source_byte_end
+
+
+def _reference_lookup_cache_key(
+    site: ReferenceSite,
+    source_bytes: bytes,
+) -> tuple[str, str, str]:
+    lexeme = source_bytes[site.source_byte_start : site.source_byte_end].decode("utf-8")
+    return site.from_id, site.kind, lexeme
 
 
 def _sorted_reference_accumulators(

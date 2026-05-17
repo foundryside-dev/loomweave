@@ -298,6 +298,63 @@ class ReferenceTimeoutSession(PyrightSession):
         return super()._request(method, params, timeout_secs)
 
 
+class PartialReferenceTimeoutSession(PyrightSession):
+    def __init__(
+        self,
+        project_root: Path,
+        *,
+        targets_by_start: dict[int, list[str]],
+        timeout_start: int,
+    ) -> None:
+        super().__init__(project_root, executable=sys.executable)
+        self.targets_by_start = targets_by_start
+        self.timeout_start = timeout_start
+        self.requested_starts: list[int] = []
+
+    def _ensure_process(self) -> bool:
+        return True
+
+    def _notify(self, method: str, params: dict[str, object]) -> None:
+        _ = (method, params)
+
+    def _reference_target_ids(
+        self,
+        uri: str,
+        site: ReferenceSite,
+        *,
+        method: str = "textDocument/definition",
+    ) -> tuple[list[str], bool]:
+        _ = (uri, method)
+        self.requested_starts.append(site.source_byte_start)
+        if site.source_byte_start == self.timeout_start:
+            raise LspTimeoutError(method)
+        return self.targets_by_start[site.source_byte_start], False
+
+
+class CountingReferenceSession(PyrightSession):
+    def __init__(self, project_root: Path, *, target_id: str) -> None:
+        super().__init__(project_root, executable=sys.executable)
+        self.target_id = target_id
+        self.requested_starts: list[int] = []
+
+    def _ensure_process(self) -> bool:
+        return True
+
+    def _notify(self, method: str, params: dict[str, object]) -> None:
+        _ = (method, params)
+
+    def _reference_target_ids(
+        self,
+        uri: str,
+        site: ReferenceSite,
+        *,
+        method: str = "textDocument/definition",
+    ) -> tuple[list[str], bool]:
+        _ = (uri, method)
+        self.requested_starts.append(site.source_byte_start)
+        return [self.target_id], False
+
+
 @pytest.mark.pyright
 def test_pyright_session_reference_resolution_timeout(
     tmp_path: Path,
@@ -312,6 +369,105 @@ def test_pyright_session_reference_resolution_timeout(
 
     assert result.edges == []
     assert result.reference_sites_total == 1
+    assert result.unresolved_reference_sites_total == 1
+    assert FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT in _finding_codes(result.findings)
+
+
+def test_pyright_session_reuses_same_owner_reference_lookup(tmp_path: Path) -> None:
+    source = textwrap.dedent(
+        """
+        def world():
+            pass
+
+        FIRST = world
+        SECOND = world
+        """,
+    ).lstrip()
+    module = _write_module(tmp_path, source)
+    first = _reference_site(source, from_id="python:module:demo", needle="world", occurrence=1)
+    second = _reference_site(source, from_id="python:module:demo", needle="world", occurrence=2)
+
+    with CountingReferenceSession(
+        tmp_path,
+        target_id="python:function:demo.world",
+    ) as session:
+        result = session.resolve_references(module, [first, second])
+        requested_starts = session.requested_starts
+
+    assert requested_starts == [first.source_byte_start]
+    assert result.reference_sites_total == 2
+    assert result.references_resolved_total == 2
+    assert result.unresolved_reference_sites_total == 0
+    assert result.edges == [
+        {
+            "kind": "references",
+            "from_id": "python:module:demo",
+            "to_id": "python:function:demo.world",
+            "confidence": "resolved",
+            "source_byte_start": first.source_byte_start,
+            "source_byte_end": first.source_byte_end,
+        },
+    ]
+
+
+def test_pyright_session_reference_timeout_skips_only_current_site(tmp_path: Path) -> None:
+    source = textwrap.dedent(
+        """
+        def alpha():
+            pass
+
+        def beta():
+            pass
+
+        def gamma():
+            pass
+
+        FIRST = alpha
+        BROKEN = beta
+        THIRD = gamma
+        """,
+    ).lstrip()
+    module = _write_module(tmp_path, source)
+    first = _reference_site(source, from_id="python:module:demo", needle="alpha", occurrence=1)
+    broken = _reference_site(source, from_id="python:module:demo", needle="beta", occurrence=1)
+    third = _reference_site(source, from_id="python:module:demo", needle="gamma", occurrence=1)
+
+    with PartialReferenceTimeoutSession(
+        tmp_path,
+        targets_by_start={
+            first.source_byte_start: ["python:function:demo.alpha"],
+            third.source_byte_start: ["python:function:demo.gamma"],
+        },
+        timeout_start=broken.source_byte_start,
+    ) as session:
+        result = session.resolve_references(module, [first, broken, third])
+        requested_starts = session.requested_starts
+
+    assert result.edges == [
+        {
+            "kind": "references",
+            "from_id": "python:module:demo",
+            "to_id": "python:function:demo.alpha",
+            "confidence": "resolved",
+            "source_byte_start": first.source_byte_start,
+            "source_byte_end": first.source_byte_end,
+        },
+        {
+            "kind": "references",
+            "from_id": "python:module:demo",
+            "to_id": "python:function:demo.gamma",
+            "confidence": "resolved",
+            "source_byte_start": third.source_byte_start,
+            "source_byte_end": third.source_byte_end,
+        },
+    ]
+    assert requested_starts == [
+        first.source_byte_start,
+        broken.source_byte_start,
+        third.source_byte_start,
+    ]
+    assert result.reference_sites_total == 3
+    assert result.references_resolved_total == 2
     assert result.unresolved_reference_sites_total == 1
     assert FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT in _finding_codes(result.findings)
 
