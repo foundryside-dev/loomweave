@@ -14,8 +14,11 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
         path.display()
     );
 
-    let _readers = ReaderPool::open(&db_path, 16)
+    let readers = ReaderPool::open(&db_path, 16)
         .map_err(|err| anyhow!("open reader pool for {}: {err}", db_path.display()))?;
+    let project_root = path
+        .canonicalize()
+        .with_context(|| format!("canonicalize project path {}", path.display()))?;
     let default_config_path = path.join("clarion.yaml");
     let config_path = config_path.unwrap_or(&default_config_path);
     let config = if config_path.exists() {
@@ -30,6 +33,7 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
     let stdout = std::io::stdout();
     let mut reader = BufReader::new(stdin.lock());
     let mut writer = stdout.lock();
+    let state = clarion_mcp::ServerState::new(project_root, readers);
 
-    clarion_mcp::serve_stdio(&mut reader, &mut writer).context("serve MCP stdio")
+    clarion_mcp::serve_stdio_with_state(&state, &mut reader, &mut writer).context("serve MCP stdio")
 }

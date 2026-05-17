@@ -4,8 +4,8 @@ use std::path::Path;
 
 use clarion_core::EdgeConfidence;
 use clarion_storage::{
-    call_edges_from, call_edges_targeting, contained_entity_ids, entity_at_line, entity_by_id,
-    find_entities, normalize_source_path, pragma, schema,
+    call_edges_from, call_edges_targeting, child_entity_ids, contained_entity_ids, entity_at_line,
+    entity_by_id, find_entities, normalize_source_path, pragma, schema,
 };
 use rusqlite::{Connection, params};
 
@@ -282,6 +282,29 @@ fn contained_entity_ids_is_depth_first_cycle_safe_and_capped() {
         ]
     );
     assert!(traversal.truncated);
+}
+
+#[test]
+fn child_entity_ids_returns_only_direct_contains_children() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    for id in [
+        "python:module:demo",
+        "python:class:demo.Demo",
+        "python:function:demo.Demo.method",
+    ] {
+        insert_entity(&conn, id, "function");
+    }
+    insert_contains_edge(&conn, "python:module:demo", "python:class:demo.Demo");
+    insert_contains_edge(
+        &conn,
+        "python:class:demo.Demo",
+        "python:function:demo.Demo.method",
+    );
+
+    let children = child_entity_ids(&conn, "python:module:demo").expect("direct children");
+
+    assert_eq!(children, vec!["python:class:demo.Demo".to_owned()]);
 }
 
 #[test]

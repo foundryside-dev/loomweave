@@ -16,7 +16,8 @@ pub use commands::{EdgeRecord, EntityRecord, RunStatus, WriterCmd};
 pub use error::{Result, StorageError};
 pub use query::{
     CallEdgeMatch, ContainedEntities, EntityRow, call_edges_from, call_edges_targeting,
-    contained_entity_ids, entity_at_line, entity_by_id, find_entities, normalize_source_path,
+    child_entity_ids, contained_entity_ids, entity_at_line, entity_by_id, find_entities,
+    normalize_source_path,
 };
 pub use reader::ReaderPool;
 pub use writer::{DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, Writer};

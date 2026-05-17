@@ -245,9 +245,11 @@ version = "0.1.0-dev"
 dependencies = [
  "clarion-core",
  "clarion-storage",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_yml",
+ "tempfile",
  "thiserror",
  "tokio",
 ]

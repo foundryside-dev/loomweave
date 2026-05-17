@@ -265,7 +265,7 @@ pub fn contained_entity_ids(
 ) -> Result<ContainedEntities> {
     let mut visited = BTreeSet::from([root_id.to_owned()]);
     let mut entity_ids = Vec::new();
-    let mut stack = children_of(conn, root_id)?;
+    let mut stack = child_entity_ids(conn, root_id)?;
     stack.reverse();
 
     while let Some(entity_id) = stack.pop() {
@@ -279,7 +279,7 @@ pub fn contained_entity_ids(
             });
         }
         entity_ids.push(entity_id.clone());
-        let mut children = children_of(conn, &entity_id)?;
+        let mut children = child_entity_ids(conn, &entity_id)?;
         children.reverse();
         for child in children {
             if !visited.contains(&child) {
@@ -327,7 +327,7 @@ fn map_stored_call_edge(row: &Row<'_>) -> rusqlite::Result<StoredCallEdge> {
     })
 }
 
-fn children_of(conn: &Connection, entity_id: &str) -> Result<Vec<String>> {
+pub fn child_entity_ids(conn: &Connection, entity_id: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT to_id \
          FROM edges \
