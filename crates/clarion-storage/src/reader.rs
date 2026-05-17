@@ -73,4 +73,16 @@ impl ReaderPool {
         })
         .await?
     }
+
+    /// Number of callers currently waiting for a connection.
+    ///
+    /// Exposed so tests can assert that a queued reader has actually reached
+    /// the pool's wait-list, replacing wall-clock sleep heuristics with a
+    /// deterministic poll. Not part of the stable API; the deadpool
+    /// `Status` shape is an implementation detail.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn waiting_count(&self) -> usize {
+        self.pool.status().waiting
+    }
 }

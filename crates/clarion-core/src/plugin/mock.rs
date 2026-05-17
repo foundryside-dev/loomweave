@@ -32,8 +32,8 @@ use std::io::Cursor;
 use thiserror::Error;
 
 use super::{
-    AnalyzeFileResult, InitializeResult, JsonRpcVersion, RequestEnvelope, ResponseEnvelope,
-    ResponsePayload, ShutdownResult, read_frame, write_frame,
+    AnalyzeFileResult, AnalyzeFileStats, InitializeResult, JsonRpcVersion, RequestEnvelope,
+    ResponseEnvelope, ResponsePayload, ShutdownResult, read_frame, write_frame,
 };
 use crate::plugin::Frame;
 use crate::plugin::limits::ContentLengthCeiling;
@@ -508,7 +508,11 @@ impl MockPlugin {
                 })]
             }
         };
-        let result = AnalyzeFileResult { entities };
+        let result = AnalyzeFileResult {
+            entities,
+            edges: vec![],
+            stats: AnalyzeFileStats::default(),
+        };
         let env = ResponseEnvelope {
             jsonrpc: JsonRpcVersion,
             id,

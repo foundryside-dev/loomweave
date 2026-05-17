@@ -52,7 +52,7 @@ def _locate_binary() -> Path:
     return binary
 
 
-def test_round_trip_self_analysis() -> None:
+def test_round_trip_self_analysis() -> None:  # noqa: PLR0915 - by-kind invariants are flat asserts
     """Plugin → analyze_file on its own extractor.py → expected entities appear."""
     binary = _locate_binary()
 
@@ -113,20 +113,86 @@ def test_round_trip_self_analysis() -> None:
         assert response["id"] == 2
 
         entities = response["result"]["entities"]
-        ids = {e["id"] for e in entities}
-        # Public extractor API must be present.
-        assert "python:function:clarion_plugin_python.extractor.module_dotted_name" in ids
-        assert "python:function:clarion_plugin_python.extractor.extract" in ids
-        # Private walker is a FunctionDef too, so it emits.
-        assert "python:function:clarion_plugin_python.extractor._walk" in ids
-        assert "python:function:clarion_plugin_python.extractor._build_entity" in ids
+        edges = response["result"]["edges"]
+        function_entities = [e for e in entities if e["kind"] == "function"]
+        module_entities = [e for e in entities if e["kind"] == "module"]
+        class_entities = [e for e in entities if e["kind"] == "class"]
+        function_ids = {e["id"] for e in function_entities}
 
-        # Every entity should carry kind="function" and the absolute
-        # source.file_path we sent (project_root relativisation only affects
-        # the qualified_name prefix, not source.file_path).
+        # Invariants — no exact totals (those become merge-conflict generators
+        # the moment someone adds a private helper to extractor.py).
+        assert len(module_entities) == 1, "exactly one module entity per analyzed file"
+        assert module_entities[0]["id"] == "python:module:clarion_plugin_python.extractor"
+        assert module_entities[0].get("parse_status") == "ok"
+
+        # Public extractor API must be present.
+        assert "python:function:clarion_plugin_python.extractor.module_dotted_name" in function_ids
+        assert "python:function:clarion_plugin_python.extractor.extract" in function_ids
+        # Private walker is a FunctionDef too, so it emits.
+        assert "python:function:clarion_plugin_python.extractor._walk" in function_ids
+        # B.2 renamed `_build_entity` → `_build_function_entity` and added
+        # `_build_class_entity` + `_build_module_entity` (and `_module_source_range`).
+        assert (
+            "python:function:clarion_plugin_python.extractor._build_function_entity" in function_ids
+        )
+        assert "python:function:clarion_plugin_python.extractor._build_class_entity" in function_ids
+        assert (
+            "python:function:clarion_plugin_python.extractor._build_module_entity" in function_ids
+        )
+
+        # extractor.py defines its wire-shape TypedDicts at module level
+        # (SourceRange, EntitySource, RawEntity); these are AST ClassDefs
+        # and so emit as `class` entities. Subset assertion only —
+        # exhaustive enumeration would be brittle.
+        class_ids = {e["id"] for e in class_entities}
+        assert "python:class:clarion_plugin_python.extractor.SourceRange" in class_ids
+        assert "python:class:clarion_plugin_python.extractor.EntitySource" in class_ids
+        assert "python:class:clarion_plugin_python.extractor.RawEntity" in class_ids
+
+        # Every entity carries the absolute source.file_path we sent
+        # (project_root relativisation only affects the qualified_name prefix).
         for entity in entities:
-            assert entity["kind"] == "function"
             assert entity["source"]["file_path"] == str(target)
+
+        # B.3 contains-edge round-trip (Task 7) + B.4* calls-edge smoke.
+        # Every non-module entity declares parent_id; every contains edge
+        # in the response matches some entity's parent_id (dual-encoding
+        # invariant, ADR-026 decision 2). Calls edges are anchored and
+        # confidence-bearing per ADR-028.
+        assert edges, "extractor.py must produce contains edges (non-empty file)"
+        contains_pairs = {(e["from_id"], e["to_id"]) for e in edges if e["kind"] == "contains"}
+        calls_edges = [e for e in edges if e["kind"] == "calls"]
+        references_edges = [e for e in edges if e["kind"] == "references"]
+        resolved_calls = [e for e in calls_edges if e["confidence"] == "resolved"]
+        ambiguous_calls = [e for e in calls_edges if e["confidence"] == "ambiguous"]
+        resolved_references = [e for e in references_edges if e["confidence"] == "resolved"]
+        assert resolved_calls, "extractor.py self-analysis must emit at least one resolved call"
+        assert resolved_references, (
+            "extractor.py self-analysis must emit at least one resolved references edge"
+        )
+        assert len(ambiguous_calls) <= len(calls_edges) // 2, (
+            "ambiguous calls should not dominate extractor.py self-analysis"
+        )
+        for edge in edges:
+            if edge["kind"] == "contains":
+                # Contains edges MUST NOT carry source range fields (ADR-026 §3).
+                assert "source_byte_start" not in edge
+                assert "source_byte_end" not in edge
+            elif edge["kind"] in {"calls", "references"}:
+                assert edge["source_byte_start"] < edge["source_byte_end"]
+                assert edge["confidence"] in {"resolved", "ambiguous"}
+            else:
+                message = f"unexpected edge kind: {edge['kind']!r}"
+                raise AssertionError(message)
+        for entity in entities:
+            if entity["kind"] == "module":
+                assert "parent_id" not in entity, (
+                    "module entity must have no parent_id within the file"
+                )
+                continue
+            assert "parent_id" in entity, f"non-module entity {entity['id']} missing parent_id"
+            pair = (entity["parent_id"], entity["id"])
+            assert pair in contains_pairs, f"no contains edge matches parent_id for {entity['id']}"
 
         # Graceful shutdown.
         proc.stdin.write(

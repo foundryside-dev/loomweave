@@ -1,9 +1,9 @@
-"""AST → function-entity extractor for the Python plugin (WP3 Task 4).
+"""AST → entity extractor for the Python plugin (Sprint 2 / B.2).
 
-Walks a parsed Python file and emits one entity per ``FunctionDef`` /
-``AsyncFunctionDef`` (Sprint 1 scope). Class, decorator, module, and
-import/call edge emission is WP3-feature-complete scope and deliberately
-out of band here.
+Walks a parsed Python file and emits one ``module`` entity per file plus
+one ``function`` entity per ``FunctionDef`` / ``AsyncFunctionDef`` and one
+``class`` entity per ``ClassDef``. Decorator, import, and call-edge emission is
+later WP3-feature-complete scope.
 
 Entity shape matches the Rust host's ``RawEntity`` + ``RawSource``
 contract (``crates/clarion-core/src/plugin/host.rs:132-154``)::
@@ -31,29 +31,166 @@ host sent) while the prefix used for qualified-name dotting can be the
 relativised form — the two are decoupled via ``extract``'s
 ``module_prefix_path`` kwarg.
 
-Behaviour:
+Behaviour (B.2 §3 Q1 supersedes Sprint-1 UQ-WP3-11 for module entities):
 
-- Empty or comment-only file → empty list (UQ-WP3-11).
-- ``SyntaxError`` during ``ast.parse`` → empty list + one stderr log line
+- Every analyzed file produces exactly one ``module`` entity. Empty
+  files and comment-only files emit one with ``parse_status="ok"``.
+  Zero *function* entities for empty files still holds (UQ-WP3-11).
+- ``SyntaxError`` during ``ast.parse`` → one degraded module entity
+  with ``parse_status="syntax_error"`` plus one stderr log line
   (UQ-WP3-02). The run continues; WP4-era findings can later attach a
   ``CLA-PY-SYNTAX-ERROR`` annotation.
+- Top-level ``__init__.py`` (where the dotted module name resolves to
+  ``""``) is skipped with stderr; the entity-ID assembler rejects an
+  empty ``canonical_qualified_name``.
 - Paths starting with ``src/`` have the prefix stripped (UQ-WP3-05).
 - ``pkg/__init__.py`` files yield qualified_names rooted at ``pkg``
   (not ``pkg.__init__``) — UQ-WP3-06.
+
+Module-entity ``source_range`` is a whole-file cover with ``end_col=0``
+as a sentinel for module entities only — class and function entities
+carry real ``ast.*.end_col_offset`` data, so consumers must NOT infer
+column semantics by analogy across kinds.
 """
 
 from __future__ import annotations
 
 import ast
 import sys
+from dataclasses import dataclass, field
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Literal, NotRequired, TypedDict, cast
 
+from clarion_plugin_python.call_resolver import (
+    CallResolutionResult,
+    CallResolver,
+    CallsEdgeProperties,
+    Finding,
+    NoOpCallResolver,
+    UnresolvedCallSite,
+)
 from clarion_plugin_python.entity_id import entity_id
 from clarion_plugin_python.qualname import reconstruct_qualname
+from clarion_plugin_python.reference_resolver import (
+    NoOpReferenceResolver,
+    ReferenceResolutionResult,
+    ReferenceResolver,
+    ReferencesEdgeProperties,
+    ReferenceSite,
+)
 
 _PLUGIN_ID = "python"
-_KIND = "function"
+_NOOP_CALL_RESOLVER = NoOpCallResolver()
+_NOOP_REFERENCE_RESOLVER = NoOpReferenceResolver()
+
+
+class SourceRange(TypedDict):
+    start_line: int
+    start_col: int
+    end_line: int
+    end_col: int
+
+
+class EntitySource(TypedDict):
+    file_path: str
+    source_range: SourceRange
+
+
+class RawEntity(TypedDict):
+    """Wire shape matching the Rust host's RawEntity contract.
+
+    ``parse_status`` is set on module entities only and rides through the
+    host's ``serde(flatten) extra`` map. Class and function entities omit
+    it; the field is ``NotRequired`` to keep mypy --strict happy.
+
+    ``parent_id`` is a B.3 addition (ADR-026 decision 2): the dual-encoded
+    half of the parent/contains relationship. Omitted entirely for module
+    entities (they have no parent within the file); set on every
+    function/class entity.
+    """
+
+    id: str
+    kind: str  # "function" | "class" | "module"; not narrowed to keep extension cheap.
+    qualified_name: str
+    source: EntitySource
+    parent_id: NotRequired[str]
+    parse_status: NotRequired[Literal["ok", "syntax_error"]]
+
+
+class RawEdge(TypedDict):
+    """Wire shape matching the Rust host's RawEdge contract (B.3 / ADR-026).
+
+    Source range fields are NotRequired and omitted entirely for structural
+    kinds (``contains``); anchored kinds (``calls``, etc.) include them when
+    the language reaches that part of the ontology in later sprints.
+    """
+
+    kind: str
+    from_id: str
+    to_id: str
+    source_byte_start: NotRequired[int]
+    source_byte_end: NotRequired[int]
+    confidence: NotRequired[Literal["resolved", "ambiguous", "inferred"]]
+    properties: NotRequired[CallsEdgeProperties | ReferencesEdgeProperties]
+
+
+@dataclass
+class ExtractionStats:
+    unresolved_call_sites_total: int = 0
+    unresolved_call_sites: list[UnresolvedCallSite] = field(default_factory=list)
+    reference_sites_total: int = 0
+    references_resolved_total: int = 0
+    references_skipped_external_total: int = 0
+    references_skipped_cap_total: int = 0
+    unresolved_reference_sites_total: int = 0
+    pyright_query_latency_ms: list[int] = field(default_factory=list)
+    findings: list[Finding] = field(default_factory=list)
+
+    @classmethod
+    def from_resolution_results(
+        cls,
+        calls: CallResolutionResult,
+        references: ReferenceResolutionResult,
+    ) -> ExtractionStats:
+        return cls(
+            unresolved_call_sites_total=calls.unresolved_call_sites_total,
+            unresolved_call_sites=calls.unresolved_call_sites,
+            reference_sites_total=references.reference_sites_total,
+            references_resolved_total=references.references_resolved_total,
+            references_skipped_external_total=references.references_skipped_external_total,
+            references_skipped_cap_total=references.references_skipped_cap_total,
+            unresolved_reference_sites_total=references.unresolved_reference_sites_total,
+            pyright_query_latency_ms=[
+                *calls.pyright_query_latency_ms,
+                *references.pyright_query_latency_ms,
+            ],
+            findings=[*calls.findings, *references.findings],
+        )
+
+
+@dataclass
+class ExtractResult:
+    entities: list[RawEntity]
+    edges: list[RawEdge]
+    stats: ExtractionStats
+
+
+def _module_source_range(source: str) -> SourceRange:
+    """Whole-file cover for module entities (Q4 resolution, B.2 §3 Q4).
+
+    Uniform formula regardless of ``parse_status``: ``end_line =
+    source.count('\\n') + 1``, ``end_col = 0``. The ``end_col = 0`` value
+    is a sentinel for module entities only — it means "end-of-file," NOT
+    "column 0 of the last line." Class and function entities use real
+    ``ast.*.end_col_offset`` data; consumers must not infer column
+    semantics by analogy across kinds.
+    """
+    return {
+        "start_line": 1,
+        "start_col": 0,
+        "end_line": source.count("\n") + 1,
+        "end_col": 0,
+    }
 
 
 def module_dotted_name(module_path: str) -> str:
@@ -83,20 +220,79 @@ def module_dotted_name(module_path: str) -> str:
     return ".".join(parts)
 
 
+def _build_module_entity(
+    source: str,
+    dotted_module: str,
+    file_path: str,
+    parse_status: Literal["ok", "syntax_error"],
+) -> RawEntity:
+    """Build the per-file module entity (Q1 + Q4 resolutions)."""
+    return {
+        "id": entity_id(_PLUGIN_ID, "module", dotted_module),
+        "kind": "module",
+        "qualified_name": dotted_module,
+        "source": {
+            "file_path": file_path,
+            "source_range": _module_source_range(source),
+        },
+        "parse_status": parse_status,
+    }
+
+
 def extract(
     source: str,
     file_path: str,
     *,
     module_prefix_path: str | None = None,
-) -> list[dict[str, Any]]:
-    """Return a list of function entities extracted from ``source``.
+    call_resolver: CallResolver = _NOOP_CALL_RESOLVER,
+    reference_resolver: ReferenceResolver = _NOOP_REFERENCE_RESOLVER,
+) -> tuple[list[RawEntity], list[RawEdge]]:
+    result = extract_with_stats(
+        source,
+        file_path,
+        module_prefix_path=module_prefix_path,
+        call_resolver=call_resolver,
+        reference_resolver=reference_resolver,
+    )
+    return result.entities, result.edges
+
+
+def extract_with_stats(
+    source: str,
+    file_path: str,
+    *,
+    module_prefix_path: str | None = None,
+    call_resolver: CallResolver = _NOOP_CALL_RESOLVER,
+    reference_resolver: ReferenceResolver = _NOOP_REFERENCE_RESOLVER,
+) -> ExtractResult:
+    """Return extracted entities/edges plus resolver observability stats.
+
+    Always emits exactly one module entity (B.2 Q1) prepended to the
+    entity list; functions and classes follow. B.3 also emits one
+    ``contains`` edge per non-module entity (immediate-parent → child),
+    plus a ``parent_id`` field on each non-module entity (the dual
+    encoding from ADR-026 decision 2). Module entities have no parent
+    within the file, so they omit ``parent_id`` and have no contains edge.
 
     ``file_path`` lands in each entity's ``source.file_path`` verbatim.
     ``module_prefix_path`` (default: same as ``file_path``) is the path
-    whose dotted form prefixes every entity's ``qualified_name`` — callers
-    can supply a project-relative path here while keeping ``file_path``
-    absolute so the host's path jail validates the original path.
+    whose dotted form prefixes every entity's ``qualified_name`` —
+    callers can supply a project-relative path here while keeping
+    ``file_path`` absolute so the host's path jail validates the
+    original path.
     """
+    prefix_source = module_prefix_path if module_prefix_path is not None else file_path
+    dotted_module = module_dotted_name(prefix_source)
+
+    # Top-level __init__.py would resolve to "" — entity_id() rejects that
+    # (crates/clarion-core/src/entity_id.rs:97-101). Skip with stderr.
+    if not dotted_module:
+        sys.stderr.write(
+            f"clarion-plugin-python: skipping {file_path}: "
+            f"top-level __init__.py has no package name\n",
+        )
+        return ExtractResult([], [], ExtractionStats())
+
     try:
         tree = ast.parse(source)
     except SyntaxError as exc:
@@ -104,41 +300,310 @@ def extract(
             f"clarion-plugin-python: skipping {file_path}: syntax error at "
             f"line {exc.lineno}: {exc.msg}\n",
         )
-        return []
+        return ExtractResult(
+            [_build_module_entity(source, dotted_module, file_path, "syntax_error")],
+            [],
+            ExtractionStats(),
+        )
 
-    prefix_source = module_prefix_path if module_prefix_path is not None else file_path
-    dotted_module = module_dotted_name(prefix_source)
-    entities: list[dict[str, Any]] = []
-    _walk(tree, [tree], dotted_module, file_path, entities)
-    return entities
+    module_entity = _build_module_entity(source, dotted_module, file_path, "ok")
+    entities: list[RawEntity] = [module_entity]
+    edges: list[RawEdge] = []
+    function_ids: list[str] = []
+    _walk(
+        tree,
+        [tree],
+        dotted_module,
+        file_path,
+        module_entity["id"],
+        entities,
+        edges,
+        function_ids,
+    )
+    reference_sites = _collect_reference_sites(source, tree, dotted_module, module_entity["id"])
+    call_stats = call_resolver.resolve_calls(file_path, function_ids)
+    reference_stats = reference_resolver.resolve_references(file_path, reference_sites)
+    edges.extend(cast("list[RawEdge]", call_stats.edges))
+    edges.extend(cast("list[RawEdge]", reference_stats.edges))
+    return ExtractResult(
+        entities,
+        edges,
+        ExtractionStats.from_resolution_results(call_stats, reference_stats),
+    )
 
 
-def _walk(
+def _collect_reference_sites(
+    source: str,
+    tree: ast.Module,
+    dotted_module: str,
+    module_entity_id: str,
+) -> list[ReferenceSite]:
+    collector = _ReferenceSiteCollector(source, tree, dotted_module, module_entity_id)
+    collector.visit(tree)
+    return collector.sites
+
+
+class _ReferenceSiteCollector(ast.NodeVisitor):
+    def __init__(
+        self,
+        source: str,
+        tree: ast.Module,
+        dotted_module: str,
+        module_entity_id: str,
+    ) -> None:
+        self.source = source
+        self.source_lines = source.splitlines(keepends=True)
+        self.line_starts = _line_starts(source)
+        self.dotted_module = dotted_module
+        self.parents: list[ast.AST] = [tree]
+        self.owner_stack = [module_entity_id]
+        self.bound_stack = [_scope_local_names(tree)]
+        self.annotation_depth = 0
+        self.sites: list[ReferenceSite] = []
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_function(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_function(node)
+
+    def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        function_id = self._entity_id_for_scope("function", node)
+        self.owner_stack.append(function_id)
+        self.bound_stack.append(_scope_local_names(node))
+        self._visit_function_signature(node)
+        self.parents.append(node)
+        for statement in node.body:
+            self.visit(statement)
+        self.parents.pop()
+        self.bound_stack.pop()
+        self.owner_stack.pop()
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        class_id = self._entity_id_for_scope("class", node)
+        self.owner_stack.append(class_id)
+        self.bound_stack.append(_scope_local_names(node))
+        self.parents.append(node)
+        for statement in node.body:
+            self.visit(statement)
+        self.parents.pop()
+        self.bound_stack.pop()
+        self.owner_stack.pop()
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        # Lambdas are not entities in v0.1; keep the surrounding owner and
+        # suppress lambda-local argument names.
+        self.bound_stack.append(_lambda_bound_names(node))
+        self.visit(node.body)
+        self.bound_stack.pop()
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self._visit_annotation(node.annotation)
+        if node.value is not None:
+            self.visit(node.value)
+
+    def visit_arg(self, node: ast.arg) -> None:
+        if node.annotation is not None:
+            self._visit_annotation(node.annotation)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        # `calls` owns the callee expression; references inside it are suppressed.
+        for arg in node.args:
+            self.visit(arg)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Load) and node.id not in self.bound_stack[-1]:
+            self.sites.append(self._site_for_name(node))
+
+    def _visit_function_signature(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        for arg in [
+            *node.args.posonlyargs,
+            *node.args.args,
+            *node.args.kwonlyargs,
+        ]:
+            self.visit(arg)
+        if node.args.vararg is not None:
+            self.visit(node.args.vararg)
+        if node.args.kwarg is not None:
+            self.visit(node.args.kwarg)
+        if node.returns is not None:
+            self._visit_annotation(node.returns)
+        for default in [*node.args.defaults, *(d for d in node.args.kw_defaults if d is not None)]:
+            self.visit(default)
+
+    def _visit_annotation(self, node: ast.expr) -> None:
+        self.annotation_depth += 1
+        self.visit(node)
+        self.annotation_depth -= 1
+
+    def _entity_id_for_scope(
+        self,
+        kind: Literal["class", "function"],
+        node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> str:
+        python_qualname = reconstruct_qualname(node, self.parents)
+        qualified_name = (
+            f"{self.dotted_module}.{python_qualname}" if self.dotted_module else python_qualname
+        )
+        return entity_id(_PLUGIN_ID, kind, qualified_name)
+
+    def _site_for_name(self, node: ast.Name) -> ReferenceSite:
+        line = node.lineno - 1
+        end_line = (node.end_lineno or node.lineno) - 1
+        end_col = node.end_col_offset or node.col_offset + len(node.id.encode("utf-8"))
+        source_byte_start = self.line_starts[line] + node.col_offset
+        source_byte_end = self.line_starts[end_line] + end_col
+        return ReferenceSite(
+            from_id=self.owner_stack[-1],
+            line=line,
+            character=_byte_col_to_lsp_character(self.source_lines[line], node.col_offset),
+            end_line=end_line,
+            end_character=_byte_col_to_lsp_character(self.source_lines[end_line], end_col),
+            source_byte_start=source_byte_start,
+            source_byte_end=source_byte_end,
+            kind="annotation" if self.annotation_depth else "name",
+        )
+
+
+def _line_starts(source: str) -> tuple[int, ...]:
+    starts = [0]
+    total = 0
+    for line in source.splitlines(keepends=True):
+        total += len(line.encode("utf-8"))
+        starts.append(total)
+    return tuple(starts)
+
+
+def _byte_col_to_lsp_character(line: str, byte_col: int) -> int:
+    prefix = line.encode("utf-8")[:byte_col].decode("utf-8")
+    return len(prefix.encode("utf-16-le")) // 2
+
+
+def _scope_local_names(
+    scope: ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
+) -> set[str]:
+    collector = _LocalNameCollector()
+    if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        collector.names.update(_function_arg_names(scope))
+    for statement in scope.body:
+        collector.visit(statement)
+    return collector.names
+
+
+def _lambda_bound_names(node: ast.Lambda) -> set[str]:
+    return set(_arguments_arg_names(node.args))
+
+
+def _function_arg_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    return set(_arguments_arg_names(node.args))
+
+
+def _arguments_arg_names(args: ast.arguments) -> list[str]:
+    names = [
+        *(arg.arg for arg in args.posonlyargs),
+        *(arg.arg for arg in args.args),
+        *(arg.arg for arg in args.kwonlyargs),
+    ]
+    if args.vararg is not None:
+        names.append(args.vararg.arg)
+    if args.kwarg is not None:
+        names.append(args.kwarg.arg)
+    return names
+
+
+class _LocalNameCollector(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        _ = node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        _ = node
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        _ = node
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.names.add(node.id)
+
+
+def _walk(  # noqa: PLR0913 - recursive walker needs both accumulators + parent context (B.3)
     node: ast.AST,
     parents: list[ast.AST],
     dotted_module: str,
     file_path: str,
-    out: list[dict[str, Any]],
+    parent_entity_id: str,
+    out_entities: list[RawEntity],
+    out_edges: list[RawEdge],
+    out_function_ids: list[str],
 ) -> None:
+    """Recursively walk ``node``'s AST children, emitting entities + contains edges.
+
+    ``parent_entity_id`` is the immediate-parent entity id for direct
+    children of ``node``. When a child entity is itself an entity-bearing
+    node (Class/FunctionDef), recursion drops into it with the child's
+    own id as the new parent — so grandchildren get the right ``from_id``
+    on their contains edge (B.3 Q3: emitter is exhaustive, never
+    transitive).
+    """
     for child in ast.iter_child_nodes(node):
-        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            out.append(_build_entity(child, parents, dotted_module, file_path))
-        _walk(child, [*parents, child], dotted_module, file_path, out)
+        new_parent_id = parent_entity_id
+        match child:
+            case ast.FunctionDef() | ast.AsyncFunctionDef():
+                entity, child_id = _build_function_entity(
+                    child, parents, dotted_module, file_path, parent_entity_id
+                )
+                out_entities.append(entity)
+                out_edges.append(_contains_edge(parent_entity_id, child_id))
+                out_function_ids.append(child_id)
+                new_parent_id = child_id
+            case ast.ClassDef():
+                entity, child_id = _build_class_entity(
+                    child, parents, dotted_module, file_path, parent_entity_id
+                )
+                out_entities.append(entity)
+                out_edges.append(_contains_edge(parent_entity_id, child_id))
+                new_parent_id = child_id
+        _walk(
+            child,
+            [*parents, child],
+            dotted_module,
+            file_path,
+            new_parent_id,
+            out_entities,
+            out_edges,
+            out_function_ids,
+        )
 
 
-def _build_entity(
+def _contains_edge(parent_id: str, child_id: str) -> RawEdge:
+    """Build a ``contains`` edge per ADR-026 decision 3 (no source range)."""
+    return {
+        "kind": "contains",
+        "from_id": parent_id,
+        "to_id": child_id,
+    }
+
+
+def _build_function_entity(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
     parents: list[ast.AST],
     dotted_module: str,
     file_path: str,
-) -> dict[str, Any]:
+    parent_entity_id: str,
+) -> tuple[RawEntity, str]:
     python_qualname = reconstruct_qualname(node, parents)
     qualified_name = f"{dotted_module}.{python_qualname}" if dotted_module else python_qualname
     end_line = node.end_lineno if node.end_lineno is not None else node.lineno
     end_col = node.end_col_offset if node.end_col_offset is not None else node.col_offset
-    return {
-        "id": entity_id(_PLUGIN_ID, _KIND, qualified_name),
-        "kind": _KIND,
+    child_id = entity_id(_PLUGIN_ID, "function", qualified_name)
+    entity: RawEntity = {
+        "id": child_id,
+        "kind": "function",
         "qualified_name": qualified_name,
         "source": {
             "file_path": file_path,
@@ -149,4 +614,43 @@ def _build_entity(
                 "end_col": end_col,
             },
         },
+        "parent_id": parent_entity_id,
     }
+    return entity, child_id
+
+
+def _build_class_entity(
+    node: ast.ClassDef,
+    parents: list[ast.AST],
+    dotted_module: str,
+    file_path: str,
+    parent_entity_id: str,
+) -> tuple[RawEntity, str]:
+    """Build a class entity. Uses real ast.end_lineno/end_col_offset (not the module sentinel).
+
+    Class methods continue to emit as ``function`` entities (per
+    detailed-design.md:67); no separate ``method`` kind. Nested classes
+    nest in the qualname per ``reconstruct_qualname`` (no ``<locals>``
+    between class names).
+    """
+    python_qualname = reconstruct_qualname(node, parents)
+    qualified_name = f"{dotted_module}.{python_qualname}" if dotted_module else python_qualname
+    end_line = node.end_lineno if node.end_lineno is not None else node.lineno
+    end_col = node.end_col_offset if node.end_col_offset is not None else node.col_offset
+    child_id = entity_id(_PLUGIN_ID, "class", qualified_name)
+    entity: RawEntity = {
+        "id": child_id,
+        "kind": "class",
+        "qualified_name": qualified_name,
+        "source": {
+            "file_path": file_path,
+            "source_range": {
+                "start_line": node.lineno,
+                "start_col": node.col_offset,
+                "end_line": end_line,
+                "end_col": end_col,
+            },
+        },
+        "parent_id": parent_entity_id,
+    }
+    return entity, child_id

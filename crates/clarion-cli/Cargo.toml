@@ -15,8 +15,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
 clap.workspace = true
 clarion-core = { path = "../clarion-core", version = "0.1.0-dev" }
+clarion-mcp = { path = "../clarion-mcp", version = "0.1.0-dev" }
 clarion-storage = { path = "../clarion-storage", version = "0.1.0-dev" }
 rusqlite.workspace = true
 serde_json.workspace = true

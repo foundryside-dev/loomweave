@@ -1,3 +1,3 @@
-"""clarion-plugin-python — Python language plugin for Clarion (Sprint 1 walking skeleton)."""
+"""clarion-plugin-python — Python language plugin for Clarion."""
 
-__version__ = "0.1.0"
+__version__ = "0.1.4"

@@ -27,7 +27,7 @@
 //! only calls `setrlimit(2)`, which is async-signal-safe per POSIX.1-2017
 //! §2.4.3. The `unsafe` block is the minimum required by the `pre_exec` API.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -43,9 +43,9 @@ use crate::plugin::limits::{
 };
 use crate::plugin::manifest::{Manifest, ManifestError};
 use crate::plugin::protocol::{
-    AnalyzeFileParams, AnalyzeFileResult, ExitNotification, InitializeParams, InitializeResult,
-    InitializedNotification, ProtocolError, ResponseEnvelope, ResponsePayload, ShutdownParams,
-    make_notification, make_request,
+    AnalyzeFileParams, AnalyzeFileResult, AnalyzeFileStats, EdgeConfidence, ExitNotification,
+    InitializeParams, InitializeResult, InitializedNotification, ProtocolError, ResponseEnvelope,
+    ResponsePayload, ShutdownParams, UnresolvedCallSite, make_notification, make_request,
 };
 use crate::plugin::transport::{Frame, TransportError, read_frame, write_frame};
 
@@ -100,6 +100,27 @@ pub const FINDING_NON_UTF8_PATH: &str = "CLA-INFRA-HOST-NON-UTF8-PATH";
 /// (which bounds a single frame, not the run-cumulative total).
 pub const FINDING_ENTITY_FIELD_OVERSIZE: &str = "CLA-INFRA-PLUGIN-ENTITY-FIELD-OVERSIZE";
 
+/// Emitted when a plugin returns an edge whose JSON shape fails to
+/// deserialise into [`RawEdge`] (missing required field, wrong type, etc.).
+/// Symmetric with [`FINDING_MALFORMED_ENTITY`]; edge is dropped, run continues.
+pub const FINDING_MALFORMED_EDGE: &str = "CLA-INFRA-PLUGIN-MALFORMED-EDGE";
+
+/// Emitted when a plugin emits an edge whose `kind` is not in the manifest's
+/// `edge_kinds` list (ADR-022 ontology boundary, edge variant). Drop + finding;
+/// no kill.
+pub const FINDING_UNDECLARED_EDGE_KIND: &str = "CLA-INFRA-PLUGIN-UNDECLARED-EDGE-KIND";
+
+/// Emitted when a plugin returns an edge with a string field longer than
+/// [`MAX_ENTITY_FIELD_BYTES`]. Edge is dropped; plugin is not killed.
+/// Same rationale as [`FINDING_ENTITY_FIELD_OVERSIZE`] (RAM amplification).
+pub const FINDING_EDGE_FIELD_OVERSIZE: &str = "CLA-INFRA-PLUGIN-EDGE-FIELD-OVERSIZE";
+
+/// Emitted when `stats.unresolved_call_sites` contains a row that cannot be
+/// tied back to the accepted entities and source bytes for this `analyze_file`
+/// response. The row is dropped; aggregate counters are retained.
+pub const FINDING_MALFORMED_UNRESOLVED_CALL_SITE: &str =
+    "CLA-INFRA-PLUGIN-MALFORMED-UNRESOLVED-CALL-SITE";
+
 /// Per-string length cap applied to [`RawEntity::id`], [`RawEntity::kind`],
 /// [`RawEntity::qualified_name`], and [`RawSource::file_path`].
 ///
@@ -109,6 +130,10 @@ pub const FINDING_ENTITY_FIELD_OVERSIZE: &str = "CLA-INFRA-PLUGIN-ENTITY-FIELD-O
 /// check, not a style constraint — pick a value that rejects `DoS` payloads
 /// without false-positing on pathological-but-legitimate inputs.
 pub const MAX_ENTITY_FIELD_BYTES: usize = 4 * 1024;
+
+/// Maximum UTF-8 byte length for one unresolved callee expression retained for
+/// query-time inferred dispatch.
+pub const MAX_UNRESOLVED_CALLEE_EXPR_BYTES: usize = 512;
 
 /// Per-entity cap on the total serialised size of the untyped passthrough
 /// maps [`RawEntity::extra`] and [`RawSource::extra`].
@@ -121,6 +146,21 @@ pub const MAX_ENTITY_FIELD_BYTES: usize = 4 * 1024;
 /// well above any legitimate plugin-declared properties bag (WP3's wardline
 /// payload is <2 KiB) while rejecting payload floods.
 pub const MAX_ENTITY_EXTRA_BYTES: usize = 64 * 1024;
+
+/// Pyright's Node-based language server spawns helper threads/processes and
+/// inherits the plugin child's `RLIMIT_NPROC`. On Linux that limit is checked
+/// against all processes/threads for the user, not just descendants of the
+/// plugin, so the Sprint-1 single-plugin ceiling is too low for B.4* call
+/// resolution on ordinary developer workstations.
+const PYRIGHT_MAX_NPROC: u64 = 4096;
+
+fn effective_max_nproc(manifest: &Manifest) -> u64 {
+    if manifest.capabilities.runtime.pyright.is_some() {
+        PYRIGHT_MAX_NPROC
+    } else {
+        DEFAULT_MAX_NPROC
+    }
+}
 
 // ── Wire entity types (Option A) ──────────────────────────────────────────────
 
@@ -138,7 +178,49 @@ pub struct RawEntity {
     pub qualified_name: String,
     /// Source location.
     pub source: RawSource,
+    /// Immediate-parent entity id (B.3, ADR-026). `None` for module entities;
+    /// `Some(id)` for nested entities (function in module, method in class, etc.).
+    /// Typed top-level field — NOT routed through `extra` because the writer's
+    /// parent-id/contains-edge consistency check (ADR-026 decision 2) reads
+    /// this load-bearing field; a string-key lookup through the opaque map
+    /// would silently drop the field on a typo.
+    #[serde(default)]
+    pub parent_id: Option<String>,
     /// Extra fields — accepted without interpretation.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Raw edge as received from the plugin wire (B.3, ADR-026).
+///
+/// Deserialised per-element from `AnalyzeFileResult.edges`. Surviving edges
+/// become [`AcceptedEdge`] values after validation.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RawEdge {
+    /// Edge kind from the ontology, e.g. `"contains"`.
+    pub kind: String,
+    /// Source entity id (the parent / caller / etc., depending on kind).
+    pub from_id: String,
+    /// Target entity id (the child / callee / etc., depending on kind).
+    pub to_id: String,
+    /// Byte offset of the edge's anchor in the source file. NULL for
+    /// structural kinds (`contains`, `in_subsystem`, `guides`, `emits_finding`)
+    /// per ADR-026 decision 3; required for anchored kinds (`calls`, `imports`,
+    /// `decorates`, `inherits_from`). Writer enforces the per-kind contract.
+    #[serde(default)]
+    pub source_byte_start: Option<i64>,
+    /// End byte offset; same per-kind contract as `source_byte_start`.
+    #[serde(default)]
+    pub source_byte_end: Option<i64>,
+    /// Confidence tier for this edge. Defaults to resolved so B.3-era plugins
+    /// that omit the field keep emitting structural edges correctly.
+    #[serde(default)]
+    pub confidence: EdgeConfidence,
+    /// Edge-kind-specific properties (e.g. `decorated_by.stack_index`).
+    /// Round-trips as JSON; writer inserts verbatim.
+    #[serde(default)]
+    pub properties: Option<serde_json::Value>,
+    /// Extra fields — accepted without interpretation (matches `RawEntity::extra`).
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -162,6 +244,36 @@ pub struct RawSource {
 /// `extra` (serialised) → `source.extra` (serialised). The four scalar
 /// string fields are bounded by [`MAX_ENTITY_FIELD_BYTES`]; the two
 /// untyped passthrough maps are bounded by [`MAX_ENTITY_EXTRA_BYTES`].
+/// Per-string and serialised-map oversize check for [`RawEdge`].
+/// Mirrors [`oversize_field`] in spirit: rejects any plugin-controlled string
+/// or untyped passthrough map exceeding the B.3 per-field caps. Fields
+/// checked in a stable order so the finding deterministically names the
+/// first offender for the same input.
+fn oversize_edge_field(raw: &RawEdge) -> Option<(&'static str, usize)> {
+    for (name, len) in [
+        ("kind", raw.kind.len()),
+        ("from_id", raw.from_id.len()),
+        ("to_id", raw.to_id.len()),
+    ] {
+        if len > MAX_ENTITY_FIELD_BYTES {
+            return Some((name, len));
+        }
+    }
+    if !raw.extra.is_empty() {
+        let len = serde_json::to_vec(&raw.extra).map_or(0, |b| b.len());
+        if len > MAX_ENTITY_EXTRA_BYTES {
+            return Some(("extra", len));
+        }
+    }
+    if let Some(props) = &raw.properties {
+        let len = serde_json::to_vec(props).map_or(0, |b| b.len());
+        if len > MAX_ENTITY_EXTRA_BYTES {
+            return Some(("properties", len));
+        }
+    }
+    None
+}
+
 fn oversize_field(raw: &RawEntity) -> Option<(&'static str, usize)> {
     for (name, len) in [
         ("id", raw.id.len()),
@@ -193,6 +305,39 @@ fn oversize_field(raw: &RawEntity) -> Option<(&'static str, usize)> {
     None
 }
 
+fn invalid_unresolved_call_site_reason(
+    site: &UnresolvedCallSite,
+    accepted_ids: &BTreeSet<String>,
+    file_len: Option<i64>,
+) -> Option<String> {
+    if !accepted_ids.contains(&site.caller_entity_id) {
+        return Some("caller entity was not accepted for this file".to_owned());
+    }
+    if site.site_ordinal < 0 {
+        return Some("site_ordinal is negative".to_owned());
+    }
+    if site.source_byte_start < 0 {
+        return Some("source_byte_start is negative".to_owned());
+    }
+    if site.source_byte_end <= site.source_byte_start {
+        return Some("source byte range is empty or reversed".to_owned());
+    }
+    if let Some(file_len) = file_len
+        && site.source_byte_end > file_len
+    {
+        return Some("source byte range exceeds analyzed file length".to_owned());
+    }
+    if site.callee_expr.is_empty() {
+        return Some("callee_expr is empty".to_owned());
+    }
+    if site.callee_expr.len() > MAX_UNRESOLVED_CALLEE_EXPR_BYTES {
+        return Some(format!(
+            "callee_expr exceeds {MAX_UNRESOLVED_CALLEE_EXPR_BYTES} bytes"
+        ));
+    }
+    None
+}
+
 /// An entity that has passed all validation checks.
 ///
 /// Returned by [`PluginHost::analyze_file`] for each entity that survived the
@@ -209,6 +354,43 @@ pub struct AcceptedEntity {
     pub source_file_path: String,
     /// The original raw entity (for downstream consumers, e.g. WP1 writer).
     pub raw: RawEntity,
+}
+
+/// An edge that has passed host-side validation (B.3, ADR-026).
+///
+/// The per-kind source-range contract is NOT enforced here — it lives in the
+/// writer-actor because the contract is the same wherever an edge ends up,
+/// not just on the plugin path. The host validates:
+/// kind against `manifest.ontology.edge_kinds`, field-size caps, and
+/// (forward-only) `from_id`/`to_id` are non-empty strings. The writer-actor
+/// owns the per-kind contract and the `parent_id`/contains consistency check.
+#[derive(Debug, Clone)]
+pub struct AcceptedEdge {
+    /// Edge kind (matches `manifest.ontology.edge_kinds`).
+    pub kind: String,
+    /// `from_id` as received; FK-checked at storage time.
+    pub from_id: String,
+    /// `to_id` as received; FK-checked at storage time.
+    pub to_id: String,
+    /// Module entity id for the file this `analyze_file` call processed, if
+    /// the plugin emitted a module entity. Derived host-side (ADR-022
+    /// boundary: plugin does not encode the file entity id formula).
+    pub source_file_id: Option<String>,
+    /// Confidence tier from the plugin wire.
+    pub confidence: EdgeConfidence,
+    /// The original raw edge (downstream consumers convert to `EdgeRecord`).
+    pub raw: RawEdge,
+}
+
+/// Combined outcome of one `analyze_file` round-trip (B.3).
+///
+/// Replaces the Sprint-1 `Vec<AcceptedEntity>` return so the CLI can issue
+/// both `InsertEntity` and `InsertEdge` from the same call.
+#[derive(Debug, Clone, Default)]
+pub struct AnalyzeFileOutcome {
+    pub entities: Vec<AcceptedEntity>,
+    pub edges: Vec<AcceptedEdge>,
+    pub stats: AnalyzeFileStats,
 }
 
 // ── Error types ───────────────────────────────────────────────────────────────
@@ -355,6 +537,62 @@ impl HostFinding {
         Self {
             subcode: FINDING_MALFORMED_ENTITY,
             message: format!("plugin emitted an entity that failed to deserialise: {serde_err}"),
+            metadata,
+        }
+    }
+
+    fn malformed_edge(serde_err: &str) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("serde_error".to_owned(), serde_err.to_owned());
+        Self {
+            subcode: FINDING_MALFORMED_EDGE,
+            message: format!("plugin emitted an edge that failed to deserialise: {serde_err}"),
+            metadata,
+        }
+    }
+
+    fn undeclared_edge_kind(kind: &str, from_id: &str, to_id: &str) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("kind".to_owned(), kind.to_owned());
+        metadata.insert("from_id".to_owned(), from_id.to_owned());
+        metadata.insert("to_id".to_owned(), to_id.to_owned());
+        Self {
+            subcode: FINDING_UNDECLARED_EDGE_KIND,
+            message: format!("edge kind {kind:?} is not declared in the manifest ontology"),
+            metadata,
+        }
+    }
+
+    fn edge_field_oversize(field: &'static str, actual_bytes: usize) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("field".to_owned(), field.to_owned());
+        metadata.insert("actual_bytes".to_owned(), actual_bytes.to_string());
+        metadata.insert("limit_bytes".to_owned(), MAX_ENTITY_FIELD_BYTES.to_string());
+        Self {
+            subcode: FINDING_EDGE_FIELD_OVERSIZE,
+            message: format!(
+                "edge field {field:?} is {actual_bytes} bytes, over the {MAX_ENTITY_FIELD_BYTES}-byte limit"
+            ),
+            metadata,
+        }
+    }
+
+    fn malformed_unresolved_call_site(site: &UnresolvedCallSite, reason: &str) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("caller_entity_id".to_owned(), site.caller_entity_id.clone());
+        metadata.insert("site_ordinal".to_owned(), site.site_ordinal.to_string());
+        metadata.insert(
+            "source_byte_start".to_owned(),
+            site.source_byte_start.to_string(),
+        );
+        metadata.insert(
+            "source_byte_end".to_owned(),
+            site.source_byte_end.to_string(),
+        );
+        metadata.insert("reason".to_owned(), reason.to_owned());
+        Self {
+            subcode: FINDING_MALFORMED_UNRESOLVED_CALL_SITE,
+            message: format!("plugin emitted malformed unresolved call site: {reason}"),
             metadata,
         }
     }
@@ -570,7 +808,7 @@ impl
                 DEFAULT_MAX_RSS_MIB,
             );
             let max_nofile = DEFAULT_MAX_NOFILE;
-            let max_nproc = DEFAULT_MAX_NPROC;
+            let max_nproc = effective_max_nproc(&manifest);
             #[allow(unsafe_code)]
             unsafe {
                 command.pre_exec(move || {
@@ -790,7 +1028,7 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
     /// - [`HostError::PathEscapeBreakerTripped`] when >10 path escapes occur.
     /// - [`HostError::EntityCapExceeded`] when the run-cumulative cap is exceeded.
     /// - Transport / serde errors on wire failures.
-    pub fn analyze_file(&mut self, path: &Path) -> Result<Vec<AcceptedEntity>, HostError> {
+    pub fn analyze_file(&mut self, path: &Path) -> Result<AnalyzeFileOutcome, HostError> {
         // The wire protocol is JSON; non-UTF-8 path bytes cannot survive
         // the round-trip. `to_string_lossy` would replace them with U+FFFD
         // and ask the plugin about a path that doesn't exist — an obscure
@@ -799,7 +1037,7 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
         let Some(file_path) = path.to_str().map(str::to_owned) else {
             self.findings
                 .push(HostFinding::non_utf8_path(&path.to_string_lossy()));
-            return Ok(Vec::new());
+            return Ok(AnalyzeFileOutcome::default());
         };
         let id = self.next_id();
         let params = AnalyzeFileParams { file_path };
@@ -949,7 +1187,99 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
             });
         }
 
-        Ok(accepted)
+        let accepted_edges = self.process_edges(afr.edges, &accepted);
+        let stats = self.process_stats(afr.stats, &accepted, path);
+
+        Ok(AnalyzeFileOutcome {
+            entities: accepted,
+            edges: accepted_edges,
+            stats,
+        })
+    }
+
+    /// B.3: per-edge validation pipeline. Mirrors the entity loop's
+    /// drop-on-violation/emit-finding posture but without the kill paths —
+    /// edges do not participate in the path-escape breaker or entity cap
+    /// (those are entity-only). Returns the accepted edges; findings flow
+    /// through `self.findings`.
+    ///
+    /// `source_file_id` is derived from the single `module`-kind accepted
+    /// entity for this file (the host, not the plugin, owns the file-id
+    /// formula per ADR-022). If the plugin's ontology has no module kind
+    /// (fixture plugin, etc.), `source_file_id` stays `None` and the writer
+    /// persists `NULL`.
+    fn process_edges(
+        &mut self,
+        raw_edges: Vec<serde_json::Value>,
+        accepted_entities: &[AcceptedEntity],
+    ) -> Vec<AcceptedEdge> {
+        let module_entity_id = accepted_entities
+            .iter()
+            .find(|e| e.kind == "module")
+            .map(|e| e.id.as_str().to_owned());
+        let declared_edge_kinds = self.manifest.ontology.edge_kinds.clone();
+        let mut accepted_edges = Vec::with_capacity(raw_edges.len());
+        for raw_val in raw_edges {
+            let raw: RawEdge = match serde_json::from_value(raw_val) {
+                Ok(e) => e,
+                Err(e) => {
+                    self.findings
+                        .push(HostFinding::malformed_edge(&e.to_string()));
+                    continue;
+                }
+            };
+            if let Some((field, len)) = oversize_edge_field(&raw) {
+                self.findings
+                    .push(HostFinding::edge_field_oversize(field, len));
+                continue;
+            }
+            if !declared_edge_kinds.contains(&raw.kind) {
+                self.findings.push(HostFinding::undeclared_edge_kind(
+                    &raw.kind,
+                    &raw.from_id,
+                    &raw.to_id,
+                ));
+                continue;
+            }
+            accepted_edges.push(AcceptedEdge {
+                kind: raw.kind.clone(),
+                from_id: raw.from_id.clone(),
+                to_id: raw.to_id.clone(),
+                source_file_id: module_entity_id.clone(),
+                confidence: raw.confidence,
+                raw,
+            });
+        }
+        accepted_edges
+    }
+
+    fn process_stats(
+        &mut self,
+        mut stats: AnalyzeFileStats,
+        accepted_entities: &[AcceptedEntity],
+        analyzed_path: &Path,
+    ) -> AnalyzeFileStats {
+        let accepted_ids: BTreeSet<String> = accepted_entities
+            .iter()
+            .map(|entity| entity.id.as_str().to_owned())
+            .collect();
+        let file_len = std::fs::metadata(analyzed_path)
+            .ok()
+            .and_then(|metadata| i64::try_from(metadata.len()).ok());
+
+        let mut retained = Vec::with_capacity(stats.unresolved_call_sites.len());
+        for site in stats.unresolved_call_sites {
+            if let Some(reason) =
+                invalid_unresolved_call_site_reason(&site, &accepted_ids, file_len)
+            {
+                self.findings
+                    .push(HostFinding::malformed_unresolved_call_site(&site, &reason));
+                continue;
+            }
+            retained.push(site);
+        }
+        stats.unresolved_call_sites = retained;
+        stats
     }
 
     /// Send `shutdown` request followed by the `exit` notification.
@@ -1156,6 +1486,61 @@ ontology_version = "0.1.0"
         crate::plugin::parse_manifest(toml.as_bytes()).expect("valid compliant manifest")
     }
 
+    fn calls_manifest() -> Manifest {
+        let toml = r#"
+[plugin]
+name = "mock-plugin"
+plugin_id = "mock"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "mock-plugin"
+language = "mock"
+extensions = ["mock"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 256
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+entity_kinds = ["module", "function"]
+edge_kinds = ["contains", "calls"]
+rule_id_prefix = "CLA-MOCK-"
+ontology_version = "0.4.0"
+"#;
+        crate::plugin::parse_manifest(toml.as_bytes()).expect("valid calls manifest")
+    }
+
+    fn pyright_manifest() -> Manifest {
+        let toml = r#"
+[plugin]
+name = "mock-plugin"
+plugin_id = "mock"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "mock-plugin"
+language = "mock"
+extensions = ["mock"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 2048
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[capabilities.runtime.pyright]
+pin = "1.1.409"
+
+[ontology]
+entity_kinds = ["module", "function"]
+edge_kinds = ["contains", "calls"]
+rule_id_prefix = "CLA-MOCK-"
+ontology_version = "0.4.0"
+"#;
+        crate::plugin::parse_manifest(toml.as_bytes()).expect("valid pyright manifest")
+    }
+
     fn reads_outside_manifest() -> Manifest {
         let toml = r#"
 [plugin]
@@ -1180,6 +1565,15 @@ rule_id_prefix = "CLA-MOCK-"
 ontology_version = "0.1.0"
 "#;
         crate::plugin::parse_manifest(toml.as_bytes()).expect("valid reads-outside manifest")
+    }
+
+    #[test]
+    fn pyright_runtime_raises_process_ceiling_for_language_server() {
+        assert_eq!(
+            effective_max_nproc(&compliant_manifest()),
+            DEFAULT_MAX_NPROC
+        );
+        assert_eq!(effective_max_nproc(&pyright_manifest()), PYRIGHT_MAX_NPROC);
     }
 
     // ── Full end-to-end helper ────────────────────────────────────────────────
@@ -1425,9 +1819,9 @@ ontology_version = "0.1.0"
             .expect("analyze_file must not error");
 
         assert!(
-            result.is_empty(),
+            result.entities.is_empty(),
             "undeclared-kind entity must be dropped; got {} accepted",
-            result.len()
+            result.entities.len()
         );
         let findings = host.take_findings();
         // Pin the count to exactly one. `any()` would pass even if the
@@ -1476,7 +1870,10 @@ ontology_version = "0.1.0"
         let result = host
             .analyze_file(&sample)
             .expect("analyze_file must not error");
-        assert!(result.is_empty(), "id-mismatch entity must be dropped");
+        assert!(
+            result.entities.is_empty(),
+            "id-mismatch entity must be dropped"
+        );
         let findings = host.take_findings();
         assert!(
             findings
@@ -1517,7 +1914,10 @@ ontology_version = "0.1.0"
         let result = host
             .analyze_file(&sample)
             .expect("analyze_file must not return error for 1 escape");
-        assert!(result.is_empty(), "escaping-path entity must be dropped");
+        assert!(
+            result.entities.is_empty(),
+            "escaping-path entity must be dropped"
+        );
         let findings = host.take_findings();
         assert!(
             findings.iter().any(|f| f.subcode == FINDING_PATH_ESCAPE),
@@ -1659,13 +2059,13 @@ ontology_version = "0.1.0"
             .expect("analyze_file must not error on happy path");
 
         assert_eq!(
-            result.len(),
+            result.entities.len(),
             1,
             "compliant entity must be accepted; got {} entities",
-            result.len()
+            result.entities.len()
         );
-        assert_eq!(result[0].kind, "function");
-        assert_eq!(result[0].qualified_name, "stub");
+        assert_eq!(result.entities[0].kind, "function");
+        assert_eq!(result.entities[0].qualified_name, "stub");
 
         let findings = host.take_findings();
         assert!(
@@ -1734,9 +2134,9 @@ ontology_version = "0.1.0"
             .expect("oversize-field entity must not error the run");
 
         assert!(
-            result.is_empty(),
+            result.entities.is_empty(),
             "oversize-field entity must be dropped; got {} accepted",
-            result.len()
+            result.entities.len()
         );
 
         let findings = host.take_findings();
@@ -2000,9 +2400,9 @@ ontology_version = "0.1.0"
             .analyze_file(&bad_path)
             .expect("non-UTF-8 path is a skip, not an error");
         assert!(
-            result.is_empty(),
+            result.entities.is_empty(),
             "non-UTF-8 path must return empty result; got {} entities",
-            result.len()
+            result.entities.len()
         );
 
         let findings = host.take_findings();
@@ -2385,9 +2785,9 @@ ontology_version = "0.1.0"
 
         let result = host.analyze_file(&sample).expect("must not error");
         assert!(
-            result.is_empty(),
+            result.entities.is_empty(),
             "cross-plugin-id entity must be dropped; got {} accepted",
-            result.len()
+            result.entities.len()
         );
         let findings = host.take_findings();
         let count = findings
@@ -2397,6 +2797,239 @@ ontology_version = "0.1.0"
         assert_eq!(
             count, 1,
             "expected exactly one FINDING_ENTITY_ID_MISMATCH; got {count} in {findings:?}"
+        );
+    }
+
+    #[test]
+    fn raw_edge_confidence_survives_host_round_trip() {
+        let manifest = calls_manifest();
+        let mut mock = MockPlugin::new_compliant();
+        let (mut host, project_dir) = connect_and_handshake(manifest, &mut mock);
+
+        let sample = project_dir.path().join("demo.mock");
+        std::fs::write(&sample, b"").unwrap();
+
+        let response_id = host.next_request_id_test();
+        let sample_path = sample.to_string_lossy().into_owned();
+        let response_json = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": response_id,
+            "result": {
+                "entities": [
+                    {
+                        "id": "mock:module:demo",
+                        "kind": "module",
+                        "qualified_name": "demo",
+                        "source": { "file_path": sample_path }
+                    },
+                    {
+                        "id": "mock:function:demo.caller",
+                        "kind": "function",
+                        "qualified_name": "demo.caller",
+                        "source": { "file_path": sample_path },
+                        "parent_id": "mock:module:demo"
+                    },
+                    {
+                        "id": "mock:function:demo.callee",
+                        "kind": "function",
+                        "qualified_name": "demo.callee",
+                        "source": { "file_path": sample_path },
+                        "parent_id": "mock:module:demo"
+                    }
+                ],
+                "edges": [{
+                    "kind": "calls",
+                    "from_id": "mock:function:demo.caller",
+                    "to_id": "mock:function:demo.callee",
+                    "source_byte_start": 12,
+                    "source_byte_end": 18,
+                    "confidence": "ambiguous"
+                }]
+            }
+        });
+        let body = serde_json::to_vec(&response_json).unwrap();
+        {
+            let reader = host.reader_mut_test();
+            let pos_before = reader.position();
+            let old_end = reader.get_ref().len() as u64;
+            let mut framed: Vec<u8> = Vec::new();
+            write_frame(&mut framed, &Frame { body }).unwrap();
+            reader.get_mut().extend_from_slice(&framed);
+            if pos_before == old_end {
+                reader.set_position(old_end);
+            }
+        }
+
+        let result = host.analyze_file(&sample).expect("must not error");
+        assert_eq!(result.edges.len(), 1);
+        assert_eq!(result.edges[0].confidence, EdgeConfidence::Ambiguous);
+        assert_eq!(result.edges[0].raw.confidence, EdgeConfidence::Ambiguous);
+    }
+
+    #[test]
+    fn references_edge_is_rejected_until_manifest_declares_kind() {
+        let manifest = calls_manifest();
+        let mut mock = MockPlugin::new_compliant();
+        let (mut host, project_dir) = connect_and_handshake(manifest, &mut mock);
+
+        let sample = project_dir.path().join("demo.mock");
+        std::fs::write(&sample, b"").unwrap();
+
+        let response_id = host.next_request_id_test();
+        let sample_path = sample.to_string_lossy().into_owned();
+        let response_json = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": response_id,
+            "result": {
+                "entities": [
+                    {
+                        "id": "mock:module:demo",
+                        "kind": "module",
+                        "qualified_name": "demo",
+                        "source": { "file_path": sample_path }
+                    },
+                    {
+                        "id": "mock:function:demo.caller",
+                        "kind": "function",
+                        "qualified_name": "demo.caller",
+                        "source": { "file_path": sample_path },
+                        "parent_id": "mock:module:demo"
+                    },
+                    {
+                        "id": "mock:function:demo.callee",
+                        "kind": "function",
+                        "qualified_name": "demo.callee",
+                        "source": { "file_path": sample_path },
+                        "parent_id": "mock:module:demo"
+                    }
+                ],
+                "edges": [{
+                    "kind": "references",
+                    "from_id": "mock:function:demo.caller",
+                    "to_id": "mock:function:demo.callee",
+                    "source_byte_start": 12,
+                    "source_byte_end": 18,
+                    "confidence": "resolved"
+                }]
+            }
+        });
+        let body = serde_json::to_vec(&response_json).unwrap();
+        {
+            let reader = host.reader_mut_test();
+            let pos_before = reader.position();
+            let old_end = reader.get_ref().len() as u64;
+            let mut framed: Vec<u8> = Vec::new();
+            write_frame(&mut framed, &Frame { body }).unwrap();
+            reader.get_mut().extend_from_slice(&framed);
+            if pos_before == old_end {
+                reader.set_position(old_end);
+            }
+        }
+
+        let result = host.analyze_file(&sample).expect("must not error");
+        assert!(
+            result.edges.is_empty(),
+            "undeclared references edge must be dropped; got {:#?}",
+            result.edges
+        );
+        let findings = host.take_findings();
+        let count = findings
+            .iter()
+            .filter(|f| f.subcode == FINDING_UNDECLARED_EDGE_KIND)
+            .count();
+        assert_eq!(
+            count, 1,
+            "expected exactly one FINDING_UNDECLARED_EDGE_KIND; got {count} in {findings:?}"
+        );
+    }
+
+    #[test]
+    fn unresolved_call_site_stats_are_validated_against_accepted_entities() {
+        let manifest = calls_manifest();
+        let mut mock = MockPlugin::new_compliant();
+        let (mut host, project_dir) = connect_and_handshake(manifest, &mut mock);
+
+        let sample = project_dir.path().join("demo.mock");
+        std::fs::write(&sample, b"dynamic_target()\n").unwrap();
+
+        let response_id = host.next_request_id_test();
+        let sample_path = sample.to_string_lossy().into_owned();
+        let response_json = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": response_id,
+            "result": {
+                "entities": [
+                    {
+                        "id": "mock:module:demo",
+                        "kind": "module",
+                        "qualified_name": "demo",
+                        "source": { "file_path": sample_path }
+                    },
+                    {
+                        "id": "mock:function:demo.caller",
+                        "kind": "function",
+                        "qualified_name": "demo.caller",
+                        "source": { "file_path": sample_path },
+                        "parent_id": "mock:module:demo"
+                    }
+                ],
+                "stats": {
+                    "unresolved_call_sites_total": 3,
+                    "unresolved_call_sites": [
+                        {
+                            "caller_entity_id": "mock:function:demo.caller",
+                            "site_ordinal": 0,
+                            "source_byte_start": 0,
+                            "source_byte_end": 14,
+                            "callee_expr": "dynamic_target"
+                        },
+                        {
+                            "caller_entity_id": "mock:function:demo.missing",
+                            "site_ordinal": 1,
+                            "source_byte_start": 0,
+                            "source_byte_end": 14,
+                            "callee_expr": "dynamic_target"
+                        },
+                        {
+                            "caller_entity_id": "mock:function:demo.caller",
+                            "site_ordinal": 2,
+                            "source_byte_start": 14,
+                            "source_byte_end": 14,
+                            "callee_expr": "dynamic_target"
+                        }
+                    ]
+                }
+            }
+        });
+        let body = serde_json::to_vec(&response_json).unwrap();
+        {
+            let reader = host.reader_mut_test();
+            let pos_before = reader.position();
+            let old_end = reader.get_ref().len() as u64;
+            let mut framed: Vec<u8> = Vec::new();
+            write_frame(&mut framed, &Frame { body }).unwrap();
+            reader.get_mut().extend_from_slice(&framed);
+            if pos_before == old_end {
+                reader.set_position(old_end);
+            }
+        }
+
+        let result = host.analyze_file(&sample).expect("must not error");
+
+        assert_eq!(result.stats.unresolved_call_sites_total, 3);
+        assert_eq!(result.stats.unresolved_call_sites.len(), 1);
+        assert_eq!(
+            result.stats.unresolved_call_sites[0].caller_entity_id,
+            "mock:function:demo.caller"
+        );
+        let findings = host.take_findings();
+        let count = findings
+            .iter()
+            .filter(|f| f.subcode == FINDING_MALFORMED_UNRESOLVED_CALL_SITE)
+            .count();
+        assert_eq!(
+            count, 2,
+            "expected two malformed unresolved-call-site findings; got {count} in {findings:?}"
         );
     }
 
@@ -2462,10 +3095,10 @@ ontology_version = "0.1.0"
             .analyze_file(&sample)
             .expect("drain-until-match must succeed past stale frame");
         assert_eq!(
-            result.len(),
+            result.entities.len(),
             1,
             "matching response must yield its entity; got {} entities",
-            result.len()
+            result.entities.len()
         );
     }
 
