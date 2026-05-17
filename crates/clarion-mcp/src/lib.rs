@@ -883,7 +883,11 @@ impl ServerState {
 
         if let Some(mut rx) = maybe_rx {
             return match tokio::time::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
-                Ok(Ok(outcome)) => outcome.into_result(),
+                Ok(Ok(outcome)) => {
+                    let mut stats = outcome.into_result()?;
+                    stats.coalesced_waits_total += 1;
+                    Ok(stats)
+                }
                 Ok(Err(_)) => Err(InferredDispatchFailure::new(
                     "inferred-dispatch-cancelled",
                     "inferred dispatch owner ended before broadcasting a result",
@@ -1353,6 +1357,7 @@ struct InferredDispatchStats {
     edges_materialized_total: u64,
     edges_skipped_static_duplicates_total: u64,
     candidate_callers_considered: u64,
+    coalesced_waits_total: u64,
     llm_cost_usd: f64,
     tokens_total: i64,
 }
@@ -1384,6 +1389,7 @@ impl InferredDispatchStats {
         self.edges_materialized_total += other.edges_materialized_total;
         self.edges_skipped_static_duplicates_total += other.edges_skipped_static_duplicates_total;
         self.candidate_callers_considered += other.candidate_callers_considered;
+        self.coalesced_waits_total += other.coalesced_waits_total;
         self.llm_cost_usd += other.llm_cost_usd;
         self.tokens_total += other.tokens_total;
     }
@@ -1395,6 +1401,7 @@ impl InferredDispatchStats {
             "inferred_edges_materialized_total": self.edges_materialized_total,
             "inferred_edges_skipped_static_duplicates_total": self.edges_skipped_static_duplicates_total,
             "inferred_candidate_callers_considered": self.candidate_callers_considered,
+            "inferred_dispatch_coalesced_total": self.coalesced_waits_total,
             "inferred_llm_cost_usd": self.llm_cost_usd,
             "inferred_tokens_total": self.tokens_total
         })

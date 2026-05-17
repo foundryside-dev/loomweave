@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Sprint 2 B.6a MCP-surface end-to-end test.
+# Sprint 2 B.6 MCP-surface end-to-end test.
 #
 # Builds a real demo Clarion database through `clarion analyze`, starts
 # `clarion serve`, and sends Content-Length framed MCP JSON-RPC requests for
-# the five storage-backed navigation tools.
+# the seven MCP navigation tools. Filigree is represented by a local HTTP
+# server that implements the B.7 reverse entity-association route.
 
 set -euo pipefail
 
@@ -72,8 +73,12 @@ clarion analyze .
 log "driving MCP stdio requests ..."
 python3 - "$CLARION_BIN" "$DEMO_DIR" <<'PY'
 import json
+import sqlite3
 import subprocess
 import sys
+import threading
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 clarion_bin = Path(sys.argv[1])
@@ -113,6 +118,74 @@ def assert_tool_ok(response: dict[str, object]) -> dict[str, object]:
     assert "stats_delta" in envelope, envelope
     return envelope
 
+
+conn = sqlite3.connect(project_dir / ".clarion" / "clarion.db")
+world_hash = conn.execute(
+    "SELECT content_hash FROM entities WHERE id = ?",
+    ("python:function:demo.world",),
+).fetchone()[0]
+conn.close()
+filigree_requests: list[str] = []
+
+
+class FiligreeHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/api/entity-associations":
+            self.send_error(404)
+            return
+        entity_id = urllib.parse.parse_qs(parsed.query).get("entity_id", [""])[0]
+        filigree_requests.append(entity_id)
+        associations: list[dict[str, str]] = []
+        if entity_id == "python:function:demo.world":
+            associations.append(
+                {
+                    "issue_id": "filigree-world",
+                    "clarion_entity_id": entity_id,
+                    "content_hash_at_attach": world_hash,
+                    "attached_at": "2026-05-17T00:00:00.000Z",
+                    "attached_by": "codex",
+                }
+            )
+        elif entity_id == "python:function:demo.hello":
+            associations.append(
+                {
+                    "issue_id": "filigree-hello-drifted",
+                    "clarion_entity_id": entity_id,
+                    "content_hash_at_attach": "old-hash",
+                    "attached_at": "2026-05-17T00:00:00.000Z",
+                    "attached_by": "codex",
+                }
+            )
+        body = json.dumps({"associations": associations}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+filigree_server = ThreadingHTTPServer(("127.0.0.1", 0), FiligreeHandler)
+filigree_thread = threading.Thread(target=filigree_server.serve_forever, daemon=True)
+filigree_thread.start()
+(project_dir / "clarion.yaml").write_text(
+    f"""
+version: 1
+llm:
+  enabled: false
+integrations:
+  filigree:
+    enabled: true
+    base_url: http://127.0.0.1:{filigree_server.server_port}
+    actor: clarion-e2e
+    token_env: FILIGREE_API_TOKEN
+    timeout_seconds: 2
+""".lstrip(),
+    encoding="utf-8",
+)
 
 proc = subprocess.Popen(
     [str(clarion_bin), "serve", "--path", str(project_dir)],
@@ -214,6 +287,15 @@ requests: list[tuple[str, dict[str, object]]] = [
             "params": {"name": "neighborhood", "arguments": {"id": "python:function:demo.world"}},
         },
     ),
+    (
+        "issues",
+        {
+            "jsonrpc": "2.0",
+            "id": "issues",
+            "method": "tools/call",
+            "params": {"name": "issues_for", "arguments": {"id": "python:module:demo"}},
+        },
+    ),
 ]
 
 responses: dict[str, dict[str, object]] = {}
@@ -227,6 +309,8 @@ finally:
     proc.stdin.close()
     status = proc.wait(timeout=5)
     stderr = proc.stderr.read().decode("utf-8", "replace")
+    filigree_server.shutdown()
+    filigree_server.server_close()
     assert status == 0, f"clarion serve exited {status}; stderr={stderr}"
 
 assert responses["initialize"]["result"]["protocolVersion"] == "2025-11-25"
@@ -272,6 +356,16 @@ neighborhood = assert_tool_ok(responses["neighborhood"])
 neighbor_callers = {item["entity"]["id"] for item in neighborhood["result"]["callers"]}
 assert "python:function:demo.hello" in neighbor_callers, neighborhood
 assert neighborhood["result"]["container"]["id"] == "python:module:demo", neighborhood
+
+issues = assert_tool_ok(responses["issues"])
+assert issues["result"]["available"] is True, issues
+matched_ids = {item["issue_id"] for item in issues["result"]["matched"]}
+drifted_ids = {item["issue_id"] for item in issues["result"]["drifted"]}
+assert "filigree-world" in matched_ids, issues
+assert "filigree-hello-drifted" in drifted_ids, issues
+assert issues["stats_delta"]["filigree_requests_total"] >= 2, issues
+assert "python:function:demo.world" in filigree_requests, filigree_requests
+assert "python:function:demo.hello" in filigree_requests, filigree_requests
 PY
 
-log "PASS: MCP stdio surface returned storage-backed tool responses"
+log "PASS: MCP stdio surface returned seven tool responses"

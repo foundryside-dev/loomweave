@@ -1059,6 +1059,13 @@ async fn callers_of_inferred_coalesces_concurrent_cold_requests() {
     assert_eq!(first["ok"], true);
     assert_eq!(second["ok"], true);
     assert_eq!(provider.invocations().len(), 1);
+    let coalesced_total = first["stats_delta"]["inferred_dispatch_coalesced_total"]
+        .as_u64()
+        .unwrap_or(0)
+        + second["stats_delta"]["inferred_dispatch_coalesced_total"]
+            .as_u64()
+            .unwrap_or(0);
+    assert_eq!(coalesced_total, 1);
 
     drop(state);
     drop(writer);
