@@ -19,9 +19,17 @@ use rusqlite::{Connection, params};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::commands::{Ack, EdgeRecord, EntityRecord, RunStatus, WriterCmd};
+use crate::cache::{
+    InferredEdgeCacheEntry, inferred_edge_cache_key_id, touch_summary_cache,
+    upsert_inferred_edge_cache, upsert_summary_cache,
+};
+use crate::commands::{
+    Ack, EdgeConfidence, EdgeRecord, EntityRecord, InferredCallEdgeRecord, InferredEdgeWriteStats,
+    RunStatus, WriterCmd,
+};
 use crate::error::{Result, StorageError};
 use crate::pragma;
+use crate::unresolved::replace_unresolved_call_sites_for_caller;
 
 /// Default transaction batch size per ADR-011.
 pub const DEFAULT_BATCH_SIZE: usize = 50;
@@ -40,13 +48,16 @@ pub struct Writer {
     /// Read this field before dropping the [`Writer`]: the actor holds its
     /// own `Arc` clone that lives until the `JoinHandle` resolves.
     pub commits_observed: Arc<AtomicUsize>,
-    /// Process-lifetime count of edges silently deduped by the writer.
+    /// Process-lifetime count of edges silently deduped or rejected by the writer.
     ///
     /// `InsertEdge` uses `INSERT OR IGNORE`; a UNIQUE conflict on
     /// `(kind, from_id, to_id)` increments this counter. Walking-skeleton
-    /// e2e asserts this is zero post-analyze (B.3 §6). Per-kind contract
-    /// violations and parent-id mismatches are hard rejects, NOT counted here.
+    /// e2e asserts this is zero post-analyze (B.3 §6). B.4* extends the
+    /// counter to per-kind contract rejections so malformed plugin edges are
+    /// visible in the same run stat.
     pub dropped_edges_total: Arc<AtomicUsize>,
+    /// Process-lifetime count of accepted ambiguous-confidence edges.
+    pub ambiguous_edges_total: Arc<AtomicUsize>,
 }
 
 impl Writer {
@@ -68,8 +79,10 @@ impl Writer {
         let (tx, rx) = mpsc::channel(channel_capacity);
         let commits_observed = Arc::new(AtomicUsize::new(0));
         let dropped_edges_total = Arc::new(AtomicUsize::new(0));
+        let ambiguous_edges_total = Arc::new(AtomicUsize::new(0));
         let commits_for_actor = commits_observed.clone();
         let dropped_for_actor = dropped_edges_total.clone();
+        let ambiguous_for_actor = ambiguous_edges_total.clone();
         let handle = tokio::task::spawn_blocking(move || -> Result<()> {
             let mut conn = Connection::open(&db_path)?;
             pragma::apply_write_pragmas(&conn)?;
@@ -79,6 +92,7 @@ impl Writer {
                 batch_size,
                 &commits_for_actor,
                 &dropped_for_actor,
+                &ambiguous_for_actor,
             );
             Ok(())
         });
@@ -87,6 +101,7 @@ impl Writer {
                 tx,
                 commits_observed,
                 dropped_edges_total,
+                ambiguous_edges_total,
             },
             handle,
         ))
@@ -130,6 +145,7 @@ fn run_actor(
     batch_size: usize,
     commits_observed: &AtomicUsize,
     dropped_edges_total: &AtomicUsize,
+    ambiguous_edges_total: &AtomicUsize,
 ) {
     let mut state = ActorState::new(batch_size);
 
@@ -157,6 +173,49 @@ fn run_actor(
                     &edge,
                     commits_observed,
                     dropped_edges_total,
+                    ambiguous_edges_total,
+                );
+                reply(ack, res);
+            }
+            WriterCmd::InsertInferredEdges {
+                cache_entry,
+                edges,
+                ack,
+            } => {
+                let res = query_time_write(conn, &mut state, commits_observed, |conn| {
+                    insert_inferred_edges(conn, &cache_entry, &edges)
+                });
+                reply(ack, res);
+            }
+            WriterCmd::UpsertSummaryCache { entry, ack } => {
+                let res = query_time_write(conn, &mut state, commits_observed, |conn| {
+                    upsert_summary_cache(conn, &entry)
+                });
+                reply(ack, res);
+            }
+            WriterCmd::TouchSummaryCache {
+                key,
+                last_accessed_at,
+                ack,
+            } => {
+                let res = query_time_write(conn, &mut state, commits_observed, |conn| {
+                    touch_summary_cache(conn, &key, &last_accessed_at)
+                });
+                reply(ack, res);
+            }
+            WriterCmd::ReplaceUnresolvedCallSitesForCaller {
+                caller_entity_id,
+                caller_content_hash,
+                sites,
+                ack,
+            } => {
+                let res = replace_unresolved_call_sites_in_run(
+                    conn,
+                    &mut state,
+                    &caller_entity_id,
+                    &caller_content_hash,
+                    &sites,
+                    commits_observed,
                 );
                 reply(ack, res);
             }
@@ -288,7 +347,7 @@ fn insert_entity(
     conn.execute(
         "INSERT INTO entities ( \
             id, plugin_id, kind, name, short_name, \
-            parent_id, source_file_id, \
+            parent_id, source_file_id, source_file_path, \
             source_byte_start, source_byte_end, \
             source_line_start, source_line_end, \
             properties, content_hash, summary, wardline, \
@@ -296,12 +355,12 @@ fn insert_entity(
             created_at, updated_at \
          ) VALUES ( \
             ?1, ?2, ?3, ?4, ?5, \
-            ?6, ?7, \
-            ?8, ?9, \
-            ?10, ?11, \
-            ?12, ?13, ?14, ?15, \
-            ?16, ?17, \
-            ?18, ?19 \
+            ?6, ?7, ?8, \
+            ?9, ?10, \
+            ?11, ?12, \
+            ?13, ?14, ?15, ?16, \
+            ?17, ?18, \
+            ?19, ?20 \
          )",
         params![
             entity.id,
@@ -311,6 +370,7 @@ fn insert_entity(
             entity.short_name,
             entity.parent_id,
             entity.source_file_id,
+            entity.source_file_path,
             entity.source_byte_start,
             entity.source_byte_end,
             entity.source_line_start,
@@ -329,21 +389,42 @@ fn insert_entity(
     Ok(())
 }
 
-/// 8 ontology-defined edge kinds (ADR-026). Unknown kinds reaching the
+/// 9 ontology-defined edge kinds (ADR-026 + ADR-028). Unknown kinds reaching the
 /// writer are a manifest/wire-version drift bug — reject strictly.
 const STRUCTURAL_EDGE_KINDS: &[&str] = &["contains", "in_subsystem", "guides", "emits_finding"];
-const ANCHORED_EDGE_KINDS: &[&str] = &["calls", "imports", "decorates", "inherits_from"];
+const ANCHORED_EDGE_KINDS: &[&str] = &[
+    "calls",
+    "references",
+    "imports",
+    "decorates",
+    "inherits_from",
+];
 
-/// Enforce the per-kind source-range contract documented in
+/// Enforce the per-kind confidence + source-range contract documented in
 /// `docs/implementation/sprint-2/b3-contains-edges.md` §3 Q5 and ADR-026
-/// decision 3. Returns a [`StorageError::WriterProtocol`] whose message
-/// embeds `CLA-INFRA-EDGE-SOURCE-RANGE-CONTRACT` (structural/anchored
-/// mismatch) or `CLA-INFRA-EDGE-UNKNOWN-KIND` (kind not in the ontology),
+/// decision 3, extended by ADR-028. Returns a
+/// [`StorageError::WriterProtocol`] whose message embeds
+/// `CLA-INFRA-EDGE-CONFIDENCE-CONTRACT` (per-kind confidence mismatch),
+/// `CLA-INFRA-EDGE-SOURCE-RANGE-CONTRACT` (structural/anchored mismatch), or
+/// `CLA-INFRA-EDGE-UNKNOWN-KIND` (kind not in the ontology),
 /// so the surrounding `runs.stats.failure_reason` carries the code.
 fn enforce_edge_contract(edge: &EdgeRecord) -> Result<()> {
-    let has_range = edge.source_byte_start.is_some() || edge.source_byte_end.is_some();
+    let has_start = edge.source_byte_start.is_some();
+    let has_end = edge.source_byte_end.is_some();
+    let has_any_range = has_start || has_end;
     if STRUCTURAL_EDGE_KINDS.contains(&edge.kind.as_str()) {
-        if has_range {
+        if edge.confidence != EdgeConfidence::Resolved {
+            return Err(StorageError::WriterProtocol(format!(
+                "CLA-INFRA-EDGE-CONFIDENCE-CONTRACT: structural edge kind {kind:?} \
+                 MUST carry confidence=resolved; got confidence={confidence:?} \
+                 for ({from} -> {to})",
+                kind = edge.kind,
+                confidence = edge.confidence,
+                from = edge.from_id,
+                to = edge.to_id,
+            )));
+        }
+        if has_any_range {
             return Err(StorageError::WriterProtocol(format!(
                 "CLA-INFRA-EDGE-SOURCE-RANGE-CONTRACT: edge kind {kind:?} \
                  MUST have NULL source_byte_start/end; got start={start:?} end={end:?} \
@@ -356,19 +437,31 @@ fn enforce_edge_contract(edge: &EdgeRecord) -> Result<()> {
             )));
         }
     } else if ANCHORED_EDGE_KINDS.contains(&edge.kind.as_str()) {
-        if !has_range {
+        if edge.confidence == EdgeConfidence::Inferred {
+            return Err(StorageError::WriterProtocol(format!(
+                "CLA-INFRA-EDGE-CONFIDENCE-CONTRACT: inferred-tier edges are \
+                 query-time-only at scan time; got confidence=inferred for \
+                 anchored edge kind {kind:?} ({from} -> {to})",
+                kind = edge.kind,
+                from = edge.from_id,
+                to = edge.to_id,
+            )));
+        }
+        if !has_start || !has_end {
             return Err(StorageError::WriterProtocol(format!(
                 "CLA-INFRA-EDGE-SOURCE-RANGE-CONTRACT: edge kind {kind:?} \
-                 MUST have Some source_byte_start AND source_byte_end; got None \
-                 for ({from} -> {to})",
+                 MUST have Some source_byte_start AND source_byte_end; got \
+                 start={start:?} end={end:?} for ({from} -> {to})",
                 kind = edge.kind,
+                start = edge.source_byte_start,
+                end = edge.source_byte_end,
                 from = edge.from_id,
                 to = edge.to_id,
             )));
         }
     } else {
         return Err(StorageError::WriterProtocol(format!(
-            "CLA-INFRA-EDGE-UNKNOWN-KIND: edge kind {kind:?} not in the v0.3.0 \
+            "CLA-INFRA-EDGE-UNKNOWN-KIND: edge kind {kind:?} not in the writer \
              ontology; known kinds: {structural:?} + {anchored:?}",
             kind = edge.kind,
             structural = STRUCTURAL_EDGE_KINDS,
@@ -384,13 +477,17 @@ fn insert_edge(
     edge: &EdgeRecord,
     commits_observed: &AtomicUsize,
     dropped_edges_total: &AtomicUsize,
+    ambiguous_edges_total: &AtomicUsize,
 ) -> Result<()> {
     if state.current_run.is_none() {
         return Err(StorageError::WriterProtocol(
             "InsertEdge received without a preceding BeginRun".to_owned(),
         ));
     }
-    enforce_edge_contract(edge)?;
+    if let Err(err) = enforce_edge_contract(edge) {
+        dropped_edges_total.fetch_add(1, Ordering::Relaxed);
+        return Err(err);
+    }
     if !state.in_tx {
         conn.execute_batch("BEGIN")?;
         state.in_tx = true;
@@ -398,8 +495,8 @@ fn insert_edge(
     let changed = conn.execute(
         "INSERT OR IGNORE INTO edges ( \
             kind, from_id, to_id, properties, source_file_id, \
-            source_byte_start, source_byte_end \
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            source_byte_start, source_byte_end, confidence \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             edge.kind,
             edge.from_id,
@@ -408,13 +505,117 @@ fn insert_edge(
             edge.source_file_id,
             edge.source_byte_start,
             edge.source_byte_end,
+            edge.confidence.as_str(),
         ],
     )?;
     if changed == 0 {
         // UNIQUE conflict on (kind, from_id, to_id) — silent dedupe is the
         // idempotent-re-analyze contract (B.3 §6).
         dropped_edges_total.fetch_add(1, Ordering::Relaxed);
+    } else if edge.confidence == EdgeConfidence::Ambiguous {
+        ambiguous_edges_total.fetch_add(1, Ordering::Relaxed);
     }
+    bump_writes_and_maybe_commit(conn, state, commits_observed)?;
+    Ok(())
+}
+
+fn insert_inferred_edges(
+    conn: &Connection,
+    cache_entry: &InferredEdgeCacheEntry,
+    edges: &[InferredCallEdgeRecord],
+) -> Result<InferredEdgeWriteStats> {
+    upsert_inferred_edge_cache(conn, cache_entry)?;
+    let cache_key = inferred_edge_cache_key_id(&cache_entry.key);
+    conn.execute(
+        "DELETE FROM edges \
+         WHERE kind = 'calls' \
+           AND from_id = ?1 \
+           AND confidence = 'inferred' \
+           AND COALESCE(json_extract(properties, '$.inference_cache_key'), '') <> ?2",
+        params![cache_entry.key.caller_entity_id, cache_key],
+    )?;
+
+    let mut stats = InferredEdgeWriteStats {
+        inserted_edges: 0,
+        skipped_static_duplicates: 0,
+    };
+    for edge in edges {
+        validate_inferred_edge(edge)?;
+        if static_call_edge_exists(conn, &edge.from_id, &edge.to_id)? {
+            stats.skipped_static_duplicates += 1;
+            continue;
+        }
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO edges ( \
+                kind, from_id, to_id, confidence, properties, source_file_id, \
+                source_byte_start, source_byte_end \
+             ) VALUES ('calls', ?1, ?2, 'inferred', ?3, ?4, ?5, ?6)",
+            params![
+                edge.from_id,
+                edge.to_id,
+                edge.properties_json,
+                edge.source_file_id,
+                edge.source_byte_start,
+                edge.source_byte_end,
+            ],
+        )?;
+        stats.inserted_edges += u64::try_from(inserted).unwrap_or(u64::MAX);
+    }
+    Ok(stats)
+}
+
+fn validate_inferred_edge(edge: &InferredCallEdgeRecord) -> Result<()> {
+    if edge.from_id.is_empty() || edge.to_id.is_empty() {
+        return Err(StorageError::WriterProtocol(
+            "InsertInferredEdges requires non-empty from_id and to_id".to_owned(),
+        ));
+    }
+    if edge.source_byte_start < 0 || edge.source_byte_end <= edge.source_byte_start {
+        return Err(StorageError::WriterProtocol(
+            "InsertInferredEdges requires a non-empty source byte range".to_owned(),
+        ));
+    }
+    if serde_json::from_str::<serde_json::Value>(&edge.properties_json).is_err() {
+        return Err(StorageError::WriterProtocol(
+            "InsertInferredEdges properties_json must be valid JSON".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn static_call_edge_exists(conn: &Connection, from_id: &str, to_id: &str) -> Result<bool> {
+    let exists = conn.query_row(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM edges \
+            WHERE kind = 'calls' \
+              AND from_id = ?1 \
+              AND to_id = ?2 \
+              AND confidence IN ('resolved', 'ambiguous') \
+         )",
+        params![from_id, to_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(exists != 0)
+}
+
+fn replace_unresolved_call_sites_in_run(
+    conn: &mut Connection,
+    state: &mut ActorState,
+    caller_entity_id: &str,
+    caller_content_hash: &str,
+    sites: &[crate::unresolved::UnresolvedCallSiteRecord],
+    commits_observed: &AtomicUsize,
+) -> Result<()> {
+    if state.current_run.is_none() {
+        return Err(StorageError::WriterProtocol(
+            "ReplaceUnresolvedCallSitesForCaller received without a preceding BeginRun".to_owned(),
+        ));
+    }
+    if !state.in_tx {
+        conn.execute_batch("BEGIN")?;
+        state.in_tx = true;
+    }
+    replace_unresolved_call_sites_for_caller(conn, caller_entity_id, caller_content_hash, sites)?;
     bump_writes_and_maybe_commit(conn, state, commits_observed)?;
     Ok(())
 }
@@ -441,6 +642,30 @@ fn bump_writes_and_maybe_commit(
         state.in_tx = true;
     }
     Ok(())
+}
+
+fn query_time_write<T>(
+    conn: &mut Connection,
+    state: &mut ActorState,
+    commits_observed: &AtomicUsize,
+    write: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    let reopen_run_transaction = state.current_run.is_some();
+    if state.in_tx {
+        state.in_tx = false;
+        state.writes_in_batch = 0;
+        conn.execute_batch("COMMIT")?;
+        commits_observed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let result = write(conn);
+
+    if reopen_run_transaction {
+        conn.execute_batch("BEGIN")?;
+        state.in_tx = true;
+    }
+
+    result
 }
 
 fn commit_run(

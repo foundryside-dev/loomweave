@@ -1,6 +1,6 @@
 # Sprint 2 — Mid-Sprint Scope Amendment
 
-**Status**: ACCEPTED — Sprint 2 resumes under this amended scope
+**Status**: ACCEPTED — Sprint 2 resumes under this amended scope; B.4* complete (see [B.4* exit criteria §9](./b4-calls-edges.md#9-exit-criteria-panel-revised))
 **Date opened**: 2026-05-16
 **Author**: John Morrissey
 **Predecessor**: [`docs/superpowers/handoffs/2026-04-30-sprint-2-kickoff.md`](../../superpowers/handoffs/2026-04-30-sprint-2-kickoff.md)

@@ -171,6 +171,8 @@ mod tests {
         kind: String,
         canonical_qualified_name: String,
         expected_entity_id: String,
+        #[serde(default)]
+        parent_id: Option<String>,
     }
 
     #[test]
@@ -345,9 +347,39 @@ mod tests {
     }
 
     #[derive(Debug, serde::Deserialize)]
+    struct CallsEdgeFixtureRow {
+        #[allow(dead_code)]
+        description: String,
+        caller_id: String,
+        callee_id: String,
+        source_byte_start: i64,
+        source_byte_end: i64,
+        confidence: String,
+        #[serde(default)]
+        candidate_ids: Vec<String>,
+        expected_wire: serde_json::Value,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct ReferencesEdgeFixtureRow {
+        #[allow(dead_code)]
+        description: String,
+        from_id: String,
+        to_id: String,
+        source_byte_start: i64,
+        source_byte_end: i64,
+        confidence: String,
+        #[serde(default)]
+        candidate_ids: Vec<String>,
+        expected_wire: serde_json::Value,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
     struct SharedFixture {
         entities: Vec<FixtureRow>,
         contains_edges: Vec<ContainsEdgeFixtureRow>,
+        calls_edges: Vec<CallsEdgeFixtureRow>,
+        references_edges: Vec<ReferencesEdgeFixtureRow>,
     }
 
     #[test]
@@ -413,6 +445,158 @@ mod tests {
                 !obj.contains_key("source_byte_end"),
                 "contains edge must never carry source_byte_end"
             );
+        }
+    }
+
+    #[test]
+    fn shared_parent_id_rows_match_contains_edge_fixture() {
+        let fixture: SharedFixture = load_fixture();
+        let contains_pairs = fixture
+            .contains_edges
+            .iter()
+            .map(|edge| (edge.parent_id.as_str(), edge.child_id.as_str()))
+            .collect::<std::collections::HashSet<_>>();
+        let rows = fixture
+            .entities
+            .iter()
+            .filter(|row| row.parent_id.is_some())
+            .collect::<Vec<_>>();
+        assert!(
+            !rows.is_empty(),
+            "fixture must include at least one parent_id entity row"
+        );
+        for row in rows {
+            let parent_id = row.parent_id.as_deref().expect("filtered above");
+            assert!(
+                contains_pairs.contains(&(parent_id, row.expected_entity_id.as_str())),
+                "parent_id row lacks matching contains edge: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_calls_edge_fixture_parity() {
+        // B.4* cross-language parity for `calls` edge wire shape: calls are
+        // anchored, confidence-bearing edges, and ambiguous rows carry
+        // `properties.candidates` per ADR-028.
+        let fixture: SharedFixture = load_fixture();
+        let edges = &fixture.calls_edges;
+        assert!(
+            edges.len() >= 2,
+            "fixture must have at least 2 calls-edge rows; got {}",
+            edges.len()
+        );
+        for row in edges {
+            let mut wire = serde_json::json!({
+                "kind": "calls",
+                "from_id": row.caller_id,
+                "to_id": row.callee_id,
+                "source_byte_start": row.source_byte_start,
+                "source_byte_end": row.source_byte_end,
+                "confidence": row.confidence,
+            });
+            if !row.candidate_ids.is_empty() {
+                wire["properties"] = serde_json::json!({
+                    "candidates": row.candidate_ids,
+                });
+            }
+
+            assert_eq!(
+                wire, row.expected_wire,
+                "mismatch on calls-edge row {row:?}"
+            );
+            assert!(
+                row.source_byte_start < row.source_byte_end,
+                "calls edge source range must be non-empty: {row:?}"
+            );
+            match row.confidence.as_str() {
+                "resolved" => {
+                    assert!(
+                        row.candidate_ids.is_empty(),
+                        "resolved calls edge must not carry candidates: {row:?}"
+                    );
+                    let obj = wire.as_object().expect("wire is an object");
+                    assert!(
+                        !obj.contains_key("properties"),
+                        "resolved calls edge must not carry properties: {row:?}"
+                    );
+                }
+                "ambiguous" => {
+                    assert!(
+                        row.candidate_ids.len() >= 2,
+                        "ambiguous calls edge must carry at least two candidates: {row:?}"
+                    );
+                    assert_eq!(
+                        wire["properties"],
+                        serde_json::json!({ "candidates": row.candidate_ids }),
+                        "ambiguous calls edge candidates mismatch: {row:?}"
+                    );
+                }
+                _ => panic!("unexpected calls confidence on row {row:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn shared_references_edge_fixture_parity() {
+        // B.5* cross-language parity for `references` edge wire shape:
+        // references are anchored, confidence-bearing edges and ambiguous
+        // rows carry `properties.candidates` just like B.4* calls edges.
+        let fixture: SharedFixture = load_fixture();
+        let edges = &fixture.references_edges;
+        assert!(
+            edges.len() >= 2,
+            "fixture must have at least 2 references-edge rows; got {}",
+            edges.len()
+        );
+        for row in edges {
+            let mut wire = serde_json::json!({
+                "kind": "references",
+                "from_id": row.from_id,
+                "to_id": row.to_id,
+                "source_byte_start": row.source_byte_start,
+                "source_byte_end": row.source_byte_end,
+                "confidence": row.confidence,
+            });
+            if !row.candidate_ids.is_empty() {
+                wire["properties"] = serde_json::json!({
+                    "candidates": row.candidate_ids,
+                });
+            }
+
+            assert_eq!(
+                wire, row.expected_wire,
+                "mismatch on references-edge row {row:?}"
+            );
+            assert!(
+                row.source_byte_start < row.source_byte_end,
+                "references edge source range must be non-empty: {row:?}"
+            );
+            match row.confidence.as_str() {
+                "resolved" => {
+                    assert!(
+                        row.candidate_ids.is_empty(),
+                        "resolved references edge must not carry candidates: {row:?}"
+                    );
+                    let obj = wire.as_object().expect("wire is an object");
+                    assert!(
+                        !obj.contains_key("properties"),
+                        "resolved references edge must not carry properties: {row:?}"
+                    );
+                }
+                "ambiguous" => {
+                    assert!(
+                        row.candidate_ids.len() >= 2,
+                        "ambiguous references edge must carry at least two candidates: {row:?}"
+                    );
+                    assert_eq!(
+                        wire["properties"],
+                        serde_json::json!({ "candidates": row.candidate_ids }),
+                        "ambiguous references edge candidates mismatch: {row:?}"
+                    );
+                }
+                _ => panic!("unexpected references confidence on row {row:?}"),
+            }
         }
     }
 

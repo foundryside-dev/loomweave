@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "clarion-plugin-python"
-version = "0.1.2"
+version = "0.1.4"
 description = "Clarion Python language plugin — walking-skeleton v0.1 baseline"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -17,6 +17,7 @@ classifiers = [
 ]
 dependencies = [
     "packaging>=24",
+    "pyright==1.1.409",
 ]
 
 [project.optional-dependencies]
@@ -89,3 +90,7 @@ files = ["src", "tests"]
 testpaths = ["tests"]
 addopts = "--strict-markers --cov=clarion_plugin_python --cov-report=term-missing"
 pythonpath = ["src"]
+markers = [
+    "pyright: requires pyright-langserver on PATH or in the active virtualenv",
+    "slow: exercises subprocess or scale behavior that is slower than unit tests",
+]

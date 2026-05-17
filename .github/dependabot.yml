@@ -1,0 +1,8 @@
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/plugins/python"
+    schedule:
+      interval: "weekly"
+    ignore:
+      - dependency-name: "pyright"

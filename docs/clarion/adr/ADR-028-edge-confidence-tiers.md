@@ -113,6 +113,32 @@ The same cost ceiling, retry, and RecordingProvider replay discipline that gover
 
 **`MAX_INFERRED_EDGES_PER_CALLER`.** A single LLM call returns at most N inferred candidate callees per caller entity (default 8, configurable in `clarion.yaml`). Pyright's unresolved-site count for the caller bounds the cost: if the caller has zero unresolved sites, no LLM call fires regardless of `confidence >= Inferred`.
 
+### 2026-05-17 B.6 implementation resolution — query-time inference
+
+B.6 resolves the deferred queryability and writer-path details as follows:
+
+- Unresolved call sites are stored in a sibling `entity_unresolved_call_sites`
+  table, not as Filigree findings and not as synthetic placeholder `edges`
+  rows. The table is keyed by caller entity, caller content hash, and a stable
+  site key; re-analysis replaces rows for the current caller hash and deletes
+  rows for older hashes. This keeps unresolved sites queryable without making
+  `neighborhood` or `execution_paths_from` traverse fake callees.
+- Query-time inference writes through the writer actor via
+  `WriterCmd::InsertInferredEdges`. The scan-time `WriterCmd::InsertEdge`
+  contract still rejects `calls` edges with `confidence='inferred'`, so the
+  call site makes the cache-write origin explicit.
+- B.6 keeps both an `inferred_edge_cache` table and materialized
+  `edges(confidence='inferred')` rows. Cache rows are keyed by
+  `(caller_entity_id, caller_content_hash, model_id, prompt_version)`.
+  Materialized rows carry the cache key, model id, prompt version, unresolved
+  site key, optional model confidence, and optional rationale in `properties`.
+- If a static `resolved` or `ambiguous` `calls` edge already exists for the same
+  `(from_id, to_id)`, `InsertInferredEdges` skips the inferred materialization
+  and reports it in writer stats instead of downgrading static evidence.
+- Concurrent cold MCP queries for the same inference cache key are coalesced by
+  the server in-flight registry. Waiters subscribe to the owner result and
+  report `inferred_dispatch_coalesced_total` in their response stats.
+
 ## Alternatives Considered
 
 ### Alternative 1 — Two tiers (resolved / inferred)
@@ -162,8 +188,17 @@ Compute inferred edges for every unresolved site during `clarion analyze`.
 
 ## Open Questions
 
-- **Storage location for inferred edges** — same `edges` table with `confidence='inferred'` rows, or separate `inferred_edges_cache` table? Decision deferred to B.4* implementation pass. Both shapes are compatible with this ADR's wire and tier definitions.
-- **Inference-result longevity** — when does an inferred edge become stale? Caller content hash changes invalidate; candidate target content-hash changes also invalidate? Decision deferred to ADR-030 (on-demand summary scope) — same cache-staleness reasoning applies to both.
+- **Storage location for inferred edges** — RESOLVED by B.6: inferred results
+  are cached in `inferred_edge_cache` and materialized into the same `edges`
+  table with `confidence='inferred'` for traversal. This is additive to the
+  B.4* confidence-column decision and preserves the existing graph indexes.
+- **Unresolved-call-site queryability** — RESOLVED by B.6: unresolved sites live
+  in `entity_unresolved_call_sites`; they are not per-site Filigree findings and
+  not synthetic zero-candidate edges.
+- **Inference-result longevity** — RESOLVED by B.6 for v0.1: caller content-hash
+  changes invalidate the inference cache key and re-analysis removes old-hash
+  unresolved-site anchors. Candidate target churn is handled by the cache row's
+  materialization step; static duplicate edges win over inferred rows.
 - **Per-model confidence-tier mapping** — if Haiku produces an inference and Sonnet produces a different inference for the same caller, are both stored? Initial answer: keyed on `model_id`, so yes; query path returns the model the operator's `clarion.yaml` names as the inference tier. Refinable in ADR-030.
 
 ## Related Decisions

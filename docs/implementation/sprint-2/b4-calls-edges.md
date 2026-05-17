@@ -1,6 +1,6 @@
 # B.4* — Python plugin: `calls` edges via pyright + confidence tiers (Sprint 2 amended / Tier B)
 
-**Status**: PANEL-REVIEWED, READY-FOR-IMPLEMENTATION — Sprint 2 amended Tier-B B.4* work-package design
+**Status**: IMPLEMENTED — Sprint 2 amended Tier-B B.4* work-package design closed; see §9 exit criteria and [B.4* gate results](./b4-gate-results.md)
 **Anchoring design**: [system-design.md §4 (Plugin host / analyze pipeline)](../../clarion/v0.1/system-design.md), [detailed-design.md §"Python plugin specifics — call graph precision"](../../clarion/v0.1/detailed-design.md), [scope-amendment-2026-05.md](./scope-amendment-2026-05.md)
 **Accepted ADRs**: [ADR-002](../../clarion/adr/ADR-002-plugin-transport-json-rpc.md), [ADR-003](../../clarion/adr/ADR-003-entity-id-scheme.md), [ADR-007](../../clarion/adr/ADR-007-summary-cache-key.md), [ADR-022](../../clarion/adr/ADR-022-core-plugin-ontology.md), [ADR-023](../../clarion/adr/ADR-023-tooling-baseline.md), [ADR-024](../../clarion/adr/ADR-024-guidance-schema-vocabulary.md), [ADR-026](../../clarion/adr/ADR-026-containment-wire-and-edge-identity.md), [ADR-027](../../clarion/adr/ADR-027-ontology-version-semver.md), [ADR-028](../../clarion/adr/ADR-028-edge-confidence-tiers.md)
 **Predecessor**: [B.3 — `contains` edges](./b3-contains-edges.md)

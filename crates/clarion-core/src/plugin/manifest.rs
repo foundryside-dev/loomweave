@@ -203,6 +203,18 @@ pub struct CapabilitiesRuntime {
     /// The parser accepts the field faithfully; [`Manifest::validate_for_v0_1`] performs
     /// the rejection check.
     pub reads_outside_project_root: bool,
+
+    /// Optional `[capabilities.runtime.pyright]` declaration for Python call resolution.
+    #[serde(default)]
+    pub pyright: Option<PyrightRuntime>,
+}
+
+/// `[capabilities.runtime.pyright]` — pinned Pyright runtime metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PyrightRuntime {
+    /// Exact Pyright package pin used by the plugin runtime.
+    pub pin: String,
 }
 
 /// `[ontology]` table — plugin-declared ontology per ADR-022.
@@ -468,6 +480,9 @@ expected_entities_per_file = 5000
 wardline_aware = true
 reads_outside_project_root = false
 
+[capabilities.runtime.pyright]
+pin = "1.1.409"
+
 [ontology]
 entity_kinds = ["function", "class", "module", "decorator"]
 edge_kinds = ["imports", "calls", "decorates", "contains"]
@@ -498,6 +513,15 @@ ontology_version = "0.1.0"
         );
         assert!(manifest.capabilities.runtime.wardline_aware);
         assert!(!manifest.capabilities.runtime.reads_outside_project_root);
+        assert_eq!(
+            manifest
+                .capabilities
+                .runtime
+                .pyright
+                .as_ref()
+                .map(|pyright| pyright.pin.as_str()),
+            Some("1.1.409")
+        );
 
         // [ontology]
         assert_eq!(

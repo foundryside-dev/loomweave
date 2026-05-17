@@ -15,8 +15,8 @@ use std::io::{BufReader, Write};
 use clarion_core::plugin::limits::ContentLengthCeiling;
 use clarion_core::plugin::transport::{Frame, read_frame, write_frame};
 use clarion_core::plugin::{
-    AnalyzeFileParams, AnalyzeFileResult, InitializeResult, JsonRpcVersion, ResponseEnvelope,
-    ResponsePayload, ShutdownResult,
+    AnalyzeFileParams, AnalyzeFileResult, AnalyzeFileStats, InitializeResult, JsonRpcVersion,
+    ResponseEnvelope, ResponsePayload, ShutdownResult,
 };
 use serde_json::Value;
 
@@ -102,6 +102,7 @@ fn main() {
                 let result = AnalyzeFileResult {
                     entities: vec![entity],
                     edges: vec![],
+                    stats: AnalyzeFileStats::default(),
                 };
                 send_result(&mut writer, id, serde_json::to_value(result).unwrap());
             }

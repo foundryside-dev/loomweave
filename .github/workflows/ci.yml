@@ -66,6 +66,15 @@ jobs:
           cache: pip
           cache-dependency-path: plugins/python/pyproject.toml
 
+      - name: cache pyright runtime
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pyright-python/
+          key: pyright-python-1.1.409-${{ runner.os }}
+
+      - name: check B.4* gate result freshness
+        run: python scripts/check-b4-gate-result.py
+
       - name: install plugin (dev extras)
         run: python -m pip install -e 'plugins/python[dev]'
 
@@ -97,6 +106,12 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: plugins/python/pyproject.toml
+
+      - name: cache pyright runtime
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pyright-python/
+          key: pyright-python-1.1.409-${{ runner.os }}
 
       - name: install sqlite3 cli
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends sqlite3

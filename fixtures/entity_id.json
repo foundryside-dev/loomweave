@@ -8,6 +8,14 @@
       "expected_entity_id": "python:function:demo.hello"
     },
     {
+      "description": "module-level function with parent_id matching contains edge (B.3)",
+      "plugin_id": "python",
+      "kind": "function",
+      "canonical_qualified_name": "demo.world",
+      "expected_entity_id": "python:function:demo.world",
+      "parent_id": "python:module:demo"
+    },
+    {
       "description": "class method",
       "plugin_id": "python",
       "kind": "function",
@@ -181,6 +189,16 @@
       }
     },
     {
+      "description": "module \u2192 top-level function with parent_id fixture row",
+      "parent_id": "python:module:demo",
+      "child_id": "python:function:demo.world",
+      "expected_wire": {
+        "kind": "contains",
+        "from_id": "python:module:demo",
+        "to_id": "python:function:demo.world"
+      }
+    },
+    {
       "description": "class \u2192 method",
       "parent_id": "python:class:demo.Foo",
       "child_id": "python:function:demo.Foo.bar",
@@ -218,6 +236,94 @@
         "kind": "contains",
         "from_id": "python:class:demo.Outer",
         "to_id": "python:class:demo.Outer.Inner"
+      }
+    }
+  ],
+  "calls_edges": [
+    {
+      "description": "resolved call from hello to world with source byte offsets",
+      "caller_id": "python:function:demo.hello",
+      "callee_id": "python:function:demo.world",
+      "source_byte_start": 42,
+      "source_byte_end": 49,
+      "confidence": "resolved",
+      "expected_wire": {
+        "kind": "calls",
+        "from_id": "python:function:demo.hello",
+        "to_id": "python:function:demo.world",
+        "source_byte_start": 42,
+        "source_byte_end": 49,
+        "confidence": "resolved"
+      }
+    },
+    {
+      "description": "ambiguous call with sorted candidate ids in properties.candidates",
+      "caller_id": "python:function:demo.Foo.bar",
+      "callee_id": "python:function:demo.hello",
+      "source_byte_start": 88,
+      "source_byte_end": 103,
+      "confidence": "ambiguous",
+      "candidate_ids": [
+        "python:function:demo.hello",
+        "python:function:demo.world"
+      ],
+      "expected_wire": {
+        "kind": "calls",
+        "from_id": "python:function:demo.Foo.bar",
+        "to_id": "python:function:demo.hello",
+        "source_byte_start": 88,
+        "source_byte_end": 103,
+        "confidence": "ambiguous",
+        "properties": {
+          "candidates": [
+            "python:function:demo.hello",
+            "python:function:demo.world"
+          ]
+        }
+      }
+    }
+  ],
+  "references_edges": [
+    {
+      "description": "resolved module-level reference to function with source byte offsets",
+      "from_id": "python:module:demo",
+      "to_id": "python:function:demo.world",
+      "source_byte_start": 124,
+      "source_byte_end": 129,
+      "confidence": "resolved",
+      "expected_wire": {
+        "kind": "references",
+        "from_id": "python:module:demo",
+        "to_id": "python:function:demo.world",
+        "source_byte_start": 124,
+        "source_byte_end": 129,
+        "confidence": "resolved"
+      }
+    },
+    {
+      "description": "ambiguous reference with sorted candidate ids in properties.candidates",
+      "from_id": "python:function:demo.annotated",
+      "to_id": "python:class:demo.Alpha",
+      "source_byte_start": 188,
+      "source_byte_end": 193,
+      "confidence": "ambiguous",
+      "candidate_ids": [
+        "python:class:demo.Alpha",
+        "python:class:demo.Beta"
+      ],
+      "expected_wire": {
+        "kind": "references",
+        "from_id": "python:function:demo.annotated",
+        "to_id": "python:class:demo.Alpha",
+        "source_byte_start": 188,
+        "source_byte_end": 193,
+        "confidence": "ambiguous",
+        "properties": {
+          "candidates": [
+            "python:class:demo.Alpha",
+            "python:class:demo.Beta"
+          ]
+        }
       }
     }
   ]
