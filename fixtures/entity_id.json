@@ -282,5 +282,49 @@
         }
       }
     }
+  ],
+  "references_edges": [
+    {
+      "description": "resolved module-level reference to function with source byte offsets",
+      "from_id": "python:module:demo",
+      "to_id": "python:function:demo.world",
+      "source_byte_start": 124,
+      "source_byte_end": 129,
+      "confidence": "resolved",
+      "expected_wire": {
+        "kind": "references",
+        "from_id": "python:module:demo",
+        "to_id": "python:function:demo.world",
+        "source_byte_start": 124,
+        "source_byte_end": 129,
+        "confidence": "resolved"
+      }
+    },
+    {
+      "description": "ambiguous reference with sorted candidate ids in properties.candidates",
+      "from_id": "python:function:demo.annotated",
+      "to_id": "python:class:demo.Alpha",
+      "source_byte_start": 188,
+      "source_byte_end": 193,
+      "confidence": "ambiguous",
+      "candidate_ids": [
+        "python:class:demo.Alpha",
+        "python:class:demo.Beta"
+      ],
+      "expected_wire": {
+        "kind": "references",
+        "from_id": "python:function:demo.annotated",
+        "to_id": "python:class:demo.Alpha",
+        "source_byte_start": 188,
+        "source_byte_end": 193,
+        "confidence": "ambiguous",
+        "properties": {
+          "candidates": [
+            "python:class:demo.Alpha",
+            "python:class:demo.Beta"
+          ]
+        }
+      }
+    }
   ]
 }
