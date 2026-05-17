@@ -2,24 +2,29 @@
 
 pub mod config;
 
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clarion_core::{
-    EdgeConfidence, LEAF_SUMMARY_PROMPT_TEMPLATE_ID, LeafSummaryPromptInput, LlmProvider,
-    LlmPurpose, LlmRequest, build_leaf_summary_prompt,
+    EdgeConfidence, INFERRED_CALLS_PROMPT_VERSION, InferredCallsPromptInput,
+    LEAF_SUMMARY_PROMPT_TEMPLATE_ID, LeafSummaryPromptInput, LlmProvider, LlmPurpose, LlmRequest,
+    build_inferred_calls_prompt, build_leaf_summary_prompt,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot};
 
 use clarion_core::plugin::{ContentLengthCeiling, Frame, TransportError};
 use clarion_storage::{
-    CallEdgeMatch, EntityRow, ReaderPool, StorageError, SummaryCacheEntry, SummaryCacheKey,
-    WriterCmd, call_edges_from, call_edges_targeting, child_entity_ids, entity_at_line,
-    entity_by_id, find_entities, normalize_source_path, summary_cache_lookup,
+    CallEdgeMatch, EntityRow, InferredCallEdgeRecord, InferredEdgeCacheEntry, InferredEdgeCacheKey,
+    InferredEdgeWriteStats, ReaderPool, StorageError, SummaryCacheEntry, SummaryCacheKey,
+    UnresolvedCallSiteRow, WriterCmd, call_edges_from, call_edges_targeting,
+    candidate_entities_for_unresolved_sites, child_entity_ids, entity_at_line, entity_by_id,
+    find_entities, inferred_edge_cache_key_id, inferred_edge_cache_lookup, normalize_source_path,
+    summary_cache_lookup, unresolved_call_sites_for_caller, unresolved_callers_for_target,
 };
 
 use crate::config::LlmConfig;
@@ -164,6 +169,8 @@ pub struct ServerState {
     summary_llm: Option<SummaryLlmState>,
     clock: Arc<dyn Fn() -> String + Send + Sync>,
     budget: Arc<Mutex<BudgetLedger>>,
+    inferred_inflight:
+        Arc<AsyncMutex<HashMap<InferredEdgeCacheKey, broadcast::Sender<InferredDispatchOutcome>>>>,
 }
 
 impl ServerState {
@@ -176,6 +183,7 @@ impl ServerState {
             summary_llm: None,
             clock: Arc::new(default_now_string),
             budget: Arc::new(Mutex::new(BudgetLedger::default())),
+            inferred_inflight: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
 
@@ -341,13 +349,14 @@ impl ServerState {
     ) -> std::result::Result<Value, ParamError> {
         let entity_id = required_str(arguments, "id")?.to_owned();
         let confidence = optional_confidence(arguments)?;
-        if confidence == EdgeConfidence::Inferred {
-            return Ok(tool_error_envelope(
-                "inferred-unavailable",
-                "inferred call dispatch lands in B.6b; request confidence=ambiguous for static expansion",
-                false,
-            ));
-        }
+        let stats_delta = if confidence == EdgeConfidence::Inferred {
+            match self.ensure_inferred_for_target(&entity_id).await {
+                Ok(stats) => stats.to_json(),
+                Err(err) => return Ok(err.to_envelope()),
+            }
+        } else {
+            json!({})
+        };
         let result = self
             .readers
             .with_reader(move |conn| {
@@ -362,7 +371,10 @@ impl ServerState {
                     .into_iter()
                     .filter_map(|edge| caller_json(conn, &edge).transpose())
                     .collect::<Result<Vec<_>, StorageError>>()?;
-                Ok(success_envelope(json!({"callers": callers})))
+                Ok(success_envelope_with_stats(
+                    json!({"callers": callers}),
+                    stats_delta,
+                ))
             })
             .await;
         Ok(flatten_storage_envelope_result(result))
@@ -378,11 +390,7 @@ impl ServerState {
             .clamp(1, 8);
         let confidence = optional_confidence(arguments)?;
         if confidence == EdgeConfidence::Inferred {
-            return Ok(tool_error_envelope(
-                "inferred-unavailable",
-                "inferred call dispatch lands in B.6b; request confidence=ambiguous for static expansion",
-                false,
-            ));
+            return Ok(self.inferred_execution_paths(entity_id, max_depth).await);
         }
         let edge_cap = self.execution_edge_cap;
         let result = self
@@ -415,6 +423,92 @@ impl ServerState {
         Ok(flatten_storage_envelope_result(result))
     }
 
+    async fn inferred_execution_paths(&self, entity_id: String, max_depth: usize) -> Value {
+        let exists = self
+            .readers
+            .with_reader({
+                let entity_id = entity_id.clone();
+                move |conn| entity_by_id(conn, &entity_id).map(|entity| entity.is_some())
+            })
+            .await;
+        match exists {
+            Ok(true) => {}
+            Ok(false) => {
+                return tool_error_envelope(
+                    "entity-not-found",
+                    &format!("entity {entity_id} was not found"),
+                    false,
+                );
+            }
+            Err(err) => return tool_error_envelope("storage-error", &err.to_string(), true),
+        }
+
+        let mut stats = InferredDispatchStats::default();
+        let mut dispatched_callers = BTreeSet::new();
+        let mut stack = vec![(entity_id.clone(), vec![entity_id], max_depth)];
+        let mut paths = Vec::new();
+        let mut edge_count_visited = 0;
+        let mut truncated = false;
+
+        while let Some((current_id, path, remaining_depth)) = stack.pop() {
+            if remaining_depth == 0 || truncated {
+                continue;
+            }
+            if dispatched_callers.insert(current_id.clone()) {
+                match self.ensure_inferred_for_caller(&current_id).await {
+                    Ok(delta) => stats.merge(&delta),
+                    Err(err) => return err.to_envelope(),
+                }
+            }
+            let edges = match self
+                .readers
+                .with_reader({
+                    let current_id = current_id.clone();
+                    move |conn| call_edges_from(conn, &current_id, EdgeConfidence::Inferred)
+                })
+                .await
+            {
+                Ok(edges) => edges,
+                Err(err) => return tool_error_envelope("storage-error", &err.to_string(), true),
+            };
+            for edge in edges.into_iter().rev() {
+                edge_count_visited += 1;
+                if edge_count_visited > self.execution_edge_cap {
+                    truncated = true;
+                    break;
+                }
+                if path.iter().any(|seen| seen == &edge.to_id) {
+                    continue;
+                }
+                let mut next_path = path.clone();
+                next_path.push(edge.to_id.clone());
+                paths.push(next_path.clone());
+                stack.push((edge.to_id, next_path, remaining_depth - 1));
+            }
+        }
+
+        let resolved_paths = self
+            .readers
+            .with_reader(move |conn| {
+                paths
+                    .iter()
+                    .map(|path| path_json(conn, path))
+                    .collect::<Result<Vec<_>, StorageError>>()
+            })
+            .await;
+        match resolved_paths {
+            Ok(paths) => success_envelope_with_truncation_and_stats(
+                json!({
+                    "paths": paths,
+                    "edge_count_visited": edge_count_visited
+                }),
+                truncated.then_some("edge-cap"),
+                stats.to_json(),
+            ),
+            Err(err) => tool_error_envelope("storage-error", &err.to_string(), true),
+        }
+    }
+
     async fn tool_neighborhood(
         &self,
         arguments: &serde_json::Map<String, Value>,
@@ -422,11 +516,12 @@ impl ServerState {
         let entity_id = required_str(arguments, "id")?.to_owned();
         let confidence = optional_confidence(arguments)?;
         if confidence == EdgeConfidence::Inferred {
-            return Ok(tool_error_envelope(
-                "inferred-unavailable",
-                "inferred call dispatch lands in B.6b; request confidence=ambiguous for static expansion",
-                false,
-            ));
+            if let Err(err) = self.ensure_inferred_for_target(&entity_id).await {
+                return Ok(err.to_envelope());
+            }
+            if let Err(err) = self.ensure_inferred_for_caller(&entity_id).await {
+                return Ok(err.to_envelope());
+            }
         }
         let result = self
             .readers
@@ -521,6 +616,250 @@ impl ServerState {
         }
 
         Ok(self.refresh_summary(*ready, summary_llm, now).await)
+    }
+
+    async fn ensure_inferred_for_target(
+        &self,
+        target_id: &str,
+    ) -> Result<InferredDispatchStats, InferredDispatchFailure> {
+        let target_id = target_id.to_owned();
+        let caller_ids = self
+            .readers
+            .with_reader(move |conn| {
+                let Some(target) = entity_by_id(conn, &target_id)? else {
+                    return Ok(Vec::new());
+                };
+                let sites = unresolved_callers_for_target(conn, &target, 50)?;
+                let mut seen = std::collections::BTreeSet::new();
+                Ok(sites
+                    .into_iter()
+                    .filter_map(|site| {
+                        if seen.insert(site.caller_entity_id.clone()) {
+                            Some(site.caller_entity_id)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>())
+            })
+            .await
+            .map_err(|err| InferredDispatchFailure::from_storage(&err))?;
+
+        let mut stats = InferredDispatchStats {
+            candidate_callers_considered: u64::try_from(caller_ids.len()).unwrap_or(u64::MAX),
+            ..InferredDispatchStats::default()
+        };
+        for caller_id in caller_ids {
+            stats.merge(&self.ensure_inferred_for_caller(&caller_id).await?);
+        }
+        Ok(stats)
+    }
+
+    async fn ensure_inferred_for_caller(
+        &self,
+        caller_id: &str,
+    ) -> Result<InferredDispatchStats, InferredDispatchFailure> {
+        let model_id = self.inferred_edges_model_id();
+        let Some(read) = self
+            .read_inferred_inputs(caller_id.to_owned(), model_id)
+            .await?
+        else {
+            return Ok(InferredDispatchStats::default());
+        };
+
+        if let Some(cached) = read.cached.clone() {
+            return self.materialize_cached_inferred(read, cached).await;
+        }
+
+        if self.summary_budget_blocked() {
+            return Err(InferredDispatchFailure::new(
+                "cost-ceiling-exceeded",
+                "LLM session cost ceiling has been reached",
+                false,
+            ));
+        }
+        let Some(llm) = self.inference_llm_snapshot() else {
+            return Err(InferredDispatchFailure::new(
+                "llm-disabled",
+                "LLM inferred-edge dispatch is disabled and no cache row is available",
+                false,
+            ));
+        };
+        if !llm.config.enabled {
+            return Err(InferredDispatchFailure::new(
+                "llm-disabled",
+                "LLM inferred-edge dispatch is disabled and no cache row is available",
+                false,
+            ));
+        }
+
+        self.coalesced_inferred_dispatch(read.key.clone(), read, llm)
+            .await
+    }
+
+    async fn read_inferred_inputs(
+        &self,
+        caller_id: String,
+        model_id: String,
+    ) -> Result<Option<InferredRead>, InferredDispatchFailure> {
+        self.readers
+            .with_reader(move |conn| {
+                let Some(caller) = entity_by_id(conn, &caller_id)? else {
+                    return Ok(None);
+                };
+                let Some(content_hash) = caller.content_hash.clone() else {
+                    return Ok(None);
+                };
+                let sites = unresolved_call_sites_for_caller(conn, &caller_id, 100)?;
+                if sites.is_empty() {
+                    return Ok(None);
+                }
+                let candidates = candidate_entities_for_unresolved_sites(conn, &sites, 100)?;
+                let key = InferredEdgeCacheKey {
+                    caller_entity_id: caller.id.clone(),
+                    caller_content_hash: content_hash,
+                    model_id,
+                    prompt_version: INFERRED_CALLS_PROMPT_VERSION.to_owned(),
+                };
+                let cached = inferred_edge_cache_lookup(conn, &key)?;
+                Ok(Some(InferredRead {
+                    caller,
+                    sites,
+                    candidates,
+                    key,
+                    cached,
+                }))
+            })
+            .await
+            .map_err(|err| InferredDispatchFailure::from_storage(&err))
+    }
+
+    async fn materialize_cached_inferred(
+        &self,
+        read: InferredRead,
+        mut cached: InferredEdgeCacheEntry,
+    ) -> Result<InferredDispatchStats, InferredDispatchFailure> {
+        let Some(llm) = self.inference_llm_snapshot() else {
+            return Err(InferredDispatchFailure::new(
+                "llm-disabled",
+                "LLM inferred-edge dispatch is disabled and no writer is available",
+                false,
+            ));
+        };
+        let now = (self.clock)();
+        cached.last_accessed_at = now;
+        let edges = inferred_records_from_result(
+            &read,
+            &cached.result_json,
+            self.max_inferred_edges_per_caller(),
+        )?;
+        let write = self
+            .send_writer(&llm.writer, |ack| WriterCmd::InsertInferredEdges {
+                cache_entry: Box::new(cached),
+                edges,
+                ack,
+            })
+            .await
+            .map_err(|err| InferredDispatchFailure::from_storage(&err))?;
+        Ok(InferredDispatchStats::cache_hit(write))
+    }
+
+    async fn coalesced_inferred_dispatch(
+        &self,
+        key: InferredEdgeCacheKey,
+        read: InferredRead,
+        llm: InferenceLlmState,
+    ) -> Result<InferredDispatchStats, InferredDispatchFailure> {
+        let maybe_rx = {
+            let mut in_flight = self.inferred_inflight.lock().await;
+            if let Some(sender) = in_flight.get(&key) {
+                Some(sender.subscribe())
+            } else {
+                let (sender, _) = broadcast::channel(8);
+                in_flight.insert(key.clone(), sender);
+                None
+            }
+        };
+
+        if let Some(mut rx) = maybe_rx {
+            return match tokio::time::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
+                Ok(Ok(outcome)) => outcome.into_result(),
+                Ok(Err(_)) => Err(InferredDispatchFailure::new(
+                    "inferred-dispatch-cancelled",
+                    "inferred dispatch owner ended before broadcasting a result",
+                    true,
+                )),
+                Err(_) => Err(InferredDispatchFailure::new(
+                    "inferred-dispatch-timeout",
+                    "timed out waiting for in-flight inferred dispatch",
+                    true,
+                )),
+            };
+        }
+
+        let outcome =
+            InferredDispatchOutcome::from_result(self.perform_inferred_dispatch(read, &llm).await);
+        if let Some(sender) = self.inferred_inflight.lock().await.remove(&key) {
+            let _ = sender.send(outcome.clone());
+        }
+        outcome.into_result()
+    }
+
+    async fn perform_inferred_dispatch(
+        &self,
+        read: InferredRead,
+        llm: &InferenceLlmState,
+    ) -> Result<InferredDispatchStats, InferredDispatchFailure> {
+        let prompt = build_inferred_calls_prompt(&InferredCallsPromptInput {
+            caller_entity_id: read.caller.id.clone(),
+            caller_source_excerpt: source_excerpt(&read.caller),
+            unresolved_call_sites_json: unresolved_sites_json(&read.sites),
+            candidate_entities_json: entities_json(&read.candidates),
+        });
+        let request = LlmRequest {
+            purpose: LlmPurpose::InferredEdges,
+            model_id: read.key.model_id.clone(),
+            prompt_id: prompt.id.to_owned(),
+            prompt: prompt.body,
+            max_output_tokens: 512,
+        };
+        let response = llm.provider.invoke(request).map_err(|err| {
+            InferredDispatchFailure::new("llm-provider-error", &err.to_string(), true)
+        })?;
+        if !self.try_spend_budget(response.cost_usd, llm.config.session_cost_ceiling_usd) {
+            return Err(InferredDispatchFailure::new(
+                "cost-ceiling-exceeded",
+                "LLM session cost ceiling has been reached",
+                false,
+            ));
+        }
+        let edges = inferred_records_from_result(
+            &read,
+            &response.output_json,
+            self.max_inferred_edges_per_caller(),
+        )?;
+        let now = (self.clock)();
+        let entry = InferredEdgeCacheEntry {
+            key: read.key,
+            result_json: response.output_json,
+            cost_usd: response.cost_usd,
+            token_count: i64::from(response.input_tokens) + i64::from(response.output_tokens),
+            created_at: now.clone(),
+            last_accessed_at: now,
+        };
+        let write = self
+            .send_writer(&llm.writer, |ack| WriterCmd::InsertInferredEdges {
+                cache_entry: Box::new(entry.clone()),
+                edges,
+                ack,
+            })
+            .await
+            .map_err(|err| InferredDispatchFailure::from_storage(&err))?;
+        Ok(InferredDispatchStats::cache_miss(
+            write,
+            entry.cost_usd,
+            entry.token_count,
+        ))
     }
 
     async fn read_summary_inputs(
@@ -693,6 +1032,10 @@ impl ServerState {
     }
 
     fn try_spend_summary_budget(&self, cost_usd: f64, ceiling_usd: f64) -> bool {
+        self.try_spend_budget(cost_usd, ceiling_usd)
+    }
+
+    fn try_spend_budget(&self, cost_usd: f64, ceiling_usd: f64) -> bool {
         let mut budget = self
             .budget
             .lock()
@@ -703,6 +1046,14 @@ impl ServerState {
         }
         budget.spent_usd += cost_usd;
         true
+    }
+
+    fn inference_llm_snapshot(&self) -> Option<InferenceLlmState> {
+        self.summary_llm.as_ref().map(|llm| InferenceLlmState {
+            writer: llm.writer.clone(),
+            config: llm.config.clone(),
+            provider: Arc::clone(&llm.provider),
+        })
     }
 
     fn summary_cache_max_age_days(&self) -> u32 {
@@ -722,6 +1073,25 @@ impl ServerState {
                     .to_owned()
             },
         )
+    }
+
+    fn inferred_edges_model_id(&self) -> String {
+        self.summary_llm.as_ref().map_or_else(
+            || "claude-haiku-4-5".to_owned(),
+            |summary| {
+                summary
+                    .provider
+                    .tier_to_model("inferred_edges")
+                    .unwrap_or(&summary.config.inferred_edges_model_id)
+                    .to_owned()
+            },
+        )
+    }
+
+    fn max_inferred_edges_per_caller(&self) -> usize {
+        self.summary_llm.as_ref().map_or(8, |summary| {
+            usize::try_from(summary.config.max_inferred_edges_per_caller).unwrap_or(8)
+        })
     }
 }
 
@@ -749,6 +1119,142 @@ struct SummaryReady {
     cached: Option<SummaryCacheEntry>,
     caller_count: i64,
     fan_out: i64,
+}
+
+#[derive(Clone)]
+struct InferenceLlmState {
+    writer: mpsc::Sender<WriterCmd>,
+    config: LlmConfig,
+    provider: Arc<dyn LlmProvider>,
+}
+
+#[derive(Clone)]
+struct InferredRead {
+    caller: EntityRow,
+    sites: Vec<UnresolvedCallSiteRow>,
+    candidates: Vec<EntityRow>,
+    key: InferredEdgeCacheKey,
+    cached: Option<InferredEdgeCacheEntry>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct InferredDispatchStats {
+    cache_hits_total: u64,
+    cache_misses_total: u64,
+    edges_materialized_total: u64,
+    edges_skipped_static_duplicates_total: u64,
+    candidate_callers_considered: u64,
+    llm_cost_usd: f64,
+    tokens_total: i64,
+}
+
+impl InferredDispatchStats {
+    fn cache_hit(write: InferredEdgeWriteStats) -> Self {
+        Self {
+            cache_hits_total: 1,
+            edges_materialized_total: write.inserted_edges,
+            edges_skipped_static_duplicates_total: write.skipped_static_duplicates,
+            ..Self::default()
+        }
+    }
+
+    fn cache_miss(write: InferredEdgeWriteStats, cost_usd: f64, tokens: i64) -> Self {
+        Self {
+            cache_misses_total: 1,
+            edges_materialized_total: write.inserted_edges,
+            edges_skipped_static_duplicates_total: write.skipped_static_duplicates,
+            llm_cost_usd: cost_usd,
+            tokens_total: tokens,
+            ..Self::default()
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.cache_hits_total += other.cache_hits_total;
+        self.cache_misses_total += other.cache_misses_total;
+        self.edges_materialized_total += other.edges_materialized_total;
+        self.edges_skipped_static_duplicates_total += other.edges_skipped_static_duplicates_total;
+        self.candidate_callers_considered += other.candidate_callers_considered;
+        self.llm_cost_usd += other.llm_cost_usd;
+        self.tokens_total += other.tokens_total;
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "inferred_dispatch_cache_hits_total": self.cache_hits_total,
+            "inferred_dispatch_misses_total": self.cache_misses_total,
+            "inferred_edges_materialized_total": self.edges_materialized_total,
+            "inferred_edges_skipped_static_duplicates_total": self.edges_skipped_static_duplicates_total,
+            "inferred_candidate_callers_considered": self.candidate_callers_considered,
+            "inferred_llm_cost_usd": self.llm_cost_usd,
+            "inferred_tokens_total": self.tokens_total
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InferredDispatchFailure {
+    code: &'static str,
+    message: String,
+    retryable: bool,
+}
+
+impl InferredDispatchFailure {
+    fn new(code: &'static str, message: &str, retryable: bool) -> Self {
+        Self {
+            code,
+            message: message.to_owned(),
+            retryable,
+        }
+    }
+
+    fn from_storage(err: &StorageError) -> Self {
+        Self {
+            code: "storage-error",
+            message: err.to_string(),
+            retryable: true,
+        }
+    }
+
+    fn to_envelope(&self) -> Value {
+        tool_error_envelope(self.code, &self.message, self.retryable)
+    }
+}
+
+#[derive(Debug, Clone)]
+enum InferredDispatchOutcome {
+    Ok(InferredDispatchStats),
+    Err(InferredDispatchFailure),
+}
+
+impl InferredDispatchOutcome {
+    fn from_result(result: Result<InferredDispatchStats, InferredDispatchFailure>) -> Self {
+        match result {
+            Ok(stats) => Self::Ok(stats),
+            Err(err) => Self::Err(err),
+        }
+    }
+
+    fn into_result(self) -> Result<InferredDispatchStats, InferredDispatchFailure> {
+        match self {
+            Self::Ok(stats) => Ok(stats),
+            Self::Err(err) => Err(err),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct InferredCallsResponse {
+    #[serde(default)]
+    edges: Vec<InferredCallsResponseEdge>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InferredCallsResponseEdge {
+    site_key: Option<String>,
+    target_id: String,
+    confidence: Option<f64>,
+    rationale: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -1039,6 +1545,18 @@ fn success_envelope_with_truncation(result: Value, truncation_reason: Option<&st
     Value::Object(envelope)
 }
 
+fn success_envelope_with_truncation_and_stats(
+    result: Value,
+    truncation_reason: Option<&str>,
+    stats_delta: Value,
+) -> Value {
+    let mut envelope = success_envelope_with_truncation(result, truncation_reason);
+    if let Some(object) = envelope.as_object_mut() {
+        object.insert("stats_delta".to_owned(), stats_delta);
+    }
+    envelope
+}
+
 fn success_envelope_with_stats(result: Value, stats_delta: Value) -> Value {
     let mut envelope = success_envelope(result);
     if let Some(object) = envelope.as_object_mut() {
@@ -1160,6 +1678,84 @@ fn source_excerpt(entity: &EntityRow) -> String {
             }
         })
         .unwrap_or_default()
+}
+
+fn unresolved_sites_json(sites: &[UnresolvedCallSiteRow]) -> String {
+    serde_json::to_string(
+        &sites
+            .iter()
+            .map(|site| {
+                json!({
+                    "caller_entity_id": site.caller_entity_id,
+                    "caller_content_hash": site.caller_content_hash,
+                    "site_key": site.site_key,
+                    "site_ordinal": site.site_ordinal,
+                    "source_file_id": site.source_file_id,
+                    "source_byte_start": site.source_byte_start,
+                    "source_byte_end": site.source_byte_end,
+                    "callee_expr": site.callee_expr
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .expect("unresolved site JSON serializes")
+}
+
+fn entities_json(entities: &[EntityRow]) -> String {
+    serde_json::to_string(&entities.iter().map(entity_json).collect::<Vec<_>>())
+        .expect("candidate entity JSON serializes")
+}
+
+fn inferred_records_from_result(
+    read: &InferredRead,
+    result_json: &str,
+    max_edges: usize,
+) -> Result<Vec<InferredCallEdgeRecord>, InferredDispatchFailure> {
+    let parsed: InferredCallsResponse = serde_json::from_str(result_json).map_err(|err| {
+        InferredDispatchFailure::new(
+            "llm-invalid-json",
+            &format!("inferred provider returned invalid JSON: {err}"),
+            true,
+        )
+    })?;
+    let cache_key = inferred_edge_cache_key_id(&read.key);
+    let sites_by_key = read
+        .sites
+        .iter()
+        .map(|site| (site.site_key.as_str(), site))
+        .collect::<HashMap<_, _>>();
+    let mut records = Vec::new();
+    for edge in parsed.edges.into_iter().take(max_edges) {
+        if edge.target_id.trim().is_empty() {
+            continue;
+        }
+        let site = match edge.site_key.as_deref() {
+            Some(site_key) => sites_by_key.get(site_key).copied(),
+            None if read.sites.len() == 1 => read.sites.first(),
+            None => None,
+        };
+        let Some(site) = site else {
+            continue;
+        };
+        let properties = json!({
+            "model_id": read.key.model_id,
+            "prompt_version": read.key.prompt_version,
+            "caller_content_hash": read.key.caller_content_hash,
+            "inference_cache_key": cache_key,
+            "site_key": site.site_key,
+            "model_confidence": edge.confidence,
+            "rationale": edge.rationale
+        });
+        records.push(InferredCallEdgeRecord {
+            from_id: read.caller.id.clone(),
+            to_id: edge.target_id,
+            source_file_id: site.source_file_id.clone(),
+            source_byte_start: site.source_byte_start,
+            source_byte_end: site.source_byte_end,
+            properties_json: properties.to_string(),
+        });
+    }
+    Ok(records)
 }
 
 fn stale_semantic(entry: &SummaryCacheEntry, caller_count: i64, fan_out: i64) -> bool {

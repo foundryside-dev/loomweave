@@ -19,8 +19,14 @@ use rusqlite::{Connection, params};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::cache::{touch_summary_cache, upsert_summary_cache};
-use crate::commands::{Ack, EdgeConfidence, EdgeRecord, EntityRecord, RunStatus, WriterCmd};
+use crate::cache::{
+    InferredEdgeCacheEntry, inferred_edge_cache_key_id, touch_summary_cache,
+    upsert_inferred_edge_cache, upsert_summary_cache,
+};
+use crate::commands::{
+    Ack, EdgeConfidence, EdgeRecord, EntityRecord, InferredCallEdgeRecord, InferredEdgeWriteStats,
+    RunStatus, WriterCmd,
+};
 use crate::error::{Result, StorageError};
 use crate::pragma;
 use crate::unresolved::replace_unresolved_call_sites_for_caller;
@@ -169,6 +175,16 @@ fn run_actor(
                     dropped_edges_total,
                     ambiguous_edges_total,
                 );
+                reply(ack, res);
+            }
+            WriterCmd::InsertInferredEdges {
+                cache_entry,
+                edges,
+                ack,
+            } => {
+                let res = query_time_write(conn, &mut state, commits_observed, |conn| {
+                    insert_inferred_edges(conn, &cache_entry, &edges)
+                });
                 reply(ack, res);
             }
             WriterCmd::UpsertSummaryCache { entry, ack } => {
@@ -501,6 +517,85 @@ fn insert_edge(
     }
     bump_writes_and_maybe_commit(conn, state, commits_observed)?;
     Ok(())
+}
+
+fn insert_inferred_edges(
+    conn: &Connection,
+    cache_entry: &InferredEdgeCacheEntry,
+    edges: &[InferredCallEdgeRecord],
+) -> Result<InferredEdgeWriteStats> {
+    upsert_inferred_edge_cache(conn, cache_entry)?;
+    let cache_key = inferred_edge_cache_key_id(&cache_entry.key);
+    conn.execute(
+        "DELETE FROM edges \
+         WHERE kind = 'calls' \
+           AND from_id = ?1 \
+           AND confidence = 'inferred' \
+           AND COALESCE(json_extract(properties, '$.inference_cache_key'), '') <> ?2",
+        params![cache_entry.key.caller_entity_id, cache_key],
+    )?;
+
+    let mut stats = InferredEdgeWriteStats {
+        inserted_edges: 0,
+        skipped_static_duplicates: 0,
+    };
+    for edge in edges {
+        validate_inferred_edge(edge)?;
+        if static_call_edge_exists(conn, &edge.from_id, &edge.to_id)? {
+            stats.skipped_static_duplicates += 1;
+            continue;
+        }
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO edges ( \
+                kind, from_id, to_id, confidence, properties, source_file_id, \
+                source_byte_start, source_byte_end \
+             ) VALUES ('calls', ?1, ?2, 'inferred', ?3, ?4, ?5, ?6)",
+            params![
+                edge.from_id,
+                edge.to_id,
+                edge.properties_json,
+                edge.source_file_id,
+                edge.source_byte_start,
+                edge.source_byte_end,
+            ],
+        )?;
+        stats.inserted_edges += u64::try_from(inserted).unwrap_or(u64::MAX);
+    }
+    Ok(stats)
+}
+
+fn validate_inferred_edge(edge: &InferredCallEdgeRecord) -> Result<()> {
+    if edge.from_id.is_empty() || edge.to_id.is_empty() {
+        return Err(StorageError::WriterProtocol(
+            "InsertInferredEdges requires non-empty from_id and to_id".to_owned(),
+        ));
+    }
+    if edge.source_byte_start < 0 || edge.source_byte_end <= edge.source_byte_start {
+        return Err(StorageError::WriterProtocol(
+            "InsertInferredEdges requires a non-empty source byte range".to_owned(),
+        ));
+    }
+    if serde_json::from_str::<serde_json::Value>(&edge.properties_json).is_err() {
+        return Err(StorageError::WriterProtocol(
+            "InsertInferredEdges properties_json must be valid JSON".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn static_call_edge_exists(conn: &Connection, from_id: &str, to_id: &str) -> Result<bool> {
+    let exists = conn.query_row(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM edges \
+            WHERE kind = 'calls' \
+              AND from_id = ?1 \
+              AND to_id = ?2 \
+              AND confidence IN ('resolved', 'ambiguous') \
+         )",
+        params![from_id, to_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(exists != 0)
 }
 
 fn replace_unresolved_call_sites_in_run(

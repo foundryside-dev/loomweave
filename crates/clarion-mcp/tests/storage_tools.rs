@@ -1,10 +1,12 @@
 //! MCP storage-backed tool tests.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use clarion_core::{
-    LEAF_SUMMARY_PROMPT_TEMPLATE_ID, LeafSummaryPromptInput, LlmPurpose, LlmRequest, LlmResponse,
-    Recording, RecordingProvider, build_leaf_summary_prompt,
+    CachingModel, INFERRED_CALLS_PROMPT_VERSION, InferredCallsPromptInput,
+    LEAF_SUMMARY_PROMPT_TEMPLATE_ID, LeafSummaryPromptInput, LlmProvider, LlmProviderError,
+    LlmPurpose, LlmRequest, LlmResponse, Recording, RecordingProvider, build_inferred_calls_prompt,
+    build_leaf_summary_prompt,
 };
 use clarion_mcp::{
     ServerState,
@@ -199,6 +201,17 @@ fn insert_edge(
     .expect("insert edge");
 }
 
+fn insert_unresolved_call_site(conn: &Connection, caller_id: &str, site_key: &str, expr: &str) {
+    conn.execute(
+        "INSERT INTO entity_unresolved_call_sites (
+            caller_entity_id, caller_content_hash, site_key, site_ordinal,
+            source_file_id, source_byte_start, source_byte_end, callee_expr, created_at
+         ) VALUES (?1, ?2, ?3, 0, 'python:module:demo', 30, 37, ?4, '2026-05-17T00:00:00.000Z')",
+        params![caller_id, format!("hash-{caller_id}"), site_key, expr],
+    )
+    .expect("insert unresolved call site");
+}
+
 fn state_for(project_root: &std::path::Path, db_path: &std::path::Path) -> ServerState {
     let pool = ReaderPool::open(db_path, 2).expect("reader pool");
     ServerState::new(project_root.to_path_buf(), pool)
@@ -216,7 +229,7 @@ fn state_for_summary(
     project_root: &std::path::Path,
     db_path: &std::path::Path,
     writer: &Writer,
-    provider: Arc<RecordingProvider>,
+    provider: Arc<dyn LlmProvider>,
     config: LlmConfig,
 ) -> ServerState {
     let pool = ReaderPool::open(db_path, 2).expect("reader pool");
@@ -253,6 +266,146 @@ fn summary_recording(project_root: &std::path::Path, entity_id: &str) -> Arc<Rec
             cost_usd: 0.001,
         },
     }]))
+}
+
+fn expected_inferred_request(
+    project_root: &std::path::Path,
+    caller_id: &str,
+    site_key: &str,
+    callee_expr: &str,
+    target_id: &str,
+) -> LlmRequest {
+    let source_excerpt = std::fs::read_to_string(project_root.join("demo.py")).unwrap();
+    let unresolved_call_sites_json = serde_json::to_string(&vec![json!({
+        "caller_entity_id": caller_id,
+        "caller_content_hash": format!("hash-{caller_id}"),
+        "site_key": site_key,
+        "site_ordinal": 0,
+        "source_file_id": "python:module:demo",
+        "source_byte_start": 30,
+        "source_byte_end": 37,
+        "callee_expr": callee_expr
+    })])
+    .unwrap();
+    let source_file_path = project_root.join("demo.py").display().to_string();
+    let candidate_entities_json = serde_json::to_string(&vec![json!({
+        "id": target_id,
+        "kind": "function",
+        "name": target_id,
+        "short_name": target_id,
+        "source_file_path": source_file_path,
+        "source_line_start": 9,
+        "source_line_end": 10,
+        "content_hash": format!("hash-{target_id}")
+    })])
+    .unwrap();
+    let prompt = build_inferred_calls_prompt(&InferredCallsPromptInput {
+        caller_entity_id: caller_id.to_owned(),
+        caller_source_excerpt: source_excerpt,
+        unresolved_call_sites_json,
+        candidate_entities_json,
+    });
+    LlmRequest {
+        purpose: LlmPurpose::InferredEdges,
+        model_id: "claude-haiku-4-5".to_owned(),
+        prompt_id: INFERRED_CALLS_PROMPT_VERSION.to_owned(),
+        prompt: prompt.body,
+        max_output_tokens: 512,
+    }
+}
+
+fn inferred_recording(
+    project_root: &std::path::Path,
+    caller_id: &str,
+    site_key: &str,
+    callee_expr: &str,
+    target_id: &str,
+) -> Arc<RecordingProvider> {
+    Arc::new(RecordingProvider::from_recordings(vec![Recording {
+        request: expected_inferred_request(
+            project_root,
+            caller_id,
+            site_key,
+            callee_expr,
+            target_id,
+        ),
+        response: LlmResponse {
+            model_id: "claude-haiku-4-5".to_owned(),
+            output_json: format!(
+                r#"{{"edges":[{{"site_key":"{site_key}","target_id":"{target_id}","confidence":0.91,"rationale":"name match"}}]}}"#
+            ),
+            input_tokens: 100,
+            output_tokens: 20,
+            cost_usd: 0.002,
+        },
+    }]))
+}
+
+#[derive(Debug)]
+struct AnyInferredProvider {
+    invocations: Mutex<Vec<LlmRequest>>,
+    output_json: String,
+    delay_ms: u64,
+}
+
+impl AnyInferredProvider {
+    fn new(output_json: &str) -> Self {
+        Self {
+            invocations: Mutex::new(Vec::new()),
+            output_json: output_json.to_owned(),
+            delay_ms: 0,
+        }
+    }
+
+    fn new_slow(output_json: &str, delay_ms: u64) -> Self {
+        Self {
+            invocations: Mutex::new(Vec::new()),
+            output_json: output_json.to_owned(),
+            delay_ms,
+        }
+    }
+
+    fn invocations(&self) -> Vec<LlmRequest> {
+        self.invocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl LlmProvider for AnyInferredProvider {
+    fn name(&self) -> &'static str {
+        "recording"
+    }
+
+    fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
+        self.invocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(request.clone());
+        if self.delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
+        }
+        Ok(LlmResponse {
+            model_id: request.model_id,
+            output_json: self.output_json.clone(),
+            input_tokens: 100,
+            output_tokens: 20,
+            cost_usd: 0.002,
+        })
+    }
+
+    fn estimate_cost_usd(&self, _request: &LlmRequest) -> f64 {
+        0.0
+    }
+
+    fn tier_to_model(&self, _tier: &str) -> Option<&str> {
+        None
+    }
+
+    fn caching_model(&self) -> CachingModel {
+        CachingModel::AnthropicPromptCache
+    }
 }
 
 async fn call_tool(state: &ServerState, name: &str, arguments: Value) -> Value {
@@ -558,6 +711,126 @@ async fn callers_of_defaults_to_resolved_and_expands_ambiguous_candidates() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn callers_of_inferred_dispatches_and_materializes_recording_result() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    let source_path = project.path().join("demo.py");
+    insert_entity(
+        &conn,
+        "python:function:demo.dynamic",
+        "function",
+        &source_path,
+        Some((9, 10)),
+        Some("python:module:demo"),
+    );
+    insert_unresolved_call_site(
+        &conn,
+        "python:function:demo.entry",
+        "site-dynamic",
+        "dynamic",
+    );
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnyInferredProvider::new(
+        r#"{"edges":[{"site_key":"site-dynamic","target_id":"python:function:demo.dynamic","confidence":0.91,"rationale":"name match"}]}"#,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.dynamic", "confidence": "inferred"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(
+        envelope["result"]["callers"][0]["entity"]["id"],
+        "python:function:demo.entry"
+    );
+    assert_eq!(
+        envelope["result"]["callers"][0]["edge_confidence"],
+        "inferred"
+    );
+    assert_eq!(envelope["stats_delta"]["inferred_dispatch_misses_total"], 1);
+    assert_eq!(provider.invocations().len(), 1);
+    assert_eq!(provider.invocations()[0].purpose, LlmPurpose::InferredEdges);
+    assert_eq!(
+        provider.invocations()[0].prompt_id,
+        INFERRED_CALLS_PROMPT_VERSION
+    );
+
+    let warm = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.dynamic", "confidence": "inferred"}),
+    )
+    .await;
+    assert_eq!(warm["ok"], true);
+    assert_eq!(provider.invocations().len(), 1);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn callers_of_inferred_coalesces_concurrent_cold_requests() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    let source_path = project.path().join("demo.py");
+    insert_entity(
+        &conn,
+        "python:function:demo.dynamic",
+        "function",
+        &source_path,
+        Some((9, 10)),
+        Some("python:module:demo"),
+    );
+    insert_unresolved_call_site(
+        &conn,
+        "python:function:demo.entry",
+        "site-dynamic",
+        "dynamic",
+    );
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnyInferredProvider::new_slow(
+        r#"{"edges":[{"site_key":"site-dynamic","target_id":"python:function:demo.dynamic","confidence":0.91,"rationale":"name match"}]}"#,
+        100,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+    let args = json!({"id": "python:function:demo.dynamic", "confidence": "inferred"});
+
+    let (first, second) = tokio::join!(
+        call_tool(&state, "callers_of", args.clone()),
+        call_tool(&state, "callers_of", args),
+    );
+
+    assert_eq!(first["ok"], true);
+    assert_eq!(second["ok"], true);
+    assert_eq!(provider.invocations().len(), 1);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn execution_paths_from_reports_edge_cap_truncation() {
     let (project, db_path) = open_project();
@@ -574,6 +847,125 @@ async fn execution_paths_from_reports_edge_cap_truncation() {
     assert_eq!(envelope["truncated"], true);
     assert_eq!(envelope["truncation_reason"], "edge-cap");
     assert_eq!(envelope["result"]["edge_count_visited"], 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn execution_paths_from_inferred_dispatches_start_caller() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    let source_path = project.path().join("demo.py");
+    insert_entity(
+        &conn,
+        "python:function:demo.dynamic",
+        "function",
+        &source_path,
+        Some((9, 10)),
+        Some("python:module:demo"),
+    );
+    insert_unresolved_call_site(
+        &conn,
+        "python:function:demo.entry",
+        "site-dynamic",
+        "dynamic",
+    );
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnyInferredProvider::new(
+        r#"{"edges":[{"site_key":"site-dynamic","target_id":"python:function:demo.dynamic","confidence":0.91,"rationale":"name match"}]}"#,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "execution_paths_from",
+        json!({"id": "python:function:demo.entry", "max_depth": 1, "confidence": "inferred"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert!(
+        envelope["result"]["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| {
+                path.as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|node| node["id"] == "python:function:demo.dynamic")
+            })
+    );
+    assert_eq!(provider.invocations().len(), 1);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn execution_paths_from_inferred_dispatches_reached_callers() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    let source_path = project.path().join("demo.py");
+    insert_entity(
+        &conn,
+        "python:function:demo.dynamic",
+        "function",
+        &source_path,
+        Some((9, 10)),
+        Some("python:module:demo"),
+    );
+    insert_unresolved_call_site(&conn, "python:function:demo.mid", "site-dynamic", "dynamic");
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = inferred_recording(
+        project.path(),
+        "python:function:demo.mid",
+        "site-dynamic",
+        "dynamic",
+        "python:function:demo.dynamic",
+    );
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "execution_paths_from",
+        json!({"id": "python:function:demo.entry", "max_depth": 2, "confidence": "inferred"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert!(
+        envelope["result"]["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| {
+                path.as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|node| node["id"] == "python:function:demo.dynamic")
+            })
+    );
+    assert_eq!(provider.invocations().len(), 1);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
 }
 
 #[tokio::test]

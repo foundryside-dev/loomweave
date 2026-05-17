@@ -27,7 +27,7 @@ pub struct SummaryCacheEntry {
     pub last_accessed_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct InferredEdgeCacheKey {
     pub caller_entity_id: String,
     pub caller_content_hash: String,
@@ -200,6 +200,13 @@ pub fn touch_inferred_edge_cache(
         ],
     )?;
     Ok(changed > 0)
+}
+
+pub fn inferred_edge_cache_key_id(key: &InferredEdgeCacheKey) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        key.caller_entity_id, key.caller_content_hash, key.model_id, key.prompt_version
+    )
 }
 
 fn map_summary_cache_entry(row: &Row<'_>) -> rusqlite::Result<SummaryCacheEntry> {

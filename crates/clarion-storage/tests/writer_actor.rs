@@ -8,7 +8,8 @@ use rusqlite::Connection;
 use tokio::sync::oneshot;
 
 use clarion_storage::{
-    ReaderPool, SummaryCacheEntry, SummaryCacheKey, UnresolvedCallSiteRecord, Writer,
+    InferredCallEdgeRecord, InferredEdgeCacheEntry, InferredEdgeCacheKey, ReaderPool,
+    SummaryCacheEntry, SummaryCacheKey, UnresolvedCallSiteRecord, Writer,
     commands::{EdgeConfidence, EdgeRecord, EntityRecord, RunStatus, WriterCmd},
     pragma, schema,
 };
@@ -193,6 +194,33 @@ fn unresolved_site(callee_expr: &str, ordinal: i64) -> UnresolvedCallSiteRecord 
     }
 }
 
+fn inferred_cache_entry() -> InferredEdgeCacheEntry {
+    InferredEdgeCacheEntry {
+        key: InferredEdgeCacheKey {
+            caller_entity_id: "python:function:demo.caller".to_owned(),
+            caller_content_hash: "hash-python:function:demo.caller".to_owned(),
+            model_id: "claude-haiku-4-5".to_owned(),
+            prompt_version: "inferred-calls-v1".to_owned(),
+        },
+        result_json: r#"{"edges":[{"target_id":"python:function:demo.inferred"}]}"#.to_owned(),
+        cost_usd: 0.002,
+        token_count: 42,
+        created_at: now_iso(),
+        last_accessed_at: now_iso(),
+    }
+}
+
+fn inferred_record(to_id: &str, start: i64) -> InferredCallEdgeRecord {
+    InferredCallEdgeRecord {
+        from_id: "python:function:demo.caller".to_owned(),
+        to_id: to_id.to_owned(),
+        source_file_id: Some("python:module:demo".to_owned()),
+        source_byte_start: start,
+        source_byte_end: start + 8,
+        properties_json: r#"{"inference_cache_key":"cache-a"}"#.to_owned(),
+    }
+}
+
 async fn assert_edge_rejected_with_counter(
     writer: &Writer,
     tx: &tokio::sync::mpsc::Sender<WriterCmd>,
@@ -345,6 +373,112 @@ async fn replace_unresolved_call_sites_replaces_current_and_old_hash_rows_for_ca
             ),
         ]
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn insert_inferred_edges_materializes_and_skips_static_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-inferred").await;
+    seed_module_and_functions(&tx).await;
+    seed_contains_edges_for_demo_functions(&tx).await;
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(make_entity_with_parent(
+            "python:function:demo.inferred",
+            Some("python:module:demo"),
+        )),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::InsertEdge {
+        edge: Box::new(make_contains_edge(
+            "python:module:demo",
+            "python:function:demo.inferred",
+        )),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::InsertEdge {
+        edge: Box::new(make_calls_edge(
+            "python:function:demo.caller",
+            "python:function:demo.callee",
+            EdgeConfidence::Resolved,
+        )),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-inferred".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    let stats = send::<clarion_storage::InferredEdgeWriteStats>(&tx, |ack| {
+        WriterCmd::InsertInferredEdges {
+            cache_entry: Box::new(inferred_cache_entry()),
+            edges: vec![
+                inferred_record("python:function:demo.callee", 10),
+                inferred_record("python:function:demo.inferred", 20),
+            ],
+            ack,
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(stats.inserted_edges, 1);
+    assert_eq!(stats.skipped_static_duplicates, 1);
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let conn = Connection::open(path).unwrap();
+    let rows: Vec<(String, String, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT from_id, to_id, confidence \
+                 FROM edges \
+                 WHERE kind = 'calls' AND from_id = ?1 \
+                 ORDER BY to_id",
+            )
+            .unwrap();
+        stmt.query_map(rusqlite::params!["python:function:demo.caller"], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    };
+    assert!(rows.contains(&(
+        "python:function:demo.caller".to_owned(),
+        "python:function:demo.callee".to_owned(),
+        "resolved".to_owned(),
+    )));
+    assert!(rows.contains(&(
+        "python:function:demo.caller".to_owned(),
+        "python:function:demo.inferred".to_owned(),
+        "inferred".to_owned(),
+    )));
+
+    let cached: String = conn
+        .query_row(
+            "SELECT result_json FROM inferred_edge_cache WHERE caller_entity_id = ?1",
+            rusqlite::params!["python:function:demo.caller"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(cached.contains("python:function:demo.inferred"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

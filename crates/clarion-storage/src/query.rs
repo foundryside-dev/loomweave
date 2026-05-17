@@ -45,6 +45,18 @@ pub struct ContainedEntities {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedCallSiteRow {
+    pub caller_entity_id: String,
+    pub caller_content_hash: String,
+    pub site_key: String,
+    pub site_ordinal: i64,
+    pub source_file_id: Option<String>,
+    pub source_byte_start: i64,
+    pub source_byte_end: i64,
+    pub callee_expr: String,
+}
+
 #[derive(Debug, Clone)]
 struct StoredCallEdge {
     from_id: String,
@@ -258,6 +270,87 @@ pub fn call_edges_from(
     Ok(matches)
 }
 
+pub fn unresolved_call_sites_for_caller(
+    conn: &Connection,
+    caller_id: &str,
+    limit: usize,
+) -> Result<Vec<UnresolvedCallSiteRow>> {
+    let limit_i64 = i64::try_from(limit.clamp(1, 500)).map_err(|_| {
+        StorageError::InvalidQuery("unresolved call-site limit is too large".to_owned())
+    })?;
+    let mut stmt = conn.prepare(
+        "SELECT caller_entity_id, caller_content_hash, site_key, site_ordinal, \
+                source_file_id, source_byte_start, source_byte_end, callee_expr \
+         FROM entity_unresolved_call_sites \
+         WHERE caller_entity_id = ?1 \
+         ORDER BY site_ordinal, site_key \
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![caller_id, limit_i64], map_unresolved_call_site_row)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+pub fn unresolved_callers_for_target(
+    conn: &Connection,
+    target: &EntityRow,
+    limit: usize,
+) -> Result<Vec<UnresolvedCallSiteRow>> {
+    let limit_i64 = i64::try_from(limit.clamp(1, 500)).map_err(|_| {
+        StorageError::InvalidQuery("unresolved caller limit is too large".to_owned())
+    })?;
+    let target_short = target
+        .short_name
+        .rsplit('.')
+        .next()
+        .unwrap_or(&target.short_name);
+    let suffix = format!("%.{}", escape_like(target_short));
+    let mut stmt = conn.prepare(
+        "SELECT u.caller_entity_id, u.caller_content_hash, u.site_key, u.site_ordinal, \
+                u.source_file_id, u.source_byte_start, u.source_byte_end, u.callee_expr \
+         FROM entity_unresolved_call_sites u \
+         JOIN entities caller ON caller.id = u.caller_entity_id \
+         WHERE u.callee_expr = ?1 \
+            OR u.callee_expr = ?2 \
+            OR u.callee_expr LIKE ?3 ESCAPE '\\' \
+         ORDER BY CASE WHEN caller.source_file_id = ?4 THEN 0 ELSE 1 END, \
+                  u.caller_entity_id, u.site_ordinal, u.site_key \
+         LIMIT ?5",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            target_short,
+            target.name,
+            suffix,
+            target.source_file_id,
+            limit_i64,
+        ],
+        map_unresolved_call_site_row,
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+pub fn candidate_entities_for_unresolved_sites(
+    conn: &Connection,
+    sites: &[UnresolvedCallSiteRow],
+    limit: usize,
+) -> Result<Vec<EntityRow>> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for site in sites {
+        for entity in candidate_entities_for_expr(conn, &site.callee_expr, limit)? {
+            if seen.insert(entity.id.clone()) {
+                out.push(entity);
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn contained_entity_ids(
     conn: &Connection,
     root_id: &str,
@@ -325,6 +418,50 @@ fn map_stored_call_edge(row: &Row<'_>) -> rusqlite::Result<StoredCallEdge> {
         source_byte_end: row.get(5)?,
         properties_json: row.get(6)?,
     })
+}
+
+fn map_unresolved_call_site_row(row: &Row<'_>) -> rusqlite::Result<UnresolvedCallSiteRow> {
+    Ok(UnresolvedCallSiteRow {
+        caller_entity_id: row.get(0)?,
+        caller_content_hash: row.get(1)?,
+        site_key: row.get(2)?,
+        site_ordinal: row.get(3)?,
+        source_file_id: row.get(4)?,
+        source_byte_start: row.get(5)?,
+        source_byte_end: row.get(6)?,
+        callee_expr: row.get(7)?,
+    })
+}
+
+fn candidate_entities_for_expr(
+    conn: &Connection,
+    callee_expr: &str,
+    limit: usize,
+) -> Result<Vec<EntityRow>> {
+    let short = callee_expr.rsplit('.').next().unwrap_or(callee_expr).trim();
+    if short.is_empty() {
+        return Ok(Vec::new());
+    }
+    let suffix = format!("%.{}", escape_like(short));
+    let limit_i64 = i64::try_from(limit.clamp(1, 100)).map_err(|_| {
+        StorageError::InvalidQuery("candidate entity limit is too large".to_owned())
+    })?;
+    let sql = format!(
+        "SELECT {ENTITY_COLUMNS} \
+         FROM entities \
+         WHERE short_name = ?1 \
+            OR name = ?2 \
+            OR name LIKE ?3 ESCAPE '\\' \
+         ORDER BY id \
+         LIMIT ?4"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params![short, callee_expr, suffix, limit_i64],
+        map_entity_row,
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
 }
 
 pub fn child_entity_ids(conn: &Connection, entity_id: &str) -> Result<Vec<String>> {

@@ -228,7 +228,7 @@ pub fn build_inferred_calls_prompt(input: &InferredCallsPromptInput) -> PromptTe
              Caller source excerpt:\n{source}\n\
              Unresolved call sites JSON:\n{sites}\n\
              Candidate entities JSON:\n{candidates}\n\
-             Return JSON with an edges array containing target_id, confidence, and rationale.",
+             Return JSON with an edges array containing site_key, target_id, confidence, and rationale.",
             caller = input.caller_entity_id,
             source = input.caller_source_excerpt,
             sites = input.unresolved_call_sites_json,

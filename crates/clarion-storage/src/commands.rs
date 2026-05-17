@@ -13,7 +13,7 @@ use tokio::sync::oneshot;
 
 pub use clarion_core::EdgeConfidence;
 
-use crate::cache::{SummaryCacheEntry, SummaryCacheKey};
+use crate::cache::{InferredEdgeCacheEntry, SummaryCacheEntry, SummaryCacheKey};
 use crate::error::StorageError;
 use crate::unresolved::UnresolvedCallSiteRecord;
 
@@ -90,6 +90,22 @@ pub struct EdgeRecord {
     pub source_byte_end: Option<i64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct InferredCallEdgeRecord {
+    pub from_id: String,
+    pub to_id: String,
+    pub source_file_id: Option<String>,
+    pub source_byte_start: i64,
+    pub source_byte_end: i64,
+    pub properties_json: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InferredEdgeWriteStats {
+    pub inserted_edges: u64,
+    pub skipped_static_duplicates: u64,
+}
+
 /// All writer operations as a single enum so the actor loop exhausts
 /// everything via one match.
 #[derive(Debug)]
@@ -115,6 +131,14 @@ pub enum WriterCmd {
     /// `Writer::dropped_edges_total` on dedupe. Also advances the per-batch
     /// write counter — edges and entities share one batch boundary.
     InsertEdge { edge: Box<EdgeRecord>, ack: Ack<()> },
+    /// Upsert one inferred-edge cache row and materialize its current inferred
+    /// call edges. This query-time MCP write does not require an active
+    /// analyze run and does not use scan-time edge contracts.
+    InsertInferredEdges {
+        cache_entry: Box<InferredEdgeCacheEntry>,
+        edges: Vec<InferredCallEdgeRecord>,
+        ack: Ack<InferredEdgeWriteStats>,
+    },
     /// Upsert one on-demand summary cache row. This query-time MCP write does
     /// not require an active analyze run.
     UpsertSummaryCache {
