@@ -1,8 +1,10 @@
 use std::io::BufReader;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use clarion_mcp::config::{McpConfig, select_provider_with_env};
+use clarion_mcp::filigree::FiligreeHttpClient;
 use clarion_storage::ReaderPool;
 
 pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
@@ -26,6 +28,10 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
         McpConfig::default()
     };
     let _provider_selection = select_provider_with_env(&config, |name| std::env::var(name).ok())?;
+    let filigree_client = FiligreeHttpClient::from_config(&config.integrations.filigree, |name| {
+        std::env::var(name).ok()
+    })
+    .context("build Filigree HTTP client")?;
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -38,7 +44,10 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
     let _runtime_guard = runtime.enter();
     let readers = ReaderPool::open(&db_path, 16)
         .map_err(|err| anyhow!("open reader pool for {}: {err}", db_path.display()))?;
-    let state = clarion_mcp::ServerState::new(project_root, readers);
+    let mut state = clarion_mcp::ServerState::new(project_root, readers);
+    if let Some(client) = filigree_client {
+        state = state.with_filigree_client(Arc::new(client));
+    }
 
     clarion_mcp::serve_stdio_with_state_on_runtime(&runtime, &state, &mut reader, &mut writer)
         .context("serve MCP stdio")

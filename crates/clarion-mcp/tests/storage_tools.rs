@@ -11,6 +11,9 @@ use clarion_core::{
 use clarion_mcp::{
     ServerState,
     config::{LlmConfig, LlmProviderKind},
+    filigree::{
+        EntityAssociation, EntityAssociationsResponse, FiligreeClientError, FiligreeLookup,
+    },
 };
 use clarion_storage::{
     ReaderPool, SummaryCacheEntry, SummaryCacheKey, Writer, pragma, schema, upsert_summary_cache,
@@ -238,6 +241,15 @@ fn state_for_summary(
         .with_clock(|| "2026-05-17T00:00:02.000Z".to_owned())
 }
 
+fn state_for_filigree(
+    project_root: &std::path::Path,
+    db_path: &std::path::Path,
+    client: Arc<dyn FiligreeLookup>,
+) -> ServerState {
+    let pool = ReaderPool::open(db_path, 2).expect("reader pool");
+    ServerState::new(project_root.to_path_buf(), pool).with_filigree_client(client)
+}
+
 fn expected_summary_request(project_root: &std::path::Path, entity_id: &str) -> LlmRequest {
     let source_excerpt = std::fs::read_to_string(project_root.join("demo.py")).unwrap();
     let prompt = build_leaf_summary_prompt(&LeafSummaryPromptInput {
@@ -408,6 +420,60 @@ impl LlmProvider for AnyInferredProvider {
     }
 }
 
+#[derive(Debug, Default)]
+struct FakeFiligreeClient {
+    responses: Mutex<std::collections::HashMap<String, EntityAssociationsResponse>>,
+    calls: Mutex<Vec<String>>,
+}
+
+impl FakeFiligreeClient {
+    fn with_response(mut self, entity_id: &str, associations: Vec<EntityAssociation>) -> Self {
+        self.responses.get_mut().unwrap().insert(
+            entity_id.to_owned(),
+            EntityAssociationsResponse { associations },
+        );
+        self
+    }
+
+    fn calls(&self) -> Vec<String> {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl FiligreeLookup for FakeFiligreeClient {
+    fn associations_for(
+        &self,
+        entity_id: &str,
+    ) -> Result<EntityAssociationsResponse, FiligreeClientError> {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(entity_id.to_owned());
+        Ok(self
+            .responses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(entity_id)
+            .cloned()
+            .unwrap_or_else(|| EntityAssociationsResponse {
+                associations: Vec::new(),
+            }))
+    }
+}
+
+fn association(issue_id: &str, entity_id: &str, content_hash: &str) -> EntityAssociation {
+    EntityAssociation {
+        issue_id: issue_id.to_owned(),
+        clarion_entity_id: entity_id.to_owned(),
+        content_hash_at_attach: content_hash.to_owned(),
+        attached_at: "2026-05-17T00:00:00.000Z".to_owned(),
+        attached_by: "codex".to_owned(),
+    }
+}
+
 async fn call_tool(state: &ServerState, name: &str, arguments: Value) -> Value {
     let response = state
         .handle_json_rpc(&json!({
@@ -423,6 +489,174 @@ async fn call_tool(state: &ServerState, name: &str, arguments: Value) -> Value {
         .as_str()
         .expect("tool content text");
     serde_json::from_str(text).expect("tool envelope JSON")
+}
+
+#[tokio::test]
+async fn issues_for_returns_unavailable_when_filigree_disabled() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "issues_for",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["result"]["available"], false);
+    assert_eq!(envelope["result"]["reason"], "filigree-disabled");
+}
+
+#[tokio::test]
+async fn issues_for_includes_contained_entities_and_flags_drift() {
+    let (project, db_path) = open_project();
+    let client = Arc::new(
+        FakeFiligreeClient::default()
+            .with_response(
+                "python:function:demo.entry",
+                vec![association(
+                    "filigree-fresh",
+                    "python:function:demo.entry",
+                    "hash-python:function:demo.entry",
+                )],
+            )
+            .with_response(
+                "python:function:demo.mid",
+                vec![association(
+                    "filigree-drifted",
+                    "python:function:demo.mid",
+                    "old-hash",
+                )],
+            ),
+    );
+    let state = state_for_filigree(project.path(), &db_path, client.clone());
+
+    let envelope = call_tool(&state, "issues_for", json!({"id": "python:module:demo"})).await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["result"]["available"], true);
+    assert_eq!(
+        envelope["result"]["matched"][0]["issue_id"],
+        "filigree-fresh"
+    );
+    assert_eq!(
+        envelope["result"]["drifted"][0]["issue_id"],
+        "filigree-drifted"
+    );
+    assert!(
+        client
+            .calls()
+            .contains(&"python:function:demo.entry".to_owned())
+    );
+    assert!(
+        client
+            .calls()
+            .contains(&"python:function:demo.mid".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn issues_for_respects_include_contained_false() {
+    let (project, db_path) = open_project();
+    let client = Arc::new(
+        FakeFiligreeClient::default()
+            .with_response(
+                "python:module:demo",
+                vec![association(
+                    "filigree-module",
+                    "python:module:demo",
+                    "hash-python:module:demo",
+                )],
+            )
+            .with_response(
+                "python:function:demo.entry",
+                vec![association(
+                    "filigree-entry",
+                    "python:function:demo.entry",
+                    "hash-python:function:demo.entry",
+                )],
+            ),
+    );
+    let state = state_for_filigree(project.path(), &db_path, client.clone());
+
+    let envelope = call_tool(
+        &state,
+        "issues_for",
+        json!({"id": "python:module:demo", "include_contained": false}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(
+        envelope["result"]["matched"][0]["issue_id"],
+        "filigree-module"
+    );
+    assert_eq!(client.calls(), vec!["python:module:demo".to_owned()]);
+}
+
+#[tokio::test]
+async fn issues_for_truncates_at_issue_cap() {
+    let (project, db_path) = open_project();
+    let associations = (0..101)
+        .map(|idx| {
+            association(
+                &format!("filigree-{idx:03}"),
+                "python:function:demo.entry",
+                "hash-python:function:demo.entry",
+            )
+        })
+        .collect();
+    let client = Arc::new(
+        FakeFiligreeClient::default().with_response("python:function:demo.entry", associations),
+    );
+    let state = state_for_filigree(project.path(), &db_path, client);
+
+    let envelope = call_tool(
+        &state,
+        "issues_for",
+        json!({"id": "python:function:demo.entry", "include_contained": false}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["truncated"], true);
+    assert_eq!(envelope["truncation_reason"], "issue-cap");
+    assert_eq!(envelope["result"]["matched"].as_array().unwrap().len(), 100);
+}
+
+#[tokio::test]
+async fn issues_for_stops_filigree_calls_after_issue_cap() {
+    let (project, db_path) = open_project();
+    let associations = (0..101)
+        .map(|idx| {
+            association(
+                &format!("filigree-{idx:03}"),
+                "python:module:demo",
+                "hash-python:module:demo",
+            )
+        })
+        .collect();
+    let client = Arc::new(
+        FakeFiligreeClient::default()
+            .with_response("python:module:demo", associations)
+            .with_response(
+                "python:function:demo.entry",
+                vec![association(
+                    "filigree-entry",
+                    "python:function:demo.entry",
+                    "hash-python:function:demo.entry",
+                )],
+            ),
+    );
+    let state = state_for_filigree(project.path(), &db_path, client.clone());
+
+    let envelope = call_tool(&state, "issues_for", json!({"id": "python:module:demo"})).await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["truncated"], true);
+    assert_eq!(envelope["truncation_reason"], "issue-cap");
+    assert_eq!(client.calls(), vec!["python:module:demo".to_owned()]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

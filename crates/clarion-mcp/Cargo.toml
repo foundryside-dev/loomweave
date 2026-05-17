@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 clarion-core = { path = "../clarion-core", version = "0.1.0-dev" }
 clarion-storage = { path = "../clarion-storage", version = "0.1.0-dev" }
+reqwest.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

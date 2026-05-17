@@ -23,12 +23,14 @@ use clarion_storage::{
     CallEdgeMatch, EntityRow, InferredCallEdgeRecord, InferredEdgeCacheEntry, InferredEdgeCacheKey,
     InferredEdgeWriteStats, ReaderPool, StorageError, SummaryCacheEntry, SummaryCacheKey,
     UnresolvedCallSiteRow, WriterCmd, call_edges_from, call_edges_targeting,
-    candidate_entities_for_unresolved_sites, child_entity_ids, entity_at_line, entity_by_id,
-    find_entities, inferred_edge_cache_key_id, inferred_edge_cache_lookup, normalize_source_path,
-    summary_cache_lookup, unresolved_call_sites_for_caller, unresolved_callers_for_target,
+    candidate_entities_for_unresolved_sites, child_entity_ids, contained_entity_ids,
+    entity_at_line, entity_by_id, find_entities, inferred_edge_cache_key_id,
+    inferred_edge_cache_lookup, normalize_source_path, summary_cache_lookup,
+    unresolved_call_sites_for_caller, unresolved_callers_for_target,
 };
 
 use crate::config::LlmConfig;
+use crate::filigree::{EntityAssociation, EntityAssociationsResponse, FiligreeLookup};
 
 /// MCP protocol revision supported by the B.6 stdio server.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -172,6 +174,7 @@ pub struct ServerState {
     budget: Arc<Mutex<BudgetLedger>>,
     inferred_inflight:
         Arc<AsyncMutex<HashMap<InferredEdgeCacheKey, broadcast::Sender<InferredDispatchOutcome>>>>,
+    filigree_client: Option<Arc<dyn FiligreeLookup>>,
 }
 
 impl ServerState {
@@ -185,6 +188,7 @@ impl ServerState {
             clock: Arc::new(default_now_string),
             budget: Arc::new(Mutex::new(BudgetLedger::default())),
             inferred_inflight: Arc::new(AsyncMutex::new(HashMap::new())),
+            filigree_client: None,
         }
     }
 
@@ -212,6 +216,12 @@ impl ServerState {
     #[must_use]
     pub fn with_clock(mut self, clock: impl Fn() -> String + Send + Sync + 'static) -> Self {
         self.clock = Arc::new(clock);
+        self
+    }
+
+    #[must_use]
+    pub fn with_filigree_client(mut self, client: Arc<dyn FiligreeLookup>) -> Self {
+        self.filigree_client = Some(client);
         self
     }
 
@@ -273,11 +283,10 @@ impl ServerState {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "issues_for" => tool_error_envelope(
-                "tool-unimplemented",
-                "issues_for is reserved for B.6b and is not implemented yet",
-                false,
-            ),
+            "issues_for" => match self.tool_issues_for(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
             _ => unreachable!("known tools checked above"),
         };
 
@@ -569,6 +578,96 @@ impl ServerState {
             })
             .await;
         Ok(flatten_storage_envelope_result(result))
+    }
+
+    async fn tool_issues_for(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let entity_id = required_str(arguments, "id")?.to_owned();
+        let include_contained = optional_bool(arguments, "include_contained")?.unwrap_or(true);
+        let Some(client) = self.filigree_client.clone() else {
+            return Ok(issues_unavailable(
+                "filigree-disabled",
+                "Filigree integration is disabled",
+            ));
+        };
+        let read = match self
+            .read_issues_for_entities(entity_id, include_contained)
+            .await
+        {
+            Ok(Some(read)) => read,
+            Ok(None) => {
+                return Ok(issues_unavailable(
+                    "entity-not-found",
+                    "Clarion entity was not found",
+                ));
+            }
+            Err(err) => return Ok(tool_error_envelope("storage-error", &err.to_string(), true)),
+        };
+        let mut accumulator = IssuesForAccumulator::new(&read.entities);
+        let mut requests_total = 0_usize;
+        for (idx, entity) in read.entities.iter().enumerate() {
+            let entity_id = entity.id.clone();
+            let client = client.clone();
+            let response = match tokio::task::spawn_blocking(move || {
+                client.associations_for(&entity_id)
+            })
+            .await
+            {
+                Ok(Ok(response)) => response,
+                Ok(Err(err)) => {
+                    return Ok(issues_unavailable("filigree-unreachable", &err.to_string()));
+                }
+                Err(err) => {
+                    return Ok(issues_unavailable(
+                        "filigree-client-error",
+                        &format!("Filigree client task failed: {err}"),
+                    ));
+                }
+            };
+            requests_total += 1;
+            accumulator.add_response(response);
+            if accumulator.emitted >= 100 && idx + 1 < read.entities.len() {
+                accumulator.issue_cap_truncated = true;
+                break;
+            }
+            if accumulator.issue_cap_truncated {
+                break;
+            }
+        }
+        Ok(accumulator.into_envelope(read.entity_cap_truncated, requests_total))
+    }
+
+    async fn read_issues_for_entities(
+        &self,
+        entity_id: String,
+        include_contained: bool,
+    ) -> Result<Option<IssuesForRead>, StorageError> {
+        self.readers
+            .with_reader(move |conn| {
+                let Some(root) = entity_by_id(conn, &entity_id)? else {
+                    return Ok(None);
+                };
+                let mut ids = vec![root.id.clone()];
+                let mut entity_cap_truncated = false;
+                if include_contained {
+                    let contained = contained_entity_ids(conn, &entity_id, 1_000)?;
+                    entity_cap_truncated = contained.truncated;
+                    ids.extend(contained.entity_ids);
+                }
+                let mut entities = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if let Some(entity) = entity_by_id(conn, &id)? {
+                        entities.push(entity);
+                    }
+                }
+                Ok(Some(IssuesForRead {
+                    entities,
+                    entity_cap_truncated,
+                }))
+            })
+            .await
     }
 
     async fn tool_summary(
@@ -1122,6 +1221,115 @@ struct SummaryReady {
     fan_out: i64,
 }
 
+struct IssuesForRead {
+    entities: Vec<EntityRow>,
+    entity_cap_truncated: bool,
+}
+
+struct IssuesForAccumulator {
+    entities_by_id: HashMap<String, EntityRow>,
+    seen_issue_ids: BTreeSet<String>,
+    matched: Vec<Value>,
+    drifted: Vec<Value>,
+    not_found: Vec<Value>,
+    diagnostics: Vec<Value>,
+    emitted: usize,
+    issue_cap_truncated: bool,
+}
+
+impl IssuesForAccumulator {
+    fn new(entities: &[EntityRow]) -> Self {
+        Self {
+            entities_by_id: entities
+                .iter()
+                .map(|entity| (entity.id.clone(), entity.clone()))
+                .collect(),
+            seen_issue_ids: BTreeSet::new(),
+            matched: Vec::new(),
+            drifted: Vec::new(),
+            not_found: Vec::new(),
+            diagnostics: Vec::new(),
+            emitted: 0,
+            issue_cap_truncated: false,
+        }
+    }
+
+    fn add_response(&mut self, response: EntityAssociationsResponse) {
+        for association in response.associations {
+            if self.emitted >= 100 {
+                self.issue_cap_truncated = true;
+                break;
+            }
+            if !self.seen_issue_ids.insert(association.issue_id.clone()) {
+                continue;
+            }
+            self.emitted += 1;
+            self.add_association(&association);
+        }
+    }
+
+    fn add_association(&mut self, association: &EntityAssociation) {
+        match self.entities_by_id.get(&association.clarion_entity_id) {
+            None => self
+                .not_found
+                .push(association_json(association, None, None, "not_found")),
+            Some(entity) => match entity.content_hash.as_deref() {
+                Some(current_hash) if current_hash == association.content_hash_at_attach => {
+                    self.matched.push(association_json(
+                        association,
+                        Some(entity),
+                        Some(current_hash),
+                        "matched",
+                    ));
+                }
+                Some(current_hash) => {
+                    self.drifted.push(association_json(
+                        association,
+                        Some(entity),
+                        Some(current_hash),
+                        "drifted",
+                    ));
+                }
+                None => {
+                    self.diagnostics.push(json!({
+                        "code": "CLA-ENTITY-CONTENT-HASH-MISSING",
+                        "entity_id": entity.id
+                    }));
+                    self.matched
+                        .push(association_json(association, Some(entity), None, "unknown"));
+                }
+            },
+        }
+    }
+
+    fn into_envelope(self, entity_cap_truncated: bool, requests_total: usize) -> Value {
+        let truncation_reason = if self.issue_cap_truncated {
+            Some("issue-cap")
+        } else {
+            entity_cap_truncated.then_some("entity-cap")
+        };
+        let mut envelope = success_envelope_with_truncation_and_stats(
+            json!({
+                "available": true,
+                "matched": self.matched,
+                "drifted": self.drifted,
+                "not_found": self.not_found
+            }),
+            truncation_reason,
+            json!({
+                "filigree_requests_total": requests_total,
+                "filigree_issues_returned_total": self.emitted
+            }),
+        );
+        if let Some(object) = envelope.as_object_mut()
+            && !self.diagnostics.is_empty()
+        {
+            object.insert("diagnostics".to_owned(), Value::Array(self.diagnostics));
+        }
+        envelope
+    }
+}
+
 #[derive(Clone)]
 struct InferenceLlmState {
     writer: mpsc::Sender<WriterCmd>,
@@ -1497,6 +1705,19 @@ fn optional_usize(
         .map_err(|_| ParamError::new(&format!("{field} is too large")))
 }
 
+fn optional_bool(
+    arguments: &serde_json::Map<String, Value>,
+    field: &str,
+) -> std::result::Result<Option<bool>, ParamError> {
+    let Some(value) = arguments.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| ParamError::new(&format!("{field} must be a boolean")))
+}
+
 fn optional_confidence(
     arguments: &serde_json::Map<String, Value>,
 ) -> std::result::Result<EdgeConfidence, ParamError> {
@@ -1579,6 +1800,35 @@ fn tool_error_envelope(code: &str, message: &str, retryable: bool) -> Value {
         "truncated": false,
         "truncation_reason": null,
         "stats_delta": {}
+    })
+}
+
+fn issues_unavailable(reason: &str, message: &str) -> Value {
+    success_envelope(json!({
+        "available": false,
+        "reason": reason,
+        "message": message,
+        "matched": [],
+        "drifted": [],
+        "not_found": []
+    }))
+}
+
+fn association_json(
+    association: &EntityAssociation,
+    entity: Option<&EntityRow>,
+    current_content_hash: Option<&str>,
+    drift_status: &str,
+) -> Value {
+    json!({
+        "issue_id": association.issue_id,
+        "entity_id": association.clarion_entity_id,
+        "entity": entity.map(entity_json),
+        "content_hash_at_attach": association.content_hash_at_attach,
+        "current_content_hash": current_content_hash,
+        "attached_at": association.attached_at,
+        "attached_by": association.attached_by,
+        "drift_status": drift_status
     })
 }
 
