@@ -23,6 +23,7 @@ use crate::cache::{touch_summary_cache, upsert_summary_cache};
 use crate::commands::{Ack, EdgeConfidence, EdgeRecord, EntityRecord, RunStatus, WriterCmd};
 use crate::error::{Result, StorageError};
 use crate::pragma;
+use crate::unresolved::replace_unresolved_call_sites_for_caller;
 
 /// Default transaction batch size per ADR-011.
 pub const DEFAULT_BATCH_SIZE: usize = 50;
@@ -184,6 +185,22 @@ fn run_actor(
                 let res = query_time_write(conn, &mut state, commits_observed, |conn| {
                     touch_summary_cache(conn, &key, &last_accessed_at)
                 });
+                reply(ack, res);
+            }
+            WriterCmd::ReplaceUnresolvedCallSitesForCaller {
+                caller_entity_id,
+                caller_content_hash,
+                sites,
+                ack,
+            } => {
+                let res = replace_unresolved_call_sites_in_run(
+                    conn,
+                    &mut state,
+                    &caller_entity_id,
+                    &caller_content_hash,
+                    &sites,
+                    commits_observed,
+                );
                 reply(ack, res);
             }
             WriterCmd::CommitRun {
@@ -482,6 +499,28 @@ fn insert_edge(
     } else if edge.confidence == EdgeConfidence::Ambiguous {
         ambiguous_edges_total.fetch_add(1, Ordering::Relaxed);
     }
+    bump_writes_and_maybe_commit(conn, state, commits_observed)?;
+    Ok(())
+}
+
+fn replace_unresolved_call_sites_in_run(
+    conn: &mut Connection,
+    state: &mut ActorState,
+    caller_entity_id: &str,
+    caller_content_hash: &str,
+    sites: &[crate::unresolved::UnresolvedCallSiteRecord],
+    commits_observed: &AtomicUsize,
+) -> Result<()> {
+    if state.current_run.is_none() {
+        return Err(StorageError::WriterProtocol(
+            "ReplaceUnresolvedCallSitesForCaller received without a preceding BeginRun".to_owned(),
+        ));
+    }
+    if !state.in_tx {
+        conn.execute_batch("BEGIN")?;
+        state.in_tx = true;
+    }
+    replace_unresolved_call_sites_for_caller(conn, caller_entity_id, caller_content_hash, sites)?;
     bump_writes_and_maybe_commit(conn, state, commits_observed)?;
     Ok(())
 }

@@ -80,6 +80,7 @@ fn migration_0001_creates_every_expected_table() {
         "entity_tags",
         "findings",
         "inferred_edge_cache",
+        "entity_unresolved_call_sites",
         "runs",
         "schema_migrations",
         "summary_cache",
@@ -249,6 +250,41 @@ fn migration_0001_creates_inferred_edge_cache_with_four_part_key() {
         )
         .unwrap();
     assert_eq!(count, 1);
+}
+
+#[test]
+fn migration_0001_creates_unresolved_call_sites_table_and_indexes() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    let columns = table_columns(&conn, "entity_unresolved_call_sites");
+
+    for expected in &[
+        "caller_entity_id",
+        "caller_content_hash",
+        "site_key",
+        "site_ordinal",
+        "source_file_id",
+        "source_byte_start",
+        "source_byte_end",
+        "callee_expr",
+        "created_at",
+    ] {
+        assert!(
+            columns.iter().any(|column| column == expected),
+            "missing entity_unresolved_call_sites.{expected} in {columns:?}"
+        );
+    }
+
+    let indexes = index_names(&conn);
+    for expected in &[
+        "ix_unresolved_call_sites_caller",
+        "ix_unresolved_call_sites_expr",
+    ] {
+        assert!(
+            indexes.iter().any(|index| index == expected),
+            "missing unresolved-call-site index {expected} in {indexes:?}"
+        );
+    }
 }
 
 #[test]

@@ -11,6 +11,7 @@ pub mod pragma;
 pub mod query;
 pub mod reader;
 pub mod schema;
+pub mod unresolved;
 pub mod writer;
 
 pub use cache::{
@@ -26,4 +27,5 @@ pub use query::{
     normalize_source_path,
 };
 pub use reader::ReaderPool;
+pub use unresolved::{UnresolvedCallSiteRecord, replace_unresolved_call_sites_for_caller};
 pub use writer::{DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, Writer};

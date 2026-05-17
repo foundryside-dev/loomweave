@@ -44,6 +44,6 @@ pub use protocol::{
     AnalyzeFileParams, AnalyzeFileResult, AnalyzeFileStats, EdgeConfidence, ExitNotification,
     InitializeParams, InitializeResult, InitializedNotification, JsonRpcVersion,
     NotificationEnvelope, ProtocolError, RequestEnvelope, ResponseEnvelope, ResponsePayload,
-    ShutdownParams, ShutdownResult,
+    ShutdownParams, ShutdownResult, UnresolvedCallSite,
 };
 pub use transport::{Frame, TransportError, read_frame, write_frame};

@@ -15,6 +15,7 @@ pub use clarion_core::EdgeConfidence;
 
 use crate::cache::{SummaryCacheEntry, SummaryCacheKey};
 use crate::error::StorageError;
+use crate::unresolved::UnresolvedCallSiteRecord;
 
 pub type Ack<T> = oneshot::Sender<Result<T, StorageError>>;
 
@@ -127,6 +128,15 @@ pub enum WriterCmd {
         key: SummaryCacheKey,
         last_accessed_at: String,
         ack: Ack<bool>,
+    },
+    /// Replace all unresolved call-site rows for one caller. This is an
+    /// analyze-time mapping command that requires an active run transaction so
+    /// stale rows from previous content hashes cannot survive re-analysis.
+    ReplaceUnresolvedCallSitesForCaller {
+        caller_entity_id: String,
+        caller_content_hash: String,
+        sites: Vec<UnresolvedCallSiteRecord>,
+        ack: Ack<()>,
     },
     /// Commit the in-flight transaction, update the run row to the given
     /// terminal status + `completed_at` + `stats_json`, and clear per-run

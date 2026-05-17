@@ -316,6 +316,15 @@ def test_analyze_file_reports_call_resolver_stats(
             _ = (file_path, function_ids)
             return CallResolutionResult(
                 unresolved_call_sites_total=3,
+                unresolved_call_sites=[
+                    {
+                        "caller_entity_id": "python:function:demo.caller",
+                        "site_ordinal": 0,
+                        "source_byte_start": 12,
+                        "source_byte_end": 20,
+                        "callee_expr": "dynamic_target",
+                    },
+                ],
                 pyright_query_latency_ms=[11, 29],
             )
 
@@ -358,6 +367,15 @@ def test_analyze_file_reports_call_resolver_stats(
 
     assert response["stats"] == {
         "unresolved_call_sites_total": 3,
+        "unresolved_call_sites": [
+            {
+                "caller_entity_id": "python:function:demo.caller",
+                "site_ordinal": 0,
+                "source_byte_start": 12,
+                "source_byte_end": 20,
+                "callee_expr": "dynamic_target",
+            },
+        ],
         "reference_sites_total": 1,
         "references_resolved_total": 1,
         "references_skipped_external_total": 2,

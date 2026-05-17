@@ -40,6 +40,7 @@ pub use plugin::{
     Manifest,
     ManifestError,
     PluginHost,
+    UnresolvedCallSite,
     discover,
     parse_manifest,
 };

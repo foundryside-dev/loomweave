@@ -68,7 +68,15 @@ while True:
                         "id": "callsfixture:function:demo.caller",
                         "kind": "function",
                         "qualified_name": "demo.caller",
-                        "source": {"file_path": path},
+                        "source": {
+                            "file_path": path,
+                            "source_range": {
+                                "start_line": 1,
+                                "start_col": 0,
+                                "end_line": 1,
+                                "end_col": 13
+                            },
+                        },
                         "parent_id": "callsfixture:module:demo",
                     },
                     {
@@ -101,6 +109,15 @@ while True:
                 ],
                 "stats": {
                     "unresolved_call_sites_total": 2,
+                    "unresolved_call_sites": [
+                        {
+                            "caller_entity_id": "callsfixture:function:demo.caller",
+                            "site_ordinal": 0,
+                            "source_byte_start": 0,
+                            "source_byte_end": 6,
+                            "callee_expr": "dynamic_target",
+                        },
+                    ],
                     "reference_sites_total": 3,
                     "references_resolved_total": 4,
                     "references_skipped_external_total": 5,
@@ -282,6 +299,23 @@ fn analyze_stats_reports_ambiguous_edges_total() {
         stats["pyright_query_latency_p95_ms"].as_u64(),
         Some(950),
         "pyright_query_latency_p95_ms should be the deterministic p95; got {stats_raw}"
+    );
+    let unresolved_row: (String, String, i64, i64) = conn
+        .query_row(
+            "SELECT caller_entity_id, callee_expr, source_byte_start, source_byte_end \
+             FROM entity_unresolved_call_sites",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("query unresolved call site row");
+    assert_eq!(
+        unresolved_row,
+        (
+            "callsfixture:function:demo.caller".to_owned(),
+            "dynamic_target".to_owned(),
+            0,
+            6,
+        )
     );
 }
 

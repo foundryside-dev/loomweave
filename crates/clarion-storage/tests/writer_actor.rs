@@ -8,7 +8,7 @@ use rusqlite::Connection;
 use tokio::sync::oneshot;
 
 use clarion_storage::{
-    ReaderPool, SummaryCacheEntry, SummaryCacheKey, Writer,
+    ReaderPool, SummaryCacheEntry, SummaryCacheKey, UnresolvedCallSiteRecord, Writer,
     commands::{EdgeConfidence, EdgeRecord, EntityRecord, RunStatus, WriterCmd},
     pragma, schema,
 };
@@ -179,6 +179,20 @@ fn summary_cache_entry() -> SummaryCacheEntry {
     }
 }
 
+fn unresolved_site(callee_expr: &str, ordinal: i64) -> UnresolvedCallSiteRecord {
+    UnresolvedCallSiteRecord {
+        caller_entity_id: "python:function:demo.caller".to_owned(),
+        caller_content_hash: "hash-python:function:demo.caller".to_owned(),
+        site_key: format!("site-{ordinal}"),
+        site_ordinal: ordinal,
+        source_file_id: Some("python:module:demo".to_owned()),
+        source_byte_start: ordinal * 10,
+        source_byte_end: ordinal * 10 + 4,
+        callee_expr: callee_expr.to_owned(),
+        created_at: now_iso(),
+    }
+}
+
 async fn assert_edge_rejected_with_counter(
     writer: &Writer,
     tx: &tokio::sync::mpsc::Sender<WriterCmd>,
@@ -249,6 +263,88 @@ async fn summary_cache_writer_commands_do_not_require_active_analyze_run() {
         .unwrap();
     assert_eq!(summary_json, r#"{"purpose":"demo"}"#);
     assert_eq!(last_accessed_at, "2026-04-18T00:00:01.000Z");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replace_unresolved_call_sites_replaces_current_and_old_hash_rows_for_caller() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-unresolved").await;
+    seed_module_and_functions(&tx).await;
+    seed_contains_edges_for_demo_functions(&tx).await;
+
+    send::<()>(&tx, |ack| WriterCmd::ReplaceUnresolvedCallSitesForCaller {
+        caller_entity_id: "python:function:demo.caller".to_owned(),
+        caller_content_hash: "old-hash".to_owned(),
+        sites: vec![UnresolvedCallSiteRecord {
+            caller_content_hash: "old-hash".to_owned(),
+            site_key: "old-site".to_owned(),
+            ..unresolved_site("old_target", 1)
+        }],
+        ack,
+    })
+    .await
+    .unwrap();
+
+    send::<()>(&tx, |ack| WriterCmd::ReplaceUnresolvedCallSitesForCaller {
+        caller_entity_id: "python:function:demo.caller".to_owned(),
+        caller_content_hash: "hash-python:function:demo.caller".to_owned(),
+        sites: vec![
+            unresolved_site("dynamic_target", 1),
+            unresolved_site("fallback", 2),
+        ],
+        ack,
+    })
+    .await
+    .unwrap();
+
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-unresolved".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let conn = Connection::open(path).unwrap();
+    let rows: Vec<(String, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT caller_content_hash, callee_expr \
+                 FROM entity_unresolved_call_sites \
+                 WHERE caller_entity_id = ?1 \
+                 ORDER BY site_ordinal",
+            )
+            .unwrap();
+        stmt.query_map(rusqlite::params!["python:function:demo.caller"], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    };
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "hash-python:function:demo.caller".to_owned(),
+                "dynamic_target".to_owned()
+            ),
+            (
+                "hash-python:function:demo.caller".to_owned(),
+                "fallback".to_owned()
+            ),
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
