@@ -34,6 +34,7 @@ fn make_entity(id: &str) -> EntityRecord {
         short_name: "hello".to_owned(),
         parent_id: None,
         source_file_id: None,
+        source_file_path: None,
         source_byte_start: None,
         source_byte_end: None,
         source_line_start: None,

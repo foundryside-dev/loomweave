@@ -97,6 +97,23 @@ fn migration_0001_creates_entity_fts_virtual_table() {
 }
 
 #[test]
+fn migration_0001_creates_entity_source_file_path_column_and_index() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+
+    conn.execute_batch("SELECT source_file_path FROM entities LIMIT 0")
+        .expect("entities.source_file_path is queryable");
+
+    let indexes = index_names(&conn);
+    assert!(
+        indexes
+            .iter()
+            .any(|idx| idx == "ix_entities_source_file_path"),
+        "missing source-file path index in {indexes:?}"
+    );
+}
+
+#[test]
 fn migration_0001_creates_all_three_fts_triggers() {
     let tempdir = tempfile::tempdir().unwrap();
     let conn = open_fresh(&tempdir);

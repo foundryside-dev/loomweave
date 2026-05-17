@@ -51,6 +51,7 @@ pub struct EntityRecord {
     pub short_name: String,
     pub parent_id: Option<String>,
     pub source_file_id: Option<String>,
+    pub source_file_path: Option<String>,
     pub source_byte_start: Option<i64>,
     pub source_byte_end: Option<i64>,
     pub source_line_start: Option<i64>,

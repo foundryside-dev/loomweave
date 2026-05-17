@@ -297,7 +297,7 @@ fn insert_entity(
     conn.execute(
         "INSERT INTO entities ( \
             id, plugin_id, kind, name, short_name, \
-            parent_id, source_file_id, \
+            parent_id, source_file_id, source_file_path, \
             source_byte_start, source_byte_end, \
             source_line_start, source_line_end, \
             properties, content_hash, summary, wardline, \
@@ -305,12 +305,12 @@ fn insert_entity(
             created_at, updated_at \
          ) VALUES ( \
             ?1, ?2, ?3, ?4, ?5, \
-            ?6, ?7, \
-            ?8, ?9, \
-            ?10, ?11, \
-            ?12, ?13, ?14, ?15, \
-            ?16, ?17, \
-            ?18, ?19 \
+            ?6, ?7, ?8, \
+            ?9, ?10, \
+            ?11, ?12, \
+            ?13, ?14, ?15, ?16, \
+            ?17, ?18, \
+            ?19, ?20 \
          )",
         params![
             entity.id,
@@ -320,6 +320,7 @@ fn insert_entity(
             entity.short_name,
             entity.parent_id,
             entity.source_file_id,
+            entity.source_file_path,
             entity.source_byte_start,
             entity.source_byte_end,
             entity.source_line_start,

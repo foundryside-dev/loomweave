@@ -34,6 +34,7 @@ CREATE TABLE entities (
     short_name         TEXT NOT NULL,
     parent_id          TEXT REFERENCES entities(id),
     source_file_id     TEXT REFERENCES entities(id),
+    source_file_path   TEXT,
     source_byte_start  INTEGER,
     source_byte_end    INTEGER,
     source_line_start  INTEGER,
@@ -52,6 +53,7 @@ CREATE INDEX ix_entities_kind              ON entities(kind);
 CREATE INDEX ix_entities_plugin_kind       ON entities(plugin_id, kind);
 CREATE INDEX ix_entities_parent            ON entities(parent_id);
 CREATE INDEX ix_entities_source_file       ON entities(source_file_id);
+CREATE INDEX ix_entities_source_file_path  ON entities(source_file_path);
 CREATE INDEX ix_entities_content_hash      ON entities(content_hash);
 
 -- Tags (denormalised)

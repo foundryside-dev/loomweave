@@ -10,8 +10,8 @@
 //! - Zero successful plugins discovered → `SkippedNoPlugins` (existing path).
 
 use std::collections::BTreeSet;
-use std::io;
 use std::path::{Path, PathBuf};
+use std::{fs, io};
 
 use anyhow::{Context, Result, bail};
 use uuid::Uuid;
@@ -650,9 +650,13 @@ fn run_plugin_blocking(
             collected_stats
                 .pyright_query_latency_ms
                 .extend(stats.pyright_query_latency_ms);
+            let source_file_id = entities
+                .iter()
+                .find(|entity| entity.kind == "module")
+                .map(|entity| entity.id.to_string());
             for entity in &entities {
                 let id_str = entity.id.to_string();
-                let record = map_entity_to_record(entity, plugin_id);
+                let record = map_entity_to_record(entity, plugin_id, source_file_id.clone());
                 collected_entities.push((id_str, record));
             }
             for edge in edges {
@@ -788,7 +792,11 @@ fn classify_host_error(plugin_id: &str, e: HostError) -> String {
 }
 
 /// Map an `AcceptedEntity` to an `EntityRecord` for the writer-actor.
-fn map_entity_to_record(entity: &AcceptedEntity, plugin_id: &str) -> EntityRecord {
+fn map_entity_to_record(
+    entity: &AcceptedEntity,
+    plugin_id: &str,
+    source_file_id: Option<String>,
+) -> EntityRecord {
     let short_name = entity
         .qualified_name
         .rsplit('.')
@@ -800,6 +808,7 @@ fn map_entity_to_record(entity: &AcceptedEntity, plugin_id: &str) -> EntityRecor
         serde_json::to_string(&entity.raw.extra).unwrap_or_else(|_| "{}".to_owned());
 
     let now = iso8601_now();
+    let source_line_range = source_line_range(entity);
 
     EntityRecord {
         id: entity.id.to_string(),
@@ -808,13 +817,14 @@ fn map_entity_to_record(entity: &AcceptedEntity, plugin_id: &str) -> EntityRecor
         name: entity.qualified_name.clone(),
         short_name,
         parent_id: entity.raw.parent_id.clone(),
-        source_file_id: None,
+        source_file_id,
+        source_file_path: Some(entity.source_file_path.clone()),
         source_byte_start: None,
         source_byte_end: None,
-        source_line_start: None,
-        source_line_end: None,
+        source_line_start: source_line_range.map(|range| range.start_line),
+        source_line_end: source_line_range.map(|range| range.end_line),
         properties_json,
-        content_hash: None,
+        content_hash: content_hash_for_entity(entity, source_line_range),
         summary_json: None,
         wardline_json: None,
         first_seen_commit: None,
@@ -822,6 +832,47 @@ fn map_entity_to_record(entity: &AcceptedEntity, plugin_id: &str) -> EntityRecor
         created_at: now.clone(),
         updated_at: now,
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SourceLineRange {
+    start_line: i64,
+    end_line: i64,
+}
+
+fn source_line_range(entity: &AcceptedEntity) -> Option<SourceLineRange> {
+    let source_range = entity.raw.source.extra.get("source_range")?;
+    let start_line = source_range.get("start_line")?.as_i64()?;
+    let end_line = source_range.get("end_line")?.as_i64()?;
+    if start_line <= 0 || end_line < start_line {
+        return None;
+    }
+    Some(SourceLineRange {
+        start_line,
+        end_line,
+    })
+}
+
+fn content_hash_for_entity(
+    entity: &AcceptedEntity,
+    source_line_range: Option<SourceLineRange>,
+) -> Option<String> {
+    if entity.kind == "module" {
+        let bytes = fs::read(&entity.source_file_path).ok()?;
+        return Some(blake3::hash(&bytes).to_hex().to_string());
+    }
+
+    let range = source_line_range?;
+    let source = fs::read_to_string(&entity.source_file_path).ok()?;
+    let lines: Vec<&str> = source.lines().collect();
+    let start = usize::try_from(range.start_line - 1).ok()?;
+    let mut end = usize::try_from(range.end_line).ok()?;
+    end = end.min(lines.len());
+    if start >= end {
+        return None;
+    }
+    let normalized = lines[start..end].join("\n");
+    Some(blake3::hash(normalized.as_bytes()).to_hex().to_string())
 }
 
 /// Map an `AcceptedEdge` to an `EdgeRecord` for the writer-actor (B.3).
@@ -1069,5 +1120,51 @@ mod tests {
             }
             Ok(_) => panic!("JoinError must convert to Err, not Ok"),
         }
+    }
+
+    #[test]
+    fn map_entity_persists_source_metadata_and_content_hash() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let source_path = tempdir.path().join("demo.py");
+        std::fs::write(&source_path, "def hello():\n    return 'hé'\n\n").unwrap();
+        let source_range = serde_json::json!({
+            "source_range": {
+                "start_line": 1,
+                "start_col": 0,
+                "end_line": 2,
+                "end_col": 15
+            }
+        });
+        let entity = AcceptedEntity {
+            id: "python:function:demo.hello".parse().unwrap(),
+            kind: "function".to_owned(),
+            qualified_name: "demo.hello".to_owned(),
+            source_file_path: source_path.display().to_string(),
+            raw: clarion_core::plugin::host::RawEntity {
+                id: "python:function:demo.hello".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "demo.hello".to_owned(),
+                source: clarion_core::plugin::host::RawSource {
+                    file_path: source_path.display().to_string(),
+                    extra: source_range.as_object().unwrap().clone(),
+                },
+                parent_id: Some("python:module:demo".to_owned()),
+                extra: serde_json::Map::new(),
+            },
+        };
+
+        let record = map_entity_to_record(&entity, "python", Some("python:module:demo".to_owned()));
+
+        assert_eq!(
+            record.source_file_path.as_deref(),
+            Some(source_path.to_str().unwrap())
+        );
+        assert_eq!(record.source_file_id.as_deref(), Some("python:module:demo"));
+        assert_eq!(record.source_line_start, Some(1));
+        assert_eq!(record.source_line_end, Some(2));
+        let expected_hash = blake3::hash("def hello():\n    return 'hé'".as_bytes())
+            .to_hex()
+            .to_string();
+        assert_eq!(record.content_hash.as_deref(), Some(expected_hash.as_str()));
     }
 }
