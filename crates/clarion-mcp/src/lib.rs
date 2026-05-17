@@ -675,14 +675,6 @@ impl ServerState {
         arguments: &serde_json::Map<String, Value>,
     ) -> std::result::Result<Value, ParamError> {
         let entity_id = required_str(arguments, "id")?.to_owned();
-        if self.summary_budget_blocked() {
-            return Ok(tool_error_envelope(
-                "cost-ceiling-exceeded",
-                "LLM session cost ceiling has been reached",
-                false,
-            ));
-        }
-
         let now = (self.clock)();
         let read = match self
             .read_summary_inputs(entity_id, self.summary_model_id())
@@ -698,6 +690,12 @@ impl ServerState {
 
         if let Some(envelope) = self.cached_summary_envelope(&ready, &now).await {
             return Ok(envelope);
+        }
+
+        if self.summary_budget_blocked() {
+            return Ok(cost_ceiling_envelope(
+                "LLM session cost ceiling has been reached",
+            ));
         }
 
         let Some(summary_llm) = &self.summary_llm else {
@@ -927,10 +925,20 @@ impl ServerState {
             prompt: prompt.body,
             max_output_tokens: 512,
         };
+        let Some(reservation) = self.reserve_budget(
+            llm.provider.estimate_cost_usd(&request),
+            llm.config.session_cost_ceiling_usd,
+        ) else {
+            return Err(InferredDispatchFailure::new(
+                "cost-ceiling-exceeded",
+                "LLM session cost ceiling has been reached",
+                false,
+            ));
+        };
         let response = llm.provider.invoke(request).map_err(|err| {
             InferredDispatchFailure::new("llm-provider-error", &err.to_string(), true)
         })?;
-        if !self.try_spend_budget(response.cost_usd, llm.config.session_cost_ceiling_usd) {
+        if !reservation.commit(response.cost_usd, llm.config.session_cost_ceiling_usd) {
             return Err(InferredDispatchFailure::new(
                 "cost-ceiling-exceeded",
                 "LLM session cost ceiling has been reached",
@@ -1044,28 +1052,31 @@ impl ServerState {
             name: ready.entity.name.clone(),
             source_excerpt: source_excerpt(&ready.entity),
         });
-        let response = match summary_llm.provider.invoke(LlmRequest {
+        let request = LlmRequest {
             purpose: LlmPurpose::Summary,
             model_id: model_id.clone(),
             prompt_id: prompt.id.to_owned(),
             prompt: prompt.body,
             max_output_tokens: 512,
-        }) {
+        };
+        let Some(reservation) = self.reserve_budget(
+            summary_llm.provider.estimate_cost_usd(&request),
+            summary_llm.config.session_cost_ceiling_usd,
+        ) else {
+            return cost_ceiling_envelope("LLM session cost ceiling has been reached");
+        };
+        let response = match summary_llm.provider.invoke(request) {
             Ok(response) => response,
             Err(err) => {
                 return tool_error_envelope("llm-provider-error", &err.to_string(), true);
             }
         };
 
-        if !self.try_spend_summary_budget(
+        if !reservation.commit(
             response.cost_usd,
             summary_llm.config.session_cost_ceiling_usd,
         ) {
-            return tool_error_envelope(
-                "cost-ceiling-exceeded",
-                "LLM session cost ceiling has been reached",
-                false,
-            );
+            return cost_ceiling_envelope("LLM session cost ceiling has been reached");
         }
 
         if serde_json::from_str::<Value>(&response.output_json).is_err() {
@@ -1135,21 +1146,22 @@ impl ServerState {
             .blocked
     }
 
-    fn try_spend_summary_budget(&self, cost_usd: f64, ceiling_usd: f64) -> bool {
-        self.try_spend_budget(cost_usd, ceiling_usd)
-    }
-
-    fn try_spend_budget(&self, cost_usd: f64, ceiling_usd: f64) -> bool {
+    fn reserve_budget(&self, estimate_usd: f64, ceiling_usd: f64) -> Option<BudgetReservation> {
+        let estimate_usd = estimate_usd.max(0.0);
         let mut budget = self
             .budget
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if budget.blocked || budget.spent_usd + cost_usd > ceiling_usd {
+        if budget.blocked || budget.spent_usd + budget.reserved_usd + estimate_usd > ceiling_usd {
             budget.blocked = true;
-            return false;
+            return None;
         }
-        budget.spent_usd += cost_usd;
-        true
+        budget.reserved_usd += estimate_usd;
+        Some(BudgetReservation {
+            budget: Arc::clone(&self.budget),
+            amount_usd: estimate_usd,
+            active: true,
+        })
     }
 
     fn inference_llm_snapshot(&self) -> Option<InferenceLlmState> {
@@ -1208,7 +1220,48 @@ struct SummaryLlmState {
 #[derive(Default)]
 struct BudgetLedger {
     spent_usd: f64,
+    reserved_usd: f64,
     blocked: bool,
+}
+
+struct BudgetReservation {
+    budget: Arc<Mutex<BudgetLedger>>,
+    amount_usd: f64,
+    active: bool,
+}
+
+impl BudgetReservation {
+    fn commit(mut self, actual_cost_usd: f64, ceiling_usd: f64) -> bool {
+        let actual_cost_usd = actual_cost_usd.max(0.0);
+        let mut budget = self
+            .budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.active {
+            budget.reserved_usd = (budget.reserved_usd - self.amount_usd).max(0.0);
+            self.active = false;
+        }
+        if budget.blocked || budget.spent_usd + actual_cost_usd > ceiling_usd {
+            budget.blocked = true;
+            return false;
+        }
+        budget.spent_usd += actual_cost_usd;
+        true
+    }
+}
+
+impl Drop for BudgetReservation {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut budget = self
+            .budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        budget.reserved_usd = (budget.reserved_usd - self.amount_usd).max(0.0);
+        self.active = false;
+    }
 }
 
 enum SummaryRead {
@@ -1433,6 +1486,9 @@ impl InferredDispatchFailure {
     }
 
     fn to_envelope(&self) -> Value {
+        if self.code == "cost-ceiling-exceeded" {
+            return cost_ceiling_envelope(&self.message);
+        }
         tool_error_envelope(self.code, &self.message, self.retryable)
     }
 }
@@ -1807,6 +1863,29 @@ fn tool_error_envelope(code: &str, message: &str, retryable: bool) -> Value {
         "truncated": false,
         "truncation_reason": null,
         "stats_delta": {}
+    })
+}
+
+fn cost_ceiling_envelope(message: &str) -> Value {
+    json!({
+        "ok": false,
+        "result": null,
+        "error": {
+            "code": "cost-ceiling-exceeded",
+            "message": message,
+            "retryable": false
+        },
+        "diagnostics": [
+            {
+                "code": "CLA-LLM-COST-CEILING-EXCEEDED",
+                "message": message
+            }
+        ],
+        "truncated": false,
+        "truncation_reason": null,
+        "stats_delta": {
+            "cost_ceiling_exceeded_total": 1
+        }
     })
 }
 

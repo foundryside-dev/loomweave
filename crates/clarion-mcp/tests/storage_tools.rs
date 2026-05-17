@@ -385,6 +385,67 @@ impl AnyInferredProvider {
     }
 }
 
+#[derive(Debug)]
+struct AnySummaryProvider {
+    invocations: Mutex<Vec<LlmRequest>>,
+    delay_ms: u64,
+    estimate_usd: f64,
+    cost_usd: f64,
+}
+
+impl AnySummaryProvider {
+    fn new_slow(delay_ms: u64, estimate_usd: f64, cost_usd: f64) -> Self {
+        Self {
+            invocations: Mutex::new(Vec::new()),
+            delay_ms,
+            estimate_usd,
+            cost_usd,
+        }
+    }
+
+    fn invocations(&self) -> Vec<LlmRequest> {
+        self.invocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl LlmProvider for AnySummaryProvider {
+    fn name(&self) -> &'static str {
+        "recording"
+    }
+
+    fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
+        self.invocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(request.clone());
+        if self.delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
+        }
+        Ok(LlmResponse {
+            model_id: request.model_id,
+            output_json: r#"{"purpose":"concurrent"}"#.to_owned(),
+            input_tokens: 100,
+            output_tokens: 20,
+            cost_usd: self.cost_usd,
+        })
+    }
+
+    fn estimate_cost_usd(&self, _request: &LlmRequest) -> f64 {
+        self.estimate_usd
+    }
+
+    fn tier_to_model(&self, _tier: &str) -> Option<&str> {
+        None
+    }
+
+    fn caching_model(&self) -> CachingModel {
+        CachingModel::AnthropicPromptCache
+    }
+}
+
 impl LlmProvider for AnyInferredProvider {
     fn name(&self) -> &'static str {
         "recording"
@@ -852,6 +913,11 @@ async fn summary_cost_ceiling_blocks_session_after_expensive_cold_call() {
     .await;
     assert_eq!(first["ok"], false);
     assert_eq!(first["error"]["code"], "cost-ceiling-exceeded");
+    assert_eq!(first["stats_delta"]["cost_ceiling_exceeded_total"], 1);
+    assert_eq!(
+        first["diagnostics"][0]["code"],
+        "CLA-LLM-COST-CEILING-EXCEEDED"
+    );
     assert_eq!(provider.invocations().len(), 1);
 
     let second = call_tool(
@@ -862,7 +928,116 @@ async fn summary_cost_ceiling_blocks_session_after_expensive_cold_call() {
     .await;
     assert_eq!(second["ok"], false);
     assert_eq!(second["error"]["code"], "cost-ceiling-exceeded");
+    assert_eq!(second["stats_delta"]["cost_ceiling_exceeded_total"], 1);
     assert_eq!(provider.invocations().len(), 1);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_cost_ceiling_reserves_concurrent_cold_misses() {
+    let (project, db_path) = open_project();
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnySummaryProvider::new_slow(100, 0.001, 0.001));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        LlmConfig {
+            session_cost_ceiling_usd: 0.0015,
+            ..llm_config()
+        },
+    );
+
+    let first = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    );
+    let second = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.target"}),
+    );
+    let (first, second) = tokio::join!(first, second);
+
+    let ok_count = [first["ok"].as_bool(), second["ok"].as_bool()]
+        .into_iter()
+        .filter(|ok| *ok == Some(true))
+        .count();
+    let ceiling_count = [&first, &second]
+        .into_iter()
+        .filter(|envelope| envelope["error"]["code"] == "cost-ceiling-exceeded")
+        .count();
+    assert_eq!(
+        ok_count, 1,
+        "exactly one cold summary should reserve budget"
+    );
+    assert_eq!(
+        ceiling_count, 1,
+        "the overlapping cold summary should fail before provider dispatch"
+    );
+    assert_eq!(
+        provider.invocations().len(),
+        1,
+        "budget reservation should block the second provider call"
+    );
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn summary_cache_hits_survive_blocked_budget() {
+    let (project, db_path) = open_project();
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnySummaryProvider::new_slow(0, 0.001, 0.001));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        LlmConfig {
+            session_cost_ceiling_usd: 0.0015,
+            ..llm_config()
+        },
+    );
+
+    let first = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(first["ok"], true);
+    assert_eq!(first["result"]["cache"]["hit"], false);
+
+    let blocked = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.target"}),
+    )
+    .await;
+    assert_eq!(blocked["ok"], false);
+    assert_eq!(blocked["error"]["code"], "cost-ceiling-exceeded");
+
+    let cached = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(cached["ok"], true);
+    assert_eq!(cached["result"]["cache"]["hit"], true);
+    assert_eq!(
+        provider.invocations().len(),
+        1,
+        "blocked budget should not prevent cached summaries from being served"
+    );
 
     drop(state);
     drop(writer);

@@ -117,6 +117,26 @@ If the consult-mode agent asks for `summary(module_id)` and expects an aggregate
 
 The v0.2 shape (Phase 4 / 5 / 6 hierarchical pass) is preserved in `system-design.md` §6 and `detailed-design.md` §4 as the target architecture; this ADR scopes only what ships in v0.1.
 
+### 2026-05-17 B.6 implementation resolution — session cost ceiling
+
+B.6 resolves cost-ceiling granularity as an MCP server-session budget:
+
+- `clarion.yaml` exposes `llm.session_cost_ceiling_usd`, defaulting to USD
+  10.00. The budget is process-local and resets when `clarion serve` restarts.
+- `summary()` and lazy inferred-edge dispatch share the same in-memory
+  `BudgetLedger` with `spent`, `reserved`, and `blocked` state. Cache hits do
+  not reserve or spend budget.
+- Before a provider call, the MCP server reserves the provider's estimated
+  request cost. If `spent + reserved + estimate` exceeds the configured
+  ceiling, the tool returns an MCP error envelope with code
+  `cost-ceiling-exceeded` without calling the provider.
+- After a provider call, the reservation is released and actual reported cost
+  is debited. If the actual cost pushes the session over the ceiling, that
+  response returns `cost-ceiling-exceeded` and the session is blocked for
+  further live LLM dispatch. Provider failures release the reservation.
+- Ceiling responses emit `CLA-LLM-COST-CEILING-EXCEEDED` and
+  `cost_ceiling_exceeded_total: 1` in the MCP response envelope.
+
 ## Alternatives Considered
 
 ### Alternative 1 — Ship full WP6 (Phases 4-6) before the MVP MCP surface
@@ -166,7 +186,9 @@ Add edge-vs-summary as a cache-key component; share one cache implementation.
 
 ## Open Questions
 
-- **Cost-ceiling enforcement granularity.** The original WP6 design had a per-`clarion analyze` cost ceiling. The on-demand path needs a per-MCP-server-session ceiling and/or a daily aggregate ceiling. Decision deferred to the WP6-narrowed implementation pass.
+- **Cost-ceiling enforcement granularity** — RESOLVED by B.6: v0.1 uses a
+  per-MCP-server-session ceiling configured by `llm.session_cost_ceiling_usd`.
+  A daily or cross-process aggregate ceiling is deferred beyond v0.1.
 - **Cache eviction.** ADR-007 names a TTL backstop but no eviction policy for the lazy-populated case (the eager case naturally bounds cache size to entity count). Decision deferred; initial implementation can run unbounded with manual cache rotation, since v0.1 operators are the same humans who can `rm .clarion/cache/`.
 - **Multi-model cache coexistence.** If an operator changes `model_tier` in `clarion.yaml`, the cache key changes and prior entries become unreachable but not garbage-collected. Same TTL discipline applies. Acceptable for v0.1.
 
