@@ -18,7 +18,7 @@ fn main() -> Result<()> {
                 .build()?;
             rt.block_on(analyze::run(path))
         }
-        cli::Command::Serve { path } => serve::run(&path),
+        cli::Command::Serve { path, config } => serve::run(&path, config.as_deref()),
     }
 }
 

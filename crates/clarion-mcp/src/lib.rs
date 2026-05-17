@@ -1,5 +1,7 @@
 //! MCP protocol surface for Clarion.
 
+pub mod config;
+
 use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;

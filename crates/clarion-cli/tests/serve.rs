@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::Write;
 use std::process::{Command as StdCommand, Stdio};
 
@@ -74,4 +75,29 @@ fn serve_stdio_initialize_round_trip() {
     assert_eq!(response["id"], 1);
     assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
     assert_eq!(response["result"]["serverInfo"]["name"], "clarion");
+}
+
+#[test]
+fn serve_rejects_invalid_project_config() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    fs::write(
+        dir.path().join("clarion.yaml"),
+        "llm: [not valid for this schema]\n",
+    )
+    .expect("write invalid config");
+
+    let assert = clarion_bin()
+        .args(["serve", "--path"])
+        .arg(dir.path())
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("stderr is utf8");
+
+    assert!(stderr.contains("invalid MCP config"));
 }
