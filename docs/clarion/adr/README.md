@@ -26,6 +26,11 @@ This folder is the canonical home for authored Clarion architecture decision rec
 | [ADR-023](./ADR-023-tooling-baseline.md) | Rust + Python tooling baseline (edition 2024, pedantic, cargo-deny, nextest, CI; ruff + mypy-strict + pre-commit) | Accepted |
 | [ADR-024](./ADR-024-guidance-schema-vocabulary.md) | Guidance schema vocabulary rename (priority→scope_level/scope_rank; critical→pinned; source→provenance) and in-place migration policy | Accepted |
 | [ADR-025](./ADR-025-minor-shared-standards.md) | Minor shared standards — registry of small project-wide conventions; first entry MSS-1 locks the `tier:*` filigree label namespace | Accepted |
+| [ADR-026](./ADR-026-containment-wire-and-edge-identity.md) | Containment wire shape and edge identity (top-level `edges` field; drop `edges.id` column; per-kind `source_byte_start/end` contract) | Accepted |
+| [ADR-027](./ADR-027-ontology-version-semver.md) | Ontology version semver policy (MAJOR/MINOR/PATCH semantics for `[ontology].ontology_version`; clarifies ADR-022) | Accepted |
+| [ADR-028](./ADR-028-edge-confidence-tiers.md) | Edge confidence tiers (`resolved` / `ambiguous` / `inferred`); MCP queries default to `>= resolved`; inferred edges lazy-computed at query time | Accepted |
+| [ADR-029](./ADR-029-entity-associations-binding.md) | Entity associations — Filigree-side `entity_associations` table; `add_entity_association` MCP tool on Filigree; `issues_for` MCP tool on Clarion; WP9 split into A (binding, v0.1) and B (findings emission) | Accepted |
+| [ADR-030](./ADR-030-on-demand-summary-scope.md) | On-demand summary scope — narrows WP6 to MCP-driven `summary(id)`; 5-tuple cache key unchanged; module/subsystem aggregation deferred to v0.2 | Accepted |
 
 ## Backlog still tracked in the detailed design
 

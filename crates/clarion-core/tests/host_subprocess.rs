@@ -95,18 +95,23 @@ fn t1_subprocess_happy_path() {
         PluginHost::spawn(manifest, project_dir.path(), &exec).expect("spawn must succeed");
 
     // 5. Analyze the fixture file.
-    let entities = host
+    let outcome = host
         .analyze_file(&sample_path)
         .expect("analyze_file must succeed");
 
-    // 6. Assert: exactly one entity.
+    // 6. Assert: exactly one entity, zero edges (fixture plugin emits no edges).
     assert_eq!(
-        entities.len(),
+        outcome.entities.len(),
         1,
         "fixture plugin must return exactly one entity per analyze_file; got {}",
-        entities.len()
+        outcome.entities.len()
     );
-    let entity = &entities[0];
+    assert!(
+        outcome.edges.is_empty(),
+        "fixture plugin must return no edges; got {}",
+        outcome.edges.len()
+    );
+    let entity = &outcome.entities[0];
     assert_eq!(
         entity.kind, "widget",
         "entity kind must be 'widget'; got {:?}",

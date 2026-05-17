@@ -34,6 +34,7 @@ CREATE TABLE entities (
     short_name         TEXT NOT NULL,
     parent_id          TEXT REFERENCES entities(id),
     source_file_id     TEXT REFERENCES entities(id),
+    source_file_path   TEXT,
     source_byte_start  INTEGER,
     source_byte_end    INTEGER,
     source_line_start  INTEGER,
@@ -52,6 +53,7 @@ CREATE INDEX ix_entities_kind              ON entities(kind);
 CREATE INDEX ix_entities_plugin_kind       ON entities(plugin_id, kind);
 CREATE INDEX ix_entities_parent            ON entities(parent_id);
 CREATE INDEX ix_entities_source_file       ON entities(source_file_id);
+CREATE INDEX ix_entities_source_file_path  ON entities(source_file_path);
 CREATE INDEX ix_entities_content_hash      ON entities(content_hash);
 
 -- Tags (denormalised)
@@ -62,9 +64,12 @@ CREATE TABLE entity_tags (
 );
 CREATE INDEX ix_entity_tags_tag ON entity_tags(tag);
 
--- Edges. Deduped by (kind, from_id, to_id); see detailed-design.md §3 note.
+-- Edges. Natural PK (kind, from_id, to_id) per ADR-026 decision 4 (B.3).
+-- Synthetic `id` column dropped: no Sprint-1 or B.3 query selects edges by
+-- `id`; the natural composite is stable across re-analyze, and the only
+-- finding-attachment cross-reference (findings.entity_id) points at entities,
+-- not edges. WITHOUT ROWID drops the now-redundant rowid pages.
 CREATE TABLE edges (
-    id                 TEXT PRIMARY KEY,
     kind               TEXT NOT NULL,
     from_id            TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
     to_id              TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
@@ -72,11 +77,14 @@ CREATE TABLE edges (
     source_file_id     TEXT REFERENCES entities(id),
     source_byte_start  INTEGER,
     source_byte_end    INTEGER,
-    UNIQUE (kind, from_id, to_id)
-);
+    confidence         TEXT NOT NULL DEFAULT 'resolved'
+                       CHECK (confidence IN ('resolved', 'ambiguous', 'inferred')),
+    PRIMARY KEY (kind, from_id, to_id)
+) WITHOUT ROWID;
 CREATE INDEX ix_edges_from_kind ON edges(from_id, kind);
 CREATE INDEX ix_edges_to_kind   ON edges(to_id,   kind);
 CREATE INDEX ix_edges_kind      ON edges(kind);
+CREATE INDEX ix_edges_kind_confidence ON edges(kind, confidence);
 
 -- Findings
 CREATE TABLE findings (
@@ -120,8 +128,44 @@ CREATE TABLE summary_cache (
     tokens_input          INTEGER NOT NULL,
     tokens_output         INTEGER NOT NULL,
     created_at            TEXT NOT NULL,
+    last_accessed_at      TEXT NOT NULL,
+    caller_count          INTEGER NOT NULL,
+    fan_out               INTEGER NOT NULL,
+    stale_semantic        INTEGER NOT NULL DEFAULT 0 CHECK (stale_semantic IN (0, 1)),
     PRIMARY KEY (entity_id, content_hash, prompt_template_id, model_tier, guidance_fingerprint)
 );
+
+-- Inferred edge cache
+CREATE TABLE inferred_edge_cache (
+    caller_entity_id     TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    caller_content_hash  TEXT NOT NULL,
+    model_id             TEXT NOT NULL,
+    prompt_version       TEXT NOT NULL,
+    result_json          TEXT NOT NULL,
+    cost_usd             REAL NOT NULL DEFAULT 0.0,
+    token_count          INTEGER NOT NULL DEFAULT 0,
+    created_at           TEXT NOT NULL,
+    last_accessed_at     TEXT NOT NULL,
+    PRIMARY KEY (caller_entity_id, caller_content_hash, model_id, prompt_version)
+);
+
+-- Unresolved call sites for query-time inferred dispatch
+CREATE TABLE entity_unresolved_call_sites (
+    caller_entity_id     TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    caller_content_hash  TEXT NOT NULL,
+    site_key             TEXT NOT NULL,
+    site_ordinal         INTEGER NOT NULL,
+    source_file_id       TEXT REFERENCES entities(id),
+    source_byte_start    INTEGER NOT NULL,
+    source_byte_end      INTEGER NOT NULL,
+    callee_expr          TEXT NOT NULL,
+    created_at           TEXT NOT NULL,
+    PRIMARY KEY (caller_entity_id, caller_content_hash, site_key)
+);
+CREATE INDEX ix_unresolved_call_sites_caller
+    ON entity_unresolved_call_sites(caller_entity_id);
+CREATE INDEX ix_unresolved_call_sites_expr
+    ON entity_unresolved_call_sites(callee_expr);
 
 -- Runs (provenance). Sprint 1 writes started_at/completed_at/config/stats/status;
 -- WP2 will populate plugin-invocation fields inside `config` JSON (per UQ-WP1-05).

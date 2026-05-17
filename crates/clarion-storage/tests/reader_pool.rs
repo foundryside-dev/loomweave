@@ -137,9 +137,10 @@ async fn pool_queues_when_exhausted_and_proceeds_after_release() {
     .await
     .unwrap();
 
-    // Second reader: should block on the exhausted pool. Spawn it and assert
-    // it is NOT yet finished — if the pool mis-behaved and let two readers
-    // in concurrently, this would flake-pass before; now we catch it.
+    // Second reader: should block on the exhausted pool. Spawn it and wait
+    // until deadpool reports it as a queued waiter — then assert it is not
+    // finished. Polling waiting_count avoids the 100 ms wall-clock guess
+    // that bug clarion-b5b1029f5a flagged as flaky under CI load.
     let pool_for_wait = pool.clone();
     let second_handle = tokio::spawn(async move {
         pool_for_wait
@@ -149,9 +150,16 @@ async fn pool_queues_when_exhausted_and_proceeds_after_release() {
             })
             .await
     });
-    // Give the runtime a turn to schedule the second task; if it hasn't
-    // blocked by then, the pool is handing out two concurrent connections.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if pool.waiting_count() >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("second reader should have reached the pool wait-list within 2s");
     assert!(
         !second_handle.is_finished(),
         "second reader must be parked while first holds the only connection"

@@ -1,6 +1,8 @@
 mod analyze;
 mod cli;
 mod install;
+mod serve;
+mod stats;
 
 use anyhow::Result;
 use clap::Parser;
@@ -16,6 +18,7 @@ fn main() -> Result<()> {
                 .build()?;
             rt.block_on(analyze::run(path))
         }
+        cli::Command::Serve { path, config } => serve::run(&path, config.as_deref()),
     }
 }
 

@@ -28,11 +28,12 @@ from pathlib import Path
 from typing import IO, Any
 
 from clarion_plugin_python import __version__
-from clarion_plugin_python.extractor import extract
+from clarion_plugin_python.extractor import extract_with_stats
+from clarion_plugin_python.pyright_session import PyrightSession
 from clarion_plugin_python.stdout_guard import install_stdio
 from clarion_plugin_python.wardline_probe import probe as wardline_probe
 
-ONTOLOGY_VERSION = "0.2.0"
+ONTOLOGY_VERSION = "0.5.0"
 
 # Sprint 1 defaults for the Wardline version pin (WP3 L8 + plugin.toml
 # `[integrations.wardline]`). Kept as module constants so Task 7's
@@ -64,6 +65,7 @@ class ServerState:
     initialized: bool = False
     shutdown_requested: bool = False
     project_root: Path | None = field(default=None)
+    pyright: PyrightSession | None = field(default=None)
 
 
 def read_frame(stream: IO[bytes]) -> dict[str, Any] | None:
@@ -173,23 +175,50 @@ def _resolve_module_path(file_path_raw: str, state: ServerState) -> str:
 
 
 def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str, Any]:
-    """Read the requested file, extract entities, return AnalyzeFileResult shape."""
+    """Read the requested file, extract entities + edges, return AnalyzeFileResult shape."""
+    empty_stats = {
+        "unresolved_call_sites_total": 0,
+        "unresolved_call_sites": [],
+        "reference_sites_total": 0,
+        "references_resolved_total": 0,
+        "references_skipped_external_total": 0,
+        "references_skipped_cap_total": 0,
+        "unresolved_reference_sites_total": 0,
+        "pyright_query_latency_ms": [],
+    }
     file_path_raw = params.get("file_path")
     if not isinstance(file_path_raw, str):
-        return {"entities": []}
+        return {"entities": [], "edges": [], "stats": empty_stats}
     path = Path(file_path_raw)
+    if state.pyright is None:
+        state.pyright = PyrightSession(state.project_root or path.parent)
     try:
         source = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         sys.stderr.write(f"clarion-plugin-python: cannot read {file_path_raw}: {exc}\n")
-        return {"entities": []}
+        return {"entities": [], "edges": [], "stats": empty_stats}
     # Emit source.file_path exactly as received so the host's jail check
     # (which canonicalises against project_root) sees the original path.
     # Derive qualified-name dotting from the project-relative form.
     module_prefix = _resolve_module_path(file_path_raw, state)
-    return {
-        "entities": extract(source, file_path_raw, module_prefix_path=module_prefix),
+    result = extract_with_stats(
+        source,
+        file_path_raw,
+        module_prefix_path=module_prefix,
+        call_resolver=state.pyright,
+        reference_resolver=state.pyright,
+    )
+    stats = {
+        "unresolved_call_sites_total": result.stats.unresolved_call_sites_total,
+        "unresolved_call_sites": result.stats.unresolved_call_sites,
+        "reference_sites_total": result.stats.reference_sites_total,
+        "references_resolved_total": result.stats.references_resolved_total,
+        "references_skipped_external_total": result.stats.references_skipped_external_total,
+        "references_skipped_cap_total": result.stats.references_skipped_cap_total,
+        "unresolved_reference_sites_total": result.stats.unresolved_reference_sites_total,
+        "pyright_query_latency_ms": result.stats.pyright_query_latency_ms,
     }
+    return {"entities": result.entities, "edges": result.edges, "stats": stats}
 
 
 Handler = Callable[[dict[str, Any], ServerState], dict[str, Any]]
@@ -214,6 +243,9 @@ def dispatch(frame: dict[str, Any], state: ServerState) -> dict[str, Any] | None
         return None
     if method == "shutdown":
         state.shutdown_requested = True
+        if state.pyright is not None:
+            state.pyright.close()
+            state.pyright = None
         return _success(request_id, {})
     if not isinstance(method, str):
         return _error(request_id, _ERR_INVALID_REQUEST, f"invalid method: {method!r}")

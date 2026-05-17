@@ -1,7 +1,7 @@
 [plugin]
 name = "clarion-plugin-python"
 plugin_id = "python"
-version = "0.1.0"
+version = "0.1.4"
 protocol_version = "1.0"
 # Bare basename per ADR-021 §Layer 1 + WP2 scrub commit eb0a41d — the host
 # refuses manifests whose `executable` carries any path component.
@@ -11,9 +11,10 @@ extensions = ["py"]
 
 [capabilities.runtime]
 # Plugin's declared RSS envelope (MiB). Effective prlimit is
-# min(this, core default 2 GiB). 512 MiB is comfortable for CPython
-# plus imports plus the Sprint-1 extractor working set.
-expected_max_rss_mb = 512
+# min(this, core default 2 GiB). Pyright's Node-based language server
+# inherits this limit from the plugin process, so B.4* declares the core
+# ceiling rather than the Sprint-1 CPython-only working set.
+expected_max_rss_mb = 2048
 # Triggers CLA-INFRA-PLUGIN-ENTITY-OVERRUN-WARNING well before the 500k
 # core cap (warning emission itself is deferred to Tier B — Sprint 1
 # only lands the declaration).
@@ -24,20 +25,25 @@ wardline_aware = true
 # v0.1 rejects `true` at initialize with CLA-INFRA-MANIFEST-UNSUPPORTED-CAPABILITY.
 reads_outside_project_root = false
 
+[capabilities.runtime.pyright]
+pin = "1.1.409"
+
 [ontology]
-# Sprint 2 B.2: classes + modules join the kind set. Decorators, edges,
-# imports, calls remain WP3-feature-complete (later Sprint 2+).
+# Sprint 2 B.2: classes + modules join the kind set. B.3 (ADR-026) adds
+# the first edge kind, `contains`. B.4* adds scan-time `calls` edges.
+# B.5* adds scan-time `references` edges.
 entity_kinds = ["function", "class", "module"]
-edge_kinds = []
+edge_kinds = ["contains", "calls", "references"]
 # Per ADR-022: uppercase `CLA-{PLUGIN_ID_UPPER}-`. Reserved at parse
 # against the CLA-INFRA-* and CLA-FACT-* namespaces.
 rule_id_prefix = "CLA-PY-"
-# Bumps when the entity/edge/rule set shifts. NOTE: ADR-007's summary-cache
-# key is the 5-tuple (entity_id, content_hash, prompt_template_id,
-# model_tier, guidance_fingerprint) — ontology_version is handshake-validation,
-# NOT a cache-key component. New module/class entity_ids miss the cache by
-# component-1 of the 5-tuple organically.
-ontology_version = "0.2.0"
+# Bumps per ADR-027 when the entity/edge/rule set shifts. B.5* is a MINOR
+# bump (additive `references` edge kind). NOTE: ADR-007's summary-cache key
+# is the 5-tuple (entity_id, content_hash, prompt_template_id, model_tier,
+# guidance_fingerprint) — ontology_version is handshake-validation, NOT a
+# cache-key component. New edge rows miss the cache by component-1 of
+# the 5-tuple organically (no edges live in the 5-tuple yet anyway).
+ontology_version = "0.5.0"
 
 [integrations.wardline]
 # Verified present in Wardline source (src/wardline/core/registry.py:55,

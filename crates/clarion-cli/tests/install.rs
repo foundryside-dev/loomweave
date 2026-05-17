@@ -113,6 +113,43 @@ fn install_force_returns_unimplemented_in_sprint_one() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn install_cleans_up_clarion_dir_when_post_mkdir_step_fails() {
+    // Bug clarion-ed5017139f: `clarion install` left .clarion/ partially
+    // populated on failure, blocking re-install without manual rm -rf.
+    //
+    // Reproducer: pre-create clarion.yaml as a *broken symlink* whose target
+    // sits under a non-existent parent dir. Install's `yaml_path.exists()`
+    // check follows symlinks → returns false → install attempts `fs::write`,
+    // which follows the symlink → tries to open a path under a non-existent
+    // dir → ENOENT. By that point .clarion/ has been mkdir'd and populated;
+    // the bug was leaving it on disk.
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = dir.path().join("clarion.yaml");
+    symlink(
+        "/clarion-test-nonexistent-by-construction/never/exists/cannot-write",
+        &yaml,
+    )
+    .unwrap();
+
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .assert()
+        .failure();
+
+    let clarion = dir.path().join(".clarion");
+    assert!(
+        !clarion.exists(),
+        ".clarion/ should have been cleaned up after install failed, \
+         but it still exists at {}",
+        clarion.display()
+    );
+}
+
 #[test]
 fn install_leaves_existing_clarion_yaml_untouched() {
     let dir = tempfile::tempdir().unwrap();

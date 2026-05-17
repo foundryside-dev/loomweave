@@ -113,6 +113,7 @@ def test_round_trip_self_analysis() -> None:  # noqa: PLR0915 - by-kind invarian
         assert response["id"] == 2
 
         entities = response["result"]["entities"]
+        edges = response["result"]["edges"]
         function_entities = [e for e in entities if e["kind"] == "function"]
         module_entities = [e for e in entities if e["kind"] == "module"]
         class_entities = [e for e in entities if e["kind"] == "class"]
@@ -152,6 +153,46 @@ def test_round_trip_self_analysis() -> None:  # noqa: PLR0915 - by-kind invarian
         # (project_root relativisation only affects the qualified_name prefix).
         for entity in entities:
             assert entity["source"]["file_path"] == str(target)
+
+        # B.3 contains-edge round-trip (Task 7) + B.4* calls-edge smoke.
+        # Every non-module entity declares parent_id; every contains edge
+        # in the response matches some entity's parent_id (dual-encoding
+        # invariant, ADR-026 decision 2). Calls edges are anchored and
+        # confidence-bearing per ADR-028.
+        assert edges, "extractor.py must produce contains edges (non-empty file)"
+        contains_pairs = {(e["from_id"], e["to_id"]) for e in edges if e["kind"] == "contains"}
+        calls_edges = [e for e in edges if e["kind"] == "calls"]
+        references_edges = [e for e in edges if e["kind"] == "references"]
+        resolved_calls = [e for e in calls_edges if e["confidence"] == "resolved"]
+        ambiguous_calls = [e for e in calls_edges if e["confidence"] == "ambiguous"]
+        resolved_references = [e for e in references_edges if e["confidence"] == "resolved"]
+        assert resolved_calls, "extractor.py self-analysis must emit at least one resolved call"
+        assert resolved_references, (
+            "extractor.py self-analysis must emit at least one resolved references edge"
+        )
+        assert len(ambiguous_calls) <= len(calls_edges) // 2, (
+            "ambiguous calls should not dominate extractor.py self-analysis"
+        )
+        for edge in edges:
+            if edge["kind"] == "contains":
+                # Contains edges MUST NOT carry source range fields (ADR-026 §3).
+                assert "source_byte_start" not in edge
+                assert "source_byte_end" not in edge
+            elif edge["kind"] in {"calls", "references"}:
+                assert edge["source_byte_start"] < edge["source_byte_end"]
+                assert edge["confidence"] in {"resolved", "ambiguous"}
+            else:
+                message = f"unexpected edge kind: {edge['kind']!r}"
+                raise AssertionError(message)
+        for entity in entities:
+            if entity["kind"] == "module":
+                assert "parent_id" not in entity, (
+                    "module entity must have no parent_id within the file"
+                )
+                continue
+            assert "parent_id" in entity, f"non-module entity {entity['id']} missing parent_id"
+            pair = (entity["parent_id"], entity["id"])
+            assert pair in contains_pairs, f"no contains edge matches parent_id for {entity['id']}"
 
         # Graceful shutdown.
         proc.stdin.write(

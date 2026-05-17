@@ -35,6 +35,33 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Map, Value};
 
+/// Edge-confidence tier carried on edge rows and wire records (ADR-028).
+///
+/// Ordering is permissiveness, not trust strength: `Resolved < Ambiguous <
+/// Inferred`, so a consumer asking for `confidence >= Ambiguous` opts into
+/// ambiguous and inferred tiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EdgeConfidence {
+    /// Static analysis resolved the edge unambiguously.
+    #[default]
+    Resolved,
+    /// Static analysis found more than one in-project candidate.
+    Ambiguous,
+    /// Query-time inference produced the edge.
+    Inferred,
+}
+
+impl EdgeConfidence {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resolved => "resolved",
+            Self::Ambiguous => "ambiguous",
+            Self::Inferred => "inferred",
+        }
+    }
+}
+
 // ── JSON-RPC version wrapper ──────────────────────────────────────────────────
 
 /// Wrapper that (de)serialises to/from the literal string `"2.0"`.
@@ -323,17 +350,81 @@ pub struct AnalyzeFileParams {
     pub file_path: String,
 }
 
+/// Run-observability counters emitted per `analyze_file` result.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnalyzeFileStats {
+    /// Call sites where the plugin found no in-project candidate.
+    #[serde(default)]
+    pub unresolved_call_sites_total: u64,
+    /// Concrete unresolved call sites available for query-time inference.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_call_sites: Vec<UnresolvedCallSite>,
+    /// Reference sites enumerated by the plugin before resolver filtering.
+    #[serde(default)]
+    pub reference_sites_total: u64,
+    /// Reference sites resolved to at least one in-project target.
+    #[serde(default)]
+    pub references_resolved_total: u64,
+    /// Reference sites skipped because pyright resolved only external targets.
+    #[serde(default)]
+    pub references_skipped_external_total: u64,
+    /// Reference sites skipped because the per-file site cap was exceeded.
+    #[serde(default)]
+    pub references_skipped_cap_total: u64,
+    /// Reference sites where no in-project target was emitted.
+    #[serde(default)]
+    pub unresolved_reference_sites_total: u64,
+    /// Raw latency samples (milliseconds) for per-file Pyright LSP queries.
+    #[serde(default)]
+    pub pyright_query_latency_ms: Vec<u64>,
+}
+
+impl AnalyzeFileStats {
+    fn is_empty(&self) -> bool {
+        self.unresolved_call_sites_total == 0
+            && self.reference_sites_total == 0
+            && self.references_resolved_total == 0
+            && self.references_skipped_external_total == 0
+            && self.references_skipped_cap_total == 0
+            && self.unresolved_reference_sites_total == 0
+            && self.unresolved_call_sites.is_empty()
+            && self.pyright_query_latency_ms.is_empty()
+    }
+}
+
+/// One unresolved call site emitted by a plugin for lazy inferred-call dispatch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnresolvedCallSite {
+    pub caller_entity_id: String,
+    pub site_ordinal: i64,
+    pub source_byte_start: i64,
+    pub source_byte_end: i64,
+    pub callee_expr: String,
+}
+
 /// Result for `analyze_file` (plugin → core).
 ///
-/// `entities` is `Vec<serde_json::Value>` as a Sprint 1 placeholder.
-/// Task 6 (ontology boundary enforcement) will introduce a typed `Entity`
-/// struct and replace this field. The `Vec<Value>` shape matches the wire
-/// contract without requiring Task 2 to know the entity schema.
+/// `entities` is `Vec<serde_json::Value>` as a Sprint 1 placeholder; per-element
+/// deserialisation into `RawEntity` happens in `plugin::host::analyze_file`,
+/// so a single malformed entity drops with a finding rather than failing the
+/// whole response. B.3 added `edges` under the same per-element pattern.
+///
+/// `edges` defaults to empty for Sprint-1 plugins that pre-date B.3 — the
+/// `#[serde(default)]` makes the new field non-breaking on the wire.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AnalyzeFileResult {
     /// Extracted entities. Element shape is the plugin's concern; the core
     /// stores them opaquely until Task 6 introduces the typed ontology layer.
     pub entities: Vec<Value>,
+    /// Edges emitted by the plugin (B.3, ADR-026). Per-element
+    /// deserialisation into `plugin::host::RawEdge` happens in the host;
+    /// malformed edges drop with a finding. `serde(default)` keeps the
+    /// addition non-breaking for Sprint-1 plugins.
+    #[serde(default)]
+    pub edges: Vec<Value>,
+    /// Observability counters and samples. Defaults keep pre-B.4 plugins valid.
+    #[serde(default, skip_serializing_if = "AnalyzeFileStats::is_empty")]
+    pub stats: AnalyzeFileStats,
 }
 
 // ── shutdown ──────────────────────────────────────────────────────────────────
@@ -569,10 +660,69 @@ mod tests {
         // analyze_file result
         let r = AnalyzeFileResult {
             entities: vec![serde_json::json!({"kind": "function", "name": "main"})],
+            edges: vec![serde_json::json!({
+                "kind": "contains",
+                "from_id": "python:module:m",
+                "to_id": "python:function:m.main",
+            })],
+            stats: AnalyzeFileStats {
+                unresolved_call_sites_total: 2,
+                unresolved_call_sites: vec![UnresolvedCallSite {
+                    caller_entity_id: "python:function:m.main".to_owned(),
+                    site_ordinal: 1,
+                    source_byte_start: 10,
+                    source_byte_end: 14,
+                    callee_expr: "dynamic_target".to_owned(),
+                }],
+                reference_sites_total: 3,
+                references_resolved_total: 4,
+                references_skipped_external_total: 5,
+                references_skipped_cap_total: 6,
+                unresolved_reference_sites_total: 7,
+                pyright_query_latency_ms: vec![10, 20, 30],
+            },
         };
         let back: AnalyzeFileResult =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(r, back);
+
+        // analyze_file result with omitted `edges` field (Sprint-1 plugins
+        // pre-date B.3); serde(default) means it deserialises to empty.
+        let pre_b3 = r#"{"entities": []}"#;
+        let back: AnalyzeFileResult =
+            serde_json::from_str(pre_b3).expect("pre-B.3 wire shape must remain accepted");
+        assert!(
+            back.edges.is_empty(),
+            "missing edges field must default to empty vec"
+        );
+        assert_eq!(
+            back.stats.unresolved_call_sites_total, 0,
+            "missing stats field must default unresolved-call-site counter to zero"
+        );
+        assert_eq!(
+            back.stats.reference_sites_total, 0,
+            "missing stats field must default reference-site counter to zero"
+        );
+        assert_eq!(
+            back.stats.references_resolved_total, 0,
+            "missing stats field must default resolved-reference counter to zero"
+        );
+        assert_eq!(
+            back.stats.references_skipped_external_total, 0,
+            "missing stats field must default external-reference counter to zero"
+        );
+        assert_eq!(
+            back.stats.references_skipped_cap_total, 0,
+            "missing stats field must default reference-cap counter to zero"
+        );
+        assert_eq!(
+            back.stats.unresolved_reference_sites_total, 0,
+            "missing stats field must default unresolved-reference counter to zero"
+        );
+        assert!(
+            back.stats.pyright_query_latency_ms.is_empty(),
+            "missing stats field must default pyright latency samples to empty"
+        );
 
         // shutdown params (empty)
         let p = ShutdownParams {};

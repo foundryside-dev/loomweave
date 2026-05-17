@@ -5,13 +5,17 @@
 //! commands via a bounded `mpsc::Sender<WriterCmd>`. Each variant carries
 //! a `oneshot::Sender` for the per-command ack (UQ-WP1-03 resolution).
 //!
-//! Sprint 1 ships four variants: `BeginRun`, `InsertEntity`, `CommitRun`,
-//! `FailRun`. Later WPs add `InsertEdge`, `InsertFinding`, etc. by appending
-//! variants — the pattern is frozen here.
+//! Sprint 1 shipped four variants: `BeginRun`, `InsertEntity`, `CommitRun`,
+//! `FailRun`. B.3 adds `InsertEdge` (ADR-026). Later WPs add `InsertFinding`,
+//! etc. by appending variants — the pattern is frozen here.
 
 use tokio::sync::oneshot;
 
+pub use clarion_core::EdgeConfidence;
+
+use crate::cache::{InferredEdgeCacheEntry, SummaryCacheEntry, SummaryCacheKey};
 use crate::error::StorageError;
+use crate::unresolved::UnresolvedCallSiteRecord;
 
 pub type Ack<T> = oneshot::Sender<Result<T, StorageError>>;
 
@@ -49,6 +53,7 @@ pub struct EntityRecord {
     pub short_name: String,
     pub parent_id: Option<String>,
     pub source_file_id: Option<String>,
+    pub source_file_path: Option<String>,
     pub source_byte_start: Option<i64>,
     pub source_byte_end: Option<i64>,
     pub source_line_start: Option<i64>,
@@ -65,6 +70,42 @@ pub struct EntityRecord {
     pub updated_at: String,
 }
 
+/// Plain-old-data edge record as seen by the writer. Per ADR-026 the
+/// natural key is `(kind, from_id, to_id)`. `source_byte_start`/`end` are
+/// kind-dispatched (NULL for structural edges like `contains`; required for
+/// AST-anchored edges like `calls`); the writer enforces the per-kind
+/// contract on `InsertEdge`.
+#[derive(Debug, Clone)]
+pub struct EdgeRecord {
+    pub kind: String,
+    pub from_id: String,
+    pub to_id: String,
+    pub confidence: EdgeConfidence,
+    /// JSON string; writer inserts verbatim. None ⇒ NULL.
+    pub properties_json: Option<String>,
+    /// Module entity id for the file the edge was emitted from. Derived by
+    /// the host, not the plugin (ADR-022 boundary).
+    pub source_file_id: Option<String>,
+    pub source_byte_start: Option<i64>,
+    pub source_byte_end: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InferredCallEdgeRecord {
+    pub from_id: String,
+    pub to_id: String,
+    pub source_file_id: Option<String>,
+    pub source_byte_start: i64,
+    pub source_byte_end: i64,
+    pub properties_json: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InferredEdgeWriteStats {
+    pub inserted_edges: u64,
+    pub skipped_static_duplicates: u64,
+}
+
 /// All writer operations as a single enum so the actor loop exhausts
 /// everything via one match.
 #[derive(Debug)]
@@ -78,10 +119,47 @@ pub enum WriterCmd {
         started_at: String,
         ack: Ack<()>,
     },
-    /// Insert an entity; also advances the per-batch insert counter and
+    /// Insert an entity; also advances the per-batch write counter and
     /// commits the in-flight transaction if the batch boundary is crossed.
     InsertEntity {
         entity: Box<EntityRecord>,
+        ack: Ack<()>,
+    },
+    /// Insert an edge under the natural PK `(kind, from_id, to_id)`. The
+    /// writer enforces the per-kind source-range contract (ADR-026) and
+    /// silently dedupes UNIQUE conflicts via `INSERT OR IGNORE`, incrementing
+    /// `Writer::dropped_edges_total` on dedupe. Also advances the per-batch
+    /// write counter — edges and entities share one batch boundary.
+    InsertEdge { edge: Box<EdgeRecord>, ack: Ack<()> },
+    /// Upsert one inferred-edge cache row and materialize its current inferred
+    /// call edges. This query-time MCP write does not require an active
+    /// analyze run and does not use scan-time edge contracts.
+    InsertInferredEdges {
+        cache_entry: Box<InferredEdgeCacheEntry>,
+        edges: Vec<InferredCallEdgeRecord>,
+        ack: Ack<InferredEdgeWriteStats>,
+    },
+    /// Upsert one on-demand summary cache row. This query-time MCP write does
+    /// not require an active analyze run.
+    UpsertSummaryCache {
+        entry: Box<SummaryCacheEntry>,
+        ack: Ack<()>,
+    },
+    /// Touch one on-demand summary cache row. Returns whether a row was
+    /// updated. This query-time MCP write does not require an active analyze
+    /// run.
+    TouchSummaryCache {
+        key: SummaryCacheKey,
+        last_accessed_at: String,
+        ack: Ack<bool>,
+    },
+    /// Replace all unresolved call-site rows for one caller. This is an
+    /// analyze-time mapping command that requires an active run transaction so
+    /// stale rows from previous content hashes cannot survive re-analysis.
+    ReplaceUnresolvedCallSitesForCaller {
+        caller_entity_id: String,
+        caller_content_hash: String,
+        sites: Vec<UnresolvedCallSiteRecord>,
         ack: Ack<()>,
     },
     /// Commit the in-flight transaction, update the run row to the given

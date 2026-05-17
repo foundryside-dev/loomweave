@@ -9,21 +9,24 @@
 //! - On unrecoverable error (cap, escape, spawn, transport) → `FailRun`.
 //! - Zero successful plugins discovered → `SkippedNoPlugins` (existing path).
 
-use std::collections::BTreeSet;
-use std::io;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::{fs, io};
 
 use anyhow::{Context, Result, bail};
 use uuid::Uuid;
 
 use clarion_core::{
-    AcceptedEntity, CrashLoopBreaker, CrashLoopState, DiscoveredPlugin,
-    FINDING_DISABLED_CRASH_LOOP, HostError, HostFinding, discover,
+    AcceptedEdge, AcceptedEntity, AnalyzeFileOutcome, CrashLoopBreaker, CrashLoopState,
+    DiscoveredPlugin, FINDING_DISABLED_CRASH_LOOP, HostError, HostFinding, UnresolvedCallSite,
+    discover,
 };
 use clarion_storage::{
-    DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, Writer,
-    commands::{EntityRecord, RunStatus, WriterCmd},
+    DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, UnresolvedCallSiteRecord, Writer,
+    commands::{EdgeRecord, EntityRecord, RunStatus, WriterCmd},
 };
+
+use crate::stats::P95Accumulator;
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -137,7 +140,20 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
                 run_id: run_id.clone(),
                 status: RunStatus::SkippedNoPlugins,
                 completed_at: completed_at.clone(),
-                stats_json: r#"{"entities_inserted":0}"#.into(),
+                stats_json: serde_json::json!({
+                    "entities_inserted": 0,
+                    "edges_inserted": 0,
+                    "dropped_edges_total": 0,
+                    "ambiguous_edges_total": 0,
+                    "unresolved_call_sites_total": 0,
+                    "reference_sites_total": 0,
+                    "references_resolved_total": 0,
+                    "references_skipped_external_total": 0,
+                    "references_skipped_cap_total": 0,
+                    "unresolved_reference_sites_total": 0,
+                    "pyright_query_latency_p95_ms": 0,
+                })
+                .to_string(),
                 ack,
             })
             .await
@@ -180,6 +196,14 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
     // Writer-actor errors (InsertEntity rejected) ARE run-fatal: the DB
     // layer is unusable for the rest of this run.
     let mut total_entity_count: u64 = 0;
+    let mut total_edge_count: u64 = 0;
+    let mut unresolved_call_sites_total: u64 = 0;
+    let mut reference_sites_total: u64 = 0;
+    let mut references_resolved_total: u64 = 0;
+    let mut references_skipped_external_total: u64 = 0;
+    let mut references_skipped_cap_total: u64 = 0;
+    let mut unresolved_reference_sites_total: u64 = 0;
+    let mut pyright_latency = P95Accumulator::default();
     let mut run_outcome: RunOutcome = RunOutcome::Completed;
     let mut breaker = CrashLoopBreaker::default();
     let mut crash_reasons: Vec<String> = Vec::new();
@@ -266,7 +290,21 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
                 // Fall through to the next iteration — nothing else to do
                 // for a crashed plugin, and there's no code after the match.
             }
-            Ok(BatchResult { entities, findings }) => {
+            Ok(BatchResult {
+                entities,
+                edges,
+                unresolved_call_sites,
+                stats,
+                findings,
+            }) => {
+                unresolved_call_sites_total += stats.unresolved_call_sites_total;
+                reference_sites_total += stats.reference_sites_total;
+                references_resolved_total += stats.references_resolved_total;
+                references_skipped_external_total += stats.references_skipped_external_total;
+                references_skipped_cap_total += stats.references_skipped_cap_total;
+                unresolved_reference_sites_total += stats.unresolved_reference_sites_total;
+                pyright_latency.record_many(stats.pyright_query_latency_ms);
+
                 // Log findings individually (Tier B persistence is future
                 // work). Logging only the count leaves operators guessing
                 // whether the plugin tripped an ontology check, emitted
@@ -288,14 +326,17 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
                     }
                 }
 
-                // Persist entities via writer-actor (async side).
+                // Persist entities + edges via writer-actor (async side).
                 //
-                // A writer-actor error here (e.g. unique-key constraint, disk full)
-                // must NOT short-circuit `run()` via `?` — that would bypass the
-                // CommitRun/FailRun block below and leave `runs.status = 'running'`
-                // permanently. Instead we convert the error to a terminal
-                // `RunOutcome::Failed` so the FailRun path marks the run.
-                let count = entities.len() as u64;
+                // A writer-actor error here (per-kind contract violation,
+                // unique-key constraint, disk full) must NOT short-circuit
+                // `run()` via `?` — that would bypass the CommitRun/FailRun
+                // block below and leave `runs.status = 'running'` permanently.
+                // Convert to a terminal `RunOutcome::HardFailed` so FailRun
+                // marks the run. Entities are inserted before edges so the
+                // edge FK references resolve at insert time (B.3 §5).
+                let entity_count = entities.len() as u64;
+                let edge_count = edges.len() as u64;
                 let mut insert_err: Option<anyhow::Error> = None;
                 for (id_str, record) in entities {
                     let res = writer
@@ -311,19 +352,61 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
                         break;
                     }
                 }
+                if insert_err.is_none() {
+                    for pending in unresolved_call_sites {
+                        let caller_id = pending.caller_entity_id.clone();
+                        let res = writer
+                            .send_wait(|ack| WriterCmd::ReplaceUnresolvedCallSitesForCaller {
+                                caller_entity_id: pending.caller_entity_id,
+                                caller_content_hash: pending.caller_content_hash,
+                                sites: pending.sites,
+                                ack,
+                            })
+                            .await
+                            .map_err(|e| anyhow::anyhow!("{e}"))
+                            .with_context(|| {
+                                format!("ReplaceUnresolvedCallSitesForCaller for {caller_id}")
+                            });
+                        if let Err(e) = res {
+                            insert_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if insert_err.is_none() {
+                    for (descr, record) in edges {
+                        let res = writer
+                            .send_wait(|ack| WriterCmd::InsertEdge {
+                                edge: Box::new(record),
+                                ack,
+                            })
+                            .await
+                            .map_err(|e| anyhow::anyhow!("{e}"))
+                            .with_context(|| format!("InsertEdge {descr}"));
+                        if let Err(e) = res {
+                            insert_err = Some(e);
+                            break;
+                        }
+                    }
+                }
                 if let Some(e) = insert_err {
                     tracing::error!(
                         plugin_id = %plugin_id,
                         error = %e,
-                        "writer-actor rejected InsertEntity; failing run"
+                        "writer-actor rejected insert; failing run"
                     );
                     run_outcome = RunOutcome::HardFailed {
                         reason: format!("{e:#}"),
                     };
                     break 'plugins;
                 }
-                total_entity_count += count;
-                tracing::info!(plugin_id = %plugin_id, entity_count = count, "plugin complete");
+                total_entity_count += entity_count;
+                total_edge_count += edge_count;
+                tracing::info!(
+                    plugin_id = %plugin_id,
+                    entity_count, edge_count,
+                    "plugin complete",
+                );
             }
         }
     }
@@ -346,6 +429,16 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
     }
 
     let completed_at = iso8601_now();
+    // Snapshot the writer's process-lifetime dropped-edges counter so the
+    // run's durable stats record the dedupe count (B.3 §6). Read BEFORE
+    // CommitRun so the value reflects exactly this run's inserts.
+    let dropped_edges_total = writer
+        .dropped_edges_total
+        .load(std::sync::atomic::Ordering::Relaxed) as u64;
+    let ambiguous_edges_total = writer
+        .ambiguous_edges_total
+        .load(std::sync::atomic::Ordering::Relaxed) as u64;
+    let pyright_query_latency_p95_ms = pyright_latency.p95_ms();
     // Extract the failure reason (if any) before the match consumes run_outcome.
     let fail_reason: Option<String> = match &run_outcome {
         RunOutcome::SoftFailed { reason } | RunOutcome::HardFailed { reason } => {
@@ -356,7 +449,20 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
 
     match run_outcome {
         RunOutcome::Completed => {
-            let stats_json = format!(r#"{{"entities_inserted":{total_entity_count}}}"#);
+            let stats_json = serde_json::json!({
+                "entities_inserted": total_entity_count,
+                "edges_inserted": total_edge_count,
+                "dropped_edges_total": dropped_edges_total,
+                "ambiguous_edges_total": ambiguous_edges_total,
+                "unresolved_call_sites_total": unresolved_call_sites_total,
+                "reference_sites_total": reference_sites_total,
+                "references_resolved_total": references_resolved_total,
+                "references_skipped_external_total": references_skipped_external_total,
+                "references_skipped_cap_total": references_skipped_cap_total,
+                "unresolved_reference_sites_total": unresolved_reference_sites_total,
+                "pyright_query_latency_p95_ms": pyright_query_latency_p95_ms,
+            })
+            .to_string();
             writer
                 .send_wait(|ack| WriterCmd::CommitRun {
                     run_id: run_id.clone(),
@@ -376,6 +482,16 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
             // was persisted alongside the failure reason.
             let stats_json = serde_json::json!({
                 "entities_inserted": total_entity_count,
+                "edges_inserted": total_edge_count,
+                "dropped_edges_total": dropped_edges_total,
+                "ambiguous_edges_total": ambiguous_edges_total,
+                "unresolved_call_sites_total": unresolved_call_sites_total,
+                "reference_sites_total": reference_sites_total,
+                "references_resolved_total": references_resolved_total,
+                "references_skipped_external_total": references_skipped_external_total,
+                "references_skipped_cap_total": references_skipped_cap_total,
+                "unresolved_reference_sites_total": unresolved_reference_sites_total,
+                "pyright_query_latency_p95_ms": pyright_query_latency_p95_ms,
                 "failure_reason": reason,
             })
             .to_string();
@@ -418,7 +534,10 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
         bail!("analyze run {run_id} failed — {reason}");
     }
 
-    println!("analyze complete: run {run_id} completed ({total_entity_count} entities)");
+    println!(
+        "analyze complete: run {run_id} completed \
+         ({total_entity_count} entities, {total_edge_count} edges)"
+    );
     Ok(())
 }
 
@@ -477,9 +596,42 @@ fn handle_plugin_task_join_result(
 struct BatchResult {
     /// `(entity_id_string, record)` pairs for every accepted entity.
     entities: Vec<(String, EntityRecord)>,
+    /// `(descriptor, record)` pairs for every accepted edge — descriptor is
+    /// `"(kind from_id -> to_id)"` for diagnostic messages on insert failure.
+    edges: Vec<(String, EdgeRecord)>,
+    /// Per-caller unresolved site replacements derived from authoritative
+    /// plugin stats for this batch.
+    unresolved_call_sites: Vec<PendingUnresolvedCallSites>,
+    /// Per-file observability stats reported by the plugin and folded by the CLI.
+    stats: BatchStats,
     /// Findings accumulated by the host during the session.
     findings: Vec<clarion_core::HostFinding>,
 }
+
+#[derive(Debug, Default)]
+struct BatchStats {
+    unresolved_call_sites_total: u64,
+    reference_sites_total: u64,
+    references_resolved_total: u64,
+    references_skipped_external_total: u64,
+    references_skipped_cap_total: u64,
+    unresolved_reference_sites_total: u64,
+    pyright_query_latency_ms: Vec<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingUnresolvedCallSites {
+    caller_entity_id: String,
+    caller_content_hash: String,
+    sites: Vec<UnresolvedCallSiteRecord>,
+}
+
+type Collected = (
+    Vec<(String, EntityRecord)>,
+    Vec<(String, EdgeRecord)>,
+    Vec<PendingUnresolvedCallSites>,
+    BatchStats,
+);
 
 /// Spawn the plugin, handshake, run `analyze_file` for each file, collect results.
 ///
@@ -509,19 +661,66 @@ fn run_plugin_blocking(
             other => format!("plugin {plugin_id} spawn/handshake error: {other}"),
         })?;
 
-    let work_result: Result<Vec<(String, EntityRecord)>, String> = (|| {
-        let mut collected: Vec<(String, EntityRecord)> = Vec::new();
+    let work_result: Result<Collected, String> = (|| {
+        let mut collected_entities: Vec<(String, EntityRecord)> = Vec::new();
+        let mut collected_edges: Vec<(String, EdgeRecord)> = Vec::new();
+        let mut collected_unresolved_call_sites: Vec<PendingUnresolvedCallSites> = Vec::new();
+        let mut collected_stats = BatchStats::default();
         for file in files {
-            let entities: Vec<AcceptedEntity> = host
+            let AnalyzeFileOutcome {
+                entities,
+                edges,
+                stats,
+            } = host
                 .analyze_file(file)
                 .map_err(|e| classify_host_error(plugin_id, e))?;
-            for entity in entities {
+            collected_stats.unresolved_call_sites_total += stats.unresolved_call_sites_total;
+            collected_stats.reference_sites_total += stats.reference_sites_total;
+            collected_stats.references_resolved_total += stats.references_resolved_total;
+            collected_stats.references_skipped_external_total +=
+                stats.references_skipped_external_total;
+            collected_stats.references_skipped_cap_total += stats.references_skipped_cap_total;
+            collected_stats.unresolved_reference_sites_total +=
+                stats.unresolved_reference_sites_total;
+            collected_stats
+                .pyright_query_latency_ms
+                .extend(stats.pyright_query_latency_ms.iter().copied());
+            let source_file_id = entities
+                .iter()
+                .find(|entity| entity.kind == "module")
+                .map(|entity| entity.id.to_string());
+            let mut file_entities: Vec<(String, EntityRecord)> = Vec::new();
+            for entity in &entities {
                 let id_str = entity.id.to_string();
-                let record = map_entity_to_record(&entity, plugin_id);
-                collected.push((id_str, record));
+                let record = map_entity_to_record(entity, plugin_id, source_file_id.clone());
+                file_entities.push((id_str.clone(), record.clone()));
+                collected_entities.push((id_str, record));
+            }
+            let unresolved_for_file =
+                map_unresolved_call_sites_for_file(&stats, &file_entities, &iso8601_now())
+                    .map_err(|e| {
+                        format!(
+                            "plugin {plugin_id} emitted invalid unresolved call-site stats: {e:#}"
+                        )
+                    })?;
+            collected_unresolved_call_sites.extend(unresolved_for_file);
+            for edge in edges {
+                let descr = format!(
+                    "({kind} {from} -> {to})",
+                    kind = edge.kind,
+                    from = edge.from_id,
+                    to = edge.to_id,
+                );
+                let record = map_edge_to_record(edge);
+                collected_edges.push((descr, record));
             }
         }
-        Ok(collected)
+        Ok((
+            collected_entities,
+            collected_edges,
+            collected_unresolved_call_sites,
+            collected_stats,
+        ))
     })();
 
     // Try a graceful shutdown on the happy path; on error, skip straight to
@@ -548,8 +747,11 @@ fn run_plugin_blocking(
     reap_and_classify_exit(&mut child, plugin_id, &mut findings);
 
     match work_result {
-        Ok(collected) => Ok(BatchResult {
-            entities: collected,
+        Ok((entities, edges, unresolved_call_sites, stats)) => Ok(BatchResult {
+            entities,
+            edges,
+            unresolved_call_sites,
+            stats,
             findings,
         }),
         Err(reason) => Err(reason),
@@ -641,7 +843,11 @@ fn classify_host_error(plugin_id: &str, e: HostError) -> String {
 }
 
 /// Map an `AcceptedEntity` to an `EntityRecord` for the writer-actor.
-fn map_entity_to_record(entity: &AcceptedEntity, plugin_id: &str) -> EntityRecord {
+fn map_entity_to_record(
+    entity: &AcceptedEntity,
+    plugin_id: &str,
+    source_file_id: Option<String>,
+) -> EntityRecord {
     let short_name = entity
         .qualified_name
         .rsplit('.')
@@ -653,6 +859,7 @@ fn map_entity_to_record(entity: &AcceptedEntity, plugin_id: &str) -> EntityRecor
         serde_json::to_string(&entity.raw.extra).unwrap_or_else(|_| "{}".to_owned());
 
     let now = iso8601_now();
+    let source_line_range = source_line_range(entity);
 
     EntityRecord {
         id: entity.id.to_string(),
@@ -660,14 +867,15 @@ fn map_entity_to_record(entity: &AcceptedEntity, plugin_id: &str) -> EntityRecor
         kind: entity.kind.clone(),
         name: entity.qualified_name.clone(),
         short_name,
-        parent_id: None,
-        source_file_id: None,
+        parent_id: entity.raw.parent_id.clone(),
+        source_file_id,
+        source_file_path: Some(entity.source_file_path.clone()),
         source_byte_start: None,
         source_byte_end: None,
-        source_line_start: None,
-        source_line_end: None,
+        source_line_start: source_line_range.map(|range| range.start_line),
+        source_line_end: source_line_range.map(|range| range.end_line),
         properties_json,
-        content_hash: None,
+        content_hash: content_hash_for_entity(entity, source_line_range),
         summary_json: None,
         wardline_json: None,
         first_seen_commit: None,
@@ -675,6 +883,175 @@ fn map_entity_to_record(entity: &AcceptedEntity, plugin_id: &str) -> EntityRecor
         created_at: now.clone(),
         updated_at: now,
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SourceLineRange {
+    start_line: i64,
+    end_line: i64,
+}
+
+fn source_line_range(entity: &AcceptedEntity) -> Option<SourceLineRange> {
+    let source_range = entity.raw.source.extra.get("source_range")?;
+    let start_line = source_range.get("start_line")?.as_i64()?;
+    let end_line = source_range.get("end_line")?.as_i64()?;
+    if start_line <= 0 || end_line < start_line {
+        return None;
+    }
+    Some(SourceLineRange {
+        start_line,
+        end_line,
+    })
+}
+
+fn content_hash_for_entity(
+    entity: &AcceptedEntity,
+    source_line_range: Option<SourceLineRange>,
+) -> Option<String> {
+    if entity.kind == "module" {
+        let bytes = fs::read(&entity.source_file_path).ok()?;
+        return Some(blake3::hash(&bytes).to_hex().to_string());
+    }
+
+    let range = source_line_range?;
+    let source = fs::read_to_string(&entity.source_file_path).ok()?;
+    let lines: Vec<&str> = source.lines().collect();
+    let start = usize::try_from(range.start_line - 1).ok()?;
+    let mut end = usize::try_from(range.end_line).ok()?;
+    end = end.min(lines.len());
+    if start >= end {
+        return None;
+    }
+    let normalized = lines[start..end].join("\n");
+    Some(blake3::hash(normalized.as_bytes()).to_hex().to_string())
+}
+
+/// Map an `AcceptedEdge` to an `EdgeRecord` for the writer-actor (B.3).
+fn map_edge_to_record(edge: AcceptedEdge) -> EdgeRecord {
+    let properties_json = edge
+        .raw
+        .properties
+        .as_ref()
+        .and_then(|v| serde_json::to_string(v).ok());
+    EdgeRecord {
+        kind: edge.kind,
+        from_id: edge.from_id,
+        to_id: edge.to_id,
+        confidence: edge.confidence,
+        properties_json,
+        source_file_id: edge.source_file_id,
+        source_byte_start: edge.raw.source_byte_start,
+        source_byte_end: edge.raw.source_byte_end,
+    }
+}
+
+fn map_unresolved_call_sites_for_file(
+    stats: &clarion_core::AnalyzeFileStats,
+    entities: &[(String, EntityRecord)],
+    created_at: &str,
+) -> Result<Vec<PendingUnresolvedCallSites>> {
+    let entities_by_id: BTreeMap<&str, &EntityRecord> = entities
+        .iter()
+        .map(|(id, record)| (id.as_str(), record))
+        .collect();
+    let authoritative =
+        u64::try_from(stats.unresolved_call_sites.len()) == Ok(stats.unresolved_call_sites_total);
+    let mut grouped: BTreeMap<String, PendingUnresolvedCallSites> = BTreeMap::new();
+
+    if authoritative {
+        for (id, record) in entities {
+            if record.kind != "function" {
+                continue;
+            }
+            let Some(content_hash) = &record.content_hash else {
+                continue;
+            };
+            grouped.insert(
+                id.clone(),
+                PendingUnresolvedCallSites {
+                    caller_entity_id: id.clone(),
+                    caller_content_hash: content_hash.clone(),
+                    sites: Vec::new(),
+                },
+            );
+        }
+    }
+
+    for site in &stats.unresolved_call_sites {
+        validate_unresolved_call_site(site)?;
+        let caller = entities_by_id
+            .get(site.caller_entity_id.as_str())
+            .with_context(|| {
+                format!(
+                    "unresolved call site refers to caller not emitted in same file: {}",
+                    site.caller_entity_id
+                )
+            })?;
+        let content_hash = caller.content_hash.clone().with_context(|| {
+            format!(
+                "unresolved call site caller lacks content_hash: {}",
+                site.caller_entity_id
+            )
+        })?;
+        let entry = grouped
+            .entry(site.caller_entity_id.clone())
+            .or_insert_with(|| PendingUnresolvedCallSites {
+                caller_entity_id: site.caller_entity_id.clone(),
+                caller_content_hash: content_hash.clone(),
+                sites: Vec::new(),
+            });
+        entry.sites.push(UnresolvedCallSiteRecord {
+            caller_entity_id: site.caller_entity_id.clone(),
+            caller_content_hash: content_hash,
+            site_key: unresolved_call_site_key(
+                &site.caller_entity_id,
+                site.source_byte_start,
+                site.source_byte_end,
+                &site.callee_expr,
+            ),
+            site_ordinal: site.site_ordinal,
+            source_file_id: caller.source_file_id.clone(),
+            source_byte_start: site.source_byte_start,
+            source_byte_end: site.source_byte_end,
+            callee_expr: site.callee_expr.clone(),
+            created_at: created_at.to_owned(),
+        });
+    }
+
+    Ok(grouped.into_values().collect())
+}
+
+fn validate_unresolved_call_site(site: &UnresolvedCallSite) -> Result<()> {
+    if site.site_ordinal < 0 {
+        bail!("unresolved call site has negative site_ordinal");
+    }
+    if site.source_byte_start < 0 {
+        bail!("unresolved call site has negative source_byte_start");
+    }
+    if site.source_byte_end <= site.source_byte_start {
+        bail!("unresolved call site has empty or reversed source byte range");
+    }
+    if site.callee_expr.is_empty() {
+        bail!("unresolved call site has empty callee_expr");
+    }
+    if site.callee_expr.len() > 512 {
+        bail!("unresolved call site callee_expr exceeds 512 bytes");
+    }
+    Ok(())
+}
+
+fn unresolved_call_site_key(
+    caller_entity_id: &str,
+    source_byte_start: i64,
+    source_byte_end: i64,
+    callee_expr: &str,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(caller_entity_id.as_bytes());
+    hasher.update(&source_byte_start.to_be_bytes());
+    hasher.update(&source_byte_end.to_be_bytes());
+    hasher.update(callee_expr.as_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 // ── Source-tree walk ──────────────────────────────────────────────────────────
@@ -862,6 +1239,9 @@ mod tests {
     fn handle_task_passes_through_ok_ok() {
         let br = BatchResult {
             entities: Vec::new(),
+            edges: Vec::new(),
+            unresolved_call_sites: Vec::new(),
+            stats: BatchStats::default(),
             findings: Vec::new(),
         };
         let out = handle_plugin_task_join_result(Ok(Ok(br)), "python");
@@ -901,5 +1281,156 @@ mod tests {
             }
             Ok(_) => panic!("JoinError must convert to Err, not Ok"),
         }
+    }
+
+    #[test]
+    fn map_entity_persists_source_metadata_and_content_hash() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let source_path = tempdir.path().join("demo.py");
+        std::fs::write(&source_path, "def hello():\n    return 'hé'\n\n").unwrap();
+        let source_range = serde_json::json!({
+            "source_range": {
+                "start_line": 1,
+                "start_col": 0,
+                "end_line": 2,
+                "end_col": 15
+            }
+        });
+        let entity = AcceptedEntity {
+            id: "python:function:demo.hello".parse().unwrap(),
+            kind: "function".to_owned(),
+            qualified_name: "demo.hello".to_owned(),
+            source_file_path: source_path.display().to_string(),
+            raw: clarion_core::plugin::host::RawEntity {
+                id: "python:function:demo.hello".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "demo.hello".to_owned(),
+                source: clarion_core::plugin::host::RawSource {
+                    file_path: source_path.display().to_string(),
+                    extra: source_range.as_object().unwrap().clone(),
+                },
+                parent_id: Some("python:module:demo".to_owned()),
+                extra: serde_json::Map::new(),
+            },
+        };
+
+        let record = map_entity_to_record(&entity, "python", Some("python:module:demo".to_owned()));
+
+        assert_eq!(
+            record.source_file_path.as_deref(),
+            Some(source_path.to_str().unwrap())
+        );
+        assert_eq!(record.source_file_id.as_deref(), Some("python:module:demo"));
+        assert_eq!(record.source_line_start, Some(1));
+        assert_eq!(record.source_line_end, Some(2));
+        let expected_hash = blake3::hash("def hello():\n    return 'hé'".as_bytes())
+            .to_hex()
+            .to_string();
+        assert_eq!(record.content_hash.as_deref(), Some(expected_hash.as_str()));
+    }
+
+    #[test]
+    fn map_unresolved_call_sites_groups_by_current_caller_hash() {
+        let caller = EntityRecord {
+            id: "python:function:demo.caller".to_owned(),
+            plugin_id: "python".to_owned(),
+            kind: "function".to_owned(),
+            name: "demo.caller".to_owned(),
+            short_name: "caller".to_owned(),
+            parent_id: Some("python:module:demo".to_owned()),
+            source_file_id: Some("python:module:demo".to_owned()),
+            source_file_path: Some("demo.py".to_owned()),
+            source_byte_start: None,
+            source_byte_end: None,
+            source_line_start: Some(1),
+            source_line_end: Some(3),
+            properties_json: "{}".to_owned(),
+            content_hash: Some("hash-python:function:demo.caller".to_owned()),
+            summary_json: None,
+            wardline_json: None,
+            first_seen_commit: None,
+            last_seen_commit: None,
+            created_at: "2026-05-17T00:00:00.000Z".to_owned(),
+            updated_at: "2026-05-17T00:00:00.000Z".to_owned(),
+        };
+        let module = {
+            let mut record = caller.clone();
+            record.id = "python:module:demo".to_owned();
+            record.kind = "module".to_owned();
+            record.content_hash = Some("hash-python:module:demo".to_owned());
+            record
+        };
+        let entities = vec![
+            ("python:module:demo".to_owned(), module),
+            ("python:function:demo.caller".to_owned(), caller.clone()),
+        ];
+        let stats = clarion_core::AnalyzeFileStats {
+            unresolved_call_sites_total: 1,
+            unresolved_call_sites: vec![clarion_core::UnresolvedCallSite {
+                caller_entity_id: caller.id.clone(),
+                site_ordinal: 0,
+                source_byte_start: 14,
+                source_byte_end: 24,
+                callee_expr: "dynamic_target".to_owned(),
+            }],
+            ..clarion_core::AnalyzeFileStats::default()
+        };
+
+        let mapped =
+            map_unresolved_call_sites_for_file(&stats, &entities, "2026-05-17T00:00:00.000Z")
+                .unwrap();
+
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].caller_entity_id, "python:function:demo.caller");
+        assert_eq!(
+            mapped[0].caller_content_hash,
+            "hash-python:function:demo.caller"
+        );
+        assert_eq!(mapped[0].sites.len(), 1);
+        assert_eq!(
+            mapped[0].sites[0].source_file_id.as_deref(),
+            Some("python:module:demo")
+        );
+        assert_eq!(mapped[0].sites[0].callee_expr, "dynamic_target");
+        assert_eq!(
+            mapped[0].sites[0].site_key,
+            unresolved_call_site_key("python:function:demo.caller", 14, 24, "dynamic_target")
+        );
+    }
+
+    #[test]
+    fn map_unresolved_call_sites_clears_hash_present_callers_when_authoritative_empty() {
+        let caller = EntityRecord {
+            id: "python:function:demo.caller".to_owned(),
+            plugin_id: "python".to_owned(),
+            kind: "function".to_owned(),
+            name: "demo.caller".to_owned(),
+            short_name: "caller".to_owned(),
+            parent_id: Some("python:module:demo".to_owned()),
+            source_file_id: Some("python:module:demo".to_owned()),
+            source_file_path: Some("demo.py".to_owned()),
+            source_byte_start: None,
+            source_byte_end: None,
+            source_line_start: Some(1),
+            source_line_end: Some(3),
+            properties_json: "{}".to_owned(),
+            content_hash: Some("hash-python:function:demo.caller".to_owned()),
+            summary_json: None,
+            wardline_json: None,
+            first_seen_commit: None,
+            last_seen_commit: None,
+            created_at: "2026-05-17T00:00:00.000Z".to_owned(),
+            updated_at: "2026-05-17T00:00:00.000Z".to_owned(),
+        };
+        let entities = vec![("python:function:demo.caller".to_owned(), caller)];
+        let stats = clarion_core::AnalyzeFileStats::default();
+
+        let mapped =
+            map_unresolved_call_sites_for_file(&stats, &entities, "2026-05-17T00:00:00.000Z")
+                .unwrap();
+
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].caller_entity_id, "python:function:demo.caller");
+        assert!(mapped[0].sites.is_empty());
     }
 }
