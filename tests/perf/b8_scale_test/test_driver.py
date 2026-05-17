@@ -182,3 +182,13 @@ def test_manifest_is_deterministic_and_marks_cache_state() -> None:
     assert len(warm_summary) == 3
     assert {request.arguments["id"] for request in warm_summary} == {"summary"}
     assert {request.cache_state for request in warm_summary} == {"warm"}
+
+    heavy_summary = [
+        request
+        for request in requests
+        if request.pattern == "heavy" and request.tool == "summary"
+    ]
+    assert heavy_summary
+    assert {request.phase for request in heavy_summary} == {"steady_state"}
+    assert {request.cache_state for request in heavy_summary} == {"warm"}
+    assert heavy_summary[0].label.startswith("H")

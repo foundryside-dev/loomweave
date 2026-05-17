@@ -583,10 +583,19 @@ def light_pattern(targets: QueryTargets) -> list[ToolRequest]:
     ]
 
 
-def _medium_like(pattern: str, targets: QueryTargets, count: int) -> list[ToolRequest]:
+def _medium_like(
+    pattern: str,
+    targets: QueryTargets,
+    count: int,
+    *,
+    phase: str | None = None,
+    summary_cache_state: str | None = None,
+    label_prefix: str | None = None,
+) -> list[ToolRequest]:
     warm = pattern == "medium-warm"
-    phase = "steady_state" if warm else "warmup"
-    cache_state = "warm" if warm else "cold"
+    phase = phase or ("steady_state" if warm else "warmup")
+    cache_state = summary_cache_state or ("warm" if warm else "cold")
+    label_prefix = label_prefix or ("MW" if warm else "MC")
     manifest = [
         (
             "entity_at",
@@ -646,7 +655,7 @@ def _medium_like(pattern: str, targets: QueryTargets, count: int) -> list[ToolRe
         requests.append(
             _request(
                 pattern,
-                f"{'MW' if warm else 'MC'}{i + 1:02d}-{tool.replace('_', '-')}",
+                f"{label_prefix}{i + 1:02d}-{tool.replace('_', '-')}",
                 tool,
                 phase,
                 request_cache_state,
@@ -678,7 +687,16 @@ def build_requests(
     requests.extend(light_pattern(targets))
     requests.extend(_medium_like("medium-cold", targets, 20))
     requests.extend(_medium_like("medium-warm", targets, 20))
-    requests.extend(_medium_like("heavy", targets, max(50, heavy_count)))
+    requests.extend(
+        _medium_like(
+            "heavy",
+            targets,
+            max(50, heavy_count),
+            phase="steady_state",
+            summary_cache_state="warm",
+            label_prefix="H",
+        )
+    )
     if include_inferred and targets.inferred_targets:
         requests.extend(inferred_pattern(targets))
     else:
