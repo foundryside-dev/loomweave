@@ -187,6 +187,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "clarion-core",
+ "clarion-mcp",
  "clarion-plugin-fixture",
  "clarion-storage",
  "rusqlite",
