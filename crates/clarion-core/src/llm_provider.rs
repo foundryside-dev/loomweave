@@ -1,11 +1,15 @@
 //! LLM provider surface for WP6 and MCP on-demand tools.
 
 use std::sync::Mutex;
+use std::time::Duration;
 
+use serde::Deserialize;
 use thiserror::Error;
 
 pub const LEAF_SUMMARY_PROMPT_TEMPLATE_ID: &str = "leaf-v1";
 pub const INFERRED_CALLS_PROMPT_VERSION: &str = "inferred-calls-v1";
+const ANTHROPIC_MESSAGES_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LlmPurpose {
@@ -47,8 +51,14 @@ pub enum LlmProviderError {
     #[error("live Anthropic provider requires an API key")]
     MissingApiKey,
 
-    #[error("live Anthropic invocation is not available in this build")]
-    LiveInvocationUnavailable,
+    #[error("live Anthropic HTTP request failed: {0}")]
+    Http(String),
+
+    #[error("live Anthropic returned HTTP {status}: {body}")]
+    HttpStatus { status: u16, body: String },
+
+    #[error("invalid live Anthropic response: {0}")]
+    InvalidResponse(String),
 }
 
 pub trait LlmProvider: Send + Sync {
@@ -128,27 +138,40 @@ pub struct AnthropicProviderConfig {
     pub inferred_edges_model_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct AnthropicProvider {
     summary_model_id: String,
     inferred_edges_model_id: String,
+    api_key: String,
+    endpoint: String,
+    client: reqwest::blocking::Client,
 }
 
 impl AnthropicProvider {
     pub fn from_config(config: AnthropicProviderConfig) -> Result<Self, LlmProviderError> {
+        Self::from_config_with_endpoint(config, ANTHROPIC_MESSAGES_ENDPOINT.to_owned())
+    }
+
+    pub fn from_config_with_endpoint(
+        config: AnthropicProviderConfig,
+        endpoint: String,
+    ) -> Result<Self, LlmProviderError> {
         if !config.allow_live_provider {
             return Err(LlmProviderError::LiveProviderNotAllowed);
         }
-        if config
-            .api_key
-            .as_deref()
-            .is_none_or(|key| key.trim().is_empty())
-        {
+        let Some(api_key) = config.api_key.filter(|key| !key.trim().is_empty()) else {
             return Err(LlmProviderError::MissingApiKey);
-        }
+        };
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .map_err(|err| LlmProviderError::Http(err.to_string()))?;
         Ok(Self {
             summary_model_id: config.summary_model_id,
             inferred_edges_model_id: config.inferred_edges_model_id,
+            api_key,
+            endpoint,
+            client,
         })
     }
 }
@@ -158,12 +181,60 @@ impl LlmProvider for AnthropicProvider {
         "anthropic"
     }
 
-    fn invoke(&self, _request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
-        Err(LlmProviderError::LiveInvocationUnavailable)
+    fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
+        let payload = serde_json::json!({
+            "model": request.model_id,
+            "max_tokens": request.max_output_tokens,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": request.prompt
+                }
+            ]
+        });
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .header("x-api-key", self.api_key.as_str())
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .json(&payload)
+            .send()
+            .map_err(|err| LlmProviderError::Http(err.to_string()))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .map_err(|err| LlmProviderError::Http(err.to_string()))?;
+        if !status.is_success() {
+            return Err(LlmProviderError::HttpStatus {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let message: AnthropicMessageResponse = serde_json::from_str(&body)
+            .map_err(|err| LlmProviderError::InvalidResponse(err.to_string()))?;
+        let output_json = message.output_text()?;
+        let cost_usd = cost_for_usage(
+            &message.model,
+            message.usage.input_tokens,
+            message.usage.output_tokens,
+        );
+        Ok(LlmResponse {
+            model_id: message.model,
+            output_json,
+            input_tokens: message.usage.input_tokens,
+            output_tokens: message.usage.output_tokens,
+            cost_usd,
+        })
     }
 
-    fn estimate_cost_usd(&self, _request: &LlmRequest) -> f64 {
-        0.0
+    fn estimate_cost_usd(&self, request: &LlmRequest) -> f64 {
+        let estimated_input_tokens = estimate_tokens(&request.prompt);
+        cost_for_usage(
+            &request.model_id,
+            estimated_input_tokens,
+            request.max_output_tokens,
+        )
     }
 
     fn tier_to_model(&self, tier: &str) -> Option<&str> {
@@ -176,6 +247,71 @@ impl LlmProvider for AnthropicProvider {
 
     fn caching_model(&self) -> CachingModel {
         CachingModel::AnthropicPromptCache
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicMessageResponse {
+    model: String,
+    content: Vec<AnthropicContentBlock>,
+    usage: AnthropicUsage,
+}
+
+impl AnthropicMessageResponse {
+    fn output_text(&self) -> Result<String, LlmProviderError> {
+        let text = self
+            .content
+            .iter()
+            .filter(|block| block.kind == "text")
+            .filter_map(|block| block.text.as_deref())
+            .collect::<Vec<_>>()
+            .join("");
+        if text.trim().is_empty() {
+            return Err(LlmProviderError::InvalidResponse(
+                "response contained no text blocks".to_owned(),
+            ));
+        }
+        Ok(text)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicContentBlock {
+    #[serde(rename = "type")]
+    kind: String,
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicUsage {
+    input_tokens: u32,
+    output_tokens: u32,
+}
+
+fn estimate_tokens(text: &str) -> u32 {
+    u32::try_from(text.chars().count().div_ceil(4))
+        .unwrap_or(u32::MAX)
+        .max(1)
+}
+
+fn cost_for_usage(model_id: &str, input_tokens: u32, output_tokens: u32) -> f64 {
+    let (input_per_mtok, output_per_mtok) = model_pricing_usd_per_mtok(model_id);
+    (f64::from(input_tokens) * input_per_mtok + f64::from(output_tokens) * output_per_mtok)
+        / 1_000_000.0
+}
+
+fn model_pricing_usd_per_mtok(model_id: &str) -> (f64, f64) {
+    let model = model_id.to_ascii_lowercase();
+    if model.contains("haiku") {
+        (1.0, 5.0)
+    } else if model.contains("sonnet") {
+        (3.0, 15.0)
+    } else if model.contains("opus-4-1") || model.contains("opus-4-202") {
+        (15.0, 75.0)
+    } else if model.contains("opus") {
+        (5.0, 25.0)
+    } else {
+        (3.0, 15.0)
     }
 }
 
@@ -332,6 +468,72 @@ mod tests {
             Some("claude-haiku-4-5")
         );
         assert_eq!(provider.caching_model(), CachingModel::AnthropicPromptCache);
+    }
+
+    #[test]
+    fn anthropic_provider_invokes_messages_api_and_prices_usage() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = [0_u8; 8192];
+            let read = stream.read(&mut request).expect("read request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.contains("POST /v1/messages HTTP/1.1"));
+            assert!(request.contains("x-api-key: secret"));
+            assert!(request.contains("anthropic-version: 2023-06-01"));
+            assert!(request.contains(r#""model":"claude-haiku-4-5""#));
+            assert!(request.contains(r#""max_tokens":512"#));
+            assert!(request.contains("Summarize this function"));
+
+            let body = r#"{
+                "id": "msg_01",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-haiku-4-5",
+                "content": [
+                    {"type": "text", "text": "{\"purpose\":\"demo\"}"}
+                ],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1000, "output_tokens": 200}
+            }"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write response");
+        });
+        let provider = AnthropicProvider::from_config_with_endpoint(
+            AnthropicProviderConfig {
+                api_key: Some("secret".to_owned()),
+                allow_live_provider: true,
+                summary_model_id: "claude-haiku-4-5".to_owned(),
+                inferred_edges_model_id: "claude-haiku-4-5".to_owned(),
+            },
+            format!("http://{addr}/v1/messages"),
+        )
+        .expect("test provider");
+
+        let response = provider
+            .invoke(LlmRequest {
+                purpose: LlmPurpose::Summary,
+                model_id: "claude-haiku-4-5".to_owned(),
+                prompt_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+                prompt: "Summarize this function".to_owned(),
+                max_output_tokens: 512,
+            })
+            .expect("invoke mocked Anthropic");
+
+        assert_eq!(response.output_json, r#"{"purpose":"demo"}"#);
+        assert_eq!(response.input_tokens, 1000);
+        assert_eq!(response.output_tokens, 200);
+        assert!((response.cost_usd - 0.002).abs() < f64::EPSILON);
+        handle.join().expect("server thread");
     }
 
     #[test]

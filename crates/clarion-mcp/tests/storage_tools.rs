@@ -251,7 +251,7 @@ fn state_for_filigree(
 }
 
 fn expected_summary_request(project_root: &std::path::Path, entity_id: &str) -> LlmRequest {
-    let source_excerpt = std::fs::read_to_string(project_root.join("demo.py")).unwrap();
+    let source_excerpt = expected_source_excerpt(project_root, entity_id);
     let prompt = build_leaf_summary_prompt(&LeafSummaryPromptInput {
         entity_id: entity_id.to_owned(),
         kind: "function".to_owned(),
@@ -287,7 +287,7 @@ fn expected_inferred_request(
     callee_expr: &str,
     target_id: &str,
 ) -> LlmRequest {
-    let source_excerpt = std::fs::read_to_string(project_root.join("demo.py")).unwrap();
+    let source_excerpt = expected_source_excerpt(project_root, caller_id);
     let unresolved_call_sites_json = serde_json::to_string(&vec![json!({
         "caller_entity_id": caller_id,
         "caller_content_hash": format!("hash-{caller_id}"),
@@ -323,6 +323,31 @@ fn expected_inferred_request(
         prompt_id: INFERRED_CALLS_PROMPT_VERSION.to_owned(),
         prompt: prompt.body,
         max_output_tokens: 512,
+    }
+}
+
+fn expected_source_excerpt(project_root: &std::path::Path, entity_id: &str) -> String {
+    let source = std::fs::read_to_string(project_root.join("demo.py")).unwrap();
+    let Some((start_line, end_line)) = expected_line_range(entity_id) else {
+        return source;
+    };
+    let start = usize::try_from(start_line - 1).unwrap();
+    let end = usize::try_from(end_line).unwrap();
+    let lines = source.split_inclusive('\n').collect::<Vec<_>>();
+    if start >= lines.len() {
+        return source;
+    }
+    lines[start..end.min(lines.len())].concat()
+}
+
+fn expected_line_range(entity_id: &str) -> Option<(i64, i64)> {
+    match entity_id {
+        "python:module:demo" => Some((1, 8)),
+        "python:function:demo.entry" => Some((1, 2)),
+        "python:function:demo.mid" => Some((4, 5)),
+        "python:function:demo.target" | "python:function:demo.alt_target" => Some((7, 8)),
+        "python:function:demo.dynamic" => Some((9, 10)),
+        _ => None,
     }
 }
 
@@ -784,6 +809,45 @@ async fn summary_cold_miss_records_provider_response_then_hits_cache() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_prompt_uses_entity_source_range_not_whole_file() {
+    let (project, db_path) = open_project();
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnySummaryProvider::new_slow(0, 0.0, 0.001));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    let invocation = provider
+        .invocations()
+        .into_iter()
+        .next()
+        .expect("summary provider invocation");
+    assert!(invocation.prompt.contains("def entry():"));
+    assert!(invocation.prompt.contains("return mid()"));
+    assert!(
+        !invocation.prompt.contains("def mid():"),
+        "summary prompt leaked neighboring function source: {}",
+        invocation.prompt
+    );
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn summary_cache_hit_reports_stale_semantic_when_graph_counts_drift() {
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).unwrap();
@@ -1185,6 +1249,64 @@ async fn callers_of_inferred_dispatches_and_materializes_recording_result() {
     .await;
     assert_eq!(warm["ok"], true);
     assert_eq!(provider.invocations().len(), 1);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inferred_dispatch_prompt_uses_caller_source_range_not_whole_file() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    let source_path = project.path().join("demo.py");
+    insert_entity(
+        &conn,
+        "python:function:demo.dynamic",
+        "function",
+        &source_path,
+        Some((1, 2)),
+        Some("python:module:demo"),
+    );
+    insert_unresolved_call_site(
+        &conn,
+        "python:function:demo.dynamic",
+        "site-dynamic",
+        "target",
+    );
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnyInferredProvider::new(
+        r#"{"edges":[{"site_key":"site-dynamic","target_id":"python:function:demo.target","confidence":0.91,"rationale":"name match"}]}"#,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.target", "confidence": "inferred"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    let invocation = provider
+        .invocations()
+        .into_iter()
+        .next()
+        .expect("inferred provider invocation");
+    assert!(invocation.prompt.contains("def entry():"));
+    assert!(
+        !invocation.prompt.contains("def mid():"),
+        "inferred prompt leaked neighboring function source: {}",
+        invocation.prompt
+    );
 
     drop(state);
     drop(writer);

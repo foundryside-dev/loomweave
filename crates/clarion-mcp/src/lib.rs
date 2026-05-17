@@ -2008,13 +2008,40 @@ fn source_excerpt(entity: &EntityRow) -> String {
         .as_deref()
         .and_then(|path| std::fs::read_to_string(path).ok())
         .map(|source| {
-            if source.len() > 8_000 {
-                source.chars().take(8_000).collect()
-            } else {
-                source
-            }
+            let excerpt =
+                line_range_excerpt(&source, entity.source_line_start, entity.source_line_end)
+                    .unwrap_or(source);
+            truncate_excerpt(excerpt)
         })
         .unwrap_or_default()
+}
+
+fn line_range_excerpt(
+    source: &str,
+    start_line: Option<i64>,
+    end_line: Option<i64>,
+) -> Option<String> {
+    let start_line = start_line?;
+    let end_line = end_line?;
+    if start_line <= 0 || end_line < start_line {
+        return None;
+    }
+    let start = usize::try_from(start_line - 1).ok()?;
+    let end = usize::try_from(end_line).ok()?;
+    let lines = source.split_inclusive('\n').collect::<Vec<_>>();
+    let end = end.min(lines.len());
+    if start >= end {
+        return None;
+    }
+    Some(lines[start..end].concat())
+}
+
+fn truncate_excerpt(source: String) -> String {
+    if source.len() > 8_000 {
+        source.chars().take(8_000).collect()
+    } else {
+        source
+    }
 }
 
 fn unresolved_sites_json(sites: &[UnresolvedCallSiteRow]) -> String {
