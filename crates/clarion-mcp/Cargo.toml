@@ -16,7 +16,7 @@ reqwest.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yml.workspace = true
+serde_norway.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 

@@ -24,7 +24,7 @@ impl McpConfig {
         if raw.trim().is_empty() {
             return Ok(Self::default());
         }
-        serde_yml::from_str(raw).map_err(|err| ConfigError::Yaml(err.to_string()))
+        serde_norway::from_str(raw).map_err(|err| ConfigError::Yaml(err.to_string()))
     }
 }
 
