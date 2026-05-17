@@ -57,7 +57,7 @@ from __future__ import annotations
 
 import ast
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Literal, NotRequired, TypedDict, cast
 
@@ -65,13 +65,22 @@ from clarion_plugin_python.call_resolver import (
     CallResolutionResult,
     CallResolver,
     CallsEdgeProperties,
+    Finding,
     NoOpCallResolver,
 )
 from clarion_plugin_python.entity_id import entity_id
 from clarion_plugin_python.qualname import reconstruct_qualname
+from clarion_plugin_python.reference_resolver import (
+    NoOpReferenceResolver,
+    ReferenceResolutionResult,
+    ReferenceResolver,
+    ReferencesEdgeProperties,
+    ReferenceSite,
+)
 
 _PLUGIN_ID = "python"
 _NOOP_CALL_RESOLVER = NoOpCallResolver()
+_NOOP_REFERENCE_RESOLVER = NoOpReferenceResolver()
 
 
 class SourceRange(TypedDict):
@@ -121,14 +130,46 @@ class RawEdge(TypedDict):
     source_byte_start: NotRequired[int]
     source_byte_end: NotRequired[int]
     confidence: NotRequired[Literal["resolved", "ambiguous", "inferred"]]
-    properties: NotRequired[CallsEdgeProperties]
+    properties: NotRequired[CallsEdgeProperties | ReferencesEdgeProperties]
+
+
+@dataclass
+class ExtractionStats:
+    unresolved_call_sites_total: int = 0
+    reference_sites_total: int = 0
+    references_resolved_total: int = 0
+    references_skipped_external_total: int = 0
+    references_skipped_cap_total: int = 0
+    unresolved_reference_sites_total: int = 0
+    pyright_query_latency_ms: list[int] = field(default_factory=list)
+    findings: list[Finding] = field(default_factory=list)
+
+    @classmethod
+    def from_resolution_results(
+        cls,
+        calls: CallResolutionResult,
+        references: ReferenceResolutionResult,
+    ) -> ExtractionStats:
+        return cls(
+            unresolved_call_sites_total=calls.unresolved_call_sites_total,
+            reference_sites_total=references.reference_sites_total,
+            references_resolved_total=references.references_resolved_total,
+            references_skipped_external_total=references.references_skipped_external_total,
+            references_skipped_cap_total=references.references_skipped_cap_total,
+            unresolved_reference_sites_total=references.unresolved_reference_sites_total,
+            pyright_query_latency_ms=[
+                *calls.pyright_query_latency_ms,
+                *references.pyright_query_latency_ms,
+            ],
+            findings=[*calls.findings, *references.findings],
+        )
 
 
 @dataclass
 class ExtractResult:
     entities: list[RawEntity]
     edges: list[RawEdge]
-    stats: CallResolutionResult
+    stats: ExtractionStats
 
 
 def _module_source_range(source: str) -> SourceRange:
@@ -201,12 +242,14 @@ def extract(
     *,
     module_prefix_path: str | None = None,
     call_resolver: CallResolver = _NOOP_CALL_RESOLVER,
+    reference_resolver: ReferenceResolver = _NOOP_REFERENCE_RESOLVER,
 ) -> tuple[list[RawEntity], list[RawEdge]]:
     result = extract_with_stats(
         source,
         file_path,
         module_prefix_path=module_prefix_path,
         call_resolver=call_resolver,
+        reference_resolver=reference_resolver,
     )
     return result.entities, result.edges
 
@@ -217,6 +260,7 @@ def extract_with_stats(
     *,
     module_prefix_path: str | None = None,
     call_resolver: CallResolver = _NOOP_CALL_RESOLVER,
+    reference_resolver: ReferenceResolver = _NOOP_REFERENCE_RESOLVER,
 ) -> ExtractResult:
     """Return extracted entities/edges plus resolver observability stats.
 
@@ -244,7 +288,7 @@ def extract_with_stats(
             f"clarion-plugin-python: skipping {file_path}: "
             f"top-level __init__.py has no package name\n",
         )
-        return ExtractResult([], [], CallResolutionResult())
+        return ExtractResult([], [], ExtractionStats())
 
     try:
         tree = ast.parse(source)
@@ -256,7 +300,7 @@ def extract_with_stats(
         return ExtractResult(
             [_build_module_entity(source, dotted_module, file_path, "syntax_error")],
             [],
-            CallResolutionResult(),
+            ExtractionStats(),
         )
 
     module_entity = _build_module_entity(source, dotted_module, file_path, "ok")
@@ -273,9 +317,215 @@ def extract_with_stats(
         edges,
         function_ids,
     )
-    stats = call_resolver.resolve_calls(file_path, function_ids)
-    edges.extend(cast("list[RawEdge]", stats.edges))
-    return ExtractResult(entities, edges, stats)
+    reference_sites = _collect_reference_sites(source, tree, dotted_module, module_entity["id"])
+    call_stats = call_resolver.resolve_calls(file_path, function_ids)
+    reference_stats = reference_resolver.resolve_references(file_path, reference_sites)
+    edges.extend(cast("list[RawEdge]", call_stats.edges))
+    edges.extend(cast("list[RawEdge]", reference_stats.edges))
+    return ExtractResult(
+        entities,
+        edges,
+        ExtractionStats.from_resolution_results(call_stats, reference_stats),
+    )
+
+
+def _collect_reference_sites(
+    source: str,
+    tree: ast.Module,
+    dotted_module: str,
+    module_entity_id: str,
+) -> list[ReferenceSite]:
+    collector = _ReferenceSiteCollector(source, tree, dotted_module, module_entity_id)
+    collector.visit(tree)
+    return collector.sites
+
+
+class _ReferenceSiteCollector(ast.NodeVisitor):
+    def __init__(
+        self,
+        source: str,
+        tree: ast.Module,
+        dotted_module: str,
+        module_entity_id: str,
+    ) -> None:
+        self.source = source
+        self.source_lines = source.splitlines(keepends=True)
+        self.line_starts = _line_starts(source)
+        self.dotted_module = dotted_module
+        self.parents: list[ast.AST] = [tree]
+        self.owner_stack = [module_entity_id]
+        self.bound_stack = [_scope_local_names(tree)]
+        self.annotation_depth = 0
+        self.sites: list[ReferenceSite] = []
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_function(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_function(node)
+
+    def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        function_id = self._entity_id_for_scope("function", node)
+        self.owner_stack.append(function_id)
+        self.bound_stack.append(_scope_local_names(node))
+        self._visit_function_signature(node)
+        self.parents.append(node)
+        for statement in node.body:
+            self.visit(statement)
+        self.parents.pop()
+        self.bound_stack.pop()
+        self.owner_stack.pop()
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        class_id = self._entity_id_for_scope("class", node)
+        self.owner_stack.append(class_id)
+        self.bound_stack.append(_scope_local_names(node))
+        self.parents.append(node)
+        for statement in node.body:
+            self.visit(statement)
+        self.parents.pop()
+        self.bound_stack.pop()
+        self.owner_stack.pop()
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        # Lambdas are not entities in v0.1; keep the surrounding owner and
+        # suppress lambda-local argument names.
+        self.bound_stack.append(_lambda_bound_names(node))
+        self.visit(node.body)
+        self.bound_stack.pop()
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self._visit_annotation(node.annotation)
+        if node.value is not None:
+            self.visit(node.value)
+
+    def visit_arg(self, node: ast.arg) -> None:
+        if node.annotation is not None:
+            self._visit_annotation(node.annotation)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        # `calls` owns the callee expression; references inside it are suppressed.
+        for arg in node.args:
+            self.visit(arg)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Load) and node.id not in self.bound_stack[-1]:
+            self.sites.append(self._site_for_name(node))
+
+    def _visit_function_signature(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        for arg in [
+            *node.args.posonlyargs,
+            *node.args.args,
+            *node.args.kwonlyargs,
+        ]:
+            self.visit(arg)
+        if node.args.vararg is not None:
+            self.visit(node.args.vararg)
+        if node.args.kwarg is not None:
+            self.visit(node.args.kwarg)
+        if node.returns is not None:
+            self._visit_annotation(node.returns)
+        for default in [*node.args.defaults, *(d for d in node.args.kw_defaults if d is not None)]:
+            self.visit(default)
+
+    def _visit_annotation(self, node: ast.expr) -> None:
+        self.annotation_depth += 1
+        self.visit(node)
+        self.annotation_depth -= 1
+
+    def _entity_id_for_scope(
+        self,
+        kind: Literal["class", "function"],
+        node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> str:
+        python_qualname = reconstruct_qualname(node, self.parents)
+        qualified_name = (
+            f"{self.dotted_module}.{python_qualname}" if self.dotted_module else python_qualname
+        )
+        return entity_id(_PLUGIN_ID, kind, qualified_name)
+
+    def _site_for_name(self, node: ast.Name) -> ReferenceSite:
+        line = node.lineno - 1
+        end_line = (node.end_lineno or node.lineno) - 1
+        end_col = node.end_col_offset or node.col_offset + len(node.id.encode("utf-8"))
+        source_byte_start = self.line_starts[line] + node.col_offset
+        source_byte_end = self.line_starts[end_line] + end_col
+        return ReferenceSite(
+            from_id=self.owner_stack[-1],
+            line=line,
+            character=_byte_col_to_lsp_character(self.source_lines[line], node.col_offset),
+            end_line=end_line,
+            end_character=_byte_col_to_lsp_character(self.source_lines[end_line], end_col),
+            source_byte_start=source_byte_start,
+            source_byte_end=source_byte_end,
+            kind="annotation" if self.annotation_depth else "name",
+        )
+
+
+def _line_starts(source: str) -> tuple[int, ...]:
+    starts = [0]
+    total = 0
+    for line in source.splitlines(keepends=True):
+        total += len(line.encode("utf-8"))
+        starts.append(total)
+    return tuple(starts)
+
+
+def _byte_col_to_lsp_character(line: str, byte_col: int) -> int:
+    prefix = line.encode("utf-8")[:byte_col].decode("utf-8")
+    return len(prefix.encode("utf-16-le")) // 2
+
+
+def _scope_local_names(
+    scope: ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
+) -> set[str]:
+    collector = _LocalNameCollector()
+    if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        collector.names.update(_function_arg_names(scope))
+    for statement in scope.body:
+        collector.visit(statement)
+    return collector.names
+
+
+def _lambda_bound_names(node: ast.Lambda) -> set[str]:
+    return set(_arguments_arg_names(node.args))
+
+
+def _function_arg_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    return set(_arguments_arg_names(node.args))
+
+
+def _arguments_arg_names(args: ast.arguments) -> list[str]:
+    names = [
+        *(arg.arg for arg in args.posonlyargs),
+        *(arg.arg for arg in args.args),
+        *(arg.arg for arg in args.kwonlyargs),
+    ]
+    if args.vararg is not None:
+        names.append(args.vararg.arg)
+    if args.kwarg is not None:
+        names.append(args.kwarg.arg)
+    return names
+
+
+class _LocalNameCollector(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        _ = node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        _ = node
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        _ = node
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.names.add(node.id)
 
 
 def _walk(  # noqa: PLR0913 - recursive walker needs both accumulators + parent context (B.3)

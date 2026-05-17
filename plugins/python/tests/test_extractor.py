@@ -20,6 +20,7 @@ from clarion_plugin_python.extractor import (
     module_dotted_name,
 )
 from clarion_plugin_python.pyright_session import PyrightSession
+from clarion_plugin_python.reference_resolver import ReferenceResolutionResult, ReferenceSite
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -50,6 +51,21 @@ class FakeCallResolver:
             unresolved_call_sites_total=2,
             pyright_query_latency_ms=[17],
         )
+
+
+class RecordingReferenceResolver:
+    def __init__(self) -> None:
+        self.file_path: str | Path | None = None
+        self.sites: list[ReferenceSite] = []
+
+    def resolve_references(
+        self,
+        file_path: str | Path,
+        sites: Sequence[ReferenceSite],
+    ) -> ReferenceResolutionResult:
+        self.file_path = file_path
+        self.sites = list(sites)
+        return ReferenceResolutionResult(reference_sites_total=len(self.sites))
 
 
 @pytest.fixture(scope="session")
@@ -86,6 +102,123 @@ def _extract_with_pyright(
 
 def _call_edges(edges: Sequence[RawEdge]) -> list[RawEdge]:
     return [edge for edge in edges if edge["kind"] == "calls"]
+
+
+def _reference_sites_for(source: str) -> list[ReferenceSite]:
+    resolver = RecordingReferenceResolver()
+    extract_with_stats(source, "demo.py", reference_resolver=resolver)
+    assert resolver.file_path == "demo.py"
+    return resolver.sites
+
+
+def test_reference_site_module_level_name_read_owned_by_module() -> None:
+    source = "def world():\n    pass\n\nCONST_REF = world\n"
+
+    sites = _reference_sites_for(source)
+
+    assert sites == [
+        ReferenceSite(
+            from_id="python:module:demo",
+            line=3,
+            character=12,
+            end_line=3,
+            end_character=17,
+            source_byte_start=source.encode().find(b"world", source.encode().find(b"CONST_REF")),
+            source_byte_end=source.encode().find(b"world", source.encode().find(b"CONST_REF"))
+            + len(b"world"),
+            kind="name",
+        ),
+    ]
+
+
+def test_reference_site_function_annotations_owned_by_function() -> None:
+    sites = _reference_sites_for(
+        "class Foo:\n    pass\n\ndef annotated(x: Foo) -> Foo:\n    return x\n",
+    )
+
+    assert [(site.from_id, site.kind) for site in sites] == [
+        ("python:function:demo.annotated", "annotation"),
+        ("python:function:demo.annotated", "annotation"),
+    ]
+
+
+def test_reference_site_class_body_annotation_owned_by_class() -> None:
+    sites = _reference_sites_for(
+        "class Foo:\n    pass\n\nclass Box:\n    item: Foo\n",
+    )
+
+    assert [(site.from_id, site.kind) for site in sites] == [
+        ("python:class:demo.Box", "annotation"),
+    ]
+
+
+def test_reference_site_nested_subscripted_annotation_records_inner_token() -> None:
+    source = (
+        "class Foo:\n"
+        "    pass\n\n"
+        "def annotated(items: list[Foo]) -> dict[str, Foo]:\n"
+        "    return {}\n"
+    )
+    sites = _reference_sites_for(
+        source,
+    )
+    foo_start_positions = [
+        source.encode().find(b"Foo", source.encode().find(b"list")),
+        source.encode().rfind(b"Foo"),
+    ]
+    foo_sites = [site for site in sites if site.source_byte_start in foo_start_positions]
+
+    assert [(site.from_id, site.kind) for site in foo_sites] == [
+        ("python:function:demo.annotated", "annotation"),
+        ("python:function:demo.annotated", "annotation"),
+    ]
+    assert all(site.source_byte_start < site.source_byte_end for site in foo_sites)
+
+
+def test_reference_site_call_callee_ranges_are_suppressed() -> None:
+    sites = _reference_sites_for(
+        "def world():\n    pass\n\ndef caller():\n    return world()\n\nCONST_REF = world\n",
+    )
+
+    assert [(site.from_id, site.kind) for site in sites] == [
+        ("python:module:demo", "name"),
+    ]
+
+
+def test_reference_site_subclass_and_decorator_expressions_are_excluded() -> None:
+    sites = _reference_sites_for(
+        "class Foo:\n"
+        "    pass\n\n"
+        "def deco(fn):\n"
+        "    return fn\n\n"
+        "@deco\n"
+        "def target():\n"
+        "    pass\n\n"
+        "class Child(Foo):\n"
+        "    pass\n",
+    )
+
+    assert sites == []
+
+
+def test_reference_site_byte_offsets_handle_non_ascii_prefix() -> None:
+    source = "éé = 1\nclass Foo:\n    pass\nCONST_REF = Foo\n"
+
+    sites = _reference_sites_for(source)
+
+    expected_start = source.encode().rfind(b"Foo")
+    assert sites == [
+        ReferenceSite(
+            from_id="python:module:demo",
+            line=3,
+            character=12,
+            end_line=3,
+            end_character=15,
+            source_byte_start=expected_start,
+            source_byte_end=expected_start + len(b"Foo"),
+            kind="name",
+        ),
+    ]
 
 
 def test_empty_file_yields_one_module_entity() -> None:
