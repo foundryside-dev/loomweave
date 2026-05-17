@@ -491,6 +491,16 @@ pub fn serve_stdio_with_state(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    serve_stdio_with_state_on_runtime(&runtime, state, reader, writer)
+}
+
+pub fn serve_stdio_with_state_on_runtime(
+    runtime: &tokio::runtime::Runtime,
+    state: &ServerState,
+    reader: &mut impl std::io::BufRead,
+    writer: &mut impl std::io::Write,
+) -> Result<(), McpError> {
+    let _guard = runtime.enter();
     loop {
         let frame = match clarion_core::plugin::read_frame(reader, ContentLengthCeiling::DEFAULT) {
             Ok(frame) => frame,

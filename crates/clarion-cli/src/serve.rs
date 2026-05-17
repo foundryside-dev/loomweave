@@ -14,8 +14,6 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
         path.display()
     );
 
-    let readers = ReaderPool::open(&db_path, 16)
-        .map_err(|err| anyhow!("open reader pool for {}: {err}", db_path.display()))?;
     let project_root = path
         .canonicalize()
         .with_context(|| format!("canonicalize project path {}", path.display()))?;
@@ -33,7 +31,15 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
     let stdout = std::io::stdout();
     let mut reader = BufReader::new(stdin.lock());
     let mut writer = stdout.lock();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("create MCP runtime")?;
+    let _runtime_guard = runtime.enter();
+    let readers = ReaderPool::open(&db_path, 16)
+        .map_err(|err| anyhow!("open reader pool for {}: {err}", db_path.display()))?;
     let state = clarion_mcp::ServerState::new(project_root, readers);
 
-    clarion_mcp::serve_stdio_with_state(&state, &mut reader, &mut writer).context("serve MCP stdio")
+    clarion_mcp::serve_stdio_with_state_on_runtime(&runtime, &state, &mut reader, &mut writer)
+        .context("serve MCP stdio")
 }
