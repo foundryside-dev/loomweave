@@ -86,7 +86,7 @@ Cost-per-token math stays outside Clarion. Operators already have OpenRouter's
 billing dashboard and can choose models based on their own budget. Clarion's
 enforcement becomes a token ceiling:
 
-- Config: `llm.session_token_ceiling`
+- Config: `llm_policy.session_token_ceiling`
 - Default: `1000000`
 - Scope: one `clarion serve` process/session
 - Cache hits do not spend tokens
@@ -126,7 +126,7 @@ errors retryable.
 `clarion.yaml`:
 
 ```yaml
-llm:
+llm_policy:
   enabled: true
   provider: openrouter
   allow_live_provider: false
@@ -146,9 +146,11 @@ llm:
 gateway can use `http://localhost:4000` without code changes. v0.1 defaults to
 OpenRouter direct.
 
-The old `anthropic_api_key_env` or `provider: anthropic` shape should produce a
-clear `CLA-CONFIG-DEPRECATED-PROVIDER` configuration error/finding that points
-operators to `provider: openrouter` and `llm.openrouter.api_key_env`.
+The existing implementation also accepts the earlier `llm:` key as a
+compatibility alias. The old `anthropic_api_key_env` or `provider: anthropic`
+shape should produce a clear `CLA-CONFIG-DEPRECATED-PROVIDER` configuration
+error/finding that points operators to `provider: openrouter` and
+`llm_policy.openrouter.api_key_env`.
 
 `clarion serve` must not panic at startup with no API key. If live provider use
 is not explicitly enabled, no provider is constructed. If live use is enabled
