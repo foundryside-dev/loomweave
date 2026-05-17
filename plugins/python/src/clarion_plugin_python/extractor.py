@@ -1,9 +1,9 @@
 """AST → entity extractor for the Python plugin (Sprint 2 / B.2).
 
 Walks a parsed Python file and emits one ``module`` entity per file plus
-one ``function`` entity per ``FunctionDef`` / ``AsyncFunctionDef``. Class
-entity emission joins in the next plan task; decorator, import, and
-call-edge emission is later WP3-feature-complete scope.
+one ``function`` entity per ``FunctionDef`` / ``AsyncFunctionDef`` and one
+``class`` entity per ``ClassDef``. Decorator, import, and call-edge emission is
+later WP3-feature-complete scope.
 
 Entity shape matches the Rust host's ``RawEntity`` + ``RawSource``
 contract (``crates/clarion-core/src/plugin/host.rs:132-154``)::

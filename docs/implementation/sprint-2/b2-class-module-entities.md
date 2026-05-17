@@ -108,7 +108,7 @@ def _walk(node, parents, dotted_module, file_path, out):
 
 `RawEntity.extra` carries one new field for module entities:
 
-- `parse_status: "ok" | "empty" | "syntax_error"` — rides through `extra` via serde flatten; host stores into `properties_json` (subject to `MAX_ENTITY_EXTRA_BYTES`, currently 64 KiB).
+- `parse_status: "ok" | "syntax_error"` — rides through `extra` via serde flatten; host stores into `properties_json` (subject to `MAX_ENTITY_EXTRA_BYTES`, currently 64 KiB). Empty/comment-only files use `"ok"` because they parse successfully and emit a whole-file module entity with zero function/class children.
 
 No structural wire-shape change at the host. No top-level field addition.
 
@@ -297,7 +297,7 @@ Files:
 - Modify `plugins/python/tests/test_extractor.py`.
 
 Steps:
-- `test_empty_file_yields_zero_entities` → `test_empty_file_yields_one_module_entity` with updated assertion (length 1, kind module, parse_status "empty").
+- `test_empty_file_yields_zero_entities` → `test_empty_file_yields_one_module_entity` with updated assertion (length 1, kind module, parse_status "ok").
 - `test_whitespace_only_file_yields_zero_entities` → same shape.
 - Verify pass.
 - Commit: `test(wp3): rename empty-file tests for B.2 module-emit semantics`.

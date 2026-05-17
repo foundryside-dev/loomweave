@@ -105,7 +105,8 @@ python:module:demo|module"
 if [ "$RESULT" != "$EXPECTED" ]; then
     log "DB contents:"
     sqlite3 "$DEMO_DIR/.clarion/clarion.db" "select * from entities;" >&2 || true
-    fail "expected exactly:\n$EXPECTED\ngot:\n$RESULT"
+    message=$(printf 'expected exactly:\n%s\ngot:\n%s' "$EXPECTED" "$RESULT")
+    fail "$message"
 fi
 
 # ── 8. Verify source metadata for MCP entity_at/summary cache (B.6a) ─────────
