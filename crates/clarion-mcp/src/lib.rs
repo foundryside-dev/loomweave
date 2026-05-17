@@ -1,6 +1,7 @@
 //! MCP protocol surface for Clarion.
 
 pub mod config;
+pub mod filigree;
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
