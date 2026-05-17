@@ -145,6 +145,11 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
                     "dropped_edges_total": 0,
                     "ambiguous_edges_total": 0,
                     "unresolved_call_sites_total": 0,
+                    "reference_sites_total": 0,
+                    "references_resolved_total": 0,
+                    "references_skipped_external_total": 0,
+                    "references_skipped_cap_total": 0,
+                    "unresolved_reference_sites_total": 0,
                     "pyright_query_latency_p95_ms": 0,
                 })
                 .to_string(),
@@ -192,6 +197,11 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
     let mut total_entity_count: u64 = 0;
     let mut total_edge_count: u64 = 0;
     let mut unresolved_call_sites_total: u64 = 0;
+    let mut reference_sites_total: u64 = 0;
+    let mut references_resolved_total: u64 = 0;
+    let mut references_skipped_external_total: u64 = 0;
+    let mut references_skipped_cap_total: u64 = 0;
+    let mut unresolved_reference_sites_total: u64 = 0;
     let mut pyright_latency = P95Accumulator::default();
     let mut run_outcome: RunOutcome = RunOutcome::Completed;
     let mut breaker = CrashLoopBreaker::default();
@@ -286,6 +296,11 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
                 findings,
             }) => {
                 unresolved_call_sites_total += stats.unresolved_call_sites_total;
+                reference_sites_total += stats.reference_sites_total;
+                references_resolved_total += stats.references_resolved_total;
+                references_skipped_external_total += stats.references_skipped_external_total;
+                references_skipped_cap_total += stats.references_skipped_cap_total;
+                unresolved_reference_sites_total += stats.unresolved_reference_sites_total;
                 pyright_latency.record_many(stats.pyright_query_latency_ms);
 
                 // Log findings individually (Tier B persistence is future
@@ -417,6 +432,11 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
                 "dropped_edges_total": dropped_edges_total,
                 "ambiguous_edges_total": ambiguous_edges_total,
                 "unresolved_call_sites_total": unresolved_call_sites_total,
+                "reference_sites_total": reference_sites_total,
+                "references_resolved_total": references_resolved_total,
+                "references_skipped_external_total": references_skipped_external_total,
+                "references_skipped_cap_total": references_skipped_cap_total,
+                "unresolved_reference_sites_total": unresolved_reference_sites_total,
                 "pyright_query_latency_p95_ms": pyright_query_latency_p95_ms,
             })
             .to_string();
@@ -443,6 +463,11 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
                 "dropped_edges_total": dropped_edges_total,
                 "ambiguous_edges_total": ambiguous_edges_total,
                 "unresolved_call_sites_total": unresolved_call_sites_total,
+                "reference_sites_total": reference_sites_total,
+                "references_resolved_total": references_resolved_total,
+                "references_skipped_external_total": references_skipped_external_total,
+                "references_skipped_cap_total": references_skipped_cap_total,
+                "unresolved_reference_sites_total": unresolved_reference_sites_total,
                 "pyright_query_latency_p95_ms": pyright_query_latency_p95_ms,
                 "failure_reason": reason,
             })
@@ -560,6 +585,11 @@ struct BatchResult {
 #[derive(Debug, Default)]
 struct BatchStats {
     unresolved_call_sites_total: u64,
+    reference_sites_total: u64,
+    references_resolved_total: u64,
+    references_skipped_external_total: u64,
+    references_skipped_cap_total: u64,
+    unresolved_reference_sites_total: u64,
     pyright_query_latency_ms: Vec<u64>,
 }
 
@@ -610,6 +640,13 @@ fn run_plugin_blocking(
                 .analyze_file(file)
                 .map_err(|e| classify_host_error(plugin_id, e))?;
             collected_stats.unresolved_call_sites_total += stats.unresolved_call_sites_total;
+            collected_stats.reference_sites_total += stats.reference_sites_total;
+            collected_stats.references_resolved_total += stats.references_resolved_total;
+            collected_stats.references_skipped_external_total +=
+                stats.references_skipped_external_total;
+            collected_stats.references_skipped_cap_total += stats.references_skipped_cap_total;
+            collected_stats.unresolved_reference_sites_total +=
+                stats.unresolved_reference_sites_total;
             collected_stats
                 .pyright_query_latency_ms
                 .extend(stats.pyright_query_latency_ms);

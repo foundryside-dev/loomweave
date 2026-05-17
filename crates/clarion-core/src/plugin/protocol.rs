@@ -356,6 +356,21 @@ pub struct AnalyzeFileStats {
     /// Call sites where the plugin found no in-project candidate.
     #[serde(default)]
     pub unresolved_call_sites_total: u64,
+    /// Reference sites enumerated by the plugin before resolver filtering.
+    #[serde(default)]
+    pub reference_sites_total: u64,
+    /// Reference sites resolved to at least one in-project target.
+    #[serde(default)]
+    pub references_resolved_total: u64,
+    /// Reference sites skipped because pyright resolved only external targets.
+    #[serde(default)]
+    pub references_skipped_external_total: u64,
+    /// Reference sites skipped because the per-file site cap was exceeded.
+    #[serde(default)]
+    pub references_skipped_cap_total: u64,
+    /// Reference sites where no in-project target was emitted.
+    #[serde(default)]
+    pub unresolved_reference_sites_total: u64,
     /// Raw latency samples (milliseconds) for per-file Pyright LSP queries.
     #[serde(default)]
     pub pyright_query_latency_ms: Vec<u64>,
@@ -363,7 +378,13 @@ pub struct AnalyzeFileStats {
 
 impl AnalyzeFileStats {
     fn is_empty(&self) -> bool {
-        self.unresolved_call_sites_total == 0 && self.pyright_query_latency_ms.is_empty()
+        self.unresolved_call_sites_total == 0
+            && self.reference_sites_total == 0
+            && self.references_resolved_total == 0
+            && self.references_skipped_external_total == 0
+            && self.references_skipped_cap_total == 0
+            && self.unresolved_reference_sites_total == 0
+            && self.pyright_query_latency_ms.is_empty()
     }
 }
 
@@ -632,6 +653,11 @@ mod tests {
             })],
             stats: AnalyzeFileStats {
                 unresolved_call_sites_total: 2,
+                reference_sites_total: 3,
+                references_resolved_total: 4,
+                references_skipped_external_total: 5,
+                references_skipped_cap_total: 6,
+                unresolved_reference_sites_total: 7,
                 pyright_query_latency_ms: vec![10, 20, 30],
             },
         };
@@ -651,6 +677,26 @@ mod tests {
         assert_eq!(
             back.stats.unresolved_call_sites_total, 0,
             "missing stats field must default unresolved-call-site counter to zero"
+        );
+        assert_eq!(
+            back.stats.reference_sites_total, 0,
+            "missing stats field must default reference-site counter to zero"
+        );
+        assert_eq!(
+            back.stats.references_resolved_total, 0,
+            "missing stats field must default resolved-reference counter to zero"
+        );
+        assert_eq!(
+            back.stats.references_skipped_external_total, 0,
+            "missing stats field must default external-reference counter to zero"
+        );
+        assert_eq!(
+            back.stats.references_skipped_cap_total, 0,
+            "missing stats field must default reference-cap counter to zero"
+        );
+        assert_eq!(
+            back.stats.unresolved_reference_sites_total, 0,
+            "missing stats field must default unresolved-reference counter to zero"
         );
         assert!(
             back.stats.pyright_query_latency_ms.is_empty(),

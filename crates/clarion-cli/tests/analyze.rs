@@ -101,6 +101,11 @@ while True:
                 ],
                 "stats": {
                     "unresolved_call_sites_total": 2,
+                    "reference_sites_total": 3,
+                    "references_resolved_total": 4,
+                    "references_skipped_external_total": 5,
+                    "references_skipped_cap_total": 6,
+                    "unresolved_reference_sites_total": 7,
                     "pyright_query_latency_ms": list(range(10, 1010, 10)),
                 },
             },
@@ -247,6 +252,31 @@ fn analyze_stats_reports_ambiguous_edges_total() {
         stats["unresolved_call_sites_total"].as_u64(),
         Some(2),
         "unresolved_call_sites_total should aggregate plugin stats; got {stats_raw}"
+    );
+    assert_eq!(
+        stats["reference_sites_total"].as_u64(),
+        Some(3),
+        "reference_sites_total should aggregate plugin stats; got {stats_raw}"
+    );
+    assert_eq!(
+        stats["references_resolved_total"].as_u64(),
+        Some(4),
+        "references_resolved_total should aggregate plugin stats; got {stats_raw}"
+    );
+    assert_eq!(
+        stats["references_skipped_external_total"].as_u64(),
+        Some(5),
+        "references_skipped_external_total should aggregate plugin stats; got {stats_raw}"
+    );
+    assert_eq!(
+        stats["references_skipped_cap_total"].as_u64(),
+        Some(6),
+        "references_skipped_cap_total should aggregate plugin stats; got {stats_raw}"
+    );
+    assert_eq!(
+        stats["unresolved_reference_sites_total"].as_u64(),
+        Some(7),
+        "unresolved_reference_sites_total should aggregate plugin stats; got {stats_raw}"
     );
     assert_eq!(
         stats["pyright_query_latency_p95_ms"].as_u64(),

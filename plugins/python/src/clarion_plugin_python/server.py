@@ -178,6 +178,11 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
     """Read the requested file, extract entities + edges, return AnalyzeFileResult shape."""
     empty_stats = {
         "unresolved_call_sites_total": 0,
+        "reference_sites_total": 0,
+        "references_resolved_total": 0,
+        "references_skipped_external_total": 0,
+        "references_skipped_cap_total": 0,
+        "unresolved_reference_sites_total": 0,
         "pyright_query_latency_ms": [],
     }
     file_path_raw = params.get("file_path")
@@ -200,9 +205,15 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
         file_path_raw,
         module_prefix_path=module_prefix,
         call_resolver=state.pyright,
+        reference_resolver=state.pyright,
     )
     stats = {
         "unresolved_call_sites_total": result.stats.unresolved_call_sites_total,
+        "reference_sites_total": result.stats.reference_sites_total,
+        "references_resolved_total": result.stats.references_resolved_total,
+        "references_skipped_external_total": result.stats.references_skipped_external_total,
+        "references_skipped_cap_total": result.stats.references_skipped_cap_total,
+        "unresolved_reference_sites_total": result.stats.unresolved_reference_sites_total,
         "pyright_query_latency_ms": result.stats.pyright_query_latency_ms,
     }
     return {"entities": result.entities, "edges": result.edges, "stats": stats}
