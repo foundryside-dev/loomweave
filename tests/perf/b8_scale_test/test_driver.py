@@ -105,6 +105,38 @@ def test_summarize_records_groups_by_pattern_and_tool() -> None:
         ),
         driver.CallRecord(
             "light",
+            "callers_of",
+            "steady_state",
+            "inferred",
+            150.0,
+            220,
+            55,
+            False,
+            True,
+            False,
+            False,
+            None,
+            None,
+            {"inferred_tokens_total": 7, "inferred_cost_usd": 0.002},
+        ),
+        driver.CallRecord(
+            "light",
+            "summary",
+            "steady_state",
+            "warm",
+            180.0,
+            220,
+            55,
+            False,
+            True,
+            False,
+            False,
+            None,
+            None,
+            {"summary_tokens_total": 3, "summary_cost_usd": 0.001},
+        ),
+        driver.CallRecord(
+            "light",
             "summary",
             "steady_state",
             "warm",
@@ -132,12 +164,13 @@ def test_summarize_records_groups_by_pattern_and_tool() -> None:
     assert find["useful_result_count"] == 2
 
     pattern = summary["by_pattern"]["light"]
-    assert pattern["call_count"] == 4
+    assert pattern["call_count"] == 6
     assert pattern["unavailable_count"] == 1
     assert pattern["summary_cache_hit_rate"] == 0.5
-    assert pattern["tokens_total"] == 5
-    assert summary["by_phase"]["steady_state"]["call_count"] == 3
-    assert summary["gate"]["steady_state_storage_backed"]["p95_latency_ms"] == 40.0
+    assert pattern["tokens_total"] == 15
+    assert pattern["cost_usd"] == pytest.approx(0.003, abs=0.0001)
+    assert summary["by_phase"]["steady_state"]["call_count"] == 5
+    assert summary["gate"]["steady_state_storage_backed"]["p95_latency_ms"] == 150.0
     assert driver.summary_miss_then_hit(records) is False
 
 

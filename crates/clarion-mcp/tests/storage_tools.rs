@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use clarion_core::{
     CachingModel, INFERRED_CALLS_PROMPT_VERSION, InferredCallsPromptInput,
     LEAF_SUMMARY_PROMPT_TEMPLATE_ID, LeafSummaryPromptInput, LlmProvider, LlmProviderError,
-    LlmPurpose, LlmRequest, LlmResponse, Recording, RecordingProvider, build_inferred_calls_prompt,
-    build_leaf_summary_prompt,
+    LlmPurpose, LlmRequest, LlmResponse, OpenRouterProvider, OpenRouterProviderConfig, Recording,
+    RecordingProvider, build_inferred_calls_prompt, build_leaf_summary_prompt,
 };
 use clarion_mcp::{
     ServerState,
@@ -317,13 +317,14 @@ fn expected_inferred_request(
         caller_source_excerpt: source_excerpt,
         unresolved_call_sites_json,
         candidate_entities_json,
+        max_edges: 8,
     });
     LlmRequest {
         purpose: LlmPurpose::InferredEdges,
         model_id: "anthropic/claude-sonnet-4.6".to_owned(),
         prompt_id: INFERRED_CALLS_PROMPT_VERSION.to_owned(),
         prompt: prompt.body,
-        max_output_tokens: 512,
+        max_output_tokens: 2048,
     }
 }
 
@@ -415,18 +416,33 @@ impl AnyInferredProvider {
 #[derive(Debug)]
 struct AnySummaryProvider {
     invocations: Mutex<Vec<LlmRequest>>,
+    output_json: String,
     delay_ms: u64,
     estimate_tokens: u64,
     total_tokens: u32,
+    cost_usd: f64,
 }
 
 impl AnySummaryProvider {
     fn new_slow(delay_ms: u64, estimate_tokens: u64, total_tokens: u32) -> Self {
         Self {
             invocations: Mutex::new(Vec::new()),
+            output_json: r#"{"purpose":"concurrent"}"#.to_owned(),
             delay_ms,
             estimate_tokens,
             total_tokens,
+            cost_usd: 0.0,
+        }
+    }
+
+    fn new_output(output_json: &str, total_tokens: u32, cost_usd: f64) -> Self {
+        Self {
+            invocations: Mutex::new(Vec::new()),
+            output_json: output_json.to_owned(),
+            delay_ms: 0,
+            estimate_tokens: 0,
+            total_tokens,
+            cost_usd,
         }
     }
 
@@ -453,11 +469,11 @@ impl LlmProvider for AnySummaryProvider {
         }
         Ok(LlmResponse {
             model_id: request.model_id,
-            output_json: r#"{"purpose":"concurrent"}"#.to_owned(),
+            output_json: self.output_json.clone(),
             input_tokens: 100,
             output_tokens: 20,
             total_tokens: self.total_tokens,
-            cost_usd: 0.0,
+            cost_usd: self.cost_usd,
         })
     }
 
@@ -810,6 +826,111 @@ async fn summary_cold_miss_records_provider_response_then_hits_cache() {
     drop(state);
     drop(writer);
     handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_invalid_json_preserves_usage_accounting() {
+    let (project, db_path) = open_project();
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnySummaryProvider::new_output("not-json", 120, 0.012));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "llm-invalid-json");
+    assert_eq!(envelope["stats_delta"]["summary_cache_misses_total"], 1);
+    assert_eq!(envelope["stats_delta"]["summary_tokens_input"], 100);
+    assert_eq!(envelope["stats_delta"]["summary_tokens_output"], 20);
+    assert_eq!(envelope["stats_delta"]["summary_tokens_total"], 120);
+    assert_eq!(envelope["stats_delta"]["summary_cost_usd"], 0.012);
+    assert_eq!(envelope["stats_delta"]["llm_invalid_json_total"], 1);
+    assert_eq!(provider.invocations().len(), 1);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_openrouter_provider_runs_outside_async_runtime() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let (project, db_path) = open_project();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test OpenRouter");
+    let addr = listener.local_addr().expect("test OpenRouter addr");
+    let http = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept OpenRouter request");
+        let mut request = [0_u8; 8192];
+        let read = stream.read(&mut request).expect("read OpenRouter request");
+        let request = String::from_utf8_lossy(&request[..read]);
+        assert!(request.contains(r#""response_format":{"json_schema":{"name":"clarion_summary""#));
+        let body = r#"{
+            "id": "gen-01",
+            "object": "chat.completion",
+            "created": 1779000000,
+            "model": "anthropic/claude-sonnet-4.6",
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "native_finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": "{\"purpose\":\"demo\",\"behavior\":\"returns mid\",\"relationships\":\"calls mid\",\"risks\":\"\"}"
+                    }
+                }
+            ],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}
+        }"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write OpenRouter response");
+    });
+    let provider = Arc::new(
+        OpenRouterProvider::from_config(OpenRouterProviderConfig {
+            api_key: Some("secret".to_owned()),
+            allow_live_provider: true,
+            model_id: "anthropic/claude-sonnet-4.6".to_owned(),
+            endpoint_url: format!("http://{addr}/api/v1"),
+            referer: "https://github.com/qacona/clarion".to_owned(),
+            title: "Clarion Test".to_owned(),
+        })
+        .expect("OpenRouter provider"),
+    );
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let state = state_for_summary(project.path(), &db_path, &writer, provider, llm_config());
+
+    let envelope = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["result"]["summary"]["purpose"], "demo");
+    assert_eq!(envelope["stats_delta"]["summary_tokens_total"], 120);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+    http.join().expect("OpenRouter server thread");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1367,6 +1488,59 @@ async fn callers_of_inferred_coalesces_concurrent_cold_requests() {
             .as_u64()
             .unwrap_or(0);
     assert_eq!(coalesced_total, 1);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn callers_of_inferred_invalid_json_preserves_usage_accounting() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    let source_path = project.path().join("demo.py");
+    insert_entity(
+        &conn,
+        "python:function:demo.dynamic",
+        "function",
+        &source_path,
+        Some((9, 10)),
+        Some("python:module:demo"),
+    );
+    insert_unresolved_call_site(
+        &conn,
+        "python:function:demo.entry",
+        "site-dynamic",
+        "dynamic",
+    );
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnyInferredProvider::new("not-json"));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.dynamic", "confidence": "inferred"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "llm-invalid-json");
+    assert_eq!(envelope["stats_delta"]["inferred_dispatch_misses_total"], 1);
+    assert_eq!(envelope["stats_delta"]["inferred_tokens_input"], 100);
+    assert_eq!(envelope["stats_delta"]["inferred_tokens_output"], 20);
+    assert_eq!(envelope["stats_delta"]["inferred_tokens_total"], 120);
+    assert_eq!(envelope["stats_delta"]["inferred_cost_usd"], 0.0);
+    assert_eq!(envelope["stats_delta"]["llm_invalid_json_total"], 1);
+    assert_eq!(provider.invocations().len(), 1);
 
     drop(state);
     drop(writer);

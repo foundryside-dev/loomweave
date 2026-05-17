@@ -278,3 +278,151 @@ What slips:
 - operator-facing token/cost validation for LLM-backed MCP consultations.
 
 Follow-up issue: `clarion-ac5f9bf35b`.
+
+## 2026-05-17T22:43Z — GREEN Rerun Superseding RED
+
+verdict: **GREEN**
+
+supersedes: **2026-05-17T21:56Z — RED** for the live LLM JSON/cost/cache
+blocker tracked as `clarion-ac5f9bf35b`.
+
+This rerun used the same analyzed elspeth-slice database from the RED entry:
+`/tmp/clarion-b8-elspeth-tests-20260517T2156Z/.clarion/clarion.db`. No analyze
+rerun was performed; the proof is scoped to the missing `clarion serve` live
+OpenRouter/cache evidence.
+
+Raw artifacts:
+
+- Cold-cache repair run: `tests/perf/b8_scale_test/results/2026-05-17T2243Z/mcp-driver-output.json`
+- Warm-cache steady-state rerun: `tests/perf/b8_scale_test/results/2026-05-17T2243Z/mcp-driver-output-warm-cache.json`
+
+Clarion source at run time: branch `sprint-2/b8-scale-test`, base commit
+`e6bba0f`, with the B.8 repair patch in the working tree. Filigree HTTP was the
+real dashboard route at `http://127.0.0.1:9388/api/entity-associations`.
+
+### Repair Summary
+
+The live OpenRouter provider now sends strict structured-output requests for
+both LLM purposes and uses OpenRouter's broadly supported `max_tokens`
+parameter. Invalid semantic JSON paths now preserve token and cost usage in the
+MCP envelope; this is covered by regression tests for summary and inferred
+dispatch malformed-output paths.
+
+### Cold-Cache Repair Run
+
+| Measurement | Value |
+|---|---:|
+| Tool calls | 100 |
+| OK envelopes | 100 |
+| Error envelopes | 0 |
+| Unavailable envelopes | 0 |
+| Useful-result calls | 96 |
+| All-tool p50 latency | 1.749 ms |
+| All-tool p95 latency | 9,379.681 ms |
+| Summary cache rows after run | 3 |
+| Inferred edge cache rows after run | 10 |
+| Inferred `calls` edges materialized | 57 |
+
+Summary cache proof:
+
+| Measurement | Value |
+|---|---:|
+| Summary calls | 13 |
+| Cold misses that wrote cache rows | 3 |
+| Warm/cache-hit summary calls | 10 |
+| Warm summary hit rate | 100% |
+| Driver `summary_miss_then_hit` | true |
+| Summary prompt tokens | 4,480 |
+| Summary completion tokens | 1,196 |
+| Summary total tokens | 5,676 |
+| Summary cost | $0.031380 |
+
+Inferred dispatch proof:
+
+| Measurement | Value |
+|---|---:|
+| Inferred `callers_of` tool calls | 5 |
+| Inferred dispatch misses | 10 |
+| In-run inferred cache hits | 3 |
+| Candidate callers considered | 13 |
+| Inferred edges materialized | 57 |
+| Inferred prompt+completion tokens | 142,585 |
+| Inferred cost | $0.503091 |
+
+Per-tool usefulness in the cold-cache run:
+
+| Tool | Calls | OK | Errors | Useful |
+|---|---:|---:|---:|---:|
+| `entity_at` | 16 | 16 | 0 | 16 |
+| `find_entity` | 15 | 15 | 0 | 15 |
+| `callers_of` | 20 | 20 | 0 | 20 |
+| `execution_paths_from` | 13 | 13 | 0 | 13 |
+| `summary` | 13 | 13 | 0 | 13 |
+| `issues_for` | 9 | 9 | 0 | 5 |
+| `neighborhood` | 14 | 14 | 0 | 14 |
+
+`issues_for` used the real Filigree reverse route and remained fast:
+
+| Measurement | Value |
+|---|---:|
+| Calls | 9 |
+| OK | 9 |
+| p50 latency | 1.801 ms |
+| p95 latency | 3.545 ms |
+| Matched-issue calls | 5 |
+
+The cold all-tool p95 is intentionally not the steady-state gate signal because
+it includes first-time live OpenRouter calls. It is retained as cost/latency
+evidence for cache population.
+
+### Warm-Cache Steady-State Rerun
+
+The warm-cache rerun was executed without clearing `summary_cache`,
+`inferred_edge_cache`, or materialized inferred edges after the cold-cache run.
+
+| Measurement | Value |
+|---|---:|
+| Tool calls | 100 |
+| OK envelopes | 100 |
+| Error envelopes | 0 |
+| Unavailable envelopes | 0 |
+| All-tool p50 latency | 1.759 ms |
+| All-tool p95 latency | 200.273 ms |
+| All-tool max latency | 1,996.851 ms |
+| Summary cache hit rate | 100% |
+| New LLM tokens | 0 |
+| New LLM cost | $0.000000 |
+
+Warm summary and inferred-cache checks:
+
+| Check | Value |
+|---|---:|
+| Summary hits / summary calls | 13 / 13 |
+| Warm-labeled summary hits / warm-labeled calls | 10 / 10 |
+| Inferred dispatch misses | 0 |
+| Inferred cache hits reported | 13 |
+| Inferred cached p95 latency | 1,996.851 ms |
+| Medium-warm pattern p95 | 4.463 ms |
+| Heavy pattern p95 | 4.294 ms |
+
+The warm all-tool p95 is green under the `<500 ms` target. Cached inferred
+dispatch p95 is yellow but inside the `500 ms-2 s` boundary; it performs no new
+LLM calls and reports zero token/cost deltas.
+
+### NFR And Gate Outcome
+
+| Gate | Target | Outcome |
+|---|---|---|
+| Analyze wall-clock | NFR-PERF-01 <= 60m | PASS from RED run: 7m27s on the same DB |
+| Live summary JSON contract | `summary()` returns parseable contract JSON | PASS: 13/13 summary calls OK, strict fields present |
+| Summary cache hit rate | NFR-COST-02 >=95% post-stabilisation | PASS: 10/10 warm-labeled hits in cold run; 13/13 hits in warm rerun |
+| Inferred dispatch | Materializes or cleanly caches inferred results | PASS: 57 inferred edges, 10 inferred cache rows, 0 warm misses |
+| Cost/tokens on invalid LLM output | Operator-facing evidence even on semantic parse failure | PASS: regression tests cover malformed summary and inferred output stats |
+| Seven-tool end-to-end surface | every tool exercised and useful | PASS: all seven tools OK; every tool produced useful results |
+| Warm steady-state p95 | <500ms green, 500ms-2s yellow | PASS: all-tool warm p95 200.273 ms green; cached inferred p95 1,996.851 ms yellow |
+| Filigree HTTP integration | real reverse route, measured RTT | PASS: p95 3.545 ms |
+
+The B.4* extrapolation caveat remains a **yellow follow-up**: actual analyze
+wall-clock was still ~4.34x slower than the mini-gate's linear projection, even
+though the measured analyze run stayed comfortably inside the v0.1 60-minute
+envelope.

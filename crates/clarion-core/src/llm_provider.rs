@@ -167,7 +167,6 @@ pub struct OpenRouterProvider {
     endpoint_url: String,
     referer: String,
     title: String,
-    client: reqwest::blocking::Client,
 }
 
 impl OpenRouterProvider {
@@ -178,20 +177,12 @@ impl OpenRouterProvider {
         let Some(api_key) = config.api_key.filter(|key| !key.trim().is_empty()) else {
             return Err(LlmProviderError::MissingApiKey);
         };
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .map_err(|err| LlmProviderError::Http {
-                message: err.to_string(),
-                retryable: false,
-            })?;
         Ok(Self {
             model_id: config.model_id,
             api_key,
             endpoint_url: config.endpoint_url,
             referer: config.referer,
             title: config.title,
-            client,
         })
     }
 
@@ -211,8 +202,12 @@ impl LlmProvider for OpenRouterProvider {
     fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
         let payload = serde_json::json!({
             "model": request.model_id,
-            "max_completion_tokens": request.max_output_tokens,
+            "max_tokens": request.max_output_tokens,
             "temperature": 0,
+            "provider": {
+                "require_parameters": true
+            },
+            "response_format": response_format_for_purpose(&request.purpose),
             "messages": [
                 {
                     "role": "user",
@@ -220,8 +215,14 @@ impl LlmProvider for OpenRouterProvider {
                 }
             ]
         });
-        let response = self
-            .client
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .map_err(|err| LlmProviderError::Http {
+                message: err.to_string(),
+                retryable: false,
+            })?;
+        let response = client
             .post(self.chat_completions_url())
             .header("authorization", format!("Bearer {}", self.api_key))
             .header("HTTP-Referer", self.referer.as_str())
@@ -273,7 +274,7 @@ impl LlmProvider for OpenRouterProvider {
             input_tokens: usage.prompt,
             output_tokens: usage.completion,
             total_tokens: usage.total,
-            cost_usd: 0.0,
+            cost_usd: usage.cost.unwrap_or(0.0),
         })
     }
 
@@ -290,6 +291,81 @@ impl LlmProvider for OpenRouterProvider {
 
     fn caching_model(&self) -> CachingModel {
         CachingModel::OpenAiChatCompletions
+    }
+}
+
+fn response_format_for_purpose(purpose: &LlmPurpose) -> Value {
+    match purpose {
+        LlmPurpose::Summary => serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "clarion_summary",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "purpose": {
+                            "type": "string",
+                            "description": "Why this entity exists in the local codebase."
+                        },
+                        "behavior": {
+                            "type": "string",
+                            "description": "What the entity does at leaf scope."
+                        },
+                        "relationships": {
+                            "type": "string",
+                            "description": "Important callers, callees, ownership, or adjacent entities visible from the prompt."
+                        },
+                        "risks": {
+                            "type": "string",
+                            "description": "Notable implementation risks, caveats, or empty string when none are visible."
+                        }
+                    },
+                    "required": ["purpose", "behavior", "relationships", "risks"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        LlmPurpose::InferredEdges => serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "clarion_inferred_calls",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "edges": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "site_key": {
+                                        "type": "string",
+                                        "description": "The unresolved call-site key from the prompt."
+                                    },
+                                    "target_id": {
+                                        "type": "string",
+                                        "description": "The Clarion entity id for the inferred callee."
+                                    },
+                                    "confidence": {
+                                        "type": "number",
+                                        "description": "Model confidence from 0.0 to 1.0."
+                                    },
+                                    "rationale": {
+                                        "type": "string",
+                                        "description": "Brief evidence for the inferred target."
+                                    }
+                                },
+                                "required": ["site_key", "target_id", "confidence", "rationale"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["edges"],
+                    "additionalProperties": false
+                }
+            }
+        }),
     }
 }
 
@@ -346,6 +422,7 @@ struct OpenRouterUsage {
     completion: u32,
     #[serde(rename = "total_tokens")]
     total: u32,
+    cost: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -442,6 +519,7 @@ pub struct InferredCallsPromptInput {
     pub caller_source_excerpt: String,
     pub unresolved_call_sites_json: String,
     pub candidate_entities_json: String,
+    pub max_edges: usize,
 }
 
 pub fn build_leaf_summary_prompt(input: &LeafSummaryPromptInput) -> PromptTemplate {
@@ -471,11 +549,13 @@ pub fn build_inferred_calls_prompt(input: &InferredCallsPromptInput) -> PromptTe
              Caller source excerpt:\n{source}\n\
              Unresolved call sites JSON:\n{sites}\n\
              Candidate entities JSON:\n{candidates}\n\
-             Return JSON with an edges array containing site_key, target_id, confidence, and rationale.",
+             Return JSON with an edges array containing no more than {max_edges} entries. \
+             Each edge must contain site_key, target_id, confidence, and rationale.",
             caller = input.caller_entity_id,
             source = input.caller_source_excerpt,
             sites = input.unresolved_call_sites_json,
             candidates = input.candidate_entities_json,
+            max_edges = input.max_edges,
         ),
     }
 }
@@ -535,10 +615,12 @@ mod tests {
             caller_source_excerpt: "return DISPATCH[key]()".to_owned(),
             unresolved_call_sites_json: r#"[{"site_key":"a"}]"#.to_owned(),
             candidate_entities_json: r#"[{"id":"python:function:demo.world"}]"#.to_owned(),
+            max_edges: 8,
         });
         assert_eq!(inferred.id, INFERRED_CALLS_PROMPT_VERSION);
         assert!(inferred.body.contains("python:function:demo.via_dispatch"));
         assert!(inferred.body.contains("Return JSON"));
+        assert!(inferred.body.contains("no more than 8 entries"));
     }
 
     #[test]
@@ -607,8 +689,15 @@ mod tests {
             assert!(request.contains("http-referer: https://github.com/qacona/clarion"));
             assert!(request.contains("x-openrouter-title: Clarion"));
             assert!(request.contains(r#""model":"anthropic/claude-sonnet-4.6""#));
-            assert!(request.contains(r#""max_completion_tokens":512"#));
+            assert!(request.contains(r#""max_tokens":512"#));
             assert!(request.contains("Summarize this function"));
+            assert!(
+                request.contains(r#""response_format":{"json_schema":{"name":"clarion_summary""#)
+            );
+            assert!(request.contains(r#""strict":true"#));
+            assert!(
+                request.contains(r#""required":["purpose","behavior","relationships","risks"]"#)
+            );
 
             let body = r#"{
                 "id": "gen-01",
@@ -622,7 +711,7 @@ mod tests {
                         "message": {"role": "assistant", "content": "{\"purpose\":\"demo\"}"}
                     }
                 ],
-                "usage": {"prompt_tokens": 1000, "completion_tokens": 200, "total_tokens": 1200}
+                "usage": {"prompt_tokens": 1000, "completion_tokens": 200, "total_tokens": 1200, "cost": 0.123}
             }"#;
             write!(
                 stream,
@@ -656,7 +745,7 @@ mod tests {
         assert_eq!(response.input_tokens, 1000);
         assert_eq!(response.output_tokens, 200);
         assert_eq!(response.total_tokens, 1200);
-        assert!((response.cost_usd - 0.0).abs() < f64::EPSILON);
+        assert!((response.cost_usd - 0.123).abs() < f64::EPSILON);
         handle.join().expect("server thread");
     }
 
@@ -707,6 +796,76 @@ mod tests {
             }
         ));
         assert!(err.to_string().contains("Provider disconnected"));
+    }
+
+    #[test]
+    fn openrouter_provider_uses_inferred_calls_schema_for_inferred_requests() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = [0_u8; 8192];
+            let read = stream.read(&mut request).expect("read request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(
+                request.contains(
+                    r#""response_format":{"json_schema":{"name":"clarion_inferred_calls""#
+                )
+            );
+            assert!(request.contains(r#""required":["edges"]"#));
+            assert!(
+                request.contains(r#""required":["site_key","target_id","confidence","rationale"]"#)
+            );
+
+            let body = r#"{
+                "id": "gen-01",
+                "object": "chat.completion",
+                "created": 1779000000,
+                "model": "anthropic/claude-sonnet-4.6",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "native_finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "{\"edges\":[]}"}
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12, "cost": 0.004}
+            }"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write response");
+        });
+        let provider = OpenRouterProvider::from_config(OpenRouterProviderConfig {
+            api_key: Some("secret".to_owned()),
+            allow_live_provider: true,
+            model_id: "anthropic/claude-sonnet-4.6".to_owned(),
+            endpoint_url: format!("http://{addr}/api/v1"),
+            referer: "https://github.com/qacona/clarion".to_owned(),
+            title: "Clarion".to_owned(),
+        })
+        .expect("test provider");
+
+        let response = provider
+            .invoke(LlmRequest {
+                purpose: LlmPurpose::InferredEdges,
+                model_id: "anthropic/claude-sonnet-4.6".to_owned(),
+                prompt_id: INFERRED_CALLS_PROMPT_VERSION.to_owned(),
+                prompt: "Resolve calls".to_owned(),
+                max_output_tokens: 512,
+            })
+            .expect("invoke mocked OpenRouter");
+
+        assert_eq!(response.output_json, r#"{"edges":[]}"#);
+        assert_eq!(response.total_tokens, 12);
+        assert!((response.cost_usd - 0.004).abs() < f64::EPSILON);
+        handle.join().expect("server thread");
     }
 
     #[test]

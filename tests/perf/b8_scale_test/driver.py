@@ -209,10 +209,16 @@ def _summarize_group(records: list[CallRecord]) -> dict[str, Any]:
         record.cache_hit for record in records if record.cache_hit is not None
     ]
     tokens_total = 0
+    cost_usd = 0.0
     for record in records:
-        value = record.stats_delta.get("summary_tokens_total")
-        if isinstance(value, int | float):
-            tokens_total += int(value)
+        for key in ("summary_tokens_total", "inferred_tokens_total"):
+            value = record.stats_delta.get(key)
+            if isinstance(value, int | float):
+                tokens_total += int(value)
+        for key in ("summary_cost_usd", "inferred_cost_usd"):
+            value = record.stats_delta.get(key)
+            if isinstance(value, int | float):
+                cost_usd += float(value)
 
     return {
         "call_count": len(records),
@@ -245,6 +251,7 @@ def _summarize_group(records: list[CallRecord]) -> dict[str, Any]:
             else None
         ),
         "tokens_total": tokens_total,
+        "cost_usd": round(cost_usd, 6),
     }
 
 

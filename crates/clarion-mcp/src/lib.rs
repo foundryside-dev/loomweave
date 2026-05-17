@@ -10,8 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clarion_core::{
     EdgeConfidence, INFERRED_CALLS_PROMPT_VERSION, InferredCallsPromptInput,
-    LEAF_SUMMARY_PROMPT_TEMPLATE_ID, LeafSummaryPromptInput, LlmProvider, LlmPurpose, LlmRequest,
-    build_inferred_calls_prompt, build_leaf_summary_prompt,
+    LEAF_SUMMARY_PROMPT_TEMPLATE_ID, LeafSummaryPromptInput, LlmProvider, LlmProviderError,
+    LlmPurpose, LlmRequest, LlmResponse, build_inferred_calls_prompt, build_leaf_summary_prompt,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -917,13 +917,14 @@ impl ServerState {
             caller_source_excerpt: source_excerpt(&read.caller),
             unresolved_call_sites_json: unresolved_sites_json(&read.sites),
             candidate_entities_json: entities_json(&read.candidates),
+            max_edges: self.max_inferred_edges_per_caller(),
         });
         let request = LlmRequest {
             purpose: LlmPurpose::InferredEdges,
             model_id: read.key.model_id.clone(),
             prompt_id: prompt.id.to_owned(),
             prompt: prompt.body,
-            max_output_tokens: 512,
+            max_output_tokens: 2048,
         };
         let Some(reservation) = self.reserve_budget(
             llm.provider.estimate_tokens(&request),
@@ -935,9 +936,15 @@ impl ServerState {
                 false,
             ));
         };
-        let response = llm.provider.invoke(request).map_err(|err| {
-            InferredDispatchFailure::new("llm-provider-error", &err.to_string(), err.retryable())
-        })?;
+        let response = invoke_llm_provider(Arc::clone(&llm.provider), request)
+            .await
+            .map_err(|err| {
+                InferredDispatchFailure::new(
+                    "llm-provider-error",
+                    &err.to_string(),
+                    err.retryable(),
+                )
+            })?;
         if !reservation.commit(
             u64::from(response.total_tokens),
             llm.config.session_token_ceiling,
@@ -948,15 +955,29 @@ impl ServerState {
                 false,
             ));
         }
-        let edges = inferred_records_from_result(
+        let edges = match inferred_records_from_result(
             &read,
             &response.output_json,
             self.max_inferred_edges_per_caller(),
-        )?;
+        ) {
+            Ok(edges) => edges,
+            Err(err) if err.code == "llm-invalid-json" => {
+                let message = err.message.clone();
+                return Err(err.with_stats(
+                    inferred_usage_stats(&response, true),
+                    vec![json!({
+                        "code": "CLA-LLM-INVALID-JSON",
+                        "message": message,
+                        "usage": llm_usage_json(&response)
+                    })],
+                ));
+            }
+            Err(err) => return Err(err),
+        };
         let now = (self.clock)();
         let entry = InferredEdgeCacheEntry {
             key: read.key,
-            result_json: response.output_json,
+            result_json: response.output_json.clone(),
             cost_usd: response.cost_usd,
             token_count: i64::from(response.total_tokens),
             created_at: now.clone(),
@@ -970,7 +991,7 @@ impl ServerState {
             })
             .await
             .map_err(|err| InferredDispatchFailure::from_storage(&err))?;
-        Ok(InferredDispatchStats::cache_miss(write, entry.token_count))
+        Ok(InferredDispatchStats::cache_miss(write, &response))
     }
 
     async fn read_summary_inputs(
@@ -1064,7 +1085,7 @@ impl ServerState {
         ) else {
             return token_ceiling_envelope("LLM session token ceiling has been reached");
         };
-        let response = match summary_llm.provider.invoke(request) {
+        let response = match invoke_llm_provider(Arc::clone(&summary_llm.provider), request).await {
             Ok(response) => response,
             Err(err) => {
                 return tool_error_envelope(
@@ -1083,10 +1104,16 @@ impl ServerState {
         }
 
         if serde_json::from_str::<Value>(&response.output_json).is_err() {
-            return tool_error_envelope(
+            return tool_error_envelope_with_diagnostics(
                 "llm-invalid-json",
                 "summary provider returned non-JSON output",
                 true,
+                summary_usage_stats(&response, true),
+                vec![json!({
+                    "code": "CLA-LLM-INVALID-JSON",
+                    "message": "summary provider returned non-JSON output",
+                    "usage": llm_usage_json(&response)
+                })],
             );
         }
 
@@ -1121,7 +1148,8 @@ impl ServerState {
                 "summary_cache_misses_total": 1,
                 "summary_tokens_input": entry.tokens_input,
                 "summary_tokens_output": entry.tokens_output,
-                "summary_tokens_total": entry.tokens_input + entry.tokens_output
+                "summary_tokens_total": entry.tokens_input + entry.tokens_output,
+                "summary_cost_usd": entry.cost_usd
             }),
         )
     }
@@ -1221,6 +1249,18 @@ impl ServerState {
             usize::try_from(summary.config.max_inferred_edges_per_caller).unwrap_or(8)
         })
     }
+}
+
+async fn invoke_llm_provider(
+    provider: Arc<dyn LlmProvider>,
+    request: LlmRequest,
+) -> Result<LlmResponse, LlmProviderError> {
+    tokio::task::spawn_blocking(move || provider.invoke(request))
+        .await
+        .map_err(|err| LlmProviderError::InvalidResponse {
+            message: format!("LLM provider task failed: {err}"),
+            retryable: true,
+        })?
 }
 
 struct SummaryLlmState {
@@ -1422,7 +1462,10 @@ struct InferredDispatchStats {
     edges_skipped_static_duplicates_total: u64,
     candidate_callers_considered: u64,
     coalesced_waits_total: u64,
+    tokens_input: i64,
+    tokens_output: i64,
     tokens_total: i64,
+    cost_usd: f64,
 }
 
 impl InferredDispatchStats {
@@ -1435,12 +1478,15 @@ impl InferredDispatchStats {
         }
     }
 
-    fn cache_miss(write: InferredEdgeWriteStats, tokens: i64) -> Self {
+    fn cache_miss(write: InferredEdgeWriteStats, response: &LlmResponse) -> Self {
         Self {
             cache_misses_total: 1,
             edges_materialized_total: write.inserted_edges,
             edges_skipped_static_duplicates_total: write.skipped_static_duplicates,
-            tokens_total: tokens,
+            tokens_input: i64::from(response.input_tokens),
+            tokens_output: i64::from(response.output_tokens),
+            tokens_total: i64::from(response.total_tokens),
+            cost_usd: response.cost_usd,
             ..Self::default()
         }
     }
@@ -1452,7 +1498,10 @@ impl InferredDispatchStats {
         self.edges_skipped_static_duplicates_total += other.edges_skipped_static_duplicates_total;
         self.candidate_callers_considered += other.candidate_callers_considered;
         self.coalesced_waits_total += other.coalesced_waits_total;
+        self.tokens_input += other.tokens_input;
+        self.tokens_output += other.tokens_output;
         self.tokens_total += other.tokens_total;
+        self.cost_usd += other.cost_usd;
     }
 
     fn to_json(&self) -> Value {
@@ -1463,7 +1512,10 @@ impl InferredDispatchStats {
             "inferred_edges_skipped_static_duplicates_total": self.edges_skipped_static_duplicates_total,
             "inferred_candidate_callers_considered": self.candidate_callers_considered,
             "inferred_dispatch_coalesced_total": self.coalesced_waits_total,
-            "inferred_tokens_total": self.tokens_total
+            "inferred_tokens_input": self.tokens_input,
+            "inferred_tokens_output": self.tokens_output,
+            "inferred_tokens_total": self.tokens_total,
+            "inferred_cost_usd": self.cost_usd
         })
     }
 }
@@ -1473,6 +1525,8 @@ struct InferredDispatchFailure {
     code: &'static str,
     message: String,
     retryable: bool,
+    stats_delta: Value,
+    diagnostics: Vec<Value>,
 }
 
 impl InferredDispatchFailure {
@@ -1481,6 +1535,8 @@ impl InferredDispatchFailure {
             code,
             message: message.to_owned(),
             retryable,
+            stats_delta: json!({}),
+            diagnostics: Vec::new(),
         }
     }
 
@@ -1489,14 +1545,28 @@ impl InferredDispatchFailure {
             code: "storage-error",
             message: err.to_string(),
             retryable: true,
+            stats_delta: json!({}),
+            diagnostics: Vec::new(),
         }
+    }
+
+    fn with_stats(mut self, stats_delta: Value, diagnostics: Vec<Value>) -> Self {
+        self.stats_delta = stats_delta;
+        self.diagnostics = diagnostics;
+        self
     }
 
     fn to_envelope(&self) -> Value {
         if self.code == "token-ceiling-exceeded" {
             return token_ceiling_envelope(&self.message);
         }
-        tool_error_envelope(self.code, &self.message, self.retryable)
+        tool_error_envelope_with_diagnostics(
+            self.code,
+            &self.message,
+            self.retryable,
+            self.stats_delta.clone(),
+            self.diagnostics.clone(),
+        )
     }
 }
 
@@ -1858,6 +1928,16 @@ fn success_envelope_with_stats(result: Value, stats_delta: Value) -> Value {
 }
 
 fn tool_error_envelope(code: &str, message: &str, retryable: bool) -> Value {
+    tool_error_envelope_with_diagnostics(code, message, retryable, json!({}), Vec::new())
+}
+
+fn tool_error_envelope_with_diagnostics(
+    code: &str,
+    message: &str,
+    retryable: bool,
+    stats_delta: Value,
+    diagnostics: Vec<Value>,
+) -> Value {
     json!({
         "ok": false,
         "result": null,
@@ -1866,11 +1946,64 @@ fn tool_error_envelope(code: &str, message: &str, retryable: bool) -> Value {
             "message": message,
             "retryable": retryable
         },
-        "diagnostics": [],
+        "diagnostics": diagnostics,
         "truncated": false,
         "truncation_reason": null,
-        "stats_delta": {}
+        "stats_delta": stats_delta
     })
+}
+
+fn llm_usage_json(response: &LlmResponse) -> Value {
+    json!({
+        "tokens_input": response.input_tokens,
+        "tokens_output": response.output_tokens,
+        "tokens_total": response.total_tokens,
+        "cost_usd": response.cost_usd
+    })
+}
+
+fn summary_usage_stats(response: &LlmResponse, invalid_json: bool) -> Value {
+    let mut stats = serde_json::Map::new();
+    stats.insert("summary_cache_misses_total".to_owned(), json!(1));
+    stats.insert(
+        "summary_tokens_input".to_owned(),
+        json!(response.input_tokens),
+    );
+    stats.insert(
+        "summary_tokens_output".to_owned(),
+        json!(response.output_tokens),
+    );
+    stats.insert(
+        "summary_tokens_total".to_owned(),
+        json!(response.total_tokens),
+    );
+    stats.insert("summary_cost_usd".to_owned(), json!(response.cost_usd));
+    if invalid_json {
+        stats.insert("llm_invalid_json_total".to_owned(), json!(1));
+    }
+    Value::Object(stats)
+}
+
+fn inferred_usage_stats(response: &LlmResponse, invalid_json: bool) -> Value {
+    let mut stats = serde_json::Map::new();
+    stats.insert("inferred_dispatch_misses_total".to_owned(), json!(1));
+    stats.insert(
+        "inferred_tokens_input".to_owned(),
+        json!(response.input_tokens),
+    );
+    stats.insert(
+        "inferred_tokens_output".to_owned(),
+        json!(response.output_tokens),
+    );
+    stats.insert(
+        "inferred_tokens_total".to_owned(),
+        json!(response.total_tokens),
+    );
+    stats.insert("inferred_cost_usd".to_owned(), json!(response.cost_usd));
+    if invalid_json {
+        stats.insert("llm_invalid_json_total".to_owned(), json!(1));
+    }
+    Value::Object(stats)
 }
 
 fn token_ceiling_envelope(message: &str) -> Value {
