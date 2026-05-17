@@ -13,6 +13,7 @@ use tokio::sync::oneshot;
 
 pub use clarion_core::EdgeConfidence;
 
+use crate::cache::{SummaryCacheEntry, SummaryCacheKey};
 use crate::error::StorageError;
 
 pub type Ack<T> = oneshot::Sender<Result<T, StorageError>>;
@@ -113,6 +114,20 @@ pub enum WriterCmd {
     /// `Writer::dropped_edges_total` on dedupe. Also advances the per-batch
     /// write counter — edges and entities share one batch boundary.
     InsertEdge { edge: Box<EdgeRecord>, ack: Ack<()> },
+    /// Upsert one on-demand summary cache row. This query-time MCP write does
+    /// not require an active analyze run.
+    UpsertSummaryCache {
+        entry: Box<SummaryCacheEntry>,
+        ack: Ack<()>,
+    },
+    /// Touch one on-demand summary cache row. Returns whether a row was
+    /// updated. This query-time MCP write does not require an active analyze
+    /// run.
+    TouchSummaryCache {
+        key: SummaryCacheKey,
+        last_accessed_at: String,
+        ack: Ack<bool>,
+    },
     /// Commit the in-flight transaction, update the run row to the given
     /// terminal status + `completed_at` + `stats_json`, and clear per-run
     /// state.

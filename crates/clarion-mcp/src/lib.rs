@@ -3,20 +3,30 @@
 pub mod config;
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use clarion_core::EdgeConfidence;
+use clarion_core::{
+    EdgeConfidence, LEAF_SUMMARY_PROMPT_TEMPLATE_ID, LeafSummaryPromptInput, LlmProvider,
+    LlmPurpose, LlmRequest, build_leaf_summary_prompt,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio::sync::{mpsc, oneshot};
 
 use clarion_core::plugin::{ContentLengthCeiling, Frame, TransportError};
 use clarion_storage::{
-    CallEdgeMatch, EntityRow, ReaderPool, StorageError, call_edges_from, call_edges_targeting,
-    child_entity_ids, entity_at_line, entity_by_id, find_entities, normalize_source_path,
+    CallEdgeMatch, EntityRow, ReaderPool, StorageError, SummaryCacheEntry, SummaryCacheKey,
+    WriterCmd, call_edges_from, call_edges_targeting, child_entity_ids, entity_at_line,
+    entity_by_id, find_entities, normalize_source_path, summary_cache_lookup,
 };
+
+use crate::config::LlmConfig;
 
 /// MCP protocol revision supported by the B.6 stdio server.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+const EMPTY_GUIDANCE_FINGERPRINT: &str = "guidance-empty";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ToolDefinition {
@@ -151,6 +161,9 @@ pub struct ServerState {
     project_root: PathBuf,
     readers: ReaderPool,
     execution_edge_cap: usize,
+    summary_llm: Option<SummaryLlmState>,
+    clock: Arc<dyn Fn() -> String + Send + Sync>,
+    budget: Arc<Mutex<BudgetLedger>>,
 }
 
 impl ServerState {
@@ -160,12 +173,36 @@ impl ServerState {
             project_root,
             readers,
             execution_edge_cap: 500,
+            summary_llm: None,
+            clock: Arc::new(default_now_string),
+            budget: Arc::new(Mutex::new(BudgetLedger::default())),
         }
     }
 
     #[must_use]
     pub fn with_edge_cap(mut self, execution_edge_cap: usize) -> Self {
         self.execution_edge_cap = execution_edge_cap;
+        self
+    }
+
+    #[must_use]
+    pub fn with_summary_llm(
+        mut self,
+        writer: mpsc::Sender<WriterCmd>,
+        config: LlmConfig,
+        provider: Arc<dyn LlmProvider>,
+    ) -> Self {
+        self.summary_llm = Some(SummaryLlmState {
+            writer,
+            config,
+            provider,
+        });
+        self
+    }
+
+    #[must_use]
+    pub fn with_clock(mut self, clock: impl Fn() -> String + Send + Sync + 'static) -> Self {
+        self.clock = Arc::new(clock);
         self
     }
 
@@ -223,9 +260,13 @@ impl ServerState {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "summary" | "issues_for" => tool_error_envelope(
+            "summary" => match self.tool_summary(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "issues_for" => tool_error_envelope(
                 "tool-unimplemented",
-                &format!("{name} is reserved for B.6b and is not implemented yet"),
+                "issues_for is reserved for B.6b and is not implemented yet",
                 false,
             ),
             _ => unreachable!("known tools checked above"),
@@ -433,6 +474,281 @@ impl ServerState {
             .await;
         Ok(flatten_storage_envelope_result(result))
     }
+
+    async fn tool_summary(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let entity_id = required_str(arguments, "id")?.to_owned();
+        if self.summary_budget_blocked() {
+            return Ok(tool_error_envelope(
+                "cost-ceiling-exceeded",
+                "LLM session cost ceiling has been reached",
+                false,
+            ));
+        }
+
+        let now = (self.clock)();
+        let read = match self
+            .read_summary_inputs(entity_id, self.summary_model_id())
+            .await
+        {
+            Ok(read) => read,
+            Err(err) => return Ok(tool_error_envelope("storage-error", &err.to_string(), true)),
+        };
+
+        let SummaryRead::Ready(ready) = read else {
+            return Ok(summary_read_error(read));
+        };
+
+        if let Some(envelope) = self.cached_summary_envelope(&ready, &now).await {
+            return Ok(envelope);
+        }
+
+        let Some(summary_llm) = &self.summary_llm else {
+            return Ok(tool_error_envelope(
+                "llm-disabled",
+                "LLM summaries are disabled and no fresh cache row is available",
+                false,
+            ));
+        };
+        if !summary_llm.config.enabled {
+            return Ok(tool_error_envelope(
+                "llm-disabled",
+                "LLM summaries are disabled and no fresh cache row is available",
+                false,
+            ));
+        }
+
+        Ok(self.refresh_summary(*ready, summary_llm, now).await)
+    }
+
+    async fn read_summary_inputs(
+        &self,
+        entity_id: String,
+        summary_model_id: String,
+    ) -> Result<SummaryRead, StorageError> {
+        self.readers
+            .with_reader(move |conn| {
+                let Some(entity) = entity_by_id(conn, &entity_id)? else {
+                    return Ok(SummaryRead::EntityNotFound(entity_id));
+                };
+                let Some(content_hash) = entity.content_hash.clone() else {
+                    return Ok(SummaryRead::MissingContentHash(entity.id));
+                };
+                let key = SummaryCacheKey {
+                    entity_id: entity.id.clone(),
+                    content_hash,
+                    prompt_template_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+                    model_tier: summary_model_id,
+                    guidance_fingerprint: EMPTY_GUIDANCE_FINGERPRINT.to_owned(),
+                };
+                let cached = summary_cache_lookup(conn, &key)?;
+                let caller_count = i64::try_from(
+                    call_edges_targeting(conn, &entity.id, EdgeConfidence::Ambiguous)?.len(),
+                )
+                .unwrap_or(i64::MAX);
+                let fan_out = i64::try_from(
+                    call_edges_from(conn, &entity.id, EdgeConfidence::Ambiguous)?.len(),
+                )
+                .unwrap_or(i64::MAX);
+                Ok(SummaryRead::Ready(Box::new(SummaryReady {
+                    entity,
+                    key,
+                    cached,
+                    caller_count,
+                    fan_out,
+                })))
+            })
+            .await
+    }
+
+    async fn cached_summary_envelope(&self, ready: &SummaryReady, now: &str) -> Option<Value> {
+        let cached = ready.cached.as_ref()?;
+        if summary_cache_expired(&cached.created_at, now, self.summary_cache_max_age_days()) {
+            return None;
+        }
+        if let Some(summary_llm) = &self.summary_llm
+            && let Err(err) = self
+                .send_writer(&summary_llm.writer, |ack| WriterCmd::TouchSummaryCache {
+                    key: ready.key.clone(),
+                    last_accessed_at: now.to_owned(),
+                    ack,
+                })
+                .await
+        {
+            return Some(tool_error_envelope("storage-error", &err.to_string(), true));
+        }
+        Some(summary_success_envelope(
+            &ready.entity,
+            cached,
+            true,
+            stale_semantic(cached, ready.caller_count, ready.fan_out),
+            json!({"summary_cache_hits_total": 1}),
+        ))
+    }
+
+    async fn refresh_summary(
+        &self,
+        ready: SummaryReady,
+        summary_llm: &SummaryLlmState,
+        now: String,
+    ) -> Value {
+        let model_id = self.summary_model_id();
+        let prompt = build_leaf_summary_prompt(&LeafSummaryPromptInput {
+            entity_id: ready.entity.id.clone(),
+            kind: ready.entity.kind.clone(),
+            name: ready.entity.name.clone(),
+            source_excerpt: source_excerpt(&ready.entity),
+        });
+        let response = match summary_llm.provider.invoke(LlmRequest {
+            purpose: LlmPurpose::Summary,
+            model_id: model_id.clone(),
+            prompt_id: prompt.id.to_owned(),
+            prompt: prompt.body,
+            max_output_tokens: 512,
+        }) {
+            Ok(response) => response,
+            Err(err) => {
+                return tool_error_envelope("llm-provider-error", &err.to_string(), true);
+            }
+        };
+
+        if !self.try_spend_summary_budget(
+            response.cost_usd,
+            summary_llm.config.session_cost_ceiling_usd,
+        ) {
+            return tool_error_envelope(
+                "cost-ceiling-exceeded",
+                "LLM session cost ceiling has been reached",
+                false,
+            );
+        }
+
+        if serde_json::from_str::<Value>(&response.output_json).is_err() {
+            return tool_error_envelope(
+                "llm-invalid-json",
+                "summary provider returned non-JSON output",
+                true,
+            );
+        }
+
+        let entry = SummaryCacheEntry {
+            key: ready.key,
+            summary_json: response.output_json,
+            cost_usd: response.cost_usd,
+            tokens_input: i64::from(response.input_tokens),
+            tokens_output: i64::from(response.output_tokens),
+            caller_count: ready.caller_count,
+            fan_out: ready.fan_out,
+            stale_semantic: false,
+            created_at: now.clone(),
+            last_accessed_at: now,
+        };
+        if let Err(err) = self
+            .send_writer(&summary_llm.writer, |ack| WriterCmd::UpsertSummaryCache {
+                entry: Box::new(entry.clone()),
+                ack,
+            })
+            .await
+        {
+            return tool_error_envelope("storage-error", &err.to_string(), true);
+        }
+
+        summary_success_envelope(
+            &ready.entity,
+            &entry,
+            false,
+            false,
+            json!({
+                "summary_cache_misses_total": 1,
+                "summary_llm_cost_usd": entry.cost_usd,
+                "summary_tokens_input": entry.tokens_input,
+                "summary_tokens_output": entry.tokens_output
+            }),
+        )
+    }
+
+    async fn send_writer<T>(
+        &self,
+        writer: &mpsc::Sender<WriterCmd>,
+        build: impl FnOnce(oneshot::Sender<Result<T, StorageError>>) -> WriterCmd,
+    ) -> Result<T, StorageError>
+    where
+        T: Send + 'static,
+    {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        writer
+            .send(build(ack_tx))
+            .await
+            .map_err(|_| StorageError::WriterGone)?;
+        ack_rx.await.map_err(|_| StorageError::WriterNoResponse)?
+    }
+
+    fn summary_budget_blocked(&self) -> bool {
+        self.budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .blocked
+    }
+
+    fn try_spend_summary_budget(&self, cost_usd: f64, ceiling_usd: f64) -> bool {
+        let mut budget = self
+            .budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if budget.blocked || budget.spent_usd + cost_usd > ceiling_usd {
+            budget.blocked = true;
+            return false;
+        }
+        budget.spent_usd += cost_usd;
+        true
+    }
+
+    fn summary_cache_max_age_days(&self) -> u32 {
+        self.summary_llm
+            .as_ref()
+            .map_or(180, |summary| summary.config.cache_max_age_days)
+    }
+
+    fn summary_model_id(&self) -> String {
+        self.summary_llm.as_ref().map_or_else(
+            || "claude-haiku-4-5".to_owned(),
+            |summary| {
+                summary
+                    .provider
+                    .tier_to_model("summary")
+                    .unwrap_or(&summary.config.summary_model_id)
+                    .to_owned()
+            },
+        )
+    }
+}
+
+struct SummaryLlmState {
+    writer: mpsc::Sender<WriterCmd>,
+    config: LlmConfig,
+    provider: Arc<dyn LlmProvider>,
+}
+
+#[derive(Default)]
+struct BudgetLedger {
+    spent_usd: f64,
+    blocked: bool,
+}
+
+enum SummaryRead {
+    Ready(Box<SummaryReady>),
+    EntityNotFound(String),
+    MissingContentHash(String),
+}
+
+struct SummaryReady {
+    entity: EntityRow,
+    key: SummaryCacheKey,
+    cached: Option<SummaryCacheEntry>,
+    caller_count: i64,
+    fan_out: i64,
 }
 
 #[derive(Debug, Error)]
@@ -723,6 +1039,14 @@ fn success_envelope_with_truncation(result: Value, truncation_reason: Option<&st
     Value::Object(envelope)
 }
 
+fn success_envelope_with_stats(result: Value, stats_delta: Value) -> Value {
+    let mut envelope = success_envelope(result);
+    if let Some(object) = envelope.as_object_mut() {
+        object.insert("stats_delta".to_owned(), stats_delta);
+    }
+    envelope
+}
+
 fn tool_error_envelope(code: &str, message: &str, retryable: bool) -> Value {
     json!({
         "ok": false,
@@ -737,6 +1061,58 @@ fn tool_error_envelope(code: &str, message: &str, retryable: bool) -> Value {
         "truncation_reason": null,
         "stats_delta": {}
     })
+}
+
+fn summary_read_error(read: SummaryRead) -> Value {
+    match read {
+        SummaryRead::EntityNotFound(id) => tool_error_envelope(
+            "entity-not-found",
+            &format!("entity {id} was not found"),
+            false,
+        ),
+        SummaryRead::MissingContentHash(id) => tool_error_envelope(
+            "content-hash-missing",
+            &format!("entity {id} has no content hash for summary cache keying"),
+            false,
+        ),
+        SummaryRead::Ready(_) => unreachable!("ready summary read is not an error"),
+    }
+}
+
+fn summary_success_envelope(
+    entity: &EntityRow,
+    entry: &SummaryCacheEntry,
+    cache_hit: bool,
+    stale_semantic: bool,
+    stats_delta: Value,
+) -> Value {
+    let summary = serde_json::from_str::<Value>(&entry.summary_json).unwrap_or_else(|_| {
+        json!({
+            "raw": entry.summary_json
+        })
+    });
+    success_envelope_with_stats(
+        json!({
+            "available": true,
+            "entity": entity_json(entity),
+            "summary": summary,
+            "cache": {
+                "hit": cache_hit,
+                "prompt_template_id": entry.key.prompt_template_id,
+                "model_id": entry.key.model_tier,
+                "guidance_fingerprint": entry.key.guidance_fingerprint,
+                "stale_semantic": stale_semantic,
+                "created_at": entry.created_at,
+                "last_accessed_at": entry.last_accessed_at
+            },
+            "usage": {
+                "cost_usd": entry.cost_usd,
+                "tokens_input": entry.tokens_input,
+                "tokens_output": entry.tokens_output
+            }
+        }),
+        stats_delta,
+    )
 }
 
 fn tool_json_rpc_response(id: &Value, envelope: &Value) -> Value {
@@ -769,6 +1145,76 @@ fn entity_json(entity: &EntityRow) -> Value {
         "source_line_end": entity.source_line_end,
         "content_hash": entity.content_hash
     })
+}
+
+fn source_excerpt(entity: &EntityRow) -> String {
+    entity
+        .source_file_path
+        .as_deref()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|source| {
+            if source.len() > 8_000 {
+                source.chars().take(8_000).collect()
+            } else {
+                source
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn stale_semantic(entry: &SummaryCacheEntry, caller_count: i64, fan_out: i64) -> bool {
+    entry.stale_semantic
+        || count_drifted(entry.caller_count, caller_count)
+        || count_drifted(entry.fan_out, fan_out)
+}
+
+fn count_drifted(stored: i64, current: i64) -> bool {
+    if stored == current {
+        return false;
+    }
+    if stored == 0 {
+        return current != 0;
+    }
+    i128::from((current - stored).abs()) * 2 > i128::from(stored.abs())
+}
+
+fn summary_cache_expired(created_at: &str, now: &str, max_age_days: u32) -> bool {
+    let Some(created) = timestamp_day_index(created_at) else {
+        return false;
+    };
+    let Some(current) = timestamp_day_index(now) else {
+        return false;
+    };
+    current.saturating_sub(created) > i64::from(max_age_days)
+}
+
+fn timestamp_day_index(raw: &str) -> Option<i64> {
+    if let Some(seconds) = raw.strip_prefix("unix:") {
+        return seconds.parse::<i64>().ok().map(|value| value / 86_400);
+    }
+    let date = raw.get(..10)?;
+    let mut parts = date.split('-');
+    let year = parts.next()?.parse::<i64>().ok()?;
+    let month = parts.next()?.parse::<i64>().ok()?;
+    let day = parts.next()?.parse::<i64>().ok()?;
+    Some(days_from_civil(year, month, day))
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * month_prime + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn default_now_string() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    format!("unix:{seconds}")
 }
 
 fn caller_json(

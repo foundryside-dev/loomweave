@@ -19,6 +19,7 @@ use rusqlite::{Connection, params};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::cache::{touch_summary_cache, upsert_summary_cache};
 use crate::commands::{Ack, EdgeConfidence, EdgeRecord, EntityRecord, RunStatus, WriterCmd};
 use crate::error::{Result, StorageError};
 use crate::pragma;
@@ -167,6 +168,22 @@ fn run_actor(
                     dropped_edges_total,
                     ambiguous_edges_total,
                 );
+                reply(ack, res);
+            }
+            WriterCmd::UpsertSummaryCache { entry, ack } => {
+                let res = query_time_write(conn, &mut state, commits_observed, |conn| {
+                    upsert_summary_cache(conn, &entry)
+                });
+                reply(ack, res);
+            }
+            WriterCmd::TouchSummaryCache {
+                key,
+                last_accessed_at,
+                ack,
+            } => {
+                let res = query_time_write(conn, &mut state, commits_observed, |conn| {
+                    touch_summary_cache(conn, &key, &last_accessed_at)
+                });
                 reply(ack, res);
             }
             WriterCmd::CommitRun {
@@ -491,6 +508,30 @@ fn bump_writes_and_maybe_commit(
         state.in_tx = true;
     }
     Ok(())
+}
+
+fn query_time_write<T>(
+    conn: &mut Connection,
+    state: &mut ActorState,
+    commits_observed: &AtomicUsize,
+    write: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    let reopen_run_transaction = state.current_run.is_some();
+    if state.in_tx {
+        state.in_tx = false;
+        state.writes_in_batch = 0;
+        conn.execute_batch("COMMIT")?;
+        commits_observed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let result = write(conn);
+
+    if reopen_run_transaction {
+        conn.execute_batch("BEGIN")?;
+        state.in_tx = true;
+    }
+
+    result
 }
 
 fn commit_run(

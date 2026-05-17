@@ -1,7 +1,18 @@
 //! MCP storage-backed tool tests.
 
-use clarion_mcp::ServerState;
-use clarion_storage::{ReaderPool, pragma, schema};
+use std::sync::Arc;
+
+use clarion_core::{
+    LEAF_SUMMARY_PROMPT_TEMPLATE_ID, LeafSummaryPromptInput, LlmPurpose, LlmRequest, LlmResponse,
+    Recording, RecordingProvider, build_leaf_summary_prompt,
+};
+use clarion_mcp::{
+    ServerState,
+    config::{LlmConfig, LlmProviderKind},
+};
+use clarion_storage::{
+    ReaderPool, SummaryCacheEntry, SummaryCacheKey, Writer, pragma, schema, upsert_summary_cache,
+};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 
@@ -193,6 +204,57 @@ fn state_for(project_root: &std::path::Path, db_path: &std::path::Path) -> Serve
     ServerState::new(project_root.to_path_buf(), pool)
 }
 
+fn llm_config() -> LlmConfig {
+    LlmConfig {
+        enabled: true,
+        provider: LlmProviderKind::Recording,
+        ..LlmConfig::default()
+    }
+}
+
+fn state_for_summary(
+    project_root: &std::path::Path,
+    db_path: &std::path::Path,
+    writer: &Writer,
+    provider: Arc<RecordingProvider>,
+    config: LlmConfig,
+) -> ServerState {
+    let pool = ReaderPool::open(db_path, 2).expect("reader pool");
+    ServerState::new(project_root.to_path_buf(), pool)
+        .with_summary_llm(writer.sender(), config, provider)
+        .with_clock(|| "2026-05-17T00:00:02.000Z".to_owned())
+}
+
+fn expected_summary_request(project_root: &std::path::Path, entity_id: &str) -> LlmRequest {
+    let source_excerpt = std::fs::read_to_string(project_root.join("demo.py")).unwrap();
+    let prompt = build_leaf_summary_prompt(&LeafSummaryPromptInput {
+        entity_id: entity_id.to_owned(),
+        kind: "function".to_owned(),
+        name: entity_id.to_owned(),
+        source_excerpt,
+    });
+    LlmRequest {
+        purpose: LlmPurpose::Summary,
+        model_id: "claude-haiku-4-5".to_owned(),
+        prompt_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+        prompt: prompt.body,
+        max_output_tokens: 512,
+    }
+}
+
+fn summary_recording(project_root: &std::path::Path, entity_id: &str) -> Arc<RecordingProvider> {
+    Arc::new(RecordingProvider::from_recordings(vec![Recording {
+        request: expected_summary_request(project_root, entity_id),
+        response: LlmResponse {
+            model_id: "claude-haiku-4-5".to_owned(),
+            output_json: r#"{"purpose":"cached demo"}"#.to_owned(),
+            input_tokens: 120,
+            output_tokens: 24,
+            cost_usd: 0.001,
+        },
+    }]))
+}
+
 async fn call_tool(state: &ServerState, name: &str, arguments: Value) -> Value {
     let response = state
         .handle_json_rpc(&json!({
@@ -208,6 +270,216 @@ async fn call_tool(state: &ServerState, name: &str, arguments: Value) -> Value {
         .as_str()
         .expect("tool content text");
     serde_json::from_str(text).expect("tool envelope JSON")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_returns_disabled_when_cache_empty_and_llm_off() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "llm-disabled");
+    assert_eq!(envelope["result"], Value::Null);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_cold_miss_records_provider_response_then_hits_cache() {
+    let (project, db_path) = open_project();
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = summary_recording(project.path(), "python:function:demo.entry");
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let cold = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(cold["ok"], true);
+    assert_eq!(cold["result"]["available"], true);
+    assert_eq!(cold["result"]["summary"]["purpose"], "cached demo");
+    assert_eq!(cold["result"]["cache"]["hit"], false);
+    assert_eq!(cold["result"]["cache"]["stale_semantic"], false);
+    assert_eq!(cold["stats_delta"]["summary_cache_misses_total"], 1);
+    assert_eq!(provider.invocations().len(), 1);
+
+    let warm = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(warm["ok"], true);
+    assert_eq!(warm["result"]["cache"]["hit"], true);
+    assert_eq!(warm["result"]["summary"]["purpose"], "cached demo");
+    assert_eq!(warm["stats_delta"]["summary_cache_hits_total"], 1);
+    assert_eq!(provider.invocations().len(), 1);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_cache_hit_reports_stale_semantic_when_graph_counts_drift() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    upsert_summary_cache(
+        &conn,
+        &SummaryCacheEntry {
+            key: SummaryCacheKey {
+                entity_id: "python:function:demo.entry".to_owned(),
+                content_hash: "hash-python:function:demo.entry".to_owned(),
+                prompt_template_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+                model_tier: "claude-haiku-4-5".to_owned(),
+                guidance_fingerprint: "guidance-empty".to_owned(),
+            },
+            summary_json: r#"{"purpose":"old"}"#.to_owned(),
+            cost_usd: 0.001,
+            tokens_input: 100,
+            tokens_output: 20,
+            caller_count: 0,
+            fan_out: 0,
+            stale_semantic: false,
+            created_at: "2026-05-17T00:00:00.000Z".to_owned(),
+            last_accessed_at: "2026-05-17T00:00:00.000Z".to_owned(),
+        },
+    )
+    .unwrap();
+    drop(conn);
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(RecordingProvider::from_recordings(Vec::new()));
+    let state = state_for_summary(project.path(), &db_path, &writer, provider, llm_config());
+
+    let envelope = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["result"]["cache"]["hit"], true);
+    assert_eq!(envelope["result"]["cache"]["stale_semantic"], true);
+    assert_eq!(envelope["stats_delta"]["summary_cache_hits_total"], 1);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_expired_cache_row_is_refreshed_by_recording_provider() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    upsert_summary_cache(
+        &conn,
+        &SummaryCacheEntry {
+            key: SummaryCacheKey {
+                entity_id: "python:function:demo.entry".to_owned(),
+                content_hash: "hash-python:function:demo.entry".to_owned(),
+                prompt_template_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+                model_tier: "claude-haiku-4-5".to_owned(),
+                guidance_fingerprint: "guidance-empty".to_owned(),
+            },
+            summary_json: r#"{"purpose":"old"}"#.to_owned(),
+            cost_usd: 0.001,
+            tokens_input: 100,
+            tokens_output: 20,
+            caller_count: 0,
+            fan_out: 2,
+            stale_semantic: false,
+            created_at: "2026-05-01T00:00:00.000Z".to_owned(),
+            last_accessed_at: "2026-05-01T00:00:00.000Z".to_owned(),
+        },
+    )
+    .unwrap();
+    drop(conn);
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = summary_recording(project.path(), "python:function:demo.entry");
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        LlmConfig {
+            cache_max_age_days: 1,
+            ..llm_config()
+        },
+    );
+
+    let envelope = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["result"]["cache"]["hit"], false);
+    assert_eq!(envelope["result"]["summary"]["purpose"], "cached demo");
+    assert_eq!(envelope["stats_delta"]["summary_cache_misses_total"], 1);
+    assert_eq!(provider.invocations().len(), 1);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_cost_ceiling_blocks_session_after_expensive_cold_call() {
+    let (project, db_path) = open_project();
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = summary_recording(project.path(), "python:function:demo.entry");
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        LlmConfig {
+            session_cost_ceiling_usd: 0.0005,
+            ..llm_config()
+        },
+    );
+
+    let first = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(first["ok"], false);
+    assert_eq!(first["error"]["code"], "cost-ceiling-exceeded");
+    assert_eq!(provider.invocations().len(), 1);
+
+    let second = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(second["ok"], false);
+    assert_eq!(second["error"]["code"], "cost-ceiling-exceeded");
+    assert_eq!(provider.invocations().len(), 1);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
 }
 
 #[tokio::test]

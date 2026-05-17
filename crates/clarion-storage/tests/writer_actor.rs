@@ -8,7 +8,7 @@ use rusqlite::Connection;
 use tokio::sync::oneshot;
 
 use clarion_storage::{
-    ReaderPool, Writer,
+    ReaderPool, SummaryCacheEntry, SummaryCacheKey, Writer,
     commands::{EdgeConfidence, EdgeRecord, EntityRecord, RunStatus, WriterCmd},
     pragma, schema,
 };
@@ -158,6 +158,27 @@ async fn seed_contains_edges_for_demo_functions(tx: &tokio::sync::mpsc::Sender<W
     }
 }
 
+fn summary_cache_entry() -> SummaryCacheEntry {
+    SummaryCacheEntry {
+        key: SummaryCacheKey {
+            entity_id: "python:function:demo.hello".to_owned(),
+            content_hash: "hash-python:function:demo.hello".to_owned(),
+            prompt_template_id: "leaf-v1".to_owned(),
+            model_tier: "claude-haiku-4-5".to_owned(),
+            guidance_fingerprint: "guidance-empty".to_owned(),
+        },
+        summary_json: r#"{"purpose":"demo"}"#.to_owned(),
+        cost_usd: 0.001,
+        tokens_input: 100,
+        tokens_output: 20,
+        caller_count: 1,
+        fan_out: 2,
+        stale_semantic: false,
+        created_at: now_iso(),
+        last_accessed_at: now_iso(),
+    }
+}
+
 async fn assert_edge_rejected_with_counter(
     writer: &Writer,
     tx: &tokio::sync::mpsc::Sender<WriterCmd>,
@@ -189,6 +210,45 @@ async fn send<T>(
     let (ack_tx, ack_rx) = oneshot::channel();
     tx.send(build(ack_tx)).await.unwrap();
     ack_rx.await.unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_cache_writer_commands_do_not_require_active_analyze_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    send::<()>(&tx, |ack| WriterCmd::UpsertSummaryCache {
+        entry: Box::new(summary_cache_entry()),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    send::<bool>(&tx, |ack| WriterCmd::TouchSummaryCache {
+        key: summary_cache_entry().key,
+        last_accessed_at: "2026-04-18T00:00:01.000Z".to_owned(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let conn = Connection::open(path).unwrap();
+    let (summary_json, last_accessed_at): (String, String) = conn
+        .query_row(
+            "SELECT summary_json, last_accessed_at FROM summary_cache \
+             WHERE entity_id = ?1",
+            rusqlite::params!["python:function:demo.hello"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(summary_json, r#"{"purpose":"demo"}"#);
+    assert_eq!(last_accessed_at, "2026-04-18T00:00:01.000Z");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
