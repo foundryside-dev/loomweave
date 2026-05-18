@@ -1998,9 +1998,9 @@ path works; LFS is a v0.2+ knob.
 
 ## Related Decisions
 
-- [ADR-011](./ADR-011-writer-actor-concurrency.md) — names the shadow-DB
+- [ADR-011](../../clarion/adr/ADR-011-writer-actor-concurrency.md) — names the shadow-DB
   intermediate; this ADR excludes it from git.
-- [ADR-014](./ADR-014-filigree-registry-backend.md) — cross-tool references
+- [ADR-014](../../clarion/adr/ADR-014-filigree-registry-backend.md) — cross-tool references
   rely on `clarion.db` being available to readers (Filigree, Wardline); the
   commit-by-default posture keeps those references resolvable across machines.
 

@@ -97,11 +97,11 @@ Create `/home/john/clarion/crates/clarion-core/src/plugin/mod.rs`:
 //! # Scope
 //!
 //! This module is the Clarion-side end of the plugin transport defined in
-//! [ADR-002](../../../../../docs/clarion/adr/ADR-002-plugin-transport-json-rpc.md)
+//! [ADR-002](../../clarion/adr/ADR-002-plugin-transport-json-rpc.md)
 //! and the enforcement surface for
-//! [ADR-021](../../../../../docs/clarion/adr/ADR-021-plugin-authority-hybrid.md)
+//! [ADR-021](../../clarion/adr/ADR-021-plugin-authority-hybrid.md)
 //! §2a-d. The ontology boundary rules from
-//! [ADR-022](../../../../../docs/clarion/adr/ADR-022-core-plugin-ontology.md)
+//! [ADR-022](../../clarion/adr/ADR-022-core-plugin-ontology.md)
 //! are enforced by [`host`] against the manifest parsed by [`manifest`].
 //!
 //! # Sub-modules
@@ -195,7 +195,7 @@ Create `/home/john/clarion/crates/clarion-core/src/plugin/manifest.rs` with the 
 //! `plugin.toml` parser + validator (L5).
 //!
 //! Parses the manifest shape locked by WP2 §L5 and validates against
-//! [ADR-022](../../../../../docs/clarion/adr/ADR-022-core-plugin-ontology.md):
+//! [ADR-022](../../clarion/adr/ADR-022-core-plugin-ontology.md):
 //! plugin `name` must match the identifier grammar; entity kinds cannot
 //! shadow the core-reserved set (`file`, `subsystem`, `guidance`); rule-ID
 //! prefix must be `CLA-<PLUGIN_ID_UPPERCASE>-` and end with `-`.
@@ -527,7 +527,7 @@ pub enum ManifestError {
 }
 
 /// Core-reserved entity kinds per
-/// [ADR-022](../../../../../docs/clarion/adr/ADR-022-core-plugin-ontology.md).
+/// [ADR-022](../../clarion/adr/ADR-022-core-plugin-ontology.md).
 /// These are produced by core-owned algorithms (file-discovery, Leiden
 /// clustering, guidance composition). A plugin declaring any of them in
 /// its `entity_kinds` list is rejected at manifest parse.

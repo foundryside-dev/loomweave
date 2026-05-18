@@ -167,6 +167,6 @@ A `loom-findings` package that both products import; the library owns emission t
 
 - [Loom doctrine §5 (v0.1 asterisks, asterisk 1)](../../suite/loom.md) — pipeline-coupling asterisk for (Wardline, Filigree) with this ADR as the retirement condition.
 - [Clarion v0.1 detailed design §9 (Wardline prerequisites) item 3](../v0.1/detailed-design.md) (line 1361) — Option A / Option B enumeration.
-- [Clarion v0.1 scope commitments](../v0.1/plans/v0.1-scope-commitments.md) (lines 72, 190, 202) — default deferral; spike promotion condition.
-- [Clarion v0.1 integration reconnaissance §4.3](../v0.1/reviews/pre-restructure/integration-recon.md) (line 339) — "Wardline has zero HTTP client code"; empirical basis for the v0.2 deferral default.
-- [Panel doctrine synthesis](../v0.1/reviews/panel-2026-04-17/11-doctrine-panel-synthesis.md) — SARIF triangle framing; asterisk requirement.
+- [Clarion v0.1 scope commitments](../../implementation/v0.1-scope-plans/v0.1-scope-commitments.md) (lines 72, 190, 202) — default deferral; spike promotion condition.
+- [Clarion v0.1 integration reconnaissance §4.3](../../implementation/v0.1-reviews/pre-restructure/integration-recon.md) (line 339) — "Wardline has zero HTTP client code"; empirical basis for the v0.2 deferral default.
+- [Panel doctrine synthesis](../../implementation/v0.1-reviews/panel-2026-04-17/11-doctrine-panel-synthesis.md) — SARIF triangle framing; asterisk requirement.

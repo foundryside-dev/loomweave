@@ -192,6 +192,6 @@ Instead of typed `source_byte_start/end` columns, edges carry a `properties: { s
 ## References
 
 - [B.3 design doc](../../implementation/sprint-2/b3-contains-edges.md) — wire shape, emission policy, parent_id provenance, manifest bump, test plan.
-- [Sprint-2 kickoff handoff §"Edge wire shape"](../../superpowers/handoffs/2026-04-30-sprint-2-kickoff.md) — the deferral this ADR resolves.
+- [Sprint-2 kickoff handoff §"Edge wire shape"](../../implementation/handoffs/2026-04-30-sprint-2-kickoff.md) — the deferral this ADR resolves.
 - [Sprint-1 walking-skeleton e2e](../../../tests/e2e/sprint_1_walking_skeleton.sh) — extends to assert at least one edge row post-B.3.
 - Five-reviewer panel transcripts (in B.3 brainstorming conversation log on `sprint-2/b3-design` branch).

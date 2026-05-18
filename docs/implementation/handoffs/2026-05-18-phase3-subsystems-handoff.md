@@ -2,7 +2,7 @@
 
 **Date**: 2026-05-18
 **For**: an agent picking this up cold
-**Predecessor context**: Sprint 2 closed GREEN; [arch-analysis 2026-05-18](../../arch-analysis-2026-05-18-1244/04-final-report.md) is the current-state snapshot; [Thread-1 publish-prep program](../../implementation/v0.1-publish/thread-1-pre-publish-blockers.md) runs in parallel to this and does not block.
+**Predecessor context**: Sprint 2 closed GREEN; [arch-analysis 2026-05-18](../arch-analysis-2026-05-18-1244/04-final-report.md) is the current-state snapshot; [Thread-1 publish-prep program](../../implementation/v0.1-publish/thread-1-pre-publish-blockers.md) runs in parallel to this and does not block.
 
 ---
 
@@ -16,7 +16,7 @@ Closing this gap is the single highest-leverage move between the current MCP-MVP
 
 Two things, in order, with a human review gate between them.
 
-1. **An implementation plan** (file: `docs/superpowers/plans/2026-XX-XX-phase3-subsystems.md`) in the existing plan-doc convention (see [`docs/superpowers/plans/2026-05-05-b2-class-module-entities.md`](../plans/2026-05-05-b2-class-module-entities.md) for the canonical shape). Task-by-task, file-by-file, with exit criteria each task.
+1. **An implementation plan** (file: `docs/superpowers/plans/2026-XX-XX-phase3-subsystems.md`) in the existing plan-doc convention (see [`docs/superpowers/plans/2026-05-05-b2-class-module-entities.md`](../agent-plans/2026-05-05-b2-class-module-entities.md) for the canonical shape). Task-by-task, file-by-file, with exit criteria each task.
 2. **The implementation itself**, executed task-by-task under TDD discipline, after the human approves the plan.
 
 **Do not skip Phase 1.** Phase 3 clustering touches the schema, the analyze orchestrator, the MCP read surface, and (when WP6 module/subsystem aggregation lands in v0.2) the LLM pipeline. The plan is the surface where the human catches "you missed `runs.stats` serialisation" or "the `in_subsystem` edge needs the writer-actor's edge-contract validator updated" before you write the wrong code for an afternoon.
@@ -181,6 +181,6 @@ The last bullet is the actual capability the work delivers. If it works in CI bu
 - [REQ-CATALOG-05, REQ-ANALYZE-01, REQ-ANALYZE-05](../../clarion/v0.1/requirements.md)
 - [v0.1-plan.md WP4](../../implementation/v0.1-plan.md#wp4--core-only-pipeline-phases-03-7-8)
 - [Sprint-2 scope amendment — explicit Phase 3 deferral with retirement path](../../implementation/sprint-2/scope-amendment-2026-05.md)
-- [Arch-analysis 2026-05-18 — current code geography](../../arch-analysis-2026-05-18-1244/04-final-report.md)
-- [B.2 plan-doc shape — canonical example](../plans/2026-05-05-b2-class-module-entities.md)
+- [Arch-analysis 2026-05-18 — current code geography](../arch-analysis-2026-05-18-1244/04-final-report.md)
+- [B.2 plan-doc shape — canonical example](../agent-plans/2026-05-05-b2-class-module-entities.md)
 - [Sprint-2 B.4* — the week-2 go/no-go gate pattern to mimic](../../implementation/sprint-2/scope-amendment-2026-05.md#5-the-week-2-gono-go-gate-load-bearing-risk)

@@ -8,6 +8,11 @@
 **Requirements floor**: `NFR-SEC-01` (pre-ingest scan + block + baseline), `NFR-SEC-04` (security events as findings), `NFR-OPS-01` / `NFR-OPS-04` (single-binary distribution).
 **Effort estimate**: 6–9 working days at agentic velocity. Tasks 1 and 2 parallelisable; 3 → 4 → 5 sequential; 6 + 7 parallel with any.
 
+**Implementation accuracy note**: code-path references and line numbers in
+this planning package were last checked on 2026-05-19 against the `scanner`
+branch. Treat symbol names as authoritative and line numbers as historical
+orientation only.
+
 ---
 
 ## 1. Purpose
@@ -132,10 +137,10 @@ For each detection, the `FindingRecord` is populated:
 | `run_id` | current run's `run_id` |
 | `rule_id` | `"CLA-SEC-SECRET-DETECTED"` (or other; see §6 catalogue) |
 | `kind` | `"defect"` (per ADR-004; secrets are defects pending remediation) |
-| `severity` | `"error"` (or `"info"` for `CLA-INFRA-SECRET-BASELINE-MATCH`) |
+| `severity` | `"ERROR"` (or `"INFO"` for `CLA-INFRA-SECRET-BASELINE-MATCH`) |
 | `confidence` | `Some(1.0)` for named-pattern matches; `Some(0.6)` for high-entropy detections (rough heuristic — refine in Task 1) |
 | `confidence_basis` | `Some("pattern")` or `Some("entropy")` |
-| `entity_id` | empty string (file-level, not entity-bound; the file path is in `evidence_json`) |
+| `entity_id` | `core:file:{blake3(relative_path)}` synthetic file anchor for file-level findings; the file path is also retained in `evidence_json` |
 | `related_entities_json` | `"[]"` |
 | `message` | one-line human-readable, e.g. `"AWS access key detected in src/api/keys.py:42"` (the literal bytes NEVER appear in this string) |
 | `evidence_json` | `{"file_path": "...", "line_number": 42, "rule": "AwsAccessKeyId", "hashed_secret_hex": "..."}` |
@@ -464,9 +469,9 @@ processing loop, insert a pre-ingest scan pass:
 
 4. Emit findings via `WriterCmd::InsertFinding` (see §3.1):
    - One `CLA-SEC-SECRET-DETECTED` per `allowed` detection (severity
-     `error`).
+     `ERROR`).
    - One `CLA-INFRA-SECRET-BASELINE-MATCH` per `fired_entries` element
-     (severity `info`).
+     (severity `INFO`).
    - One `CLA-INFRA-SECRET-BASELINE-NO-JUSTIFICATION` per
      `BaselineError::MissingJustification` surfaced at load time.
 5. Pass the `BlockSet` through to the per-plugin processing loop so the
@@ -750,11 +755,11 @@ existing table shape in §5 (do not invent a new format).
 
 | Rule-ID | Severity | Category | Description (one sentence) | Remediation (one sentence) | ADR |
 |---|---|---|---|---|---|
-| `CLA-SEC-SECRET-DETECTED` | error | security | Pre-ingest secret scanner detected a credential pattern in a file slated for LLM dispatch. | Remove the secret, rotate the credential, or whitelist via `.clarion/secrets-baseline.yaml` with a justification. | [ADR-013](../adr/ADR-013-pre-ingest-secret-scanner.md) |
-| `CLA-SEC-UNREDACTED-SECRETS-ALLOWED` | error | security | Operator invoked `--allow-unredacted-secrets`; file content reached the LLM provider with secrets intact. | Audit override usage via `filigree list --rule-id=CLA-SEC-UNREDACTED-SECRETS-ALLOWED --since 30d`. | [ADR-013](../adr/ADR-013-pre-ingest-secret-scanner.md) |
-| `CLA-INFRA-SECRET-BASELINE-NO-JUSTIFICATION` | error | infra | Baseline entry missing required `justification` field; entry not honoured. | Add a `justification` string explaining why the match is safe. | [ADR-013](../adr/ADR-013-pre-ingest-secret-scanner.md) |
-| `CLA-INFRA-SECRET-BASELINE-MATCH` | info | infra | Baseline entry suppressed a scanner detection (audit surface). | None — informational, retained for `NFR-SEC-04` audit. | [ADR-013](../adr/ADR-013-pre-ingest-secret-scanner.md) |
-| `CLA-INFRA-SECRET-OVERRIDE-UNCONFIRMED` | error | infra | `--allow-unredacted-secrets` supplied without confirmation; run aborted before start. | Supply `--confirm-allow-unredacted-secrets=yes-i-understand` in non-TTY contexts or run interactively. | [ADR-013](../adr/ADR-013-pre-ingest-secret-scanner.md) |
+| `CLA-SEC-SECRET-DETECTED` | error | security | Pre-ingest secret scanner detected a credential pattern in a file slated for LLM dispatch. | Remove the secret, rotate the credential, or whitelist via `.clarion/secrets-baseline.yaml` with a justification. | [ADR-013](../../clarion/adr/ADR-013-pre-ingest-secret-scanner.md) |
+| `CLA-SEC-UNREDACTED-SECRETS-ALLOWED` | error | security | Operator invoked `--allow-unredacted-secrets`; file content reached the LLM provider with secrets intact. | Audit override usage via `filigree list --rule-id=CLA-SEC-UNREDACTED-SECRETS-ALLOWED --since 30d`. | [ADR-013](../../clarion/adr/ADR-013-pre-ingest-secret-scanner.md) |
+| `CLA-INFRA-SECRET-BASELINE-NO-JUSTIFICATION` | error | infra | Baseline entry missing required `justification` field; entry not honoured. | Add a `justification` string explaining why the match is safe. | [ADR-013](../../clarion/adr/ADR-013-pre-ingest-secret-scanner.md) |
+| `CLA-INFRA-SECRET-BASELINE-MATCH` | info | infra | Baseline entry suppressed a scanner detection (audit surface). | None — informational, retained for `NFR-SEC-04` audit. | [ADR-013](../../clarion/adr/ADR-013-pre-ingest-secret-scanner.md) |
+| `CLA-INFRA-SECRET-OVERRIDE-UNCONFIRMED` | error | infra | `--allow-unredacted-secrets` supplied without confirmation; run aborted before start. | Supply `--confirm-allow-unredacted-secrets=yes-i-understand` in non-TTY contexts or run interactively. | [ADR-013](../../clarion/adr/ADR-013-pre-ingest-secret-scanner.md) |
 
 These IDs make the WP9-B Filigree-emission story (v0.2) able to
 round-trip without a separate spec pass.
@@ -1019,5 +1024,5 @@ off via the criteria in §9.
 - [Thread 1 — Pre-publish blockers (program of work)](./thread-1-pre-publish-blockers.md) — the umbrella program.
 - [v0.1-plan.md — WP5 scope](../v0.1-plan.md#wp5--pre-ingest-secret-scanner) — original work-package definition.
 - [Sprint 2 scope amendment — WP5 deferral rationale](../sprint-2/scope-amendment-2026-05.md) — "production deployment against unknown corpora gates on this returning."
-- [Arch-analysis final report §7 follow-ups](../../arch-analysis-2026-05-18-1244/04-final-report.md) — H-1 (`SoftFailed` coverage) coverage now closed via `clarion-141ca7de30`; relevant precondition for Task 3.
+- [Arch-analysis final report §7 follow-ups](../arch-analysis-2026-05-18-1244/04-final-report.md) — H-1 (`SoftFailed` coverage) coverage now closed via `clarion-141ca7de30`; relevant precondition for Task 3.
 - [`detect-secrets` baseline format](https://github.com/Yelp/detect-secrets/blob/master/README.md#baseline-file) — the format Task 2 matches.

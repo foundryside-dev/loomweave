@@ -115,6 +115,6 @@ Accept that Filigree mints its own file IDs forever; Clarion reconciles post-hoc
 ## References
 
 - [Clarion v0.1 system design §9](../v0.1/system-design.md) — integration posture; capability probe; degraded modes.
-- [Integration reconnaissance §2.1](../v0.1/reviews/pre-restructure/integration-recon.md) — `file_records` schema; four NOT-NULL foreign keys; three auto-create paths; verified absence of `registry_backend` and error code.
+- [Integration reconnaissance §2.1](../../implementation/v0.1-reviews/pre-restructure/integration-recon.md) — `file_records` schema; four NOT-NULL foreign keys; three auto-create paths; verified absence of `registry_backend` and error code.
 - [Loom doctrine §4, §5, §6](../../suite/loom.md) — pairwise composability; enrichment failure test; no-shared-store rule.
-- [Clarion v0.1 scope commitments](../v0.1/plans/v0.1-scope-commitments.md) — Q2 commits `registry_backend` to v0.1 as within-scope Filigree work.
+- [Clarion v0.1 scope commitments](../../implementation/v0.1-scope-plans/v0.1-scope-commitments.md) — Q2 commits `registry_backend` to v0.1 as within-scope Filigree work.

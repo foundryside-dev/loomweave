@@ -17,5 +17,5 @@ This `docs/` tree is organized by reader intent:
 
 - Canonical suite docs live in [suite/](./suite/README.md).
 - Canonical Clarion v0.1 design docs live in [clarion/v0.1/](./clarion/v0.1/README.md).
-- Supporting reviews and planning history live alongside the relevant version under `reviews/` and `plans/`.
 - Architecture decisions live in [clarion/adr/](./clarion/adr/README.md).
+- Supporting reviews, scope memos, sprint plans, and agent handoffs are archived under [implementation/](./implementation/README.md) — non-normative.

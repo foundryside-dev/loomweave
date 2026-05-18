@@ -48,7 +48,7 @@ The following decisions are still backlog items rather than authored ADR files. 
 
 ## Pre-implementation scope commitments
 
-The priorities and scope implied by these ADRs are committed in [../v0.1/plans/v0.1-scope-commitments.md](../v0.1/plans/v0.1-scope-commitments.md). The ADR authoring sprint is staged against that memo.
+The priorities and scope implied by these ADRs are committed in [../v0.1/plans/v0.1-scope-commitments.md](../../implementation/v0.1-scope-plans/v0.1-scope-commitments.md). The ADR authoring sprint is staged against that memo.
 
 ## ADR acceptance criteria — Loom vocabulary discipline
 

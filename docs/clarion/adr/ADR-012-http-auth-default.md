@@ -153,8 +153,8 @@ v0.1 tokens carry scope claims — read-only catalog, read-only findings, submit
 
 ## References
 
-- [Clarion v0.1 panel threat model T-02](../v0.1/reviews/panel-2026-04-17/09-threat-model.md) (line 233) — original risk scoring.
-- [Panel threat model §12 recommendation 1](../v0.1/reviews/panel-2026-04-17/09-threat-model.md) (line 298) — the specific "authenticated or not listening" prescription.
+- [Clarion v0.1 panel threat model T-02](../../implementation/v0.1-reviews/panel-2026-04-17/09-threat-model.md) (line 233) — original risk scoring.
+- [Panel threat model §12 recommendation 1](../../implementation/v0.1-reviews/panel-2026-04-17/09-threat-model.md) (line 298) — the specific "authenticated or not listening" prescription.
 - [Clarion v0.1 system design §10 "Loopback is not a security boundary"](../v0.1/system-design.md) — the paragraph this ADR flips; updated in the same commit.
 - [Clarion v0.1 detailed design §7 Token auth — full spec](../v0.1/detailed-design.md) (lines 1286-1304) — the token machinery this ADR reuses as the fallback.
-- [Clarion v0.1 scope commitments — action 5](../v0.1/plans/v0.1-scope-commitments.md) (line 199) — the commitment mandate.
+- [Clarion v0.1 scope commitments — action 5](../../implementation/v0.1-scope-plans/v0.1-scope-commitments.md) (line 199) — the commitment mandate.

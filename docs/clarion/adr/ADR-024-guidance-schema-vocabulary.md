@@ -13,7 +13,7 @@ Three guidance-schema fields and one finding field are renamed: `entity.properti
 
 The Loom federation axiom (`docs/suite/loom.md` §3–§5) requires solo-useful, pairwise-composable, enrich-only products. None of the three failure modes (semantic / initialization / pipeline coupling) directly applies to vocabulary, but cross-product readability is the *prerequisite* for honest pairwise composition. When a Loom user reads Clarion's design and Filigree's CLI in the same session and `priority` means different things in each, every cross-product debugging pass starts from a misframe. The bug at `clarion-4cd11905e2` is the concrete proof: the issue's filer assumed Filigree's meaning, the audit pass had to reframe before any fix could land.
 
-Three mismatches are documented in the [skeleton audit](../../superpowers/handoffs/2026-05-03-skeleton-audit.md):
+Three mismatches are documented in the [skeleton audit](../../implementation/handoffs/2026-05-03-skeleton-audit.md):
 
 1. **`priority`** — Clarion's guidance composition rank `project | subsystem | package | module | class | function`
    (`detailed-design.md:453`, `system-design.md:346`) collides with Filigree's `priority` label vocabulary
@@ -168,7 +168,7 @@ Add the audit's findings to the glossary as `open` clashes; defer the schema cor
 
 ## References
 
-- [Skeleton audit](../../superpowers/handoffs/2026-05-03-skeleton-audit.md) — durable record of the audit pass, reviewer feedback (architecture-critic + leverage-analyst), and the reconciled plan that produced this ADR.
+- [Skeleton audit](../../implementation/handoffs/2026-05-03-skeleton-audit.md) — durable record of the audit pass, reviewer feedback (architecture-critic + leverage-analyst), and the reconciled plan that produced this ADR.
 - [Loom suite glossary](../../suite/glossary.md) — the federation-safe design-review artefact this ADR moves three entries from `open` to `managed` within.
 - [Loom federation axiom](../../suite/loom.md) §3–§5 — the doctrine the glossary defends; the failure-test mode this ADR addresses is reader-side cross-product disambiguation cost.
 - `crates/clarion-storage/migrations/0001_initial_schema.sql:163-191` — the schema sites this ADR edits in place.

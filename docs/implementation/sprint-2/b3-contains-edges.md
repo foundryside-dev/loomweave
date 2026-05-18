@@ -5,7 +5,7 @@
 **Accepted ADRs**: [ADR-002](../../clarion/adr/ADR-002-plugin-transport-json-rpc.md), [ADR-003](../../clarion/adr/ADR-003-entity-id-scheme.md), [ADR-006](../../clarion/adr/ADR-006-clustering-algorithm.md), [ADR-007](../../clarion/adr/ADR-007-summary-cache-key.md), [ADR-022](../../clarion/adr/ADR-022-core-plugin-ontology.md), [ADR-023](../../clarion/adr/ADR-023-tooling-baseline.md), [ADR-024](../../clarion/adr/ADR-024-guidance-schema-vocabulary.md), [ADR-026](../../clarion/adr/ADR-026-containment-wire-and-edge-identity.md), [ADR-027](../../clarion/adr/ADR-027-ontology-version-semver.md)
 **Predecessor**: [B.2 — class + module entity emission](./b2-class-module-entities.md)
 **Successor**: B.1 (multi-file dispatch — WP4 Phase 0+1) and B.4 (catalog rendering)
-**Sprint-2 kickoff handoff**: [`docs/superpowers/handoffs/2026-04-30-sprint-2-kickoff.md`](../../superpowers/handoffs/2026-04-30-sprint-2-kickoff.md) §"What's in scope for Sprint 2" Tier B row B.3
+**Sprint-2 kickoff handoff**: [`docs/superpowers/handoffs/2026-04-30-sprint-2-kickoff.md`](../handoffs/2026-04-30-sprint-2-kickoff.md) §"What's in scope for Sprint 2" Tier B row B.3
 
 ---
 

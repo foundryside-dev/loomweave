@@ -97,4 +97,4 @@ For later versions:
 
 - [Clarion v0.1 system design](../v0.1/system-design.md)
 - [Clarion v0.1 detailed design](../v0.1/detailed-design.md)
-- [Clarion v0.1 design review](../v0.1/reviews/pre-restructure/design-review.md)
+- [Clarion v0.1 design review](../../implementation/v0.1-reviews/pre-restructure/design-review.md)

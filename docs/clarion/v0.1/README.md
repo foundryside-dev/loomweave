@@ -10,9 +10,8 @@ This folder is the canonical Clarion v0.1 document set.
 
 ## Supporting docs
 
-- [reviews/README.md](./reviews/README.md) — retained historical reviews and panel outputs that shaped the current docset.
-- [plans/v0.1-scope-commitments.md](./plans/v0.1-scope-commitments.md) — dated scope and decision memo for the v0.1 design freeze.
 - [../adr/README.md](../adr/README.md) — authored ADRs and remaining decision backlog.
+- [../../implementation/README.md](../../implementation/README.md) — archived planning and review history (scope commitments, panel reviews, sprint plans, agent handoffs). Non-normative; supporting context only.
 
 ## Reading order
 
@@ -23,4 +22,4 @@ This folder is the canonical Clarion v0.1 document set.
 ## Document roles
 
 - `requirements.md`, `system-design.md`, and `detailed-design.md` are the authoritative layered design set.
-- `reviews/` and `plans/` are supporting context, not normative sources.
+- Reviews and planning memos under [../../implementation/](../../implementation/) are supporting context, not normative sources.

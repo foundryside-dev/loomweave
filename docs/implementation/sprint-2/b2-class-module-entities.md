@@ -5,7 +5,7 @@
 **Accepted ADRs**: [ADR-007](../../clarion/adr/ADR-007-summary-cache-key.md), [ADR-018](../../clarion/adr/ADR-018-identity-reconciliation.md), [ADR-021](../../clarion/adr/ADR-021-plugin-authority-hybrid.md), [ADR-022](../../clarion/adr/ADR-022-core-plugin-ontology.md), [ADR-023](../../clarion/adr/ADR-023-tooling-baseline.md)
 **Predecessor**: [WP3 Sprint-1 baseline](../sprint-1/wp3-python-plugin.md) (function-only extraction)
 **Successor**: B.3 — `contains` edges (planned)
-**Sprint-2 kickoff handoff**: [`docs/superpowers/handoffs/2026-04-30-sprint-2-kickoff.md`](../../superpowers/handoffs/2026-04-30-sprint-2-kickoff.md) §"What's in scope for Sprint 2" Tier B row B.2
+**Sprint-2 kickoff handoff**: [`docs/superpowers/handoffs/2026-04-30-sprint-2-kickoff.md`](../handoffs/2026-04-30-sprint-2-kickoff.md) §"What's in scope for Sprint 2" Tier B row B.2
 
 ---
 

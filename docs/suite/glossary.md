@@ -15,7 +15,7 @@ This file is a **design-review artifact**, not infrastructure. Nothing imports i
 - Authoring an ADR that introduces or renames a cross-product-visible field name
 - Reviewing a wire-format change that adds a new top-level key
 - Onboarding to a Loom product after working on another, to surface vocabulary surprises
-- Triaging a bug whose framing depends on what a word means (the trigger that produced this glossary was exactly such a triage — see [skeleton-audit](../superpowers/handoffs/2026-05-03-skeleton-audit.md))
+- Triaging a bug whose framing depends on what a word means (the trigger that produced this glossary was exactly such a triage — see [skeleton-audit](../implementation/handoffs/2026-05-03-skeleton-audit.md))
 
 **Update this glossary when**:
 
@@ -56,7 +56,7 @@ A vocabulary verdict is part of ADR-acceptance evidence, not a courtesy. Three o
 | `rule_id` | Clarion + Wardline → Filigree | Namespaced prefix per emitter: `CLA-PY-*`, `CLA-INFRA-*`, `CLA-FACT-*`, `CLA-SEC-*`, `WLN-*`. Filigree stores byte-for-byte; round-trip preserved. | [ADR-017](../clarion/adr/ADR-017-severity-and-dedup.md), [ADR-022](../clarion/adr/ADR-022-core-plugin-ontology.md) — namespacing convention + grammar enforcement at the Clarion-plugin boundary |
 | `finding` (wire shape) | Clarion + Wardline → Filigree | Cross-product unified record type. Field ownership documented; extension via `metadata` slot (top-level keys outside the enumerated set are silently dropped). | [ADR-004](../clarion/adr/ADR-004-finding-exchange-format.md) — full wire schema with explicit ownership |
 
-### Renamed clashes (resolved by ADR-024 — see [skeleton-audit](../superpowers/handoffs/2026-05-03-skeleton-audit.md))
+### Renamed clashes (resolved by ADR-024 — see [skeleton-audit](../implementation/handoffs/2026-05-03-skeleton-audit.md))
 
 These entries record the resolution per the `renamed` verdict (see ADR-acceptance rule above). Each row names the pre-rename collision and the post-rename Clarion field name; Filigree's vocabulary is unchanged.
 

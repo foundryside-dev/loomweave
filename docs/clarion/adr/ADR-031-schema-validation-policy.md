@@ -405,7 +405,7 @@ permanent.
 
 ## References
 
-- [Skeleton audit](../../superpowers/handoffs/2026-05-03-skeleton-audit.md)
+- [Skeleton audit](../../implementation/handoffs/2026-05-03-skeleton-audit.md)
   — F-13 in the Reviewer additions table; the audit framing that
   motivated this ADR.
 - `crates/clarion-storage/migrations/0001_initial_schema.sql:80-81, 134`

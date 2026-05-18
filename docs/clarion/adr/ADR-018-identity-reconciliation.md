@@ -169,4 +169,4 @@ Wardline exports its REGISTRY as a declarative descriptor file (`wardline_regist
 - [Clarion v0.1 system design §2 (Direct REGISTRY import), §9 (state-file ingest), §9 (Entity resolve oracle)](../v0.1/system-design.md) — import pattern, ingest paths, HTTP oracle.
 - [Clarion v0.1 detailed design §2 (Identity reconciliation across the suite)](../v0.1/detailed-design.md) (lines 553-571) — three-scheme translation table; ingest-path rules.
 - [Loom doctrine §5 (v0.1 asterisks), §6 (What Loom is NOT)](../../suite/loom.md) — initialization-coupling asterisk; "no identity reconciliation service" categorical.
-- [Panel doctrine synthesis](../v0.1/reviews/panel-2026-04-17/11-doctrine-panel-synthesis.md) — the asterisks framing originated here.
+- [Panel doctrine synthesis](../../implementation/v0.1-reviews/panel-2026-04-17/11-doctrine-panel-synthesis.md) — the asterisks framing originated here.

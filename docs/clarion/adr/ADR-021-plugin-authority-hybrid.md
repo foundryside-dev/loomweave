@@ -143,9 +143,9 @@ Use cgroup v2 (`systemd-run --user --scope` or direct cgroup mounts) for per-plu
 
 ## References
 
-- [Panel threat-model review §7 (risk matrix)](../v0.1/reviews/panel-2026-04-17/09-threat-model.md) — T-01, T-08, T-11, T-12 scorings.
-- [Panel threat-model review §8, §12](../v0.1/reviews/panel-2026-04-17/09-threat-model.md) — missing controls (1); three non-negotiable v0.1 controls (2).
+- [Panel threat-model review §7 (risk matrix)](../../implementation/v0.1-reviews/panel-2026-04-17/09-threat-model.md) — T-01, T-08, T-11, T-12 scorings.
+- [Panel threat-model review §8, §12](../../implementation/v0.1-reviews/panel-2026-04-17/09-threat-model.md) — missing controls (1); three non-negotiable v0.1 controls (2).
 - [Clarion v0.1 system design §10](../v0.1/system-design.md) — threat model summary table; `Defences NOT in v0.1` (seccomp/landlock deferred).
 - [Clarion v0.1 detailed design §1.3](../v0.1/detailed-design.md) (lines 56-145) — plugin manifest shape; crash-loop circuit breaker.
-- [Clarion v0.1 scope commitments — Q3](../v0.1/plans/v0.1-scope-commitments.md) — committed decision to hybrid (declared + enforced) over full sandbox.
+- [Clarion v0.1 scope commitments — Q3](../../implementation/v0.1-scope-plans/v0.1-scope-commitments.md) — committed decision to hybrid (declared + enforced) over full sandbox.
 - [NG-16](../v0.1/requirements.md) — plugin hash-pinning deferred to v0.2; companion v0.2 control for T-01/T-15.

@@ -4,7 +4,7 @@
 **Sprint goal**: [Tier A — walking skeleton](./signoffs.md#tier-a--sprint-1-close-walking-skeleton)
 **Scope**: WP1 (scaffold + storage) → WP2 (plugin protocol + hybrid authority) → WP3 (Python plugin v0.1 baseline)
 **Predecessor plan**: [`../v0.1-plan.md`](../v0.1-plan.md)
-**Scope memo**: [`../../clarion/v0.1/plans/v0.1-scope-commitments.md`](../../clarion/v0.1/plans/v0.1-scope-commitments.md)
+**Scope memo**: [`../../clarion/v0.1/plans/v0.1-scope-commitments.md`](../v0.1-scope-plans/v0.1-scope-commitments.md)
 **Gate to close**: every checkbox ticked in [`signoffs.md`](./signoffs.md) Tier A.
 
 ---

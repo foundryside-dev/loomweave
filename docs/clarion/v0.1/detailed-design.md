@@ -9,8 +9,8 @@
 **Companion documents**:
 - [requirements.md](./requirements.md) — requirements (the *what*; REQ-* / NFR-* / CON-* / NG-*)
 - [system-design.md](./system-design.md) — system design (the *how*, mid-level; architecture, mechanisms, diagrams)
-- [reviews/pre-restructure/design-review.md](./reviews/pre-restructure/design-review.md) — design review that drove revisions 2-4
-- [reviews/pre-restructure/integration-recon.md](./reviews/pre-restructure/integration-recon.md) — integration reality check against Filigree / Wardline
+- [reviews/pre-restructure/design-review.md](../../implementation/v0.1-reviews/pre-restructure/design-review.md) — design review that drove revisions 2-4
+- [reviews/pre-restructure/integration-recon.md](../../implementation/v0.1-reviews/pre-restructure/integration-recon.md) — integration reality check against Filigree / Wardline
 
 ---
 

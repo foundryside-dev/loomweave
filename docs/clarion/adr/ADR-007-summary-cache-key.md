@@ -165,5 +165,5 @@ Store `"sonnet"` instead of `"claude-sonnet-4-6"`.
 - [Clarion v0.1 detailed design §4 (Summary cache key design)](../v0.1/detailed-design.md) (lines 965-983) — the target this ADR formalises.
 - [Clarion v0.1 detailed design §3 schema — `summary_cache` table](../v0.1/detailed-design.md) (lines 679-691) — storage shape.
 - [Clarion v0.1 requirements — NFR-COST-01, NFR-COST-02, NFR-PERF-01](../v0.1/requirements.md) — cost/performance envelopes this cache design serves.
-- [Clarion v0.1 scope commitments — Q1](../v0.1/plans/v0.1-scope-commitments.md) (line 68) — v0.2 deferrals: cache optimisations beyond the simple shape.
-- [Clarion v0.1 scope commitments — Validation](../v0.1/plans/v0.1-scope-commitments.md) (lines 237-247) — empirical validation plan for NFR-COST-01/02 and the 95% hit-rate assumption this ADR depends on.
+- [Clarion v0.1 scope commitments — Q1](../../implementation/v0.1-scope-plans/v0.1-scope-commitments.md) (line 68) — v0.2 deferrals: cache optimisations beyond the simple shape.
+- [Clarion v0.1 scope commitments — Validation](../../implementation/v0.1-scope-plans/v0.1-scope-commitments.md) (lines 237-247) — empirical validation plan for NFR-COST-01/02 and the 95% hit-rate assumption this ADR depends on.

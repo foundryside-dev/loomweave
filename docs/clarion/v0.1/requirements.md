@@ -7,8 +7,8 @@
 **Companion documents**:
 - [system-design.md](./system-design.md) — system design (the *how*, mid-level)
 - [detailed-design.md](./detailed-design.md) — detailed design reference (implementation-level)
-- [reviews/pre-restructure/design-review.md](./reviews/pre-restructure/design-review.md) — prior review that shaped revs 2-4
-- [reviews/pre-restructure/integration-recon.md](./reviews/pre-restructure/integration-recon.md) — reality check against Filigree / Wardline
+- [reviews/pre-restructure/design-review.md](../../implementation/v0.1-reviews/pre-restructure/design-review.md) — prior review that shaped revs 2-4
+- [reviews/pre-restructure/integration-recon.md](../../implementation/v0.1-reviews/pre-restructure/integration-recon.md) — reality check against Filigree / Wardline
 
 ---
 

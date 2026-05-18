@@ -3,8 +3,8 @@
 **Status**: Sprint 2 closed — RED partial milestone; see [signoffs.md](./signoffs.md) and [b8-results.md](./b8-results.md).
 **Date opened**: 2026-05-16
 **Author**: John Morrissey
-**Predecessor**: [`docs/superpowers/handoffs/2026-04-30-sprint-2-kickoff.md`](../../superpowers/handoffs/2026-04-30-sprint-2-kickoff.md)
-**Successor**: [`docs/superpowers/handoffs/2026-05-16-sprint-2-resume.md`](../../superpowers/handoffs/2026-05-16-sprint-2-resume.md)
+**Predecessor**: [`docs/superpowers/handoffs/2026-04-30-sprint-2-kickoff.md`](../handoffs/2026-04-30-sprint-2-kickoff.md)
+**Successor**: [`docs/superpowers/handoffs/2026-05-16-sprint-2-resume.md`](../handoffs/2026-05-16-sprint-2-resume.md)
 
 This memo serves three roles in one artifact:
 
@@ -216,7 +216,7 @@ Existing open Sprint-2 issues that stay open:
 
 - [v0.1-plan.md](../v0.1-plan.md) — the 11-WP plan; gets a forward-pointer to this memo
 - [Sprint 1 signoffs](../sprint-1/signoffs.md) — the ladder format Sprint 2's eventual close will follow
-- [Sprint 2 kickoff handoff](../../superpowers/handoffs/2026-04-30-sprint-2-kickoff.md) — the original 7-box scope
+- [Sprint 2 kickoff handoff](../handoffs/2026-04-30-sprint-2-kickoff.md) — the original 7-box scope
 - [B.2 design](./b2-class-module-entities.md) — shipped
 - [B.3 design](./b3-contains-edges.md) — implementation pending
 - [ADR-028](../../clarion/adr/ADR-028-edge-confidence-tiers.md) — new

@@ -24,7 +24,7 @@ Clarion ingests a codebase, extracts entities (functions, classes, modules, pack
 
 **Typical invocation**: `clarion analyze <project>` for batch indexing; `clarion serve` for MCP + HTTP consult.
 
-**Status**: designed, not yet built. Target first customer is `elspeth` (~425k LOC Python).
+**Status**: walking skeleton merged (Sprint 1, tagged `v0.1-sprint-1`); v0.1 build in flight against the published design. Target first customer is `elspeth` (~425k LOC Python).
 
 ### Filigree — the workflow and findings tracker
 
@@ -137,7 +137,7 @@ Four commitments keep the Loom products from drifting into overlap (see [loom.md
 |---|---|---|---|
 | Filigree | Yes | Yes — active development | `filigree` itself; this project |
 | Wardline | Yes | Yes — commit-cadence scanner | Wardline's own codebase |
-| Clarion | No — designed only | Not yet | `elspeth` (~425k LOC Python) targeted for v0.1 validation |
+| Clarion | Partial — Sprint 1 walking skeleton tagged `v0.1-sprint-1`; v0.1 build in flight | Not yet — pre-v0.1 release | `elspeth` (~425k LOC Python) targeted for v0.1 validation |
 | Shuttle | No — proposed; no design yet | Not yet | None — not yet scoped |
 
 ### What Clarion v0.1 ships
@@ -180,7 +180,7 @@ Clarion's v0.1 design set spells these asks out in [system-design.md](../clarion
 | Read Clarion's requirements | [../clarion/v0.1/requirements.md](../clarion/v0.1/requirements.md) |
 | Read Clarion's system design | [../clarion/v0.1/system-design.md](../clarion/v0.1/system-design.md) |
 | Read Clarion's detailed design reference | [../clarion/v0.1/detailed-design.md](../clarion/v0.1/detailed-design.md) |
-| See what the design reviewer flagged | [../clarion/v0.1/reviews/pre-restructure/design-review.md](../clarion/v0.1/reviews/pre-restructure/design-review.md) |
-| See the integration reality check | [../clarion/v0.1/reviews/pre-restructure/integration-recon.md](../clarion/v0.1/reviews/pre-restructure/integration-recon.md) |
+| Read accepted architecture decisions | [../clarion/adr/README.md](../clarion/adr/README.md) |
+| Review the planning and review archive | [../implementation/README.md](../implementation/README.md) |
 | Work with Filigree today | Check out the Filigree repository; start with its `CLAUDE.md` and `filigree --help`. |
 | Work with Wardline today | Check out the Wardline repository; start with `docs/spec/`. |

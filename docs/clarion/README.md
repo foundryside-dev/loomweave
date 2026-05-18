@@ -15,4 +15,4 @@ This folder holds Clarion product documentation.
 ## Canonical vs supporting
 
 - Canonical design docs for the current product version live under `v0.1/`.
-- Reviews and planning history live under the matching version in `reviews/` and `plans/`.
+- Reviews and planning history are archived under [../implementation/](../implementation/) — non-normative supporting context.
