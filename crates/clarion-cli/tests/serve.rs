@@ -1,8 +1,10 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Command as StdCommand, Stdio};
+use std::process::{Child, Command as StdCommand, Stdio};
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use clarion_core::{
@@ -81,6 +83,98 @@ fn serve_stdio_initialize_round_trip() {
 
     assert_eq!(response["id"], 1);
     assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
+    assert_eq!(response["result"]["serverInfo"]["name"], "clarion");
+}
+
+#[test]
+fn serve_http_files_endpoint_resolves_known_file_on_configured_port() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let (file_id, content_hash, canonical_path) = seed_file_entity(dir.path());
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+
+    let mut child = spawn_serve(dir.path());
+    let response = wait_for_http_json(&bind, "/api/v1/files?path=demo.py&language=python");
+    stop_serve(&mut child);
+    let response = response.expect("HTTP /api/v1/files response");
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../docs/federation/fixtures/get-api-v1-files.demo-python.json"
+    ))
+    .expect("parse files fixture");
+
+    assert_eq!(response["entity_id"], file_id);
+    assert_eq!(response["content_hash"], content_hash);
+    assert_eq!(response["canonical_path"], canonical_path);
+    assert_eq!(response["language"], "python");
+    assert_eq!(response, fixture["response"]);
+}
+
+#[test]
+fn serve_http_capabilities_and_mcp_stdio_coexist() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+
+    let mut child = spawn_serve(dir.path());
+    let capabilities = wait_for_http_json(&bind, "/api/v1/_capabilities")
+        .expect("HTTP /api/v1/_capabilities response");
+
+    assert_eq!(capabilities["registry_backend"], true);
+    assert_eq!(capabilities["version"], "0.1");
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../docs/federation/fixtures/get-api-v1-capabilities.json"
+    ))
+    .expect("parse capabilities fixture");
+    assert_eq!(capabilities, fixture["response"]);
+
+    {
+        let stdin = child.stdin.as_mut().expect("child stdin");
+        write_frame(
+            stdin,
+            &Frame {
+                body: serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 42,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": {"name": "test-client", "version": "0.0.0"}
+                    }
+                }))
+                .expect("serialize request"),
+            },
+        )
+        .expect("write initialize frame");
+        stdin.flush().expect("flush initialize frame");
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("wait for clarion serve");
+
+    assert!(
+        output.status.success(),
+        "serve failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(output.stdout));
+    let frame = read_frame(&mut reader, ContentLengthCeiling::new(usize::MAX))
+        .expect("read initialize response");
+    let response: serde_json::Value =
+        serde_json::from_slice(&frame.body).expect("response body is json");
+
+    assert_eq!(response["id"], 42);
     assert_eq!(response["result"]["serverInfo"]["name"], "clarion");
 }
 
@@ -510,4 +604,106 @@ fn call_summary_through_serve(project_root: &Path) -> Value {
         .as_str()
         .expect("tool text");
     serde_json::from_str(tool_text).expect("tool envelope")
+}
+
+fn seed_file_entity(project_root: &Path) -> (String, String, String) {
+    let source_path = project_root.join("demo.py");
+    fs::write(&source_path, "def entry():\n    return 1\n").expect("write source");
+    let canonical_path = source_path
+        .canonicalize()
+        .expect("canonical source path")
+        .display()
+        .to_string();
+    let content_hash = "hash-demo-file".to_owned();
+    let file_id = "core:file:hash-demo@demo.py".to_owned();
+    let db_path = project_root.join(".clarion/clarion.db");
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            ?1, 'core', 'file', 'demo.py', 'demo.py', ?2,
+            1, 2, '{}', ?3,
+            '2026-05-19T00:00:00.000Z', '2026-05-19T00:00:00.000Z'
+         )",
+        params![file_id, canonical_path, content_hash],
+    )
+    .expect("insert file entity");
+    (file_id, content_hash, "demo.py".to_owned())
+}
+
+fn free_loopback_bind() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind free loopback port");
+    listener.local_addr().expect("local addr").to_string()
+}
+
+fn write_http_config(project_root: &Path, bind: &str) {
+    fs::write(
+        project_root.join("clarion.yaml"),
+        format!("version: 1\nserve:\n  http:\n    enabled: true\n    bind: \"{bind}\"\n"),
+    )
+    .expect("write HTTP serve config");
+}
+
+fn spawn_serve(project_root: &Path) -> Child {
+    StdCommand::new(assert_cmd::cargo::cargo_bin("clarion"))
+        .args(["serve", "--path"])
+        .arg(project_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn clarion serve")
+}
+
+fn stop_serve(child: &mut Child) {
+    drop(child.stdin.take());
+    if let Ok(Some(_)) = child.try_wait() {
+        return;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn wait_for_http_json(bind: &str, path: &str) -> Result<Value, String> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut last_error = String::new();
+    while Instant::now() < deadline {
+        match http_get_json(bind, path) {
+            Ok(value) => return Ok(value),
+            Err(err) => last_error = err,
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err(last_error)
+}
+
+fn http_get_json(bind: &str, path: &str) -> Result<Value, String> {
+    let addr = bind
+        .parse()
+        .map_err(|err| format!("parse bind address {bind}: {err}"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(100))
+        .map_err(|err| format!("connect to {bind}: {err}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .map_err(|err| format!("set read timeout: {err}"))?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {bind}\r\nConnection: close\r\n\r\n"
+    )
+    .map_err(|err| format!("write request: {err}"))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|err| format!("read response: {err}"))?;
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| format!("malformed HTTP response: {response}"))?;
+    if !head.starts_with("HTTP/1.1 200") {
+        return Err(format!(
+            "unexpected HTTP response head: {head}; body: {body}"
+        ));
+    }
+    serde_json::from_str(body).map_err(|err| format!("parse json body {body:?}: {err}"))
 }

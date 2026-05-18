@@ -2,6 +2,7 @@ mod analyze;
 mod cli;
 mod clustering;
 mod config;
+mod http_read;
 mod install;
 mod run_lifecycle;
 mod secret_scan;

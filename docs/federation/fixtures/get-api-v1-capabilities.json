@@ -1,0 +1,12 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/api/v1/_capabilities"
+  },
+  "response": {
+    "registry_backend": true,
+    "file_registry": true,
+    "version": "0.1"
+  }
+}
+

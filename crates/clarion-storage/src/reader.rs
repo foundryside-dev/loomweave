@@ -14,6 +14,7 @@ use crate::error::Result;
 use crate::pragma;
 
 /// A read-only connection pool backed by `deadpool-sqlite`.
+#[derive(Clone)]
 pub struct ReaderPool {
     pool: Pool,
 }

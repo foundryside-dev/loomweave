@@ -1718,6 +1718,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn codex_cli_provider_invokes_exec_with_schema_stdin_and_usage() {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
@@ -1848,7 +1849,7 @@ printf '%s' '{{"purpose":"via codex","behavior":"ran fake CLI","relationships":"
         assert_eq!(response.cached_input_tokens, 4);
         assert_eq!(response.output_tokens, 7);
         assert_eq!(response.total_tokens, 18);
-        assert_eq!(response.cost_usd, 0.0);
+        assert!(response.cost_usd.abs() < f64::EPSILON);
 
         let log = fs::read_to_string(log_path).expect("read fake codex log");
         assert!(log.contains("subcommand=exec"));
@@ -1860,6 +1861,7 @@ printf '%s' '{{"purpose":"via codex","behavior":"ran fake CLI","relationships":"
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn claude_cli_provider_invokes_print_mode_with_schema_and_usage() {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;

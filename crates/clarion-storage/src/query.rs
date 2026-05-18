@@ -1,6 +1,7 @@
 //! Read-side query helpers used by the MCP navigation surface.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use clarion_core::EdgeConfidence;
@@ -72,6 +73,14 @@ pub struct ModuleDependencyEdge {
     pub to_module_id: String,
     pub reference_count: u64,
     pub edge_kinds: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedFile {
+    pub entity_id: String,
+    pub content_hash: String,
+    pub canonical_path: String,
+    pub language: String,
 }
 
 const MODULE_ANCESTOR_MAX_DEPTH: i64 = 32;
@@ -148,6 +157,109 @@ pub fn entity_by_id(conn: &Connection, entity_id: &str) -> Result<Option<EntityR
     conn.query_row(&sql, params![entity_id], map_entity_row)
         .optional()
         .map_err(StorageError::from)
+}
+
+pub fn resolve_file(
+    conn: &Connection,
+    project_root: &Path,
+    file: &str,
+    language: &str,
+) -> Result<Option<ResolvedFile>> {
+    let normalized = normalize_source_path(project_root, file)?;
+    let canonical_path = project_relative_path(project_root, Path::new(&normalized))?;
+    if let Some(entity) = source_entity_for_path(conn, &normalized, Some("file"))? {
+        return Ok(Some(ResolvedFile {
+            entity_id: entity.id,
+            content_hash: entity
+                .content_hash
+                .or_else(|| file_content_hash(Path::new(&normalized)))
+                .unwrap_or_default(),
+            canonical_path,
+            language: resolved_language(language, &entity.plugin_id, Path::new(&normalized)),
+        }));
+    }
+    let Some(anchor) = source_entity_for_path(conn, &normalized, None)? else {
+        return Ok(None);
+    };
+    let content_hash = anchor
+        .content_hash
+        .or_else(|| file_content_hash(Path::new(&normalized)))
+        .unwrap_or_default();
+    let synthetic_id = format!("core:file:{content_hash}@{canonical_path}");
+    Ok(Some(ResolvedFile {
+        entity_id: synthetic_id,
+        content_hash,
+        canonical_path,
+        language: resolved_language(language, &anchor.plugin_id, Path::new(&normalized)),
+    }))
+}
+
+fn source_entity_for_path(
+    conn: &Connection,
+    normalized_path: &str,
+    required_kind: Option<&str>,
+) -> Result<Option<EntityRow>> {
+    let kind_filter = required_kind.map_or(String::new(), |_| "AND kind = ?2".to_owned());
+    let sql = format!(
+        "SELECT {ENTITY_COLUMNS} \
+         FROM entities \
+         WHERE source_file_path = ?1 \
+         {kind_filter} \
+         ORDER BY CASE kind \
+                    WHEN 'file' THEN 0 \
+                    WHEN 'module' THEN 1 \
+                    ELSE 2 \
+                  END ASC, \
+                  id ASC \
+         LIMIT 1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let row = if let Some(kind) = required_kind {
+        stmt.query_row(params![normalized_path, kind], map_entity_row)
+            .optional()?
+    } else {
+        stmt.query_row(params![normalized_path], map_entity_row)
+            .optional()?
+    };
+    Ok(row)
+}
+
+fn project_relative_path(project_root: &Path, normalized_path: &Path) -> Result<String> {
+    let root = project_root.canonicalize()?;
+    let relative = normalized_path.strip_prefix(&root).map_err(|_| {
+        StorageError::InvalidSourcePath(format!(
+            "{} is not under project root {}",
+            normalized_path.display(),
+            root.display()
+        ))
+    })?;
+    relative
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| StorageError::InvalidSourcePath("source path is not valid UTF-8".to_owned()))
+}
+
+fn file_content_hash(path: &Path) -> Option<String> {
+    fs::read(path)
+        .ok()
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+}
+
+fn resolved_language(requested: &str, plugin_id: &str, path: &Path) -> String {
+    if !requested.trim().is_empty() {
+        return requested.trim().to_owned();
+    }
+    if plugin_id != "core" {
+        return plugin_id.to_owned();
+    }
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("py") => "python".to_owned(),
+        Some("rs") => "rust".to_owned(),
+        Some("js") => "javascript".to_owned(),
+        Some("ts") => "typescript".to_owned(),
+        Some(extension) => extension.to_owned(),
+        None => String::new(),
+    }
 }
 
 /// Return the subset of `candidates` whose `id` appears in `entities`. Used by

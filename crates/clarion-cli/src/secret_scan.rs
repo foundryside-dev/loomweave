@@ -89,6 +89,10 @@ pub(crate) fn pre_ingest(
     source_files: &[PathBuf],
     options: &SecretScanOptions,
 ) -> Result<SecretScanOutcome> {
+    let project_root = project_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize project root {}", project_root.display()))?;
+    let project_root = project_root.as_path();
     let scanner = Scanner::new();
     let (baseline, mut findings) = baseline::load_for_scan(project_root)?;
     let mut per_file = Vec::new();
@@ -136,7 +140,7 @@ pub(crate) fn pre_ingest(
         per_file.push((canonical_file, allowed));
     }
 
-    let override_confirmed = confirm_override_if_needed(&all_allowed, options);
+    let override_confirmed = confirm_override_if_needed(project_root, &all_allowed, options);
     let mut briefing_blocks = BTreeMap::new();
     let mut override_files = BTreeSet::new();
     findings.extend(baseline_matches);
@@ -186,6 +190,7 @@ pub(crate) fn pre_ingest(
 }
 
 fn confirm_override_if_needed(
+    project_root: &Path,
     allowed: &[(PathBuf, Detection)],
     options: &SecretScanOptions,
 ) -> bool {
@@ -195,18 +200,11 @@ fn confirm_override_if_needed(
     if options.confirm_allow_unredacted_secrets.as_deref() == Some(CONFIRM_TOKEN) {
         return true;
     }
+    print_detection_list(project_root, allowed);
     if options.confirm_allow_unredacted_secrets.is_some() {
         abort_unconfirmed_override();
     }
     if io::stdin().is_terminal() {
-        for (file, detection) in allowed {
-            eprintln!(
-                "{}:{} {}",
-                file.display(),
-                detection.line_number,
-                detection.rule_id
-            );
-        }
         eprint!("Type '{CONFIRM_TOKEN}' to proceed: ");
         let _ = io::stderr().flush();
         let mut input = String::new();
@@ -215,6 +213,17 @@ fn confirm_override_if_needed(
         }
     }
     abort_unconfirmed_override();
+}
+
+fn print_detection_list(project_root: &Path, allowed: &[(PathBuf, Detection)]) {
+    for (file, detection) in allowed {
+        eprintln!(
+            "{}:{} {}",
+            display_relative(project_root, file),
+            detection.line_number,
+            detection.rule_id
+        );
+    }
 }
 
 fn abort_unconfirmed_override() -> ! {
@@ -231,12 +240,38 @@ fn normalize_project_path(root: &Path, path: &Path) -> PathBuf {
 }
 
 fn project_relative_path(root: &Path, path: &Path) -> PathBuf {
-    path.strip_prefix(root).unwrap_or(path).to_path_buf()
+    relative_path(root, path).unwrap_or_else(|| path.to_path_buf())
 }
 
 pub(super) fn display_relative(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
+    relative_path(root, path)
+        .unwrap_or_else(|| path.to_path_buf())
         .display()
         .to_string()
+}
+
+fn relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
+    let root = canonical_or_original(root);
+    let path = canonical_or_original(path);
+    path.strip_prefix(root).ok().map(Path::to_path_buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_relative;
+
+    #[cfg(unix)]
+    #[test]
+    fn display_relative_handles_noncanonical_root_with_canonical_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_root = tmp.path().join("real");
+        let link_root = tmp.path().join("link");
+        std::fs::create_dir(&real_root).expect("create real root");
+        std::os::unix::fs::symlink(&real_root, &link_root).expect("symlink project root");
+        let file = real_root.join(".env");
+        std::fs::write(&file, b"token=example\n").expect("write fixture");
+        let canonical_file = file.canonicalize().expect("canonical file");
+
+        assert_eq!(display_relative(&link_root, &canonical_file), ".env");
+    }
 }

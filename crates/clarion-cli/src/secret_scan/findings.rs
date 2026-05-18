@@ -104,12 +104,7 @@ pub(super) fn secret_detected_finding(file: &Path, detection: &Detection) -> Pen
 }
 
 fn finding_entity_id(file_path: &Path, anchors: &BTreeMap<PathBuf, String>) -> Option<String> {
-    anchors.get(file_path).cloned().or_else(|| {
-        anchors
-            .iter()
-            .find(|(candidate, _)| candidate.ends_with(file_path))
-            .map(|(_, entity_id)| entity_id.clone())
-    })
+    anchors.get(file_path).cloned()
 }
 
 fn hex20(bytes: [u8; 20]) -> String {
@@ -120,4 +115,24 @@ fn hex20(bytes: [u8; 20]) -> String {
         out.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::finding_entity_id;
+    use std::{collections::BTreeMap, path::PathBuf};
+
+    #[test]
+    fn finding_entity_id_requires_exact_anchor_path() {
+        let mut anchors = BTreeMap::new();
+        anchors.insert(
+            PathBuf::from("/repo/vendor/lib/.env"),
+            "core:file:vendor".to_owned(),
+        );
+
+        assert_eq!(
+            finding_entity_id(PathBuf::from("lib/.env").as_path(), &anchors),
+            None
+        );
+    }
 }

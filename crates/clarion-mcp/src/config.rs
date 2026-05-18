@@ -10,6 +10,7 @@ pub struct McpConfig {
     #[serde(alias = "llm_policy")]
     pub llm: LlmConfig,
     pub integrations: IntegrationsConfig,
+    pub serve: ServeConfig,
 }
 
 impl McpConfig {
@@ -186,6 +187,28 @@ impl Default for ClaudeCliConfig {
 #[serde(default)]
 pub struct IntegrationsConfig {
     pub filigree: FiligreeConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct ServeConfig {
+    pub http: HttpReadConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct HttpReadConfig {
+    pub enabled: bool,
+    pub bind: String,
+}
+
+impl Default for HttpReadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "127.0.0.1:9111".to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -375,6 +398,7 @@ llm_policy:
                 ..LlmConfig::default()
             },
             integrations: IntegrationsConfig::default(),
+            serve: ServeConfig::default(),
         };
 
         let selected = select_provider_with_env(&cfg, |name| {
@@ -395,6 +419,7 @@ llm_policy:
                 ..LlmConfig::default()
             },
             integrations: IntegrationsConfig::default(),
+            serve: ServeConfig::default(),
         };
 
         let missing = select_provider_with_env(&cfg, |_| None).expect_err("missing key");
@@ -456,6 +481,7 @@ llm_policy:
                 ..LlmConfig::default()
             },
             integrations: IntegrationsConfig::default(),
+            serve: ServeConfig::default(),
         };
 
         let selected = select_provider_with_env(&cfg, |_| None).expect("provider selection");
@@ -515,6 +541,7 @@ llm_policy:
                 ..LlmConfig::default()
             },
             integrations: IntegrationsConfig::default(),
+            serve: ServeConfig::default(),
         };
 
         let selected = select_provider_with_env(&cfg, |_| None).expect("provider selection");

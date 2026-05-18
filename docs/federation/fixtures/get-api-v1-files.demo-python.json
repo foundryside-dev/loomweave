@@ -1,0 +1,13 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/api/v1/files?path=demo.py&language=python"
+  },
+  "response": {
+    "entity_id": "core:file:hash-demo@demo.py",
+    "content_hash": "hash-demo-file",
+    "canonical_path": "demo.py",
+    "language": "python"
+  }
+}
+

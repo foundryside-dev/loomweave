@@ -50,7 +50,11 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
     let _runtime_guard = runtime.enter();
     let readers = ReaderPool::open(&db_path, 16)
         .map_err(|err| anyhow!("open reader pool for {}: {err}", db_path.display()))?;
+    let http_project_root = project_root.clone();
     let mut state = clarion_mcp::ServerState::new(project_root, readers);
+    let http_server =
+        crate::http_read::spawn(http_project_root, db_path.clone(), &config.serve.http)
+            .context("start HTTP read API")?;
     let mut llm_writer = None;
     let mut llm_writer_join = None;
     if let Some(provider) = llm_provider {
@@ -72,6 +76,9 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
         clarion_mcp::serve_stdio_with_state_on_runtime(&runtime, &state, &mut reader, &mut writer)
             .context("serve MCP stdio");
     drop(state);
+    if let Some(server) = http_server {
+        server.shutdown().context("stop HTTP read API")?;
+    }
     drop(llm_writer);
     let writer_result = if let Some(handle) = llm_writer_join {
         Some(

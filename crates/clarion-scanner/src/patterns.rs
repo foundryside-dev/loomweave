@@ -1,4 +1,4 @@
-use regex::{Regex, RegexSet};
+use regex::bytes::{Regex, RegexSet};
 
 use crate::{
     Detection, SecretCategory, entropy::EntropyTuning, line_number_for_offset, sha1_digest,
@@ -77,18 +77,19 @@ impl Scanner {
 
     #[must_use]
     pub fn scan_bytes(&self, buf: &[u8]) -> Vec<Detection> {
-        let source = String::from_utf8_lossy(buf);
-        let bytes = source.as_bytes();
-        let _set_matches = self.patterns.matches(&source);
+        let set_matches = self.patterns.matches(buf);
         let mut detections = Vec::new();
 
-        for compiled in &self.compiled_patterns {
-            for captures in compiled.regex.captures_iter(&source) {
+        for (idx, compiled) in self.compiled_patterns.iter().enumerate() {
+            if !set_matches.matched(idx) {
+                continue;
+            }
+            for captures in compiled.regex.captures_iter(buf) {
                 let Some(whole_match) = captures.get(0) else {
                     continue;
                 };
                 if compiled.meta.category == SecretCategory::ContextualCredential
-                    && line_is_comment(bytes, whole_match.start())
+                    && line_is_comment(buf, whole_match.start())
                 {
                     continue;
                 }
@@ -102,7 +103,7 @@ impl Scanner {
                 };
                 detections.push(detection_from_match(
                     &compiled.meta,
-                    bytes,
+                    buf,
                     secret_match.start(),
                     secret_match.end(),
                 ));
@@ -118,7 +119,7 @@ impl Scanner {
                 )
             })
             .collect::<Vec<_>>();
-        self.scan_entropy(bytes, &named_ranges, &mut detections);
+        self.scan_entropy(buf, &named_ranges, &mut detections);
 
         detections.sort_by_key(|d| (d.byte_offset, d.rule_id));
         detections
@@ -130,14 +131,10 @@ impl Scanner {
         named_ranges: &[(usize, usize)],
         detections: &mut Vec<Detection>,
     ) {
-        let source = String::from_utf8_lossy(bytes);
-        for candidate in self.entropy_b64_re.find_iter(&source) {
-            let candidate_bytes = &source.as_bytes()[candidate.start()..candidate.end()];
-            if base64_candidate_has_boundaries(
-                source.as_bytes(),
-                candidate.start(),
-                candidate.end(),
-            ) && !range_overlaps(candidate.start(), candidate.end(), named_ranges)
+        for candidate in self.entropy_b64_re.find_iter(bytes) {
+            let candidate_bytes = &bytes[candidate.start()..candidate.end()];
+            if base64_candidate_has_boundaries(bytes, candidate.start(), candidate.end())
+                && !range_overlaps(candidate.start(), candidate.end(), named_ranges)
                 && self.entropy_b64.accepts(candidate_bytes)
             {
                 detections.push(entropy_detection(
@@ -149,8 +146,8 @@ impl Scanner {
                 ));
             }
         }
-        for candidate in self.entropy_hex_re.find_iter(&source) {
-            let candidate_bytes = &source.as_bytes()[candidate.start()..candidate.end()];
+        for candidate in self.entropy_hex_re.find_iter(bytes) {
+            let candidate_bytes = &bytes[candidate.start()..candidate.end()];
             if !range_overlaps(candidate.start(), candidate.end(), named_ranges)
                 && self.entropy_hex.accepts(candidate_bytes)
             {
@@ -306,6 +303,9 @@ fn is_base64_candidate_byte(byte: u8) -> bool {
 }
 
 fn line_is_comment(bytes: &[u8], offset: usize) -> bool {
+    // ADR-013's v0.1 rule floor is Python/.env-first, so only shell/Python
+    // `#` comments are ignored here. Other language comment forms should use
+    // an explicit baseline entry until their detector context is added.
     let line_start = bytes
         .get(..offset.min(bytes.len()))
         .and_then(|prefix| prefix.iter().rposition(|byte| *byte == b'\n'))

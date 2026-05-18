@@ -470,6 +470,7 @@ fn non_tty_override_without_confirmation_exits_78_before_run_start() {
         .code(78);
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
     assert!(stderr.contains("CLA-INFRA-SECRET-OVERRIDE-UNCONFIRMED"));
+    assert!(stderr.contains("leaky.sec:1 AwsAccessKeyId"));
     let run_count: i64 = conn(project.path())
         .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
         .unwrap();
@@ -500,6 +501,7 @@ fn non_tty_override_with_wrong_confirmation_exits_78_before_run_start() {
         .code(78);
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
     assert!(stderr.contains("CLA-INFRA-SECRET-OVERRIDE-UNCONFIRMED"));
+    assert!(stderr.contains("leaky.sec:1 AwsAccessKeyId"));
     let run_count: i64 = conn(project.path())
         .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
         .unwrap();

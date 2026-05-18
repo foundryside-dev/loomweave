@@ -155,6 +155,26 @@ fn detection_records_line_and_sha1_hash_without_literal() {
 }
 
 #[test]
+fn scan_bytes_reports_offsets_in_original_non_utf8_buffer() {
+    let input = b"\xff\xffkey = 'AKIAIOSFODNN7EXAMPLE'\n";
+    let detections = Scanner::new().scan_bytes(input);
+    let detection = detections
+        .iter()
+        .find(|detection| detection.rule_id == "AwsAccessKeyId")
+        .expect("AWS key detection");
+    let expected_offset = input
+        .windows(b"AKIAIOSFODNN7EXAMPLE".len())
+        .position(|window| window == b"AKIAIOSFODNN7EXAMPLE")
+        .expect("secret literal is in fixture");
+
+    assert_eq!(detection.byte_offset, expected_offset);
+    assert_eq!(
+        hex20(detection.hashed_secret),
+        sha1_hex(b"AKIAIOSFODNN7EXAMPLE")
+    );
+}
+
+#[test]
 fn baseline_suppresses_matching_detection_and_reports_fired_entry() {
     let scanner = Scanner::new();
     let detections = scanner.scan_bytes(b"key = 'AKIAIOSFODNN7EXAMPLE'\n");

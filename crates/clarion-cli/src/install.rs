@@ -62,7 +62,11 @@ integrations:\n\
     base_url: http://127.0.0.1:8766\n\
     actor: clarion-mcp\n\
     token_env: FILIGREE_API_TOKEN\n\
-    timeout_seconds: 5\n";
+    timeout_seconds: 5\n\
+serve:\n\
+  http:\n\
+    enabled: false\n\
+    bind: 127.0.0.1:9111\n";
 
 const GITIGNORE_CONTENTS: &str = "\
 # Clarion .gitignore — ADR-005 tracked-vs-excluded list.

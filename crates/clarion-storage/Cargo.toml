@@ -10,6 +10,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+blake3.workspace = true
 clarion-core = { path = "../clarion-core", version = "0.1.0-dev" }
 deadpool-sqlite.workspace = true
 rusqlite.workspace = true

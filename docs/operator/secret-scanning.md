@@ -65,10 +65,21 @@ where rule_id like 'CLA-SEC-%'
    or rule_id like 'CLA-INFRA-SECRET-%';
 ```
 
+Currently blocked entities:
+
+```sql
+select id, plugin_id, kind, name,
+       json_extract(properties, '$.briefing_blocked') as block_reason
+from entities
+where json_extract(properties, '$.briefing_blocked') is not null;
+```
+
 Filigree integration for scanner findings is planned for v0.2. Until then, the local `findings` table is the authoritative WP5 audit surface.
 
 ## Limitations
 
 The scanner is pattern-based. It can miss novel internal key formats and it can flag high-entropy test data. Use a justified baseline for reviewed false positives, and prefer `--no-llm` or an air-gapped workflow for repos where any source disclosure would be unacceptable.
+
+Contextual credential suppression only recognises shell/Python `#` comments in v0.1. It does not recognise `//` or `/* */` comments; use a justified baseline entry for reviewed non-Python test fixtures.
 
 See [ADR-013](../clarion/adr/ADR-013-pre-ingest-secret-scanner.md) for design rationale.

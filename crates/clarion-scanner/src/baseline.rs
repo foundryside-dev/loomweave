@@ -195,10 +195,9 @@ impl Baseline {
 
     fn entries_for(&self, file: &Path) -> Vec<(&PathBuf, &BaselineEntry)> {
         self.entries
-            .iter()
-            .filter(|(candidate, _)| candidate.as_path() == file)
-            .flat_map(|(path, entries)| entries.iter().map(move |entry| (path, entry)))
-            .collect()
+            .get_key_value(file)
+            .map(|(path, entries)| entries.iter().map(move |entry| (path, entry)).collect())
+            .unwrap_or_default()
     }
 }
 
