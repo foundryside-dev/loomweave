@@ -63,7 +63,7 @@ impl Scanner {
             compiled_patterns,
             entropy_b64: EntropyTuning::BASE64,
             entropy_hex: EntropyTuning::HEX,
-            entropy_b64_re: Regex::new(r"\b[A-Za-z0-9+/]{20,}={0,2}\b")
+            entropy_b64_re: Regex::new(r"[A-Za-z0-9+/]{20,}={0,2}")
                 .expect("base64 candidate regex compiles"),
             entropy_hex_re: Regex::new(r"\b[a-fA-F0-9]{40,}\b")
                 .expect("hex candidate regex compiles"),
@@ -133,14 +133,16 @@ impl Scanner {
         let source = String::from_utf8_lossy(bytes);
         for candidate in self.entropy_b64_re.find_iter(&source) {
             let candidate_bytes = &source.as_bytes()[candidate.start()..candidate.end()];
-            if looks_like_sha256_base64(&source, candidate.start(), candidate.end()) {
-                continue;
-            }
-            if !range_overlaps(candidate.start(), candidate.end(), named_ranges)
+            if base64_candidate_has_boundaries(
+                source.as_bytes(),
+                candidate.start(),
+                candidate.end(),
+            ) && !range_overlaps(candidate.start(), candidate.end(), named_ranges)
                 && self.entropy_b64.accepts(candidate_bytes)
             {
                 detections.push(entropy_detection(
                     "HighEntropyBase64",
+                    "Base64 High Entropy String",
                     bytes,
                     candidate.start(),
                     candidate.end(),
@@ -154,6 +156,7 @@ impl Scanner {
             {
                 detections.push(entropy_detection(
                     "HighEntropyHex",
+                    "Hex High Entropy String",
                     bytes,
                     candidate.start(),
                     candidate.end(),
@@ -167,6 +170,7 @@ fn detection_from_match(meta: &PatternMeta, bytes: &[u8], start: usize, end: usi
     let matched = &bytes[start..end];
     Detection {
         rule_id: meta.rule_id,
+        detect_secrets_type: meta.detect_secrets_type,
         category: meta.category,
         byte_offset: start,
         line_number: line_number_for_offset(bytes, start),
@@ -175,9 +179,16 @@ fn detection_from_match(meta: &PatternMeta, bytes: &[u8], start: usize, end: usi
     }
 }
 
-fn entropy_detection(rule_id: &'static str, bytes: &[u8], start: usize, end: usize) -> Detection {
+fn entropy_detection(
+    rule_id: &'static str,
+    detect_secrets_type: &'static str,
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+) -> Detection {
     Detection {
         rule_id,
+        detect_secrets_type,
         category: SecretCategory::HighEntropy,
         byte_offset: start,
         line_number: line_number_for_offset(bytes, start),
@@ -262,7 +273,7 @@ fn default_pattern_meta() -> Vec<PatternMeta> {
             rule_id: "PrivateKeyHeader",
             detect_secrets_type: "Private Key",
             category: SecretCategory::PrivateKey,
-            pattern: r"-----BEGIN (?:RSA|EC|DSA|OPENSSH|PGP|ENCRYPTED) PRIVATE KEY-----",
+            pattern: r"-----BEGIN (?:(?:RSA|EC|DSA|OPENSSH|ENCRYPTED) PRIVATE KEY|PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----",
             capture_group: None,
         },
         PatternMeta {
@@ -281,6 +292,19 @@ fn range_overlaps(start: usize, end: usize, ranges: &[(usize, usize)]) -> bool {
         .any(|(range_start, range_end)| start < *range_end && end > *range_start)
 }
 
+fn base64_candidate_has_boundaries(bytes: &[u8], start: usize, end: usize) -> bool {
+    let before_ok = start == 0 || !is_base64_candidate_byte(bytes[start - 1]);
+    let after_ok = end == bytes.len() || !is_base64_candidate_byte(bytes[end]);
+    before_ok && after_ok
+}
+
+fn is_base64_candidate_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'='
+    )
+}
+
 fn line_is_comment(bytes: &[u8], offset: usize) -> bool {
     let line_start = bytes
         .get(..offset.min(bytes.len()))
@@ -291,10 +315,4 @@ fn line_is_comment(bytes: &[u8], offset: usize) -> bool {
         .copied()
         .find(|byte| !byte.is_ascii_whitespace())
         == Some(b'#')
-}
-
-fn looks_like_sha256_base64(source: &str, start: usize, end: usize) -> bool {
-    let candidate = &source[start..end];
-    (candidate.len() == 44 && candidate.ends_with('='))
-        || (candidate.len() == 43 && source.as_bytes().get(end) == Some(&b'='))
 }

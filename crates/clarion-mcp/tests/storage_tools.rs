@@ -1708,6 +1708,61 @@ async fn callers_of_inferred_dispatches_and_materializes_recording_result() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn callers_of_inferred_skips_briefing_blocked_callers_without_llm() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    add_dynamic_source(project.path());
+    let source_path = project.path().join("demo.py");
+    insert_entity(
+        &conn,
+        "python:function:demo.dynamic",
+        "function",
+        &source_path,
+        Some((9, 10)),
+        Some("python:module:demo"),
+    );
+    insert_unresolved_call_site(
+        &conn,
+        "python:function:demo.entry",
+        "site-dynamic",
+        "dynamic",
+    );
+    conn.execute(
+        "UPDATE entities SET properties = ?1 WHERE id = 'python:function:demo.entry'",
+        params![json!({"briefing_blocked": "secret_present"}).to_string()],
+    )
+    .expect("mark caller briefing-blocked");
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnyInferredProvider::new(
+        r#"{"edges":[{"site_key":"site-dynamic","target_id":"python:function:demo.dynamic","confidence":0.91,"rationale":"name match"}]}"#,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.dynamic", "confidence": "inferred"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["result"]["callers"].as_array().unwrap().len(), 0);
+    assert!(provider.invocations().is_empty());
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inferred_dispatch_prompt_uses_caller_source_range_not_whole_file() {
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).unwrap();

@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,8 @@ pub enum BaselineError {
     UnsupportedVersion(String),
     #[error("baseline entries missing required field 'justification'")]
     MissingJustifications { entries: Vec<BaselineEntryIssue> },
+    #[error("baseline path must be repository-relative and stay within the project: {file}")]
+    InvalidPath { file: PathBuf },
     #[error("baseline entry has invalid hashed_secret at {file}:{line}: {details}")]
     InvalidHash {
         file: PathBuf,
@@ -107,9 +109,11 @@ impl Baseline {
                 }
                 if entry.hashed_secret == detection.hashed_secret
                     && entry.line_number == detection.line_number
+                    && entry.rule_type == detection.detect_secrets_type
                 {
                     let key = (
                         (*baseline_path).clone(),
+                        entry.rule_type.clone(),
                         entry.hashed_secret,
                         entry.line_number,
                     );
@@ -136,6 +140,9 @@ impl Baseline {
     fn from_raw(raw: RawBaseline) -> Result<Self, BaselineError> {
         if raw.version != "1.0" {
             return Err(BaselineError::UnsupportedVersion(raw.version));
+        }
+        for file in raw.results.keys() {
+            validate_baseline_path(file)?;
         }
         let mut missing_justifications = Vec::new();
         for (file, raw_entries) in &raw.results {
@@ -189,9 +196,27 @@ impl Baseline {
     fn entries_for(&self, file: &Path) -> Vec<(&PathBuf, &BaselineEntry)> {
         self.entries
             .iter()
-            .filter(|(candidate, _)| baseline_path_matches(file, candidate))
+            .filter(|(candidate, _)| candidate.as_path() == file)
             .flat_map(|(path, entries)| entries.iter().map(move |entry| (path, entry)))
             .collect()
+    }
+}
+
+fn validate_baseline_path(file: &Path) -> Result<(), BaselineError> {
+    let invalid = file.as_os_str().is_empty()
+        || file.is_absolute()
+        || file.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        });
+    if invalid {
+        Err(BaselineError::InvalidPath {
+            file: file.to_path_buf(),
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -208,9 +233,13 @@ struct RawBaselineEntry {
     rule_type: String,
     hashed_secret: String,
     line_number: u32,
-    #[serde(default)]
+    #[serde(default = "default_is_secret")]
     is_secret: bool,
     justification: Option<String>,
+}
+
+fn default_is_secret() -> bool {
+    true
 }
 
 impl From<&Baseline> for RawBaseline {
@@ -239,8 +268,4 @@ impl From<&Baseline> for RawBaseline {
             results,
         }
     }
-}
-
-fn baseline_path_matches(file: &Path, baseline_path: &Path) -> bool {
-    file == baseline_path || file.ends_with(baseline_path)
 }

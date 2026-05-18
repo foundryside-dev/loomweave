@@ -11,14 +11,16 @@ use anyhow::Result;
 use clap::Parser;
 
 fn main() -> Result<()> {
-    // Load .env from CWD or any ancestor directory, before tracing setup so a
-    // .env-supplied RUST_LOG is in effect by the time the filter is built.
-    // Existing process env vars win over .env values (dotenvy default), so an
-    // explicit `OPENROUTER_API_KEY=… clarion serve` still beats a checked-in
-    // dev .env. Missing .env is not an error — silently skip.
-    let _ = dotenvy::dotenv();
-    init_tracing();
     let cli = cli::Cli::parse();
+    // Load .env before tracing setup for operator-facing commands so a
+    // .env-supplied RUST_LOG is in effect by the time the filter is built.
+    // `analyze` is deliberately excluded: project .env contents are scanned
+    // as source sidecars and must not be imported into plugin subprocess
+    // environments before WP5's pre-ingest secret gate runs.
+    if !matches!(&cli.command, cli::Command::Analyze { .. }) {
+        let _ = dotenvy::dotenv();
+    }
+    init_tracing();
     match cli.command {
         cli::Command::Install { force, path } => install::run(&path, force),
         cli::Command::Analyze {

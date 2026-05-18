@@ -856,6 +856,10 @@ impl ServerState {
             return Ok(InferredDispatchStats::default());
         };
 
+        if briefing_block_reason(&read.caller).is_some() {
+            return Ok(InferredDispatchStats::default());
+        }
+
         if let Some(cached) = read.cached.clone() {
             return self.materialize_cached_inferred(read, cached).await;
         }

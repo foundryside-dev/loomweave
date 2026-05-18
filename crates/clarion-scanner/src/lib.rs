@@ -19,6 +19,7 @@ pub use patterns::{PatternMeta, Scanner};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Detection {
     pub rule_id: &'static str,
+    pub detect_secrets_type: &'static str,
     pub category: SecretCategory,
     pub byte_offset: usize,
     pub line_number: u32,

@@ -84,11 +84,12 @@ pub(crate) fn pre_ingest(
         scanned_files.insert(canonical_file.clone());
         let buf = fs::read(file).with_context(|| format!("read {}", file.display()))?;
         let detections = scanner.scan_bytes(&buf);
+        let baseline_file = project_relative_path(project_root, &canonical_file);
         let SuppressionResult {
             allowed,
             fired_entries,
             ..
-        } = baseline.suppress(detections, file);
+        } = baseline.suppress(detections, &baseline_file);
         if !allowed.is_empty() {
             all_allowed.extend(
                 allowed
@@ -237,6 +238,10 @@ fn canonical_or_original(path: &Path) -> PathBuf {
 
 fn normalize_project_path(root: &Path, path: &Path) -> PathBuf {
     canonical_or_original(&root.join(path))
+}
+
+fn project_relative_path(root: &Path, path: &Path) -> PathBuf {
+    path.strip_prefix(root).unwrap_or(path).to_path_buf()
 }
 
 fn display_relative(root: &Path, path: &Path) -> String {

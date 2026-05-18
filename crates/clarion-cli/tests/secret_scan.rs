@@ -54,6 +54,11 @@ while True:
             },
         })
     elif method == "analyze_file":
+        if (
+            os.environ.get("SECRETFIXTURE_ASSERT_ENV_ABSENT")
+            and os.environ.get("CLARION_DOTENV_SENTINEL") is not None
+        ):
+            raise SystemExit(42)
         path = msg["params"]["file_path"]
         source_path = os.environ.get("SECRETFIXTURE_SOURCE_OVERRIDE", path)
         name = "file_" + re.sub(r"[^A-Za-z0-9_]", "_", pathlib.Path(path).name)
@@ -235,6 +240,29 @@ fn dotenv_sidecar_persists_finding_with_core_file_anchor() {
         .unwrap();
     assert_eq!(finding_count, 1);
     assert_eq!(anchor_count, 1);
+}
+
+#[test]
+fn analyze_does_not_load_dotenv_into_plugin_environment() {
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    std::fs::write(project.path().join("clean.sec"), b"nothing to see\n").unwrap();
+    std::fs::write(
+        project.path().join(".env"),
+        b"CLARION_DOTENV_SENTINEL=ordinaryvalue\n",
+    )
+    .unwrap();
+
+    clarion_bin()
+        .arg("analyze")
+        .arg(".")
+        .current_dir(project.path())
+        .env("PATH", plugin_path(plugin.path()))
+        .env("SECRETFIXTURE_ASSERT_ENV_ABSENT", "1")
+        .assert()
+        .success();
 }
 
 #[test]
