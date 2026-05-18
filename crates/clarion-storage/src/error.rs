@@ -46,3 +46,70 @@ pub enum StorageError {
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
+
+impl StorageError {
+    /// `true` iff the underlying rusqlite error is a foreign-key
+    /// constraint violation (`SQLite` extended code 787). The MCP envelope
+    /// layer uses this to mark such failures `retryable=false`, because
+    /// a deterministic FK violation against the same row will recur on
+    /// retry and re-burn LLM tokens (clarion-df58379de4).
+    #[must_use]
+    pub fn is_foreign_key_violation(&self) -> bool {
+        match self {
+            Self::Sqlite(rusqlite::Error::SqliteFailure(err, _)) => {
+                err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    #[test]
+    fn is_foreign_key_violation_detects_sqlite_fk_breach() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON; \
+             CREATE TABLE parent (id TEXT PRIMARY KEY); \
+             CREATE TABLE child (id TEXT PRIMARY KEY, parent_id TEXT REFERENCES parent(id));",
+        )
+        .unwrap();
+        let raw = conn
+            .execute(
+                "INSERT INTO child (id, parent_id) VALUES ('c1', 'absent')",
+                [],
+            )
+            .expect_err("FK violation should fail the insert");
+        let err: StorageError = raw.into();
+        assert!(
+            err.is_foreign_key_violation(),
+            "expected FK classifier to recognise SQLITE_CONSTRAINT_FOREIGNKEY (787), got {err}"
+        );
+    }
+
+    #[test]
+    fn is_foreign_key_violation_rejects_other_constraint_breaches() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE t (id TEXT PRIMARY KEY)", [])
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('a')", []).unwrap();
+        let raw = conn
+            .execute("INSERT INTO t VALUES ('a')", [])
+            .expect_err("PK collision should fail the insert");
+        let err: StorageError = raw.into();
+        assert!(
+            !err.is_foreign_key_violation(),
+            "PK collision should not be classified as FK violation: {err}"
+        );
+    }
+
+    #[test]
+    fn is_foreign_key_violation_returns_false_for_non_sqlite_errors() {
+        let err = StorageError::WriterGone;
+        assert!(!err.is_foreign_key_violation());
+    }
+}

@@ -1547,6 +1547,83 @@ async fn callers_of_inferred_invalid_json_preserves_usage_accounting() {
     handle.await.unwrap().unwrap();
 }
 
+// clarion-df58379de4: when the LLM hallucinates a `target_id` that isn't in the
+// `entities` table, the inferred-dispatch path must drop that edge before
+// reaching the writer-actor's FK-protected INSERT. The cache row must still be
+// persisted so a warm rerun does not re-burn LLM tokens, and the dispatch must
+// return `ok=true` with a `inferred_unresolved_targets_dropped_total` count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn callers_of_inferred_drops_targets_missing_from_entities_table() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    let source_path = project.path().join("demo.py");
+    insert_entity(
+        &conn,
+        "python:function:demo.dynamic",
+        "function",
+        &source_path,
+        Some((9, 10)),
+        Some("python:module:demo"),
+    );
+    insert_unresolved_call_site(
+        &conn,
+        "python:function:demo.entry",
+        "site-dynamic",
+        "dynamic",
+    );
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnyInferredProvider::new(
+        r#"{"edges":[{"site_key":"site-dynamic","target_id":"python:function:nonexistent.hallucinated","confidence":0.91,"rationale":"name match"}]}"#,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.dynamic", "confidence": "inferred"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "envelope was {envelope}");
+    assert_eq!(
+        envelope["stats_delta"]["inferred_unresolved_targets_dropped_total"],
+        1
+    );
+    assert_eq!(
+        envelope["stats_delta"]["inferred_edges_materialized_total"],
+        0
+    );
+    assert_eq!(envelope["result"]["callers"].as_array().unwrap().len(), 0);
+    assert_eq!(provider.invocations().len(), 1);
+
+    // Warm rerun: cache row must have been persisted even though the LLM
+    // proposed an unresolvable target, so we do not re-dispatch.
+    let warm = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.dynamic", "confidence": "inferred"}),
+    )
+    .await;
+    assert_eq!(warm["ok"], true);
+    assert_eq!(provider.invocations().len(), 1, "cache miss on warm rerun");
+    assert_eq!(
+        warm["stats_delta"]["inferred_unresolved_targets_dropped_total"],
+        1
+    );
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn execution_paths_from_reports_edge_cap_truncation() {
     let (project, db_path) = open_project();

@@ -3,7 +3,7 @@
 pub mod config;
 pub mod filigree;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,7 +24,7 @@ use clarion_storage::{
     InferredEdgeWriteStats, ReaderPool, StorageError, SummaryCacheEntry, SummaryCacheKey,
     UnresolvedCallSiteRow, WriterCmd, call_edges_from, call_edges_targeting,
     candidate_entities_for_unresolved_sites, child_entity_ids, contained_entity_ids,
-    entity_at_line, entity_by_id, find_entities, inferred_edge_cache_key_id,
+    entity_at_line, entity_by_id, existing_entity_ids, find_entities, inferred_edge_cache_key_id,
     inferred_edge_cache_lookup, normalize_source_path, summary_cache_lookup,
     unresolved_call_sites_for_caller, unresolved_callers_for_target,
 };
@@ -450,7 +450,13 @@ impl ServerState {
                     false,
                 );
             }
-            Err(err) => return tool_error_envelope("storage-error", &err.to_string(), true),
+            Err(err) => {
+                return tool_error_envelope(
+                    "storage-error",
+                    &err.to_string(),
+                    storage_retryable(&err),
+                );
+            }
         }
 
         let mut stats = InferredDispatchStats::default();
@@ -479,7 +485,13 @@ impl ServerState {
                 .await
             {
                 Ok(edges) => edges,
-                Err(err) => return tool_error_envelope("storage-error", &err.to_string(), true),
+                Err(err) => {
+                    return tool_error_envelope(
+                        "storage-error",
+                        &err.to_string(),
+                        storage_retryable(&err),
+                    );
+                }
             };
             for edge in edges.into_iter().rev() {
                 edge_count_visited += 1;
@@ -515,7 +527,9 @@ impl ServerState {
                 truncated.then_some("edge-cap"),
                 stats.to_json(),
             ),
-            Err(err) => tool_error_envelope("storage-error", &err.to_string(), true),
+            Err(err) => {
+                tool_error_envelope("storage-error", &err.to_string(), storage_retryable(&err))
+            }
         }
     }
 
@@ -603,7 +617,13 @@ impl ServerState {
                     "Clarion entity was not found",
                 ));
             }
-            Err(err) => return Ok(tool_error_envelope("storage-error", &err.to_string(), true)),
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    "storage-error",
+                    &err.to_string(),
+                    storage_retryable(&err),
+                ));
+            }
         };
         let mut accumulator = IssuesForAccumulator::new(&read.entities);
         let mut requests_total = 0_usize;
@@ -681,7 +701,13 @@ impl ServerState {
             .await
         {
             Ok(read) => read,
-            Err(err) => return Ok(tool_error_envelope("storage-error", &err.to_string(), true)),
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    "storage-error",
+                    &err.to_string(),
+                    storage_retryable(&err),
+                ));
+            }
         };
 
         let SummaryRead::Ready(ready) = read else {
@@ -851,6 +877,7 @@ impl ServerState {
             &cached.result_json,
             self.max_inferred_edges_per_caller(),
         )?;
+        let (edges, dropped) = self.drop_unresolved_inferred_targets(edges).await?;
         let write = self
             .send_writer(&llm.writer, |ack| WriterCmd::InsertInferredEdges {
                 cache_entry: Box::new(cached),
@@ -859,7 +886,9 @@ impl ServerState {
             })
             .await
             .map_err(|err| InferredDispatchFailure::from_storage(&err))?;
-        Ok(InferredDispatchStats::cache_hit(write))
+        let mut stats = InferredDispatchStats::cache_hit(write);
+        stats.unresolved_targets_dropped_total = dropped;
+        Ok(stats)
     }
 
     async fn coalesced_inferred_dispatch(
@@ -974,6 +1003,7 @@ impl ServerState {
             }
             Err(err) => return Err(err),
         };
+        let (edges, dropped) = self.drop_unresolved_inferred_targets(edges).await?;
         let now = (self.clock)();
         let entry = InferredEdgeCacheEntry {
             key: read.key,
@@ -991,7 +1021,44 @@ impl ServerState {
             })
             .await
             .map_err(|err| InferredDispatchFailure::from_storage(&err))?;
-        Ok(InferredDispatchStats::cache_miss(write, &response))
+        let mut stats = InferredDispatchStats::cache_miss(write, &response);
+        stats.unresolved_targets_dropped_total = dropped;
+        Ok(stats)
+    }
+
+    /// Strip `to_id`s that don't exist in the `entities` table so the
+    /// writer-actor's FK-protected INSERT never sees a hallucinated edge
+    /// target (clarion-df58379de4). Returns the surviving records and the
+    /// count of dropped edges so callers can fold the number into
+    /// `InferredDispatchStats`.
+    async fn drop_unresolved_inferred_targets(
+        &self,
+        records: Vec<InferredCallEdgeRecord>,
+    ) -> Result<(Vec<InferredCallEdgeRecord>, u64), InferredDispatchFailure> {
+        if records.is_empty() {
+            return Ok((records, 0));
+        }
+        let unique_targets: Vec<String> = records
+            .iter()
+            .map(|record| record.to_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let existing = self
+            .readers
+            .with_reader({
+                let targets = unique_targets.clone();
+                move |conn| existing_entity_ids(conn, &targets)
+            })
+            .await
+            .map_err(|err| InferredDispatchFailure::from_storage(&err))?;
+        let original_len = records.len();
+        let kept: Vec<InferredCallEdgeRecord> = records
+            .into_iter()
+            .filter(|record| existing.contains(&record.to_id))
+            .collect();
+        let dropped = u64::try_from(original_len - kept.len()).unwrap_or(0);
+        Ok((kept, dropped))
     }
 
     async fn read_summary_inputs(
@@ -1048,7 +1115,11 @@ impl ServerState {
                 })
                 .await
         {
-            return Some(tool_error_envelope("storage-error", &err.to_string(), true));
+            return Some(tool_error_envelope(
+                "storage-error",
+                &err.to_string(),
+                storage_retryable(&err),
+            ));
         }
         Some(summary_success_envelope(
             &ready.entity,
@@ -1136,7 +1207,7 @@ impl ServerState {
             })
             .await
         {
-            return tool_error_envelope("storage-error", &err.to_string(), true);
+            return tool_error_envelope("storage-error", &err.to_string(), storage_retryable(&err));
         }
 
         summary_success_envelope(
@@ -1463,6 +1534,11 @@ struct InferredDispatchStats {
     cache_misses_total: u64,
     edges_materialized_total: u64,
     edges_skipped_static_duplicates_total: u64,
+    /// LLM-proposed `to_id` values that did not resolve in the `entities`
+    /// table at write time (clarion-df58379de4). Counted here, dropped from
+    /// the persisted edge set to avoid the FK violation that previously
+    /// poisoned the cache row and re-burned LLM tokens on retry.
+    unresolved_targets_dropped_total: u64,
     candidate_callers_considered: u64,
     coalesced_waits_total: u64,
     tokens_input: i64,
@@ -1499,6 +1575,7 @@ impl InferredDispatchStats {
         self.cache_misses_total += other.cache_misses_total;
         self.edges_materialized_total += other.edges_materialized_total;
         self.edges_skipped_static_duplicates_total += other.edges_skipped_static_duplicates_total;
+        self.unresolved_targets_dropped_total += other.unresolved_targets_dropped_total;
         self.candidate_callers_considered += other.candidate_callers_considered;
         self.coalesced_waits_total += other.coalesced_waits_total;
         self.tokens_input += other.tokens_input;
@@ -1513,6 +1590,7 @@ impl InferredDispatchStats {
             "inferred_dispatch_misses_total": self.cache_misses_total,
             "inferred_edges_materialized_total": self.edges_materialized_total,
             "inferred_edges_skipped_static_duplicates_total": self.edges_skipped_static_duplicates_total,
+            "inferred_unresolved_targets_dropped_total": self.unresolved_targets_dropped_total,
             "inferred_candidate_callers_considered": self.candidate_callers_considered,
             "inferred_dispatch_coalesced_total": self.coalesced_waits_total,
             "inferred_tokens_input": self.tokens_input,
@@ -1544,10 +1622,14 @@ impl InferredDispatchFailure {
     }
 
     fn from_storage(err: &StorageError) -> Self {
+        // FK violations are deterministic against the same row set; treating
+        // them as `retryable=true` causes the client to re-issue the LLM call
+        // and re-pay the token cost (clarion-df58379de4). Mark them
+        // non-retryable so a client honouring the hint gives up immediately.
         Self {
             code: "storage-error",
             message: err.to_string(),
-            retryable: true,
+            retryable: !err.is_foreign_key_violation(),
             stats_delta: json!({}),
             diagnostics: Vec::new(),
         }
@@ -1877,15 +1959,22 @@ fn optional_confidence(
 fn envelope_from_storage_result(result: Result<Value, StorageError>) -> Value {
     match result {
         Ok(result) => success_envelope(result),
-        Err(err) => tool_error_envelope("storage-error", &err.to_string(), true),
+        Err(err) => tool_error_envelope("storage-error", &err.to_string(), storage_retryable(&err)),
     }
 }
 
 fn flatten_storage_envelope_result(result: Result<Value, StorageError>) -> Value {
     match result {
         Ok(envelope) => envelope,
-        Err(err) => tool_error_envelope("storage-error", &err.to_string(), true),
+        Err(err) => tool_error_envelope("storage-error", &err.to_string(), storage_retryable(&err)),
     }
+}
+
+/// `storage-error` retryable hint. FK violations are deterministic against
+/// the same row set; everything else (`SQLITE_BUSY`, disk-full, pool errors)
+/// stays retryable (clarion-df58379de4).
+fn storage_retryable(err: &StorageError) -> bool {
+    !err.is_foreign_key_violation()
 }
 
 fn success_envelope(result: Value) -> Value {

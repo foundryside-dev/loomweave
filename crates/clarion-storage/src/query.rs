@@ -1,10 +1,10 @@
 //! Read-side query helpers used by the MCP navigation surface.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use clarion_core::EdgeConfidence;
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 
 use crate::{Result, StorageError};
 
@@ -108,6 +108,32 @@ pub fn entity_by_id(conn: &Connection, entity_id: &str) -> Result<Option<EntityR
     conn.query_row(&sql, params![entity_id], map_entity_row)
         .optional()
         .map_err(StorageError::from)
+}
+
+/// Return the subset of `candidates` whose `id` appears in `entities`. Used by
+/// the inferred-edge dispatch path to pre-filter LLM-proposed `to_id` values
+/// before they reach the writer-actor's FK-protected INSERT (clarion-df58379de4).
+/// Empty input is handled cheaply; large inputs are chunked to stay under the
+/// default `SQLite` parameter cap (32766 placeholders per statement).
+pub fn existing_entity_ids(conn: &Connection, candidates: &[String]) -> Result<HashSet<String>> {
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut found = HashSet::with_capacity(candidates.len());
+    for chunk in candidates.chunks(500) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT id FROM entities WHERE id IN ({placeholders})");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(chunk.iter()), |row| {
+            row.get::<_, String>(0)
+        })?;
+        for row in rows {
+            found.insert(row?);
+        }
+    }
+    Ok(found)
 }
 
 pub fn entity_at_line(

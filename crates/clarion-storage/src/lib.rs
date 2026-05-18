@@ -27,8 +27,8 @@ pub use error::{Result, StorageError};
 pub use query::{
     CallEdgeMatch, ContainedEntities, EntityRow, UnresolvedCallSiteRow, call_edges_from,
     call_edges_targeting, candidate_entities_for_unresolved_sites, child_entity_ids,
-    contained_entity_ids, entity_at_line, entity_by_id, find_entities, normalize_source_path,
-    unresolved_call_sites_for_caller, unresolved_callers_for_target,
+    contained_entity_ids, entity_at_line, entity_by_id, existing_entity_ids, find_entities,
+    normalize_source_path, unresolved_call_sites_for_caller, unresolved_callers_for_target,
 };
 pub use reader::ReaderPool;
 pub use unresolved::{UnresolvedCallSiteRecord, replace_unresolved_call_sites_for_caller};
