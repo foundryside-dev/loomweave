@@ -6,7 +6,7 @@ Clarion scans source files before any file content can be used for LLM summaries
 
 Blocking is file-level. If `src/config.py` contains a detected key, entities from that file remain queryable through structural tools, but the `summary` tool returns a policy envelope instead of calling the LLM provider or writing `summary_cache`.
 
-Files outside the analyzed plugin extension set are not scanned because they are not candidates for plugin dispatch in that run.
+Plugin source files and `.env` sidecars are scanned. If a plugin reports an entity for some other in-project path that was not covered by the scanner, Clarion marks that entity `briefing_blocked: unscanned_source` so source bytes cannot reach the LLM provider without a prior scan.
 
 ## Whitelist A False Positive
 

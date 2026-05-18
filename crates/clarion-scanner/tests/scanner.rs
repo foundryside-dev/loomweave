@@ -189,10 +189,38 @@ results:
 "#,
     )
     .expect_err("missing justification should fail");
-    assert!(matches!(
-        err,
-        BaselineError::MissingJustification { line: 42, .. }
-    ));
+    let BaselineError::MissingJustifications { entries } = err else {
+        panic!("expected MissingJustifications, got {err:?}");
+    };
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].line, 42);
+}
+
+#[test]
+fn baseline_missing_justification_reports_all_entries() {
+    let err = Baseline::from_yaml_str(
+        r#"
+version: "1.0"
+results:
+  "src/one.py":
+    - type: "AWS Access Key"
+      hashed_secret: "0123456789abcdef0123456789abcdef01234567"
+      line_number: 4
+      is_secret: false
+  "src/two.py":
+    - type: "AWS Access Key"
+      hashed_secret: "0123456789abcdef0123456789abcdef01234567"
+      line_number: 8
+      is_secret: false
+"#,
+    )
+    .expect_err("all missing justifications should be reported");
+    let BaselineError::MissingJustifications { entries } = err else {
+        panic!("expected MissingJustifications, got {err:?}");
+    };
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].line, 4);
+    assert_eq!(entries[1].line, 8);
 }
 
 #[test]

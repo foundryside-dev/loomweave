@@ -416,6 +416,8 @@ where
     stderr_tail: Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>>,
     /// Canonical source paths whose entities must not be sent for LLM briefing.
     briefing_blocks: BTreeMap<PathBuf, String>,
+    /// Canonical source paths that were covered by the core pre-ingest scanner.
+    scanned_source_files: BTreeSet<PathBuf>,
 }
 
 /// Size of the stderr ring buffer kept for diagnostics. 64 KiB holds
@@ -664,6 +666,7 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
             ontology_version: None,
             stderr_tail: None,
             briefing_blocks: BTreeMap::new(),
+            scanned_source_files: BTreeSet::new(),
         }
     }
 
@@ -696,6 +699,15 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
     /// policy reasons such as `secret_present`.
     pub fn set_briefing_blocks(&mut self, blocks: BTreeMap<PathBuf, String>) {
         self.briefing_blocks = blocks;
+    }
+
+    /// Install canonical source paths covered by the pre-ingest scanner.
+    ///
+    /// If a plugin returns an entity for a jailed in-project path that is not in
+    /// this set, the entity is policy-blocked from LLM briefing because its file
+    /// bytes have not passed the scanner.
+    pub fn set_scanned_source_files(&mut self, files: BTreeSet<PathBuf>) {
+        self.scanned_source_files = files;
     }
 
     /// Perform the `initialize` → `initialized` handshake.
@@ -955,10 +967,18 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
     }
 
     fn apply_briefing_block(&self, raw: &mut RawEntity, jailed: &str) {
-        if let Some(reason) = self.briefing_blocks.get(Path::new(jailed)) {
+        let jailed_path = Path::new(jailed);
+        let reason = self
+            .briefing_blocks
+            .get(jailed_path)
+            .map(String::as_str)
+            .or_else(|| {
+                (!self.scanned_source_files.contains(jailed_path)).then_some("unscanned_source")
+            });
+        if let Some(reason) = reason {
             raw.extra.insert(
                 "briefing_blocked".to_owned(),
-                serde_json::Value::String(reason.clone()),
+                serde_json::Value::String(reason.to_owned()),
             );
         }
     }

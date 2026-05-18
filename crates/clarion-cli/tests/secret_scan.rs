@@ -9,6 +9,7 @@ fn clarion_bin() -> Command {
 
 const PLUGIN_SCRIPT: &str = r#"#!/usr/bin/python3
 import json
+import os
 import pathlib
 import re
 import sys
@@ -54,6 +55,7 @@ while True:
         })
     elif method == "analyze_file":
         path = msg["params"]["file_path"]
+        source_path = os.environ.get("SECRETFIXTURE_SOURCE_OVERRIDE", path)
         name = "file_" + re.sub(r"[^A-Za-z0-9_]", "_", pathlib.Path(path).name)
         write_frame({
             "jsonrpc": "2.0",
@@ -64,7 +66,7 @@ while True:
                         "id": "secretfixture:module:" + name,
                         "kind": "module",
                         "qualified_name": name,
-                        "source": {"file_path": path},
+                        "source": {"file_path": source_path},
                     }
                 ],
                 "edges": [],
@@ -193,6 +195,77 @@ fn secret_file_persists_finding_and_briefing_block() {
 }
 
 #[test]
+fn dotenv_sidecar_persists_finding_with_core_file_anchor() {
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    std::fs::write(project.path().join("clean.sec"), b"nothing to see\n").unwrap();
+    std::fs::write(
+        project.path().join(".env"),
+        b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n",
+    )
+    .unwrap();
+
+    clarion_bin()
+        .arg("analyze")
+        .arg(project.path())
+        .env("PATH", plugin_path(plugin.path()))
+        .assert()
+        .success();
+
+    let db = conn(project.path());
+    let finding_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'CLA-SEC-SECRET-DETECTED'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let anchor_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM entities \
+             WHERE plugin_id = 'core' \
+               AND kind = 'file' \
+               AND source_file_path LIKE '%.env' \
+               AND json_extract(properties, '$.briefing_blocked') = 'secret_present'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(finding_count, 1);
+    assert_eq!(anchor_count, 1);
+}
+
+#[test]
+fn plugin_entity_for_unscanned_source_is_briefing_blocked() {
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    std::fs::write(project.path().join("clean.sec"), b"nothing to see\n").unwrap();
+    let unscanned = project.path().join("notes.txt");
+    std::fs::write(&unscanned, b"ordinary notes\n").unwrap();
+
+    clarion_bin()
+        .arg("analyze")
+        .arg(project.path())
+        .env("PATH", plugin_path(plugin.path()))
+        .env("SECRETFIXTURE_SOURCE_OVERRIDE", &unscanned)
+        .assert()
+        .success();
+
+    let blocked: String = conn(project.path())
+        .query_row(
+            "SELECT json_extract(properties, '$.briefing_blocked') FROM entities",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(blocked, "unscanned_source");
+}
+
+#[test]
 fn baseline_suppresses_secret_and_emits_audit_match() {
     let project = tempfile::tempdir().unwrap();
     let plugin = tempfile::tempdir().unwrap();
@@ -273,6 +346,11 @@ results:
       hashed_secret: "25910f981e85ca04baf359199dd0bd4a3ae738b6"
       line_number: 1
       is_secret: false
+  "stale.sec":
+    - type: "AWS Access Key"
+      hashed_secret: "25910f981e85ca04baf359199dd0bd4a3ae738b6"
+      line_number: 9
+      is_secret: false
 "#,
     )
     .unwrap();
@@ -291,7 +369,7 @@ results:
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(count, 1);
+    assert_eq!(count, 2);
 }
 
 #[test]
@@ -358,6 +436,36 @@ fn non_tty_override_without_confirmation_exits_78_before_run_start() {
 
     let assert = clarion_bin()
         .args(["analyze", "--allow-unredacted-secrets"])
+        .arg(project.path())
+        .env("PATH", plugin_path(plugin.path()))
+        .assert()
+        .code(78);
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(stderr.contains("CLA-INFRA-SECRET-OVERRIDE-UNCONFIRMED"));
+    let run_count: i64 = conn(project.path())
+        .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(run_count, 0);
+}
+
+#[test]
+fn non_tty_override_with_wrong_confirmation_exits_78_before_run_start() {
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    std::fs::write(
+        project.path().join("leaky.sec"),
+        b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n",
+    )
+    .unwrap();
+
+    let assert = clarion_bin()
+        .args([
+            "analyze",
+            "--allow-unredacted-secrets",
+            "--confirm-allow-unredacted-secrets=oops",
+        ])
         .arg(project.path())
         .env("PATH", plugin_path(plugin.path()))
         .assert()

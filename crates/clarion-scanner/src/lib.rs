@@ -9,7 +9,8 @@ mod entropy;
 mod patterns;
 
 pub use baseline::{
-    Baseline, BaselineEntry, BaselineError, BaselineMatch, SuppressionResult, load_baseline,
+    Baseline, BaselineEntry, BaselineEntryIssue, BaselineError, BaselineMatch, SuppressionResult,
+    load_baseline,
 };
 pub use entropy::EntropyTuning;
 pub use patterns::{PatternMeta, Scanner};

@@ -38,9 +38,21 @@ pub(crate) struct SecretScanOutcome {
     pub(crate) briefing_blocks: BTreeMap<PathBuf, String>,
     findings: Vec<PendingFinding>,
     override_files: Vec<PathBuf>,
+    scanned_files: BTreeSet<PathBuf>,
 }
 
 impl SecretScanOutcome {
+    pub(crate) fn scanned_files(&self) -> &BTreeSet<PathBuf> {
+        &self.scanned_files
+    }
+
+    pub(crate) fn finding_files(&self) -> BTreeSet<PathBuf> {
+        self.findings
+            .iter()
+            .map(|finding| finding.file_path.clone())
+            .collect()
+    }
+
     pub(crate) fn augment_stats(&self, stats: &mut serde_json::Value) {
         if self.override_files.is_empty() {
             return;
@@ -65,8 +77,11 @@ pub(crate) fn pre_ingest(
     let mut per_file = Vec::new();
     let mut all_allowed = Vec::new();
     let mut baseline_matches = Vec::new();
+    let mut scanned_files = BTreeSet::new();
 
     for file in source_files {
+        let canonical_file = canonical_or_original(file);
+        scanned_files.insert(canonical_file.clone());
         let buf = fs::read(file).with_context(|| format!("read {}", file.display()))?;
         let detections = scanner.scan_bytes(&buf);
         let SuppressionResult {
@@ -79,11 +94,11 @@ pub(crate) fn pre_ingest(
                 allowed
                     .iter()
                     .cloned()
-                    .map(|detection| (canonical_or_original(file), detection)),
+                    .map(|detection| (canonical_file.clone(), detection)),
             );
         }
         baseline_matches.extend(fired_entries.into_iter().map(|entry| PendingFinding {
-            file_path: entry.file_path.clone(),
+            file_path: normalize_project_path(project_root, &entry.file_path),
             rule_id: BASELINE_MATCH,
             kind: "fact",
             severity: "INFO",
@@ -100,7 +115,7 @@ pub(crate) fn pre_ingest(
                 "rule": entry.entry.rule_type,
             }),
         }));
-        per_file.push((canonical_or_original(file), allowed));
+        per_file.push((canonical_file, allowed));
     }
 
     let override_confirmed = confirm_override_if_needed(&all_allowed, options);
@@ -147,6 +162,7 @@ pub(crate) fn pre_ingest(
         briefing_blocks,
         findings,
         override_files: override_files.into_iter().collect(),
+        scanned_files,
     })
 }
 
@@ -154,22 +170,25 @@ fn load_baseline_for_scan(project_root: &Path) -> Result<(Baseline, Vec<PendingF
     let path = project_root.join(".clarion/secrets-baseline.yaml");
     match clarion_scanner::load_baseline(&path) {
         Ok(baseline) => Ok((baseline, Vec::new())),
-        Err(BaselineError::MissingJustification { file, line }) => Ok((
+        Err(BaselineError::MissingJustifications { entries }) => Ok((
             Baseline::empty(),
-            vec![PendingFinding {
-                file_path: project_root.join(file.clone()),
-                rule_id: BASELINE_NO_JUSTIFICATION,
-                kind: "defect",
-                severity: "ERROR",
-                confidence: Some(1.0),
-                confidence_basis: Some("baseline_schema"),
-                message: format!(
-                    "Secret baseline entry missing justification at {}:{}",
-                    file.display(),
-                    line
-                ),
-                evidence: json!({"file_path": file, "line_number": line}),
-            }],
+            entries
+                .into_iter()
+                .map(|entry| PendingFinding {
+                    file_path: normalize_project_path(project_root, &entry.file),
+                    rule_id: BASELINE_NO_JUSTIFICATION,
+                    kind: "defect",
+                    severity: "ERROR",
+                    confidence: Some(1.0),
+                    confidence_basis: Some("baseline_schema"),
+                    message: format!(
+                        "Secret baseline entry missing justification at {}:{}",
+                        entry.file.display(),
+                        entry.line
+                    ),
+                    evidence: json!({"file_path": entry.file, "line_number": entry.line}),
+                })
+                .collect(),
         )),
         Err(err) => Err(err).context("load secret baseline"),
     }
@@ -214,6 +233,10 @@ fn abort_unconfirmed_override() -> ! {
 
 fn canonical_or_original(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn normalize_project_path(root: &Path, path: &Path) -> PathBuf {
+    canonical_or_original(&root.join(path))
 }
 
 fn display_relative(root: &Path, path: &Path) -> String {

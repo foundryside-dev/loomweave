@@ -30,6 +30,12 @@ pub struct BaselineMatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineEntryIssue {
+    pub file: PathBuf,
+    pub line: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuppressionResult {
     pub allowed: Vec<Detection>,
     pub suppressed: Vec<Detection>,
@@ -40,8 +46,8 @@ pub struct SuppressionResult {
 pub enum BaselineError {
     #[error("baseline version mismatch: expected 1.0, got {0}")]
     UnsupportedVersion(String),
-    #[error("baseline entry missing required field 'justification' at {file}:{line}")]
-    MissingJustification { file: PathBuf, line: u32 },
+    #[error("baseline entries missing required field 'justification'")]
+    MissingJustifications { entries: Vec<BaselineEntryIssue> },
     #[error("baseline entry has invalid hashed_secret at {file}:{line}: {details}")]
     InvalidHash {
         file: PathBuf,
@@ -131,17 +137,32 @@ impl Baseline {
         if raw.version != "1.0" {
             return Err(BaselineError::UnsupportedVersion(raw.version));
         }
+        let mut missing_justifications = Vec::new();
+        for (file, raw_entries) in &raw.results {
+            for entry in raw_entries {
+                if entry
+                    .justification
+                    .as_ref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    missing_justifications.push(BaselineEntryIssue {
+                        file: file.clone(),
+                        line: entry.line_number,
+                    });
+                }
+            }
+        }
+        if !missing_justifications.is_empty() {
+            return Err(BaselineError::MissingJustifications {
+                entries: missing_justifications,
+            });
+        }
+
         let mut entries = BTreeMap::new();
         for (file, raw_entries) in raw.results {
             let mut converted = Vec::new();
             for entry in raw_entries {
                 let justification = entry.justification.unwrap_or_default();
-                if justification.trim().is_empty() {
-                    return Err(BaselineError::MissingJustification {
-                        file,
-                        line: entry.line_number,
-                    });
-                }
                 let hashed_secret = hex_decode_20(&entry.hashed_secret).map_err(|details| {
                     BaselineError::InvalidHash {
                         file: file.clone(),

@@ -94,15 +94,19 @@ TOML
 log "scratch project: $DEMO_DIR"
 "$CLARION_BIN" install --path "$DEMO_DIR"
 printf "aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n" > "$DEMO_DIR/leaky.sec"
+printf "aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n" > "$DEMO_DIR/.env"
 
 PATH="$PLUGIN_DIR" "$CLARION_BIN" analyze "$DEMO_DIR"
 
 DB="$DEMO_DIR/.clarion/clarion.db"
-BLOCKED=$(sqlite3 "$DB" "select json_extract(properties, '\$.briefing_blocked') from entities;")
-[ "$BLOCKED" = "secret_present" ] || fail "expected briefing_blocked secret_present, got $BLOCKED"
+BLOCKED=$(sqlite3 "$DB" "select count(*) from entities where json_extract(properties, '\$.briefing_blocked') = 'secret_present';")
+[ "$BLOCKED" = "2" ] || fail "expected two briefing_blocked secret_present entities, got $BLOCKED"
 
 FINDINGS=$(sqlite3 "$DB" "select count(*) from findings where rule_id = 'CLA-SEC-SECRET-DETECTED';")
-[ "$FINDINGS" = "1" ] || fail "expected one CLA-SEC-SECRET-DETECTED finding, got $FINDINGS"
+[ "$FINDINGS" = "2" ] || fail "expected two CLA-SEC-SECRET-DETECTED findings, got $FINDINGS"
+
+DOTENV_ANCHOR=$(sqlite3 "$DB" "select count(*) from entities where plugin_id = 'core' and kind = 'file' and source_file_path = '$DEMO_DIR/.env' and json_extract(properties, '\$.briefing_blocked') = 'secret_present';")
+[ "$DOTENV_ANCHOR" = "1" ] || fail "expected .env core file anchor with briefing_blocked secret_present, got $DOTENV_ANCHOR"
 
 RUN_STATUS=$(sqlite3 "$DB" "select status from runs;")
 [ "$RUN_STATUS" = "completed" ] || fail "expected completed run, got $RUN_STATUS"

@@ -2353,13 +2353,18 @@ fn summary_scope_deferred(entity: &EntityRow) -> Value {
 }
 
 fn summary_briefing_blocked(entity: &EntityRow, reason: &str) -> Value {
+    let remediation = if reason == "unscanned_source" {
+        "Entity source file was not covered by the pre-ingest secret scan. Re-run with scanner coverage for that path or fix the plugin source path before requesting a summary."
+    } else {
+        "File flagged by pre-ingest secret scan. Fix the secret or whitelist via .clarion/secrets-baseline.yaml. See ADR-013."
+    };
     success_envelope(json!({
         "available": false,
         "entity_id": entity.id,
         "entity": entity_json(entity),
         "summary": null,
         "briefing_blocked": reason,
-        "remediation": "File flagged by pre-ingest secret scan. Fix the secret or whitelist via .clarion/secrets-baseline.yaml. See ADR-013."
+        "remediation": remediation
     }))
 }
 

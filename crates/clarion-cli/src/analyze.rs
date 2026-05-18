@@ -207,8 +207,13 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let source_files = collect_source_files(&project_root, &wanted_extensions);
     tracing::info!(file_count = source_files.len(), "source tree walk complete");
 
+    let secret_scan_files = collect_secret_scan_files(&project_root, &source_files);
+    tracing::info!(
+        file_count = secret_scan_files.len(),
+        "secret scan file walk complete"
+    );
     let secret_scan_outcome =
-        crate::secret_scan::pre_ingest(&project_root, &source_files, &options.secret_scan)?;
+        crate::secret_scan::pre_ingest(&project_root, &secret_scan_files, &options.secret_scan)?;
     begin_run(&writer, &run_id, &analyze_config_json, &started_at).await?;
 
     // ── Per-plugin processing ─────────────────────────────────────────────────
@@ -280,6 +285,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         let exec_clone = plugin.executable.clone();
         let files_clone = plugin_files.clone();
         let briefing_blocks_clone = secret_scan_outcome.briefing_blocks.clone();
+        let scanned_files_clone = secret_scan_outcome.scanned_files().clone();
 
         // A JoinError here means the blocking task panicked (OOM, stack
         // overflow, internal unwrap, abort — anything that unwinds past the
@@ -298,6 +304,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     &exec_clone,
                     &files_clone,
                     &briefing_blocks_clone,
+                    &scanned_files_clone,
                 )
             })
             .await,
@@ -433,6 +440,22 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 );
             }
         }
+    }
+
+    if !matches!(run_outcome, RunOutcome::HardFailed { .. })
+        && let Err(e) = ensure_secret_finding_anchors(
+            &writer,
+            &project_root,
+            &started_at,
+            &secret_scan_outcome,
+            &mut secret_finding_anchors,
+        )
+        .await
+    {
+        tracing::error!(run_id = %run_id, error = %e, "secret finding anchor persistence failed");
+        run_outcome = RunOutcome::HardFailed {
+            reason: format!("secret finding anchor persistence failed: {e:#}"),
+        };
     }
 
     if !matches!(run_outcome, RunOutcome::HardFailed { .. })
@@ -1207,6 +1230,7 @@ fn run_plugin_blocking(
     executable: &Path,
     files: &[PathBuf],
     briefing_blocks: &BTreeMap<PathBuf, String>,
+    scanned_source_files: &BTreeSet<PathBuf>,
 ) -> Result<BatchResult, PluginRunError> {
     use clarion_core::PluginHost;
 
@@ -1223,6 +1247,7 @@ fn run_plugin_blocking(
             }
         })?;
     host.set_briefing_blocks(briefing_blocks.clone());
+    host.set_scanned_source_files(scanned_source_files.clone());
 
     let work_result: Result<Collected, String> = (|| {
         let mut collected_entities: Vec<(String, EntityRecord)> = Vec::new();
@@ -1551,6 +1576,91 @@ fn remember_secret_finding_anchors(
     }
 }
 
+async fn ensure_secret_finding_anchors(
+    writer: &Writer,
+    project_root: &Path,
+    started_at: &str,
+    outcome: &crate::secret_scan::SecretScanOutcome,
+    anchors: &mut BTreeMap<PathBuf, String>,
+) -> Result<()> {
+    for file in outcome.finding_files() {
+        let key = canonical_or_original(&file);
+        if anchors.contains_key(&key) {
+            continue;
+        }
+        let id = secret_finding_anchor_id(project_root, &key);
+        let relative = display_relative_path(project_root, &key);
+        let short_name = key
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&relative)
+            .to_owned();
+        let mut properties = serde_json::Map::new();
+        properties.insert("finding_anchor".to_owned(), serde_json::json!(true));
+        if let Some(reason) = outcome.briefing_blocks.get(&key) {
+            properties.insert(
+                "briefing_blocked".to_owned(),
+                serde_json::Value::String(reason.clone()),
+            );
+        }
+        let record = EntityRecord {
+            id: id.clone(),
+            plugin_id: "core".to_owned(),
+            kind: "file".to_owned(),
+            name: relative,
+            short_name,
+            parent_id: None,
+            source_file_id: None,
+            source_file_path: Some(key.display().to_string()),
+            source_byte_start: None,
+            source_byte_end: None,
+            source_line_start: None,
+            source_line_end: None,
+            properties_json: serde_json::Value::Object(properties).to_string(),
+            content_hash: file_content_hash(&key),
+            summary_json: None,
+            wardline_json: None,
+            first_seen_commit: None,
+            last_seen_commit: None,
+            created_at: started_at.to_owned(),
+            updated_at: started_at.to_owned(),
+        };
+        writer
+            .send_wait(|ack| WriterCmd::InsertEntity {
+                entity: Box::new(record),
+                ack,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("InsertEntity for secret finding anchor {id}"))?;
+        anchors.insert(key, id);
+    }
+    Ok(())
+}
+
+fn secret_finding_anchor_id(project_root: &Path, file: &Path) -> String {
+    let relative = display_relative_path(project_root, file);
+    let digest = blake3::hash(relative.as_bytes()).to_hex().to_string();
+    format!("core:file:{digest}")
+}
+
+fn canonical_or_original(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn display_relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn file_content_hash(path: &Path) -> Option<String> {
+    fs::read(path)
+        .ok()
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+}
+
 /// Map an `AcceptedEntity` to an `EntityRecord` for the writer-actor.
 fn map_entity_to_record(
     entity: &AcceptedEntity,
@@ -1844,6 +1954,52 @@ fn collect_source_files(root: &Path, wanted_extensions: &BTreeSet<String>) -> Ve
         );
     }
     out
+}
+
+fn collect_secret_scan_files(root: &Path, source_files: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: BTreeSet<PathBuf> = source_files
+        .iter()
+        .map(|path| canonical_or_original(path))
+        .collect();
+    for path in collect_secret_scan_sidecars(root) {
+        out.insert(canonical_or_original(&path));
+    }
+    out.into_iter().collect()
+}
+
+fn collect_secret_scan_sidecars(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .follow_links(false)
+        .hidden(false)
+        .ignore(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .parents(false)
+        .require_git(false)
+        .filter_entry(|entry| !is_skipped_dir(entry));
+
+    for entry in builder.build().filter_map(std::result::Result::ok) {
+        let Some(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.into_path();
+        if file_type.is_file() && is_secret_scan_sidecar(&path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+fn is_secret_scan_sidecar(path: &Path) -> bool {
+    let file_name = path.file_name().and_then(|name| name.to_str());
+    file_name.is_some_and(|name| name == ".env" || name.starts_with(".env."))
+        || path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("env"))
 }
 
 fn is_skipped_dir(entry: &DirEntry) -> bool {
