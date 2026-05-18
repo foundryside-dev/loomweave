@@ -1,6 +1,6 @@
 //! Read-side query helpers used by the MCP navigation surface.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use clarion_core::EdgeConfidence;
@@ -64,6 +64,21 @@ pub struct ReferenceEdgeMatch {
     pub source_file_id: Option<String>,
     pub source_byte_start: Option<i64>,
     pub source_byte_end: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleDependencyEdge {
+    pub from_module_id: String,
+    pub to_module_id: String,
+    pub reference_count: u64,
+    pub edge_kinds: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubsystemMember {
+    pub id: String,
+    pub name: String,
+    pub source_file_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,6 +410,106 @@ pub fn reference_edges_for_entity(
     let rows = stmt.query_map(params![entity_id], map_reference_edge_match)?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(StorageError::from)
+}
+
+pub fn module_dependency_edges(
+    conn: &Connection,
+    edge_types: &[&str],
+) -> Result<Vec<ModuleDependencyEdge>> {
+    if edge_types.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = std::iter::repeat_n("?", edge_types.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "WITH RECURSIVE module_ancestors(entity_id, module_id) AS ( \
+             SELECT id, id FROM entities WHERE kind = 'module' \
+             UNION \
+             SELECT child.to_id, module_ancestors.module_id \
+             FROM edges child \
+             JOIN module_ancestors ON module_ancestors.entity_id = child.from_id \
+             WHERE child.kind = 'contains' \
+         ) \
+         SELECT from_module.module_id, to_module.module_id, edges.kind \
+         FROM edges \
+         JOIN module_ancestors from_module ON from_module.entity_id = edges.from_id \
+         JOIN module_ancestors to_module ON to_module.entity_id = edges.to_id \
+         WHERE edges.kind IN ({placeholders}) \
+           AND from_module.module_id != to_module.module_id \
+         ORDER BY from_module.module_id, to_module.module_id, edges.kind",
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(edge_types.iter().copied()), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+
+    let mut grouped: BTreeMap<(String, String), (u64, BTreeSet<String>)> = BTreeMap::new();
+    for row in rows {
+        let (from_module_id, to_module_id, edge_kind) = row?;
+        let (reference_count, edge_kinds) = grouped
+            .entry((from_module_id, to_module_id))
+            .or_insert_with(|| (0, BTreeSet::new()));
+        *reference_count += 1;
+        edge_kinds.insert(edge_kind);
+    }
+
+    Ok(grouped
+        .into_iter()
+        .map(
+            |((from_module_id, to_module_id), (reference_count, edge_kinds))| {
+                ModuleDependencyEdge {
+                    from_module_id,
+                    to_module_id,
+                    reference_count,
+                    edge_kinds: edge_kinds.into_iter().collect(),
+                }
+            },
+        )
+        .collect())
+}
+
+pub fn subsystem_members(conn: &Connection, subsystem_id: &str) -> Result<Vec<SubsystemMember>> {
+    let mut stmt = conn.prepare(
+        "SELECT entities.id, entities.name, entities.source_file_path \
+         FROM edges \
+         JOIN entities ON entities.id = edges.from_id \
+         WHERE edges.kind = 'in_subsystem' \
+           AND edges.to_id = ?1 \
+           AND entities.kind = 'module' \
+         ORDER BY entities.name, entities.id",
+    )?;
+    let rows = stmt.query_map(params![subsystem_id], |row| {
+        Ok(SubsystemMember {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            source_file_path: row.get(2)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+pub fn subsystem_for_member(conn: &Connection, module_id: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT edges.to_id \
+         FROM edges \
+         JOIN entities ON entities.id = edges.to_id \
+         WHERE edges.kind = 'in_subsystem' \
+           AND edges.from_id = ?1 \
+           AND entities.kind = 'subsystem' \
+         ORDER BY edges.to_id \
+         LIMIT 1",
+        params![module_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(StorageError::from)
 }
 
 pub fn candidate_entities_for_unresolved_sites(

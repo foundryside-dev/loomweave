@@ -4,9 +4,10 @@ use std::path::Path;
 
 use clarion_core::EdgeConfidence;
 use clarion_storage::{
-    ReferenceDirection, call_edges_from, call_edges_targeting, child_entity_ids,
-    contained_entity_ids, entity_at_line, entity_by_id, find_entities, normalize_source_path,
-    pragma, reference_edges_for_entity, schema,
+    ModuleDependencyEdge, ReferenceDirection, SubsystemMember, call_edges_from,
+    call_edges_targeting, child_entity_ids, contained_entity_ids, entity_at_line, entity_by_id,
+    find_entities, module_dependency_edges, normalize_source_path, pragma,
+    reference_edges_for_entity, schema, subsystem_for_member, subsystem_members,
 };
 use rusqlite::{Connection, params};
 
@@ -19,15 +20,27 @@ fn open_fresh(tempdir: &tempfile::TempDir) -> Connection {
 }
 
 fn insert_entity(conn: &Connection, id: &str, kind: &str) {
+    insert_named_entity(conn, id, kind, id, id, None);
+}
+
+fn insert_named_entity(
+    conn: &Connection,
+    id: &str,
+    kind: &str,
+    name: &str,
+    short_name: &str,
+    source_file_path: Option<&str>,
+) {
     conn.execute(
         "INSERT INTO entities (
-            id, plugin_id, kind, name, short_name, properties, created_at, updated_at
+            id, plugin_id, kind, name, short_name, source_file_path, properties, created_at,
+            updated_at
          ) VALUES (
-            ?1, 'python', ?2, ?1, ?1, '{}',
+            ?1, 'python', ?2, ?3, ?4, ?5, '{}',
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          )",
-        params![id, kind],
+        params![id, kind, name, short_name, source_file_path],
     )
     .expect("insert entity");
 }
@@ -105,6 +118,247 @@ fn insert_references_edge(
         params![from_id, to_id, confidence.as_str(), start, end],
     )
     .expect("insert references edge");
+}
+
+fn insert_imports_edge(conn: &Connection, from_id: &str, to_id: &str) {
+    conn.execute(
+        "INSERT INTO edges (
+            kind, from_id, to_id, confidence, source_byte_start, source_byte_end
+         ) VALUES ('imports', ?1, ?2, 'resolved', 30, 40)",
+        params![from_id, to_id],
+    )
+    .expect("insert imports edge");
+}
+
+fn insert_in_subsystem_edge(conn: &Connection, module_id: &str, subsystem_id: &str) {
+    conn.execute(
+        "INSERT INTO edges (kind, from_id, to_id, confidence)
+         VALUES ('in_subsystem', ?1, ?2, 'resolved')",
+        params![module_id, subsystem_id],
+    )
+    .expect("insert in_subsystem edge");
+}
+
+#[test]
+fn module_dependency_edges_include_imports() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity(&conn, "python:module:pkg.alpha", "module");
+    insert_entity(&conn, "python:module:pkg.beta", "module");
+    insert_imports_edge(&conn, "python:module:pkg.alpha", "python:module:pkg.beta");
+
+    let edges = module_dependency_edges(&conn, &["imports"]).expect("module dependency edges");
+
+    assert_eq!(
+        edges,
+        vec![ModuleDependencyEdge {
+            from_module_id: "python:module:pkg.alpha".to_owned(),
+            to_module_id: "python:module:pkg.beta".to_owned(),
+            reference_count: 1,
+            edge_kinds: vec!["imports".to_owned()],
+        }],
+    );
+}
+
+#[test]
+fn module_dependency_edges_roll_up_function_calls_to_parent_modules() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    for id in ["python:module:pkg.alpha", "python:module:pkg.beta"] {
+        insert_entity(&conn, id, "module");
+    }
+    for id in [
+        "python:function:pkg.alpha.source",
+        "python:function:pkg.beta.target",
+    ] {
+        insert_entity(&conn, id, "function");
+    }
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.alpha",
+        "python:function:pkg.alpha.source",
+    );
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.beta",
+        "python:function:pkg.beta.target",
+    );
+    insert_calls_edge(
+        &conn,
+        "python:function:pkg.alpha.source",
+        "python:function:pkg.beta.target",
+        EdgeConfidence::Resolved,
+        &[],
+    );
+
+    let edges = module_dependency_edges(&conn, &["calls"]).expect("module dependency edges");
+
+    assert_eq!(
+        edges,
+        vec![ModuleDependencyEdge {
+            from_module_id: "python:module:pkg.alpha".to_owned(),
+            to_module_id: "python:module:pkg.beta".to_owned(),
+            reference_count: 1,
+            edge_kinds: vec!["calls".to_owned()],
+        }],
+    );
+}
+
+#[test]
+fn module_dependency_edges_weight_by_reference_count() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    for id in ["python:module:pkg.alpha", "python:module:pkg.beta"] {
+        insert_entity(&conn, id, "module");
+    }
+    for id in [
+        "python:function:pkg.alpha.first",
+        "python:function:pkg.alpha.second",
+        "python:function:pkg.beta.target",
+    ] {
+        insert_entity(&conn, id, "function");
+    }
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.alpha",
+        "python:function:pkg.alpha.first",
+    );
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.alpha",
+        "python:function:pkg.alpha.second",
+    );
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.beta",
+        "python:function:pkg.beta.target",
+    );
+    insert_calls_edge(
+        &conn,
+        "python:function:pkg.alpha.first",
+        "python:function:pkg.beta.target",
+        EdgeConfidence::Resolved,
+        &[],
+    );
+    insert_calls_edge(
+        &conn,
+        "python:function:pkg.alpha.second",
+        "python:function:pkg.beta.target",
+        EdgeConfidence::Resolved,
+        &[],
+    );
+    insert_imports_edge(&conn, "python:module:pkg.alpha", "python:module:pkg.beta");
+
+    let edges =
+        module_dependency_edges(&conn, &["imports", "calls"]).expect("module dependency edges");
+
+    assert_eq!(
+        edges,
+        vec![ModuleDependencyEdge {
+            from_module_id: "python:module:pkg.alpha".to_owned(),
+            to_module_id: "python:module:pkg.beta".to_owned(),
+            reference_count: 3,
+            edge_kinds: vec!["calls".to_owned(), "imports".to_owned()],
+        }],
+    );
+}
+
+#[test]
+fn module_dependency_edges_skip_self_edges() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity(&conn, "python:module:pkg.alpha", "module");
+    insert_entity(&conn, "python:function:pkg.alpha.first", "function");
+    insert_entity(&conn, "python:function:pkg.alpha.second", "function");
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.alpha",
+        "python:function:pkg.alpha.first",
+    );
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.alpha",
+        "python:function:pkg.alpha.second",
+    );
+    insert_calls_edge(
+        &conn,
+        "python:function:pkg.alpha.first",
+        "python:function:pkg.alpha.second",
+        EdgeConfidence::Resolved,
+        &[],
+    );
+    insert_imports_edge(&conn, "python:module:pkg.alpha", "python:module:pkg.alpha");
+
+    let edges =
+        module_dependency_edges(&conn, &["imports", "calls"]).expect("module dependency edges");
+
+    assert!(edges.is_empty());
+}
+
+#[test]
+fn subsystem_members_returns_modules_ordered_by_name() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_named_entity(
+        &conn,
+        "core:subsystem:abc123def456",
+        "subsystem",
+        "Auth subsystem",
+        "Auth subsystem",
+        None,
+    );
+    insert_named_entity(
+        &conn,
+        "python:module:pkg.beta",
+        "module",
+        "pkg.beta",
+        "beta",
+        Some("/tmp/pkg/beta.py"),
+    );
+    insert_named_entity(
+        &conn,
+        "python:module:pkg.alpha",
+        "module",
+        "pkg.alpha",
+        "alpha",
+        Some("/tmp/pkg/alpha.py"),
+    );
+    insert_in_subsystem_edge(
+        &conn,
+        "python:module:pkg.beta",
+        "core:subsystem:abc123def456",
+    );
+    insert_in_subsystem_edge(
+        &conn,
+        "python:module:pkg.alpha",
+        "core:subsystem:abc123def456",
+    );
+
+    let members =
+        subsystem_members(&conn, "core:subsystem:abc123def456").expect("subsystem members");
+    let subsystem =
+        subsystem_for_member(&conn, "python:module:pkg.alpha").expect("subsystem for member");
+
+    assert_eq!(
+        members,
+        vec![
+            SubsystemMember {
+                id: "python:module:pkg.alpha".to_owned(),
+                name: "pkg.alpha".to_owned(),
+                source_file_path: Some("/tmp/pkg/alpha.py".to_owned()),
+            },
+            SubsystemMember {
+                id: "python:module:pkg.beta".to_owned(),
+                name: "pkg.beta".to_owned(),
+                source_file_path: Some("/tmp/pkg/beta.py".to_owned()),
+            },
+        ],
+    );
+    assert_eq!(subsystem, Some("core:subsystem:abc123def456".to_owned()));
+    assert_eq!(
+        subsystem_for_member(&conn, "python:module:pkg.gamma").expect("unknown member"),
+        None,
+    );
 }
 
 #[test]

@@ -437,13 +437,13 @@ cargo test -p clarion-cli analyze_filters_external_import_edges_before_writer_in
 **Scope:** Read the persisted graph into a module-level dependency graph, and
 read subsystem memberships. No analyze integration yet.
 
-- [ ] Write failing storage tests with seeded SQLite data:
+- [x] Write failing storage tests with seeded SQLite data:
   - `module_dependency_edges_include_imports`
   - `module_dependency_edges_roll_up_function_calls_to_parent_modules`
   - `module_dependency_edges_weight_by_reference_count`
   - `module_dependency_edges_skip_self_edges`
   - `subsystem_members_returns_modules_ordered_by_name`
-- [ ] Add query structs:
+- [x] Add query structs:
 
 ```rust
 pub struct ModuleDependencyEdge {
@@ -460,11 +460,11 @@ pub struct SubsystemMember {
 }
 ```
 
-- [ ] Implement:
+- [x] Implement:
   - `module_dependency_edges(conn, edge_types) -> Result<Vec<ModuleDependencyEdge>>`
   - `subsystem_members(conn, subsystem_id) -> Result<Vec<SubsystemMember>>`
   - `subsystem_for_member(conn, module_id) -> Result<Option<String>>`
-- [ ] Preserve the existing rule that `imports` and `calls` are anchored edge
+- [x] Preserve the existing rule that `imports` and `calls` are anchored edge
   kinds, while `in_subsystem` is structural.
 
 **Exit:** Query tests pass and existing writer/schema tests still pass.

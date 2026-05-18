@@ -157,6 +157,41 @@ fn migration_0001_creates_entity_source_file_path_column_and_index() {
 }
 
 #[test]
+fn schema_accepts_open_entity_and_edge_kinds() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, properties, created_at, updated_at
+         ) VALUES (
+            'custom:widget:left', 'custom', 'widget', 'left', 'left', '{}',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        [],
+    )
+    .expect("insert custom source entity kind");
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, properties, created_at, updated_at
+         ) VALUES (
+            'custom:gadget:right', 'custom', 'gadget', 'right', 'right', '{}',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        [],
+    )
+    .expect("insert custom target entity kind");
+    conn.execute(
+        "INSERT INTO edges (kind, from_id, to_id, confidence)
+         VALUES ('custom_relation', 'custom:widget:left', 'custom:gadget:right', 'resolved')",
+        [],
+    )
+    .expect("insert custom edge kind");
+}
+
+#[test]
 fn migration_0001_extends_summary_cache_for_mcp_staleness_tracking() {
     let tempdir = tempfile::tempdir().unwrap();
     let conn = open_fresh(&tempdir);
