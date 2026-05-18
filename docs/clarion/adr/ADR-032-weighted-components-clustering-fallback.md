@@ -20,7 +20,12 @@ analysis:
 
 Subsystem `properties_json.algorithm`, MCP subsystem envelopes, and
 `runs.stats.clustering.algorithm` record `weighted_components` when this
-fallback supplies the partition.
+fallback supplies the partition. `runs.stats.clustering.configured_algorithm`
+records the requested config value for auditability.
+
+When the configured algorithm is `leiden`, the fallback trigger is explicit:
+Clarion computes `weighted_components` if Leiden returns zero or one community,
+and uses the fallback only when it produces more communities than Leiden.
 
 ## Decision
 
@@ -38,6 +43,8 @@ be reported as Louvain in config, stored properties, stats, or MCP output.
 ## Consequences
 
 - `analysis.clustering.algorithm` supports `leiden` and `weighted_components`.
+- A run configured as `leiden` can persist `weighted_components` in subsystem
+  properties and run stats when the auto-fallback trigger fires.
 - Existing pre-v0.1 artifacts that recorded `louvain` should be regenerated or
   treated as pre-publish test data.
 - A future real Louvain implementation remains allowed, but must land as a new

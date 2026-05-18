@@ -7,7 +7,9 @@ Usage: derive-elspeth-corpus.sh <elspeth-checkout> <output-dir>
 
 Copies the Python source corpus used by the B.8/Phase 3 scale gate into a clean
 directory while recording the elspeth commit and dirty status that produced it.
-The output directory must not already exist.
+Git worktrees are accepted. The corpus includes tracked and untracked .py files
+visible to git; inspect elspeth-dirty-status.txt when reproducing a dirty source
+checkout. The output directory must not already exist.
 USAGE
 }
 
@@ -19,7 +21,7 @@ fi
 elspeth_root=$1
 output_dir=$2
 
-if [[ ! -d "$elspeth_root/.git" ]]; then
+if ! git -C "$elspeth_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "elspeth checkout not found: $elspeth_root" >&2
   exit 1
 fi

@@ -1691,6 +1691,77 @@ async fn orphan_contains_edge_with_no_matching_parent_id_rejects_run() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flush_run_batch_rejects_parent_contains_mismatch_before_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    send::<()>(&tx, |ack| WriterCmd::BeginRun {
+        run_id: "run-flush-mismatch".into(),
+        config_json: "{}".into(),
+        started_at: now_iso(),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(make_module_entity("python:module:demo")),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(make_entity_with_parent(
+            "python:function:demo.lonely",
+            Some("python:module:demo"),
+        )),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    let result = send::<()>(&tx, |ack| WriterCmd::FlushRunBatch { ack }).await;
+    let err = result.expect_err("FlushRunBatch should reject parent mismatch");
+    assert!(
+        format!("{err:?}").contains("CLA-INFRA-PARENT-CONTAINS-MISMATCH"),
+        "expected CLA-INFRA-PARENT-CONTAINS-MISMATCH in error; got {err:?}"
+    );
+
+    send::<()>(&tx, |ack| WriterCmd::FailRun {
+        run_id: "run-flush-mismatch".into(),
+        reason: "phase3 clustering failed: parent mismatch".into(),
+        completed_at: now_iso(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let pool = ReaderPool::open(&path, 1).unwrap();
+    let (status, entity_count): (String, i64) = pool
+        .with_reader(|conn| {
+            let s: String = conn.query_row(
+                "SELECT status FROM runs WHERE id = 'run-flush-mismatch'",
+                [],
+                |row| row.get(0),
+            )?;
+            let n: i64 = conn.query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))?;
+            Ok((s, n))
+        })
+        .await
+        .unwrap();
+    assert_eq!(status, "failed");
+    assert_eq!(
+        entity_count, 0,
+        "flush-boundary rejection must roll back pending plugin rows"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn writes_in_batch_counts_entities_and_edges_uniformly() {
     // Q2 / Task 2: rename inserts_in_batch -> writes_in_batch and increment
     // on both InsertEntity and InsertEdge. With batch_size=4, a mix of 2

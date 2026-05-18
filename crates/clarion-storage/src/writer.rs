@@ -809,6 +809,14 @@ fn flush_run_batch(
             "FlushRunBatch received without a preceding BeginRun".to_owned(),
         ));
     }
+    if let Some(mismatch) = parent_contains_mismatch(conn)? {
+        if state.in_tx {
+            let _ = conn.execute_batch("ROLLBACK");
+            state.in_tx = false;
+            state.writes_in_batch = 0;
+        }
+        return Err(StorageError::WriterProtocol(mismatch));
+    }
     if state.in_tx {
         state.in_tx = false;
         state.writes_in_batch = 0;

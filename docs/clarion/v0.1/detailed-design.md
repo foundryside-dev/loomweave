@@ -989,6 +989,7 @@ analysis:
     edge_types: [imports, calls]
     weight_by: reference_count
     min_cluster_size: 3
+    weak_modularity_threshold: 0.3
 
 integrations:
   filigree:

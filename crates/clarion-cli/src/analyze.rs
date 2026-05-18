@@ -35,7 +35,6 @@ use crate::config::{AnalyzeConfig, ClusteringConfig};
 use crate::stats::P95Accumulator;
 
 const WEAK_MODULARITY_RULE_ID: &str = "CLA-FACT-CLUSTERING-WEAK-MODULARITY";
-const WEAK_MODULARITY_THRESHOLD: f64 = 0.3;
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -641,6 +640,7 @@ async fn run_phase3_clustering(
             weak_modularity_finding: false,
             clustering_stats: phase3_stats_json(
                 config,
+                config.algorithm,
                 "disabled",
                 Some("disabled"),
                 0,
@@ -679,6 +679,7 @@ async fn run_phase3_clustering(
             weak_modularity_finding: false,
             clustering_stats: phase3_stats_json(
                 config,
+                config.algorithm,
                 "skipped",
                 Some("no_module_dependency_edges"),
                 module_ids.len(),
@@ -720,6 +721,7 @@ async fn run_phase3_clustering(
             weak_modularity_finding: false,
             clustering_stats: phase3_stats_json(
                 config,
+                cluster_result.algorithm_used,
                 "skipped",
                 Some("no_clusters_emitted"),
                 graph.modules.len(),
@@ -745,6 +747,7 @@ async fn run_phase3_clustering(
         let hash = cluster_hash(community);
         let subsystem_id = subsystem_entity_id(&hash)
             .with_context(|| format!("assemble subsystem entity id for hash {hash}"))?;
+        let (subsystem_name, subsystem_short_name) = subsystem_display_name(community, &hash);
         let now = iso8601_now();
         let properties_json = serde_json::json!({
             "algorithm": cluster_result.algorithm_used.as_str(),
@@ -765,8 +768,8 @@ async fn run_phase3_clustering(
                     id: subsystem_id.clone(),
                     plugin_id: "core".to_owned(),
                     kind: "subsystem".to_owned(),
-                    name: format!("Subsystem {hash}"),
-                    short_name: hash,
+                    name: subsystem_name,
+                    short_name: subsystem_short_name,
                     parent_id: None,
                     source_file_id: None,
                     source_file_path: None,
@@ -818,19 +821,20 @@ async fn run_phase3_clustering(
         });
     }
 
-    let weak_modularity_finding_emitted =
-        if cluster_result.modularity_score < WEAK_MODULARITY_THRESHOLD {
-            insert_weak_modularity_finding(
-                writer,
-                run_id,
-                config,
-                &inserted_subsystems,
-                cluster_result.modularity_score,
-            )
-            .await?
-        } else {
-            false
-        };
+    let weak_modularity_finding_emitted = if config.weak_modularity_threshold > 0.0
+        && cluster_result.modularity_score < config.weak_modularity_threshold
+    {
+        insert_weak_modularity_finding(
+            writer,
+            run_id,
+            config,
+            &inserted_subsystems,
+            cluster_result.modularity_score,
+        )
+        .await?
+    } else {
+        false
+    };
 
     let subsystems_inserted = u64::try_from(inserted_subsystems.len()).unwrap_or(u64::MAX);
     Ok(Phase3Output {
@@ -839,6 +843,7 @@ async fn run_phase3_clustering(
         weak_modularity_finding: weak_modularity_finding_emitted,
         clustering_stats: phase3_stats_json(
             config,
+            cluster_result.algorithm_used,
             "completed",
             None,
             graph.modules.len(),
@@ -855,6 +860,48 @@ async fn run_phase3_clustering(
 
 fn subsystem_entity_id(cluster_hash: &str) -> Result<String> {
     Ok(clarion_core::entity_id::entity_id("core", "subsystem", cluster_hash)?.to_string())
+}
+
+fn subsystem_display_name(member_ids: &[String], cluster_hash: &str) -> (String, String) {
+    common_module_prefix(member_ids).map_or_else(
+        || (format!("Subsystem {cluster_hash}"), cluster_hash.to_owned()),
+        |prefix| (prefix.clone(), prefix),
+    )
+}
+
+fn common_module_prefix(member_ids: &[String]) -> Option<String> {
+    let mut names = member_ids.iter().filter_map(|id| module_qualified_name(id));
+    let first = names.next()?;
+    let mut common = first.split('.').collect::<Vec<_>>();
+    for name in names {
+        let parts = name.split('.').collect::<Vec<_>>();
+        let shared = common
+            .iter()
+            .zip(parts.iter())
+            .take_while(|(left, right)| left == right)
+            .count();
+        common.truncate(shared);
+        if common.is_empty() {
+            return None;
+        }
+    }
+    if common.is_empty() {
+        None
+    } else {
+        Some(common.join("."))
+    }
+}
+
+fn module_qualified_name(entity_id: &str) -> Option<&str> {
+    let mut parts = entity_id.splitn(3, ':');
+    let _plugin_id = parts.next()?;
+    let kind = parts.next()?;
+    let qualified = parts.next()?;
+    if kind == "module" && !qualified.is_empty() {
+        Some(qualified)
+    } else {
+        None
+    }
 }
 
 async fn insert_weak_modularity_finding(
@@ -895,14 +942,14 @@ async fn insert_weak_modularity_finding(
                 message: "Module graph has weak subsystem modularity".to_owned(),
                 evidence_json: serde_json::json!({
                     "modularity_score": modularity_score,
-                    "threshold": WEAK_MODULARITY_THRESHOLD,
+                    "threshold": config.weak_modularity_threshold,
                     "subsystem_count": subsystems.len(),
                 })
                 .to_string(),
                 properties_json: serde_json::json!({
                     "algorithm": config.algorithm.as_str(),
                     "modularity_score": modularity_score,
-                    "threshold": WEAK_MODULARITY_THRESHOLD,
+                    "threshold": config.weak_modularity_threshold,
                     "subsystem_count": subsystems.len(),
                 })
                 .to_string(),
@@ -933,6 +980,7 @@ fn module_entity_ids(conn: &Connection) -> Result<Vec<String>> {
 #[allow(clippy::too_many_arguments)]
 fn phase3_stats_json(
     config: &ClusteringConfig,
+    algorithm: crate::clustering::ClusterAlgorithm,
     status: &str,
     skipped_reason: Option<&str>,
     module_count: usize,
@@ -946,7 +994,8 @@ fn phase3_stats_json(
 ) -> serde_json::Value {
     serde_json::json!({
         "enabled": config.enabled,
-        "algorithm": config.algorithm.as_str(),
+        "algorithm": algorithm.as_str(),
+        "configured_algorithm": config.algorithm.as_str(),
         "status": status,
         "seed": config.seed,
         "resolution": config.resolution,
@@ -961,7 +1010,7 @@ fn phase3_stats_json(
         "duration_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "subsystems_inserted": subsystems_inserted,
         "in_subsystem_edges_inserted": in_subsystem_edges_inserted,
-        "weak_modularity_threshold": WEAK_MODULARITY_THRESHOLD,
+        "weak_modularity_threshold": config.weak_modularity_threshold,
         "weak_modularity_finding_emitted": weak_modularity_finding_emitted,
         "skipped_reason": skipped_reason,
     })
@@ -977,9 +1026,11 @@ fn phase3_stats_json(
 //   entities that should persist → `CommitRun(Failed)`. The writer folds
 //   `UPDATE runs ... status='failed'` into the open entity transaction so
 //   the batch commits and the run row marks failed atomically. Exit 1.
-// - `HardFailed`: writer-actor rejected an `InsertEntity` (DB locked, disk
-//   full, etc.) → `FailRun`. The writer rolls back the open transaction.
-//   Exit 1. Continuing past this makes no sense — the DB is unusable.
+// - `HardFailed`: the writer rejected a mutation or the Phase 3 pre-flush
+//   validation rejected the pending graph (DB locked, disk full,
+//   parent/contains mismatch, etc.) → `FailRun`. The writer rolls back the
+//   still-open transaction before the run row is marked failed. Exit 1.
+//   Continuing past this makes no sense — the DB is unusable or inconsistent.
 
 #[derive(Debug)]
 enum RunOutcome {
@@ -1400,10 +1451,49 @@ fn filter_external_import_edges(
         .map(|(id, _)| id.as_str())
         .collect();
     let before = edges.len();
-    edges.retain(|(_, edge)| {
-        edge.kind != "imports" || module_entity_ids.contains(edge.to_id.as_str())
+    edges.retain_mut(|(_, edge)| {
+        if edge.kind != "imports" {
+            return true;
+        }
+        if let Some(local_submodule) =
+            absolute_from_import_submodule_target(edge, &module_entity_ids)
+        {
+            edge.to_id = local_submodule;
+            return true;
+        }
+        module_entity_ids.contains(edge.to_id.as_str())
     });
     u64::try_from(before - edges.len()).unwrap_or(u64::MAX)
+}
+
+fn absolute_from_import_submodule_target(
+    edge: &EdgeRecord,
+    module_entity_ids: &BTreeSet<&str>,
+) -> Option<String> {
+    let properties = edge
+        .properties_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())?;
+    if properties
+        .get("import_style")
+        .and_then(|value| value.as_str())
+        != Some("from_import")
+    {
+        return None;
+    }
+    if properties.get("level").and_then(serde_json::Value::as_u64) != Some(0) {
+        return None;
+    }
+    let imported_name = properties
+        .get("imported_name")
+        .and_then(|value| value.as_str())?;
+    if imported_name == "*" || imported_name.is_empty() {
+        return None;
+    }
+    let candidate = format!("{}.{}", edge.to_id, imported_name);
+    module_entity_ids
+        .contains(candidate.as_str())
+        .then_some(candidate)
 }
 
 /// Map an `AcceptedEntity` to an `EntityRecord` for the writer-actor.
@@ -1769,6 +1859,172 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(relative, vec!["kept.py"]);
+    }
+
+    #[test]
+    fn filter_import_edges_prefers_absolute_from_import_submodule_when_local() {
+        let entities = vec![
+            module_record("python:module:pkg"),
+            module_record("python:module:pkg.service"),
+        ];
+        let mut edges = vec![from_import_edge(
+            "python:module:consumer",
+            "python:module:pkg",
+            "service",
+        )];
+
+        let skipped = filter_external_import_edges(&entities, &mut edges);
+
+        assert_eq!(skipped, 0);
+        assert_eq!(edges[0].1.to_id, "python:module:pkg.service");
+    }
+
+    #[test]
+    fn filter_import_edges_keeps_parent_for_absolute_from_import_reexport() {
+        let entities = vec![module_record("python:module:pkg")];
+        let mut edges = vec![from_import_edge(
+            "python:module:consumer",
+            "python:module:pkg",
+            "helper",
+        )];
+
+        let skipped = filter_external_import_edges(&entities, &mut edges);
+
+        assert_eq!(skipped, 0);
+        assert_eq!(edges[0].1.to_id, "python:module:pkg");
+    }
+
+    #[test]
+    fn filter_import_edges_accepts_namespace_package_submodule() {
+        let entities = vec![module_record("python:module:pkg.service")];
+        let mut edges = vec![from_import_edge(
+            "python:module:consumer",
+            "python:module:pkg",
+            "service",
+        )];
+
+        let skipped = filter_external_import_edges(&entities, &mut edges);
+
+        assert_eq!(skipped, 0);
+        assert_eq!(edges[0].1.to_id, "python:module:pkg.service");
+    }
+
+    #[test]
+    fn filter_import_edges_counts_only_truly_external_imports() {
+        let entities = vec![module_record("python:module:consumer")];
+        let mut edges = vec![from_import_edge(
+            "python:module:consumer",
+            "python:module:external",
+            "service",
+        )];
+
+        let skipped = filter_external_import_edges(&entities, &mut edges);
+
+        assert_eq!(skipped, 1);
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn subsystem_display_name_uses_common_module_prefix() {
+        let (name, short_name) = subsystem_display_name(
+            &[
+                "python:module:pkg.auth.login".to_owned(),
+                "python:module:pkg.auth.policy".to_owned(),
+                "python:module:pkg.auth.token".to_owned(),
+            ],
+            "abc123def456",
+        );
+
+        assert_eq!(name, "pkg.auth");
+        assert_eq!(short_name, "pkg.auth");
+    }
+
+    #[test]
+    fn subsystem_display_name_falls_back_to_hash_without_common_prefix() {
+        let (name, short_name) = subsystem_display_name(
+            &[
+                "python:module:auth.login".to_owned(),
+                "python:module:billing.invoice".to_owned(),
+            ],
+            "abc123def456",
+        );
+
+        assert_eq!(name, "Subsystem abc123def456");
+        assert_eq!(short_name, "abc123def456");
+    }
+
+    #[test]
+    fn phase3_stats_distinguishes_configured_and_used_algorithm() {
+        let config = AnalyzeConfig::default().analysis.clustering;
+
+        let stats = phase3_stats_json(
+            &config,
+            crate::clustering::ClusterAlgorithm::WeightedComponents,
+            "completed",
+            None,
+            3,
+            2,
+            2,
+            Some(0.5),
+            2,
+            3,
+            false,
+            std::time::Instant::now(),
+        );
+
+        assert_eq!(stats["configured_algorithm"].as_str(), Some("leiden"));
+        assert_eq!(stats["algorithm"].as_str(), Some("weighted_components"));
+    }
+
+    fn module_record(id: &str) -> (String, EntityRecord) {
+        (
+            id.to_owned(),
+            EntityRecord {
+                id: id.to_owned(),
+                plugin_id: "python".to_owned(),
+                kind: "module".to_owned(),
+                name: id.trim_start_matches("python:module:").to_owned(),
+                short_name: id.rsplit('.').next().unwrap_or(id).to_owned(),
+                parent_id: None,
+                source_file_id: None,
+                source_file_path: None,
+                source_byte_start: None,
+                source_byte_end: None,
+                source_line_start: None,
+                source_line_end: None,
+                properties_json: "{}".to_owned(),
+                content_hash: None,
+                summary_json: None,
+                wardline_json: None,
+                first_seen_commit: None,
+                last_seen_commit: None,
+                created_at: "2026-05-17T00:00:00.000Z".to_owned(),
+                updated_at: "2026-05-17T00:00:00.000Z".to_owned(),
+            },
+        )
+    }
+
+    fn from_import_edge(from_id: &str, to_id: &str, imported_name: &str) -> (String, EdgeRecord) {
+        (
+            format!("imports {from_id} -> {to_id}"),
+            EdgeRecord {
+                kind: "imports".to_owned(),
+                from_id: from_id.to_owned(),
+                to_id: to_id.to_owned(),
+                confidence: clarion_core::EdgeConfidence::Resolved,
+                properties_json: Some(
+                    serde_json::json!({
+                        "imported_name": imported_name,
+                        "import_style": "from_import",
+                        "level": 0
+                    })
+                    .to_string(),
+                ),
+                source_file_id: Some(from_id.to_owned()),
+                source_byte_start: Some(0),
+                source_byte_end: Some(10),
+            },
+        )
     }
 
     // ── handle_plugin_task_join_result ────────────────────────────────────────

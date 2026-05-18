@@ -62,6 +62,11 @@ impl AnalyzeConfig {
             clustering.min_cluster_size > 0,
             "invalid analyze config: analysis.clustering.min_cluster_size must be greater than zero"
         );
+        ensure!(
+            clustering.weak_modularity_threshold.is_finite()
+                && clustering.weak_modularity_threshold >= 0.0,
+            "invalid analyze config: analysis.clustering.weak_modularity_threshold must be a non-negative finite number"
+        );
         if clustering.edge_types.is_empty() {
             bail!("invalid analyze config: analysis.clustering.edge_types must not be empty");
         }
@@ -86,6 +91,7 @@ pub(crate) struct ClusteringConfig {
     pub(crate) min_cluster_size: usize,
     pub(crate) edge_types: Vec<ClusteringEdgeType>,
     pub(crate) weight_by: ClusteringWeightBy,
+    pub(crate) weak_modularity_threshold: f64,
 }
 
 impl Default for ClusteringConfig {
@@ -99,6 +105,7 @@ impl Default for ClusteringConfig {
             min_cluster_size: 3,
             edge_types: vec![ClusteringEdgeType::Imports, ClusteringEdgeType::Calls],
             weight_by: ClusteringWeightBy::ReferenceCount,
+            weak_modularity_threshold: 0.3,
         }
     }
 }

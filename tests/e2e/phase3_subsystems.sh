@@ -87,16 +87,10 @@ def apply(amount: int) -> int:
 def preview(amount: int) -> int:
     return ledger.record(amount)
 PY
-    cat > "$dest/pkg/app.py" <<'PY'
-from pkg.auth import login
-from pkg.billing import invoice
-
-def run() -> tuple[str, int]:
-    return login.login(" Ada "), invoice.create(10)
-PY
     cat > "$dest/clarion.yaml" <<YAML
 analysis:
   clustering:
+    algorithm: weighted_components
     min_cluster_size: $MIN_CLUSTER_SIZE
 YAML
 }
@@ -155,6 +149,12 @@ CLUSTERING_STATUS=$(sqlite3 "$DB_A" \
 if [ "$CLUSTERING_STATUS" != "completed" ]; then
     sqlite3 "$DB_A" "SELECT id, status, stats FROM runs;" >&2 || true
     fail "expected runs.stats.clustering.status=completed; got $CLUSTERING_STATUS"
+fi
+CLUSTERING_ALGORITHM=$(sqlite3 "$DB_A" \
+    "SELECT json_extract(stats, '\$.clustering.algorithm') FROM runs ORDER BY started_at DESC LIMIT 1;")
+if [ "$CLUSTERING_ALGORITHM" != "weighted_components" ]; then
+    sqlite3 "$DB_A" "SELECT id, status, stats FROM runs;" >&2 || true
+    fail "expected runs.stats.clustering.algorithm=weighted_components; got $CLUSTERING_ALGORITHM"
 fi
 
 log "verifying deterministic subsystem signature across clean runs ..."

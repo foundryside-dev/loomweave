@@ -713,6 +713,8 @@ impl ServerState {
                 Ok(success_envelope(json!({
                     "subsystem": {
                         "id": subsystem.id,
+                        "name": subsystem.name,
+                        "short_name": subsystem.short_name,
                         "properties": entity_properties_json(&subsystem)
                     },
                     "members": members
@@ -2378,11 +2380,8 @@ fn entity_json(entity: &EntityRow) -> Value {
 }
 
 fn entity_properties_json(entity: &EntityRow) -> Value {
-    serde_json::from_str::<Value>(&entity.properties_json).unwrap_or_else(|_| {
-        json!({
-            "raw": entity.properties_json
-        })
-    })
+    serde_json::from_str::<Value>(&entity.properties_json)
+        .expect("entity properties_json should be valid JSON")
 }
 
 fn verified_source_excerpt(entity: &EntityRow) -> Result<String, SourceExcerptError> {

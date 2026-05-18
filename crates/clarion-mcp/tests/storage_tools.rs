@@ -740,6 +740,14 @@ async fn subsystem_members_returns_member_modules() {
         "core:subsystem:abc123def456"
     );
     assert_eq!(
+        envelope["result"]["subsystem"]["name"],
+        "Subsystem abc123def456"
+    );
+    assert_eq!(
+        envelope["result"]["subsystem"]["short_name"],
+        "abc123def456"
+    );
+    assert_eq!(
         envelope["result"]["subsystem"]["properties"]["member_count"],
         2
     );

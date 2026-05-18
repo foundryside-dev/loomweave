@@ -593,6 +593,7 @@ fn analyze_default_config_records_clustering_defaults() {
         serde_json::json!(["imports", "calls"])
     );
     assert_eq!(clustering["weight_by"].as_str(), Some("reference_count"));
+    assert_eq!(clustering["weak_modularity_threshold"].as_f64(), Some(0.3));
 }
 
 #[test]
@@ -613,6 +614,7 @@ analysis:
   clustering:
     algorithm: weighted_components
     seed: 99
+    weak_modularity_threshold: 0.0
 ",
     )
     .expect("write analyze config");
@@ -634,6 +636,7 @@ analysis:
     assert_eq!(clustering["seed"].as_u64(), Some(99));
     assert_eq!(clustering["enabled"].as_bool(), Some(true));
     assert_eq!(clustering["max_iterations"].as_u64(), Some(100));
+    assert_eq!(clustering["weak_modularity_threshold"].as_f64(), Some(0.0));
 }
 
 #[test]
@@ -714,7 +717,11 @@ fn analyze_phase3_emits_subsystem_entities_and_edges() {
     assert_eq!(clustering["in_subsystem_edges_inserted"].as_u64(), Some(4));
     assert_eq!(clustering["module_count"].as_u64(), Some(4));
     assert_eq!(clustering["module_edge_count"].as_u64(), Some(4));
-    assert_eq!(clustering["algorithm"].as_str(), Some("leiden"));
+    assert_eq!(clustering["configured_algorithm"].as_str(), Some("leiden"));
+    assert_eq!(
+        clustering["algorithm"].as_str(),
+        Some("weighted_components")
+    );
     assert!(clustering["modularity_score"].is_number());
 }
 
@@ -800,6 +807,40 @@ fn analyze_phase3_emits_weak_modularity_fact_when_below_threshold() {
     assert_eq!(
         stats["clustering"]["weak_modularity_finding_emitted"].as_bool(),
         Some(true)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_phase3_weak_modularity_threshold_zero_disables_fact() {
+    let project_dir = run_phase3_fixture(
+        &["weak_a", "weak_b"],
+        r"
+analysis:
+  clustering:
+    min_cluster_size: 2
+    weak_modularity_threshold: 0.0
+",
+    );
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    let finding_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM findings \
+             WHERE rule_id = 'CLA-FACT-CLUSTERING-WEAK-MODULARITY'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query weak modularity finding count");
+    assert_eq!(finding_count, 0);
+
+    let stats = latest_run_stats(project_dir.path());
+    assert_eq!(
+        stats["clustering"]["weak_modularity_threshold"].as_f64(),
+        Some(0.0)
+    );
+    assert_eq!(
+        stats["clustering"]["weak_modularity_finding_emitted"].as_bool(),
+        Some(false)
     );
 }
 

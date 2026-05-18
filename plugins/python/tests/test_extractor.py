@@ -358,6 +358,66 @@ def test_relative_import_from_package_init_targets_sibling_module() -> None:
     ]
 
 
+def test_level_two_relative_import_from_package_init_targets_parent_sibling() -> None:
+    _entities, edges = extract("from .. import sibling\n", "pkg/sub/__init__.py")
+
+    assert _import_edges(edges) == [
+        {
+            "kind": "imports",
+            "from_id": "python:module:pkg.sub",
+            "to_id": "python:module:pkg.sibling",
+            "source_byte_start": 0,
+            "source_byte_end": len(b"from .. import sibling"),
+            "confidence": "resolved",
+            "properties": {
+                "imported_name": "sibling",
+                "import_style": "from_import",
+                "level": 2,
+            },
+        },
+    ]
+
+
+def test_level_two_relative_import_module_from_package_init_targets_parent_module() -> None:
+    _entities, edges = extract("from ..other import x\n", "pkg/sub/__init__.py")
+
+    assert _import_edges(edges) == [
+        {
+            "kind": "imports",
+            "from_id": "python:module:pkg.sub",
+            "to_id": "python:module:pkg.other",
+            "source_byte_start": 0,
+            "source_byte_end": len(b"from ..other import x"),
+            "confidence": "resolved",
+            "properties": {
+                "imported_name": "x",
+                "import_style": "from_import",
+                "level": 2,
+            },
+        },
+    ]
+
+
+def test_level_three_relative_import_from_deep_package_init_targets_root_sibling() -> None:
+    _entities, edges = extract("from ... import x\n", "pkg/sub/deeper/__init__.py")
+
+    assert _import_edges(edges) == [
+        {
+            "kind": "imports",
+            "from_id": "python:module:pkg.sub.deeper",
+            "to_id": "python:module:pkg.x",
+            "source_byte_start": 0,
+            "source_byte_end": len(b"from ... import x"),
+            "confidence": "resolved",
+            "properties": {
+                "imported_name": "x",
+                "import_style": "from_import",
+                "level": 3,
+            },
+        },
+    ]
+
+
 def test_import_edges_have_source_byte_range_and_resolved_confidence() -> None:
     source = "é = 1\nimport pkg.service\n"
     _entities, edges = extract(source, "consumer.py")

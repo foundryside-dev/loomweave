@@ -296,6 +296,110 @@ fn module_dependency_edges_skip_self_edges() {
 }
 
 #[test]
+fn module_dependency_edges_exclude_inferred_calls() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    for id in ["python:module:pkg.alpha", "python:module:pkg.beta"] {
+        insert_entity(&conn, id, "module");
+    }
+    for id in [
+        "python:function:pkg.alpha.source",
+        "python:function:pkg.beta.target",
+    ] {
+        insert_entity(&conn, id, "function");
+    }
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.alpha",
+        "python:function:pkg.alpha.source",
+    );
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.beta",
+        "python:function:pkg.beta.target",
+    );
+    insert_calls_edge(
+        &conn,
+        "python:function:pkg.alpha.source",
+        "python:function:pkg.beta.target",
+        EdgeConfidence::Inferred,
+        &[],
+    );
+
+    let edges = module_dependency_edges(&conn, &["calls"]).expect("module dependency edges");
+
+    assert!(
+        edges.is_empty(),
+        "query-time inferred calls must not contaminate Phase 3 clustering input"
+    );
+}
+
+#[test]
+fn module_dependency_edges_expands_ambiguous_call_candidates() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    for id in [
+        "python:module:pkg.alpha",
+        "python:module:pkg.beta",
+        "python:module:pkg.gamma",
+    ] {
+        insert_entity(&conn, id, "module");
+    }
+    for id in [
+        "python:function:pkg.alpha.source",
+        "python:function:pkg.beta.first",
+        "python:function:pkg.gamma.second",
+    ] {
+        insert_entity(&conn, id, "function");
+    }
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.alpha",
+        "python:function:pkg.alpha.source",
+    );
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.beta",
+        "python:function:pkg.beta.first",
+    );
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.gamma",
+        "python:function:pkg.gamma.second",
+    );
+    insert_calls_edge(
+        &conn,
+        "python:function:pkg.alpha.source",
+        "python:function:pkg.beta.first",
+        EdgeConfidence::Ambiguous,
+        &[
+            "python:function:pkg.beta.first",
+            "python:function:pkg.gamma.second",
+        ],
+    );
+
+    let edges = module_dependency_edges(&conn, &["calls"]).expect("module dependency edges");
+
+    assert_eq!(
+        edges,
+        vec![
+            ModuleDependencyEdge {
+                from_module_id: "python:module:pkg.alpha".to_owned(),
+                to_module_id: "python:module:pkg.beta".to_owned(),
+                reference_count: 1,
+                edge_kinds: vec!["calls".to_owned()],
+            },
+            ModuleDependencyEdge {
+                from_module_id: "python:module:pkg.alpha".to_owned(),
+                to_module_id: "python:module:pkg.gamma".to_owned(),
+                reference_count: 1,
+                edge_kinds: vec!["calls".to_owned()],
+            },
+        ],
+    );
+}
+
+#[test]
 fn subsystem_members_returns_modules_ordered_by_name() {
     let tempdir = tempfile::tempdir().unwrap();
     let conn = open_fresh(&tempdir);

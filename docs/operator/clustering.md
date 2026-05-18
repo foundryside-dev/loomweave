@@ -19,6 +19,7 @@ analysis:
     min_cluster_size: 3
     edge_types: [imports, calls]
     weight_by: reference_count
+    weak_modularity_threshold: 0.3
 ```
 
 Supported algorithms are `leiden` and `weighted_components`. The
@@ -26,6 +27,14 @@ Supported algorithms are `leiden` and `weighted_components`. The
 weight is at least the graph's average positive edge weight; it is deterministic
 and does not perform Louvain modularity optimisation. `edge_types` may include
 `imports`, `calls`, or both. `weight_by` is currently `reference_count`.
+
+When `algorithm: leiden` produces zero or one community, Clarion computes the
+local `weighted_components` fallback and uses it only if it produces more
+communities than Leiden. Stored subsystem properties and
+`runs.stats.clustering.algorithm` record the algorithm actually used, while
+`runs.stats.clustering.configured_algorithm` keeps the requested config value.
+So a run configured as `leiden` can report `weighted_components` when this
+fallback fires.
 
 ## Stored Subsystems
 
@@ -67,7 +76,8 @@ not call the LLM provider in v0.1.
 
 Clarion emits a fact finding with rule
 `CLA-FACT-CLUSTERING-WEAK-MODULARITY` when clustering succeeds but the
-modularity score is below the v0.1 threshold of 0.3. This means the graph did not
+modularity score is below `analysis.clustering.weak_modularity_threshold`
+(default `0.3`; set `0.0` to disable the finding). This means the graph did not
 separate cleanly into strong communities. Treat it as operator guidance, not a
 defect: inspect the subsystem membership, then decide whether the project needs
 different config, graph pruning, or an ADR amendment.
