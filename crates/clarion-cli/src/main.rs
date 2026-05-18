@@ -3,6 +3,7 @@ mod cli;
 mod clustering;
 mod config;
 mod install;
+mod secret_scan;
 mod serve;
 mod stats;
 
@@ -20,20 +21,31 @@ fn main() -> Result<()> {
     let cli = cli::Cli::parse();
     match cli.command {
         cli::Command::Install { force, path } => install::run(&path, force),
-        cli::Command::Analyze { path, config } => {
+        cli::Command::Analyze {
+            path,
+            config,
+            allow_unredacted_secrets,
+            confirm_allow_unredacted_secrets,
+        } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            if let Some(config_path) = config {
-                rt.block_on(analyze::run_with_options(
-                    path,
-                    analyze::AnalyzeOptions {
-                        config_path: Some(config_path),
-                    },
-                ))
-            } else {
-                rt.block_on(analyze::run(path))
+            if config.is_none()
+                && !allow_unredacted_secrets
+                && confirm_allow_unredacted_secrets.is_none()
+            {
+                return rt.block_on(analyze::run(path));
             }
+            rt.block_on(analyze::run_with_options(
+                path,
+                analyze::AnalyzeOptions {
+                    config_path: config,
+                    secret_scan: secret_scan::SecretScanOptions {
+                        allow_unredacted_secrets,
+                        confirm_allow_unredacted_secrets,
+                    },
+                },
+            ))
         }
         cli::Command::Serve { path, config } => serve::run(&path, config.as_deref()),
     }

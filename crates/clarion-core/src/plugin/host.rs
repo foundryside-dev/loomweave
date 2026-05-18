@@ -27,7 +27,7 @@
 //! only calls `setrlimit(2)`, which is async-signal-safe per POSIX.1-2017
 //! §2.4.3. The `unsafe` block is the minimum required by the `pre_exec` API.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -414,6 +414,8 @@ where
     /// discarded on overflow so the plugin cannot back-pressure the host
     /// via stderr writes.
     stderr_tail: Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>>,
+    /// Canonical source paths whose entities must not be sent for LLM briefing.
+    briefing_blocks: BTreeMap<PathBuf, String>,
 }
 
 /// Size of the stderr ring buffer kept for diagnostics. 64 KiB holds
@@ -661,6 +663,7 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
             terminated: false,
             ontology_version: None,
             stderr_tail: None,
+            briefing_blocks: BTreeMap::new(),
         }
     }
 
@@ -686,6 +689,13 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
     /// keying (ADR-007).
     pub fn ontology_version(&self) -> Option<&str> {
         self.ontology_version.as_deref()
+    }
+
+    /// Install file-level briefing blocks produced by the core pre-ingest
+    /// scanner. Keys are canonical source paths and values are open-vocabulary
+    /// policy reasons such as `secret_present`.
+    pub fn set_briefing_blocks(&mut self, blocks: BTreeMap<PathBuf, String>) {
+        self.briefing_blocks = blocks;
     }
 
     /// Perform the `initialize` → `initialized` handshake.
@@ -824,7 +834,7 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
         let mut accepted = Vec::new();
 
         for raw_val in afr.entities {
-            let raw: RawEntity = match serde_json::from_value(raw_val) {
+            let mut raw: RawEntity = match serde_json::from_value(raw_val) {
                 Ok(e) => e,
                 Err(e) => {
                     // Drop the entity, but record the serde error so operators
@@ -923,6 +933,8 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
                 return Err(HostError::EntityCapExceeded(e));
             }
 
+            self.apply_briefing_block(&mut raw, &jailed);
+
             accepted.push(AcceptedEntity {
                 id: expected_id,
                 kind: raw.kind.clone(),
@@ -940,6 +952,15 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
             edges: accepted_edges,
             stats,
         })
+    }
+
+    fn apply_briefing_block(&self, raw: &mut RawEntity, jailed: &str) {
+        if let Some(reason) = self.briefing_blocks.get(Path::new(jailed)) {
+            raw.extra.insert(
+                "briefing_blocked".to_owned(),
+                serde_json::Value::String(reason.clone()),
+            );
+        }
     }
 
     /// B.3: per-edge validation pipeline. Mirrors the entity loop's

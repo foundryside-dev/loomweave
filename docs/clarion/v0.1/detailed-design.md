@@ -1050,6 +1050,18 @@ These rules combine signals Clarion uniquely holds — clusters from Phase 3, Wa
 
 **`CLA-FACT-TIER-SUBSYSTEM-MIXING` threshold**: default `min_outlier_count: 2` and `min_outlier_fraction: 0.1` (i.e., at least 2 outliers AND at least 10% of subsystem members). Configurable via `clarion.yaml:analysis.clustering.tier_mixing_thresholds`. Tuned to avoid flagging subsystems where a single outlier is legitimate boundary-infrastructure (e.g., an `EXTERNAL_RAW` parser adjacent to an otherwise-`INTEGRAL` validation subsystem).
 
+### Pre-ingest secret-scanning findings (WP5)
+
+These core-emitted rules are the ADR-013 audit surface. ADR-013 remains canonical for scanner behaviour; this catalogue records the emitted finding IDs.
+
+| Rule | Severity | Category | Description | Remediation | ADR |
+|---|---|---|---|---|---|
+| `CLA-SEC-SECRET-DETECTED` | ERROR | security | Pre-ingest secret scanner detected a credential pattern in a file slated for LLM dispatch. | Remove the secret, rotate the credential, or whitelist via `.clarion/secrets-baseline.yaml` with a justification. | [ADR-013](../adr/ADR-013-pre-ingest-secret-scanner.md) |
+| `CLA-SEC-UNREDACTED-SECRETS-ALLOWED` | ERROR | security | Operator invoked `--allow-unredacted-secrets`; file content reached the LLM provider with secrets intact. | Audit override usage via `filigree list --rule-id=CLA-SEC-UNREDACTED-SECRETS-ALLOWED --since 30d`. | [ADR-013](../adr/ADR-013-pre-ingest-secret-scanner.md) |
+| `CLA-INFRA-SECRET-BASELINE-NO-JUSTIFICATION` | ERROR | infra | Baseline entry missing required `justification` field; entry not honoured. | Add a `justification` string explaining why the match is safe. | [ADR-013](../adr/ADR-013-pre-ingest-secret-scanner.md) |
+| `CLA-INFRA-SECRET-BASELINE-MATCH` | INFO | infra | Baseline entry suppressed a scanner detection as an audit event. | None; informational and retained for `NFR-SEC-04` audit. | [ADR-013](../adr/ADR-013-pre-ingest-secret-scanner.md) |
+| `CLA-INFRA-SECRET-OVERRIDE-UNCONFIRMED` | ERROR | infra | `--allow-unredacted-secrets` supplied without confirmation; run aborted before start. | Supply `--confirm-allow-unredacted-secrets=yes-i-understand` in non-TTY contexts or run interactively. | [ADR-013](../adr/ADR-013-pre-ingest-secret-scanner.md) |
+
 ### Entity-set diff (deletion detection)
 
 At Phase 7, Clarion compares the current run's entity IDs against the prior run's set (read from the prior `run_id`'s stats; if no prior run exists, this phase is a no-op). For each entity ID present before and absent now:
@@ -1380,6 +1392,9 @@ Every security-relevant event emits a finding:
 
 - `CLA-SEC-SECRET-DETECTED` — unredacted secret blocked LLM dispatch
 - `CLA-SEC-UNREDACTED-SECRETS-ALLOWED` — operator overrode block with `--allow-unredacted-secrets`
+- `CLA-INFRA-SECRET-BASELINE-NO-JUSTIFICATION` — baseline entry lacks the required review rationale
+- `CLA-INFRA-SECRET-BASELINE-MATCH` — baseline entry suppressed a scanner hit
+- `CLA-INFRA-SECRET-OVERRIDE-UNCONFIRMED` — override flag was not confirmed, so the run aborted before start
 - `CLA-INFRA-TOKEN-STORAGE-DEGRADED` — OS keychain unavailable, fell back to file-mode `0600`
 - `CLA-INFRA-BRIEFING-INVALID` — LLM returned schema-invalid content twice, possible injection
 - `CLA-SEC-VOCABULARY-CANDIDATE-NOVEL` — novel `patterns`/`antipatterns` tag proposed by LLM (light signal; mostly harmless)

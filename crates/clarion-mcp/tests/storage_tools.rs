@@ -818,6 +818,62 @@ async fn summary_on_subsystem_returns_policy_envelope_without_llm_call() {
     handle.await.unwrap().unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_on_secret_blocked_entity_returns_policy_envelope_without_llm_or_cache() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "UPDATE entities SET properties = ?1 WHERE id = 'python:function:demo.entry'",
+        params![json!({"briefing_blocked": "secret_present"}).to_string()],
+    )
+    .expect("mark entity blocked");
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnySummaryProvider::new_output(
+        r#"{"purpose":"should not run"}"#,
+        120,
+        0.012,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["result"]["summary"], Value::Null);
+    assert_eq!(envelope["result"]["briefing_blocked"], "secret_present");
+    assert_eq!(envelope["stats_delta"], json!({}));
+    assert!(provider.invocations().is_empty());
+
+    let entity_at = call_tool(&state, "entity_at", json!({"file": "demo.py", "line": 1})).await;
+    assert_eq!(entity_at["ok"], true);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    let cache_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM summary_cache WHERE entity_id = 'python:function:demo.entry'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query summary cache");
+    assert_eq!(cache_rows, 0);
+}
+
 #[tokio::test]
 async fn issues_for_returns_unavailable_when_filigree_disabled() {
     let (project, db_path) = open_project();

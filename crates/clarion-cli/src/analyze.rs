@@ -41,6 +41,7 @@ const WEAK_MODULARITY_RULE_ID: &str = "CLA-FACT-CLUSTERING-WEAK-MODULARITY";
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AnalyzeOptions {
     pub(crate) config_path: Option<PathBuf>,
+    pub(crate) secret_scan: crate::secret_scan::SecretScanOptions,
 }
 
 /// Run the analyze command against `project_path`.
@@ -93,17 +94,6 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let run_id = Uuid::new_v4().to_string();
     let started_at = iso8601_now();
 
-    writer
-        .send_wait(|ack| WriterCmd::BeginRun {
-            run_id: run_id.clone(),
-            config_json: analyze_config_json.clone(),
-            started_at: started_at.clone(),
-            ack,
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("BeginRun")?;
-
     // ── Discover plugins ──────────────────────────────────────────────────────
     let discovery_results = discover();
     let mut plugins: Vec<DiscoveredPlugin> = Vec::new();
@@ -138,6 +128,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 discovery_errors.join("; ")
             );
             tracing::error!(run_id = %run_id, reason = %reason, "failing run: discovery errors");
+            begin_run(&writer, &run_id, &analyze_config_json, &started_at).await?;
             let completed_at = iso8601_now();
             writer
                 .send_wait(|ack| WriterCmd::FailRun {
@@ -164,6 +155,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         }
 
         tracing::warn!(run_id = %run_id, "no plugins discovered");
+        begin_run(&writer, &run_id, &analyze_config_json, &started_at).await?;
         let completed_at = iso8601_now();
         writer
             .send_wait(|ack| WriterCmd::CommitRun {
@@ -215,6 +207,10 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let source_files = collect_source_files(&project_root, &wanted_extensions);
     tracing::info!(file_count = source_files.len(), "source tree walk complete");
 
+    let secret_scan_outcome =
+        crate::secret_scan::pre_ingest(&project_root, &source_files, &options.secret_scan)?;
+    begin_run(&writer, &run_id, &analyze_config_json, &started_at).await?;
+
     // ── Per-plugin processing ─────────────────────────────────────────────────
     //
     // A per-plugin crash (spawn / handshake / analyze_file Err) does NOT tank
@@ -242,6 +238,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let mut run_outcome: RunOutcome = RunOutcome::Completed;
     let mut breaker = CrashLoopBreaker::default();
     let mut crash_reasons: Vec<String> = Vec::new();
+    let mut secret_finding_anchors: BTreeMap<PathBuf, String> = BTreeMap::new();
 
     'plugins: for plugin in plugins {
         let plugin_id = plugin.manifest.plugin.plugin_id.clone();
@@ -282,6 +279,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         let pid_clone = plugin_id.clone();
         let exec_clone = plugin.executable.clone();
         let files_clone = plugin_files.clone();
+        let briefing_blocks_clone = secret_scan_outcome.briefing_blocks.clone();
 
         // A JoinError here means the blocking task panicked (OOM, stack
         // overflow, internal unwrap, abort — anything that unwinds past the
@@ -299,6 +297,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     &pid_clone,
                     &exec_clone,
                     &files_clone,
+                    &briefing_blocks_clone,
                 )
             })
             .await,
@@ -361,6 +360,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 // edge FK references resolve at insert time (B.3 §5).
                 let entity_count = entities.len() as u64;
                 let edge_count = edges.len() as u64;
+                remember_secret_finding_anchors(&entities, &mut secret_finding_anchors);
                 let mut insert_err: Option<anyhow::Error> = None;
                 for (id_str, record) in entities {
                     let res = writer
@@ -435,6 +435,22 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         }
     }
 
+    if !matches!(run_outcome, RunOutcome::HardFailed { .. })
+        && let Err(e) = crate::secret_scan::emit_findings(
+            &writer,
+            &run_id,
+            &started_at,
+            &secret_scan_outcome,
+            &secret_finding_anchors,
+        )
+        .await
+    {
+        tracing::error!(run_id = %run_id, error = %e, "secret finding persistence failed");
+        run_outcome = RunOutcome::HardFailed {
+            reason: format!("secret finding persistence failed: {e:#}"),
+        };
+    }
+
     // ── Commit or fail the run ────────────────────────────────────────────────
     //
     // Writer-actor failures set `run_outcome = HardFailed` above (and break).
@@ -497,7 +513,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
 
     match run_outcome {
         RunOutcome::Completed => {
-            let stats_json = serde_json::json!({
+            let mut stats_json = serde_json::json!({
                 "entities_inserted": total_entity_count,
                 "edges_inserted": total_edge_count,
                 "dropped_edges_total": dropped_edges_total,
@@ -513,8 +529,9 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "pyright_index_parse_latency_p95_ms": pyright_index_parse_latency_p95_ms,
                 "extractor_parse_latency_p95_ms": extractor_parse_latency_p95_ms,
                 "clustering": phase3_output.clustering_stats.clone(),
-            })
-            .to_string();
+            });
+            secret_scan_outcome.augment_stats(&mut stats_json);
+            let stats_json = stats_json.to_string();
             writer
                 .send_wait(|ack| WriterCmd::CommitRun {
                     run_id: run_id.clone(),
@@ -532,7 +549,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             // failed, atomically (writer folds the UPDATE into the open tx).
             // The stats JSON carries both fields so operators can see what
             // was persisted alongside the failure reason.
-            let stats_json = serde_json::json!({
+            let mut stats_json = serde_json::json!({
                 "entities_inserted": total_entity_count,
                 "edges_inserted": total_edge_count,
                 "dropped_edges_total": dropped_edges_total,
@@ -549,8 +566,9 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "extractor_parse_latency_p95_ms": extractor_parse_latency_p95_ms,
                 "clustering": phase3_output.clustering_stats.clone(),
                 "failure_reason": reason,
-            })
-            .to_string();
+            });
+            secret_scan_outcome.augment_stats(&mut stats_json);
+            let stats_json = stats_json.to_string();
             writer
                 .send_wait(|ack| WriterCmd::CommitRun {
                     run_id: run_id.clone(),
@@ -595,6 +613,24 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
          ({total_entity_count} entities, {total_edge_count} edges)"
     );
     Ok(())
+}
+
+async fn begin_run(
+    writer: &Writer,
+    run_id: &str,
+    analyze_config_json: &str,
+    started_at: &str,
+) -> Result<()> {
+    writer
+        .send_wait(|ack| WriterCmd::BeginRun {
+            run_id: run_id.to_owned(),
+            config_json: analyze_config_json.to_owned(),
+            started_at: started_at.to_owned(),
+            ack,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("BeginRun")
 }
 
 // ── Phase 3 subsystem materialisation ─────────────────────────────────────────
@@ -1170,6 +1206,7 @@ fn run_plugin_blocking(
     plugin_id: &str,
     executable: &Path,
     files: &[PathBuf],
+    briefing_blocks: &BTreeMap<PathBuf, String>,
 ) -> Result<BatchResult, PluginRunError> {
     use clarion_core::PluginHost;
 
@@ -1185,6 +1222,7 @@ fn run_plugin_blocking(
                 PluginRunError::new(format!("plugin {plugin_id} spawn/handshake error: {other}"))
             }
         })?;
+    host.set_briefing_blocks(briefing_blocks.clone());
 
     let work_result: Result<Collected, String> = (|| {
         let mut collected_entities: Vec<(String, EntityRecord)> = Vec::new();
@@ -1494,6 +1532,23 @@ fn absolute_from_import_submodule_target(
     module_entity_ids
         .contains(candidate.as_str())
         .then_some(candidate)
+}
+
+fn remember_secret_finding_anchors(
+    entities: &[(String, EntityRecord)],
+    anchors: &mut BTreeMap<PathBuf, String>,
+) {
+    for (id, record) in entities {
+        let Some(path) = record.source_file_path.as_deref() else {
+            continue;
+        };
+        let key = Path::new(path)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(path));
+        if record.kind == "module" || !anchors.contains_key(&key) {
+            anchors.insert(key, id.clone());
+        }
+    }
 }
 
 /// Map an `AcceptedEntity` to an `EntityRecord` for the writer-actor.

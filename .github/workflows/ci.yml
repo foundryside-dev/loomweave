@@ -128,3 +128,6 @@ jobs:
 
       - name: run walking skeleton
         run: bash tests/e2e/sprint_1_walking_skeleton.sh
+
+      - name: run WP5 secret scanner smoke
+        run: CARGO_BUILD=0 bash tests/e2e/wp5_secret_scan.sh

@@ -19,6 +19,7 @@ blake3.workspace = true
 clap.workspace = true
 clarion-core = { path = "../clarion-core", version = "0.1.0-dev" }
 clarion-mcp = { path = "../clarion-mcp", version = "0.1.0-dev" }
+clarion-scanner = { path = "../clarion-scanner", version = "0.1.0-dev" }
 clarion-storage = { path = "../clarion-storage", version = "0.1.0-dev" }
 dotenvy.workspace = true
 ignore.workspace = true

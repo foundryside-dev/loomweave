@@ -32,6 +32,15 @@ pub enum Command {
         /// Path to clarion.yaml (default: project-root/clarion.yaml if present).
         #[arg(long)]
         config: Option<PathBuf>,
+
+        /// Allow analysis of files containing unredacted secrets. Requires a
+        /// confirmation step when detections are present.
+        #[arg(long)]
+        allow_unredacted_secrets: bool,
+
+        /// Non-TTY confirmation token for --allow-unredacted-secrets.
+        #[arg(long, value_name = "TOKEN", requires = "allow_unredacted_secrets")]
+        confirm_allow_unredacted_secrets: Option<String>,
     },
 
     /// Run the MCP stdio server.

@@ -6,3 +6,5 @@ Practical notes for configuring and running Clarion.
   headers, and token-ceiling configuration for v0.1.
 - [Runtime topology](./runtime-topology.md) — supported `clarion serve` and
   `clarion analyze` concurrency against one `.clarion/clarion.db`.
+- [Secret scanning](./secret-scanning.md) — pre-ingest scanner behavior,
+  baseline false-positive workflow, override confirmation, and audit queries.

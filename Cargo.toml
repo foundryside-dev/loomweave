@@ -6,6 +6,7 @@ members = [
     "crates/clarion-cli",
     "crates/clarion-mcp",
     "crates/clarion-plugin-fixture",
+    "crates/clarion-scanner",
 ]
 
 [workspace.package]
@@ -38,9 +39,11 @@ dotenvy = "0.15"
 ignore = "0.4"
 rusqlite = { version = "0.31", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_norway = "0.9.42"
+sha1 = "0.10"
 sha2 = "0.10"
 thiserror = "1"
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }

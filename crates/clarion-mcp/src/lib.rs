@@ -1146,6 +1146,9 @@ impl ServerState {
                 if entity.kind == "subsystem" {
                     return Ok(SummaryRead::ScopeDeferred(Box::new(entity)));
                 }
+                if let Some(reason) = briefing_block_reason(&entity) {
+                    return Ok(SummaryRead::BriefingBlocked(Box::new(entity), reason));
+                }
                 let Some(content_hash) = entity.content_hash.clone() else {
                     return Ok(SummaryRead::MissingContentHash(entity.id));
                 };
@@ -1473,6 +1476,7 @@ enum SummaryRead {
     EntityNotFound(String),
     MissingContentHash(String),
     ScopeDeferred(Box<EntityRow>),
+    BriefingBlocked(Box<EntityRow>, String),
 }
 
 struct SummaryReady {
@@ -2274,6 +2278,7 @@ fn summary_read_error(read: SummaryRead) -> Value {
             false,
         ),
         SummaryRead::ScopeDeferred(entity) => summary_scope_deferred(&entity),
+        SummaryRead::BriefingBlocked(entity, reason) => summary_briefing_blocked(&entity, &reason),
         SummaryRead::Ready(_) => unreachable!("ready summary read is not an error"),
     }
 }
@@ -2345,6 +2350,24 @@ fn summary_scope_deferred(entity: &EntityRow) -> Value {
         "message": "subsystem summaries are deferred to v0.2",
         "entity": entity_json(entity)
     }))
+}
+
+fn summary_briefing_blocked(entity: &EntityRow, reason: &str) -> Value {
+    success_envelope(json!({
+        "available": false,
+        "entity_id": entity.id,
+        "entity": entity_json(entity),
+        "summary": null,
+        "briefing_blocked": reason,
+        "remediation": "File flagged by pre-ingest secret scan. Fix the secret or whitelist via .clarion/secrets-baseline.yaml. See ADR-013."
+    }))
+}
+
+fn briefing_block_reason(entity: &EntityRow) -> Option<String> {
+    entity_properties_json(entity)
+        .get("briefing_blocked")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 fn tool_json_rpc_response(id: &Value, envelope: &Value) -> Value {

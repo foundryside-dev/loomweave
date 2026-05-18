@@ -255,6 +255,7 @@ dependencies = [
  "clarion-core",
  "clarion-mcp",
  "clarion-plugin-fixture",
+ "clarion-scanner",
  "clarion-storage",
  "dotenvy",
  "ignore",
@@ -311,6 +312,18 @@ dependencies = [
  "clarion-core",
  "nix",
  "serde_json",
+]
+
+[[package]]
+name = "clarion-scanner"
+version = "0.1.0-dev"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_norway",
+ "sha1",
+ "tempfile",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1313,6 +1326,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "regex"
+version = "1.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e10754a14b9137dd7b1e3e5b0493cc9171fdd105e0ab477f51b72e7f3ac0e276"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "regex-automata"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1597,6 +1622,17 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest",
 ]
 
 [[package]]
