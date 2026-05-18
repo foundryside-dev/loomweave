@@ -1,5 +1,5 @@
-use std::fs;
 use std::path::Path;
+use std::{fs, net::SocketAddr};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -139,7 +139,7 @@ pub struct CodexCliConfig {
     pub executable: String,
     pub model: Option<String>,
     pub profile: Option<String>,
-    pub sandbox: String,
+    pub sandbox: CodexSandboxMode,
     pub timeout_seconds: u64,
 }
 
@@ -149,8 +149,27 @@ impl Default for CodexCliConfig {
             executable: "codex".to_owned(),
             model: None,
             profile: None,
-            sandbox: "read-only".to_owned(),
+            sandbox: CodexSandboxMode::ReadOnly,
             timeout_seconds: 300,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexSandboxMode {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+impl CodexSandboxMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::WorkspaceWrite => "workspace-write",
+            Self::DangerFullAccess => "danger-full-access",
         }
     }
 }
@@ -160,7 +179,7 @@ impl Default for CodexCliConfig {
 pub struct ClaudeCliConfig {
     pub executable: String,
     pub model: Option<String>,
-    pub permission_mode: String,
+    pub permission_mode: ClaudePermissionMode,
     pub tools: Vec<String>,
     pub timeout_seconds: u64,
     pub max_turns: u32,
@@ -173,12 +192,36 @@ impl Default for ClaudeCliConfig {
         Self {
             executable: "claude".to_owned(),
             model: None,
-            permission_mode: "plan".to_owned(),
+            permission_mode: ClaudePermissionMode::Plan,
             tools: Vec::new(),
             timeout_seconds: 300,
             max_turns: 2,
             no_session_persistence: true,
             exclude_dynamic_system_prompt_sections: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum ClaudePermissionMode {
+    #[serde(rename = "plan")]
+    Plan,
+    #[serde(rename = "default")]
+    Default,
+    #[serde(rename = "acceptEdits")]
+    AcceptEdits,
+    #[serde(rename = "bypassPermissions")]
+    BypassPermissions,
+}
+
+impl ClaudePermissionMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Default => "default",
+            Self::AcceptEdits => "acceptEdits",
+            Self::BypassPermissions => "bypassPermissions",
         }
     }
 }
@@ -199,16 +242,26 @@ pub struct ServeConfig {
 #[serde(default)]
 pub struct HttpReadConfig {
     pub enabled: bool,
-    pub bind: String,
+    #[serde(deserialize_with = "deserialize_socket_addr")]
+    pub bind: SocketAddr,
 }
 
 impl Default for HttpReadConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            bind: "127.0.0.1:9111".to_owned(),
+            bind: SocketAddr::from(([127, 0, 0, 1], 9111)),
         }
     }
+}
+
+fn deserialize_socket_addr<'de, D>(deserializer: D) -> Result<SocketAddr, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    raw.parse()
+        .map_err(|err| serde::de::Error::custom(format!("invalid serve.http.bind {raw:?}: {err}")))
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -465,7 +518,7 @@ llm_policy:
         assert_eq!(cfg.llm.codex_cli.executable, "/tmp/fake-codex");
         assert_eq!(cfg.llm.codex_cli.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(cfg.llm.codex_cli.profile.as_deref(), Some("clarion"));
-        assert_eq!(cfg.llm.codex_cli.sandbox, "read-only");
+        assert_eq!(cfg.llm.codex_cli.sandbox, CodexSandboxMode::ReadOnly);
         assert_eq!(cfg.llm.codex_cli.timeout_seconds, 30);
 
         let selected = select_provider_with_env(&cfg, |_| None).expect("provider selection");
@@ -522,7 +575,10 @@ llm_policy:
             cfg.llm.claude_cli.model.as_deref(),
             Some("claude-sonnet-4-6")
         );
-        assert_eq!(cfg.llm.claude_cli.permission_mode, "plan");
+        assert_eq!(
+            cfg.llm.claude_cli.permission_mode,
+            ClaudePermissionMode::Plan
+        );
         assert_eq!(cfg.llm.claude_cli.tools, vec!["Read", "Glob", "Grep"]);
         assert_eq!(cfg.llm.claude_cli.timeout_seconds, 45);
         assert_eq!(cfg.llm.claude_cli.max_turns, 2);
@@ -552,6 +608,39 @@ llm_policy:
         })
         .expect("provider selection via env opt-in");
         assert_eq!(env_selected, ProviderSelection::ClaudeCli);
+    }
+
+    #[test]
+    fn http_bind_is_parsed_when_config_loads() {
+        let cfg = McpConfig::from_yaml_str(
+            r#"
+serve:
+  http:
+    enabled: true
+    bind: "127.0.0.1:0"
+"#,
+        )
+        .expect("parse HTTP bind");
+
+        assert_eq!(cfg.serve.http.bind, SocketAddr::from(([127, 0, 0, 1], 0)));
+    }
+
+    #[test]
+    fn invalid_http_bind_fails_config_load() {
+        let err = McpConfig::from_yaml_str(
+            r#"
+serve:
+  http:
+    enabled: true
+    bind: "not-a-socket"
+"#,
+        )
+        .expect_err("invalid bind should fail");
+
+        assert!(
+            err.to_string().contains("invalid serve.http.bind"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

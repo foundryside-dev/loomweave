@@ -5,7 +5,9 @@ use clarion_scanner::{Baseline, BaselineError};
 use serde_json::json;
 
 use super::normalize_project_path;
-use crate::secret_scan::findings::PendingFinding;
+use crate::secret_scan::findings::{
+    FindingConfidenceBasis, FindingKind, FindingSeverity, PendingFinding,
+};
 
 const BASELINE_NO_JUSTIFICATION: &str = "CLA-INFRA-SECRET-BASELINE-NO-JUSTIFICATION";
 const BASELINE_MATCH: &str = "CLA-INFRA-SECRET-BASELINE-MATCH";
@@ -21,10 +23,10 @@ pub(super) fn load_for_scan(project_root: &Path) -> Result<(Baseline, Vec<Pendin
                 .map(|entry| PendingFinding {
                     file_path: normalize_project_path(project_root, &entry.file),
                     rule_id: BASELINE_NO_JUSTIFICATION,
-                    kind: "defect",
-                    severity: "ERROR",
+                    kind: FindingKind::Defect,
+                    severity: FindingSeverity::Error,
                     confidence: Some(1.0),
-                    confidence_basis: Some("baseline_schema"),
+                    confidence_basis: Some(FindingConfidenceBasis::BaselineSchema),
                     message: format!(
                         "Secret baseline entry missing justification at {}:{}",
                         entry.file.display(),

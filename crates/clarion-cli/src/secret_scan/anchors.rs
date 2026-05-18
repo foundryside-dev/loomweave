@@ -65,7 +65,7 @@ async fn ensure_finding_anchors(
         if let Some(reason) = outcome.briefing_blocks.get(&key) {
             properties.insert(
                 "briefing_blocked".to_owned(),
-                serde_json::Value::String(reason.clone()),
+                serde_json::Value::String(reason.as_str().to_owned()),
             );
         }
         let record = EntityRecord {

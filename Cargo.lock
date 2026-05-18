@@ -330,6 +330,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_norway",
+ "sha1",
  "sha2",
  "tempfile",
  "time",
@@ -370,6 +371,7 @@ dependencies = [
  "thiserror 1.0.69",
  "time",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

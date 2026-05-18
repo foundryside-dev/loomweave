@@ -31,7 +31,7 @@ A matching baseline entry suppresses the block and records `CLA-INFRA-SECRET-BAS
 
 Use `--allow-unredacted-secrets` only when you deliberately accept that detected secrets may reach the LLM provider.
 
-Interactive runs prompt for:
+When detections exist, interactive runs prompt for:
 
 ```text
 yes-i-understand

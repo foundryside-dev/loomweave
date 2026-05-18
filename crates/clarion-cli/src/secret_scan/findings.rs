@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use clarion_scanner::Detection;
+use clarion_scanner::{Detection, SecretCategory};
 use clarion_storage::{
     Writer,
     commands::{FindingRecord, WriterCmd},
@@ -20,12 +20,77 @@ const SECRET_DETECTED: &str = "CLA-SEC-SECRET-DETECTED";
 pub(super) struct PendingFinding {
     pub(super) file_path: PathBuf,
     pub(super) rule_id: &'static str,
-    pub(super) kind: &'static str,
-    pub(super) severity: &'static str,
+    pub(super) kind: FindingKind,
+    pub(super) severity: FindingSeverity,
     pub(super) confidence: Option<f64>,
-    pub(super) confidence_basis: Option<&'static str>,
+    pub(super) confidence_basis: Option<FindingConfidenceBasis>,
     pub(super) message: String,
     pub(super) evidence: serde_json::Value,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FindingKind {
+    Defect,
+    Fact,
+    Classification,
+    Metric,
+    Suggestion,
+}
+
+impl FindingKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Defect => "defect",
+            Self::Fact => "fact",
+            Self::Classification => "classification",
+            Self::Metric => "metric",
+            Self::Suggestion => "suggestion",
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FindingSeverity {
+    Info,
+    Warn,
+    Error,
+    Critical,
+    None,
+}
+
+impl FindingSeverity {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+            Self::Error => "ERROR",
+            Self::Critical => "CRITICAL",
+            Self::None => "NONE",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FindingConfidenceBasis {
+    Pattern,
+    Entropy,
+    Baseline,
+    BaselineSchema,
+    OperatorOverride,
+}
+
+impl FindingConfidenceBasis {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pattern => "pattern",
+            Self::Entropy => "entropy",
+            Self::Baseline => "baseline",
+            Self::BaselineSchema => "baseline_schema",
+            Self::OperatorOverride => "operator_override",
+        }
+    }
 }
 
 pub(crate) async fn emit_findings(
@@ -49,10 +114,13 @@ pub(crate) async fn emit_findings(
                     tool_version: env!("CARGO_PKG_VERSION").to_owned(),
                     run_id: run_id.to_owned(),
                     rule_id: pending.rule_id.to_owned(),
-                    kind: pending.kind.to_owned(),
-                    severity: pending.severity.to_owned(),
+                    kind: pending.kind.as_str().to_owned(),
+                    severity: pending.severity.as_str().to_owned(),
                     confidence: pending.confidence,
-                    confidence_basis: pending.confidence_basis.map(str::to_owned),
+                    confidence_basis: pending
+                        .confidence_basis
+                        .map(FindingConfidenceBasis::as_str)
+                        .map(str::to_owned),
                     entity_id,
                     related_entities_json: "[]".to_owned(),
                     message: pending.message.clone(),
@@ -76,17 +144,17 @@ pub(super) fn secret_detected_finding(file: &Path, detection: &Detection) -> Pen
     PendingFinding {
         file_path: file.to_path_buf(),
         rule_id: SECRET_DETECTED,
-        kind: "defect",
-        severity: "ERROR",
-        confidence: if detection.rule_id.starts_with("HighEntropy") {
+        kind: FindingKind::Defect,
+        severity: FindingSeverity::Error,
+        confidence: if detection.category == SecretCategory::HighEntropy {
             Some(0.6)
         } else {
             Some(1.0)
         },
-        confidence_basis: if detection.rule_id.starts_with("HighEntropy") {
-            Some("entropy")
+        confidence_basis: if detection.category == SecretCategory::HighEntropy {
+            Some(FindingConfidenceBasis::Entropy)
         } else {
-            Some("pattern")
+            Some(FindingConfidenceBasis::Pattern)
         },
         message: format!(
             "{} detected in {}:{}",
@@ -98,7 +166,7 @@ pub(super) fn secret_detected_finding(file: &Path, detection: &Detection) -> Pen
             "file_path": file,
             "line_number": detection.line_number,
             "rule": detection.rule_id,
-            "hashed_secret_hex": hex20(detection.hashed_secret),
+            "hashed_secret_hex": detection.hashed_secret.to_string(),
         }),
     }
 }
@@ -107,19 +175,10 @@ fn finding_entity_id(file_path: &Path, anchors: &BTreeMap<PathBuf, String>) -> O
     anchors.get(file_path).cloned()
 }
 
-fn hex20(bytes: [u8; 20]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(40);
-    for byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
-    use super::finding_entity_id;
+    use super::{FindingConfidenceBasis, finding_entity_id, secret_detected_finding};
+    use clarion_scanner::{DetectSecretsRule, Detection, HashedSecret, SecretCategory};
     use std::{collections::BTreeMap, path::PathBuf};
 
     #[test]
@@ -133,6 +192,27 @@ mod tests {
         assert_eq!(
             finding_entity_id(PathBuf::from("lib/.env").as_path(), &anchors),
             None
+        );
+    }
+
+    #[test]
+    fn confidence_basis_uses_detection_category_not_rule_id_prefix() {
+        let detection = Detection {
+            rule_id: "HighEntropyNamedPattern",
+            detect_secrets_type: DetectSecretsRule::AwsAccessKey,
+            category: SecretCategory::CloudCredential,
+            byte_offset: 0,
+            line_number: 7,
+            matched_len: 20,
+            hashed_secret: HashedSecret::from_bytes([1u8; 20]),
+        };
+
+        let finding = secret_detected_finding(PathBuf::from("demo.sec").as_path(), &detection);
+
+        assert_eq!(finding.confidence, Some(1.0));
+        assert_eq!(
+            finding.confidence_basis,
+            Some(FindingConfidenceBasis::Pattern)
         );
     }
 }

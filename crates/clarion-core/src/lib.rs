@@ -25,6 +25,7 @@ pub use plugin::{
     AcceptedEntity,
     AnalyzeFileOutcome,
     AnalyzeFileStats,
+    BriefingBlockReason,
     CapExceeded,
     // breaker (Task 7) — callers drive crash-loop accounting
     CrashLoopBreaker,

@@ -131,7 +131,7 @@ fn build_llm_provider(
                 model_id: config.llm.model_id.clone(),
                 model: config.llm.codex_cli.model.clone(),
                 profile: config.llm.codex_cli.profile.clone(),
-                sandbox: config.llm.codex_cli.sandbox.clone(),
+                sandbox: config.llm.codex_cli.sandbox.as_str().to_owned(),
                 timeout_seconds: config.llm.codex_cli.timeout_seconds,
             })
             .context("build Codex CLI LLM provider")?;
@@ -143,7 +143,7 @@ fn build_llm_provider(
                 project_root: project_root.to_owned(),
                 model_id: config.llm.model_id.clone(),
                 model: config.llm.claude_cli.model.clone(),
-                permission_mode: config.llm.claude_cli.permission_mode.clone(),
+                permission_mode: config.llm.claude_cli.permission_mode.as_str().to_owned(),
                 tools: config.llm.claude_cli.tools.clone(),
                 timeout_seconds: config.llm.claude_cli.timeout_seconds,
                 max_turns: config.llm.claude_cli.max_turns,

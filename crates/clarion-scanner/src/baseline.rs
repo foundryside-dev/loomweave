@@ -6,7 +6,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Detection, hex_decode_20};
+use crate::{DetectSecretsRule, Detection, HashedSecret};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Baseline {
@@ -16,8 +16,8 @@ pub struct Baseline {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaselineEntry {
-    pub rule_type: String,
-    pub hashed_secret: [u8; 20],
+    pub rule_type: DetectSecretsRule,
+    pub hashed_secret: HashedSecret,
     pub line_number: u32,
     pub is_secret: bool,
     pub justification: String,
@@ -55,6 +55,12 @@ pub enum BaselineError {
         file: PathBuf,
         line: u32,
         details: String,
+    },
+    #[error("baseline entry has unsupported detector type at {file}:{line}: {rule_type:?}")]
+    UnsupportedRuleType {
+        file: PathBuf,
+        line: u32,
+        rule_type: String,
     },
     #[error("baseline parse error: {0}")]
     Parse(#[from] serde_norway::Error),
@@ -113,7 +119,7 @@ impl Baseline {
                 {
                     let key = (
                         (*baseline_path).clone(),
-                        entry.rule_type.clone(),
+                        entry.rule_type,
                         entry.hashed_secret,
                         entry.line_number,
                     );
@@ -170,15 +176,24 @@ impl Baseline {
             let mut converted = Vec::new();
             for entry in raw_entries {
                 let justification = entry.justification.unwrap_or_default();
-                let hashed_secret = hex_decode_20(&entry.hashed_secret).map_err(|details| {
-                    BaselineError::InvalidHash {
-                        file: file.clone(),
-                        line: entry.line_number,
-                        details,
-                    }
-                })?;
+                let rule_type =
+                    DetectSecretsRule::try_from(entry.rule_type.as_str()).map_err(|_| {
+                        BaselineError::UnsupportedRuleType {
+                            file: file.clone(),
+                            line: entry.line_number,
+                            rule_type: entry.rule_type.clone(),
+                        }
+                    })?;
+                let hashed_secret =
+                    HashedSecret::from_hex(&entry.hashed_secret).map_err(|details| {
+                        BaselineError::InvalidHash {
+                            file: file.clone(),
+                            line: entry.line_number,
+                            details: details.to_string(),
+                        }
+                    })?;
                 converted.push(BaselineEntry {
-                    rule_type: entry.rule_type,
+                    rule_type,
                     hashed_secret,
                     line_number: entry.line_number,
                     is_secret: entry.is_secret,
@@ -252,8 +267,8 @@ impl From<&Baseline> for RawBaseline {
                     entries
                         .iter()
                         .map(|entry| RawBaselineEntry {
-                            rule_type: entry.rule_type.clone(),
-                            hashed_secret: crate::hex_encode(&entry.hashed_secret),
+                            rule_type: entry.rule_type.as_str().to_owned(),
+                            hashed_secret: entry.hashed_secret.to_string(),
                             line_number: entry.line_number,
                             is_secret: entry.is_secret,
                             justification: Some(entry.justification.clone()),

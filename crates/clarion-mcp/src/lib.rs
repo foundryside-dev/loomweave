@@ -856,8 +856,13 @@ impl ServerState {
             return Ok(InferredDispatchStats::default());
         };
 
-        if briefing_block_reason(&read.caller).is_some() {
-            return Ok(InferredDispatchStats::default());
+        if let Some(reason) = briefing_block_reason(&read.caller) {
+            tracing::warn!(
+                caller_id = %caller_id,
+                briefing_blocked = %reason,
+                "skipping inferred-edge dispatch for briefing-blocked caller"
+            );
+            return Ok(InferredDispatchStats::briefing_blocked());
         }
 
         if let Some(cached) = read.cached.clone() {
@@ -1690,6 +1695,7 @@ struct InferredDispatchStats {
     /// the persisted edge set to avoid the FK violation that previously
     /// poisoned the cache row and re-burned LLM tokens on retry.
     unresolved_targets_dropped_total: u64,
+    briefing_blocked_total: u64,
     candidate_callers_considered: u64,
     coalesced_waits_total: u64,
     tokens_input: i64,
@@ -1723,12 +1729,20 @@ impl InferredDispatchStats {
         }
     }
 
+    fn briefing_blocked() -> Self {
+        Self {
+            briefing_blocked_total: 1,
+            ..Self::default()
+        }
+    }
+
     fn merge(&mut self, other: &Self) {
         self.cache_hits_total += other.cache_hits_total;
         self.cache_misses_total += other.cache_misses_total;
         self.edges_materialized_total += other.edges_materialized_total;
         self.edges_skipped_static_duplicates_total += other.edges_skipped_static_duplicates_total;
         self.unresolved_targets_dropped_total += other.unresolved_targets_dropped_total;
+        self.briefing_blocked_total += other.briefing_blocked_total;
         self.candidate_callers_considered += other.candidate_callers_considered;
         self.coalesced_waits_total += other.coalesced_waits_total;
         self.tokens_input += other.tokens_input;
@@ -1745,6 +1759,7 @@ impl InferredDispatchStats {
             "inferred_edges_materialized_total": self.edges_materialized_total,
             "inferred_edges_skipped_static_duplicates_total": self.edges_skipped_static_duplicates_total,
             "inferred_unresolved_targets_dropped_total": self.unresolved_targets_dropped_total,
+            "inferred_dispatch_briefing_blocked_total": self.briefing_blocked_total,
             "inferred_candidate_callers_considered": self.candidate_callers_considered,
             "inferred_dispatch_coalesced_total": self.coalesced_waits_total,
             "inferred_tokens_input": self.tokens_input,

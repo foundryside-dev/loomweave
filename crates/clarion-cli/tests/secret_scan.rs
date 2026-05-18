@@ -2,6 +2,7 @@
 
 use assert_cmd::Command;
 use rusqlite::Connection;
+use sha1::{Digest, Sha1};
 
 fn clarion_bin() -> Command {
     Command::cargo_bin("clarion").expect("clarion binary")
@@ -134,6 +135,19 @@ fn plugin_path(plugin_dir: &std::path::Path) -> std::ffi::OsString {
 
 fn conn(project: &std::path::Path) -> Connection {
     Connection::open(project.join(".clarion/clarion.db")).expect("open clarion db")
+}
+
+fn sha1_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut hasher = Sha1::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(40);
+    for byte in digest {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
 }
 
 #[test]
@@ -304,18 +318,21 @@ fn baseline_suppresses_secret_and_emits_audit_match() {
         b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n",
     )
     .unwrap();
+    let hashed_secret = sha1_hex(b"AKIAIOSFODNN7EXAMPLE");
     std::fs::write(
         project.path().join(".clarion/secrets-baseline.yaml"),
-        r#"
+        format!(
+            r#"
 version: "1.0"
 results:
   "leaky.sec":
     - type: "AWS Access Key"
-      hashed_secret: "25910f981e85ca04baf359199dd0bd4a3ae738b6"
+      hashed_secret: "{hashed_secret}"
       line_number: 1
       is_secret: false
       justification: "AWS documentation example key."
-"#,
+"#
+        ),
     )
     .unwrap();
 
@@ -364,22 +381,25 @@ fn missing_baseline_justification_degrades_to_finding() {
         b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n",
     )
     .unwrap();
+    let hashed_secret = sha1_hex(b"AKIAIOSFODNN7EXAMPLE");
     std::fs::write(
         project.path().join(".clarion/secrets-baseline.yaml"),
-        r#"
+        format!(
+            r#"
 version: "1.0"
 results:
   "leaky.sec":
     - type: "AWS Access Key"
-      hashed_secret: "25910f981e85ca04baf359199dd0bd4a3ae738b6"
+      hashed_secret: "{hashed_secret}"
       line_number: 1
       is_secret: false
   "stale.sec":
     - type: "AWS Access Key"
-      hashed_secret: "25910f981e85ca04baf359199dd0bd4a3ae738b6"
+      hashed_secret: "{hashed_secret}"
       line_number: 9
       is_secret: false
-"#,
+"#
+        ),
     )
     .unwrap();
 
@@ -445,9 +465,24 @@ fn non_tty_override_confirmed_allows_briefing_and_records_stats() {
             |row| row.get(0),
         )
         .unwrap();
+    let evidence_json: String = db
+        .query_row(
+            "SELECT evidence FROM findings WHERE rule_id = 'CLA-SEC-UNREDACTED-SECRETS-ALLOWED'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let evidence: serde_json::Value =
+        serde_json::from_str(&evidence_json).expect("override evidence JSON");
     assert_eq!(blocked_count, 0);
     assert_eq!(override_count, 1);
     assert_eq!(override_used, 1);
+    assert_eq!(evidence["detections"][0]["rule_id"], "AwsAccessKeyId");
+    assert_eq!(evidence["detections"][0]["line_number"], 1);
+    assert_eq!(
+        evidence["detections"][0]["hashed_secret_hex"],
+        sha1_hex(b"AKIAIOSFODNN7EXAMPLE")
+    );
 }
 
 #[test]
@@ -501,11 +536,180 @@ fn non_tty_override_with_wrong_confirmation_exits_78_before_run_start() {
         .code(78);
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
     assert!(stderr.contains("CLA-INFRA-SECRET-OVERRIDE-UNCONFIRMED"));
-    assert!(stderr.contains("leaky.sec:1 AwsAccessKeyId"));
     let run_count: i64 = conn(project.path())
         .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
         .unwrap();
     assert_eq!(run_count, 0);
+}
+
+#[test]
+fn baseline_suppression_and_override_admission_are_audited_together() {
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    std::fs::write(
+        project.path().join("fixture.sec"),
+        b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("live.sec"),
+        b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n",
+    )
+    .unwrap();
+    let hashed_secret = sha1_hex(b"AKIAIOSFODNN7EXAMPLE");
+    std::fs::write(
+        project.path().join(".clarion/secrets-baseline.yaml"),
+        format!(
+            r#"
+version: "1.0"
+results:
+  "fixture.sec":
+    - type: "AWS Access Key"
+      hashed_secret: "{hashed_secret}"
+      line_number: 1
+      is_secret: false
+      justification: "AWS documentation example key."
+"#
+        ),
+    )
+    .unwrap();
+
+    clarion_bin()
+        .args([
+            "analyze",
+            "--allow-unredacted-secrets",
+            "--confirm-allow-unredacted-secrets=yes-i-understand",
+        ])
+        .arg(project.path())
+        .env("PATH", plugin_path(plugin.path()))
+        .assert()
+        .success();
+
+    let db = conn(project.path());
+    let baseline_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'CLA-INFRA-SECRET-BASELINE-MATCH'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let override_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'CLA-SEC-UNREDACTED-SECRETS-ALLOWED'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let secret_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'CLA-SEC-SECRET-DETECTED'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let blocked_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE json_extract(properties, '$.briefing_blocked') IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(baseline_count, 1);
+    assert_eq!(override_count, 1);
+    assert_eq!(secret_count, 0);
+    assert_eq!(blocked_count, 0);
+}
+
+fn assert_invalid_baseline_aborts(raw_baseline: &str, expected_stderr: &str) {
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    std::fs::write(project.path().join("leaky.sec"), b"nothing to see\n").unwrap();
+    std::fs::write(
+        project.path().join(".clarion/secrets-baseline.yaml"),
+        raw_baseline,
+    )
+    .unwrap();
+
+    let assert = clarion_bin()
+        .arg("analyze")
+        .arg(project.path())
+        .env("PATH", plugin_path(plugin.path()))
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("load secret baseline"),
+        "stderr did not include baseline context: {stderr}"
+    );
+    assert!(
+        stderr.contains(expected_stderr),
+        "stderr did not include {expected_stderr:?}: {stderr}"
+    );
+    let run_count: i64 = conn(project.path())
+        .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(run_count, 0);
+}
+
+#[test]
+fn invalid_baseline_path_aborts_analyze_with_context() {
+    assert_invalid_baseline_aborts(
+        r#"
+version: "1.0"
+results:
+  "../leaky.sec":
+    - type: "AWS Access Key"
+      hashed_secret: "0123456789abcdef0123456789abcdef01234567"
+      line_number: 1
+      is_secret: false
+      justification: "Invalid path."
+"#,
+        "repository-relative",
+    );
+}
+
+#[test]
+fn invalid_baseline_hash_aborts_analyze_with_context() {
+    assert_invalid_baseline_aborts(
+        r#"
+version: "1.0"
+results:
+  "leaky.sec":
+    - type: "AWS Access Key"
+      hashed_secret: "not-a-sha1"
+      line_number: 1
+      is_secret: false
+      justification: "Invalid hash."
+"#,
+        "invalid hashed_secret",
+    );
+}
+
+#[test]
+fn unsupported_baseline_version_aborts_analyze_with_context() {
+    assert_invalid_baseline_aborts(
+        r#"
+version: "2.0"
+results: {}
+"#,
+        "baseline version mismatch",
+    );
+}
+
+#[test]
+fn malformed_baseline_yaml_aborts_analyze_with_context() {
+    assert_invalid_baseline_aborts(
+        r#"
+version: "1.0"
+results:
+  "leaky.sec": [
+"#,
+        "baseline parse error",
+    );
 }
 
 #[test]

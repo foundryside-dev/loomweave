@@ -73,3 +73,74 @@ fn is_skipped_dir(entry: &DirEntry) -> bool {
             .to_str()
             .is_some_and(|name| SKIP_DIRS.contains(&name))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::collect_scan_files;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn sidecar_walk_collects_dotenv_variants_and_skips_known_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        write(root.join("src/app.py"), "print('ok')\n");
+        write(root.join(".env"), "TOKEN=one\n");
+        write(root.join(".env.local"), "TOKEN=two\n");
+        write(root.join(".env.production"), "TOKEN=three\n");
+        write(root.join("nested/service.env"), "TOKEN=four\n");
+        write(root.join("nested/.env"), "TOKEN=five\n");
+        write(root.join("nested/not-env.txt"), "TOKEN=six\n");
+        write(root.join(".clarion/.env"), "TOKEN=skip\n");
+        write(root.join("node_modules/.env"), "TOKEN=skip\n");
+
+        let files = collect_scan_files(root, &[root.join("src/app.py")]);
+        let rel = relative_names(root, files);
+
+        assert!(rel.contains(&".env".to_owned()));
+        assert!(rel.contains(&".env.local".to_owned()));
+        assert!(rel.contains(&".env.production".to_owned()));
+        assert!(rel.contains(&"nested/service.env".to_owned()));
+        assert!(rel.contains(&"nested/.env".to_owned()));
+        assert!(rel.contains(&"src/app.py".to_owned()));
+        assert!(!rel.contains(&"nested/not-env.txt".to_owned()));
+        assert!(!rel.contains(&".clarion/.env".to_owned()));
+        assert!(!rel.contains(&"node_modules/.env".to_owned()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_walk_does_not_follow_directory_symlinks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&root).expect("create root");
+        std::fs::create_dir(&outside).expect("create outside");
+        write(outside.join(".env"), "TOKEN=outside\n");
+        std::os::unix::fs::symlink(&outside, root.join("linked")).expect("symlink");
+
+        let files = collect_scan_files(&root, &[]);
+        let rel = relative_names(&root, files);
+
+        assert!(!rel.contains(&"linked/.env".to_owned()));
+    }
+
+    fn write(path: PathBuf, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+        std::fs::write(path, content).expect("write fixture");
+    }
+
+    fn relative_names(root: &Path, files: Vec<PathBuf>) -> Vec<String> {
+        let root = root.canonicalize().expect("canonical root");
+        files
+            .into_iter()
+            .map(|path| {
+                path.strip_prefix(&root)
+                    .expect("scan path under root")
+                    .display()
+                    .to_string()
+            })
+            .collect()
+    }
+}

@@ -1190,7 +1190,7 @@ fn run_plugin_blocking(
     plugin_id: &str,
     executable: &Path,
     files: &[PathBuf],
-    briefing_blocks: &BTreeMap<PathBuf, String>,
+    briefing_blocks: &BTreeMap<PathBuf, clarion_core::BriefingBlockReason>,
     scanned_source_files: &BTreeSet<PathBuf>,
 ) -> Result<BatchResult, PluginRunError> {
     use clarion_core::PluginHost;

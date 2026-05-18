@@ -34,9 +34,21 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
+            let secret_scan = match secret_scan::SecretScanOptions::from_cli(
+                allow_unredacted_secrets,
+                confirm_allow_unredacted_secrets,
+            ) {
+                Ok(options) => options,
+                Err(err) => {
+                    eprintln!("{err}");
+                    std::process::exit(78);
+                }
+            };
             if config.is_none()
-                && !allow_unredacted_secrets
-                && confirm_allow_unredacted_secrets.is_none()
+                && matches!(
+                    secret_scan.override_policy,
+                    secret_scan::OverridePolicy::Forbid
+                )
             {
                 return rt.block_on(analyze::run(path));
             }
@@ -44,10 +56,7 @@ fn main() -> Result<()> {
                 path,
                 analyze::AnalyzeOptions {
                     config_path: config,
-                    secret_scan: secret_scan::SecretScanOptions {
-                        allow_unredacted_secrets,
-                        confirm_allow_unredacted_secrets,
-                    },
+                    secret_scan,
                 },
             ))
         }

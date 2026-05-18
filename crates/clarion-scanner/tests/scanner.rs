@@ -1,4 +1,6 @@
-use clarion_scanner::{Baseline, BaselineError, Scanner, load_baseline};
+use clarion_scanner::{
+    Baseline, BaselineError, EntropyTuning, HashedSecret, Scanner, load_baseline,
+};
 use sha1::{Digest, Sha1};
 
 fn rules_for(input: &str) -> Vec<&'static str> {
@@ -140,6 +142,17 @@ fn contextual_credentials_detect_assignments_but_not_comments_or_hashes() {
         "ContextualCredential",
     );
     assert_not_detects("# password = \"abcDEF1234567890\"", "ContextualCredential");
+    assert_detects("// password = \"abcDEF1234567890\"", "ContextualCredential");
+    assert_detects(
+        "/* password = \"abcDEF1234567890\" */",
+        "ContextualCredential",
+    );
+}
+
+#[test]
+fn entropy_minimum_lengths_are_pinned() {
+    assert_eq!(EntropyTuning::BASE64.min_len, 20);
+    assert_eq!(EntropyTuning::HEX.min_len, 40);
 }
 
 #[test]
@@ -151,7 +164,16 @@ fn detection_records_line_and_sha1_hash_without_literal() {
         .expect("AWS key detection");
     assert_eq!(detection.line_number, 2);
     assert_eq!(detection.matched_len, "AKIAIOSFODNN7EXAMPLE".len());
-    assert_ne!(detection.hashed_secret, [0u8; 20]);
+    assert_ne!(detection.hashed_secret.as_bytes(), &[0u8; 20]);
+}
+
+#[test]
+fn hashed_secret_round_trips_hex_display() {
+    let hash = HashedSecret::from_hex("0123456789abcdef0123456789abcdef01234567")
+        .expect("valid SHA-1 hex");
+
+    assert_eq!(hash.to_string(), "0123456789abcdef0123456789abcdef01234567");
+    assert!(HashedSecret::from_hex("not-a-sha1").is_err());
 }
 
 #[test]
@@ -232,6 +254,28 @@ results:
     assert_eq!(result.allowed.len(), 1);
     assert!(result.suppressed.is_empty());
     assert!(result.fired_entries.is_empty());
+}
+
+#[test]
+fn baseline_rejects_unknown_detector_types() {
+    let err = Baseline::from_yaml_str(
+        r#"
+version: "1.0"
+results:
+  "src/demo.py":
+    - type: "AWS Acceess Key"
+      hashed_secret: "0123456789abcdef0123456789abcdef01234567"
+      line_number: 42
+      is_secret: false
+      justification: "Typo should not silently lose suppression."
+"#,
+    )
+    .expect_err("unknown detector type should fail");
+
+    assert!(
+        err.to_string().contains("unsupported detector type"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -438,14 +482,8 @@ results:
     assert_eq!(parsed, reparsed);
 }
 
-fn hex20(bytes: [u8; 20]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::new();
-    for byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
+fn hex20(hash: HashedSecret) -> String {
+    hash.to_string()
 }
 
 fn sha1_hex(bytes: &[u8]) -> String {

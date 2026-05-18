@@ -878,6 +878,55 @@ async fn summary_on_secret_blocked_entity_returns_policy_envelope_without_llm_or
     assert_eq!(cache_rows, 0);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_on_unscanned_source_returns_policy_envelope_without_llm_or_cache() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "UPDATE entities SET properties = ?1 WHERE id = 'python:function:demo.entry'",
+        params![json!({"briefing_blocked": "unscanned_source"}).to_string()],
+    )
+    .expect("mark entity blocked");
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnySummaryProvider::new_output(
+        r#"{"purpose":"should not run"}"#,
+        120,
+        0.012,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["result"]["summary"], Value::Null);
+    assert_eq!(envelope["result"]["briefing_blocked"], "unscanned_source");
+    assert!(
+        envelope["result"]["remediation"]
+            .as_str()
+            .expect("remediation text")
+            .contains("not covered by the pre-ingest secret scan")
+    );
+    assert_eq!(envelope["stats_delta"], json!({}));
+    assert!(provider.invocations().is_empty());
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn issues_for_returns_unavailable_when_filigree_disabled() {
     let (project, db_path) = open_project();
@@ -1759,6 +1808,10 @@ async fn callers_of_inferred_skips_briefing_blocked_callers_without_llm() {
 
     assert_eq!(envelope["ok"], true);
     assert_eq!(envelope["result"]["callers"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        envelope["stats_delta"]["inferred_dispatch_briefing_blocked_total"],
+        1
+    );
     assert!(provider.invocations().is_empty());
 
     drop(state);

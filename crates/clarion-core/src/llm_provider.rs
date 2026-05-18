@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -527,12 +527,9 @@ impl LlmProvider for CodexCliProvider {
     }
 
     fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
-        let output_path = codex_temp_path("clarion-codex-output", "json");
-        let schema_path = codex_temp_path("clarion-codex-schema", "json");
-        let result = self.invoke_with_temp_files(request, &output_path, &schema_path);
-        let _ = fs::remove_file(output_path);
-        let _ = fs::remove_file(schema_path);
-        result
+        let output_file = codex_temp_file("clarion-codex-output", ".json")?;
+        let schema_file = codex_temp_file("clarion-codex-schema", ".json")?;
+        self.invoke_with_temp_files(request, output_file.path(), schema_file.path())
     }
 
     fn estimate_tokens(&self, request: &LlmRequest) -> u64 {
@@ -673,7 +670,9 @@ impl LlmProvider for ClaudeCliProvider {
         if let Some(model) = &self.model {
             command.arg("--model").arg(model);
         }
-        command.arg("--tools").arg(self.tools.join(","));
+        if !self.tools.is_empty() {
+            command.arg("--tools").arg(self.tools.join(","));
+        }
         command
             .current_dir(&self.project_root)
             .stdin(Stdio::piped())
@@ -943,15 +942,18 @@ fn codex_status_retryable(status: ExitStatus) -> bool {
     cli_status_retryable(status)
 }
 
-fn codex_temp_path(prefix: &str, extension: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "{prefix}-{}-{nonce}.{extension}",
-        std::process::id()
-    ))
+fn codex_temp_file(
+    prefix: &str,
+    suffix: &str,
+) -> Result<tempfile::NamedTempFile, LlmProviderError> {
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .suffix(suffix)
+        .tempfile()
+        .map_err(|err| LlmProviderError::Cli {
+            message: format!("create Codex CLI temp file {prefix}: {err}"),
+            retryable: true,
+        })
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -2035,6 +2037,77 @@ printf '%s\n' '{{"type":"result","subtype":"success","structured_output":{{"purp
         assert!(log.contains("slash_disabled=1"));
         assert!(log.contains("no_session_persistence=1"));
         assert!(log.contains("exclude_dynamic=1"));
+    }
+
+    #[test]
+    fn claude_cli_provider_omits_tools_arg_when_no_tools_are_configured() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir(&project_root).expect("project root");
+        let fake_claude = temp.path().join("claude");
+        let log_path = temp.path().join("claude.log");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+log="{log}"
+saw_tools=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --tools)
+      saw_tools=1
+      shift 2
+      ;;
+    -p|--print|--output-format|--json-schema|--permission-mode|--max-turns|--mcp-config)
+      shift 2
+      ;;
+    --strict-mcp-config|--disable-slash-commands|--no-session-persistence|--exclude-dynamic-system-prompt-sections)
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+cat >/dev/null
+echo "saw_tools=$saw_tools" >> "$log"
+printf '%s\n' '{{"type":"result","subtype":"success","structured_output":{{"purpose":"via claude","behavior":"ran fake CLI","relationships":"","risks":""}},"usage":{{"input_tokens":1,"output_tokens":1,"total_tokens":2}},"total_cost_usd":0.0}}'
+"#,
+            log = log_path.display()
+        );
+        fs::write(&fake_claude, script).expect("write fake claude");
+        let mut permissions = fs::metadata(&fake_claude).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_claude, permissions).expect("chmod fake claude");
+
+        let provider = ClaudeCliProvider::from_config(ClaudeCliProviderConfig {
+            executable: fake_claude.display().to_string(),
+            project_root,
+            model_id: "claude-code-default".to_owned(),
+            model: None,
+            permission_mode: "plan".to_owned(),
+            tools: Vec::new(),
+            timeout_seconds: 5,
+            max_turns: 2,
+            no_session_persistence: true,
+            exclude_dynamic_system_prompt_sections: true,
+        })
+        .expect("construct Claude CLI provider");
+
+        provider
+            .invoke(LlmRequest {
+                purpose: LlmPurpose::Summary,
+                model_id: "claude-code-default".to_owned(),
+                prompt_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+                prompt: "Summarize this function".to_owned(),
+                max_output_tokens: 512,
+            })
+            .expect("invoke fake Claude CLI");
+
+        let log = fs::read_to_string(log_path).expect("read fake claude log");
+        assert!(log.contains("saw_tools=0"));
     }
 
     #[test]

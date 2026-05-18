@@ -415,9 +415,26 @@ where
     /// via stderr writes.
     stderr_tail: Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>>,
     /// Canonical source paths whose entities must not be sent for LLM briefing.
-    briefing_blocks: BTreeMap<PathBuf, String>,
+    briefing_blocks: BTreeMap<PathBuf, BriefingBlockReason>,
     /// Canonical source paths that were covered by the core pre-ingest scanner.
     scanned_source_files: BTreeSet<PathBuf>,
+}
+
+/// File-level reason an entity must not be dispatched for LLM briefing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BriefingBlockReason {
+    SecretPresent,
+    UnscannedSource,
+}
+
+impl BriefingBlockReason {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SecretPresent => "secret_present",
+            Self::UnscannedSource => "unscanned_source",
+        }
+    }
 }
 
 /// Size of the stderr ring buffer kept for diagnostics. 64 KiB holds
@@ -695,9 +712,9 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
     }
 
     /// Install file-level briefing blocks produced by the core pre-ingest
-    /// scanner. Keys are canonical source paths and values are open-vocabulary
-    /// policy reasons such as `secret_present`.
-    pub fn set_briefing_blocks(&mut self, blocks: BTreeMap<PathBuf, String>) {
+    /// scanner. Keys are canonical source paths and values are typed policy
+    /// reasons rendered into `properties_json` by [`BriefingBlockReason::as_str`].
+    pub fn set_briefing_blocks(&mut self, blocks: BTreeMap<PathBuf, BriefingBlockReason>) {
         self.briefing_blocks = blocks;
     }
 
@@ -968,17 +985,14 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
 
     fn apply_briefing_block(&self, raw: &mut RawEntity, jailed: &str) {
         let jailed_path = Path::new(jailed);
-        let reason = self
-            .briefing_blocks
-            .get(jailed_path)
-            .map(String::as_str)
-            .or_else(|| {
-                (!self.scanned_source_files.contains(jailed_path)).then_some("unscanned_source")
-            });
+        let reason = self.briefing_blocks.get(jailed_path).copied().or_else(|| {
+            (!self.scanned_source_files.contains(jailed_path))
+                .then_some(BriefingBlockReason::UnscannedSource)
+        });
         if let Some(reason) = reason {
             raw.extra.insert(
                 "briefing_blocked".to_owned(),
-                serde_json::Value::String(reason.to_owned()),
+                serde_json::Value::String(reason.as_str().to_owned()),
             );
         }
     }

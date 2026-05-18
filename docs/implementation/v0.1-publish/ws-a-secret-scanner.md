@@ -8,10 +8,9 @@
 **Requirements floor**: `NFR-SEC-01` (pre-ingest scan + block + baseline), `NFR-SEC-04` (security events as findings), `NFR-OPS-01` / `NFR-OPS-04` (single-binary distribution).
 **Effort estimate**: 6–9 working days at agentic velocity. Tasks 1 and 2 parallelisable; 3 → 4 → 5 sequential; 6 + 7 parallel with any.
 
-**Implementation accuracy note**: code-path references and line numbers in
-this planning package were last checked on 2026-05-19 against the `scanner`
-branch. Treat symbol names as authoritative and line numbers as historical
-orientation only.
+**Accuracy as of 2026-05-19**: code-path references and line numbers in this
+planning package were last checked against the `scanner` branch. Treat symbol
+names as authoritative and line numbers as historical orientation only.
 
 ---
 

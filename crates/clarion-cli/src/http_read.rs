@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::thread;
 
@@ -46,10 +45,7 @@ pub fn spawn(
     if !config.enabled {
         return Ok(None);
     }
-    let bind: SocketAddr = config
-        .bind
-        .parse()
-        .with_context(|| format!("parse serve.http.bind {:?}", config.bind))?;
+    let bind = config.bind;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let join = thread::spawn(move || -> Result<()> {
