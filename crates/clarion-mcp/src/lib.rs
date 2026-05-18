@@ -1938,19 +1938,22 @@ fn tool_error_envelope_with_diagnostics(
     stats_delta: Value,
     diagnostics: Vec<Value>,
 ) -> Value {
-    json!({
-        "ok": false,
-        "result": null,
-        "error": {
+    let mut envelope = serde_json::Map::new();
+    envelope.insert("ok".to_owned(), Value::Bool(false));
+    envelope.insert("result".to_owned(), Value::Null);
+    envelope.insert(
+        "error".to_owned(),
+        json!({
             "code": code,
             "message": message,
-            "retryable": retryable
-        },
-        "diagnostics": diagnostics,
-        "truncated": false,
-        "truncation_reason": null,
-        "stats_delta": stats_delta
-    })
+            "retryable": retryable,
+        }),
+    );
+    envelope.insert("diagnostics".to_owned(), Value::Array(diagnostics));
+    envelope.insert("truncated".to_owned(), Value::Bool(false));
+    envelope.insert("truncation_reason".to_owned(), Value::Null);
+    envelope.insert("stats_delta".to_owned(), stats_delta);
+    Value::Object(envelope)
 }
 
 fn llm_usage_json(response: &LlmResponse) -> Value {
