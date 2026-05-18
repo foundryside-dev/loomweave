@@ -1,13 +1,13 @@
-# ADR-006: Clustering Algorithm — Leiden on Imports+Calls Subgraph with Louvain Fallback
+# ADR-006: Clustering Algorithm — Leiden on Imports+Calls Subgraph with Weighted-Components Fallback
 
-**Status**: Accepted
+**Status**: Accepted; amended by [ADR-032](./ADR-032-weighted-components-clustering-fallback.md)
 **Date**: 2026-04-18
 **Deciders**: qacona@gmail.com
 **Context**: Phase 3 subsystem discovery takes module-level structural edges and produces `subsystem` entities; algorithm choice shapes downstream LLM cost and query quality
 
 ## Summary
 
-Phase 3 clustering runs **Leiden** over a directed, weighted subgraph of module-level `imports` + `calls` edges, with edge weights equal to reference counts. The algorithm is seeded (for determinism), filters out clusters smaller than `min_cluster_size` (default 3), and records `modularity_score` on each resulting `subsystem` entity. **Louvain** is a configured fallback — selectable via `clarion.yaml:analysis.clustering.algorithm: louvain`. The fallback exists because Leiden implementations in Rust are less common than Louvain; if the vendored/chosen implementation proves unstable at implementation time, Louvain is the deterministic cutover. Both algorithms produce subsystem entities under the core-reserved `subsystem` kind (ADR-022), identified as `core:subsystem:{cluster_hash}` (ADR-003). No hard modularity pass/fail threshold ships in v0.1 — the score is reported, not enforced.
+Phase 3 clustering runs **Leiden** over a directed, weighted subgraph of module-level `imports` + `calls` edges, with edge weights equal to reference counts. The algorithm is seeded (for determinism), filters out clusters smaller than `min_cluster_size` (default 3), and records `modularity_score` on each resulting `subsystem` entity. ADR-032 amends the original Louvain fallback into a deterministic **weighted-components** fallback, selectable via `clarion.yaml:analysis.clustering.algorithm: weighted_components` and used automatically only when Leiden emits zero or one community and the fallback emits more. Both algorithms produce subsystem entities under the core-reserved `subsystem` kind (ADR-022), identified as `core:subsystem:{cluster_hash}` (ADR-003). No hard modularity pass/fail threshold ships in v0.1 — the score is reported, not enforced.
 
 ## Context
 
@@ -40,11 +40,11 @@ The trade-off: Leiden is less widely implemented than Louvain in the Rust ecosys
 - **Resolution parameter**: `γ = 1.0` default (standard modularity). Configurable via `clarion.yaml:analysis.clustering.resolution` if operators want finer or coarser communities.
 - **Iteration cap**: 100 passes (configurable). Most runs converge in <10.
 
-### Fallback: Louvain
+### Fallback: Weighted Components
 
-- **Trigger**: `clarion.yaml:analysis.clustering.algorithm: louvain` explicit selection, *or* Leiden implementation-side failure detected at implementation time (this is an implementation-decision trigger, not a runtime fallback — if Leiden is broken at release, Louvain becomes the default for that release with an ADR revision).
-- **Implementation**: `petgraph`-based; Louvain is simpler and the crate ecosystem offers stable options.
-- **Behaviour delta**: Louvain may produce disconnected communities. Phase 3 post-processes Louvain output to split disconnected clusters by weakly-connected components, mitigating the defect at the cost of occasional fragmentation.
+- **Trigger**: `clarion.yaml:analysis.clustering.algorithm: weighted_components` explicit selection, or runtime auto-fallback when `algorithm: leiden` returns zero or one community and weighted components returns more communities.
+- **Implementation**: deterministic connected components over edges whose weight is at least the average positive edge weight.
+- **Behaviour delta**: weighted components is an explainable local grouping fallback, not modularity optimisation. `properties.algorithm` and `runs.stats.clustering.algorithm` record the algorithm actually used.
 
 ### Output
 
@@ -52,7 +52,7 @@ Each cluster above `min_cluster_size` (default 3) becomes a `subsystem` entity (
 
 - `id`: `core:subsystem:{cluster_hash}` where `cluster_hash = sha256(sorted(member_module_ids))` truncated to 12 chars (ADR-003).
 - `properties`:
-  - `cluster_algorithm`: `"leiden"` or `"louvain"`
+  - `algorithm`: `"leiden"` or `"weighted_components"`
   - `modularity_score`: floating-point; reported, not enforced
   - `member_count`: integer
   - `synthesised_at`: timestamp (Phase-6 LLM-synthesised name/description; absent until Phase 6 runs)
@@ -62,7 +62,7 @@ Each cluster above `min_cluster_size` (default 3) becomes a `subsystem` entity (
 
 ### Quality assessment
 
-No hard modularity threshold passes/fails in v0.1. Modularity scores below 0.3 are conventionally "weak" clustering; Phase 3 emits `CLA-FACT-CLUSTERING-WEAK-MODULARITY` (severity INFO) when the overall score falls below that. Operators see the signal but Phase 3 does not refuse to emit clusters. Block C1's cost-model spike will validate whether weak-modularity subsystems produce useful Opus output or wasted cost; a v0.2 decision may add a hard threshold with `--refuse-weak-modularity` semantics.
+No hard modularity threshold passes/fails in v0.1. Modularity scores below `analysis.clustering.weak_modularity_threshold` (default `0.3`, set `0.0` to disable the finding) emit `CLA-FACT-CLUSTERING-WEAK-MODULARITY` (severity INFO). Operators see the signal but Phase 3 does not refuse to emit clusters. Block C1's cost-model spike will validate whether weak-modularity subsystems produce useful Opus output or wasted cost; a v0.2 decision may add a hard threshold with `--refuse-weak-modularity` semantics.
 
 ## Alternatives Considered
 
@@ -74,7 +74,7 @@ Skip Leiden; use Louvain as the v0.1 algorithm.
 
 **Cons**: Louvain's disconnected-community defect is a semantic bug for subsystem membership. The post-processing split-by-connected-components mitigates but does not eliminate the problem — the resulting "subsystem A-1" and "subsystem A-2" are semantically two subsystems the algorithm failed to distinguish. Leiden produces the right answer in one step.
 
-**Why rejected**: quality delta matters for Phase 6 Opus spend and query coherence; Leiden is the right answer and the implementation risk is absorbable via the Louvain fallback.
+**Why rejected**: quality delta matters for Phase 6 Opus spend and query coherence; Leiden is the right answer and the implementation risk is absorbable via the weighted-components fallback.
 
 ### Alternative 2: Graph-neural community detection
 
@@ -123,17 +123,17 @@ Operators declare subsystems in `clarion.yaml`; clustering is skipped.
 - Leiden's connected-community guarantee makes `CLA-FACT-TIER-SUBSYSTEM-MIXING` and subsystem-navigation MCP tools semantically sound — a "subsystem" is always a coherent group.
 - Phase 6's per-subsystem Opus call lands against meaningful clusters, not noise. Cost spend tracks semantically-relevant subsystems.
 - Determinism (seeded RNG) makes `--resume` and cross-run diffing of subsystem structure possible. Operators see "this module left subsystem X" as a real signal, not RNG noise.
-- Louvain fallback absorbs implementation risk without redesigning the decision.
+- Weighted-components fallback absorbs implementation risk without redesigning the decision.
 
 ### Negative
 
-- Leiden implementations in Rust are less mature than Louvain's. Vendoring ~400 LoC or depending on a possibly-young crate is real implementation risk. Mitigation: the fallback exists specifically for this.
+- Leiden implementations in Rust are less mature than simpler local graph cuts. Vendoring ~400 LoC or depending on a possibly-young crate is real implementation risk. Mitigation: the weighted-components fallback exists specifically for this.
 - Modularity is a quality *signal* not a hard threshold. Weak clusterings ship. Operators reading `CLA-FACT-CLUSTERING-WEAK-MODULARITY` may not know how to act on it. Mitigation: v0.2 validation work (and the C1 cost-model spike) clarifies whether a hard threshold is warranted.
 - Module-level only. Classes, functions, and decorators don't get their own clusters in v0.1. Operators wanting finer grains (sub-module clusters) get the "module is the unit" limitation — noted in release documentation.
 
 ### Neutral
 
-- Algorithm selection is a config, not a code change. Switching from Leiden to Louvain mid-project (if a critical implementation bug emerges) is a `clarion.yaml` edit + reindex.
+- Algorithm selection is a config, not a code change. Switching from Leiden to weighted-components mid-project is a `clarion.yaml` edit + reindex.
 - Resolution parameter (`γ`) is exposed for operators with unusual codebases; most never touch it.
 - Subsystem entity IDs are content-addressed over sorted member IDs; renaming a module changes the hash. This is correct — "the subsystem" changed composition, so a new identity is right. Filigree issues tagged to the old ID follow the ADR-003 EntityAlias story.
 

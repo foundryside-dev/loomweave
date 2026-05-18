@@ -75,6 +75,13 @@ fn main() {
                 send_result(&mut writer, id, serde_json::to_value(result).unwrap());
             }
             "analyze_file" => {
+                if std::env::var_os("CLARION_FIXTURE_EXCEED_RLIMIT_AS").is_some() {
+                    #[cfg(unix)]
+                    exceed_rlimit_as();
+                    #[cfg(not(unix))]
+                    std::process::exit(1);
+                }
+
                 // Extract the file_path from params.
                 let file_path = raw
                     .get("params")
@@ -125,4 +132,53 @@ fn send_result(writer: &mut impl Write, id: i64, result: Value) {
     let frame = Frame { body };
     write_frame(writer, &frame).expect("write frame");
     writer.flush().expect("flush");
+}
+
+#[cfg(unix)]
+fn exceed_rlimit_as() -> ! {
+    use std::num::NonZeroUsize;
+
+    const FIRST_REQUEST_BYTES: usize = 128 * 1024 * 1024;
+    let mut mappings = Vec::new();
+    mappings
+        .try_reserve_exact(1024)
+        .expect("reserve mapping handles before memory pressure");
+    let mut request_bytes = FIRST_REQUEST_BYTES;
+    loop {
+        let length = NonZeroUsize::new(request_bytes).expect("non-zero request");
+        // SAFETY: This fixture intentionally asks the kernel for anonymous
+        // address space after the host has applied RLIMIT_AS. The mapping is
+        // never dereferenced; it is only held so successful probes continue to
+        // count against the child process until the next probe fails.
+        let mapped = {
+            #[allow(unsafe_code)]
+            unsafe {
+                nix::sys::mman::mmap_anonymous(
+                    None,
+                    length,
+                    nix::sys::mman::ProtFlags::PROT_NONE,
+                    nix::sys::mman::MapFlags::MAP_PRIVATE,
+                )
+            }
+        };
+        match mapped {
+            Ok(ptr) => {
+                mappings.push(ptr);
+                let next_request = request_bytes.saturating_mul(2);
+                if next_request == request_bytes {
+                    terminate_after_rlimit_failure();
+                }
+                request_bytes = next_request;
+            }
+            Err(_) => {
+                terminate_after_rlimit_failure();
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn terminate_after_rlimit_failure() -> ! {
+    let _ = nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGKILL);
+    std::process::abort();
 }

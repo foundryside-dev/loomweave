@@ -1,12 +1,15 @@
 //! MCP storage-backed tool tests.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    fs,
+    sync::{Arc, Mutex},
+};
 
 use clarion_core::{
     CachingModel, INFERRED_CALLS_PROMPT_VERSION, InferredCallsPromptInput,
     LEAF_SUMMARY_PROMPT_TEMPLATE_ID, LeafSummaryPromptInput, LlmProvider, LlmProviderError,
-    LlmPurpose, LlmRequest, LlmResponse, Recording, RecordingProvider, build_inferred_calls_prompt,
-    build_leaf_summary_prompt,
+    LlmPurpose, LlmRequest, LlmResponse, OpenRouterProvider, OpenRouterProviderConfig, Recording,
+    RecordingProvider, build_inferred_calls_prompt, build_leaf_summary_prompt,
 };
 use clarion_mcp::{
     ServerState,
@@ -14,6 +17,7 @@ use clarion_mcp::{
     filigree::{
         EntityAssociation, EntityAssociationsResponse, FiligreeClientError, FiligreeLookup,
     },
+    list_tools,
 };
 use clarion_storage::{
     ReaderPool, SummaryCacheEntry, SummaryCacheKey, Writer, pragma, schema, upsert_summary_cache,
@@ -32,6 +36,14 @@ fn open_project() -> (tempfile::TempDir, std::path::PathBuf) {
     seed_graph(&conn, project.path());
     drop(conn);
     (project, db_path)
+}
+
+fn add_dynamic_source(project_root: &std::path::Path) {
+    std::fs::write(
+        project_root.join("demo.py"),
+        "def entry():\n    return mid()\n\ndef mid():\n    return target()\n\ndef target():\n    return 1\n\ndef dynamic():\n    return target()\n",
+    )
+    .expect("write dynamic source");
 }
 
 fn seed_graph(conn: &Connection, project_root: &std::path::Path) {
@@ -156,6 +168,7 @@ fn insert_entity(
     range: Option<(i64, i64)>,
     parent_id: Option<&str>,
 ) {
+    let content_hash = fixture_content_hash(kind, source_path, range);
     conn.execute(
         "INSERT INTO entities (
             id, plugin_id, kind, name, short_name, parent_id, source_file_path,
@@ -172,10 +185,31 @@ fn insert_entity(
             source_path.display().to_string(),
             range.map(|(start, _)| start),
             range.map(|(_, end)| end),
-            format!("hash-{id}"),
+            content_hash,
         ],
     )
     .expect("insert entity");
+}
+
+fn fixture_content_hash(
+    kind: &str,
+    source_path: &std::path::Path,
+    range: Option<(i64, i64)>,
+) -> String {
+    if kind == "module" {
+        return blake3::hash(&std::fs::read(source_path).expect("read module source"))
+            .to_hex()
+            .to_string();
+    }
+    let source = std::fs::read_to_string(source_path).expect("read entity source");
+    let (start_line, end_line) = range.expect("non-module fixture has source range");
+    let start = usize::try_from(start_line - 1).expect("start line fits usize");
+    let mut end = usize::try_from(end_line).expect("end line fits usize");
+    let lines = source.lines().collect::<Vec<_>>();
+    end = end.min(lines.len());
+    assert!(start < end, "fixture range must overlap source");
+    let normalized = lines[start..end].join("\n");
+    blake3::hash(normalized.as_bytes()).to_hex().to_string()
 }
 
 fn insert_edge(
@@ -205,14 +239,67 @@ fn insert_edge(
 }
 
 fn insert_unresolved_call_site(conn: &Connection, caller_id: &str, site_key: &str, expr: &str) {
+    let caller_content_hash: String = conn
+        .query_row(
+            "SELECT content_hash FROM entities WHERE id = ?1",
+            params![caller_id],
+            |row| row.get(0),
+        )
+        .expect("caller content hash");
     conn.execute(
         "INSERT INTO entity_unresolved_call_sites (
             caller_entity_id, caller_content_hash, site_key, site_ordinal,
             source_file_id, source_byte_start, source_byte_end, callee_expr, created_at
          ) VALUES (?1, ?2, ?3, 0, 'python:module:demo', 30, 37, ?4, '2026-05-17T00:00:00.000Z')",
-        params![caller_id, format!("hash-{caller_id}"), site_key, expr],
+        params![caller_id, caller_content_hash, site_key, expr],
     )
     .expect("insert unresolved call site");
+}
+
+fn seed_subsystem(conn: &Connection, project_root: &std::path::Path) -> String {
+    let extra_source_path = project_root.join("pkg_auth.py");
+    std::fs::write(&extra_source_path, "def login():\n    return True\n")
+        .expect("write extra module source");
+    insert_entity(
+        conn,
+        "python:module:pkg.auth",
+        "module",
+        &extra_source_path,
+        Some((1, 2)),
+        None,
+    );
+
+    let subsystem_id = "core:subsystem:abc123def456".to_owned();
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, properties, created_at, updated_at
+         ) VALUES (
+            ?1, 'core', 'subsystem', 'Subsystem abc123def456', 'abc123def456',
+            ?2, '2026-05-17T00:00:00.000Z', '2026-05-17T00:00:00.000Z'
+         )",
+        params![
+            subsystem_id,
+            json!({"member_count": 2, "modularity_score": 0.42}).to_string(),
+        ],
+    )
+    .expect("insert subsystem entity");
+    insert_edge(
+        conn,
+        "in_subsystem",
+        "python:module:demo",
+        &subsystem_id,
+        "resolved",
+        None,
+    );
+    insert_edge(
+        conn,
+        "in_subsystem",
+        "python:module:pkg.auth",
+        &subsystem_id,
+        "resolved",
+        None,
+    );
+    subsystem_id
 }
 
 fn state_for(project_root: &std::path::Path, db_path: &std::path::Path) -> ServerState {
@@ -289,9 +376,11 @@ fn expected_inferred_request(
     target_id: &str,
 ) -> LlmRequest {
     let source_excerpt = expected_source_excerpt(project_root, caller_id);
+    let caller_content_hash = expected_content_hash(project_root, caller_id);
+    let target_content_hash = expected_content_hash(project_root, target_id);
     let unresolved_call_sites_json = serde_json::to_string(&vec![json!({
         "caller_entity_id": caller_id,
-        "caller_content_hash": format!("hash-{caller_id}"),
+        "caller_content_hash": caller_content_hash,
         "site_key": site_key,
         "site_ordinal": 0,
         "source_file_id": "python:module:demo",
@@ -309,7 +398,7 @@ fn expected_inferred_request(
         "source_file_path": source_file_path,
         "source_line_start": 9,
         "source_line_end": 10,
-        "content_hash": format!("hash-{target_id}")
+        "content_hash": target_content_hash
     })])
     .unwrap();
     let prompt = build_inferred_calls_prompt(&InferredCallsPromptInput {
@@ -317,13 +406,14 @@ fn expected_inferred_request(
         caller_source_excerpt: source_excerpt,
         unresolved_call_sites_json,
         candidate_entities_json,
+        max_edges: 8,
     });
     LlmRequest {
         purpose: LlmPurpose::InferredEdges,
         model_id: "anthropic/claude-sonnet-4.6".to_owned(),
         prompt_id: INFERRED_CALLS_PROMPT_VERSION.to_owned(),
         prompt: prompt.body,
-        max_output_tokens: 512,
+        max_output_tokens: 2048,
     }
 }
 
@@ -339,6 +429,19 @@ fn expected_source_excerpt(project_root: &std::path::Path, entity_id: &str) -> S
         return source;
     }
     lines[start..end.min(lines.len())].concat()
+}
+
+fn expected_content_hash(project_root: &std::path::Path, entity_id: &str) -> String {
+    let kind = if entity_id == "python:module:demo" {
+        "module"
+    } else {
+        "function"
+    };
+    fixture_content_hash(
+        kind,
+        &project_root.join("demo.py"),
+        expected_line_range(entity_id),
+    )
 }
 
 fn expected_line_range(entity_id: &str) -> Option<(i64, i64)> {
@@ -415,18 +518,33 @@ impl AnyInferredProvider {
 #[derive(Debug)]
 struct AnySummaryProvider {
     invocations: Mutex<Vec<LlmRequest>>,
+    output_json: String,
     delay_ms: u64,
     estimate_tokens: u64,
     total_tokens: u32,
+    cost_usd: f64,
 }
 
 impl AnySummaryProvider {
     fn new_slow(delay_ms: u64, estimate_tokens: u64, total_tokens: u32) -> Self {
         Self {
             invocations: Mutex::new(Vec::new()),
+            output_json: r#"{"purpose":"concurrent"}"#.to_owned(),
             delay_ms,
             estimate_tokens,
             total_tokens,
+            cost_usd: 0.0,
+        }
+    }
+
+    fn new_output(output_json: &str, total_tokens: u32, cost_usd: f64) -> Self {
+        Self {
+            invocations: Mutex::new(Vec::new()),
+            output_json: output_json.to_owned(),
+            delay_ms: 0,
+            estimate_tokens: 0,
+            total_tokens,
+            cost_usd,
         }
     }
 
@@ -453,11 +571,11 @@ impl LlmProvider for AnySummaryProvider {
         }
         Ok(LlmResponse {
             model_id: request.model_id,
-            output_json: r#"{"purpose":"concurrent"}"#.to_owned(),
+            output_json: self.output_json.clone(),
             input_tokens: 100,
             output_tokens: 20,
             total_tokens: self.total_tokens,
-            cost_usd: 0.0,
+            cost_usd: self.cost_usd,
         })
     }
 
@@ -581,6 +699,125 @@ async fn call_tool(state: &ServerState, name: &str, arguments: Value) -> Value {
     serde_json::from_str(text).expect("tool envelope JSON")
 }
 
+#[test]
+fn tools_list_includes_subsystem_members() {
+    let tools = list_tools();
+    let tool = tools
+        .iter()
+        .find(|tool| tool.name == "subsystem_members")
+        .expect("subsystem_members tool definition");
+
+    assert_eq!(
+        tool.description,
+        "List module entities assigned to a subsystem entity."
+    );
+    assert_eq!(
+        tool.input_schema,
+        json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "minLength": 1}
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        })
+    );
+}
+
+#[tokio::test]
+async fn subsystem_members_returns_member_modules() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    let subsystem_id = seed_subsystem(&conn, project.path());
+    drop(conn);
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(&state, "subsystem_members", json!({"id": subsystem_id})).await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(
+        envelope["result"]["subsystem"]["id"],
+        "core:subsystem:abc123def456"
+    );
+    assert_eq!(
+        envelope["result"]["subsystem"]["name"],
+        "Subsystem abc123def456"
+    );
+    assert_eq!(
+        envelope["result"]["subsystem"]["short_name"],
+        "abc123def456"
+    );
+    assert_eq!(
+        envelope["result"]["subsystem"]["properties"]["member_count"],
+        2
+    );
+    assert_eq!(
+        envelope["result"]["subsystem"]["properties"]["modularity_score"],
+        0.42
+    );
+    let members = envelope["result"]["members"].as_array().unwrap();
+    assert_eq!(members.len(), 2);
+    assert_eq!(members[0]["id"], "python:module:demo");
+    assert_eq!(members[1]["id"], "python:module:pkg.auth");
+    assert!(
+        members[0]["source_file_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("demo.py")
+    );
+}
+
+#[tokio::test]
+async fn subsystem_members_rejects_non_subsystem_id() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "subsystem_members",
+        json!({"id": "python:module:demo"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "not-a-subsystem");
+    assert_eq!(envelope["result"], Value::Null);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_on_subsystem_returns_policy_envelope_without_llm_call() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    let subsystem_id = seed_subsystem(&conn, project.path());
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnySummaryProvider::new_output(
+        r#"{"purpose":"should not run"}"#,
+        120,
+        0.012,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(&state, "summary", json!({"id": subsystem_id})).await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["result"]["available"], false);
+    assert_eq!(envelope["result"]["reason"], "summary-scope-deferred");
+    assert_eq!(envelope["stats_delta"], json!({}));
+    assert!(provider.invocations().is_empty());
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn issues_for_returns_unavailable_when_filigree_disabled() {
     let (project, db_path) = open_project();
@@ -608,7 +845,7 @@ async fn issues_for_includes_contained_entities_and_flags_drift() {
                 vec![association(
                     "filigree-fresh",
                     "python:function:demo.entry",
-                    "hash-python:function:demo.entry",
+                    &expected_content_hash(project.path(), "python:function:demo.entry"),
                 )],
             )
             .with_response(
@@ -656,7 +893,7 @@ async fn issues_for_respects_include_contained_false() {
                 vec![association(
                     "filigree-module",
                     "python:module:demo",
-                    "hash-python:module:demo",
+                    &expected_content_hash(project.path(), "python:module:demo"),
                 )],
             )
             .with_response(
@@ -664,7 +901,7 @@ async fn issues_for_respects_include_contained_false() {
                 vec![association(
                     "filigree-entry",
                     "python:function:demo.entry",
-                    "hash-python:function:demo.entry",
+                    &expected_content_hash(project.path(), "python:function:demo.entry"),
                 )],
             ),
     );
@@ -693,7 +930,7 @@ async fn issues_for_truncates_at_issue_cap() {
             association(
                 &format!("filigree-{idx:03}"),
                 "python:function:demo.entry",
-                "hash-python:function:demo.entry",
+                &expected_content_hash(project.path(), "python:function:demo.entry"),
             )
         })
         .collect();
@@ -723,7 +960,7 @@ async fn issues_for_stops_filigree_calls_after_issue_cap() {
             association(
                 &format!("filigree-{idx:03}"),
                 "python:module:demo",
-                "hash-python:module:demo",
+                &expected_content_hash(project.path(), "python:module:demo"),
             )
         })
         .collect();
@@ -735,7 +972,7 @@ async fn issues_for_stops_filigree_calls_after_issue_cap() {
                 vec![association(
                     "filigree-entry",
                     "python:function:demo.entry",
-                    "hash-python:function:demo.entry",
+                    &expected_content_hash(project.path(), "python:function:demo.entry"),
                 )],
             ),
     );
@@ -813,6 +1050,111 @@ async fn summary_cold_miss_records_provider_response_then_hits_cache() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_invalid_json_preserves_usage_accounting() {
+    let (project, db_path) = open_project();
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnySummaryProvider::new_output("not-json", 120, 0.012));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "llm-invalid-json");
+    assert_eq!(envelope["stats_delta"]["summary_cache_misses_total"], 1);
+    assert_eq!(envelope["stats_delta"]["summary_tokens_input"], 100);
+    assert_eq!(envelope["stats_delta"]["summary_tokens_output"], 20);
+    assert_eq!(envelope["stats_delta"]["summary_tokens_total"], 120);
+    assert_eq!(envelope["stats_delta"]["summary_cost_usd"], 0.012);
+    assert_eq!(envelope["stats_delta"]["llm_invalid_json_total"], 1);
+    assert_eq!(provider.invocations().len(), 1);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_openrouter_provider_runs_outside_async_runtime() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let (project, db_path) = open_project();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test OpenRouter");
+    let addr = listener.local_addr().expect("test OpenRouter addr");
+    let http = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept OpenRouter request");
+        let mut request = [0_u8; 8192];
+        let read = stream.read(&mut request).expect("read OpenRouter request");
+        let request = String::from_utf8_lossy(&request[..read]);
+        assert!(request.contains(r#""response_format":{"json_schema":{"name":"clarion_summary""#));
+        let body = r#"{
+            "id": "gen-01",
+            "object": "chat.completion",
+            "created": 1779000000,
+            "model": "anthropic/claude-sonnet-4.6",
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "native_finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": "{\"purpose\":\"demo\",\"behavior\":\"returns mid\",\"relationships\":\"calls mid\",\"risks\":\"\"}"
+                    }
+                }
+            ],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}
+        }"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write OpenRouter response");
+    });
+    let provider = Arc::new(
+        OpenRouterProvider::from_config(OpenRouterProviderConfig {
+            api_key: Some("secret".to_owned()),
+            allow_live_provider: true,
+            model_id: "anthropic/claude-sonnet-4.6".to_owned(),
+            endpoint_url: format!("http://{addr}/api/v1"),
+            referer: "https://github.com/qacona/clarion".to_owned(),
+            title: "Clarion Test".to_owned(),
+        })
+        .expect("OpenRouter provider"),
+    );
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let state = state_for_summary(project.path(), &db_path, &writer, provider, llm_config());
+
+    let envelope = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["result"]["summary"]["purpose"], "demo");
+    assert_eq!(envelope["stats_delta"]["summary_tokens_total"], 120);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+    http.join().expect("OpenRouter server thread");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn summary_prompt_uses_entity_source_range_not_whole_file() {
     let (project, db_path) = open_project();
     let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
@@ -852,6 +1194,55 @@ async fn summary_prompt_uses_entity_source_range_not_whole_file() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_cold_miss_refuses_live_source_drift() {
+    let (project, db_path) = open_project();
+    let original_hash = blake3::hash("def entry():\n    return mid()".as_bytes())
+        .to_hex()
+        .to_string();
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE entities SET content_hash = ?1 WHERE id = 'python:function:demo.entry'",
+        params![original_hash],
+    )
+    .unwrap();
+    drop(conn);
+    fs::write(
+        project.path().join("demo.py"),
+        "def entry():\n    return changed()\n\ndef mid():\n    return target()\n\ndef target():\n    return 1\n",
+    )
+    .unwrap();
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnySummaryProvider::new_output(
+        r#"{"purpose":"should not run"}"#,
+        120,
+        0.0,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "content-drift");
+    assert_eq!(provider.invocations().len(), 0);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn summary_cache_hit_reports_stale_semantic_when_graph_counts_drift() {
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).unwrap();
@@ -860,7 +1251,7 @@ async fn summary_cache_hit_reports_stale_semantic_when_graph_counts_drift() {
         &SummaryCacheEntry {
             key: SummaryCacheKey {
                 entity_id: "python:function:demo.entry".to_owned(),
-                content_hash: "hash-python:function:demo.entry".to_owned(),
+                content_hash: expected_content_hash(project.path(), "python:function:demo.entry"),
                 prompt_template_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
                 model_tier: "anthropic/claude-sonnet-4.6".to_owned(),
                 guidance_fingerprint: "guidance-empty".to_owned(),
@@ -908,7 +1299,7 @@ async fn summary_expired_cache_row_is_refreshed_by_recording_provider() {
         &SummaryCacheEntry {
             key: SummaryCacheKey {
                 entity_id: "python:function:demo.entry".to_owned(),
-                content_hash: "hash-python:function:demo.entry".to_owned(),
+                content_hash: expected_content_hash(project.path(), "python:function:demo.entry"),
                 prompt_template_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
                 model_tier: "anthropic/claude-sonnet-4.6".to_owned(),
                 guidance_fingerprint: "guidance-empty".to_owned(),
@@ -1192,6 +1583,7 @@ async fn callers_of_defaults_to_resolved_and_expands_ambiguous_candidates() {
 async fn callers_of_inferred_dispatches_and_materializes_recording_result() {
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).unwrap();
+    add_dynamic_source(project.path());
     let source_path = project.path().join("demo.py");
     insert_entity(
         &conn,
@@ -1263,6 +1655,7 @@ async fn callers_of_inferred_dispatches_and_materializes_recording_result() {
 async fn inferred_dispatch_prompt_uses_caller_source_range_not_whole_file() {
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).unwrap();
+    add_dynamic_source(project.path());
     let source_path = project.path().join("demo.py");
     insert_entity(
         &conn,
@@ -1321,6 +1714,7 @@ async fn inferred_dispatch_prompt_uses_caller_source_range_not_whole_file() {
 async fn callers_of_inferred_coalesces_concurrent_cold_requests() {
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).unwrap();
+    add_dynamic_source(project.path());
     let source_path = project.path().join("demo.py");
     insert_entity(
         &conn,
@@ -1373,6 +1767,138 @@ async fn callers_of_inferred_coalesces_concurrent_cold_requests() {
     handle.await.unwrap().unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn callers_of_inferred_invalid_json_preserves_usage_accounting() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    add_dynamic_source(project.path());
+    let source_path = project.path().join("demo.py");
+    insert_entity(
+        &conn,
+        "python:function:demo.dynamic",
+        "function",
+        &source_path,
+        Some((9, 10)),
+        Some("python:module:demo"),
+    );
+    insert_unresolved_call_site(
+        &conn,
+        "python:function:demo.entry",
+        "site-dynamic",
+        "dynamic",
+    );
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnyInferredProvider::new("not-json"));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.dynamic", "confidence": "inferred"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "llm-invalid-json");
+    assert_eq!(envelope["stats_delta"]["inferred_dispatch_misses_total"], 1);
+    assert_eq!(envelope["stats_delta"]["inferred_tokens_input"], 100);
+    assert_eq!(envelope["stats_delta"]["inferred_tokens_output"], 20);
+    assert_eq!(envelope["stats_delta"]["inferred_tokens_total"], 120);
+    assert_eq!(envelope["stats_delta"]["inferred_cost_usd"], 0.0);
+    assert_eq!(envelope["stats_delta"]["llm_invalid_json_total"], 1);
+    assert_eq!(provider.invocations().len(), 1);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+// clarion-df58379de4: when the LLM hallucinates a `target_id` that isn't in the
+// `entities` table, the inferred-dispatch path must drop that edge before
+// reaching the writer-actor's FK-protected INSERT. The cache row must still be
+// persisted so a warm rerun does not re-burn LLM tokens, and the dispatch must
+// return `ok=true` with a `inferred_unresolved_targets_dropped_total` count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn callers_of_inferred_drops_targets_missing_from_entities_table() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    add_dynamic_source(project.path());
+    let source_path = project.path().join("demo.py");
+    insert_entity(
+        &conn,
+        "python:function:demo.dynamic",
+        "function",
+        &source_path,
+        Some((9, 10)),
+        Some("python:module:demo"),
+    );
+    insert_unresolved_call_site(
+        &conn,
+        "python:function:demo.entry",
+        "site-dynamic",
+        "dynamic",
+    );
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnyInferredProvider::new(
+        r#"{"edges":[{"site_key":"site-dynamic","target_id":"python:function:nonexistent.hallucinated","confidence":0.91,"rationale":"name match"}]}"#,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.dynamic", "confidence": "inferred"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "envelope was {envelope}");
+    assert_eq!(
+        envelope["stats_delta"]["inferred_unresolved_targets_dropped_total"],
+        1
+    );
+    assert_eq!(
+        envelope["stats_delta"]["inferred_edges_materialized_total"],
+        0
+    );
+    assert_eq!(envelope["result"]["callers"].as_array().unwrap().len(), 0);
+    assert_eq!(provider.invocations().len(), 1);
+
+    // Warm rerun: cache row must have been persisted even though the LLM
+    // proposed an unresolvable target, so we do not re-dispatch.
+    let warm = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.dynamic", "confidence": "inferred"}),
+    )
+    .await;
+    assert_eq!(warm["ok"], true);
+    assert_eq!(provider.invocations().len(), 1, "cache miss on warm rerun");
+    assert_eq!(
+        warm["stats_delta"]["inferred_unresolved_targets_dropped_total"],
+        1
+    );
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn execution_paths_from_reports_edge_cap_truncation() {
     let (project, db_path) = open_project();
@@ -1395,6 +1921,7 @@ async fn execution_paths_from_reports_edge_cap_truncation() {
 async fn execution_paths_from_inferred_dispatches_start_caller() {
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).unwrap();
+    add_dynamic_source(project.path());
     let source_path = project.path().join("demo.py");
     insert_entity(
         &conn,
@@ -1455,6 +1982,7 @@ async fn execution_paths_from_inferred_dispatches_start_caller() {
 async fn execution_paths_from_inferred_dispatches_reached_callers() {
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).unwrap();
+    add_dynamic_source(project.path());
     let source_path = project.path().join("demo.py");
     insert_entity(
         &conn,

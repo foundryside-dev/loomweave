@@ -1,10 +1,10 @@
 //! Read-side query helpers used by the MCP navigation surface.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use clarion_core::EdgeConfidence;
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 
 use crate::{Result, StorageError};
 
@@ -57,6 +57,38 @@ pub struct UnresolvedCallSiteRow {
     pub callee_expr: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceEdgeMatch {
+    pub neighbor_id: String,
+    pub confidence: EdgeConfidence,
+    pub source_file_id: Option<String>,
+    pub source_byte_start: Option<i64>,
+    pub source_byte_end: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleDependencyEdge {
+    pub from_module_id: String,
+    pub to_module_id: String,
+    pub reference_count: u64,
+    pub edge_kinds: Vec<String>,
+}
+
+const MODULE_ANCESTOR_MAX_DEPTH: i64 = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubsystemMember {
+    pub id: String,
+    pub name: String,
+    pub source_file_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceDirection {
+    In,
+    Out,
+}
+
 #[derive(Debug, Clone)]
 struct StoredCallEdge {
     from_id: String,
@@ -65,6 +97,14 @@ struct StoredCallEdge {
     source_file_id: Option<String>,
     source_byte_start: Option<i64>,
     source_byte_end: Option<i64>,
+    properties_json: Option<String>,
+}
+
+struct StoredDependencyEdge {
+    from_id: String,
+    to_id: String,
+    kind: String,
+    confidence: EdgeConfidence,
     properties_json: Option<String>,
 }
 
@@ -108,6 +148,32 @@ pub fn entity_by_id(conn: &Connection, entity_id: &str) -> Result<Option<EntityR
     conn.query_row(&sql, params![entity_id], map_entity_row)
         .optional()
         .map_err(StorageError::from)
+}
+
+/// Return the subset of `candidates` whose `id` appears in `entities`. Used by
+/// the inferred-edge dispatch path to pre-filter LLM-proposed `to_id` values
+/// before they reach the writer-actor's FK-protected INSERT (clarion-df58379de4).
+/// Empty input is handled cheaply; large inputs are chunked to stay under the
+/// default `SQLite` parameter cap (32766 placeholders per statement).
+pub fn existing_entity_ids(conn: &Connection, candidates: &[String]) -> Result<HashSet<String>> {
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut found = HashSet::with_capacity(candidates.len());
+    for chunk in candidates.chunks(500) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT id FROM entities WHERE id IN ({placeholders})");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(chunk.iter()), |row| {
+            row.get::<_, String>(0)
+        })?;
+        for row in rows {
+            found.insert(row?);
+        }
+    }
+    Ok(found)
 }
 
 pub fn entity_at_line(
@@ -331,6 +397,180 @@ pub fn unresolved_callers_for_target(
         .map_err(StorageError::from)
 }
 
+pub fn reference_edges_for_entity(
+    conn: &Connection,
+    entity_id: &str,
+    direction: ReferenceDirection,
+) -> Result<Vec<ReferenceEdgeMatch>> {
+    let sql = match direction {
+        ReferenceDirection::In => {
+            "SELECT from_id, confidence, source_file_id, source_byte_start, source_byte_end \
+             FROM edges \
+             WHERE kind = 'references' AND to_id = ?1 \
+             ORDER BY from_id, source_byte_start, source_byte_end"
+        }
+        ReferenceDirection::Out => {
+            "SELECT to_id, confidence, source_file_id, source_byte_start, source_byte_end \
+             FROM edges \
+             WHERE kind = 'references' AND from_id = ?1 \
+             ORDER BY to_id, source_byte_start, source_byte_end"
+        }
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![entity_id], map_reference_edge_match)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+pub fn module_dependency_edges(
+    conn: &Connection,
+    edge_types: &[&str],
+) -> Result<Vec<ModuleDependencyEdge>> {
+    if edge_types.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // v0.1 assumes a wipe-and-rerun analyze workflow, so clustering reads the
+    // whole static graph. v0.2 incremental analyze needs run-scoped edge
+    // provenance before this helper can filter by current run.
+    let ancestors = module_ancestor_map(conn)?;
+    let placeholders = std::iter::repeat_n("?", edge_types.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT from_id, to_id, kind, confidence, properties \
+         FROM edges \
+         WHERE kind IN ({placeholders}) \
+           AND confidence != 'inferred' \
+         ORDER BY from_id, to_id, kind",
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(edge_types.iter().copied()), |row| {
+        let raw_confidence: String = row.get(3)?;
+        Ok(StoredDependencyEdge {
+            from_id: row.get(0)?,
+            to_id: row.get(1)?,
+            kind: row.get(2)?,
+            confidence: parse_confidence(&raw_confidence)?,
+            properties_json: row.get(4)?,
+        })
+    })?;
+
+    let mut grouped: BTreeMap<(String, String), (u64, BTreeSet<String>)> = BTreeMap::new();
+    for row in rows {
+        let edge = row?;
+        let Some(from_modules) = ancestors.get(&edge.from_id) else {
+            continue;
+        };
+        for target_id in dependency_edge_target_ids(&edge) {
+            let Some(to_modules) = ancestors.get(&target_id) else {
+                continue;
+            };
+            for from_module_id in from_modules {
+                for to_module_id in to_modules {
+                    if from_module_id == to_module_id {
+                        continue;
+                    }
+                    let (reference_count, edge_kinds) = grouped
+                        .entry((from_module_id.clone(), to_module_id.clone()))
+                        .or_insert_with(|| (0, BTreeSet::new()));
+                    *reference_count += 1;
+                    edge_kinds.insert(edge.kind.clone());
+                }
+            }
+        }
+    }
+
+    Ok(grouped
+        .into_iter()
+        .map(
+            |((from_module_id, to_module_id), (reference_count, edge_kinds))| {
+                ModuleDependencyEdge {
+                    from_module_id,
+                    to_module_id,
+                    reference_count,
+                    edge_kinds: edge_kinds.into_iter().collect(),
+                }
+            },
+        )
+        .collect())
+}
+
+fn module_ancestor_map(conn: &Connection) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE module_ancestors(entity_id, module_id, depth) AS ( \
+             SELECT id, id, 0 FROM entities WHERE kind = 'module' \
+             UNION ALL \
+             SELECT child.to_id, module_ancestors.module_id, module_ancestors.depth + 1 \
+             FROM edges child \
+             JOIN module_ancestors ON module_ancestors.entity_id = child.from_id \
+             WHERE child.kind = 'contains' \
+               AND module_ancestors.depth < ?1 \
+         ) \
+         SELECT DISTINCT entity_id, module_id \
+         FROM module_ancestors \
+         ORDER BY entity_id, module_id",
+    )?;
+    let rows = stmt.query_map(params![MODULE_ANCESTOR_MAX_DEPTH], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut ancestors: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for row in rows {
+        let (entity_id, module_id) = row?;
+        ancestors.entry(entity_id).or_default().insert(module_id);
+    }
+    Ok(ancestors)
+}
+
+fn dependency_edge_target_ids(edge: &StoredDependencyEdge) -> BTreeSet<String> {
+    let mut targets = BTreeSet::from([edge.to_id.clone()]);
+    if edge.kind == "calls" && edge.confidence == EdgeConfidence::Ambiguous {
+        targets.extend(candidate_ids(edge.properties_json.as_deref()));
+    }
+    targets
+}
+
+pub fn subsystem_members(conn: &Connection, subsystem_id: &str) -> Result<Vec<SubsystemMember>> {
+    let mut stmt = conn.prepare(
+        "SELECT entities.id, entities.name, entities.source_file_path \
+         FROM edges \
+         JOIN entities ON entities.id = edges.from_id \
+         WHERE edges.kind = 'in_subsystem' \
+           AND edges.to_id = ?1 \
+           AND entities.kind = 'module' \
+         ORDER BY entities.name, entities.id",
+    )?;
+    let rows = stmt.query_map(params![subsystem_id], |row| {
+        Ok(SubsystemMember {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            source_file_path: row.get(2)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+pub fn subsystem_for_member(conn: &Connection, module_id: &str) -> Result<Option<String>> {
+    // Reserved for v0.2 neighborhood / issues_for enrichment. v0.1's MCP
+    // surface exposes subsystem_members, but keeping this inverse lookup here
+    // preserves the query contract and tests until those callers land.
+    conn.query_row(
+        "SELECT edges.to_id \
+         FROM edges \
+         JOIN entities ON entities.id = edges.to_id \
+         WHERE edges.kind = 'in_subsystem' \
+           AND edges.from_id = ?1 \
+           AND entities.kind = 'subsystem' \
+         ORDER BY edges.to_id \
+         LIMIT 1",
+        params![module_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(StorageError::from)
+}
+
 pub fn candidate_entities_for_unresolved_sites(
     conn: &Connection,
     sites: &[UnresolvedCallSiteRow],
@@ -433,6 +673,17 @@ fn map_unresolved_call_site_row(row: &Row<'_>) -> rusqlite::Result<UnresolvedCal
     })
 }
 
+fn map_reference_edge_match(row: &Row<'_>) -> rusqlite::Result<ReferenceEdgeMatch> {
+    let raw_confidence: String = row.get(1)?;
+    Ok(ReferenceEdgeMatch {
+        neighbor_id: row.get(0)?,
+        confidence: parse_confidence(&raw_confidence)?,
+        source_file_id: row.get(2)?,
+        source_byte_start: row.get(3)?,
+        source_byte_end: row.get(4)?,
+    })
+}
+
 fn candidate_entities_for_expr(
     conn: &Connection,
     callee_expr: &str,
@@ -522,15 +773,18 @@ fn parse_confidence(raw: &str) -> rusqlite::Result<EdgeConfidence> {
 
 impl StoredCallEdge {
     fn candidate_ids(&self) -> BTreeSet<String> {
-        self.properties_json
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-            .and_then(|value| value.get("candidates").and_then(|c| c.as_array()).cloned())
-            .into_iter()
-            .flatten()
-            .filter_map(|value| value.as_str().map(ToOwned::to_owned))
-            .collect()
+        candidate_ids(self.properties_json.as_deref())
     }
+}
+
+fn candidate_ids(properties_json: Option<&str>) -> BTreeSet<String> {
+    properties_json
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| value.get("candidates").and_then(|c| c.as_array()).cloned())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+        .collect()
 }
 
 fn normalize_lexically(path: &Path) -> PathBuf {

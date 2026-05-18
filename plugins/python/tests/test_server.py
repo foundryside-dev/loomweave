@@ -81,8 +81,8 @@ def test_initialize_roundtrip() -> None:
         assert response["id"] == 1
         result = response["result"]
         assert result["name"] == "clarion-plugin-python"
-        assert result["version"] == "0.1.4"
-        assert result["ontology_version"] == "0.5.0"
+        assert result["version"] == "0.1.5"
+        assert result["ontology_version"] == "0.6.0"
         # Capabilities carry the L8 Wardline probe result. We don't pin a
         # specific status here because the probe's output depends on whether
         # wardline is installed in the test environment — all three legal
@@ -326,6 +326,7 @@ def test_analyze_file_reports_call_resolver_stats(
                     },
                 ],
                 pyright_query_latency_ms=[11, 29],
+                pyright_index_parse_latency_ms=[5],
             )
 
         def resolve_references(
@@ -353,6 +354,7 @@ def test_analyze_file_reports_call_resolver_stats(
                 references_skipped_cap_total=3,
                 unresolved_reference_sites_total=4,
                 pyright_query_latency_ms=[31],
+                pyright_index_parse_latency_ms=[7],
             )
 
         def close(self) -> None:
@@ -365,7 +367,11 @@ def test_analyze_file_reports_call_resolver_stats(
 
     response = server_module.handle_analyze_file({"file_path": str(demo)}, state)
 
-    assert response["stats"] == {
+    stats = response["stats"]
+    extractor_parse_latency_ms = stats.pop("extractor_parse_latency_ms")
+    assert isinstance(extractor_parse_latency_ms, int)
+    assert extractor_parse_latency_ms > 0
+    assert stats == {
         "unresolved_call_sites_total": 3,
         "unresolved_call_sites": [
             {
@@ -382,6 +388,7 @@ def test_analyze_file_reports_call_resolver_stats(
         "references_skipped_cap_total": 3,
         "unresolved_reference_sites_total": 4,
         "pyright_query_latency_ms": [11, 29, 31],
+        "pyright_index_parse_latency_ms": [5, 7],
     }
     assert any(edge["kind"] == "references" for edge in response["edges"])
 

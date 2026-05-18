@@ -1,0 +1,3848 @@
+{
+  "clarion_bin": "/home/john/clarion/target/release/clarion",
+  "config": "/tmp/clarion-b8-elspeth-tests-20260517T2156Z/clarion-b8-live.yaml",
+  "generated_at_unix": 1779058078,
+  "initialize": {
+    "id": "init",
+    "jsonrpc": "2.0",
+    "result": {
+      "capabilities": {
+        "tools": {}
+      },
+      "protocolVersion": "2025-11-25",
+      "serverInfo": {
+        "name": "clarion",
+        "version": "0.1.0-dev"
+      }
+    }
+  },
+  "initialize_latency_ms": 5.837,
+  "manifest": [
+    {
+      "arguments": {
+        "file": "conftest.py",
+        "line": 125
+      },
+      "cache_state": "none",
+      "label": "L01-entity-at",
+      "pattern": "light",
+      "phase": "cold_start",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 10,
+        "pattern": "_allow_raw_secrets_in_tests"
+      },
+      "cache_state": "none",
+      "label": "L02-find-entity",
+      "pattern": "light",
+      "phase": "cold_start",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability._AddFieldTransform"
+      },
+      "cache_state": "none",
+      "label": "L03-callers-of",
+      "pattern": "light",
+      "phase": "cold_start",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "id": "python:function:conftest._allow_raw_secrets_in_tests"
+      },
+      "cache_state": "none",
+      "label": "L04-neighborhood",
+      "pattern": "light",
+      "phase": "cold_start",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "file": "conftest.py",
+        "line": 125
+      },
+      "cache_state": "none",
+      "label": "L05-entity-at-repeat",
+      "pattern": "light",
+      "phase": "cold_start",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "file": "conftest.py",
+        "line": 125
+      },
+      "cache_state": "none",
+      "label": "MC01-entity-at",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_allow_raw_secrets_in_tests"
+      },
+      "cache_state": "none",
+      "label": "MC02-find-entity",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability._AddFieldTransform"
+      },
+      "cache_state": "none",
+      "label": "MC03-callers-of",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "id": "python:function:e2e.audit.test_attributability.TestAttributability.test_every_output_row_has_complete_lineage",
+        "max_depth": 3
+      },
+      "cache_state": "none",
+      "label": "MC04-execution-paths-from",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability.TestAttributability"
+      },
+      "cache_state": "cold",
+      "label": "MC05-summary",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability.TestAttributability",
+        "include_contained": true
+      },
+      "cache_state": "none",
+      "label": "MC06-issues-for",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "issues_for"
+    },
+    {
+      "arguments": {
+        "id": "python:function:conftest._allow_raw_secrets_in_tests"
+      },
+      "cache_state": "none",
+      "label": "MC07-neighborhood",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "file": "conftest.py",
+        "line": 137
+      },
+      "cache_state": "none",
+      "label": "MC08-entity-at",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_freeze_runtime_val_registries_before_begin_run"
+      },
+      "cache_state": "none",
+      "label": "MC09-find-entity",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_full_lineage._EnrichTransform"
+      },
+      "cache_state": "none",
+      "label": "MC10-callers-of",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability._AddFieldTransform"
+      },
+      "cache_state": "cold",
+      "label": "MC11-summary",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "id": "python:function:conftest._freeze_runtime_val_registries_before_begin_run"
+      },
+      "cache_state": "none",
+      "label": "MC12-neighborhood",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "id": "python:function:e2e.audit.test_attributability.TestAttributability.test_lineage_after_multi_transform",
+        "max_depth": 3
+      },
+      "cache_state": "none",
+      "label": "MC13-execution-paths-from",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability._AddFieldTransform",
+        "include_contained": false
+      },
+      "cache_state": "none",
+      "label": "MC14-issues-for",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "issues_for"
+    },
+    {
+      "arguments": {
+        "file": "conftest.py",
+        "line": 160
+      },
+      "cache_state": "none",
+      "label": "MC15-entity-at",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "wrapped_begin_run"
+      },
+      "cache_state": "none",
+      "label": "MC16-find-entity",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_export_reimport.TestExportReimport"
+      },
+      "cache_state": "cold",
+      "label": "MC17-summary",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "confidence": "ambiguous",
+        "id": "python:class:e2e.recovery.test_crash_and_resume._DoublerTransform"
+      },
+      "cache_state": "none",
+      "label": "MC18-callers-of",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "confidence": "ambiguous",
+        "id": "python:function:conftest._freeze_runtime_val_registries_before_begin_run.<locals>.wrapped_begin_run"
+      },
+      "cache_state": "none",
+      "label": "MC19-neighborhood",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "id": "python:function:e2e.audit.test_attributability.TestAttributability.test_lineage_includes_hash_integrity",
+        "max_depth": 2
+      },
+      "cache_state": "none",
+      "label": "MC20-execution-paths-from",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "file": "conftest.py",
+        "line": 125
+      },
+      "cache_state": "none",
+      "label": "MW01-entity-at",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_allow_raw_secrets_in_tests"
+      },
+      "cache_state": "none",
+      "label": "MW02-find-entity",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability._AddFieldTransform"
+      },
+      "cache_state": "none",
+      "label": "MW03-callers-of",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "id": "python:function:e2e.audit.test_attributability.TestAttributability.test_every_output_row_has_complete_lineage",
+        "max_depth": 3
+      },
+      "cache_state": "none",
+      "label": "MW04-execution-paths-from",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability.TestAttributability"
+      },
+      "cache_state": "warm",
+      "label": "MW05-summary",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability.TestAttributability",
+        "include_contained": true
+      },
+      "cache_state": "none",
+      "label": "MW06-issues-for",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "issues_for"
+    },
+    {
+      "arguments": {
+        "id": "python:function:conftest._allow_raw_secrets_in_tests"
+      },
+      "cache_state": "none",
+      "label": "MW07-neighborhood",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "file": "conftest.py",
+        "line": 137
+      },
+      "cache_state": "none",
+      "label": "MW08-entity-at",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_freeze_runtime_val_registries_before_begin_run"
+      },
+      "cache_state": "none",
+      "label": "MW09-find-entity",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_full_lineage._EnrichTransform"
+      },
+      "cache_state": "none",
+      "label": "MW10-callers-of",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability._AddFieldTransform"
+      },
+      "cache_state": "warm",
+      "label": "MW11-summary",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "id": "python:function:conftest._freeze_runtime_val_registries_before_begin_run"
+      },
+      "cache_state": "none",
+      "label": "MW12-neighborhood",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "id": "python:function:e2e.audit.test_attributability.TestAttributability.test_lineage_after_multi_transform",
+        "max_depth": 3
+      },
+      "cache_state": "none",
+      "label": "MW13-execution-paths-from",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability._AddFieldTransform",
+        "include_contained": false
+      },
+      "cache_state": "none",
+      "label": "MW14-issues-for",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "issues_for"
+    },
+    {
+      "arguments": {
+        "file": "conftest.py",
+        "line": 160
+      },
+      "cache_state": "none",
+      "label": "MW15-entity-at",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "wrapped_begin_run"
+      },
+      "cache_state": "none",
+      "label": "MW16-find-entity",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_export_reimport.TestExportReimport"
+      },
+      "cache_state": "warm",
+      "label": "MW17-summary",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "confidence": "ambiguous",
+        "id": "python:class:e2e.recovery.test_crash_and_resume._DoublerTransform"
+      },
+      "cache_state": "none",
+      "label": "MW18-callers-of",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "confidence": "ambiguous",
+        "id": "python:function:conftest._freeze_runtime_val_registries_before_begin_run.<locals>.wrapped_begin_run"
+      },
+      "cache_state": "none",
+      "label": "MW19-neighborhood",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "id": "python:function:e2e.audit.test_attributability.TestAttributability.test_lineage_includes_hash_integrity",
+        "max_depth": 2
+      },
+      "cache_state": "none",
+      "label": "MW20-execution-paths-from",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "file": "conftest.py",
+        "line": 125
+      },
+      "cache_state": "none",
+      "label": "H01-entity-at",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_allow_raw_secrets_in_tests"
+      },
+      "cache_state": "none",
+      "label": "H02-find-entity",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability._AddFieldTransform"
+      },
+      "cache_state": "none",
+      "label": "H03-callers-of",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "id": "python:function:e2e.audit.test_attributability.TestAttributability.test_every_output_row_has_complete_lineage",
+        "max_depth": 3
+      },
+      "cache_state": "none",
+      "label": "H04-execution-paths-from",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability.TestAttributability"
+      },
+      "cache_state": "warm",
+      "label": "H05-summary",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability.TestAttributability",
+        "include_contained": true
+      },
+      "cache_state": "none",
+      "label": "H06-issues-for",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "issues_for"
+    },
+    {
+      "arguments": {
+        "id": "python:function:conftest._allow_raw_secrets_in_tests"
+      },
+      "cache_state": "none",
+      "label": "H07-neighborhood",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "file": "conftest.py",
+        "line": 137
+      },
+      "cache_state": "none",
+      "label": "H08-entity-at",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_freeze_runtime_val_registries_before_begin_run"
+      },
+      "cache_state": "none",
+      "label": "H09-find-entity",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_full_lineage._EnrichTransform"
+      },
+      "cache_state": "none",
+      "label": "H10-callers-of",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability._AddFieldTransform"
+      },
+      "cache_state": "warm",
+      "label": "H11-summary",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "id": "python:function:conftest._freeze_runtime_val_registries_before_begin_run"
+      },
+      "cache_state": "none",
+      "label": "H12-neighborhood",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "id": "python:function:e2e.audit.test_attributability.TestAttributability.test_lineage_after_multi_transform",
+        "max_depth": 3
+      },
+      "cache_state": "none",
+      "label": "H13-execution-paths-from",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability._AddFieldTransform",
+        "include_contained": false
+      },
+      "cache_state": "none",
+      "label": "H14-issues-for",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "issues_for"
+    },
+    {
+      "arguments": {
+        "file": "conftest.py",
+        "line": 160
+      },
+      "cache_state": "none",
+      "label": "H15-entity-at",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "wrapped_begin_run"
+      },
+      "cache_state": "none",
+      "label": "H16-find-entity",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_export_reimport.TestExportReimport"
+      },
+      "cache_state": "warm",
+      "label": "H17-summary",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "confidence": "ambiguous",
+        "id": "python:class:e2e.recovery.test_crash_and_resume._DoublerTransform"
+      },
+      "cache_state": "none",
+      "label": "H18-callers-of",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "confidence": "ambiguous",
+        "id": "python:function:conftest._freeze_runtime_val_registries_before_begin_run.<locals>.wrapped_begin_run"
+      },
+      "cache_state": "none",
+      "label": "H19-neighborhood",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "id": "python:function:e2e.audit.test_attributability.TestAttributability.test_lineage_includes_hash_integrity",
+        "max_depth": 2
+      },
+      "cache_state": "none",
+      "label": "H20-execution-paths-from",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "file": "conftest.py",
+        "line": 125
+      },
+      "cache_state": "none",
+      "label": "H21-entity-at",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_allow_raw_secrets_in_tests"
+      },
+      "cache_state": "none",
+      "label": "H22-find-entity",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability._AddFieldTransform"
+      },
+      "cache_state": "none",
+      "label": "H23-callers-of",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "id": "python:function:e2e.audit.test_attributability.TestAttributability.test_every_output_row_has_complete_lineage",
+        "max_depth": 3
+      },
+      "cache_state": "none",
+      "label": "H24-execution-paths-from",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability.TestAttributability"
+      },
+      "cache_state": "warm",
+      "label": "H25-summary",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability.TestAttributability",
+        "include_contained": true
+      },
+      "cache_state": "none",
+      "label": "H26-issues-for",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "issues_for"
+    },
+    {
+      "arguments": {
+        "id": "python:function:conftest._allow_raw_secrets_in_tests"
+      },
+      "cache_state": "none",
+      "label": "H27-neighborhood",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "file": "conftest.py",
+        "line": 137
+      },
+      "cache_state": "none",
+      "label": "H28-entity-at",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_freeze_runtime_val_registries_before_begin_run"
+      },
+      "cache_state": "none",
+      "label": "H29-find-entity",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_full_lineage._EnrichTransform"
+      },
+      "cache_state": "none",
+      "label": "H30-callers-of",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability._AddFieldTransform"
+      },
+      "cache_state": "warm",
+      "label": "H31-summary",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "id": "python:function:conftest._freeze_runtime_val_registries_before_begin_run"
+      },
+      "cache_state": "none",
+      "label": "H32-neighborhood",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "id": "python:function:e2e.audit.test_attributability.TestAttributability.test_lineage_after_multi_transform",
+        "max_depth": 3
+      },
+      "cache_state": "none",
+      "label": "H33-execution-paths-from",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability._AddFieldTransform",
+        "include_contained": false
+      },
+      "cache_state": "none",
+      "label": "H34-issues-for",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "issues_for"
+    },
+    {
+      "arguments": {
+        "file": "conftest.py",
+        "line": 160
+      },
+      "cache_state": "none",
+      "label": "H35-entity-at",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "wrapped_begin_run"
+      },
+      "cache_state": "none",
+      "label": "H36-find-entity",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_export_reimport.TestExportReimport"
+      },
+      "cache_state": "warm",
+      "label": "H37-summary",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "confidence": "ambiguous",
+        "id": "python:class:e2e.recovery.test_crash_and_resume._DoublerTransform"
+      },
+      "cache_state": "none",
+      "label": "H38-callers-of",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "confidence": "ambiguous",
+        "id": "python:function:conftest._freeze_runtime_val_registries_before_begin_run.<locals>.wrapped_begin_run"
+      },
+      "cache_state": "none",
+      "label": "H39-neighborhood",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "id": "python:function:e2e.audit.test_attributability.TestAttributability.test_lineage_includes_hash_integrity",
+        "max_depth": 2
+      },
+      "cache_state": "none",
+      "label": "H40-execution-paths-from",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "file": "conftest.py",
+        "line": 125
+      },
+      "cache_state": "none",
+      "label": "H41-entity-at",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_allow_raw_secrets_in_tests"
+      },
+      "cache_state": "none",
+      "label": "H42-find-entity",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability._AddFieldTransform"
+      },
+      "cache_state": "none",
+      "label": "H43-callers-of",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "id": "python:function:e2e.audit.test_attributability.TestAttributability.test_every_output_row_has_complete_lineage",
+        "max_depth": 3
+      },
+      "cache_state": "none",
+      "label": "H44-execution-paths-from",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability.TestAttributability"
+      },
+      "cache_state": "warm",
+      "label": "H45-summary",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_attributability.TestAttributability",
+        "include_contained": true
+      },
+      "cache_state": "none",
+      "label": "H46-issues-for",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "issues_for"
+    },
+    {
+      "arguments": {
+        "id": "python:function:conftest._allow_raw_secrets_in_tests"
+      },
+      "cache_state": "none",
+      "label": "H47-neighborhood",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "file": "conftest.py",
+        "line": 137
+      },
+      "cache_state": "none",
+      "label": "H48-entity-at",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_freeze_runtime_val_registries_before_begin_run"
+      },
+      "cache_state": "none",
+      "label": "H49-find-entity",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:e2e.audit.test_full_lineage._EnrichTransform"
+      },
+      "cache_state": "none",
+      "label": "H50-callers-of",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "confidence": "inferred",
+        "id": "python:class:e2e.audit.test_attributability._AddFieldTransform"
+      },
+      "cache_state": "inferred",
+      "label": "callers-inferred-0",
+      "pattern": "inferred",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "confidence": "inferred",
+        "id": "python:class:e2e.audit.test_full_lineage._EnrichTransform"
+      },
+      "cache_state": "inferred",
+      "label": "callers-inferred-1",
+      "pattern": "inferred",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "confidence": "inferred",
+        "id": "python:class:e2e.recovery.test_crash_and_resume._DoublerTransform"
+      },
+      "cache_state": "inferred",
+      "label": "callers-inferred-2",
+      "pattern": "inferred",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "confidence": "inferred",
+        "id": "python:class:e2e.recovery.test_crash_and_resume._ResumeSink"
+      },
+      "cache_state": "inferred",
+      "label": "callers-inferred-3",
+      "pattern": "inferred",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "confidence": "inferred",
+        "id": "python:class:e2e.recovery.test_crash_and_resume._ResumeSource"
+      },
+      "cache_state": "inferred",
+      "label": "callers-inferred-4",
+      "pattern": "inferred",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    }
+  ],
+  "project": "/tmp/clarion-b8-elspeth-tests-20260517T2156Z",
+  "records": [
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 160,
+      "label": "L01-entity-at",
+      "latency_ms": 0.615,
+      "ok": true,
+      "pattern": "light",
+      "phase": "cold_start",
+      "response_bytes": 637,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 166,
+      "label": "L02-find-entity",
+      "latency_ms": 0.88,
+      "ok": true,
+      "pattern": "light",
+      "phase": "cold_start",
+      "response_bytes": 662,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 60,
+      "label": "L03-callers-of",
+      "latency_ms": 3.33,
+      "ok": true,
+      "pattern": "light",
+      "phase": "cold_start",
+      "response_bytes": 238,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 266,
+      "label": "L04-neighborhood",
+      "latency_ms": 2.626,
+      "ok": true,
+      "pattern": "light",
+      "phase": "cold_start",
+      "response_bytes": 1063,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 160,
+      "label": "L05-entity-at-repeat",
+      "latency_ms": 0.206,
+      "ok": true,
+      "pattern": "light",
+      "phase": "cold_start",
+      "response_bytes": 637,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 161,
+      "label": "MC01-entity-at",
+      "latency_ms": 0.172,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 643,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 167,
+      "label": "MC02-find-entity",
+      "latency_ms": 0.582,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 668,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 61,
+      "label": "MC03-callers-of",
+      "latency_ms": 1.914,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 244,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 312,
+      "label": "MC04-execution-paths-from",
+      "latency_ms": 0.212,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 1246,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "cold",
+      "error": false,
+      "estimated_response_tokens": 697,
+      "label": "MC05-summary",
+      "latency_ms": 4.328,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 2787,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 311,
+      "label": "MC06-issues-for",
+      "latency_ms": 3.099,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 1244,
+      "stats_delta": {
+        "filigree_issues_returned_total": 1,
+        "filigree_requests_total": 4
+      },
+      "tool": "issues_for",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 268,
+      "label": "MC07-neighborhood",
+      "latency_ms": 2.844,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 1070,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 176,
+      "label": "MC08-entity-at",
+      "latency_ms": 0.205,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 704,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 304,
+      "label": "MC09-find-entity",
+      "latency_ms": 0.487,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 1216,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 62,
+      "label": "MC10-callers-of",
+      "latency_ms": 1.762,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 245,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "cold",
+      "error": false,
+      "estimated_response_tokens": 634,
+      "label": "MC11-summary",
+      "latency_ms": 3.542,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 2533,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 550,
+      "label": "MC12-neighborhood",
+      "latency_ms": 2.36,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 2200,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 306,
+      "label": "MC13-execution-paths-from",
+      "latency_ms": 0.195,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 1224,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 91,
+      "label": "MC14-issues-for",
+      "latency_ms": 0.613,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 362,
+      "stats_delta": {
+        "filigree_issues_returned_total": 0,
+        "filigree_requests_total": 1
+      },
+      "tool": "issues_for",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 182,
+      "label": "MC15-entity-at",
+      "latency_ms": 0.186,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 728,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 189,
+      "label": "MC16-find-entity",
+      "latency_ms": 0.324,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 753,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "cold",
+      "error": false,
+      "estimated_response_tokens": 788,
+      "label": "MC17-summary",
+      "latency_ms": 3.663,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 3150,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 62,
+      "label": "MC18-callers-of",
+      "latency_ms": 4.062,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 245,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 464,
+      "label": "MC19-neighborhood",
+      "latency_ms": 4.379,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 1855,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 308,
+      "label": "MC20-execution-paths-from",
+      "latency_ms": 0.206,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 1230,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 161,
+      "label": "MW01-entity-at",
+      "latency_ms": 0.179,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 644,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 168,
+      "label": "MW02-find-entity",
+      "latency_ms": 0.543,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 669,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 62,
+      "label": "MW03-callers-of",
+      "latency_ms": 1.759,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 245,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 312,
+      "label": "MW04-execution-paths-from",
+      "latency_ms": 0.204,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 1247,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "warm",
+      "error": false,
+      "estimated_response_tokens": 697,
+      "label": "MW05-summary",
+      "latency_ms": 3.538,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 2788,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 311,
+      "label": "MW06-issues-for",
+      "latency_ms": 1.896,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 1244,
+      "stats_delta": {
+        "filigree_issues_returned_total": 1,
+        "filigree_requests_total": 4
+      },
+      "tool": "issues_for",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 268,
+      "label": "MW07-neighborhood",
+      "latency_ms": 2.325,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 1070,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 176,
+      "label": "MW08-entity-at",
+      "latency_ms": 0.189,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 704,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 304,
+      "label": "MW09-find-entity",
+      "latency_ms": 0.425,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 1216,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 62,
+      "label": "MW10-callers-of",
+      "latency_ms": 1.879,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 245,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "warm",
+      "error": false,
+      "estimated_response_tokens": 634,
+      "label": "MW11-summary",
+      "latency_ms": 3.549,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 2533,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 550,
+      "label": "MW12-neighborhood",
+      "latency_ms": 2.656,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 2200,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 306,
+      "label": "MW13-execution-paths-from",
+      "latency_ms": 0.194,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 1224,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 91,
+      "label": "MW14-issues-for",
+      "latency_ms": 0.737,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 362,
+      "stats_delta": {
+        "filigree_issues_returned_total": 0,
+        "filigree_requests_total": 1
+      },
+      "tool": "issues_for",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 182,
+      "label": "MW15-entity-at",
+      "latency_ms": 0.185,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 728,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 189,
+      "label": "MW16-find-entity",
+      "latency_ms": 0.334,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 753,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "warm",
+      "error": false,
+      "estimated_response_tokens": 788,
+      "label": "MW17-summary",
+      "latency_ms": 4.463,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 3150,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 62,
+      "label": "MW18-callers-of",
+      "latency_ms": 3.776,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 245,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 464,
+      "label": "MW19-neighborhood",
+      "latency_ms": 4.245,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 1855,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 308,
+      "label": "MW20-execution-paths-from",
+      "latency_ms": 0.252,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 1230,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 160,
+      "label": "H01-entity-at",
+      "latency_ms": 0.174,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 638,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 166,
+      "label": "H02-find-entity",
+      "latency_ms": 0.482,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 663,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 60,
+      "label": "H03-callers-of",
+      "latency_ms": 1.792,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 239,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 311,
+      "label": "H04-execution-paths-from",
+      "latency_ms": 0.202,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1241,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "warm",
+      "error": false,
+      "estimated_response_tokens": 696,
+      "label": "H05-summary",
+      "latency_ms": 3.504,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 2782,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 310,
+      "label": "H06-issues-for",
+      "latency_ms": 1.802,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1238,
+      "stats_delta": {
+        "filigree_issues_returned_total": 1,
+        "filigree_requests_total": 4
+      },
+      "tool": "issues_for",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 266,
+      "label": "H07-neighborhood",
+      "latency_ms": 2.469,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1064,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 175,
+      "label": "H08-entity-at",
+      "latency_ms": 0.253,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 698,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 303,
+      "label": "H09-find-entity",
+      "latency_ms": 0.482,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1210,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 60,
+      "label": "H10-callers-of",
+      "latency_ms": 2.457,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 239,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "warm",
+      "error": false,
+      "estimated_response_tokens": 632,
+      "label": "H11-summary",
+      "latency_ms": 4.294,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 2527,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 549,
+      "label": "H12-neighborhood",
+      "latency_ms": 2.884,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 2194,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 305,
+      "label": "H13-execution-paths-from",
+      "latency_ms": 0.214,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1218,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 89,
+      "label": "H14-issues-for",
+      "latency_ms": 0.628,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 356,
+      "stats_delta": {
+        "filigree_issues_returned_total": 0,
+        "filigree_requests_total": 1
+      },
+      "tool": "issues_for",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 181,
+      "label": "H15-entity-at",
+      "latency_ms": 0.199,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 722,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 187,
+      "label": "H16-find-entity",
+      "latency_ms": 0.336,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 747,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "warm",
+      "error": false,
+      "estimated_response_tokens": 786,
+      "label": "H17-summary",
+      "latency_ms": 3.503,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 3144,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 60,
+      "label": "H18-callers-of",
+      "latency_ms": 3.274,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 239,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 463,
+      "label": "H19-neighborhood",
+      "latency_ms": 4.699,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1849,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 306,
+      "label": "H20-execution-paths-from",
+      "latency_ms": 0.259,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1224,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 160,
+      "label": "H21-entity-at",
+      "latency_ms": 0.229,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 638,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 166,
+      "label": "H22-find-entity",
+      "latency_ms": 0.54,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 663,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 60,
+      "label": "H23-callers-of",
+      "latency_ms": 1.689,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 239,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 311,
+      "label": "H24-execution-paths-from",
+      "latency_ms": 0.178,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1241,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "warm",
+      "error": false,
+      "estimated_response_tokens": 696,
+      "label": "H25-summary",
+      "latency_ms": 3.34,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 2782,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 310,
+      "label": "H26-issues-for",
+      "latency_ms": 1.922,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1238,
+      "stats_delta": {
+        "filigree_issues_returned_total": 1,
+        "filigree_requests_total": 4
+      },
+      "tool": "issues_for",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 266,
+      "label": "H27-neighborhood",
+      "latency_ms": 2.226,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1064,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 175,
+      "label": "H28-entity-at",
+      "latency_ms": 0.161,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 698,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 303,
+      "label": "H29-find-entity",
+      "latency_ms": 0.414,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1210,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 60,
+      "label": "H30-callers-of",
+      "latency_ms": 2.444,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 239,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "warm",
+      "error": false,
+      "estimated_response_tokens": 632,
+      "label": "H31-summary",
+      "latency_ms": 3.751,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 2527,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 549,
+      "label": "H32-neighborhood",
+      "latency_ms": 2.368,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 2194,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 305,
+      "label": "H33-execution-paths-from",
+      "latency_ms": 0.214,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1218,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 89,
+      "label": "H34-issues-for",
+      "latency_ms": 0.569,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 356,
+      "stats_delta": {
+        "filigree_issues_returned_total": 0,
+        "filigree_requests_total": 1
+      },
+      "tool": "issues_for",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 181,
+      "label": "H35-entity-at",
+      "latency_ms": 0.223,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 722,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 187,
+      "label": "H36-find-entity",
+      "latency_ms": 0.446,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 747,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "warm",
+      "error": false,
+      "estimated_response_tokens": 786,
+      "label": "H37-summary",
+      "latency_ms": 3.688,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 3144,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 60,
+      "label": "H38-callers-of",
+      "latency_ms": 3.371,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 239,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 463,
+      "label": "H39-neighborhood",
+      "latency_ms": 3.923,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1849,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 306,
+      "label": "H40-execution-paths-from",
+      "latency_ms": 0.219,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1224,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 160,
+      "label": "H41-entity-at",
+      "latency_ms": 0.196,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 638,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 166,
+      "label": "H42-find-entity",
+      "latency_ms": 0.521,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 663,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 60,
+      "label": "H43-callers-of",
+      "latency_ms": 1.772,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 239,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 311,
+      "label": "H44-execution-paths-from",
+      "latency_ms": 0.222,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1241,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "warm",
+      "error": false,
+      "estimated_response_tokens": 696,
+      "label": "H45-summary",
+      "latency_ms": 3.849,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 2782,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 310,
+      "label": "H46-issues-for",
+      "latency_ms": 1.793,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1238,
+      "stats_delta": {
+        "filigree_issues_returned_total": 1,
+        "filigree_requests_total": 4
+      },
+      "tool": "issues_for",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 266,
+      "label": "H47-neighborhood",
+      "latency_ms": 2.546,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1064,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 175,
+      "label": "H48-entity-at",
+      "latency_ms": 0.224,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 698,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 303,
+      "label": "H49-find-entity",
+      "latency_ms": 0.45,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1210,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 60,
+      "label": "H50-callers-of",
+      "latency_ms": 1.73,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 239,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "inferred",
+      "error": false,
+      "estimated_response_tokens": 350,
+      "label": "callers-inferred-0",
+      "latency_ms": 200.273,
+      "ok": true,
+      "pattern": "inferred",
+      "phase": "steady_state",
+      "response_bytes": 1399,
+      "stats_delta": {
+        "inferred_candidate_callers_considered": 1,
+        "inferred_cost_usd": 0.0,
+        "inferred_dispatch_cache_hits_total": 1,
+        "inferred_dispatch_coalesced_total": 0,
+        "inferred_dispatch_misses_total": 0,
+        "inferred_edges_materialized_total": 0,
+        "inferred_edges_skipped_static_duplicates_total": 0,
+        "inferred_tokens_input": 0,
+        "inferred_tokens_output": 0,
+        "inferred_tokens_total": 0
+      },
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "inferred",
+      "error": false,
+      "estimated_response_tokens": 561,
+      "label": "callers-inferred-1",
+      "latency_ms": 1996.851,
+      "ok": true,
+      "pattern": "inferred",
+      "phase": "steady_state",
+      "response_bytes": 2242,
+      "stats_delta": {
+        "inferred_candidate_callers_considered": 7,
+        "inferred_cost_usd": 0.0,
+        "inferred_dispatch_cache_hits_total": 7,
+        "inferred_dispatch_coalesced_total": 0,
+        "inferred_dispatch_misses_total": 0,
+        "inferred_edges_materialized_total": 0,
+        "inferred_edges_skipped_static_duplicates_total": 0,
+        "inferred_tokens_input": 0,
+        "inferred_tokens_output": 0,
+        "inferred_tokens_total": 0
+      },
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "inferred",
+      "error": false,
+      "estimated_response_tokens": 367,
+      "label": "callers-inferred-2",
+      "latency_ms": 1167.442,
+      "ok": true,
+      "pattern": "inferred",
+      "phase": "steady_state",
+      "response_bytes": 1466,
+      "stats_delta": {
+        "inferred_candidate_callers_considered": 1,
+        "inferred_cost_usd": 0.0,
+        "inferred_dispatch_cache_hits_total": 1,
+        "inferred_dispatch_coalesced_total": 0,
+        "inferred_dispatch_misses_total": 0,
+        "inferred_edges_materialized_total": 0,
+        "inferred_edges_skipped_static_duplicates_total": 0,
+        "inferred_tokens_input": 0,
+        "inferred_tokens_output": 0,
+        "inferred_tokens_total": 0
+      },
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "inferred",
+      "error": false,
+      "estimated_response_tokens": 576,
+      "label": "callers-inferred-3",
+      "latency_ms": 1459.596,
+      "ok": true,
+      "pattern": "inferred",
+      "phase": "steady_state",
+      "response_bytes": 2302,
+      "stats_delta": {
+        "inferred_candidate_callers_considered": 2,
+        "inferred_cost_usd": 0.0,
+        "inferred_dispatch_cache_hits_total": 2,
+        "inferred_dispatch_coalesced_total": 0,
+        "inferred_dispatch_misses_total": 0,
+        "inferred_edges_materialized_total": 0,
+        "inferred_edges_skipped_static_duplicates_total": 0,
+        "inferred_tokens_input": 0,
+        "inferred_tokens_output": 0,
+        "inferred_tokens_total": 0
+      },
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "inferred",
+      "error": false,
+      "estimated_response_tokens": 578,
+      "label": "callers-inferred-4",
+      "latency_ms": 1469.195,
+      "ok": true,
+      "pattern": "inferred",
+      "phase": "steady_state",
+      "response_bytes": 2310,
+      "stats_delta": {
+        "inferred_candidate_callers_considered": 2,
+        "inferred_cost_usd": 0.0,
+        "inferred_dispatch_cache_hits_total": 2,
+        "inferred_dispatch_coalesced_total": 0,
+        "inferred_dispatch_misses_total": 0,
+        "inferred_edges_materialized_total": 0,
+        "inferred_edges_skipped_static_duplicates_total": 0,
+        "inferred_tokens_input": 0,
+        "inferred_tokens_output": 0,
+        "inferred_tokens_total": 0
+      },
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    }
+  ],
+  "skipped_patterns": [],
+  "summary": {
+    "by_pattern": {
+      "heavy": {
+        "available_count": 50,
+        "call_count": 50,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 4.699,
+        "ok_count": 50,
+        "p50_latency_ms": 1.689,
+        "p95_latency_ms": 4.294,
+        "response_size_p50_kb": 1.039,
+        "response_size_p95_kb": 3.07,
+        "response_tokens_p50": 266,
+        "response_tokens_p95": 786,
+        "summary_cache_hit_rate": 1.0,
+        "tokens_total": 0,
+        "tools": {
+          "callers_of": {
+            "available_count": 8,
+            "call_count": 8,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 3.371,
+            "ok_count": 8,
+            "p50_latency_ms": 2.444,
+            "p95_latency_ms": 3.371,
+            "response_size_p50_kb": 0.233,
+            "response_size_p95_kb": 0.233,
+            "response_tokens_p50": 60,
+            "response_tokens_p95": 60,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 0
+          },
+          "entity_at": {
+            "available_count": 8,
+            "call_count": 8,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 0.253,
+            "ok_count": 8,
+            "p50_latency_ms": 0.223,
+            "p95_latency_ms": 0.253,
+            "response_size_p50_kb": 0.682,
+            "response_size_p95_kb": 0.705,
+            "response_tokens_p50": 175,
+            "response_tokens_p95": 181,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 8
+          },
+          "execution_paths_from": {
+            "available_count": 7,
+            "call_count": 7,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 0.259,
+            "ok_count": 7,
+            "p50_latency_ms": 0.214,
+            "p95_latency_ms": 0.259,
+            "response_size_p50_kb": 1.195,
+            "response_size_p95_kb": 1.212,
+            "response_tokens_p50": 306,
+            "response_tokens_p95": 311,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 7
+          },
+          "find_entity": {
+            "available_count": 8,
+            "call_count": 8,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 0.54,
+            "ok_count": 8,
+            "p50_latency_ms": 0.482,
+            "p95_latency_ms": 0.54,
+            "response_size_p50_kb": 0.729,
+            "response_size_p95_kb": 1.182,
+            "response_tokens_p50": 187,
+            "response_tokens_p95": 303,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 8
+          },
+          "issues_for": {
+            "available_count": 5,
+            "call_count": 5,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 1.922,
+            "ok_count": 5,
+            "p50_latency_ms": 1.793,
+            "p95_latency_ms": 1.922,
+            "response_size_p50_kb": 1.209,
+            "response_size_p95_kb": 1.209,
+            "response_tokens_p50": 310,
+            "response_tokens_p95": 310,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 3
+          },
+          "neighborhood": {
+            "available_count": 7,
+            "call_count": 7,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 4.699,
+            "ok_count": 7,
+            "p50_latency_ms": 2.546,
+            "p95_latency_ms": 4.699,
+            "response_size_p50_kb": 1.806,
+            "response_size_p95_kb": 2.143,
+            "response_tokens_p50": 463,
+            "response_tokens_p95": 549,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 7
+          },
+          "summary": {
+            "available_count": 7,
+            "call_count": 7,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 4.294,
+            "ok_count": 7,
+            "p50_latency_ms": 3.688,
+            "p95_latency_ms": 4.294,
+            "response_size_p50_kb": 2.717,
+            "response_size_p95_kb": 3.07,
+            "response_tokens_p50": 696,
+            "response_tokens_p95": 786,
+            "summary_cache_hit_rate": 1.0,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 7
+          }
+        },
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 40
+      },
+      "inferred": {
+        "available_count": 5,
+        "call_count": 5,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 1996.851,
+        "ok_count": 5,
+        "p50_latency_ms": 1459.596,
+        "p95_latency_ms": 1996.851,
+        "response_size_p50_kb": 2.189,
+        "response_size_p95_kb": 2.256,
+        "response_tokens_p50": 561,
+        "response_tokens_p95": 578,
+        "summary_cache_hit_rate": null,
+        "tokens_total": 0,
+        "tools": {
+          "callers_of": {
+            "available_count": 5,
+            "call_count": 5,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 1996.851,
+            "ok_count": 5,
+            "p50_latency_ms": 1459.596,
+            "p95_latency_ms": 1996.851,
+            "response_size_p50_kb": 2.189,
+            "response_size_p95_kb": 2.256,
+            "response_tokens_p50": 561,
+            "response_tokens_p95": 578,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 5
+          }
+        },
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 5
+      },
+      "light": {
+        "available_count": 5,
+        "call_count": 5,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 3.33,
+        "ok_count": 5,
+        "p50_latency_ms": 0.88,
+        "p95_latency_ms": 3.33,
+        "response_size_p50_kb": 0.622,
+        "response_size_p95_kb": 1.038,
+        "response_tokens_p50": 160,
+        "response_tokens_p95": 266,
+        "summary_cache_hit_rate": null,
+        "tokens_total": 0,
+        "tools": {
+          "callers_of": {
+            "available_count": 1,
+            "call_count": 1,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 3.33,
+            "ok_count": 1,
+            "p50_latency_ms": 3.33,
+            "p95_latency_ms": 3.33,
+            "response_size_p50_kb": 0.232,
+            "response_size_p95_kb": 0.232,
+            "response_tokens_p50": 60,
+            "response_tokens_p95": 60,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 0
+          },
+          "entity_at": {
+            "available_count": 2,
+            "call_count": 2,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 0.615,
+            "ok_count": 2,
+            "p50_latency_ms": 0.615,
+            "p95_latency_ms": 0.615,
+            "response_size_p50_kb": 0.622,
+            "response_size_p95_kb": 0.622,
+            "response_tokens_p50": 160,
+            "response_tokens_p95": 160,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 2
+          },
+          "find_entity": {
+            "available_count": 1,
+            "call_count": 1,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 0.88,
+            "ok_count": 1,
+            "p50_latency_ms": 0.88,
+            "p95_latency_ms": 0.88,
+            "response_size_p50_kb": 0.646,
+            "response_size_p95_kb": 0.646,
+            "response_tokens_p50": 166,
+            "response_tokens_p95": 166,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 1
+          },
+          "neighborhood": {
+            "available_count": 1,
+            "call_count": 1,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 2.626,
+            "ok_count": 1,
+            "p50_latency_ms": 2.626,
+            "p95_latency_ms": 2.626,
+            "response_size_p50_kb": 1.038,
+            "response_size_p95_kb": 1.038,
+            "response_tokens_p50": 266,
+            "response_tokens_p95": 266,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 1
+          }
+        },
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 4
+      },
+      "medium-cold": {
+        "available_count": 20,
+        "call_count": 20,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 4.379,
+        "ok_count": 20,
+        "p50_latency_ms": 1.762,
+        "p95_latency_ms": 4.379,
+        "response_size_p50_kb": 1.188,
+        "response_size_p95_kb": 3.076,
+        "response_tokens_p50": 304,
+        "response_tokens_p95": 788,
+        "summary_cache_hit_rate": 1.0,
+        "tokens_total": 0,
+        "tools": {
+          "callers_of": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 4.062,
+            "ok_count": 3,
+            "p50_latency_ms": 1.914,
+            "p95_latency_ms": 4.062,
+            "response_size_p50_kb": 0.239,
+            "response_size_p95_kb": 0.239,
+            "response_tokens_p50": 62,
+            "response_tokens_p95": 62,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 0
+          },
+          "entity_at": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 0.205,
+            "ok_count": 3,
+            "p50_latency_ms": 0.186,
+            "p95_latency_ms": 0.205,
+            "response_size_p50_kb": 0.688,
+            "response_size_p95_kb": 0.711,
+            "response_tokens_p50": 176,
+            "response_tokens_p95": 182,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 3
+          },
+          "execution_paths_from": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 0.212,
+            "ok_count": 3,
+            "p50_latency_ms": 0.206,
+            "p95_latency_ms": 0.212,
+            "response_size_p50_kb": 1.201,
+            "response_size_p95_kb": 1.217,
+            "response_tokens_p50": 308,
+            "response_tokens_p95": 312,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 3
+          },
+          "find_entity": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 0.582,
+            "ok_count": 3,
+            "p50_latency_ms": 0.487,
+            "p95_latency_ms": 0.582,
+            "response_size_p50_kb": 0.735,
+            "response_size_p95_kb": 1.188,
+            "response_tokens_p50": 189,
+            "response_tokens_p95": 304,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 3
+          },
+          "issues_for": {
+            "available_count": 2,
+            "call_count": 2,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 3.099,
+            "ok_count": 2,
+            "p50_latency_ms": 3.099,
+            "p95_latency_ms": 3.099,
+            "response_size_p50_kb": 1.215,
+            "response_size_p95_kb": 1.215,
+            "response_tokens_p50": 311,
+            "response_tokens_p95": 311,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 1
+          },
+          "neighborhood": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 4.379,
+            "ok_count": 3,
+            "p50_latency_ms": 2.844,
+            "p95_latency_ms": 4.379,
+            "response_size_p50_kb": 1.812,
+            "response_size_p95_kb": 2.148,
+            "response_tokens_p50": 464,
+            "response_tokens_p95": 550,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 3
+          },
+          "summary": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 4.328,
+            "ok_count": 3,
+            "p50_latency_ms": 3.663,
+            "p95_latency_ms": 4.328,
+            "response_size_p50_kb": 2.722,
+            "response_size_p95_kb": 3.076,
+            "response_tokens_p50": 697,
+            "response_tokens_p95": 788,
+            "summary_cache_hit_rate": 1.0,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 3
+          }
+        },
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 16
+      },
+      "medium-warm": {
+        "available_count": 20,
+        "call_count": 20,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 4.463,
+        "ok_count": 20,
+        "p50_latency_ms": 1.759,
+        "p95_latency_ms": 4.463,
+        "response_size_p50_kb": 1.188,
+        "response_size_p95_kb": 3.076,
+        "response_tokens_p50": 304,
+        "response_tokens_p95": 788,
+        "summary_cache_hit_rate": 1.0,
+        "tokens_total": 0,
+        "tools": {
+          "callers_of": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 3.776,
+            "ok_count": 3,
+            "p50_latency_ms": 1.879,
+            "p95_latency_ms": 3.776,
+            "response_size_p50_kb": 0.239,
+            "response_size_p95_kb": 0.239,
+            "response_tokens_p50": 62,
+            "response_tokens_p95": 62,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 0
+          },
+          "entity_at": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 0.189,
+            "ok_count": 3,
+            "p50_latency_ms": 0.185,
+            "p95_latency_ms": 0.189,
+            "response_size_p50_kb": 0.688,
+            "response_size_p95_kb": 0.711,
+            "response_tokens_p50": 176,
+            "response_tokens_p95": 182,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 3
+          },
+          "execution_paths_from": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 0.252,
+            "ok_count": 3,
+            "p50_latency_ms": 0.204,
+            "p95_latency_ms": 0.252,
+            "response_size_p50_kb": 1.201,
+            "response_size_p95_kb": 1.218,
+            "response_tokens_p50": 308,
+            "response_tokens_p95": 312,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 3
+          },
+          "find_entity": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 0.543,
+            "ok_count": 3,
+            "p50_latency_ms": 0.425,
+            "p95_latency_ms": 0.543,
+            "response_size_p50_kb": 0.735,
+            "response_size_p95_kb": 1.188,
+            "response_tokens_p50": 189,
+            "response_tokens_p95": 304,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 3
+          },
+          "issues_for": {
+            "available_count": 2,
+            "call_count": 2,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 1.896,
+            "ok_count": 2,
+            "p50_latency_ms": 1.896,
+            "p95_latency_ms": 1.896,
+            "response_size_p50_kb": 1.215,
+            "response_size_p95_kb": 1.215,
+            "response_tokens_p50": 311,
+            "response_tokens_p95": 311,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 1
+          },
+          "neighborhood": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 4.245,
+            "ok_count": 3,
+            "p50_latency_ms": 2.656,
+            "p95_latency_ms": 4.245,
+            "response_size_p50_kb": 1.812,
+            "response_size_p95_kb": 2.148,
+            "response_tokens_p50": 464,
+            "response_tokens_p95": 550,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 3
+          },
+          "summary": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 4.463,
+            "ok_count": 3,
+            "p50_latency_ms": 3.549,
+            "p95_latency_ms": 4.463,
+            "response_size_p50_kb": 2.723,
+            "response_size_p95_kb": 3.076,
+            "response_tokens_p50": 697,
+            "response_tokens_p95": 788,
+            "summary_cache_hit_rate": 1.0,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 3
+          }
+        },
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 16
+      }
+    },
+    "by_phase": {
+      "cold_start": {
+        "available_count": 5,
+        "call_count": 5,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 3.33,
+        "ok_count": 5,
+        "p50_latency_ms": 0.88,
+        "p95_latency_ms": 3.33,
+        "response_size_p50_kb": 0.622,
+        "response_size_p95_kb": 1.038,
+        "response_tokens_p50": 160,
+        "response_tokens_p95": 266,
+        "summary_cache_hit_rate": null,
+        "tokens_total": 0,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 4
+      },
+      "steady_state": {
+        "available_count": 75,
+        "call_count": 75,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 1996.851,
+        "ok_count": 75,
+        "p50_latency_ms": 1.759,
+        "p95_latency_ms": 1459.596,
+        "response_size_p50_kb": 1.182,
+        "response_size_p95_kb": 3.07,
+        "response_tokens_p50": 303,
+        "response_tokens_p95": 786,
+        "summary_cache_hit_rate": 1.0,
+        "tokens_total": 0,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 61
+      },
+      "warmup": {
+        "available_count": 20,
+        "call_count": 20,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 4.379,
+        "ok_count": 20,
+        "p50_latency_ms": 1.762,
+        "p95_latency_ms": 4.379,
+        "response_size_p50_kb": 1.188,
+        "response_size_p95_kb": 3.076,
+        "response_tokens_p50": 304,
+        "response_tokens_p95": 788,
+        "summary_cache_hit_rate": 1.0,
+        "tokens_total": 0,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 16
+      }
+    },
+    "by_tool": {
+      "callers_of": {
+        "available_count": 20,
+        "call_count": 20,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 1996.851,
+        "ok_count": 20,
+        "p50_latency_ms": 3.274,
+        "p95_latency_ms": 1996.851,
+        "response_size_p50_kb": 0.239,
+        "response_size_p95_kb": 2.256,
+        "response_tokens_p50": 62,
+        "response_tokens_p95": 578,
+        "summary_cache_hit_rate": null,
+        "tokens_total": 0,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 5
+      },
+      "entity_at": {
+        "available_count": 16,
+        "call_count": 16,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 0.615,
+        "ok_count": 16,
+        "p50_latency_ms": 0.199,
+        "p95_latency_ms": 0.615,
+        "response_size_p50_kb": 0.682,
+        "response_size_p95_kb": 0.711,
+        "response_tokens_p50": 175,
+        "response_tokens_p95": 182,
+        "summary_cache_hit_rate": null,
+        "tokens_total": 0,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 16
+      },
+      "execution_paths_from": {
+        "available_count": 13,
+        "call_count": 13,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 0.259,
+        "ok_count": 13,
+        "p50_latency_ms": 0.212,
+        "p95_latency_ms": 0.259,
+        "response_size_p50_kb": 1.201,
+        "response_size_p95_kb": 1.218,
+        "response_tokens_p50": 308,
+        "response_tokens_p95": 312,
+        "summary_cache_hit_rate": null,
+        "tokens_total": 0,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 13
+      },
+      "find_entity": {
+        "available_count": 15,
+        "call_count": 15,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 0.88,
+        "ok_count": 15,
+        "p50_latency_ms": 0.482,
+        "p95_latency_ms": 0.88,
+        "response_size_p50_kb": 0.729,
+        "response_size_p95_kb": 1.188,
+        "response_tokens_p50": 187,
+        "response_tokens_p95": 304,
+        "summary_cache_hit_rate": null,
+        "tokens_total": 0,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 15
+      },
+      "issues_for": {
+        "available_count": 9,
+        "call_count": 9,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 3.099,
+        "ok_count": 9,
+        "p50_latency_ms": 1.793,
+        "p95_latency_ms": 3.099,
+        "response_size_p50_kb": 1.209,
+        "response_size_p95_kb": 1.215,
+        "response_tokens_p50": 310,
+        "response_tokens_p95": 311,
+        "summary_cache_hit_rate": null,
+        "tokens_total": 0,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 5
+      },
+      "neighborhood": {
+        "available_count": 14,
+        "call_count": 14,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 4.699,
+        "ok_count": 14,
+        "p50_latency_ms": 2.656,
+        "p95_latency_ms": 4.699,
+        "response_size_p50_kb": 1.806,
+        "response_size_p95_kb": 2.148,
+        "response_tokens_p50": 463,
+        "response_tokens_p95": 550,
+        "summary_cache_hit_rate": null,
+        "tokens_total": 0,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 14
+      },
+      "summary": {
+        "available_count": 13,
+        "call_count": 13,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 4.463,
+        "ok_count": 13,
+        "p50_latency_ms": 3.663,
+        "p95_latency_ms": 4.463,
+        "response_size_p50_kb": 2.717,
+        "response_size_p95_kb": 3.076,
+        "response_tokens_p50": 696,
+        "response_tokens_p95": 788,
+        "summary_cache_hit_rate": 1.0,
+        "tokens_total": 0,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 13
+      }
+    },
+    "gate": {
+      "steady_state_storage_backed": {
+        "available_count": 58,
+        "call_count": 58,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 1996.851,
+        "ok_count": 58,
+        "p50_latency_ms": 0.521,
+        "p95_latency_ms": 1469.195,
+        "response_size_p50_kb": 1.039,
+        "response_size_p95_kb": 2.248,
+        "response_tokens_p50": 266,
+        "response_tokens_p95": 576,
+        "summary_cache_hit_rate": null,
+        "tokens_total": 0,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 47
+      }
+    },
+    "overall": {
+      "available_count": 100,
+      "call_count": 100,
+      "cost_usd": 0.0,
+      "error_count": 0,
+      "max_latency_ms": 1996.851,
+      "ok_count": 100,
+      "p50_latency_ms": 1.759,
+      "p95_latency_ms": 200.273,
+      "response_size_p50_kb": 1.045,
+      "response_size_p95_kb": 2.723,
+      "response_tokens_p50": 268,
+      "response_tokens_p95": 697,
+      "summary_cache_hit_rate": 1.0,
+      "tokens_total": 0,
+      "truncation_count": 0,
+      "unavailable_count": 0,
+      "useful_result_count": 81
+    }
+  },
+  "summary_miss_then_hit": false,
+  "tools": [
+    "entity_at",
+    "find_entity",
+    "callers_of",
+    "execution_paths_from",
+    "summary",
+    "issues_for",
+    "neighborhood"
+  ],
+  "tools_list_latency_ms": 0.167
+}

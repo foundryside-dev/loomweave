@@ -13,7 +13,7 @@ pub struct Cli {
 pub enum Command {
     /// Initialise .clarion/ in the current directory.
     Install {
-        /// Overwrite an existing .clarion/ (not implemented in Sprint 1).
+        /// Overwrite an existing .clarion/ directory.
         #[arg(long)]
         force: bool,
 
@@ -28,6 +28,10 @@ pub enum Command {
         /// Path to analyse (default: current directory).
         #[arg(default_value = ".")]
         path: PathBuf,
+
+        /// Path to clarion.yaml (default: project-root/clarion.yaml if present).
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 
     /// Run the MCP stdio server.

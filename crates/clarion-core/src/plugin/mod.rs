@@ -8,11 +8,13 @@
 //!   - `limits`     — Task 4: core-enforced ceilings and circuit-breakers (ADR-021 §2b–§2d).
 //!   - `discovery`  — Task 5: `$PATH` scanning for `clarion-plugin-*` executables (L9, ADR-021 §L9).
 //!   - `host`       — Task 6: plugin-host supervisor (ADR-021 §Layer 2, ADR-022, UQ-WP2-11).
+//!   - `host_findings` — `HostFinding` subcodes and constructors used by `host`.
 //!   - `breaker`    — Task 7: crash-loop breaker (ADR-002 + UQ-WP2-10).
 
 pub mod breaker;
 pub mod discovery;
 pub mod host;
+mod host_findings;
 pub mod jail;
 pub mod limits;
 pub mod manifest;

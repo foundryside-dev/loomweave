@@ -33,7 +33,7 @@ from clarion_plugin_python.pyright_session import PyrightSession
 from clarion_plugin_python.stdout_guard import install_stdio
 from clarion_plugin_python.wardline_probe import probe as wardline_probe
 
-ONTOLOGY_VERSION = "0.5.0"
+ONTOLOGY_VERSION = "0.6.0"
 
 # Sprint 1 defaults for the Wardline version pin (WP3 L8 + plugin.toml
 # `[integrations.wardline]`). Kept as module constants so Task 7's
@@ -185,6 +185,8 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
         "references_skipped_cap_total": 0,
         "unresolved_reference_sites_total": 0,
         "pyright_query_latency_ms": [],
+        "pyright_index_parse_latency_ms": [],
+        "extractor_parse_latency_ms": 0,
     }
     file_path_raw = params.get("file_path")
     if not isinstance(file_path_raw, str):
@@ -217,6 +219,8 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
         "references_skipped_cap_total": result.stats.references_skipped_cap_total,
         "unresolved_reference_sites_total": result.stats.unresolved_reference_sites_total,
         "pyright_query_latency_ms": result.stats.pyright_query_latency_ms,
+        "pyright_index_parse_latency_ms": result.stats.pyright_index_parse_latency_ms,
+        "extractor_parse_latency_ms": result.stats.extractor_parse_latency_ms,
     }
     return {"entities": result.entities, "edges": result.edges, "stats": stats}
 

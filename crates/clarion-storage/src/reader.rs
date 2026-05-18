@@ -42,8 +42,11 @@ impl ReaderPool {
 
     /// Acquire a reader and run a blocking closure on it.
     ///
-    /// Read-side PRAGMAs are applied on every acquisition — cheap and
-    /// guarantees `busy_timeout` + `foreign_keys` are always on.
+    /// Read-side PRAGMAs are applied on every acquisition even though they
+    /// persist for a connection's lifetime. This is an intentional
+    /// belt-and-suspenders choice: `deadpool-sqlite` opens connections lazily,
+    /// the current API does not install a post-create hook, and these two
+    /// PRAGMAs are cheap compared with the queries that use the reader.
     ///
     /// The closure must be `'static`: captures must be owned or cloned
     /// into the closure (borrowed references from the caller's scope

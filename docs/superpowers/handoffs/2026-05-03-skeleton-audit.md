@@ -407,6 +407,8 @@ naming and split doctrine vs. schema fix) shaped Phase 2.
 
 F-1 through F-8 are absorbed by ADR-024 (`docs/clarion/adr/ADR-024-guidance-schema-vocabulary.md`) and the Phase 1 + Phase 2 commits on this branch. The original priority-affinity bug `clarion-4cd11905e2` is closed with the audit-resolution comment.
 
+F-13 is absorbed by [ADR-031](../../clarion/adr/ADR-031-schema-validation-policy.md) (2026-05-18): CHECK constraints on closed core-owned vocabularies (`findings.{kind,severity,status}`, `runs.status`); writer-actor + ADR-022 manifest acceptance remain the only enforcement layer for plugin-extensible vocabularies (`entities.kind`, `edges.kind`). Filigree issue `clarion-fbe50aa6e1` closed.
+
 ### Naming refinements applied to Phase 2
 
 The original audit proposed `composition_level`/`composition_rank`,

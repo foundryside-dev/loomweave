@@ -39,6 +39,12 @@ impl McpConfig {
                 code: "CLA-CONFIG-DEPRECATED-PROVIDER",
             });
         }
+        if self.integrations.filigree.enabled && self.integrations.filigree.actor.trim().is_empty()
+        {
+            return Err(ConfigError::InvalidFiligreeActor {
+                code: "CLA-CONFIG-FILIGREE-ACTOR-BLANK",
+            });
+        }
         Ok(())
     }
 }
@@ -209,6 +215,9 @@ pub enum ConfigError {
         "{code}: llm.provider=anthropic is deprecated; use llm_policy.provider: openrouter with llm_policy.openrouter.api_key_env and llm_policy.model_id"
     )]
     DeprecatedProvider { code: &'static str },
+
+    #[error("{code}: integrations.filigree.actor must not be blank when Filigree is enabled")]
+    InvalidFiligreeActor { code: &'static str },
 }
 
 #[cfg(test)]
@@ -348,5 +357,20 @@ llm:
         assert!(matches!(err, ConfigError::DeprecatedProvider { .. }));
         assert!(err.to_string().contains("CLA-CONFIG-DEPRECATED-PROVIDER"));
         assert!(err.to_string().contains("provider: openrouter"));
+    }
+
+    #[test]
+    fn enabled_filigree_integration_rejects_blank_actor() {
+        let err = McpConfig::from_yaml_str(
+            r#"
+integrations:
+  filigree:
+    enabled: true
+    actor: "   "
+"#,
+        )
+        .expect_err("blank Filigree actor should be rejected");
+
+        assert!(err.to_string().contains("CLA-CONFIG-FILIGREE-ACTOR-BLANK"));
     }
 }

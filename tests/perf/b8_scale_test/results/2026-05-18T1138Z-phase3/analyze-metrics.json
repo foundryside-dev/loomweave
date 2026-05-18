@@ -1,0 +1,94 @@
+{
+  "command": [
+    "/home/john/clarion/target/release/clarion",
+    "analyze",
+    "/tmp/clarion-b8-elspeth-full-20260518T0016Z"
+  ],
+  "peak_rss_bytes": 207720448,
+  "peak_rss_mb": 198.098,
+  "returncode": 0,
+  "sample_count": 1511,
+  "samples_tail": [
+    {
+      "rss_bytes": 192024576,
+      "t": 373.057
+    },
+    {
+      "rss_bytes": 192024576,
+      "t": 373.307
+    },
+    {
+      "rss_bytes": 190746624,
+      "t": 373.558
+    },
+    {
+      "rss_bytes": 190746624,
+      "t": 373.808
+    },
+    {
+      "rss_bytes": 190746624,
+      "t": 374.058
+    },
+    {
+      "rss_bytes": 190746624,
+      "t": 374.308
+    },
+    {
+      "rss_bytes": 190746624,
+      "t": 374.558
+    },
+    {
+      "rss_bytes": 190746624,
+      "t": 374.809
+    },
+    {
+      "rss_bytes": 190746624,
+      "t": 375.059
+    },
+    {
+      "rss_bytes": 190746624,
+      "t": 375.309
+    },
+    {
+      "rss_bytes": 190746624,
+      "t": 375.559
+    },
+    {
+      "rss_bytes": 190746624,
+      "t": 375.809
+    },
+    {
+      "rss_bytes": 190746624,
+      "t": 376.06
+    },
+    {
+      "rss_bytes": 190746624,
+      "t": 376.31
+    },
+    {
+      "rss_bytes": 190746624,
+      "t": 376.56
+    },
+    {
+      "rss_bytes": 190746624,
+      "t": 376.81
+    },
+    {
+      "rss_bytes": 190746624,
+      "t": 377.06
+    },
+    {
+      "rss_bytes": 178737152,
+      "t": 377.311
+    },
+    {
+      "rss_bytes": 191537152,
+      "t": 377.561
+    },
+    {
+      "rss_bytes": 0,
+      "t": 377.811
+    }
+  ],
+  "wall_seconds": 377.811
+}

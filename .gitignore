@@ -21,3 +21,5 @@ __pycache__/
 .coverage
 htmlcov/
 .claude/
+
+.env

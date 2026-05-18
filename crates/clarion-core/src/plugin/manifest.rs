@@ -25,7 +25,7 @@ use crate::entity_id::validate_kind_grammar;
 // ── Reserved lists (ADR-022) ──────────────────────────────────────────────────
 
 /// Entity kinds the core owns; plugins may not declare these (ADR-022 §Core owns).
-const RESERVED_ENTITY_KINDS: &[&str] = &["file", "subsystem", "guidance"];
+pub const RESERVED_ENTITY_KINDS: &[&str] = &["file", "subsystem", "guidance"];
 
 /// Rule-ID prefixes the core owns; plugins may not claim these (ADR-022 §Core owns).
 ///
@@ -41,6 +41,7 @@ const RESERVED_RULE_ID_PREFIXES: &[&str] = &["CLA-INFRA-", "CLA-FACT-"];
 /// surfaces in the `initialize` handshake reply. Use [`ManifestError::subcode`] to
 /// obtain the machine-readable finding code.
 #[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ManifestError {
     /// TOML parse failure or a required field is absent.
     ///
@@ -49,7 +50,7 @@ pub enum ManifestError {
     Malformed { message: String },
 
     /// An identifier string fails the ADR-022 grammar `[a-z][a-z0-9_]*` (kinds)
-    /// or `CLA-[A-Z]+(-[A-Z0-9]+)*-` (rule-ID prefix).
+    /// or `CLA-[A-Z]+(-[A-Z0-9]+)+-` (rule-ID prefix).
     ///
     /// Finding code: `CLA-INFRA-MANIFEST-MALFORMED`.
     #[error("CLA-INFRA-MANIFEST-MALFORMED: {field} {value:?} violates ADR-022 identifier grammar")]
@@ -122,8 +123,9 @@ pub struct Manifest {
     /// `[ontology]` table.
     pub ontology: Ontology,
 
-    /// `[integrations.*]` — optional, opaque passthrough for plugin-specific
-    /// integration config (e.g. WP3's `[integrations.wardline]`).
+    /// `[integrations.*]` — optional string-valued passthrough for
+    /// plugin-specific integration config (e.g. WP3's
+    /// `[integrations.wardline]`).
     ///
     /// The core does not interpret this table; it is preserved so Task 6 can
     /// forward it to the plugin during `initialize` if needed.
@@ -131,7 +133,7 @@ pub struct Manifest {
     /// Entry count is capped at [`MAX_INTEGRATIONS`] at parse time — see
     /// [`parse_manifest`].
     #[serde(default)]
-    pub integrations: BTreeMap<String, toml::Value>,
+    pub integrations: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 /// Maximum number of `[integrations.*]` entries accepted per manifest.
@@ -232,7 +234,7 @@ pub struct Ontology {
     pub edge_kinds: Vec<String>,
 
     /// Rule-ID prefix, e.g. `"CLA-PY-"`. Must end with `-` and match
-    /// `CLA-[A-Z]+(-[A-Z0-9]+)*-`. Must not be a core-reserved prefix.
+    /// `CLA-[A-Z]+(-[A-Z0-9]+)+-`. Must not be a core-reserved prefix.
     pub rule_id_prefix: String,
 
     /// Ontology version (semver). Bumped when entity/edge/rule set changes.
@@ -401,10 +403,12 @@ fn validate_kind_string(field: &'static str, value: &str) -> Result<(), Manifest
 ///
 /// Rules:
 /// 1. Must end with `-`.
-/// 2. Strip the trailing `-`; the remainder must match `CLA-[A-Z]+(-[A-Z0-9]+)*`.
+/// 2. Strip the trailing `-`; the remainder must match `CLA-[A-Z]+(-[A-Z0-9]+)+`
+///    (one-or-more `-[A-Z0-9]+` segments after `CLA`, per ADR-022).
 ///    Implementation: split on `-`, verify the first segment is `CLA`, and each
 ///    subsequent non-empty segment is `[A-Z0-9]+` (ASCII uppercase or digit).
-///    There must be at least one segment after `CLA` (so `CLA-` alone is invalid).
+///    The `segments.len() < 2` guard below is how the `+` quantifier is enforced
+///    without a regex engine — `CLA-` alone has only one segment and is rejected.
 ///
 /// Examples of valid prefixes: `CLA-PY-`, `CLA-JAVA-`, `CLA-FOO-BAR-`.
 /// Examples of invalid prefixes: `PY-`, `cla-py-`, `CLA-py-`, `CLA-PY` (no trailing
@@ -489,6 +493,46 @@ edge_kinds = ["imports", "calls", "decorates", "contains"]
 rule_id_prefix = "CLA-PY-"
 ontology_version = "0.1.0"
 "#;
+
+    fn manifest_with(field_override: &str) -> String {
+        let (field, _) = field_override
+            .split_once('=')
+            .expect("override is a TOML key/value line");
+        let field = field.trim();
+        let prefix = format!("{field} =");
+        let mut replaced = false;
+        let lines = VALID_MANIFEST
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with(&prefix) {
+                    replaced = true;
+                    field_override.to_owned()
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(replaced, "field {field:?} exists in VALID_MANIFEST");
+        lines.join("\n")
+    }
+
+    fn manifest_without(field: &str) -> String {
+        let prefix = format!("{field} =");
+        let mut removed = false;
+        let lines = VALID_MANIFEST
+            .lines()
+            .filter_map(|line| {
+                if line.trim_start().starts_with(&prefix) {
+                    removed = true;
+                    None
+                } else {
+                    Some(line.to_owned())
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(removed, "field {field:?} exists in VALID_MANIFEST");
+        lines.join("\n")
+    }
 
     // ── Positive: full parse ──────────────────────────────────────────────────
 
@@ -607,14 +651,21 @@ max_version = "1.0.0"
 "#;
         let manifest = parse_manifest(toml.as_bytes()).unwrap();
         // The integrations table is present; the core does not interpret it.
-        assert!(manifest.integrations.contains_key("wardline"));
+        let wardline: &BTreeMap<String, String> = manifest
+            .integrations
+            .get("wardline")
+            .expect("wardline integration");
+        assert_eq!(
+            wardline.get("min_version").map(String::as_str),
+            Some("0.1.0")
+        );
     }
 
     // ── Negative: too many [integrations.*] entries ───────────────────────────
 
     /// A `plugin.toml` with more than [`MAX_INTEGRATIONS`] entries is rejected
     /// as `Malformed` — prevents an attacker-controlled manifest from forcing
-    /// the host to retain an unbounded `BTreeMap<String, toml::Value>` for
+    /// the host to retain an unbounded integrations map for
     /// the run lifetime.
     #[test]
     fn negative_integrations_above_cap_is_rejected() {
@@ -696,27 +747,7 @@ ontology_version = "0.1.0"
     fn negative_missing_plugin_id_returns_malformed() {
         // A manifest without [plugin].plugin_id must fail deserialization because
         // plugin_id is a required field (no serde default).
-        let toml = r#"
-[plugin]
-name = "my-plugin"
-version = "0.1.0"
-protocol_version = "1.0"
-executable = "my-plugin"
-language = "mylang"
-extensions = ["my"]
-
-[capabilities.runtime]
-expected_max_rss_mb = 256
-expected_entities_per_file = 100
-wardline_aware = false
-reads_outside_project_root = false
-
-[ontology]
-entity_kinds = ["widget"]
-edge_kinds = []
-rule_id_prefix = "CLA-MY-"
-ontology_version = "0.1.0"
-"#;
+        let toml = manifest_without("plugin_id");
         let err = parse_manifest(toml.as_bytes()).unwrap_err();
         assert_eq!(err.subcode(), "CLA-INFRA-MANIFEST-MALFORMED");
         assert!(matches!(err, ManifestError::Malformed { .. }));
@@ -729,28 +760,7 @@ ontology_version = "0.1.0"
         // "my-plugin" contains a hyphen; the ADR-022 kind grammar [a-z][a-z0-9_]*
         // forbids it. This is the exact contradiction that motivated separating
         // plugin_id from name.
-        let toml = r#"
-[plugin]
-name = "my-plugin"
-plugin_id = "my-plugin"
-version = "0.1.0"
-protocol_version = "1.0"
-executable = "my-plugin"
-language = "mylang"
-extensions = ["my"]
-
-[capabilities.runtime]
-expected_max_rss_mb = 256
-expected_entities_per_file = 100
-wardline_aware = false
-reads_outside_project_root = false
-
-[ontology]
-entity_kinds = ["widget"]
-edge_kinds = []
-rule_id_prefix = "CLA-MY-"
-ontology_version = "0.1.0"
-"#;
+        let toml = manifest_with(r#"plugin_id = "my-plugin""#);
         let err = parse_manifest(toml.as_bytes()).unwrap_err();
         assert_eq!(err.subcode(), "CLA-INFRA-MANIFEST-MALFORMED");
         assert!(matches!(
@@ -766,26 +776,7 @@ ontology_version = "0.1.0"
 
     #[test]
     fn negative_missing_plugin_name_returns_malformed() {
-        let toml = r#"
-[plugin]
-version = "0.1.0"
-protocol_version = "1.0"
-executable = "my-plugin"
-language = "mylang"
-extensions = ["my"]
-
-[capabilities.runtime]
-expected_max_rss_mb = 256
-expected_entities_per_file = 100
-wardline_aware = false
-reads_outside_project_root = false
-
-[ontology]
-entity_kinds = ["widget"]
-edge_kinds = []
-rule_id_prefix = "CLA-MY-"
-ontology_version = "0.1.0"
-"#;
+        let toml = manifest_without("name");
         let err = parse_manifest(toml.as_bytes()).unwrap_err();
         assert_eq!(err.subcode(), "CLA-INFRA-MANIFEST-MALFORMED");
         assert!(matches!(err, ManifestError::Malformed { .. }));
@@ -795,28 +786,7 @@ ontology_version = "0.1.0"
 
     #[test]
     fn negative_zero_rss_mb_rejected() {
-        let toml = r#"
-[plugin]
-name = "my-plugin"
-plugin_id = "myplugin"
-version = "0.1.0"
-protocol_version = "1.0"
-executable = "my-plugin"
-language = "mylang"
-extensions = ["my"]
-
-[capabilities.runtime]
-expected_max_rss_mb = 0
-expected_entities_per_file = 100
-wardline_aware = false
-reads_outside_project_root = false
-
-[ontology]
-entity_kinds = ["widget"]
-edge_kinds = []
-rule_id_prefix = "CLA-MY-"
-ontology_version = "0.1.0"
-"#;
+        let toml = manifest_with("expected_max_rss_mb = 0");
         let err = parse_manifest(toml.as_bytes()).unwrap_err();
         assert_eq!(err.subcode(), "CLA-INFRA-MANIFEST-MALFORMED");
         assert!(
@@ -828,28 +798,7 @@ ontology_version = "0.1.0"
 
     #[test]
     fn negative_empty_entity_kinds_rejected() {
-        let toml = r#"
-[plugin]
-name = "my-plugin"
-plugin_id = "myplugin"
-version = "0.1.0"
-protocol_version = "1.0"
-executable = "my-plugin"
-language = "mylang"
-extensions = ["my"]
-
-[capabilities.runtime]
-expected_max_rss_mb = 256
-expected_entities_per_file = 100
-wardline_aware = false
-reads_outside_project_root = false
-
-[ontology]
-entity_kinds = []
-edge_kinds = []
-rule_id_prefix = "CLA-MY-"
-ontology_version = "0.1.0"
-"#;
+        let toml = manifest_with("entity_kinds = []");
         let err = parse_manifest(toml.as_bytes()).unwrap_err();
         assert_eq!(err.subcode(), "CLA-INFRA-MANIFEST-MALFORMED");
         assert!(
@@ -861,28 +810,7 @@ ontology_version = "0.1.0"
 
     #[test]
     fn negative_entity_kind_uppercase_is_grammar_violation() {
-        let toml = r#"
-[plugin]
-name = "my-plugin"
-plugin_id = "myplugin"
-version = "0.1.0"
-protocol_version = "1.0"
-executable = "my-plugin"
-language = "mylang"
-extensions = ["my"]
-
-[capabilities.runtime]
-expected_max_rss_mb = 256
-expected_entities_per_file = 100
-wardline_aware = false
-reads_outside_project_root = false
-
-[ontology]
-entity_kinds = ["Function"]
-edge_kinds = []
-rule_id_prefix = "CLA-MY-"
-ontology_version = "0.1.0"
-"#;
+        let toml = manifest_with(r#"entity_kinds = ["Function"]"#);
         let err = parse_manifest(toml.as_bytes()).unwrap_err();
         assert_eq!(err.subcode(), "CLA-INFRA-MANIFEST-MALFORMED");
         assert!(matches!(
@@ -893,28 +821,7 @@ ontology_version = "0.1.0"
 
     #[test]
     fn negative_entity_kind_hyphen_is_grammar_violation() {
-        let toml = r#"
-[plugin]
-name = "my-plugin"
-plugin_id = "myplugin"
-version = "0.1.0"
-protocol_version = "1.0"
-executable = "my-plugin"
-language = "mylang"
-extensions = ["my"]
-
-[capabilities.runtime]
-expected_max_rss_mb = 256
-expected_entities_per_file = 100
-wardline_aware = false
-reads_outside_project_root = false
-
-[ontology]
-entity_kinds = ["func-tion"]
-edge_kinds = []
-rule_id_prefix = "CLA-MY-"
-ontology_version = "0.1.0"
-"#;
+        let toml = manifest_with(r#"entity_kinds = ["func-tion"]"#);
         let err = parse_manifest(toml.as_bytes()).unwrap_err();
         assert_eq!(err.subcode(), "CLA-INFRA-MANIFEST-MALFORMED");
         assert!(matches!(
@@ -925,28 +832,7 @@ ontology_version = "0.1.0"
 
     #[test]
     fn negative_entity_kind_digit_prefix_is_grammar_violation() {
-        let toml = r#"
-[plugin]
-name = "my-plugin"
-plugin_id = "myplugin"
-version = "0.1.0"
-protocol_version = "1.0"
-executable = "my-plugin"
-language = "mylang"
-extensions = ["my"]
-
-[capabilities.runtime]
-expected_max_rss_mb = 256
-expected_entities_per_file = 100
-wardline_aware = false
-reads_outside_project_root = false
-
-[ontology]
-entity_kinds = ["1function"]
-edge_kinds = []
-rule_id_prefix = "CLA-MY-"
-ontology_version = "0.1.0"
-"#;
+        let toml = manifest_with(r#"entity_kinds = ["1function"]"#);
         let err = parse_manifest(toml.as_bytes()).unwrap_err();
         assert_eq!(err.subcode(), "CLA-INFRA-MANIFEST-MALFORMED");
         assert!(matches!(
@@ -960,28 +846,7 @@ ontology_version = "0.1.0"
     #[test]
     fn negative_rule_id_prefix_no_cla_prefix_rejected() {
         // "PY-" — does not start with CLA.
-        let toml = r#"
-[plugin]
-name = "my-plugin"
-plugin_id = "myplugin"
-version = "0.1.0"
-protocol_version = "1.0"
-executable = "my-plugin"
-language = "mylang"
-extensions = ["my"]
-
-[capabilities.runtime]
-expected_max_rss_mb = 256
-expected_entities_per_file = 100
-wardline_aware = false
-reads_outside_project_root = false
-
-[ontology]
-entity_kinds = ["widget"]
-edge_kinds = []
-rule_id_prefix = "PY-"
-ontology_version = "0.1.0"
-"#;
+        let toml = manifest_with(r#"rule_id_prefix = "PY-""#);
         let err = parse_manifest(toml.as_bytes()).unwrap_err();
         assert_eq!(err.subcode(), "CLA-INFRA-MANIFEST-MALFORMED");
         assert!(matches!(
@@ -993,28 +858,7 @@ ontology_version = "0.1.0"
     #[test]
     fn negative_rule_id_prefix_lowercase_rejected() {
         // "cla-py-" — lowercase is invalid.
-        let toml = r#"
-[plugin]
-name = "my-plugin"
-plugin_id = "myplugin"
-version = "0.1.0"
-protocol_version = "1.0"
-executable = "my-plugin"
-language = "mylang"
-extensions = ["my"]
-
-[capabilities.runtime]
-expected_max_rss_mb = 256
-expected_entities_per_file = 100
-wardline_aware = false
-reads_outside_project_root = false
-
-[ontology]
-entity_kinds = ["widget"]
-edge_kinds = []
-rule_id_prefix = "cla-py-"
-ontology_version = "0.1.0"
-"#;
+        let toml = manifest_with(r#"rule_id_prefix = "cla-py-""#);
         let err = parse_manifest(toml.as_bytes()).unwrap_err();
         assert_eq!(err.subcode(), "CLA-INFRA-MANIFEST-MALFORMED");
         assert!(matches!(
@@ -1026,28 +870,7 @@ ontology_version = "0.1.0"
     #[test]
     fn negative_rule_id_prefix_mixed_case_segment_rejected() {
         // "CLA-py-" — mixed-case segment after CLA.
-        let toml = r#"
-[plugin]
-name = "my-plugin"
-plugin_id = "myplugin"
-version = "0.1.0"
-protocol_version = "1.0"
-executable = "my-plugin"
-language = "mylang"
-extensions = ["my"]
-
-[capabilities.runtime]
-expected_max_rss_mb = 256
-expected_entities_per_file = 100
-wardline_aware = false
-reads_outside_project_root = false
-
-[ontology]
-entity_kinds = ["widget"]
-edge_kinds = []
-rule_id_prefix = "CLA-py-"
-ontology_version = "0.1.0"
-"#;
+        let toml = manifest_with(r#"rule_id_prefix = "CLA-py-""#);
         let err = parse_manifest(toml.as_bytes()).unwrap_err();
         assert_eq!(err.subcode(), "CLA-INFRA-MANIFEST-MALFORMED");
         assert!(matches!(
@@ -1060,28 +883,7 @@ ontology_version = "0.1.0"
 
     #[test]
     fn negative_reserved_entity_kind_file_rejected() {
-        let toml = r#"
-[plugin]
-name = "my-plugin"
-plugin_id = "myplugin"
-version = "0.1.0"
-protocol_version = "1.0"
-executable = "my-plugin"
-language = "mylang"
-extensions = ["my"]
-
-[capabilities.runtime]
-expected_max_rss_mb = 256
-expected_entities_per_file = 100
-wardline_aware = false
-reads_outside_project_root = false
-
-[ontology]
-entity_kinds = ["file", "widget"]
-edge_kinds = []
-rule_id_prefix = "CLA-MY-"
-ontology_version = "0.1.0"
-"#;
+        let toml = manifest_with(r#"entity_kinds = ["file", "widget"]"#);
         let err = parse_manifest(toml.as_bytes()).unwrap_err();
         assert_eq!(err.subcode(), "CLA-INFRA-MANIFEST-RESERVED-KIND");
         assert!(matches!(
@@ -1092,28 +894,7 @@ ontology_version = "0.1.0"
 
     #[test]
     fn negative_reserved_entity_kind_subsystem_rejected() {
-        let toml = r#"
-[plugin]
-name = "my-plugin"
-plugin_id = "myplugin"
-version = "0.1.0"
-protocol_version = "1.0"
-executable = "my-plugin"
-language = "mylang"
-extensions = ["my"]
-
-[capabilities.runtime]
-expected_max_rss_mb = 256
-expected_entities_per_file = 100
-wardline_aware = false
-reads_outside_project_root = false
-
-[ontology]
-entity_kinds = ["subsystem"]
-edge_kinds = []
-rule_id_prefix = "CLA-MY-"
-ontology_version = "0.1.0"
-"#;
+        let toml = manifest_with(r#"entity_kinds = ["subsystem"]"#);
         let err = parse_manifest(toml.as_bytes()).unwrap_err();
         assert_eq!(err.subcode(), "CLA-INFRA-MANIFEST-RESERVED-KIND");
         assert!(matches!(
@@ -1124,28 +905,7 @@ ontology_version = "0.1.0"
 
     #[test]
     fn negative_reserved_entity_kind_guidance_rejected() {
-        let toml = r#"
-[plugin]
-name = "my-plugin"
-plugin_id = "myplugin"
-version = "0.1.0"
-protocol_version = "1.0"
-executable = "my-plugin"
-language = "mylang"
-extensions = ["my"]
-
-[capabilities.runtime]
-expected_max_rss_mb = 256
-expected_entities_per_file = 100
-wardline_aware = false
-reads_outside_project_root = false
-
-[ontology]
-entity_kinds = ["guidance"]
-edge_kinds = []
-rule_id_prefix = "CLA-MY-"
-ontology_version = "0.1.0"
-"#;
+        let toml = manifest_with(r#"entity_kinds = ["guidance"]"#);
         let err = parse_manifest(toml.as_bytes()).unwrap_err();
         assert_eq!(err.subcode(), "CLA-INFRA-MANIFEST-RESERVED-KIND");
         assert!(matches!(
@@ -1158,28 +918,7 @@ ontology_version = "0.1.0"
 
     #[test]
     fn negative_reserved_prefix_cla_infra_rejected() {
-        let toml = r#"
-[plugin]
-name = "my-plugin"
-plugin_id = "myplugin"
-version = "0.1.0"
-protocol_version = "1.0"
-executable = "my-plugin"
-language = "mylang"
-extensions = ["my"]
-
-[capabilities.runtime]
-expected_max_rss_mb = 256
-expected_entities_per_file = 100
-wardline_aware = false
-reads_outside_project_root = false
-
-[ontology]
-entity_kinds = ["widget"]
-edge_kinds = []
-rule_id_prefix = "CLA-INFRA-"
-ontology_version = "0.1.0"
-"#;
+        let toml = manifest_with(r#"rule_id_prefix = "CLA-INFRA-""#);
         let err = parse_manifest(toml.as_bytes()).unwrap_err();
         assert_eq!(err.subcode(), "CLA-INFRA-RULE-ID-NAMESPACE");
         assert!(matches!(
@@ -1190,28 +929,7 @@ ontology_version = "0.1.0"
 
     #[test]
     fn negative_reserved_prefix_cla_fact_rejected() {
-        let toml = r#"
-[plugin]
-name = "my-plugin"
-plugin_id = "myplugin"
-version = "0.1.0"
-protocol_version = "1.0"
-executable = "my-plugin"
-language = "mylang"
-extensions = ["my"]
-
-[capabilities.runtime]
-expected_max_rss_mb = 256
-expected_entities_per_file = 100
-wardline_aware = false
-reads_outside_project_root = false
-
-[ontology]
-entity_kinds = ["widget"]
-edge_kinds = []
-rule_id_prefix = "CLA-FACT-"
-ontology_version = "0.1.0"
-"#;
+        let toml = manifest_with(r#"rule_id_prefix = "CLA-FACT-""#);
         let err = parse_manifest(toml.as_bytes()).unwrap_err();
         assert_eq!(err.subcode(), "CLA-INFRA-RULE-ID-NAMESPACE");
         assert!(matches!(
@@ -1225,28 +943,7 @@ ontology_version = "0.1.0"
     #[test]
     fn negative_reads_outside_project_root_flagged_by_validator() {
         // The parser accepts this field faithfully; the validator rejects it.
-        let toml = r#"
-[plugin]
-name = "my-plugin"
-plugin_id = "myplugin"
-version = "0.1.0"
-protocol_version = "1.0"
-executable = "my-plugin"
-language = "mylang"
-extensions = ["my"]
-
-[capabilities.runtime]
-expected_max_rss_mb = 256
-expected_entities_per_file = 100
-wardline_aware = false
-reads_outside_project_root = true
-
-[ontology]
-entity_kinds = ["widget"]
-edge_kinds = []
-rule_id_prefix = "CLA-MY-"
-ontology_version = "0.1.0"
-"#;
+        let toml = manifest_with("reads_outside_project_root = true");
         // parse_manifest must succeed — the parser does not reject this field.
         let manifest = parse_manifest(toml.as_bytes()).unwrap();
         assert!(manifest.capabilities.runtime.reads_outside_project_root);
@@ -1306,28 +1003,7 @@ ontology_version = "0.1.0"
     #[test]
     fn negative_rule_id_prefix_no_trailing_hyphen_rejected() {
         // "CLA-PY" — missing trailing `-`.
-        let toml = r#"
-[plugin]
-name = "my-plugin"
-plugin_id = "myplugin"
-version = "0.1.0"
-protocol_version = "1.0"
-executable = "my-plugin"
-language = "mylang"
-extensions = ["my"]
-
-[capabilities.runtime]
-expected_max_rss_mb = 256
-expected_entities_per_file = 100
-wardline_aware = false
-reads_outside_project_root = false
-
-[ontology]
-entity_kinds = ["widget"]
-edge_kinds = []
-rule_id_prefix = "CLA-PY"
-ontology_version = "0.1.0"
-"#;
+        let toml = manifest_with(r#"rule_id_prefix = "CLA-PY""#);
         let err = parse_manifest(toml.as_bytes()).unwrap_err();
         assert_eq!(err.subcode(), "CLA-INFRA-MANIFEST-MALFORMED");
         assert!(matches!(
@@ -1342,28 +1018,7 @@ ontology_version = "0.1.0"
     #[test]
     fn negative_rule_id_prefix_empty_inner_segment_rejected() {
         // "CLA--PY-" — empty segment between hyphens.
-        let toml = r#"
-[plugin]
-name = "my-plugin"
-plugin_id = "myplugin"
-version = "0.1.0"
-protocol_version = "1.0"
-executable = "my-plugin"
-language = "mylang"
-extensions = ["my"]
-
-[capabilities.runtime]
-expected_max_rss_mb = 256
-expected_entities_per_file = 100
-wardline_aware = false
-reads_outside_project_root = false
-
-[ontology]
-entity_kinds = ["widget"]
-edge_kinds = []
-rule_id_prefix = "CLA--PY-"
-ontology_version = "0.1.0"
-"#;
+        let toml = manifest_with(r#"rule_id_prefix = "CLA--PY-""#);
         let err = parse_manifest(toml.as_bytes()).unwrap_err();
         assert_eq!(err.subcode(), "CLA-INFRA-MANIFEST-MALFORMED");
         assert!(matches!(
@@ -1378,28 +1033,7 @@ ontology_version = "0.1.0"
     #[test]
     fn negative_rule_id_prefix_only_cla_rejected() {
         // "CLA-" — no segment after CLA.
-        let toml = r#"
-[plugin]
-name = "my-plugin"
-plugin_id = "myplugin"
-version = "0.1.0"
-protocol_version = "1.0"
-executable = "my-plugin"
-language = "mylang"
-extensions = ["my"]
-
-[capabilities.runtime]
-expected_max_rss_mb = 256
-expected_entities_per_file = 100
-wardline_aware = false
-reads_outside_project_root = false
-
-[ontology]
-entity_kinds = ["widget"]
-edge_kinds = []
-rule_id_prefix = "CLA-"
-ontology_version = "0.1.0"
-"#;
+        let toml = manifest_with(r#"rule_id_prefix = "CLA-""#);
         let err = parse_manifest(toml.as_bytes()).unwrap_err();
         assert_eq!(err.subcode(), "CLA-INFRA-MANIFEST-MALFORMED");
         assert!(matches!(
@@ -1414,28 +1048,7 @@ ontology_version = "0.1.0"
     #[test]
     fn positive_multi_segment_rule_id_prefix_valid() {
         // "CLA-FOO-BAR-" — valid multi-segment prefix.
-        let toml = r#"
-[plugin]
-name = "my-plugin"
-plugin_id = "myplugin"
-version = "0.1.0"
-protocol_version = "1.0"
-executable = "my-plugin"
-language = "mylang"
-extensions = ["my"]
-
-[capabilities.runtime]
-expected_max_rss_mb = 256
-expected_entities_per_file = 100
-wardline_aware = false
-reads_outside_project_root = false
-
-[ontology]
-entity_kinds = ["widget"]
-edge_kinds = []
-rule_id_prefix = "CLA-FOO-BAR-"
-ontology_version = "0.1.0"
-"#;
+        let toml = manifest_with(r#"rule_id_prefix = "CLA-FOO-BAR-""#);
         let manifest = parse_manifest(toml.as_bytes()).unwrap();
         assert_eq!(manifest.ontology.rule_id_prefix, "CLA-FOO-BAR-");
     }

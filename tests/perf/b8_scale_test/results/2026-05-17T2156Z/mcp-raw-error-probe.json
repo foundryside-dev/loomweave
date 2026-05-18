@@ -1,0 +1,41 @@
+{
+  "generated_from": "targeted post-run raw MCP probe",
+  "project": "/tmp/clarion-b8-elspeth-tests-20260517T2156Z",
+  "config": "/tmp/clarion-b8-elspeth-tests-20260517T2156Z/clarion-b8-live.yaml",
+  "summary_probe": {
+    "latency_ms": 12213.408,
+    "response": {
+      "id": "summary-probe",
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "{\"diagnostics\":[],\"error\":{\"code\":\"llm-invalid-json\",\"message\":\"summary provider returned non-JSON output\",\"retryable\":true},\"ok\":false,\"result\":null,\"stats_delta\":{},\"truncated\":false,\"truncation_reason\":null}",
+            "type": "text"
+          }
+        ],
+        "isError": true
+      }
+    }
+  },
+  "inferred_probe": {
+    "latency_ms": 14146.773,
+    "response": {
+      "id": "inferred-probe",
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "{\"diagnostics\":[],\"error\":{\"code\":\"llm-invalid-json\",\"message\":\"inferred provider returned invalid JSON: expected value at line 1 column 1\",\"retryable\":true},\"ok\":false,\"result\":null,\"stats_delta\":{},\"truncated\":false,\"truncation_reason\":null}",
+            "type": "text"
+          }
+        ],
+        "isError": true
+      }
+    }
+  },
+  "post_run_cache_counts": {
+    "summary_cache": 0,
+    "inferred_edge_cache": 0
+  }
+}

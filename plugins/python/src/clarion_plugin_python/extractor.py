@@ -2,8 +2,8 @@
 
 Walks a parsed Python file and emits one ``module`` entity per file plus
 one ``function`` entity per ``FunctionDef`` / ``AsyncFunctionDef`` and one
-``class`` entity per ``ClassDef``. Decorator, import, and call-edge emission is
-later WP3-feature-complete scope.
+``class`` entity per ``ClassDef``. It also emits anchored scan-time
+``imports``, ``calls``, and ``references`` candidate edges.
 
 Entity shape matches the Rust host's ``RawEntity`` + ``RawSource``
 contract (``crates/clarion-core/src/plugin/host.rs:132-154``)::
@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import ast
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Literal, NotRequired, TypedDict, cast
@@ -131,7 +132,13 @@ class RawEdge(TypedDict):
     source_byte_start: NotRequired[int]
     source_byte_end: NotRequired[int]
     confidence: NotRequired[Literal["resolved", "ambiguous", "inferred"]]
-    properties: NotRequired[CallsEdgeProperties | ReferencesEdgeProperties]
+    properties: NotRequired[CallsEdgeProperties | ReferencesEdgeProperties | ImportsEdgeProperties]
+
+
+class ImportsEdgeProperties(TypedDict):
+    imported_name: str
+    import_style: Literal["import", "from_import"]
+    level: int
 
 
 @dataclass
@@ -144,7 +151,10 @@ class ExtractionStats:
     references_skipped_cap_total: int = 0
     unresolved_reference_sites_total: int = 0
     pyright_query_latency_ms: list[int] = field(default_factory=list)
+    pyright_index_parse_latency_ms: list[int] = field(default_factory=list)
+    extractor_parse_latency_ms: int = 0
     findings: list[Finding] = field(default_factory=list)
+    duplicate_entities_dropped_total: int = 0
 
     @classmethod
     def from_resolution_results(
@@ -163,6 +173,10 @@ class ExtractionStats:
             pyright_query_latency_ms=[
                 *calls.pyright_query_latency_ms,
                 *references.pyright_query_latency_ms,
+            ],
+            pyright_index_parse_latency_ms=[
+                *calls.pyright_index_parse_latency_ms,
+                *references.pyright_index_parse_latency_ms,
             ],
             findings=[*calls.findings, *references.findings],
         )
@@ -280,9 +294,21 @@ def extract_with_stats(
     callers can supply a project-relative path here while keeping
     ``file_path`` absolute so the host's path jail validates the
     original path.
+
+    Same-id collisions (PEP-484 ``@overload`` stubs, ``singledispatch``
+    ``def _(...):`` sequences, intentional redefinitions) are resolved at
+    the emit boundary so the host's ``UNIQUE(entities.id)`` never trips
+    mid-run. ``@overload`` stubs are recognised and dropped *before* the
+    walk descends — their bodies (``...``) carry only type-checker hints
+    so signature references are also suppressed. Any other duplicates
+    that survive (e.g. aliased ``from typing import overload as o``,
+    ``singledispatch.register`` users writing ``def _():`` repeatedly)
+    are deduplicated first-wins with a stderr line per drop and
+    ``ExtractionStats.duplicate_entities_dropped_total`` bumped per drop.
     """
     prefix_source = module_prefix_path if module_prefix_path is not None else file_path
     dotted_module = module_dotted_name(prefix_source)
+    is_package_module = PurePosixPath(prefix_source).name == "__init__.py"
 
     # Top-level __init__.py would resolve to "" — entity_id() rejects that
     # (crates/clarion-core/src/entity_id.rs:97-101). Skip with stderr.
@@ -293,9 +319,11 @@ def extract_with_stats(
         )
         return ExtractResult([], [], ExtractionStats())
 
+    parse_started_ns = time.perf_counter_ns()
     try:
         tree = ast.parse(source)
     except SyntaxError as exc:
+        parse_latency_ms = _elapsed_ms(parse_started_ns)
         sys.stderr.write(
             f"clarion-plugin-python: skipping {file_path}: syntax error at "
             f"line {exc.lineno}: {exc.msg}\n",
@@ -303,13 +331,15 @@ def extract_with_stats(
         return ExtractResult(
             [_build_module_entity(source, dotted_module, file_path, "syntax_error")],
             [],
-            ExtractionStats(),
+            ExtractionStats(extractor_parse_latency_ms=parse_latency_ms),
         )
+    parse_latency_ms = _elapsed_ms(parse_started_ns)
 
     module_entity = _build_module_entity(source, dotted_module, file_path, "ok")
     entities: list[RawEntity] = [module_entity]
     edges: list[RawEdge] = []
     function_ids: list[str] = []
+    walk_state = _WalkState(seen_ids={module_entity["id"]}, file_path=file_path)
     _walk(
         tree,
         [tree],
@@ -319,17 +349,173 @@ def extract_with_stats(
         entities,
         edges,
         function_ids,
+        walk_state,
+    )
+    edges.extend(
+        _collect_import_edges(
+            source,
+            tree,
+            dotted_module,
+            module_entity["id"],
+            is_package_module=is_package_module,
+        ),
     )
     reference_sites = _collect_reference_sites(source, tree, dotted_module, module_entity["id"])
     call_stats = call_resolver.resolve_calls(file_path, function_ids)
     reference_stats = reference_resolver.resolve_references(file_path, reference_sites)
     edges.extend(cast("list[RawEdge]", call_stats.edges))
     edges.extend(cast("list[RawEdge]", reference_stats.edges))
-    return ExtractResult(
-        entities,
-        edges,
-        ExtractionStats.from_resolution_results(call_stats, reference_stats),
+    stats = ExtractionStats.from_resolution_results(call_stats, reference_stats)
+    stats.extractor_parse_latency_ms = parse_latency_ms
+    stats.duplicate_entities_dropped_total = walk_state.duplicate_entities_dropped
+    return ExtractResult(entities, edges, stats)
+
+
+def _elapsed_ms(started_ns: int) -> int:
+    return max(1, (time.perf_counter_ns() - started_ns + 999_999) // 1_000_000)
+
+
+def _collect_import_edges(
+    source: str,
+    tree: ast.Module,
+    dotted_module: str,
+    module_entity_id: str,
+    *,
+    is_package_module: bool,
+) -> list[RawEdge]:
+    collector = _ImportEdgeCollector(
+        source,
+        dotted_module,
+        module_entity_id,
+        is_package_module=is_package_module,
     )
+    collector.visit(tree)
+    return collector.edges
+
+
+class _ImportEdgeCollector(ast.NodeVisitor):
+    def __init__(
+        self,
+        source: str,
+        dotted_module: str,
+        module_entity_id: str,
+        *,
+        is_package_module: bool,
+    ) -> None:
+        self.source = source
+        self.dotted_module = dotted_module
+        self.module_entity_id = module_entity_id
+        self.is_package_module = is_package_module
+        self.edges: list[RawEdge] = []
+
+    def visit_Import(self, node: ast.Import) -> None:
+        source_byte_start, source_byte_end = _node_byte_range(self.source, node)
+        for alias in node.names:
+            self.edges.append(
+                self._edge(
+                    target_module=alias.name,
+                    imported_name=alias.name,
+                    import_style="import",
+                    level=0,
+                    source_range=(source_byte_start, source_byte_end),
+                ),
+            )
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        source_byte_start, source_byte_end = _node_byte_range(self.source, node)
+        for alias in node.names:
+            target_module = _import_from_target(
+                self.dotted_module,
+                node.module,
+                node.level,
+                alias.name,
+                is_package_module=self.is_package_module,
+            )
+            if target_module is None:
+                continue
+            self.edges.append(
+                self._edge(
+                    target_module=target_module,
+                    imported_name=alias.name,
+                    import_style="from_import",
+                    level=node.level,
+                    source_range=(source_byte_start, source_byte_end),
+                ),
+            )
+
+    def _edge(
+        self,
+        *,
+        target_module: str,
+        imported_name: str,
+        import_style: Literal["import", "from_import"],
+        level: int,
+        source_range: tuple[int, int],
+    ) -> RawEdge:
+        source_byte_start, source_byte_end = source_range
+        return {
+            "kind": "imports",
+            "from_id": self.module_entity_id,
+            "to_id": entity_id(_PLUGIN_ID, "module", target_module),
+            "source_byte_start": source_byte_start,
+            "source_byte_end": source_byte_end,
+            "confidence": "resolved",
+            "properties": {
+                "imported_name": imported_name,
+                "import_style": import_style,
+                "level": level,
+            },
+        }
+
+
+def _import_from_target(
+    dotted_module: str,
+    module: str | None,
+    level: int,
+    imported_name: str,
+    *,
+    is_package_module: bool,
+) -> str | None:
+    if level == 0:
+        return module
+
+    base_parts = _relative_import_base_parts(
+        dotted_module,
+        level,
+        is_package_module=is_package_module,
+    )
+    if base_parts is None:
+        return None
+
+    target_parts = [*base_parts]
+    if module:
+        target_parts.extend(part for part in module.split(".") if part)
+    elif imported_name != "*":
+        target_parts.append(imported_name)
+
+    return ".".join(target_parts) if target_parts else None
+
+
+def _relative_import_base_parts(
+    dotted_module: str,
+    level: int,
+    *,
+    is_package_module: bool,
+) -> list[str] | None:
+    all_parts = dotted_module.split(".")
+    package_parts = all_parts if is_package_module else all_parts[:-1]
+    keep = len(package_parts) - (level - 1)
+    if keep < 0:
+        return None
+    return package_parts[:keep]
+
+
+def _node_byte_range(source: str, node: ast.Import | ast.ImportFrom) -> tuple[int, int]:
+    line_starts = _line_starts(source)
+    start_line = node.lineno - 1
+    end_line = (node.end_lineno or node.lineno) - 1
+    end_col = node.end_col_offset if node.end_col_offset is not None else node.col_offset
+    return line_starts[start_line] + node.col_offset, line_starts[end_line] + end_col
 
 
 def _collect_reference_sites(
@@ -368,6 +554,12 @@ class _ReferenceSiteCollector(ast.NodeVisitor):
         self._visit_function(node)
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        # PEP 484 stub: signature annotations are type-checker hints, not
+        # references the consult-mode briefing cares about; the body is `...`.
+        # Skipping keeps reference-site ownership consistent with `_walk` (no
+        # entity for the stub → nothing to attribute references to).
+        if _has_overload_decorator(node):
+            return
         function_id = self._entity_id_for_scope("function", node)
         self.owner_stack.append(function_id)
         self.bound_stack.append(_scope_local_names(node))
@@ -531,6 +723,43 @@ class _LocalNameCollector(ast.NodeVisitor):
             self.names.add(node.id)
 
 
+@dataclass
+class _WalkState:
+    """Mutable accumulator threaded through ``_walk`` for cross-cutting bookkeeping.
+
+    ``seen_ids`` is seeded with the module-entity id by ``extract_with_stats``
+    so the safety net catches the (degenerate) case of a function colliding
+    with the module's id. ``duplicate_entities_dropped`` is bumped once per
+    same-id drop; the caller copies it into ``ExtractionStats``.
+    """
+
+    seen_ids: set[str]
+    file_path: str
+    duplicate_entities_dropped: int = 0
+
+
+def _has_overload_decorator(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Return True if ``node`` is decorated with ``@overload`` (PEP 484 stub).
+
+    Recognises three import-name forms in source: bare ``@overload`` (from
+    ``from typing import overload``), ``@typing.overload``, and
+    ``@typing_extensions.overload``. Aliased re-imports such as
+    ``from typing import overload as o`` defeat this pattern-based check —
+    the safety-net dedup in ``_walk`` catches the resulting same-id
+    collision and keeps the run alive.
+    """
+    for decorator in node.decorator_list:
+        match decorator:
+            case ast.Name(id="overload"):
+                return True
+            case ast.Attribute(
+                value=ast.Name(id="typing" | "typing_extensions"),
+                attr="overload",
+            ):
+                return True
+    return False
+
+
 def _walk(  # noqa: PLR0913 - recursive walker needs both accumulators + parent context (B.3)
     node: ast.AST,
     parents: list[ast.AST],
@@ -540,6 +769,7 @@ def _walk(  # noqa: PLR0913 - recursive walker needs both accumulators + parent 
     out_entities: list[RawEntity],
     out_edges: list[RawEdge],
     out_function_ids: list[str],
+    state: _WalkState,
 ) -> None:
     """Recursively walk ``node``'s AST children, emitting entities + contains edges.
 
@@ -549,14 +779,36 @@ def _walk(  # noqa: PLR0913 - recursive walker needs both accumulators + parent 
     own id as the new parent — so grandchildren get the right ``from_id``
     on their contains edge (B.3 Q3: emitter is exhaustive, never
     transitive).
+
+    Two stub-skip rules keep the host's ``UNIQUE(entities.id)`` from
+    tripping. (1) ``@overload``-decorated functions are recognised
+    semantically: skip emission, skip recursion (PEP 484 stub bodies are
+    ``...``). The implementation appears last in source order and emits
+    normally. (2) Any other surviving same-id collision (aliased
+    ``overload`` imports, ``singledispatch.register`` ``def _():``
+    sequences, manual redefinition) is dropped first-wins with a stderr
+    line and a ``state.duplicate_entities_dropped`` bump. Recursion into
+    the dropped child is suppressed too: its nested entities would carry
+    a parent_id whose entity the host never sees.
     """
     for child in ast.iter_child_nodes(node):
         new_parent_id = parent_entity_id
         match child:
             case ast.FunctionDef() | ast.AsyncFunctionDef():
+                if _has_overload_decorator(child):
+                    continue
                 entity, child_id = _build_function_entity(
                     child, parents, dotted_module, file_path, parent_entity_id
                 )
+                if child_id in state.seen_ids:
+                    state.duplicate_entities_dropped += 1
+                    sys.stderr.write(
+                        f"clarion-plugin-python: dropping duplicate entity {child_id} "
+                        f"in {state.file_path} at line {child.lineno} "
+                        f"(first definition wins)\n",
+                    )
+                    continue
+                state.seen_ids.add(child_id)
                 out_entities.append(entity)
                 out_edges.append(_contains_edge(parent_entity_id, child_id))
                 out_function_ids.append(child_id)
@@ -565,6 +817,15 @@ def _walk(  # noqa: PLR0913 - recursive walker needs both accumulators + parent 
                 entity, child_id = _build_class_entity(
                     child, parents, dotted_module, file_path, parent_entity_id
                 )
+                if child_id in state.seen_ids:
+                    state.duplicate_entities_dropped += 1
+                    sys.stderr.write(
+                        f"clarion-plugin-python: dropping duplicate entity {child_id} "
+                        f"in {state.file_path} at line {child.lineno} "
+                        f"(first definition wins)\n",
+                    )
+                    continue
+                state.seen_ids.add(child_id)
                 out_entities.append(entity)
                 out_edges.append(_contains_edge(parent_entity_id, child_id))
                 new_parent_id = child_id
@@ -577,6 +838,7 @@ def _walk(  # noqa: PLR0913 - recursive walker needs both accumulators + parent 
             out_entities,
             out_edges,
             out_function_ids,
+            state,
         )
 
 

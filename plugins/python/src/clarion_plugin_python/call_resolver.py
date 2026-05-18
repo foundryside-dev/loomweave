@@ -43,6 +43,7 @@ class CallResolutionResult:
     unresolved_call_sites_total: int = 0
     unresolved_call_sites: list[UnresolvedCallSite] = field(default_factory=list)
     pyright_query_latency_ms: list[int] = field(default_factory=list)
+    pyright_index_parse_latency_ms: list[int] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
 
 

@@ -358,17 +358,17 @@ fn find_manifest(exec_path: &std::path::Path, suffix: &str) -> Result<PathBuf, D
 
         // 2. Install-prefix fallback: only when parent dir basename is "bin".
         let parent_name = parent.file_name().and_then(|n| n.to_str());
-        if parent_name == Some("bin") {
-            if let Some(grandparent) = parent.parent() {
-                let share_path = grandparent
-                    .join("share")
-                    .join("clarion")
-                    .join("plugins")
-                    .join(suffix)
-                    .join("plugin.toml");
-                if let Some(found) = probe_manifest(&share_path)? {
-                    return Ok(found);
-                }
+        if parent_name == Some("bin")
+            && let Some(grandparent) = parent.parent()
+        {
+            let share_path = grandparent
+                .join("share")
+                .join("clarion")
+                .join("plugins")
+                .join(suffix)
+                .join("plugin.toml");
+            if let Some(found) = probe_manifest(&share_path)? {
+                return Ok(found);
             }
         }
     }

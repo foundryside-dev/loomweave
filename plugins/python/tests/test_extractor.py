@@ -113,6 +113,10 @@ def _call_edges(edges: Sequence[RawEdge]) -> list[RawEdge]:
     return [edge for edge in edges if edge["kind"] == "calls"]
 
 
+def _import_edges(edges: Sequence[RawEdge]) -> list[RawEdge]:
+    return [edge for edge in edges if edge["kind"] == "imports"]
+
+
 def _reference_sites_for(source: str) -> list[ReferenceSite]:
     resolver = RecordingReferenceResolver()
     extract_with_stats(source, "demo.py", reference_resolver=resolver)
@@ -252,6 +256,179 @@ def test_extractor_with_noop_resolver_emits_no_calls() -> None:
     assert [edge for edge in edges if edge["kind"] == "calls"] == []
 
 
+def test_import_statement_emits_module_import_edge() -> None:
+    _entities, edges = extract("import pkg.service\n", "consumer.py")
+
+    assert _import_edges(edges) == [
+        {
+            "kind": "imports",
+            "from_id": "python:module:consumer",
+            "to_id": "python:module:pkg.service",
+            "source_byte_start": 0,
+            "source_byte_end": len(b"import pkg.service"),
+            "confidence": "resolved",
+            "properties": {
+                "imported_name": "pkg.service",
+                "import_style": "import",
+                "level": 0,
+            },
+        },
+    ]
+
+
+def test_from_import_emits_import_edge_to_parent_module() -> None:
+    _entities, edges = extract("from pkg.service import Client\n", "consumer.py")
+
+    assert _import_edges(edges) == [
+        {
+            "kind": "imports",
+            "from_id": "python:module:consumer",
+            "to_id": "python:module:pkg.service",
+            "source_byte_start": 0,
+            "source_byte_end": len(b"from pkg.service import Client"),
+            "confidence": "resolved",
+            "properties": {
+                "imported_name": "Client",
+                "import_style": "from_import",
+                "level": 0,
+            },
+        },
+    ]
+
+
+def test_multi_name_from_import_emits_one_edge_per_imported_name() -> None:
+    source = "from pkg.service import Client, helper, CONSTANT\n"
+    _entities, edges = extract(source, "consumer.py")
+
+    assert _import_edges(edges) == [
+        {
+            "kind": "imports",
+            "from_id": "python:module:consumer",
+            "to_id": "python:module:pkg.service",
+            "source_byte_start": 0,
+            "source_byte_end": len(b"from pkg.service import Client, helper, CONSTANT"),
+            "confidence": "resolved",
+            "properties": {
+                "imported_name": imported_name,
+                "import_style": "from_import",
+                "level": 0,
+            },
+        }
+        for imported_name in ("Client", "helper", "CONSTANT")
+    ]
+
+
+def test_relative_import_emits_package_relative_module_edge() -> None:
+    _entities, edges = extract("from . import sibling\n", "pkg/consumer.py")
+
+    assert _import_edges(edges) == [
+        {
+            "kind": "imports",
+            "from_id": "python:module:pkg.consumer",
+            "to_id": "python:module:pkg.sibling",
+            "source_byte_start": 0,
+            "source_byte_end": len(b"from . import sibling"),
+            "confidence": "resolved",
+            "properties": {
+                "imported_name": "sibling",
+                "import_style": "from_import",
+                "level": 1,
+            },
+        },
+    ]
+
+
+def test_relative_import_from_package_init_targets_sibling_module() -> None:
+    _entities, edges = extract("from . import sibling\n", "pkg/__init__.py")
+
+    assert _import_edges(edges) == [
+        {
+            "kind": "imports",
+            "from_id": "python:module:pkg",
+            "to_id": "python:module:pkg.sibling",
+            "source_byte_start": 0,
+            "source_byte_end": len(b"from . import sibling"),
+            "confidence": "resolved",
+            "properties": {
+                "imported_name": "sibling",
+                "import_style": "from_import",
+                "level": 1,
+            },
+        },
+    ]
+
+
+def test_level_two_relative_import_from_package_init_targets_parent_sibling() -> None:
+    _entities, edges = extract("from .. import sibling\n", "pkg/sub/__init__.py")
+
+    assert _import_edges(edges) == [
+        {
+            "kind": "imports",
+            "from_id": "python:module:pkg.sub",
+            "to_id": "python:module:pkg.sibling",
+            "source_byte_start": 0,
+            "source_byte_end": len(b"from .. import sibling"),
+            "confidence": "resolved",
+            "properties": {
+                "imported_name": "sibling",
+                "import_style": "from_import",
+                "level": 2,
+            },
+        },
+    ]
+
+
+def test_level_two_relative_import_module_from_package_init_targets_parent_module() -> None:
+    _entities, edges = extract("from ..other import x\n", "pkg/sub/__init__.py")
+
+    assert _import_edges(edges) == [
+        {
+            "kind": "imports",
+            "from_id": "python:module:pkg.sub",
+            "to_id": "python:module:pkg.other",
+            "source_byte_start": 0,
+            "source_byte_end": len(b"from ..other import x"),
+            "confidence": "resolved",
+            "properties": {
+                "imported_name": "x",
+                "import_style": "from_import",
+                "level": 2,
+            },
+        },
+    ]
+
+
+def test_level_three_relative_import_from_deep_package_init_targets_root_sibling() -> None:
+    _entities, edges = extract("from ... import x\n", "pkg/sub/deeper/__init__.py")
+
+    assert _import_edges(edges) == [
+        {
+            "kind": "imports",
+            "from_id": "python:module:pkg.sub.deeper",
+            "to_id": "python:module:pkg.x",
+            "source_byte_start": 0,
+            "source_byte_end": len(b"from ... import x"),
+            "confidence": "resolved",
+            "properties": {
+                "imported_name": "x",
+                "import_style": "from_import",
+                "level": 3,
+            },
+        },
+    ]
+
+
+def test_import_edges_have_source_byte_range_and_resolved_confidence() -> None:
+    source = "é = 1\nimport pkg.service\n"
+    _entities, edges = extract(source, "consumer.py")
+    import_edge = _import_edges(edges)[0]
+
+    expected_start = len("é = 1\n".encode())
+    assert import_edge["source_byte_start"] == expected_start
+    assert import_edge["source_byte_end"] == expected_start + len(b"import pkg.service")
+    assert import_edge["confidence"] == "resolved"
+
+
 def test_extractor_appends_calls_from_resolver_and_carries_stats() -> None:
     result = extract_with_stats(
         "def callee():\n    pass\n\ndef caller():\n    callee()\n",
@@ -280,6 +457,8 @@ def test_extractor_appends_calls_from_resolver_and_carries_stats() -> None:
         },
     ]
     assert result.stats.pyright_query_latency_ms == [17]
+    assert result.stats.pyright_index_parse_latency_ms == []
+    assert result.stats.extractor_parse_latency_ms > 0
 
 
 @pytest.mark.pyright
@@ -833,3 +1012,187 @@ def test_every_non_module_entity_has_matching_contains_edge() -> None:
             continue
         pair = (entity["parent_id"], entity["id"])
         assert pair in edge_pairs, f"missing contains edge for {entity['id']}"
+
+
+# ── @typing.overload disposition (clarion-e29402d1ba) ──────────────────────────
+
+
+def test_module_overload_collapses_to_implementation_entity() -> None:
+    """`@overload` stubs share a qualname with the implementation; only the impl is callable.
+
+    Per PEP 484 the stub signatures are type-checker hints — emitting them as
+    entities collides on the host's UNIQUE(entities.id). Plugin must skip the
+    stubs and emit one function entity whose source range is the implementation.
+    """
+    source = (
+        "from typing import overload\n"
+        "\n"
+        "@overload\n"
+        "def foo(x: int) -> int: ...\n"
+        "@overload\n"
+        "def foo(x: str) -> str: ...\n"
+        "def foo(x):\n"
+        "    return x\n"
+    )
+    entities, edges = extract(source, "demo.py")
+    function_entities = [e for e in entities if e["kind"] == "function"]
+    assert len(function_entities) == 1
+    fn = function_entities[0]
+    assert fn["id"] == "python:function:demo.foo"
+    # Source range points at the implementation (the `def foo(x):` at line 7), not a stub.
+    assert fn["source"]["source_range"]["start_line"] == 7
+    # Exactly one contains edge for the function.
+    contains_edges = [e for e in edges if e["kind"] == "contains"]
+    assert contains_edges == [
+        {"kind": "contains", "from_id": "python:module:demo", "to_id": fn["id"]},
+    ]
+
+
+def test_method_overload_collapses_to_implementation_entity_elspeth_reproducer() -> None:
+    """Exact shape of elspeth ExecutionRepository.complete_node_state (3 stubs + impl)."""
+    source = (
+        "from typing import overload\n"
+        "\n"
+        "class ExecutionRepository:\n"
+        "    @overload\n"
+        "    def complete_node_state(self, status: int) -> int: ...\n"
+        "    @overload\n"
+        "    def complete_node_state(self, status: str) -> str: ...\n"
+        "    @overload\n"
+        "    def complete_node_state(self, status: bool) -> bool: ...\n"
+        "    def complete_node_state(self, status):\n"
+        "        return status\n"
+    )
+    entities, _ = extract(source, "demo.py")
+    function_ids = [e["id"] for e in entities if e["kind"] == "function"]
+    assert function_ids == [
+        "python:function:demo.ExecutionRepository.complete_node_state",
+    ]
+
+
+def test_qualified_typing_overload_is_recognised() -> None:
+    """`@typing.overload` attribute form must also collapse stubs."""
+    source = (
+        "import typing\n"
+        "\n"
+        "@typing.overload\n"
+        "def foo(x: int) -> int: ...\n"
+        "@typing.overload\n"
+        "def foo(x: str) -> str: ...\n"
+        "def foo(x):\n"
+        "    return x\n"
+    )
+    entities, _ = extract(source, "demo.py")
+    function_ids = [e["id"] for e in entities if e["kind"] == "function"]
+    assert function_ids == ["python:function:demo.foo"]
+
+
+def test_typing_extensions_overload_is_recognised() -> None:
+    """`@typing_extensions.overload` is the same protocol as typing.overload."""
+    source = (
+        "import typing_extensions\n"
+        "\n"
+        "@typing_extensions.overload\n"
+        "def foo(x: int) -> int: ...\n"
+        "def foo(x):\n"
+        "    return x\n"
+    )
+    entities, _ = extract(source, "demo.py")
+    function_ids = [e["id"] for e in entities if e["kind"] == "function"]
+    assert function_ids == ["python:function:demo.foo"]
+
+
+def test_async_overload_is_recognised() -> None:
+    """`async def` overloads collapse the same way as sync `def`."""
+    source = (
+        "from typing import overload\n"
+        "\n"
+        "@overload\n"
+        "async def foo(x: int) -> int: ...\n"
+        "async def foo(x):\n"
+        "    return x\n"
+    )
+    entities, _ = extract(source, "demo.py")
+    function_ids = [e["id"] for e in entities if e["kind"] == "function"]
+    assert function_ids == ["python:function:demo.foo"]
+
+
+def test_overload_stub_with_extra_decorators_is_still_skipped() -> None:
+    """A function carrying `@overload` alongside other decorators is still a stub."""
+    source = (
+        "from typing import overload\n"
+        "\n"
+        "class Foo:\n"
+        "    @staticmethod\n"
+        "    @overload\n"
+        "    def bar(x: int) -> int: ...\n"
+        "    @staticmethod\n"
+        "    def bar(x):\n"
+        "        return x\n"
+    )
+    entities, _ = extract(source, "demo.py")
+    function_ids = [e["id"] for e in entities if e["kind"] == "function"]
+    assert function_ids == ["python:function:demo.Foo.bar"]
+
+
+def test_references_inside_overload_implementation_body_are_emitted() -> None:
+    """Skipping stub bodies must not suppress reference collection inside the impl."""
+    source = (
+        "from typing import overload\n"
+        "\n"
+        "@overload\n"
+        "def foo(x: int) -> int: ...\n"
+        "def foo(x):\n"
+        "    return BAR\n"
+    )
+    sites = _reference_sites_for(source)
+    # `overload` import is referenced by the decorators on stubs; those should still surface
+    # at the module level. The key assertion is that the impl's body reference to `BAR`
+    # is attributed to the implementation function, not lost.
+    impl_sites = [s for s in sites if s.from_id == "python:function:demo.foo"]
+    assert len(impl_sites) == 1
+    assert impl_sites[0].kind == "name"
+
+
+def test_safety_net_drops_duplicate_non_overload_definitions(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Two non-overload defs sharing a qualname (rare but legal Python) must not crash the run.
+
+    Example pattern in the wild: `@singledispatch.register` users frequently write
+    `def _(arg): ...` repeatedly at the same scope. First-wins, stderr-logged,
+    counter bumped, and the host never sees a duplicate id.
+    """
+    source = (
+        "def helper(x):\n"
+        "    return x + 1\n"
+        "\n"
+        "def helper(x):\n"  # redefinition shadows the first; same qualname.
+        "    return x * 2\n"
+    )
+    result = extract_with_stats(source, "demo.py")
+    function_entities = [e for e in result.entities if e["kind"] == "function"]
+    assert len(function_entities) == 1, "duplicate ids deduped at the emit boundary"
+    assert function_entities[0]["id"] == "python:function:demo.helper"
+    # First-wins: source range points at the first def (line 1), not the second.
+    assert function_entities[0]["source"]["source_range"]["start_line"] == 1
+    assert result.stats.duplicate_entities_dropped_total == 1
+    err = capsys.readouterr().err
+    assert "python:function:demo.helper" in err
+    assert "demo.py" in err
+
+
+def test_safety_net_drops_contains_edges_to_dropped_entities() -> None:
+    """A contains edge pointing at a dropped duplicate must also be dropped."""
+    source = "def helper(x):\n    return x\n\ndef helper(x):\n    return x\n"
+    result = extract_with_stats(source, "demo.py")
+    # Both defs are top-level so contains-edges would be (module → helper) twice;
+    # after dedup, exactly one survives.
+    contains_edges = [e for e in result.edges if e["kind"] == "contains"]
+    assert contains_edges == [
+        {
+            "kind": "contains",
+            "from_id": "python:module:demo",
+            "to_id": "python:function:demo.helper",
+        },
+    ]

@@ -7,9 +7,7 @@
 //! - `<path>/clarion.yaml`        (user-edited config stub at project root;
 //!   see detailed-design.md §File layout)
 //!
-//! Refuses if `.clarion/` already exists (UQ-WP1-08). `--force` is accepted
-//! by the CLI but currently returns an error — Sprint 1 does not implement
-//! overwrite.
+//! Refuses if `.clarion/` already exists unless `--force` is passed.
 
 use std::fs;
 use std::path::Path;
@@ -80,17 +78,10 @@ runs/*/log.jsonl
 ///
 /// # Errors
 ///
-/// Returns an error if `--force` is passed (not implemented in Sprint 1),
-/// if `.clarion/` already exists, if the target directory cannot be
-/// canonicalised, or if any filesystem or database operation fails.
+/// Returns an error if `.clarion/` already exists without `--force`, if the
+/// target directory cannot be canonicalised, or if any filesystem or database
+/// operation fails.
 pub fn run(path: &Path, force: bool) -> Result<()> {
-    if force {
-        bail!(
-            "--force is not implemented in Sprint 1. Remove .clarion/ manually \
-             if you need a clean reinit."
-        );
-    }
-
     if !path.exists() {
         bail!(
             "target directory does not exist: {}. Create it first or pass a valid --path.",
@@ -102,11 +93,21 @@ pub fn run(path: &Path, force: bool) -> Result<()> {
         .with_context(|| format!("cannot canonicalise --path {}", path.display()))?;
     let clarion_dir = project_root.join(".clarion");
     if clarion_dir.exists() {
-        bail!(
-            ".clarion/ already exists at {}. Delete it (or pass --force when \
-             Sprint 2+ implements overwrite) and try again.",
-            clarion_dir.display()
-        );
+        if !force {
+            bail!(
+                ".clarion/ already exists at {}. Delete it or pass --force to overwrite it.",
+                clarion_dir.display()
+            );
+        }
+        if !clarion_dir.is_dir() {
+            bail!(
+                "--force can only overwrite an existing .clarion/ directory; \
+                 found non-directory at {}.",
+                clarion_dir.display()
+            );
+        }
+        fs::remove_dir_all(&clarion_dir)
+            .with_context(|| format!("remove existing {}", clarion_dir.display()))?;
     }
 
     fs::create_dir_all(&clarion_dir).with_context(|| format!("mkdir {}", clarion_dir.display()))?;

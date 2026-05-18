@@ -530,14 +530,34 @@ mod tests {
 
     /// On Linux: calling `apply_prlimit_as` with the default ceiling returns Ok.
     ///
-    /// This sets `RLIMIT_AS` on the test process itself, which is safe — tests
-    /// run well under 2 GiB. Note: this test sets **both the soft and hard**
-    /// `RLIMIT_AS` to `DEFAULT_MAX_RSS_MIB` (2 GiB) on the test binary's
-    /// process. Any subsequent test in the same binary cannot raise the limit
-    /// above 2 GiB without root privileges.
+    /// `setrlimit` lowers the current process hard limit, so the actual syscall
+    /// probe runs in a child test process. That keeps default parallel test runs
+    /// from starving sibling tests after this probe succeeds.
     #[cfg(target_os = "linux")]
     #[test]
     fn apply_prlimit_linux_returns_ok() {
+        let output = std::process::Command::new(std::env::current_exe().expect("current exe"))
+            .args([
+                "--exact",
+                "plugin::limits::tests::apply_prlimit_linux_child_process_returns_ok",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .expect("spawn child prlimit test");
+        assert!(
+            output.status.success(),
+            "child prlimit test failed with status {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "invoked by apply_prlimit_linux_returns_ok in a child process"]
+    fn apply_prlimit_linux_child_process_returns_ok() {
         let result = apply_prlimit_as(DEFAULT_MAX_RSS_MIB);
         assert!(result.is_ok(), "apply_prlimit_as must succeed: {result:?}");
     }

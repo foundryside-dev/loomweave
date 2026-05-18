@@ -29,6 +29,11 @@ jobs:
       - name: fmt
         run: cargo fmt --all -- --check
 
+      - name: migration retirement guard
+        run: |
+          python scripts/check-migration-retirement.py --self-test
+          python scripts/check-migration-retirement.py
+
       - name: clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -74,6 +79,11 @@ jobs:
 
       - name: check B.4* gate result freshness
         run: python scripts/check-b4-gate-result.py
+
+      - name: check Python ontology version lockstep
+        run: |
+          python scripts/check-python-ontology-version.py --self-test
+          python scripts/check-python-ontology-version.py
 
       - name: install plugin (dev extras)
         run: python -m pip install -e 'plugins/python[dev]'

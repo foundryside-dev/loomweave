@@ -95,6 +95,11 @@ impl<'de> Deserialize<'de> for JsonRpcVersion {
 /// JSON-RPC 2.0 request envelope (core → plugin).
 ///
 /// Wire shape: `{"jsonrpc":"2.0","method":"...","params":{...},"id":1}`
+///
+/// JSON-RPC 2.0 permits string, number, or null request IDs. Clarion narrows
+/// this to `i64` as an application-level policy because the plugin transport is
+/// core-initiated and core-controlled. Revisit this type before exposing the
+/// envelope to external JSON-RPC peers or plugins that originate arbitrary IDs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RequestEnvelope {
     pub jsonrpc: JsonRpcVersion,
@@ -120,6 +125,11 @@ pub struct NotificationEnvelope {
 /// Wire shape (success): `{"jsonrpc":"2.0","result":{...},"id":1}`
 /// Wire shape (error):   `{"jsonrpc":"2.0","error":{...},"id":1}`
 ///
+/// Like [`RequestEnvelope`], this intentionally accepts only `i64` IDs. That is
+/// narrower than JSON-RPC 2.0 but matches Clarion's current core-issued request
+/// IDs; a plugin response with a string or null ID is treated as malformed
+/// plugin traffic rather than general JSON-RPC interop.
+///
 /// The spec (§5) requires **exactly one** of `result`/`error`. This type
 /// enforces that invariant during deserialisation:
 /// - both present → error (so a misbehaving plugin can't hide an error by
@@ -140,6 +150,7 @@ pub struct ResponseEnvelope {
 /// Serialisation/deserialisation of the enclosing envelope is custom
 /// (see [`ResponseEnvelope`]) — do not add serde attributes here.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ResponsePayload {
     Result(Value),
     Error(ProtocolError),
@@ -377,6 +388,12 @@ pub struct AnalyzeFileStats {
     /// Raw latency samples (milliseconds) for per-file Pyright LSP queries.
     #[serde(default)]
     pub pyright_query_latency_ms: Vec<u64>,
+    /// Raw latency samples (milliseconds) for Pyright-side AST index builds.
+    #[serde(default)]
+    pub pyright_index_parse_latency_ms: Vec<u64>,
+    /// Extractor-side `ast.parse` latency for this file in milliseconds.
+    #[serde(default)]
+    pub extractor_parse_latency_ms: u64,
 }
 
 impl AnalyzeFileStats {
@@ -389,6 +406,8 @@ impl AnalyzeFileStats {
             && self.unresolved_reference_sites_total == 0
             && self.unresolved_call_sites.is_empty()
             && self.pyright_query_latency_ms.is_empty()
+            && self.pyright_index_parse_latency_ms.is_empty()
+            && self.extractor_parse_latency_ms == 0
     }
 }
 
@@ -680,6 +699,8 @@ mod tests {
                 references_skipped_cap_total: 6,
                 unresolved_reference_sites_total: 7,
                 pyright_query_latency_ms: vec![10, 20, 30],
+                pyright_index_parse_latency_ms: vec![8, 13],
+                extractor_parse_latency_ms: 5,
             },
         };
         let back: AnalyzeFileResult =
@@ -722,6 +743,14 @@ mod tests {
         assert!(
             back.stats.pyright_query_latency_ms.is_empty(),
             "missing stats field must default pyright latency samples to empty"
+        );
+        assert!(
+            back.stats.pyright_index_parse_latency_ms.is_empty(),
+            "missing stats field must default pyright index parse samples to empty"
+        );
+        assert_eq!(
+            back.stats.extractor_parse_latency_ms, 0,
+            "missing stats field must default extractor parse latency to zero"
         );
 
         // shutdown params (empty)

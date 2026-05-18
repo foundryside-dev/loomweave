@@ -250,7 +250,6 @@ struct Entity {
 
 ```rust
 struct Edge {
-    id: EdgeId,                        // deduped hash of (kind, from, to)
     from: EntityId,
     to: EntityId,
     kind: String,                      // plugin-defined OR core-reserved
@@ -258,6 +257,15 @@ struct Edge {
     source: Option<SourceRange>,
 }
 ```
+
+**Edge identity and coexistence policy**: the store admits at most one edge for a
+given `(kind, from_id, to_id)` tuple. `properties` carries evidence and
+kind-specific metadata (for example ambiguous-call candidates), but it is not
+part of edge identity and does not allow multiple same-kind relationships
+between the same endpoints to coexist. Re-analysis and repeated plugin evidence
+therefore remain idempotent; callers that need several observations for one
+relationship must merge them into the single edge's properties shape rather than
+emitting duplicate rows.
 
 **Core-reserved edge kinds**: `contains`, `guides`, `emits_finding`, `in_subsystem`. All others are plugin-defined.
 
@@ -586,7 +594,7 @@ The v0.2 **Wardline annotation descriptor** (§9, promoted from earlier deferral
 
 ### SQLite rationale
 
-- Graph algorithms (Louvain, Leiden, centrality, path-finding) run in Rust against in-memory projections; the store serves neighbour lookups.
+- Graph algorithms (Leiden, weighted-components fallback, centrality, path-finding) run in Rust against in-memory projections; the store serves neighbour lookups.
 - Consult-mode queries are overwhelmingly one-hop (callers, callees, contains) — indexed range scans.
 - WAL mode with a **writer-actor** (single owner of the write connection; see Concurrency below) permits `clarion serve` to keep answering reads while `clarion analyze` is ingesting and while consult-mode cache writes happen.
 - JSON1 handles plugin property bags without giving up query ergonomics.
@@ -633,37 +641,49 @@ CREATE INDEX ix_entities_content_hash ON entities(content_hash);
 
 -- Tags (denormalised)
 CREATE TABLE entity_tags (
+    -- `plugin_id` is the namespace that emitted/owns the free-form tag.
+    -- Entity IDs already carry an entity owner, but multiple plugins may tag
+    -- the same core or sibling entity; tag ownership is therefore explicit.
     entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    plugin_id TEXT NOT NULL,
     tag TEXT NOT NULL,
-    PRIMARY KEY (entity_id, tag)
+    PRIMARY KEY (entity_id, plugin_id, tag)
 );
 CREATE INDEX ix_entity_tags_tag ON entity_tags(tag);
+CREATE INDEX ix_entity_tags_plugin_tag ON entity_tags(plugin_id, tag);
 
--- Edges. Deduped by (kind, from_id, to_id) — two edges of the same kind
--- between the same entities collapse into one (the plugin's emitter
--- may observe a call twice for overloaded names; the store is idempotent).
+-- Edges. Natural PK (kind, from_id, to_id) per ADR-026: two edges of the
+-- same kind between the same entities collapse into one even when their
+-- properties differ. The properties bag is evidence/metadata, not identity.
 CREATE TABLE edges (
-    id TEXT PRIMARY KEY,
-    kind TEXT NOT NULL,
-    from_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
-    to_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
-    properties TEXT,
-    source_file_id TEXT REFERENCES entities(id),
+    kind               TEXT NOT NULL,
+    from_id            TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    to_id              TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    properties         TEXT,
+    source_file_id     TEXT REFERENCES entities(id),
     source_byte_start INTEGER,
-    source_byte_end INTEGER,
-    UNIQUE (kind, from_id, to_id)
-);
-CREATE INDEX ix_edges_from_kind ON edges(from_id, kind);
-CREATE INDEX ix_edges_to_kind ON edges(to_id, kind);
-CREATE INDEX ix_edges_kind ON edges(kind);
+    source_byte_end   INTEGER,
+    confidence         TEXT NOT NULL DEFAULT 'resolved'
+                       CHECK (confidence IN ('resolved', 'ambiguous', 'inferred')),
+    PRIMARY KEY (kind, from_id, to_id)
+) WITHOUT ROWID;
+CREATE INDEX ix_edges_from_kind       ON edges(from_id, kind);
+CREATE INDEX ix_edges_to_kind         ON edges(to_id, kind);
+CREATE INDEX ix_edges_kind            ON edges(kind);
+CREATE INDEX ix_edges_kind_confidence ON edges(kind, confidence);
 
 -- Findings
 CREATE TABLE findings (
     id TEXT PRIMARY KEY,
-    tool TEXT NOT NULL, tool_version TEXT NOT NULL, run_id TEXT NOT NULL,
+    tool TEXT NOT NULL, tool_version TEXT NOT NULL,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
     rule_id TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    severity TEXT NOT NULL,
+    -- Closed core-owned vocabulary per ADR-031; values per ADR-004.
+    kind TEXT NOT NULL
+         CHECK (kind IN ('defect', 'fact', 'classification', 'metric', 'suggestion')),
+    -- Closed core-owned vocabulary per ADR-031; values per ADR-017.
+    severity TEXT NOT NULL
+             CHECK (severity IN ('INFO', 'WARN', 'ERROR', 'CRITICAL', 'NONE')),
     confidence REAL,
     confidence_basis TEXT,
     entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
@@ -673,7 +693,9 @@ CREATE TABLE findings (
     properties TEXT NOT NULL,
     supports TEXT NOT NULL,
     supported_by TEXT NOT NULL,
-    status TEXT NOT NULL,
+    -- Closed core-owned vocabulary per ADR-031; finding lifecycle states.
+    status TEXT NOT NULL
+           CHECK (status IN ('open', 'acknowledged', 'suppressed', 'promoted_to_issue')),
     suppression_reason TEXT,
     filigree_issue_id TEXT,
     created_at TEXT NOT NULL,
@@ -706,7 +728,10 @@ CREATE TABLE runs (
     started_at TEXT NOT NULL, completed_at TEXT,
     config TEXT NOT NULL,
     stats TEXT NOT NULL,
+    -- Closed core-owned vocabulary per ADR-031; terminal values from the
+    -- writer-actor `RunStatus` enum; 'running' is the BeginRun in-flight literal.
     status TEXT NOT NULL
+           CHECK (status IN ('running', 'skipped_no_plugins', 'completed', 'failed'))
 );
 
 -- FTS5 for text search
@@ -960,10 +985,11 @@ analysis:
     - "**/.venv/**"
   plugins: [python]
   clustering:
-    algorithm: leiden                # leiden | louvain
+    algorithm: leiden                # leiden | weighted_components
     edge_types: [imports, calls]
     weight_by: reference_count
     min_cluster_size: 3
+    weak_modularity_threshold: 0.3
 
 integrations:
   filigree:
@@ -1535,7 +1561,7 @@ The table below is a navigation aid for implementers: it maps each ADR to the se
 | ADR-003 | Entity ID scheme: symbolic canonical-name; file path as property; EntityAlias v0.2 | §2 |
 | ADR-004 | Finding-exchange format: Filigree-native intake; `metadata.clarion.*` nesting | §2, §7 |
 | ADR-005 | `.clarion/` git-committable by default | §3 |
-| [ADR-006](../adr/ADR-006-clustering-algorithm.md) | Clustering algorithm: Leiden with Louvain fallback | §4, §5 |
+| [ADR-006](../adr/ADR-006-clustering-algorithm.md), [ADR-032](../adr/ADR-032-weighted-components-clustering-fallback.md) | Clustering algorithm: Leiden with weighted-components fallback | §4, §5 |
 | [ADR-007](../adr/ADR-007-summary-cache-key.md) | Summary cache key design and invalidation | §4 |
 | ADR-008 | Superseded by ADR-014 | §7, §9 |
 | ADR-009 | Structured briefings vs free-form prose | §2 |
@@ -1677,7 +1703,7 @@ The v0.1 core is Rust (locked — see §11 ADR-001). Crate choices below are rec
 
 ### Graph algorithms
 
-- **petgraph** for in-memory graph representations; Leiden / Louvain clustering implemented on top of it. `petgraph` doesn't ship Leiden directly — v0.1 vendors a minimal Leiden implementation (~400 lines) or pulls a maintained crate if one exists by implementation time. ADR-006 captures the decision.
+- In-memory graph projections feed the Leiden adapter and local weighted-components fallback. ADR-006 captures the Leiden decision; ADR-032 names the local fallback.
 
 ### Hashing, IDs, time
 

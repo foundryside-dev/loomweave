@@ -128,25 +128,11 @@ fn validate_grammar(field: &'static str, value: &str) -> Result<(), EntityIdErro
         return Err(EntityIdError::EmptySegment { field });
     }
     validate_no_colon(field, value)?;
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        // Unreachable: emptiness is checked above, but the defensive branch
-        // avoids any panic path and satisfies clippy::unwrap_in_result.
-        return Err(EntityIdError::EmptySegment { field });
-    };
-    if !first.is_ascii_lowercase() {
+    if !validate_kind_grammar(value) {
         return Err(EntityIdError::GrammarViolation {
             field,
             value: value.to_owned(),
         });
-    }
-    for c in chars {
-        if !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
-            return Err(EntityIdError::GrammarViolation {
-                field,
-                value: value.to_owned(),
-            });
-        }
     }
     Ok(())
 }

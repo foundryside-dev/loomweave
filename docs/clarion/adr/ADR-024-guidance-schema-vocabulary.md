@@ -92,7 +92,7 @@ The semantic ordering `project → subsystem → package → module → class �
 
 ### `findings.run_id` ↔ `runs.id` relationship
 
-This ADR confirms (does not change) that `findings.run_id` and `runs.id` are the same string. The schema does not enforce it via foreign key (see filigree issue F-17, follow-up); confirming it here so future readers do not have to derive it from code. The Rust writer-actor produces both identifiers from the same `Uuid::new_v4()` per analyze invocation.
+This ADR confirms that `findings.run_id` and `runs.id` are the same string. The Rust writer-actor produces both identifiers from the same `Uuid::new_v4()` per analyze invocation. The Sprint 2 F-17 follow-up encoded that provenance relationship mechanically: `findings.run_id` now references `runs(id)` in `0001_initial_schema.sql`.
 
 ## Alternatives Considered
 

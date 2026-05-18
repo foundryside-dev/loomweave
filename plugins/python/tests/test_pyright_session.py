@@ -117,6 +117,7 @@ def test_pyright_session_resolves_direct_call(tmp_path: Path, pyright_langserver
     ]
     assert result.edges[0]["source_byte_start"] < result.edges[0]["source_byte_end"]
     assert result.pyright_query_latency_ms[0] > 0
+    assert result.pyright_index_parse_latency_ms[0] > 0
     assert result.unresolved_call_sites_total == 0
 
 

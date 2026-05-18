@@ -20,12 +20,19 @@ clap.workspace = true
 clarion-core = { path = "../clarion-core", version = "0.1.0-dev" }
 clarion-mcp = { path = "../clarion-mcp", version = "0.1.0-dev" }
 clarion-storage = { path = "../clarion-storage", version = "0.1.0-dev" }
+dotenvy.workspace = true
+ignore.workspace = true
 rusqlite.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+serde_norway.workspace = true
+sha2.workspace = true
+time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+xgraph.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true

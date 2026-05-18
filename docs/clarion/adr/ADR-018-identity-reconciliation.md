@@ -16,7 +16,7 @@ Three identity schemes coexist and none are byte-equal for the same underlying s
 | Scheme | Example | Owner | Format |
 |---|---|---|---|
 | Clarion `EntityId` | `python:class:auth.tokens::TokenManager` | Clarion | `{plugin_id}:{kind}:{canonical_qualified_name}` |
-| Wardline `qualname` | `TokenManager.verify` | Wardline `FingerprintEntry` | Nested class/method dotted form (not Python `__qualname__`; no `<locals>` suffix) |
+| Wardline `module` + `qualified_name` | `src/auth/tokens.py` + `TokenManager.verify` | Wardline `FingerprintEntry` | Source file path plus Python's bare `__qualname__`; not byte-equal to Clarion's dotted-module-prefixed `qualified_name` |
 | Wardline exception-register `location` | `src/wardline/scanner/engine.py::ScanEngine._scan_file` | `wardline.exceptions.json` | `{file_path}::{qualname}` |
 
 Any cross-tool query — "which Filigree findings attach to this Clarion entity?", "which Wardline exception covers this qualname?" — has to bridge at least two of these. The ADR-003 decision to use symbolic canonical names produces Clarion's scheme but leaves the translation question open.
@@ -32,12 +32,34 @@ The 2026-04-17 panel's doctrine synthesis (`11-doctrine-panel-synthesis.md`) fla
 ### Translation direction and authority
 
 - **Inbound translation only.** Clarion translates Wardline qualnames, exception-register locations, and SARIF logical locations into `EntityId`s. Clarion does not push its ID scheme outbound — Wardline's emissions remain in Wardline's format, and Clarion's translation layer maps them at ingest.
-- **Wardline is authoritative for its own qualnames.** `FingerprintEntry.qualname` is Wardline's contract; Clarion reads it and maps it. A future Wardline refactor that changes qualname format is a Wardline-side decision Clarion adapts to; the inverse is not true.
+- **Wardline is authoritative for its own qualnames.** `FingerprintEntry.qualified_name` and its paired `module` path are Wardline's contract; Clarion reads them and maps them. A future Wardline refactor that changes either field's format is a Wardline-side decision Clarion adapts to; the inverse is not true.
 - **Reverse mapping is recorded, not pushed.** `WardlineMeta.wardline_qualname` on each Clarion entity property is the reverse lookup cache. It lives on Clarion's entity, not on Wardline's side, and is re-computed on every `clarion analyze`.
+
+### 2026-05-18 amendment: asymmetric qualname storage is canonical
+
+Sprint 1 verification proved that the two products encode the same Python symbol
+with different field boundaries:
+
+- Clarion's Python plugin emits `qualified_name =
+  "{dotted_module}.{python.__qualname__}"` on each entity, e.g.
+  `auth.tokens.TokenManager.verify`.
+- Wardline's `FingerprintEntry` stores `module` as the source file path and
+  `qualified_name` as Python's bare `__qualname__`, e.g.
+  `src/auth/tokens.py` plus `TokenManager.verify`.
+
+Direct string equality between Clarion's `qualified_name` and Wardline's
+`qualified_name` is therefore forbidden for joins. Wardline-to-Clarion
+translation composes Clarion's dotted module name from Wardline's `module`
+using the same rules as the Python plugin's `module_dotted_name()` (`src/`
+prefix stripped, `.py` removed, and `__init__.py` collapsed), then appends
+Wardline's bare `qualified_name`. Clarion-to-Wardline translation must prefer
+the recorded `WardlineMeta` / translator output; naively splitting on dots is
+unsafe because dotted class chains and `<locals>` markers are part of Python's
+`__qualname__`, not the module path.
 
 ### Translation entry points (v0.1)
 
-1. **`wardline.fingerprint.json`**: for each `FingerprintEntry`, compute `(file_path, qualname) → EntityId` using Wardline's `module_file_map` (from `ScanContext`). Write `WardlineMeta.wardline_qualname = qualname` on the resolved Clarion entity.
+1. **`wardline.fingerprint.json`**: for each `FingerprintEntry`, compute `(module, qualified_name) → EntityId` using Wardline's `module_file_map` (from `ScanContext`). Write `WardlineMeta.wardline_qualname = qualified_name` on the resolved Clarion entity.
 2. **`wardline.exceptions.json`**: parse `location` as `file_path::qualname` (split on the first `::`); same mapping rule. Unresolvable entries emit `CLA-INFRA-WARDLINE-EXCEPTION-UNRESOLVED` and persist as dangling records with `entity_id: null`.
 3. **`wardline.sarif.baseline.json`**: use `location.logicalLocations[].fullyQualifiedName` when present, or `partialFingerprints` as a fallback. Unresolvable SARIF results carry `metadata.clarion.unresolved: true` through translation.
 4. **`GET /api/v1/entities/resolve?scheme=<scheme>&value=<value>`**: HTTP read-API oracle. Schemes accepted: `wardline_qualname`, `wardline_exception_location`, `file_path`, `sarif_logical_location`. Response carries `resolution_confidence` (`exact | heuristic | none`) plus candidates for non-exact matches. 404-like misses return 200 with `resolution_confidence: "none"` to distinguish "Clarion doesn't know" from "Clarion is down."
@@ -65,7 +87,7 @@ This preserves the federation test: removing Wardline breaks Wardline-derived an
 
 ### Alternative 1: Wardline adopts Clarion's entity-ID scheme
 
-Wardline changes its `FingerprintEntry.qualname` to carry Clarion's `{plugin_id}:{kind}:{canonical_qualified_name}` format directly.
+Wardline changes its `FingerprintEntry.qualified_name` to carry Clarion's `{plugin_id}:{kind}:{canonical_qualified_name}` format directly.
 
 **Pros**: zero translation layer; one identity scheme across the suite; cross-tool queries are string-equal comparisons.
 

@@ -16,3 +16,6 @@ path = "src/main.rs"
 [dependencies]
 clarion-core = { path = "../clarion-core", version = "0.1.0-dev" }
 serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["mman", "signal"] }

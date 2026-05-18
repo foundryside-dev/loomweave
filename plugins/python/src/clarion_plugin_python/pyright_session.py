@@ -94,6 +94,7 @@ class _EntityInfo:
 class _FunctionIndex:
     source: str
     line_starts: tuple[int, ...]
+    parse_latency_ms: int
     module_id: str
     by_id: dict[str, _FunctionInfo]
     by_name_position: dict[tuple[int, int], _FunctionInfo]
@@ -143,6 +144,7 @@ class PyrightSession:
         self._disabled = False
         self._findings: list[Finding] = []
         self._function_indexes: dict[Path, _FunctionIndex] = {}
+        self._index_parse_latency_ms: list[int] = []
 
     def __enter__(self) -> Self:
         return self
@@ -190,11 +192,15 @@ class PyrightSession:
         ]
         ast_call_sites_total = sum(len(function.call_sites) for function in requested)
         if not requested:
-            return CallResolutionResult(findings=self._pop_findings())
+            return CallResolutionResult(
+                pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
+                findings=self._pop_findings(),
+            )
 
         if not self._ensure_process():
             return CallResolutionResult(
                 unresolved_call_sites_total=ast_call_sites_total,
+                pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
                 findings=self._pop_findings(),
             )
 
@@ -222,6 +228,7 @@ class PyrightSession:
             unresolved_call_sites_total=unresolved,
             unresolved_call_sites=unresolved_sites,
             pyright_query_latency_ms=[latency_ms],
+            pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
             findings=self._pop_findings(),
         )
 
@@ -234,7 +241,10 @@ class PyrightSession:
         index = self._function_index_for_path(path)
         reference_sites_total = len(sites)
         if not sites:
-            return ReferenceResolutionResult(findings=self._pop_findings())
+            return ReferenceResolutionResult(
+                pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
+                findings=self._pop_findings(),
+            )
         if reference_sites_total > self.max_reference_sites_per_file:
             self._record_finding(
                 FINDING_PYRIGHT_REFERENCE_SITE_CAP,
@@ -246,12 +256,14 @@ class PyrightSession:
                 reference_sites_total=reference_sites_total,
                 references_skipped_cap_total=reference_sites_total,
                 unresolved_reference_sites_total=reference_sites_total,
+                pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
                 findings=self._pop_findings(),
             )
         if not self._ensure_process():
             return ReferenceResolutionResult(
                 reference_sites_total=reference_sites_total,
                 unresolved_reference_sites_total=reference_sites_total,
+                pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
                 findings=self._pop_findings(),
             )
 
@@ -287,6 +299,7 @@ class PyrightSession:
             references_skipped_external_total=skipped_external,
             unresolved_reference_sites_total=unresolved,
             pyright_query_latency_ms=[latency_ms],
+            pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
             findings=self._pop_findings(),
         )
 
@@ -739,6 +752,7 @@ class PyrightSession:
         source = resolved.read_text(encoding="utf-8")
         index = _build_function_index(self.project_root, resolved, source)
         self._function_indexes[resolved] = index
+        self._index_parse_latency_ms.append(index.parse_latency_ms)
         return index
 
     def _record_finding(self, subcode: str, message: str, **metadata: object) -> None:
@@ -756,11 +770,18 @@ class PyrightSession:
         self._findings = []
         return findings
 
+    def _pop_index_parse_latencies(self) -> list[int]:
+        latencies = self._index_parse_latency_ms
+        self._index_parse_latency_ms = []
+        return latencies
+
 
 def _build_function_index(project_root: Path, path: Path, source: str) -> _FunctionIndex:
     relative = path.relative_to(project_root) if path.is_relative_to(project_root) else path
     dotted_module = module_dotted_name(relative.as_posix())
+    parse_started = time.perf_counter()
     tree = ast.parse(source)
+    parse_latency_ms = max(1, math.ceil((time.perf_counter() - parse_started) * 1000))
     functions: list[_FunctionInfo] = []
     entities: list[_EntityInfo] = []
     source_lines = source.splitlines()
@@ -777,6 +798,7 @@ def _build_function_index(project_root: Path, path: Path, source: str) -> _Funct
     return _FunctionIndex(
         source=source,
         line_starts=line_starts,
+        parse_latency_ms=parse_latency_ms,
         module_id=module_id,
         by_id=by_id,
         by_name_position=by_name_position,

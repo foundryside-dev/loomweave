@@ -49,7 +49,7 @@ A future operator may want to prewarm summaries for a subset of the project (hig
 
 Hierarchical aggregation requires:
 
-- A clustering pass (ADR-006 / WP4 Phase 3 — Leiden / Louvain). Deferred to v0.2 by the scope-amendment memo.
+- A clustering pass (ADR-006 / ADR-032 / WP4 Phase 3 — Leiden / weighted-components). Deferred to v0.2 by the scope-amendment memo.
 - A determinate ordering for aggregation (Phase 8's entity-set diff — deferred).
 - An aggregation prompt that handles entity-count variability per module/subsystem.
 

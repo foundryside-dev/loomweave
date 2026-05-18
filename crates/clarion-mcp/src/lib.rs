@@ -3,30 +3,31 @@
 pub mod config;
 pub mod filigree;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use clarion_core::{
     EdgeConfidence, INFERRED_CALLS_PROMPT_VERSION, InferredCallsPromptInput,
-    LEAF_SUMMARY_PROMPT_TEMPLATE_ID, LeafSummaryPromptInput, LlmProvider, LlmPurpose, LlmRequest,
-    build_inferred_calls_prompt, build_leaf_summary_prompt,
+    LEAF_SUMMARY_PROMPT_TEMPLATE_ID, LeafSummaryPromptInput, LlmProvider, LlmProviderError,
+    LlmPurpose, LlmRequest, LlmResponse, build_inferred_calls_prompt, build_leaf_summary_prompt,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use time::{Date, Month, OffsetDateTime, macros::format_description};
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot};
 
 use clarion_core::plugin::{ContentLengthCeiling, Frame, TransportError};
 use clarion_storage::{
     CallEdgeMatch, EntityRow, InferredCallEdgeRecord, InferredEdgeCacheEntry, InferredEdgeCacheKey,
-    InferredEdgeWriteStats, ReaderPool, StorageError, SummaryCacheEntry, SummaryCacheKey,
-    UnresolvedCallSiteRow, WriterCmd, call_edges_from, call_edges_targeting,
+    InferredEdgeWriteStats, ReaderPool, ReferenceDirection, StorageError, SummaryCacheEntry,
+    SummaryCacheKey, UnresolvedCallSiteRow, WriterCmd, call_edges_from, call_edges_targeting,
     candidate_entities_for_unresolved_sites, child_entity_ids, contained_entity_ids,
-    entity_at_line, entity_by_id, find_entities, inferred_edge_cache_key_id,
-    inferred_edge_cache_lookup, normalize_source_path, summary_cache_lookup,
-    unresolved_call_sites_for_caller, unresolved_callers_for_target,
+    entity_at_line, entity_by_id, existing_entity_ids, find_entities, inferred_edge_cache_key_id,
+    inferred_edge_cache_lookup, normalize_source_path, reference_edges_for_entity,
+    subsystem_members, summary_cache_lookup, unresolved_call_sites_for_caller,
+    unresolved_callers_for_target,
 };
 
 use crate::config::LlmConfig;
@@ -35,6 +36,9 @@ use crate::filigree::{EntityAssociation, EntityAssociationsResponse, FiligreeLoo
 /// MCP protocol revision supported by the B.6 stdio server.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 const EMPTY_GUIDANCE_FINGERPRINT: &str = "guidance-empty";
+
+type InferredInflight =
+    Arc<AsyncMutex<HashMap<InferredEdgeCacheKey, broadcast::Sender<InferredDispatchOutcome>>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ToolDefinition {
@@ -116,6 +120,11 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             description: "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, and references. Default confidence is resolved; ambiguous and inferred calls are opt-in. References are not execution flow.",
             input_schema: id_confidence_schema(),
         },
+        ToolDefinition {
+            name: "subsystem_members",
+            description: "List module entities assigned to a subsystem entity.",
+            input_schema: id_schema(),
+        },
     ]
 }
 
@@ -150,6 +159,9 @@ fn id_confidence_schema() -> Value {
     })
 }
 
+/// Handle state-free MCP requests such as `initialize` and `tools/list`.
+///
+/// Storage-backed tool calls require [`ServerState::handle_json_rpc`].
 #[must_use]
 pub fn handle_json_rpc(request: &Value) -> Value {
     let id = request.get("id").cloned().unwrap_or(Value::Null);
@@ -160,7 +172,11 @@ pub fn handle_json_rpc(request: &Value) -> Value {
     match method {
         "initialize" => result_response(&id, &initialize_result()),
         "tools/list" => result_response(&id, &json!({"tools": list_tools()})),
-        "tools/call" => handle_tool_call(&id, request.get("params")),
+        "tools/call" => error_response(
+            &id,
+            -32601,
+            "tools/call requires ServerState::handle_json_rpc",
+        ),
         _ => error_response(&id, -32601, "method not found"),
     }
 }
@@ -172,8 +188,7 @@ pub struct ServerState {
     summary_llm: Option<SummaryLlmState>,
     clock: Arc<dyn Fn() -> String + Send + Sync>,
     budget: Arc<Mutex<BudgetLedger>>,
-    inferred_inflight:
-        Arc<AsyncMutex<HashMap<InferredEdgeCacheKey, broadcast::Sender<InferredDispatchOutcome>>>>,
+    inferred_inflight: InferredInflight,
     filigree_client: Option<Arc<dyn FiligreeLookup>>,
 }
 
@@ -284,6 +299,10 @@ impl ServerState {
                 Err(response) => return response.to_json_rpc(id),
             },
             "issues_for" => match self.tool_issues_for(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "subsystem_members" => match self.tool_subsystem_members(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
@@ -450,7 +469,13 @@ impl ServerState {
                     false,
                 );
             }
-            Err(err) => return tool_error_envelope("storage-error", &err.to_string(), true),
+            Err(err) => {
+                return tool_error_envelope(
+                    "storage-error",
+                    &err.to_string(),
+                    storage_retryable(&err),
+                );
+            }
         }
 
         let mut stats = InferredDispatchStats::default();
@@ -479,7 +504,13 @@ impl ServerState {
                 .await
             {
                 Ok(edges) => edges,
-                Err(err) => return tool_error_envelope("storage-error", &err.to_string(), true),
+                Err(err) => {
+                    return tool_error_envelope(
+                        "storage-error",
+                        &err.to_string(),
+                        storage_retryable(&err),
+                    );
+                }
             };
             for edge in edges.into_iter().rev() {
                 edge_count_visited += 1;
@@ -515,7 +546,9 @@ impl ServerState {
                 truncated.then_some("edge-cap"),
                 stats.to_json(),
             ),
-            Err(err) => tool_error_envelope("storage-error", &err.to_string(), true),
+            Err(err) => {
+                tool_error_envelope("storage-error", &err.to_string(), storage_retryable(&err))
+            }
         }
     }
 
@@ -603,7 +636,13 @@ impl ServerState {
                     "Clarion entity was not found",
                 ));
             }
-            Err(err) => return Ok(tool_error_envelope("storage-error", &err.to_string(), true)),
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    "storage-error",
+                    &err.to_string(),
+                    storage_retryable(&err),
+                ));
+            }
         };
         let mut accumulator = IssuesForAccumulator::new(&read.entities);
         let mut requests_total = 0_usize;
@@ -637,6 +676,52 @@ impl ServerState {
             }
         }
         Ok(accumulator.into_envelope(read.entity_cap_truncated, requests_total))
+    }
+
+    async fn tool_subsystem_members(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let subsystem_id = required_str(arguments, "id")?.to_owned();
+        let result = self
+            .readers
+            .with_reader(move |conn| {
+                let Some(subsystem) = entity_by_id(conn, &subsystem_id)? else {
+                    return Ok(tool_error_envelope(
+                        "entity-not-found",
+                        &format!("entity {subsystem_id} was not found"),
+                        false,
+                    ));
+                };
+                if subsystem.kind != "subsystem" {
+                    return Ok(tool_error_envelope(
+                        "not-a-subsystem",
+                        &format!("entity {} is kind {}", subsystem.id, subsystem.kind),
+                        false,
+                    ));
+                }
+                let members = subsystem_members(conn, &subsystem.id)?
+                    .iter()
+                    .map(|member| {
+                        json!({
+                            "id": member.id,
+                            "name": member.name,
+                            "source_file_path": member.source_file_path
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(success_envelope(json!({
+                    "subsystem": {
+                        "id": subsystem.id,
+                        "name": subsystem.name,
+                        "short_name": subsystem.short_name,
+                        "properties": entity_properties_json(&subsystem)
+                    },
+                    "members": members
+                })))
+            })
+            .await;
+        Ok(flatten_storage_envelope_result(result))
     }
 
     async fn read_issues_for_entities(
@@ -681,7 +766,13 @@ impl ServerState {
             .await
         {
             Ok(read) => read,
-            Err(err) => return Ok(tool_error_envelope("storage-error", &err.to_string(), true)),
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    "storage-error",
+                    &err.to_string(),
+                    storage_retryable(&err),
+                ));
+            }
         };
 
         let SummaryRead::Ready(ready) = read else {
@@ -851,6 +942,7 @@ impl ServerState {
             &cached.result_json,
             self.max_inferred_edges_per_caller(),
         )?;
+        let (edges, dropped) = self.drop_unresolved_inferred_targets(edges).await?;
         let write = self
             .send_writer(&llm.writer, |ack| WriterCmd::InsertInferredEdges {
                 cache_entry: Box::new(cached),
@@ -859,7 +951,9 @@ impl ServerState {
             })
             .await
             .map_err(|err| InferredDispatchFailure::from_storage(&err))?;
-        Ok(InferredDispatchStats::cache_hit(write))
+        let mut stats = InferredDispatchStats::cache_hit(write);
+        stats.unresolved_targets_dropped_total = dropped;
+        Ok(stats)
     }
 
     async fn coalesced_inferred_dispatch(
@@ -868,14 +962,14 @@ impl ServerState {
         read: InferredRead,
         llm: InferenceLlmState,
     ) -> Result<InferredDispatchStats, InferredDispatchFailure> {
-        let maybe_rx = {
+        let (maybe_rx, leader_sender) = {
             let mut in_flight = self.inferred_inflight.lock().await;
             if let Some(sender) = in_flight.get(&key) {
-                Some(sender.subscribe())
+                (Some(sender.subscribe()), None)
             } else {
                 let (sender, _) = broadcast::channel(8);
-                in_flight.insert(key.clone(), sender);
-                None
+                in_flight.insert(key.clone(), sender.clone());
+                (None, Some(sender))
             }
         };
 
@@ -899,9 +993,14 @@ impl ServerState {
             };
         }
 
+        let guard = InferredInflightGuard::new(
+            Arc::clone(&self.inferred_inflight),
+            key,
+            leader_sender.expect("leader sender is present for non-coalesced dispatch"),
+        );
         let outcome =
             InferredDispatchOutcome::from_result(self.perform_inferred_dispatch(read, &llm).await);
-        if let Some(sender) = self.inferred_inflight.lock().await.remove(&key) {
+        if let Some(sender) = guard.remove().await {
             let _ = sender.send(outcome.clone());
         }
         outcome.into_result()
@@ -912,18 +1011,21 @@ impl ServerState {
         read: InferredRead,
         llm: &InferenceLlmState,
     ) -> Result<InferredDispatchStats, InferredDispatchFailure> {
+        let caller_source_excerpt =
+            verified_source_excerpt(&read.caller).map_err(|err| err.to_inferred_failure())?;
         let prompt = build_inferred_calls_prompt(&InferredCallsPromptInput {
             caller_entity_id: read.caller.id.clone(),
-            caller_source_excerpt: source_excerpt(&read.caller),
+            caller_source_excerpt,
             unresolved_call_sites_json: unresolved_sites_json(&read.sites),
             candidate_entities_json: entities_json(&read.candidates),
+            max_edges: self.max_inferred_edges_per_caller(),
         });
         let request = LlmRequest {
             purpose: LlmPurpose::InferredEdges,
             model_id: read.key.model_id.clone(),
             prompt_id: prompt.id.to_owned(),
             prompt: prompt.body,
-            max_output_tokens: 512,
+            max_output_tokens: 2048,
         };
         let Some(reservation) = self.reserve_budget(
             llm.provider.estimate_tokens(&request),
@@ -935,9 +1037,15 @@ impl ServerState {
                 false,
             ));
         };
-        let response = llm.provider.invoke(request).map_err(|err| {
-            InferredDispatchFailure::new("llm-provider-error", &err.to_string(), err.retryable())
-        })?;
+        let response = invoke_llm_provider(Arc::clone(&llm.provider), request)
+            .await
+            .map_err(|err| {
+                InferredDispatchFailure::new(
+                    "llm-provider-error",
+                    &err.to_string(),
+                    err.retryable(),
+                )
+            })?;
         if !reservation.commit(
             u64::from(response.total_tokens),
             llm.config.session_token_ceiling,
@@ -948,15 +1056,30 @@ impl ServerState {
                 false,
             ));
         }
-        let edges = inferred_records_from_result(
+        let edges = match inferred_records_from_result(
             &read,
             &response.output_json,
             self.max_inferred_edges_per_caller(),
-        )?;
+        ) {
+            Ok(edges) => edges,
+            Err(err) if err.code == "llm-invalid-json" => {
+                let message = err.message.clone();
+                return Err(err.with_stats(
+                    inferred_usage_stats(&response, true),
+                    vec![json!({
+                        "code": "CLA-LLM-INVALID-JSON",
+                        "message": message,
+                        "usage": llm_usage_json(&response)
+                    })],
+                ));
+            }
+            Err(err) => return Err(err),
+        };
+        let (edges, dropped) = self.drop_unresolved_inferred_targets(edges).await?;
         let now = (self.clock)();
         let entry = InferredEdgeCacheEntry {
             key: read.key,
-            result_json: response.output_json,
+            result_json: response.output_json.clone(),
             cost_usd: response.cost_usd,
             token_count: i64::from(response.total_tokens),
             created_at: now.clone(),
@@ -970,7 +1093,44 @@ impl ServerState {
             })
             .await
             .map_err(|err| InferredDispatchFailure::from_storage(&err))?;
-        Ok(InferredDispatchStats::cache_miss(write, entry.token_count))
+        let mut stats = InferredDispatchStats::cache_miss(write, &response);
+        stats.unresolved_targets_dropped_total = dropped;
+        Ok(stats)
+    }
+
+    /// Strip `to_id`s that don't exist in the `entities` table so the
+    /// writer-actor's FK-protected INSERT never sees a hallucinated edge
+    /// target (clarion-df58379de4). Returns the surviving records and the
+    /// count of dropped edges so callers can fold the number into
+    /// `InferredDispatchStats`.
+    async fn drop_unresolved_inferred_targets(
+        &self,
+        records: Vec<InferredCallEdgeRecord>,
+    ) -> Result<(Vec<InferredCallEdgeRecord>, u64), InferredDispatchFailure> {
+        if records.is_empty() {
+            return Ok((records, 0));
+        }
+        let unique_targets: Vec<String> = records
+            .iter()
+            .map(|record| record.to_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let existing = self
+            .readers
+            .with_reader({
+                let targets = unique_targets.clone();
+                move |conn| existing_entity_ids(conn, &targets)
+            })
+            .await
+            .map_err(|err| InferredDispatchFailure::from_storage(&err))?;
+        let original_len = records.len();
+        let kept: Vec<InferredCallEdgeRecord> = records
+            .into_iter()
+            .filter(|record| existing.contains(&record.to_id))
+            .collect();
+        let dropped = u64::try_from(original_len - kept.len()).unwrap_or(0);
+        Ok((kept, dropped))
     }
 
     async fn read_summary_inputs(
@@ -983,6 +1143,9 @@ impl ServerState {
                 let Some(entity) = entity_by_id(conn, &entity_id)? else {
                     return Ok(SummaryRead::EntityNotFound(entity_id));
                 };
+                if entity.kind == "subsystem" {
+                    return Ok(SummaryRead::ScopeDeferred(Box::new(entity)));
+                }
                 let Some(content_hash) = entity.content_hash.clone() else {
                     return Ok(SummaryRead::MissingContentHash(entity.id));
                 };
@@ -1027,7 +1190,11 @@ impl ServerState {
                 })
                 .await
         {
-            return Some(tool_error_envelope("storage-error", &err.to_string(), true));
+            return Some(tool_error_envelope(
+                "storage-error",
+                &err.to_string(),
+                storage_retryable(&err),
+            ));
         }
         Some(summary_success_envelope(
             &ready.entity,
@@ -1045,11 +1212,15 @@ impl ServerState {
         now: String,
     ) -> Value {
         let model_id = self.summary_model_id();
+        let source_excerpt = match verified_source_excerpt(&ready.entity) {
+            Ok(excerpt) => excerpt,
+            Err(err) => return err.to_envelope(),
+        };
         let prompt = build_leaf_summary_prompt(&LeafSummaryPromptInput {
             entity_id: ready.entity.id.clone(),
             kind: ready.entity.kind.clone(),
             name: ready.entity.name.clone(),
-            source_excerpt: source_excerpt(&ready.entity),
+            source_excerpt,
         });
         let request = LlmRequest {
             purpose: LlmPurpose::Summary,
@@ -1064,7 +1235,7 @@ impl ServerState {
         ) else {
             return token_ceiling_envelope("LLM session token ceiling has been reached");
         };
-        let response = match summary_llm.provider.invoke(request) {
+        let response = match invoke_llm_provider(Arc::clone(&summary_llm.provider), request).await {
             Ok(response) => response,
             Err(err) => {
                 return tool_error_envelope(
@@ -1083,10 +1254,16 @@ impl ServerState {
         }
 
         if serde_json::from_str::<Value>(&response.output_json).is_err() {
-            return tool_error_envelope(
+            return tool_error_envelope_with_diagnostics(
                 "llm-invalid-json",
                 "summary provider returned non-JSON output",
                 true,
+                summary_usage_stats(&response, true),
+                vec![json!({
+                    "code": "CLA-LLM-INVALID-JSON",
+                    "message": "summary provider returned non-JSON output",
+                    "usage": llm_usage_json(&response)
+                })],
             );
         }
 
@@ -1109,7 +1286,7 @@ impl ServerState {
             })
             .await
         {
-            return tool_error_envelope("storage-error", &err.to_string(), true);
+            return tool_error_envelope("storage-error", &err.to_string(), storage_retryable(&err));
         }
 
         summary_success_envelope(
@@ -1121,7 +1298,8 @@ impl ServerState {
                 "summary_cache_misses_total": 1,
                 "summary_tokens_input": entry.tokens_input,
                 "summary_tokens_output": entry.tokens_output,
-                "summary_tokens_total": entry.tokens_input + entry.tokens_output
+                "summary_tokens_total": entry.tokens_input + entry.tokens_output,
+                "summary_cost_usd": entry.cost_usd
             }),
         )
     }
@@ -1223,6 +1401,18 @@ impl ServerState {
     }
 }
 
+async fn invoke_llm_provider(
+    provider: Arc<dyn LlmProvider>,
+    request: LlmRequest,
+) -> Result<LlmResponse, LlmProviderError> {
+    tokio::task::spawn_blocking(move || provider.invoke(request))
+        .await
+        .map_err(|err| LlmProviderError::InvalidResponse {
+            message: format!("LLM provider task failed: {err}"),
+            retryable: true,
+        })?
+}
+
 struct SummaryLlmState {
     writer: mpsc::Sender<WriterCmd>,
     config: LlmConfig,
@@ -1252,7 +1442,10 @@ impl BudgetReservation {
             budget.reserved_tokens = budget.reserved_tokens.saturating_sub(self.amount_tokens);
             self.active = false;
         }
-        if budget.blocked || budget.spent_tokens.saturating_add(actual_tokens) > ceiling_tokens {
+        // `budget.blocked` gates *new* reservations, not in-flight commits.
+        // A reservation that already cleared reserve_budget paid for its
+        // dispatch slot; commit it iff the actual usage fits the ceiling.
+        if budget.spent_tokens.saturating_add(actual_tokens) > ceiling_tokens {
             budget.blocked = true;
             return false;
         }
@@ -1279,6 +1472,7 @@ enum SummaryRead {
     Ready(Box<SummaryReady>),
     EntityNotFound(String),
     MissingContentHash(String),
+    ScopeDeferred(Box<EntityRow>),
 }
 
 struct SummaryReady {
@@ -1405,6 +1599,71 @@ struct InferenceLlmState {
     provider: Arc<dyn LlmProvider>,
 }
 
+struct InferredInflightGuard {
+    in_flight: InferredInflight,
+    key: InferredEdgeCacheKey,
+    sender: broadcast::Sender<InferredDispatchOutcome>,
+    active: bool,
+}
+
+impl InferredInflightGuard {
+    fn new(
+        in_flight: InferredInflight,
+        key: InferredEdgeCacheKey,
+        sender: broadcast::Sender<InferredDispatchOutcome>,
+    ) -> Self {
+        Self {
+            in_flight,
+            key,
+            sender,
+            active: true,
+        }
+    }
+
+    async fn remove(mut self) -> Option<broadcast::Sender<InferredDispatchOutcome>> {
+        let removed = remove_matching_inferred_inflight(
+            Arc::clone(&self.in_flight),
+            self.key.clone(),
+            self.sender.clone(),
+        )
+        .await;
+        self.active = false;
+        removed
+    }
+}
+
+impl Drop for InferredInflightGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let in_flight = Arc::clone(&self.in_flight);
+        let key = self.key.clone();
+        let sender = self.sender.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = remove_matching_inferred_inflight(in_flight, key, sender).await;
+            });
+        }
+    }
+}
+
+async fn remove_matching_inferred_inflight(
+    in_flight: InferredInflight,
+    key: InferredEdgeCacheKey,
+    sender: broadcast::Sender<InferredDispatchOutcome>,
+) -> Option<broadcast::Sender<InferredDispatchOutcome>> {
+    let mut map = in_flight.lock().await;
+    if map
+        .get(&key)
+        .is_some_and(|current| current.same_channel(&sender))
+    {
+        map.remove(&key)
+    } else {
+        None
+    }
+}
+
 #[derive(Clone)]
 struct InferredRead {
     caller: EntityRow,
@@ -1420,9 +1679,17 @@ struct InferredDispatchStats {
     cache_misses_total: u64,
     edges_materialized_total: u64,
     edges_skipped_static_duplicates_total: u64,
+    /// LLM-proposed `to_id` values that did not resolve in the `entities`
+    /// table at write time (clarion-df58379de4). Counted here, dropped from
+    /// the persisted edge set to avoid the FK violation that previously
+    /// poisoned the cache row and re-burned LLM tokens on retry.
+    unresolved_targets_dropped_total: u64,
     candidate_callers_considered: u64,
     coalesced_waits_total: u64,
+    tokens_input: i64,
+    tokens_output: i64,
     tokens_total: i64,
+    cost_usd: f64,
 }
 
 impl InferredDispatchStats {
@@ -1435,12 +1702,15 @@ impl InferredDispatchStats {
         }
     }
 
-    fn cache_miss(write: InferredEdgeWriteStats, tokens: i64) -> Self {
+    fn cache_miss(write: InferredEdgeWriteStats, response: &LlmResponse) -> Self {
         Self {
             cache_misses_total: 1,
             edges_materialized_total: write.inserted_edges,
             edges_skipped_static_duplicates_total: write.skipped_static_duplicates,
-            tokens_total: tokens,
+            tokens_input: i64::from(response.input_tokens),
+            tokens_output: i64::from(response.output_tokens),
+            tokens_total: i64::from(response.total_tokens),
+            cost_usd: response.cost_usd,
             ..Self::default()
         }
     }
@@ -1450,9 +1720,13 @@ impl InferredDispatchStats {
         self.cache_misses_total += other.cache_misses_total;
         self.edges_materialized_total += other.edges_materialized_total;
         self.edges_skipped_static_duplicates_total += other.edges_skipped_static_duplicates_total;
+        self.unresolved_targets_dropped_total += other.unresolved_targets_dropped_total;
         self.candidate_callers_considered += other.candidate_callers_considered;
         self.coalesced_waits_total += other.coalesced_waits_total;
+        self.tokens_input += other.tokens_input;
+        self.tokens_output += other.tokens_output;
         self.tokens_total += other.tokens_total;
+        self.cost_usd += other.cost_usd;
     }
 
     fn to_json(&self) -> Value {
@@ -1461,9 +1735,13 @@ impl InferredDispatchStats {
             "inferred_dispatch_misses_total": self.cache_misses_total,
             "inferred_edges_materialized_total": self.edges_materialized_total,
             "inferred_edges_skipped_static_duplicates_total": self.edges_skipped_static_duplicates_total,
+            "inferred_unresolved_targets_dropped_total": self.unresolved_targets_dropped_total,
             "inferred_candidate_callers_considered": self.candidate_callers_considered,
             "inferred_dispatch_coalesced_total": self.coalesced_waits_total,
-            "inferred_tokens_total": self.tokens_total
+            "inferred_tokens_input": self.tokens_input,
+            "inferred_tokens_output": self.tokens_output,
+            "inferred_tokens_total": self.tokens_total,
+            "inferred_cost_usd": self.cost_usd
         })
     }
 }
@@ -1473,6 +1751,8 @@ struct InferredDispatchFailure {
     code: &'static str,
     message: String,
     retryable: bool,
+    stats_delta: Value,
+    diagnostics: Vec<Value>,
 }
 
 impl InferredDispatchFailure {
@@ -1481,22 +1761,42 @@ impl InferredDispatchFailure {
             code,
             message: message.to_owned(),
             retryable,
+            stats_delta: json!({}),
+            diagnostics: Vec::new(),
         }
     }
 
     fn from_storage(err: &StorageError) -> Self {
+        // FK violations are deterministic against the same row set; treating
+        // them as `retryable=true` causes the client to re-issue the LLM call
+        // and re-pay the token cost (clarion-df58379de4). Mark them
+        // non-retryable so a client honouring the hint gives up immediately.
         Self {
             code: "storage-error",
             message: err.to_string(),
-            retryable: true,
+            retryable: !err.is_foreign_key_violation(),
+            stats_delta: json!({}),
+            diagnostics: Vec::new(),
         }
+    }
+
+    fn with_stats(mut self, stats_delta: Value, diagnostics: Vec<Value>) -> Self {
+        self.stats_delta = stats_delta;
+        self.diagnostics = diagnostics;
+        self
     }
 
     fn to_envelope(&self) -> Value {
         if self.code == "token-ceiling-exceeded" {
             return token_ceiling_envelope(&self.message);
         }
-        tool_error_envelope(self.code, &self.message, self.retryable)
+        tool_error_envelope_with_diagnostics(
+            self.code,
+            &self.message,
+            self.retryable,
+            self.stats_delta.clone(),
+            self.diagnostics.clone(),
+        )
     }
 }
 
@@ -1548,6 +1848,9 @@ pub enum McpError {
     Runtime(#[from] std::io::Error),
 }
 
+/// Decode and handle a state-free MCP frame.
+///
+/// Storage-backed tool calls require [`handle_frame_with_state`].
 pub fn handle_frame(frame: &Frame) -> Result<Frame, McpError> {
     let request = serde_json::from_slice(&frame.body)?;
     let response = handle_json_rpc(&request);
@@ -1567,6 +1870,9 @@ pub async fn handle_frame_with_state(
     })
 }
 
+/// Serve state-free MCP protocol metadata over stdio.
+///
+/// Storage-backed tool calls require [`serve_stdio_with_state`].
 pub fn serve_stdio(
     reader: &mut impl std::io::BufRead,
     writer: &mut impl std::io::Write,
@@ -1626,43 +1932,6 @@ fn initialize_result() -> Value {
             "version": env!("CARGO_PKG_VERSION")
         }
     })
-}
-
-fn handle_tool_call(id: &Value, params: Option<&Value>) -> Value {
-    let Some(params) = params.and_then(Value::as_object) else {
-        return error_response(id, -32602, "invalid tools/call params");
-    };
-    let Some(name) = params.get("name").and_then(Value::as_str) else {
-        return error_response(id, -32602, "invalid tools/call params: missing name");
-    };
-    if !list_tools().iter().any(|tool| tool.name == name) {
-        return error_response(id, -32601, &format!("unknown tool: {name}"));
-    }
-
-    result_response(
-        id,
-        &json!({
-            "content": [
-                {
-                    "type": "text",
-                    "text": serde_json::to_string(&json!({
-                        "ok": false,
-                        "result": null,
-                        "error": {
-                            "code": "tool-unimplemented",
-                            "message": format!("{name} is not implemented yet"),
-                            "retryable": false
-                        },
-                        "diagnostics": [],
-                        "truncated": false,
-                        "truncation_reason": null,
-                        "stats_delta": {}
-                    })).expect("tool error envelope serializes")
-                }
-            ],
-            "isError": true
-        }),
-    )
 }
 
 #[derive(Debug)]
@@ -1729,12 +1998,6 @@ impl PathTraversal {
         }
         Ok(())
     }
-}
-
-#[derive(Clone, Copy)]
-enum ReferenceDirection {
-    In,
-    Out,
 }
 
 fn required_str<'a>(
@@ -1804,15 +2067,22 @@ fn optional_confidence(
 fn envelope_from_storage_result(result: Result<Value, StorageError>) -> Value {
     match result {
         Ok(result) => success_envelope(result),
-        Err(err) => tool_error_envelope("storage-error", &err.to_string(), true),
+        Err(err) => tool_error_envelope("storage-error", &err.to_string(), storage_retryable(&err)),
     }
 }
 
 fn flatten_storage_envelope_result(result: Result<Value, StorageError>) -> Value {
     match result {
         Ok(envelope) => envelope,
-        Err(err) => tool_error_envelope("storage-error", &err.to_string(), true),
+        Err(err) => tool_error_envelope("storage-error", &err.to_string(), storage_retryable(&err)),
     }
+}
+
+/// `storage-error` retryable hint. FK violations are deterministic against
+/// the same row set; everything else (`SQLITE_BUSY`, disk-full, pool errors)
+/// stays retryable (clarion-df58379de4).
+fn storage_retryable(err: &StorageError) -> bool {
+    !err.is_foreign_key_violation()
 }
 
 fn success_envelope(result: Value) -> Value {
@@ -1858,19 +2128,85 @@ fn success_envelope_with_stats(result: Value, stats_delta: Value) -> Value {
 }
 
 fn tool_error_envelope(code: &str, message: &str, retryable: bool) -> Value {
-    json!({
-        "ok": false,
-        "result": null,
-        "error": {
+    tool_error_envelope_with_diagnostics(code, message, retryable, json!({}), Vec::new())
+}
+
+fn tool_error_envelope_with_diagnostics(
+    code: &str,
+    message: &str,
+    retryable: bool,
+    stats_delta: Value,
+    diagnostics: Vec<Value>,
+) -> Value {
+    let mut envelope = serde_json::Map::new();
+    envelope.insert("ok".to_owned(), Value::Bool(false));
+    envelope.insert("result".to_owned(), Value::Null);
+    envelope.insert(
+        "error".to_owned(),
+        json!({
             "code": code,
             "message": message,
-            "retryable": retryable
-        },
-        "diagnostics": [],
-        "truncated": false,
-        "truncation_reason": null,
-        "stats_delta": {}
+            "retryable": retryable,
+        }),
+    );
+    envelope.insert("diagnostics".to_owned(), Value::Array(diagnostics));
+    envelope.insert("truncated".to_owned(), Value::Bool(false));
+    envelope.insert("truncation_reason".to_owned(), Value::Null);
+    envelope.insert("stats_delta".to_owned(), stats_delta);
+    Value::Object(envelope)
+}
+
+fn llm_usage_json(response: &LlmResponse) -> Value {
+    json!({
+        "tokens_input": response.input_tokens,
+        "tokens_output": response.output_tokens,
+        "tokens_total": response.total_tokens,
+        "cost_usd": response.cost_usd
     })
+}
+
+fn summary_usage_stats(response: &LlmResponse, invalid_json: bool) -> Value {
+    let mut stats = serde_json::Map::new();
+    stats.insert("summary_cache_misses_total".to_owned(), json!(1));
+    stats.insert(
+        "summary_tokens_input".to_owned(),
+        json!(response.input_tokens),
+    );
+    stats.insert(
+        "summary_tokens_output".to_owned(),
+        json!(response.output_tokens),
+    );
+    stats.insert(
+        "summary_tokens_total".to_owned(),
+        json!(response.total_tokens),
+    );
+    stats.insert("summary_cost_usd".to_owned(), json!(response.cost_usd));
+    if invalid_json {
+        stats.insert("llm_invalid_json_total".to_owned(), json!(1));
+    }
+    Value::Object(stats)
+}
+
+fn inferred_usage_stats(response: &LlmResponse, invalid_json: bool) -> Value {
+    let mut stats = serde_json::Map::new();
+    stats.insert("inferred_dispatch_misses_total".to_owned(), json!(1));
+    stats.insert(
+        "inferred_tokens_input".to_owned(),
+        json!(response.input_tokens),
+    );
+    stats.insert(
+        "inferred_tokens_output".to_owned(),
+        json!(response.output_tokens),
+    );
+    stats.insert(
+        "inferred_tokens_total".to_owned(),
+        json!(response.total_tokens),
+    );
+    stats.insert("inferred_cost_usd".to_owned(), json!(response.cost_usd));
+    if invalid_json {
+        stats.insert("llm_invalid_json_total".to_owned(), json!(1));
+    }
+    Value::Object(stats)
 }
 
 fn token_ceiling_envelope(message: &str) -> Value {
@@ -1937,7 +2273,32 @@ fn summary_read_error(read: SummaryRead) -> Value {
             &format!("entity {id} has no content hash for summary cache keying"),
             false,
         ),
+        SummaryRead::ScopeDeferred(entity) => summary_scope_deferred(&entity),
         SummaryRead::Ready(_) => unreachable!("ready summary read is not an error"),
+    }
+}
+
+#[derive(Debug)]
+struct SourceExcerptError {
+    entity_id: String,
+    stored_content_hash: String,
+    current_content_hash: String,
+}
+
+impl SourceExcerptError {
+    fn message(&self) -> String {
+        format!(
+            "entity {} source content drifted: stored content_hash {} but current file hashes to {}; rerun `clarion analyze` before requesting LLM output",
+            self.entity_id, self.stored_content_hash, self.current_content_hash
+        )
+    }
+
+    fn to_envelope(&self) -> Value {
+        tool_error_envelope("content-drift", &self.message(), false)
+    }
+
+    fn to_inferred_failure(&self) -> InferredDispatchFailure {
+        InferredDispatchFailure::new("content-drift", &self.message(), false)
     }
 }
 
@@ -1977,6 +2338,15 @@ fn summary_success_envelope(
     )
 }
 
+fn summary_scope_deferred(entity: &EntityRow) -> Value {
+    success_envelope(json!({
+        "available": false,
+        "reason": "summary-scope-deferred",
+        "message": "subsystem summaries are deferred to v0.2",
+        "entity": entity_json(entity)
+    }))
+}
+
 fn tool_json_rpc_response(id: &Value, envelope: &Value) -> Value {
     let is_error = !envelope
         .get("ok")
@@ -2009,18 +2379,61 @@ fn entity_json(entity: &EntityRow) -> Value {
     })
 }
 
-fn source_excerpt(entity: &EntityRow) -> String {
-    entity
-        .source_file_path
-        .as_deref()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .map(|source| {
-            let excerpt =
-                line_range_excerpt(&source, entity.source_line_start, entity.source_line_end)
-                    .unwrap_or(source);
-            truncate_excerpt(excerpt)
-        })
-        .unwrap_or_default()
+fn entity_properties_json(entity: &EntityRow) -> Value {
+    serde_json::from_str::<Value>(&entity.properties_json)
+        .expect("entity properties_json should be valid JSON")
+}
+
+fn verified_source_excerpt(entity: &EntityRow) -> Result<String, SourceExcerptError> {
+    let Some(path) = entity.source_file_path.as_deref() else {
+        return Ok(String::new());
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return Ok(String::new());
+    };
+    let source = String::from_utf8(bytes.clone()).ok();
+    if let (Some(stored_content_hash), Some(current_content_hash)) = (
+        entity.content_hash.as_deref(),
+        current_source_content_hash(entity, &bytes, source.as_deref()),
+    ) && stored_content_hash != current_content_hash
+    {
+        return Err(SourceExcerptError {
+            entity_id: entity.id.clone(),
+            stored_content_hash: stored_content_hash.to_owned(),
+            current_content_hash,
+        });
+    }
+    let Some(source) = source else {
+        return Ok(String::new());
+    };
+    let excerpt = line_range_excerpt(&source, entity.source_line_start, entity.source_line_end)
+        .unwrap_or(source);
+    Ok(truncate_excerpt(excerpt))
+}
+
+fn current_source_content_hash(
+    entity: &EntityRow,
+    file_bytes: &[u8],
+    source: Option<&str>,
+) -> Option<String> {
+    if entity.kind == "module" {
+        return Some(blake3::hash(file_bytes).to_hex().to_string());
+    }
+    let source = source?;
+    let start_line = entity.source_line_start?;
+    let end_line = entity.source_line_end?;
+    if start_line <= 0 || end_line < start_line {
+        return None;
+    }
+    let start = usize::try_from(start_line - 1).ok()?;
+    let mut end = usize::try_from(end_line).ok()?;
+    let lines = source.lines().collect::<Vec<_>>();
+    end = end.min(lines.len());
+    if start >= end {
+        return None;
+    }
+    let normalized = lines[start..end].join("\n");
+    Some(blake3::hash(normalized.as_bytes()).to_hex().to_string())
 }
 
 fn line_range_excerpt(
@@ -2160,27 +2573,14 @@ fn timestamp_day_index(raw: &str) -> Option<i64> {
         return seconds.parse::<i64>().ok().map(|value| value / 86_400);
     }
     let date = raw.get(..10)?;
-    let mut parts = date.split('-');
-    let year = parts.next()?.parse::<i64>().ok()?;
-    let month = parts.next()?.parse::<i64>().ok()?;
-    let day = parts.next()?.parse::<i64>().ok()?;
-    Some(days_from_civil(year, month, day))
-}
-
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = year - i64::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let yoe = year - era * 400;
-    let month_prime = month + if month > 2 { -3 } else { 9 };
-    let doy = (153 * month_prime + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
+    let date = Date::parse(date, format_description!("[year]-[month]-[day]")).ok()?;
+    let unix_epoch = Date::from_calendar_date(1970, Month::January, 1)
+        .expect("Unix epoch is a valid calendar date");
+    Some(i64::from(date.to_julian_day() - unix_epoch.to_julian_day()))
 }
 
 fn default_now_string() -> String {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs());
+    let seconds = OffsetDateTime::now_utc().unix_timestamp();
     format!("unix:{seconds}")
 }
 
@@ -2229,34 +2629,14 @@ fn reference_neighbors(
     entity_id: &str,
     direction: ReferenceDirection,
 ) -> Result<Vec<Value>, StorageError> {
-    let (predicate, neighbor_column) = match direction {
-        ReferenceDirection::In => ("to_id = ?1", "from_id"),
-        ReferenceDirection::Out => ("from_id = ?1", "to_id"),
-    };
-    let sql = format!(
-        "SELECT {neighbor_column}, confidence, source_byte_start, source_byte_end \
-         FROM edges \
-         WHERE kind = 'references' AND {predicate} \
-         ORDER BY {neighbor_column}, source_byte_start, source_byte_end"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params![entity_id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<i64>>(2)?,
-            row.get::<_, Option<i64>>(3)?,
-        ))
-    })?;
     let mut neighbors = Vec::new();
-    for row in rows {
-        let (neighbor_id, confidence, source_byte_start, source_byte_end) = row?;
-        if let Some(entity) = entity_by_id(conn, &neighbor_id)? {
+    for edge in reference_edges_for_entity(conn, entity_id, direction)? {
+        if let Some(entity) = entity_by_id(conn, &edge.neighbor_id)? {
             neighbors.push(json!({
                 "entity": entity_json(&entity),
-                "edge_confidence": confidence,
-                "source_byte_start": source_byte_start,
-                "source_byte_end": source_byte_end
+                "edge_confidence": edge.confidence.as_str(),
+                "source_byte_start": edge.source_byte_start,
+                "source_byte_end": edge.source_byte_end
             }));
         }
     }
@@ -2284,13 +2664,23 @@ fn error_response(id: &Value, code: i64, message: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::list_tools;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use clarion_core::{CachingModel, LlmProvider, LlmProviderError, LlmRequest, LlmResponse};
+    use clarion_storage::{
+        EntityRow, InferredEdgeCacheKey, ReaderPool, UnresolvedCallSiteRow, pragma, schema,
+    };
+    use rusqlite::Connection;
+    use tokio::sync::mpsc;
+
+    use super::{InferenceLlmState, InferredRead, ServerState, config::LlmConfig, list_tools};
 
     #[test]
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
@@ -2325,6 +2715,11 @@ mod tests {
         assert_eq!(
             tools[6].description,
             "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, and references. Default confidence is resolved; ambiguous and inferred calls are opt-in. References are not execution flow."
+        );
+        assert_eq!(tools[7].name, "subsystem_members");
+        assert_eq!(
+            tools[7].description,
+            "List module entities assigned to a subsystem entity."
         );
     }
 
@@ -2362,8 +2757,9 @@ mod tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], "tools-1");
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 8);
         assert_eq!(response["result"]["tools"][0]["name"], "entity_at");
+        assert_eq!(response["result"]["tools"][7]["name"], "subsystem_members");
     }
 
     #[test]
@@ -2379,7 +2775,7 @@ mod tests {
     }
 
     #[test]
-    fn call_tool_rejects_unknown_tool() {
+    fn stateless_call_tool_requires_server_state_before_tool_validation() {
         let response = super::handle_json_rpc(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": 8,
@@ -2388,11 +2784,32 @@ mod tests {
         }));
 
         assert_eq!(response["error"]["code"], -32601);
-        assert_eq!(response["error"]["message"], "unknown tool: not_a_tool");
+        assert_eq!(
+            response["error"]["message"],
+            "tools/call requires ServerState::handle_json_rpc"
+        );
     }
 
     #[test]
-    fn call_tool_rejects_invalid_params() {
+    fn stateless_json_rpc_does_not_fake_tool_calls() {
+        let response = super::handle_json_rpc(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 88,
+            "method": "tools/call",
+            "params": {"name": "summary", "arguments": {"id": "python:function:demo.entry"}}
+        }));
+
+        assert_eq!(response["error"]["code"], -32601);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("ServerState")
+        );
+    }
+
+    #[test]
+    fn stateless_call_tool_with_invalid_params_requires_server_state() {
         let response = super::handle_json_rpc(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": 9,
@@ -2400,7 +2817,11 @@ mod tests {
             "params": {"arguments": {}}
         }));
 
-        assert_eq!(response["error"]["code"], -32602);
+        assert_eq!(response["error"]["code"], -32601);
+        assert_eq!(
+            response["error"]["message"],
+            "tools/call requires ServerState::handle_json_rpc"
+        );
     }
 
     #[test]
@@ -2420,7 +2841,7 @@ mod tests {
 
         assert_eq!(decoded["jsonrpc"], "2.0");
         assert_eq!(decoded["id"], 10);
-        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 8);
     }
 
     #[test]
@@ -2479,6 +2900,162 @@ mod tests {
         assert_eq!(first_json["id"], 11);
         assert_eq!(first_json["result"]["serverInfo"]["name"], "clarion");
         assert_eq!(second_json["id"], 12);
-        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn inferred_inflight_entry_is_removed_when_leader_future_is_aborted() {
+        let project = tempfile::tempdir().expect("temp project");
+        let db_path = project.path().join("clarion.db");
+        let mut conn = Connection::open(&db_path).expect("open sqlite");
+        pragma::apply_write_pragmas(&conn).expect("write pragmas");
+        schema::apply_migrations(&mut conn).expect("apply migrations");
+        drop(conn);
+
+        let readers = ReaderPool::open(&db_path, 1).expect("reader pool");
+        let state = Arc::new(ServerState::new(project.path().to_path_buf(), readers));
+        let key = inferred_test_key();
+        let read = inferred_test_read(key.clone());
+        let (writer, _rx) = mpsc::channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let llm = InferenceLlmState {
+            writer,
+            config: LlmConfig::default(),
+            provider: Arc::new(BlockingProvider {
+                release: Mutex::new(release_rx),
+            }),
+        };
+
+        let leader_state = Arc::clone(&state);
+        let leader_key = key.clone();
+        let handle = tokio::spawn(async move {
+            leader_state
+                .coalesced_inferred_dispatch(leader_key, read, llm)
+                .await
+        });
+        assert_inferred_inflight_contains(&state, &key).await;
+
+        handle.abort();
+        let _ = handle.await;
+        let removed = wait_until_inferred_inflight_removed(&state, &key).await;
+        let _ = release_tx.send(());
+
+        assert!(
+            removed,
+            "aborted inferred-dispatch leader left stale in-flight key"
+        );
+    }
+
+    async fn assert_inferred_inflight_contains(state: &ServerState, key: &InferredEdgeCacheKey) {
+        for _ in 0..50 {
+            if state.inferred_inflight.lock().await.contains_key(key) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("inferred-dispatch leader never registered in-flight key");
+    }
+
+    async fn wait_until_inferred_inflight_removed(
+        state: &ServerState,
+        key: &InferredEdgeCacheKey,
+    ) -> bool {
+        for _ in 0..50 {
+            if !state.inferred_inflight.lock().await.contains_key(key) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    fn inferred_test_key() -> InferredEdgeCacheKey {
+        InferredEdgeCacheKey {
+            caller_entity_id: "python:function:demo.dynamic".to_owned(),
+            caller_content_hash: "hash-caller".to_owned(),
+            model_id: "test-model".to_owned(),
+            prompt_version: "test-prompt".to_owned(),
+        }
+    }
+
+    fn inferred_test_read(key: InferredEdgeCacheKey) -> InferredRead {
+        InferredRead {
+            caller: entity_row(&key.caller_entity_id, "dynamic", Some("hash-caller")),
+            sites: vec![UnresolvedCallSiteRow {
+                caller_entity_id: key.caller_entity_id.clone(),
+                caller_content_hash: key.caller_content_hash.clone(),
+                site_key: "site-1".to_owned(),
+                site_ordinal: 0,
+                source_file_id: Some("python:module:demo".to_owned()),
+                source_byte_start: 0,
+                source_byte_end: 8,
+                callee_expr: "target()".to_owned(),
+            }],
+            candidates: vec![entity_row(
+                "python:function:demo.target",
+                "target",
+                Some("hash-target"),
+            )],
+            key,
+            cached: None,
+        }
+    }
+
+    fn entity_row(id: &str, name: &str, content_hash: Option<&str>) -> EntityRow {
+        EntityRow {
+            id: id.to_owned(),
+            plugin_id: "python".to_owned(),
+            kind: "function".to_owned(),
+            name: name.to_owned(),
+            short_name: name.to_owned(),
+            parent_id: Some("python:module:demo".to_owned()),
+            source_file_id: Some("python:module:demo".to_owned()),
+            source_file_path: None,
+            source_byte_start: Some(0),
+            source_byte_end: Some(8),
+            source_line_start: Some(1),
+            source_line_end: Some(1),
+            properties_json: "{}".to_owned(),
+            content_hash: content_hash.map(str::to_owned),
+            summary_json: None,
+        }
+    }
+
+    struct BlockingProvider {
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl LlmProvider for BlockingProvider {
+        fn name(&self) -> &'static str {
+            "blocking"
+        }
+
+        fn invoke(&self, _request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
+            let _ = self
+                .release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv();
+            Ok(LlmResponse {
+                model_id: "test-model".to_owned(),
+                output_json: r#"{"edges":[]}"#.to_owned(),
+                input_tokens: 1,
+                output_tokens: 1,
+                total_tokens: 2,
+                cost_usd: 0.0,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &LlmRequest) -> u64 {
+            1
+        }
+
+        fn tier_to_model(&self, _tier: &str) -> Option<&str> {
+            Some("test-model")
+        }
+
+        fn caching_model(&self) -> CachingModel {
+            CachingModel::OpenAiChatCompletions
+        }
     }
 }

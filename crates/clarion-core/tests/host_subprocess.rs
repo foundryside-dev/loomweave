@@ -23,7 +23,8 @@ const FIXTURE_MANIFEST_BYTES: &[u8] = include_bytes!("fixtures/plugin.toml");
 /// 2. `<target_dir>/debug/clarion-plugin-fixture` (default dev build).
 /// 3. `<target_dir>/release/clarion-plugin-fixture` (release build).
 ///
-/// Panics with a clear message if the binary is not found.
+/// Builds the fixture on demand and panics with a clear message if the binary
+/// still cannot be found.
 fn fixture_binary_path() -> std::path::PathBuf {
     // Check if an explicit path was provided (e.g. by a future artifact dep).
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_clarion-plugin-fixture") {
@@ -43,18 +44,57 @@ fn fixture_binary_path() -> std::path::PathBuf {
     let target_dir = std::env::var("CARGO_TARGET_DIR")
         .map_or_else(|_| workspace_root.join("target"), std::path::PathBuf::from);
 
-    for profile in &["debug", "release"] {
-        let candidate = target_dir.join(profile).join("clarion-plugin-fixture");
-        if candidate.exists() {
-            return candidate;
-        }
+    if let Some(path) = find_fixture_binary(&target_dir) {
+        return path;
+    }
+
+    build_fixture_binary(workspace_root, &target_dir);
+
+    if let Some(path) = find_fixture_binary(&target_dir) {
+        return path;
     }
 
     panic!(
         "clarion-plugin-fixture binary not found. \
-         Run `cargo build -p clarion-plugin-fixture` before running this test. \
+         Tried `cargo build -p clarion-plugin-fixture --bin clarion-plugin-fixture`. \
          Searched in: {}",
         target_dir.display()
+    );
+}
+
+fn find_fixture_binary(target_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    for profile in &["debug", "release"] {
+        let candidate = target_dir.join(profile).join(format!(
+            "clarion-plugin-fixture{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn build_fixture_binary(workspace_root: &std::path::Path, target_dir: &std::path::Path) {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    let output = std::process::Command::new(cargo)
+        .current_dir(workspace_root)
+        .arg("build")
+        .arg("-p")
+        .arg("clarion-plugin-fixture")
+        .arg("--bin")
+        .arg("clarion-plugin-fixture")
+        .arg("--target-dir")
+        .arg(target_dir)
+        .output()
+        .expect("spawn cargo build for clarion-plugin-fixture");
+
+    assert!(
+        output.status.success(),
+        "cargo build for clarion-plugin-fixture failed with status {}.\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
