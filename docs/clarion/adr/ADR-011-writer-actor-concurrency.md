@@ -168,7 +168,7 @@ Already rejected in ADR-001 for the storage-engine selection. Re-cited here beca
 ## Related Decisions
 
 - [ADR-001](./ADR-001-rust-for-core.md) — Rust + `rusqlite` + `tokio` is the framework this ADR lives inside. `deadpool-sqlite` is named in ADR-001's ecosystem argument.
-- ADR-005 (pending) — `.clarion/` git-committable default. `clarion.db.new` (shadow-DB intermediate) must be `.gitignore`d; ADR-005 picks the exact ignore rules.
+- [ADR-005](./ADR-005-clarion-dir-tracking.md) — `.clarion/` git-committable default. `clarion.db.new` (shadow-DB intermediate) must be `.gitignore`d; ADR-005 picks the exact ignore rules.
 - [ADR-021](./ADR-021-plugin-authority-hybrid.md) — the per-run entity-count cap (Layer 2d) interacts with transaction granularity: the cap triggers a final flush and abort, which lands cleanly because per-N-files keeps the write path predictable.
 
 ## References

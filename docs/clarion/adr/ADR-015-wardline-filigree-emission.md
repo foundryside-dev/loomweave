@@ -23,7 +23,7 @@ Three decisions exist inside the emission question:
 2. **When does Wardline gain a native path?** v0.2 default, or a v0.1 stretch-goal contingent on a cheap implementation?
 3. **What happens to the Clarion translator when Wardline gains native emission?** Does it retire entirely, or stay for other SARIF emitters?
 
-The default committed answers in `v0.1-scope-commitments.md:190` are: Option A for v0.1, Option B for v0.2 (default deferral, optional promotion pending spike), translator stays permanently for non-Wardline SARIF sources.
+The default committed answers in `../../implementation/v0.1-scope-plans/v0.1-scope-commitments.md:190` are: Option A for v0.1, Option B for v0.2 (default deferral, optional promotion pending spike), translator stays permanently for non-Wardline SARIF sources.
 
 This ADR formalises those answers and names the revision trigger.
 

@@ -137,7 +137,7 @@ Use cgroup v2 (`systemd-run --user --scope` or direct cgroup mounts) for per-plu
 ## Related Decisions
 
 - [ADR-002](./ADR-002-plugin-transport-json-rpc.md) — the subprocess transport is the enforcement surface for Content-Length ceiling and crash-loop counting. This ADR extends ADR-002's supervision loop with four specific violation subcodes.
-- ADR-012 (pending, rewritten for Block B) — the HTTP auth default flip closes T-02 the way this ADR closes T-08/T-11/T-12. The two ADRs form a matched pair covering the panel's "three non-negotiable v0.1 controls."
+- [ADR-012](./ADR-012-http-auth-default.md) — the HTTP auth default flip closes T-02 the way this ADR closes T-08/T-11/T-12. The two ADRs form a matched pair covering the panel's "three non-negotiable v0.1 controls."
 - [ADR-013](./ADR-013-pre-ingest-secret-scanner.md) — pre-ingest secret scanner covers T-10 (source + secrets exfiltration); this ADR's path-jail prevents a plugin from bypassing the scanner by reading outside `project_root`, and ADR-013's scanner runs on the file list this ADR's path-jail has already filtered.
 - [ADR-022](./ADR-022-core-plugin-ontology.md) — data-layer authority counterpart. This ADR's Layer 2 enforces at the transport/pipeline layer; ADR-022 enforces at the ontology layer (manifest-declared kinds, rule-ID namespacing). Both share the manifest-acceptance checkpoint.
 

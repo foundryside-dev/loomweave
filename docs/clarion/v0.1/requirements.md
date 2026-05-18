@@ -7,8 +7,9 @@
 **Companion documents**:
 - [system-design.md](./system-design.md) — system design (the *how*, mid-level)
 - [detailed-design.md](./detailed-design.md) — detailed design reference (implementation-level)
-- [reviews/pre-restructure/design-review.md](../../implementation/v0.1-reviews/pre-restructure/design-review.md) — prior review that shaped revs 2-4
-- [reviews/pre-restructure/integration-recon.md](../../implementation/v0.1-reviews/pre-restructure/integration-recon.md) — reality check against Filigree / Wardline
+- [../adr/README.md](../adr/README.md) — Accepted ADRs
+- [../../implementation/v0.1-reviews/pre-restructure/design-review.md](../../implementation/v0.1-reviews/pre-restructure/design-review.md) — archived design review that shaped revs 2-4
+- [../../implementation/v0.1-reviews/pre-restructure/integration-recon.md](../../implementation/v0.1-reviews/pre-restructure/integration-recon.md) — archived reality check against Filigree / Wardline
 
 ---
 

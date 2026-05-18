@@ -305,7 +305,7 @@ generates less value than the discipline floor it provides.
   contract. Plugins authored in Python (WP3) or later in other languages
   can adopt tooling baselines appropriate to their ecosystem; the Rust
   host's baseline is defined here.
-- Scope-commitment memo [`../v0.1/plans/v0.1-scope-commitments.md`](../../implementation/v0.1-scope-plans/v0.1-scope-commitments.md)
+- Scope-commitment memo [`../../implementation/v0.1-scope-plans/v0.1-scope-commitments.md`](../../implementation/v0.1-scope-plans/v0.1-scope-commitments.md)
   — "enterprise rigor at lack of scale" is the phrase this ADR operationalises
   at the tooling layer.
 

@@ -1215,7 +1215,7 @@ The parallel listing in [detailed-design.md §11](./detailed-design.md#11-archit
 
 ### Writing cadence
 
-ADR-001 through ADR-004, ADR-006, ADR-007, ADR-011, ADR-012, ADR-013, ADR-014, ADR-015, ADR-016, ADR-017, ADR-018, ADR-021, and ADR-022 are authored and Accepted as standalone files in [../adr/](../adr/README.md). The remaining backlog items are ADR-005, ADR-009, ADR-010, ADR-019, and ADR-020; they stay summarised here and in the ADR index until the code that depends on them is ready to land. Any decision reversal during implementation (e.g., "writer-actor doesn't work; switching to shadow-DB") requires a new dated ADR revision, not an edit to the original.
+Most ADRs are now authored and Accepted as standalone files in [../adr/](../adr/README.md); ADR-008 is Superseded (by ADR-014); ADR-009, ADR-010, ADR-019, and ADR-020 remain backlog and stay summarised here and in the ADR index until the code that depends on them is ready to land. Additional Sprint-2-era ADRs (ADR-023 through ADR-032) were authored after this design layer was baselined; their summaries live in the ADR index rather than in this section. Any decision reversal during implementation (e.g., "writer-actor doesn't work; switching to shadow-DB") requires a new dated ADR revision, not an edit to the original.
 
 Authored ADR text (context, decision, alternatives considered, consequences, status) lives in [../adr/README.md](../adr/README.md). These summaries are the navigation aid; the canonical record of completed decisions is the ADR collection itself.
 

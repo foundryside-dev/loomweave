@@ -148,7 +148,7 @@ v0.1 tokens carry scope claims — read-only catalog, read-only findings, submit
 
 ## Related Decisions
 
-- ADR-005 (pending; see the [ADR index backlog](./README.md)) — `.clarion/` git-committable by default, but `.clarion/socket` and `.clarion/auth.token` are runtime artifacts that must be excluded. ADR-005 picks the `.gitignore` rules that protect against both.
+- [ADR-005](./ADR-005-clarion-dir-tracking.md) — `.clarion/` git-committable by default, but `.clarion/socket` and `.clarion/auth.token` are runtime artifacts that must be excluded. ADR-005 picks the `.gitignore` rules that protect against both.
 - [ADR-021](./ADR-021-plugin-authority-hybrid.md) — closes the plugin-side attack surface (T-01, T-08, T-11, T-12); this ADR closes the HTTP-side attack surface (T-02, T-05). Together they are the panel's "three non-negotiable v0.1 controls" (third being ADR-013, secret scanner).
 
 ## References

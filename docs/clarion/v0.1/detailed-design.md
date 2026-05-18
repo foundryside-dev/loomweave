@@ -9,8 +9,9 @@
 **Companion documents**:
 - [requirements.md](./requirements.md) — requirements (the *what*; REQ-* / NFR-* / CON-* / NG-*)
 - [system-design.md](./system-design.md) — system design (the *how*, mid-level; architecture, mechanisms, diagrams)
-- [reviews/pre-restructure/design-review.md](../../implementation/v0.1-reviews/pre-restructure/design-review.md) — design review that drove revisions 2-4
-- [reviews/pre-restructure/integration-recon.md](../../implementation/v0.1-reviews/pre-restructure/integration-recon.md) — integration reality check against Filigree / Wardline
+- [../adr/README.md](../adr/README.md) — Accepted ADRs (including ADR-023 through ADR-032 authored after this layer was baselined)
+- [../../implementation/v0.1-reviews/pre-restructure/design-review.md](../../implementation/v0.1-reviews/pre-restructure/design-review.md) — design review that drove revisions 2-4 (archived)
+- [../../implementation/v0.1-reviews/pre-restructure/integration-recon.md](../../implementation/v0.1-reviews/pre-restructure/integration-recon.md) — integration reality check against Filigree / Wardline (archived)
 
 ---
 
@@ -1566,6 +1567,8 @@ Decisions in this design are load-bearing enough that they deserve explicit Arch
 **Canonical source**: [system-design.md §12](./system-design.md#12-architecture-decisions) carries the authoritative ADR list with status, priority, and rationale summaries. Authored ADR files live in [../adr/README.md](../adr/README.md).
 
 The table below is a navigation aid for implementers: it maps each ADR to the section(s) of *this detailed design* where the decision shows up concretely. It deliberately does not duplicate the rationale or status columns from system-design.md — consult the canonical table for those.
+
+**Coverage note**: this table reflects the ADR set at the 2026-04-18 baseline (ADR-001 through ADR-022). ADR-023 through ADR-032 were authored after the baseline; they touch implementation surfaces this document describes but are not catalogued in the table below. The [ADR index](../adr/README.md) is the canonical list for post-baseline decisions, and the relevant ADR files cite the schema/wire/section they affect.
 
 ### Where each ADR is captured in this detailed design
 
