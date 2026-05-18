@@ -242,10 +242,10 @@ not emit a finding.
 | `crates/clarion-cli/src/main.rs` | Pass analyze config path into `analyze::run` | 2 |
 | `crates/clarion-cli/src/cli.rs` | Add `clarion analyze --config <path>` | 2 |
 | `crates/clarion-cli/src/config.rs` | New analyze config parser and defaults for `analysis.clustering` | 2 |
-| `crates/clarion-cli/src/analyze.rs` | Accept config, persist config JSON, call Phase 3 before commit, merge clustering stats | 2, 5 |
+| `crates/clarion-cli/src/analyze.rs` | Accept config, persist config JSON, filter candidate `imports` before writer insertion, call Phase 3 before commit, merge clustering stats | 2, 3, 5 |
 | `crates/clarion-cli/src/clustering.rs` | New Phase 3 graph/algorithm/subsystem writer orchestration | 1, 4, 5 |
 | `crates/clarion-cli/Cargo.toml` | Wire dependencies used by config/clustering | 1, 2 |
-| `crates/clarion-cli/tests/analyze.rs` | Config/run-stats/Phase-3 integration tests | 2, 5 |
+| `crates/clarion-cli/tests/analyze.rs` | Config/run-stats/import-filter/Phase-3 integration tests | 2, 3, 5 |
 | `plugins/python/plugin.toml` | Add `imports`; bump plugin and ontology versions | 3 |
 | `plugins/python/src/clarion_plugin_python/__init__.py` | Bump package version | 3 |
 | `plugins/python/src/clarion_plugin_python/server.py` | Bump ontology constant; pass import resolver inputs if needed | 3 |
@@ -366,6 +366,8 @@ cargo test -p clarion-cli analyze_without_plugins_writes_skipped_run_row -- --no
 ## Task 3: Python imports Edge Emission
 
 **Files:**
+- Modify: `crates/clarion-cli/src/analyze.rs`
+- Modify: `crates/clarion-cli/tests/analyze.rs`
 - Modify: `plugins/python/plugin.toml`
 - Modify: `plugins/python/src/clarion_plugin_python/__init__.py`
 - Modify: `plugins/python/src/clarion_plugin_python/server.py`
@@ -385,6 +387,8 @@ foreign keys.
   - `test_from_import_emits_import_edge_to_parent_module`
   - `test_relative_import_emits_package_relative_module_edge`
   - `test_import_edges_have_source_byte_range_and_resolved_confidence`
+- [ ] Write failing Rust host test:
+  - `analyze_filters_external_import_edges_before_writer_insert`
 - [ ] Add `ImportsEdgeProperties` with at least:
   - `imported_name`
   - `import_style` (`import` or `from_import`)
@@ -392,6 +396,13 @@ foreign keys.
 - [ ] Add an AST import-site collector. Source range comes from the AST node's
   byte offsets using the same source-buffer convention as calls/references.
 - [ ] Emit edges from current module entity to `python:module:{target}`.
+- [ ] In `run_plugin_blocking`, after all files in a plugin batch have been
+  analyzed and before returning `collected_edges` to the async writer-insert
+  path, filter `imports` edges to targets present in the batch's accepted
+  module entity IDs. Preserve internal imports; drop external or unresolved
+  imports with an additive `imports_skipped_external_total` counter in
+  `BatchStats`/`runs.stats` rather than allowing SQLite FK failure during
+  `WriterCmd::InsertEdge`.
 - [ ] Add `imports` to plugin manifest `edge_kinds`, bump ontology version and
   package patch version.
 - [ ] Add or update shared edge parity fixture only if the current fixture
@@ -407,6 +418,7 @@ plugins/python/.venv/bin/pytest plugins/python/tests/test_round_trip.py -q
 plugins/python/.venv/bin/mypy --strict plugins/python
 plugins/python/.venv/bin/ruff check plugins/python
 plugins/python/.venv/bin/ruff format --check plugins/python
+cargo test -p clarion-cli analyze_filters_external_import_edges_before_writer_insert -- --nocapture
 ```
 
 **Commit:** `feat(wp3): emit python imports edges (phase3 task 3)`
@@ -495,7 +507,6 @@ modularity fact.
   - `clustering_stats`
   - `weak_modularity_finding`
 - [ ] In `analyze::run`, after plugin insertion and before outcome commit:
-  - filter candidate `imports` to existing module targets
   - read module dependency graph
   - cluster if enabled
   - insert subsystem entities
