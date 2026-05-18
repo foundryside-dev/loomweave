@@ -17,6 +17,7 @@ use clarion_mcp::{
     filigree::{
         EntityAssociation, EntityAssociationsResponse, FiligreeClientError, FiligreeLookup,
     },
+    list_tools,
 };
 use clarion_storage::{
     ReaderPool, SummaryCacheEntry, SummaryCacheKey, Writer, pragma, schema, upsert_summary_cache,
@@ -253,6 +254,52 @@ fn insert_unresolved_call_site(conn: &Connection, caller_id: &str, site_key: &st
         params![caller_id, caller_content_hash, site_key, expr],
     )
     .expect("insert unresolved call site");
+}
+
+fn seed_subsystem(conn: &Connection, project_root: &std::path::Path) -> String {
+    let extra_source_path = project_root.join("pkg_auth.py");
+    std::fs::write(&extra_source_path, "def login():\n    return True\n")
+        .expect("write extra module source");
+    insert_entity(
+        conn,
+        "python:module:pkg.auth",
+        "module",
+        &extra_source_path,
+        Some((1, 2)),
+        None,
+    );
+
+    let subsystem_id = "core:subsystem:abc123def456".to_owned();
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, properties, created_at, updated_at
+         ) VALUES (
+            ?1, 'core', 'subsystem', 'Subsystem abc123def456', 'abc123def456',
+            ?2, '2026-05-17T00:00:00.000Z', '2026-05-17T00:00:00.000Z'
+         )",
+        params![
+            subsystem_id,
+            json!({"member_count": 2, "modularity_score": 0.42}).to_string(),
+        ],
+    )
+    .expect("insert subsystem entity");
+    insert_edge(
+        conn,
+        "in_subsystem",
+        "python:module:demo",
+        &subsystem_id,
+        "resolved",
+        None,
+    );
+    insert_edge(
+        conn,
+        "in_subsystem",
+        "python:module:pkg.auth",
+        &subsystem_id,
+        "resolved",
+        None,
+    );
+    subsystem_id
 }
 
 fn state_for(project_root: &std::path::Path, db_path: &std::path::Path) -> ServerState {
@@ -650,6 +697,117 @@ async fn call_tool(state: &ServerState, name: &str, arguments: Value) -> Value {
         .as_str()
         .expect("tool content text");
     serde_json::from_str(text).expect("tool envelope JSON")
+}
+
+#[test]
+fn tools_list_includes_subsystem_members() {
+    let tools = list_tools();
+    let tool = tools
+        .iter()
+        .find(|tool| tool.name == "subsystem_members")
+        .expect("subsystem_members tool definition");
+
+    assert_eq!(
+        tool.description,
+        "List module entities assigned to a subsystem entity."
+    );
+    assert_eq!(
+        tool.input_schema,
+        json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "minLength": 1}
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        })
+    );
+}
+
+#[tokio::test]
+async fn subsystem_members_returns_member_modules() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    let subsystem_id = seed_subsystem(&conn, project.path());
+    drop(conn);
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(&state, "subsystem_members", json!({"id": subsystem_id})).await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(
+        envelope["result"]["subsystem"]["id"],
+        "core:subsystem:abc123def456"
+    );
+    assert_eq!(
+        envelope["result"]["subsystem"]["properties"]["member_count"],
+        2
+    );
+    assert_eq!(
+        envelope["result"]["subsystem"]["properties"]["modularity_score"],
+        0.42
+    );
+    let members = envelope["result"]["members"].as_array().unwrap();
+    assert_eq!(members.len(), 2);
+    assert_eq!(members[0]["id"], "python:module:demo");
+    assert_eq!(members[1]["id"], "python:module:pkg.auth");
+    assert!(
+        members[0]["source_file_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("demo.py")
+    );
+}
+
+#[tokio::test]
+async fn subsystem_members_rejects_non_subsystem_id() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "subsystem_members",
+        json!({"id": "python:module:demo"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "not-a-subsystem");
+    assert_eq!(envelope["result"], Value::Null);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_on_subsystem_returns_policy_envelope_without_llm_call() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    let subsystem_id = seed_subsystem(&conn, project.path());
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnySummaryProvider::new_output(
+        r#"{"purpose":"should not run"}"#,
+        120,
+        0.012,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(&state, "summary", json!({"id": subsystem_id})).await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["result"]["available"], false);
+    assert_eq!(envelope["result"]["reason"], "summary-scope-deferred");
+    assert_eq!(envelope["stats_delta"], json!({}));
+    assert!(provider.invocations().is_empty());
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
 }
 
 #[tokio::test]

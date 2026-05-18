@@ -26,7 +26,8 @@ use clarion_storage::{
     candidate_entities_for_unresolved_sites, child_entity_ids, contained_entity_ids,
     entity_at_line, entity_by_id, existing_entity_ids, find_entities, inferred_edge_cache_key_id,
     inferred_edge_cache_lookup, normalize_source_path, reference_edges_for_entity,
-    summary_cache_lookup, unresolved_call_sites_for_caller, unresolved_callers_for_target,
+    subsystem_members, summary_cache_lookup, unresolved_call_sites_for_caller,
+    unresolved_callers_for_target,
 };
 
 use crate::config::LlmConfig;
@@ -118,6 +119,11 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             name: "neighborhood",
             description: "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, and references. Default confidence is resolved; ambiguous and inferred calls are opt-in. References are not execution flow.",
             input_schema: id_confidence_schema(),
+        },
+        ToolDefinition {
+            name: "subsystem_members",
+            description: "List module entities assigned to a subsystem entity.",
+            input_schema: id_schema(),
         },
     ]
 }
@@ -293,6 +299,10 @@ impl ServerState {
                 Err(response) => return response.to_json_rpc(id),
             },
             "issues_for" => match self.tool_issues_for(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "subsystem_members" => match self.tool_subsystem_members(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
@@ -666,6 +676,50 @@ impl ServerState {
             }
         }
         Ok(accumulator.into_envelope(read.entity_cap_truncated, requests_total))
+    }
+
+    async fn tool_subsystem_members(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let subsystem_id = required_str(arguments, "id")?.to_owned();
+        let result = self
+            .readers
+            .with_reader(move |conn| {
+                let Some(subsystem) = entity_by_id(conn, &subsystem_id)? else {
+                    return Ok(tool_error_envelope(
+                        "entity-not-found",
+                        &format!("entity {subsystem_id} was not found"),
+                        false,
+                    ));
+                };
+                if subsystem.kind != "subsystem" {
+                    return Ok(tool_error_envelope(
+                        "not-a-subsystem",
+                        &format!("entity {} is kind {}", subsystem.id, subsystem.kind),
+                        false,
+                    ));
+                }
+                let members = subsystem_members(conn, &subsystem.id)?
+                    .iter()
+                    .map(|member| {
+                        json!({
+                            "id": member.id,
+                            "name": member.name,
+                            "source_file_path": member.source_file_path
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(success_envelope(json!({
+                    "subsystem": {
+                        "id": subsystem.id,
+                        "properties": entity_properties_json(&subsystem)
+                    },
+                    "members": members
+                })))
+            })
+            .await;
+        Ok(flatten_storage_envelope_result(result))
     }
 
     async fn read_issues_for_entities(
@@ -1087,6 +1141,9 @@ impl ServerState {
                 let Some(entity) = entity_by_id(conn, &entity_id)? else {
                     return Ok(SummaryRead::EntityNotFound(entity_id));
                 };
+                if entity.kind == "subsystem" {
+                    return Ok(SummaryRead::ScopeDeferred(Box::new(entity)));
+                }
                 let Some(content_hash) = entity.content_hash.clone() else {
                     return Ok(SummaryRead::MissingContentHash(entity.id));
                 };
@@ -1413,6 +1470,7 @@ enum SummaryRead {
     Ready(Box<SummaryReady>),
     EntityNotFound(String),
     MissingContentHash(String),
+    ScopeDeferred(Box<EntityRow>),
 }
 
 struct SummaryReady {
@@ -2213,6 +2271,7 @@ fn summary_read_error(read: SummaryRead) -> Value {
             &format!("entity {id} has no content hash for summary cache keying"),
             false,
         ),
+        SummaryRead::ScopeDeferred(entity) => summary_scope_deferred(&entity),
         SummaryRead::Ready(_) => unreachable!("ready summary read is not an error"),
     }
 }
@@ -2277,6 +2336,15 @@ fn summary_success_envelope(
     )
 }
 
+fn summary_scope_deferred(entity: &EntityRow) -> Value {
+    success_envelope(json!({
+        "available": false,
+        "reason": "summary-scope-deferred",
+        "message": "subsystem summaries are deferred to v0.2",
+        "entity": entity_json(entity)
+    }))
+}
+
 fn tool_json_rpc_response(id: &Value, envelope: &Value) -> Value {
     let is_error = !envelope
         .get("ok")
@@ -2306,6 +2374,14 @@ fn entity_json(entity: &EntityRow) -> Value {
         "source_line_start": entity.source_line_start,
         "source_line_end": entity.source_line_end,
         "content_hash": entity.content_hash
+    })
+}
+
+fn entity_properties_json(entity: &EntityRow) -> Value {
+    serde_json::from_str::<Value>(&entity.properties_json).unwrap_or_else(|_| {
+        json!({
+            "raw": entity.properties_json
+        })
     })
 }
 
@@ -2605,7 +2681,7 @@ mod tests {
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
@@ -2640,6 +2716,11 @@ mod tests {
         assert_eq!(
             tools[6].description,
             "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, and references. Default confidence is resolved; ambiguous and inferred calls are opt-in. References are not execution flow."
+        );
+        assert_eq!(tools[7].name, "subsystem_members");
+        assert_eq!(
+            tools[7].description,
+            "List module entities assigned to a subsystem entity."
         );
     }
 
@@ -2677,8 +2758,9 @@ mod tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], "tools-1");
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 8);
         assert_eq!(response["result"]["tools"][0]["name"], "entity_at");
+        assert_eq!(response["result"]["tools"][7]["name"], "subsystem_members");
     }
 
     #[test]

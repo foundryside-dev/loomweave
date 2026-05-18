@@ -556,12 +556,12 @@ cargo test -p clarion-cli analyze_without_plugins_writes_skipped_run_row -- --no
 
 **Scope:** Surface persisted subsystems through MCP without invoking the LLM.
 
-- [ ] Write failing MCP tests:
+- [x] Write failing MCP tests:
   - `tools_list_includes_subsystem_members`
   - `subsystem_members_returns_member_modules`
   - `subsystem_members_rejects_non_subsystem_id`
   - `summary_on_subsystem_returns_policy_envelope_without_llm_call`
-- [ ] Add tool definition:
+- [x] Add tool definition:
 
 ```json
 {
@@ -577,7 +577,7 @@ cargo test -p clarion-cli analyze_without_plugins_writes_skipped_run_row -- --no
 }
 ```
 
-- [ ] Response shape:
+- [x] Response shape:
 
 ```json
 {
@@ -591,7 +591,7 @@ cargo test -p clarion-cli analyze_without_plugins_writes_skipped_run_row -- --no
 }
 ```
 
-- [ ] Add a `summary` early branch for subsystem kind that returns the
+- [x] Add a `summary` early branch for subsystem kind that returns the
   existing policy/error envelope and does not consult cache or provider.
 
 **Exit:** MCP tests pass and the existing seven tools are unchanged except for
