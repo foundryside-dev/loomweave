@@ -12,6 +12,15 @@ pub(crate) enum ClusterAlgorithm {
     Louvain,
 }
 
+impl ClusterAlgorithm {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ClusterAlgorithm::Leiden => "leiden",
+            ClusterAlgorithm::Louvain => "louvain",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ModuleEdge {
     pub(crate) from: String,

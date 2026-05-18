@@ -493,28 +493,28 @@ cargo test -p clarion-storage schema_accepts_open_entity_and_edge_kinds -- --noc
 `clarion analyze`, then persist run-level clustering stats and the weak
 modularity fact.
 
-- [ ] Write failing Rust tests:
+- [x] Write failing Rust tests:
   - `analyze_phase3_emits_subsystem_entities_and_edges`
   - `analyze_phase3_is_deterministic_across_two_runs`
   - `analyze_phase3_skips_empty_graph_with_stats`
   - `analyze_phase3_emits_weak_modularity_fact_when_below_threshold`
   - `writer_inserts_fact_findings`
-- [ ] Add `FindingRecord` and `WriterCmd::InsertFinding`.
-- [ ] Implement writer insertion for `findings`, including JSON fields as
+- [x] Add `FindingRecord` and `WriterCmd::InsertFinding`.
+- [x] Implement writer insertion for `findings`, including JSON fields as
   serialized strings and `status = 'open'`.
-- [ ] Add `Phase3Output`:
+- [x] Add `Phase3Output`:
   - `subsystems_inserted`
   - `in_subsystem_edges_inserted`
   - `clustering_stats`
   - `weak_modularity_finding`
-- [ ] In `analyze::run`, after plugin insertion and before outcome commit:
+- [x] In `analyze::run`, after plugin insertion and before outcome commit:
   - read module dependency graph
   - cluster if enabled
   - insert subsystem entities
   - insert `in_subsystem` edges
   - insert weak-modularity finding if applicable
   - merge clustering stats into completed or soft-failed stats JSON
-- [ ] Subsystem entity properties:
+- [x] Subsystem entity properties:
 
 ```json
 {

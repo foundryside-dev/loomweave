@@ -106,6 +106,32 @@ pub struct InferredEdgeWriteStats {
     pub skipped_static_duplicates: u64,
 }
 
+/// Plain-old-data finding record as seen by the writer. JSON-typed fields are
+/// serialized by the caller and inserted verbatim; lifecycle status is owned by
+/// the writer and starts as `open`.
+#[derive(Debug, Clone)]
+pub struct FindingRecord {
+    pub id: String,
+    pub tool: String,
+    pub tool_version: String,
+    pub run_id: String,
+    pub rule_id: String,
+    pub kind: String,
+    pub severity: String,
+    pub confidence: Option<f64>,
+    pub confidence_basis: Option<String>,
+    pub entity_id: String,
+    pub related_entities_json: String,
+    pub message: String,
+    pub evidence_json: String,
+    pub properties_json: String,
+    pub supports_json: String,
+    pub supported_by_json: String,
+    /// ISO-8601 UTC; writer inserts verbatim.
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// All writer operations as a single enum so the actor loop exhausts
 /// everything via one match.
 #[derive(Debug)]
@@ -131,6 +157,15 @@ pub enum WriterCmd {
     /// `Writer::dropped_edges_total` on dedupe. Also advances the per-batch
     /// write counter — edges and entities share one batch boundary.
     InsertEdge { edge: Box<EdgeRecord>, ack: Ack<()> },
+    /// Insert one finding. The writer initializes lifecycle status to `open`
+    /// and leaves suppression / Filigree-link fields empty.
+    InsertFinding {
+        finding: Box<FindingRecord>,
+        ack: Ack<()>,
+    },
+    /// Commit the current analyze batch and reopen it so readers on separate
+    /// `SQLite` connections can observe graph rows before `CommitRun`.
+    FlushRunBatch { ack: Ack<()> },
     /// Upsert one inferred-edge cache row and materialize its current inferred
     /// call edges. This query-time MCP write does not require an active
     /// analyze run and does not use scan-time edge contracts.

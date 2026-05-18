@@ -110,8 +110,25 @@ pub(crate) enum ClusteringEdgeType {
     Calls,
 }
 
+impl ClusteringEdgeType {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ClusteringEdgeType::Imports => "imports",
+            ClusteringEdgeType::Calls => "calls",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ClusteringWeightBy {
     ReferenceCount,
+}
+
+impl ClusteringWeightBy {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ClusteringWeightBy::ReferenceCount => "reference_count",
+        }
+    }
 }

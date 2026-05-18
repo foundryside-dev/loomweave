@@ -19,6 +19,18 @@ fn latest_run_config(project_root: &std::path::Path) -> serde_json::Value {
     serde_json::from_str(&config_raw).expect("runs.config JSON")
 }
 
+fn latest_run_stats(project_root: &std::path::Path) -> serde_json::Value {
+    let conn = Connection::open(project_root.join(".clarion/clarion.db")).unwrap();
+    let stats_raw: String = conn
+        .query_row(
+            "SELECT stats FROM runs ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query latest runs.stats");
+    serde_json::from_str(&stats_raw).expect("runs.stats JSON")
+}
+
 #[cfg(unix)]
 const AMBIGUOUS_CALLS_PLUGIN_SCRIPT: &str = r#"#!/usr/bin/python3
 import json
@@ -289,6 +301,122 @@ ontology_version = "0.6.0"
 "#;
 
 #[cfg(unix)]
+const PHASE3_PLUGIN_SCRIPT: &str = r#"#!/usr/bin/python3
+import json
+import pathlib
+import sys
+
+
+def read_frame():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if line in (b"", b"\r\n"):
+            break
+        name, value = line.decode("ascii").strip().split(":", 1)
+        headers[name.lower()] = value.strip()
+    length = int(headers["content-length"])
+    return json.loads(sys.stdin.buffer.read(length))
+
+
+def write_frame(message):
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n")
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+
+TARGETS = {
+    "auth_a": ["auth_b"],
+    "auth_b": ["auth_a"],
+    "billing_a": ["billing_b"],
+    "billing_b": ["billing_a"],
+    "weak_a": ["weak_b"],
+}
+
+
+while True:
+    msg = read_frame()
+    method = msg.get("method")
+    if method == "initialized":
+        continue
+    if method == "exit":
+        raise SystemExit(0)
+    ident = msg["id"]
+    if method == "initialize":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "name": "clarion-plugin-phase3",
+                "version": "0.1.0",
+                "ontology_version": "0.6.0",
+                "capabilities": {},
+            },
+        })
+    elif method == "analyze_file":
+        path = msg["params"]["file_path"]
+        stem = pathlib.Path(path).stem
+        module_id = f"phase3fixture:module:{stem}"
+        edges = [
+            {
+                "kind": "imports",
+                "from_id": module_id,
+                "to_id": f"phase3fixture:module:{target}",
+                "source_byte_start": 0,
+                "source_byte_end": 10,
+                "confidence": "resolved",
+                "properties": {"imported_name": target},
+            }
+            for target in TARGETS.get(stem, [])
+        ]
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "entities": [
+                    {
+                        "id": module_id,
+                        "kind": "module",
+                        "qualified_name": stem,
+                        "source": {"file_path": path},
+                    },
+                ],
+                "edges": edges,
+                "stats": {},
+            },
+        })
+    elif method == "shutdown":
+        write_frame({"jsonrpc": "2.0", "id": ident, "result": {}})
+    else:
+        raise SystemExit(1)
+"#;
+
+#[cfg(unix)]
+const PHASE3_PLUGIN_MANIFEST: &str = r#"
+[plugin]
+name = "clarion-plugin-phase3"
+plugin_id = "phase3fixture"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "clarion-plugin-phase3"
+language = "phase3fixture"
+extensions = ["p3"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 256
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+entity_kinds = ["module"]
+edge_kinds = ["imports"]
+rule_id_prefix = "CLA-PHASE3-"
+ontology_version = "0.6.0"
+"#;
+
+#[cfg(unix)]
 fn write_ambiguous_calls_plugin(plugin_dir: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -322,6 +450,64 @@ fn write_imports_plugin(plugin_dir: &std::path::Path) {
 
     std::fs::write(plugin_dir.join("plugin.toml"), IMPORTS_PLUGIN_MANIFEST)
         .expect("write imports plugin manifest");
+}
+
+#[cfg(unix)]
+fn write_phase3_plugin(plugin_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let plugin_script = plugin_dir.join("clarion-plugin-phase3");
+    std::fs::write(&plugin_script, PHASE3_PLUGIN_SCRIPT).expect("write phase3 plugin script");
+    let mut perms = std::fs::metadata(&plugin_script)
+        .expect("stat phase3 plugin")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&plugin_script, perms).expect("chmod phase3 plugin");
+
+    std::fs::write(plugin_dir.join("plugin.toml"), PHASE3_PLUGIN_MANIFEST)
+        .expect("write phase3 plugin manifest");
+}
+
+#[cfg(unix)]
+fn run_phase3_fixture(stems: &[&str], config_yaml: &str) -> tempfile::TempDir {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_phase3_plugin(plugin_dir.path());
+
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    for stem in stems {
+        std::fs::write(project_dir.path().join(format!("{stem}.p3")), b"module\n")
+            .expect("write phase3 fixture file");
+    }
+    let config_path = project_dir.path().join("phase3-clarion.yaml");
+    std::fs::write(&config_path, config_yaml).expect("write phase3 config");
+
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    clarion_bin()
+        .args(["analyze", "--config"])
+        .arg(&config_path)
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    project_dir
+}
+
+#[cfg(unix)]
+fn phase3_config(min_cluster_size: u64) -> String {
+    format!(
+        r"
+analysis:
+  clustering:
+    min_cluster_size: {min_cluster_size}
+"
+    )
 }
 
 #[test]
@@ -474,6 +660,132 @@ analysis:
         .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
         .expect("query run count");
     assert_eq!(run_count, 0, "invalid config must fail before BeginRun");
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_phase3_emits_subsystem_entities_and_edges() {
+    let project_dir = run_phase3_fixture(
+        &["auth_a", "auth_b", "billing_a", "billing_b"],
+        &phase3_config(2),
+    );
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+
+    let subsystem_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE kind = 'subsystem'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query subsystem count");
+    assert!(
+        subsystem_count >= 2,
+        "expected at least two subsystem entities, got {subsystem_count}"
+    );
+
+    let in_subsystem_edges: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges WHERE kind = 'in_subsystem'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query in_subsystem edge count");
+    assert_eq!(in_subsystem_edges, 4);
+
+    let stats = latest_run_stats(project_dir.path());
+    let clustering = &stats["clustering"];
+    assert_eq!(clustering["status"].as_str(), Some("completed"));
+    assert_eq!(clustering["subsystems_inserted"].as_u64(), Some(2));
+    assert_eq!(clustering["in_subsystem_edges_inserted"].as_u64(), Some(4));
+    assert_eq!(clustering["module_count"].as_u64(), Some(4));
+    assert_eq!(clustering["module_edge_count"].as_u64(), Some(4));
+    assert_eq!(clustering["algorithm"].as_str(), Some("leiden"));
+    assert!(clustering["modularity_score"].is_number());
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_phase3_is_deterministic_across_two_runs() {
+    fn signature(project_root: &std::path::Path) -> Vec<(String, String)> {
+        let conn = Connection::open(project_root.join(".clarion/clarion.db")).unwrap();
+        conn.prepare("SELECT id, properties FROM entities WHERE kind = 'subsystem' ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    let config = phase3_config(2);
+    let first = run_phase3_fixture(&["auth_a", "auth_b", "billing_a", "billing_b"], &config);
+    let second = run_phase3_fixture(&["auth_a", "auth_b", "billing_a", "billing_b"], &config);
+
+    assert_eq!(signature(first.path()), signature(second.path()));
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_phase3_skips_empty_graph_with_stats() {
+    let project_dir = run_phase3_fixture(&["solo"], &phase3_config(2));
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    let subsystem_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE kind = 'subsystem'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query subsystem count");
+    assert_eq!(subsystem_count, 0);
+
+    let stats = latest_run_stats(project_dir.path());
+    let clustering = &stats["clustering"];
+    assert_eq!(clustering["status"].as_str(), Some("skipped"));
+    assert_eq!(
+        clustering["skipped_reason"].as_str(),
+        Some("no_module_dependency_edges")
+    );
+    assert_eq!(clustering["module_count"].as_u64(), Some(1));
+    assert_eq!(clustering["module_edge_count"].as_u64(), Some(0));
+    assert_eq!(clustering["subsystems_inserted"].as_u64(), Some(0));
+    assert_eq!(clustering["in_subsystem_edges_inserted"].as_u64(), Some(0));
+    assert!(clustering["modularity_score"].is_null());
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_phase3_emits_weak_modularity_fact_when_below_threshold() {
+    let project_dir = run_phase3_fixture(&["weak_a", "weak_b"], &phase3_config(2));
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    let row: (String, String, String, String, String) = conn
+        .query_row(
+            "SELECT rule_id, kind, severity, status, properties \
+             FROM findings WHERE rule_id = 'CLA-FACT-CLUSTERING-WEAK-MODULARITY'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .expect("query weak modularity finding");
+    assert_eq!(row.0, "CLA-FACT-CLUSTERING-WEAK-MODULARITY");
+    assert_eq!(row.1, "fact");
+    assert_eq!(row.2, "INFO");
+    assert_eq!(row.3, "open");
+    let properties: serde_json::Value = serde_json::from_str(&row.4).expect("finding properties");
+    assert_eq!(properties["threshold"].as_f64(), Some(0.25));
+    assert_eq!(properties["algorithm"].as_str(), Some("leiden"));
+    assert!(properties["modularity_score"].as_f64().unwrap_or(1.0) < 0.25);
+
+    let stats = latest_run_stats(project_dir.path());
+    assert_eq!(
+        stats["clustering"]["weak_modularity_finding_emitted"].as_bool(),
+        Some(true)
+    );
 }
 
 #[test]

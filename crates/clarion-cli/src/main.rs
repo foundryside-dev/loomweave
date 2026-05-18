@@ -1,10 +1,7 @@
 mod analyze;
 mod cli;
-mod config;
-// Phase 3 Task 1 lands the clustering adapter before Task 5 wires it into
-// `clarion analyze`; keep the pre-integration adapter warning-clean meanwhile.
-#[allow(dead_code)]
 mod clustering;
+mod config;
 mod install;
 mod serve;
 mod stats;

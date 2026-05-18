@@ -21,7 +21,8 @@ pub use cache::{
     upsert_summary_cache,
 };
 pub use commands::{
-    EdgeRecord, EntityRecord, InferredCallEdgeRecord, InferredEdgeWriteStats, RunStatus, WriterCmd,
+    EdgeRecord, EntityRecord, FindingRecord, InferredCallEdgeRecord, InferredEdgeWriteStats,
+    RunStatus, WriterCmd,
 };
 pub use error::{Result, StorageError};
 pub use query::{

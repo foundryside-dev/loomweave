@@ -24,8 +24,8 @@ use crate::cache::{
     upsert_inferred_edge_cache, upsert_summary_cache,
 };
 use crate::commands::{
-    Ack, EdgeConfidence, EdgeRecord, EntityRecord, InferredCallEdgeRecord, InferredEdgeWriteStats,
-    RunStatus, WriterCmd,
+    Ack, EdgeConfidence, EdgeRecord, EntityRecord, FindingRecord, InferredCallEdgeRecord,
+    InferredEdgeWriteStats, RunStatus, WriterCmd,
 };
 use crate::error::{Result, StorageError};
 use crate::pragma;
@@ -177,6 +177,14 @@ fn run_actor(
                 );
                 reply(ack, res);
             }
+            WriterCmd::InsertFinding { finding, ack } => {
+                let res = insert_finding(conn, &mut state, &finding, commits_observed);
+                reply(ack, res);
+            }
+            WriterCmd::FlushRunBatch { ack } => {
+                let res = flush_run_batch(conn, &mut state, commits_observed);
+                reply(ack, res);
+            }
             WriterCmd::InsertInferredEdges {
                 cache_entry,
                 edges,
@@ -248,13 +256,12 @@ fn run_actor(
             }
         }
     }
-    // Channel closed. Best-effort cleanup.
-    //
-    // Two hazards to cover: an open entity transaction must be rolled back,
-    // and — if a run was in progress — its `runs.status` row must not be
-    // left permanently as `'running'`. We self-heal both. This path is
-    // reached when the Writer handle is dropped mid-run; once the normal
-    // CommitRun / FailRun flows are used, current_run is None here.
+    cleanup_after_channel_close(conn, &mut state);
+}
+
+fn cleanup_after_channel_close(conn: &mut Connection, state: &mut ActorState) {
+    // Two hazards to cover: an open entity transaction must be rolled back, and
+    // a run in progress must not be left permanently as `'running'`.
     if state.in_tx {
         let _ = conn.execute_batch("ROLLBACK");
         state.in_tx = false;
@@ -587,6 +594,58 @@ fn insert_edge(
     Ok(())
 }
 
+fn insert_finding(
+    conn: &mut Connection,
+    state: &mut ActorState,
+    finding: &FindingRecord,
+    commits_observed: &AtomicUsize,
+) -> Result<()> {
+    if state.current_run.is_none() {
+        return Err(StorageError::WriterProtocol(
+            "InsertFinding received without a preceding BeginRun".to_owned(),
+        ));
+    }
+    if !state.in_tx {
+        conn.execute_batch("BEGIN")?;
+        state.in_tx = true;
+    }
+    conn.execute(
+        "INSERT INTO findings ( \
+            id, tool, tool_version, run_id, rule_id, kind, severity, confidence, \
+            confidence_basis, entity_id, related_entities, message, evidence, \
+            properties, supports, supported_by, status, suppression_reason, \
+            filigree_issue_id, created_at, updated_at \
+         ) VALUES ( \
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, \
+            ?9, ?10, ?11, ?12, ?13, \
+            ?14, ?15, ?16, 'open', NULL, \
+            NULL, ?17, ?18 \
+         )",
+        params![
+            finding.id,
+            finding.tool,
+            finding.tool_version,
+            finding.run_id,
+            finding.rule_id,
+            finding.kind,
+            finding.severity,
+            finding.confidence,
+            finding.confidence_basis,
+            finding.entity_id,
+            finding.related_entities_json,
+            finding.message,
+            finding.evidence_json,
+            finding.properties_json,
+            finding.supports_json,
+            finding.supported_by_json,
+            finding.created_at,
+            finding.updated_at,
+        ],
+    )?;
+    bump_writes_and_maybe_commit(conn, state, commits_observed)?;
+    Ok(())
+}
+
 fn insert_inferred_edges(
     conn: &Connection,
     cache_entry: &InferredEdgeCacheEntry,
@@ -721,6 +780,27 @@ fn bump_writes_and_maybe_commit(
         conn.execute_batch("BEGIN")?;
         state.in_tx = true;
     }
+    Ok(())
+}
+
+fn flush_run_batch(
+    conn: &mut Connection,
+    state: &mut ActorState,
+    commits_observed: &AtomicUsize,
+) -> Result<()> {
+    if state.current_run.is_none() {
+        return Err(StorageError::WriterProtocol(
+            "FlushRunBatch received without a preceding BeginRun".to_owned(),
+        ));
+    }
+    if state.in_tx {
+        state.in_tx = false;
+        state.writes_in_batch = 0;
+        conn.execute_batch("COMMIT")?;
+        commits_observed.fetch_add(1, Ordering::Relaxed);
+    }
+    conn.execute_batch("BEGIN")?;
+    state.in_tx = true;
     Ok(())
 }
 

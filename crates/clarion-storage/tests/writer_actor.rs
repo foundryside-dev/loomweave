@@ -10,7 +10,7 @@ use tokio::sync::oneshot;
 use clarion_storage::{
     InferredCallEdgeRecord, InferredEdgeCacheEntry, InferredEdgeCacheKey, ReaderPool,
     SummaryCacheEntry, SummaryCacheKey, UnresolvedCallSiteRecord, Writer,
-    commands::{EdgeConfidence, EdgeRecord, EntityRecord, RunStatus, WriterCmd},
+    commands::{EdgeConfidence, EdgeRecord, EntityRecord, FindingRecord, RunStatus, WriterCmd},
     pragma, schema,
 };
 
@@ -540,6 +540,108 @@ async fn round_trip_insert_persists_entity() {
         .await
         .unwrap();
     assert_eq!(kind, "function");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn writer_inserts_fact_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-finding").await;
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(make_module_entity("python:module:demo")),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    send::<()>(&tx, |ack| WriterCmd::InsertFinding {
+        finding: Box::new(FindingRecord {
+            id: "finding-1".to_owned(),
+            tool: "clarion".to_owned(),
+            tool_version: "0.1.0".to_owned(),
+            run_id: "run-finding".to_owned(),
+            rule_id: "CLA-FACT-CLUSTERING-WEAK-MODULARITY".to_owned(),
+            kind: "fact".to_owned(),
+            severity: "INFO".to_owned(),
+            confidence: Some(0.9),
+            confidence_basis: Some("deterministic modularity calculation".to_owned()),
+            entity_id: "python:module:demo".to_owned(),
+            related_entities_json: r#"["python:module:demo"]"#.to_owned(),
+            message: "Module graph has weak subsystem modularity".to_owned(),
+            evidence_json: r#"{"modularity_score":0.0}"#.to_owned(),
+            properties_json: r#"{"threshold":0.25}"#.to_owned(),
+            supports_json: "[]".to_owned(),
+            supported_by_json: "[]".to_owned(),
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        }),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-finding".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let conn = Connection::open(path).unwrap();
+    let row: (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT rule_id, kind, severity, status, related_entities, evidence, properties, \
+             supports, supported_by FROM findings WHERE id = ?1",
+            rusqlite::params!["finding-1"],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        row,
+        (
+            "CLA-FACT-CLUSTERING-WEAK-MODULARITY".to_owned(),
+            "fact".to_owned(),
+            "INFO".to_owned(),
+            "open".to_owned(),
+            r#"["python:module:demo"]"#.to_owned(),
+            r#"{"modularity_score":0.0}"#.to_owned(),
+            r#"{"threshold":0.25}"#.to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        )
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

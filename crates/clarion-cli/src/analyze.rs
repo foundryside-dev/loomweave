@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use ignore::{DirEntry, WalkBuilder};
+use rusqlite::Connection;
 use time::{OffsetDateTime, macros::format_description};
 use uuid::Uuid;
 
@@ -25,11 +26,16 @@ use clarion_core::{
 };
 use clarion_storage::{
     DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, UnresolvedCallSiteRecord, Writer,
-    commands::{EdgeRecord, EntityRecord, RunStatus, WriterCmd},
+    commands::{EdgeRecord, EntityRecord, FindingRecord, RunStatus, WriterCmd},
+    module_dependency_edges,
 };
 
-use crate::config::AnalyzeConfig;
+use crate::clustering::{ClusterConfig, ModuleEdge, ModuleGraph, cluster_hash, cluster_modules};
+use crate::config::{AnalyzeConfig, ClusteringConfig};
 use crate::stats::P95Accumulator;
+
+const WEAK_MODULARITY_RULE_ID: &str = "CLA-FACT-CLUSTERING-WEAK-MODULARITY";
+const WEAK_MODULARITY_THRESHOLD: f64 = 0.25;
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -78,9 +84,13 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let analyze_config_json = analyze_config.to_json_string()?;
 
     // ── Writer actor ──────────────────────────────────────────────────────────
-    let (writer, handle) = Writer::spawn(db_path, DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY)
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("spawn writer actor")?;
+    let (writer, handle) = Writer::spawn(
+        db_path.clone(),
+        DEFAULT_BATCH_SIZE,
+        DEFAULT_CHANNEL_CAPACITY,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))
+    .context("spawn writer actor")?;
     let run_id = Uuid::new_v4().to_string();
     let started_at = iso8601_now();
 
@@ -443,6 +453,28 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         };
     }
 
+    let phase3_output = if matches!(run_outcome, RunOutcome::HardFailed { .. }) {
+        Phase3Output::not_run()
+    } else {
+        match run_phase3_clustering(&writer, &db_path, &run_id, &analyze_config).await {
+            Ok(output) => {
+                total_entity_count += output.subsystems_inserted;
+                total_edge_count += output.in_subsystem_edges_inserted;
+                if output.weak_modularity_finding {
+                    tracing::info!(run_id = %run_id, "phase3 emitted weak-modularity finding");
+                }
+                output
+            }
+            Err(e) => {
+                tracing::error!(run_id = %run_id, error = %e, "phase3 clustering failed");
+                run_outcome = RunOutcome::HardFailed {
+                    reason: format!("phase3 clustering failed: {e:#}"),
+                };
+                Phase3Output::not_run()
+            }
+        }
+    };
+
     let completed_at = iso8601_now();
     // Snapshot the writer's process-lifetime dropped-edges counter so the
     // run's durable stats record the dedupe count (B.3 §6). Read BEFORE
@@ -481,6 +513,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "pyright_query_latency_p95_ms": pyright_query_latency_p95_ms,
                 "pyright_index_parse_latency_p95_ms": pyright_index_parse_latency_p95_ms,
                 "extractor_parse_latency_p95_ms": extractor_parse_latency_p95_ms,
+                "clustering": phase3_output.clustering_stats.clone(),
             })
             .to_string();
             writer
@@ -515,6 +548,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "pyright_query_latency_p95_ms": pyright_query_latency_p95_ms,
                 "pyright_index_parse_latency_p95_ms": pyright_index_parse_latency_p95_ms,
                 "extractor_parse_latency_p95_ms": extractor_parse_latency_p95_ms,
+                "clustering": phase3_output.clustering_stats.clone(),
                 "failure_reason": reason,
             })
             .to_string();
@@ -562,6 +596,370 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
          ({total_entity_count} entities, {total_edge_count} edges)"
     );
     Ok(())
+}
+
+// ── Phase 3 subsystem materialisation ─────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct Phase3Output {
+    subsystems_inserted: u64,
+    in_subsystem_edges_inserted: u64,
+    weak_modularity_finding: bool,
+    clustering_stats: serde_json::Value,
+}
+
+impl Phase3Output {
+    fn not_run() -> Self {
+        Self {
+            subsystems_inserted: 0,
+            in_subsystem_edges_inserted: 0,
+            weak_modularity_finding: false,
+            clustering_stats: serde_json::Value::Null,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InsertedSubsystem {
+    id: String,
+    member_count: usize,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_phase3_clustering(
+    writer: &Writer,
+    db_path: &Path,
+    run_id: &str,
+    analyze_config: &AnalyzeConfig,
+) -> Result<Phase3Output> {
+    let started = std::time::Instant::now();
+    let config = &analyze_config.analysis.clustering;
+    if !config.enabled {
+        return Ok(Phase3Output {
+            subsystems_inserted: 0,
+            in_subsystem_edges_inserted: 0,
+            weak_modularity_finding: false,
+            clustering_stats: phase3_stats_json(
+                config,
+                "disabled",
+                Some("disabled"),
+                0,
+                0,
+                0,
+                None,
+                0,
+                0,
+                false,
+                started,
+            ),
+        });
+    }
+
+    writer
+        .send_wait(|ack| WriterCmd::FlushRunBatch { ack })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("FlushRunBatch before phase3 clustering")?;
+
+    let conn = Connection::open(db_path).context("open read connection for phase3 clustering")?;
+    let module_ids = module_entity_ids(&conn).context("load module entities for phase3")?;
+    let edge_type_names = config
+        .edge_types
+        .iter()
+        .map(|edge_type| edge_type.as_str())
+        .collect::<Vec<_>>();
+    let dependency_edges = module_dependency_edges(&conn, &edge_type_names)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("load module dependency edges for phase3")?;
+
+    if dependency_edges.is_empty() {
+        return Ok(Phase3Output {
+            subsystems_inserted: 0,
+            in_subsystem_edges_inserted: 0,
+            weak_modularity_finding: false,
+            clustering_stats: phase3_stats_json(
+                config,
+                "skipped",
+                Some("no_module_dependency_edges"),
+                module_ids.len(),
+                0,
+                0,
+                None,
+                0,
+                0,
+                false,
+                started,
+            ),
+        });
+    }
+
+    let graph = ModuleGraph {
+        modules: module_ids,
+        edges: dependency_edges
+            .iter()
+            .map(|edge| ModuleEdge {
+                from: edge.from_module_id.clone(),
+                to: edge.to_module_id.clone(),
+                reference_count: edge.reference_count,
+            })
+            .collect(),
+    };
+    let cluster_config = ClusterConfig {
+        algorithm: config.algorithm,
+        seed: config.seed,
+        resolution: config.resolution,
+        max_iterations: config.max_iterations,
+        min_cluster_size: config.min_cluster_size,
+    };
+    let cluster_result = cluster_modules(&graph, &cluster_config).context("cluster modules")?;
+
+    if cluster_result.communities.is_empty() {
+        return Ok(Phase3Output {
+            subsystems_inserted: 0,
+            in_subsystem_edges_inserted: 0,
+            weak_modularity_finding: false,
+            clustering_stats: phase3_stats_json(
+                config,
+                "skipped",
+                Some("no_clusters_emitted"),
+                graph.modules.len(),
+                graph.edges.len(),
+                0,
+                Some(cluster_result.modularity_score),
+                0,
+                0,
+                false,
+                started,
+            ),
+        });
+    }
+
+    let mut inserted_subsystems = Vec::new();
+    let mut in_subsystem_edges_inserted = 0_u64;
+    let edge_type_values = config
+        .edge_types
+        .iter()
+        .map(|edge_type| edge_type.as_str())
+        .collect::<Vec<_>>();
+    for community in &cluster_result.communities {
+        let hash = cluster_hash(community);
+        let subsystem_id = format!("core:subsystem:{hash}");
+        let now = iso8601_now();
+        let properties_json = serde_json::json!({
+            "algorithm": cluster_result.algorithm_used.as_str(),
+            "seed": config.seed,
+            "resolution": config.resolution,
+            "max_iterations": config.max_iterations,
+            "modularity_score": cluster_result.modularity_score,
+            "cluster_hash": hash,
+            "member_module_ids": community,
+            "member_count": community.len(),
+            "edge_types": edge_type_values,
+            "weight_by": config.weight_by.as_str(),
+        })
+        .to_string();
+        writer
+            .send_wait(|ack| WriterCmd::InsertEntity {
+                entity: Box::new(EntityRecord {
+                    id: subsystem_id.clone(),
+                    plugin_id: "core".to_owned(),
+                    kind: "subsystem".to_owned(),
+                    name: format!("Subsystem {hash}"),
+                    short_name: hash,
+                    parent_id: None,
+                    source_file_id: None,
+                    source_file_path: None,
+                    source_byte_start: None,
+                    source_byte_end: None,
+                    source_line_start: None,
+                    source_line_end: None,
+                    properties_json,
+                    content_hash: None,
+                    summary_json: None,
+                    wardline_json: None,
+                    first_seen_commit: None,
+                    last_seen_commit: None,
+                    created_at: now.clone(),
+                    updated_at: now,
+                }),
+                ack,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("InsertEntity subsystem {subsystem_id}"))?;
+
+        for module_id in community {
+            writer
+                .send_wait(|ack| WriterCmd::InsertEdge {
+                    edge: Box::new(EdgeRecord {
+                        kind: "in_subsystem".to_owned(),
+                        from_id: module_id.clone(),
+                        to_id: subsystem_id.clone(),
+                        confidence: clarion_core::EdgeConfidence::Resolved,
+                        properties_json: None,
+                        source_file_id: None,
+                        source_byte_start: None,
+                        source_byte_end: None,
+                    }),
+                    ack,
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .with_context(|| {
+                    format!("InsertEdge in_subsystem {module_id} -> {subsystem_id}")
+                })?;
+            in_subsystem_edges_inserted += 1;
+        }
+
+        inserted_subsystems.push(InsertedSubsystem {
+            id: subsystem_id,
+            member_count: community.len(),
+        });
+    }
+
+    let weak_modularity_finding_emitted =
+        if cluster_result.modularity_score < WEAK_MODULARITY_THRESHOLD {
+            insert_weak_modularity_finding(
+                writer,
+                run_id,
+                config,
+                &inserted_subsystems,
+                cluster_result.modularity_score,
+            )
+            .await?
+        } else {
+            false
+        };
+
+    let subsystems_inserted = u64::try_from(inserted_subsystems.len()).unwrap_or(u64::MAX);
+    Ok(Phase3Output {
+        subsystems_inserted,
+        in_subsystem_edges_inserted,
+        weak_modularity_finding: weak_modularity_finding_emitted,
+        clustering_stats: phase3_stats_json(
+            config,
+            "completed",
+            None,
+            graph.modules.len(),
+            graph.edges.len(),
+            inserted_subsystems.len(),
+            Some(cluster_result.modularity_score),
+            subsystems_inserted,
+            in_subsystem_edges_inserted,
+            weak_modularity_finding_emitted,
+            started,
+        ),
+    })
+}
+
+async fn insert_weak_modularity_finding(
+    writer: &Writer,
+    run_id: &str,
+    config: &ClusteringConfig,
+    subsystems: &[InsertedSubsystem],
+    modularity_score: f64,
+) -> Result<bool> {
+    let Some(anchor) = subsystems
+        .iter()
+        .max_by_key(|subsystem| (subsystem.member_count, std::cmp::Reverse(&subsystem.id)))
+    else {
+        return Ok(false);
+    };
+    let subsystem_ids = subsystems
+        .iter()
+        .map(|subsystem| subsystem.id.clone())
+        .collect::<Vec<_>>();
+    let now = iso8601_now();
+    let finding_id = format!("core:finding:{run_id}:weak-modularity");
+    let related_entities_json = serde_json::to_string(&subsystem_ids)
+        .context("serialize weak modularity related_entities")?;
+    writer
+        .send_wait(|ack| WriterCmd::InsertFinding {
+            finding: Box::new(FindingRecord {
+                id: finding_id.clone(),
+                tool: "clarion".to_owned(),
+                tool_version: env!("CARGO_PKG_VERSION").to_owned(),
+                run_id: run_id.to_owned(),
+                rule_id: WEAK_MODULARITY_RULE_ID.to_owned(),
+                kind: "fact".to_owned(),
+                severity: "INFO".to_owned(),
+                confidence: Some(1.0),
+                confidence_basis: Some("deterministic module graph modularity".to_owned()),
+                entity_id: anchor.id.clone(),
+                related_entities_json,
+                message: "Module graph has weak subsystem modularity".to_owned(),
+                evidence_json: serde_json::json!({
+                    "modularity_score": modularity_score,
+                    "threshold": WEAK_MODULARITY_THRESHOLD,
+                    "subsystem_count": subsystems.len(),
+                })
+                .to_string(),
+                properties_json: serde_json::json!({
+                    "algorithm": config.algorithm.as_str(),
+                    "modularity_score": modularity_score,
+                    "threshold": WEAK_MODULARITY_THRESHOLD,
+                    "subsystem_count": subsystems.len(),
+                })
+                .to_string(),
+                supports_json: "[]".to_owned(),
+                supported_by_json: "[]".to_owned(),
+                created_at: now.clone(),
+                updated_at: now,
+            }),
+            ack,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("InsertFinding {finding_id}"))?;
+    Ok(true)
+}
+
+fn module_entity_ids(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM entities WHERE kind = 'module' ORDER BY id")
+        .context("prepare module entity query")?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .context("query module entities")?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .context("collect module entities")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn phase3_stats_json(
+    config: &ClusteringConfig,
+    status: &str,
+    skipped_reason: Option<&str>,
+    module_count: usize,
+    module_edge_count: usize,
+    subsystem_count: usize,
+    modularity_score: Option<f64>,
+    subsystems_inserted: u64,
+    in_subsystem_edges_inserted: u64,
+    weak_modularity_finding_emitted: bool,
+    started: std::time::Instant,
+) -> serde_json::Value {
+    serde_json::json!({
+        "enabled": config.enabled,
+        "algorithm": config.algorithm.as_str(),
+        "status": status,
+        "seed": config.seed,
+        "resolution": config.resolution,
+        "max_iterations": config.max_iterations,
+        "min_cluster_size": config.min_cluster_size,
+        "edge_types": config.edge_types.iter().map(|edge_type| edge_type.as_str()).collect::<Vec<_>>(),
+        "weight_by": config.weight_by.as_str(),
+        "module_count": module_count,
+        "module_edge_count": module_edge_count,
+        "subsystem_count": subsystem_count,
+        "modularity_score": modularity_score,
+        "duration_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "subsystems_inserted": subsystems_inserted,
+        "in_subsystem_edges_inserted": in_subsystem_edges_inserted,
+        "weak_modularity_threshold": WEAK_MODULARITY_THRESHOLD,
+        "weak_modularity_finding_emitted": weak_modularity_finding_emitted,
+        "skipped_reason": skipped_reason,
+    })
 }
 
 // ── Run-outcome ───────────────────────────────────────────────────────────────
