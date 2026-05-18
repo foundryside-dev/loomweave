@@ -172,6 +172,123 @@ ontology_version = "0.4.0"
 "#;
 
 #[cfg(unix)]
+const IMPORTS_PLUGIN_SCRIPT: &str = r#"#!/usr/bin/python3
+import json
+import pathlib
+import sys
+
+
+def read_frame():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if line in (b"", b"\r\n"):
+            break
+        name, value = line.decode("ascii").strip().split(":", 1)
+        headers[name.lower()] = value.strip()
+    length = int(headers["content-length"])
+    return json.loads(sys.stdin.buffer.read(length))
+
+
+def write_frame(message):
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n")
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+
+while True:
+    msg = read_frame()
+    method = msg.get("method")
+    if method == "initialized":
+        continue
+    if method == "exit":
+        raise SystemExit(0)
+    ident = msg["id"]
+    if method == "initialize":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "name": "clarion-plugin-imports",
+                "version": "0.1.0",
+                "ontology_version": "0.6.0",
+                "capabilities": {},
+            },
+        })
+    elif method == "analyze_file":
+        path = msg["params"]["file_path"]
+        stem = pathlib.Path(path).stem
+        module_id = f"importsfixture:module:{stem}"
+        edges = []
+        if stem == "consumer":
+            edges = [
+                {
+                    "kind": "imports",
+                    "from_id": module_id,
+                    "to_id": "importsfixture:module:internal",
+                    "source_byte_start": 0,
+                    "source_byte_end": 15,
+                    "confidence": "resolved",
+                    "properties": {"imported_name": "internal"},
+                },
+                {
+                    "kind": "imports",
+                    "from_id": module_id,
+                    "to_id": "importsfixture:module:external",
+                    "source_byte_start": 16,
+                    "source_byte_end": 31,
+                    "confidence": "resolved",
+                    "properties": {"imported_name": "external"},
+                },
+            ]
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "entities": [
+                    {
+                        "id": module_id,
+                        "kind": "module",
+                        "qualified_name": stem,
+                        "source": {"file_path": path},
+                    },
+                ],
+                "edges": edges,
+                "stats": {},
+            },
+        })
+    elif method == "shutdown":
+        write_frame({"jsonrpc": "2.0", "id": ident, "result": {}})
+    else:
+        raise SystemExit(1)
+"#;
+
+#[cfg(unix)]
+const IMPORTS_PLUGIN_MANIFEST: &str = r#"
+[plugin]
+name = "clarion-plugin-imports"
+plugin_id = "importsfixture"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "clarion-plugin-imports"
+language = "importsfixture"
+extensions = ["imp"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 256
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+entity_kinds = ["module"]
+edge_kinds = ["imports"]
+rule_id_prefix = "CLA-IMPORTS-"
+ontology_version = "0.6.0"
+"#;
+
+#[cfg(unix)]
 fn write_ambiguous_calls_plugin(plugin_dir: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -189,6 +306,22 @@ fn write_ambiguous_calls_plugin(plugin_dir: &std::path::Path) {
         AMBIGUOUS_CALLS_PLUGIN_MANIFEST,
     )
     .expect("write calls plugin manifest");
+}
+
+#[cfg(unix)]
+fn write_imports_plugin(plugin_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let plugin_script = plugin_dir.join("clarion-plugin-imports");
+    std::fs::write(&plugin_script, IMPORTS_PLUGIN_SCRIPT).expect("write imports plugin script");
+    let mut perms = std::fs::metadata(&plugin_script)
+        .expect("stat imports plugin")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&plugin_script, perms).expect("chmod imports plugin");
+
+    std::fs::write(plugin_dir.join("plugin.toml"), IMPORTS_PLUGIN_MANIFEST)
+        .expect("write imports plugin manifest");
 }
 
 #[test]
@@ -452,6 +585,62 @@ fn analyze_stats_reports_ambiguous_edges_total() {
             0,
             6,
         )
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_filters_external_import_edges_before_writer_insert() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_imports_plugin(plugin_dir.path());
+
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    std::fs::write(
+        project_dir.path().join("consumer.imp"),
+        b"import internal\n",
+    )
+    .expect("write consumer.imp");
+    std::fs::write(project_dir.path().join("internal.imp"), b"# internal\n")
+        .expect("write internal.imp");
+
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    clarion_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    let import_edges: Vec<(String, String)> = conn
+        .prepare("SELECT from_id, to_id FROM edges WHERE kind = 'imports' ORDER BY from_id, to_id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        import_edges,
+        vec![(
+            "importsfixture:module:consumer".to_owned(),
+            "importsfixture:module:internal".to_owned(),
+        )],
+    );
+
+    let stats_raw: String = conn
+        .query_row("SELECT stats FROM runs LIMIT 1", [], |row| row.get(0))
+        .expect("query runs.stats");
+    let stats: serde_json::Value = serde_json::from_str(&stats_raw).expect("stats JSON");
+    assert_eq!(
+        stats["imports_skipped_external_total"].as_u64(),
+        Some(1),
+        "host should count the filtered external import; got {stats_raw}"
     );
 }
 

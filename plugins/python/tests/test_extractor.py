@@ -113,6 +113,10 @@ def _call_edges(edges: Sequence[RawEdge]) -> list[RawEdge]:
     return [edge for edge in edges if edge["kind"] == "calls"]
 
 
+def _import_edges(edges: Sequence[RawEdge]) -> list[RawEdge]:
+    return [edge for edge in edges if edge["kind"] == "imports"]
+
+
 def _reference_sites_for(source: str) -> list[ReferenceSite]:
     resolver = RecordingReferenceResolver()
     extract_with_stats(source, "demo.py", reference_resolver=resolver)
@@ -250,6 +254,77 @@ def test_extractor_with_noop_resolver_emits_no_calls() -> None:
         "python:function:demo.caller",
     ]
     assert [edge for edge in edges if edge["kind"] == "calls"] == []
+
+
+def test_import_statement_emits_module_import_edge() -> None:
+    _entities, edges = extract("import pkg.service\n", "consumer.py")
+
+    assert _import_edges(edges) == [
+        {
+            "kind": "imports",
+            "from_id": "python:module:consumer",
+            "to_id": "python:module:pkg.service",
+            "source_byte_start": 0,
+            "source_byte_end": len(b"import pkg.service"),
+            "confidence": "resolved",
+            "properties": {
+                "imported_name": "pkg.service",
+                "import_style": "import",
+                "level": 0,
+            },
+        },
+    ]
+
+
+def test_from_import_emits_import_edge_to_parent_module() -> None:
+    _entities, edges = extract("from pkg.service import Client\n", "consumer.py")
+
+    assert _import_edges(edges) == [
+        {
+            "kind": "imports",
+            "from_id": "python:module:consumer",
+            "to_id": "python:module:pkg.service",
+            "source_byte_start": 0,
+            "source_byte_end": len(b"from pkg.service import Client"),
+            "confidence": "resolved",
+            "properties": {
+                "imported_name": "Client",
+                "import_style": "from_import",
+                "level": 0,
+            },
+        },
+    ]
+
+
+def test_relative_import_emits_package_relative_module_edge() -> None:
+    _entities, edges = extract("from . import sibling\n", "pkg/consumer.py")
+
+    assert _import_edges(edges) == [
+        {
+            "kind": "imports",
+            "from_id": "python:module:pkg.consumer",
+            "to_id": "python:module:pkg.sibling",
+            "source_byte_start": 0,
+            "source_byte_end": len(b"from . import sibling"),
+            "confidence": "resolved",
+            "properties": {
+                "imported_name": "sibling",
+                "import_style": "from_import",
+                "level": 1,
+            },
+        },
+    ]
+
+
+def test_import_edges_have_source_byte_range_and_resolved_confidence() -> None:
+    source = "é = 1\nimport pkg.service\n"
+    _entities, edges = extract(source, "consumer.py")
+    import_edge = _import_edges(edges)[0]
+
+    expected_start = len("é = 1\n".encode())
+    assert import_edge["source_byte_start"] == expected_start
+    assert import_edge["source_byte_end"] == expected_start + len(b"import pkg.service")
+    assert import_edge["confidence"] == "resolved"
 
 
 def test_extractor_appends_calls_from_resolver_and_carries_stats() -> None:

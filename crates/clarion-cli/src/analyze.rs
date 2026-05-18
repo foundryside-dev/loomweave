@@ -171,6 +171,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     "references_resolved_total": 0,
                     "references_skipped_external_total": 0,
                     "references_skipped_cap_total": 0,
+                    "imports_skipped_external_total": 0,
                     "unresolved_reference_sites_total": 0,
                     "pyright_query_latency_p95_ms": 0,
                     "pyright_index_parse_latency_p95_ms": 0,
@@ -224,6 +225,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let mut references_resolved_total: u64 = 0;
     let mut references_skipped_external_total: u64 = 0;
     let mut references_skipped_cap_total: u64 = 0;
+    let mut imports_skipped_external_total: u64 = 0;
     let mut unresolved_reference_sites_total: u64 = 0;
     let mut pyright_latency = P95Accumulator::default();
     let mut pyright_index_parse_latency = P95Accumulator::default();
@@ -327,6 +329,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 references_resolved_total += stats.references_resolved_total;
                 references_skipped_external_total += stats.references_skipped_external_total;
                 references_skipped_cap_total += stats.references_skipped_cap_total;
+                imports_skipped_external_total += stats.imports_skipped_external_total;
                 unresolved_reference_sites_total += stats.unresolved_reference_sites_total;
                 pyright_latency.record_many(stats.pyright_query_latency_ms);
                 pyright_index_parse_latency.record_many(stats.pyright_index_parse_latency_ms);
@@ -473,6 +476,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "references_resolved_total": references_resolved_total,
                 "references_skipped_external_total": references_skipped_external_total,
                 "references_skipped_cap_total": references_skipped_cap_total,
+                "imports_skipped_external_total": imports_skipped_external_total,
                 "unresolved_reference_sites_total": unresolved_reference_sites_total,
                 "pyright_query_latency_p95_ms": pyright_query_latency_p95_ms,
                 "pyright_index_parse_latency_p95_ms": pyright_index_parse_latency_p95_ms,
@@ -506,6 +510,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "references_resolved_total": references_resolved_total,
                 "references_skipped_external_total": references_skipped_external_total,
                 "references_skipped_cap_total": references_skipped_cap_total,
+                "imports_skipped_external_total": imports_skipped_external_total,
                 "unresolved_reference_sites_total": unresolved_reference_sites_total,
                 "pyright_query_latency_p95_ms": pyright_query_latency_p95_ms,
                 "pyright_index_parse_latency_p95_ms": pyright_index_parse_latency_p95_ms,
@@ -674,6 +679,7 @@ struct BatchStats {
     references_resolved_total: u64,
     references_skipped_external_total: u64,
     references_skipped_cap_total: u64,
+    imports_skipped_external_total: u64,
     unresolved_reference_sites_total: u64,
     pyright_query_latency_ms: Vec<u64>,
     pyright_index_parse_latency_ms: Vec<u64>,
@@ -788,6 +794,8 @@ fn run_plugin_blocking(
                 collected_edges.push((descr, record));
             }
         }
+        collected_stats.imports_skipped_external_total +=
+            filter_external_import_edges(&collected_entities, &mut collected_edges);
         Ok((
             collected_entities,
             collected_edges,
@@ -977,6 +985,22 @@ fn classify_host_error(plugin_id: &str, e: HostError) -> String {
         }
         other => format!("plugin {plugin_id} error: {other}"),
     }
+}
+
+fn filter_external_import_edges(
+    entities: &[(String, EntityRecord)],
+    edges: &mut Vec<(String, EdgeRecord)>,
+) -> u64 {
+    let module_entity_ids: BTreeSet<&str> = entities
+        .iter()
+        .filter(|(_, record)| record.kind == "module")
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let before = edges.len();
+    edges.retain(|(_, edge)| {
+        edge.kind != "imports" || module_entity_ids.contains(edge.to_id.as_str())
+    });
+    u64::try_from(before - edges.len()).unwrap_or(u64::MAX)
 }
 
 /// Map an `AcceptedEntity` to an `EntityRecord` for the writer-actor.

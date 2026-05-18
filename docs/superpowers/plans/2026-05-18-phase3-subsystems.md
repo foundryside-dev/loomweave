@@ -382,31 +382,32 @@ host filters candidate imports whose `to_id` module is not present in the same
 analysis batch before writer insertion, so external imports do not trip edge
 foreign keys.
 
-- [ ] Write failing Python tests:
+- [x] Write failing Python tests:
   - `test_import_statement_emits_module_import_edge`
   - `test_from_import_emits_import_edge_to_parent_module`
   - `test_relative_import_emits_package_relative_module_edge`
   - `test_import_edges_have_source_byte_range_and_resolved_confidence`
-- [ ] Write failing Rust host test:
+- [x] Write failing Rust host test:
   - `analyze_filters_external_import_edges_before_writer_insert`
-- [ ] Add `ImportsEdgeProperties` with at least:
+- [x] Add `ImportsEdgeProperties` with at least:
   - `imported_name`
   - `import_style` (`import` or `from_import`)
   - `level` for relative imports
-- [ ] Add an AST import-site collector. Source range comes from the AST node's
+- [x] Add an AST import-site collector. Source range comes from the AST node's
   byte offsets using the same source-buffer convention as calls/references.
-- [ ] Emit edges from current module entity to `python:module:{target}`.
-- [ ] In `run_plugin_blocking`, after all files in a plugin batch have been
+- [x] Emit edges from current module entity to `python:module:{target}`.
+- [x] In `run_plugin_blocking`, after all files in a plugin batch have been
   analyzed and before returning `collected_edges` to the async writer-insert
   path, filter `imports` edges to targets present in the batch's accepted
   module entity IDs. Preserve internal imports; drop external or unresolved
   imports with an additive `imports_skipped_external_total` counter in
   `BatchStats`/`runs.stats` rather than allowing SQLite FK failure during
   `WriterCmd::InsertEdge`.
-- [ ] Add `imports` to plugin manifest `edge_kinds`, bump ontology version and
+- [x] Add `imports` to plugin manifest `edge_kinds`, bump ontology version and
   package patch version.
-- [ ] Add or update shared edge parity fixture only if the current fixture
-  structure supports a fourth edge family cleanly.
+- [x] Add or update shared edge parity fixture only if the current fixture
+  structure supports a fourth edge family cleanly. Not extended in this slice;
+  extractor and host-filter regressions cover the new edge family directly.
 
 **Exit:** Python unit tests, strict typing, linting, and round trip pass. The
 walking skeleton still passes because a single file has no internal import

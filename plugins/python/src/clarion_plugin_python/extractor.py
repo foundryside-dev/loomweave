@@ -2,8 +2,8 @@
 
 Walks a parsed Python file and emits one ``module`` entity per file plus
 one ``function`` entity per ``FunctionDef`` / ``AsyncFunctionDef`` and one
-``class`` entity per ``ClassDef``. Decorator, import, and call-edge emission is
-later WP3-feature-complete scope.
+``class`` entity per ``ClassDef``. It also emits anchored scan-time
+``imports``, ``calls``, and ``references`` candidate edges.
 
 Entity shape matches the Rust host's ``RawEntity`` + ``RawSource``
 contract (``crates/clarion-core/src/plugin/host.rs:132-154``)::
@@ -132,7 +132,13 @@ class RawEdge(TypedDict):
     source_byte_start: NotRequired[int]
     source_byte_end: NotRequired[int]
     confidence: NotRequired[Literal["resolved", "ambiguous", "inferred"]]
-    properties: NotRequired[CallsEdgeProperties | ReferencesEdgeProperties]
+    properties: NotRequired[CallsEdgeProperties | ReferencesEdgeProperties | ImportsEdgeProperties]
+
+
+class ImportsEdgeProperties(TypedDict):
+    imported_name: str
+    import_style: Literal["import", "from_import"]
+    level: int
 
 
 @dataclass
@@ -344,6 +350,7 @@ def extract_with_stats(
         function_ids,
         walk_state,
     )
+    edges.extend(_collect_import_edges(source, tree, dotted_module, module_entity["id"]))
     reference_sites = _collect_reference_sites(source, tree, dotted_module, module_entity["id"])
     call_stats = call_resolver.resolve_calls(file_path, function_ids)
     reference_stats = reference_resolver.resolve_references(file_path, reference_sites)
@@ -357,6 +364,121 @@ def extract_with_stats(
 
 def _elapsed_ms(started_ns: int) -> int:
     return max(1, (time.perf_counter_ns() - started_ns + 999_999) // 1_000_000)
+
+
+def _collect_import_edges(
+    source: str,
+    tree: ast.Module,
+    dotted_module: str,
+    module_entity_id: str,
+) -> list[RawEdge]:
+    collector = _ImportEdgeCollector(source, dotted_module, module_entity_id)
+    collector.visit(tree)
+    return collector.edges
+
+
+class _ImportEdgeCollector(ast.NodeVisitor):
+    def __init__(self, source: str, dotted_module: str, module_entity_id: str) -> None:
+        self.source = source
+        self.dotted_module = dotted_module
+        self.module_entity_id = module_entity_id
+        self.edges: list[RawEdge] = []
+
+    def visit_Import(self, node: ast.Import) -> None:
+        source_byte_start, source_byte_end = _node_byte_range(self.source, node)
+        for alias in node.names:
+            self.edges.append(
+                self._edge(
+                    target_module=alias.name,
+                    imported_name=alias.name,
+                    import_style="import",
+                    level=0,
+                    source_range=(source_byte_start, source_byte_end),
+                ),
+            )
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        source_byte_start, source_byte_end = _node_byte_range(self.source, node)
+        for alias in node.names:
+            target_module = _import_from_target(
+                self.dotted_module,
+                node.module,
+                node.level,
+                alias.name,
+            )
+            if target_module is None:
+                continue
+            self.edges.append(
+                self._edge(
+                    target_module=target_module,
+                    imported_name=alias.name,
+                    import_style="from_import",
+                    level=node.level,
+                    source_range=(source_byte_start, source_byte_end),
+                ),
+            )
+
+    def _edge(
+        self,
+        *,
+        target_module: str,
+        imported_name: str,
+        import_style: Literal["import", "from_import"],
+        level: int,
+        source_range: tuple[int, int],
+    ) -> RawEdge:
+        source_byte_start, source_byte_end = source_range
+        return {
+            "kind": "imports",
+            "from_id": self.module_entity_id,
+            "to_id": entity_id(_PLUGIN_ID, "module", target_module),
+            "source_byte_start": source_byte_start,
+            "source_byte_end": source_byte_end,
+            "confidence": "resolved",
+            "properties": {
+                "imported_name": imported_name,
+                "import_style": import_style,
+                "level": level,
+            },
+        }
+
+
+def _import_from_target(
+    dotted_module: str,
+    module: str | None,
+    level: int,
+    imported_name: str,
+) -> str | None:
+    if level == 0:
+        return module
+
+    base_parts = _relative_import_base_parts(dotted_module, level)
+    if base_parts is None:
+        return None
+
+    target_parts = [*base_parts]
+    if module:
+        target_parts.extend(part for part in module.split(".") if part)
+    elif imported_name != "*":
+        target_parts.append(imported_name)
+
+    return ".".join(target_parts) if target_parts else None
+
+
+def _relative_import_base_parts(dotted_module: str, level: int) -> list[str] | None:
+    package_parts = dotted_module.split(".")[:-1]
+    keep = len(package_parts) - (level - 1)
+    if keep < 0:
+        return None
+    return package_parts[:keep]
+
+
+def _node_byte_range(source: str, node: ast.Import | ast.ImportFrom) -> tuple[int, int]:
+    line_starts = _line_starts(source)
+    start_line = node.lineno - 1
+    end_line = (node.end_lineno or node.lineno) - 1
+    end_col = node.end_col_offset if node.end_col_offset is not None else node.col_offset
+    return line_starts[start_line] + node.col_offset, line_starts[end_line] + end_col
 
 
 def _collect_reference_sites(

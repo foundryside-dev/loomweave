@@ -81,8 +81,8 @@ def test_initialize_roundtrip() -> None:
         assert response["id"] == 1
         result = response["result"]
         assert result["name"] == "clarion-plugin-python"
-        assert result["version"] == "0.1.4"
-        assert result["ontology_version"] == "0.5.0"
+        assert result["version"] == "0.1.5"
+        assert result["ontology_version"] == "0.6.0"
         # Capabilities carry the L8 Wardline probe result. We don't pin a
         # specific status here because the probe's output depends on whether
         # wardline is installed in the test environment — all three legal

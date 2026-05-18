@@ -163,9 +163,11 @@ def test_round_trip_self_analysis() -> None:  # noqa: PLR0915 - by-kind invarian
         contains_pairs = {(e["from_id"], e["to_id"]) for e in edges if e["kind"] == "contains"}
         calls_edges = [e for e in edges if e["kind"] == "calls"]
         references_edges = [e for e in edges if e["kind"] == "references"]
+        imports_edges = [e for e in edges if e["kind"] == "imports"]
         resolved_calls = [e for e in calls_edges if e["confidence"] == "resolved"]
         ambiguous_calls = [e for e in calls_edges if e["confidence"] == "ambiguous"]
         resolved_references = [e for e in references_edges if e["confidence"] == "resolved"]
+        assert imports_edges, "extractor.py self-analysis must emit import candidate edges"
         assert resolved_calls, "extractor.py self-analysis must emit at least one resolved call"
         assert resolved_references, (
             "extractor.py self-analysis must emit at least one resolved references edge"
@@ -178,7 +180,7 @@ def test_round_trip_self_analysis() -> None:  # noqa: PLR0915 - by-kind invarian
                 # Contains edges MUST NOT carry source range fields (ADR-026 §3).
                 assert "source_byte_start" not in edge
                 assert "source_byte_end" not in edge
-            elif edge["kind"] in {"calls", "references"}:
+            elif edge["kind"] in {"calls", "references", "imports"}:
                 assert edge["source_byte_start"] < edge["source_byte_end"]
                 assert edge["confidence"] in {"resolved", "ambiguous"}
             else:
