@@ -1,10 +1,12 @@
 use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use xgraph::graph::algorithms::leiden_clustering::{CommunityConfig, CommunityDetection};
 use xgraph::graph::graph::Graph;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ClusterAlgorithm {
     Leiden,
     Louvain,

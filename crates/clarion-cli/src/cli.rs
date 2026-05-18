@@ -28,6 +28,10 @@ pub enum Command {
         /// Path to analyse (default: current directory).
         #[arg(default_value = ".")]
         path: PathBuf,
+
+        /// Path to clarion.yaml (default: project-root/clarion.yaml if present).
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 
     /// Run the MCP stdio server.

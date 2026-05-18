@@ -7,6 +7,18 @@ fn clarion_bin() -> Command {
     Command::cargo_bin("clarion").expect("clarion binary")
 }
 
+fn latest_run_config(project_root: &std::path::Path) -> serde_json::Value {
+    let conn = Connection::open(project_root.join(".clarion/clarion.db")).unwrap();
+    let config_raw: String = conn
+        .query_row(
+            "SELECT config FROM runs ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query latest runs.config");
+    serde_json::from_str(&config_raw).expect("runs.config JSON")
+}
+
 #[cfg(unix)]
 const AMBIGUOUS_CALLS_PLUGIN_SCRIPT: &str = r#"#!/usr/bin/python3
 import json
@@ -217,6 +229,118 @@ fn analyze_without_plugins_writes_skipped_run_row() {
         .query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))
         .unwrap();
     assert_eq!(entity_count, 0);
+}
+
+#[test]
+fn analyze_default_config_records_clustering_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+
+    clarion_bin()
+        .args(["analyze"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+
+    let config = latest_run_config(dir.path());
+    let clustering = &config["analysis"]["clustering"];
+    assert_eq!(clustering["enabled"].as_bool(), Some(true));
+    assert_eq!(clustering["algorithm"].as_str(), Some("leiden"));
+    assert_eq!(clustering["seed"].as_u64(), Some(42));
+    assert_eq!(clustering["resolution"].as_f64(), Some(1.0));
+    assert_eq!(clustering["max_iterations"].as_u64(), Some(100));
+    assert_eq!(clustering["min_cluster_size"].as_u64(), Some(3));
+    assert_eq!(
+        clustering["edge_types"],
+        serde_json::json!(["imports", "calls"])
+    );
+    assert_eq!(clustering["weight_by"].as_str(), Some("reference_count"));
+}
+
+#[test]
+fn analyze_config_file_overrides_clustering_seed_and_algorithm() {
+    let dir = tempfile::tempdir().unwrap();
+
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let config_path = dir.path().join("custom-clarion.yaml");
+    std::fs::write(
+        &config_path,
+        r"
+analysis:
+  clustering:
+    algorithm: louvain
+    seed: 99
+",
+    )
+    .expect("write analyze config");
+
+    clarion_bin()
+        .args(["analyze", "--config"])
+        .arg(&config_path)
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+
+    let config = latest_run_config(dir.path());
+    let clustering = &config["analysis"]["clustering"];
+    assert_eq!(clustering["algorithm"].as_str(), Some("louvain"));
+    assert_eq!(clustering["seed"].as_u64(), Some(99));
+    assert_eq!(clustering["enabled"].as_bool(), Some(true));
+    assert_eq!(clustering["max_iterations"].as_u64(), Some(100));
+}
+
+#[test]
+fn analyze_rejects_invalid_clustering_algorithm() {
+    let dir = tempfile::tempdir().unwrap();
+
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let config_path = dir.path().join("bad-clarion.yaml");
+    std::fs::write(
+        &config_path,
+        r"
+analysis:
+  clustering:
+    algorithm: spectral
+",
+    )
+    .expect("write invalid analyze config");
+
+    let out = clarion_bin()
+        .args(["analyze", "--config"])
+        .arg(&config_path)
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("invalid analyze config") && stderr.contains("algorithm"),
+        "stderr should identify invalid clustering algorithm; got: {stderr}"
+    );
+
+    let conn = Connection::open(dir.path().join(".clarion/clarion.db")).unwrap();
+    let run_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+        .expect("query run count");
+    assert_eq!(run_count, 0, "invalid config must fail before BeginRun");
 }
 
 #[test]

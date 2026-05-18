@@ -28,9 +28,15 @@ use clarion_storage::{
     commands::{EdgeRecord, EntityRecord, RunStatus, WriterCmd},
 };
 
+use crate::config::AnalyzeConfig;
 use crate::stats::P95Accumulator;
 
 // ── Public entry point ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AnalyzeOptions {
+    pub(crate) config_path: Option<PathBuf>,
+}
 
 /// Run the analyze command against `project_path`.
 ///
@@ -38,8 +44,19 @@ use crate::stats::P95Accumulator;
 ///
 /// Returns an error if the target directory does not exist, has no `.clarion/`
 /// directory, or if the writer actor fails to start or process commands.
-#[allow(clippy::too_many_lines)]
 pub async fn run(project_path: PathBuf) -> Result<()> {
+    run_with_options(project_path, AnalyzeOptions::default()).await
+}
+
+/// Run the analyze command against `project_path` with resolved CLI options.
+///
+/// # Errors
+///
+/// Returns an error if the target directory does not exist, has no `.clarion/`
+/// directory, if analyze config is invalid, or if the writer actor fails to
+/// start or process commands.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOptions) -> Result<()> {
     if !project_path.exists() {
         bail!(
             "target directory does not exist: {}. Pass a valid path or cd to it first.",
@@ -57,6 +74,8 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
         );
     }
     let db_path = clarion_dir.join("clarion.db");
+    let analyze_config = AnalyzeConfig::load(&project_root, options.config_path.as_deref())?;
+    let analyze_config_json = analyze_config.to_json_string()?;
 
     // ── Writer actor ──────────────────────────────────────────────────────────
     let (writer, handle) = Writer::spawn(db_path, DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY)
@@ -68,7 +87,7 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
     writer
         .send_wait(|ack| WriterCmd::BeginRun {
             run_id: run_id.clone(),
-            config_json: "{}".into(),
+            config_json: analyze_config_json.clone(),
             started_at: started_at.clone(),
             ack,
         })

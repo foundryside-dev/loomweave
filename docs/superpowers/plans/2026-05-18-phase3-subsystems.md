@@ -323,11 +323,11 @@ without broadening `deny.toml`. If not, stop and amend this plan.
 **Scope:** Give `clarion analyze` the `analysis.clustering` configuration
 surface and persist the resolved config in `runs.config`. No subsystem rows yet.
 
-- [ ] Write failing tests:
+- [x] Write failing tests:
   - `analyze_default_config_records_clustering_defaults`
   - `analyze_config_file_overrides_clustering_seed_and_algorithm`
   - `analyze_rejects_invalid_clustering_algorithm`
-- [ ] Add `AnalyzeConfig` with default:
+- [x] Add `AnalyzeConfig` with default:
 
 ```yaml
 analysis:
@@ -342,11 +342,11 @@ analysis:
     weight_by: reference_count
 ```
 
-- [ ] Add `clarion analyze --config <path>`, defaulting to
+- [x] Add `clarion analyze --config <path>`, defaulting to
   `<project-root>/clarion.yaml` if present, otherwise defaults.
-- [ ] Change `analyze::run(path)` to accept an options/config value while
+- [x] Change `analyze::run(path)` to accept an options/config value while
   preserving tests that call the default path.
-- [ ] Replace the current `BeginRun.config_json = "{}"` with the resolved
+- [x] Replace the current `BeginRun.config_json = "{}"` with the resolved
   analyze config JSON.
 
 **Exit:** Focused tests pass, invalid config fails before `BeginRun`, and
