@@ -13,7 +13,7 @@ pub struct Cli {
 pub enum Command {
     /// Initialise .clarion/ in the current directory.
     Install {
-        /// Overwrite an existing .clarion/ (not implemented in Sprint 1).
+        /// Overwrite an existing .clarion/ directory.
         #[arg(long)]
         force: bool,
 

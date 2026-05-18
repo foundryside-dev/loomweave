@@ -63,16 +63,20 @@ CREATE INDEX ix_entities_content_hash      ON entities(content_hash);
 -- Tags (denormalised)
 CREATE TABLE entity_tags (
     entity_id  TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    plugin_id  TEXT NOT NULL,
     tag        TEXT NOT NULL,
-    PRIMARY KEY (entity_id, tag)
+    PRIMARY KEY (entity_id, plugin_id, tag)
 );
 CREATE INDEX ix_entity_tags_tag ON entity_tags(tag);
+CREATE INDEX ix_entity_tags_plugin_tag ON entity_tags(plugin_id, tag);
 
 -- Edges. Natural PK (kind, from_id, to_id) per ADR-026 decision 4 (B.3).
 -- Synthetic `id` column dropped: no Sprint-1 or B.3 query selects edges by
 -- `id`; the natural composite is stable across re-analyze, and the only
 -- finding-attachment cross-reference (findings.entity_id) points at entities,
--- not edges. WITHOUT ROWID drops the now-redundant rowid pages.
+-- not edges. The properties bag is evidence/metadata, not identity; callers
+-- that need multiple observations for the same relationship merge them into
+-- one edge row. WITHOUT ROWID drops the now-redundant rowid pages.
 CREATE TABLE edges (
     -- ADR-031: plugin-extensible vocabulary (ADR-022 admits plugin-declared
     -- edge kinds beyond the four core-reserved structural ones); no CHECK by
@@ -100,7 +104,7 @@ CREATE TABLE findings (
     id                  TEXT PRIMARY KEY,
     tool                TEXT NOT NULL,
     tool_version        TEXT NOT NULL,
-    run_id              TEXT NOT NULL,
+    run_id              TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
     rule_id             TEXT NOT NULL,
     -- ADR-031: closed core-owned vocabulary; values per ADR-004 +
     -- detailed-design.md §3.

@@ -63,6 +63,13 @@ pub enum JailError {
 /// - `Ok(canonical_candidate)` — the resolved, confirmed-safe path.
 /// - `Err(JailError::EscapedRoot)` — `candidate` resolves outside `root`.
 /// - `Err(JailError::Io)` — either path does not exist or cannot be resolved.
+///
+/// The returned path is a membership proof at canonicalization time, not a
+/// durable file handle. Code that later opens or serves the path must account
+/// for filesystem races between this check and the later open. Use an
+/// `openat`-style strategy anchored to a pinned root descriptor, or re-run the
+/// jail check after opening and compare against the canonical path accepted
+/// here.
 pub fn jail(root: &Path, candidate: &Path) -> Result<PathBuf, JailError> {
     let canonical_root = std::fs::canonicalize(root)?;
     let canonical_candidate = std::fs::canonicalize(candidate)?;
@@ -133,7 +140,7 @@ mod tests {
 
     /// A path constructed with `..` that resolves *above* the root must be
     /// rejected. `std::fs::canonicalize` resolves the `..` before the
-    /// `starts_with` check, so there is no TOCTOU window.
+    /// `starts_with` check, so lexical parent segments cannot bypass the jail.
     #[test]
     fn jail_02_dotdot_escape_returns_escaped_root() {
         let root = TempDir::new().expect("tmpdir");

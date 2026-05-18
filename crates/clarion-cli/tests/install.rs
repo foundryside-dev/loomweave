@@ -99,17 +99,36 @@ fn install_refuses_to_overwrite_existing_clarion_dir() {
 }
 
 #[test]
-fn install_force_returns_unimplemented_in_sprint_one() {
+fn install_force_replaces_existing_clarion_dir_without_overwriting_yaml() {
     let dir = tempfile::tempdir().unwrap();
-    let out = clarion_bin()
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .assert()
+        .success();
+
+    let clarion = dir.path().join(".clarion");
+    fs::write(clarion.join("stale.tmp"), "stale").unwrap();
+    fs::write(
+        dir.path().join("clarion.yaml"),
+        "version: 1\ncustom: true\n",
+    )
+    .unwrap();
+
+    clarion_bin()
         .args(["install", "--force", "--path"])
         .arg(dir.path())
         .assert()
-        .failure();
-    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+        .success();
+
     assert!(
-        stderr.contains("not implemented in Sprint 1"),
-        "expected Sprint 1 --force stub message: {stderr}"
+        !clarion.join("stale.tmp").exists(),
+        "--force should remove stale .clarion/ contents"
+    );
+    assert!(clarion.join("clarion.db").exists(), "clarion.db missing");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("clarion.yaml")).unwrap(),
+        "version: 1\ncustom: true\n"
     );
 }
 

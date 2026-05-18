@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::{env, fs};
 
 use assert_cmd::Command;
+use clarion_core::plugin::limits::FINDING_OOM_KILLED;
 use rusqlite::Connection;
 use tempfile::TempDir;
 
@@ -92,6 +93,40 @@ fn setup_plugin_dir(fixture_bin: &PathBuf) -> TempDir {
         .join("plugin.toml");
     let toml_dest = plugin_dir.path().join("plugin.toml");
     fs::copy(&toml_src, &toml_dest).expect("copy plugin.toml");
+
+    plugin_dir
+}
+
+#[cfg(target_os = "linux")]
+fn setup_oom_plugin_dir(fixture_bin: &PathBuf) -> TempDir {
+    let plugin_dir = TempDir::new().expect("create oom plugin tempdir");
+
+    let dest = plugin_dir.path().join("clarion-plugin-oom");
+    std::os::unix::fs::symlink(fixture_bin, &dest).expect("symlink clarion-plugin-oom");
+
+    let manifest = r#"
+[plugin]
+name = "clarion-plugin-oom"
+plugin_id = "oom"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "clarion-plugin-oom"
+language = "fixture"
+extensions = ["oom"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 64
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+entity_kinds = ["widget"]
+edge_kinds = []
+rule_id_prefix = "CLA-OOM-"
+ontology_version = "0.1.0"
+"#;
+    fs::write(plugin_dir.path().join("plugin.toml"), manifest).expect("write oom plugin.toml");
 
     plugin_dir
 }
@@ -205,6 +240,55 @@ fn wp2_e2e_smoke_fixture_plugin_round_trip() {
     assert_eq!(
         entity_name, "demo.sample",
         "entity name must be 'demo.sample'; got {entity_name:?}"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn wp2_rlimit_as_oom_kill_is_reported_as_host_finding() {
+    let fixture_bin = fixture_binary_path();
+    let plugin_dir = setup_oom_plugin_dir(&fixture_bin);
+
+    let project_dir = TempDir::new().expect("create project tempdir");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    fs::write(project_dir.path().join("demo.oom"), b"oom trigger\n").expect("write demo.oom");
+
+    let new_path =
+        env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).expect("join_paths");
+
+    let out = clarion_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &new_path)
+        .env("CLARION_FIXTURE_EXCEED_RLIMIT_AS", "1")
+        .assert()
+        .failure();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stdout.contains(FINDING_OOM_KILLED),
+        "OOM finding missing from analyze output.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    let (run_status, stats_raw): (String, String) = conn
+        .query_row("SELECT status, stats FROM runs LIMIT 1", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .expect("query run row");
+    assert_eq!(run_status, "failed");
+    let stats: serde_json::Value =
+        serde_json::from_str(&stats_raw).expect("stats must be valid JSON");
+    let failure_reason = stats["failure_reason"]
+        .as_str()
+        .expect("failure_reason must be a string");
+    assert!(
+        failure_reason.contains("oom"),
+        "failure_reason should name the OOM plugin; got {failure_reason:?}"
     );
 }
 

@@ -73,12 +73,15 @@ pub enum MockError {
 /// Transitions:
 /// ```text
 /// Fresh ──(initialize response sent)──► Initialized
+///       └─(oversize corrupt frame sent)─► Fresh [terminal Oversize branch]
 /// Initialized ──(initialized notification received)──► Ready  [Compliant]
 ///                                                   ──► Crashed [Crashing]
 /// Ready ──(shutdown response sent)──► ShutdownRequested
 /// ShutdownRequested ──(exit notification received)──► Exited
 /// * ──(exit notification received)──► Exited  [shortcut]
 /// Crashed ── all further frames silently dropped
+/// Oversize remains Fresh; repeated initialize requests append another corrupt
+/// Content-Length frame and never advance to Initialized.
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MockState {
@@ -543,10 +546,9 @@ impl MockPlugin {
     fn write_response(&mut self, env: &ResponseEnvelope) -> Result<(), MockError> {
         let body = serde_json::to_vec(env)?;
         let frame = Frame { body };
-        // Append to the outbox vec without disturbing the read position.
-        let mut tmp: Vec<u8> = Vec::new();
-        write_frame(&mut tmp, &frame)?;
-        self.outbox.get_mut().extend_from_slice(&tmp);
+        // Append to the underlying buffer without disturbing the cursor's read
+        // position; `get_mut()` gives us the Vec directly, not the Cursor.
+        write_frame(self.outbox.get_mut(), &frame)?;
         Ok(())
     }
 }
@@ -574,6 +576,29 @@ mod tests {
         let env = make_notification(method, params);
         let body = serde_json::to_vec(&env).expect("serialise");
         write_frame(mock.stdin(), &Frame { body }).expect("write_frame");
+    }
+
+    fn initialize_and_notify(mock: &mut MockPlugin) -> ResponseEnvelope {
+        send_request(
+            mock,
+            "initialize",
+            &InitializeParams {
+                protocol_version: "1.0".into(),
+                project_root: "/tmp/x".to_owned(),
+            },
+            1,
+        );
+        mock.tick().expect("tick after initialize");
+
+        let frame = read_frame(mock.stdout(), ContentLengthCeiling::new(1024 * 1024))
+            .expect("read initialize response");
+        let response: ResponseEnvelope =
+            serde_json::from_slice(&frame.body).expect("deserialise initialize ResponseEnvelope");
+        assert!(matches!(response.payload, ResponsePayload::Result(_)));
+
+        send_notification(mock, "initialized", &InitializedNotification {});
+        mock.tick().expect("tick after initialized notification");
+        response
     }
 
     // ── Mandatory test: compliant mock completes handshake ────────────────────
@@ -633,25 +658,7 @@ mod tests {
     fn compliant_mock_returns_one_entity_on_analyze_file() {
         let mut mock = MockPlugin::new_compliant();
 
-        // Full handshake first.
-        send_request(
-            &mut mock,
-            "initialize",
-            &InitializeParams {
-                protocol_version: "1.0".into(),
-                project_root: "/tmp/x".to_owned(),
-            },
-            1,
-        );
-        mock.tick().expect("tick after initialize");
-
-        // Drain the initialize response frame so the cursor is ready for more.
-        read_frame(mock.stdout(), ContentLengthCeiling::new(1024 * 1024))
-            .expect("read initialize response");
-
-        // Send initialized notification; mock transitions to Ready.
-        send_notification(&mut mock, "initialized", &InitializedNotification {});
-        mock.tick().expect("tick after initialized notification");
+        initialize_and_notify(&mut mock);
 
         // Send analyze_file request.
         send_request(
@@ -691,31 +698,8 @@ mod tests {
     fn crashing_mock_produces_no_response_after_initialized() {
         let mut mock = MockPlugin::new_crashing();
 
-        // Handshake: initialize request.
-        send_request(
-            &mut mock,
-            "initialize",
-            &InitializeParams {
-                protocol_version: "1.0".into(),
-                project_root: "/tmp/x".to_owned(),
-            },
-            1,
-        );
-        mock.tick().expect("tick after initialize");
-
-        // Drain the initialize response.
-        let frame = read_frame(mock.stdout(), ContentLengthCeiling::new(1024 * 1024))
-            .expect("read initialize response");
-        let resp: ResponseEnvelope = serde_json::from_slice(&frame.body).unwrap();
-        assert!(matches!(resp.payload, ResponsePayload::Result(_)));
-
-        // Record the outbox position after the initialize response; no new bytes
-        // should appear after the crash.
+        initialize_and_notify(&mut mock);
         let pos_after_init = mock.stdout().position();
-
-        // Send initialized notification — this triggers the crash transition.
-        send_notification(&mut mock, "initialized", &InitializedNotification {});
-        mock.tick().expect("tick after initialized notification");
 
         // Send analyze_file — should be silently dropped.
         send_request(
@@ -730,17 +714,12 @@ mod tests {
             .expect("tick after analyze_file (crashing mock)");
 
         // The outbox must not have grown past the initialize response.
-        let pos_after_crash = mock.stdout().position();
-        let outbox_len = mock.stdout().get_ref().len() as u64;
+        let outbox_len = u64::try_from(mock.stdout().get_ref().len())
+            .expect("outbox length exceeds u64::MAX — impossible on any current target");
         assert_eq!(
             outbox_len, pos_after_init,
             "crashing mock must not write any bytes after the initialize response; \
              outbox grew from {pos_after_init} to {outbox_len}"
-        );
-        // Read position should not have advanced either (no new frames produced).
-        assert_eq!(
-            pos_after_crash, pos_after_init,
-            "cursor position must not advance past the initialize response"
         );
     }
 

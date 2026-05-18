@@ -21,8 +21,10 @@ clarion-core = { path = "../clarion-core", version = "0.1.0-dev" }
 clarion-mcp = { path = "../clarion-mcp", version = "0.1.0-dev" }
 clarion-storage = { path = "../clarion-storage", version = "0.1.0-dev" }
 dotenvy.workspace = true
+ignore.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
+time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

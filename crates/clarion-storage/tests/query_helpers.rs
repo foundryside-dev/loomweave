@@ -4,8 +4,9 @@ use std::path::Path;
 
 use clarion_core::EdgeConfidence;
 use clarion_storage::{
-    call_edges_from, call_edges_targeting, child_entity_ids, contained_entity_ids, entity_at_line,
-    entity_by_id, find_entities, normalize_source_path, pragma, schema,
+    ReferenceDirection, call_edges_from, call_edges_targeting, child_entity_ids,
+    contained_entity_ids, entity_at_line, entity_by_id, find_entities, normalize_source_path,
+    pragma, reference_edges_for_entity, schema,
 };
 use rusqlite::{Connection, params};
 
@@ -87,6 +88,70 @@ fn insert_contains_edge(conn: &Connection, from_id: &str, to_id: &str) {
         params![from_id, to_id],
     )
     .expect("insert contains edge");
+}
+
+fn insert_references_edge(
+    conn: &Connection,
+    from_id: &str,
+    to_id: &str,
+    confidence: EdgeConfidence,
+    start: i64,
+    end: i64,
+) {
+    conn.execute(
+        "INSERT INTO edges (
+            kind, from_id, to_id, confidence, source_byte_start, source_byte_end
+         ) VALUES ('references', ?1, ?2, ?3, ?4, ?5)",
+        params![from_id, to_id, confidence.as_str(), start, end],
+    )
+    .expect("insert references edge");
+}
+
+#[test]
+fn reference_edges_for_entity_returns_directional_neighbors() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity(&conn, "python:function:demo.source", "function");
+    insert_entity(&conn, "python:function:demo.target", "function");
+    insert_entity(&conn, "python:function:demo.outbound", "function");
+    insert_references_edge(
+        &conn,
+        "python:function:demo.source",
+        "python:function:demo.target",
+        EdgeConfidence::Resolved,
+        20,
+        25,
+    );
+    insert_references_edge(
+        &conn,
+        "python:function:demo.target",
+        "python:function:demo.outbound",
+        EdgeConfidence::Ambiguous,
+        30,
+        39,
+    );
+
+    let inbound =
+        reference_edges_for_entity(&conn, "python:function:demo.target", ReferenceDirection::In)
+            .expect("query inbound references");
+    let outbound = reference_edges_for_entity(
+        &conn,
+        "python:function:demo.target",
+        ReferenceDirection::Out,
+    )
+    .expect("query outbound references");
+
+    assert_eq!(inbound.len(), 1);
+    assert_eq!(inbound[0].neighbor_id, "python:function:demo.source");
+    assert_eq!(inbound[0].confidence, EdgeConfidence::Resolved);
+    assert_eq!(inbound[0].source_byte_start, Some(20));
+    assert_eq!(inbound[0].source_byte_end, Some(25));
+
+    assert_eq!(outbound.len(), 1);
+    assert_eq!(outbound[0].neighbor_id, "python:function:demo.outbound");
+    assert_eq!(outbound[0].confidence, EdgeConfidence::Ambiguous);
+    assert_eq!(outbound[0].source_byte_start, Some(30));
+    assert_eq!(outbound[0].source_byte_end, Some(39));
 }
 
 #[test]

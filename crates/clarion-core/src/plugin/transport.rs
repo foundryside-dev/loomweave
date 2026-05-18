@@ -48,6 +48,7 @@ pub const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
 
 /// Errors that can occur during frame read/write.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum TransportError {
     /// Underlying I/O error.
     #[error("IO error while reading/writing frame: {0}")]

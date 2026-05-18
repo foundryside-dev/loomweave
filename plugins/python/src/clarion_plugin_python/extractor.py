@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import ast
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Literal, NotRequired, TypedDict, cast
@@ -144,6 +145,8 @@ class ExtractionStats:
     references_skipped_cap_total: int = 0
     unresolved_reference_sites_total: int = 0
     pyright_query_latency_ms: list[int] = field(default_factory=list)
+    pyright_index_parse_latency_ms: list[int] = field(default_factory=list)
+    extractor_parse_latency_ms: int = 0
     findings: list[Finding] = field(default_factory=list)
     duplicate_entities_dropped_total: int = 0
 
@@ -164,6 +167,10 @@ class ExtractionStats:
             pyright_query_latency_ms=[
                 *calls.pyright_query_latency_ms,
                 *references.pyright_query_latency_ms,
+            ],
+            pyright_index_parse_latency_ms=[
+                *calls.pyright_index_parse_latency_ms,
+                *references.pyright_index_parse_latency_ms,
             ],
             findings=[*calls.findings, *references.findings],
         )
@@ -305,9 +312,11 @@ def extract_with_stats(
         )
         return ExtractResult([], [], ExtractionStats())
 
+    parse_started_ns = time.perf_counter_ns()
     try:
         tree = ast.parse(source)
     except SyntaxError as exc:
+        parse_latency_ms = _elapsed_ms(parse_started_ns)
         sys.stderr.write(
             f"clarion-plugin-python: skipping {file_path}: syntax error at "
             f"line {exc.lineno}: {exc.msg}\n",
@@ -315,8 +324,9 @@ def extract_with_stats(
         return ExtractResult(
             [_build_module_entity(source, dotted_module, file_path, "syntax_error")],
             [],
-            ExtractionStats(),
+            ExtractionStats(extractor_parse_latency_ms=parse_latency_ms),
         )
+    parse_latency_ms = _elapsed_ms(parse_started_ns)
 
     module_entity = _build_module_entity(source, dotted_module, file_path, "ok")
     entities: list[RawEntity] = [module_entity]
@@ -340,8 +350,13 @@ def extract_with_stats(
     edges.extend(cast("list[RawEdge]", call_stats.edges))
     edges.extend(cast("list[RawEdge]", reference_stats.edges))
     stats = ExtractionStats.from_resolution_results(call_stats, reference_stats)
+    stats.extractor_parse_latency_ms = parse_latency_ms
     stats.duplicate_entities_dropped_total = walk_state.duplicate_entities_dropped
     return ExtractResult(entities, edges, stats)
+
+
+def _elapsed_ms(started_ns: int) -> int:
+    return max(1, (time.perf_counter_ns() - started_ns + 999_999) // 1_000_000)
 
 
 def _collect_reference_sites(

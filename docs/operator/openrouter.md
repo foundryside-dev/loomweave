@@ -67,6 +67,17 @@ reached, MCP responses use:
 - diagnostic: `CLA-LLM-TOKEN-CEILING-EXCEEDED`
 - stat: `token_ceiling_exceeded_total`
 
+The ceiling is scoped to the running `clarion serve` process. Once a live LLM
+call attempts to exceed `llm_policy.session_token_ceiling`, Clarion blocks new
+cold LLM dispatches for the rest of that process lifetime. Cache hits can still
+be returned while the budget is blocked, because they do not spend additional
+tokens.
+
+To clear a blocked LLM budget, stop and restart `clarion serve`. To change the
+future ceiling, edit `llm_policy.session_token_ceiling` in `clarion.yaml` before
+restarting. Clarion v0.1 intentionally has no MCP tool that resets the in-memory
+budget ledger.
+
 Dollar budgeting remains an operator concern in OpenRouter billing controls.
 
 ## CI And Replay

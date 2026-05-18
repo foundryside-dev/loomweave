@@ -13,9 +13,11 @@ Rules (CPython language reference, "``__qualname__``"):
   prepends ``parent.<locals>.`` — the ``<locals>`` marker distinguishes a
   closure from a method.
 
-The L7 lock-in (``wp3-python-plugin.md §L7``) is that Clarion's Python
-plugin and Wardline's annotations must produce the same string here;
-divergence breaks the cross-product identity join (ADR-018).
+The L7 lock-in (``wp3-python-plugin.md §L7``) is that Clarion reconstructs
+the same bare Python ``__qualname__`` semantics that Wardline stores in its
+``FingerprintEntry.qualified_name`` field. Clarion entity names prepend the
+dotted module path elsewhere; ADR-018 requires cross-product joins to translate
+between those shapes instead of comparing strings directly.
 
 Sprint 1 covers ``FunctionDef`` and ``AsyncFunctionDef`` as emitted
 entities; ``ClassDef`` is recognised as a parent scope only (class

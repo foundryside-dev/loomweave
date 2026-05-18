@@ -280,6 +280,8 @@ def test_extractor_appends_calls_from_resolver_and_carries_stats() -> None:
         },
     ]
     assert result.stats.pyright_query_latency_ms == [17]
+    assert result.stats.pyright_index_parse_latency_ms == []
+    assert result.stats.extractor_parse_latency_ms > 0
 
 
 @pytest.mark.pyright

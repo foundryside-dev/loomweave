@@ -124,6 +124,8 @@ while True:
                     "references_skipped_cap_total": 6,
                     "unresolved_reference_sites_total": 7,
                     "pyright_query_latency_ms": list(range(10, 1010, 10)),
+                    "pyright_index_parse_latency_ms": [4, 8, 12],
+                    "extractor_parse_latency_ms": 6,
                 },
             },
         })
@@ -299,6 +301,16 @@ fn analyze_stats_reports_ambiguous_edges_total() {
         stats["pyright_query_latency_p95_ms"].as_u64(),
         Some(950),
         "pyright_query_latency_p95_ms should be the deterministic p95; got {stats_raw}"
+    );
+    assert_eq!(
+        stats["pyright_index_parse_latency_p95_ms"].as_u64(),
+        Some(12),
+        "pyright_index_parse_latency_p95_ms should be aggregated; got {stats_raw}"
+    );
+    assert_eq!(
+        stats["extractor_parse_latency_p95_ms"].as_u64(),
+        Some(6),
+        "extractor_parse_latency_p95_ms should be aggregated; got {stats_raw}"
     );
     let unresolved_row: (String, String, i64, i64) = conn
         .query_row(

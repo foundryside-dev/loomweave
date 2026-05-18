@@ -48,6 +48,7 @@ class ReferenceResolutionResult:
     references_skipped_cap_total: int = 0
     unresolved_reference_sites_total: int = 0
     pyright_query_latency_ms: list[int] = field(default_factory=list)
+    pyright_index_parse_latency_ms: list[int] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
 
 

@@ -69,6 +69,22 @@ fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
         .collect()
 }
 
+fn primary_key_columns(conn: &Connection, table: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap();
+    let mut columns = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+        })
+        .unwrap()
+        .map(std::result::Result::unwrap)
+        .filter(|(_, pk_position)| *pk_position > 0)
+        .collect::<Vec<_>>();
+    columns.sort_by_key(|(_, pk_position)| *pk_position);
+    columns.into_iter().map(|(name, _)| name).collect()
+}
+
 #[test]
 fn migration_0001_creates_every_expected_table() {
     let tempdir = tempfile::tempdir().unwrap();
@@ -90,6 +106,21 @@ fn migration_0001_creates_every_expected_table() {
             "missing table {expected} in {tables:?}"
         );
     }
+}
+
+#[test]
+fn entity_tags_primary_key_includes_tag_owner_plugin() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+
+    assert_eq!(
+        table_columns(&conn, "entity_tags"),
+        ["entity_id", "plugin_id", "tag"]
+    );
+    assert_eq!(
+        primary_key_columns(&conn, "entity_tags"),
+        ["entity_id", "plugin_id", "tag"]
+    );
 }
 
 #[test]
@@ -676,6 +707,15 @@ fn insert_anchor_entity(conn: &Connection, id: &str) {
     .unwrap();
 }
 
+fn insert_run(conn: &Connection, id: &str) {
+    conn.execute(
+        "INSERT INTO runs (id, started_at, config, stats, status) \
+         VALUES (?1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), '{}', '{}', 'running')",
+        params![id],
+    )
+    .unwrap();
+}
+
 fn insert_finding(
     conn: &Connection,
     entity_id: &str,
@@ -695,9 +735,23 @@ fn insert_finding(
 }
 
 #[test]
+fn findings_run_id_rejects_missing_run() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_anchor_entity(&conn, "python:function:demo.a");
+    let err = insert_finding(&conn, "python:function:demo.a", "fact", "INFO", "open")
+        .expect_err("findings.run_id should reference an existing run");
+    assert!(
+        err.to_string().contains("FOREIGN KEY constraint failed"),
+        "unexpected error for missing run_id: {err}"
+    );
+}
+
+#[test]
 fn findings_kind_check_rejects_unknown_value() {
     let tempdir = tempfile::tempdir().unwrap();
     let conn = open_fresh(&tempdir);
+    insert_run(&conn, "r1");
     insert_anchor_entity(&conn, "python:function:demo.a");
     let err = insert_finding(&conn, "python:function:demo.a", "bogus", "INFO", "open")
         .expect_err("findings.kind CHECK should reject unknown values");
@@ -711,6 +765,7 @@ fn findings_kind_check_rejects_unknown_value() {
 fn findings_kind_check_accepts_all_documented_values() {
     let tempdir = tempfile::tempdir().unwrap();
     let conn = open_fresh(&tempdir);
+    insert_run(&conn, "r1");
     insert_anchor_entity(&conn, "python:function:demo.a");
     // Insert each documented kind in turn; deletion between iterations keeps
     // the PRIMARY KEY available.
@@ -725,6 +780,7 @@ fn findings_kind_check_accepts_all_documented_values() {
 fn findings_severity_check_rejects_unknown_value() {
     let tempdir = tempfile::tempdir().unwrap();
     let conn = open_fresh(&tempdir);
+    insert_run(&conn, "r1");
     insert_anchor_entity(&conn, "python:function:demo.a");
     let err = insert_finding(&conn, "python:function:demo.a", "fact", "info", "open")
         .expect_err("findings.severity CHECK should reject lowercase 'info'");
@@ -738,6 +794,7 @@ fn findings_severity_check_rejects_unknown_value() {
 fn findings_severity_check_accepts_all_documented_values() {
     let tempdir = tempfile::tempdir().unwrap();
     let conn = open_fresh(&tempdir);
+    insert_run(&conn, "r1");
     insert_anchor_entity(&conn, "python:function:demo.a");
     for severity in ["INFO", "WARN", "ERROR", "CRITICAL", "NONE"] {
         insert_finding(&conn, "python:function:demo.a", "fact", severity, "open")
@@ -750,6 +807,7 @@ fn findings_severity_check_accepts_all_documented_values() {
 fn findings_status_check_rejects_unknown_value() {
     let tempdir = tempfile::tempdir().unwrap();
     let conn = open_fresh(&tempdir);
+    insert_run(&conn, "r1");
     insert_anchor_entity(&conn, "python:function:demo.a");
     let err = insert_finding(&conn, "python:function:demo.a", "fact", "INFO", "closed")
         .expect_err("findings.status CHECK should reject 'closed'");
@@ -763,6 +821,7 @@ fn findings_status_check_rejects_unknown_value() {
 fn findings_status_check_accepts_all_documented_values() {
     let tempdir = tempfile::tempdir().unwrap();
     let conn = open_fresh(&tempdir);
+    insert_run(&conn, "r1");
     insert_anchor_entity(&conn, "python:function:demo.a");
     for status in ["open", "acknowledged", "suppressed", "promoted_to_issue"] {
         insert_finding(&conn, "python:function:demo.a", "fact", "INFO", status)

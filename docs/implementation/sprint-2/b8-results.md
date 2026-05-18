@@ -123,6 +123,8 @@ Run counters (from `runs.stats`):
 | `references_skipped_external_total` | 19,593 |
 | `references_skipped_cap_total` | 0 |
 | `pyright_query_latency_p95_ms` | 1,194 |
+| `pyright_index_parse_latency_p95_ms` | not captured by this historical run; follow-up `clarion-7aee45d920` adds this counter for the next B.8 rerun |
+| `extractor_parse_latency_p95_ms` | not captured by this historical run; follow-up `clarion-7aee45d920` adds this counter for the next B.8 rerun |
 | `findings` table rows | 0 |
 
 Plugin-host findings observed in stdout (informational; not persisted):
@@ -634,6 +636,8 @@ excluded non-Python files.
 | Per-file analysis wall average | ~425.6 ms/file, derived from plugin processing / 1,037 files |
 | Pyright per-file p50 | not surfaced by current run stats |
 | Pyright per-file p95 | 1,108 ms |
+| Pyright AST-index parse p95 | not surfaced in this run; added as `runs.stats.pyright_index_parse_latency_p95_ms` by follow-up `clarion-7aee45d920` |
+| Extractor AST parse p95 | not surfaced in this run; added as `runs.stats.extractor_parse_latency_p95_ms` by follow-up `clarion-7aee45d920` |
 | Pyright restart count | not surfaced by current run stats |
 
 Entities by kind:

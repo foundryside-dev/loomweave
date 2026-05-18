@@ -114,5 +114,30 @@ pub fn applied_count(conn: &Connection) -> Result<u32> {
     let n: i64 = conn.query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
         row.get(0)
     })?;
-    Ok(u32::try_from(n).unwrap_or(u32::MAX))
+    migration_count_to_u32(n)
+}
+
+fn migration_count_to_u32(n: i64) -> Result<u32> {
+    u32::try_from(n).map_err(|_| StorageError::Migration {
+        version: 0,
+        source: rusqlite::Error::IntegralValueOutOfRange(0, n),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_count_conversion_rejects_overflow() {
+        let err = migration_count_to_u32(i64::from(u32::MAX) + 1)
+            .expect_err("overflowing migration count should error");
+        assert!(matches!(
+            err,
+            StorageError::Migration {
+                version: 0,
+                source: rusqlite::Error::IntegralValueOutOfRange(0, _),
+            }
+        ));
+    }
 }

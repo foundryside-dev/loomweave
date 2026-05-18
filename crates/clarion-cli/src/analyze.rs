@@ -10,10 +10,12 @@
 //! - Zero successful plugins discovered → `SkippedNoPlugins` (existing path).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::{fs, io};
 
 use anyhow::{Context, Result, bail};
+use ignore::{DirEntry, WalkBuilder};
+use time::{OffsetDateTime, macros::format_description};
 use uuid::Uuid;
 
 use clarion_core::{
@@ -152,6 +154,8 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
                     "references_skipped_cap_total": 0,
                     "unresolved_reference_sites_total": 0,
                     "pyright_query_latency_p95_ms": 0,
+                    "pyright_index_parse_latency_p95_ms": 0,
+                    "extractor_parse_latency_p95_ms": 0,
                 })
                 .to_string(),
                 ack,
@@ -179,8 +183,7 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
     }
 
     // ── Walk the source tree (once, union of all extensions) ─────────────────
-    let source_files = collect_source_files(&project_root, &wanted_extensions)
-        .with_context(|| format!("walking source tree at {}", project_root.display()))?;
+    let source_files = collect_source_files(&project_root, &wanted_extensions);
     tracing::info!(file_count = source_files.len(), "source tree walk complete");
 
     // ── Per-plugin processing ─────────────────────────────────────────────────
@@ -204,6 +207,8 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
     let mut references_skipped_cap_total: u64 = 0;
     let mut unresolved_reference_sites_total: u64 = 0;
     let mut pyright_latency = P95Accumulator::default();
+    let mut pyright_index_parse_latency = P95Accumulator::default();
+    let mut extractor_parse_latency = P95Accumulator::default();
     let mut run_outcome: RunOutcome = RunOutcome::Completed;
     let mut breaker = CrashLoopBreaker::default();
     let mut crash_reasons: Vec<String> = Vec::new();
@@ -256,7 +261,7 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
         // permanently. Treat the panic as a crash reason: it flows into the
         // existing crash-recording path below, ticks the crash-loop breaker,
         // and resolves the run via SoftFailed → CommitRun(Failed) with exit 1.
-        let spawn_result: Result<BatchResult, String> = handle_plugin_task_join_result(
+        let spawn_result: Result<BatchResult, PluginRunError> = handle_plugin_task_join_result(
             tokio::task::spawn_blocking(move || {
                 run_plugin_blocking(
                     manifest,
@@ -271,13 +276,14 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
         );
 
         match spawn_result {
-            Err(reason) => {
+            Err(plugin_error) => {
+                log_plugin_findings(&plugin_id, &plugin_error.findings);
                 tracing::warn!(
                     plugin_id = %plugin_id,
-                    reason = %reason,
+                    reason = %plugin_error.reason,
                     "plugin crashed; recording crash and continuing to next plugin",
                 );
-                crash_reasons.push(format!("{plugin_id}: {reason}"));
+                crash_reasons.push(format!("{plugin_id}: {}", plugin_error.reason));
                 let state = breaker.record_crash();
                 if state == CrashLoopState::Tripped {
                     tracing::warn!(
@@ -304,27 +310,14 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
                 references_skipped_cap_total += stats.references_skipped_cap_total;
                 unresolved_reference_sites_total += stats.unresolved_reference_sites_total;
                 pyright_latency.record_many(stats.pyright_query_latency_ms);
+                pyright_index_parse_latency.record_many(stats.pyright_index_parse_latency_ms);
+                extractor_parse_latency.record_many(stats.extractor_parse_latency_ms);
 
                 // Log findings individually (Tier B persistence is future
                 // work). Logging only the count leaves operators guessing
                 // whether the plugin tripped an ontology check, emitted
                 // malformed JSON, or hit a path-jail violation.
-                if !findings.is_empty() {
-                    tracing::warn!(
-                        plugin_id = %plugin_id,
-                        finding_count = findings.len(),
-                        "plugin host collected findings"
-                    );
-                    for f in &findings {
-                        tracing::warn!(
-                            plugin_id = %plugin_id,
-                            subcode = %f.subcode,
-                            message = %f.message,
-                            metadata = ?f.metadata,
-                            "plugin host finding",
-                        );
-                    }
-                }
+                log_plugin_findings(&plugin_id, &findings);
 
                 // Persist entities + edges via writer-actor (async side).
                 //
@@ -439,6 +432,8 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
         .ambiguous_edges_total
         .load(std::sync::atomic::Ordering::Relaxed) as u64;
     let pyright_query_latency_p95_ms = pyright_latency.p95_ms();
+    let pyright_index_parse_latency_p95_ms = pyright_index_parse_latency.p95_ms();
+    let extractor_parse_latency_p95_ms = extractor_parse_latency.p95_ms();
     // Extract the failure reason (if any) before the match consumes run_outcome.
     let fail_reason: Option<String> = match &run_outcome {
         RunOutcome::SoftFailed { reason } | RunOutcome::HardFailed { reason } => {
@@ -461,6 +456,8 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
                 "references_skipped_cap_total": references_skipped_cap_total,
                 "unresolved_reference_sites_total": unresolved_reference_sites_total,
                 "pyright_query_latency_p95_ms": pyright_query_latency_p95_ms,
+                "pyright_index_parse_latency_p95_ms": pyright_index_parse_latency_p95_ms,
+                "extractor_parse_latency_p95_ms": extractor_parse_latency_p95_ms,
             })
             .to_string();
             writer
@@ -492,6 +489,8 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
                 "references_skipped_cap_total": references_skipped_cap_total,
                 "unresolved_reference_sites_total": unresolved_reference_sites_total,
                 "pyright_query_latency_p95_ms": pyright_query_latency_p95_ms,
+                "pyright_index_parse_latency_p95_ms": pyright_index_parse_latency_p95_ms,
+                "extractor_parse_latency_p95_ms": extractor_parse_latency_p95_ms,
                 "failure_reason": reason,
             })
             .to_string();
@@ -562,10 +561,30 @@ enum RunOutcome {
     HardFailed { reason: String },
 }
 
+fn log_plugin_findings(plugin_id: &str, findings: &[HostFinding]) {
+    if findings.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        plugin_id = %plugin_id,
+        finding_count = findings.len(),
+        "plugin host collected findings"
+    );
+    for f in findings {
+        tracing::warn!(
+            plugin_id = %plugin_id,
+            subcode = %f.subcode,
+            message = %f.message,
+            metadata = ?f.metadata,
+            "plugin host finding",
+        );
+    }
+}
+
 // ── JoinError handling ────────────────────────────────────────────────────────
 
 /// Convert a `spawn_blocking` join result into the plugin-crash-shaped
-/// `Result<BatchResult, String>` the caller already knows how to handle.
+/// `Result<BatchResult, PluginRunError>` the caller already knows how to handle.
 ///
 /// The `Err(JoinError)` arm is the load-bearing one: a panic inside
 /// `run_plugin_blocking` would otherwise `?`-propagate past the run-outcome
@@ -574,9 +593,9 @@ enum RunOutcome {
 /// path (ticks the crash-loop breaker, resolves to `SoftFailed` if no writer
 /// error occurred).
 fn handle_plugin_task_join_result(
-    result: Result<Result<BatchResult, String>, tokio::task::JoinError>,
+    result: Result<Result<BatchResult, PluginRunError>, tokio::task::JoinError>,
     plugin_id: &str,
-) -> Result<BatchResult, String> {
+) -> Result<BatchResult, PluginRunError> {
     match result {
         Ok(inner) => inner,
         Err(join_err) => {
@@ -585,7 +604,9 @@ fn handle_plugin_task_join_result(
                 error = %join_err,
                 "plugin task panicked; recording as crash",
             );
-            Err(format!("plugin task for {plugin_id} panicked: {join_err}"))
+            Err(PluginRunError::new(format!(
+                "plugin task for {plugin_id} panicked: {join_err}"
+            )))
         }
     }
 }
@@ -608,6 +629,25 @@ struct BatchResult {
     findings: Vec<clarion_core::HostFinding>,
 }
 
+#[derive(Debug)]
+struct PluginRunError {
+    reason: String,
+    findings: Vec<HostFinding>,
+}
+
+impl PluginRunError {
+    fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            findings: Vec::new(),
+        }
+    }
+
+    fn with_findings(reason: String, findings: Vec<HostFinding>) -> Self {
+        Self { reason, findings }
+    }
+}
+
 #[derive(Debug, Default)]
 struct BatchStats {
     unresolved_call_sites_total: u64,
@@ -617,6 +657,8 @@ struct BatchStats {
     references_skipped_cap_total: u64,
     unresolved_reference_sites_total: u64,
     pyright_query_latency_ms: Vec<u64>,
+    pyright_index_parse_latency_ms: Vec<u64>,
+    extractor_parse_latency_ms: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -649,16 +691,20 @@ fn run_plugin_blocking(
     plugin_id: &str,
     executable: &Path,
     files: &[PathBuf],
-) -> Result<BatchResult, String> {
+) -> Result<BatchResult, PluginRunError> {
     use clarion_core::PluginHost;
 
     let (mut host, mut child) =
         PluginHost::spawn(manifest, project_root, executable).map_err(|e| match e {
-            HostError::Spawn(msg) => format!("failed to spawn plugin {plugin_id}: {msg}"),
-            HostError::Handshake(ref me) => {
-                format!("plugin {plugin_id} refused handshake: {me}")
+            HostError::Spawn(msg) => {
+                PluginRunError::new(format!("failed to spawn plugin {plugin_id}: {msg}"))
             }
-            other => format!("plugin {plugin_id} spawn/handshake error: {other}"),
+            HostError::Handshake(ref me) => {
+                PluginRunError::new(format!("plugin {plugin_id} refused handshake: {me}"))
+            }
+            other => {
+                PluginRunError::new(format!("plugin {plugin_id} spawn/handshake error: {other}"))
+            }
         })?;
 
     let work_result: Result<Collected, String> = (|| {
@@ -685,6 +731,14 @@ fn run_plugin_blocking(
             collected_stats
                 .pyright_query_latency_ms
                 .extend(stats.pyright_query_latency_ms.iter().copied());
+            collected_stats
+                .pyright_index_parse_latency_ms
+                .extend(stats.pyright_index_parse_latency_ms.iter().copied());
+            if stats.extractor_parse_latency_ms > 0 {
+                collected_stats
+                    .extractor_parse_latency_ms
+                    .push(stats.extractor_parse_latency_ms);
+            }
             let source_file_id = entities
                 .iter()
                 .find(|entity| entity.kind == "module")
@@ -742,6 +796,7 @@ fn run_plugin_blocking(
     }
 
     let mut findings = host.take_findings();
+    drop(host);
 
     // Reap unconditionally. `Child::Drop` does not wait on Unix.
     reap_and_classify_exit(&mut child, plugin_id, &mut findings);
@@ -754,7 +809,7 @@ fn run_plugin_blocking(
             stats,
             findings,
         }),
-        Err(reason) => Err(reason),
+        Err(reason) => Err(PluginRunError::with_findings(reason, findings)),
     }
 }
 
@@ -771,39 +826,46 @@ fn reap_and_classify_exit(
     plugin_id: &str,
     findings: &mut Vec<HostFinding>,
 ) {
-    match child.wait() {
-        Ok(status) if !status.success() => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::ExitStatusExt;
-                if let Some(signal) = status.signal() {
-                    tracing::warn!(
-                        plugin_id = %plugin_id,
-                        signal,
-                        "plugin terminated by signal",
-                    );
-                    // SIGKILL (9) and SIGSEGV (11) are the observed signatures
-                    // of an RLIMIT_AS kill in Sprint-1 testing.
-                    if signal == 9 || signal == 11 {
-                        findings.push(HostFinding::oom_killed(plugin_id, signal));
-                    }
-                } else if let Some(code) = status.code() {
-                    tracing::warn!(
-                        plugin_id = %plugin_id,
-                        code,
-                        "plugin exited non-zero",
-                    );
-                }
-            }
-            #[cfg(not(unix))]
-            {
+    reap_and_classify_exit_with_timeout(child, plugin_id, findings, PLUGIN_REAP_TIMEOUT);
+}
+
+const PLUGIN_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const PLUGIN_REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+fn reap_and_classify_exit_with_timeout(
+    child: &mut std::process::Child,
+    plugin_id: &str,
+    findings: &mut Vec<HostFinding>,
+    timeout: std::time::Duration,
+) {
+    match wait_child_with_timeout(child, timeout) {
+        Ok(Some(status)) => classify_child_exit_status(status, plugin_id, findings),
+        Ok(None) => {
+            tracing::warn!(
+                plugin_id = %plugin_id,
+                timeout_ms = timeout.as_millis(),
+                "plugin did not exit before reap timeout; killing child",
+            );
+            if let Err(e) = child.kill() {
                 tracing::warn!(
                     plugin_id = %plugin_id,
-                    "plugin exited non-successfully (exit-status inspection is Unix-only)",
+                    error = %e,
+                    "failed to kill plugin child after reap timeout",
                 );
             }
+            match child.wait() {
+                Ok(status) => tracing::warn!(
+                    plugin_id = %plugin_id,
+                    status = ?status,
+                    "plugin child reaped after timeout kill",
+                ),
+                Err(e) => tracing::warn!(
+                    plugin_id = %plugin_id,
+                    error = %e,
+                    "failed to wait on plugin child after timeout kill",
+                ),
+            }
         }
-        Ok(_) => {} // clean exit
         Err(e) => {
             tracing::warn!(
                 plugin_id = %plugin_id,
@@ -811,6 +873,62 @@ fn reap_and_classify_exit(
                 "failed to wait on plugin child",
             );
         }
+    }
+}
+
+fn wait_child_with_timeout(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(PLUGIN_REAP_POLL_INTERVAL.min(deadline - now));
+    }
+}
+
+fn classify_child_exit_status(
+    status: std::process::ExitStatus,
+    plugin_id: &str,
+    findings: &mut Vec<HostFinding>,
+) {
+    if status.success() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            tracing::warn!(
+                plugin_id = %plugin_id,
+                signal,
+                "plugin terminated by signal",
+            );
+            // SIGKILL (9) and SIGSEGV (11) are the observed signatures
+            // of an RLIMIT_AS kill in Sprint-1 testing.
+            if signal == 9 || signal == 11 {
+                findings.push(HostFinding::oom_killed(plugin_id, signal));
+            }
+        } else if let Some(code) = status.code() {
+            tracing::warn!(
+                plugin_id = %plugin_id,
+                code,
+                "plugin exited non-zero",
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tracing::warn!(
+            plugin_id = %plugin_id,
+            "plugin exited non-successfully (exit-status inspection is Unix-only)",
+        );
     }
 }
 
@@ -1073,9 +1191,9 @@ const SKIP_DIRS: &[&str] = &[
 
 /// Collect all source files under `root` whose extension is in `wanted`.
 ///
-/// Uses `std::fs::read_dir` recursively. No `walkdir` dependency.
-/// Symlinks are skipped (path-jail concerns for Sprint 1).
-/// P4 observation: this does not respect `.gitignore`.
+/// Uses the `ignore` crate so `.gitignore` / `.ignore` / global gitignore
+/// policy filters the source set before plugin dispatch. Symlinks are skipped
+/// (path-jail concerns for Sprint 1).
 ///
 /// Per-entry I/O errors (a dirent we couldn't stat, a file whose
 /// `file_type()` probe failed) are logged at `warn` level and counted.
@@ -1083,13 +1201,48 @@ const SKIP_DIRS: &[&str] = &[
 /// the operator can see that the file list is incomplete — silently
 /// dropping those entries would mask the same "incomplete analysis"
 /// class that the WP1 `read_applied_versions` `.ok()` pattern did.
-fn collect_source_files(
-    root: &Path,
-    wanted_extensions: &BTreeSet<String>,
-) -> io::Result<Vec<PathBuf>> {
+fn collect_source_files(root: &Path, wanted_extensions: &BTreeSet<String>) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut skipped: u64 = 0;
-    walk_dir(root, &mut out, &mut skipped, wanted_extensions)?;
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .follow_links(false)
+        .hidden(false)
+        .ignore(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .parents(true)
+        .require_git(false)
+        .filter_entry(|entry| !is_skipped_dir(entry));
+
+    for result in builder.build() {
+        match result {
+            Ok(entry) => {
+                let Some(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_file() {
+                    continue;
+                }
+                let path = entry.into_path();
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    let ext_lower = ext.to_ascii_lowercase();
+                    if wanted_extensions.contains(&ext_lower) {
+                        out.push(path);
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "source walk: skipping unreadable or ignored-path-error entry",
+                );
+                skipped += 1;
+            }
+        }
+    }
+
     if skipped > 0 {
         tracing::warn!(
             skipped = skipped,
@@ -1099,124 +1252,30 @@ fn collect_source_files(
             suffix = if skipped == 1 { "y" } else { "ies" },
         );
     }
-    Ok(out)
+    out
 }
 
-fn walk_dir(
-    dir: &Path,
-    out: &mut Vec<PathBuf>,
-    skipped: &mut u64,
-    wanted: &BTreeSet<String>,
-) -> io::Result<()> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Ok(()),
-        Err(e) => return Err(e),
-    };
-
-    for entry_result in entries {
-        let entry = match entry_result {
-            Ok(entry) => entry,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    dir = %dir.display(),
-                    "source walk: skipping unreadable directory entry",
-                );
-                *skipped += 1;
-                continue;
-            }
-        };
-        let file_type = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    path = %entry.path().display(),
-                    "source walk: skipping entry whose file_type() probe failed",
-                );
-                *skipped += 1;
-                continue;
-            }
-        };
-
-        // Skip symlinks (path-jail concerns).
-        if file_type.is_symlink() {
-            continue;
-        }
-
-        let path = entry.path();
-
-        if file_type.is_dir() {
-            // Skip directories in the skip-list.
-            let dir_name = entry.file_name();
-            let name_str = dir_name.to_string_lossy();
-            if SKIP_DIRS.iter().any(|skip| *skip == name_str.as_ref()) {
-                continue;
-            }
-            walk_dir(&path, out, skipped, wanted)?;
-        } else if file_type.is_file() {
-            // Check extension (case-insensitive compare; `wanted` is already lowercase).
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                let ext_lower = ext.to_ascii_lowercase();
-                if wanted.contains(&ext_lower) {
-                    out.push(path);
-                }
-            }
-        }
-    }
-
-    Ok(())
+fn is_skipped_dir(entry: &DirEntry) -> bool {
+    entry
+        .file_type()
+        .is_some_and(|file_type| file_type.is_dir())
+        && entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| SKIP_DIRS.contains(&name))
 }
 
 // ── Time helpers ──────────────────────────────────────────────────────────────
 
-/// Format `SystemTime::now()` as an `ISO-8601` UTC string with millisecond
-/// precision (`YYYY-MM-DDTHH:MM:SS.sssZ`).
-///
-/// Inline rather than depending on `chrono` — Sprint 1 only needs this one
-/// formatting pattern. Later WPs that want richer time handling can
-/// promote `chrono` to a workspace dependency at that point.
+const ISO8601_MILLIS_UTC: &[time::format_description::FormatItem<'_>] =
+    format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
+
+/// Format `OffsetDateTime::now_utc()` as an `ISO-8601` UTC string with
+/// millisecond precision (`YYYY-MM-DDTHH:MM:SS.sssZ`).
 fn iso8601_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let d = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("SystemTime before UNIX epoch");
-    let secs = d.as_secs();
-    let millis = d.subsec_millis();
-    let (y, mo, da, h, mi, se) = civil_from_unix_secs(secs);
-    format!("{y:04}-{mo:02}-{da:02}T{h:02}:{mi:02}:{se:02}.{millis:03}Z")
-}
-
-/// Convert a non-negative Unix timestamp (seconds since 1970-01-01 UTC)
-/// into `(year, month, day, hour, minute, second)`.
-///
-/// Algorithm: Howard Hinnant's date, `civil_from_days`. Works for any date
-/// from the Unix epoch forward. Does not account for leap seconds (none
-/// of our timestamps need leap-second precision).
-fn civil_from_unix_secs(mut secs: u64) -> (u32, u32, u32, u32, u32, u32) {
-    let se = u32::try_from(secs % 60).expect("modulo 60 fits in u32");
-    secs /= 60;
-    let mi = u32::try_from(secs % 60).expect("modulo 60 fits in u32");
-    secs /= 60;
-    let h = u32::try_from(secs % 24).expect("modulo 24 fits in u32");
-    secs /= 24;
-
-    // secs is now days since the Unix epoch (1970-01-01).
-    // Howard Hinnant's algorithm needs days shifted to 0000-03-01 epoch.
-    let days = i64::try_from(secs).expect("days since epoch fits in i64");
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = u64::try_from(z - era * 146_097).expect("day-of-era is non-negative");
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y_shifted = i64::try_from(yoe).expect("year-of-era fits in i64") + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let da = u32::try_from(doy - (153 * mp + 2) / 5 + 1).expect("day-of-month fits in u32");
-    let mo = u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 }).expect("month fits in u32");
-    let y_i64 = if mo <= 2 { y_shifted + 1 } else { y_shifted };
-    let y = u32::try_from(y_i64).expect("year fits in u32 (post-1970)");
-    (y, mo, da, h, mi, se)
+    OffsetDateTime::now_utc()
+        .format(ISO8601_MILLIS_UTC)
+        .expect("fixed ISO-8601 format description should format")
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1224,6 +1283,36 @@ fn civil_from_unix_secs(mut secs: u64) -> (u32, u32, u32, u32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+    use std::fs;
+
+    #[test]
+    fn source_walk_honours_root_gitignore() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let root = tempdir.path();
+        fs::write(root.join(".gitignore"), "ignored/\n*.generated.py\n").expect("gitignore");
+        fs::write(root.join("kept.py"), "print('kept')\n").expect("kept source");
+        fs::write(root.join("skip.generated.py"), "print('ignored pattern')\n")
+            .expect("ignored source");
+        fs::create_dir(root.join("ignored")).expect("ignored dir");
+        fs::write(root.join("ignored").join("hidden.py"), "print('hidden')\n")
+            .expect("ignored dir source");
+
+        let wanted = BTreeSet::from(["py".to_owned()]);
+        let mut files = collect_source_files(root, &wanted);
+        files.sort();
+        let relative = files
+            .into_iter()
+            .map(|path| {
+                path.strip_prefix(root)
+                    .expect("under temp root")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(relative, vec!["kept.py"]);
+    }
 
     // ── handle_plugin_task_join_result ────────────────────────────────────────
     //
@@ -1250,10 +1339,15 @@ mod tests {
 
     #[test]
     fn handle_task_passes_through_ok_err() {
-        let out =
-            handle_plugin_task_join_result(Ok(Err("spawn failed: ENOENT".to_owned())), "python");
+        let out = handle_plugin_task_join_result(
+            Ok(Err(PluginRunError::new("spawn failed: ENOENT"))),
+            "python",
+        );
         match out {
-            Err(s) => assert_eq!(s, "spawn failed: ENOENT"),
+            Err(e) => {
+                assert_eq!(e.reason, "spawn failed: ENOENT");
+                assert!(e.findings.is_empty());
+            }
             Ok(_) => panic!("expected Err pass-through"),
         }
     }
@@ -1263,7 +1357,7 @@ mod tests {
         // Drive a real JoinError through the helper by panicking inside
         // spawn_blocking. Asserting on the structure-of-Err (not the exact
         // message) so this stays robust across tokio's internal formatting.
-        let join_result = tokio::task::spawn_blocking(|| -> Result<BatchResult, String> {
+        let join_result = tokio::task::spawn_blocking(|| -> Result<BatchResult, PluginRunError> {
             panic!("simulated plugin-task panic");
         })
         .await;
@@ -1273,14 +1367,47 @@ mod tests {
         );
         let out = handle_plugin_task_join_result(join_result, "python");
         match out {
-            Err(s) => {
+            Err(e) => {
                 assert!(
-                    s.contains("plugin task for python panicked"),
-                    "reason must identify plugin_id; got: {s}"
+                    e.reason.contains("plugin task for python panicked"),
+                    "reason must identify plugin_id; got: {}",
+                    e.reason
                 );
+                assert!(e.findings.is_empty());
             }
             Ok(_) => panic!("JoinError must convert to Err, not Ok"),
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reap_timeout_kills_stubborn_child() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleeping child");
+        let mut findings = Vec::new();
+        let start = std::time::Instant::now();
+
+        reap_and_classify_exit_with_timeout(
+            &mut child,
+            "stubborn",
+            &mut findings,
+            std::time::Duration::from_millis(50),
+        );
+
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "bounded reap should not wait for the child sleep"
+        );
+        assert!(
+            child.try_wait().expect("query child status").is_some(),
+            "timed-out child should be killed and reaped"
+        );
+        assert!(
+            findings.is_empty(),
+            "timeout kill should not be misclassified as an OOM finding: {findings:?}"
+        );
     }
 
     #[test]

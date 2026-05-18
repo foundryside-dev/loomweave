@@ -13,7 +13,7 @@ version = "0.1.0-dev"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/qacona/clarion"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.lints.rust]
 # Changed from "forbid" to "deny" to allow the single documented unsafe use:
@@ -35,12 +35,14 @@ blake3 = "1.8.5"
 clap = { version = "4", features = ["derive"] }
 deadpool-sqlite = { version = "0.8", features = ["rt_tokio_1"] }
 dotenvy = "0.15"
+ignore = "0.4"
 rusqlite = { version = "0.31", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_norway = "0.9.42"
 thiserror = "1"
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

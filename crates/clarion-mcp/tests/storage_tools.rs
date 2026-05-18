@@ -1,6 +1,9 @@
 //! MCP storage-backed tool tests.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    fs,
+    sync::{Arc, Mutex},
+};
 
 use clarion_core::{
     CachingModel, INFERRED_CALLS_PROMPT_VERSION, InferredCallsPromptInput,
@@ -32,6 +35,14 @@ fn open_project() -> (tempfile::TempDir, std::path::PathBuf) {
     seed_graph(&conn, project.path());
     drop(conn);
     (project, db_path)
+}
+
+fn add_dynamic_source(project_root: &std::path::Path) {
+    std::fs::write(
+        project_root.join("demo.py"),
+        "def entry():\n    return mid()\n\ndef mid():\n    return target()\n\ndef target():\n    return 1\n\ndef dynamic():\n    return target()\n",
+    )
+    .expect("write dynamic source");
 }
 
 fn seed_graph(conn: &Connection, project_root: &std::path::Path) {
@@ -156,6 +167,7 @@ fn insert_entity(
     range: Option<(i64, i64)>,
     parent_id: Option<&str>,
 ) {
+    let content_hash = fixture_content_hash(kind, source_path, range);
     conn.execute(
         "INSERT INTO entities (
             id, plugin_id, kind, name, short_name, parent_id, source_file_path,
@@ -172,10 +184,31 @@ fn insert_entity(
             source_path.display().to_string(),
             range.map(|(start, _)| start),
             range.map(|(_, end)| end),
-            format!("hash-{id}"),
+            content_hash,
         ],
     )
     .expect("insert entity");
+}
+
+fn fixture_content_hash(
+    kind: &str,
+    source_path: &std::path::Path,
+    range: Option<(i64, i64)>,
+) -> String {
+    if kind == "module" {
+        return blake3::hash(&std::fs::read(source_path).expect("read module source"))
+            .to_hex()
+            .to_string();
+    }
+    let source = std::fs::read_to_string(source_path).expect("read entity source");
+    let (start_line, end_line) = range.expect("non-module fixture has source range");
+    let start = usize::try_from(start_line - 1).expect("start line fits usize");
+    let mut end = usize::try_from(end_line).expect("end line fits usize");
+    let lines = source.lines().collect::<Vec<_>>();
+    end = end.min(lines.len());
+    assert!(start < end, "fixture range must overlap source");
+    let normalized = lines[start..end].join("\n");
+    blake3::hash(normalized.as_bytes()).to_hex().to_string()
 }
 
 fn insert_edge(
@@ -205,12 +238,19 @@ fn insert_edge(
 }
 
 fn insert_unresolved_call_site(conn: &Connection, caller_id: &str, site_key: &str, expr: &str) {
+    let caller_content_hash: String = conn
+        .query_row(
+            "SELECT content_hash FROM entities WHERE id = ?1",
+            params![caller_id],
+            |row| row.get(0),
+        )
+        .expect("caller content hash");
     conn.execute(
         "INSERT INTO entity_unresolved_call_sites (
             caller_entity_id, caller_content_hash, site_key, site_ordinal,
             source_file_id, source_byte_start, source_byte_end, callee_expr, created_at
          ) VALUES (?1, ?2, ?3, 0, 'python:module:demo', 30, 37, ?4, '2026-05-17T00:00:00.000Z')",
-        params![caller_id, format!("hash-{caller_id}"), site_key, expr],
+        params![caller_id, caller_content_hash, site_key, expr],
     )
     .expect("insert unresolved call site");
 }
@@ -289,9 +329,11 @@ fn expected_inferred_request(
     target_id: &str,
 ) -> LlmRequest {
     let source_excerpt = expected_source_excerpt(project_root, caller_id);
+    let caller_content_hash = expected_content_hash(project_root, caller_id);
+    let target_content_hash = expected_content_hash(project_root, target_id);
     let unresolved_call_sites_json = serde_json::to_string(&vec![json!({
         "caller_entity_id": caller_id,
-        "caller_content_hash": format!("hash-{caller_id}"),
+        "caller_content_hash": caller_content_hash,
         "site_key": site_key,
         "site_ordinal": 0,
         "source_file_id": "python:module:demo",
@@ -309,7 +351,7 @@ fn expected_inferred_request(
         "source_file_path": source_file_path,
         "source_line_start": 9,
         "source_line_end": 10,
-        "content_hash": format!("hash-{target_id}")
+        "content_hash": target_content_hash
     })])
     .unwrap();
     let prompt = build_inferred_calls_prompt(&InferredCallsPromptInput {
@@ -340,6 +382,19 @@ fn expected_source_excerpt(project_root: &std::path::Path, entity_id: &str) -> S
         return source;
     }
     lines[start..end.min(lines.len())].concat()
+}
+
+fn expected_content_hash(project_root: &std::path::Path, entity_id: &str) -> String {
+    let kind = if entity_id == "python:module:demo" {
+        "module"
+    } else {
+        "function"
+    };
+    fixture_content_hash(
+        kind,
+        &project_root.join("demo.py"),
+        expected_line_range(entity_id),
+    )
 }
 
 fn expected_line_range(entity_id: &str) -> Option<(i64, i64)> {
@@ -624,7 +679,7 @@ async fn issues_for_includes_contained_entities_and_flags_drift() {
                 vec![association(
                     "filigree-fresh",
                     "python:function:demo.entry",
-                    "hash-python:function:demo.entry",
+                    &expected_content_hash(project.path(), "python:function:demo.entry"),
                 )],
             )
             .with_response(
@@ -672,7 +727,7 @@ async fn issues_for_respects_include_contained_false() {
                 vec![association(
                     "filigree-module",
                     "python:module:demo",
-                    "hash-python:module:demo",
+                    &expected_content_hash(project.path(), "python:module:demo"),
                 )],
             )
             .with_response(
@@ -680,7 +735,7 @@ async fn issues_for_respects_include_contained_false() {
                 vec![association(
                     "filigree-entry",
                     "python:function:demo.entry",
-                    "hash-python:function:demo.entry",
+                    &expected_content_hash(project.path(), "python:function:demo.entry"),
                 )],
             ),
     );
@@ -709,7 +764,7 @@ async fn issues_for_truncates_at_issue_cap() {
             association(
                 &format!("filigree-{idx:03}"),
                 "python:function:demo.entry",
-                "hash-python:function:demo.entry",
+                &expected_content_hash(project.path(), "python:function:demo.entry"),
             )
         })
         .collect();
@@ -739,7 +794,7 @@ async fn issues_for_stops_filigree_calls_after_issue_cap() {
             association(
                 &format!("filigree-{idx:03}"),
                 "python:module:demo",
-                "hash-python:module:demo",
+                &expected_content_hash(project.path(), "python:module:demo"),
             )
         })
         .collect();
@@ -751,7 +806,7 @@ async fn issues_for_stops_filigree_calls_after_issue_cap() {
                 vec![association(
                     "filigree-entry",
                     "python:function:demo.entry",
-                    "hash-python:function:demo.entry",
+                    &expected_content_hash(project.path(), "python:function:demo.entry"),
                 )],
             ),
     );
@@ -973,6 +1028,55 @@ async fn summary_prompt_uses_entity_source_range_not_whole_file() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_cold_miss_refuses_live_source_drift() {
+    let (project, db_path) = open_project();
+    let original_hash = blake3::hash("def entry():\n    return mid()".as_bytes())
+        .to_hex()
+        .to_string();
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE entities SET content_hash = ?1 WHERE id = 'python:function:demo.entry'",
+        params![original_hash],
+    )
+    .unwrap();
+    drop(conn);
+    fs::write(
+        project.path().join("demo.py"),
+        "def entry():\n    return changed()\n\ndef mid():\n    return target()\n\ndef target():\n    return 1\n",
+    )
+    .unwrap();
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnySummaryProvider::new_output(
+        r#"{"purpose":"should not run"}"#,
+        120,
+        0.0,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "content-drift");
+    assert_eq!(provider.invocations().len(), 0);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn summary_cache_hit_reports_stale_semantic_when_graph_counts_drift() {
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).unwrap();
@@ -981,7 +1085,7 @@ async fn summary_cache_hit_reports_stale_semantic_when_graph_counts_drift() {
         &SummaryCacheEntry {
             key: SummaryCacheKey {
                 entity_id: "python:function:demo.entry".to_owned(),
-                content_hash: "hash-python:function:demo.entry".to_owned(),
+                content_hash: expected_content_hash(project.path(), "python:function:demo.entry"),
                 prompt_template_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
                 model_tier: "anthropic/claude-sonnet-4.6".to_owned(),
                 guidance_fingerprint: "guidance-empty".to_owned(),
@@ -1029,7 +1133,7 @@ async fn summary_expired_cache_row_is_refreshed_by_recording_provider() {
         &SummaryCacheEntry {
             key: SummaryCacheKey {
                 entity_id: "python:function:demo.entry".to_owned(),
-                content_hash: "hash-python:function:demo.entry".to_owned(),
+                content_hash: expected_content_hash(project.path(), "python:function:demo.entry"),
                 prompt_template_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
                 model_tier: "anthropic/claude-sonnet-4.6".to_owned(),
                 guidance_fingerprint: "guidance-empty".to_owned(),
@@ -1313,6 +1417,7 @@ async fn callers_of_defaults_to_resolved_and_expands_ambiguous_candidates() {
 async fn callers_of_inferred_dispatches_and_materializes_recording_result() {
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).unwrap();
+    add_dynamic_source(project.path());
     let source_path = project.path().join("demo.py");
     insert_entity(
         &conn,
@@ -1384,6 +1489,7 @@ async fn callers_of_inferred_dispatches_and_materializes_recording_result() {
 async fn inferred_dispatch_prompt_uses_caller_source_range_not_whole_file() {
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).unwrap();
+    add_dynamic_source(project.path());
     let source_path = project.path().join("demo.py");
     insert_entity(
         &conn,
@@ -1442,6 +1548,7 @@ async fn inferred_dispatch_prompt_uses_caller_source_range_not_whole_file() {
 async fn callers_of_inferred_coalesces_concurrent_cold_requests() {
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).unwrap();
+    add_dynamic_source(project.path());
     let source_path = project.path().join("demo.py");
     insert_entity(
         &conn,
@@ -1498,6 +1605,7 @@ async fn callers_of_inferred_coalesces_concurrent_cold_requests() {
 async fn callers_of_inferred_invalid_json_preserves_usage_accounting() {
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).unwrap();
+    add_dynamic_source(project.path());
     let source_path = project.path().join("demo.py");
     insert_entity(
         &conn,
@@ -1556,6 +1664,7 @@ async fn callers_of_inferred_invalid_json_preserves_usage_accounting() {
 async fn callers_of_inferred_drops_targets_missing_from_entities_table() {
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).unwrap();
+    add_dynamic_source(project.path());
     let source_path = project.path().join("demo.py");
     insert_entity(
         &conn,
@@ -1646,6 +1755,7 @@ async fn execution_paths_from_reports_edge_cap_truncation() {
 async fn execution_paths_from_inferred_dispatches_start_caller() {
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).unwrap();
+    add_dynamic_source(project.path());
     let source_path = project.path().join("demo.py");
     insert_entity(
         &conn,
@@ -1706,6 +1816,7 @@ async fn execution_paths_from_inferred_dispatches_start_caller() {
 async fn execution_paths_from_inferred_dispatches_reached_callers() {
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).unwrap();
+    add_dynamic_source(project.path());
     let source_path = project.path().join("demo.py");
     insert_entity(
         &conn,

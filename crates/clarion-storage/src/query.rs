@@ -57,6 +57,21 @@ pub struct UnresolvedCallSiteRow {
     pub callee_expr: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceEdgeMatch {
+    pub neighbor_id: String,
+    pub confidence: EdgeConfidence,
+    pub source_file_id: Option<String>,
+    pub source_byte_start: Option<i64>,
+    pub source_byte_end: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceDirection {
+    In,
+    Out,
+}
+
 #[derive(Debug, Clone)]
 struct StoredCallEdge {
     from_id: String,
@@ -357,6 +372,31 @@ pub fn unresolved_callers_for_target(
         .map_err(StorageError::from)
 }
 
+pub fn reference_edges_for_entity(
+    conn: &Connection,
+    entity_id: &str,
+    direction: ReferenceDirection,
+) -> Result<Vec<ReferenceEdgeMatch>> {
+    let sql = match direction {
+        ReferenceDirection::In => {
+            "SELECT from_id, confidence, source_file_id, source_byte_start, source_byte_end \
+             FROM edges \
+             WHERE kind = 'references' AND to_id = ?1 \
+             ORDER BY from_id, source_byte_start, source_byte_end"
+        }
+        ReferenceDirection::Out => {
+            "SELECT to_id, confidence, source_file_id, source_byte_start, source_byte_end \
+             FROM edges \
+             WHERE kind = 'references' AND from_id = ?1 \
+             ORDER BY to_id, source_byte_start, source_byte_end"
+        }
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![entity_id], map_reference_edge_match)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
 pub fn candidate_entities_for_unresolved_sites(
     conn: &Connection,
     sites: &[UnresolvedCallSiteRow],
@@ -456,6 +496,17 @@ fn map_unresolved_call_site_row(row: &Row<'_>) -> rusqlite::Result<UnresolvedCal
         source_byte_start: row.get(5)?,
         source_byte_end: row.get(6)?,
         callee_expr: row.get(7)?,
+    })
+}
+
+fn map_reference_edge_match(row: &Row<'_>) -> rusqlite::Result<ReferenceEdgeMatch> {
+    let raw_confidence: String = row.get(1)?;
+    Ok(ReferenceEdgeMatch {
+        neighbor_id: row.get(0)?,
+        confidence: parse_confidence(&raw_confidence)?,
+        source_file_id: row.get(2)?,
+        source_byte_start: row.get(3)?,
+        source_byte_end: row.get(4)?,
     })
 }
 

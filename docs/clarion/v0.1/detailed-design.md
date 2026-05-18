@@ -250,7 +250,6 @@ struct Entity {
 
 ```rust
 struct Edge {
-    id: EdgeId,                        // deduped hash of (kind, from, to)
     from: EntityId,
     to: EntityId,
     kind: String,                      // plugin-defined OR core-reserved
@@ -258,6 +257,15 @@ struct Edge {
     source: Option<SourceRange>,
 }
 ```
+
+**Edge identity and coexistence policy**: the store admits at most one edge for a
+given `(kind, from_id, to_id)` tuple. `properties` carries evidence and
+kind-specific metadata (for example ambiguous-call candidates), but it is not
+part of edge identity and does not allow multiple same-kind relationships
+between the same endpoints to coexist. Re-analysis and repeated plugin evidence
+therefore remain idempotent; callers that need several observations for one
+relationship must merge them into the single edge's properties shape rather than
+emitting duplicate rows.
 
 **Core-reserved edge kinds**: `contains`, `guides`, `emits_finding`, `in_subsystem`. All others are plugin-defined.
 
@@ -633,34 +641,42 @@ CREATE INDEX ix_entities_content_hash ON entities(content_hash);
 
 -- Tags (denormalised)
 CREATE TABLE entity_tags (
+    -- `plugin_id` is the namespace that emitted/owns the free-form tag.
+    -- Entity IDs already carry an entity owner, but multiple plugins may tag
+    -- the same core or sibling entity; tag ownership is therefore explicit.
     entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    plugin_id TEXT NOT NULL,
     tag TEXT NOT NULL,
-    PRIMARY KEY (entity_id, tag)
+    PRIMARY KEY (entity_id, plugin_id, tag)
 );
 CREATE INDEX ix_entity_tags_tag ON entity_tags(tag);
+CREATE INDEX ix_entity_tags_plugin_tag ON entity_tags(plugin_id, tag);
 
--- Edges. Deduped by (kind, from_id, to_id) — two edges of the same kind
--- between the same entities collapse into one (the plugin's emitter
--- may observe a call twice for overloaded names; the store is idempotent).
+-- Edges. Natural PK (kind, from_id, to_id) per ADR-026: two edges of the
+-- same kind between the same entities collapse into one even when their
+-- properties differ. The properties bag is evidence/metadata, not identity.
 CREATE TABLE edges (
-    id TEXT PRIMARY KEY,
-    kind TEXT NOT NULL,
-    from_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
-    to_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
-    properties TEXT,
-    source_file_id TEXT REFERENCES entities(id),
+    kind               TEXT NOT NULL,
+    from_id            TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    to_id              TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    properties         TEXT,
+    source_file_id     TEXT REFERENCES entities(id),
     source_byte_start INTEGER,
-    source_byte_end INTEGER,
-    UNIQUE (kind, from_id, to_id)
-);
-CREATE INDEX ix_edges_from_kind ON edges(from_id, kind);
-CREATE INDEX ix_edges_to_kind ON edges(to_id, kind);
-CREATE INDEX ix_edges_kind ON edges(kind);
+    source_byte_end   INTEGER,
+    confidence         TEXT NOT NULL DEFAULT 'resolved'
+                       CHECK (confidence IN ('resolved', 'ambiguous', 'inferred')),
+    PRIMARY KEY (kind, from_id, to_id)
+) WITHOUT ROWID;
+CREATE INDEX ix_edges_from_kind       ON edges(from_id, kind);
+CREATE INDEX ix_edges_to_kind         ON edges(to_id, kind);
+CREATE INDEX ix_edges_kind            ON edges(kind);
+CREATE INDEX ix_edges_kind_confidence ON edges(kind, confidence);
 
 -- Findings
 CREATE TABLE findings (
     id TEXT PRIMARY KEY,
-    tool TEXT NOT NULL, tool_version TEXT NOT NULL, run_id TEXT NOT NULL,
+    tool TEXT NOT NULL, tool_version TEXT NOT NULL,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
     rule_id TEXT NOT NULL,
     -- Closed core-owned vocabulary per ADR-031; values per ADR-004.
     kind TEXT NOT NULL

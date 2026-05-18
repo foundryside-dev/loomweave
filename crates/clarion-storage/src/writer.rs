@@ -344,6 +344,7 @@ fn insert_entity(
         conn.execute_batch("BEGIN")?;
         state.in_tx = true;
     }
+    validate_entity_source_file_anchor(conn, entity)?;
     conn.execute(
         "INSERT INTO entities ( \
             id, plugin_id, kind, name, short_name, \
@@ -389,6 +390,61 @@ fn insert_entity(
     Ok(())
 }
 
+// B.6 stores module ids as source anchors until core-minted `file` entities
+// land; keep both accepted so the storage contract survives that handoff.
+const SOURCE_FILE_ANCHOR_KINDS: &[&str] = &["file", "module"];
+
+fn validate_source_file_anchor(
+    conn: &Connection,
+    source_file_id: Option<&str>,
+    context: &str,
+) -> Result<()> {
+    let Some(source_file_id) = source_file_id else {
+        return Ok(());
+    };
+    let kind = conn
+        .query_row(
+            "SELECT kind FROM entities WHERE id = ?1",
+            params![source_file_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => StorageError::WriterProtocol(format!(
+                "CLA-INFRA-SOURCE-FILE-MISSING: {context} {source_file_id:?} \
+                 does not reference an existing entity"
+            )),
+            other => StorageError::Sqlite(other),
+        })?;
+    if !SOURCE_FILE_ANCHOR_KINDS.contains(&kind.as_str()) {
+        let allowed = SOURCE_FILE_ANCHOR_KINDS;
+        return Err(StorageError::WriterProtocol(format!(
+            "CLA-INFRA-SOURCE-FILE-KIND-CONTRACT: {context} {source_file_id:?} \
+             MUST reference a source-anchor entity with kind in {allowed:?}; \
+             got kind={kind:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_entity_source_file_anchor(conn: &Connection, entity: &EntityRecord) -> Result<()> {
+    let Some(source_file_id) = entity.source_file_id.as_deref() else {
+        return Ok(());
+    };
+    if source_file_id == entity.id {
+        if SOURCE_FILE_ANCHOR_KINDS.contains(&entity.kind.as_str()) {
+            return Ok(());
+        }
+        let allowed = SOURCE_FILE_ANCHOR_KINDS;
+        return Err(StorageError::WriterProtocol(format!(
+            "CLA-INFRA-SOURCE-FILE-KIND-CONTRACT: InsertEntity source_file_id {source_file_id:?} \
+             MUST reference a source-anchor entity with kind in {allowed:?}; \
+             got kind={:?}",
+            entity.kind
+        )));
+    }
+    validate_source_file_anchor(conn, Some(source_file_id), "InsertEntity source_file_id")
+}
+
 /// 9 ontology-defined edge kinds (ADR-026 + ADR-028). Unknown kinds reaching the
 /// writer are a manifest/wire-version drift bug — reject strictly.
 const STRUCTURAL_EDGE_KINDS: &[&str] = &["contains", "in_subsystem", "guides", "emits_finding"];
@@ -399,6 +455,13 @@ const ANCHORED_EDGE_KINDS: &[&str] = &[
     "decorates",
     "inherits_from",
 ];
+
+pub fn known_scan_time_edge_kinds() -> impl Iterator<Item = &'static str> {
+    STRUCTURAL_EDGE_KINDS
+        .iter()
+        .chain(ANCHORED_EDGE_KINDS.iter())
+        .copied()
+}
 
 /// Enforce the per-kind confidence + source-range contract documented in
 /// `docs/implementation/sprint-2/b3-contains-edges.md` §3 Q5 and ADR-026
@@ -492,6 +555,11 @@ fn insert_edge(
         conn.execute_batch("BEGIN")?;
         state.in_tx = true;
     }
+    validate_source_file_anchor(
+        conn,
+        edge.source_file_id.as_deref(),
+        "InsertEdge source_file_id",
+    )?;
     let changed = conn.execute(
         "INSERT OR IGNORE INTO edges ( \
             kind, from_id, to_id, properties, source_file_id, \
@@ -541,6 +609,11 @@ fn insert_inferred_edges(
     };
     for edge in edges {
         validate_inferred_edge(edge)?;
+        validate_source_file_anchor(
+            conn,
+            edge.source_file_id.as_deref(),
+            "InsertInferredEdges source_file_id",
+        )?;
         if static_call_edge_exists(conn, &edge.from_id, &edge.to_id)? {
             stats.skipped_static_duplicates += 1;
             continue;
@@ -615,6 +688,13 @@ fn replace_unresolved_call_sites_in_run(
         conn.execute_batch("BEGIN")?;
         state.in_tx = true;
     }
+    for site in sites {
+        validate_source_file_anchor(
+            conn,
+            site.source_file_id.as_deref(),
+            "ReplaceUnresolvedCallSitesForCaller source_file_id",
+        )?;
+    }
     replace_unresolved_call_sites_for_caller(conn, caller_entity_id, caller_content_hash, sites)?;
     bump_writes_and_maybe_commit(conn, state, commits_observed)?;
     Ok(())
@@ -677,6 +757,7 @@ fn commit_run(
     stats_json: &str,
     commits_observed: &AtomicUsize,
 ) -> Result<()> {
+    ensure_current_run_matches(state, "CommitRun", run_id)?;
     // The run-row UPDATE and the final write-batch COMMIT must be atomic,
     // otherwise a crash or SQL error between them would leave entities/edges
     // durable but `runs.status = 'running'` — indistinguishable from an
@@ -695,18 +776,29 @@ fn commit_run(
                 "failure_reason": mismatch.clone(),
             })
             .to_string();
-            conn.execute(
+            let changed = conn.execute(
                 "UPDATE runs SET status = 'failed', completed_at = ?1, stats = ?2 \
                  WHERE id = ?3",
                 params![completed_at, failure_stats, run_id],
             )?;
+            if let Err(err) = ensure_run_update_changed_one(changed, run_id) {
+                state.current_run = None;
+                return Err(err);
+            }
             state.current_run = None;
             return Err(StorageError::WriterProtocol(mismatch));
         }
-        conn.execute(
+        let changed = conn.execute(
             "UPDATE runs SET status = ?1, completed_at = ?2, stats = ?3 WHERE id = ?4",
             params![status.as_str(), completed_at, stats_json, run_id],
         )?;
+        if let Err(err) = ensure_run_update_changed_one(changed, run_id) {
+            let _ = conn.execute_batch("ROLLBACK");
+            state.in_tx = false;
+            state.current_run = None;
+            state.writes_in_batch = 0;
+            return Err(err);
+        }
         state.in_tx = false;
         conn.execute_batch("COMMIT")?;
         commits_observed.fetch_add(1, Ordering::Relaxed);
@@ -716,10 +808,15 @@ fn commit_run(
         // atomic under SQLite's implicit transaction. No entities/edges were
         // staged-and-not-committed, so the parent-id check has nothing to
         // catch that would change the durable state.
-        conn.execute(
+        let changed = conn.execute(
             "UPDATE runs SET status = ?1, completed_at = ?2, stats = ?3 WHERE id = ?4",
             params![status.as_str(), completed_at, stats_json, run_id],
         )?;
+        if let Err(err) = ensure_run_update_changed_one(changed, run_id) {
+            state.current_run = None;
+            state.writes_in_batch = 0;
+            return Err(err);
+        }
     }
     state.current_run = None;
     state.writes_in_batch = 0;
@@ -802,16 +899,48 @@ fn fail_run(
     reason: &str,
     completed_at: &str,
 ) -> Result<()> {
+    ensure_current_run_matches(state, "FailRun", run_id)?;
     if state.in_tx {
         let _ = conn.execute_batch("ROLLBACK");
         state.in_tx = false;
     }
     let stats_json = serde_json::json!({ "failure_reason": reason }).to_string();
-    conn.execute(
+    let changed = conn.execute(
         "UPDATE runs SET status = 'failed', completed_at = ?1, stats = ?2 WHERE id = ?3",
         params![completed_at, stats_json, run_id],
     )?;
+    if let Err(err) = ensure_run_update_changed_one(changed, run_id) {
+        state.current_run = None;
+        state.writes_in_batch = 0;
+        return Err(err);
+    }
     state.current_run = None;
     state.writes_in_batch = 0;
     Ok(())
+}
+
+fn ensure_current_run_matches(
+    state: &ActorState,
+    command: &'static str,
+    run_id: &str,
+) -> Result<()> {
+    match state.current_run.as_deref() {
+        Some(current) if current == run_id => Ok(()),
+        Some(current) => Err(StorageError::WriterProtocol(format!(
+            "{command} run_id={run_id:?} does not match active run_id={current:?}",
+        ))),
+        None => Err(StorageError::WriterProtocol(format!(
+            "{command} received without a preceding BeginRun",
+        ))),
+    }
+}
+
+fn ensure_run_update_changed_one(changed: usize, run_id: &str) -> Result<()> {
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(StorageError::WriterProtocol(format!(
+            "UPDATE runs affected {changed} rows for run_id={run_id}",
+        )))
+    }
 }

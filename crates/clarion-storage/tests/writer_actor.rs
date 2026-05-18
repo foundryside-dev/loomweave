@@ -543,6 +543,107 @@ async fn round_trip_insert_persists_entity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn entity_source_file_id_rejects_non_source_anchor_entity() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-source-anchor").await;
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(make_module_entity("python:module:demo")),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(make_entity_with_parent(
+            "python:function:demo.source_like_but_not_file",
+            Some("python:module:demo"),
+        )),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    let mut bad = make_entity_with_parent(
+        "python:function:demo.bad_source_anchor",
+        Some("python:module:demo"),
+    );
+    bad.source_file_id = Some("python:function:demo.source_like_but_not_file".to_owned());
+
+    let result = send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(bad),
+        ack,
+    })
+    .await;
+    let err = result.expect_err("source_file_id must point at a source-anchor entity");
+    assert!(
+        format!("{err:?}").contains("CLA-INFRA-SOURCE-FILE-KIND-CONTRACT"),
+        "expected CLA-INFRA-SOURCE-FILE-KIND-CONTRACT in error; got {err:?}"
+    );
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_entity_may_reference_itself_as_source_file_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-source-self").await;
+
+    let mut module = make_module_entity("python:module:demo");
+    module.source_file_id = Some("python:module:demo".to_owned());
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(module),
+        ack,
+    })
+    .await
+    .expect("module source anchor may reference itself");
+
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-source-self".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[test]
+fn python_plugin_edge_kinds_are_accepted_by_writer_contract() {
+    let manifest =
+        clarion_core::parse_manifest(include_bytes!("../../../plugins/python/plugin.toml"))
+            .expect("production Python plugin manifest should parse");
+    let writer_kinds: std::collections::BTreeSet<&'static str> =
+        clarion_storage::known_scan_time_edge_kinds().collect();
+    let missing: Vec<&str> = manifest
+        .ontology
+        .edge_kinds
+        .iter()
+        .map(String::as_str)
+        .filter(|kind| !writer_kinds.contains(kind))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "Python plugin declares edge kind(s) the writer rejects: {missing:?}; \
+         writer accepts {writer_kinds:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_size_fifty_commits_every_fifty_inserts() {
     let dir = tempfile::tempdir().unwrap();
     let path = prepared_db(&dir);
@@ -595,6 +696,69 @@ async fn batch_size_fifty_commits_every_fifty_inserts() {
         .await
         .unwrap();
     assert_eq!(count, 150);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cloned_senders_accept_concurrent_entity_producers() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-concurrent-producers").await;
+
+    let tx_a = tx.clone();
+    let producer_a = tokio::spawn(async move {
+        for i in 0..25 {
+            let id = format!("python:function:demo.producer_a_{i:02}");
+            send::<()>(&tx_a, |ack| WriterCmd::InsertEntity {
+                entity: Box::new(make_entity(&id)),
+                ack,
+            })
+            .await
+            .unwrap();
+        }
+    });
+    let tx_b = tx.clone();
+    let producer_b = tokio::spawn(async move {
+        for i in 0..25 {
+            let id = format!("python:function:demo.producer_b_{i:02}");
+            send::<()>(&tx_b, |ack| WriterCmd::InsertEntity {
+                entity: Box::new(make_entity(&id)),
+                ack,
+            })
+            .await
+            .unwrap();
+        }
+    });
+    producer_a.await.unwrap();
+    producer_b.await.unwrap();
+
+    assert_eq!(writer.commits_observed.load(Ordering::Relaxed), 1);
+
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-concurrent-producers".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let pool = ReaderPool::open(&path, 2).unwrap();
+    let count: i64 = pool
+        .with_reader(|conn| {
+            let n: i64 = conn.query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))?;
+            Ok(n)
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 50);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -660,6 +824,68 @@ async fn fail_run_rolls_back_pending_inserts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fail_run_after_prior_batch_commit_rolls_back_only_pending_inserts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    send::<()>(&tx, |ack| WriterCmd::BeginRun {
+        run_id: "run-fail-after-batch".into(),
+        config_json: "{}".into(),
+        started_at: now_iso(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    for i in 0..60 {
+        let id = format!("python:function:demo.batch_fail_{i:03}");
+        send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+            entity: Box::new(make_entity(&id)),
+            ack,
+        })
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(writer.commits_observed.load(Ordering::Relaxed), 1);
+
+    send::<()>(&tx, |ack| WriterCmd::FailRun {
+        run_id: "run-fail-after-batch".into(),
+        reason: "deliberate test failure".into(),
+        completed_at: now_iso(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let pool = ReaderPool::open(&path, 2).unwrap();
+    let (entity_count, status): (i64, String) = pool
+        .with_reader(|conn| {
+            let n: i64 = conn.query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))?;
+            let s: String = conn.query_row(
+                "SELECT status FROM runs WHERE id = 'run-fail-after-batch'",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok((n, s))
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        entity_count, 50,
+        "FailRun must preserve prior committed batches and roll back only the open batch"
+    );
+    assert_eq!(status, "failed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_entity_without_begin_run_is_protocol_violation() {
     let dir = tempfile::tempdir().unwrap();
     let path = prepared_db(&dir);
@@ -676,6 +902,132 @@ async fn insert_entity_without_begin_run_is_protocol_violation() {
     assert!(
         matches!(err, clarion_storage::StorageError::WriterProtocol(_)),
         "expected WriterProtocol, got {err:?}"
+    );
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_run_without_begin_run_is_protocol_violation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    let result = send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-cold".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await;
+
+    let err = result.expect_err("CommitRun without BeginRun should fail");
+    assert!(
+        matches!(err, clarion_storage::StorageError::WriterProtocol(_)),
+        "expected WriterProtocol, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("without a preceding BeginRun"),
+        "error should explain missing BeginRun: {err}"
+    );
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fail_run_without_begin_run_is_protocol_violation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    let result = send::<()>(&tx, |ack| WriterCmd::FailRun {
+        run_id: "run-cold".into(),
+        reason: "test".into(),
+        completed_at: now_iso(),
+        ack,
+    })
+    .await;
+
+    let err = result.expect_err("FailRun without BeginRun should fail");
+    assert!(
+        matches!(err, clarion_storage::StorageError::WriterProtocol(_)),
+        "expected WriterProtocol, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("without a preceding BeginRun"),
+        "error should explain missing BeginRun: {err}"
+    );
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_run_with_stale_run_id_is_protocol_violation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-active").await;
+
+    let result = send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-stale".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await;
+
+    let err = result.expect_err("stale CommitRun run_id should fail");
+    assert!(
+        matches!(err, clarion_storage::StorageError::WriterProtocol(_)),
+        "expected WriterProtocol, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("run-stale"),
+        "error should name stale run id: {err}"
+    );
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fail_run_with_stale_run_id_is_protocol_violation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-active").await;
+
+    let result = send::<()>(&tx, |ack| WriterCmd::FailRun {
+        run_id: "run-stale".into(),
+        reason: "test".into(),
+        completed_at: now_iso(),
+        ack,
+    })
+    .await;
+
+    let err = result.expect_err("stale FailRun run_id should fail");
+    assert!(
+        matches!(err, clarion_storage::StorageError::WriterProtocol(_)),
+        "expected WriterProtocol, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("run-stale"),
+        "error should name stale run id: {err}"
     );
 
     drop(tx);
@@ -1691,7 +2043,7 @@ async fn channel_close_with_open_run_self_heals_to_failed() {
     // The run row must have been self-healed to 'failed'. The pending insert
     // is rolled back.
     let pool = ReaderPool::open(&path, 1).expect("pool");
-    let (observed_status, observed_reason, entity_count): (String, String, i64) = pool
+    let (run_status, stats_json, entity_count): (String, String, i64) = pool
         .with_reader(|conn| {
             let (s, st): (String, String) = conn.query_row(
                 "SELECT status, stats FROM runs WHERE id = 'run-abandoned'",
@@ -1705,12 +2057,14 @@ async fn channel_close_with_open_run_self_heals_to_failed() {
         .expect("reader query");
 
     assert_eq!(
-        observed_status, "failed",
+        run_status, "failed",
         "self-heal must mark abandoned run as failed"
     );
-    assert!(
-        observed_reason.contains("writer channel closed unexpectedly"),
-        "failure_reason must cite channel close; got stats = {observed_reason}"
+    let stats: serde_json::Value =
+        serde_json::from_str(&stats_json).expect("stats must be valid JSON");
+    assert_eq!(
+        stats["failure_reason"], "writer channel closed unexpectedly",
+        "failure_reason must cite channel close; got stats = {stats_json}"
     );
     assert_eq!(
         entity_count, 0,
