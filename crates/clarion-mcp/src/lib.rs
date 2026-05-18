@@ -2842,7 +2842,7 @@ mod tests {
 
         assert_eq!(decoded["jsonrpc"], "2.0");
         assert_eq!(decoded["id"], 10);
-        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 8);
     }
 
     #[test]
@@ -2901,7 +2901,7 @@ mod tests {
         assert_eq!(first_json["id"], 11);
         assert_eq!(first_json["result"]["serverInfo"]["name"], "clarion");
         assert_eq!(second_json["id"], 12);
-        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 8);
     }
 
     #[tokio::test]

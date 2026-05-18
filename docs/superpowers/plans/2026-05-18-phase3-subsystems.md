@@ -619,9 +619,9 @@ cargo test -p clarion-mcp tools_list -- --nocapture
 **Scope:** Prove the user-facing workflow, document it, and run the performance
 gate before declaring Phase 3 ready.
 
-- [ ] Write a multi-module Python fixture with at least two dense internal
+- [x] Write a multi-module Python fixture with at least two dense internal
   dependency groups and sparse cross-group edges.
-- [ ] Add E2E script:
+- [x] Add E2E script:
   - install project
   - run `clarion analyze`
   - assert at least two `subsystem` rows
@@ -630,13 +630,13 @@ gate before declaring Phase 3 ready.
   - run a second clean analysis and assert subsystem IDs and modularity match
   - run `clarion serve` fixture interaction or a direct MCP harness call for
     `subsystem_members`
-- [ ] Add `docs/operator/clustering.md` with:
+- [x] Add `docs/operator/clustering.md` with:
   - config keys and defaults
   - what subsystem entities contain
   - how to call `subsystem_members`
   - what weak modularity means
   - how empty/single-module input appears in stats
-- [ ] Performance gate:
+- [x] Performance gate:
   - Use the existing elspeth-slice/full harness from Sprint 2.
   - Capture baseline wall time and RSS from the latest B.8 artifact.
   - Measure Phase 3 wall time separately with tracing or stats.
@@ -644,8 +644,8 @@ gate before declaring Phase 3 ready.
     time and less than 500 MiB peak RSS over the existing analyze path.
   - If the gate fails, stop with a results memo and propose either Louvain
     default, graph-pruning config, or ADR amendment.
-- [ ] Run full verification floor.
-- [ ] Mark completed tasks in this plan with `[x]`.
+- [x] Run full verification floor.
+- [x] Mark completed tasks in this plan with `[x]`.
 
 **Exit:** E2E, determinism, walking skeleton, MCP membership, docs, and
 performance gate are all green.
@@ -679,7 +679,7 @@ plugins/python/.venv/bin/pytest plugins/python/tests -q
 - `in_subsystem` edges link every member module to its subsystem.
 - `runs.stats.clustering` records status, config, counts, modularity, duration,
   and skip/finding state.
-- `CLA-FACT-CLUSTERING-WEAK-MODULARITY` persists when modularity is below 0.3
+- `CLA-FACT-CLUSTERING-WEAK-MODULARITY` persists when modularity is below 0.25
   and there is an emitted subsystem anchor.
 - `subsystem_members(id)` is available through MCP.
 - `summary(id)` on a subsystem returns the no-subsystem-summary policy envelope
