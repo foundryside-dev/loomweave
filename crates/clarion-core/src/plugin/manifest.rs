@@ -49,7 +49,7 @@ pub enum ManifestError {
     Malformed { message: String },
 
     /// An identifier string fails the ADR-022 grammar `[a-z][a-z0-9_]*` (kinds)
-    /// or `CLA-[A-Z]+(-[A-Z0-9]+)*-` (rule-ID prefix).
+    /// or `CLA-[A-Z]+(-[A-Z0-9]+)+-` (rule-ID prefix).
     ///
     /// Finding code: `CLA-INFRA-MANIFEST-MALFORMED`.
     #[error("CLA-INFRA-MANIFEST-MALFORMED: {field} {value:?} violates ADR-022 identifier grammar")]
@@ -232,7 +232,7 @@ pub struct Ontology {
     pub edge_kinds: Vec<String>,
 
     /// Rule-ID prefix, e.g. `"CLA-PY-"`. Must end with `-` and match
-    /// `CLA-[A-Z]+(-[A-Z0-9]+)*-`. Must not be a core-reserved prefix.
+    /// `CLA-[A-Z]+(-[A-Z0-9]+)+-`. Must not be a core-reserved prefix.
     pub rule_id_prefix: String,
 
     /// Ontology version (semver). Bumped when entity/edge/rule set changes.
@@ -401,10 +401,12 @@ fn validate_kind_string(field: &'static str, value: &str) -> Result<(), Manifest
 ///
 /// Rules:
 /// 1. Must end with `-`.
-/// 2. Strip the trailing `-`; the remainder must match `CLA-[A-Z]+(-[A-Z0-9]+)*`.
+/// 2. Strip the trailing `-`; the remainder must match `CLA-[A-Z]+(-[A-Z0-9]+)+`
+///    (one-or-more `-[A-Z0-9]+` segments after `CLA`, per ADR-022).
 ///    Implementation: split on `-`, verify the first segment is `CLA`, and each
 ///    subsequent non-empty segment is `[A-Z0-9]+` (ASCII uppercase or digit).
-///    There must be at least one segment after `CLA` (so `CLA-` alone is invalid).
+///    The `segments.len() < 2` guard below is how the `+` quantifier is enforced
+///    without a regex engine — `CLA-` alone has only one segment and is rejected.
 ///
 /// Examples of valid prefixes: `CLA-PY-`, `CLA-JAVA-`, `CLA-FOO-BAR-`.
 /// Examples of invalid prefixes: `PY-`, `cla-py-`, `CLA-py-`, `CLA-PY` (no trailing
