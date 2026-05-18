@@ -169,3 +169,79 @@ fn install_leaves_existing_clarion_yaml_untouched() {
         "clarion.yaml was overwritten; user content lost"
     );
 }
+
+#[test]
+fn dotenv_in_cwd_is_loaded_before_tracing_setup() {
+    // Proves the dotenvy hook in `main()` runs before `init_tracing()`: a
+    // `.env`-supplied RUST_LOG=debug enables the debug-level log line in
+    // `install` (the "clarion.yaml already exists; leaving untouched"
+    // branch in install.rs) that the default `info` filter would
+    // otherwise suppress. Pre-creating `clarion.yaml` puts us on the
+    // branch that emits debug.
+    //
+    // Uses raw std::process::Command rather than assert_cmd::Command so the
+    // child env is exactly what we set — assert_cmd's wrappers were observed
+    // to drop the env_remove/env_clear effect on RUST_LOG under nextest,
+    // producing an empty stderr regardless of .env content.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join(".env"), "RUST_LOG=debug\n").unwrap();
+    fs::write(dir.path().join("clarion.yaml"), "version: 1\n").unwrap();
+
+    let bin = assert_cmd::cargo::cargo_bin("clarion");
+    let path = std::env::var("PATH").unwrap_or_default();
+    let out = std::process::Command::new(&bin)
+        .current_dir(dir.path())
+        .env_clear()
+        .env("PATH", path)
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .output()
+        .expect("clarion install");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "install failed; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // tracing_subscriber::fmt defaults to stdout, so the DEBUG line lands there.
+    assert!(
+        stdout.contains("DEBUG"),
+        ".env-supplied RUST_LOG=debug should produce DEBUG-level lines on stdout; \
+         stdout was:\n{stdout}"
+    );
+}
+
+#[test]
+fn explicit_env_var_wins_over_dotenv() {
+    // dotenvy's default semantics: existing process env vars are NOT clobbered
+    // by .env entries. An explicit `RUST_LOG=info` in the process env should
+    // suppress the debug line even when .env tries to bump verbosity.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join(".env"), "RUST_LOG=debug\n").unwrap();
+    fs::write(dir.path().join("clarion.yaml"), "version: 1\n").unwrap();
+
+    let bin = assert_cmd::cargo::cargo_bin("clarion");
+    let path = std::env::var("PATH").unwrap_or_default();
+    let out = std::process::Command::new(&bin)
+        .current_dir(dir.path())
+        .env_clear()
+        .env("PATH", path)
+        .env("RUST_LOG", "info")
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .output()
+        .expect("clarion install");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "install failed; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("DEBUG"),
+        "explicit RUST_LOG=info should beat .env's RUST_LOG=debug; \
+         stdout was:\n{stdout}"
+    );
+}

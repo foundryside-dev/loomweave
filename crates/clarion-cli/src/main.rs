@@ -8,6 +8,12 @@ use anyhow::Result;
 use clap::Parser;
 
 fn main() -> Result<()> {
+    // Load .env from CWD or any ancestor directory, before tracing setup so a
+    // .env-supplied RUST_LOG is in effect by the time the filter is built.
+    // Existing process env vars win over .env values (dotenvy default), so an
+    // explicit `OPENROUTER_API_KEY=… clarion serve` still beats a checked-in
+    // dev .env. Missing .env is not an error — silently skip.
+    let _ = dotenvy::dotenv();
     init_tracing();
     let cli = cli::Cli::parse();
     match cli.command {
