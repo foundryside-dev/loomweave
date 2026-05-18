@@ -1292,7 +1292,10 @@ impl BudgetReservation {
             budget.reserved_tokens = budget.reserved_tokens.saturating_sub(self.amount_tokens);
             self.active = false;
         }
-        if budget.blocked || budget.spent_tokens.saturating_add(actual_tokens) > ceiling_tokens {
+        // `budget.blocked` gates *new* reservations, not in-flight commits.
+        // A reservation that already cleared reserve_budget paid for its
+        // dispatch slot; commit it iff the actual usage fits the ceiling.
+        if budget.spent_tokens.saturating_add(actual_tokens) > ceiling_tokens {
             budget.blocked = true;
             return false;
         }
