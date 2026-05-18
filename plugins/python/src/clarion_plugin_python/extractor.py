@@ -145,6 +145,7 @@ class ExtractionStats:
     unresolved_reference_sites_total: int = 0
     pyright_query_latency_ms: list[int] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
+    duplicate_entities_dropped_total: int = 0
 
     @classmethod
     def from_resolution_results(
@@ -280,6 +281,17 @@ def extract_with_stats(
     callers can supply a project-relative path here while keeping
     ``file_path`` absolute so the host's path jail validates the
     original path.
+
+    Same-id collisions (PEP-484 ``@overload`` stubs, ``singledispatch``
+    ``def _(...):`` sequences, intentional redefinitions) are resolved at
+    the emit boundary so the host's ``UNIQUE(entities.id)`` never trips
+    mid-run. ``@overload`` stubs are recognised and dropped *before* the
+    walk descends — their bodies (``...``) carry only type-checker hints
+    so signature references are also suppressed. Any other duplicates
+    that survive (e.g. aliased ``from typing import overload as o``,
+    ``singledispatch.register`` users writing ``def _():`` repeatedly)
+    are deduplicated first-wins with a stderr line per drop and
+    ``ExtractionStats.duplicate_entities_dropped_total`` bumped per drop.
     """
     prefix_source = module_prefix_path if module_prefix_path is not None else file_path
     dotted_module = module_dotted_name(prefix_source)
@@ -310,6 +322,7 @@ def extract_with_stats(
     entities: list[RawEntity] = [module_entity]
     edges: list[RawEdge] = []
     function_ids: list[str] = []
+    walk_state = _WalkState(seen_ids={module_entity["id"]}, file_path=file_path)
     _walk(
         tree,
         [tree],
@@ -319,17 +332,16 @@ def extract_with_stats(
         entities,
         edges,
         function_ids,
+        walk_state,
     )
     reference_sites = _collect_reference_sites(source, tree, dotted_module, module_entity["id"])
     call_stats = call_resolver.resolve_calls(file_path, function_ids)
     reference_stats = reference_resolver.resolve_references(file_path, reference_sites)
     edges.extend(cast("list[RawEdge]", call_stats.edges))
     edges.extend(cast("list[RawEdge]", reference_stats.edges))
-    return ExtractResult(
-        entities,
-        edges,
-        ExtractionStats.from_resolution_results(call_stats, reference_stats),
-    )
+    stats = ExtractionStats.from_resolution_results(call_stats, reference_stats)
+    stats.duplicate_entities_dropped_total = walk_state.duplicate_entities_dropped
+    return ExtractResult(entities, edges, stats)
 
 
 def _collect_reference_sites(
@@ -368,6 +380,12 @@ class _ReferenceSiteCollector(ast.NodeVisitor):
         self._visit_function(node)
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        # PEP 484 stub: signature annotations are type-checker hints, not
+        # references the consult-mode briefing cares about; the body is `...`.
+        # Skipping keeps reference-site ownership consistent with `_walk` (no
+        # entity for the stub → nothing to attribute references to).
+        if _has_overload_decorator(node):
+            return
         function_id = self._entity_id_for_scope("function", node)
         self.owner_stack.append(function_id)
         self.bound_stack.append(_scope_local_names(node))
@@ -531,6 +549,43 @@ class _LocalNameCollector(ast.NodeVisitor):
             self.names.add(node.id)
 
 
+@dataclass
+class _WalkState:
+    """Mutable accumulator threaded through ``_walk`` for cross-cutting bookkeeping.
+
+    ``seen_ids`` is seeded with the module-entity id by ``extract_with_stats``
+    so the safety net catches the (degenerate) case of a function colliding
+    with the module's id. ``duplicate_entities_dropped`` is bumped once per
+    same-id drop; the caller copies it into ``ExtractionStats``.
+    """
+
+    seen_ids: set[str]
+    file_path: str
+    duplicate_entities_dropped: int = 0
+
+
+def _has_overload_decorator(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Return True if ``node`` is decorated with ``@overload`` (PEP 484 stub).
+
+    Recognises three import-name forms in source: bare ``@overload`` (from
+    ``from typing import overload``), ``@typing.overload``, and
+    ``@typing_extensions.overload``. Aliased re-imports such as
+    ``from typing import overload as o`` defeat this pattern-based check —
+    the safety-net dedup in ``_walk`` catches the resulting same-id
+    collision and keeps the run alive.
+    """
+    for decorator in node.decorator_list:
+        match decorator:
+            case ast.Name(id="overload"):
+                return True
+            case ast.Attribute(
+                value=ast.Name(id="typing" | "typing_extensions"),
+                attr="overload",
+            ):
+                return True
+    return False
+
+
 def _walk(  # noqa: PLR0913 - recursive walker needs both accumulators + parent context (B.3)
     node: ast.AST,
     parents: list[ast.AST],
@@ -540,6 +595,7 @@ def _walk(  # noqa: PLR0913 - recursive walker needs both accumulators + parent 
     out_entities: list[RawEntity],
     out_edges: list[RawEdge],
     out_function_ids: list[str],
+    state: _WalkState,
 ) -> None:
     """Recursively walk ``node``'s AST children, emitting entities + contains edges.
 
@@ -549,14 +605,36 @@ def _walk(  # noqa: PLR0913 - recursive walker needs both accumulators + parent 
     own id as the new parent — so grandchildren get the right ``from_id``
     on their contains edge (B.3 Q3: emitter is exhaustive, never
     transitive).
+
+    Two stub-skip rules keep the host's ``UNIQUE(entities.id)`` from
+    tripping. (1) ``@overload``-decorated functions are recognised
+    semantically: skip emission, skip recursion (PEP 484 stub bodies are
+    ``...``). The implementation appears last in source order and emits
+    normally. (2) Any other surviving same-id collision (aliased
+    ``overload`` imports, ``singledispatch.register`` ``def _():``
+    sequences, manual redefinition) is dropped first-wins with a stderr
+    line and a ``state.duplicate_entities_dropped`` bump. Recursion into
+    the dropped child is suppressed too: its nested entities would carry
+    a parent_id whose entity the host never sees.
     """
     for child in ast.iter_child_nodes(node):
         new_parent_id = parent_entity_id
         match child:
             case ast.FunctionDef() | ast.AsyncFunctionDef():
+                if _has_overload_decorator(child):
+                    continue
                 entity, child_id = _build_function_entity(
                     child, parents, dotted_module, file_path, parent_entity_id
                 )
+                if child_id in state.seen_ids:
+                    state.duplicate_entities_dropped += 1
+                    sys.stderr.write(
+                        f"clarion-plugin-python: dropping duplicate entity {child_id} "
+                        f"in {state.file_path} at line {child.lineno} "
+                        f"(first definition wins)\n",
+                    )
+                    continue
+                state.seen_ids.add(child_id)
                 out_entities.append(entity)
                 out_edges.append(_contains_edge(parent_entity_id, child_id))
                 out_function_ids.append(child_id)
@@ -565,6 +643,15 @@ def _walk(  # noqa: PLR0913 - recursive walker needs both accumulators + parent 
                 entity, child_id = _build_class_entity(
                     child, parents, dotted_module, file_path, parent_entity_id
                 )
+                if child_id in state.seen_ids:
+                    state.duplicate_entities_dropped += 1
+                    sys.stderr.write(
+                        f"clarion-plugin-python: dropping duplicate entity {child_id} "
+                        f"in {state.file_path} at line {child.lineno} "
+                        f"(first definition wins)\n",
+                    )
+                    continue
+                state.seen_ids.add(child_id)
                 out_entities.append(entity)
                 out_edges.append(_contains_edge(parent_entity_id, child_id))
                 new_parent_id = child_id
@@ -577,6 +664,7 @@ def _walk(  # noqa: PLR0913 - recursive walker needs both accumulators + parent 
             out_entities,
             out_edges,
             out_function_ids,
+            state,
         )
 
 
