@@ -3,6 +3,7 @@ mod cli;
 mod clustering;
 mod config;
 mod install;
+mod run_lifecycle;
 mod secret_scan;
 mod serve;
 mod stats;
