@@ -543,6 +543,67 @@ async fn round_trip_insert_persists_entity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_core_plugin_cannot_insert_reserved_entity_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    send::<()>(&tx, |ack| WriterCmd::BeginRun {
+        run_id: "run-reserved-kind".into(),
+        config_json: "{}".into(),
+        started_at: now_iso(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    let mut reserved = make_entity("python:subsystem:demo");
+    reserved.kind = "subsystem".to_owned();
+
+    let result = send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(reserved),
+        ack,
+    })
+    .await;
+
+    if result.is_ok() {
+        send::<()>(&tx, |ack| WriterCmd::FailRun {
+            run_id: "run-reserved-kind".into(),
+            completed_at: now_iso(),
+            reason: "test cleanup".into(),
+            ack,
+        })
+        .await
+        .unwrap();
+    }
+
+    let err = result.expect_err("reserved entity kind from non-core plugin must fail");
+    assert!(
+        matches!(err, clarion_storage::StorageError::WriterProtocol(_)),
+        "expected WriterProtocol, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("CLA-INFRA-RESERVED-ENTITY-KIND"),
+        "error should carry reserved-kind code; got {err:#}"
+    );
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let pool = ReaderPool::open(&path, 2).unwrap();
+    let entity_count: i64 = pool
+        .with_reader(|conn| {
+            let n: i64 = conn.query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))?;
+            Ok(n)
+        })
+        .await
+        .unwrap();
+    assert_eq!(entity_count, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn writer_inserts_fact_findings() {
     let dir = tempfile::tempdir().unwrap();
     let path = prepared_db(&dir);

@@ -9,14 +9,14 @@ use xgraph::graph::graph::Graph;
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ClusterAlgorithm {
     Leiden,
-    Louvain,
+    WeightedComponents,
 }
 
 impl ClusterAlgorithm {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             ClusterAlgorithm::Leiden => "leiden",
-            ClusterAlgorithm::Louvain => "louvain",
+            ClusterAlgorithm::WeightedComponents => "weighted_components",
         }
     }
 }
@@ -54,6 +54,15 @@ pub(crate) fn cluster_modules(
     graph: &ModuleGraph,
     config: &ClusterConfig,
 ) -> Result<ClusterResult> {
+    cluster_modules_with_algorithms(graph, config, leiden_communities, local_weighted_components)
+}
+
+fn cluster_modules_with_algorithms(
+    graph: &ModuleGraph,
+    config: &ClusterConfig,
+    leiden: impl FnOnce(&ModuleGraph, &ClusterConfig) -> Result<Vec<Vec<String>>>,
+    mut weighted_components: impl FnMut(&ModuleGraph, usize) -> Vec<Vec<String>>,
+) -> Result<ClusterResult> {
     ensure!(
         config.max_iterations > 0,
         "clustering max_iterations must be greater than zero"
@@ -63,20 +72,31 @@ pub(crate) fn cluster_modules(
         "clustering resolution must be a positive finite number"
     );
 
-    let mut communities = match config.algorithm {
-        ClusterAlgorithm::Leiden => leiden_communities(graph, config)?,
-        ClusterAlgorithm::Louvain => local_weighted_communities(graph, config.min_cluster_size),
+    let (mut communities, algorithm_used) = match config.algorithm {
+        ClusterAlgorithm::Leiden => {
+            let communities = leiden(graph, config)?;
+            if communities.len() <= 1 {
+                let fallback = weighted_components(graph, config.min_cluster_size);
+                if fallback.len() > communities.len() {
+                    (fallback, ClusterAlgorithm::WeightedComponents)
+                } else {
+                    (communities, ClusterAlgorithm::Leiden)
+                }
+            } else {
+                (communities, ClusterAlgorithm::Leiden)
+            }
+        }
+        ClusterAlgorithm::WeightedComponents => (
+            weighted_components(graph, config.min_cluster_size),
+            ClusterAlgorithm::WeightedComponents,
+        ),
     };
-    let fallback = local_weighted_communities(graph, config.min_cluster_size);
-    if communities.len() <= 1 && fallback.len() > communities.len() {
-        communities = fallback;
-    }
     normalize_communities(&mut communities);
 
     Ok(ClusterResult {
         modularity_score: directed_modularity(graph, &communities),
         communities,
-        algorithm_used: config.algorithm,
+        algorithm_used,
     })
 }
 
@@ -147,7 +167,7 @@ fn xgraph_projection(graph: &ModuleGraph) -> Result<(Graph<f64, String, ()>, Vec
     Ok((projected, module_ids))
 }
 
-fn local_weighted_communities(graph: &ModuleGraph, min_cluster_size: usize) -> Vec<Vec<String>> {
+fn local_weighted_components(graph: &ModuleGraph, min_cluster_size: usize) -> Vec<Vec<String>> {
     if graph.modules.is_empty() {
         return Vec::new();
     }
@@ -407,11 +427,69 @@ mod tests {
     }
 
     #[test]
-    fn louvain_fallback_is_config_selectable() {
-        let result =
-            cluster_modules(&sample_graph(), &config(ClusterAlgorithm::Louvain)).expect("clusters");
+    fn leiden_auto_fallback_reports_local_weighted_algorithm() {
+        let graph = sample_graph();
+        let one_cluster = graph.modules.clone();
 
-        assert_eq!(result.algorithm_used, ClusterAlgorithm::Louvain);
+        let result = cluster_modules_with_algorithms(
+            &graph,
+            &config(ClusterAlgorithm::Leiden),
+            |_graph, _config| Ok(vec![one_cluster]),
+            local_weighted_components,
+        )
+        .expect("clusters");
+
+        assert_eq!(result.algorithm_used, ClusterAlgorithm::WeightedComponents);
+        assert_eq!(result.communities.len(), 2);
+        assert!(same_cluster(
+            &result,
+            "python:module:pkg.auth.login",
+            "python:module:pkg.auth.token"
+        ));
+        assert!(same_cluster(
+            &result,
+            "python:module:pkg.billing.invoice",
+            "python:module:pkg.billing.ledger"
+        ));
+    }
+
+    #[test]
+    fn leiden_with_multiple_communities_does_not_compute_local_weighted_algorithm() {
+        let graph = sample_graph();
+        let result = cluster_modules_with_algorithms(
+            &graph,
+            &config(ClusterAlgorithm::Leiden),
+            |_graph, _config| {
+                Ok(vec![
+                    ids(&[
+                        "python:module:pkg.auth.login",
+                        "python:module:pkg.auth.token",
+                    ]),
+                    ids(&[
+                        "python:module:pkg.billing.invoice",
+                        "python:module:pkg.billing.ledger",
+                    ]),
+                ])
+            },
+            |_graph, _min_cluster_size| {
+                panic!("weighted-components fallback should not be computed")
+            },
+        )
+        .expect("clusters");
+
+        assert_eq!(result.algorithm_used, ClusterAlgorithm::Leiden);
+        assert_eq!(result.communities.len(), 2);
+    }
+
+    #[test]
+    fn weighted_components_fallback_is_config_selectable() {
+        let result = cluster_modules(
+            &sample_graph(),
+            &config(ClusterAlgorithm::WeightedComponents),
+        )
+        .expect("clusters");
+
+        assert_eq!(result.algorithm_used, ClusterAlgorithm::WeightedComponents);
         assert!(same_cluster(
             &result,
             "python:module:pkg.auth.login",

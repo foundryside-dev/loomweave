@@ -296,6 +296,28 @@ def test_from_import_emits_import_edge_to_parent_module() -> None:
     ]
 
 
+def test_multi_name_from_import_emits_one_edge_per_imported_name() -> None:
+    source = "from pkg.service import Client, helper, CONSTANT\n"
+    _entities, edges = extract(source, "consumer.py")
+
+    assert _import_edges(edges) == [
+        {
+            "kind": "imports",
+            "from_id": "python:module:consumer",
+            "to_id": "python:module:pkg.service",
+            "source_byte_start": 0,
+            "source_byte_end": len(b"from pkg.service import Client, helper, CONSTANT"),
+            "confidence": "resolved",
+            "properties": {
+                "imported_name": imported_name,
+                "import_style": "from_import",
+                "level": 0,
+            },
+        }
+        for imported_name in ("Client", "helper", "CONSTANT")
+    ]
+
+
 def test_relative_import_emits_package_relative_module_edge() -> None:
     _entities, edges = extract("from . import sibling\n", "pkg/consumer.py")
 
@@ -303,6 +325,26 @@ def test_relative_import_emits_package_relative_module_edge() -> None:
         {
             "kind": "imports",
             "from_id": "python:module:pkg.consumer",
+            "to_id": "python:module:pkg.sibling",
+            "source_byte_start": 0,
+            "source_byte_end": len(b"from . import sibling"),
+            "confidence": "resolved",
+            "properties": {
+                "imported_name": "sibling",
+                "import_style": "from_import",
+                "level": 1,
+            },
+        },
+    ]
+
+
+def test_relative_import_from_package_init_targets_sibling_module() -> None:
+    _entities, edges = extract("from . import sibling\n", "pkg/__init__.py")
+
+    assert _import_edges(edges) == [
+        {
+            "kind": "imports",
+            "from_id": "python:module:pkg",
             "to_id": "python:module:pkg.sibling",
             "source_byte_start": 0,
             "source_byte_end": len(b"from . import sibling"),

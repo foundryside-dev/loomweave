@@ -100,9 +100,9 @@ pytest, mypy, ruff, cargo nextest, cargo-deny, and existing shell E2E scripts.
 a small adapter layer and a dependency-qualification gate in Task 1. The first
 candidate is `xgraph` because current docs explicitly advertise directed and
 undirected graph support, deterministic/randomized execution, seed support,
-and modularity-oriented Leiden clustering. Add a local Louvain fallback in the
-same adapter because the crates found during planning either do not clearly
-provide Louvain with directed semantics or mark Louvain as work-in-progress.
+and modularity-oriented Leiden clustering. Post-landing ADR-032 names the local
+fallback `weighted_components` because the implementation is deterministic BFS
+over high-weight edges, not Louvain modularity optimisation.
 
 Planning-time crate check, 2026-05-18:
 
@@ -285,11 +285,11 @@ any analyze integration. This task does not write database rows.
 - [x] Write failing unit tests in `clustering.rs`:
   - `fixed_seed_leiden_is_byte_stable`
   - `directed_weighted_edges_affect_partition`
-  - `louvain_fallback_is_config_selectable`
+  - `weighted_components_fallback_is_config_selectable`
   - `cluster_hash_uses_sha256_sorted_member_ids_truncated_to_12`
 - [x] Add `sha2 = "0.10"` and the selected graph crate to workspace deps.
 - [x] Implement:
-  - `ClusterAlgorithm::{Leiden, Louvain}`
+  - `ClusterAlgorithm::{Leiden, WeightedComponents}`
   - `ModuleGraph { modules, edges }`
   - `ClusterConfig { algorithm, seed, resolution, max_iterations, min_cluster_size }`
   - `ClusterResult { communities, modularity_score, algorithm_used }`
@@ -304,7 +304,7 @@ cargo tree -p clarion-cli
 ```
 
 **Exit:** The tests prove fixed-seed determinism, directed weighted behavior,
-config-selectable Louvain, and ADR-006 hash shape. `cargo deny check` passes
+config-selectable weighted-components fallback, and ADR-006 hash shape. `cargo deny check` passes
 without broadening `deny.toml`. If not, stop and amend this plan.
 
 **Commit:** `feat(wp4): qualify clustering adapter (phase3 task 1)`
@@ -642,7 +642,7 @@ gate before declaring Phase 3 ready.
   - Measure Phase 3 wall time separately with tracing or stats.
   - Acceptance: Phase 3 over the elspeth module graph adds less than 60s wall
     time and less than 500 MiB peak RSS over the existing analyze path.
-  - If the gate fails, stop with a results memo and propose either Louvain
+  - If the gate fails, stop with a results memo and propose either weighted-components
     default, graph-pruning config, or ADR amendment.
 - [x] Run full verification floor.
 - [x] Mark completed tasks in this plan with `[x]`.
@@ -672,14 +672,14 @@ plugins/python/.venv/bin/pytest plugins/python/tests -q
 
 - ADR-006 default: Leiden clustering over directed weighted `imports` plus
   `calls` module graph, seeded from config, deterministic.
-- Louvain fallback is config-selectable and test-covered.
+- Weighted-components fallback is config-selectable and test-covered.
 - Subsystems are persisted as `core:subsystem:{sha256(sorted(member_ids))[0..12]}`
   with properties carrying algorithm, seed, resolution, modularity, member IDs,
   edge types, and weight policy.
 - `in_subsystem` edges link every member module to its subsystem.
 - `runs.stats.clustering` records status, config, counts, modularity, duration,
   and skip/finding state.
-- `CLA-FACT-CLUSTERING-WEAK-MODULARITY` persists when modularity is below 0.25
+- `CLA-FACT-CLUSTERING-WEAK-MODULARITY` persists when modularity is below 0.3
   and there is an emitted subsystem anchor.
 - `subsystem_members(id)` is available through MCP.
 - `summary(id)` on a subsystem returns the no-subsystem-summary policy envelope
@@ -697,7 +697,7 @@ plugins/python/.venv/bin/pytest plugins/python/tests -q
 
 - **Graph crate suitability.** The current Rust graph ecosystem has several
   plausible Leiden crates, but none is a perfect one-line match for
-  ADR-006 plus Louvain fallback. Task 1 is intentionally a hard qualification
+  ADR-006 plus weighted-components fallback. Task 1 is intentionally a hard qualification
   gate.
 - **Directed modularity semantics.** If the selected crate silently treats the
   graph as undirected, the adapter test must fail and the plan must be amended.

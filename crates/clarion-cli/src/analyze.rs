@@ -35,7 +35,7 @@ use crate::config::{AnalyzeConfig, ClusteringConfig};
 use crate::stats::P95Accumulator;
 
 const WEAK_MODULARITY_RULE_ID: &str = "CLA-FACT-CLUSTERING-WEAK-MODULARITY";
-const WEAK_MODULARITY_THRESHOLD: f64 = 0.25;
+const WEAK_MODULARITY_THRESHOLD: f64 = 0.3;
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -743,7 +743,8 @@ async fn run_phase3_clustering(
         .collect::<Vec<_>>();
     for community in &cluster_result.communities {
         let hash = cluster_hash(community);
-        let subsystem_id = format!("core:subsystem:{hash}");
+        let subsystem_id = subsystem_entity_id(&hash)
+            .with_context(|| format!("assemble subsystem entity id for hash {hash}"))?;
         let now = iso8601_now();
         let properties_json = serde_json::json!({
             "algorithm": cluster_result.algorithm_used.as_str(),
@@ -850,6 +851,10 @@ async fn run_phase3_clustering(
             started,
         ),
     })
+}
+
+fn subsystem_entity_id(cluster_hash: &str) -> Result<String> {
+    Ok(clarion_core::entity_id::entity_id("core", "subsystem", cluster_hash)?.to_string())
 }
 
 async fn insert_weak_modularity_finding(
@@ -1726,6 +1731,17 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use std::fs;
+
+    #[test]
+    fn subsystem_entity_id_rejects_invalid_hash_segment() {
+        let err = subsystem_entity_id("bad:hash").expect_err("colon must be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("canonical_qualified_name contains reserved ':' separator"),
+            "unexpected error: {err:#}"
+        );
+    }
 
     #[test]
     fn source_walk_honours_root_gitignore() {

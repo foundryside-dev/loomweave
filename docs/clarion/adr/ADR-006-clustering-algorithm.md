@@ -1,6 +1,6 @@
 # ADR-006: Clustering Algorithm — Leiden on Imports+Calls Subgraph with Louvain Fallback
 
-**Status**: Accepted
+**Status**: Accepted; amended by [ADR-032](./ADR-032-weighted-components-clustering-fallback.md)
 **Date**: 2026-04-18
 **Deciders**: qacona@gmail.com
 **Context**: Phase 3 subsystem discovery takes module-level structural edges and produces `subsystem` entities; algorithm choice shapes downstream LLM cost and query quality

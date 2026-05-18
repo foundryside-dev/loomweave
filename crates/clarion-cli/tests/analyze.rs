@@ -510,6 +510,18 @@ analysis:
     )
 }
 
+#[cfg(unix)]
+fn phase3_weighted_components_config(min_cluster_size: u64) -> String {
+    format!(
+        r"
+analysis:
+  clustering:
+    algorithm: weighted_components
+    min_cluster_size: {min_cluster_size}
+"
+    )
+}
+
 #[test]
 fn analyze_without_plugins_writes_skipped_run_row() {
     let dir = tempfile::tempdir().unwrap();
@@ -599,7 +611,7 @@ fn analyze_config_file_overrides_clustering_seed_and_algorithm() {
         r"
 analysis:
   clustering:
-    algorithm: louvain
+    algorithm: weighted_components
     seed: 99
 ",
     )
@@ -615,7 +627,10 @@ analysis:
 
     let config = latest_run_config(dir.path());
     let clustering = &config["analysis"]["clustering"];
-    assert_eq!(clustering["algorithm"].as_str(), Some("louvain"));
+    assert_eq!(
+        clustering["algorithm"].as_str(),
+        Some("weighted_components")
+    );
     assert_eq!(clustering["seed"].as_u64(), Some(99));
     assert_eq!(clustering["enabled"].as_bool(), Some(true));
     assert_eq!(clustering["max_iterations"].as_u64(), Some(100));
@@ -777,14 +792,112 @@ fn analyze_phase3_emits_weak_modularity_fact_when_below_threshold() {
     assert_eq!(row.2, "INFO");
     assert_eq!(row.3, "open");
     let properties: serde_json::Value = serde_json::from_str(&row.4).expect("finding properties");
-    assert_eq!(properties["threshold"].as_f64(), Some(0.25));
+    assert_eq!(properties["threshold"].as_f64(), Some(0.3));
     assert_eq!(properties["algorithm"].as_str(), Some("leiden"));
-    assert!(properties["modularity_score"].as_f64().unwrap_or(1.0) < 0.25);
+    assert!(properties["modularity_score"].as_f64().unwrap_or(1.0) < 0.3);
 
     let stats = latest_run_stats(project_dir.path());
     assert_eq!(
         stats["clustering"]["weak_modularity_finding_emitted"].as_bool(),
         Some(true)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_phase3_does_not_emit_weak_modularity_fact_when_threshold_is_met() {
+    let project_dir = run_phase3_fixture(
+        &["auth_a", "auth_b", "billing_a", "billing_b"],
+        &phase3_config(2),
+    );
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    let finding_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM findings \
+             WHERE rule_id = 'CLA-FACT-CLUSTERING-WEAK-MODULARITY'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query weak modularity finding count");
+    assert_eq!(finding_count, 0);
+
+    let stats = latest_run_stats(project_dir.path());
+    assert_eq!(
+        stats["clustering"]["weak_modularity_finding_emitted"].as_bool(),
+        Some(false)
+    );
+    assert!(
+        stats["clustering"]["modularity_score"]
+            .as_f64()
+            .unwrap_or_default()
+            >= 0.3
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_phase3_min_cluster_size_drops_undersized_weighted_components() {
+    let project_dir = run_phase3_fixture(
+        &["auth_a", "auth_b", "billing_a", "billing_b"],
+        &phase3_weighted_components_config(3),
+    );
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    let subsystem_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE kind = 'subsystem'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query subsystem count");
+    assert_eq!(subsystem_count, 0);
+
+    let in_subsystem_edges: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges WHERE kind = 'in_subsystem'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query in_subsystem edge count");
+    assert_eq!(in_subsystem_edges, 0);
+
+    let stats = latest_run_stats(project_dir.path());
+    let clustering = &stats["clustering"];
+    assert_eq!(clustering["status"].as_str(), Some("skipped"));
+    assert_eq!(
+        clustering["skipped_reason"].as_str(),
+        Some("no_clusters_emitted")
+    );
+    assert_eq!(clustering["subsystems_inserted"].as_u64(), Some(0));
+    assert_eq!(clustering["in_subsystem_edges_inserted"].as_u64(), Some(0));
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_phase3_persists_weighted_components_algorithm_when_selected() {
+    let project_dir = run_phase3_fixture(
+        &["auth_a", "auth_b", "billing_a", "billing_b"],
+        &phase3_weighted_components_config(2),
+    );
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    let properties_json: String = conn
+        .query_row(
+            "SELECT properties FROM entities \
+             WHERE kind = 'subsystem' ORDER BY id LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query subsystem properties");
+    let properties: serde_json::Value =
+        serde_json::from_str(&properties_json).expect("subsystem properties JSON");
+    assert_eq!(
+        properties["algorithm"].as_str(),
+        Some("weighted_components")
+    );
+
+    let stats = latest_run_stats(project_dir.path());
+    assert_eq!(
+        stats["clustering"]["algorithm"].as_str(),
+        Some("weighted_components")
     );
 }
 

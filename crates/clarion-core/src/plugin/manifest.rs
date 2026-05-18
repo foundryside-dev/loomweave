@@ -25,7 +25,7 @@ use crate::entity_id::validate_kind_grammar;
 // ── Reserved lists (ADR-022) ──────────────────────────────────────────────────
 
 /// Entity kinds the core owns; plugins may not declare these (ADR-022 §Core owns).
-const RESERVED_ENTITY_KINDS: &[&str] = &["file", "subsystem", "guidance"];
+pub const RESERVED_ENTITY_KINDS: &[&str] = &["file", "subsystem", "guidance"];
 
 /// Rule-ID prefixes the core owns; plugins may not claim these (ADR-022 §Core owns).
 ///

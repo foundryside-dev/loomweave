@@ -308,6 +308,7 @@ def extract_with_stats(
     """
     prefix_source = module_prefix_path if module_prefix_path is not None else file_path
     dotted_module = module_dotted_name(prefix_source)
+    is_package_module = PurePosixPath(prefix_source).name == "__init__.py"
 
     # Top-level __init__.py would resolve to "" — entity_id() rejects that
     # (crates/clarion-core/src/entity_id.rs:97-101). Skip with stderr.
@@ -350,7 +351,15 @@ def extract_with_stats(
         function_ids,
         walk_state,
     )
-    edges.extend(_collect_import_edges(source, tree, dotted_module, module_entity["id"]))
+    edges.extend(
+        _collect_import_edges(
+            source,
+            tree,
+            dotted_module,
+            module_entity["id"],
+            is_package_module=is_package_module,
+        ),
+    )
     reference_sites = _collect_reference_sites(source, tree, dotted_module, module_entity["id"])
     call_stats = call_resolver.resolve_calls(file_path, function_ids)
     reference_stats = reference_resolver.resolve_references(file_path, reference_sites)
@@ -371,17 +380,32 @@ def _collect_import_edges(
     tree: ast.Module,
     dotted_module: str,
     module_entity_id: str,
+    *,
+    is_package_module: bool,
 ) -> list[RawEdge]:
-    collector = _ImportEdgeCollector(source, dotted_module, module_entity_id)
+    collector = _ImportEdgeCollector(
+        source,
+        dotted_module,
+        module_entity_id,
+        is_package_module=is_package_module,
+    )
     collector.visit(tree)
     return collector.edges
 
 
 class _ImportEdgeCollector(ast.NodeVisitor):
-    def __init__(self, source: str, dotted_module: str, module_entity_id: str) -> None:
+    def __init__(
+        self,
+        source: str,
+        dotted_module: str,
+        module_entity_id: str,
+        *,
+        is_package_module: bool,
+    ) -> None:
         self.source = source
         self.dotted_module = dotted_module
         self.module_entity_id = module_entity_id
+        self.is_package_module = is_package_module
         self.edges: list[RawEdge] = []
 
     def visit_Import(self, node: ast.Import) -> None:
@@ -405,6 +429,7 @@ class _ImportEdgeCollector(ast.NodeVisitor):
                 node.module,
                 node.level,
                 alias.name,
+                is_package_module=self.is_package_module,
             )
             if target_module is None:
                 continue
@@ -448,11 +473,17 @@ def _import_from_target(
     module: str | None,
     level: int,
     imported_name: str,
+    *,
+    is_package_module: bool,
 ) -> str | None:
     if level == 0:
         return module
 
-    base_parts = _relative_import_base_parts(dotted_module, level)
+    base_parts = _relative_import_base_parts(
+        dotted_module,
+        level,
+        is_package_module=is_package_module,
+    )
     if base_parts is None:
         return None
 
@@ -465,8 +496,14 @@ def _import_from_target(
     return ".".join(target_parts) if target_parts else None
 
 
-def _relative_import_base_parts(dotted_module: str, level: int) -> list[str] | None:
-    package_parts = dotted_module.split(".")[:-1]
+def _relative_import_base_parts(
+    dotted_module: str,
+    level: int,
+    *,
+    is_package_module: bool,
+) -> list[str] | None:
+    all_parts = dotted_module.split(".")
+    package_parts = all_parts if is_package_module else all_parts[:-1]
     keep = len(package_parts) - (level - 1)
     if keep < 0:
         return None

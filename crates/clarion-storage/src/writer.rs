@@ -347,6 +347,7 @@ fn insert_entity(
             "InsertEntity received without a preceding BeginRun".to_owned(),
         ));
     }
+    enforce_entity_kind_contract(entity)?;
     if !state.in_tx {
         conn.execute_batch("BEGIN")?;
         state.in_tx = true;
@@ -394,6 +395,21 @@ fn insert_entity(
         ],
     )?;
     bump_writes_and_maybe_commit(conn, state, commits_observed)?;
+    Ok(())
+}
+
+fn enforce_entity_kind_contract(entity: &EntityRecord) -> Result<()> {
+    if entity.plugin_id != "core"
+        && clarion_core::plugin::manifest::RESERVED_ENTITY_KINDS.contains(&entity.kind.as_str())
+    {
+        return Err(StorageError::WriterProtocol(format!(
+            "CLA-INFRA-RESERVED-ENTITY-KIND: entity kind {kind:?} is reserved by core; \
+             plugin_id={plugin_id:?} cannot insert entity {id:?}",
+            kind = entity.kind,
+            plugin_id = entity.plugin_id,
+            id = entity.id,
+        )));
+    }
     Ok(())
 }
 

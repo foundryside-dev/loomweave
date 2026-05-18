@@ -4,14 +4,22 @@ Date: 2026-05-18
 
 Corpus: `/tmp/clarion-b8-elspeth-full-20260518T0016Z`
 
+Reproducibility status: directional historical measurement. The temporary
+corpus path is not committed; see `corpus-provenance.md` and
+`tests/perf/b8_scale_test/derive-elspeth-corpus.sh` for the committed procedure
+to re-derive a comparable corpus from an elspeth checkout.
+
 Command:
 
 ```bash
-target/release/clarion install --force --path /tmp/clarion-b8-elspeth-full-20260518T0016Z
+corpus_dir=$(bash tests/perf/b8_scale_test/derive-elspeth-corpus.sh \
+  /path/to/elspeth \
+  /tmp/clarion-b8-elspeth-corpus-$(date -u +%Y%m%dT%H%M%SZ))
+target/release/clarion install --force --path "$corpus_dir"
 python3 tests/perf/b8_scale_test/results/2026-05-18T0114Z/analyze-with-rss.py \
   tests/perf/b8_scale_test/results/2026-05-18T1138Z-phase3/analyze-metrics.json \
   /home/john/clarion/target/release/clarion analyze \
-  /tmp/clarion-b8-elspeth-full-20260518T0016Z
+  "$corpus_dir"
 ```
 
 Baseline from `2026-05-18T0114Z`:
@@ -37,4 +45,5 @@ Acceptance:
   baseline, below the 500 MiB limit.
 
 The run emitted `CLA-FACT-CLUSTERING-WEAK-MODULARITY` because the full elspeth
-graph modularity score was 0.020884003737243844, below the v0.1 threshold.
+graph modularity score was 0.020884003737243844, below the v0.1 threshold of
+0.3.

@@ -11,7 +11,7 @@ This folder is the canonical home for authored Clarion architecture decision rec
 | [ADR-003](./ADR-003-entity-id-scheme.md) | Entity ID scheme: symbolic canonical names | Accepted |
 | [ADR-004](./ADR-004-finding-exchange-format.md) | Finding-exchange format: Filigree-native intake | Accepted |
 | [ADR-005](./ADR-005-clarion-dir-tracking.md) | `.clarion/` git-committable by default; DB included, run logs excluded | Accepted |
-| [ADR-006](./ADR-006-clustering-algorithm.md) | Clustering algorithm — Leiden on imports+calls subgraph; Louvain fallback | Accepted |
+| [ADR-006](./ADR-006-clustering-algorithm.md) | Clustering algorithm — Leiden on imports+calls subgraph; fallback amended by ADR-032 | Accepted; amended |
 | [ADR-007](./ADR-007-summary-cache-key.md) | Summary cache key — 5-part composite with TTL backstop and churn-eager invalidation | Accepted |
 | [ADR-011](./ADR-011-writer-actor-concurrency.md) | Writer-actor concurrency with per-N-files transactions; `--shadow-db` opt-in | Accepted |
 | [ADR-012](./ADR-012-http-auth-default.md) | HTTP read-API authentication — UDS default with token fallback | Accepted |
@@ -32,6 +32,7 @@ This folder is the canonical home for authored Clarion architecture decision rec
 | [ADR-029](./ADR-029-entity-associations-binding.md) | Entity associations — Filigree-side `entity_associations` table; `add_entity_association` MCP tool on Filigree; `issues_for` MCP tool on Clarion; WP9 split into A (binding, v0.1) and B (findings emission) | Accepted |
 | [ADR-030](./ADR-030-on-demand-summary-scope.md) | On-demand summary scope — narrows WP6 to MCP-driven `summary(id)`; 5-tuple cache key unchanged; module/subsystem aggregation deferred to v0.2 | Accepted |
 | [ADR-031](./ADR-031-schema-validation-policy.md) | Schema-validation policy — CHECK on closed core-owned vocabularies (`findings.{kind,severity,status}`, `runs.status`); writer-actor + manifest are the only enforcement layer for plugin-extensible vocabularies (`entities.kind`, `edges.kind`) | Accepted |
+| [ADR-032](./ADR-032-weighted-components-clustering-fallback.md) | Weighted-components clustering fallback naming | Accepted |
 
 ## Backlog still tracked in the detailed design
 

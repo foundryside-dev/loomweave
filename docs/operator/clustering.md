@@ -21,7 +21,10 @@ analysis:
     weight_by: reference_count
 ```
 
-Supported algorithms are `leiden` and `louvain`. `edge_types` may include
+Supported algorithms are `leiden` and `weighted_components`. The
+`weighted_components` fallback builds connected components over edges whose
+weight is at least the graph's average positive edge weight; it is deterministic
+and does not perform Louvain modularity optimisation. `edge_types` may include
 `imports`, `calls`, or both. `weight_by` is currently `reference_count`.
 
 ## Stored Subsystems
@@ -64,7 +67,7 @@ not call the LLM provider in v0.1.
 
 Clarion emits a fact finding with rule
 `CLA-FACT-CLUSTERING-WEAK-MODULARITY` when clustering succeeds but the
-modularity score is below the v0.1 threshold. This means the graph did not
+modularity score is below the v0.1 threshold of 0.3. This means the graph did not
 separate cleanly into strong communities. Treat it as operator guidance, not a
 defect: inspect the subsystem membership, then decide whether the project needs
 different config, graph pruning, or an ADR amendment.

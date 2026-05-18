@@ -594,7 +594,7 @@ The v0.2 **Wardline annotation descriptor** (§9, promoted from earlier deferral
 
 ### SQLite rationale
 
-- Graph algorithms (Louvain, Leiden, centrality, path-finding) run in Rust against in-memory projections; the store serves neighbour lookups.
+- Graph algorithms (Leiden, weighted-components fallback, centrality, path-finding) run in Rust against in-memory projections; the store serves neighbour lookups.
 - Consult-mode queries are overwhelmingly one-hop (callers, callees, contains) — indexed range scans.
 - WAL mode with a **writer-actor** (single owner of the write connection; see Concurrency below) permits `clarion serve` to keep answering reads while `clarion analyze` is ingesting and while consult-mode cache writes happen.
 - JSON1 handles plugin property bags without giving up query ergonomics.
@@ -985,7 +985,7 @@ analysis:
     - "**/.venv/**"
   plugins: [python]
   clustering:
-    algorithm: leiden                # leiden | louvain
+    algorithm: leiden                # leiden | weighted_components
     edge_types: [imports, calls]
     weight_by: reference_count
     min_cluster_size: 3
@@ -1560,7 +1560,7 @@ The table below is a navigation aid for implementers: it maps each ADR to the se
 | ADR-003 | Entity ID scheme: symbolic canonical-name; file path as property; EntityAlias v0.2 | §2 |
 | ADR-004 | Finding-exchange format: Filigree-native intake; `metadata.clarion.*` nesting | §2, §7 |
 | ADR-005 | `.clarion/` git-committable by default | §3 |
-| [ADR-006](../adr/ADR-006-clustering-algorithm.md) | Clustering algorithm: Leiden with Louvain fallback | §4, §5 |
+| [ADR-006](../adr/ADR-006-clustering-algorithm.md), [ADR-032](../adr/ADR-032-weighted-components-clustering-fallback.md) | Clustering algorithm: Leiden with weighted-components fallback | §4, §5 |
 | [ADR-007](../adr/ADR-007-summary-cache-key.md) | Summary cache key design and invalidation | §4 |
 | ADR-008 | Superseded by ADR-014 | §7, §9 |
 | ADR-009 | Structured briefings vs free-form prose | §2 |
@@ -1702,7 +1702,7 @@ The v0.1 core is Rust (locked — see §11 ADR-001). Crate choices below are rec
 
 ### Graph algorithms
 
-- **petgraph** for in-memory graph representations; Leiden / Louvain clustering implemented on top of it. `petgraph` doesn't ship Leiden directly — v0.1 vendors a minimal Leiden implementation (~400 lines) or pulls a maintained crate if one exists by implementation time. ADR-006 captures the decision.
+- In-memory graph projections feed the Leiden adapter and local weighted-components fallback. ADR-006 captures the Leiden decision; ADR-032 names the local fallback.
 
 ### Hashing, IDs, time
 

@@ -8,7 +8,7 @@
 
 ## Why you were dispatched
 
-The amended-v0.1 MCP-MVP delivers entity extraction + on-demand leaf summarisation, but the *headline capability* the v0.1 requirements promise — **subsystems as first-class entities derived from clustering** — is missing. `REQ-CATALOG-05` (subsystem entities), `REQ-ANALYZE-01`/`REQ-ANALYZE-05` (Phase 3 in the pipeline), and `ADR-006` (Leiden / Louvain on imports+calls) collectively specify this. Nothing in the storage schema, the analyze orchestrator, or the MCP surface ships it yet. An agent asking "what is the auth subsystem of this codebase" currently gets back individual function entities; the aggregation level above the module does not exist.
+The amended-v0.1 MCP-MVP delivers entity extraction + on-demand leaf summarisation, but the *headline capability* the v0.1 requirements promise — **subsystems as first-class entities derived from clustering** — is missing. `REQ-CATALOG-05` (subsystem entities), `REQ-ANALYZE-01`/`REQ-ANALYZE-05` (Phase 3 in the pipeline), and `ADR-006` plus `ADR-032` (Leiden / weighted-components on imports+calls) collectively specify this. Nothing in the storage schema, the analyze orchestrator, or the MCP surface ships it yet. An agent asking "what is the auth subsystem of this codebase" currently gets back individual function entities; the aggregation level above the module does not exist.
 
 Closing this gap is the single highest-leverage move between the current MCP-MVP and the briefing's core pitch.
 
@@ -31,7 +31,7 @@ Two things, in order, with a human review gate between them.
 
 ## Required reading (in this order)
 
-1. **`docs/clarion/adr/ADR-006-clustering-algorithm.md`** — the authoritative spec. Read in full. Leiden on directed weighted imports+calls subgraph, seeded for determinism, Louvain as the named fallback. Output is one `subsystem` entity per cluster + `in_subsystem` edges from members. Modularity reported, not enforced.
+1. **`docs/clarion/adr/ADR-006-clustering-algorithm.md` plus ADR-032** — the authoritative spec. Read in full. Leiden on directed weighted imports+calls subgraph, seeded for determinism, with `weighted_components` as the named local fallback after ADR-032. Output is one `subsystem` entity per cluster + `in_subsystem` edges from members. Modularity reported, not enforced.
 2. **`docs/clarion/adr/ADR-022-core-plugin-ontology.md`** — `subsystem` is a core-reserved entity kind; `in_subsystem` is a core-reserved edge kind. Plugins cannot emit either. The writer-actor's edge-contract validator already knows about plugin-extensible vs core-reserved (`writer.rs:411` per arch-analysis).
 3. **`docs/clarion/adr/ADR-003-entity-id-scheme.md`** — subsystem IDs follow `core:subsystem:{cluster_hash}` per ADR-006 §Output. The hash is `sha256(sorted(member_module_ids))` truncated to 12 chars; verify the existing entity-ID validator accepts this shape (it should — `core` is a registered plugin_id per ADR-022).
 4. **`docs/clarion/v0.1/requirements.md`** — REQ-CATALOG-05 (subsystem entities), REQ-ANALYZE-01 (phased pipeline), REQ-ANALYZE-05 (Phase-7 findings — relevant because `CLA-FACT-CLUSTERING-WEAK-MODULARITY` is named in ADR-006 §Quality assessment).
@@ -51,7 +51,7 @@ Two things, in order, with a human review gate between them.
 **In scope (deliver):**
 - Phase 3 clustering as a new step in `analyze::run`, after structural entity/edge ingest, before run commit.
 - Leiden-default clustering over the (`imports` ∪ `calls`) module-level subgraph, weighted by `reference_count`, seeded from `clarion.yaml`, deterministic.
-- Louvain as a config-selectable fallback (`analysis.clustering.algorithm: louvain`).
+- Weighted-components as a config-selectable fallback (`analysis.clustering.algorithm: weighted_components`).
 - Emit one `core:subsystem:{cluster_hash}` entity per cluster ≥ `min_cluster_size` (default 3). Properties per ADR-006 §Output.
 - Emit `in_subsystem` edges from each member module to its subsystem entity. Edge ontology updated where required.
 - New `clarion.yaml` keys under `analysis.clustering` (algorithm / seed / resolution / min_cluster_size / edge_types / weight_by). Defaults match ADR-006.
@@ -114,7 +114,7 @@ A table of every file you will create / modify, with the task that touches it. S
 
 ### F. Risks and unknowns
 
-Name them. The week-2 go/no-go gate concept from B.4* (`docs/implementation/sprint-2/scope-amendment-2026-05.md` §5) is worth borrowing — define a measurable "Leiden over elspeth-slice's module subgraph runs in < N seconds" gate halfway through implementation. If it fails, the Louvain fallback is the documented response.
+Name them. The week-2 go/no-go gate concept from B.4* (`docs/implementation/sprint-2/scope-amendment-2026-05.md` §5) is worth borrowing — define a measurable "Leiden over elspeth-slice's module subgraph runs in < N seconds" gate halfway through implementation. If it fails, the weighted-components fallback is the documented response.
 
 ## Review gate
 
