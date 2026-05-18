@@ -1,0 +1,3849 @@
+{
+  "clarion_bin": "/home/john/clarion/target/release/clarion",
+  "config": "/tmp/clarion-b8-elspeth-full-20260518T0016Z/clarion-b8-live.yaml",
+  "generated_at_unix": 1779071021,
+  "initialize": {
+    "id": "init",
+    "jsonrpc": "2.0",
+    "result": {
+      "capabilities": {
+        "tools": {}
+      },
+      "protocolVersion": "2025-11-25",
+      "serverInfo": {
+        "name": "clarion",
+        "version": "0.1.0-dev"
+      }
+    }
+  },
+  "initialize_latency_ms": 6.269,
+  "manifest": [
+    {
+      "arguments": {
+        "file": "src/elspeth/cli.py",
+        "line": 1247
+      },
+      "cache_state": "none",
+      "label": "L01-entity-at",
+      "pattern": "light",
+      "phase": "cold_start",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 10,
+        "pattern": "_build_plugin_registry"
+      },
+      "cache_state": "none",
+      "label": "L02-find-entity",
+      "pattern": "light",
+      "phase": "cold_start",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli.PluginInfo"
+      },
+      "cache_state": "none",
+      "label": "L03-callers-of",
+      "pattern": "light",
+      "phase": "cold_start",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "id": "python:function:elspeth.cli._build_plugin_registry"
+      },
+      "cache_state": "none",
+      "label": "L04-neighborhood",
+      "pattern": "light",
+      "phase": "cold_start",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "file": "src/elspeth/cli.py",
+        "line": 1247
+      },
+      "cache_state": "none",
+      "label": "L05-entity-at-repeat",
+      "pattern": "light",
+      "phase": "cold_start",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "file": "src/elspeth/cli.py",
+        "line": 1247
+      },
+      "cache_state": "none",
+      "label": "MC01-entity-at",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_build_plugin_registry"
+      },
+      "cache_state": "none",
+      "label": "MC02-find-entity",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli.PluginInfo"
+      },
+      "cache_state": "none",
+      "label": "MC03-callers-of",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "id": "python:function:tests.conftest._freeze_runtime_val_registries_before_begin_run",
+        "max_depth": 3
+      },
+      "cache_state": "none",
+      "label": "MC04-execution-paths-from",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli.PluginInfo"
+      },
+      "cache_state": "cold",
+      "label": "MC05-summary",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli.PluginInfo",
+        "include_contained": true
+      },
+      "cache_state": "none",
+      "label": "MC06-issues-for",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "issues_for"
+    },
+    {
+      "arguments": {
+        "id": "python:function:elspeth.cli._build_plugin_registry"
+      },
+      "cache_state": "none",
+      "label": "MC07-neighborhood",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "file": "src/elspeth/cli.py",
+        "line": 1557
+      },
+      "cache_state": "none",
+      "label": "MC08-entity-at",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_build_resume_graphs"
+      },
+      "cache_state": "none",
+      "label": "MC09-find-entity",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.composer_mcp.audit.JsonlEventRecorder"
+      },
+      "cache_state": "none",
+      "label": "MC10-callers-of",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli._OrchestratorContext"
+      },
+      "cache_state": "cold",
+      "label": "MC11-summary",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "id": "python:function:elspeth.cli._build_resume_graphs"
+      },
+      "cache_state": "none",
+      "label": "MC12-neighborhood",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "id": "python:function:tests.conftest._freeze_runtime_val_registries_before_begin_run.<locals>.wrapped_begin_run",
+        "max_depth": 3
+      },
+      "cache_state": "none",
+      "label": "MC13-execution-paths-from",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli._OrchestratorContext",
+        "include_contained": false
+      },
+      "cache_state": "none",
+      "label": "MC14-issues-for",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "issues_for"
+    },
+    {
+      "arguments": {
+        "file": "src/elspeth/cli.py",
+        "line": 141
+      },
+      "cache_state": "none",
+      "label": "MC15-entity-at",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_ensure_output_directories"
+      },
+      "cache_state": "none",
+      "label": "MC16-find-entity",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli_helpers.PluginBundle"
+      },
+      "cache_state": "cold",
+      "label": "MC17-summary",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "confidence": "ambiguous",
+        "id": "python:class:elspeth.composer_mcp.session.SessionManager"
+      },
+      "cache_state": "none",
+      "label": "MC18-callers-of",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "confidence": "ambiguous",
+        "id": "python:function:elspeth.cli._ensure_output_directories"
+      },
+      "cache_state": "none",
+      "label": "MC19-neighborhood",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "id": "python:function:tests.fixtures.azurite.azurite_blob_service",
+        "max_depth": 2
+      },
+      "cache_state": "none",
+      "label": "MC20-execution-paths-from",
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "file": "src/elspeth/cli.py",
+        "line": 1247
+      },
+      "cache_state": "none",
+      "label": "MW01-entity-at",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_build_plugin_registry"
+      },
+      "cache_state": "none",
+      "label": "MW02-find-entity",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli.PluginInfo"
+      },
+      "cache_state": "none",
+      "label": "MW03-callers-of",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "id": "python:function:tests.conftest._freeze_runtime_val_registries_before_begin_run",
+        "max_depth": 3
+      },
+      "cache_state": "none",
+      "label": "MW04-execution-paths-from",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli.PluginInfo"
+      },
+      "cache_state": "warm",
+      "label": "MW05-summary",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli.PluginInfo",
+        "include_contained": true
+      },
+      "cache_state": "none",
+      "label": "MW06-issues-for",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "issues_for"
+    },
+    {
+      "arguments": {
+        "id": "python:function:elspeth.cli._build_plugin_registry"
+      },
+      "cache_state": "none",
+      "label": "MW07-neighborhood",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "file": "src/elspeth/cli.py",
+        "line": 1557
+      },
+      "cache_state": "none",
+      "label": "MW08-entity-at",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_build_resume_graphs"
+      },
+      "cache_state": "none",
+      "label": "MW09-find-entity",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.composer_mcp.audit.JsonlEventRecorder"
+      },
+      "cache_state": "none",
+      "label": "MW10-callers-of",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli._OrchestratorContext"
+      },
+      "cache_state": "warm",
+      "label": "MW11-summary",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "id": "python:function:elspeth.cli._build_resume_graphs"
+      },
+      "cache_state": "none",
+      "label": "MW12-neighborhood",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "id": "python:function:tests.conftest._freeze_runtime_val_registries_before_begin_run.<locals>.wrapped_begin_run",
+        "max_depth": 3
+      },
+      "cache_state": "none",
+      "label": "MW13-execution-paths-from",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli._OrchestratorContext",
+        "include_contained": false
+      },
+      "cache_state": "none",
+      "label": "MW14-issues-for",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "issues_for"
+    },
+    {
+      "arguments": {
+        "file": "src/elspeth/cli.py",
+        "line": 141
+      },
+      "cache_state": "none",
+      "label": "MW15-entity-at",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_ensure_output_directories"
+      },
+      "cache_state": "none",
+      "label": "MW16-find-entity",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli_helpers.PluginBundle"
+      },
+      "cache_state": "warm",
+      "label": "MW17-summary",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "confidence": "ambiguous",
+        "id": "python:class:elspeth.composer_mcp.session.SessionManager"
+      },
+      "cache_state": "none",
+      "label": "MW18-callers-of",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "confidence": "ambiguous",
+        "id": "python:function:elspeth.cli._ensure_output_directories"
+      },
+      "cache_state": "none",
+      "label": "MW19-neighborhood",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "id": "python:function:tests.fixtures.azurite.azurite_blob_service",
+        "max_depth": 2
+      },
+      "cache_state": "none",
+      "label": "MW20-execution-paths-from",
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "file": "src/elspeth/cli.py",
+        "line": 1247
+      },
+      "cache_state": "none",
+      "label": "H01-entity-at",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_build_plugin_registry"
+      },
+      "cache_state": "none",
+      "label": "H02-find-entity",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli.PluginInfo"
+      },
+      "cache_state": "none",
+      "label": "H03-callers-of",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "id": "python:function:tests.conftest._freeze_runtime_val_registries_before_begin_run",
+        "max_depth": 3
+      },
+      "cache_state": "none",
+      "label": "H04-execution-paths-from",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli.PluginInfo"
+      },
+      "cache_state": "warm",
+      "label": "H05-summary",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli.PluginInfo",
+        "include_contained": true
+      },
+      "cache_state": "none",
+      "label": "H06-issues-for",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "issues_for"
+    },
+    {
+      "arguments": {
+        "id": "python:function:elspeth.cli._build_plugin_registry"
+      },
+      "cache_state": "none",
+      "label": "H07-neighborhood",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "file": "src/elspeth/cli.py",
+        "line": 1557
+      },
+      "cache_state": "none",
+      "label": "H08-entity-at",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_build_resume_graphs"
+      },
+      "cache_state": "none",
+      "label": "H09-find-entity",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.composer_mcp.audit.JsonlEventRecorder"
+      },
+      "cache_state": "none",
+      "label": "H10-callers-of",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli._OrchestratorContext"
+      },
+      "cache_state": "warm",
+      "label": "H11-summary",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "id": "python:function:elspeth.cli._build_resume_graphs"
+      },
+      "cache_state": "none",
+      "label": "H12-neighborhood",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "id": "python:function:tests.conftest._freeze_runtime_val_registries_before_begin_run.<locals>.wrapped_begin_run",
+        "max_depth": 3
+      },
+      "cache_state": "none",
+      "label": "H13-execution-paths-from",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli._OrchestratorContext",
+        "include_contained": false
+      },
+      "cache_state": "none",
+      "label": "H14-issues-for",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "issues_for"
+    },
+    {
+      "arguments": {
+        "file": "src/elspeth/cli.py",
+        "line": 141
+      },
+      "cache_state": "none",
+      "label": "H15-entity-at",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_ensure_output_directories"
+      },
+      "cache_state": "none",
+      "label": "H16-find-entity",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli_helpers.PluginBundle"
+      },
+      "cache_state": "warm",
+      "label": "H17-summary",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "confidence": "ambiguous",
+        "id": "python:class:elspeth.composer_mcp.session.SessionManager"
+      },
+      "cache_state": "none",
+      "label": "H18-callers-of",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "confidence": "ambiguous",
+        "id": "python:function:elspeth.cli._ensure_output_directories"
+      },
+      "cache_state": "none",
+      "label": "H19-neighborhood",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "id": "python:function:tests.fixtures.azurite.azurite_blob_service",
+        "max_depth": 2
+      },
+      "cache_state": "none",
+      "label": "H20-execution-paths-from",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "file": "src/elspeth/cli.py",
+        "line": 1247
+      },
+      "cache_state": "none",
+      "label": "H21-entity-at",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_build_plugin_registry"
+      },
+      "cache_state": "none",
+      "label": "H22-find-entity",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli.PluginInfo"
+      },
+      "cache_state": "none",
+      "label": "H23-callers-of",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "id": "python:function:tests.conftest._freeze_runtime_val_registries_before_begin_run",
+        "max_depth": 3
+      },
+      "cache_state": "none",
+      "label": "H24-execution-paths-from",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli.PluginInfo"
+      },
+      "cache_state": "warm",
+      "label": "H25-summary",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli.PluginInfo",
+        "include_contained": true
+      },
+      "cache_state": "none",
+      "label": "H26-issues-for",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "issues_for"
+    },
+    {
+      "arguments": {
+        "id": "python:function:elspeth.cli._build_plugin_registry"
+      },
+      "cache_state": "none",
+      "label": "H27-neighborhood",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "file": "src/elspeth/cli.py",
+        "line": 1557
+      },
+      "cache_state": "none",
+      "label": "H28-entity-at",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_build_resume_graphs"
+      },
+      "cache_state": "none",
+      "label": "H29-find-entity",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.composer_mcp.audit.JsonlEventRecorder"
+      },
+      "cache_state": "none",
+      "label": "H30-callers-of",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli._OrchestratorContext"
+      },
+      "cache_state": "warm",
+      "label": "H31-summary",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "id": "python:function:elspeth.cli._build_resume_graphs"
+      },
+      "cache_state": "none",
+      "label": "H32-neighborhood",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "id": "python:function:tests.conftest._freeze_runtime_val_registries_before_begin_run.<locals>.wrapped_begin_run",
+        "max_depth": 3
+      },
+      "cache_state": "none",
+      "label": "H33-execution-paths-from",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli._OrchestratorContext",
+        "include_contained": false
+      },
+      "cache_state": "none",
+      "label": "H34-issues-for",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "issues_for"
+    },
+    {
+      "arguments": {
+        "file": "src/elspeth/cli.py",
+        "line": 141
+      },
+      "cache_state": "none",
+      "label": "H35-entity-at",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_ensure_output_directories"
+      },
+      "cache_state": "none",
+      "label": "H36-find-entity",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli_helpers.PluginBundle"
+      },
+      "cache_state": "warm",
+      "label": "H37-summary",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "confidence": "ambiguous",
+        "id": "python:class:elspeth.composer_mcp.session.SessionManager"
+      },
+      "cache_state": "none",
+      "label": "H38-callers-of",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "confidence": "ambiguous",
+        "id": "python:function:elspeth.cli._ensure_output_directories"
+      },
+      "cache_state": "none",
+      "label": "H39-neighborhood",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "id": "python:function:tests.fixtures.azurite.azurite_blob_service",
+        "max_depth": 2
+      },
+      "cache_state": "none",
+      "label": "H40-execution-paths-from",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "file": "src/elspeth/cli.py",
+        "line": 1247
+      },
+      "cache_state": "none",
+      "label": "H41-entity-at",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_build_plugin_registry"
+      },
+      "cache_state": "none",
+      "label": "H42-find-entity",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli.PluginInfo"
+      },
+      "cache_state": "none",
+      "label": "H43-callers-of",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "id": "python:function:tests.conftest._freeze_runtime_val_registries_before_begin_run",
+        "max_depth": 3
+      },
+      "cache_state": "none",
+      "label": "H44-execution-paths-from",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "execution_paths_from"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli.PluginInfo"
+      },
+      "cache_state": "warm",
+      "label": "H45-summary",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "summary"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.cli.PluginInfo",
+        "include_contained": true
+      },
+      "cache_state": "none",
+      "label": "H46-issues-for",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "issues_for"
+    },
+    {
+      "arguments": {
+        "id": "python:function:elspeth.cli._build_plugin_registry"
+      },
+      "cache_state": "none",
+      "label": "H47-neighborhood",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "neighborhood"
+    },
+    {
+      "arguments": {
+        "file": "src/elspeth/cli.py",
+        "line": 1557
+      },
+      "cache_state": "none",
+      "label": "H48-entity-at",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "entity_at"
+    },
+    {
+      "arguments": {
+        "limit": 20,
+        "pattern": "_build_resume_graphs"
+      },
+      "cache_state": "none",
+      "label": "H49-find-entity",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "find_entity"
+    },
+    {
+      "arguments": {
+        "id": "python:class:elspeth.composer_mcp.audit.JsonlEventRecorder"
+      },
+      "cache_state": "none",
+      "label": "H50-callers-of",
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "confidence": "inferred",
+        "id": "python:class:elspeth.cli.PluginInfo"
+      },
+      "cache_state": "inferred",
+      "label": "callers-inferred-0",
+      "pattern": "inferred",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "confidence": "inferred",
+        "id": "python:class:elspeth.composer_mcp.audit.JsonlEventRecorder"
+      },
+      "cache_state": "inferred",
+      "label": "callers-inferred-1",
+      "pattern": "inferred",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "confidence": "inferred",
+        "id": "python:class:elspeth.composer_mcp.session.SessionManager"
+      },
+      "cache_state": "inferred",
+      "label": "callers-inferred-2",
+      "pattern": "inferred",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "confidence": "inferred",
+        "id": "python:class:elspeth.contracts.aggregation_checkpoint.AggregationCheckpointState"
+      },
+      "cache_state": "inferred",
+      "label": "callers-inferred-3",
+      "pattern": "inferred",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    },
+    {
+      "arguments": {
+        "confidence": "inferred",
+        "id": "python:class:elspeth.contracts.aggregation_checkpoint.AggregationNodeCheckpoint"
+      },
+      "cache_state": "inferred",
+      "label": "callers-inferred-4",
+      "pattern": "inferred",
+      "phase": "steady_state",
+      "tool": "callers_of"
+    }
+  ],
+  "project": "/tmp/clarion-b8-elspeth-full-20260518T0016Z",
+  "records": [
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 159,
+      "label": "L01-entity-at",
+      "latency_ms": 1.034,
+      "ok": true,
+      "pattern": "light",
+      "phase": "cold_start",
+      "response_bytes": 636,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 459,
+      "label": "L02-find-entity",
+      "latency_ms": 0.878,
+      "ok": true,
+      "pattern": "light",
+      "phase": "cold_start",
+      "response_bytes": 1833,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 60,
+      "label": "L03-callers-of",
+      "latency_ms": 7.236,
+      "ok": true,
+      "pattern": "light",
+      "phase": "cold_start",
+      "response_bytes": 238,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 680,
+      "label": "L04-neighborhood",
+      "latency_ms": 7.57,
+      "ok": true,
+      "pattern": "light",
+      "phase": "cold_start",
+      "response_bytes": 2719,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 159,
+      "label": "L05-entity-at-repeat",
+      "latency_ms": 0.264,
+      "ok": true,
+      "pattern": "light",
+      "phase": "cold_start",
+      "response_bytes": 636,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 161,
+      "label": "MC01-entity-at",
+      "latency_ms": 0.212,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 642,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 460,
+      "label": "MC02-find-entity",
+      "latency_ms": 0.773,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 1839,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 61,
+      "label": "MC03-callers-of",
+      "latency_ms": 5.539,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 244,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 796,
+      "label": "MC04-execution-paths-from",
+      "latency_ms": 0.386,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 3183,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": false,
+      "cache_state": "cold",
+      "error": false,
+      "estimated_response_tokens": 568,
+      "label": "MC05-summary",
+      "latency_ms": 7635.296,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 2271,
+      "stats_delta": {
+        "summary_cache_misses_total": 1,
+        "summary_cost_usd": 0.004767,
+        "summary_tokens_input": 419,
+        "summary_tokens_output": 234,
+        "summary_tokens_total": 653
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 91,
+      "label": "MC06-issues-for",
+      "latency_ms": 1.843,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 362,
+      "stats_delta": {
+        "filigree_issues_returned_total": 0,
+        "filigree_requests_total": 1
+      },
+      "tool": "issues_for",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 682,
+      "label": "MC07-neighborhood",
+      "latency_ms": 8.95,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 2726,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 160,
+      "label": "MC08-entity-at",
+      "latency_ms": 0.28,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 637,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 166,
+      "label": "MC09-find-entity",
+      "latency_ms": 0.445,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 662,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 62,
+      "label": "MC10-callers-of",
+      "latency_ms": 5.401,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 245,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": false,
+      "cache_state": "cold",
+      "error": false,
+      "estimated_response_tokens": 595,
+      "label": "MC11-summary",
+      "latency_ms": 7843.519,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 2380,
+      "stats_delta": {
+        "summary_cache_misses_total": 1,
+        "summary_cost_usd": 0.005253,
+        "summary_tokens_input": 406,
+        "summary_tokens_output": 269,
+        "summary_tokens_total": 675
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 654,
+      "label": "MC12-neighborhood",
+      "latency_ms": 10.096,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 2616,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 814,
+      "label": "MC13-execution-paths-from",
+      "latency_ms": 0.387,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 3256,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 91,
+      "label": "MC14-issues-for",
+      "latency_ms": 1.25,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 362,
+      "stats_delta": {
+        "filigree_issues_returned_total": 0,
+        "filigree_requests_total": 1
+      },
+      "tool": "issues_for",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 164,
+      "label": "MC15-entity-at",
+      "latency_ms": 0.2,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 653,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 170,
+      "label": "MC16-find-entity",
+      "latency_ms": 0.385,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 678,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": false,
+      "cache_state": "cold",
+      "error": false,
+      "estimated_response_tokens": 632,
+      "label": "MC17-summary",
+      "latency_ms": 8321.475,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 2528,
+      "stats_delta": {
+        "summary_cache_misses_total": 1,
+        "summary_cost_usd": 0.005943,
+        "summary_tokens_input": 516,
+        "summary_tokens_output": 293,
+        "summary_tokens_total": 809
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 62,
+      "label": "MC18-callers-of",
+      "latency_ms": 11.478,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 245,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 272,
+      "label": "MC19-neighborhood",
+      "latency_ms": 12.556,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 1087,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 910,
+      "label": "MC20-execution-paths-from",
+      "latency_ms": 0.445,
+      "ok": true,
+      "pattern": "medium-cold",
+      "phase": "warmup",
+      "response_bytes": 3638,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 161,
+      "label": "MW01-entity-at",
+      "latency_ms": 0.315,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 643,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 460,
+      "label": "MW02-find-entity",
+      "latency_ms": 0.638,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 1840,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 62,
+      "label": "MW03-callers-of",
+      "latency_ms": 5.05,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 245,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 796,
+      "label": "MW04-execution-paths-from",
+      "latency_ms": 0.359,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 3184,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "warm",
+      "error": false,
+      "estimated_response_tokens": 538,
+      "label": "MW05-summary",
+      "latency_ms": 9.599,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 2151,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 91,
+      "label": "MW06-issues-for",
+      "latency_ms": 1.506,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 362,
+      "stats_delta": {
+        "filigree_issues_returned_total": 0,
+        "filigree_requests_total": 1
+      },
+      "tool": "issues_for",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 682,
+      "label": "MW07-neighborhood",
+      "latency_ms": 8.052,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 2726,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 160,
+      "label": "MW08-entity-at",
+      "latency_ms": 0.318,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 637,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 166,
+      "label": "MW09-find-entity",
+      "latency_ms": 0.441,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 662,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 62,
+      "label": "MW10-callers-of",
+      "latency_ms": 5.305,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 245,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "warm",
+      "error": false,
+      "estimated_response_tokens": 565,
+      "label": "MW11-summary",
+      "latency_ms": 10.602,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 2259,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 654,
+      "label": "MW12-neighborhood",
+      "latency_ms": 8.421,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 2616,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 814,
+      "label": "MW13-execution-paths-from",
+      "latency_ms": 0.414,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 3256,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 91,
+      "label": "MW14-issues-for",
+      "latency_ms": 1.074,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 362,
+      "stats_delta": {
+        "filigree_issues_returned_total": 0,
+        "filigree_requests_total": 1
+      },
+      "tool": "issues_for",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 164,
+      "label": "MW15-entity-at",
+      "latency_ms": 0.237,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 653,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 170,
+      "label": "MW16-find-entity",
+      "latency_ms": 0.397,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 678,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "warm",
+      "error": false,
+      "estimated_response_tokens": 602,
+      "label": "MW17-summary",
+      "latency_ms": 10.64,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 2407,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 62,
+      "label": "MW18-callers-of",
+      "latency_ms": 11.448,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 245,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 272,
+      "label": "MW19-neighborhood",
+      "latency_ms": 13.593,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 1087,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 910,
+      "label": "MW20-execution-paths-from",
+      "latency_ms": 0.389,
+      "ok": true,
+      "pattern": "medium-warm",
+      "phase": "steady_state",
+      "response_bytes": 3638,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 160,
+      "label": "H01-entity-at",
+      "latency_ms": 0.249,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 637,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 459,
+      "label": "H02-find-entity",
+      "latency_ms": 0.585,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1834,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 60,
+      "label": "H03-callers-of",
+      "latency_ms": 4.827,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 239,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 795,
+      "label": "H04-execution-paths-from",
+      "latency_ms": 0.301,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 3178,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "warm",
+      "error": false,
+      "estimated_response_tokens": 537,
+      "label": "H05-summary",
+      "latency_ms": 9.645,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 2145,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 89,
+      "label": "H06-issues-for",
+      "latency_ms": 1.038,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 356,
+      "stats_delta": {
+        "filigree_issues_returned_total": 0,
+        "filigree_requests_total": 1
+      },
+      "tool": "issues_for",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 680,
+      "label": "H07-neighborhood",
+      "latency_ms": 6.91,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 2720,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 158,
+      "label": "H08-entity-at",
+      "latency_ms": 0.231,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 631,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 164,
+      "label": "H09-find-entity",
+      "latency_ms": 0.333,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 656,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 60,
+      "label": "H10-callers-of",
+      "latency_ms": 4.696,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 239,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "warm",
+      "error": false,
+      "estimated_response_tokens": 564,
+      "label": "H11-summary",
+      "latency_ms": 9.473,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 2253,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 653,
+      "label": "H12-neighborhood",
+      "latency_ms": 8.459,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 2610,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 813,
+      "label": "H13-execution-paths-from",
+      "latency_ms": 0.355,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 3250,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 89,
+      "label": "H14-issues-for",
+      "latency_ms": 0.936,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 356,
+      "stats_delta": {
+        "filigree_issues_returned_total": 0,
+        "filigree_requests_total": 1
+      },
+      "tool": "issues_for",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 162,
+      "label": "H15-entity-at",
+      "latency_ms": 0.179,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 647,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 168,
+      "label": "H16-find-entity",
+      "latency_ms": 0.35,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 672,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "warm",
+      "error": false,
+      "estimated_response_tokens": 601,
+      "label": "H17-summary",
+      "latency_ms": 11.616,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 2401,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 60,
+      "label": "H18-callers-of",
+      "latency_ms": 10.366,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 239,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 271,
+      "label": "H19-neighborhood",
+      "latency_ms": 11.91,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1081,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 908,
+      "label": "H20-execution-paths-from",
+      "latency_ms": 0.438,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 3632,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 160,
+      "label": "H21-entity-at",
+      "latency_ms": 0.299,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 637,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 459,
+      "label": "H22-find-entity",
+      "latency_ms": 0.618,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1834,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 60,
+      "label": "H23-callers-of",
+      "latency_ms": 5.215,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 239,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 795,
+      "label": "H24-execution-paths-from",
+      "latency_ms": 0.327,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 3178,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "warm",
+      "error": false,
+      "estimated_response_tokens": 537,
+      "label": "H25-summary",
+      "latency_ms": 9.783,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 2145,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 89,
+      "label": "H26-issues-for",
+      "latency_ms": 1.091,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 356,
+      "stats_delta": {
+        "filigree_issues_returned_total": 0,
+        "filigree_requests_total": 1
+      },
+      "tool": "issues_for",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 680,
+      "label": "H27-neighborhood",
+      "latency_ms": 7.718,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 2720,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 158,
+      "label": "H28-entity-at",
+      "latency_ms": 0.24,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 631,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 164,
+      "label": "H29-find-entity",
+      "latency_ms": 0.367,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 656,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 60,
+      "label": "H30-callers-of",
+      "latency_ms": 5.528,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 239,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "warm",
+      "error": false,
+      "estimated_response_tokens": 564,
+      "label": "H31-summary",
+      "latency_ms": 10.887,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 2253,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 653,
+      "label": "H32-neighborhood",
+      "latency_ms": 7.942,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 2610,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 813,
+      "label": "H33-execution-paths-from",
+      "latency_ms": 0.329,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 3250,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 89,
+      "label": "H34-issues-for",
+      "latency_ms": 1.065,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 356,
+      "stats_delta": {
+        "filigree_issues_returned_total": 0,
+        "filigree_requests_total": 1
+      },
+      "tool": "issues_for",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 162,
+      "label": "H35-entity-at",
+      "latency_ms": 0.229,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 647,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 168,
+      "label": "H36-find-entity",
+      "latency_ms": 0.368,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 672,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "warm",
+      "error": false,
+      "estimated_response_tokens": 601,
+      "label": "H37-summary",
+      "latency_ms": 11.23,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 2401,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 60,
+      "label": "H38-callers-of",
+      "latency_ms": 10.151,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 239,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 271,
+      "label": "H39-neighborhood",
+      "latency_ms": 12.463,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1081,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 908,
+      "label": "H40-execution-paths-from",
+      "latency_ms": 0.388,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 3632,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 160,
+      "label": "H41-entity-at",
+      "latency_ms": 0.215,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 637,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 459,
+      "label": "H42-find-entity",
+      "latency_ms": 0.579,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 1834,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 60,
+      "label": "H43-callers-of",
+      "latency_ms": 4.946,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 239,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 795,
+      "label": "H44-execution-paths-from",
+      "latency_ms": 0.317,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 3178,
+      "stats_delta": {},
+      "tool": "execution_paths_from",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": true,
+      "cache_state": "warm",
+      "error": false,
+      "estimated_response_tokens": 537,
+      "label": "H45-summary",
+      "latency_ms": 9.887,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 2145,
+      "stats_delta": {
+        "summary_cache_hits_total": 1
+      },
+      "tool": "summary",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 89,
+      "label": "H46-issues-for",
+      "latency_ms": 1.128,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 356,
+      "stats_delta": {
+        "filigree_issues_returned_total": 0,
+        "filigree_requests_total": 1
+      },
+      "tool": "issues_for",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 680,
+      "label": "H47-neighborhood",
+      "latency_ms": 7.594,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 2720,
+      "stats_delta": {},
+      "tool": "neighborhood",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 158,
+      "label": "H48-entity-at",
+      "latency_ms": 0.222,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 631,
+      "stats_delta": {},
+      "tool": "entity_at",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 164,
+      "label": "H49-find-entity",
+      "latency_ms": 0.345,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 656,
+      "stats_delta": {},
+      "tool": "find_entity",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "none",
+      "error": false,
+      "estimated_response_tokens": 60,
+      "label": "H50-callers-of",
+      "latency_ms": 5.31,
+      "ok": true,
+      "pattern": "heavy",
+      "phase": "steady_state",
+      "response_bytes": 239,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "inferred",
+      "error": false,
+      "estimated_response_tokens": 1049,
+      "label": "callers-inferred-0",
+      "latency_ms": 18629.247,
+      "ok": true,
+      "pattern": "inferred",
+      "phase": "steady_state",
+      "response_bytes": 4194,
+      "stats_delta": {
+        "inferred_candidate_callers_considered": 5,
+        "inferred_cost_usd": 0.029829,
+        "inferred_dispatch_cache_hits_total": 0,
+        "inferred_dispatch_coalesced_total": 0,
+        "inferred_dispatch_misses_total": 5,
+        "inferred_edges_materialized_total": 0,
+        "inferred_edges_skipped_static_duplicates_total": 0,
+        "inferred_tokens_input": 5393,
+        "inferred_tokens_output": 910,
+        "inferred_tokens_total": 6303
+      },
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "inferred",
+      "error": false,
+      "estimated_response_tokens": 2564,
+      "label": "callers-inferred-1",
+      "latency_ms": 103031.958,
+      "ok": true,
+      "pattern": "inferred",
+      "phase": "steady_state",
+      "response_bytes": 10256,
+      "stats_delta": {
+        "inferred_candidate_callers_considered": 12,
+        "inferred_cost_usd": 0.203826,
+        "inferred_dispatch_cache_hits_total": 0,
+        "inferred_dispatch_coalesced_total": 0,
+        "inferred_dispatch_misses_total": 12,
+        "inferred_edges_materialized_total": 0,
+        "inferred_edges_skipped_static_duplicates_total": 19,
+        "inferred_tokens_input": 48462,
+        "inferred_tokens_output": 3896,
+        "inferred_tokens_total": 52358
+      },
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "inferred",
+      "error": false,
+      "estimated_response_tokens": 709,
+      "label": "callers-inferred-2",
+      "latency_ms": 13623.171,
+      "ok": true,
+      "pattern": "inferred",
+      "phase": "steady_state",
+      "response_bytes": 2834,
+      "stats_delta": {
+        "inferred_candidate_callers_considered": 3,
+        "inferred_cost_usd": 0.022299,
+        "inferred_dispatch_cache_hits_total": 0,
+        "inferred_dispatch_coalesced_total": 0,
+        "inferred_dispatch_misses_total": 3,
+        "inferred_edges_materialized_total": 0,
+        "inferred_edges_skipped_static_duplicates_total": 2,
+        "inferred_tokens_input": 4003,
+        "inferred_tokens_output": 686,
+        "inferred_tokens_total": 4689
+      },
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "inferred",
+      "error": false,
+      "estimated_response_tokens": 5269,
+      "label": "callers-inferred-3",
+      "latency_ms": 282161.029,
+      "ok": true,
+      "pattern": "inferred",
+      "phase": "steady_state",
+      "response_bytes": 21075,
+      "stats_delta": {
+        "inferred_candidate_callers_considered": 27,
+        "inferred_cost_usd": 0.625533,
+        "inferred_dispatch_cache_hits_total": 0,
+        "inferred_dispatch_coalesced_total": 0,
+        "inferred_dispatch_misses_total": 27,
+        "inferred_edges_materialized_total": 25,
+        "inferred_edges_skipped_static_duplicates_total": 55,
+        "inferred_tokens_input": 139771,
+        "inferred_tokens_output": 13748,
+        "inferred_tokens_total": 153519
+      },
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": true
+    },
+    {
+      "cache_hit": null,
+      "cache_state": "inferred",
+      "error": true,
+      "estimated_response_tokens": 84,
+      "label": "callers-inferred-4",
+      "latency_ms": 21462.029,
+      "ok": false,
+      "pattern": "inferred",
+      "phase": "steady_state",
+      "response_bytes": 333,
+      "stats_delta": {},
+      "tool": "callers_of",
+      "truncated": false,
+      "unavailable": false,
+      "unavailable_reason": null,
+      "useful_result": false
+    }
+  ],
+  "skipped_patterns": [],
+  "summary": {
+    "by_pattern": {
+      "heavy": {
+        "available_count": 50,
+        "call_count": 50,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 12.463,
+        "ok_count": 50,
+        "p50_latency_ms": 1.065,
+        "p95_latency_ms": 11.91,
+        "response_size_p50_kb": 0.656,
+        "response_size_p95_kb": 3.547,
+        "response_tokens_p50": 168,
+        "response_tokens_p95": 908,
+        "summary_cache_hit_rate": 1.0,
+        "tokens_total": 0,
+        "tools": {
+          "callers_of": {
+            "available_count": 8,
+            "call_count": 8,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 10.366,
+            "ok_count": 8,
+            "p50_latency_ms": 5.31,
+            "p95_latency_ms": 10.366,
+            "response_size_p50_kb": 0.233,
+            "response_size_p95_kb": 0.233,
+            "response_tokens_p50": 60,
+            "response_tokens_p95": 60,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 0
+          },
+          "entity_at": {
+            "available_count": 8,
+            "call_count": 8,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 0.299,
+            "ok_count": 8,
+            "p50_latency_ms": 0.231,
+            "p95_latency_ms": 0.299,
+            "response_size_p50_kb": 0.622,
+            "response_size_p95_kb": 0.632,
+            "response_tokens_p50": 160,
+            "response_tokens_p95": 162,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 8
+          },
+          "execution_paths_from": {
+            "available_count": 7,
+            "call_count": 7,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 0.438,
+            "ok_count": 7,
+            "p50_latency_ms": 0.329,
+            "p95_latency_ms": 0.438,
+            "response_size_p50_kb": 3.174,
+            "response_size_p95_kb": 3.547,
+            "response_tokens_p50": 813,
+            "response_tokens_p95": 908,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 7
+          },
+          "find_entity": {
+            "available_count": 8,
+            "call_count": 8,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 0.618,
+            "ok_count": 8,
+            "p50_latency_ms": 0.368,
+            "p95_latency_ms": 0.618,
+            "response_size_p50_kb": 0.656,
+            "response_size_p95_kb": 1.791,
+            "response_tokens_p50": 168,
+            "response_tokens_p95": 459,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 8
+          },
+          "issues_for": {
+            "available_count": 5,
+            "call_count": 5,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 1.128,
+            "ok_count": 5,
+            "p50_latency_ms": 1.065,
+            "p95_latency_ms": 1.128,
+            "response_size_p50_kb": 0.348,
+            "response_size_p95_kb": 0.348,
+            "response_tokens_p50": 89,
+            "response_tokens_p95": 89,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 0
+          },
+          "neighborhood": {
+            "available_count": 7,
+            "call_count": 7,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 12.463,
+            "ok_count": 7,
+            "p50_latency_ms": 7.942,
+            "p95_latency_ms": 12.463,
+            "response_size_p50_kb": 2.549,
+            "response_size_p95_kb": 2.656,
+            "response_tokens_p50": 653,
+            "response_tokens_p95": 680,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 7
+          },
+          "summary": {
+            "available_count": 7,
+            "call_count": 7,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 11.616,
+            "ok_count": 7,
+            "p50_latency_ms": 9.887,
+            "p95_latency_ms": 11.616,
+            "response_size_p50_kb": 2.2,
+            "response_size_p95_kb": 2.345,
+            "response_tokens_p50": 564,
+            "response_tokens_p95": 601,
+            "summary_cache_hit_rate": 1.0,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 7
+          }
+        },
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 37
+      },
+      "inferred": {
+        "available_count": 4,
+        "call_count": 5,
+        "cost_usd": 0.881487,
+        "error_count": 1,
+        "max_latency_ms": 282161.029,
+        "ok_count": 4,
+        "p50_latency_ms": 21462.029,
+        "p95_latency_ms": 282161.029,
+        "response_size_p50_kb": 4.096,
+        "response_size_p95_kb": 20.581,
+        "response_tokens_p50": 1049,
+        "response_tokens_p95": 5269,
+        "summary_cache_hit_rate": null,
+        "tokens_total": 216869,
+        "tools": {
+          "callers_of": {
+            "available_count": 4,
+            "call_count": 5,
+            "cost_usd": 0.881487,
+            "error_count": 1,
+            "max_latency_ms": 282161.029,
+            "ok_count": 4,
+            "p50_latency_ms": 21462.029,
+            "p95_latency_ms": 282161.029,
+            "response_size_p50_kb": 4.096,
+            "response_size_p95_kb": 20.581,
+            "response_tokens_p50": 1049,
+            "response_tokens_p95": 5269,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 216869,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 4
+          }
+        },
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 4
+      },
+      "light": {
+        "available_count": 5,
+        "call_count": 5,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 7.57,
+        "ok_count": 5,
+        "p50_latency_ms": 1.034,
+        "p95_latency_ms": 7.57,
+        "response_size_p50_kb": 0.621,
+        "response_size_p95_kb": 2.655,
+        "response_tokens_p50": 159,
+        "response_tokens_p95": 680,
+        "summary_cache_hit_rate": null,
+        "tokens_total": 0,
+        "tools": {
+          "callers_of": {
+            "available_count": 1,
+            "call_count": 1,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 7.236,
+            "ok_count": 1,
+            "p50_latency_ms": 7.236,
+            "p95_latency_ms": 7.236,
+            "response_size_p50_kb": 0.232,
+            "response_size_p95_kb": 0.232,
+            "response_tokens_p50": 60,
+            "response_tokens_p95": 60,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 0
+          },
+          "entity_at": {
+            "available_count": 2,
+            "call_count": 2,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 1.034,
+            "ok_count": 2,
+            "p50_latency_ms": 1.034,
+            "p95_latency_ms": 1.034,
+            "response_size_p50_kb": 0.621,
+            "response_size_p95_kb": 0.621,
+            "response_tokens_p50": 159,
+            "response_tokens_p95": 159,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 2
+          },
+          "find_entity": {
+            "available_count": 1,
+            "call_count": 1,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 0.878,
+            "ok_count": 1,
+            "p50_latency_ms": 0.878,
+            "p95_latency_ms": 0.878,
+            "response_size_p50_kb": 1.79,
+            "response_size_p95_kb": 1.79,
+            "response_tokens_p50": 459,
+            "response_tokens_p95": 459,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 1
+          },
+          "neighborhood": {
+            "available_count": 1,
+            "call_count": 1,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 7.57,
+            "ok_count": 1,
+            "p50_latency_ms": 7.57,
+            "p95_latency_ms": 7.57,
+            "response_size_p50_kb": 2.655,
+            "response_size_p95_kb": 2.655,
+            "response_tokens_p50": 680,
+            "response_tokens_p95": 680,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 1
+          }
+        },
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 4
+      },
+      "medium-cold": {
+        "available_count": 20,
+        "call_count": 20,
+        "cost_usd": 0.015963,
+        "error_count": 0,
+        "max_latency_ms": 8321.475,
+        "ok_count": 20,
+        "p50_latency_ms": 1.843,
+        "p95_latency_ms": 8321.475,
+        "response_size_p50_kb": 1.062,
+        "response_size_p95_kb": 3.553,
+        "response_tokens_p50": 272,
+        "response_tokens_p95": 910,
+        "summary_cache_hit_rate": 0.0,
+        "tokens_total": 2137,
+        "tools": {
+          "callers_of": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 11.478,
+            "ok_count": 3,
+            "p50_latency_ms": 5.539,
+            "p95_latency_ms": 11.478,
+            "response_size_p50_kb": 0.239,
+            "response_size_p95_kb": 0.239,
+            "response_tokens_p50": 62,
+            "response_tokens_p95": 62,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 0
+          },
+          "entity_at": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 0.28,
+            "ok_count": 3,
+            "p50_latency_ms": 0.212,
+            "p95_latency_ms": 0.28,
+            "response_size_p50_kb": 0.627,
+            "response_size_p95_kb": 0.638,
+            "response_tokens_p50": 161,
+            "response_tokens_p95": 164,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 3
+          },
+          "execution_paths_from": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 0.445,
+            "ok_count": 3,
+            "p50_latency_ms": 0.387,
+            "p95_latency_ms": 0.445,
+            "response_size_p50_kb": 3.18,
+            "response_size_p95_kb": 3.553,
+            "response_tokens_p50": 814,
+            "response_tokens_p95": 910,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 3
+          },
+          "find_entity": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 0.773,
+            "ok_count": 3,
+            "p50_latency_ms": 0.445,
+            "p95_latency_ms": 0.773,
+            "response_size_p50_kb": 0.662,
+            "response_size_p95_kb": 1.796,
+            "response_tokens_p50": 170,
+            "response_tokens_p95": 460,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 3
+          },
+          "issues_for": {
+            "available_count": 2,
+            "call_count": 2,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 1.843,
+            "ok_count": 2,
+            "p50_latency_ms": 1.843,
+            "p95_latency_ms": 1.843,
+            "response_size_p50_kb": 0.354,
+            "response_size_p95_kb": 0.354,
+            "response_tokens_p50": 91,
+            "response_tokens_p95": 91,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 0
+          },
+          "neighborhood": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 12.556,
+            "ok_count": 3,
+            "p50_latency_ms": 10.096,
+            "p95_latency_ms": 12.556,
+            "response_size_p50_kb": 2.555,
+            "response_size_p95_kb": 2.662,
+            "response_tokens_p50": 654,
+            "response_tokens_p95": 682,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 3
+          },
+          "summary": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.015963,
+            "error_count": 0,
+            "max_latency_ms": 8321.475,
+            "ok_count": 3,
+            "p50_latency_ms": 7843.519,
+            "p95_latency_ms": 8321.475,
+            "response_size_p50_kb": 2.324,
+            "response_size_p95_kb": 2.469,
+            "response_tokens_p50": 595,
+            "response_tokens_p95": 632,
+            "summary_cache_hit_rate": 0.0,
+            "tokens_total": 2137,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 3
+          }
+        },
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 15
+      },
+      "medium-warm": {
+        "available_count": 20,
+        "call_count": 20,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 13.593,
+        "ok_count": 20,
+        "p50_latency_ms": 1.506,
+        "p95_latency_ms": 13.593,
+        "response_size_p50_kb": 1.062,
+        "response_size_p95_kb": 3.553,
+        "response_tokens_p50": 272,
+        "response_tokens_p95": 910,
+        "summary_cache_hit_rate": 1.0,
+        "tokens_total": 0,
+        "tools": {
+          "callers_of": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 11.448,
+            "ok_count": 3,
+            "p50_latency_ms": 5.305,
+            "p95_latency_ms": 11.448,
+            "response_size_p50_kb": 0.239,
+            "response_size_p95_kb": 0.239,
+            "response_tokens_p50": 62,
+            "response_tokens_p95": 62,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 0
+          },
+          "entity_at": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 0.318,
+            "ok_count": 3,
+            "p50_latency_ms": 0.315,
+            "p95_latency_ms": 0.318,
+            "response_size_p50_kb": 0.628,
+            "response_size_p95_kb": 0.638,
+            "response_tokens_p50": 161,
+            "response_tokens_p95": 164,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 3
+          },
+          "execution_paths_from": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 0.414,
+            "ok_count": 3,
+            "p50_latency_ms": 0.389,
+            "p95_latency_ms": 0.414,
+            "response_size_p50_kb": 3.18,
+            "response_size_p95_kb": 3.553,
+            "response_tokens_p50": 814,
+            "response_tokens_p95": 910,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 3
+          },
+          "find_entity": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 0.638,
+            "ok_count": 3,
+            "p50_latency_ms": 0.441,
+            "p95_latency_ms": 0.638,
+            "response_size_p50_kb": 0.662,
+            "response_size_p95_kb": 1.797,
+            "response_tokens_p50": 170,
+            "response_tokens_p95": 460,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 3
+          },
+          "issues_for": {
+            "available_count": 2,
+            "call_count": 2,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 1.506,
+            "ok_count": 2,
+            "p50_latency_ms": 1.506,
+            "p95_latency_ms": 1.506,
+            "response_size_p50_kb": 0.354,
+            "response_size_p95_kb": 0.354,
+            "response_tokens_p50": 91,
+            "response_tokens_p95": 91,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 0
+          },
+          "neighborhood": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 13.593,
+            "ok_count": 3,
+            "p50_latency_ms": 8.421,
+            "p95_latency_ms": 13.593,
+            "response_size_p50_kb": 2.555,
+            "response_size_p95_kb": 2.662,
+            "response_tokens_p50": 654,
+            "response_tokens_p95": 682,
+            "summary_cache_hit_rate": null,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 3
+          },
+          "summary": {
+            "available_count": 3,
+            "call_count": 3,
+            "cost_usd": 0.0,
+            "error_count": 0,
+            "max_latency_ms": 10.64,
+            "ok_count": 3,
+            "p50_latency_ms": 10.602,
+            "p95_latency_ms": 10.64,
+            "response_size_p50_kb": 2.206,
+            "response_size_p95_kb": 2.351,
+            "response_tokens_p50": 565,
+            "response_tokens_p95": 602,
+            "summary_cache_hit_rate": 1.0,
+            "tokens_total": 0,
+            "truncation_count": 0,
+            "unavailable_count": 0,
+            "useful_result_count": 3
+          }
+        },
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 15
+      }
+    },
+    "by_phase": {
+      "cold_start": {
+        "available_count": 5,
+        "call_count": 5,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 7.57,
+        "ok_count": 5,
+        "p50_latency_ms": 1.034,
+        "p95_latency_ms": 7.57,
+        "response_size_p50_kb": 0.621,
+        "response_size_p95_kb": 2.655,
+        "response_tokens_p50": 159,
+        "response_tokens_p95": 680,
+        "summary_cache_hit_rate": null,
+        "tokens_total": 0,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 4
+      },
+      "steady_state": {
+        "available_count": 74,
+        "call_count": 75,
+        "cost_usd": 0.881487,
+        "error_count": 1,
+        "max_latency_ms": 282161.029,
+        "ok_count": 74,
+        "p50_latency_ms": 1.128,
+        "p95_latency_ms": 21462.029,
+        "response_size_p50_kb": 1.056,
+        "response_size_p95_kb": 4.096,
+        "response_tokens_p50": 271,
+        "response_tokens_p95": 1049,
+        "summary_cache_hit_rate": 1.0,
+        "tokens_total": 216869,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 56
+      },
+      "warmup": {
+        "available_count": 20,
+        "call_count": 20,
+        "cost_usd": 0.015963,
+        "error_count": 0,
+        "max_latency_ms": 8321.475,
+        "ok_count": 20,
+        "p50_latency_ms": 1.843,
+        "p95_latency_ms": 8321.475,
+        "response_size_p50_kb": 1.062,
+        "response_size_p95_kb": 3.553,
+        "response_tokens_p50": 272,
+        "response_tokens_p95": 910,
+        "summary_cache_hit_rate": 0.0,
+        "tokens_total": 2137,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 15
+      }
+    },
+    "by_tool": {
+      "callers_of": {
+        "available_count": 19,
+        "call_count": 20,
+        "cost_usd": 0.881487,
+        "error_count": 1,
+        "max_latency_ms": 282161.029,
+        "ok_count": 19,
+        "p50_latency_ms": 7.236,
+        "p95_latency_ms": 282161.029,
+        "response_size_p50_kb": 0.239,
+        "response_size_p95_kb": 20.581,
+        "response_tokens_p50": 62,
+        "response_tokens_p95": 5269,
+        "summary_cache_hit_rate": null,
+        "tokens_total": 216869,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 4
+      },
+      "entity_at": {
+        "available_count": 16,
+        "call_count": 16,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 1.034,
+        "ok_count": 16,
+        "p50_latency_ms": 0.24,
+        "p95_latency_ms": 1.034,
+        "response_size_p50_kb": 0.622,
+        "response_size_p95_kb": 0.638,
+        "response_tokens_p50": 160,
+        "response_tokens_p95": 164,
+        "summary_cache_hit_rate": null,
+        "tokens_total": 0,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 16
+      },
+      "execution_paths_from": {
+        "available_count": 13,
+        "call_count": 13,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 0.445,
+        "ok_count": 13,
+        "p50_latency_ms": 0.386,
+        "p95_latency_ms": 0.445,
+        "response_size_p50_kb": 3.174,
+        "response_size_p95_kb": 3.553,
+        "response_tokens_p50": 813,
+        "response_tokens_p95": 910,
+        "summary_cache_hit_rate": null,
+        "tokens_total": 0,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 13
+      },
+      "find_entity": {
+        "available_count": 15,
+        "call_count": 15,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 0.878,
+        "ok_count": 15,
+        "p50_latency_ms": 0.441,
+        "p95_latency_ms": 0.878,
+        "response_size_p50_kb": 0.662,
+        "response_size_p95_kb": 1.797,
+        "response_tokens_p50": 170,
+        "response_tokens_p95": 460,
+        "summary_cache_hit_rate": null,
+        "tokens_total": 0,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 15
+      },
+      "issues_for": {
+        "available_count": 9,
+        "call_count": 9,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 1.843,
+        "ok_count": 9,
+        "p50_latency_ms": 1.091,
+        "p95_latency_ms": 1.843,
+        "response_size_p50_kb": 0.348,
+        "response_size_p95_kb": 0.354,
+        "response_tokens_p50": 89,
+        "response_tokens_p95": 91,
+        "summary_cache_hit_rate": null,
+        "tokens_total": 0,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 0
+      },
+      "neighborhood": {
+        "available_count": 14,
+        "call_count": 14,
+        "cost_usd": 0.0,
+        "error_count": 0,
+        "max_latency_ms": 13.593,
+        "ok_count": 14,
+        "p50_latency_ms": 8.459,
+        "p95_latency_ms": 13.593,
+        "response_size_p50_kb": 2.555,
+        "response_size_p95_kb": 2.662,
+        "response_tokens_p50": 654,
+        "response_tokens_p95": 682,
+        "summary_cache_hit_rate": null,
+        "tokens_total": 0,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 14
+      },
+      "summary": {
+        "available_count": 13,
+        "call_count": 13,
+        "cost_usd": 0.015963,
+        "error_count": 0,
+        "max_latency_ms": 8321.475,
+        "ok_count": 13,
+        "p50_latency_ms": 10.64,
+        "p95_latency_ms": 8321.475,
+        "response_size_p50_kb": 2.206,
+        "response_size_p95_kb": 2.469,
+        "response_tokens_p50": 565,
+        "response_tokens_p95": 632,
+        "summary_cache_hit_rate": 0.7692,
+        "tokens_total": 2137,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 13
+      }
+    },
+    "gate": {
+      "steady_state_storage_backed": {
+        "available_count": 57,
+        "call_count": 58,
+        "cost_usd": 0.881487,
+        "error_count": 1,
+        "max_latency_ms": 282161.029,
+        "ok_count": 57,
+        "p50_latency_ms": 0.585,
+        "p95_latency_ms": 103031.958,
+        "response_size_p50_kb": 0.662,
+        "response_size_p95_kb": 10.016,
+        "response_tokens_p50": 170,
+        "response_tokens_p95": 2564,
+        "summary_cache_hit_rate": null,
+        "tokens_total": 216869,
+        "truncation_count": 0,
+        "unavailable_count": 0,
+        "useful_result_count": 46
+      }
+    },
+    "overall": {
+      "available_count": 99,
+      "call_count": 100,
+      "cost_usd": 0.89745,
+      "error_count": 1,
+      "max_latency_ms": 282161.029,
+      "ok_count": 99,
+      "p50_latency_ms": 1.25,
+      "p95_latency_ms": 13623.171,
+      "response_size_p50_kb": 1.056,
+      "response_size_p95_kb": 3.553,
+      "response_tokens_p50": 271,
+      "response_tokens_p95": 910,
+      "summary_cache_hit_rate": 0.7692,
+      "tokens_total": 219006,
+      "truncation_count": 0,
+      "unavailable_count": 0,
+      "useful_result_count": 75
+    }
+  },
+  "summary_miss_then_hit": true,
+  "tools": [
+    "entity_at",
+    "find_entity",
+    "callers_of",
+    "execution_paths_from",
+    "summary",
+    "issues_for",
+    "neighborhood"
+  ],
+  "tools_list_latency_ms": 0.182
+}
