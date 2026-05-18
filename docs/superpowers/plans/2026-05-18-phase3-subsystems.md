@@ -282,20 +282,20 @@ not emit a finding.
 **Scope:** Qualify the graph crate and create a tiny adapter boundary before
 any analyze integration. This task does not write database rows.
 
-- [ ] Write failing unit tests in `clustering.rs`:
+- [x] Write failing unit tests in `clustering.rs`:
   - `fixed_seed_leiden_is_byte_stable`
   - `directed_weighted_edges_affect_partition`
   - `louvain_fallback_is_config_selectable`
   - `cluster_hash_uses_sha256_sorted_member_ids_truncated_to_12`
-- [ ] Add `sha2 = "0.10"` and the selected graph crate to workspace deps.
-- [ ] Implement:
+- [x] Add `sha2 = "0.10"` and the selected graph crate to workspace deps.
+- [x] Implement:
   - `ClusterAlgorithm::{Leiden, Louvain}`
   - `ModuleGraph { modules, edges }`
   - `ClusterConfig { algorithm, seed, resolution, max_iterations, min_cluster_size }`
   - `ClusterResult { communities, modularity_score, algorithm_used }`
   - `cluster_modules(&ModuleGraph, &ClusterConfig) -> anyhow::Result<ClusterResult>`
   - `cluster_hash(member_ids: &[String]) -> String`
-- [ ] Run qualification gates:
+- [x] Run qualification gates:
 
 ```bash
 cargo test -p clarion-cli clustering -- --nocapture

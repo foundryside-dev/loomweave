@@ -24,11 +24,13 @@ dotenvy.workspace = true
 ignore.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+xgraph.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
