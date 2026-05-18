@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use clarion_core::{
+    ClaudeCliProvider, ClaudeCliProviderConfig, CodexCliProvider, CodexCliProviderConfig,
     LlmProvider, OpenRouterProvider, OpenRouterProviderConfig, Recording, RecordingProvider,
 };
 use clarion_mcp::config::{McpConfig, ProviderSelection, select_provider_with_env};
@@ -114,6 +115,38 @@ fn build_llm_provider(
                 title: config.llm.openrouter.attribution.title.clone(),
             })
             .context("build OpenRouter LLM provider")?;
+            Ok(Some(Arc::new(provider)))
+        }
+        ProviderSelection::CodexCli => {
+            let provider = CodexCliProvider::from_config(CodexCliProviderConfig {
+                executable: config.llm.codex_cli.executable.clone(),
+                project_root: project_root.to_owned(),
+                model_id: config.llm.model_id.clone(),
+                model: config.llm.codex_cli.model.clone(),
+                profile: config.llm.codex_cli.profile.clone(),
+                sandbox: config.llm.codex_cli.sandbox.clone(),
+                timeout_seconds: config.llm.codex_cli.timeout_seconds,
+            })
+            .context("build Codex CLI LLM provider")?;
+            Ok(Some(Arc::new(provider)))
+        }
+        ProviderSelection::ClaudeCli => {
+            let provider = ClaudeCliProvider::from_config(ClaudeCliProviderConfig {
+                executable: config.llm.claude_cli.executable.clone(),
+                project_root: project_root.to_owned(),
+                model_id: config.llm.model_id.clone(),
+                model: config.llm.claude_cli.model.clone(),
+                permission_mode: config.llm.claude_cli.permission_mode.clone(),
+                tools: config.llm.claude_cli.tools.clone(),
+                timeout_seconds: config.llm.claude_cli.timeout_seconds,
+                max_turns: config.llm.claude_cli.max_turns,
+                no_session_persistence: config.llm.claude_cli.no_session_persistence,
+                exclude_dynamic_system_prompt_sections: config
+                    .llm
+                    .claude_cli
+                    .exclude_dynamic_system_prompt_sections,
+            })
+            .context("build Claude CLI LLM provider")?;
             Ok(Some(Arc::new(provider)))
         }
     }

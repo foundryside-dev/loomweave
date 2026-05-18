@@ -58,6 +58,8 @@ pub struct LlmConfig {
     pub session_token_ceiling: u64,
     pub model_id: String,
     pub openrouter: OpenRouterConfig,
+    pub codex_cli: CodexCliConfig,
+    pub claude_cli: ClaudeCliConfig,
     pub recording_fixture_path: Option<String>,
     pub max_inferred_edges_per_caller: u32,
     pub cache_max_age_days: u32,
@@ -73,6 +75,8 @@ impl Default for LlmConfig {
             session_token_ceiling: 1_000_000,
             model_id: "anthropic/claude-sonnet-4.6".to_owned(),
             openrouter: OpenRouterConfig::default(),
+            codex_cli: CodexCliConfig::default(),
+            claude_cli: ClaudeCliConfig::default(),
             recording_fixture_path: None,
             max_inferred_edges_per_caller: 8,
             cache_max_age_days: 180,
@@ -86,6 +90,10 @@ impl Default for LlmConfig {
 pub enum LlmProviderKind {
     #[serde(rename = "openrouter", alias = "open_router")]
     OpenRouter,
+    #[serde(rename = "codex_cli", alias = "codex")]
+    CodexCli,
+    #[serde(rename = "claude_cli", alias = "claude_code")]
+    ClaudeCli,
     Anthropic,
     Recording,
 }
@@ -124,6 +132,56 @@ impl Default for OpenRouterAttributionConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct CodexCliConfig {
+    pub executable: String,
+    pub model: Option<String>,
+    pub profile: Option<String>,
+    pub sandbox: String,
+    pub timeout_seconds: u64,
+}
+
+impl Default for CodexCliConfig {
+    fn default() -> Self {
+        Self {
+            executable: "codex".to_owned(),
+            model: None,
+            profile: None,
+            sandbox: "read-only".to_owned(),
+            timeout_seconds: 300,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct ClaudeCliConfig {
+    pub executable: String,
+    pub model: Option<String>,
+    pub permission_mode: String,
+    pub tools: Vec<String>,
+    pub timeout_seconds: u64,
+    pub max_turns: u32,
+    pub no_session_persistence: bool,
+    pub exclude_dynamic_system_prompt_sections: bool,
+}
+
+impl Default for ClaudeCliConfig {
+    fn default() -> Self {
+        Self {
+            executable: "claude".to_owned(),
+            model: None,
+            permission_mode: "plan".to_owned(),
+            tools: Vec::new(),
+            timeout_seconds: 300,
+            max_turns: 2,
+            no_session_persistence: true,
+            exclude_dynamic_system_prompt_sections: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default)]
 pub struct IntegrationsConfig {
@@ -157,6 +215,8 @@ pub enum ProviderSelection {
     Disabled,
     Recording,
     OpenRouter { api_key_env: String },
+    CodexCli,
+    ClaudeCli,
 }
 
 pub fn select_provider_with_env<F>(
@@ -192,6 +252,20 @@ where
             Ok(ProviderSelection::OpenRouter {
                 api_key_env: env_var,
             })
+        }
+        LlmProviderKind::CodexCli => {
+            let live_env_opt_in = env_lookup("CLARION_LLM_LIVE").as_deref() == Some("1");
+            if !config.llm.allow_live_provider && !live_env_opt_in {
+                return Ok(ProviderSelection::Disabled);
+            }
+            Ok(ProviderSelection::CodexCli)
+        }
+        LlmProviderKind::ClaudeCli => {
+            let live_env_opt_in = env_lookup("CLARION_LLM_LIVE").as_deref() == Some("1");
+            if !config.llm.allow_live_provider && !live_env_opt_in {
+                return Ok(ProviderSelection::Disabled);
+            }
+            Ok(ProviderSelection::ClaudeCli)
         }
     }
 }
@@ -340,6 +414,117 @@ llm_policy:
                 api_key_env: "OPENROUTER_API_KEY".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn codex_cli_provider_requires_live_opt_in_but_no_api_key() {
+        let cfg = McpConfig::from_yaml_str(
+            r"
+llm_policy:
+  enabled: true
+  provider: codex_cli
+  allow_live_provider: true
+  model_id: codex-cli-default
+  codex_cli:
+    executable: /tmp/fake-codex
+    model: gpt-5.5
+    profile: clarion
+    sandbox: read-only
+    timeout_seconds: 30
+",
+        )
+        .expect("parse Codex CLI provider config");
+
+        assert_eq!(cfg.llm.provider, LlmProviderKind::CodexCli);
+        assert_eq!(cfg.llm.model_id, "codex-cli-default");
+        assert_eq!(cfg.llm.codex_cli.executable, "/tmp/fake-codex");
+        assert_eq!(cfg.llm.codex_cli.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(cfg.llm.codex_cli.profile.as_deref(), Some("clarion"));
+        assert_eq!(cfg.llm.codex_cli.sandbox, "read-only");
+        assert_eq!(cfg.llm.codex_cli.timeout_seconds, 30);
+
+        let selected = select_provider_with_env(&cfg, |_| None).expect("provider selection");
+        assert_eq!(selected, ProviderSelection::CodexCli);
+    }
+
+    #[test]
+    fn codex_cli_provider_stays_disabled_without_live_opt_in() {
+        let cfg = McpConfig {
+            llm: LlmConfig {
+                enabled: true,
+                provider: LlmProviderKind::CodexCli,
+                ..LlmConfig::default()
+            },
+            integrations: IntegrationsConfig::default(),
+        };
+
+        let selected = select_provider_with_env(&cfg, |_| None).expect("provider selection");
+        assert_eq!(selected, ProviderSelection::Disabled);
+
+        let env_selected = select_provider_with_env(&cfg, |name| {
+            (name == "CLARION_LLM_LIVE").then(|| "1".to_owned())
+        })
+        .expect("provider selection via env opt-in");
+        assert_eq!(env_selected, ProviderSelection::CodexCli);
+    }
+
+    #[test]
+    fn claude_cli_provider_requires_live_opt_in_but_no_api_key() {
+        let cfg = McpConfig::from_yaml_str(
+            r#"
+llm_policy:
+  enabled: true
+  provider: claude_cli
+  allow_live_provider: true
+  model_id: claude-code-default
+  claude_cli:
+    executable: /tmp/fake-claude
+    model: claude-sonnet-4-6
+    permission_mode: plan
+    tools: ["Read", "Glob", "Grep"]
+    timeout_seconds: 45
+    max_turns: 2
+    no_session_persistence: true
+"#,
+        )
+        .expect("parse Claude CLI provider config");
+
+        assert_eq!(cfg.llm.provider, LlmProviderKind::ClaudeCli);
+        assert_eq!(cfg.llm.model_id, "claude-code-default");
+        assert_eq!(cfg.llm.claude_cli.executable, "/tmp/fake-claude");
+        assert_eq!(
+            cfg.llm.claude_cli.model.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(cfg.llm.claude_cli.permission_mode, "plan");
+        assert_eq!(cfg.llm.claude_cli.tools, vec!["Read", "Glob", "Grep"]);
+        assert_eq!(cfg.llm.claude_cli.timeout_seconds, 45);
+        assert_eq!(cfg.llm.claude_cli.max_turns, 2);
+        assert!(cfg.llm.claude_cli.no_session_persistence);
+
+        let selected = select_provider_with_env(&cfg, |_| None).expect("provider selection");
+        assert_eq!(selected, ProviderSelection::ClaudeCli);
+    }
+
+    #[test]
+    fn claude_cli_provider_stays_disabled_without_live_opt_in() {
+        let cfg = McpConfig {
+            llm: LlmConfig {
+                enabled: true,
+                provider: LlmProviderKind::ClaudeCli,
+                ..LlmConfig::default()
+            },
+            integrations: IntegrationsConfig::default(),
+        };
+
+        let selected = select_provider_with_env(&cfg, |_| None).expect("provider selection");
+        assert_eq!(selected, ProviderSelection::Disabled);
+
+        let env_selected = select_provider_with_env(&cfg, |name| {
+            (name == "CLARION_LLM_LIVE").then(|| "1".to_owned())
+        })
+        .expect("provider selection via env opt-in");
+        assert_eq!(env_selected, ProviderSelection::ClaudeCli);
     }
 
     #[test]

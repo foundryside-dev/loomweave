@@ -1,7 +1,12 @@
 //! LLM provider surface for WP6 and MCP on-demand tools.
 
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -9,6 +14,8 @@ use thiserror::Error;
 
 pub const LEAF_SUMMARY_PROMPT_TEMPLATE_ID: &str = "leaf-v1";
 pub const INFERRED_CALLS_PROMPT_VERSION: &str = "inferred-calls-v1";
+const AGENT_PROVIDER_PROMPT_VERSION: &str = "clarion-agent-provider-v1";
+const CLAUDE_CLI_PRINT_PROMPT: &str = "You are Clarion's local Claude Code LLM provider. Read the Clarion provider prompt from stdin, complete that exact task, and return only the validated JSON object.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LlmPurpose {
@@ -30,6 +37,8 @@ pub struct LlmResponse {
     pub model_id: String,
     pub output_json: String,
     pub input_tokens: u32,
+    #[serde(default)]
+    pub cached_input_tokens: u32,
     pub output_tokens: u32,
     pub total_tokens: u32,
     pub cost_usd: f64,
@@ -45,7 +54,7 @@ pub enum LlmProviderError {
     #[error("recording fixture has no response for prompt {prompt_id:?} on model {model_id:?}")]
     MissingRecording { prompt_id: String, model_id: String },
 
-    #[error("live OpenRouter provider requires explicit opt-in")]
+    #[error("live LLM provider requires explicit opt-in")]
     LiveProviderNotAllowed,
 
     #[error("live OpenRouter provider requires an API key")]
@@ -64,7 +73,13 @@ pub enum LlmProviderError {
         retry_after_seconds: Option<u64>,
     },
 
-    #[error("invalid live OpenRouter response: {message}")]
+    #[error("LLM CLI invocation failed: {message}")]
+    Cli { message: String, retryable: bool },
+
+    #[error("LLM CLI invocation timed out after {timeout_seconds} seconds")]
+    Timeout { timeout_seconds: u64 },
+
+    #[error("invalid live LLM provider response: {message}")]
     InvalidResponse { message: String, retryable: bool },
 }
 
@@ -76,7 +91,9 @@ impl LlmProviderError {
             }
             Self::Http { retryable, .. }
             | Self::Provider { retryable, .. }
+            | Self::Cli { retryable, .. }
             | Self::InvalidResponse { retryable, .. } => *retryable,
+            Self::Timeout { .. } => true,
         }
     }
 }
@@ -87,6 +104,32 @@ pub trait LlmProvider: Send + Sync {
     fn estimate_tokens(&self, request: &LlmRequest) -> u64;
     fn tier_to_model(&self, tier: &str) -> Option<&str>;
     fn caching_model(&self) -> CachingModel;
+}
+
+pub fn build_coding_agent_provider_prompt(request: &LlmRequest) -> String {
+    format!(
+        "Prompt contract: {prompt_version}\n\
+         You are Clarion's coding-agent LLM provider for repository graph enrichment.\n\
+         Clarion has already selected the source excerpt, entity metadata, unresolved call sites, and candidate graph context needed for this task.\n\
+         Follow these rules exactly:\n\
+         1. Use only the evidence inside <clarion_request>. Do not inspect additional files, browse, run commands, edit files, or ask follow-up questions.\n\
+         2. Return exactly one JSON object matching the structured-output schema supplied by the caller. Do not wrap it in Markdown or prose.\n\
+         3. Reason privately if needed, but do not expose hidden reasoning. Put only concise evidence summaries in output fields that ask for rationale or relationships.\n\
+         4. When evidence is absent, prefer empty strings for optional prose fields and empty arrays for collection fields instead of guessing.\n\
+         5. Keep stable field names and JSON types; downstream Clarion storage parses the response mechanically.\n\
+         Task type: {task_type}\n\
+         Prompt template: {prompt_id}\n\
+         Task guidance:\n\
+         {task_guidance}\n\
+         <clarion_request>\n\
+         {prompt}\n\
+         </clarion_request>\n",
+        prompt_version = AGENT_PROVIDER_PROMPT_VERSION,
+        task_type = agent_task_type(&request.purpose),
+        prompt_id = request.prompt_id,
+        task_guidance = agent_task_guidance(&request.purpose),
+        prompt = request.prompt
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -272,6 +315,10 @@ impl LlmProvider for OpenRouterProvider {
             model_id: completion.model,
             output_json,
             input_tokens: usage.prompt,
+            cached_input_tokens: usage
+                .prompt_tokens_details
+                .as_ref()
+                .map_or(0, |details| details.cached_tokens),
             output_tokens: usage.completion,
             total_tokens: usage.total,
             cost_usd: usage.cost.unwrap_or(0.0),
@@ -280,6 +327,413 @@ impl LlmProvider for OpenRouterProvider {
 
     fn estimate_tokens(&self, request: &LlmRequest) -> u64 {
         u64::from(estimate_text_tokens(&request.prompt)) + u64::from(request.max_output_tokens)
+    }
+
+    fn tier_to_model(&self, tier: &str) -> Option<&str> {
+        match tier {
+            "summary" | "inferred_edges" => Some(self.model_id.as_str()),
+            _ => None,
+        }
+    }
+
+    fn caching_model(&self) -> CachingModel {
+        CachingModel::OpenAiChatCompletions
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexCliProviderConfig {
+    pub executable: String,
+    pub project_root: PathBuf,
+    pub model_id: String,
+    pub model: Option<String>,
+    pub profile: Option<String>,
+    pub sandbox: String,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexCliProvider {
+    executable: String,
+    project_root: PathBuf,
+    model_id: String,
+    model: Option<String>,
+    profile: Option<String>,
+    sandbox: String,
+    timeout: Duration,
+    timeout_seconds: u64,
+}
+
+impl CodexCliProvider {
+    pub fn from_config(config: CodexCliProviderConfig) -> Result<Self, LlmProviderError> {
+        if config.executable.trim().is_empty() {
+            return Err(LlmProviderError::Cli {
+                message: "Codex CLI executable must not be blank".to_owned(),
+                retryable: false,
+            });
+        }
+        if config.model_id.trim().is_empty() {
+            return Err(LlmProviderError::Cli {
+                message: "Codex CLI model_id must not be blank".to_owned(),
+                retryable: false,
+            });
+        }
+        if config.sandbox.trim().is_empty() {
+            return Err(LlmProviderError::Cli {
+                message: "Codex CLI sandbox must not be blank".to_owned(),
+                retryable: false,
+            });
+        }
+        if config.timeout_seconds == 0 {
+            return Err(LlmProviderError::Cli {
+                message: "Codex CLI timeout_seconds must be greater than zero".to_owned(),
+                retryable: false,
+            });
+        }
+
+        Ok(Self {
+            executable: config.executable,
+            project_root: config.project_root,
+            model_id: config.model_id,
+            model: config.model.filter(|model| !model.trim().is_empty()),
+            profile: config.profile.filter(|profile| !profile.trim().is_empty()),
+            sandbox: config.sandbox,
+            timeout: Duration::from_secs(config.timeout_seconds),
+            timeout_seconds: config.timeout_seconds,
+        })
+    }
+
+    fn invoke_with_temp_files(
+        &self,
+        request: LlmRequest,
+        output_path: &Path,
+        schema_path: &Path,
+    ) -> Result<LlmResponse, LlmProviderError> {
+        let schema = codex_output_schema_for_purpose(&request.purpose);
+        let schema_json = serde_json::to_vec_pretty(&schema).map_err(|err| {
+            LlmProviderError::InvalidResponse {
+                message: format!("serialize Codex output schema: {err}"),
+                retryable: false,
+            }
+        })?;
+        fs::write(schema_path, schema_json).map_err(|err| LlmProviderError::Cli {
+            message: format!("write Codex output schema {}: {err}", schema_path.display()),
+            retryable: false,
+        })?;
+        let provider_prompt = build_coding_agent_provider_prompt(&request);
+
+        let mut command = Command::new(&self.executable);
+        command
+            .arg("exec")
+            .arg("--sandbox")
+            .arg(&self.sandbox)
+            .arg("-c")
+            .arg("approval_policy=\"never\"")
+            .arg("--json")
+            .arg("--cd")
+            .arg(&self.project_root)
+            .arg("--output-last-message")
+            .arg(output_path)
+            .arg("--output-schema")
+            .arg(schema_path);
+        if let Some(profile) = &self.profile {
+            command.arg("--profile").arg(profile);
+        }
+        if let Some(model) = &self.model {
+            command.arg("--model").arg(model);
+        }
+        command
+            .arg("-")
+            .current_dir(&self.project_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = command.spawn().map_err(|err| LlmProviderError::Cli {
+            message: format!("spawn Codex CLI {}: {err}", self.executable),
+            retryable: false,
+        })?;
+
+        let stdout_reader = take_reader(&mut child.stdout, "stdout")?;
+        let stderr_reader = take_reader(&mut child.stderr, "stderr")?;
+        if let Err(err) = write_child_stdin(&mut child, &provider_prompt) {
+            let _ = child.kill();
+            return Err(err);
+        }
+
+        let status = wait_for_child(&mut child, self.timeout, self.timeout_seconds)?;
+        let stdout = join_reader(stdout_reader, "stdout")?;
+        let stderr = join_reader(stderr_reader, "stderr")?;
+
+        if !status.success() {
+            return Err(LlmProviderError::Cli {
+                message: format!(
+                    "codex exec exited with {status}: {}",
+                    truncate_for_error(&String::from_utf8_lossy(&stderr))
+                ),
+                retryable: codex_status_retryable(status),
+            });
+        }
+
+        let output_json =
+            fs::read_to_string(output_path).map_err(|err| LlmProviderError::InvalidResponse {
+                message: format!(
+                    "read Codex output-last-message {}: {err}",
+                    output_path.display()
+                ),
+                retryable: true,
+            })?;
+        let output_json = output_json.trim().to_owned();
+        if output_json.is_empty() {
+            return Err(LlmProviderError::InvalidResponse {
+                message: "Codex output-last-message was empty".to_owned(),
+                retryable: true,
+            });
+        }
+        serde_json::from_str::<Value>(&output_json).map_err(|err| {
+            LlmProviderError::InvalidResponse {
+                message: format!("Codex output was not valid JSON: {err}"),
+                retryable: true,
+            }
+        })?;
+
+        let usage = parse_codex_jsonl_usage(&stdout);
+        let input_tokens = usage
+            .input_tokens
+            .unwrap_or_else(|| estimate_text_tokens(&request.prompt));
+        let output_tokens = usage
+            .output_tokens
+            .unwrap_or_else(|| estimate_text_tokens(&output_json));
+        let total_tokens = usage
+            .total_tokens
+            .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+        let cached_input_tokens = usage.cached_input_tokens.unwrap_or(0);
+
+        Ok(LlmResponse {
+            model_id: request.model_id,
+            output_json,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            total_tokens,
+            cost_usd: 0.0,
+        })
+    }
+}
+
+impl LlmProvider for CodexCliProvider {
+    fn name(&self) -> &'static str {
+        "codex_cli"
+    }
+
+    fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
+        let output_path = codex_temp_path("clarion-codex-output", "json");
+        let schema_path = codex_temp_path("clarion-codex-schema", "json");
+        let result = self.invoke_with_temp_files(request, &output_path, &schema_path);
+        let _ = fs::remove_file(output_path);
+        let _ = fs::remove_file(schema_path);
+        result
+    }
+
+    fn estimate_tokens(&self, request: &LlmRequest) -> u64 {
+        u64::from(estimate_text_tokens(&build_coding_agent_provider_prompt(
+            request,
+        ))) + u64::from(request.max_output_tokens)
+    }
+
+    fn tier_to_model(&self, tier: &str) -> Option<&str> {
+        match tier {
+            "summary" | "inferred_edges" => Some(self.model_id.as_str()),
+            _ => None,
+        }
+    }
+
+    fn caching_model(&self) -> CachingModel {
+        CachingModel::OpenAiChatCompletions
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeCliProviderConfig {
+    pub executable: String,
+    pub project_root: PathBuf,
+    pub model_id: String,
+    pub model: Option<String>,
+    pub permission_mode: String,
+    pub tools: Vec<String>,
+    pub timeout_seconds: u64,
+    pub max_turns: u32,
+    pub no_session_persistence: bool,
+    pub exclude_dynamic_system_prompt_sections: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClaudeCliProvider {
+    executable: String,
+    project_root: PathBuf,
+    model_id: String,
+    model: Option<String>,
+    permission_mode: String,
+    tools: Vec<String>,
+    timeout: Duration,
+    timeout_seconds: u64,
+    max_turns: u32,
+    no_session_persistence: bool,
+    exclude_dynamic_system_prompt_sections: bool,
+}
+
+impl ClaudeCliProvider {
+    pub fn from_config(config: ClaudeCliProviderConfig) -> Result<Self, LlmProviderError> {
+        if config.executable.trim().is_empty() {
+            return Err(LlmProviderError::Cli {
+                message: "Claude CLI executable must not be blank".to_owned(),
+                retryable: false,
+            });
+        }
+        if config.model_id.trim().is_empty() {
+            return Err(LlmProviderError::Cli {
+                message: "Claude CLI model_id must not be blank".to_owned(),
+                retryable: false,
+            });
+        }
+        if config.permission_mode.trim().is_empty() {
+            return Err(LlmProviderError::Cli {
+                message: "Claude CLI permission_mode must not be blank".to_owned(),
+                retryable: false,
+            });
+        }
+        if config.timeout_seconds == 0 {
+            return Err(LlmProviderError::Cli {
+                message: "Claude CLI timeout_seconds must be greater than zero".to_owned(),
+                retryable: false,
+            });
+        }
+        if config.max_turns == 0 {
+            return Err(LlmProviderError::Cli {
+                message: "Claude CLI max_turns must be greater than zero".to_owned(),
+                retryable: false,
+            });
+        }
+
+        Ok(Self {
+            executable: config.executable,
+            project_root: config.project_root,
+            model_id: config.model_id,
+            model: config.model.filter(|model| !model.trim().is_empty()),
+            permission_mode: config.permission_mode,
+            tools: config
+                .tools
+                .into_iter()
+                .filter(|tool| !tool.trim().is_empty())
+                .collect(),
+            timeout: Duration::from_secs(config.timeout_seconds),
+            timeout_seconds: config.timeout_seconds,
+            max_turns: config.max_turns,
+            no_session_persistence: config.no_session_persistence,
+            exclude_dynamic_system_prompt_sections: config.exclude_dynamic_system_prompt_sections,
+        })
+    }
+}
+
+impl LlmProvider for ClaudeCliProvider {
+    fn name(&self) -> &'static str {
+        "claude_cli"
+    }
+
+    fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
+        let schema = codex_output_schema_for_purpose(&request.purpose);
+        let schema_json =
+            serde_json::to_string(&schema).map_err(|err| LlmProviderError::InvalidResponse {
+                message: format!("serialize Claude output schema: {err}"),
+                retryable: false,
+            })?;
+        let provider_prompt = build_coding_agent_provider_prompt(&request);
+        let mut command = Command::new(&self.executable);
+        command
+            .arg("-p")
+            .arg(CLAUDE_CLI_PRINT_PROMPT)
+            .arg("--output-format")
+            .arg("json")
+            .arg("--json-schema")
+            .arg(schema_json)
+            .arg("--permission-mode")
+            .arg(&self.permission_mode)
+            .arg("--max-turns")
+            .arg(self.max_turns.to_string())
+            .arg("--mcp-config")
+            .arg(r#"{"mcpServers":{}}"#)
+            .arg("--strict-mcp-config")
+            .arg("--disable-slash-commands");
+        if self.no_session_persistence {
+            command.arg("--no-session-persistence");
+        }
+        if self.exclude_dynamic_system_prompt_sections {
+            command.arg("--exclude-dynamic-system-prompt-sections");
+        }
+        if let Some(model) = &self.model {
+            command.arg("--model").arg(model);
+        }
+        command.arg("--tools").arg(self.tools.join(","));
+        command
+            .current_dir(&self.project_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = command.spawn().map_err(|err| LlmProviderError::Cli {
+            message: format!("spawn Claude CLI {}: {err}", self.executable),
+            retryable: false,
+        })?;
+        let stdout_reader = take_reader(&mut child.stdout, "stdout")?;
+        let stderr_reader = take_reader(&mut child.stderr, "stderr")?;
+        if let Err(err) = write_child_stdin(&mut child, &provider_prompt) {
+            let _ = child.kill();
+            return Err(err);
+        }
+
+        let status = wait_for_child(&mut child, self.timeout, self.timeout_seconds)?;
+        let stdout = join_reader(stdout_reader, "stdout")?;
+        let stderr = join_reader(stderr_reader, "stderr")?;
+        if !status.success() {
+            return Err(LlmProviderError::Cli {
+                message: format!(
+                    "claude -p exited with {status}: {}",
+                    truncate_for_error(&String::from_utf8_lossy(&stderr))
+                ),
+                retryable: cli_status_retryable(status),
+            });
+        }
+
+        let parsed = parse_claude_cli_json_output(&stdout)?;
+        let input_tokens = parsed
+            .usage
+            .input_tokens
+            .unwrap_or_else(|| estimate_text_tokens(&request.prompt));
+        let output_tokens = parsed
+            .usage
+            .output_tokens
+            .unwrap_or_else(|| estimate_text_tokens(&parsed.output_json));
+        let total_tokens = parsed
+            .usage
+            .total_tokens
+            .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+        let cached_input_tokens = parsed.usage.cached_input_tokens.unwrap_or(0);
+
+        Ok(LlmResponse {
+            model_id: request.model_id,
+            output_json: parsed.output_json,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            total_tokens,
+            cost_usd: parsed.cost_usd.unwrap_or(0.0),
+        })
+    }
+
+    fn estimate_tokens(&self, request: &LlmRequest) -> u64 {
+        u64::from(estimate_text_tokens(&build_coding_agent_provider_prompt(
+            request,
+        ))) + u64::from(request.max_output_tokens)
     }
 
     fn tier_to_model(&self, tier: &str) -> Option<&str> {
@@ -369,6 +823,346 @@ fn response_format_for_purpose(purpose: &LlmPurpose) -> Value {
     }
 }
 
+fn codex_output_schema_for_purpose(purpose: &LlmPurpose) -> Value {
+    response_format_for_purpose(purpose)["json_schema"]["schema"].clone()
+}
+
+fn agent_task_type(purpose: &LlmPurpose) -> &'static str {
+    match purpose {
+        LlmPurpose::Summary => "leaf_summary",
+        LlmPurpose::InferredEdges => "inferred_edges",
+    }
+}
+
+fn agent_task_guidance(purpose: &LlmPurpose) -> &'static str {
+    match purpose {
+        LlmPurpose::Summary => {
+            "- Produce a leaf-scope summary only for the requested entity.\n\
+             - `purpose`, `behavior`, `relationships`, and `risks` must be strings.\n\
+             - Do not summarize sibling entities except where direct caller/callee/ownership context is visible in the supplied excerpt.\n\
+             - Use an empty `risks` string when no concrete implementation risk is visible."
+        }
+        LlmPurpose::InferredEdges => {
+            "- Resolve only unresolved call sites listed in the request.\n\
+             - Choose targets only from the supplied candidate entities JSON.\n\
+             - Return no more edges than the request's max_edges instruction allows.\n\
+             - Use confidence from 0.0 to 1.0 and include brief evidence in `rationale`.\n\
+             - Return `{\"edges\":[]}` when the supplied evidence is insufficient."
+        }
+    }
+}
+
+type PipeReader = thread::JoinHandle<std::io::Result<Vec<u8>>>;
+
+fn take_reader<R>(
+    pipe: &mut Option<R>,
+    pipe_name: &'static str,
+) -> Result<PipeReader, LlmProviderError>
+where
+    R: Read + Send + 'static,
+{
+    let mut reader = pipe.take().ok_or_else(|| LlmProviderError::Cli {
+        message: format!("child {pipe_name} was not captured"),
+        retryable: false,
+    })?;
+    Ok(thread::spawn(move || {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }))
+}
+
+fn write_child_stdin(child: &mut Child, prompt: &str) -> Result<(), LlmProviderError> {
+    let mut stdin = child.stdin.take().ok_or_else(|| LlmProviderError::Cli {
+        message: "child stdin was not captured".to_owned(),
+        retryable: false,
+    })?;
+    stdin
+        .write_all(prompt.as_bytes())
+        .map_err(|err| LlmProviderError::Cli {
+            message: format!("write provider prompt to stdin: {err}"),
+            retryable: true,
+        })?;
+    Ok(())
+}
+
+fn wait_for_child(
+    child: &mut Child,
+    timeout: Duration,
+    timeout_seconds: u64,
+) -> Result<ExitStatus, LlmProviderError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(LlmProviderError::Timeout { timeout_seconds });
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(err) => {
+                return Err(LlmProviderError::Cli {
+                    message: format!("poll provider process status: {err}"),
+                    retryable: true,
+                });
+            }
+        }
+    }
+}
+
+fn join_reader(handle: PipeReader, pipe_name: &'static str) -> Result<Vec<u8>, LlmProviderError> {
+    match handle.join() {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(err)) => Err(LlmProviderError::Cli {
+            message: format!("read provider {pipe_name}: {err}"),
+            retryable: true,
+        }),
+        Err(_) => Err(LlmProviderError::Cli {
+            message: format!("read provider {pipe_name}: reader thread panicked"),
+            retryable: true,
+        }),
+    }
+}
+
+fn cli_status_retryable(status: ExitStatus) -> bool {
+    status.code().is_none()
+}
+
+fn truncate_for_error(message: &str) -> String {
+    const MAX_ERROR_CHARS: usize = 4096;
+    if message.chars().count() <= MAX_ERROR_CHARS {
+        return message.to_owned();
+    }
+    let mut truncated: String = message.chars().take(MAX_ERROR_CHARS).collect();
+    truncated.push_str("... (truncated)");
+    truncated
+}
+
+fn codex_status_retryable(status: ExitStatus) -> bool {
+    cli_status_retryable(status)
+}
+
+fn codex_temp_path(prefix: &str, extension: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "{prefix}-{}-{nonce}.{extension}",
+        std::process::id()
+    ))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct LlmUsageSummary {
+    input_tokens: Option<u32>,
+    cached_input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+    total_tokens: Option<u32>,
+    cost_usd: Option<f64>,
+}
+
+impl LlmUsageSummary {
+    fn add(&mut self, other: Self) {
+        self.input_tokens = add_optional_u32(self.input_tokens, other.input_tokens);
+        self.cached_input_tokens =
+            add_optional_u32(self.cached_input_tokens, other.cached_input_tokens);
+        self.output_tokens = add_optional_u32(self.output_tokens, other.output_tokens);
+        self.total_tokens = add_optional_u32(self.total_tokens, other.total_tokens);
+        self.cost_usd = add_optional_f64(self.cost_usd, other.cost_usd);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ClaudeCliOutput {
+    output_json: String,
+    usage: LlmUsageSummary,
+    cost_usd: Option<f64>,
+}
+
+fn add_optional_u32(left: Option<u32>, right: Option<u32>) -> Option<u32> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn add_optional_f64(left: Option<f64>, right: Option<f64>) -> Option<f64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left + right),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn parse_codex_jsonl_usage(stdout: &[u8]) -> LlmUsageSummary {
+    let mut summary = LlmUsageSummary::default();
+    let stdout_text = String::from_utf8_lossy(stdout);
+    for line in stdout_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        summary.add(usage_from_event(&event));
+    }
+    summary
+}
+
+fn parse_claude_cli_json_output(stdout: &[u8]) -> Result<ClaudeCliOutput, LlmProviderError> {
+    let stdout_text = String::from_utf8_lossy(stdout);
+    let trimmed = stdout_text.trim();
+    if trimmed.is_empty() {
+        return Err(LlmProviderError::InvalidResponse {
+            message: "Claude CLI returned empty stdout".to_owned(),
+            retryable: true,
+        });
+    }
+    let value = serde_json::from_str::<Value>(trimmed).map_err(|err| {
+        LlmProviderError::InvalidResponse {
+            message: format!("Claude CLI stdout was not JSON: {err}"),
+            retryable: true,
+        }
+    })?;
+    let events = match &value {
+        Value::Array(events) => events.as_slice(),
+        _ => std::slice::from_ref(&value),
+    };
+    let result_event = events
+        .iter()
+        .rev()
+        .find(|event| event.get("type").and_then(Value::as_str) == Some("result"))
+        .or_else(|| {
+            events
+                .iter()
+                .rev()
+                .find(|event| has_claude_structured_output(event))
+        })
+        .unwrap_or(&value);
+    let usage = if result_event.get("usage").is_some() {
+        usage_from_event(result_event)
+    } else {
+        let mut summary = LlmUsageSummary::default();
+        for event in events {
+            summary.add(usage_from_event(event));
+        }
+        summary
+    };
+    let cost_usd = result_event
+        .get("total_cost_usd")
+        .or_else(|| result_event.get("cost_usd"))
+        .and_then(Value::as_f64)
+        .or(usage.cost_usd);
+    let output_json = claude_structured_output_json(result_event)?;
+    Ok(ClaudeCliOutput {
+        output_json,
+        usage,
+        cost_usd,
+    })
+}
+
+fn has_claude_structured_output(value: &Value) -> bool {
+    value.get("structured_output").is_some()
+        || value.get("structuredOutput").is_some()
+        || value.get("result").is_some()
+}
+
+fn claude_structured_output_json(value: &Value) -> Result<String, LlmProviderError> {
+    let output = value
+        .get("structured_output")
+        .or_else(|| value.get("structuredOutput"))
+        .or_else(|| value.get("result"))
+        .unwrap_or(value);
+    json_value_to_output_json(output, "Claude CLI structured output")
+}
+
+fn json_value_to_output_json(value: &Value, label: &str) -> Result<String, LlmProviderError> {
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Err(LlmProviderError::InvalidResponse {
+                    message: format!("{label} was empty"),
+                    retryable: true,
+                });
+            }
+            serde_json::from_str::<Value>(trimmed).map_err(|err| {
+                LlmProviderError::InvalidResponse {
+                    message: format!("{label} string was not JSON: {err}"),
+                    retryable: true,
+                }
+            })?;
+            Ok(trimmed.to_owned())
+        }
+        Value::Object(_) | Value::Array(_) => {
+            serde_json::to_string(value).map_err(|err| LlmProviderError::InvalidResponse {
+                message: format!("serialize {label}: {err}"),
+                retryable: false,
+            })
+        }
+        _ => Err(LlmProviderError::InvalidResponse {
+            message: format!("{label} was not an object, array, or JSON string"),
+            retryable: true,
+        }),
+    }
+}
+
+fn usage_from_event(event: &Value) -> LlmUsageSummary {
+    let raw_usage = event
+        .get("usage")
+        .or_else(|| event.get("msg").and_then(|msg| msg.get("usage")))
+        .or_else(|| {
+            event
+                .get("message")
+                .and_then(|message| message.get("usage"))
+        });
+    let Some(raw_usage) = raw_usage else {
+        return LlmUsageSummary::default();
+    };
+    usage_from_usage_value(raw_usage)
+}
+
+fn usage_from_usage_value(raw_usage: &Value) -> LlmUsageSummary {
+    let input_tokens = u32_from_value(raw_usage.get("input_tokens"))
+        .or_else(|| u32_from_value(raw_usage.get("prompt_tokens")));
+    let output_tokens = u32_from_value(raw_usage.get("output_tokens"))
+        .or_else(|| u32_from_value(raw_usage.get("completion_tokens")));
+    let total_tokens = u32_from_value(raw_usage.get("total_tokens")).or_else(|| {
+        match (input_tokens, output_tokens) {
+            (Some(input), Some(output)) => Some(input.saturating_add(output)),
+            _ => None,
+        }
+    });
+    let cached_from_details = raw_usage
+        .get("prompt_tokens_details")
+        .and_then(|details| u32_from_value(details.get("cached_tokens")));
+    let cached_input_tokens = u32_from_value(raw_usage.get("cached_input_tokens"))
+        .or_else(|| u32_from_value(raw_usage.get("cache_read_input_tokens")))
+        .or(cached_from_details);
+    LlmUsageSummary {
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        total_tokens,
+        cost_usd: raw_usage
+            .get("cost_usd")
+            .or_else(|| raw_usage.get("cost"))
+            .and_then(Value::as_f64),
+    }
+}
+
+fn u32_from_value(value: Option<&Value>) -> Option<u32> {
+    let value = value?;
+    match value {
+        Value::Number(number) => number.as_u64().and_then(|value| u32::try_from(value).ok()),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct OpenRouterChatResponse {
     model: String,
@@ -422,7 +1216,13 @@ struct OpenRouterUsage {
     completion: u32,
     #[serde(rename = "total_tokens")]
     total: u32,
+    prompt_tokens_details: Option<OpenRouterPromptTokensDetails>,
     cost: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterPromptTokensDetails {
+    cached_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -577,6 +1377,7 @@ mod tests {
             model_id: "anthropic/claude-sonnet-4.6".to_owned(),
             output_json: r#"{"purpose":"demo"}"#.to_owned(),
             input_tokens: 120,
+            cached_input_tokens: 0,
             output_tokens: 24,
             total_tokens: 144,
             cost_usd: 0.0,
@@ -621,6 +1422,27 @@ mod tests {
         assert!(inferred.body.contains("python:function:demo.via_dispatch"));
         assert!(inferred.body.contains("Return JSON"));
         assert!(inferred.body.contains("no more than 8 entries"));
+    }
+
+    #[test]
+    fn coding_agent_provider_prompt_wraps_request_with_shared_contract() {
+        let request = LlmRequest {
+            purpose: LlmPurpose::InferredEdges,
+            model_id: "agent-default".to_owned(),
+            prompt_id: INFERRED_CALLS_PROMPT_VERSION.to_owned(),
+            prompt: "Resolve call-site a from the supplied candidates".to_owned(),
+            max_output_tokens: 2048,
+        };
+
+        let prompt = build_coding_agent_provider_prompt(&request);
+
+        assert!(prompt.contains("Prompt contract: clarion-agent-provider-v1"));
+        assert!(prompt.contains("Task type: inferred_edges"));
+        assert!(prompt.contains("Do not inspect additional files"));
+        assert!(prompt.contains("Return exactly one JSON object"));
+        assert!(prompt.contains("Choose targets only from the supplied candidate entities JSON"));
+        assert!(prompt.contains("<clarion_request>"));
+        assert!(prompt.contains("Resolve call-site a from the supplied candidates"));
     }
 
     #[test]
@@ -893,6 +1715,350 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn codex_cli_provider_invokes_exec_with_schema_stdin_and_usage() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir(&project_root).expect("project root");
+        let fake_codex = temp.path().join("codex");
+        let log_path = temp.path().join("codex.log");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+log="{log}"
+out=""
+schema=""
+cd_arg=""
+sandbox=""
+model=""
+profile=""
+json=0
+stdin_prompt=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    exec)
+      echo "subcommand=exec" >> "$log"
+      shift
+      ;;
+    --sandbox)
+      sandbox="$2"
+      shift 2
+      ;;
+    --cd)
+      cd_arg="$2"
+      shift 2
+      ;;
+    --output-last-message)
+      out="$2"
+      shift 2
+      ;;
+    --output-schema)
+      schema="$2"
+      shift 2
+      ;;
+    --model)
+      model="$2"
+      shift 2
+      ;;
+    --profile)
+      profile="$2"
+      shift 2
+      ;;
+    --json)
+      json=1
+      shift
+      ;;
+    -c)
+      echo "config=$2" >> "$log"
+      shift 2
+      ;;
+    -)
+      stdin_prompt="$(cat)"
+      shift
+      ;;
+    *)
+      echo "arg=$1" >> "$log"
+      shift
+      ;;
+  esac
+done
+
+test "$json" = "1"
+test -n "$out"
+test -s "$schema"
+grep -q '"purpose"' "$schema"
+grep -q '"behavior"' "$schema"
+case "$stdin_prompt" in
+  *"Summarize this function"*) ;;
+  *) echo "missing prompt" >&2; exit 31 ;;
+esac
+case "$stdin_prompt" in
+  *"Prompt contract: clarion-agent-provider-v1"*"Do not inspect additional files"*) ;;
+  *) echo "missing Clarion agent prompt contract" >&2; exit 32 ;;
+esac
+
+echo "sandbox=$sandbox" >> "$log"
+echo "cd=$cd_arg" >> "$log"
+echo "model=$model" >> "$log"
+echo "profile=$profile" >> "$log"
+printf '%s\n' '{{"usage":{{"input_tokens":11,"cached_input_tokens":4,"output_tokens":7,"total_tokens":18}}}}'
+printf '%s' '{{"purpose":"via codex","behavior":"ran fake CLI","relationships":"","risks":""}}' > "$out"
+"#,
+            log = log_path.display()
+        );
+        fs::write(&fake_codex, script).expect("write fake codex");
+        let mut permissions = fs::metadata(&fake_codex).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex");
+
+        let provider = CodexCliProvider::from_config(CodexCliProviderConfig {
+            executable: fake_codex.display().to_string(),
+            project_root: project_root.clone(),
+            model_id: "codex-cli-default".to_owned(),
+            model: Some("gpt-5.5".to_owned()),
+            profile: Some("clarion".to_owned()),
+            sandbox: "read-only".to_owned(),
+            timeout_seconds: 5,
+        })
+        .expect("construct Codex CLI provider");
+
+        let response = provider
+            .invoke(LlmRequest {
+                purpose: LlmPurpose::Summary,
+                model_id: "codex-cli-default".to_owned(),
+                prompt_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+                prompt: "Summarize this function".to_owned(),
+                max_output_tokens: 512,
+            })
+            .expect("invoke fake Codex CLI");
+
+        assert_eq!(provider.name(), "codex_cli");
+        assert_eq!(provider.tier_to_model("summary"), Some("codex-cli-default"));
+        assert_eq!(response.model_id, "codex-cli-default");
+        assert_eq!(
+            response.output_json,
+            r#"{"purpose":"via codex","behavior":"ran fake CLI","relationships":"","risks":""}"#
+        );
+        assert_eq!(response.input_tokens, 11);
+        assert_eq!(response.cached_input_tokens, 4);
+        assert_eq!(response.output_tokens, 7);
+        assert_eq!(response.total_tokens, 18);
+        assert_eq!(response.cost_usd, 0.0);
+
+        let log = fs::read_to_string(log_path).expect("read fake codex log");
+        assert!(log.contains("subcommand=exec"));
+        assert!(log.contains("config=approval_policy=\"never\""));
+        assert!(log.contains("sandbox=read-only"));
+        assert!(log.contains(&format!("cd={}", project_root.display())));
+        assert!(log.contains("model=gpt-5.5"));
+        assert!(log.contains("profile=clarion"));
+    }
+
+    #[test]
+    fn claude_cli_provider_invokes_print_mode_with_schema_and_usage() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir(&project_root).expect("project root");
+        let fake_claude = temp.path().join("claude");
+        let log_path = temp.path().join("claude.log");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+log="{log}"
+schema=""
+format=""
+model=""
+permission_mode=""
+tools="unset"
+max_turns=""
+no_session_persistence=0
+exclude_dynamic=0
+mcp_config=""
+strict_mcp=0
+slash_disabled=0
+print_prompt=""
+stdin_prompt=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p|--print)
+      print_prompt="$2"
+      shift 2
+      ;;
+    --output-format)
+      format="$2"
+      shift 2
+      ;;
+    --json-schema)
+      schema="$2"
+      shift 2
+      ;;
+    --model)
+      model="$2"
+      shift 2
+      ;;
+    --permission-mode)
+      permission_mode="$2"
+      shift 2
+      ;;
+    --tools)
+      tools="$2"
+      shift 2
+      ;;
+    --max-turns)
+      max_turns="$2"
+      shift 2
+      ;;
+    --mcp-config)
+      mcp_config="$2"
+      shift 2
+      ;;
+    --strict-mcp-config)
+      strict_mcp=1
+      shift
+      ;;
+    --disable-slash-commands)
+      slash_disabled=1
+      shift
+      ;;
+    --no-session-persistence)
+      no_session_persistence=1
+      shift
+      ;;
+    --exclude-dynamic-system-prompt-sections)
+      exclude_dynamic=1
+      shift
+      ;;
+    *)
+      echo "arg=$1" >> "$log"
+      shift
+      ;;
+  esac
+done
+stdin_prompt="$(cat)"
+
+test "$format" = "json"
+case "$schema" in
+  *'"purpose"'*'"behavior"'*) ;;
+  *) echo "schema missing summary fields" >&2; exit 41 ;;
+esac
+case "$stdin_prompt" in
+  *"Summarize this function"*) ;;
+  *) echo "missing prompt" >&2; exit 42 ;;
+esac
+case "$stdin_prompt" in
+  *"Prompt contract: clarion-agent-provider-v1"*"Do not inspect additional files"*) ;;
+  *) echo "missing Clarion agent prompt contract" >&2; exit 43 ;;
+esac
+
+echo "print_prompt=$print_prompt" >> "$log"
+echo "model=$model" >> "$log"
+echo "permission_mode=$permission_mode" >> "$log"
+echo "tools=$tools" >> "$log"
+echo "max_turns=$max_turns" >> "$log"
+echo "mcp_config=$mcp_config" >> "$log"
+echo "strict_mcp=$strict_mcp" >> "$log"
+echo "slash_disabled=$slash_disabled" >> "$log"
+echo "no_session_persistence=$no_session_persistence" >> "$log"
+echo "exclude_dynamic=$exclude_dynamic" >> "$log"
+printf '%s\n' '{{"type":"result","subtype":"success","structured_output":{{"purpose":"via claude","behavior":"ran fake CLI","relationships":"","risks":""}},"usage":{{"input_tokens":13,"cached_input_tokens":5,"output_tokens":6,"total_tokens":19}},"total_cost_usd":0.25}}'
+"#,
+            log = log_path.display()
+        );
+        fs::write(&fake_claude, script).expect("write fake claude");
+        let mut permissions = fs::metadata(&fake_claude).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_claude, permissions).expect("chmod fake claude");
+
+        let provider = ClaudeCliProvider::from_config(ClaudeCliProviderConfig {
+            executable: fake_claude.display().to_string(),
+            project_root,
+            model_id: "claude-code-default".to_owned(),
+            model: Some("claude-sonnet-4-6".to_owned()),
+            permission_mode: "plan".to_owned(),
+            tools: vec!["Read".to_owned(), "Grep".to_owned()],
+            timeout_seconds: 5,
+            max_turns: 2,
+            no_session_persistence: true,
+            exclude_dynamic_system_prompt_sections: true,
+        })
+        .expect("construct Claude CLI provider");
+
+        let response = provider
+            .invoke(LlmRequest {
+                purpose: LlmPurpose::Summary,
+                model_id: "claude-code-default".to_owned(),
+                prompt_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+                prompt: "Summarize this function".to_owned(),
+                max_output_tokens: 512,
+            })
+            .expect("invoke fake Claude CLI");
+
+        assert_eq!(provider.name(), "claude_cli");
+        assert_eq!(
+            provider.tier_to_model("summary"),
+            Some("claude-code-default")
+        );
+        assert_eq!(response.model_id, "claude-code-default");
+        assert_eq!(response.input_tokens, 13);
+        assert_eq!(response.cached_input_tokens, 5);
+        assert_eq!(response.output_tokens, 6);
+        assert_eq!(response.total_tokens, 19);
+        assert!((response.cost_usd - 0.25).abs() < f64::EPSILON);
+        assert_eq!(
+            serde_json::from_str::<Value>(&response.output_json).expect("response JSON"),
+            serde_json::json!({
+                "purpose": "via claude",
+                "behavior": "ran fake CLI",
+                "relationships": "",
+                "risks": ""
+            })
+        );
+
+        let log = fs::read_to_string(log_path).expect("read fake claude log");
+        assert!(log.contains("print_prompt=You are Clarion's local Claude Code LLM provider"));
+        assert!(log.contains("model=claude-sonnet-4-6"));
+        assert!(log.contains("permission_mode=plan"));
+        assert!(log.contains("tools=Read,Grep"));
+        assert!(log.contains("max_turns=2"));
+        assert!(log.contains(r#"mcp_config={"mcpServers":{}}"#));
+        assert!(log.contains("strict_mcp=1"));
+        assert!(log.contains("slash_disabled=1"));
+        assert!(log.contains("no_session_persistence=1"));
+        assert!(log.contains("exclude_dynamic=1"));
+    }
+
+    #[test]
+    fn claude_cli_output_parser_accepts_event_array_and_cache_reads() {
+        let stdout = br#"[
+          {"type":"system","subtype":"init"},
+          {"type":"assistant","message":{"usage":{"input_tokens":4,"output_tokens":3}}},
+          {"type":"result","subtype":"success","structured_output":{"purpose":"array","behavior":"ok","relationships":"","risks":""},"total_cost_usd":0.75,"usage":{"input_tokens":7,"cache_read_input_tokens":25,"output_tokens":11,"total_tokens":43}}
+        ]"#;
+
+        let parsed = parse_claude_cli_json_output(stdout).expect("parse Claude event array");
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&parsed.output_json).expect("output json"),
+            serde_json::json!({
+                "purpose": "array",
+                "behavior": "ok",
+                "relationships": "",
+                "risks": ""
+            })
+        );
+        assert_eq!(parsed.usage.input_tokens, Some(7));
+        assert_eq!(parsed.usage.cached_input_tokens, Some(25));
+        assert_eq!(parsed.usage.output_tokens, Some(11));
+        assert_eq!(parsed.usage.total_tokens, Some(43));
+        assert_eq!(parsed.cost_usd, Some(0.75));
     }
 
     #[test]

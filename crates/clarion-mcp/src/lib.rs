@@ -1208,6 +1208,7 @@ impl ServerState {
             cached,
             true,
             stale_semantic(cached, ready.caller_count, ready.fan_out),
+            None,
             json!({"summary_cache_hits_total": 1}),
         ))
     }
@@ -1274,6 +1275,8 @@ impl ServerState {
             );
         }
 
+        let cached_input_tokens = i64::from(response.cached_input_tokens);
+        let stats_delta = summary_usage_stats(&response, false);
         let entry = SummaryCacheEntry {
             key: ready.key,
             summary_json: response.output_json,
@@ -1301,13 +1304,8 @@ impl ServerState {
             &entry,
             false,
             false,
-            json!({
-                "summary_cache_misses_total": 1,
-                "summary_tokens_input": entry.tokens_input,
-                "summary_tokens_output": entry.tokens_output,
-                "summary_tokens_total": entry.tokens_input + entry.tokens_output,
-                "summary_cost_usd": entry.cost_usd
-            }),
+            Some(cached_input_tokens),
+            stats_delta,
         )
     }
 
@@ -1695,6 +1693,7 @@ struct InferredDispatchStats {
     candidate_callers_considered: u64,
     coalesced_waits_total: u64,
     tokens_input: i64,
+    tokens_cached_input: i64,
     tokens_output: i64,
     tokens_total: i64,
     cost_usd: f64,
@@ -1716,6 +1715,7 @@ impl InferredDispatchStats {
             edges_materialized_total: write.inserted_edges,
             edges_skipped_static_duplicates_total: write.skipped_static_duplicates,
             tokens_input: i64::from(response.input_tokens),
+            tokens_cached_input: i64::from(response.cached_input_tokens),
             tokens_output: i64::from(response.output_tokens),
             tokens_total: i64::from(response.total_tokens),
             cost_usd: response.cost_usd,
@@ -1732,6 +1732,7 @@ impl InferredDispatchStats {
         self.candidate_callers_considered += other.candidate_callers_considered;
         self.coalesced_waits_total += other.coalesced_waits_total;
         self.tokens_input += other.tokens_input;
+        self.tokens_cached_input += other.tokens_cached_input;
         self.tokens_output += other.tokens_output;
         self.tokens_total += other.tokens_total;
         self.cost_usd += other.cost_usd;
@@ -1747,6 +1748,7 @@ impl InferredDispatchStats {
             "inferred_candidate_callers_considered": self.candidate_callers_considered,
             "inferred_dispatch_coalesced_total": self.coalesced_waits_total,
             "inferred_tokens_input": self.tokens_input,
+            "inferred_tokens_cached_input": self.tokens_cached_input,
             "inferred_tokens_output": self.tokens_output,
             "inferred_tokens_total": self.tokens_total,
             "inferred_cost_usd": self.cost_usd
@@ -2167,6 +2169,7 @@ fn tool_error_envelope_with_diagnostics(
 fn llm_usage_json(response: &LlmResponse) -> Value {
     json!({
         "tokens_input": response.input_tokens,
+        "tokens_cached_input": response.cached_input_tokens,
         "tokens_output": response.output_tokens,
         "tokens_total": response.total_tokens,
         "cost_usd": response.cost_usd
@@ -2179,6 +2182,10 @@ fn summary_usage_stats(response: &LlmResponse, invalid_json: bool) -> Value {
     stats.insert(
         "summary_tokens_input".to_owned(),
         json!(response.input_tokens),
+    );
+    stats.insert(
+        "summary_tokens_cached_input".to_owned(),
+        json!(response.cached_input_tokens),
     );
     stats.insert(
         "summary_tokens_output".to_owned(),
@@ -2201,6 +2208,10 @@ fn inferred_usage_stats(response: &LlmResponse, invalid_json: bool) -> Value {
     stats.insert(
         "inferred_tokens_input".to_owned(),
         json!(response.input_tokens),
+    );
+    stats.insert(
+        "inferred_tokens_cached_input".to_owned(),
+        json!(response.cached_input_tokens),
     );
     stats.insert(
         "inferred_tokens_output".to_owned(),
@@ -2316,6 +2327,7 @@ fn summary_success_envelope(
     entry: &SummaryCacheEntry,
     cache_hit: bool,
     stale_semantic: bool,
+    cached_input_tokens: Option<i64>,
     stats_delta: Value,
 ) -> Value {
     let summary = serde_json::from_str::<Value>(&entry.summary_json).unwrap_or_else(|_| {
@@ -2323,6 +2335,16 @@ fn summary_success_envelope(
             "raw": entry.summary_json
         })
     });
+    let mut usage = serde_json::Map::new();
+    usage.insert("tokens_input".to_owned(), json!(entry.tokens_input));
+    if let Some(tokens) = cached_input_tokens {
+        usage.insert("tokens_cached_input".to_owned(), json!(tokens));
+    }
+    usage.insert("tokens_output".to_owned(), json!(entry.tokens_output));
+    usage.insert(
+        "tokens_total".to_owned(),
+        json!(entry.tokens_input + entry.tokens_output),
+    );
     success_envelope_with_stats(
         json!({
             "available": true,
@@ -2337,11 +2359,7 @@ fn summary_success_envelope(
                 "created_at": entry.created_at,
                 "last_accessed_at": entry.last_accessed_at
             },
-            "usage": {
-                "tokens_input": entry.tokens_input,
-                "tokens_output": entry.tokens_output,
-                "tokens_total": entry.tokens_input + entry.tokens_output
-            }
+            "usage": Value::Object(usage)
         }),
         stats_delta,
     )
@@ -3072,6 +3090,7 @@ mod tests {
                 model_id: "test-model".to_owned(),
                 output_json: r#"{"edges":[]}"#.to_owned(),
                 input_tokens: 1,
+                cached_input_tokens: 0,
                 output_tokens: 1,
                 total_tokens: 2,
                 cost_usd: 0.0,

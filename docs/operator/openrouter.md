@@ -1,9 +1,12 @@
 # OpenRouter LLM Provider
 
-Clarion v0.1 uses OpenRouter as its canonical live LLM provider. The provider
+Clarion v0.1 uses OpenRouter as its canonical HTTP LLM provider. The provider
 speaks OpenAI-compatible Chat Completions HTTP through the existing
-`LlmProvider` trait, so tests can continue to use `RecordingProvider` and future
-providers can be added without changing MCP tool call sites.
+`LlmProvider` trait, so tests can continue to use `RecordingProvider` and
+coding-agent CLI providers can be added without changing MCP tool call sites.
+
+For local-login alternatives that avoid API keys in Clarion config, see
+[Coding-agent LLM providers](./coding-agent-llm-providers.md).
 
 ## Configure Clarion
 

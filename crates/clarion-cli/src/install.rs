@@ -37,6 +37,21 @@ llm_policy:\n\
     attribution:\n\
       referer: https://github.com/qacona/clarion\n\
       title: Clarion\n\
+  codex_cli:\n\
+    executable: codex\n\
+    model: null\n\
+    profile: null\n\
+    sandbox: read-only\n\
+    timeout_seconds: 300\n\
+  claude_cli:\n\
+    executable: claude\n\
+    model: null\n\
+    permission_mode: plan\n\
+    tools: []\n\
+    timeout_seconds: 300\n\
+    max_turns: 2\n\
+    no_session_persistence: true\n\
+    exclude_dynamic_system_prompt_sections: true\n\
   model_id: anthropic/claude-sonnet-4.6\n\
   session_token_ceiling: 1000000\n\
   max_inferred_edges_per_caller: 8\n\
