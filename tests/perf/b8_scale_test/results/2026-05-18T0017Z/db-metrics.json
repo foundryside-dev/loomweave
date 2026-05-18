@@ -1,0 +1,75 @@
+{
+  "db_file_bytes": 49541120,
+  "edges_by_kind_confidence": [],
+  "edges_total": 0,
+  "entities_by_kind": {
+    "class": 5154,
+    "function": 24430,
+    "module": 1366
+  },
+  "entities_total": 30950,
+  "entity_unresolved_call_sites_rows": 0,
+  "findings_columns": [
+    "id",
+    "tool",
+    "tool_version",
+    "run_id",
+    "rule_id",
+    "kind",
+    "severity",
+    "confidence",
+    "confidence_basis",
+    "entity_id",
+    "related_entities",
+    "message",
+    "evidence",
+    "properties",
+    "supports",
+    "supported_by",
+    "status",
+    "suppression_reason",
+    "filigree_issue_id",
+    "created_at",
+    "updated_at"
+  ],
+  "findings_total": 0,
+  "latest_run_stats": {
+    "failure_reason": "InsertEntity for python:function:elspeth.core.landscape.execution_repository.ExecutionRepository.complete_node_state: sqlite error: UNIQUE constraint failed: entities.id"
+  },
+  "recent_runs": [
+    {
+      "completed_at": "2026-05-18T00:26:56.193Z",
+      "config": "{}",
+      "id": "a0fb3be2-c713-4805-80b2-07bd96e5a159",
+      "started_at": "2026-05-18T00:19:08.059Z",
+      "stats": "{\"failure_reason\":\"InsertEntity for python:function:elspeth.core.landscape.execution_repository.ExecutionRepository.complete_node_state: sqlite error: UNIQUE constraint failed: entities.id\"}",
+      "status": "failed"
+    }
+  ],
+  "runs_columns": [
+    "id",
+    "started_at",
+    "completed_at",
+    "config",
+    "stats",
+    "status"
+  ],
+  "runs_total": 1,
+  "tables": [
+    "edges",
+    "entities",
+    "entity_fts",
+    "entity_fts_config",
+    "entity_fts_content",
+    "entity_fts_data",
+    "entity_fts_docsize",
+    "entity_fts_idx",
+    "entity_tags",
+    "entity_unresolved_call_sites",
+    "findings",
+    "inferred_edge_cache",
+    "runs",
+    "schema_migrations",
+    "summary_cache"
+  ]
+}
