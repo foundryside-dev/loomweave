@@ -657,3 +657,151 @@ fn schema_migrations_records_one_row() {
         .unwrap();
     assert_eq!(name, "0001_initial_schema");
 }
+
+// ----------------------------------------------------------------------------
+// ADR-031: schema-validation policy. Each CHECK-constrained enum-shaped TEXT
+// column must reject out-of-vocabulary inserts at the SQL layer. These tests
+// mirror `edges_confidence_column_rejects_unknown_tier` (line 538) and serve
+// as the executable record of the closed-vocabulary policy.
+// ----------------------------------------------------------------------------
+
+fn insert_anchor_entity(conn: &Connection, id: &str) {
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
+         created_at, updated_at) \
+         VALUES (?1, 'python', 'function', ?1, ?1, '{}', \
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        params![id],
+    )
+    .unwrap();
+}
+
+fn insert_finding(
+    conn: &Connection,
+    entity_id: &str,
+    kind: &str,
+    severity: &str,
+    status: &str,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT INTO findings (id, tool, tool_version, run_id, rule_id, kind, severity, \
+         entity_id, related_entities, message, evidence, properties, supports, \
+         supported_by, status, created_at, updated_at) \
+         VALUES ('f1', 'clarion', '0.1', 'r1', 'CLA-FACT-TODO', ?1, ?2, ?3, '[]', \
+         'm', '{}', '{}', '[]', '[]', ?4, \
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        params![kind, severity, entity_id, status],
+    )
+}
+
+#[test]
+fn findings_kind_check_rejects_unknown_value() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_anchor_entity(&conn, "python:function:demo.a");
+    let err = insert_finding(&conn, "python:function:demo.a", "bogus", "INFO", "open")
+        .expect_err("findings.kind CHECK should reject unknown values");
+    assert!(
+        err.to_string().contains("CHECK constraint failed"),
+        "unexpected error for invalid kind: {err}"
+    );
+}
+
+#[test]
+fn findings_kind_check_accepts_all_documented_values() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_anchor_entity(&conn, "python:function:demo.a");
+    // Insert each documented kind in turn; deletion between iterations keeps
+    // the PRIMARY KEY available.
+    for kind in ["defect", "fact", "classification", "metric", "suggestion"] {
+        insert_finding(&conn, "python:function:demo.a", kind, "INFO", "open")
+            .unwrap_or_else(|err| panic!("kind={kind} rejected unexpectedly: {err}"));
+        conn.execute("DELETE FROM findings", []).unwrap();
+    }
+}
+
+#[test]
+fn findings_severity_check_rejects_unknown_value() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_anchor_entity(&conn, "python:function:demo.a");
+    let err = insert_finding(&conn, "python:function:demo.a", "fact", "info", "open")
+        .expect_err("findings.severity CHECK should reject lowercase 'info'");
+    assert!(
+        err.to_string().contains("CHECK constraint failed"),
+        "unexpected error for invalid severity: {err}"
+    );
+}
+
+#[test]
+fn findings_severity_check_accepts_all_documented_values() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_anchor_entity(&conn, "python:function:demo.a");
+    for severity in ["INFO", "WARN", "ERROR", "CRITICAL", "NONE"] {
+        insert_finding(&conn, "python:function:demo.a", "fact", severity, "open")
+            .unwrap_or_else(|err| panic!("severity={severity} rejected unexpectedly: {err}"));
+        conn.execute("DELETE FROM findings", []).unwrap();
+    }
+}
+
+#[test]
+fn findings_status_check_rejects_unknown_value() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_anchor_entity(&conn, "python:function:demo.a");
+    let err = insert_finding(&conn, "python:function:demo.a", "fact", "INFO", "closed")
+        .expect_err("findings.status CHECK should reject 'closed'");
+    assert!(
+        err.to_string().contains("CHECK constraint failed"),
+        "unexpected error for invalid status: {err}"
+    );
+}
+
+#[test]
+fn findings_status_check_accepts_all_documented_values() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_anchor_entity(&conn, "python:function:demo.a");
+    for status in ["open", "acknowledged", "suppressed", "promoted_to_issue"] {
+        insert_finding(&conn, "python:function:demo.a", "fact", "INFO", status)
+            .unwrap_or_else(|err| panic!("status={status} rejected unexpectedly: {err}"));
+        conn.execute("DELETE FROM findings", []).unwrap();
+    }
+}
+
+#[test]
+fn runs_status_check_rejects_unknown_value() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    let err = conn
+        .execute(
+            "INSERT INTO runs (id, started_at, config, stats, status) \
+             VALUES ('r1', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), '{}', '{}', 'runing')",
+            [],
+        )
+        .expect_err("runs.status CHECK should reject 'runing' typo");
+    assert!(
+        err.to_string().contains("CHECK constraint failed"),
+        "unexpected error for invalid runs.status: {err}"
+    );
+}
+
+#[test]
+fn runs_status_check_accepts_all_documented_values() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    for (i, status) in ["running", "skipped_no_plugins", "completed", "failed"]
+        .iter()
+        .enumerate()
+    {
+        let id = format!("r{i}");
+        conn.execute(
+            "INSERT INTO runs (id, started_at, config, stats, status) \
+             VALUES (?1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), '{}', '{}', ?2)",
+            params![id, status],
+        )
+        .unwrap_or_else(|err| panic!("runs.status={status} rejected unexpectedly: {err}"));
+    }
+}

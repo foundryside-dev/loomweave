@@ -11,8 +11,9 @@
 -- as long as no external operator has produced a `.clarion/clarion.db` from
 -- a published Clarion build. The retirement trigger names exactly that
 -- condition; once it fires, all schema changes stack as 0002_*.sql etc.
--- The 2026-05-03 edits (guidance vocabulary rename per ADR-024) were
--- applied under this policy.
+-- The 2026-05-03 edits (guidance vocabulary rename per ADR-024) and the
+-- 2026-05-18 edits (CHECK constraints on closed-vocabulary TEXT columns per
+-- ADR-031) were both applied under this policy.
 -- ============================================================================
 
 BEGIN;
@@ -29,6 +30,9 @@ CREATE TABLE schema_migrations (
 CREATE TABLE entities (
     id                 TEXT PRIMARY KEY,
     plugin_id          TEXT NOT NULL,
+    -- ADR-031: plugin-extensible vocabulary (ADR-022 reserves entity-kind
+    -- declaration to the plugin manifest); no CHECK by policy. Writer-actor
+    -- + manifest acceptance is the enforcement layer.
     kind               TEXT NOT NULL,
     name               TEXT NOT NULL,
     short_name         TEXT NOT NULL,
@@ -70,6 +74,10 @@ CREATE INDEX ix_entity_tags_tag ON entity_tags(tag);
 -- finding-attachment cross-reference (findings.entity_id) points at entities,
 -- not edges. WITHOUT ROWID drops the now-redundant rowid pages.
 CREATE TABLE edges (
+    -- ADR-031: plugin-extensible vocabulary (ADR-022 admits plugin-declared
+    -- edge kinds beyond the four core-reserved structural ones); no CHECK by
+    -- policy. Writer-actor `enforce_edge_contract` is the enforcement layer
+    -- for the v0.1 9-value ontology.
     kind               TEXT NOT NULL,
     from_id            TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
     to_id              TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
@@ -77,6 +85,7 @@ CREATE TABLE edges (
     source_file_id     TEXT REFERENCES entities(id),
     source_byte_start  INTEGER,
     source_byte_end    INTEGER,
+    -- ADR-031 precedent: closed core-owned vocabulary; values per ADR-028.
     confidence         TEXT NOT NULL DEFAULT 'resolved'
                        CHECK (confidence IN ('resolved', 'ambiguous', 'inferred')),
     PRIMARY KEY (kind, from_id, to_id)
@@ -93,8 +102,14 @@ CREATE TABLE findings (
     tool_version        TEXT NOT NULL,
     run_id              TEXT NOT NULL,
     rule_id             TEXT NOT NULL,
-    kind                TEXT NOT NULL,
-    severity            TEXT NOT NULL,
+    -- ADR-031: closed core-owned vocabulary; values per ADR-004 +
+    -- detailed-design.md §3.
+    kind                TEXT NOT NULL
+                        CHECK (kind IN ('defect', 'fact', 'classification', 'metric', 'suggestion')),
+    -- ADR-031: closed core-owned vocabulary; values per ADR-017 (Clarion
+    -- internal severity, pre-mapping to Filigree wire).
+    severity            TEXT NOT NULL
+                        CHECK (severity IN ('INFO', 'WARN', 'ERROR', 'CRITICAL', 'NONE')),
     confidence          REAL,
     confidence_basis    TEXT,
     entity_id           TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
@@ -104,7 +119,10 @@ CREATE TABLE findings (
     properties          TEXT NOT NULL,
     supports            TEXT NOT NULL,
     supported_by        TEXT NOT NULL,
-    status              TEXT NOT NULL,
+    -- ADR-031: closed core-owned vocabulary; values per
+    -- detailed-design.md §3 finding lifecycle.
+    status              TEXT NOT NULL
+                        CHECK (status IN ('open', 'acknowledged', 'suppressed', 'promoted_to_issue')),
     suppression_reason  TEXT,
     filigree_issue_id   TEXT,
     created_at          TEXT NOT NULL,
@@ -131,6 +149,7 @@ CREATE TABLE summary_cache (
     last_accessed_at      TEXT NOT NULL,
     caller_count          INTEGER NOT NULL,
     fan_out               INTEGER NOT NULL,
+    -- ADR-031 precedent: closed core-owned vocabulary; boolean-shaped INTEGER.
     stale_semantic        INTEGER NOT NULL DEFAULT 0 CHECK (stale_semantic IN (0, 1)),
     PRIMARY KEY (entity_id, content_hash, prompt_template_id, model_tier, guidance_fingerprint)
 );
@@ -175,7 +194,11 @@ CREATE TABLE runs (
     completed_at  TEXT,
     config        TEXT NOT NULL,
     stats         TEXT NOT NULL,
+    -- ADR-031: closed core-owned vocabulary; terminal values from the
+    -- `RunStatus` enum (commands.rs); 'running' is the in-flight literal
+    -- inserted by BeginRun (writer.rs).
     status        TEXT NOT NULL
+                  CHECK (status IN ('running', 'skipped_no_plugins', 'completed', 'failed'))
 );
 
 -- FTS5 for text search

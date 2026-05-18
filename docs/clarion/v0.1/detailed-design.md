@@ -662,8 +662,12 @@ CREATE TABLE findings (
     id TEXT PRIMARY KEY,
     tool TEXT NOT NULL, tool_version TEXT NOT NULL, run_id TEXT NOT NULL,
     rule_id TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    severity TEXT NOT NULL,
+    -- Closed core-owned vocabulary per ADR-031; values per ADR-004.
+    kind TEXT NOT NULL
+         CHECK (kind IN ('defect', 'fact', 'classification', 'metric', 'suggestion')),
+    -- Closed core-owned vocabulary per ADR-031; values per ADR-017.
+    severity TEXT NOT NULL
+             CHECK (severity IN ('INFO', 'WARN', 'ERROR', 'CRITICAL', 'NONE')),
     confidence REAL,
     confidence_basis TEXT,
     entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
@@ -673,7 +677,9 @@ CREATE TABLE findings (
     properties TEXT NOT NULL,
     supports TEXT NOT NULL,
     supported_by TEXT NOT NULL,
-    status TEXT NOT NULL,
+    -- Closed core-owned vocabulary per ADR-031; finding lifecycle states.
+    status TEXT NOT NULL
+           CHECK (status IN ('open', 'acknowledged', 'suppressed', 'promoted_to_issue')),
     suppression_reason TEXT,
     filigree_issue_id TEXT,
     created_at TEXT NOT NULL,
@@ -706,7 +712,10 @@ CREATE TABLE runs (
     started_at TEXT NOT NULL, completed_at TEXT,
     config TEXT NOT NULL,
     stats TEXT NOT NULL,
+    -- Closed core-owned vocabulary per ADR-031; terminal values from the
+    -- writer-actor `RunStatus` enum; 'running' is the BeginRun in-flight literal.
     status TEXT NOT NULL
+           CHECK (status IN ('running', 'skipped_no_plugins', 'completed', 'failed'))
 );
 
 -- FTS5 for text search

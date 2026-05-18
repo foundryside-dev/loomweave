@@ -31,6 +31,7 @@ This folder is the canonical home for authored Clarion architecture decision rec
 | [ADR-028](./ADR-028-edge-confidence-tiers.md) | Edge confidence tiers (`resolved` / `ambiguous` / `inferred`); MCP queries default to `>= resolved`; inferred edges lazy-computed at query time | Accepted |
 | [ADR-029](./ADR-029-entity-associations-binding.md) | Entity associations — Filigree-side `entity_associations` table; `add_entity_association` MCP tool on Filigree; `issues_for` MCP tool on Clarion; WP9 split into A (binding, v0.1) and B (findings emission) | Accepted |
 | [ADR-030](./ADR-030-on-demand-summary-scope.md) | On-demand summary scope — narrows WP6 to MCP-driven `summary(id)`; 5-tuple cache key unchanged; module/subsystem aggregation deferred to v0.2 | Accepted |
+| [ADR-031](./ADR-031-schema-validation-policy.md) | Schema-validation policy — CHECK on closed core-owned vocabularies (`findings.{kind,severity,status}`, `runs.status`); writer-actor + manifest are the only enforcement layer for plugin-extensible vocabularies (`entities.kind`, `edges.kind`) | Accepted |
 
 ## Backlog still tracked in the detailed design
 
