@@ -205,8 +205,7 @@ fn serve_http_files_etag_round_trip_and_if_none_match_returns_304() {
     assert_eq!(not_modified.header("etag"), Some(expected_etag.as_str()));
     assert!(
         not_modified.body.is_empty(),
-        "304 response must not include a body: {:?}",
-        not_modified
+        "304 response must not include a body: {not_modified:?}"
     );
 }
 
@@ -231,8 +230,7 @@ fn serve_http_files_blank_path_returns_invalid_path_envelope() {
     assert_eq!(response.body["code"], "INVALID_PATH");
     assert!(
         response.body["error"].as_str().is_some(),
-        "error envelope must include a string message: {:?}",
-        response
+        "error envelope must include a string message: {response:?}"
     );
 }
 
@@ -261,8 +259,7 @@ fn serve_http_files_rejects_unknown_query_fields() {
     assert_eq!(response.body["code"], "INVALID_PATH");
     assert!(
         response.body["error"].as_str().is_some(),
-        "error envelope must include a string message: {:?}",
-        response
+        "error envelope must include a string message: {response:?}"
     );
 }
 
@@ -309,8 +306,7 @@ fn serve_http_files_path_traversal_returns_outside_project_envelope() {
     assert_eq!(response.body["code"], "PATH_OUTSIDE_PROJECT");
     assert!(
         response.body["error"].as_str().is_some(),
-        "error envelope must include a string message: {:?}",
-        response
+        "error envelope must include a string message: {response:?}"
     );
 }
 
@@ -335,8 +331,7 @@ fn serve_http_files_unknown_catalog_file_returns_not_found_envelope() {
     assert_eq!(response.body["code"], "NOT_FOUND");
     assert!(
         response.body["error"].as_str().is_some(),
-        "error envelope must include a string message: {:?}",
-        response
+        "error envelope must include a string message: {response:?}"
     );
 }
 
@@ -389,13 +384,11 @@ fn serve_http_files_storage_failure_returns_closed_error_without_raw_detail() {
 
     assert!(
         response.status_code == 500 || response.status_code == 503,
-        "storage failures must be 500-class: {:?}",
-        response
+        "storage failures must be 500-class: {response:?}"
     );
     assert!(
         response.body["code"] == "STORAGE_ERROR" || response.body["code"] == "INTERNAL",
-        "unexpected storage failure code: {:?}",
-        response
+        "unexpected storage failure code: {response:?}"
     );
     let body = response.body.to_string();
     assert!(!body.to_ascii_lowercase().contains("sqlite"));

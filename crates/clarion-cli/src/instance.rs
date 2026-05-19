@@ -92,11 +92,11 @@ fn read_existing_instance_id(path: &Path, raw: &str) -> Result<String> {
 
 fn parse_instance_id(path: &Path, raw: &str) -> Result<String> {
     let trimmed = raw.trim();
-    let id = Uuid::parse_str(trimmed).map_err(|err| invalid_instance_id(path, err))?;
+    let id = Uuid::parse_str(trimmed).map_err(|err| invalid_instance_id(path, &err))?;
     Ok(id.to_string())
 }
 
-fn invalid_instance_id(path: &Path, source: uuid::Error) -> anyhow::Error {
+fn invalid_instance_id(path: &Path, source: &uuid::Error) -> anyhow::Error {
     anyhow!(
         "invalid Clarion instance ID in {}: {source}; expected a UUID",
         path.display()

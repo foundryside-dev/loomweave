@@ -83,7 +83,7 @@ fn spawn_mcp_stdio(
         .spawn(move || {
             let result = run_mcp_stdio(
                 project_root,
-                db_path,
+                &db_path,
                 readers,
                 llm_config,
                 llm_provider,
@@ -97,7 +97,7 @@ fn spawn_mcp_stdio(
 
 fn run_mcp_stdio(
     project_root: PathBuf,
-    db_path: PathBuf,
+    db_path: &Path,
     readers: ReaderPool,
     llm_config: LlmConfig,
     llm_provider: Option<Arc<dyn LlmProvider>>,
@@ -117,7 +117,7 @@ fn run_mcp_stdio(
     let mut llm_writer_join = None;
     if let Some(provider) = llm_provider {
         let (writer, handle) = Writer::spawn(
-            db_path.clone(),
+            db_path.to_owned(),
             DEFAULT_BATCH_SIZE,
             DEFAULT_CHANNEL_CAPACITY,
         )
@@ -271,6 +271,22 @@ fn build_llm_provider(
     }
 }
 
+fn load_recording_fixture(config: &McpConfig, project_root: &Path) -> Result<Vec<Recording>> {
+    let Some(path) = &config.llm.recording_fixture_path else {
+        return Ok(Vec::new());
+    };
+    let path = Path::new(path);
+    let path = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        project_root.join(path)
+    };
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("read RecordingProvider fixture {}", path.display()))?;
+    serde_json::from_str(&raw)
+        .with_context(|| format!("parse RecordingProvider fixture {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,20 +304,4 @@ mod tests {
             "unexpected error: {err:#}"
         );
     }
-}
-
-fn load_recording_fixture(config: &McpConfig, project_root: &Path) -> Result<Vec<Recording>> {
-    let Some(path) = &config.llm.recording_fixture_path else {
-        return Ok(Vec::new());
-    };
-    let path = Path::new(path);
-    let path = if path.is_absolute() {
-        path.to_owned()
-    } else {
-        project_root.join(path)
-    };
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("read RecordingProvider fixture {}", path.display()))?;
-    serde_json::from_str(&raw)
-        .with_context(|| format!("parse RecordingProvider fixture {}", path.display()))
 }

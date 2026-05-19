@@ -284,15 +284,12 @@ async fn get_file(
     headers: HeaderMap,
     query: Result<Query<FileQuery>, QueryRejection>,
 ) -> Response {
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(_) => {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                ErrorCode::InvalidPath,
-                "query parameters are invalid",
-            );
-        }
+    let Ok(Query(query)) = query else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidPath,
+            "query parameters are invalid",
+        );
     };
     if query.path.trim().is_empty() {
         return json_error(
@@ -353,7 +350,7 @@ async fn get_file(
             ErrorCode::NotFound,
             "file is not known to Clarion",
         ),
-        Err(err) => json_read_error(err),
+        Err(err) => json_read_error(&err),
     }
 }
 
@@ -424,10 +421,10 @@ async fn get_capabilities(State(state): State<AppState>) -> Json<CapabilitiesRes
     })
 }
 
-fn json_read_error(err: StorageError) -> Response {
-    let error = classify_read_error(&err);
+fn json_read_error(err: &StorageError) -> Response {
+    let error = classify_read_error(err);
     if error.status.is_server_error() {
-        log_read_server_error(error.code, error.status, &err);
+        log_read_server_error(error.code, error.status, err);
     }
     json_error(error.status, error.code, error.message)
 }
@@ -455,11 +452,6 @@ fn classify_read_error(err: &StorageError) -> ReadError {
             code: ErrorCode::StorageError,
             message: "file lookup storage is unavailable",
         },
-        StorageError::PoolInteract(_) => ReadError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: ErrorCode::Internal,
-            message: "internal file lookup failure",
-        },
         StorageError::Sqlite(_)
         | StorageError::PoolBuild(_)
         | StorageError::PragmaInvariant(_)
@@ -469,7 +461,8 @@ fn classify_read_error(err: &StorageError) -> ReadError {
             code: ErrorCode::StorageError,
             message: "file lookup failed",
         },
-        StorageError::WriterGone
+        StorageError::PoolInteract(_)
+        | StorageError::WriterGone
         | StorageError::WriterProtocol(_)
         | StorageError::WriterNoResponse => ReadError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
