@@ -78,7 +78,7 @@ Filigree integration for scanner findings is planned for v0.2. Until then, the l
 
 ## Limitations
 
-The scanner is pattern-based. It can miss novel internal key formats and it can flag high-entropy test data. Use a justified baseline for reviewed false positives, and prefer `--no-llm` or an air-gapped workflow for repos where any source disclosure would be unacceptable.
+The scanner is pattern-based. It can miss novel internal key formats and it can flag high-entropy test data. Use a justified baseline for reviewed false positives, and disable LLM dispatch entirely for repos where any source disclosure would be unacceptable — set `llm.allow_live_provider: false` in `clarion.yaml` (or leave `CLARION_LLM_LIVE` unset) so the recording provider is the only path Clarion will take.
 
 Contextual credential suppression only recognises shell/Python `#` comments in v0.1. It does not recognise `//` or `/* */` comments; use a justified baseline entry for reviewed non-Python test fixtures.
 

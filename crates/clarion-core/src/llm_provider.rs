@@ -1044,7 +1044,13 @@ fn parse_claude_cli_json_output(stdout: &[u8]) -> Result<ClaudeCliOutput, LlmPro
                 .rev()
                 .find(|event| has_claude_structured_output(event))
         })
-        .unwrap_or(&value);
+        .ok_or_else(|| LlmProviderError::InvalidResponse {
+            message: "Claude CLI stdout had no `result` event or `structured_output`/\
+                      `structuredOutput`/`result` payload; refusing to persist raw stdout \
+                      as structured output"
+                .to_owned(),
+            retryable: true,
+        })?;
     let usage = if result_event.get("usage").is_some() {
         usage_from_event(result_event)
     } else {
@@ -1078,7 +1084,12 @@ fn claude_structured_output_json(value: &Value) -> Result<String, LlmProviderErr
         .get("structured_output")
         .or_else(|| value.get("structuredOutput"))
         .or_else(|| value.get("result"))
-        .unwrap_or(value);
+        .ok_or_else(|| LlmProviderError::InvalidResponse {
+            message: "Claude CLI event lacked `structured_output`/`structuredOutput`/`result` \
+                      field; refusing to persist raw event as structured output"
+                .to_owned(),
+            retryable: true,
+        })?;
     json_value_to_output_json(output, "Claude CLI structured output")
 }
 

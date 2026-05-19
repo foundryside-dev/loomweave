@@ -138,16 +138,26 @@ async fn get_file(State(state): State<AppState>, Query(query): Query<FileQuery>)
         .with_reader(move |conn| resolve_file(conn, &project_root, &file_path, &language))
         .await;
     match result {
-        Ok(Some(file)) => (
-            StatusCode::OK,
-            Json(FileResponse {
-                entity_id: file.entity_id,
-                content_hash: file.content_hash,
-                canonical_path: file.canonical_path,
-                language: file.language,
-            }),
-        )
-            .into_response(),
+        Ok(Some(file)) => {
+            if let Some(reason) = file.briefing_blocked.as_deref() {
+                tracing::warn!(
+                    path = %file.canonical_path,
+                    reason = %reason,
+                    "HTTP /api/v1/files refusing to expose briefing-blocked entity"
+                );
+                return json_error(StatusCode::NOT_FOUND, "file is not known to Clarion");
+            }
+            (
+                StatusCode::OK,
+                Json(FileResponse {
+                    entity_id: file.entity_id,
+                    content_hash: file.content_hash,
+                    canonical_path: file.canonical_path,
+                    language: file.language,
+                }),
+            )
+                .into_response()
+        }
         Ok(None) => json_error(StatusCode::NOT_FOUND, "file is not known to Clarion"),
         Err(err) => json_error(StatusCode::BAD_REQUEST, &err.to_string()),
     }

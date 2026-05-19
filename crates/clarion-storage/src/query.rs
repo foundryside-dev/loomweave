@@ -81,6 +81,12 @@ pub struct ResolvedFile {
     pub content_hash: String,
     pub canonical_path: String,
     pub language: String,
+    /// `Some(reason)` when the resolved entity carries a `briefing_blocked`
+    /// property (set by the pre-ingest secret scanner or the unscanned-source
+    /// defense-in-depth path). Federation read surfaces must refuse to expose
+    /// blocked entities to siblings; see `http_read::get_file` for the 404
+    /// translation.
+    pub briefing_blocked: Option<String>,
 }
 
 const MODULE_ANCESTOR_MAX_DEPTH: i64 = 32;
@@ -168,6 +174,7 @@ pub fn resolve_file(
     let normalized = normalize_source_path(project_root, file)?;
     let canonical_path = project_relative_path(project_root, Path::new(&normalized))?;
     if let Some(entity) = source_entity_for_path(conn, &normalized, Some("file"))? {
+        let briefing_blocked = entity_briefing_block_reason(&entity.properties_json);
         return Ok(Some(ResolvedFile {
             entity_id: entity.id,
             content_hash: entity
@@ -176,11 +183,13 @@ pub fn resolve_file(
                 .unwrap_or_default(),
             canonical_path,
             language: resolved_language(language, &entity.plugin_id, Path::new(&normalized)),
+            briefing_blocked,
         }));
     }
     let Some(anchor) = source_entity_for_path(conn, &normalized, None)? else {
         return Ok(None);
     };
+    let briefing_blocked = entity_briefing_block_reason(&anchor.properties_json);
     let content_hash = anchor
         .content_hash
         .or_else(|| file_content_hash(Path::new(&normalized)))
@@ -191,7 +200,19 @@ pub fn resolve_file(
         content_hash,
         canonical_path,
         language: resolved_language(language, &anchor.plugin_id, Path::new(&normalized)),
+        briefing_blocked,
     }))
+}
+
+/// Extract the `briefing_blocked` reason from an entity's `properties` JSON
+/// column. Shared with `clarion-mcp` (which makes the same call inline) so
+/// federation read surfaces enforce the block uniformly.
+pub fn entity_briefing_block_reason(properties_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(properties_json)
+        .ok()?
+        .get("briefing_blocked")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 fn source_entity_for_path(

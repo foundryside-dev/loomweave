@@ -5,9 +5,10 @@ use std::path::Path;
 use clarion_core::EdgeConfidence;
 use clarion_storage::{
     ModuleDependencyEdge, ReferenceDirection, SubsystemMember, call_edges_from,
-    call_edges_targeting, child_entity_ids, contained_entity_ids, entity_at_line, entity_by_id,
-    find_entities, module_dependency_edges, normalize_source_path, pragma,
-    reference_edges_for_entity, schema, subsystem_for_member, subsystem_members,
+    call_edges_targeting, child_entity_ids, contained_entity_ids, entity_at_line,
+    entity_briefing_block_reason, entity_by_id, find_entities, module_dependency_edges,
+    normalize_source_path, pragma, reference_edges_for_entity, resolve_file, schema,
+    subsystem_for_member, subsystem_members,
 };
 use rusqlite::{Connection, params};
 
@@ -750,4 +751,97 @@ fn normalize_source_path_accepts_project_relative_paths_and_rejects_escape() {
         escaped.to_string().contains("invalid source path"),
         "unexpected error: {escaped}"
     );
+}
+
+#[test]
+fn resolve_file_surfaces_briefing_blocked_reason_from_properties() {
+    let tempdir = tempfile::tempdir().expect("temp project root");
+    let project_root = tempdir.path();
+    let source_path = project_root.join("secret.env");
+    std::fs::write(&source_path, "TOKEN=AKIAIOSFODNN7EXAMPLE\n").expect("write source");
+    let canonical = source_path.canonicalize().expect("canonical source");
+
+    let conn = open_fresh(&tempdir);
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            'core:file:hash-secret@secret.env', 'core', 'file', 'secret.env', 'secret.env', ?1,
+            1, 1, '{\"briefing_blocked\":\"secret_present\"}', 'hash-secret-file',
+            '2026-05-19T00:00:00.000Z', '2026-05-19T00:00:00.000Z'
+         )",
+        params![canonical.display().to_string()],
+    )
+    .expect("insert briefing-blocked entity");
+
+    let resolved = resolve_file(&conn, project_root, "secret.env", "env")
+        .expect("resolve_file")
+        .expect("entity is known");
+
+    assert_eq!(
+        resolved.briefing_blocked.as_deref(),
+        Some("secret_present"),
+        "resolve_file must surface briefing_blocked reason so federation read \
+         surfaces (HTTP /api/v1/files) can refuse to expose blocked entities"
+    );
+}
+
+#[test]
+fn resolve_file_returns_none_briefing_blocked_for_clean_entity() {
+    let tempdir = tempfile::tempdir().expect("temp project root");
+    let project_root = tempdir.path();
+    let source_path = project_root.join("demo.py");
+    std::fs::write(&source_path, "def entry():\n    return 1\n").expect("write source");
+    let canonical = source_path.canonicalize().expect("canonical source");
+
+    let conn = open_fresh(&tempdir);
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            'python:file:demo', 'python', 'file', 'demo.py', 'demo.py', ?1,
+            1, 2, '{}', 'hash-demo',
+            '2026-05-19T00:00:00.000Z', '2026-05-19T00:00:00.000Z'
+         )",
+        params![canonical.display().to_string()],
+    )
+    .expect("insert clean entity");
+
+    let resolved = resolve_file(&conn, project_root, "demo.py", "python")
+        .expect("resolve_file")
+        .expect("entity is known");
+
+    assert!(
+        resolved.briefing_blocked.is_none(),
+        "clean entity must not surface a briefing_blocked reason; got {:?}",
+        resolved.briefing_blocked
+    );
+}
+
+#[test]
+fn entity_briefing_block_reason_parses_property_and_tolerates_garbage() {
+    assert_eq!(
+        entity_briefing_block_reason(r#"{"briefing_blocked":"secret_present"}"#),
+        Some("secret_present".to_owned()),
+    );
+    assert_eq!(
+        entity_briefing_block_reason(r#"{"briefing_blocked":"unscanned_source"}"#),
+        Some("unscanned_source".to_owned()),
+    );
+    // No key.
+    assert_eq!(entity_briefing_block_reason("{}"), None);
+    assert_eq!(entity_briefing_block_reason(r#"{"other":"x"}"#), None);
+    // Wrong type — key present but not a string.
+    assert_eq!(
+        entity_briefing_block_reason(r#"{"briefing_blocked":42}"#),
+        None,
+    );
+    // Malformed JSON must not panic.
+    assert_eq!(entity_briefing_block_reason(""), None);
+    assert_eq!(entity_briefing_block_reason("not json"), None);
+    // Non-object root.
+    assert_eq!(entity_briefing_block_reason("null"), None);
+    assert_eq!(entity_briefing_block_reason("[]"), None);
 }

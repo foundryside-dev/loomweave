@@ -31,6 +31,7 @@ pub(crate) fn collect_scan_files(root: &Path, source_files: &[PathBuf]) -> Vec<P
 
 fn collect_secret_scan_sidecars(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
+    let mut skipped: u64 = 0;
     let mut builder = WalkBuilder::new(root);
     builder
         .follow_links(false)
@@ -43,14 +44,36 @@ fn collect_secret_scan_sidecars(root: &Path) -> Vec<PathBuf> {
         .require_git(false)
         .filter_entry(|entry| !is_skipped_dir(entry));
 
-    for entry in builder.build().filter_map(std::result::Result::ok) {
-        let Some(file_type) = entry.file_type() else {
-            continue;
-        };
-        let path = entry.into_path();
-        if file_type.is_file() && is_secret_scan_sidecar(&path) {
-            out.push(path);
+    for result in builder.build() {
+        match result {
+            Ok(entry) => {
+                let Some(file_type) = entry.file_type() else {
+                    continue;
+                };
+                let path = entry.into_path();
+                if file_type.is_file() && is_secret_scan_sidecar(&path) {
+                    out.push(path);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "sidecar walk: skipping unreadable entry; secret-scan coverage is incomplete \
+                     for this path",
+                );
+                skipped += 1;
+            }
         }
+    }
+
+    if skipped > 0 {
+        tracing::warn!(
+            skipped = skipped,
+            root = %root.display(),
+            "sidecar walk skipped {skipped} unreadable entr{suffix}; secret-scan gate is \
+             incomplete for those paths",
+            suffix = if skipped == 1 { "y" } else { "ies" },
+        );
     }
     out
 }
