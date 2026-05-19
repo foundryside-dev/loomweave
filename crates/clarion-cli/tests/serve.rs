@@ -1074,6 +1074,18 @@ fn load_contract_fixture(fixture_name: &str, source: &str) -> Value {
         fixture.get("_meta").and_then(Value::as_object).is_some(),
         "{fixture_name} missing top-level _meta object"
     );
+    for field in [
+        "contract",
+        "stability",
+        "authority",
+        "verification",
+        "updated",
+    ] {
+        assert!(
+            fixture.pointer(&format!("/_meta/{field}")).is_some(),
+            "{fixture_name} missing required _meta.{field}"
+        );
+    }
     assert!(
         fixture
             .pointer("/shape_decl/shapes")

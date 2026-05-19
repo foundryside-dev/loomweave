@@ -165,10 +165,7 @@ fn run_http_read_server(
     shutdown_rx: oneshot::Receiver<()>,
     ready_tx: mpsc::Sender<Result<std::net::SocketAddr>>,
 ) -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("create HTTP read runtime")?;
+    let runtime = build_http_runtime()?;
     runtime.block_on(async move {
         let listener = match tokio::net::TcpListener::bind(bind).await {
             Ok(listener) => listener,
@@ -193,6 +190,14 @@ fn run_http_read_server(
             .await
             .context("serve HTTP read API")
     })
+}
+
+fn build_http_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .thread_name("clarion-http-worker")
+        .enable_all()
+        .build()
+        .context("create HTTP read runtime")
 }
 
 fn router(state: AppState) -> Router {
@@ -610,5 +615,17 @@ mod tests {
 
         assert_eq!(context.loom_component.as_deref(), Some("loom"));
         assert_eq!(context.filigree_actor.as_deref(), Some("worker-f"));
+    }
+
+    #[test]
+    fn http_runtime_names_worker_threads() {
+        let runtime = build_http_runtime().expect("HTTP runtime");
+        let worker_name = runtime.block_on(async {
+            tokio::spawn(async { std::thread::current().name().map(str::to_owned) })
+                .await
+                .expect("worker task")
+        });
+
+        assert_eq!(worker_name.as_deref(), Some("clarion-http-worker"));
     }
 }

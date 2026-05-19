@@ -4,6 +4,9 @@
     "endpoint": "GET /api/v1/_capabilities",
     "api_version": 1,
     "fixture_version": 2,
+    "stability": "normative",
+    "authority": "Clarion ADR-014 federation registry-backend contract",
+    "verification": "cargo test -p clarion-cli --test serve",
     "normative": true,
     "updated": "2026-05-19",
     "description": "Contract example for Clarion registry-backend capability discovery."
