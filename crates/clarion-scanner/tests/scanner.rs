@@ -483,8 +483,8 @@ results:
 }
 
 /// Regression net for the gap noted in PR #11 review (clarion-55fc5aa885 §I6):
-/// baseline suppression keys on (hashed_secret, line_number, rule_type). A
-/// baseline entry at line 1 with one hash MUST NOT suppress a *different*
+/// baseline suppression keys on (`hashed_secret`, `line_number`, `rule_type`).
+/// A baseline entry at line 1 with one hash MUST NOT suppress a *different*
 /// detection at line 1 — that would be a silent regression where a benign
 /// stub gets replaced by a real secret at the same offset and the gate
 /// stops firing.

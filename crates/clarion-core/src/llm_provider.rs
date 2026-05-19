@@ -2218,7 +2218,8 @@ printf '%s\n' '{{"type":"result","subtype":"success","structured_output":{{"purp
         // payload and downstream consumers persisted it as a summary.
         // Post-fix (clarion-55fc5aa885 §C3), this must be a typed
         // InvalidResponse rather than silent garbage.
-        let stdout = br#"{"type":"assistant","message":{"usage":{"input_tokens":1,"output_tokens":1}}}"#;
+        let stdout =
+            br#"{"type":"assistant","message":{"usage":{"input_tokens":1,"output_tokens":1}}}"#;
         let err = parse_claude_cli_json_output(stdout).expect_err(
             "stdout without a `result` event or `structured_output` field must \
              surface InvalidResponse, not be persisted as a summary",
