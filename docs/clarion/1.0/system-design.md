@@ -1,7 +1,7 @@
-# Clarion v0.1 — System Design
+# Clarion v1.0 — System Design
 
-**Status**: Baselined for v0.1 implementation (post-ADR sprint 2026-04-18) — mid-level technical companion to requirements
-**Baseline**: 2026-04-17 · **Last updated**: 2026-04-18
+**Status**: Baselined for v1.0 release (carried forward from the v0.1 post-ADR-sprint baseline) — mid-level technical companion to requirements
+**Baseline**: 2026-04-17 · **Last updated**: 2026-05-19
 **Primary author**: qacona@gmail.com (with Claude)
 **Companion documents**:
 - [requirements.md](./requirements.md) — requirements (the *what*)

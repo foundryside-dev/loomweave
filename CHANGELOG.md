@@ -21,8 +21,9 @@ First publishable release. Clarion ships as a Rust core (`clarion` binary, five
 workspace crates) plus an editable-install Python language plugin
 (`clarion-plugin-python`). Released under the [MIT License](LICENSE).
 
-Tagged as `v1.0.0`. Supersedes the pre-release `v0.1-sprint-1` and
-`v0.1-sprint-2` working tags; those remain in the repo as historical anchors.
+Targets the `v1.0.0` tag (cut by the operator once all release blockers are
+green); supersedes the pre-release `v0.1-sprint-1` and `v0.1-sprint-2`
+working tags, which remain in the repo as historical anchors.
 
 ### Core
 

@@ -1,7 +1,7 @@
-# Clarion v0.1 — Detailed Design Reference
+# Clarion v1.0 — Detailed Design Reference
 
-**Status**: Baselined for v0.1 implementation (post-ADR sprint 2026-04-18) — Layer 3 of the Clarion v0.1 docset, implementation-level reference. Canonical home of the ADR backlog, SQL schema, Rust struct definitions, full YAML config example, exact rule-ID catalogues, wire-format mapping tables, and cross-tool prerequisite lists.
-**Baseline**: 2026-04-17 · **Last updated**: 2026-04-18
+**Status**: Baselined for v1.0 release (carried forward from the v0.1 post-ADR-sprint baseline) — Layer 3 of the Clarion v1.0 docset, implementation-level reference. Canonical home of the ADR backlog, SQL schema, Rust struct definitions, full YAML config example, exact rule-ID catalogues, wire-format mapping tables, and cross-tool prerequisite lists.
+**Baseline**: 2026-04-17 · **Last updated**: 2026-05-19
 **Primary author**: qacona@gmail.com (with Claude)
 **First customer target**: `/home/john/elspeth` (~425k LOC Python)
 **Revision**: 5 (final pre-restructure single-file revision; see Appendix D for full history). Post-restructure the three layered docs track changes via git log plus dated edits in this preamble; there is no unified "Rev 6."

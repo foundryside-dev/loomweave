@@ -1,7 +1,7 @@
-# Clarion v0.1 — Requirements
+# Clarion v1.0 — Requirements
 
-**Status**: Baselined for v0.1 implementation (post-ADR sprint 2026-04-18)
-**Baseline**: 2026-04-17 · **Last updated**: 2026-04-18
+**Status**: Baselined for v1.0 release (carried forward from v0.1 baseline 2026-04-17 with the Sprint 3 federation-hardening additions)
+**Baseline**: 2026-04-17 · **Last updated**: 2026-05-19
 **Primary author**: qacona@gmail.com (with Claude)
 **First customer target**: `/home/john/elspeth` (~425k LOC Python)
 **Companion documents**:
