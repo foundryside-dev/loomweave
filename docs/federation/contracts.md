@@ -117,8 +117,84 @@ Semantics:
 The contract fixture at
 [`fixtures/get-api-v1-files.demo-python.json`](./fixtures/get-api-v1-files.demo-python.json)
 is normative for this section. It includes `_meta`, `shape_decl`, and examples
-for the happy path, not-known, blank path, outside-root, and storage-error
-responses.
+for the happy path, not-known, blank path, outside-root, briefing-blocked,
+and storage-error responses.
+
+### `POST /api/v1/files/batch`
+
+Resolves up to **256** file paths in a single request. Filigree's
+`ClarionRegistry` uses this for cold-start hydration so that one rehydration
+costs one round-trip and one pooled-connection checkout, rather than N of each.
+
+Request body (`application/json`, max 16 KiB):
+
+```json
+{
+  "queries": [
+    {"path": "src/foo.py", "language": "python"},
+    {"path": "src/bar.py", "language": ""}
+  ]
+}
+```
+
+Successful response (`200 OK`) — every input path is partitioned into exactly
+one of four lists:
+
+```json
+{
+  "resolved": [
+    {
+      "requested_path": "src/foo.py",
+      "entity_id": "core:file:src/foo.py",
+      "content_hash": "<hash>",
+      "canonical_path": "src/foo.py",
+      "language": "python"
+    }
+  ],
+  "not_found": ["src/missing.py"],
+  "briefing_blocked": ["src/secrets.py"],
+  "errors": [
+    {
+      "requested_path": "../escapes.py",
+      "code": "PATH_OUTSIDE_PROJECT",
+      "message": "path is outside project root"
+    }
+  ]
+}
+```
+
+Semantics:
+
+- `resolved[*]` echoes the requested path back as `requested_path` so the
+  client can correlate without re-canonicalising; the rest of the fields
+  match the `GET /api/v1/files` response shape for the same input.
+- `not_found[]` and `briefing_blocked[]` are plain string arrays of the
+  requested paths — Filigree must not infer file identity from the
+  `briefing_blocked` partition (same withholding semantics as the
+  single-file `403 BRIEFING_BLOCKED`).
+- `errors[]` carries per-path resolution errors (`INVALID_PATH`,
+  `PATH_OUTSIDE_PROJECT`, `STORAGE_ERROR`, `INTERNAL`). Errors are
+  per-item, not envelope-level; the response is still `200 OK`.
+
+Failure modes (envelope-level):
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `INVALID_PATH` | Body is not a valid `{"queries": [...]}` JSON object. |
+| 400 | `BATCH_TOO_LARGE` | `queries.len() > 256`. Filigree must split client-side. |
+| 401 | `UNAUTHORIZED` | Bearer auth missing or wrong (when configured — see §Authentication). |
+| 413 | n/a | Request body exceeds the 16 KiB cap (transport-level). |
+| 500/503 | `STORAGE_ERROR` / `INTERNAL` | Whole-batch storage failure. |
+
+ETag is **not** applied to the batch endpoint; clients that want
+conditional fetch semantics should use the single-file endpoint. The whole
+batch runs inside one pooled `ReaderPool::with_reader` checkout —
+implementors must not regress this to per-query checkout, since the
+per-query model defeats the only reason the endpoint exists.
+
+The contract fixture at
+[`fixtures/post-api-v1-files-batch.json`](./fixtures/post-api-v1-files-batch.json)
+is normative for this section.
 
 ### `GET /api/v1/_capabilities`
 
@@ -152,3 +228,36 @@ The contract fixture at
 [`fixtures/get-api-v1-capabilities.json`](./fixtures/get-api-v1-capabilities.json)
 is normative for this section. Its shape declaration pins `api_version` and
 asserts that `instance_id` is a UUID; the example uses a seeded stable ID.
+
+## Path normalization
+
+Both `GET /api/v1/files` and `POST /api/v1/files/batch` accept the same
+input-path shape:
+
+- **Lexical**, not filesystem-canonical. Path normalization joins the
+  configured project root with the requested path (or treats an absolute
+  path as-is when it falls under the project root), then folds `.` /
+  `..` lexically. The path **does not need to exist on disk** at lookup
+  time — Clarion resolves against its entity catalog
+  (`entities.source_file_path`), not against `stat(2)`. This is important
+  for replay scenarios where the catalog row outlives the file.
+- **Forward-slash separators only**. Both project-relative paths
+  (`src/foo.py`) and project-root-anchored absolute paths
+  (`/var/run/clarion-corpus/src/foo.py`) are accepted; backslash
+  separators are not.
+- **Project-relative or absolute under the project root**. A request
+  whose normalized form escapes the project root returns 400
+  `PATH_OUTSIDE_PROJECT` (single-file) or surfaces as an
+  `errors[].code = "PATH_OUTSIDE_PROJECT"` entry (batch).
+- **Symlink-resolved equivalents are not reconciled**. If your project
+  contains symlinks, both Clarion and Filigree must agree on the same
+  canonical form for the same logical file (typically the lexically-
+  joined form). Clarion does **not** call `canonicalize()` on the
+  request path; the catalog row carries the canonical form chosen at
+  ingest.
+
+Reference implementation: `clarion-storage::query::normalize_lookup_path`
+(file path: [`crates/clarion-storage/src/query.rs`](../../crates/clarion-storage/src/query.rs)).
+The function signature is stable for the lifetime of `api_version: 1`;
+the *implementation* is free to change as long as the lexical /
+no-disk-touch / forward-slash / under-root contract holds.

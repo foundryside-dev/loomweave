@@ -4,13 +4,15 @@ use std::sync::{Arc, LazyLock, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use std::future::IntoFuture;
+
 use anyhow::{Context, Result, anyhow};
 use axum::error_handling::HandleErrorLayer;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use clarion_mcp::config::HttpReadConfig;
 use clarion_storage::{CanonicalProjectPath, ReaderPool, StorageError, resolve_file_catalog_entry};
@@ -260,7 +262,6 @@ fn run_http_read_server(
             instance_id,
             auth_token,
         };
-        use std::future::IntoFuture;
         let serve_future = axum::serve(listener, router(state))
             .with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
@@ -304,9 +305,10 @@ where
 #[cfg(test)]
 async fn panic_trigger_watcher() {
     loop {
-        if HTTP_THREAD_PANIC_TRIGGER.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            panic!("synthetic HTTP runtime panic for supervisor test");
-        }
+        assert!(
+            !HTTP_THREAD_PANIC_TRIGGER.swap(false, std::sync::atomic::Ordering::SeqCst),
+            "synthetic HTTP runtime panic for supervisor test"
+        );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
@@ -322,6 +324,7 @@ fn build_http_runtime() -> Result<tokio::runtime::Runtime> {
 fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/v1/files", get(get_file))
+        .route("/api/v1/files/batch", post(post_files_batch))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_bearer_token,
@@ -470,7 +473,54 @@ enum ErrorCode {
     BriefingBlocked,
     Unauthorized,
     StorageError,
+    BatchTooLarge,
     Internal,
+}
+
+/// Maximum number of `BatchFileQuery` entries a single
+/// `POST /api/v1/files/batch` request may carry. Pinned in the federation
+/// contract; Filigree splits oversize lookup sets client-side. Lifted to a
+/// constant so the contract docs, the validator, and tests all point at
+/// the same number.
+const BATCH_MAX_QUERIES: usize = 256;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchFileQuery {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    language: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchFileRequest {
+    queries: Vec<BatchFileQuery>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchResolvedItem {
+    requested_path: String,
+    entity_id: String,
+    content_hash: String,
+    canonical_path: CanonicalProjectPath,
+    language: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchErrorItem {
+    requested_path: String,
+    code: ErrorCode,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchFileResponse {
+    resolved: Vec<BatchResolvedItem>,
+    not_found: Vec<String>,
+    briefing_blocked: Vec<String>,
+    errors: Vec<BatchErrorItem>,
 }
 
 async fn get_file(
@@ -599,6 +649,107 @@ fn if_none_match_matches(value: Option<&HeaderValue>, etag: &str) -> bool {
 fn insert_etag(response: &mut Response, etag: &str) {
     if let Ok(value) = HeaderValue::from_str(etag) {
         response.headers_mut().insert(header::ETAG, value);
+    }
+}
+
+/// Batch resolution endpoint. Resolves up to `BATCH_MAX_QUERIES` paths in a
+/// single request, partitioning results into four lists:
+///
+/// - `resolved`        — paths that mapped to a file-kind entity.
+/// - `not_found`       — paths Clarion does not have a catalog row for.
+/// - `briefing_blocked` — paths whose entity carries a `briefing_blocked`
+///   property (the partition equivalent of the single-file 403 surface).
+/// - `errors`          — per-path resolution errors (`INVALID_PATH`,
+///   `PATH_OUTSIDE_PROJECT`, `STORAGE_ERROR`, `INTERNAL`).
+///
+/// The whole batch runs inside **one** `with_reader` closure so we
+/// check out one pooled connection per request, not one per query —
+/// this is the perf win Filigree's `ClarionRegistry` needs for cold-
+/// start hydration. ETag is intentionally not applied to the batch
+/// surface; clients should ETag the single-file endpoint when they
+/// want conditional fetch semantics.
+async fn post_files_batch(
+    State(state): State<AppState>,
+    body: Result<Json<BatchFileRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(request)) = body else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidPath,
+            "request body must be a JSON object {\"queries\": [...]}",
+        );
+    };
+    if request.queries.len() > BATCH_MAX_QUERIES {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::BatchTooLarge,
+            "queries[] exceeds the per-batch maximum of 256 entries",
+        );
+    }
+    let project_root = state.project_root.clone();
+    let queries = request.queries;
+    let catalog_result = state
+        .readers
+        .with_reader(move |conn| {
+            let mut resolved = Vec::new();
+            let mut not_found = Vec::new();
+            let mut briefing_blocked = Vec::new();
+            let mut errors = Vec::new();
+            for query in queries {
+                if query.path.trim().is_empty() {
+                    errors.push(BatchErrorItem {
+                        requested_path: query.path.clone(),
+                        code: ErrorCode::InvalidPath,
+                        message: "path must not be blank".to_owned(),
+                    });
+                    continue;
+                }
+                match resolve_file_catalog_entry(
+                    conn,
+                    &project_root,
+                    &query.path,
+                    &query.language,
+                ) {
+                    Ok(Some(entry)) => match entry.into_resolved_file() {
+                        Ok(file) => {
+                            if file.briefing_blocked.is_some() {
+                                briefing_blocked.push(query.path);
+                            } else {
+                                resolved.push(BatchResolvedItem {
+                                    requested_path: query.path,
+                                    entity_id: file.entity_id,
+                                    content_hash: file.content_hash,
+                                    canonical_path: file.canonical_path,
+                                    language: file.language,
+                                });
+                            }
+                        }
+                        Err(err) => errors.push(classify_batch_error(query.path, &err)),
+                    },
+                    Ok(None) => not_found.push(query.path),
+                    Err(err) => errors.push(classify_batch_error(query.path, &err)),
+                }
+            }
+            Ok::<_, StorageError>(BatchFileResponse {
+                resolved,
+                not_found,
+                briefing_blocked,
+                errors,
+            })
+        })
+        .await;
+    match catalog_result {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => json_read_error(&err),
+    }
+}
+
+fn classify_batch_error(requested_path: String, err: &StorageError) -> BatchErrorItem {
+    let classified = classify_read_error(err);
+    BatchErrorItem {
+        requested_path,
+        code: classified.code,
+        message: classified.message.to_owned(),
     }
 }
 
@@ -1112,18 +1263,15 @@ mod tests {
         // regression in the trigger path doesn't hang CI.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let err = loop {
-            match server.check_running() {
-                Err(err) => break err,
-                Ok(()) => {
-                    if std::time::Instant::now() >= deadline {
-                        panic!(
-                            "supervisor did not surface a runtime panic within 5s — \
-                             the test panic hook may not be wired correctly"
-                        );
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
+            if let Err(err) = server.check_running() {
+                break err;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "supervisor did not surface a runtime panic within 5s — \
+                 the test panic hook may not be wired correctly"
+            );
+            std::thread::sleep(Duration::from_millis(20));
         };
 
         let message = format!("{err:#}");

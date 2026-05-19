@@ -425,8 +425,14 @@ fn serve_http_files_storage_failure_returns_closed_error_without_raw_detail() {
         response.status_code == 500 || response.status_code == 503,
         "storage failures must be 500-class: {response:?}"
     );
-    assert!(
-        response.body["code"] == "STORAGE_ERROR" || response.body["code"] == "INTERNAL",
+    // The fixture pins this code: the deleted-file-on-disk path runs
+    // through `StorageError::Io` in `into_resolved_file`, which the HTTP
+    // surface classifies as `STORAGE_ERROR`. The historical `|| INTERNAL`
+    // fallback masked silent drift in the classifier; tighten it so any
+    // future re-categorisation surfaces here rather than at a federation
+    // consumer.
+    assert_eq!(
+        response.body["code"], "STORAGE_ERROR",
         "unexpected storage failure code: {response:?}"
     );
     let body = response.body.to_string();
@@ -559,6 +565,68 @@ fn serve_http_capabilities_reuses_persisted_instance_id_across_restarts() {
     );
 }
 
+/// C12 rotation positive case. The sibling
+/// `_reuses_persisted_instance_id_across_restarts` test proves *stability*
+/// (the same persisted file produces the same instance_id), which silently
+/// passes a regression that ignores the file and re-mints on every boot.
+/// This test proves the *rotation* direction: overwriting the persisted
+/// file between restarts causes `/api/v1/_capabilities` to surface the new
+/// UUID. Without it, a future refactor could hard-code a per-process UUID
+/// and pass every existing capabilities test.
+#[test]
+fn serve_http_capabilities_returns_new_instance_id_after_rotation() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let instance_id_path = dir.path().join(".clarion/instance_id");
+
+    let first_bind = free_loopback_bind();
+    write_http_config(dir.path(), &first_bind);
+    let mut first_child = spawn_serve(dir.path());
+    let first = wait_for_http_json(&first_bind, "/api/v1/_capabilities")
+        .expect("first capabilities response");
+    stop_serve(&mut first_child);
+    let first_instance_id = first["instance_id"]
+        .as_str()
+        .expect("first instance_id")
+        .to_owned();
+
+    // Rotate: overwrite the persisted file with a different valid UUID.
+    let rotated_uuid = Uuid::new_v4().to_string();
+    assert_ne!(
+        rotated_uuid, first_instance_id,
+        "rotated UUID must differ from the first to make the test meaningful"
+    );
+    fs::write(&instance_id_path, format!("{rotated_uuid}\n")).expect("rotate instance_id file");
+
+    let second_bind = free_loopback_bind();
+    write_http_config(dir.path(), &second_bind);
+    let mut second_child = spawn_serve(dir.path());
+    let second = wait_for_http_json(&second_bind, "/api/v1/_capabilities")
+        .expect("second capabilities response");
+    stop_serve(&mut second_child);
+
+    assert_eq!(
+        second["instance_id"], rotated_uuid,
+        "after rotation, /_capabilities must surface the new persisted UUID"
+    );
+    assert_ne!(
+        second["instance_id"], first["instance_id"],
+        "rotated response must differ from the pre-rotation response"
+    );
+    assert_eq!(
+        fs::read_to_string(&instance_id_path)
+            .expect("read post-rotation persisted instance_id")
+            .trim(),
+        rotated_uuid,
+        "post-rotation file content must remain the rotated UUID"
+    );
+}
+
 #[test]
 fn serve_http_capabilities_creates_instance_id_with_private_unix_mode() {
     let dir = tempfile::tempdir().expect("temp project");
@@ -646,6 +714,149 @@ fn serve_rejects_invalid_instance_id_before_serving_http() {
         stderr.contains("invalid Clarion instance ID"),
         "unexpected stderr: {stderr}"
     );
+}
+
+#[test]
+fn serve_http_batch_endpoint_resolves_mixed_paths() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    seed_file_entity(dir.path());
+    seed_briefing_blocked_file_entity(dir.path());
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+
+    let mut child = spawn_serve(dir.path());
+    let body = serde_json::json!({
+        "queries": [
+            {"path": "demo.py", "language": "python"},
+            {"path": "missing.py", "language": ""},
+            {"path": "blocked.py", "language": "python"},
+            {"path": "../escapes.py", "language": "python"},
+            {"path": "  ", "language": ""}
+        ]
+    })
+    .to_string();
+    let response = wait_for_http_post_json(&bind, "/api/v1/files/batch", &body, &[]);
+    stop_serve(&mut child);
+    let response = response.expect("batch response");
+
+    assert_eq!(response.status_code, 200);
+    let resolved = response.body["resolved"]
+        .as_array()
+        .expect("resolved array");
+    assert_eq!(resolved.len(), 1, "{response:?}");
+    assert_eq!(resolved[0]["requested_path"], "demo.py");
+    assert_eq!(resolved[0]["entity_id"], "core:file:demo.py");
+    assert_eq!(resolved[0]["content_hash"], "hash-demo-file");
+    assert_eq!(resolved[0]["canonical_path"], "demo.py");
+    assert_eq!(resolved[0]["language"], "python");
+
+    let not_found = response.body["not_found"].as_array().expect("not_found");
+    assert_eq!(not_found.len(), 1);
+    assert_eq!(not_found[0], "missing.py");
+
+    let blocked = response.body["briefing_blocked"]
+        .as_array()
+        .expect("briefing_blocked");
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(blocked[0], "blocked.py");
+
+    let errors = response.body["errors"].as_array().expect("errors");
+    assert_eq!(errors.len(), 2);
+    let by_path: std::collections::HashMap<&str, &Value> = errors
+        .iter()
+        .filter_map(|err| err["requested_path"].as_str().map(|p| (p, err)))
+        .collect();
+    let outside = by_path
+        .get("../escapes.py")
+        .expect("outside-root error entry");
+    assert_eq!(outside["code"], "PATH_OUTSIDE_PROJECT");
+    let blank = by_path.get("  ").expect("blank-path error entry");
+    assert_eq!(blank["code"], "INVALID_PATH");
+}
+
+#[test]
+fn serve_http_batch_rejects_over_256_queries() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+
+    let queries: Vec<Value> = (0..257)
+        .map(|i| serde_json::json!({"path": format!("p{i}.py"), "language": ""}))
+        .collect();
+    let body = serde_json::json!({"queries": queries}).to_string();
+    assert!(
+        body.len() <= 16 * 1024,
+        "test body should fit under the 16 KB body cap to exercise the AFTER-parse 256 limit: {} bytes",
+        body.len()
+    );
+
+    let mut child = spawn_serve(dir.path());
+    let response = wait_for_http_post_json(&bind, "/api/v1/files/batch", &body, &[]);
+    stop_serve(&mut child);
+    let response = response.expect("batch over-limit response");
+
+    assert_eq!(response.status_code, 400);
+    assert_eq!(response.body["code"], "BATCH_TOO_LARGE");
+    assert!(
+        response.body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("256")),
+        "error message should cite the 256-query ceiling: {response:?}"
+    );
+}
+
+#[test]
+fn serve_http_batch_requires_auth_when_configured() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    seed_file_entity(dir.path());
+    let bind = free_loopback_bind();
+    write_http_config_with_token_env(dir.path(), &bind, "CLARION_TEST_LOOM_TOKEN_BATCH");
+
+    let mut child = spawn_serve_with_env(
+        dir.path(),
+        &[("CLARION_TEST_LOOM_TOKEN_BATCH", "batch-secret")],
+    );
+    let body = serde_json::json!({
+        "queries": [{"path": "demo.py", "language": "python"}]
+    })
+    .to_string();
+    let unauthenticated = wait_for_http_post_json(&bind, "/api/v1/files/batch", &body, &[]);
+    let authenticated = wait_for_http_post_json(
+        &bind,
+        "/api/v1/files/batch",
+        &body,
+        &[("Authorization", "Bearer batch-secret")],
+    );
+    stop_serve(&mut child);
+    let unauthenticated = unauthenticated.expect("unauthenticated batch");
+    let authenticated = authenticated.expect("authenticated batch");
+
+    assert_eq!(unauthenticated.status_code, 401);
+    assert_eq!(unauthenticated.body["code"], "UNAUTHORIZED");
+    assert_eq!(authenticated.status_code, 200);
+    let resolved = authenticated.body["resolved"]
+        .as_array()
+        .expect("authenticated batch resolved");
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0]["entity_id"], "core:file:demo.py");
 }
 
 #[test]
@@ -1761,6 +1972,102 @@ fn wait_for_http_raw_response(
         std::thread::sleep(Duration::from_millis(25));
     }
     Err(last_error)
+}
+
+fn wait_for_http_post_json(
+    bind: &str,
+    path: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> Result<HttpJsonResponse, String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_error = String::new();
+    while Instant::now() < deadline {
+        match http_post_json(bind, path, body, headers) {
+            Ok(response) => return Ok(response),
+            Err(err) => last_error = err,
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err(last_error)
+}
+
+fn http_post_json(
+    bind: &str,
+    path: &str,
+    body: &str,
+    request_headers: &[(&str, &str)],
+) -> Result<HttpJsonResponse, String> {
+    let addr = bind
+        .parse()
+        .map_err(|err| format!("parse bind address {bind}: {err}"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(100))
+        .map_err(|err| format!("connect to {bind}: {err}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|err| format!("set read timeout: {err}"))?;
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: {bind}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+        body.len()
+    )
+    .map_err(|err| format!("write request head: {err}"))?;
+    for (name, value) in request_headers {
+        write!(stream, "{name}: {value}\r\n")
+            .map_err(|err| format!("write request header {name}: {err}"))?;
+    }
+    write!(stream, "Connection: close\r\n\r\n")
+        .map_err(|err| format!("write request terminator: {err}"))?;
+    stream
+        .write_all(body.as_bytes())
+        .map_err(|err| format!("write request body: {err}"))?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut status_line = String::new();
+    reader
+        .read_line(&mut status_line)
+        .map_err(|err| format!("read status line: {err}"))?;
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| format!("malformed HTTP status line: {status_line}"))?
+        .parse::<u16>()
+        .map_err(|err| format!("parse HTTP status from {status_line:?}: {err}"))?;
+    let mut content_length = None;
+    let mut header = String::new();
+    loop {
+        header.clear();
+        reader
+            .read_line(&mut header)
+            .map_err(|err| format!("read header: {err}"))?;
+        if header == "\r\n" || header == "\n" || header.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = header.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|err| format!("parse content-length from {header:?}: {err}"))?,
+            );
+        }
+    }
+    let mut body = String::new();
+    if let Some(content_length) = content_length {
+        let mut bytes = vec![0_u8; content_length];
+        reader
+            .read_exact(&mut bytes)
+            .map_err(|err| format!("read response body: {err}"))?;
+        body = String::from_utf8(bytes).map_err(|err| format!("response body is utf8: {err}"))?;
+    } else {
+        reader
+            .read_to_string(&mut body)
+            .map_err(|err| format!("read response body: {err}"))?;
+    }
+    let body =
+        serde_json::from_str(&body).map_err(|err| format!("parse json body {body:?}: {err}"))?;
+    Ok(HttpJsonResponse { status_code, body })
 }
 
 fn wait_for_http_get_with_body_status(
