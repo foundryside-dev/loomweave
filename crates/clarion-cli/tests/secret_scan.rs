@@ -802,3 +802,114 @@ fn only_secret_bearing_file_is_blocked_in_multi_file_project() {
         .unwrap();
     assert_eq!(blocked_count, 1);
 }
+
+#[test]
+fn cleared_sidecar_clears_stale_briefing_block() {
+    // Regression for clarion-2e34dbbdec: a sidecar-only path (.env) whose
+    // secret is cleaned must have its anchor's briefing_blocked dropped and
+    // content_hash refreshed on the next run, even though no finding is
+    // emitted for it in run N+1.
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    std::fs::write(project.path().join("clean.sec"), b"nothing to see\n").unwrap();
+    let dotenv = project.path().join(".env");
+    std::fs::write(&dotenv, b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n").unwrap();
+
+    clarion_bin()
+        .arg("analyze")
+        .arg(project.path())
+        .env("PATH", plugin_path(plugin.path()))
+        .assert()
+        .success();
+
+    let db = conn(project.path());
+    let (blocked, hash_before): (String, String) = db
+        .query_row(
+            "SELECT json_extract(properties, '$.briefing_blocked'), content_hash \
+               FROM entities \
+              WHERE plugin_id = 'core' AND kind = 'file' \
+                AND source_file_path LIKE '%.env'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(blocked, "secret_present");
+    drop(db);
+
+    std::fs::write(&dotenv, b"NO_SECRET_HERE=ordinary_value\n").unwrap();
+
+    clarion_bin()
+        .arg("analyze")
+        .arg(project.path())
+        .env("PATH", plugin_path(plugin.path()))
+        .assert()
+        .success();
+
+    let db = conn(project.path());
+    let (blocked_after, hash_after): (Option<String>, String) = db
+        .query_row(
+            "SELECT json_extract(properties, '$.briefing_blocked'), content_hash \
+               FROM entities \
+              WHERE plugin_id = 'core' AND kind = 'file' \
+                AND source_file_path LIKE '%.env'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        blocked_after, None,
+        "briefing_blocked must be cleared after the secret is removed"
+    );
+    assert_ne!(
+        hash_before, hash_after,
+        "content_hash must reflect the cleaned file, not the secret-bearing run"
+    );
+}
+
+#[test]
+fn clean_sidecar_creates_anchor_without_block() {
+    // Standalone regression: an always-clean sidecar (no secret ever) still
+    // gets a core:file anchor on first scan, with no briefing_blocked. This
+    // exercises the cleared-anchor path independent of the transition test
+    // above, so future breakage is localised even when the two-run
+    // choreography is not exercised.
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    std::fs::write(project.path().join("clean.sec"), b"nothing to see\n").unwrap();
+    std::fs::write(
+        project.path().join(".env"),
+        b"NO_SECRET_HERE=ordinary_value\n",
+    )
+    .unwrap();
+
+    clarion_bin()
+        .arg("analyze")
+        .arg(project.path())
+        .env("PATH", plugin_path(plugin.path()))
+        .assert()
+        .success();
+
+    let db = conn(project.path());
+    let (anchor_count, blocked): (i64, Option<String>) = db
+        .query_row(
+            "SELECT COUNT(*), MAX(json_extract(properties, '$.briefing_blocked')) \
+               FROM entities \
+              WHERE plugin_id = 'core' AND kind = 'file' \
+                AND source_file_path LIKE '%.env'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        anchor_count, 1,
+        "clean sidecar must have a core:file anchor"
+    );
+    assert_eq!(
+        blocked, None,
+        "anchor on an always-clean sidecar must have no briefing_blocked"
+    );
+}

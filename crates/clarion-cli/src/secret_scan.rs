@@ -86,11 +86,22 @@ pub(crate) struct SecretScanOutcome {
     finding_anchors: BTreeMap<PathBuf, String>,
     override_files: Vec<PathBuf>,
     scanned_files: BTreeSet<PathBuf>,
+    // Subset of `scanned_files` restricted to paths matched by
+    // `files::is_secret_scan_sidecar` (e.g. `.env`, `.env.*`, `*.env`).
+    // These paths have no plugin coverage by design, so their `core:file`
+    // anchor is the only catalog row tracking briefing_blocked + content_hash
+    // for that path. The anchor-reconciliation pass in `anchors.rs` iterates
+    // this set on every run to clear stale blocks once secrets are removed.
+    scanned_sidecars: BTreeSet<PathBuf>,
 }
 
 impl SecretScanOutcome {
     pub(crate) fn scanned_files(&self) -> &BTreeSet<PathBuf> {
         &self.scanned_files
+    }
+
+    pub(crate) fn scanned_sidecars(&self) -> &BTreeSet<PathBuf> {
+        &self.scanned_sidecars
     }
 
     pub(crate) fn finding_files(&self) -> BTreeSet<PathBuf> {
@@ -143,10 +154,14 @@ pub(crate) fn pre_ingest(
     let mut all_allowed = Vec::new();
     let mut baseline_matches = Vec::new();
     let mut scanned_files = BTreeSet::new();
+    let mut scanned_sidecars = BTreeSet::new();
 
     for file in source_files {
         let canonical_file = canonical_or_original(file);
         scanned_files.insert(canonical_file.clone());
+        if files::is_secret_scan_sidecar(&canonical_file) {
+            scanned_sidecars.insert(canonical_file.clone());
+        }
         let buf = fs::read(file).with_context(|| format!("read {}", file.display()))?;
         let detections = scanner.scan_bytes(&buf);
         let baseline_file = project_relative_path(project_root, &canonical_file);
@@ -242,6 +257,7 @@ pub(crate) fn pre_ingest(
         finding_anchors: BTreeMap::new(),
         override_files: override_files.into_iter().collect(),
         scanned_files,
+        scanned_sidecars,
     })
 }
 

@@ -78,7 +78,7 @@ fn collect_secret_scan_sidecars(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn is_secret_scan_sidecar(path: &Path) -> bool {
+pub(super) fn is_secret_scan_sidecar(path: &Path) -> bool {
     let file_name = path.file_name().and_then(|name| name.to_str());
     file_name.is_some_and(|name| name == ".env" || name.starts_with(".env."))
         || path
