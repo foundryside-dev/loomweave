@@ -555,13 +555,22 @@ Clarion exposes read-only HTTP endpoints: `GET /api/v1/entities`, `GET /api/v1/e
 **Verification**: Contract test for each scheme; `resolution_confidence: none` returned as 200 with empty `entity_id` (not 404) so callers can distinguish absent-from-catalog vs. server-down.
 **See**: System Design §9 (Integrations, Entity resolve).
 
-#### REQ-HTTP-03 — Token auth (opt-in)
+#### REQ-HTTP-03 — Registry-backend HTTP trust model
 
-Token auth is available via `clarion.yaml:serve.auth: token` (default: `none`). Tokens are 32 random bytes base64-encoded, prefixed `clrn_`, stored in OS keychain preferred / file-mode-0600 fallback. Wire format is `Authorization: Bearer clrn_<token>`; server-side uses constant-time comparison. Rotation via `clarion serve auth rotate` with a 24-hour grace window.
+For Filigree `registry_backend: clarion`, Clarion's HTTP read API is
+unauthenticated and loopback-only by default. Non-loopback binds are refused
+unless `serve.http.allow_non_loopback: true` is set; that opt-in requires an
+authenticated reverse proxy or equivalent operator-managed access-control layer
+outside Clarion.
 
-**Rationale**: `clarion serve` runs on shared dev hosts and in CI containers (Wardline's consumption pattern). Loopback is not a security boundary on modern hosts (shared Docker networks, devcontainer proxies, DNS rebinding). Designing auth in v0.1 (even if opt-in by default) avoids retrofitting later.
-**Verification**: Token-protected endpoint returns 401 without header; rotation accepts both old and new within grace window; constant-time comparison verified via microbenchmark.
-**See**: System Design §9 (Integrations, HTTP Read API — Token auth).
+**Rationale**: the ADR-014 read surface is a bounded local federation contract,
+not the earlier broad HTTP API. The implementation prevents accidental network
+exposure mechanically and leaves intentional non-loopback exposure to deployment
+controls.
+**Verification**: loopback bind starts without extra flags; non-loopback bind is
+rejected without `allow_non_loopback`; non-loopback opt-in logs an
+unauthenticated-surface warning.
+**See**: System Design §9 (Integrations, HTTP Read API), ADR-014.
 
 #### REQ-HTTP-04 — ETag-style response caching
 
@@ -759,13 +768,19 @@ Clarion structures prompts with explicit `<file_content trusted="false">...</fil
 **Verification**: Fixture with adversarial docstring; briefing schema-validates; `propose_guidance` call produces an observation, not a sheet; novel vocabulary surfaces as `CLA-FACT-VOCABULARY-CANDIDATE`.
 **See**: System Design §10 (Security, Prompt-injection).
 
-#### NFR-SEC-03 — Token auth storage on opt-in HTTP API
+#### NFR-SEC-03 — Non-loopback HTTP read API guard
 
-When HTTP API auth is enabled, Clarion stores tokens in the OS keychain when available and falls back to `~/.config/clarion/token` with file-mode 0600 otherwise. The fallback path emits `CLA-INFRA-TOKEN-STORAGE-DEGRADED`.
+Clarion refuses to start the ADR-014 HTTP read API on a non-loopback bind unless
+`serve.http.allow_non_loopback: true` is set. When enabled, startup logs a
+warning that the endpoint is unauthenticated and must be protected outside
+Clarion.
 
-**Rationale**: File-mode 0600 is the Unix world-line for single-user secrets; OS keychain is better when available. Making the degradation explicit (rather than silent) tells operators when they're on the weaker path.
-**Verification**: Keychain-available host uses keychain; keychain-absent host falls back with finding.
-**See**: System Design §9 (HTTP Read API, Token auth), §10 (Security).
+**Rationale**: loopback is not a complete security boundary, but accidental
+network exposure is the highest-risk failure mode for the registry-backend
+surface. The guard makes that exposure explicit.
+**Verification**: config tests cover the default, refusal, and opt-in warning
+paths.
+**See**: System Design §9 (HTTP Read API), §10 (Security), ADR-014.
 
 #### NFR-SEC-04 — Audit surface — security events as findings
 

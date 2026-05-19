@@ -17,6 +17,19 @@ serve:
 The MCP stdio server remains available on stdin/stdout. The HTTP surface is
 read-only and uses Clarion's existing SQLite reader pool.
 
+All non-2xx responses use this closed JSON error envelope:
+
+```json
+{
+  "error": "path does not resolve to a Clarion file entity",
+  "code": "NOT_FOUND"
+}
+```
+
+The initial `code` enum is closed to `INVALID_PATH`,
+`PATH_OUTSIDE_PROJECT`, `NOT_FOUND`, `STORAGE_ERROR`, and `INTERNAL`.
+Clients must switch on `code`; `error` is human-readable diagnostic text.
+
 ### `GET /api/v1/files?path=&language=`
 
 Resolves a project-relative or absolute file path to the Clarion file identity
@@ -33,7 +46,7 @@ Successful response:
 
 ```json
 {
-  "entity_id": "core:file:hash-demo@demo.py",
+  "entity_id": "core:file:demo.py",
   "content_hash": "hash-demo-file",
   "canonical_path": "demo.py",
   "language": "python"
@@ -42,14 +55,22 @@ Successful response:
 
 Semantics:
 
-- `entity_id` is opaque to Filigree.
+- `entity_id` is opaque to Filigree and follows ADR-003's file-kind shape
+  `core:file:{qualified_name}`.
 - `content_hash` is the drift signal Filigree stores with the resolved row.
-- `canonical_path` is Clarion's project-relative canonical path.
+- `canonical_path` is Clarion's project-relative canonical path: no leading
+  `/`, no leading `./`, no trailing `/`, and `/` as the separator on every
+  platform.
 - `language` is the normalized language value Clarion used for the resolution.
 - Unknown or outside-project paths return a non-2xx JSON error instead of
   guessing.
+- If no file-kind entity row exists for the path, Clarion returns
+  `404` with `code: "NOT_FOUND"` instead of synthesizing a file ID.
 
-Fixture: [`fixtures/get-api-v1-files.demo-python.json`](./fixtures/get-api-v1-files.demo-python.json).
+The RC1 fixture at
+[`fixtures/get-api-v1-files.demo-python.json`](./fixtures/get-api-v1-files.demo-python.json)
+still captures the pre-hardening response shape. It is intentionally not the
+normative contract for this section until the C3 fixture gate upgrades it.
 
 ### `GET /api/v1/_capabilities`
 
@@ -60,14 +81,26 @@ Successful response:
 
 ```json
 {
+  "api_version": 1,
+  "instance_id": "9bd7234e-6d44-4a38-9ae4-76f912a10221",
   "registry_backend": true,
-  "file_registry": true,
-  "version": "0.1"
+  "file_registry": true
 }
 ```
 
 Filigree should treat `registry_backend: true` as the flag that the
 `/api/v1/files` resolution surface is present.
 
-Fixture: [`fixtures/get-api-v1-capabilities.json`](./fixtures/get-api-v1-capabilities.json).
+`api_version` is the HTTP read API wire-contract version, not Clarion product
+semver. It increments only for incompatible changes to the wire contract
+consumed by existing Filigree clients.
 
+`instance_id` is the stable per-project Clarion instance fingerprint persisted
+in `.clarion/instance_id`. Filigree should treat a changed `instance_id` for a
+previously known endpoint as evidence that it is now talking to a different
+Clarion project instance.
+
+The RC1 fixture at
+[`fixtures/get-api-v1-capabilities.json`](./fixtures/get-api-v1-capabilities.json)
+still captures the pre-hardening response shape. It is intentionally not the
+normative contract for this section until the C3 fixture gate upgrades it.

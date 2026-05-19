@@ -999,27 +999,42 @@ Why this exists: every sibling tool consuming Clarion should ask in *their* nati
 
 404 behaviour: returns 200 with `resolution_confidence: "none"` and empty `entity_id` — distinguishes "Clarion doesn't know this" from "Clarion is down."
 
-#### Authentication — UDS default, token fallback (ADR-012)
+#### Authentication — ADR-014 registry-backend read API
 
-Loopback is not a security boundary on modern dev hosts (shared containers, devcontainers, and other local processes all sit on 127.0.0.1). v0.1 defaults to Unix domain socket authentication so that filesystem permissions are the boundary, not network topology.
+ADR-014 supersedes ADR-012 for the Filigree `registry_backend: clarion`
+HTTP read surface. The registry-backend API is unauthenticated and
+loopback-only by default. It refuses non-loopback binds unless
+`serve.http.allow_non_loopback: true`; that opt-in requires an
+operator-managed authenticated reverse proxy or equivalent access-control
+layer in front of Clarion.
 
-**Default — UDS** (`serve.auth: uds`):
-- Binds `<project_root>/.clarion/socket` with mode 0600, owner = current UID.
-- HTTP/1.1 over UDS; no Bearer header required.
-- Only the owning UID can connect; shared-Docker / multi-user-host scenarios closed structurally.
-- No TCP bind at all — DNS-rebinding attack surface (T-05) is inapplicable.
+ADR-012's UDS/token design is retained as historical context for the earlier
+broad v0.1 HTTP API proposal, but it is not the implementation contract for the
+registry-backend file-resolution endpoint.
 
-**Fallback — TCP + Bearer token** (`serve.auth: token`):
-- Auto-default on Windows (UDS support patchy until 10 1803+); explicit opt-in elsewhere for cross-UID-namespace access, SSH port-forwarding, or containerised clients.
-- `clarion serve` auto-mints `.clarion/auth.token` on first run (mode 0600, `clrn_<43 chars>` format).
-- OS keychain promotion via `clarion serve auth promote-to-keychain`.
-- Rotation via `clarion serve auth rotate` with 24-hour grace window.
-- Scoping: v0.1 has one project-wide read token; per-endpoint scoping is v0.2.
+Loopback is not a complete security boundary on modern dev hosts (shared
+containers, devcontainers, and other local processes all sit on 127.0.0.1).
+The ADR-014 stance accepts that local-read exposure for the bounded
+registry-backend API and prevents accidental network exposure through the
+non-loopback guard.
 
-**Explicit-none** (`serve.auth: none` or `--i-accept-no-auth`):
-- Allowed but loud: emits `CLA-INFRA-HTTP-AUTH-DISABLED` (severity ERROR) per serve startup; persistent warning banner in logs. For air-gapped CI with external ingress control or operators with strong local reasons.
+**Default — loopback only**:
+- Binds only to loopback addresses.
+- No Bearer header or UDS transport is required for the ADR-014 endpoint.
+- Any local process that can reach the loopback port can read registry-backend
+  file-resolution responses.
+- Non-loopback binds are rejected unless explicitly allowed.
 
-**CI integration**: `clarion check-auth --from wardline` returns exit 0 if the serve endpoint is reachable and authenticated under whichever mode is active. Wardline in CI picks up the token via `CLARION_TOKEN` env (preferred) or `.clarion/auth.token` bind-mount when in token mode.
+**Explicit non-loopback**:
+- Requires `serve.http.allow_non_loopback: true`.
+- Startup logs must warn that the surface is unauthenticated.
+- Operators must front the endpoint with an authenticated reverse proxy or
+  equivalent access-control layer.
+
+**CI integration**: Filigree and other sibling consumers should treat
+`/api/v1/_capabilities` as the compatibility probe for the registry-backend
+read surface and should rely on deployment-level access control when the API is
+intentionally exposed beyond loopback.
 
 TLS is out of scope for v0.1. Operators wanting network exposure terminate TLS at a reverse proxy.
 
@@ -1044,7 +1059,7 @@ Security is a first-class concern in v0.1 because Clarion sends source code to a
 | Secret exfiltration to LLM provider | Critical | `.env`, test fixtures, committed API keys → entities → Anthropic API | Pre-ingest secret scanner; findings block LLM dispatch |
 | Prompt injection via source | Critical | Adversarial docstrings / comments → briefing field values → future-prompt poisoning via cache | Schema validation + untrusted-content delimiters + `knowledge_basis: static_only` |
 | Guidance poisoning via LLM-proposed sheets | High | `propose_guidance` MCP tool promotes attacker text into prompts | Manual promotion gate — proposals create observations, not sheets |
-| HTTP API reachable by other local processes | High | `clarion serve` on shared dev host / container | UDS default (mode 0600, UID-scoped); TCP+token fallback on Windows / cross-UID namespaces. See ADR-012. |
+| HTTP API reachable by other local processes | Medium | `clarion serve` on shared dev host / container | ADR-014 registry-backend API is unauthenticated but loopback-only by default; non-loopback binds are refused unless explicitly allowed and protected by operator-managed access control. |
 | DB tampering via committed `.clarion/clarion.db` | Medium | Bad actor edits DB, commits, poisons teammate briefings | Content-hash cross-check on load (v0.2); `clarion db verify` CLI |
 | LLM audit-log leakage via git | Medium | `runs/<run_id>/log.jsonl` contains request/response bodies | Default-excluded from git |
 | Personal API key charged when committing team DB | Medium (operator) | Developer commits DB generated with personal key | Operator guidance; `--audit-key` hint |
@@ -1096,8 +1111,7 @@ Every security-relevant event emits a finding:
 
 - `CLA-SEC-SECRET-DETECTED` — unredacted secret blocked LLM dispatch
 - `CLA-SEC-UNREDACTED-SECRETS-ALLOWED` — operator overrode block
-- `CLA-INFRA-HTTP-AUTH-DISABLED` — `clarion serve` running with `serve.auth: none` (ADR-012); per-startup ERROR finding
-- `CLA-INFRA-TOKEN-STORAGE-DEGRADED` — OS keychain unavailable
+- `CLA-INFRA-HTTP-NON-LOOPBACK-UNAUTHENTICATED` — `clarion serve` running the ADR-014 HTTP read API on a non-loopback bind with `serve.http.allow_non_loopback: true`; per-startup WARN log
 - `CLA-INFRA-BRIEFING-INVALID` — schema validation failed twice (possible injection)
 - `CLA-SEC-VOCABULARY-CANDIDATE-NOVEL` — novel vocabulary tag proposed by LLM (light signal; mostly harmless)
 
@@ -1201,7 +1215,7 @@ The parallel listing in [detailed-design.md §11](./detailed-design.md#11-archit
 | ADR-009 | Structured briefings vs free-form prose | To author | P2 | Principle 2 requires bounded, composable responses; prose is neither. Schema validation also enables prompt-injection detection (schema-invalid → possible injection). |
 | ADR-010 | MCP as first-class surface — lock-in cost vs ecosystem reach | To author | P2 | Anthropic's MCP standard is the ecosystem's current centre of gravity for LLM tool integrations; lock-in cost is acknowledged but the ecosystem reach outweighs it for v0.1. Strategic review at v0.3+. |
 | [ADR-011](../adr/ADR-011-writer-actor-concurrency.md) | Writer-actor concurrency model (vs shadow-DB swap) | Accepted | P0 | Single writer actor + per-N-files transactions (default N=50) is the committed shape; `--shadow-db` opt-in for zero-stale-read scenarios. Design-review §2.2 CRITICAL flag retires. SQLite-concurrency-under-load assumption named as v0.2 validation task (`NG-28` proposed). |
-| [ADR-012](../adr/ADR-012-http-auth-default.md) | HTTP read-API auth: UDS default with TCP+token fallback | Accepted | P0 | v0.1 default is Unix domain socket (`.clarion/socket` mode 0600); Windows / cross-UID-namespace / SSH-forwarded cases fall back to TCP + auto-minted Bearer token. `serve.auth: none` emits `CLA-INFRA-HTTP-AUTH-DISABLED` ERROR per serve startup. Closes T-02 (risk 9) and structurally reduces T-05 in the primary path. Panel "three non-negotiable v0.1 controls" rec 1. |
+| [ADR-012](../adr/ADR-012-http-auth-default.md) | Historical HTTP read-API auth proposal: UDS default with TCP+token fallback | Superseded for ADR-014 registry-backend API | P0 | ADR-014 now owns the registry-backend HTTP read API posture: unauthenticated loopback-only by default, non-loopback refused unless explicitly allowed and protected externally. ADR-012 remains context for the earlier broad HTTP API proposal. |
 | [ADR-013](../adr/ADR-013-pre-ingest-secret-scanner.md) | Pre-ingest secret scanner with LLM-dispatch block | Accepted | P0 | Rust-native port of detect-secrets rule set (preserves NFR-OPS-04 single-binary). File-level block on detection; structural extraction preserved; briefings marked `briefing_blocked: secret_present`. `.clarion/secrets-baseline.yaml` for false-positives. `--allow-unredacted-secrets` requires TTY confirm OR explicit `--confirm-allow-unredacted-secrets=yes-i-understand` in CI. |
 | [ADR-014](../adr/ADR-014-filigree-registry-backend.md) | Filigree `registry_backend` flag + pluggable `RegistryProtocol` — schema surgery, not config flip | Accepted | P0 | Four NOT-NULL foreign keys on `file_records(id)` + three auto-create paths require a real interface, not a flag. Clarion's shadow-registry fallback preserves v0.1 shipability when Filigree hasn't landed the surgery. |
 | [ADR-015](../adr/ADR-015-wardline-filigree-emission.md) | Wardline→Filigree emission ownership: Clarion-side SARIF translator (v0.1), native Wardline POST (v0.2) | Accepted | P0 | Wardline has no HTTP client today (`integration-recon:339`); adding one is a refactor not on the v0.1 timeline. Clarion-side translator ships independently; translator stays permanent for Semgrep / CodeQL / etc. `loom.md` §5 asterisk 1 retires when native emitter lands. Revision trigger: Block C2 spike showing emitter is ≤1 day of work promotes to v0.1. |

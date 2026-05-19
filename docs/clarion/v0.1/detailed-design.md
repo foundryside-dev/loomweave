@@ -227,7 +227,7 @@ struct Entity {
 ### Entity ID scheme
 
 - **Source entities**: `{plugin_id}:{kind}:{canonical_qualified_name}` where `canonical_qualified_name` is the plugin's language-native fully-qualified identifier (for Python: `auth.tokens.TokenManager`, not `src/auth/tokens.py::TokenManager`).
-- **Files**: `core:file:{content_addressed_path_hash}@{path}` — content-addressed so rename detection has a handle; `@{path}` suffix preserves human readability in logs.
+- **Files**: `core:file:{qualified_name}` where `qualified_name` is the project-relative POSIX canonical path. File IDs may not contain `@`; content hashes are carried as drift metadata, not embedded in the ID.
 - **Subsystems**: `core:subsystem:{cluster_hash}` (from sorted member module IDs).
 - **Guidance sheets**: `core:guidance:{content_hash_short}`.
 - **Unresolvable Python imports** (stub): `python:unresolved:{module.path}` — reconciled to real entities when resolution becomes possible.
@@ -1347,35 +1347,37 @@ Response:
 
 **404 behaviour**: returns `resolution_confidence: "none"` with an empty `entity_id` rather than HTTP 404. Lets callers distinguish "Clarion doesn't know this" from "Clarion is down."
 
-### Authentication — full spec (ADR-012)
+### Authentication — registry-backend HTTP read API
 
-**Default on Linux / macOS — Unix domain socket** (`serve.auth: uds`):
+ADR-014 supersedes ADR-012 for the Filigree `registry_backend: clarion`
+HTTP read surface. The active contract is unauthenticated loopback-only by
+default, with non-loopback binds refused unless
+`serve.http.allow_non_loopback: true` and protected by an operator-managed
+authenticated reverse proxy or equivalent access-control layer.
 
-- `clarion serve` binds `<project_root>/.clarion/socket` with mode `0600`, owner = the UID running `clarion serve`.
-- Transport: HTTP/1.1 over UDS. Server: `axum` + `tokio::net::UnixListener`. Clients: `hyper-unix-connector` or equivalent.
-- Auth is filesystem-permissions based; HTTP layer does not require `Authorization` header under UDS mode.
-- Stale-socket cleanup: on startup, Clarion stat-checks `.clarion/socket` — if present and no process is listening, it unlinks before binding. Double-start (`clarion serve` twice) fails loudly with `CLA-INFRA-SOCKET-IN-USE`.
-- Sibling discovery: `.clarion/config.json` records `serve.socket_path`; sibling tools read the path and connect via `unix://<absolute path>`.
+The earlier UDS/token design remains historical context for a broader HTTP API,
+not the implementation contract for `/api/v1/_capabilities` or
+`/api/v1/files`.
 
-**Fallback (auto on Windows, opt-in elsewhere) — TCP + Bearer token** (`serve.auth: token`):
+**Default — loopback only**:
 
-- Windows default: `token` mode on `127.0.0.1:8765` (configurable via `serve.bind_port`).
-- Auto-mint: first `clarion serve` writes `.clarion/auth.token` (mode `0600`). Token format: 32 URL-safe base64 bytes (43 chars) prefixed `clrn_` for grep-ability in logs.
-- OS-keychain promotion: `clarion serve auth promote-to-keychain` migrates the token from file to macOS Keychain / Linux libsecret / Windows Credential Manager via the `keyring` crate. Emits `CLA-INFRA-TOKEN-STORAGE-DEGRADED` if the keychain is unavailable (falls back to file).
-- Wire format: HTTP header `Authorization: Bearer clrn_<43chars>`. Constant-time comparison.
-- Rotation: `clarion serve auth rotate` generates a new token, accepts both old and new for 24 hours, drops the old. Rotation is idempotent.
-- Scoping: v0.1 has one token per install with full read access. Per-endpoint scoping and revocation lists are v0.2+.
+- `clarion serve` binds only to loopback addresses.
+- HTTP layer does not require `Authorization` headers for the ADR-014 endpoint.
+- `/api/v1/_capabilities` reports `api_version` and `instance_id` so sibling
+  clients can detect compatible deployments and project-instance drift.
 
-**Explicit-none** (`serve.auth: none` or `--i-accept-no-auth`):
+**Explicit non-loopback**:
 
-- Allowed but loud: emits `CLA-INFRA-HTTP-AUTH-DISABLED` (severity ERROR) on every `clarion serve` startup and reaches Filigree through the normal finding pipeline. Persistent banner in logs.
-- Use cases: air-gapped CI where external ingress is controlled separately; local debugging with explicit operator decision. CLI flag is deliberately verbose (`--i-accept-no-auth`) to prevent accidental muscle-memory enabling.
+- Requires `serve.http.allow_non_loopback: true`.
+- Startup logs warn that the surface is unauthenticated.
+- Operators must front Clarion with authenticated ingress or equivalent access
+  control before exposing the endpoint beyond loopback.
 
-**How sibling tools pick up auth in CI**:
+**How sibling tools pick up access in CI**:
 
-- **UDS mode**: sibling tools mount the project's `.clarion/socket` into their process (bind-mount for containers, bare path for same-host processes). No token plumbing.
-- **Token mode**: `CLARION_TOKEN` env var (preferred for CI; injected via the CI provider's secret store) or `.clarion/auth.token` bind-mount. Wardline's `wardline.yaml` records the Clarion endpoint URL (`unix://…` or `http://127.0.0.1:8765`) but not the token — token comes from env.
-- **Pre-flight check**: `clarion check-auth --from wardline` returns exit 0 if the endpoint is reachable and authenticated under the active mode. Returns 0 with warning under `none` mode.
+- Same-host sibling tools use the loopback endpoint.
+- CI or remote deployments that need non-loopback access provide protection
+  outside Clarion, then use `/api/v1/_capabilities` as the compatibility probe.
 
 ---
 
@@ -1384,7 +1386,9 @@ Response:
 Some risks sit outside Clarion's code but inside the operator's responsibility. These belong in the team's onboarding doc, not in the tool's runtime defences:
 
 - **Use project-scoped API keys, not personal ones, when `storage.commit_db: true`.** Briefings in `.clarion/clarion.db` were paid for by whoever ran `clarion analyze`. A teammate pulling your committed DB benefits from LLM calls your personal key paid for. Use an Anthropic project / org key, not your personal key, when committing the DB.
-- **Rotate tokens when a committed DB exposes a stale model's output.** If `.clarion/clarion.db` was generated with a leaked or exposed API key, the token is already used; the briefings in the DB are not themselves secret but the key's usage fingerprint is. Rotate, then re-run `clarion analyze` to overwrite the briefing provenance.
+- **Protect non-loopback HTTP exposure outside Clarion.** If operators bind the
+  ADR-014 HTTP read API outside loopback, place an authenticated reverse proxy
+  or equivalent access-control layer in front of it.
 - **Review `.clarion/.gitignore` before first commit.** The default excludes `runs/*/log.jsonl` (raw LLM request/response bodies); if operators opt into committing run logs for audit, they accept that source excerpts sent to Anthropic ship to the repo. That's a choice, not an oversight — but it must be a deliberate one.
 
 ### Audit-surface finding IDs
@@ -1396,7 +1400,7 @@ Every security-relevant event emits a finding:
 - `CLA-INFRA-SECRET-BASELINE-NO-JUSTIFICATION` — baseline entry lacks the required review rationale
 - `CLA-INFRA-SECRET-BASELINE-MATCH` — baseline entry suppressed a scanner hit
 - `CLA-INFRA-SECRET-OVERRIDE-UNCONFIRMED` — override flag was not confirmed, so the run aborted before start
-- `CLA-INFRA-TOKEN-STORAGE-DEGRADED` — OS keychain unavailable, fell back to file-mode `0600`
+- `CLA-INFRA-HTTP-NON-LOOPBACK-UNAUTHENTICATED` — ADR-014 HTTP read API was explicitly bound outside loopback and must be protected outside Clarion
 - `CLA-INFRA-BRIEFING-INVALID` — LLM returned schema-invalid content twice, possible injection
 - `CLA-SEC-VOCABULARY-CANDIDATE-NOVEL` — novel `patterns`/`antipatterns` tag proposed by LLM (light signal; mostly harmless)
 
@@ -1585,9 +1589,9 @@ The table below is a navigation aid for implementers: it maps each ADR to the se
 | ADR-009 | Structured briefings vs free-form prose | §2 |
 | ADR-010 | MCP as first-class surface | — (system-design §8) |
 | [ADR-011](../adr/ADR-011-writer-actor-concurrency.md) | Writer-actor concurrency model | §3 |
-| [ADR-012](../adr/ADR-012-http-auth-default.md) | HTTP auth — UDS default with TCP+token fallback | §7 |
+| [ADR-012](../adr/ADR-012-http-auth-default.md) | Historical HTTP auth proposal — superseded by ADR-014 for registry-backend API | §7 |
 | [ADR-013](../adr/ADR-013-pre-ingest-secret-scanner.md) | Pre-ingest secret scanner | §8 |
-| ADR-014 | Filigree `registry_backend` flag + pluggable `RegistryProtocol` | §7, §9 |
+| ADR-014 | Filigree `registry_backend` flag + pluggable `RegistryProtocol`; owns registry-backend HTTP read trust model | §7, §9 |
 | [ADR-015](../adr/ADR-015-wardline-filigree-emission.md) | Wardline→Filigree emission: Clarion SARIF translator (v0.1), native Wardline POST (v0.2) | §7, §9 |
 | [ADR-016](../adr/ADR-016-observation-transport.md) | Observation transport: `filigree mcp` subprocess (v0.1); `POST /api/v1/observations` HTTP (v0.2 retirement) | §9 |
 | [ADR-017](../adr/ADR-017-severity-and-dedup.md) | Severity mapping + rule-ID round-trip + dedup via `mark_unseen=true` | §7 |
@@ -1690,7 +1694,7 @@ The v0.1 core is Rust (locked — see §11 ADR-001). Crate choices below are rec
 
 ### HTTP
 
-- **axum** for the read API (§7): integrates cleanly with tokio and `tower` middleware; Bearer-token auth, metrics, and ETag middleware compose cleanly.
+- **axum** for the read API (§7): integrates cleanly with tokio and `tower` middleware; tracing, timeout, load-shedding, body-limit, metrics, and ETag middleware compose cleanly.
 - **reqwest** for Anthropic API calls; pooled connections; TLS via `rustls` (no native-TLS; see below).
 
 ### SQLite
@@ -1728,12 +1732,6 @@ The v0.1 core is Rust (locked — see §11 ADR-001). Crate choices below are rec
 - **blake3** for all content hashes (fingerprints, entity IDs where applicable, content-addressed paths).
 - **uuid** v7 for run IDs (time-sortable, useful for log scanning).
 - **time** (not `chrono`) for all datetime handling — strict, explicit, and serde-friendly.
-
-### Cryptography
-
-- **rand** + **rand_core** for token generation.
-- **subtle** for constant-time comparison of auth tokens.
-- **keyring** crate for OS keychain (§7); `0600` file fallback uses `std::os::unix::fs::PermissionsExt`.
 
 ### Testing
 
@@ -1833,7 +1831,7 @@ Revision 5 (2026-04-17) restructures the single design document into a three-lay
 | §2.3 Python import resolution (CRITICAL) | Policies for sys.path, unresolved imports, re-exports, conditional imports | §1 Python plugin specifics |
 | §2.4 Secrets + prompt injection (CRITICAL) | Pre-ingest redaction; injection containment; operator guidance | §8, System-design §10 |
 | §2.5 Provider abstraction (HIGH) | Honest framing added — v0.1 is Anthropic-shaped by commitment | §4 LLM provider abstraction (System-design §5) |
-| §2.6 HTTP auth (HIGH) | Token auth designed in v0.1; OS keychain; Wardline pickup path | §7 HTTP read API |
+| §2.6 HTTP auth (HIGH) | ADR-014 supersedes token auth for the registry-backend API; non-loopback guard plus operator-managed access control is the active posture | §7 HTTP read API |
 | §3 ADR backlog | §11 with priorities; ADR-001 (Rust) locked without alternatives | §11 |
 | §4.1 Summary cache semantic validity | TTL backstop + graph-neighborhood drift flag | §4 |
 | §4.2 Guidance stock quality | Churn-tied staleness signals | System-design §7 |

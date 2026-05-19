@@ -29,13 +29,94 @@ Filigree introduces a `RegistryProtocol` trait with two implementations.
 
 **Mode `local` (default)**: Filigree's current behaviour. The three auto-create paths populate `file_records` using UUID-derived IDs. Filigree remains fully usable standalone — no Clarion dependency, no degradation.
 
-**Mode `clarion`**: Filigree delegates `file_id` resolution to Clarion's HTTP read API. The three auto-create paths call `RegistryProtocol::resolve_file(path, language) -> file_id` which, under `clarion` mode, issues an HTTP GET to Clarion's read API. The returned `file_id` is Clarion's symbolic entity ID (`core:file:{hash}@{path}`). The `file_records` row is created in Filigree with that ID, preserving the existing foreign-key structure.
+**Mode `clarion`**: Filigree delegates `file_id` resolution to Clarion's HTTP read API. The three auto-create paths call `RegistryProtocol::resolve_file(path, language) -> file_id` which, under `clarion` mode, issues an HTTP GET to Clarion's read API. The returned `file_id` is Clarion's symbolic file-kind entity ID (`core:file:{qualified_name}`). The `file_records` row is created in Filigree with that ID, preserving the existing foreign-key structure.
 
 **Flag surfacing**: `registry_backend` appears in `GET /api/files/_schema.config_flags`. Clarion's capability probe reads it at every `clarion analyze` start. Present + value `clarion` → proceed with delegation. Absent or value `local` → Clarion enters shadow-registry mode and emits `CLA-INFRA-FILIGREE-SHADOW-REGISTRY` per batch.
 
 **Error code**: `FILIGREE_FILE_REGISTRY_DISPLACED` is returned by Filigree to any caller that tries to directly mutate `file_records` (e.g., `register_file` MCP tool) while `registry_backend: clarion` is active. The write path is Clarion's; Filigree's direct file-registration MCP tool becomes a read-only query in `clarion` mode.
 
 **Startup failure mode**: if Filigree starts with `registry_backend: clarion` but Clarion's read API is unreachable, Filigree refuses writes (returns `503 Service Unavailable` from the three auto-create paths) rather than silently degrading to `local`. An explicit `--allow-local-fallback` flag exists for single-operator recovery scenarios; the default is fail-closed.
+
+### Capability Probe Semantics
+
+Clarion's read API exposes `GET /api/v1/_capabilities` for Filigree's
+registry-backend probe. The response includes:
+
+```json
+{
+  "api_version": 1,
+  "instance_id": "9bd7234e-6d44-4a38-9ae4-76f912a10221",
+  "registry_backend": true,
+  "file_registry": true
+}
+```
+
+`api_version` is the wire-contract version for the HTTP read API. It increments
+only when the HTTP read API changes incompatibly for existing Filigree clients.
+It is not Clarion product semver and must not be compared as a release version.
+
+`instance_id` identifies the Clarion project instance serving the API. Filigree
+uses it to detect that the same endpoint has been rebound to a different
+Clarion project instance.
+
+### File Identity Semantics
+
+Clarion resolves only existing file-kind rows. When no `kind = 'file'` entity
+row exists for the requested path, the API fails closed with `404 NOT_FOUND`.
+Clarion must not synthesize a `core:file:{content_hash}@{canonical_path}`
+identity. That pattern violates ADR-003's entity-ID grammar and creates shadow
+IDs that will not match future file-discovery rows.
+
+### Canonical Path Semantics
+
+`canonical_path` is the normalized project-relative POSIX path for the file:
+
+- no leading `/`
+- no leading `./`
+- no trailing `/`
+- `/` as the separator on every platform
+
+The path is relative to the Clarion project root so file identity responses
+survive project relocation. It is the path Filigree should store as human and
+drift context, not an absolute filesystem path.
+
+### Instance Fingerprint
+
+Clarion persists a stable per-project UUID at `.clarion/instance_id`. The first
+creation writes the file with mode `0600` on Unix. `GET /api/v1/_capabilities`
+surfaces the UUID as `instance_id`.
+
+Deleting `.clarion/` may create a new instance ID. That is acceptable because it
+represents a new Clarion project instance and should be detectable by Filigree.
+
+### Error Envelope
+
+Non-2xx read API responses use a closed JSON envelope:
+
+```json
+{
+  "error": "path does not resolve to a Clarion file entity",
+  "code": "NOT_FOUND"
+}
+```
+
+The initial `ErrorCode` enum is closed to:
+
+- `INVALID_PATH`
+- `PATH_OUTSIDE_PROJECT`
+- `NOT_FOUND`
+- `STORAGE_ERROR`
+- `INTERNAL`
+
+Clients must switch on `code`, not on human-readable `error` text.
+
+### Security Posture
+
+The HTTP read API is unauthenticated and loopback-only by default. Clarion
+refuses non-loopback HTTP binds unless `serve.http.allow_non_loopback: true` is
+set. When that opt-in is present, startup logs must warn that the HTTP read API
+surface is unauthenticated and must be protected by operator-managed network
+controls.
 
 ## Alternatives Considered
 
@@ -106,6 +187,7 @@ Accept that Filigree mints its own file IDs forever; Clarion reconciles post-hoc
 - [ADR-003](./ADR-003-entity-id-scheme.md) — symbolic entity IDs are what `clarion` mode uses as `file_records.id` values.
 - [ADR-004](./ADR-004-finding-exchange-format.md) — findings intake uses the same `file_id` that `resolve_file` returns.
 - ADR-008 (superseded) — earlier framing of this decision as a "feature flag"; the recon revealed it is an interface, not a flag.
+- [ADR-012](./ADR-012-http-auth-default.md) — superseded for this registry-backend HTTP read surface; ADR-014 owns the unauthenticated loopback-only trust model and non-loopback guard.
 - [ADR-016](./ADR-016-observation-transport.md) — the `create_observation(file_path=…)` auto-create path is one of the three delegated operations; under `registry_backend: clarion` mode the `file_id` resolution in that path uses this ADR's protocol regardless of whether ADR-016's transport is MCP-spawn (v0.1) or HTTP (v0.2).
 - [ADR-017](./ADR-017-severity-and-dedup.md) — `mark_unseen=true` dedup relies on stable file IDs, which `clarion` mode provides and shadow mode does not.
 - [ADR-018](./ADR-018-identity-reconciliation.md) — the qualname ↔ EntityId translation layer is adjacent; `clarion` mode's `file_id` resolution is one slice of the broader identity-reconciliation surface.

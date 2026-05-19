@@ -10,7 +10,7 @@
 Filigree gains a pluggable `RegistryProtocol` selected by a `registry_backend` config flag with two modes:
 
 - `local` (default, unchanged behaviour) — Filigree's native UUID-derived file IDs.
-- `clarion` (opt-in, per-project) — Filigree delegates file-identity resolution to Clarion's HTTP read API; `file_records.id` stores Clarion's symbolic entity ID (`core:file:{hash}@{path}` per Clarion ADR-003).
+- `clarion` (opt-in, per-project) — Filigree delegates file-identity resolution to Clarion's HTTP read API; `file_records.id` stores Clarion's symbolic file-kind entity ID (`core:file:{qualified_name}` per Clarion ADR-003). Clarion supplies `content_hash` separately as drift metadata; hashes are not embedded in file IDs.
 
 A `FILIGREE_FILE_REGISTRY_DISPLACED` error code surfaces direct file-registration attempts that conflict with `clarion` mode. The `registry_backend` value is published in `GET /api/files/_schema.config_flags` for capability probing. Fail-closed startup applies only under `clarion` mode (an `--allow-local-fallback` escape exists for single-operator recovery).
 

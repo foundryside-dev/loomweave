@@ -84,7 +84,14 @@ Because the strongest pressure on this charter comes from "wouldn't it be easier
 - **A central store or database.** Each product owns its data locally. No shared SQLite/Postgres/object-store sits under the suite.
 - **A system of record for any cross-product state.** Finding lifecycle lives in Filigree. Entity identity lives in Clarion. Policy baselines live in Wardline. Execution provenance (if Shuttle ships) lives in Shuttle. Loom does not own or mirror these.
 - **An identity reconciliation service.** When cross-scheme translation is needed — e.g. Wardline qualname → Clarion entity ID — the product that *cares* does the translation, because that product is the one whose authority needs it. Clarion translates qualnames because Clarion owns the catalog that makes them meaningful. There is no neutral "Loom identity oracle."
-- **A capability negotiation bus.** Products probe each other directly via their own surfaces (HTTP endpoints, MCP tools, CLI flags). Version skew is handled bilaterally, not through a Loom-level registry.
+- **A capability negotiation bus.** Products probe each other directly via
+  their own surfaces (HTTP endpoints, MCP tools, CLI flags). Version skew is
+  handled bilaterally, not through a Loom-level registry. Clarion's HTTP read
+  API is one such bilateral surface; its operator trust model is documented in
+  [`docs/operator/clarion-http-read-api.md`](../operator/clarion-http-read-api.md):
+  the HTTP surface is unauthenticated, loopback-only by default, and requires an
+  authenticated reverse proxy or equivalent control before any non-loopback
+  bind.
 
 The test for any proposed addition: if the proposal introduces something that would need to be *running* or *present* for the suite to work, it violates federation. Integration protocols, schemas, and narrow contracts are fine. Shared infrastructure that sibling products *depend on* is not.
 
