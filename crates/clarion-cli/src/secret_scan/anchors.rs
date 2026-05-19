@@ -139,9 +139,13 @@ async fn upsert_finding_anchor(
 }
 
 fn secret_finding_anchor_id(project_root: &Path, file: &Path) -> String {
+    // ADR-003 grammar: file-kind entity IDs are `core:file:{qualified_name}`
+    // where the qualified name is the canonical project-relative path. Earlier
+    // revisions hashed the path with blake3, which embedded drift state into
+    // the primary ID and was explicitly called out as non-conforming in
+    // ADR-003. The path itself is the canonical identity.
     let relative = display_relative(project_root, file);
-    let digest = blake3::hash(relative.as_bytes()).to_hex().to_string();
-    format!("core:file:{digest}")
+    format!("core:file:{relative}")
 }
 
 fn file_content_hash(path: &Path) -> Option<String> {
