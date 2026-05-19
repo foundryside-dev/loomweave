@@ -171,18 +171,22 @@ pub fn resolve_file(
     file: &str,
     language: &str,
 ) -> Result<Option<ResolvedFile>> {
-    let normalized = normalize_source_path(project_root, file)?;
-    let canonical_path = project_relative_path(project_root, Path::new(&normalized))?;
-    if let Some(entity) = source_entity_for_path(conn, &normalized, Some("file"))? {
+    let lookup_path = normalize_lookup_path(project_root, file)?;
+    let normalized = lookup_path
+        .to_str()
+        .ok_or_else(|| StorageError::InvalidSourcePath(format!("{file:?} is not valid UTF-8")))?;
+    let canonical_path = project_relative_path(project_root, &lookup_path)?;
+    if let Some(entity) = source_entity_for_path(conn, normalized, Some("file"))? {
         let briefing_blocked = entity_briefing_block_reason(&entity.properties_json);
+        let content_hash = match entity.content_hash {
+            Some(content_hash) => content_hash,
+            None => file_content_hash(&lookup_path)?,
+        };
         return Ok(Some(ResolvedFile {
             entity_id: entity.id,
-            content_hash: entity
-                .content_hash
-                .or_else(|| file_content_hash(Path::new(&normalized)))
-                .unwrap_or_default(),
+            content_hash,
             canonical_path,
-            language: resolved_language(language, &entity.plugin_id, Path::new(&normalized)),
+            language: resolved_language(language, &entity.plugin_id, &lookup_path),
             briefing_blocked,
         }));
     }
@@ -262,26 +266,46 @@ fn project_relative_path(project_root: &Path, normalized_path: &Path) -> Result<
     Ok(parts.join("/"))
 }
 
-fn file_content_hash(path: &Path) -> Option<String> {
-    fs::read(path)
-        .ok()
-        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+fn normalize_lookup_path(project_root: &Path, file: &str) -> Result<PathBuf> {
+    let root = project_root.canonicalize()?;
+    let input = Path::new(file);
+    let candidate = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        root.join(input)
+    };
+    let lexical = normalize_lexically(&candidate);
+    if !lexical.starts_with(&root) {
+        return Err(StorageError::InvalidSourcePath(format!(
+            "{file:?} escapes project root {}",
+            root.display()
+        )));
+    }
+    Ok(lexical)
+}
+
+fn file_content_hash(path: &Path) -> std::io::Result<String> {
+    fs::read(path).map(|bytes| blake3::hash(&bytes).to_hex().to_string())
 }
 
 fn resolved_language(requested: &str, plugin_id: &str, path: &Path) -> String {
-    if !requested.trim().is_empty() {
-        return requested.trim().to_owned();
-    }
     if plugin_id != "core" {
         return plugin_id.to_owned();
     }
+    if let Some(inferred) = language_for_extension(path) {
+        return inferred;
+    }
+    requested.trim().to_owned()
+}
+
+fn language_for_extension(path: &Path) -> Option<String> {
     match path.extension().and_then(|extension| extension.to_str()) {
-        Some("py") => "python".to_owned(),
-        Some("rs") => "rust".to_owned(),
-        Some("js") => "javascript".to_owned(),
-        Some("ts") => "typescript".to_owned(),
-        Some(extension) => extension.to_owned(),
-        None => String::new(),
+        Some("py") => Some("python".to_owned()),
+        Some("rs") => Some("rust".to_owned()),
+        Some("js") => Some("javascript".to_owned()),
+        Some("ts") => Some("typescript".to_owned()),
+        Some(extension) => Some(extension.to_owned()),
+        None => None,
     }
 }
 

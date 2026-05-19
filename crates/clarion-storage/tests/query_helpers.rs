@@ -862,6 +862,153 @@ fn resolve_file_returns_none_briefing_blocked_for_clean_entity() {
 }
 
 #[test]
+fn resolve_file_deleted_on_disk_but_cataloged_row_resolves() {
+    let tempdir = tempfile::tempdir().expect("temp project root");
+    let project_root = tempdir.path();
+    let source_path = project_root.join("src").join("deleted.py");
+    std::fs::create_dir_all(source_path.parent().unwrap()).expect("create source dir");
+    std::fs::write(&source_path, "def gone():\n    return 1\n").expect("write source");
+    let canonical = source_path.canonicalize().expect("canonical source");
+
+    let conn = open_fresh(&tempdir);
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            'python:file:deleted', 'python', 'file', 'deleted.py', 'deleted.py', ?1,
+            1, 2, '{}', 'hash-deleted',
+            '2026-05-19T00:00:00.000Z', '2026-05-19T00:00:00.000Z'
+         )",
+        params![canonical.display().to_string()],
+    )
+    .expect("insert deleted entity");
+    std::fs::remove_file(&source_path).expect("delete source after cataloging");
+
+    let resolved = resolve_file(&conn, project_root, "src/deleted.py", "python")
+        .expect("resolve_file should use catalog row without requiring disk file")
+        .expect("entity is known");
+
+    assert_eq!(resolved.entity_id, "python:file:deleted");
+    assert_eq!(resolved.content_hash, "hash-deleted");
+    assert_eq!(resolved.canonical_path, "src/deleted.py");
+    assert!(
+        !resolved.canonical_path.starts_with('/')
+            && !resolved.canonical_path.starts_with("./")
+            && !resolved.canonical_path.starts_with("../"),
+        "canonical path must be project-relative POSIX: {:?}",
+        resolved.canonical_path
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn resolve_file_unreadable_hash_failure_propagates() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tempdir = tempfile::tempdir().expect("temp project root");
+    let project_root = tempdir.path();
+    let source_path = project_root.join("src").join("unreadable.py");
+    std::fs::create_dir_all(source_path.parent().unwrap()).expect("create source dir");
+    std::fs::write(&source_path, "def unreadable():\n    return 1\n").expect("write source");
+    let canonical = source_path.canonicalize().expect("canonical source");
+
+    let conn = open_fresh(&tempdir);
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            'python:file:unreadable', 'python', 'file', 'unreadable.py', 'unreadable.py', ?1,
+            1, 2, '{}', NULL,
+            '2026-05-19T00:00:00.000Z', '2026-05-19T00:00:00.000Z'
+         )",
+        params![canonical.display().to_string()],
+    )
+    .expect("insert unreadable entity");
+    let original_permissions = std::fs::metadata(&source_path)
+        .expect("source metadata")
+        .permissions();
+    std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(0o000))
+        .expect("make source unreadable");
+
+    if std::fs::read(&source_path).is_ok() {
+        std::fs::set_permissions(&source_path, original_permissions).expect("restore source perms");
+        eprintln!("skipping unreadable-file assertion because this runner can read 0o000 files");
+        return;
+    }
+
+    let result = resolve_file(&conn, project_root, "src/unreadable.py", "python");
+
+    std::fs::set_permissions(&source_path, original_permissions).expect("restore source perms");
+    let error = result.expect_err("missing catalog hash must propagate hash fallback read failure");
+    assert!(
+        error.to_string().contains("io error"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn resolve_file_does_not_echo_invalid_requested_language_over_catalog_inference() {
+    let tempdir = tempfile::tempdir().expect("temp project root");
+    let project_root = tempdir.path();
+    let source_path = project_root.join("src").join("demo.py");
+    std::fs::create_dir_all(source_path.parent().unwrap()).expect("create source dir");
+    std::fs::write(&source_path, "def entry():\n    return 1\n").expect("write source");
+    let canonical = source_path.canonicalize().expect("canonical source");
+
+    let conn = open_fresh(&tempdir);
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            'python:file:demo-language', 'python', 'file', 'demo.py', 'demo.py', ?1,
+            1, 2, '{}', 'hash-demo-language',
+            '2026-05-19T00:00:00.000Z', '2026-05-19T00:00:00.000Z'
+         )",
+        params![canonical.display().to_string()],
+    )
+    .expect("insert python entity");
+
+    let resolved = resolve_file(&conn, project_root, "src/demo.py", "javascript")
+        .expect("resolve_file")
+        .expect("entity is known");
+
+    assert_eq!(resolved.language, "python");
+}
+
+#[test]
+fn resolve_file_prefers_core_extension_inference_over_requested_language() {
+    let tempdir = tempfile::tempdir().expect("temp project root");
+    let project_root = tempdir.path();
+    let source_path = project_root.join("src").join("demo.py");
+    std::fs::create_dir_all(source_path.parent().unwrap()).expect("create source dir");
+    std::fs::write(&source_path, "def entry():\n    return 1\n").expect("write source");
+    let canonical = source_path.canonicalize().expect("canonical source");
+
+    let conn = open_fresh(&tempdir);
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            'core:file:src/demo.py', 'core', 'file', 'demo.py', 'demo.py', ?1,
+            1, 2, '{}', 'hash-core-demo',
+            '2026-05-19T00:00:00.000Z', '2026-05-19T00:00:00.000Z'
+         )",
+        params![canonical.display().to_string()],
+    )
+    .expect("insert core file entity");
+
+    let resolved = resolve_file(&conn, project_root, "src/demo.py", "javascript")
+        .expect("resolve_file")
+        .expect("entity is known");
+
+    assert_eq!(resolved.language, "python");
+}
+
+#[test]
 fn entity_briefing_block_reason_parses_property_and_tolerates_garbage() {
     assert_eq!(
         entity_briefing_block_reason(r#"{"briefing_blocked":"secret_present"}"#),
