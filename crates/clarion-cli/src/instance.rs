@@ -24,12 +24,6 @@ impl InstanceId {
         Self(Uuid::new_v4())
     }
 
-    /// Borrow the inner UUID. Most callers should use Display / Serialize
-    /// rather than reaching for the inner value.
-    #[must_use]
-    pub fn as_uuid(&self) -> &Uuid {
-        &self.0
-    }
 }
 
 impl fmt::Display for InstanceId {
@@ -134,6 +128,16 @@ fn read_existing_instance_id(path: &Path, raw: &str) -> Result<InstanceId> {
 fn parse_instance_id(path: &Path, raw: &str) -> Result<InstanceId> {
     let trimmed = raw.trim();
     let id = Uuid::parse_str(trimmed).map_err(|err| invalid_instance_id(path, &err))?;
+    Ok(InstanceId(id))
+}
+
+/// Test-only constructor: parse a candidate UUID into an `InstanceId`
+/// without touching the filesystem. Used by `http_read::tests` to drive
+/// `spawn` synthetically.
+#[cfg(test)]
+pub(crate) fn parse_instance_id_for_test(raw: &str) -> Result<InstanceId> {
+    let id =
+        Uuid::parse_str(raw.trim()).map_err(|err| anyhow!("invalid synthetic instance id: {err}"))?;
     Ok(InstanceId(id))
 }
 

@@ -649,6 +649,140 @@ fn serve_rejects_invalid_instance_id_before_serving_http() {
 }
 
 #[test]
+fn serve_http_files_endpoint_requires_bearer_token_when_configured() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    seed_file_entity(dir.path());
+    let bind = free_loopback_bind();
+    write_http_config_with_token_env(dir.path(), &bind, "CLARION_TEST_LOOM_TOKEN_REQ");
+
+    let mut child =
+        spawn_serve_with_env(dir.path(), &[("CLARION_TEST_LOOM_TOKEN_REQ", "shh-its-a-secret")]);
+    let unauthenticated = wait_for_http_response(&bind, "/api/v1/files?path=demo.py&language=python");
+    let authenticated = wait_for_http_raw_response(
+        &bind,
+        "/api/v1/files?path=demo.py&language=python",
+        &[("Authorization", "Bearer shh-its-a-secret")],
+    );
+    stop_serve(&mut child);
+    let unauthenticated = unauthenticated.expect("unauthenticated probe response");
+    let authenticated = authenticated.expect("authenticated probe response");
+
+    assert_eq!(unauthenticated.status_code, 401);
+    assert_eq!(unauthenticated.body["code"], "UNAUTHORIZED");
+    assert_eq!(authenticated.status_code, 200);
+    let body: Value = serde_json::from_str(&authenticated.body)
+        .expect("authenticated body is JSON");
+    assert_eq!(body["entity_id"], "core:file:demo.py");
+}
+
+#[test]
+fn serve_http_files_endpoint_rejects_wrong_token() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    seed_file_entity(dir.path());
+    let bind = free_loopback_bind();
+    write_http_config_with_token_env(dir.path(), &bind, "CLARION_TEST_LOOM_TOKEN_WRONG");
+
+    let mut child =
+        spawn_serve_with_env(dir.path(), &[("CLARION_TEST_LOOM_TOKEN_WRONG", "correct-horse")]);
+    let wrong = wait_for_http_raw_response(
+        &bind,
+        "/api/v1/files?path=demo.py&language=python",
+        &[("Authorization", "Bearer battery-staple")],
+    );
+    let blank = wait_for_http_raw_response(
+        &bind,
+        "/api/v1/files?path=demo.py&language=python",
+        &[("Authorization", "Bearer ")],
+    );
+    let wrong_scheme = wait_for_http_raw_response(
+        &bind,
+        "/api/v1/files?path=demo.py&language=python",
+        &[("Authorization", "Basic correct-horse")],
+    );
+    stop_serve(&mut child);
+    let wrong = wrong.expect("wrong-token response");
+    let blank = blank.expect("blank-token response");
+    let wrong_scheme = wrong_scheme.expect("wrong-scheme response");
+
+    for (name, response) in [("wrong", &wrong), ("blank", &blank), ("wrong-scheme", &wrong_scheme)]
+    {
+        assert_eq!(response.status_code, 401, "{name}: {response:?}");
+        let body: Value = serde_json::from_str(&response.body)
+            .unwrap_or_else(|err| panic!("{name} body parse: {err}; raw={:?}", response.body));
+        assert_eq!(body["code"], "UNAUTHORIZED", "{name}");
+    }
+}
+
+#[test]
+fn serve_http_capabilities_does_not_require_token() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let bind = free_loopback_bind();
+    write_http_config_with_token_env(dir.path(), &bind, "CLARION_TEST_LOOM_TOKEN_CAPS");
+
+    let mut child =
+        spawn_serve_with_env(dir.path(), &[("CLARION_TEST_LOOM_TOKEN_CAPS", "any-token-value")]);
+    let response = wait_for_http_response(&bind, "/api/v1/_capabilities");
+    stop_serve(&mut child);
+    let response = response.expect("capabilities probe response");
+
+    assert_eq!(response.status_code, 200);
+    assert_eq!(response.body["registry_backend"], true);
+    assert_eq!(response.body["api_version"], 1);
+}
+
+#[test]
+fn serve_http_refuses_startup_on_non_loopback_without_token() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    // Non-loopback bind + allow_non_loopback opt-in + token_env unset
+    // should refuse to start with CLA-CONFIG-HTTP-NO-AUTH.
+    fs::write(
+        dir.path().join("clarion.yaml"),
+        "version: 1\nserve:\n  http:\n    enabled: true\n    bind: \"0.0.0.0:0\"\n    \
+         allow_non_loopback: true\n    token_env: \"CLARION_TEST_LOOM_TOKEN_REFUSE\"\n",
+    )
+    .expect("write non-loopback HTTP config without token env");
+
+    let child = spawn_serve_with_env(dir.path(), &[]);
+    let output = wait_for_child_exit(child, Duration::from_secs(2))
+        .expect("serve should refuse to start without auth on non-loopback");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("CLA-CONFIG-HTTP-NO-AUTH"),
+        "error should cite CLA-CONFIG-HTTP-NO-AUTH: {stderr}"
+    );
+    assert!(
+        stderr.contains("CLARION_TEST_LOOM_TOKEN_REFUSE"),
+        "error should name the configured token_env: {stderr}"
+    );
+}
+
+#[test]
 fn serve_rejects_non_loopback_http_bind_before_binding_without_opt_in() {
     let dir = tempfile::tempdir().expect("temp project");
     clarion_bin()
@@ -1492,6 +1626,16 @@ fn write_http_config(project_root: &Path, bind: &str) {
     .expect("write HTTP serve config");
 }
 
+fn write_http_config_with_token_env(project_root: &Path, bind: &str, token_env: &str) {
+    fs::write(
+        project_root.join("clarion.yaml"),
+        format!(
+            "version: 1\nserve:\n  http:\n    enabled: true\n    bind: \"{bind}\"\n    token_env: \"{token_env}\"\n"
+        ),
+    )
+    .expect("write HTTP serve config with token_env");
+}
+
 struct ServeChild {
     child: Option<Child>,
 }
@@ -1536,16 +1680,21 @@ impl Drop for ServeChild {
 }
 
 fn spawn_serve(project_root: &Path) -> ServeChild {
-    ServeChild::new(
-        StdCommand::new(assert_cmd::cargo::cargo_bin("clarion"))
-            .args(["serve", "--path"])
-            .arg(project_root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn clarion serve"),
-    )
+    spawn_serve_with_env(project_root, &[])
+}
+
+fn spawn_serve_with_env(project_root: &Path, env: &[(&str, &str)]) -> ServeChild {
+    let mut command = StdCommand::new(assert_cmd::cargo::cargo_bin("clarion"));
+    command
+        .args(["serve", "--path"])
+        .arg(project_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    ServeChild::new(command.spawn().expect("spawn clarion serve"))
 }
 
 fn stop_serve(child: &mut ServeChild) {

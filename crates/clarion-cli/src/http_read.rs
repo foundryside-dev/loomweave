@@ -116,6 +116,12 @@ struct AppState {
     project_root: PathBuf,
     readers: ReaderPool,
     instance_id: crate::instance::InstanceId,
+    /// Resolved inbound auth token. `Some` when the configured `token_env`
+    /// was set at spawn time, `None` when it was unset (loopback v0.1 trust
+    /// mode). All `/api/v1/files`-family requests require
+    /// `Authorization: Bearer <this>` when `Some`. `/api/v1/_capabilities`
+    /// is always unauthenticated so siblings can probe pre-auth.
+    auth_token: Option<Arc<String>>,
 }
 
 /// Ready-signal payload returned from the HTTP thread back to `spawn`.
@@ -136,17 +142,45 @@ pub fn spawn(
     instance_id: crate::instance::InstanceId,
     config: &HttpReadConfig,
 ) -> Result<Option<HttpReadServer>> {
+    spawn_with_env(project_root, readers, instance_id, config, |name| {
+        std::env::var(name).ok()
+    })
+}
+
+/// Spawn variant that takes an explicit env lookup so tests can drive the
+/// auth-trust gate (and the resolved-bearer-token plumbing) without
+/// mutating process environment.
+pub fn spawn_with_env<F>(
+    project_root: PathBuf,
+    readers: ReaderPool,
+    instance_id: crate::instance::InstanceId,
+    config: &HttpReadConfig,
+    env_lookup: F,
+) -> Result<Option<HttpReadServer>>
+where
+    F: Fn(&str) -> Option<String>,
+{
     if !config.enabled {
         return Ok(None);
     }
     config
         .validate_loopback_trust()
         .context("validate HTTP read API trust model")?;
+    config
+        .validate_auth_trust(&env_lookup)
+        .context("validate HTTP read API auth trust model")?;
+    let auth_token = env_lookup(&config.token_env)
+        .map(|raw| raw.trim().to_owned())
+        .filter(|trimmed| !trimmed.is_empty())
+        .map(Arc::new);
     let bind = config.bind;
-    let warn_unauthenticated_non_loopback = config.allow_non_loopback && !config.is_loopback_bind();
+    let warn_unauthenticated_non_loopback = config.allow_non_loopback
+        && !config.is_loopback_bind()
+        && auth_token.is_none();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<HttpReadReady>>();
     let (failure_tx, failure_rx) = mpsc::channel();
+    let auth_token_thread = auth_token.clone();
     let join = thread::Builder::new()
         .name("clarion-http-read".to_owned())
         .spawn(move || -> Result<()> {
@@ -154,6 +188,7 @@ pub fn spawn(
                 project_root,
                 readers,
                 instance_id,
+                auth_token_thread,
                 bind,
                 shutdown_rx,
                 ready_tx,
@@ -168,7 +203,7 @@ pub fn spawn(
         .recv()
         .context("wait for HTTP read API bind result")??;
     let local_addr = ready.local_addr;
-    let auth = "none";
+    let auth = if auth_token.is_some() { "bearer" } else { "none" };
     if warn_unauthenticated_non_loopback {
         tracing::warn!(
             bind = %local_addr,
@@ -189,6 +224,7 @@ fn run_http_read_server(
     project_root: PathBuf,
     readers: ReaderPool,
     instance_id: crate::instance::InstanceId,
+    auth_token: Option<Arc<String>>,
     bind: std::net::SocketAddr,
     shutdown_rx: oneshot::Receiver<()>,
     ready_tx: mpsc::Sender<Result<HttpReadReady>>,
@@ -222,6 +258,7 @@ fn run_http_read_server(
             project_root,
             readers,
             instance_id,
+            auth_token,
         };
         use std::future::IntoFuture;
         let serve_future = axum::serve(listener, router(state))
@@ -283,9 +320,15 @@ fn build_http_runtime() -> Result<tokio::runtime::Runtime> {
 }
 
 fn router(state: AppState) -> Router {
-    Router::new()
+    let protected = Router::new()
         .route("/api/v1/files", get(get_file))
-        .route("/api/v1/_capabilities", get(get_capabilities))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer_token,
+        ));
+    let unprotected = Router::new().route("/api/v1/_capabilities", get(get_capabilities));
+    protected
+        .merge(unprotected)
         .with_state(state)
         .layer(
             ServiceBuilder::new()
@@ -301,6 +344,63 @@ fn router(state: AppState) -> Router {
                 .layer(load_shed::LoadShedLayer::new())
                 .layer(ConcurrencyLimitLayer::new(64)),
         )
+}
+
+/// Enforce `Authorization: Bearer <token>` on every request to a protected
+/// route (currently `/api/v1/files` and the batch endpoint added by
+/// CONTRACT-1). Unprotected routes — only `/api/v1/_capabilities` — are
+/// served by a sibling sub-router that bypasses this middleware so siblings
+/// can probe pre-auth.
+///
+/// Trust matrix (per `HttpReadConfig::validate_auth_trust`):
+/// - loopback bind, token env unset    → `auth_token` is `None`; allow all.
+/// - loopback bind, token env set      → `auth_token` is `Some`; require it.
+/// - non-loopback bind, token env unset → `validate_auth_trust` refused
+///   startup, this branch is unreachable.
+/// - non-loopback bind, token env set   → `auth_token` is `Some`; require it.
+async fn require_bearer_token(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Some(expected) = state.auth_token.as_ref() else {
+        return next.run(request).await;
+    };
+    let presented = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
+    let Some(presented) = presented else {
+        return unauthorized_response();
+    };
+    // Constant-time compare so a wrong-length-token client can't trivially
+    // distinguish "header absent" from "token mismatch" via timing.
+    if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        return unauthorized_response();
+    }
+    next.run(request).await
+}
+
+fn unauthorized_response() -> Response {
+    json_error(
+        StatusCode::UNAUTHORIZED,
+        ErrorCode::Unauthorized,
+        "authentication required",
+    )
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0_u8;
+    for (left, right) in a.iter().zip(b.iter()) {
+        diff |= left ^ right;
+    }
+    diff == 0
 }
 
 async fn handle_middleware_error(err: BoxError) -> Response {
@@ -352,7 +452,7 @@ struct CapabilitiesResponse {
     registry_backend: bool,
     file_registry: bool,
     api_version: u8,
-    instance_id: String,
+    instance_id: crate::instance::InstanceId,
 }
 
 #[derive(Debug, Serialize)]
@@ -368,6 +468,7 @@ enum ErrorCode {
     PathOutsideProject,
     NotFound,
     BriefingBlocked,
+    Unauthorized,
     StorageError,
     Internal,
 }
@@ -959,5 +1060,76 @@ mod tests {
             serde_json::from_slice(&body).expect("response body is JSON");
         assert_eq!(parsed["error"], "internal panic");
         assert_eq!(parsed["code"], "INTERNAL");
+    }
+
+    /// C8 supervisor end-to-end. Trips the test-only
+    /// [`HTTP_THREAD_PANIC_TRIGGER`] after the HTTP thread has reported a
+    /// successful bind. The trigger fires a panic inside the runtime's
+    /// `block_on`, the thread's `JoinHandle::join()` reports
+    /// `Err(panic_payload)`, and `check_running` surfaces "HTTP read server
+    /// thread panicked" — the path that runs when `CatchPanicLayer` cannot
+    /// absorb the panic (i.e. anything outside per-request middleware).
+    #[test]
+    fn check_running_surfaces_supervisor_signal_after_runtime_panic() {
+        use clarion_mcp::config::HttpReadConfig;
+        use clarion_storage::ReaderPool;
+        use std::net::{SocketAddr, TcpListener};
+
+        // Hold-and-drop: bind to ephemeral 0 to discover a free port, then
+        // drop so the HTTP server can re-bind it. The micro-race is fine
+        // here — if the port is stolen we surface a different error.
+        let probe = TcpListener::bind(("127.0.0.1", 0)).expect("probe bind");
+        let bind: SocketAddr = probe.local_addr().expect("probe local addr");
+        drop(probe);
+
+        let tempdir = tempfile::tempdir().expect("temp project root");
+        let db_path = tempdir.path().join("clarion.db");
+        // ReaderPool::open is lazy; no connection is acquired before the
+        // panic trigger fires, so the absent SQLite file is irrelevant.
+        let readers = ReaderPool::open(&db_path, 4).expect("open reader pool");
+
+        let config = HttpReadConfig {
+            enabled: true,
+            bind,
+            allow_non_loopback: false,
+            ..HttpReadConfig::default()
+        };
+        let instance_id =
+            crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-000000000001")
+                .expect("parse synthetic instance id");
+
+        // Defensive: clear any stale trigger from a prior test.
+        HTTP_THREAD_PANIC_TRIGGER.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let mut server = spawn(tempdir.path().to_path_buf(), readers, instance_id, &config)
+            .expect("spawn HTTP read API")
+            .expect("config.enabled = true implies Some(server)");
+
+        // Trip the panic. The watcher polls every 5 ms.
+        HTTP_THREAD_PANIC_TRIGGER.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Poll check_running until it reports a failure; cap at 5 s so a
+        // regression in the trigger path doesn't hang CI.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let err = loop {
+            match server.check_running() {
+                Err(err) => break err,
+                Ok(()) => {
+                    if std::time::Instant::now() >= deadline {
+                        panic!(
+                            "supervisor did not surface a runtime panic within 5s — \
+                             the test panic hook may not be wired correctly"
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        };
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("HTTP read server thread panicked"),
+            "supervisor must report the thread panic; got: {message}"
+        );
     }
 }

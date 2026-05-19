@@ -247,6 +247,15 @@ pub struct HttpReadConfig {
     #[serde(deserialize_with = "deserialize_socket_addr")]
     pub bind: SocketAddr,
     pub allow_non_loopback: bool,
+    /// Name of the env var holding the inbound bearer token. When the env
+    /// var is set, every `/api/v1/files`-family request must carry
+    /// `Authorization: Bearer <that-value>`; the capabilities probe is
+    /// always unauthenticated. When the env var is unset on a loopback
+    /// bind, the surface stays unauthenticated (the v0.1 trust model).
+    /// When the env var is unset on a non-loopback bind, `clarion serve`
+    /// refuses to start (`CLA-CONFIG-HTTP-NO-AUTH`). Default
+    /// `CLARION_LOOM_TOKEN` matches Filigree's pinned client default.
+    pub token_env: String,
 }
 
 impl Default for HttpReadConfig {
@@ -255,6 +264,7 @@ impl Default for HttpReadConfig {
             enabled: false,
             bind: SocketAddr::from(([127, 0, 0, 1], 9111)),
             allow_non_loopback: false,
+            token_env: "CLARION_LOOM_TOKEN".to_owned(),
         }
     }
 }
@@ -268,6 +278,30 @@ impl HttpReadConfig {
             });
         }
         Ok(())
+    }
+
+    /// Refuse to start a non-loopback HTTP read API when the inbound bearer
+    /// token env var is unset. Loopback binds with the env var unset stay
+    /// unauthenticated (v0.1 trust matrix); the failure case is the explicit
+    /// `allow_non_loopback: true` opt-in plus an unset `token_env`.
+    pub fn validate_auth_trust<F>(&self, env_lookup: F) -> Result<(), ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        if !self.enabled || self.is_loopback_bind() {
+            return Ok(());
+        }
+        let has_token = env_lookup(&self.token_env)
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+        if has_token {
+            return Ok(());
+        }
+        Err(ConfigError::NonLoopbackHttpNoAuth {
+            code: "CLA-CONFIG-HTTP-NO-AUTH",
+            bind: self.bind,
+            token_env: self.token_env.clone(),
+        })
     }
 
     #[must_use]
@@ -397,6 +431,18 @@ pub enum ConfigError {
     NonLoopbackHttpBind {
         code: &'static str,
         bind: SocketAddr,
+    },
+
+    #[error(
+        "{code}: serve.http.bind {bind} is non-loopback and serve.http.allow_non_loopback is true, \
+         but the inbound auth env var ${token_env} is unset; refusing to start an unauthenticated \
+         HTTP read API on a routable interface. Set ${token_env} to a non-empty bearer token, \
+         or bind to loopback."
+    )]
+    NonLoopbackHttpNoAuth {
+        code: &'static str,
+        bind: SocketAddr,
+        token_env: String,
     },
 
     #[error(

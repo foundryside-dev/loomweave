@@ -12,10 +12,46 @@ serve:
   http:
     enabled: true
     bind: 127.0.0.1:9111
+    # Name of the env var holding the inbound bearer token. Optional on a
+    # loopback bind, required on a non-loopback bind. Default
+    # `CLARION_LOOM_TOKEN` matches Filigree's pinned client default.
+    token_env: CLARION_LOOM_TOKEN
 ```
 
 The MCP stdio server remains available on stdin/stdout. The HTTP surface is
 read-only and uses Clarion's existing SQLite reader pool.
+
+### Authentication
+
+The `/api/v1/files`-family endpoints require
+`Authorization: Bearer <token>` when Clarion has resolved a token at
+startup; `/api/v1/_capabilities` is **always** unauthenticated so
+siblings can probe the API surface pre-auth.
+
+Trust matrix (enforced by `HttpReadConfig::validate_auth_trust` at
+startup, before binding):
+
+| Bind | `token_env` resolved | Behaviour |
+|---|---|---|
+| Loopback | unset | Unauthenticated; allow all requests. |
+| Loopback | set | Bearer required on protected routes; capabilities always allowed. |
+| Non-loopback | unset | **Refuse to start** with `CLA-CONFIG-HTTP-NO-AUTH`. |
+| Non-loopback | set | Bearer required on protected routes. |
+
+Bearer rejection (any of: header absent, wrong scheme, wrong token,
+blank token) returns:
+
+```http
+HTTP/1.1 401 Unauthorized
+Content-Type: application/json
+
+{"error": "authentication required", "code": "UNAUTHORIZED"}
+```
+
+Token comparison is constant-time so a wrong-length-token client cannot
+distinguish "header absent" from "token mismatch" via timing. The token
+itself is never logged; the bind-time log line records
+`auth=bearer` or `auth=none`, not the token value.
 
 All non-2xx responses use this closed JSON error envelope:
 

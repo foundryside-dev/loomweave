@@ -49,10 +49,19 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
     let http_server = crate::http_read::spawn(
         http_project_root,
         readers.clone(),
-        instance_id.to_string(),
+        instance_id,
         &config.serve.http,
     )
     .context("start HTTP read API")?;
+    if let Some(server) = http_server.as_ref() {
+        debug_assert!(
+            std::sync::Arc::ptr_eq(server.readers_identity(), readers.identity()),
+            "HTTP read API and MCP stdio must share a single ReaderPool — the HTTP \
+             thread reported a different pool identity than the MCP-side handle. \
+             A refactor that re-opens the pool inside http_read::spawn would \
+             produce exactly this mismatch."
+        );
+    }
     let stdio = spawn_mcp_stdio(
         project_root,
         db_path,
