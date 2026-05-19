@@ -989,6 +989,11 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
             (!self.scanned_source_files.contains(jailed_path))
                 .then_some(BriefingBlockReason::UnscannedSource)
         });
+        // Scanner is the sole authority over `briefing_blocked`. Strip any
+        // plugin-supplied value first so a malicious or buggy plugin cannot
+        // unblock an entity by emitting `"briefing_blocked": <anything>`, and
+        // cannot over-block by injecting a reason the scanner did not assign.
+        raw.extra.remove("briefing_blocked");
         if let Some(reason) = reason {
             raw.extra.insert(
                 "briefing_blocked".to_owned(),

@@ -341,6 +341,18 @@ impl LlmProvider for OpenRouterProvider {
     }
 }
 
+/// Resolve `executable` via `which::which` and return a typed CLI error if
+/// it is missing on PATH or at the configured absolute path. Called from each
+/// CLI provider's `from_config` so a typo in `clarion.yaml` aborts at
+/// `clarion serve` startup rather than exploding on the first MCP request.
+fn validate_cli_executable(label: &str, executable: &str) -> Result<(), LlmProviderError> {
+    which::which(executable).map_err(|err| LlmProviderError::Cli {
+        message: format!("{label} executable {executable:?} not resolvable: {err}"),
+        retryable: false,
+    })?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexCliProviderConfig {
     pub executable: String,
@@ -390,6 +402,7 @@ impl CodexCliProvider {
                 retryable: false,
             });
         }
+        validate_cli_executable("Codex CLI", &config.executable)?;
 
         Ok(Self {
             executable: config.executable,
@@ -611,6 +624,7 @@ impl ClaudeCliProvider {
                 retryable: false,
             });
         }
+        validate_cli_executable("Claude CLI", &config.executable)?;
 
         Ok(Self {
             executable: config.executable,
@@ -1002,15 +1016,33 @@ fn add_optional_f64(left: Option<f64>, right: Option<f64>) -> Option<f64> {
 fn parse_codex_jsonl_usage(stdout: &[u8]) -> LlmUsageSummary {
     let mut summary = LlmUsageSummary::default();
     let stdout_text = String::from_utf8_lossy(stdout);
+    let mut malformed: u64 = 0;
     for line in stdout_text
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        let Ok(event) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        summary.add(usage_from_event(&event));
+        match serde_json::from_str::<Value>(line) {
+            Ok(event) => summary.add(usage_from_event(&event)),
+            Err(err) => {
+                malformed += 1;
+                tracing::warn!(
+                    error = %err,
+                    snippet = %line.chars().take(80).collect::<String>(),
+                    "Codex JSONL usage parser: skipping malformed line; token totals will be \
+                     under-reported and `session_token_ceiling` enforcement may diverge from \
+                     true accounting"
+                );
+            }
+        }
+    }
+    if malformed > 0 {
+        tracing::warn!(
+            malformed = malformed,
+            "Codex JSONL usage parser skipped {malformed} malformed line{suffix}; token totals \
+             below are a lower bound only",
+            suffix = if malformed == 1 { "" } else { "s" },
+        );
     }
     summary
 }

@@ -110,7 +110,17 @@ fn secret_finding_anchor_id(project_root: &Path, file: &Path) -> String {
 }
 
 fn file_content_hash(path: &Path) -> Option<String> {
-    fs::read(path)
-        .ok()
-        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+    match fs::read(path) {
+        Ok(bytes) => Some(blake3::hash(&bytes).to_hex().to_string()),
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "secret-scan finding-anchor: content-hash read failed; entity briefing-block \
+                 lookups may fail for this path because the finding anchor will land without a \
+                 content_hash"
+            );
+            None
+        }
+    }
 }
