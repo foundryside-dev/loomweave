@@ -319,6 +319,8 @@ Clarion's rule IDs follow the `CLA-*` namespace: `CLA-PY-*` for Python-plugin st
 
 #### REQ-FINDING-03 — Emit findings to Filigree
 
+> **Deferred to v0.2** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). Clarion v0.1 emits findings to its own SQLite `findings` table; cross-product emission to Filigree lands with WP9-B.
+
 Clarion POSTs findings to Filigree via `POST /api/v1/scan-results` using Filigree's native intake schema. Clarion's richer fields (`kind`, `confidence`, `confidence_basis`, `supports`/`supported_by`, `related_entities`, internal severity, internal status) nest inside each finding's `metadata.clarion.*`.
 
 **Rationale**: Filigree owns finding triage and lifecycle (per the Loom federation axiom — `CON-LOOM-01`). Emitting to Filigree surfaces Clarion's findings alongside Wardline's and any future scanners' in the team's unified triage view.
@@ -327,13 +329,17 @@ Clarion POSTs findings to Filigree via `POST /api/v1/scan-results` using Filigre
 
 #### REQ-FINDING-04 — General-purpose SARIF → Filigree translator
 
-Clarion v0.1 ships `clarion sarif import <file> [--scan-source <name>]` that translates any SARIF v2.1.0 emitter (Wardline, Semgrep, CodeQL, Trivy) to Filigree's scan-results format, preserving `result.properties` into `metadata.<driver>_properties.*`.
+> **Deferred to v0.2** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP10). The SARIF translator is independent of MCP surface delivery and lands with the v0.2 cross-product work.
 
-**Rationale**: The translator is a permanent suite feature (SARIF is external, Filigree's intake is not SARIF). For v0.1 it serves Wardline-to-Filigree as a side-effect; in v0.2+ Wardline ships its own native POST, but the translator stays for third-party SARIF sources.
+Clarion ships `clarion sarif import <file> [--scan-source <name>]` that translates any SARIF v2.1.0 emitter (Wardline, Semgrep, CodeQL, Trivy) to Filigree's scan-results format, preserving `result.properties` into `metadata.<driver>_properties.*`.
+
+**Rationale**: The translator is a permanent suite feature (SARIF is external, Filigree's intake is not SARIF). For v0.1 it served Wardline-to-Filigree as a side-effect; in v0.2+ Wardline ships its own native POST, but the translator stays for third-party SARIF sources.
 **Verification**: SARIF corpus at `tests/fixtures/wardline-sarif/` translates to scan-results POSTs; `wardline.*` property-bag keys land in `metadata.wardline_properties.*`; severity mapped via `{error→high, warning→medium, note→info}`.
 **See**: System Design §9 (Integrations, SARIF translator).
 
 #### REQ-FINDING-05 — `scan_run_id` lifecycle
+
+> **Deferred to v0.2** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). Lands with REQ-FINDING-03 (findings emission to Filigree).
 
 Clarion's `run_id` maps 1:1 onto Filigree's `scan_run_id`. Phase 0 of `clarion analyze` creates the scan run; Phase 8 closes it with `complete_scan_run=true`. Resume (`--resume`) reuses the same `run_id` and posts with `mark_unseen=false`.
 
@@ -342,6 +348,8 @@ Clarion's `run_id` maps 1:1 onto Filigree's `scan_run_id`. Phase 0 of `clarion a
 **See**: System Design §9 (Integrations, scan_run_id).
 
 #### REQ-FINDING-06 — Dedup policy for moved entities
+
+> **Deferred to v0.2** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). Concerns Filigree-side dedup; lands with REQ-FINDING-03 (findings emission).
 
 Clarion POSTs findings with `mark_unseen=true` by default so that old-position findings for the same rule on the same file transition to `unseen_in_latest` when the entity moves within the file. `clarion analyze --prune-unseen` removes `unseen_in_latest` findings older than 30 days (configurable).
 
@@ -571,6 +579,8 @@ Clarion's side of Filigree integration.
 
 #### REQ-INTEG-FILIGREE-01 — Findings via scan-results intake
 
+> **Deferred to v0.2** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). Lands with REQ-FINDING-03.
+
 Clarion POSTs findings to Filigree's `POST /api/v1/scan-results` using the native schema (see `REQ-FINDING-03`) with `scan_source: "clarion"`. Clarion inspects `response.warnings[]` on every POST for silent coercion / unknown-key drops.
 
 **Rationale**: Filigree's scan-results intake is the battle-tested cross-tool finding-exchange path; the warnings array is how Filigree signals schema drift. Ignoring warnings means silently shipping malformed findings.
@@ -579,13 +589,17 @@ Clarion POSTs findings to Filigree's `POST /api/v1/scan-results` using the nativ
 
 #### REQ-INTEG-FILIGREE-02 — Observation emission (HTTP preferred, MCP fallback)
 
+> **Deferred to v0.2** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). Clarion v0.1 surfaces structural and security findings via its own MCP `issues_for` tool (WP9-A); cross-product observation emission to Filigree lands with WP9-B.
+
 Clarion emits observations to Filigree via `POST /api/v1/observations` when available; falls back to MCP-client transport (spawning `filigree mcp` as subprocess) when the HTTP endpoint is absent. The fallback is signalled in the capability compat report.
 
-**Rationale**: Observations are fire-and-forget notes; Clarion generates them during analyse and consult. HTTP is the natural transport for a Rust binary emitting to a local Filigree; MCP is the v0.1 workaround while Filigree adds the HTTP endpoint (see `CON-FILIGREE-02`).
+**Rationale**: Observations are fire-and-forget notes; Clarion generates them during analyse and consult. HTTP is the natural transport for a Rust binary emitting to a local Filigree; MCP is the v0.1 workaround while Filigree adds the HTTP endpoint.
 **Verification**: HTTP path used by default; `--no-filigree-http` flag forces MCP fallback; both paths produce observations visible in Filigree.
 **See**: System Design §9 (Integrations, Filigree — Observations), §11 (Suite Bootstrap).
 
 #### REQ-INTEG-FILIGREE-03 — Registry-backend consumption
+
+> **Deferred to v0.2** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B/WP10) and reflected in [CON-FILIGREE-02](#con-filigree-02--file-registry-displacement-is-deferred-to-v02). Filigree's `registry_backend` flag shipped (ADR-014); Clarion's read-side `RegistryProtocol` implementation is the v0.2 work. Clarion v0.1 ships shadow-registry only.
 
 When Filigree's `registry_backend` flag is set to `clarion`, Clarion serves as Filigree's file registry: Filigree consults Clarion's HTTP read API for file ID resolution; auto-create paths route through `RegistryProtocol` to Clarion. Absent the flag, Clarion operates in shadow-registry mode (findings POSTed normally; Filigree auto-creates `file_records` under its native rules).
 
@@ -595,6 +609,8 @@ When Filigree's `registry_backend` flag is set to `clarion`, Clarion serves as F
 
 #### REQ-INTEG-FILIGREE-04 — `scan_source` namespace + schema pin test
 
+> **Deferred to v0.2** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). Lands with REQ-FINDING-03 (findings emission to Filigree); schema-pin test is moot until Clarion is actually POSTing.
+
 Clarion uses `scan_source: "clarion"` for emissions; CI runs a schema-compatibility test against a Filigree release's `GET /api/files/_schema` output to detect drift in `valid_severities`, `valid_finding_statuses`, `valid_association_types`.
 
 **Rationale**: Filigree's CHANGELOG flags breaking API changes but relies on social discipline; a pinned schema-compat test gives Clarion CI-level protection against silent schema shifts.
@@ -602,6 +618,8 @@ Clarion uses `scan_source: "clarion"` for emissions; CI runs a schema-compatibil
 **See**: System Design §9 (Integrations, Filigree — Schema contract).
 
 #### REQ-INTEG-FILIGREE-05 — Capability-negotiation probe
+
+> **Deferred to v0.2** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). The capability probe is meaningful only once Clarion is talking to Filigree via the v0.2 cross-product surfaces (REQ-FINDING-03, REQ-INTEG-FILIGREE-02/03).
 
 At `clarion analyze` startup, Clarion probes Filigree's presence, version, `registry_backend` setting, and `/api/v1/observations` availability via `GET /api/files/_schema` + `HEAD` checks. Results emit in a single `CLA-INFRA-SUITE-COMPAT-REPORT` finding.
 
@@ -942,12 +960,14 @@ Clarion emits findings to Filigree via `POST /api/v1/scan-results` using Filigre
 **Rationale**: Filigree's scan-results endpoint is the production path; deviating requires Filigree work that is out of v0.1 scope. The `metadata` nesting and severity enum are existing Filigree semantics verified by recon.
 **See**: System Design §9 (Integrations, Filigree — Wire format).
 
-### CON-FILIGREE-02 — `registry_backend` flag is a hard dependency
+### CON-FILIGREE-02 — File-registry displacement is deferred to v0.2
 
-Clarion v0.1's "Clarion owns the file registry" claim depends on Filigree shipping a `registry_backend` config flag + pluggable `RegistryProtocol`. Absent the flag, Clarion operates in shadow-registry mode (downgrade to "owns the entity catalog").
+Clarion v0.1 does **not** displace Filigree's file registry. The "Clarion owns the file registry" story — Filigree's `registry_backend` flag + pluggable `RegistryProtocol` and Clarion serving as Filigree's registry backend — is deferred to v0.2 per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B + WP10). Filigree did ship the `registry_backend` flag during Sprint 2 (ADR-014); Clarion's read-side implementation of `RegistryProtocol` and the associated suite-compat reporting are the v0.2 work.
 
-**Rationale**: Filigree's four NOT-NULL `file_records(id)` foreign keys + three auto-create paths make the displacement a schema surgery, not a feature flag. Degraded mode preserves v0.1 shipability; full integration depends on Filigree's cadence.
-**See**: System Design §11 (Suite Bootstrap, Prerequisites named here).
+In v0.1, Clarion operates in shadow-registry mode by default: Clarion owns its entity catalog; Filigree, when present, auto-creates `file_records` under its native rules. The two stores reference the same paths but neither delegates id allocation to the other. This is acceptable because Clarion v0.1's MVP MCP surface (the seven tools — `entity_at`, `find_entity`, `callers_of`, `execution_paths_from`, `summary`, `issues_for`, `neighborhood`) queries Clarion's own SQLite store directly and does not require registry coupling.
+
+**Rationale**: Filigree's four NOT-NULL `file_records(id)` foreign keys + three auto-create paths make registry displacement a schema-surgery integration, not a feature flag — out of v0.1 scope per the scope amendment. Shadow mode preserves v0.1 shipability; full integration lands with the WP9-B/WP10 cluster in v0.2.
+**See**: System Design §11 (Suite Bootstrap), [ADR-014 — Filigree `registry_backend` flag and pluggable `RegistryProtocol`](../adr/ADR-014-filigree-registry-backend.md), [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md).
 
 ### CON-WARDLINE-01 — Wardline owns its REGISTRY
 
