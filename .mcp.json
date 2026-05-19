@@ -3,16 +3,17 @@
     "filigree": {
       "type": "stdio",
       "command": "/home/john/.local/bin/filigree-mcp",
-      "args": [],
-      "env": {}
+      "args": []
     },
     "clarion": {
       "type": "stdio",
       "command": "/home/john/clarion/target/release/clarion",
       "args": [
         "serve",
-        "--path", "/tmp/clarion-b8-elspeth-full-20260518T0016Z",
-        "--config", "/tmp/clarion-b8-elspeth-full-20260518T0016Z/clarion-b8-live.yaml"
+        "--path",
+        "/tmp/clarion-b8-elspeth-full-20260518T0016Z",
+        "--config",
+        "/tmp/clarion-b8-elspeth-full-20260518T0016Z/clarion-b8-live.yaml"
       ],
       "env": {}
     }
