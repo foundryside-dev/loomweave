@@ -74,7 +74,7 @@ from entities
 where json_extract(properties, '$.briefing_blocked') is not null;
 ```
 
-Filigree integration for scanner findings is planned for v0.2. Until then, the local `findings` table is the authoritative WP5 audit surface.
+Filigree integration for scanner findings is planned for v0.2. Until then, the local `findings` table is the authoritative scanner audit surface.
 
 ## Limitations
 

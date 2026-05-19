@@ -17,8 +17,8 @@ fn main() -> Result<()> {
     // Load .env before tracing setup for operator-facing commands so a
     // .env-supplied RUST_LOG is in effect by the time the filter is built.
     // `analyze` is deliberately excluded: project .env contents are scanned
-    // as source sidecars and must not be imported into plugin subprocess
-    // environments before WP5's pre-ingest secret gate runs.
+    // as source sidecars by the pre-ingest secret scanner and must not be
+    // imported into plugin subprocess environments before that gate runs.
     if !matches!(&cli.command, cli::Command::Analyze { .. }) {
         let _ = dotenvy::dotenv();
     }
