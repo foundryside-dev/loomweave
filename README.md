@@ -27,6 +27,13 @@ and trust-topology tools.
   WP9-B, deferred per the
   [Sprint 2 scope amendment](docs/implementation/sprint-2/scope-amendment-2026-05.md#4-v01-planmd-resequencing).
 
+**Known v1.0 limitations:**
+
+- **HTTP file language inference uses stored plugin identity plus a narrow
+  core-extension fallback.** Plugin manifests already declare language and
+  extensions, but v1.0 does not persist a manifest language registry for the
+  `/api/v1/files` read path. This is tracked as post-v1.0 hardening.
+
 ## What it does today
 
 `clarion serve` exposes seven MCP tools that a consult-mode agent calls instead

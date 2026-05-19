@@ -7,8 +7,8 @@ use clarion_storage::{
     ModuleDependencyEdge, ReferenceDirection, SubsystemMember, call_edges_from,
     call_edges_targeting, child_entity_ids, contained_entity_ids, entity_at_line,
     entity_briefing_block_reason, entity_by_id, find_entities, module_dependency_edges,
-    normalize_source_path, pragma, reference_edges_for_entity, resolve_file, schema,
-    subsystem_for_member, subsystem_members,
+    normalize_source_path, pragma, reference_edges_for_entity, resolve_file,
+    resolve_file_catalog_entry, schema, subsystem_for_member, subsystem_members,
 };
 use rusqlite::{Connection, params};
 
@@ -899,6 +899,40 @@ fn resolve_file_deleted_on_disk_but_cataloged_row_resolves() {
         "canonical path must be project-relative POSIX: {:?}",
         resolved.canonical_path
     );
+}
+
+#[test]
+fn resolve_file_catalog_entry_returns_missing_hash_without_reading_disk() {
+    let tempdir = tempfile::tempdir().expect("temp project root");
+    let project_root = tempdir.path();
+    let source_path = project_root.join("src").join("missing-hash.py");
+    std::fs::create_dir_all(source_path.parent().unwrap()).expect("create source dir");
+    std::fs::write(&source_path, "def missing_hash():\n    return 1\n").expect("write source");
+    let canonical = source_path.canonicalize().expect("canonical source");
+
+    let conn = open_fresh(&tempdir);
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            'python:file:missing_hash', 'python', 'file', 'missing-hash.py', 'missing-hash.py', ?1,
+            1, 2, '{}', NULL,
+            '2026-05-19T00:00:00.000Z', '2026-05-19T00:00:00.000Z'
+         )",
+        params![canonical.display().to_string()],
+    )
+    .expect("insert file entity without cached hash");
+    std::fs::remove_file(&source_path).expect("delete source after cataloging");
+
+    let entry = resolve_file_catalog_entry(&conn, project_root, "src/missing-hash.py", "python")
+        .expect("catalog lookup should not read deleted source")
+        .expect("entity is known");
+
+    assert_eq!(entry.entity_id, "python:file:missing_hash");
+    assert_eq!(entry.content_hash, None);
+    assert_eq!(entry.canonical_path, "src/missing-hash.py");
+    assert_eq!(entry.language, "python");
 }
 
 #[test]

@@ -89,6 +89,32 @@ pub struct ResolvedFile {
     pub briefing_blocked: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedFileCatalogEntry {
+    pub entity_id: String,
+    pub content_hash: Option<String>,
+    pub canonical_path: String,
+    pub language: String,
+    pub briefing_blocked: Option<String>,
+    content_hash_path: PathBuf,
+}
+
+impl ResolvedFileCatalogEntry {
+    pub fn into_resolved_file(self) -> Result<ResolvedFile> {
+        let content_hash = match self.content_hash {
+            Some(content_hash) => content_hash,
+            None => file_content_hash(&self.content_hash_path)?,
+        };
+        Ok(ResolvedFile {
+            entity_id: self.entity_id,
+            content_hash,
+            canonical_path: self.canonical_path,
+            language: self.language,
+            briefing_blocked: self.briefing_blocked,
+        })
+    }
+}
+
 const MODULE_ANCESTOR_MAX_DEPTH: i64 = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +197,18 @@ pub fn resolve_file(
     file: &str,
     language: &str,
 ) -> Result<Option<ResolvedFile>> {
+    let Some(entry) = resolve_file_catalog_entry(conn, project_root, file, language)? else {
+        return Ok(None);
+    };
+    entry.into_resolved_file().map(Some)
+}
+
+pub fn resolve_file_catalog_entry(
+    conn: &Connection,
+    project_root: &Path,
+    file: &str,
+    language: &str,
+) -> Result<Option<ResolvedFileCatalogEntry>> {
     let lookup_path = normalize_lookup_path(project_root, file)?;
     let normalized = lookup_path
         .to_str()
@@ -178,16 +216,13 @@ pub fn resolve_file(
     let canonical_path = project_relative_path(project_root, &lookup_path)?;
     if let Some(entity) = source_entity_for_path(conn, normalized, Some("file"))? {
         let briefing_blocked = entity_briefing_block_reason(&entity.properties_json);
-        let content_hash = match entity.content_hash {
-            Some(content_hash) => content_hash,
-            None => file_content_hash(&lookup_path)?,
-        };
-        return Ok(Some(ResolvedFile {
+        return Ok(Some(ResolvedFileCatalogEntry {
             entity_id: entity.id,
-            content_hash,
+            content_hash: entity.content_hash,
             canonical_path,
             language: resolved_language(language, &entity.plugin_id, &lookup_path),
             briefing_blocked,
+            content_hash_path: lookup_path,
         }));
     }
     Ok(None)

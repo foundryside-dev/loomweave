@@ -23,6 +23,22 @@ struct HttpJsonResponse {
     body: Value,
 }
 
+#[derive(Debug)]
+struct HttpRawResponse {
+    status_code: u16,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+impl HttpRawResponse {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
 fn clarion_bin() -> Command {
     Command::cargo_bin("clarion").expect("clarion binary")
 }
@@ -158,6 +174,43 @@ fn serve_http_files_endpoint_resolves_known_file_on_configured_port() {
 }
 
 #[test]
+fn serve_http_files_etag_round_trip_and_if_none_match_returns_304() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let (_file_id, content_hash, _canonical_path) = seed_file_entity(dir.path());
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+
+    let mut child = spawn_serve(dir.path());
+    let response =
+        wait_for_http_raw_response(&bind, "/api/v1/files?path=demo.py&language=python", &[]);
+    let not_modified = wait_for_http_raw_response(
+        &bind,
+        "/api/v1/files?path=demo.py&language=python",
+        &[("If-None-Match", "\"hash-demo-file\"")],
+    );
+    stop_serve(&mut child);
+    let response = response.expect("HTTP /api/v1/files response");
+    let not_modified = not_modified.expect("HTTP /api/v1/files conditional response");
+
+    let expected_etag = format!("\"{content_hash}\"");
+    assert_eq!(response.status_code, 200);
+    assert_eq!(response.header("etag"), Some(expected_etag.as_str()));
+    assert_eq!(not_modified.status_code, 304);
+    assert_eq!(not_modified.header("etag"), Some(expected_etag.as_str()));
+    assert!(
+        not_modified.body.is_empty(),
+        "304 response must not include a body: {:?}",
+        not_modified
+    );
+}
+
+#[test]
 fn serve_http_files_blank_path_returns_invalid_path_envelope() {
     let dir = tempfile::tempdir().expect("temp project");
     clarion_bin()
@@ -173,6 +226,36 @@ fn serve_http_files_blank_path_returns_invalid_path_envelope() {
     let response = wait_for_http_response(&bind, "/api/v1/files?path=&language=python");
     stop_serve(&mut child);
     let response = response.expect("HTTP /api/v1/files error response");
+
+    assert_eq!(response.status_code, 400);
+    assert_eq!(response.body["code"], "INVALID_PATH");
+    assert!(
+        response.body["error"].as_str().is_some(),
+        "error envelope must include a string message: {:?}",
+        response
+    );
+}
+
+#[test]
+fn serve_http_files_rejects_unknown_query_fields() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    seed_file_entity(dir.path());
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+
+    let mut child = spawn_serve(dir.path());
+    let response = wait_for_http_response(
+        &bind,
+        "/api/v1/files?path=demo.py&language=python&surprise=1",
+    );
+    stop_serve(&mut child);
+    let response = response.expect("HTTP /api/v1/files query rejection");
 
     assert_eq!(response.status_code, 400);
     assert_eq!(response.body["code"], "INVALID_PATH");
@@ -1443,6 +1526,23 @@ fn wait_for_http_response(bind: &str, path: &str) -> Result<HttpJsonResponse, St
     Err(last_error)
 }
 
+fn wait_for_http_raw_response(
+    bind: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Result<HttpRawResponse, String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_error = String::new();
+    while Instant::now() < deadline {
+        match http_raw_response(bind, path, headers) {
+            Ok(response) => return Ok(response),
+            Err(err) => last_error = err,
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err(last_error)
+}
+
 fn wait_for_http_get_with_body_status(
     bind: &str,
     path: &str,
@@ -1490,6 +1590,82 @@ fn http_get_with_body_status(bind: &str, path: &str, body: &[u8]) -> Result<u16,
         .ok_or_else(|| format!("malformed HTTP status line: {status_line}"))?
         .parse::<u16>()
         .map_err(|err| format!("parse HTTP status from {status_line:?}: {err}"))
+}
+
+fn http_raw_response(
+    bind: &str,
+    path: &str,
+    request_headers: &[(&str, &str)],
+) -> Result<HttpRawResponse, String> {
+    let addr = bind
+        .parse()
+        .map_err(|err| format!("parse bind address {bind}: {err}"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(100))
+        .map_err(|err| format!("connect to {bind}: {err}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|err| format!("set read timeout: {err}"))?;
+    write!(stream, "GET {path} HTTP/1.1\r\nHost: {bind}\r\n")
+        .map_err(|err| format!("write request line: {err}"))?;
+    for (name, value) in request_headers {
+        write!(stream, "{name}: {value}\r\n")
+            .map_err(|err| format!("write request header {name}: {err}"))?;
+    }
+    write!(stream, "Connection: close\r\n\r\n")
+        .map_err(|err| format!("write request terminator: {err}"))?;
+
+    let mut reader = std::io::BufReader::new(stream);
+    let mut status_line = String::new();
+    reader
+        .read_line(&mut status_line)
+        .map_err(|err| format!("read status line: {err}"))?;
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| format!("malformed HTTP status line: {status_line}"))?
+        .parse::<u16>()
+        .map_err(|err| format!("parse HTTP status from {status_line:?}: {err}"))?;
+    let mut content_length = None;
+    let mut response_headers = Vec::new();
+    let mut header = String::new();
+    loop {
+        header.clear();
+        reader
+            .read_line(&mut header)
+            .map_err(|err| format!("read header: {err}"))?;
+        if header == "\r\n" || header == "\n" || header.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = header.split_once(':') {
+            let name = name.trim().to_owned();
+            let value = value.trim().to_owned();
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|err| format!("parse content-length from {header:?}: {err}"))?,
+                );
+            }
+            response_headers.push((name, value));
+        }
+    }
+    let mut body = String::new();
+    if let Some(content_length) = content_length {
+        let mut bytes = vec![0_u8; content_length];
+        reader
+            .read_exact(&mut bytes)
+            .map_err(|err| format!("read response body: {err}"))?;
+        body = String::from_utf8(bytes).map_err(|err| format!("response body is utf8: {err}"))?;
+    } else {
+        reader
+            .read_to_string(&mut body)
+            .map_err(|err| format!("read response body: {err}"))?;
+    }
+    Ok(HttpRawResponse {
+        status_code,
+        headers: response_headers,
+        body,
+    })
 }
 
 fn http_get_response(bind: &str, path: &str) -> Result<HttpJsonResponse, String> {

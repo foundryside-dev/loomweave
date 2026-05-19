@@ -6,13 +6,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use axum::error_handling::HandleErrorLayer;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use clarion_mcp::config::HttpReadConfig;
-use clarion_storage::{ReaderPool, StorageError, resolve_file};
+use clarion_storage::{ReaderPool, StorageError, resolve_file_catalog_entry};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tower::limit::ConcurrencyLimitLayer;
@@ -202,7 +203,11 @@ fn router(state: AppState) -> Router {
         .layer(
             ServiceBuilder::new()
                 .layer(HandleErrorLayer::new(handle_middleware_error))
-                .layer(TraceLayer::new_for_http().on_failure(()))
+                .layer(
+                    TraceLayer::new_for_http()
+                        .make_span_with(http_request_span)
+                        .on_failure(()),
+                )
                 .layer(timeout::TimeoutLayer::new(Duration::from_secs(10)))
                 .layer(RequestBodyLimitLayer::new(16 * 1024))
                 .layer(load_shed::LoadShedLayer::new())
@@ -234,6 +239,7 @@ async fn handle_middleware_error(err: BoxError) -> Response {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileQuery {
     #[serde(default)]
     path: String,
@@ -273,7 +279,21 @@ enum ErrorCode {
     Internal,
 }
 
-async fn get_file(State(state): State<AppState>, Query(query): Query<FileQuery>) -> Response {
+async fn get_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    query: Result<Query<FileQuery>, QueryRejection>,
+) -> Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidPath,
+                "query parameters are invalid",
+            );
+        }
+    };
     if query.path.trim().is_empty() {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -284,10 +304,17 @@ async fn get_file(State(state): State<AppState>, Query(query): Query<FileQuery>)
     let project_root = state.project_root.clone();
     let file_path = query.path;
     let language = query.language;
-    let result = state
+    let catalog_result = state
         .readers
-        .with_reader(move |conn| resolve_file(conn, &project_root, &file_path, &language))
+        .with_reader(move |conn| {
+            resolve_file_catalog_entry(conn, &project_root, &file_path, &language)
+        })
         .await;
+    let result = match catalog_result {
+        Ok(Some(entry)) => entry.into_resolved_file().map(Some),
+        Ok(None) => Ok(None),
+        Err(err) => Err(err),
+    };
     match result {
         Ok(Some(file)) => {
             if let Some(reason) = file.briefing_blocked.as_deref() {
@@ -302,7 +329,13 @@ async fn get_file(State(state): State<AppState>, Query(query): Query<FileQuery>)
                     "file is not known to Clarion",
                 );
             }
-            (
+            let etag = file_etag(&file.content_hash);
+            if if_none_match_matches(headers.get(header::IF_NONE_MATCH), &etag) {
+                let mut response = StatusCode::NOT_MODIFIED.into_response();
+                insert_etag(&mut response, &etag);
+                return response;
+            }
+            let mut response = (
                 StatusCode::OK,
                 Json(FileResponse {
                     entity_id: file.entity_id,
@@ -311,7 +344,9 @@ async fn get_file(State(state): State<AppState>, Query(query): Query<FileQuery>)
                     language: file.language,
                 }),
             )
-                .into_response()
+                .into_response();
+            insert_etag(&mut response, &etag);
+            response
         }
         Ok(None) => json_error(
             StatusCode::NOT_FOUND,
@@ -319,6 +354,64 @@ async fn get_file(State(state): State<AppState>, Query(query): Query<FileQuery>)
             "file is not known to Clarion",
         ),
         Err(err) => json_read_error(err),
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RequestLogContext {
+    loom_component: Option<String>,
+    filigree_actor: Option<String>,
+}
+
+fn request_log_context(headers: &HeaderMap) -> RequestLogContext {
+    RequestLogContext {
+        loom_component: log_header_value(headers, "x-loom-component"),
+        filigree_actor: log_header_value(headers, "x-filigree-actor"),
+    }
+}
+
+fn log_header_value(headers: &HeaderMap, name: &'static str) -> Option<String> {
+    let value = headers.get(name)?.to_str().ok()?.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn http_request_span<B>(request: &Request<B>) -> tracing::Span {
+    let context = request_log_context(request.headers());
+    let span = tracing::info_span!(
+        "http_read_request",
+        method = %request.method(),
+        path = %request.uri().path(),
+        loom_component = tracing::field::Empty,
+        filigree_actor = tracing::field::Empty,
+    );
+    if let Some(loom_component) = context.loom_component {
+        span.record("loom_component", tracing::field::display(loom_component));
+    }
+    if let Some(filigree_actor) = context.filigree_actor {
+        span.record("filigree_actor", tracing::field::display(filigree_actor));
+    }
+    span
+}
+
+fn file_etag(content_hash: &str) -> String {
+    format!("\"{content_hash}\"")
+}
+
+fn if_none_match_matches(value: Option<&HeaderValue>, etag: &str) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    value.split(',').map(str::trim).any(|candidate| {
+        candidate == "*" || candidate == etag || candidate.strip_prefix("W/") == Some(etag)
+    })
+}
+
+fn insert_etag(response: &mut Response, etag: &str) {
+    if let Ok(value) = HeaderValue::from_str(etag) {
+        response.headers_mut().insert(header::ETAG, value);
     }
 }
 
@@ -432,6 +525,7 @@ mod tests {
     use std::task::{Context, Poll};
 
     use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
     use tower::Service;
 
     #[test]
@@ -511,5 +605,17 @@ mod tests {
             .expect("test runtime");
         let response = runtime.block_on(handle_middleware_error(err));
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn request_log_context_reads_optional_actor_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Loom-Component", HeaderValue::from_static("loom"));
+        headers.insert("X-Filigree-Actor", HeaderValue::from_static("worker-f"));
+
+        let context = request_log_context(&headers);
+
+        assert_eq!(context.loom_component.as_deref(), Some("loom"));
+        assert_eq!(context.filigree_actor.as_deref(), Some("worker-f"));
     }
 }
