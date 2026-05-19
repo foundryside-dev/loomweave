@@ -788,10 +788,43 @@ fn resolve_file_surfaces_briefing_blocked_reason_from_properties() {
 }
 
 #[test]
+fn resolve_file_returns_none_when_no_file_kind_entity_exists() {
+    let tempdir = tempfile::tempdir().expect("temp project root");
+    let project_root = tempdir.path();
+    let source_path = project_root.join("src").join("demo.py");
+    std::fs::create_dir_all(source_path.parent().unwrap()).expect("create source dir");
+    std::fs::write(&source_path, "def entry():\n    return 1\n").expect("write source");
+    let canonical = source_path.canonicalize().expect("canonical source");
+
+    let conn = open_fresh(&tempdir);
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            'python:module:demo', 'python', 'module', 'demo', 'demo', ?1,
+            1, 2, '{}', 'hash-demo-module',
+            '2026-05-19T00:00:00.000Z', '2026-05-19T00:00:00.000Z'
+         )",
+        params![canonical.display().to_string()],
+    )
+    .expect("insert module entity");
+
+    let resolved =
+        resolve_file(&conn, project_root, "src/demo.py", "python").expect("resolve_file");
+
+    assert!(
+        resolved.is_none(),
+        "resolve_file must fail closed instead of synthesizing a file identity from a module row"
+    );
+}
+
+#[test]
 fn resolve_file_returns_none_briefing_blocked_for_clean_entity() {
     let tempdir = tempfile::tempdir().expect("temp project root");
     let project_root = tempdir.path();
-    let source_path = project_root.join("demo.py");
+    let source_path = project_root.join("src").join("demo.py");
+    std::fs::create_dir_all(source_path.parent().unwrap()).expect("create source dir");
     std::fs::write(&source_path, "def entry():\n    return 1\n").expect("write source");
     let canonical = source_path.canonicalize().expect("canonical source");
 
@@ -809,10 +842,18 @@ fn resolve_file_returns_none_briefing_blocked_for_clean_entity() {
     )
     .expect("insert clean entity");
 
-    let resolved = resolve_file(&conn, project_root, "demo.py", "python")
+    let resolved = resolve_file(&conn, project_root, "src/demo.py", "python")
         .expect("resolve_file")
         .expect("entity is known");
 
+    assert_eq!(resolved.canonical_path, "src/demo.py");
+    assert!(
+        !resolved.canonical_path.starts_with('/')
+            && !resolved.canonical_path.starts_with("./")
+            && !resolved.canonical_path.starts_with("../"),
+        "canonical path must be project-relative POSIX: {:?}",
+        resolved.canonical_path
+    );
     assert!(
         resolved.briefing_blocked.is_none(),
         "clean entity must not surface a briefing_blocked reason; got {:?}",

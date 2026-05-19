@@ -186,22 +186,7 @@ pub fn resolve_file(
             briefing_blocked,
         }));
     }
-    let Some(anchor) = source_entity_for_path(conn, &normalized, None)? else {
-        return Ok(None);
-    };
-    let briefing_blocked = entity_briefing_block_reason(&anchor.properties_json);
-    let content_hash = anchor
-        .content_hash
-        .or_else(|| file_content_hash(Path::new(&normalized)))
-        .unwrap_or_default();
-    let synthetic_id = format!("core:file:{content_hash}@{canonical_path}");
-    Ok(Some(ResolvedFile {
-        entity_id: synthetic_id,
-        content_hash,
-        canonical_path,
-        language: resolved_language(language, &anchor.plugin_id, Path::new(&normalized)),
-        briefing_blocked,
-    }))
+    Ok(None)
 }
 
 /// Extract the `briefing_blocked` reason from an entity's `properties` JSON
@@ -254,10 +239,27 @@ fn project_relative_path(project_root: &Path, normalized_path: &Path) -> Result<
             root.display()
         ))
     })?;
-    relative
-        .to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| StorageError::InvalidSourcePath("source path is not valid UTF-8".to_owned()))
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => {
+                let Some(part) = part.to_str() else {
+                    return Err(StorageError::InvalidSourcePath(
+                        "source path is not valid UTF-8".to_owned(),
+                    ));
+                };
+                parts.push(part);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(StorageError::InvalidSourcePath(format!(
+                    "{} is not a project-relative source path",
+                    normalized_path.display()
+                )));
+            }
+        }
+    }
+    Ok(parts.join("/"))
 }
 
 fn file_content_hash(path: &Path) -> Option<String> {
