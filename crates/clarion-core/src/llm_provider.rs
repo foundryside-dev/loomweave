@@ -2180,6 +2180,110 @@ printf '%s\n' '{{"type":"result","subtype":"success","structured_output":{{"purp
     }
 
     #[test]
+    fn claude_cli_parser_rejects_empty_stdout_as_retryable_invalid_response() {
+        let err = parse_claude_cli_json_output(b"")
+            .expect_err("empty stdout must surface a typed InvalidResponse");
+        match err {
+            LlmProviderError::InvalidResponse { message, retryable } => {
+                assert!(retryable, "empty stdout should be retryable (transient)");
+                assert!(
+                    message.contains("empty stdout"),
+                    "error message must name the failure mode: {message}"
+                );
+            }
+            other => panic!("expected InvalidResponse for empty stdout, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_cli_parser_rejects_non_json_stdout() {
+        let err = parse_claude_cli_json_output(b"not json")
+            .expect_err("non-JSON stdout must surface a typed InvalidResponse");
+        match err {
+            LlmProviderError::InvalidResponse { message, retryable } => {
+                assert!(retryable);
+                assert!(
+                    message.contains("not JSON"),
+                    "error message must reference JSON parse failure: {message}"
+                );
+            }
+            other => panic!("expected InvalidResponse for non-JSON stdout, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_cli_parser_refuses_raw_stdout_when_no_structured_output_or_result_event() {
+        // Single event with neither `type=result` nor any of the structured
+        // output fields. Pre-fix, the parser fell back to the raw event
+        // payload and downstream consumers persisted it as a summary.
+        // Post-fix (clarion-55fc5aa885 §C3), this must be a typed
+        // InvalidResponse rather than silent garbage.
+        let stdout = br#"{"type":"assistant","message":{"usage":{"input_tokens":1,"output_tokens":1}}}"#;
+        let err = parse_claude_cli_json_output(stdout).expect_err(
+            "stdout without a `result` event or `structured_output` field must \
+             surface InvalidResponse, not be persisted as a summary",
+        );
+        match err {
+            LlmProviderError::InvalidResponse { message, retryable } => {
+                assert!(retryable);
+                assert!(
+                    message.contains("no `result` event"),
+                    "error must explain the missing-structured-output failure: {message}"
+                );
+            }
+            other => {
+                panic!("expected InvalidResponse for missing structured output, got: {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn claude_cli_parser_accepts_result_event_with_string_result_payload() {
+        // The other arm `result_event.get("result")` selects a `result`
+        // event that has a JSON-string `result` field. Exercise it to pin
+        // the contract.
+        let stdout = br#"{"type":"result","result":"{\"purpose\":\"string\",\"behavior\":\"ok\",\"relationships\":\"\",\"risks\":\"\"}"}"#;
+        let parsed = parse_claude_cli_json_output(stdout).expect("parse result event");
+        assert_eq!(
+            serde_json::from_str::<Value>(&parsed.output_json).expect("output json"),
+            serde_json::json!({
+                "purpose": "string",
+                "behavior": "ok",
+                "relationships": "",
+                "risks": ""
+            })
+        );
+    }
+
+    #[test]
+    fn cli_status_retryable_treats_signal_kill_as_retryable() {
+        use std::os::unix::process::ExitStatusExt;
+        // ExitStatus::from_raw with a non-exit signal code yields code()=None.
+        let killed = ExitStatus::from_raw(9);
+        assert!(
+            cli_status_retryable(killed),
+            "child killed by signal must be treated as retryable so the orchestrator can retry"
+        );
+        assert!(
+            codex_status_retryable(killed),
+            "codex retryable check must agree with the CLI floor"
+        );
+    }
+
+    #[test]
+    fn cli_status_retryable_treats_clean_nonzero_exit_as_non_retryable() {
+        use std::os::unix::process::ExitStatusExt;
+        // raw status 0x100 → exit code 1, code()=Some(1)
+        let exit_one = ExitStatus::from_raw(0x100);
+        assert!(
+            !cli_status_retryable(exit_one),
+            "clean process exit must be treated as non-retryable: the CLI \
+             rejected the request deterministically"
+        );
+        assert!(!codex_status_retryable(exit_one));
+    }
+
+    #[test]
     fn provider_trait_exposes_wp6_methods() {
         fn assert_trait<T: LlmProvider>(_: &T) {}
         let provider = RecordingProvider::from_recordings(Vec::new());

@@ -26,6 +26,7 @@ impl McpConfig {
         if raw.trim().is_empty() {
             return Ok(Self::default());
         }
+        reject_llm_policy_alias_collision(raw)?;
         let config: Self =
             serde_norway::from_str(raw).map_err(|err| ConfigError::Yaml(err.to_string()))?;
         config.validate()?;
@@ -368,6 +369,37 @@ pub enum ConfigError {
 
     #[error("{code}: integrations.filigree.actor must not be blank when Filigree is enabled")]
     InvalidFiligreeActor { code: &'static str },
+
+    #[error(
+        "{code}: clarion.yaml contains both `llm` and `llm_policy` top-level keys; \
+         `llm_policy` is a serde alias for `llm` and serde silently discards one. \
+         Pick one and remove the other."
+    )]
+    AmbiguousLlmKey { code: &'static str },
+}
+
+/// Reject configs that name both `llm` and `llm_policy` at the top level.
+/// They alias the same field; serde-norway silently picks one and discards
+/// the other, which is the classic copy-paste-migration pitfall. Detecting
+/// the collision pre-parse turns a silent override into a typed error.
+fn reject_llm_policy_alias_collision(raw: &str) -> Result<(), ConfigError> {
+    let value: serde_norway::Value = match serde_norway::from_str(raw) {
+        Ok(value) => value,
+        // If the YAML doesn't even parse as a generic Value, let the typed
+        // parse below produce the canonical Yaml error.
+        Err(_) => return Ok(()),
+    };
+    let Some(mapping) = value.as_mapping() else {
+        return Ok(());
+    };
+    let has_llm = mapping.contains_key("llm");
+    let has_llm_policy = mapping.contains_key("llm_policy");
+    if has_llm && has_llm_policy {
+        return Err(ConfigError::AmbiguousLlmKey {
+            code: "CLA-CONFIG-AMBIGUOUS-LLM-KEY",
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -440,6 +472,32 @@ llm_policy:
         assert!(cfg.llm.enabled);
         assert_eq!(cfg.llm.provider, LlmProviderKind::OpenRouter);
         assert_eq!(cfg.llm.model_id, "openai/gpt-4o-mini");
+    }
+
+    #[test]
+    fn rejects_both_llm_and_llm_policy_keys_present_together() {
+        // Realistic migration-doc copy-paste case: operator copies the new
+        // `llm_policy:` block but forgets to delete the old `llm:` block.
+        // Serde-norway would silently pick one and discard the other.
+        let err = McpConfig::from_yaml_str(
+            r"
+llm:
+  enabled: false
+  provider: recording
+llm_policy:
+  enabled: true
+  provider: openrouter
+  model_id: openai/gpt-4o-mini
+",
+        )
+        .expect_err("ambiguous llm key must be rejected");
+
+        match err {
+            ConfigError::AmbiguousLlmKey { code } => {
+                assert_eq!(code, "CLA-CONFIG-AMBIGUOUS-LLM-KEY");
+            }
+            other => panic!("expected AmbiguousLlmKey error, got: {other:?}"),
+        }
     }
 
     #[test]

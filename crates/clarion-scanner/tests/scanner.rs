@@ -482,6 +482,143 @@ results:
     assert_eq!(parsed, reparsed);
 }
 
+/// Regression net for the gap noted in PR #11 review (clarion-55fc5aa885 §I6):
+/// baseline suppression keys on (hashed_secret, line_number, rule_type). A
+/// baseline entry at line 1 with one hash MUST NOT suppress a *different*
+/// detection at line 1 — that would be a silent regression where a benign
+/// stub gets replaced by a real secret at the same offset and the gate
+/// stops firing.
+#[test]
+fn baseline_does_not_suppress_when_hash_drifts_at_same_line() {
+    let scanner = Scanner::new();
+    // Original benign content the operator baselined.
+    let benign_detections = scanner.scan_bytes(b"key = 'AKIAIOSFODNN7EXAMPLE'\n");
+    let benign = benign_detections
+        .iter()
+        .find(|detection| detection.rule_id == "AwsAccessKeyId")
+        .expect("AWS detection in benign content")
+        .clone();
+    // Operator commits a baseline acknowledging the benign secret on line 1.
+    let baseline = Baseline::from_yaml_str(&format!(
+        r#"
+version: "1.0"
+results:
+  "src/demo.py":
+    - type: "AWS Access Key"
+      hashed_secret: "{}"
+      line_number: 1
+      is_secret: false
+      justification: "Documented public AWS example key."
+"#,
+        hex20(benign.hashed_secret)
+    ))
+    .expect("baseline parses");
+
+    // Later, the file is mutated: same line, same rule, *different* secret.
+    let drifted_detections = scanner.scan_bytes(b"key = 'AKIAJONOTTHESAMEAS18'\n");
+    let drifted = drifted_detections
+        .iter()
+        .find(|detection| detection.rule_id == "AwsAccessKeyId")
+        .expect("AWS detection in drifted content")
+        .clone();
+    assert_ne!(
+        benign.hashed_secret, drifted.hashed_secret,
+        "test premise: drifted content must hash differently",
+    );
+
+    let result = baseline.suppress(vec![drifted], std::path::Path::new("src/demo.py"));
+    assert_eq!(
+        result.allowed.len(),
+        1,
+        "baseline must NOT suppress a drifted hash at the same line — that is \
+         the security regression CLA-SEC-SECRET-DETECTED exists to catch",
+    );
+    assert!(result.suppressed.is_empty());
+    assert!(result.fired_entries.is_empty());
+}
+
+/// Regression net for the gap noted in PR #11 review (clarion-55fc5aa885 §I7):
+/// `HighEntropyHex` at 40 chars / entropy ≥ 3.0 will fire on git SHA-1 hashes,
+/// blake3 hex digests, and lockfile integrity fields. The accepted v0.1 path
+/// is *not* to tighten the rule (which would let real low-entropy secrets
+/// through) but to document the operator-baseline workflow as the
+/// resolution — exactly what this fixture asserts.
+///
+/// Tightening the entropy floor risks missing real secrets that happen to
+/// look hash-like; the baseline path is per-(rule,file,line,hash) and is the
+/// existing escape hatch ADR-013 §"Operator baseline" describes.
+#[test]
+fn high_entropy_hex_fires_on_lockfile_shas_but_baseline_suppresses_them() {
+    // Lockfile integrity hash (npm-style sha512-truncated to hex) and a git
+    // SHA-1. Both are 40-char hex, entropy ≈ log2(16) ≈ 4 — well above the
+    // HighEntropyHex floor.
+    let lockfile_payload = b"\"integrity\": \"a3f5e8c2b1d4f0967e8c2a1b5d3e0f4a6c8b2d1e\"";
+    let git_sha = b"commit a3f5e8c2b1d4f0967e8c2a1b5d3e0f4a6c8b2d1e\n";
+
+    let scanner = Scanner::new();
+    let lockfile_detections = scanner.scan_bytes(lockfile_payload);
+    let git_detections = scanner.scan_bytes(git_sha);
+    let lockfile_hex = lockfile_detections
+        .iter()
+        .find(|detection| detection.rule_id == "HighEntropyHex")
+        .cloned();
+    let git_hex = git_detections
+        .iter()
+        .find(|detection| detection.rule_id == "HighEntropyHex")
+        .cloned();
+
+    let lockfile_hex = lockfile_hex.expect(
+        "HighEntropyHex fires on lockfile integrity hash — the regression \
+         net is the operator-baseline workflow, not a tightened rule",
+    );
+    let git_hex = git_hex.expect(
+        "HighEntropyHex fires on git SHA-1 — the regression net is the \
+         operator-baseline workflow, not a tightened rule",
+    );
+
+    // Operator commits a baseline pinning both the lockfile and git SHA on
+    // their respective files. The same workflow scales to blake3 hex
+    // digests and any other hash-like content.
+    let baseline_yaml = format!(
+        r#"
+version: "1.0"
+results:
+  "package-lock.json":
+    - type: "Hex High Entropy String"
+      hashed_secret: "{lock_hash}"
+      line_number: 1
+      is_secret: false
+      justification: "npm lockfile integrity hash, not a credential."
+  "git-log.txt":
+    - type: "Hex High Entropy String"
+      hashed_secret: "{git_hash}"
+      line_number: 1
+      is_secret: false
+      justification: "Git commit SHA, not a credential."
+"#,
+        lock_hash = hex20(lockfile_hex.hashed_secret),
+        git_hash = hex20(git_hex.hashed_secret),
+    );
+    let baseline = Baseline::from_yaml_str(&baseline_yaml).expect("baseline parses");
+
+    let lockfile_result = baseline.suppress(
+        vec![lockfile_hex],
+        std::path::Path::new("package-lock.json"),
+    );
+    let git_result = baseline.suppress(vec![git_hex], std::path::Path::new("git-log.txt"));
+
+    assert!(
+        lockfile_result.allowed.is_empty(),
+        "operator-baseline must suppress the lockfile integrity-hash false positive",
+    );
+    assert!(
+        git_result.allowed.is_empty(),
+        "operator-baseline must suppress the git SHA false positive",
+    );
+    assert_eq!(lockfile_result.fired_entries.len(), 1);
+    assert_eq!(git_result.fired_entries.len(), 1);
+}
+
 fn hex20(hash: HashedSecret) -> String {
     hash.to_string()
 }
