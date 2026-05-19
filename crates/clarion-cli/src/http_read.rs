@@ -58,7 +58,11 @@ pub fn spawn(
     if !config.enabled {
         return Ok(None);
     }
+    config
+        .validate_loopback_trust()
+        .context("validate HTTP read API trust model")?;
     let bind = config.bind;
+    let warn_unauthenticated_non_loopback = config.allow_non_loopback && !config.is_loopback_bind();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let join = thread::spawn(move || -> Result<()> {
@@ -96,7 +100,15 @@ pub fn spawn(
     let local_addr = ready_rx
         .recv()
         .context("wait for HTTP read API bind result")??;
-    tracing::info!(bind = %local_addr, "Clarion HTTP read API listening");
+    let auth = "none";
+    if warn_unauthenticated_non_loopback {
+        tracing::warn!(
+            bind = %local_addr,
+            auth = %auth,
+            "Clarion HTTP read API listening on non-loopback interface without authentication"
+        );
+    }
+    tracing::info!(bind = %local_addr, auth = %auth, "Clarion HTTP read API listening");
     Ok(Some(HttpReadServer {
         shutdown: Some(shutdown_tx),
         join: Some(join),

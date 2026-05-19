@@ -513,6 +513,37 @@ fn serve_rejects_invalid_instance_id_before_serving_http() {
 }
 
 #[test]
+fn serve_rejects_non_loopback_http_bind_before_binding_without_opt_in() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    fs::write(
+        dir.path().join("clarion.yaml"),
+        "version: 1\nserve:\n  http:\n    enabled: true\n    bind: \"0.0.0.0:0\"\n",
+    )
+    .expect("write non-loopback HTTP config");
+
+    let child = spawn_serve(dir.path());
+    let output = wait_for_child_exit(child, Duration::from_secs(2))
+        .expect("serve should reject non-loopback HTTP bind before binding");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unauthenticated non-loopback"),
+        "error should explain non-loopback unauthenticated risk: {stderr}"
+    );
+    assert!(
+        stderr.contains("allow_non_loopback"),
+        "error should name the explicit opt-in: {stderr}"
+    );
+}
+
+#[test]
 fn serve_rejects_invalid_project_config() {
     let dir = tempfile::tempdir().expect("temp project");
     clarion_bin()

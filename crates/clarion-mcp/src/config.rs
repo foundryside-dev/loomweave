@@ -47,6 +47,7 @@ impl McpConfig {
                 code: "CLA-CONFIG-FILIGREE-ACTOR-BLANK",
             });
         }
+        self.serve.http.validate_loopback_trust()?;
         Ok(())
     }
 }
@@ -245,6 +246,7 @@ pub struct HttpReadConfig {
     pub enabled: bool,
     #[serde(deserialize_with = "deserialize_socket_addr")]
     pub bind: SocketAddr,
+    pub allow_non_loopback: bool,
 }
 
 impl Default for HttpReadConfig {
@@ -252,7 +254,25 @@ impl Default for HttpReadConfig {
         Self {
             enabled: false,
             bind: SocketAddr::from(([127, 0, 0, 1], 9111)),
+            allow_non_loopback: false,
         }
+    }
+}
+
+impl HttpReadConfig {
+    pub fn validate_loopback_trust(&self) -> Result<(), ConfigError> {
+        if self.enabled && !self.allow_non_loopback && !self.is_loopback_bind() {
+            return Err(ConfigError::NonLoopbackHttpBind {
+                code: "CLA-CONFIG-HTTP-NON-LOOPBACK",
+                bind: self.bind,
+            });
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn is_loopback_bind(&self) -> bool {
+        self.bind.ip().is_loopback()
     }
 }
 
@@ -369,6 +389,15 @@ pub enum ConfigError {
 
     #[error("{code}: integrations.filigree.actor must not be blank when Filigree is enabled")]
     InvalidFiligreeActor { code: &'static str },
+
+    #[error(
+        "{code}: serve.http.bind {bind} exposes the unauthenticated non-loopback Clarion HTTP read API; \
+         bind to loopback (127.0.0.1 or ::1) or set serve.http.allow_non_loopback: true only on a trusted network"
+    )]
+    NonLoopbackHttpBind {
+        code: &'static str,
+        bind: SocketAddr,
+    },
 
     #[error(
         "{code}: clarion.yaml contains both `llm` and `llm_policy` top-level keys; \
@@ -681,6 +710,97 @@ serve:
         .expect("parse HTTP bind");
 
         assert_eq!(cfg.serve.http.bind, SocketAddr::from(([127, 0, 0, 1], 0)));
+    }
+
+    #[test]
+    fn http_allow_non_loopback_defaults_false() {
+        assert!(!McpConfig::default().serve.http.allow_non_loopback);
+    }
+
+    #[test]
+    fn http_allow_non_loopback_is_parsed_when_config_loads() {
+        let cfg = McpConfig::from_yaml_str(
+            r#"
+serve:
+  http:
+    enabled: true
+    bind: "127.0.0.1:0"
+    allow_non_loopback: true
+"#,
+        )
+        .expect("parse HTTP allow_non_loopback");
+
+        assert!(cfg.serve.http.allow_non_loopback);
+    }
+
+    #[test]
+    fn enabled_non_loopback_http_bind_requires_allow_non_loopback() {
+        let err = McpConfig::from_yaml_str(
+            r#"
+serve:
+  http:
+    enabled: true
+    bind: "0.0.0.0:0"
+"#,
+        )
+        .expect_err("enabled wildcard HTTP bind should require explicit opt-in");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("unauthenticated non-loopback"),
+            "error should explain the unauthenticated non-loopback risk: {message}"
+        );
+        assert!(
+            message.contains("allow_non_loopback"),
+            "error should name the explicit opt-in: {message}"
+        );
+    }
+
+    #[test]
+    fn enabled_lan_http_bind_requires_allow_non_loopback() {
+        let err = McpConfig::from_yaml_str(
+            r#"
+serve:
+  http:
+    enabled: true
+    bind: "192.168.1.10:0"
+"#,
+        )
+        .expect_err("enabled LAN HTTP bind should require explicit opt-in");
+
+        assert!(matches!(err, ConfigError::NonLoopbackHttpBind { .. }));
+    }
+
+    #[test]
+    fn enabled_ipv6_loopback_http_bind_is_allowed_by_default() {
+        let cfg = McpConfig::from_yaml_str(
+            r#"
+serve:
+  http:
+    enabled: true
+    bind: "[::1]:0"
+"#,
+        )
+        .expect("IPv6 loopback HTTP bind should not require non-loopback opt-in");
+
+        assert!(!cfg.serve.http.allow_non_loopback);
+        assert!(cfg.serve.http.is_loopback_bind());
+    }
+
+    #[test]
+    fn enabled_non_loopback_http_bind_allows_explicit_opt_in() {
+        let cfg = McpConfig::from_yaml_str(
+            r#"
+serve:
+  http:
+    enabled: true
+    bind: "0.0.0.0:0"
+    allow_non_loopback: true
+"#,
+        )
+        .expect("explicit opt-in should allow non-loopback HTTP bind");
+
+        assert!(cfg.serve.http.allow_non_loopback);
     }
 
     #[test]
