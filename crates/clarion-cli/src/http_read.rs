@@ -46,11 +46,13 @@ impl HttpReadServer {
 struct AppState {
     project_root: PathBuf,
     readers: ReaderPool,
+    instance_id: String,
 }
 
 pub fn spawn(
     project_root: PathBuf,
     db_path: PathBuf,
+    instance_id: String,
     config: &HttpReadConfig,
 ) -> Result<Option<HttpReadServer>> {
     if !config.enabled {
@@ -81,6 +83,7 @@ pub fn spawn(
             let state = AppState {
                 project_root,
                 readers,
+                instance_id,
             };
             axum::serve(listener, router(state))
                 .with_graceful_shutdown(async {
@@ -127,7 +130,8 @@ struct FileResponse {
 struct CapabilitiesResponse {
     registry_backend: bool,
     file_registry: bool,
-    version: &'static str,
+    api_version: u8,
+    instance_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -195,11 +199,12 @@ async fn get_file(State(state): State<AppState>, Query(query): Query<FileQuery>)
     }
 }
 
-async fn get_capabilities() -> Json<CapabilitiesResponse> {
+async fn get_capabilities(State(state): State<AppState>) -> Json<CapabilitiesResponse> {
     Json(CapabilitiesResponse {
         registry_backend: true,
         file_registry: true,
-        version: "0.1",
+        api_version: 1,
+        instance_id: state.instance_id,
     })
 }
 

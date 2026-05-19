@@ -13,6 +13,7 @@ use clarion_core::{
 };
 use rusqlite::{Connection, params};
 use serde_json::Value;
+use uuid::Uuid;
 
 #[derive(Debug)]
 struct HttpJsonResponse {
@@ -275,6 +276,11 @@ fn serve_http_capabilities_and_mcp_stdio_coexist() {
         .env("PATH", "")
         .assert()
         .success();
+    fs::write(
+        dir.path().join(".clarion/instance_id"),
+        "9bd7234e-6d44-4a38-9ae4-76f912a10221\n",
+    )
+    .expect("seed stable instance ID");
     let bind = free_loopback_bind();
     write_http_config(dir.path(), &bind);
 
@@ -283,7 +289,13 @@ fn serve_http_capabilities_and_mcp_stdio_coexist() {
         .expect("HTTP /api/v1/_capabilities response");
 
     assert_eq!(capabilities["registry_backend"], true);
-    assert_eq!(capabilities["version"], "0.1");
+    assert_eq!(capabilities["file_registry"], true);
+    assert_eq!(capabilities["api_version"], 1);
+    assert!(capabilities.get("version").is_none());
+    let instance_id = capabilities["instance_id"]
+        .as_str()
+        .expect("instance_id is a string");
+    Uuid::parse_str(instance_id).expect("instance_id is a UUID");
     let fixture: Value = serde_json::from_str(include_str!(
         "../../../docs/federation/fixtures/get-api-v1-capabilities.json"
     ))
@@ -327,6 +339,139 @@ fn serve_http_capabilities_and_mcp_stdio_coexist() {
 
     assert_eq!(response["id"], 42);
     assert_eq!(response["result"]["serverInfo"]["name"], "clarion");
+}
+
+#[test]
+fn serve_http_capabilities_reuses_persisted_instance_id_across_restarts() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let instance_id_path = dir.path().join(".clarion/instance_id");
+
+    let first_bind = free_loopback_bind();
+    write_http_config(dir.path(), &first_bind);
+    let mut first_child = spawn_serve(dir.path());
+    let first = wait_for_http_json(&first_bind, "/api/v1/_capabilities")
+        .expect("first capabilities response");
+    stop_serve(&mut first_child);
+    let first_instance_id = first["instance_id"]
+        .as_str()
+        .expect("first instance_id")
+        .to_owned();
+    assert_eq!(
+        fs::read_to_string(&instance_id_path)
+            .expect("read first persisted instance_id")
+            .trim(),
+        first_instance_id
+    );
+
+    let second_bind = free_loopback_bind();
+    write_http_config(dir.path(), &second_bind);
+    let mut second_child = spawn_serve(dir.path());
+    let second = wait_for_http_json(&second_bind, "/api/v1/_capabilities")
+        .expect("second capabilities response");
+    stop_serve(&mut second_child);
+
+    assert_eq!(second["instance_id"], first["instance_id"]);
+    assert_eq!(
+        fs::read_to_string(&instance_id_path)
+            .expect("read second persisted instance_id")
+            .trim(),
+        first_instance_id
+    );
+}
+
+#[test]
+fn serve_http_capabilities_creates_instance_id_with_private_unix_mode() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+
+    let mut child = spawn_serve(dir.path());
+    let capabilities = wait_for_http_json(&bind, "/api/v1/_capabilities")
+        .expect("HTTP /api/v1/_capabilities response");
+    stop_serve(&mut child);
+
+    let instance_id_path = dir.path().join(".clarion/instance_id");
+    assert_eq!(
+        fs::read_to_string(&instance_id_path)
+            .expect("read persisted instance_id")
+            .trim(),
+        capabilities["instance_id"].as_str().expect("instance_id")
+    );
+    let mode = fs::metadata(instance_id_path)
+        .expect("instance_id metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+#[test]
+fn serve_http_capabilities_repairs_existing_instance_id_mode() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let instance_id_path = dir.path().join(".clarion/instance_id");
+    let seeded_id = "9bd7234e-6d44-4a38-9ae4-76f912a10221";
+    fs::write(&instance_id_path, format!("{seeded_id}\n")).expect("seed instance ID");
+    fs::set_permissions(&instance_id_path, fs::Permissions::from_mode(0o644))
+        .expect("seed permissive instance ID mode");
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+
+    let mut child = spawn_serve(dir.path());
+    let capabilities = wait_for_http_json(&bind, "/api/v1/_capabilities");
+    stop_serve(&mut child);
+    let capabilities = capabilities.expect("HTTP /api/v1/_capabilities response");
+
+    assert_eq!(capabilities["instance_id"], seeded_id);
+    let mode = fs::metadata(instance_id_path)
+        .expect("instance_id metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+#[test]
+fn serve_rejects_invalid_instance_id_before_serving_http() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    fs::write(dir.path().join(".clarion/instance_id"), "not-a-uuid\n")
+        .expect("write invalid instance ID");
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+
+    let child = spawn_serve(dir.path());
+    let output = wait_for_child_exit(child, Duration::from_secs(2))
+        .expect("serve should fail before accepting HTTP requests");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid Clarion instance ID"),
+        "unexpected stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -797,24 +942,85 @@ fn write_http_config(project_root: &Path, bind: &str) {
     .expect("write HTTP serve config");
 }
 
-fn spawn_serve(project_root: &Path) -> Child {
-    StdCommand::new(assert_cmd::cargo::cargo_bin("clarion"))
-        .args(["serve", "--path"])
-        .arg(project_root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn clarion serve")
+struct ServeChild {
+    child: Option<Child>,
 }
 
-fn stop_serve(child: &mut Child) {
+impl ServeChild {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn stop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            stop_child(&mut child);
+        }
+    }
+
+    fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
+        self.child
+            .take()
+            .expect("serve child was already stopped")
+            .wait_with_output()
+    }
+}
+
+impl std::ops::Deref for ServeChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        self.child.as_ref().expect("serve child was stopped")
+    }
+}
+
+impl std::ops::DerefMut for ServeChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.child.as_mut().expect("serve child was stopped")
+    }
+}
+
+impl Drop for ServeChild {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn spawn_serve(project_root: &Path) -> ServeChild {
+    ServeChild::new(
+        StdCommand::new(assert_cmd::cargo::cargo_bin("clarion"))
+            .args(["serve", "--path"])
+            .arg(project_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn clarion serve"),
+    )
+}
+
+fn stop_serve(child: &mut ServeChild) {
+    child.stop();
+}
+
+fn stop_child(child: &mut Child) {
     drop(child.stdin.take());
     if let Ok(Some(_)) = child.try_wait() {
         return;
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+fn wait_for_child_exit(mut child: ServeChild, timeout: Duration) -> Option<std::process::Output> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if child.try_wait().expect("poll child").is_some() {
+            return Some(child.wait_with_output().expect("collect child output"));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    child.stop();
+    None
 }
 
 fn wait_for_http_json(bind: &str, path: &str) -> Result<Value, String> {

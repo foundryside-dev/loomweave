@@ -6,7 +6,7 @@
   "response": {
     "registry_backend": true,
     "file_registry": true,
-    "version": "0.1"
+    "api_version": 1,
+    "instance_id": "9bd7234e-6d44-4a38-9ae4-76f912a10221"
   }
 }
-

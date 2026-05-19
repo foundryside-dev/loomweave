@@ -4,6 +4,7 @@ mod clustering;
 mod config;
 mod http_read;
 mod install;
+mod instance;
 mod run_lifecycle;
 mod secret_scan;
 mod serve;

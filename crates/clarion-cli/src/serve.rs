@@ -24,6 +24,8 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
     let project_root = path
         .canonicalize()
         .with_context(|| format!("canonicalize project path {}", path.display()))?;
+    let instance_id = crate::instance::load_or_create(&project_root)
+        .context("load Clarion project instance ID")?;
     let default_config_path = path.join("clarion.yaml");
     let config_path = config_path.unwrap_or(&default_config_path);
     let config = if config_path.exists() {
@@ -52,9 +54,13 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
         .map_err(|err| anyhow!("open reader pool for {}: {err}", db_path.display()))?;
     let http_project_root = project_root.clone();
     let mut state = clarion_mcp::ServerState::new(project_root, readers);
-    let http_server =
-        crate::http_read::spawn(http_project_root, db_path.clone(), &config.serve.http)
-            .context("start HTTP read API")?;
+    let http_server = crate::http_read::spawn(
+        http_project_root,
+        db_path.clone(),
+        instance_id,
+        &config.serve.http,
+    )
+    .context("start HTTP read API")?;
     let mut llm_writer = None;
     let mut llm_writer_join = None;
     if let Some(provider) = llm_provider {
