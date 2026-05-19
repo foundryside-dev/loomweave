@@ -26,6 +26,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Python is used by the migration-retirement guard and the
+      # workspace-version-lockstep guard below. Pin >= 3.11 explicitly so the
+      # stdlib `tomllib` is available regardless of which Python the runner
+      # image happens to preinstall.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: fmt
         run: cargo fmt --all -- --check
 

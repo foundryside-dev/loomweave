@@ -5,7 +5,7 @@ agent CLIs instead of an HTTP API key. These routes still send prompt content to
 the agent vendor, so they require the same explicit live-provider opt-in as
 OpenRouter.
 
-Supported v0.1 provider values:
+Supported provider values:
 
 - `codex_cli` uses `codex exec` with local Codex authentication.
 - `claude_cli` uses `claude -p` with local Claude Code authentication.

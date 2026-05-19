@@ -36,7 +36,7 @@ and trust-topology tools.
 
 ## What it does today
 
-`clarion serve` exposes seven MCP tools that a consult-mode agent calls instead
+`clarion serve` exposes eight MCP tools that a consult-mode agent calls instead
 of grep-and-read:
 
 | Tool | What it answers |
@@ -48,9 +48,7 @@ of grep-and-read:
 | `summary(id)` | "Give me a one-paragraph summary of this entity." (lazy LLM dispatch + cached) |
 | `issues_for(id)` | "What Filigree issues are attached to this entity?" |
 | `neighborhood(id)` | "Show callers, callees, container, contained entities, and references in one hop." |
-
-`subsystem_members(id)` is also exposed for listing members of a subsystem
-entity (clustering output).
+| `subsystem_members(id)` | "Which entities belong to this subsystem?" (clustering output) |
 
 ## Quick start
 
@@ -86,7 +84,7 @@ crates/                 Rust workspace
 ├── clarion-storage/    Writer-actor + reader-pool over SQLite (ADR-011)
 ├── clarion-scanner/    Pre-ingest secret scanner (ADR-013, WP5)
 ├── clarion-cli/        The `clarion` binary (install, analyze, serve)
-└── clarion-mcp/        MCP server exposing the seven consult tools
+└── clarion-mcp/        MCP server exposing the eight consult tools
 plugins/python/         Python language plugin (pyright-backed)
 docs/clarion/1.0/      Design ladder — requirements → system-design → detailed-design
 docs/clarion/adr/       Authored architecture decision records
