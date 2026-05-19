@@ -684,9 +684,7 @@ impl LlmProvider for ClaudeCliProvider {
         if let Some(model) = &self.model {
             command.arg("--model").arg(model);
         }
-        if !self.tools.is_empty() {
-            command.arg("--tools").arg(self.tools.join(","));
-        }
+        command.arg("--tools").arg(self.tools.join(","));
         command
             .current_dir(&self.project_root)
             .stdin(Stdio::piped())
@@ -2083,7 +2081,7 @@ printf '%s\n' '{{"type":"result","subtype":"success","structured_output":{{"purp
     }
 
     #[test]
-    fn claude_cli_provider_omits_tools_arg_when_no_tools_are_configured() {
+    fn claude_cli_provider_passes_empty_tools_arg_when_no_tools_are_configured() {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
@@ -2097,10 +2095,12 @@ printf '%s\n' '{{"type":"result","subtype":"success","structured_output":{{"purp
 set -euo pipefail
 log="{log}"
 saw_tools=0
+tools_value="<unset>"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tools)
       saw_tools=1
+      tools_value="${{2-<missing>}}"
       shift 2
       ;;
     -p|--print|--output-format|--json-schema|--permission-mode|--max-turns|--mcp-config)
@@ -2116,6 +2116,7 @@ while [[ $# -gt 0 ]]; do
 done
 cat >/dev/null
 echo "saw_tools=$saw_tools" >> "$log"
+echo "tools_value=[$tools_value]" >> "$log"
 printf '%s\n' '{{"type":"result","subtype":"success","structured_output":{{"purpose":"via claude","behavior":"ran fake CLI","relationships":"","risks":""}},"usage":{{"input_tokens":1,"output_tokens":1,"total_tokens":2}},"total_cost_usd":0.0}}'
 "#,
             log = log_path.display()
@@ -2150,7 +2151,14 @@ printf '%s\n' '{{"type":"result","subtype":"success","structured_output":{{"purp
             .expect("invoke fake Claude CLI");
 
         let log = fs::read_to_string(log_path).expect("read fake claude log");
-        assert!(log.contains("saw_tools=0"));
+        assert!(
+            log.contains("saw_tools=1"),
+            "Claude CLI must always receive --tools so the default no-tools posture is mechanically enforced (ADR-013). log: {log}"
+        );
+        assert!(
+            log.contains("tools_value=[]"),
+            "Empty tools list must be passed as an explicit empty --tools value, not omitted. log: {log}"
+        );
     }
 
     #[test]
