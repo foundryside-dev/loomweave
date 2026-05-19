@@ -1,0 +1,190 @@
+name: Release
+
+# Per ADR-033 — pushed tags matching v* trigger a multi-platform binary build
+# plus Python plugin sdist, attached to a GitHub Release.
+on:
+  push:
+    tags:
+      - "v*"
+  # Manual dispatch lets us produce pre-release artifacts (e.g. v1.0.0-rc1)
+  # without pushing a tag for full validation of the workflow.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Pre-release tag name (used as the GH Release name; e.g. v1.0.0-rc1)"
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+permissions:
+  contents: write
+
+jobs:
+  build-rust:
+    name: Build clarion (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: aarch64-apple-darwin
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: build release
+        run: cargo build --release --locked --bin clarion --target ${{ matrix.target }}
+
+      - name: package
+        id: package
+        run: |
+          set -euo pipefail
+          STAGE="clarion-${{ matrix.target }}"
+          mkdir -p "$STAGE"
+          cp "target/${{ matrix.target }}/release/clarion" "$STAGE/"
+          cp README.md "$STAGE/"
+          if [ -f LICENSE ]; then cp LICENSE "$STAGE/"; fi
+          ARCHIVE="$STAGE.tar.gz"
+          tar czf "$ARCHIVE" "$STAGE"
+          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clarion-${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  build-plugin:
+    name: Build Python plugin sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: install build
+        run: python -m pip install --upgrade build
+
+      - name: build sdist
+        run: python -m build --sdist --outdir dist plugins/python
+
+      - name: checksum
+        run: |
+          set -euo pipefail
+          cd dist
+          for f in *.tar.gz; do
+            sha256sum "$f" > "$f.sha256"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clarion-plugin-python-sdist
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-rust, build-plugin]
+    # Only publish to a Release when a real tag pushed; workflow_dispatch leaves
+    # artifacts on the workflow run for inspection without creating a public Release.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: stage release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find artifacts -name '*.tar.gz' -o -name '*.tar.gz.sha256' \
+            | xargs -I{} cp {} release/
+          ls -la release/
+
+      - name: derive previous tag
+        id: prev
+        run: |
+          set -euo pipefail
+          PREV=$(git tag --sort=-v:refname | grep -v "^${GITHUB_REF_NAME}\$" | head -n1 || true)
+          if [ -z "$PREV" ]; then
+            echo "previous=" >> "$GITHUB_OUTPUT"
+            echo "No previous tag found (first release)."
+          else
+            echo "previous=$PREV" >> "$GITHUB_OUTPUT"
+            echo "Previous tag: $PREV"
+          fi
+
+      - name: generate notes
+        id: notes
+        run: |
+          set -euo pipefail
+          PREV="${{ steps.prev.outputs.previous }}"
+          {
+            echo "## Clarion ${GITHUB_REF_NAME}"
+            echo ""
+            echo "### Install"
+            echo ""
+            echo "Pick the archive for your platform from the Assets list below."
+            echo "Verify the SHA256, extract, and place \`clarion\` on your \`\$PATH\`."
+            echo ""
+            echo "\`\`\`bash"
+            echo "curl -L -o clarion.tar.gz \\"
+            echo "  https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/clarion-x86_64-unknown-linux-gnu.tar.gz"
+            echo "tar xzf clarion.tar.gz"
+            echo "install clarion-x86_64-unknown-linux-gnu/clarion ~/.local/bin/"
+            echo ""
+            echo "pipx install \\"
+            echo "  https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/clarion-plugin-python-1.0.0.tar.gz"
+            echo "\`\`\`"
+            echo ""
+            echo "Full walkthrough: [docs/operator/getting-started.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/docs/operator/getting-started.md)."
+            echo ""
+            echo "### Changes"
+            echo ""
+            if [ -n "$PREV" ]; then
+              git log --merges --pretty='- %s (%h)' "${PREV}..${GITHUB_REF_NAME}" || true
+            else
+              echo "First release — see git history."
+            fi
+          } > NOTES.md
+          echo "notes-file=NOTES.md" >> "$GITHUB_OUTPUT"
+
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Clarion ${{ github.ref_name }}
+          body_path: ${{ steps.notes.outputs.notes-file }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') }}
+          files: release/*
+          fail_on_unmatched_files: true

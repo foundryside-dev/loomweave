@@ -2,6 +2,9 @@
 
 Practical notes for configuring and running Clarion.
 
+- [Getting started](./getting-started.md) — single-flow walkthrough: install,
+  analyse a small repo, connect an MCP client, ask three questions, verify
+  the secret-block. Target ≤15 minutes end-to-end.
 - [OpenRouter LLM provider](./openrouter.md) — API key, model ID, attribution
   headers, and token-ceiling configuration for v0.1.
 - [Coding-agent LLM providers](./coding-agent-llm-providers.md) — Codex CLI

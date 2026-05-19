@@ -23,50 +23,54 @@ const CONFIG_JSON_STUB: &str = r#"{
 }
 "#;
 
-const CLARION_YAML_STUB: &str = "# clarion.yaml — user-edited config.\n\
-# Do not delete this file: clarion serve reads MCP, LLM, and integration\n\
-# settings from here when present.\n\
-version: 1\n\
-llm_policy:\n\
-  enabled: false\n\
-  provider: openrouter\n\
-  allow_live_provider: false\n\
-  openrouter:\n\
-    endpoint_url: https://openrouter.ai/api/v1\n\
-    api_key_env: OPENROUTER_API_KEY\n\
-    attribution:\n\
-      referer: https://github.com/qacona/clarion\n\
-      title: Clarion\n\
-  codex_cli:\n\
-    executable: codex\n\
-    model: null\n\
-    profile: null\n\
-    sandbox: read-only\n\
-    timeout_seconds: 300\n\
-  claude_cli:\n\
-    executable: claude\n\
-    model: null\n\
-    permission_mode: plan\n\
-    tools: []\n\
-    timeout_seconds: 300\n\
-    max_turns: 2\n\
-    no_session_persistence: true\n\
-    exclude_dynamic_system_prompt_sections: true\n\
-  model_id: anthropic/claude-sonnet-4.6\n\
-  session_token_ceiling: 1000000\n\
-  max_inferred_edges_per_caller: 8\n\
-  cache_max_age_days: 180\n\
-integrations:\n\
-  filigree:\n\
-    enabled: false\n\
-    base_url: http://127.0.0.1:8766\n\
-    actor: clarion-mcp\n\
-    token_env: FILIGREE_API_TOKEN\n\
-    timeout_seconds: 5\n\
-serve:\n\
-  http:\n\
-    enabled: false\n\
-    bind: 127.0.0.1:9111\n";
+// NOTE: Do not use `\` line-continuation here — Rust strips both the newline
+// AND all leading whitespace on the continuation line, producing flat (and
+// therefore broken) YAML. Use raw newlines + explicit indentation.
+const CLARION_YAML_STUB: &str = "# clarion.yaml — user-edited config.
+# Do not delete this file: clarion serve reads MCP, LLM, and integration
+# settings from here when present.
+version: 1
+llm_policy:
+  enabled: false
+  provider: openrouter
+  allow_live_provider: false
+  openrouter:
+    endpoint_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    attribution:
+      referer: https://github.com/tachyon-beep/clarion
+      title: Clarion
+  codex_cli:
+    executable: codex
+    model: null
+    profile: null
+    sandbox: read-only
+    timeout_seconds: 300
+  claude_cli:
+    executable: claude
+    model: null
+    permission_mode: plan
+    tools: []
+    timeout_seconds: 300
+    max_turns: 2
+    no_session_persistence: true
+    exclude_dynamic_system_prompt_sections: true
+  model_id: anthropic/claude-sonnet-4.6
+  session_token_ceiling: 1000000
+  max_inferred_edges_per_caller: 8
+  cache_max_age_days: 180
+integrations:
+  filigree:
+    enabled: false
+    base_url: http://127.0.0.1:8766
+    actor: clarion-mcp
+    token_env: FILIGREE_API_TOKEN
+    timeout_seconds: 5
+serve:
+  http:
+    enabled: false
+    bind: 127.0.0.1:9111
+";
 
 const GITIGNORE_CONTENTS: &str = "\
 # Clarion .gitignore — ADR-005 tracked-vs-excluded list.

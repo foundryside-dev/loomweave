@@ -127,7 +127,7 @@ pub struct OpenRouterAttributionConfig {
 impl Default for OpenRouterAttributionConfig {
     fn default() -> Self {
         Self {
-            referer: "https://github.com/qacona/clarion".to_owned(),
+            referer: "https://github.com/tachyon-beep/clarion".to_owned(),
             title: "Clarion".to_owned(),
         }
     }

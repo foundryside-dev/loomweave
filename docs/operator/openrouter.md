@@ -22,7 +22,7 @@ llm_policy:
     endpoint_url: https://openrouter.ai/api/v1
     api_key_env: OPENROUTER_API_KEY
     attribution:
-      referer: https://github.com/qacona/clarion
+      referer: https://github.com/tachyon-beep/clarion
       title: Clarion
   model_id: anthropic/claude-sonnet-4.6
   session_token_ceiling: 1000000

@@ -17,7 +17,14 @@
 //! 1. **Neighbor first**: `<dir>/plugin.toml`.
 //! 2. **Install-prefix fallback** (only when `<dir>` has basename `bin`):
 //!    `<dir>/../share/clarion/plugins/<suffix>/plugin.toml`.
-//! 3. Neither found → [`DiscoveryError::ManifestNotFound`].
+//! 3. **Symlink-resolved install-prefix fallback** (only when `<dir>` has
+//!    basename `bin` and the executable is a symlink, e.g. pipx layout):
+//!    canonicalise the executable, then try
+//!    `<canonical-dir>/../share/clarion/plugins/<suffix>/plugin.toml`.
+//!    This catches `pipx install` (which puts a symlink in `~/.local/bin/`
+//!    pointing into `~/.local/share/pipx/venvs/<pkg>/bin/`, with the
+//!    manifest under that venv's `share/`).
+//! 4. None found → [`DiscoveryError::ManifestNotFound`].
 //!
 //! **Limitation**: when multiple `clarion-plugin-*` binaries share the same
 //! directory (e.g. `/usr/local/bin`), they all resolve to the *same*
@@ -358,16 +365,26 @@ fn find_manifest(exec_path: &std::path::Path, suffix: &str) -> Result<PathBuf, D
 
         // 2. Install-prefix fallback: only when parent dir basename is "bin".
         let parent_name = parent.file_name().and_then(|n| n.to_str());
-        if parent_name == Some("bin")
-            && let Some(grandparent) = parent.parent()
-        {
-            let share_path = grandparent
-                .join("share")
-                .join("clarion")
-                .join("plugins")
-                .join(suffix)
-                .join("plugin.toml");
-            if let Some(found) = probe_manifest(&share_path)? {
+        if parent_name == Some("bin") {
+            if let Some(grandparent) = parent.parent()
+                && let Some(found) = probe_install_prefix_manifest(grandparent, suffix)?
+            {
+                return Ok(found);
+            }
+
+            // 3. Symlink-resolved install-prefix fallback for pipx-style
+            //    layouts: ~/.local/bin/clarion-plugin-<x> is a symlink into
+            //    ~/.local/share/pipx/venvs/<pkg>/bin/clarion-plugin-<x>, and
+            //    the manifest lives under that venv's share/. Canonicalise
+            //    the executable and re-try the install-prefix layout from
+            //    the resolved location.
+            if let Ok(canonical) = exec_path.canonicalize()
+                && canonical != exec_path
+                && let Some(canon_parent) = canonical.parent()
+                && canon_parent.file_name().and_then(|n| n.to_str()) == Some("bin")
+                && let Some(canon_grandparent) = canon_parent.parent()
+                && let Some(found) = probe_install_prefix_manifest(canon_grandparent, suffix)?
+            {
                 return Ok(found);
             }
         }
@@ -376,6 +393,19 @@ fn find_manifest(exec_path: &std::path::Path, suffix: &str) -> Result<PathBuf, D
     Err(DiscoveryError::ManifestNotFound {
         executable: exec_path.to_owned(),
     })
+}
+
+fn probe_install_prefix_manifest(
+    prefix: &std::path::Path,
+    suffix: &str,
+) -> Result<Option<PathBuf>, DiscoveryError> {
+    let share_path = prefix
+        .join("share")
+        .join("clarion")
+        .join("plugins")
+        .join(suffix)
+        .join("plugin.toml");
+    probe_manifest(&share_path)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

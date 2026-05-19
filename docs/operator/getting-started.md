@@ -1,0 +1,291 @@
+# Getting started with Clarion
+
+A single-flow walkthrough that takes you from an empty machine to a working
+consult-mode agent asking real questions about a real codebase. Target time:
+**≤15 minutes** once prerequisites are in place.
+
+You will:
+
+1. [Install Clarion + the Python plugin.](#1-install)
+2. [Run `clarion analyze` against a small public Python project.](#2-analyze)
+3. [Start `clarion serve` and connect an MCP client.](#3-serve)
+4. [Ask three questions through the MCP tools.](#4-ask)
+5. [Verify the secret-scanner block fires on a planted secret.](#5-secret-block)
+
+If a step fails, see [Troubleshooting](#troubleshooting) at the end.
+
+## Prerequisites
+
+| Tool | Required version | How to check |
+|---|---|---|
+| Rust toolchain | `stable` per [`rust-toolchain.toml`](../../rust-toolchain.toml) | `rustc --version` |
+| Python | `>= 3.11` per the [plugin manifest](../../plugins/python/pyproject.toml) | `python3 --version` |
+| `pipx` (recommended for plugin install) | any recent | `pipx --version` |
+| `pyright-langserver` | `1.1.409` — pinned in the [plugin manifest](../../plugins/python/plugin.toml) (`capabilities.runtime.pyright.pin`) | `pyright --version` (the `pyright-langserver` entrypoint only accepts protocol flags like `--stdio`) |
+| An MCP client | any MCP-speaking client | see [§3](#3-serve) |
+
+The Python plugin will fail at runtime if `pyright-langserver` is not on
+`$PATH` at the pinned version (1.1.409 in v1.0). Install via
+`npm install -g pyright@1.1.409` or `pipx install pyright==1.1.409`.
+
+### Required environment variables
+
+For step 4's `summary` question you need an OpenRouter API key:
+
+```bash
+export OPENROUTER_API_KEY=sk-or-v1-...
+```
+
+`clarion analyze` (step 2) and the structural MCP tools (`entity_at`,
+`find_entity`, `callers_of`, `execution_paths_from`, `issues_for`,
+`neighborhood`) work without any LLM credentials — the key is only consulted
+when an MCP client calls `summary(id)` against an entity that does not yet
+have a cached summary.
+
+## 1. Install
+
+> Once the v1.0 release artifacts ship via GitHub Releases (per
+> [ADR-033](../clarion/adr/ADR-033-v1.0-distribution.md)), the install
+> commands below collapse to a single `curl | sh` plus
+> `pipx install ./clarion-plugin-python-*.tar.gz`. Until the first tag fires,
+> install from source.
+
+```bash
+# Rust core
+cargo install --git https://github.com/tachyon-beep/clarion clarion-cli
+
+# Python plugin (provides clarion-plugin-python on $PATH)
+pipx install git+https://github.com/tachyon-beep/clarion#subdirectory=plugins/python
+```
+
+Verify the discovery surface:
+
+```bash
+which clarion                     # e.g. ~/.cargo/bin/clarion
+which clarion-plugin-python       # e.g. ~/.local/bin/clarion-plugin-python
+```
+
+**`$PATH` discipline matters.** Clarion's plugin host (per
+[ADR-002](../clarion/adr/ADR-002-plugin-transport-json-rpc.md)) discovers
+plugins by walking `$PATH` for executables matching `clarion-plugin-*`. If
+`pipx`'s install directory (`~/.local/bin/` on Linux, `~/Library/...` on
+macOS) is not on your shell's `$PATH`, `clarion analyze` will exit
+**successfully** with status `skipped_no_plugins` and emit a `WARN no plugins
+discovered` line — the analyse pass produces nothing. See
+[Troubleshooting → "analyze runs but emits no entities"](#analyze-runs-but-emits-no-entities)
+below for the diagnostic.
+
+## 2. Analyze
+
+Pick a small, well-behaved Python project. The walkthrough uses the `requests`
+library's source tree:
+
+```bash
+cd /tmp
+curl -L -o requests-2.32.4.tar.gz https://github.com/psf/requests/archive/refs/tags/v2.32.4.tar.gz
+tar xzf requests-2.32.4.tar.gz
+cd requests-2.32.4
+```
+
+Initialise Clarion's project-local state, then run the analyser:
+
+```bash
+clarion install
+clarion analyze
+```
+
+Expected output (abridged):
+
+```
+applying migration version=1 name="0001_initial_schema"
+clarion install complete clarion_dir=/tmp/requests-2.32.4/.clarion
+Initialised /tmp/requests-2.32.4/.clarion
+...
+analyze complete: run <uuid> ok (entities=NNN, edges=MMM)
+```
+
+The first run on a tree of this size completes in well under a minute on
+typical hardware. The result lives at `.clarion/clarion.db` (a single SQLite
+file) and is safe to commit to git — see
+[ADR-005](../clarion/adr/ADR-005-clarion-dir-tracking.md).
+
+## 3. Serve
+
+Start the MCP stdio server in one shell:
+
+```bash
+clarion serve --path /tmp/requests-2.32.4
+```
+
+`clarion serve` speaks the MCP protocol over stdio. Any MCP client works;
+documented options:
+
+- **Claude Desktop.** Add to your `claude_desktop_config.json`:
+
+  ```json
+  {
+    "mcpServers": {
+      "clarion-requests": {
+        "command": "/path/to/clarion",
+        "args": ["serve", "--path", "/tmp/requests-2.32.4"],
+        "env": {
+          "OPENROUTER_API_KEY": "sk-or-v1-..."
+        }
+      }
+    }
+  }
+  ```
+
+- **MCP Inspector** (`npm install -g @modelcontextprotocol/inspector`) for
+  ad-hoc tool-level exploration without an agent in the loop:
+
+  ```bash
+  npx @modelcontextprotocol/inspector clarion serve --path /tmp/requests-2.32.4
+  ```
+
+Pick whichever you have; the questions in step 4 are client-agnostic.
+
+## 4. Ask
+
+### Enable live LLM (one-time)
+
+The structural MCP tools work out of the box, but `summary(id)` (question 3
+below) needs the live OpenRouter path explicitly opted into. Edit
+`/tmp/requests-2.32.4/clarion.yaml` and set both:
+
+```yaml
+llm_policy:
+  enabled: true
+  allow_live_provider: true
+```
+
+`OPENROUTER_API_KEY` must also be exported in the environment that
+`clarion serve` (or your MCP client wrapper) inherits — see the
+prerequisites section above. Skip this block if you don't have a key; the
+first six tools still work, only `summary` will return an "LLM disabled"
+envelope.
+
+### The seven tools
+
+The MCP surface exposes seven primary tools (plus `subsystem_members` for
+clustering output). Each is a structured graph query, not free-text grep.
+
+| Tool | Example invocation |
+|---|---|
+| `entity_at(file, line)` | `entity_at(file="requests/sessions.py", line=480)` — which entity covers this source location? |
+| `find_entity(pattern)` | `find_entity(pattern="Session.send")` — find entities matching a name or summary fragment. |
+| `callers_of(id)` | `callers_of(id="python:function:requests.sessions.Session.send")` — who calls this function? Default confidence is `resolved`. |
+| `execution_paths_from(id, max_depth)` | `execution_paths_from(id="python:function:requests.api.get", max_depth=3)` — bounded calls-only paths from an entry point. |
+| `summary(id)` | `summary(id="python:function:requests.sessions.Session.send")` — structured LLM summary with `purpose` / `behavior` / `relationships` / `risks` fields. Requires the live-LLM opt-in above plus `OPENROUTER_API_KEY`. First call dispatches the LLM and caches; subsequent calls hit the cache. |
+| `issues_for(id)` | `issues_for(id="python:module:requests.sessions")` — Filigree issues attached to this entity, if Filigree is reachable. Returns an `unavailable` envelope if not (Filigree is enrich-only). |
+| `neighborhood(id)` | `neighborhood(id="python:function:requests.sessions.Session.send")` — callers, callees, container, contained entities, and references in one hop. |
+
+The three questions to walk through with your agent:
+
+1. **"List the top-level modules in this project."** Exercises `find_entity`
+   with a broad pattern.
+2. **"What calls `requests.get`?"** Exercises `callers_of` against a
+   well-known entry point.
+3. **"Summarise `requests.sessions.Session.send`."** Exercises the live LLM
+   path (`summary`), the OpenRouter provider, the budget ledger, and the
+   summary cache. The second invocation of the same `summary(id)` is a cache
+   hit; verify by re-asking and noting the near-zero latency.
+
+A successful run gives you three substantive, graph-grounded answers — not
+"here is what grep found." If the agent improvises by reading source files
+directly, the answer is real but does not exercise the MCP surface; check
+that your client actually called the tools.
+
+Re-run analyse for idempotency:
+
+```bash
+clarion analyze
+# entity/edge counts on the second run should match the first
+```
+
+## 5. Secret-block
+
+Plant a fake AWS credential and re-run analyse:
+
+```bash
+cat > .env <<'EOF'
+AWS_ACCESS_KEY_ID=AKIA0123456789ABCDEF
+EOF
+
+clarion analyze
+```
+
+Expected behaviour:
+
+- `clarion analyze` exits **0** with run status `completed`.
+- A `CLA-SEC-SECRET-DETECTED` finding lands in `findings` with the message
+  `AwsAccessKeyId detected in /tmp/requests-2.32.4/.env:1`. Inspect with
+  `sqlite3 .clarion/clarion.db "SELECT rule_id, message FROM findings
+  WHERE rule_id LIKE 'CLA-SEC%';"`.
+- The `.env` file itself has no language entities (it's not Python), so
+  the finding is anchored to the core-minted file entity rather than a
+  language-plugin entity. Source files in the project that the scanner
+  also flags (e.g. high-entropy strings in `requests/utils.py`) get
+  `properties.briefing_blocked = "secret_present"` on their containing
+  module entity, and the `summary(id)` MCP tool returns a
+  `briefing_blocked: "secret_present"` envelope instead of dispatching
+  the LLM.
+
+Full mechanics — baseline format, override flags, audit queries — in
+[secret-scanning.md](./secret-scanning.md).
+
+## Troubleshooting
+
+### `analyze` runs but emits no entities
+
+Look for `WARN no plugins discovered` and `skipped_no_plugins` in the
+analyse output. The plugin host walks `$PATH` for `clarion-plugin-*`
+executables; if your shell's `$PATH` does not include `pipx`'s install
+directory the plugin is invisible.
+
+Confirm and fix:
+
+```bash
+which clarion-plugin-python || echo "not on PATH"
+echo $PATH                          # is pipx's bin dir in here?
+
+# If pipx is installed but its bin dir is missing:
+pipx ensurepath                     # writes the PATH update; restart shell
+```
+
+Note: `clarion analyze` deliberately exits **0** even when no plugins are
+discovered, so the run can be re-attempted without manual cleanup. The
+`WARN` line and the `skipped_no_plugins` run status are the operator-facing
+signals. A `clarion doctor` subcommand that surfaces discovery state at exit
+is on the v2.0 roadmap; for v1.0 the diagnostic is the WARN line plus the
+`which clarion-plugin-*` check above.
+
+### "secret_present" block fires on a real file
+
+Add the file to `.clarion/secrets-baseline.yaml` with a written justification
+(the schema requires it). Full procedure: [secret-scanning.md](./secret-scanning.md).
+
+### `summary` returns an error citing budget or LLM provider
+
+Check `OPENROUTER_API_KEY` is set in the environment that `clarion serve`
+inherits (for Claude Desktop that means the `env` block in the MCP-server
+config). Live LLM calls are also gated by `llm_policy.enabled: true` and
+`llm_policy.allow_live_provider: true` in `clarion.yaml` — see
+[openrouter.md](./openrouter.md).
+
+### `issues_for` returns an `unavailable` envelope
+
+Expected when Filigree is not reachable. Filigree integration is
+*enrich-only* per the Loom federation axiom — Clarion's structural answers
+are unaffected. See
+[CON-FILIGREE-02](../clarion/v0.1/requirements.md#con-filigree-02--file-registry-displacement-is-deferred-to-v02)
+for the v1.0 → v2.0 trajectory.
+
+## Where to go next
+
+- [Operator notes index](./README.md) — OpenRouter, runtime topology,
+  secret scanning, federation contracts, coding-agent LLM providers.
+- [Design ladder](../clarion/v0.1/README.md) — requirements → system-design →
+  detailed-design.
+- [ADR index](../clarion/adr/README.md) — accepted architecture decisions.
+- [CLAUDE.md](../../CLAUDE.md) — repository conventions.

@@ -1454,7 +1454,7 @@ mod tests {
             allow_live_provider: false,
             model_id: "anthropic/claude-sonnet-4.6".to_owned(),
             endpoint_url: "https://openrouter.ai/api/v1".to_owned(),
-            referer: "https://github.com/qacona/clarion".to_owned(),
+            referer: "https://github.com/tachyon-beep/clarion".to_owned(),
             title: "Clarion".to_owned(),
         })
         .expect_err("api key alone must not enable live calls");
@@ -1465,7 +1465,7 @@ mod tests {
             allow_live_provider: true,
             model_id: "anthropic/claude-sonnet-4.6".to_owned(),
             endpoint_url: "https://openrouter.ai/api/v1".to_owned(),
-            referer: "https://github.com/qacona/clarion".to_owned(),
+            referer: "https://github.com/tachyon-beep/clarion".to_owned(),
             title: "Clarion".to_owned(),
         })
         .expect_err("live opt-in without key should fail");
@@ -1476,7 +1476,7 @@ mod tests {
             allow_live_provider: true,
             model_id: "anthropic/claude-sonnet-4.6".to_owned(),
             endpoint_url: "https://openrouter.ai/api/v1".to_owned(),
-            referer: "https://github.com/qacona/clarion".to_owned(),
+            referer: "https://github.com/tachyon-beep/clarion".to_owned(),
             title: "Clarion".to_owned(),
         })
         .expect("live opt-in and key should construct provider");
@@ -1510,7 +1510,7 @@ mod tests {
             let request = String::from_utf8_lossy(&request[..read]);
             assert!(request.contains("POST /api/v1/chat/completions HTTP/1.1"));
             assert!(request.contains("authorization: Bearer secret"));
-            assert!(request.contains("http-referer: https://github.com/qacona/clarion"));
+            assert!(request.contains("http-referer: https://github.com/tachyon-beep/clarion"));
             assert!(request.contains("x-openrouter-title: Clarion"));
             assert!(request.contains(r#""model":"anthropic/claude-sonnet-4.6""#));
             assert!(request.contains(r#""max_tokens":512"#));
@@ -1550,7 +1550,7 @@ mod tests {
             allow_live_provider: true,
             model_id: "anthropic/claude-sonnet-4.6".to_owned(),
             endpoint_url: format!("http://{addr}/api/v1"),
-            referer: "https://github.com/qacona/clarion".to_owned(),
+            referer: "https://github.com/tachyon-beep/clarion".to_owned(),
             title: "Clarion".to_owned(),
         })
         .expect("test provider");
@@ -1671,7 +1671,7 @@ mod tests {
             allow_live_provider: true,
             model_id: "anthropic/claude-sonnet-4.6".to_owned(),
             endpoint_url: format!("http://{addr}/api/v1"),
-            referer: "https://github.com/qacona/clarion".to_owned(),
+            referer: "https://github.com/tachyon-beep/clarion".to_owned(),
             title: "Clarion".to_owned(),
         })
         .expect("test provider");
@@ -1702,7 +1702,7 @@ mod tests {
             allow_live_provider: true,
             model_id: "anthropic/claude-sonnet-4.6".to_owned(),
             endpoint_url: format!("http://{addr}/api/v1"),
-            referer: "https://github.com/qacona/clarion".to_owned(),
+            referer: "https://github.com/tachyon-beep/clarion".to_owned(),
             title: "Clarion".to_owned(),
         })
         .expect("test provider");
@@ -2178,7 +2178,7 @@ printf '%s\n' '{{"type":"result","subtype":"success","structured_output":{{"purp
             allow_live_provider: true,
             model_id: "anthropic/claude-sonnet-4.6".to_owned(),
             endpoint_url: format!("http://{addr}/api/v1"),
-            referer: "https://github.com/qacona/clarion".to_owned(),
+            referer: "https://github.com/tachyon-beep/clarion".to_owned(),
             title: "Clarion".to_owned(),
         })
         .expect("test provider");

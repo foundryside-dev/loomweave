@@ -22,8 +22,11 @@ pub enum Command {
         path: PathBuf,
     },
 
-    /// Run an analysis pass. Sprint 1: no plugins are loaded; run status is
-    /// `skipped_no_plugins`. WP2 wires plugin spawning.
+    /// Run an analysis pass: walk the source tree, dispatch discovered plugins
+    /// to extract entities/edges, and persist results to `.clarion/clarion.db`.
+    /// Re-runs are idempotent (UPSERT on `entities.id`). If no plugins are on
+    /// `$PATH`, exits 0 with a WARN and status `skipped_no_plugins` — see
+    /// `docs/operator/getting-started.md` Troubleshooting.
     Analyze {
         /// Path to analyse (default: current directory).
         #[arg(default_value = ".")]

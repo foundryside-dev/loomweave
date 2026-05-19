@@ -33,6 +33,7 @@ This folder is the canonical home for authored Clarion architecture decision rec
 | [ADR-030](./ADR-030-on-demand-summary-scope.md) | On-demand summary scope — narrows WP6 to MCP-driven `summary(id)`; 5-tuple cache key unchanged; module/subsystem aggregation deferred to v0.2 | Accepted |
 | [ADR-031](./ADR-031-schema-validation-policy.md) | Schema-validation policy — CHECK on closed core-owned vocabularies (`findings.{kind,severity,status}`, `runs.status`); writer-actor + manifest are the only enforcement layer for plugin-extensible vocabularies (`entities.kind`, `edges.kind`) | Accepted |
 | [ADR-032](./ADR-032-weighted-components-clustering-fallback.md) | Weighted-components clustering fallback naming | Accepted |
+| [ADR-033](./ADR-033-v1.0-distribution.md) | v1.0 distribution via GitHub Releases (binary matrix + Python sdist; promote to crates.io/PyPI at v2.0) | Accepted |
 
 ## Backlog still tracked in the detailed design
 

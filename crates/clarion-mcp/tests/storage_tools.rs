@@ -1238,7 +1238,7 @@ async fn summary_openrouter_provider_runs_outside_async_runtime() {
             allow_live_provider: true,
             model_id: "anthropic/claude-sonnet-4.6".to_owned(),
             endpoint_url: format!("http://{addr}/api/v1"),
-            referer: "https://github.com/qacona/clarion".to_owned(),
+            referer: "https://github.com/tachyon-beep/clarion".to_owned(),
             title: "Clarion Test".to_owned(),
         })
         .expect("OpenRouter provider"),

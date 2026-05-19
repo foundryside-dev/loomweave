@@ -543,6 +543,139 @@ async fn round_trip_insert_persists_entity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn insert_entity_is_idempotent_across_runs() {
+    // Regression: `clarion analyze` re-runs against an unchanged corpus
+    // must not crash with `UNIQUE constraint failed: entities.id`. The
+    // insert path UPSERTs on `id`, preserving `created_at`/`first_seen_commit`
+    // and updating the rest from the new run. WS-D smoke gate.
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    let entity_id = "python:function:demo.hello";
+    let first_created = "2026-05-01T00:00:00Z".to_owned();
+    let first_updated = "2026-05-01T00:00:00Z".to_owned();
+    let second_updated = "2026-05-02T00:00:00Z".to_owned();
+
+    // Run 1: insert.
+    send::<()>(&tx, |ack| WriterCmd::BeginRun {
+        run_id: "run-1".into(),
+        config_json: "{}".into(),
+        started_at: now_iso(),
+        ack,
+    })
+    .await
+    .unwrap();
+    let mut e = make_entity(entity_id);
+    e.created_at = first_created.clone();
+    e.updated_at = first_updated.clone();
+    e.first_seen_commit = Some("commit-abc".to_owned());
+    e.last_seen_commit = Some("commit-abc".to_owned());
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(e),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-1".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    // Run 2: re-insert same id with refreshed fields. Must not raise UNIQUE.
+    send::<()>(&tx, |ack| WriterCmd::BeginRun {
+        run_id: "run-2".into(),
+        config_json: "{}".into(),
+        started_at: now_iso(),
+        ack,
+    })
+    .await
+    .unwrap();
+    let mut e2 = make_entity(entity_id);
+    e2.short_name = "hello-v2".to_owned();
+    e2.created_at = "2026-12-31T00:00:00Z".to_owned();
+    e2.updated_at = second_updated.clone();
+    e2.first_seen_commit = Some("commit-NEW-should-be-ignored".to_owned());
+    e2.last_seen_commit = Some("commit-xyz".to_owned());
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(e2),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-2".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let pool = ReaderPool::open(&path, 2).unwrap();
+    let (count, short_name, created_at, updated_at, first_commit, last_commit): (
+        i64,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = pool
+        .with_reader(move |conn| {
+            let n: i64 = conn.query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))?;
+            let row = conn.query_row(
+                "SELECT short_name, created_at, updated_at, first_seen_commit, last_seen_commit \
+                 FROM entities WHERE id = ?1",
+                rusqlite::params![entity_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )?;
+            Ok((n, row.0, row.1, row.2, row.3, row.4))
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "second InsertEntity must not duplicate the row");
+    assert_eq!(
+        short_name, "hello-v2",
+        "mutable fields refresh on re-insert"
+    );
+    assert_eq!(
+        created_at, first_created,
+        "created_at is preserved across re-insert"
+    );
+    assert_eq!(
+        updated_at, second_updated,
+        "updated_at refreshes to latest run's value"
+    );
+    assert_eq!(
+        first_commit, "commit-abc",
+        "first_seen_commit is preserved across re-insert"
+    );
+    assert_eq!(
+        last_commit, "commit-xyz",
+        "last_seen_commit refreshes to latest run's value"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn non_core_plugin_cannot_insert_reserved_entity_kind() {
     let dir = tempfile::tempdir().unwrap();
     let path = prepared_db(&dir);

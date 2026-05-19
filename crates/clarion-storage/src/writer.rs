@@ -353,6 +353,12 @@ fn insert_entity(
         state.in_tx = true;
     }
     validate_entity_source_file_anchor(conn, entity)?;
+    // ON CONFLICT(id) DO UPDATE makes `clarion analyze` idempotent across runs:
+    // a re-walk that produces the same entity updates the existing row instead
+    // of raising UNIQUE. `created_at` and `first_seen_commit` are preserved
+    // (the entity was first seen on its original run); `updated_at` and
+    // `last_seen_commit` are refreshed from the latest run's record. The
+    // AFTER UPDATE trigger on `entities` keeps `entity_fts` in sync.
     conn.execute(
         "INSERT INTO entities ( \
             id, plugin_id, kind, name, short_name, \
@@ -370,7 +376,25 @@ fn insert_entity(
             ?13, ?14, ?15, ?16, \
             ?17, ?18, \
             ?19, ?20 \
-         )",
+         ) \
+         ON CONFLICT(id) DO UPDATE SET \
+            plugin_id         = excluded.plugin_id, \
+            kind              = excluded.kind, \
+            name              = excluded.name, \
+            short_name        = excluded.short_name, \
+            parent_id         = excluded.parent_id, \
+            source_file_id    = excluded.source_file_id, \
+            source_file_path  = excluded.source_file_path, \
+            source_byte_start = excluded.source_byte_start, \
+            source_byte_end   = excluded.source_byte_end, \
+            source_line_start = excluded.source_line_start, \
+            source_line_end   = excluded.source_line_end, \
+            properties        = excluded.properties, \
+            content_hash      = excluded.content_hash, \
+            summary           = excluded.summary, \
+            wardline          = excluded.wardline, \
+            last_seen_commit  = excluded.last_seen_commit, \
+            updated_at        = excluded.updated_at",
         params![
             entity.id,
             entity.plugin_id,
