@@ -176,9 +176,8 @@ where
         .filter(|trimmed| !trimmed.is_empty())
         .map(Arc::new);
     let bind = config.bind;
-    let warn_unauthenticated_non_loopback = config.allow_non_loopback
-        && !config.is_loopback_bind()
-        && auth_token.is_none();
+    let warn_unauthenticated_non_loopback =
+        config.allow_non_loopback && !config.is_loopback_bind() && auth_token.is_none();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<HttpReadReady>>();
     let (failure_tx, failure_rx) = mpsc::channel();
@@ -205,7 +204,11 @@ where
         .recv()
         .context("wait for HTTP read API bind result")??;
     let local_addr = ready.local_addr;
-    let auth = if auth_token.is_some() { "bearer" } else { "none" };
+    let auth = if auth_token.is_some() {
+        "bearer"
+    } else {
+        "none"
+    };
     if warn_unauthenticated_non_loopback {
         tracing::warn!(
             bind = %local_addr,
@@ -330,23 +333,20 @@ fn router(state: AppState) -> Router {
             require_bearer_token,
         ));
     let unprotected = Router::new().route("/api/v1/_capabilities", get(get_capabilities));
-    protected
-        .merge(unprotected)
-        .with_state(state)
-        .layer(
-            ServiceBuilder::new()
-                .layer(CatchPanicLayer::custom(catch_panic_response))
-                .layer(HandleErrorLayer::new(handle_middleware_error))
-                .layer(
-                    TraceLayer::new_for_http()
-                        .make_span_with(http_request_span)
-                        .on_failure(()),
-                )
-                .layer(timeout::TimeoutLayer::new(Duration::from_secs(10)))
-                .layer(RequestBodyLimitLayer::new(16 * 1024))
-                .layer(load_shed::LoadShedLayer::new())
-                .layer(ConcurrencyLimitLayer::new(64)),
-        )
+    protected.merge(unprotected).with_state(state).layer(
+        ServiceBuilder::new()
+            .layer(CatchPanicLayer::custom(catch_panic_response))
+            .layer(HandleErrorLayer::new(handle_middleware_error))
+            .layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(http_request_span)
+                    .on_failure(()),
+            )
+            .layer(timeout::TimeoutLayer::new(Duration::from_secs(10)))
+            .layer(RequestBodyLimitLayer::new(16 * 1024))
+            .layer(load_shed::LoadShedLayer::new())
+            .layer(ConcurrencyLimitLayer::new(64)),
+    )
 }
 
 /// Enforce `Authorization: Bearer <token>` on every request to a protected
@@ -665,8 +665,8 @@ fn insert_etag(response: &mut Response, etag: &str) {
 /// The whole batch runs inside **one** `with_reader` closure so we
 /// check out one pooled connection per request, not one per query —
 /// this is the perf win Filigree's `ClarionRegistry` needs for cold-
-/// start hydration. ETag is intentionally not applied to the batch
-/// surface; clients should ETag the single-file endpoint when they
+/// start hydration. `ETag` is intentionally not applied to the batch
+/// surface; clients should `ETag` the single-file endpoint when they
 /// want conditional fetch semantics.
 async fn post_files_batch(
     State(state): State<AppState>,
@@ -704,12 +704,8 @@ async fn post_files_batch(
                     });
                     continue;
                 }
-                match resolve_file_catalog_entry(
-                    conn,
-                    &project_root,
-                    &query.path,
-                    &query.language,
-                ) {
+                match resolve_file_catalog_entry(conn, &project_root, &query.path, &query.language)
+                {
                     Ok(Some(entry)) => match entry.into_resolved_file() {
                         Ok(file) => {
                             if file.briefing_blocked.is_some() {

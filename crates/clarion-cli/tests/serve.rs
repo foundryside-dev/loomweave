@@ -159,8 +159,7 @@ fn serve_http_files_endpoint_returns_briefing_blocked_for_blocked_entity() {
     write_http_config(dir.path(), &bind);
 
     let mut child = spawn_serve(dir.path());
-    let response =
-        wait_for_http_response(&bind, "/api/v1/files?path=blocked.py&language=python");
+    let response = wait_for_http_response(&bind, "/api/v1/files?path=blocked.py&language=python");
     stop_serve(&mut child);
     let response = response.expect("HTTP /api/v1/files briefing-blocked response");
 
@@ -567,7 +566,7 @@ fn serve_http_capabilities_reuses_persisted_instance_id_across_restarts() {
 
 /// C12 rotation positive case. The sibling
 /// `_reuses_persisted_instance_id_across_restarts` test proves *stability*
-/// (the same persisted file produces the same instance_id), which silently
+/// (the same persisted file produces the same `instance_id`), which silently
 /// passes a regression that ignores the file and re-mints on every boot.
 /// This test proves the *rotation* direction: overwriting the persisted
 /// file between restarts causes `/api/v1/_capabilities` to surface the new
@@ -872,9 +871,12 @@ fn serve_http_files_endpoint_requires_bearer_token_when_configured() {
     let bind = free_loopback_bind();
     write_http_config_with_token_env(dir.path(), &bind, "CLARION_TEST_LOOM_TOKEN_REQ");
 
-    let mut child =
-        spawn_serve_with_env(dir.path(), &[("CLARION_TEST_LOOM_TOKEN_REQ", "shh-its-a-secret")]);
-    let unauthenticated = wait_for_http_response(&bind, "/api/v1/files?path=demo.py&language=python");
+    let mut child = spawn_serve_with_env(
+        dir.path(),
+        &[("CLARION_TEST_LOOM_TOKEN_REQ", "shh-its-a-secret")],
+    );
+    let unauthenticated =
+        wait_for_http_response(&bind, "/api/v1/files?path=demo.py&language=python");
     let authenticated = wait_for_http_raw_response(
         &bind,
         "/api/v1/files?path=demo.py&language=python",
@@ -887,8 +889,8 @@ fn serve_http_files_endpoint_requires_bearer_token_when_configured() {
     assert_eq!(unauthenticated.status_code, 401);
     assert_eq!(unauthenticated.body["code"], "UNAUTHORIZED");
     assert_eq!(authenticated.status_code, 200);
-    let body: Value = serde_json::from_str(&authenticated.body)
-        .expect("authenticated body is JSON");
+    let body: Value =
+        serde_json::from_str(&authenticated.body).expect("authenticated body is JSON");
     assert_eq!(body["entity_id"], "core:file:demo.py");
 }
 
@@ -905,8 +907,10 @@ fn serve_http_files_endpoint_rejects_wrong_token() {
     let bind = free_loopback_bind();
     write_http_config_with_token_env(dir.path(), &bind, "CLARION_TEST_LOOM_TOKEN_WRONG");
 
-    let mut child =
-        spawn_serve_with_env(dir.path(), &[("CLARION_TEST_LOOM_TOKEN_WRONG", "correct-horse")]);
+    let mut child = spawn_serve_with_env(
+        dir.path(),
+        &[("CLARION_TEST_LOOM_TOKEN_WRONG", "correct-horse")],
+    );
     let wrong = wait_for_http_raw_response(
         &bind,
         "/api/v1/files?path=demo.py&language=python",
@@ -927,8 +931,11 @@ fn serve_http_files_endpoint_rejects_wrong_token() {
     let blank = blank.expect("blank-token response");
     let wrong_scheme = wrong_scheme.expect("wrong-scheme response");
 
-    for (name, response) in [("wrong", &wrong), ("blank", &blank), ("wrong-scheme", &wrong_scheme)]
-    {
+    for (name, response) in [
+        ("wrong", &wrong),
+        ("blank", &blank),
+        ("wrong-scheme", &wrong_scheme),
+    ] {
         assert_eq!(response.status_code, 401, "{name}: {response:?}");
         let body: Value = serde_json::from_str(&response.body)
             .unwrap_or_else(|err| panic!("{name} body parse: {err}; raw={:?}", response.body));
@@ -948,8 +955,10 @@ fn serve_http_capabilities_does_not_require_token() {
     let bind = free_loopback_bind();
     write_http_config_with_token_env(dir.path(), &bind, "CLARION_TEST_LOOM_TOKEN_CAPS");
 
-    let mut child =
-        spawn_serve_with_env(dir.path(), &[("CLARION_TEST_LOOM_TOKEN_CAPS", "any-token-value")]);
+    let mut child = spawn_serve_with_env(
+        dir.path(),
+        &[("CLARION_TEST_LOOM_TOKEN_CAPS", "any-token-value")],
+    );
     let response = wait_for_http_response(&bind, "/api/v1/_capabilities");
     stop_serve(&mut child);
     let response = response.expect("capabilities probe response");

@@ -19,11 +19,10 @@ const INSTANCE_ID_FILE: &str = "instance_id";
 pub struct InstanceId(Uuid);
 
 impl InstanceId {
-    /// Fresh random instance ID (UUIDv4). Used when no persisted file exists.
+    /// Fresh random instance ID (`UUIDv4`). Used when no persisted file exists.
     fn new_random() -> Self {
         Self(Uuid::new_v4())
     }
-
 }
 
 impl fmt::Display for InstanceId {
@@ -136,8 +135,8 @@ fn parse_instance_id(path: &Path, raw: &str) -> Result<InstanceId> {
 /// `spawn` synthetically.
 #[cfg(test)]
 pub(crate) fn parse_instance_id_for_test(raw: &str) -> Result<InstanceId> {
-    let id =
-        Uuid::parse_str(raw.trim()).map_err(|err| anyhow!("invalid synthetic instance id: {err}"))?;
+    let id = Uuid::parse_str(raw.trim())
+        .map_err(|err| anyhow!("invalid synthetic instance id: {err}"))?;
     Ok(InstanceId(id))
 }
 
