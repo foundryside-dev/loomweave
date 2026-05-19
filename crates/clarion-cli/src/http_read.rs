@@ -1,9 +1,11 @@
 use std::error::Error as StdError;
 use std::path::PathBuf;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use axum::error_handling::HandleErrorLayer;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -13,6 +15,12 @@ use clarion_mcp::config::HttpReadConfig;
 use clarion_storage::{ReaderPool, StorageError, resolve_file};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
+use tower::limit::ConcurrencyLimitLayer;
+use tower::load_shed;
+use tower::timeout;
+use tower::{BoxError, ServiceBuilder};
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::trace::TraceLayer;
 
 static HTTP_ERROR_DISPATCH: LazyLock<tracing::Dispatch> = LazyLock::new(|| {
     let subscriber = tracing_subscriber::fmt()
@@ -26,10 +34,40 @@ static HTTP_ERROR_DISPATCH: LazyLock<tracing::Dispatch> = LazyLock::new(|| {
 #[derive(Debug)]
 pub struct HttpReadServer {
     shutdown: Option<oneshot::Sender<()>>,
+    failure_rx: mpsc::Receiver<String>,
     join: Option<thread::JoinHandle<Result<()>>>,
 }
 
 impl HttpReadServer {
+    pub fn check_running(&mut self) -> Result<()> {
+        match self.failure_rx.try_recv() {
+            Ok(error) => {
+                let join_result = self.join_finished();
+                if let Some(Err(join_error)) = join_result {
+                    return Err(join_error.context(error));
+                }
+                return Err(anyhow!(error).context("HTTP read API server failed"));
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                if self
+                    .join
+                    .as_ref()
+                    .is_some_and(thread::JoinHandle::is_finished)
+                {
+                    match self.join_finished() {
+                        Some(Ok(())) => {
+                            return Err(anyhow!("HTTP read API server exited unexpectedly"));
+                        }
+                        Some(Err(err)) => return Err(err),
+                        None => {}
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn shutdown(mut self) -> Result<()> {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
@@ -39,6 +77,22 @@ impl HttpReadServer {
                 .map_err(|_| anyhow!("HTTP read server thread panicked"))??;
         }
         Ok(())
+    }
+
+    fn join_finished(&mut self) -> Option<Result<()>> {
+        let finished = self
+            .join
+            .as_ref()
+            .is_some_and(thread::JoinHandle::is_finished);
+        if !finished {
+            return None;
+        }
+        let join = self.join.take()?;
+        Some(
+            join.join()
+                .map_err(|_| anyhow!("HTTP read server thread panicked"))
+                .and_then(|result| result),
+        )
     }
 }
 
@@ -51,7 +105,7 @@ struct AppState {
 
 pub fn spawn(
     project_root: PathBuf,
-    db_path: PathBuf,
+    readers: ReaderPool,
     instance_id: String,
     config: &HttpReadConfig,
 ) -> Result<Option<HttpReadServer>> {
@@ -65,38 +119,24 @@ pub fn spawn(
     let warn_unauthenticated_non_loopback = config.allow_non_loopback && !config.is_loopback_bind();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    let join = thread::spawn(move || -> Result<()> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .context("create HTTP read runtime")?;
-        runtime.block_on(async move {
-            let readers = ReaderPool::open(&db_path, 16)
-                .map_err(|err| anyhow!("open HTTP reader pool for {}: {err}", db_path.display()))?;
-            let listener = match tokio::net::TcpListener::bind(bind).await {
-                Ok(listener) => listener,
-                Err(err) => {
-                    let _ = ready_tx.send(Err(anyhow!("bind HTTP read API on {bind}: {err}")));
-                    return Err(anyhow!("bind HTTP read API on {bind}: {err}"));
-                }
-            };
-            let local_addr = listener
-                .local_addr()
-                .context("read HTTP read API local addr")?;
-            let _ = ready_tx.send(Ok(local_addr));
-            let state = AppState {
+    let (failure_tx, failure_rx) = mpsc::channel();
+    let join = thread::Builder::new()
+        .name("clarion-http-read".to_owned())
+        .spawn(move || -> Result<()> {
+            let result = run_http_read_server(
                 project_root,
                 readers,
                 instance_id,
-            };
-            axum::serve(listener, router(state))
-                .with_graceful_shutdown(async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-                .context("serve HTTP read API")
+                bind,
+                shutdown_rx,
+                ready_tx,
+            );
+            if let Err(err) = &result {
+                let _ = failure_tx.send(format!("{err:#}"));
+            }
+            result
         })
-    });
+        .context("spawn HTTP read server thread")?;
     let local_addr = ready_rx
         .recv()
         .context("wait for HTTP read API bind result")??;
@@ -111,8 +151,47 @@ pub fn spawn(
     tracing::info!(bind = %local_addr, auth = %auth, "Clarion HTTP read API listening");
     Ok(Some(HttpReadServer {
         shutdown: Some(shutdown_tx),
+        failure_rx,
         join: Some(join),
     }))
+}
+
+fn run_http_read_server(
+    project_root: PathBuf,
+    readers: ReaderPool,
+    instance_id: String,
+    bind: std::net::SocketAddr,
+    shutdown_rx: oneshot::Receiver<()>,
+    ready_tx: mpsc::Sender<Result<std::net::SocketAddr>>,
+) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("create HTTP read runtime")?;
+    runtime.block_on(async move {
+        let listener = match tokio::net::TcpListener::bind(bind).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                let _ = ready_tx.send(Err(anyhow!("bind HTTP read API on {bind}: {err}")));
+                return Err(anyhow!("bind HTTP read API on {bind}: {err}"));
+            }
+        };
+        let local_addr = listener
+            .local_addr()
+            .context("read HTTP read API local addr")?;
+        let _ = ready_tx.send(Ok(local_addr));
+        let state = AppState {
+            project_root,
+            readers,
+            instance_id,
+        };
+        axum::serve(listener, router(state))
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .context("serve HTTP read API")
+    })
 }
 
 fn router(state: AppState) -> Router {
@@ -120,6 +199,38 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/files", get(get_file))
         .route("/api/v1/_capabilities", get(get_capabilities))
         .with_state(state)
+        .layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(handle_middleware_error))
+                .layer(TraceLayer::new_for_http().on_failure(()))
+                .layer(timeout::TimeoutLayer::new(Duration::from_secs(10)))
+                .layer(RequestBodyLimitLayer::new(16 * 1024))
+                .layer(load_shed::LoadShedLayer::new())
+                .layer(ConcurrencyLimitLayer::new(64)),
+        )
+}
+
+async fn handle_middleware_error(err: BoxError) -> Response {
+    if err.is::<timeout::error::Elapsed>() {
+        return json_error(
+            StatusCode::REQUEST_TIMEOUT,
+            ErrorCode::Internal,
+            "HTTP request timed out",
+        );
+    }
+    if err.is::<load_shed::error::Overloaded>() {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::StorageError,
+            "HTTP read API is overloaded",
+        );
+    }
+    tracing::error!(error = %err, "HTTP read API middleware failed");
+    json_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ErrorCode::Internal,
+        "HTTP read API middleware failed",
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -312,4 +423,93 @@ fn json_error(status: StatusCode, code: ErrorCode, message: &str) -> Response {
         }),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::{Future, Pending, pending};
+    use std::sync::mpsc;
+    use std::task::{Context, Poll};
+
+    use super::*;
+    use tower::Service;
+
+    #[test]
+    fn check_running_surfaces_completed_http_thread_failure_before_shutdown() {
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        let (failure_tx, failure_rx) = mpsc::channel();
+        failure_tx
+            .send("simulated HTTP server failure".to_owned())
+            .expect("send simulated failure");
+        let join = thread::spawn(|| Err(anyhow!("simulated HTTP server failure")));
+        let mut server = HttpReadServer {
+            shutdown: Some(shutdown_tx),
+            failure_rx,
+            join: Some(join),
+        };
+
+        let err = server
+            .check_running()
+            .expect_err("HTTP failure should surface before shutdown");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("simulated HTTP server failure"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn load_shed_converts_concurrency_backpressure_to_overload_response() {
+        #[derive(Clone)]
+        struct PendingService;
+
+        impl Service<()> for PendingService {
+            type Response = ();
+            type Error = BoxError;
+            type Future = Pending<Result<(), BoxError>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _request: ()) -> Self::Future {
+                pending()
+            }
+        }
+
+        let mut service = ServiceBuilder::new()
+            .layer(load_shed::LoadShedLayer::new())
+            .layer(ConcurrencyLimitLayer::new(1))
+            .service(PendingService);
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        assert!(
+            service.poll_ready(&mut cx).is_ready(),
+            "first request should acquire the only concurrency permit"
+        );
+        let _held_permit = service.call(());
+
+        assert!(
+            service.poll_ready(&mut cx).is_ready(),
+            "load-shed should stay ready when the concurrency limiter is saturated"
+        );
+        let mut overloaded = std::pin::pin!(service.call(()));
+        let err = match Future::poll(overloaded.as_mut(), &mut cx) {
+            Poll::Ready(Err(err)) => err,
+            other => panic!("expected immediate overload error, got {other:?}"),
+        };
+        assert!(
+            err.is::<load_shed::error::Overloaded>(),
+            "expected load-shed overload error, got {err}"
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let response = runtime.block_on(handle_middleware_error(err));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 }

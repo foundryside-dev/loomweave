@@ -184,6 +184,27 @@ fn serve_http_files_blank_path_returns_invalid_path_envelope() {
 }
 
 #[test]
+fn serve_http_rejects_oversized_get_body_before_handler() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+
+    let mut child = spawn_serve(dir.path());
+    let status_code =
+        wait_for_http_get_with_body_status(&bind, "/api/v1/_capabilities", 16 * 1024 + 1);
+    stop_serve(&mut child);
+    let status_code = status_code.expect("HTTP response to oversized body");
+
+    assert_eq!(status_code, 413);
+}
+
+#[test]
 fn serve_http_files_path_traversal_returns_outside_project_envelope() {
     let dir = tempfile::tempdir().expect("temp project");
     clarion_bin()
@@ -1420,6 +1441,55 @@ fn wait_for_http_response(bind: &str, path: &str) -> Result<HttpJsonResponse, St
         std::thread::sleep(Duration::from_millis(25));
     }
     Err(last_error)
+}
+
+fn wait_for_http_get_with_body_status(
+    bind: &str,
+    path: &str,
+    body_len: usize,
+) -> Result<u16, String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let body = vec![b'x'; body_len];
+    let mut last_error = String::new();
+    while Instant::now() < deadline {
+        match http_get_with_body_status(bind, path, &body) {
+            Ok(status_code) => return Ok(status_code),
+            Err(err) => last_error = err,
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err(last_error)
+}
+
+fn http_get_with_body_status(bind: &str, path: &str, body: &[u8]) -> Result<u16, String> {
+    let addr = bind
+        .parse()
+        .map_err(|err| format!("parse bind address {bind}: {err}"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(100))
+        .map_err(|err| format!("connect to {bind}: {err}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|err| format!("set read timeout: {err}"))?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {bind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .map_err(|err| format!("write request head: {err}"))?;
+    stream
+        .write_all(body)
+        .map_err(|err| format!("write request body: {err}"))?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut status_line = String::new();
+    reader
+        .read_line(&mut status_line)
+        .map_err(|err| format!("read status line: {err}"))?;
+    status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| format!("malformed HTTP status line: {status_line}"))?
+        .parse::<u16>()
+        .map_err(|err| format!("parse HTTP status from {status_line:?}: {err}"))
 }
 
 fn http_get_response(bind: &str, path: &str) -> Result<HttpJsonResponse, String> {
