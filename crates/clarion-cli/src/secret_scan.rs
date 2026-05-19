@@ -194,16 +194,24 @@ pub(crate) fn pre_ingest(
         if allowed.is_empty() {
             continue;
         }
+        // ADR-013 §"Override — --allow-unredacted-secrets": each detection
+        // emits its own `CLA-SEC-SECRET-DETECTED` finding regardless of
+        // whether the operator subsequently overrode the block. The override
+        // finding (`CLA-SEC-UNREDACTED-SECRETS-ALLOWED`) is additive — it
+        // records the operator decision but does not replace the
+        // per-(rule,file,line) audit row, so a security review running
+        // `filigree list --rule-id=CLA-SEC-SECRET-DETECTED` enumerates the
+        // full detection population.
+        findings.extend(
+            allowed
+                .iter()
+                .map(|detection| secret_detected_finding(&file, detection)),
+        );
         if override_confirmed {
             override_files.insert(file.clone());
             override_detections.insert(file, allowed);
         } else {
-            briefing_blocks.insert(file.clone(), BriefingBlockReason::SecretPresent);
-            findings.extend(
-                allowed
-                    .iter()
-                    .map(|detection| secret_detected_finding(&file, detection)),
-            );
+            briefing_blocks.insert(file, BriefingBlockReason::SecretPresent);
         }
     }
 

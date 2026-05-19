@@ -474,9 +474,24 @@ fn non_tty_override_confirmed_allows_briefing_and_records_stats() {
         .unwrap();
     let evidence: serde_json::Value =
         serde_json::from_str(&evidence_json).expect("override evidence JSON");
+    // ADR-013: override is additive — per-(rule,file,line) SECRET_DETECTED
+    // still lands so `filigree list --rule-id=CLA-SEC-SECRET-DETECTED`
+    // enumerates the full audited population, not just the unoverridden tail.
+    let secret_detected_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'CLA-SEC-SECRET-DETECTED'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(blocked_count, 0);
     assert_eq!(override_count, 1);
     assert_eq!(override_used, 1);
+    assert_eq!(
+        secret_detected_count, 1,
+        "ADR-013 audit-trail fidelity: SECRET_DETECTED must be emitted even \
+         under override so audit queries by rule_id are complete"
+    );
     assert_eq!(evidence["detections"][0]["rule_id"], "AwsAccessKeyId");
     assert_eq!(evidence["detections"][0]["line_number"], 1);
     assert_eq!(
@@ -618,7 +633,14 @@ results:
         .unwrap();
     assert_eq!(baseline_count, 1);
     assert_eq!(override_count, 1);
-    assert_eq!(secret_count, 0);
+    // ADR-013: SECRET_DETECTED emits on detection regardless of override.
+    // Baseline-suppressed `fixture.sec` contributes 0 detections; the live
+    // overridden `live.sec` contributes 1.
+    assert_eq!(
+        secret_count, 1,
+        "override is additive: live.sec's detection still lands as \
+         SECRET_DETECTED so audit-by-rule_id is complete"
+    );
     assert_eq!(blocked_count, 0);
 }
 
