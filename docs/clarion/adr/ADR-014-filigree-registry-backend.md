@@ -1,6 +1,6 @@
 # ADR-014: Filigree `registry_backend` Flag and Pluggable `RegistryProtocol`
 
-**Status**: Accepted
+**Status**: Accepted; partially extended by [ADR-034](./ADR-034-federation-http-read-api-hardening.md) (Security Posture and Error Envelope sections only — registry-backend protocol decision remains in force)
 **Date**: 2026-04-18
 **Deciders**: qacona@gmail.com
 **Context**: Clarion v0.1 integration boundary with Filigree's file registry; joint deliverable (Clarion + Filigree, same author)

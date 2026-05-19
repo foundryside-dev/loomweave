@@ -16,7 +16,7 @@ This folder is the canonical home for authored Clarion architecture decision rec
 | [ADR-011](./ADR-011-writer-actor-concurrency.md) | Writer-actor concurrency with per-N-files transactions; `--shadow-db` opt-in | Accepted |
 | [ADR-012](./ADR-012-http-auth-default.md) | HTTP read-API authentication — UDS default with token fallback | Superseded for ADR-014 registry-backend API |
 | [ADR-013](./ADR-013-pre-ingest-secret-scanner.md) | Pre-ingest secret scanner with LLM-dispatch block | Accepted |
-| [ADR-014](./ADR-014-filigree-registry-backend.md) | Filigree `registry_backend` flag and pluggable `RegistryProtocol` | Accepted |
+| [ADR-014](./ADR-014-filigree-registry-backend.md) | Filigree `registry_backend` flag and pluggable `RegistryProtocol` | Accepted; partially extended by ADR-034 |
 | [ADR-015](./ADR-015-wardline-filigree-emission.md) | Wardline→Filigree emission ownership — Clarion-side SARIF translator (v0.1), native Wardline emitter (v0.2) | Accepted |
 | [ADR-016](./ADR-016-observation-transport.md) | Observation transport — MCP-spawn (v0.1), Filigree HTTP endpoint (v0.2) | Accepted |
 | [ADR-017](./ADR-017-severity-and-dedup.md) | Severity mapping, rule-ID round-trip, and dedup policy | Accepted |
@@ -34,6 +34,7 @@ This folder is the canonical home for authored Clarion architecture decision rec
 | [ADR-031](./ADR-031-schema-validation-policy.md) | Schema-validation policy — CHECK on closed core-owned vocabularies (`findings.{kind,severity,status}`, `runs.status`); writer-actor + manifest are the only enforcement layer for plugin-extensible vocabularies (`entities.kind`, `edges.kind`) | Accepted |
 | [ADR-032](./ADR-032-weighted-components-clustering-fallback.md) | Weighted-components clustering fallback naming | Accepted |
 | [ADR-033](./ADR-033-v1.0-distribution.md) | v1.0 distribution via GitHub Releases (binary matrix + Python sdist; promote to crates.io/PyPI at v2.0) | Accepted |
+| [ADR-034](./ADR-034-federation-http-read-api-hardening.md) | Federation HTTP read API hardening — bearer auth, batch resolution, `BRIEFING_BLOCKED`, instance ID | Accepted |
 
 ## Backlog still tracked in the detailed design
 

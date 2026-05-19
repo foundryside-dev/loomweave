@@ -64,8 +64,10 @@ All non-2xx responses use this closed JSON error envelope:
 
 The initial `code` enum is closed to `INVALID_PATH`,
 `PATH_OUTSIDE_PROJECT`, `NOT_FOUND`, `BRIEFING_BLOCKED`, `UNAUTHORIZED`,
-`STORAGE_ERROR`, and `INTERNAL`. Clients must switch on `code`; `error`
-is human-readable diagnostic text.
+`STORAGE_ERROR`, `BATCH_TOO_LARGE`, and `INTERNAL`. Clients must switch
+on `code`; `error` is human-readable diagnostic text. `BATCH_TOO_LARGE`
+is only emitted by `POST /api/v1/files/batch` (see the batch endpoint
+section below).
 
 ### `GET /api/v1/files?path=&language=`
 
