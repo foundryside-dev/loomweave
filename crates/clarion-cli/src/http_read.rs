@@ -1,6 +1,6 @@
 use std::error::Error as StdError;
 use std::path::PathBuf;
-use std::sync::{LazyLock, mpsc};
+use std::sync::{Arc, LazyLock, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -13,13 +13,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use clarion_mcp::config::HttpReadConfig;
-use clarion_storage::{ReaderPool, StorageError, resolve_file_catalog_entry};
+use clarion_storage::{CanonicalProjectPath, ReaderPool, StorageError, resolve_file_catalog_entry};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tower::limit::ConcurrencyLimitLayer;
 use tower::load_shed;
 use tower::timeout;
 use tower::{BoxError, ServiceBuilder};
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
@@ -37,6 +38,19 @@ pub struct HttpReadServer {
     shutdown: Option<oneshot::Sender<()>>,
     failure_rx: mpsc::Receiver<String>,
     join: Option<thread::JoinHandle<Result<()>>>,
+    /// `ReaderPool::identity()` captured **inside the HTTP thread**, after
+    /// the pool that the runtime actually uses has been moved into place.
+    /// Callers can `Arc::ptr_eq` this against their own `ReaderPool` to
+    /// catch a refactor that re-opens the pool inside this module.
+    readers_identity: Arc<()>,
+}
+
+impl HttpReadServer {
+    /// Borrow the in-thread `ReaderPool` identity tag. See the field comment.
+    #[must_use]
+    pub fn readers_identity(&self) -> &Arc<()> {
+        &self.readers_identity
+    }
 }
 
 impl HttpReadServer {
@@ -101,13 +115,25 @@ impl HttpReadServer {
 struct AppState {
     project_root: PathBuf,
     readers: ReaderPool,
-    instance_id: String,
+    instance_id: crate::instance::InstanceId,
+}
+
+/// Ready-signal payload returned from the HTTP thread back to `spawn`.
+///
+/// `readers_identity` is captured **inside** `run_http_read_server`, after
+/// `readers` has been moved into the runtime. A refactor that re-opens the
+/// pool inside the thread ships the new pool's identity back, and the
+/// caller-side `Arc::ptr_eq` check fires. Capturing on the caller side
+/// (before the move into the thread) would silently miss that refactor.
+struct HttpReadReady {
+    local_addr: std::net::SocketAddr,
+    readers_identity: Arc<()>,
 }
 
 pub fn spawn(
     project_root: PathBuf,
     readers: ReaderPool,
-    instance_id: String,
+    instance_id: crate::instance::InstanceId,
     config: &HttpReadConfig,
 ) -> Result<Option<HttpReadServer>> {
     if !config.enabled {
@@ -119,7 +145,7 @@ pub fn spawn(
     let bind = config.bind;
     let warn_unauthenticated_non_loopback = config.allow_non_loopback && !config.is_loopback_bind();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<HttpReadReady>>();
     let (failure_tx, failure_rx) = mpsc::channel();
     let join = thread::Builder::new()
         .name("clarion-http-read".to_owned())
@@ -138,9 +164,10 @@ pub fn spawn(
             result
         })
         .context("spawn HTTP read server thread")?;
-    let local_addr = ready_rx
+    let ready = ready_rx
         .recv()
         .context("wait for HTTP read API bind result")??;
+    let local_addr = ready.local_addr;
     let auth = "none";
     if warn_unauthenticated_non_loopback {
         tracing::warn!(
@@ -154,17 +181,23 @@ pub fn spawn(
         shutdown: Some(shutdown_tx),
         failure_rx,
         join: Some(join),
+        readers_identity: ready.readers_identity,
     }))
 }
 
 fn run_http_read_server(
     project_root: PathBuf,
     readers: ReaderPool,
-    instance_id: String,
+    instance_id: crate::instance::InstanceId,
     bind: std::net::SocketAddr,
     shutdown_rx: oneshot::Receiver<()>,
-    ready_tx: mpsc::Sender<Result<std::net::SocketAddr>>,
+    ready_tx: mpsc::Sender<Result<HttpReadReady>>,
 ) -> Result<()> {
+    // Capture identity here, after `readers` has been moved in. A refactor
+    // that opens a fresh pool inside this function would ship its new
+    // identity back to the caller, who will `Arc::ptr_eq`-fail. Capturing
+    // before the move (in `spawn`) would silently miss that refactor.
+    let readers_identity = readers.identity().clone();
     let runtime = build_http_runtime()?;
     runtime.block_on(async move {
         let listener = match tokio::net::TcpListener::bind(bind).await {
@@ -174,22 +207,71 @@ fn run_http_read_server(
                 return Err(anyhow!("bind HTTP read API on {bind}: {err}"));
             }
         };
-        let local_addr = listener
-            .local_addr()
-            .context("read HTTP read API local addr")?;
-        let _ = ready_tx.send(Ok(local_addr));
+        let local_addr = match listener.local_addr() {
+            Ok(addr) => addr,
+            Err(err) => {
+                let _ = ready_tx.send(Err(anyhow!("read HTTP read API local addr: {err}")));
+                return Err(anyhow!("read HTTP read API local addr: {err}"));
+            }
+        };
+        let _ = ready_tx.send(Ok(HttpReadReady {
+            local_addr,
+            readers_identity,
+        }));
         let state = AppState {
             project_root,
             readers,
             instance_id,
         };
-        axum::serve(listener, router(state))
+        use std::future::IntoFuture;
+        let serve_future = axum::serve(listener, router(state))
             .with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
             })
-            .await
-            .context("serve HTTP read API")
+            .into_future();
+        run_serve_future(serve_future).await
     })
+}
+
+#[cfg(not(test))]
+async fn run_serve_future<F>(serve_future: F) -> Result<()>
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    serve_future.await.context("serve HTTP read API")
+}
+
+/// Test-only cooperative panic hook. Setting [`HTTP_THREAD_PANIC_TRIGGER`]
+/// to `true` causes the HTTP thread's `block_on` future to panic on its
+/// next 5 ms tick. The panic propagates up through `block_on`, the thread's
+/// `JoinHandle::join()` returns `Err(panic_payload)`, and
+/// `HttpReadServer::check_running` then surfaces `"HTTP read server thread
+/// panicked"` to the supervisor. This is the only path that still exercises
+/// the supervisor's runtime-internal-panic arm after `CatchPanicLayer` was
+/// introduced (which absorbs per-request handler panics into 500 envelopes).
+#[cfg(test)]
+pub(crate) static HTTP_THREAD_PANIC_TRIGGER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+async fn run_serve_future<F>(serve_future: F) -> Result<()>
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    tokio::select! {
+        () = panic_trigger_watcher() => unreachable!("panic_trigger_watcher must panic, not return"),
+        result = serve_future => result.context("serve HTTP read API"),
+    }
+}
+
+#[cfg(test)]
+async fn panic_trigger_watcher() {
+    loop {
+        if HTTP_THREAD_PANIC_TRIGGER.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            panic!("synthetic HTTP runtime panic for supervisor test");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 fn build_http_runtime() -> Result<tokio::runtime::Runtime> {
@@ -207,6 +289,7 @@ fn router(state: AppState) -> Router {
         .with_state(state)
         .layer(
             ServiceBuilder::new()
+                .layer(CatchPanicLayer::custom(catch_panic_response))
                 .layer(HandleErrorLayer::new(handle_middleware_error))
                 .layer(
                     TraceLayer::new_for_http()
@@ -235,12 +318,16 @@ async fn handle_middleware_error(err: BoxError) -> Response {
             "HTTP read API is overloaded",
         );
     }
-    tracing::error!(error = %err, "HTTP read API middleware failed");
-    json_error(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        ErrorCode::Internal,
-        "HTTP read API middleware failed",
-    )
+    // Refuse the wildcard: any middleware BoxError that is not enumerated above
+    // is a programming defect, not a recoverable condition. We panic with the
+    // full source chain in the payload; the outer `CatchPanicLayer` translates
+    // the panic into the standard 500 INTERNAL envelope so clients still get a
+    // structured response, while CI / tests surface the missing enumeration as
+    // a hard failure rather than a silent 500.
+    let error_chain = format_dyn_error_chain(&*err);
+    panic!(
+        "HTTP read API middleware produced an unhandled error type — enumerate it explicitly: {error_chain}"
+    );
 }
 
 #[derive(Debug, Deserialize)]
@@ -256,7 +343,7 @@ struct FileQuery {
 struct FileResponse {
     entity_id: String,
     content_hash: String,
-    canonical_path: String,
+    canonical_path: CanonicalProjectPath,
     language: String,
 }
 
@@ -280,6 +367,7 @@ enum ErrorCode {
     InvalidPath,
     PathOutsideProject,
     NotFound,
+    BriefingBlocked,
     StorageError,
     Internal,
 }
@@ -320,15 +408,11 @@ async fn get_file(
     match result {
         Ok(Some(file)) => {
             if let Some(reason) = file.briefing_blocked.as_deref() {
-                tracing::warn!(
-                    path = %file.canonical_path,
-                    reason = %reason,
-                    "HTTP /api/v1/files refusing to expose briefing-blocked entity"
-                );
+                log_briefing_blocked_refusal(file.canonical_path.as_str(), reason);
                 return json_error(
-                    StatusCode::NOT_FOUND,
-                    ErrorCode::NotFound,
-                    "file is not known to Clarion",
+                    StatusCode::FORBIDDEN,
+                    ErrorCode::BriefingBlocked,
+                    "entity is briefing-blocked and cannot be exposed",
                 );
             }
             let etag = file_etag(&file.content_hash);
@@ -478,6 +562,10 @@ fn classify_read_error(err: &StorageError) -> ReadError {
 }
 
 fn format_error_chain(err: &StorageError) -> String {
+    format_dyn_error_chain(err)
+}
+
+fn format_dyn_error_chain(err: &(dyn StdError + 'static)) -> String {
     let mut chain = vec![err.to_string()];
     let mut source = err.source();
     let mut depth = 0;
@@ -493,6 +581,16 @@ fn format_error_chain(err: &StorageError) -> String {
     chain.join(": caused by: ")
 }
 
+fn log_briefing_blocked_refusal(canonical_path: &str, reason: &str) {
+    tracing::dispatcher::with_default(&HTTP_ERROR_DISPATCH, || {
+        tracing::warn!(
+            path = %canonical_path,
+            reason = %reason,
+            "HTTP /api/v1/files refusing to expose briefing-blocked entity"
+        );
+    });
+}
+
 fn log_read_server_error(code: ErrorCode, status: StatusCode, err: &StorageError) {
     let error_chain = format_error_chain(err);
     tracing::dispatcher::with_default(&HTTP_ERROR_DISPATCH, || {
@@ -503,6 +601,25 @@ fn log_read_server_error(code: ErrorCode, status: StatusCode, err: &StorageError
             "HTTP /api/v1/files lookup failed"
         );
     });
+}
+
+#[allow(clippy::needless_pass_by_value)] // `ResponseForPanic` requires owned payload
+fn catch_panic_response(payload: Box<dyn std::any::Any + Send + 'static>) -> Response {
+    let detail = if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_owned()
+    };
+    tracing::dispatcher::with_default(&HTTP_ERROR_DISPATCH, || {
+        tracing::error!(panic = %detail, "HTTP read API handler panicked");
+    });
+    json_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ErrorCode::Internal,
+        "internal panic",
+    )
 }
 
 fn json_error(status: StatusCode, code: ErrorCode, message: &str) -> Response {
@@ -538,6 +655,7 @@ mod tests {
             shutdown: Some(shutdown_tx),
             failure_rx,
             join: Some(join),
+            readers_identity: Arc::new(()),
         };
 
         let err = server
@@ -627,5 +745,219 @@ mod tests {
         });
 
         assert_eq!(worker_name.as_deref(), Some("clarion-http-worker"));
+    }
+
+    #[test]
+    fn format_dyn_error_chain_walks_box_error_sources() {
+        #[derive(Debug)]
+        struct Inner;
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("inner cause")
+            }
+        }
+        impl StdError for Inner {}
+
+        #[derive(Debug)]
+        struct Outer(Inner);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("outer failure")
+            }
+        }
+        impl StdError for Outer {
+            fn source(&self) -> Option<&(dyn StdError + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let err: BoxError = Box::new(Outer(Inner));
+        let chain = format_dyn_error_chain(&*err);
+
+        assert_eq!(chain, "outer failure: caused by: inner cause");
+    }
+
+    #[test]
+    #[should_panic(expected = "unhandled error type")]
+    fn handle_middleware_error_refuses_unenumerated_box_error() {
+        #[derive(Debug)]
+        struct UnknownInner;
+        impl std::fmt::Display for UnknownInner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("inner unknown")
+            }
+        }
+        impl StdError for UnknownInner {}
+
+        #[derive(Debug)]
+        struct UnknownMiddlewareError(UnknownInner);
+        impl std::fmt::Display for UnknownMiddlewareError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("synthetic unknown middleware failure")
+            }
+        }
+        impl StdError for UnknownMiddlewareError {
+            fn source(&self) -> Option<&(dyn StdError + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let err: BoxError = Box::new(UnknownMiddlewareError(UnknownInner));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(handle_middleware_error(err));
+    }
+
+    #[test]
+    fn unknown_middleware_error_translated_to_internal_envelope_via_catch_panic() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::Request;
+        use std::convert::Infallible;
+        use std::pin::Pin;
+        use tower::{Layer, Service, ServiceExt};
+
+        #[derive(Debug)]
+        struct UnknownInjected;
+        impl std::fmt::Display for UnknownInjected {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("injected unknown middleware error")
+            }
+        }
+        impl StdError for UnknownInjected {}
+
+        #[derive(Clone)]
+        struct InjectUnknownErrorLayer;
+
+        impl<S> Layer<S> for InjectUnknownErrorLayer {
+            type Service = InjectUnknownErrorService<S>;
+            fn layer(&self, inner: S) -> Self::Service {
+                InjectUnknownErrorService { inner }
+            }
+        }
+
+        #[derive(Clone)]
+        #[allow(dead_code)] // `inner` is held to satisfy Layer wiring; this service short-circuits.
+        struct InjectUnknownErrorService<S> {
+            inner: S,
+        }
+
+        impl<S, B> Service<Request<B>> for InjectUnknownErrorService<S>
+        where
+            S: Service<Request<B>, Error = Infallible> + Send + 'static,
+            S::Future: Send + 'static,
+            B: Send + 'static,
+        {
+            type Response = S::Response;
+            type Error = BoxError;
+            type Future =
+                Pin<Box<dyn std::future::Future<Output = Result<Self::Response, BoxError>> + Send>>;
+
+            fn poll_ready(
+                &mut self,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<B>) -> Self::Future {
+                Box::pin(async { Err(BoxError::from(Box::new(UnknownInjected))) })
+            }
+        }
+
+        async fn never_called() -> Response {
+            unreachable!("inner handler must not run when middleware short-circuits")
+        }
+
+        let app: Router<()> = Router::new().route("/x", get(never_called)).layer(
+            ServiceBuilder::new()
+                .layer(CatchPanicLayer::custom(catch_panic_response))
+                .layer(HandleErrorLayer::new(handle_middleware_error))
+                .layer(InjectUnknownErrorLayer),
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let (status, body) = runtime.block_on(async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/x")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("oneshot response");
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 4096)
+                .await
+                .expect("read response body");
+            (status, bytes)
+        });
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("response body is JSON");
+        assert_eq!(parsed["error"], "internal panic");
+        assert_eq!(parsed["code"], "INTERNAL");
+    }
+
+    #[test]
+    fn catch_panic_response_returns_internal_envelope() {
+        let payload: Box<dyn std::any::Any + Send + 'static> =
+            Box::new("handler exploded".to_owned());
+
+        let response = catch_panic_response(payload);
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn catch_panic_layer_translates_handler_panic_to_internal_envelope() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        async fn boom() -> Response {
+            panic!("synthetic handler panic");
+        }
+
+        let app: Router<()> = Router::new().route("/boom", get(boom)).layer(
+            ServiceBuilder::new()
+                .layer(CatchPanicLayer::custom(catch_panic_response))
+                .layer(HandleErrorLayer::new(handle_middleware_error))
+                .layer(timeout::TimeoutLayer::new(Duration::from_secs(1))),
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let (status, body) = runtime.block_on(async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/boom")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("oneshot response");
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 4096)
+                .await
+                .expect("read response body");
+            (status, bytes)
+        });
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("response body is JSON");
+        assert_eq!(parsed["error"], "internal panic");
+        assert_eq!(parsed["code"], "INTERNAL");
     }
 }

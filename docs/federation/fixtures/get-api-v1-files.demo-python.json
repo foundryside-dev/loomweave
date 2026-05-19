@@ -3,7 +3,7 @@
     "contract": "clarion-http-read-api",
     "endpoint": "GET /api/v1/files",
     "api_version": 1,
-    "fixture_version": 2,
+    "fixture_version": 3,
     "stability": "normative",
     "authority": "Clarion ADR-014 federation registry-backend contract",
     "verification": "cargo test -p clarion-cli --test serve",
@@ -39,6 +39,8 @@
       "error_envelope": {
         "status_any": [
           400,
+          401,
+          403,
           404,
           500,
           503
@@ -53,6 +55,8 @@
               "INVALID_PATH",
               "PATH_OUTSIDE_PROJECT",
               "NOT_FOUND",
+              "BRIEFING_BLOCKED",
+              "UNAUTHORIZED",
               "STORAGE_ERROR",
               "INTERNAL"
             ]
@@ -128,6 +132,21 @@
         "body": {
           "error": "path is outside project root",
           "code": "PATH_OUTSIDE_PROJECT"
+        }
+      }
+    },
+    {
+      "name": "briefing_blocked_403",
+      "request": {
+        "method": "GET",
+        "path": "/api/v1/files?path=blocked.py&language=python"
+      },
+      "response": {
+        "status": 403,
+        "shape": "error_envelope",
+        "body": {
+          "error": "entity is briefing-blocked and cannot be exposed",
+          "code": "BRIEFING_BLOCKED"
         }
       }
     },

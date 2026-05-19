@@ -27,8 +27,9 @@ All non-2xx responses use this closed JSON error envelope:
 ```
 
 The initial `code` enum is closed to `INVALID_PATH`,
-`PATH_OUTSIDE_PROJECT`, `NOT_FOUND`, `STORAGE_ERROR`, and `INTERNAL`.
-Clients must switch on `code`; `error` is human-readable diagnostic text.
+`PATH_OUTSIDE_PROJECT`, `NOT_FOUND`, `BRIEFING_BLOCKED`, `UNAUTHORIZED`,
+`STORAGE_ERROR`, and `INTERNAL`. Clients must switch on `code`; `error`
+is human-readable diagnostic text.
 
 ### `GET /api/v1/files?path=&language=`
 
@@ -66,6 +67,16 @@ Semantics:
   guessing.
 - If no file-kind entity row exists for the path, Clarion returns
   `404` with `code: "NOT_FOUND"` instead of synthesizing a file ID.
+- If the file-kind entity row carries a `briefing_blocked` property (set
+  by the pre-ingest secret scanner or the unscanned-source defense-in-
+  depth path), Clarion returns `403` with
+  `code: "BRIEFING_BLOCKED"` and the response body
+  `{"error": "entity is briefing-blocked and cannot be exposed",
+  "code": "BRIEFING_BLOCKED"}`. The response does not include the
+  `entity_id`, `content_hash`, `canonical_path`, or `language` fields,
+  so Filigree must not infer file identity from a 403 envelope. Distinguish
+  this from `404 NOT_FOUND`, which means no entity row exists at all;
+  `403 BRIEFING_BLOCKED` confirms the file is known but withheld.
 
 The contract fixture at
 [`fixtures/get-api-v1-files.demo-python.json`](./fixtures/get-api-v1-files.demo-python.json)

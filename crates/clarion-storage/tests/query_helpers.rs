@@ -846,11 +846,11 @@ fn resolve_file_returns_none_briefing_blocked_for_clean_entity() {
         .expect("resolve_file")
         .expect("entity is known");
 
-    assert_eq!(resolved.canonical_path, "src/demo.py");
+    assert_eq!(resolved.canonical_path.as_str(), "src/demo.py");
     assert!(
-        !resolved.canonical_path.starts_with('/')
-            && !resolved.canonical_path.starts_with("./")
-            && !resolved.canonical_path.starts_with("../"),
+        !resolved.canonical_path.as_str().starts_with('/')
+            && !resolved.canonical_path.as_str().starts_with("./")
+            && !resolved.canonical_path.as_str().starts_with("../"),
         "canonical path must be project-relative POSIX: {:?}",
         resolved.canonical_path
     );
@@ -891,11 +891,11 @@ fn resolve_file_deleted_on_disk_but_cataloged_row_resolves() {
 
     assert_eq!(resolved.entity_id, "python:file:deleted");
     assert_eq!(resolved.content_hash, "hash-deleted");
-    assert_eq!(resolved.canonical_path, "src/deleted.py");
+    assert_eq!(resolved.canonical_path.as_str(), "src/deleted.py");
     assert!(
-        !resolved.canonical_path.starts_with('/')
-            && !resolved.canonical_path.starts_with("./")
-            && !resolved.canonical_path.starts_with("../"),
+        !resolved.canonical_path.as_str().starts_with('/')
+            && !resolved.canonical_path.as_str().starts_with("./")
+            && !resolved.canonical_path.as_str().starts_with("../"),
         "canonical path must be project-relative POSIX: {:?}",
         resolved.canonical_path
     );
@@ -931,7 +931,7 @@ fn resolve_file_catalog_entry_returns_missing_hash_without_reading_disk() {
 
     assert_eq!(entry.entity_id, "python:file:missing_hash");
     assert_eq!(entry.content_hash, None);
-    assert_eq!(entry.canonical_path, "src/missing-hash.py");
+    assert_eq!(entry.canonical_path.as_str(), "src/missing-hash.py");
     assert_eq!(entry.language, "python");
 }
 

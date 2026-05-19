@@ -26,9 +26,9 @@ pub use commands::{
 };
 pub use error::{Result, StorageError};
 pub use query::{
-    CallEdgeMatch, ContainedEntities, EntityRow, ModuleDependencyEdge, ReferenceDirection,
-    ReferenceEdgeMatch, ResolvedFile, ResolvedFileCatalogEntry, SubsystemMember,
-    UnresolvedCallSiteRow, call_edges_from, call_edges_targeting,
+    CallEdgeMatch, CanonicalProjectPath, ContainedEntities, EntityRow, ModuleDependencyEdge,
+    ReferenceDirection, ReferenceEdgeMatch, ResolvedFile, ResolvedFileCatalogEntry,
+    SubsystemMember, UnresolvedCallSiteRow, call_edges_from, call_edges_targeting,
     candidate_entities_for_unresolved_sites, child_entity_ids, contained_entity_ids,
     entity_at_line, entity_briefing_block_reason, entity_by_id, existing_entity_ids, find_entities,
     module_dependency_edges, normalize_source_path, reference_edges_for_entity, resolve_file,

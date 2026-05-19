@@ -49,7 +49,7 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
     let http_server = crate::http_read::spawn(
         http_project_root,
         readers.clone(),
-        instance_id,
+        instance_id.to_string(),
         &config.serve.http,
     )
     .context("start HTTP read API")?;

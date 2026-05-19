@@ -7,6 +7,7 @@
 //! connection.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use deadpool_sqlite::{Config, Pool, Runtime};
 
@@ -14,9 +15,17 @@ use crate::error::Result;
 use crate::pragma;
 
 /// A read-only connection pool backed by `deadpool-sqlite`.
+///
+/// `identity` is a per-`open()` Arc that survives every `Clone` of the
+/// `ReaderPool`. Two `ReaderPool` values share a `ReaderPool::identity`
+/// pointer if-and-only-if they were produced by `Clone`-ing the same
+/// original. Callers that need to *prove at runtime* that two pool handles
+/// are the same pool (rather than coincidentally pointing at the same
+/// file) use [`ReaderPool::shares_pool_with`].
 #[derive(Clone)]
 pub struct ReaderPool {
     pool: Pool,
+    identity: Arc<()>,
 }
 
 impl ReaderPool {
@@ -38,7 +47,26 @@ impl ReaderPool {
         let mut cfg = Config::new(db_path.as_ref());
         cfg.pool = Some(deadpool_sqlite::PoolConfig::new(max_size));
         let pool = cfg.create_pool(Runtime::Tokio1)?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            identity: Arc::new(()),
+        })
+    }
+
+    /// Borrow the per-pool identity tag. Two `ReaderPool` clones from the
+    /// same original return tags that satisfy `Arc::ptr_eq`; pools opened
+    /// independently do not.
+    #[must_use]
+    pub fn identity(&self) -> &Arc<()> {
+        &self.identity
+    }
+
+    /// Returns `true` iff `self` and `other` were produced by cloning the
+    /// same original `ReaderPool` (i.e. they share the same in-process pool
+    /// instance, not just the same backing file).
+    #[must_use]
+    pub fn shares_pool_with(&self, other: &ReaderPool) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity)
     }
 
     /// Acquire a reader and run a blocking closure on it.

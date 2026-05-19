@@ -1,13 +1,70 @@
 //! Read-side query helpers used by the MCP navigation surface.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use clarion_core::EdgeConfidence;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
+use serde::{Serialize, Serializer};
 
 use crate::{Result, StorageError};
+
+/// A path that is *proven* to be:
+///
+/// 1. anchored under the project root (no `..` / `/` / drive prefix),
+/// 2. composed solely of normal UTF-8 path components, and
+/// 3. emitted in POSIX-style (`/`-joined) form.
+///
+/// The inner string is private and `try_new` is the only public constructor,
+/// so a `CanonicalProjectPath` cannot exist without that proof. Serializes
+/// transparently as its inner string so federation wire formats are
+/// unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalProjectPath(String);
+
+impl CanonicalProjectPath {
+    /// Construct from a `normalized` absolute path under `project_root`.
+    /// `normalized` is expected to already be lexically + filesystem
+    /// canonicalised by the caller (see [`normalize_source_path`]); this
+    /// constructor proves the residual project-relative-POSIX shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::InvalidSourcePath`] when the path escapes
+    /// `project_root`, contains any non-`Normal` component, or is not
+    /// valid UTF-8.
+    pub fn try_new(project_root: &Path, normalized: &Path) -> Result<Self> {
+        Ok(Self(project_relative_path(project_root, normalized)?))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for CanonicalProjectPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for CanonicalProjectPath {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl AsRef<str> for CanonicalProjectPath {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntityRow {
@@ -79,7 +136,7 @@ pub struct ModuleDependencyEdge {
 pub struct ResolvedFile {
     pub entity_id: String,
     pub content_hash: String,
-    pub canonical_path: String,
+    pub canonical_path: CanonicalProjectPath,
     pub language: String,
     /// `Some(reason)` when the resolved entity carries a `briefing_blocked`
     /// property (set by the pre-ingest secret scanner or the unscanned-source
@@ -93,7 +150,7 @@ pub struct ResolvedFile {
 pub struct ResolvedFileCatalogEntry {
     pub entity_id: String,
     pub content_hash: Option<String>,
-    pub canonical_path: String,
+    pub canonical_path: CanonicalProjectPath,
     pub language: String,
     pub briefing_blocked: Option<String>,
     content_hash_path: PathBuf,
@@ -213,7 +270,7 @@ pub fn resolve_file_catalog_entry(
     let normalized = lookup_path
         .to_str()
         .ok_or_else(|| StorageError::InvalidSourcePath(format!("{file:?} is not valid UTF-8")))?;
-    let canonical_path = project_relative_path(project_root, &lookup_path)?;
+    let canonical_path = CanonicalProjectPath::try_new(project_root, &lookup_path)?;
     if let Some(entity) = source_entity_for_path(conn, normalized, Some("file"))? {
         let briefing_blocked = entity_briefing_block_reason(&entity.properties_json);
         return Ok(Some(ResolvedFileCatalogEntry {

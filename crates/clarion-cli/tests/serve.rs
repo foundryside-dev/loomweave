@@ -135,6 +135,7 @@ fn serve_http_responses_match_federation_fixture_contracts() {
     .expect("seed stable instance ID");
     seed_file_entity(dir.path());
     seed_storage_failure_file_entity(dir.path());
+    seed_briefing_blocked_file_entity(dir.path());
     let bind = free_loopback_bind();
     write_http_config(dir.path(), &bind);
 
@@ -142,6 +143,44 @@ fn serve_http_responses_match_federation_fixture_contracts() {
     validate_fixture_examples(&bind, &files_fixture, "get-api-v1-files.demo-python.json");
     validate_fixture_examples(&bind, &capabilities_fixture, "get-api-v1-capabilities.json");
     stop_serve(&mut child);
+}
+
+#[test]
+fn serve_http_files_endpoint_returns_briefing_blocked_for_blocked_entity() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    seed_briefing_blocked_file_entity(dir.path());
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+
+    let mut child = spawn_serve(dir.path());
+    let response =
+        wait_for_http_response(&bind, "/api/v1/files?path=blocked.py&language=python");
+    stop_serve(&mut child);
+    let response = response.expect("HTTP /api/v1/files briefing-blocked response");
+
+    assert_eq!(response.status_code, 403);
+    assert_eq!(response.body["code"], "BRIEFING_BLOCKED");
+    let error = response.body["error"]
+        .as_str()
+        .expect("briefing-blocked error has string message");
+    assert!(
+        error.to_ascii_lowercase().contains("briefing-blocked"),
+        "briefing-blocked message must mention the block: {error}"
+    );
+    assert!(
+        response.body.get("entity_id").is_none(),
+        "blocked responses must not leak the entity_id: {response:?}"
+    );
+    assert!(
+        response.body.get("content_hash").is_none(),
+        "blocked responses must not leak the content hash: {response:?}"
+    );
 }
 
 #[test]
@@ -1384,6 +1423,33 @@ fn seed_file_entity(project_root: &Path) -> (String, String, String) {
     )
     .expect("insert file entity");
     (file_id, content_hash, "demo.py".to_owned())
+}
+
+fn seed_briefing_blocked_file_entity(project_root: &Path) {
+    let source_path = project_root.join("blocked.py");
+    fs::write(&source_path, "secret = \"redacted\"\n").expect("write blocked source");
+    let canonical_path = source_path
+        .canonicalize()
+        .expect("canonical blocked path")
+        .display()
+        .to_string();
+    let db_path = project_root.join(".clarion/clarion.db");
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            'core:file:blocked.py', 'core', 'file',
+            'blocked.py', 'blocked.py', ?1,
+            1, 2,
+            '{\"briefing_blocked\":\"pre-ingest secret scan flagged this file\"}',
+            'hash-blocked',
+            '2026-05-19T00:00:00.000Z', '2026-05-19T00:00:00.000Z'
+         )",
+        params![canonical_path],
+    )
+    .expect("insert briefing-blocked file entity");
 }
 
 fn seed_storage_failure_file_entity(project_root: &Path) {
