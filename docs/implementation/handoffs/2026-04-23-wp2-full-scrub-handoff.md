@@ -80,9 +80,9 @@ Anchoring documents to read-with:
 - `docs/clarion/adr/ADR-021-plugin-authority-hybrid.md`
 - `docs/clarion/adr/ADR-022-core-plugin-ontology.md`
 - `docs/clarion/adr/ADR-023-tooling-baseline.md`
-- `docs/clarion/v0.1/requirements.md` — REQ / NFR / CON IDs WP2 addresses
-- `docs/clarion/v0.1/system-design.md` §§4–6 (host, plugin protocol, limits)
-- `docs/clarion/v0.1/detailed-design.md` §§4–5 (wire schemas, rule catalogues)
+- `docs/clarion/1.0/requirements.md` — REQ / NFR / CON IDs WP2 addresses
+- `docs/clarion/1.0/system-design.md` §§4–6 (host, plugin protocol, limits)
+- `docs/clarion/1.0/detailed-design.md` §§4–5 (wire schemas, rule catalogues)
 
 ## Open WP2 review-2 tail at session start
 

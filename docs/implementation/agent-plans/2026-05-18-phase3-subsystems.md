@@ -25,8 +25,8 @@ serde_norway, sha2 for ADR-006 subsystem hashes, a graph-clustering crate
 candidate qualified in Task 1, Python 3.11 AST extraction for import edges,
 pytest, mypy, ruff, cargo nextest, cargo-deny, and existing shell E2E scripts.
 
-**Spec:** ADR-006, ADR-003, ADR-022, `docs/clarion/v0.1/requirements.md`,
-`docs/clarion/v0.1/system-design.md`, and the Phase 3 handoff
+**Spec:** ADR-006, ADR-003, ADR-022, `docs/clarion/1.0/requirements.md`,
+`docs/clarion/1.0/system-design.md`, and the Phase 3 handoff
 `docs/superpowers/handoffs/2026-05-18-phase3-subsystems-handoff.md`.
 
 **Filigree umbrella:** `clarion-1dfeebfa36` (P1 work_package;
@@ -140,7 +140,7 @@ Direction: `member_module -> subsystem`. The MCP membership helper queries
 
 **Recommendation:** add a new `subsystem_members(id)` MCP tool rather than
 folding the behavior into `neighborhood`. Requirements already name
-`subsystem_members` (`docs/clarion/v0.1/requirements.md:365-371`), and a
+`subsystem_members` (`docs/clarion/1.0/requirements.md:365-371`), and a
 separate tool keeps the response schema narrow: subsystem metadata plus an
 ordered member list. `neighborhood` can later include subsystem links
 additively, but that should not be the only way to inspect a subsystem.

@@ -168,7 +168,7 @@ This is the bigger slice. WP3 builds an editable Python package at
 lock-ins:
 
 - **L7**: qualname reconstruction per
-  `docs/clarion/v0.1/detailed-design.md §§4–5` (module-level, nested,
+  `docs/clarion/1.0/detailed-design.md §§4–5` (module-level, nested,
   class, async, nested-class). Shared test fixture at
   `/fixtures/entity_id.json` must pass byte-for-byte in both Rust and
   Python — this is the L2+L7 alignment proof (A.3.4).
@@ -269,8 +269,8 @@ The scrub changed several surfaces that WP3 will touch:
 - `docs/clarion/adr/ADR-007-summary-cache-keying.md` — you'll produce
   `ontology_version` but not consume it yet
 - `docs/clarion/adr/ADR-023-tooling-baseline.md` — Python tooling gates
-- `docs/clarion/v0.1/detailed-design.md §§4–5` — qualname rules
-- `docs/clarion/v0.1/requirements.md` — REQ-/NFR- IDs WP3 addresses
+- `docs/clarion/1.0/detailed-design.md §§4–5` — qualname rules
+- `docs/clarion/1.0/requirements.md` — REQ-/NFR- IDs WP3 addresses
 
 ## Methodology
 

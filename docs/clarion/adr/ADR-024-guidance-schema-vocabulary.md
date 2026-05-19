@@ -173,6 +173,6 @@ Add the audit's findings to the glossary as `open` clashes; defer the schema cor
 - [Loom federation axiom](../../suite/loom.md) §3–§5 — the doctrine the glossary defends; the failure-test mode this ADR addresses is reader-side cross-product disambiguation cost.
 - `crates/clarion-storage/migrations/0001_initial_schema.sql:163-191` — the schema sites this ADR edits in place.
 - `crates/clarion-storage/tests/schema_apply.rs:138-169` — the test that documented the bug and is rewritten to test the corrected design.
-- `docs/clarion/v0.1/detailed-design.md:204, 270, 449, 453, 467, 471, 737-748` — the design-doc sites this ADR's renames touch.
-- `docs/clarion/v0.1/system-design.md:346, 675` — the system-level guidance composition references.
+- `docs/clarion/1.0/detailed-design.md:204, 270, 449, 453, 467, 471, 737-748` — the design-doc sites this ADR's renames touch.
+- `docs/clarion/1.0/system-design.md:346, 675` — the system-level guidance composition references.
 - Filigree issue `clarion-4cd11905e2` — the misframed bug whose triage produced this audit.

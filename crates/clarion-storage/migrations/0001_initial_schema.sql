@@ -1,7 +1,7 @@
 -- ============================================================================
 -- Clarion migration 0001 — initial schema.
 --
--- Source: docs/clarion/v0.1/detailed-design.md §3 (Storage Implementation).
+-- Source: docs/clarion/1.0/detailed-design.md §3 (Storage Implementation).
 -- Sprint 1 walking skeleton writes only to `entities` and `runs`, but every
 -- table, FTS5 virtual table, trigger, generated column, and view is created
 -- here so the full shape is frozen at L1-lock time. See ADR-011 for the

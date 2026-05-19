@@ -745,7 +745,7 @@ existing `summary_scope_deferred` check, since both are
 
 | Action | Path |
 |---|---|
-| modify | `docs/clarion/v0.1/detailed-design.md` (§5 rule catalogue) |
+| modify | `docs/clarion/1.0/detailed-design.md` (§5 rule catalogue) |
 
 #### Scope
 

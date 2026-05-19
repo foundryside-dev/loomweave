@@ -42,7 +42,7 @@ Out of scope (deliberate; flag for separate audit if useful):
 
 For each candidate concept:
 
-1. Locate every site in `docs/clarion/v0.1/{requirements,system-design,detailed-design}.md`,
+1. Locate every site in `docs/clarion/1.0/{requirements,system-design,detailed-design}.md`,
    `docs/clarion/adr/`, `crates/clarion-storage/migrations/0001_initial_schema.sql`,
    and any code path that reads/writes the column.
 2. Cross-reference Filigree's vocabulary via `filigree taxonomy` and
@@ -75,9 +75,9 @@ For each candidate concept:
 ## F-1: `priority` is the same word for two different things
 
 **Sites**:
-- Clarion: `docs/clarion/v0.1/detailed-design.md:453` — guidance entity
+- Clarion: `docs/clarion/1.0/detailed-design.md:453` — guidance entity
   property; values `"project" | "subsystem" | "package" | "module" | "class" | "function"`.
-- Clarion: `docs/clarion/v0.1/system-design.md:346` — same definition,
+- Clarion: `docs/clarion/1.0/system-design.md:346` — same definition,
   semantic ordering `project → subsystem → package → module → class → function`
   (outer-overrides-inner composition order).
 - Clarion schema: `crates/clarion-storage/migrations/0001_initial_schema.sql:163-165`
@@ -121,7 +121,7 @@ DB) or stack `0002_*.sql`? Decide once for the project.
 ## F-2: `critical` is the same word for two different things
 
 **Sites**:
-- Clarion: `docs/clarion/v0.1/detailed-design.md:467` — guidance entity
+- Clarion: `docs/clarion/1.0/detailed-design.md:467` — guidance entity
   `critical: bool` flag — semantics: "preserved across token-budget pressure"
   (i.e., do-not-drop).
 - Clarion: `detailed-design.md:449` — `tags: ["critical"]` literal as the
@@ -316,8 +316,8 @@ finding/guidance) plus the schema change and test fix into a single ADR-024
 ("Loom vocabulary discipline and guidance schema") and a single PR before
 Tier B starts. Touches:
 
-- `docs/clarion/v0.1/detailed-design.md` (multiple sites)
-- `docs/clarion/v0.1/system-design.md` (one site)
+- `docs/clarion/1.0/detailed-design.md` (multiple sites)
+- `docs/clarion/1.0/system-design.md` (one site)
 - `docs/clarion/adr/ADR-024-*.md` (new)
 - `crates/clarion-storage/migrations/0001_initial_schema.sql` (priority
   column + index; possibly add `0002_*.sql` instead — see migration policy

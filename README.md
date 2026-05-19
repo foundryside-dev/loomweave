@@ -88,12 +88,12 @@ crates/                 Rust workspace
 ├── clarion-cli/        The `clarion` binary (install, analyze, serve)
 └── clarion-mcp/        MCP server exposing the seven consult tools
 plugins/python/         Python language plugin (pyright-backed)
-docs/clarion/v0.1/      Design ladder — requirements → system-design → detailed-design
+docs/clarion/1.0/      Design ladder — requirements → system-design → detailed-design
 docs/clarion/adr/       Authored architecture decision records
 ```
 
 For the design ladder start at
-[docs/clarion/v0.1/README.md](docs/clarion/v0.1/README.md). The full ADR index
+[docs/clarion/1.0/README.md](docs/clarion/1.0/README.md). The full ADR index
 is at [docs/clarion/adr/README.md](docs/clarion/adr/README.md). The Loom
 federation doctrine that anchors every cross-product decision is in
 [docs/suite/loom.md](docs/suite/loom.md).

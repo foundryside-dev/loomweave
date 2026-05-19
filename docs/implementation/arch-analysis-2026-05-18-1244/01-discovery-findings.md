@@ -293,7 +293,7 @@ Authored ADRs span 001–031 with gaps (008–010, 019–020 are tracked as back
 
 ### 6.7 Top-level
 
-`docs/README.md` + `docs/clarion/README.md` + `docs/clarion/v0.1/README.md` + `docs/implementation/README.md` form the navigation tree.
+`docs/README.md` + `docs/clarion/README.md` + `docs/clarion/1.0/README.md` + `docs/implementation/README.md` form the navigation tree.
 
 ---
 

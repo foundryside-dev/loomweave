@@ -710,7 +710,7 @@ Write `/home/john/clarion/crates/clarion-storage/migrations/0001_initial_schema.
 -- ============================================================================
 -- Clarion migration 0001 — initial schema.
 --
--- Source: docs/clarion/v0.1/detailed-design.md §3 (Storage Implementation).
+-- Source: docs/clarion/1.0/detailed-design.md §3 (Storage Implementation).
 -- Sprint 1 walking skeleton writes only to `entities` and `runs`, but every
 -- table, FTS5 virtual table, trigger, generated column, index, and view
 -- is created here so the full shape is frozen at L1-lock time. See ADR-011
@@ -1612,7 +1612,7 @@ const CONFIG_JSON_STUB: &str = r#"{
 "#;
 
 const CLARION_YAML_STUB: &str = "# clarion.yaml — user-edited config.\n\
-# Full schema TBD; see docs/clarion/v0.1 design. Sprint 1 walking skeleton\n\
+# Full schema TBD; see docs/clarion/1.0 design. Sprint 1 walking skeleton\n\
 # ignores most fields. Do not delete this file: later versions will require\n\
 # it for model-tier mappings and analysis knobs.\n\
 version: 1\n";

@@ -219,7 +219,7 @@ Phase A must ship before Phase C can land an integration that does anything obse
 - Clarion ADR-029: `/home/john/clarion/docs/clarion/adr/ADR-029-entity-associations-binding.md`.
 - Clarion v0.1 plan §WP10: `/home/john/clarion/docs/implementation/v0.1-plan.md` (the cross-product work package this ADR fulfils).
 - Sprint 2 scope amendment (defer): `/home/john/clarion/docs/implementation/sprint-2/scope-amendment-2026-05.md`.
-- Clarion integration recon: `/home/john/clarion/docs/clarion/v0.1/reviews/pre-restructure/integration-recon.md` (auto-create paths and FK survey).
+- Clarion integration recon: `/home/john/clarion/docs/clarion/1.0/reviews/pre-restructure/integration-recon.md` (auto-create paths and FK survey).
 - Filigree auto-create paths (verified 2026-05-19):
   - `src/filigree/db_files.py:640` `_upsert_file_record`
   - `src/filigree/db_files.py:184` `register_file`
