@@ -1,4 +1,6 @@
+use std::error::Error as StdError;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::thread;
 
 use anyhow::{Context, Result, anyhow};
@@ -8,9 +10,18 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use clarion_mcp::config::HttpReadConfig;
-use clarion_storage::{ReaderPool, resolve_file};
+use clarion_storage::{ReaderPool, StorageError, resolve_file};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
+
+static HTTP_ERROR_DISPATCH: LazyLock<tracing::Dispatch> = LazyLock::new(|| {
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .with_ansi(false)
+        .finish();
+    tracing::Dispatch::new(subscriber)
+});
 
 #[derive(Debug)]
 pub struct HttpReadServer {
@@ -98,6 +109,7 @@ fn router(state: AppState) -> Router {
 
 #[derive(Debug, Deserialize)]
 struct FileQuery {
+    #[serde(default)]
     path: String,
     #[serde(default)]
     language: String,
@@ -121,12 +133,24 @@ struct CapabilitiesResponse {
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
+    code: ErrorCode,
+}
+
+#[derive(Debug, Copy, Clone, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ErrorCode {
+    InvalidPath,
+    PathOutsideProject,
+    NotFound,
+    StorageError,
+    Internal,
 }
 
 async fn get_file(State(state): State<AppState>, Query(query): Query<FileQuery>) -> Response {
     if query.path.trim().is_empty() {
         return json_error(
             StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidPath,
             "path query parameter must not be blank",
         );
     }
@@ -145,7 +169,11 @@ async fn get_file(State(state): State<AppState>, Query(query): Query<FileQuery>)
                     reason = %reason,
                     "HTTP /api/v1/files refusing to expose briefing-blocked entity"
                 );
-                return json_error(StatusCode::NOT_FOUND, "file is not known to Clarion");
+                return json_error(
+                    StatusCode::NOT_FOUND,
+                    ErrorCode::NotFound,
+                    "file is not known to Clarion",
+                );
             }
             (
                 StatusCode::OK,
@@ -158,8 +186,12 @@ async fn get_file(State(state): State<AppState>, Query(query): Query<FileQuery>)
             )
                 .into_response()
         }
-        Ok(None) => json_error(StatusCode::NOT_FOUND, "file is not known to Clarion"),
-        Err(err) => json_error(StatusCode::BAD_REQUEST, &err.to_string()),
+        Ok(None) => json_error(
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "file is not known to Clarion",
+        ),
+        Err(err) => json_read_error(err),
     }
 }
 
@@ -171,11 +203,95 @@ async fn get_capabilities() -> Json<CapabilitiesResponse> {
     })
 }
 
-fn json_error(status: StatusCode, message: &str) -> Response {
+fn json_read_error(err: StorageError) -> Response {
+    let error = classify_read_error(&err);
+    if error.status.is_server_error() {
+        log_read_server_error(error.code, error.status, &err);
+    }
+    json_error(error.status, error.code, error.message)
+}
+
+struct ReadError {
+    status: StatusCode,
+    code: ErrorCode,
+    message: &'static str,
+}
+
+fn classify_read_error(err: &StorageError) -> ReadError {
+    match err {
+        StorageError::InvalidQuery(_) => ReadError {
+            status: StatusCode::BAD_REQUEST,
+            code: ErrorCode::InvalidPath,
+            message: "path query parameter is invalid",
+        },
+        StorageError::InvalidSourcePath(_) => ReadError {
+            status: StatusCode::BAD_REQUEST,
+            code: ErrorCode::PathOutsideProject,
+            message: "path is outside project root",
+        },
+        StorageError::Pool(_) => ReadError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ErrorCode::StorageError,
+            message: "file lookup storage is unavailable",
+        },
+        StorageError::PoolInteract(_) => ReadError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: ErrorCode::Internal,
+            message: "internal file lookup failure",
+        },
+        StorageError::Sqlite(_)
+        | StorageError::PoolBuild(_)
+        | StorageError::PragmaInvariant(_)
+        | StorageError::Migration { .. }
+        | StorageError::Io(_) => ReadError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: ErrorCode::StorageError,
+            message: "file lookup failed",
+        },
+        StorageError::WriterGone
+        | StorageError::WriterProtocol(_)
+        | StorageError::WriterNoResponse => ReadError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: ErrorCode::Internal,
+            message: "internal file lookup failure",
+        },
+    }
+}
+
+fn format_error_chain(err: &StorageError) -> String {
+    let mut chain = vec![err.to_string()];
+    let mut source = err.source();
+    let mut depth = 0;
+    while let Some(err) = source {
+        if depth >= 8 {
+            chain.push("additional sources omitted".to_owned());
+            break;
+        }
+        chain.push(err.to_string());
+        source = err.source();
+        depth += 1;
+    }
+    chain.join(": caused by: ")
+}
+
+fn log_read_server_error(code: ErrorCode, status: StatusCode, err: &StorageError) {
+    let error_chain = format_error_chain(err);
+    tracing::dispatcher::with_default(&HTTP_ERROR_DISPATCH, || {
+        tracing::error!(
+            code = ?code,
+            status = status.as_u16(),
+            error_chain = %error_chain,
+            "HTTP /api/v1/files lookup failed"
+        );
+    });
+}
+
+fn json_error(status: StatusCode, code: ErrorCode, message: &str) -> Response {
     (
         status,
         Json(ErrorResponse {
             error: message.to_owned(),
+            code,
         }),
     )
         .into_response()

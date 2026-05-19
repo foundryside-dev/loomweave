@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -13,6 +13,12 @@ use clarion_core::{
 };
 use rusqlite::{Connection, params};
 use serde_json::Value;
+
+#[derive(Debug)]
+struct HttpJsonResponse {
+    status_code: u16,
+    body: Value,
+}
 
 fn clarion_bin() -> Command {
     Command::cargo_bin("clarion").expect("clarion binary")
@@ -113,6 +119,151 @@ fn serve_http_files_endpoint_resolves_known_file_on_configured_port() {
     assert_eq!(response["canonical_path"], canonical_path);
     assert_eq!(response["language"], "python");
     assert_eq!(response, fixture["response"]);
+}
+
+#[test]
+fn serve_http_files_blank_path_returns_invalid_path_envelope() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+
+    let mut child = spawn_serve(dir.path());
+    let response = wait_for_http_response(&bind, "/api/v1/files?path=&language=python");
+    stop_serve(&mut child);
+    let response = response.expect("HTTP /api/v1/files error response");
+
+    assert_eq!(response.status_code, 400);
+    assert_eq!(response.body["code"], "INVALID_PATH");
+    assert!(
+        response.body["error"].as_str().is_some(),
+        "error envelope must include a string message: {:?}",
+        response
+    );
+}
+
+#[test]
+fn serve_http_files_path_traversal_returns_outside_project_envelope() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+
+    let mut child = spawn_serve(dir.path());
+    let response =
+        wait_for_http_response(&bind, "/api/v1/files?path=../outside.py&language=python");
+    stop_serve(&mut child);
+    let response = response.expect("HTTP /api/v1/files error response");
+
+    assert_eq!(response.status_code, 400);
+    assert_eq!(response.body["code"], "PATH_OUTSIDE_PROJECT");
+    assert!(
+        response.body["error"].as_str().is_some(),
+        "error envelope must include a string message: {:?}",
+        response
+    );
+}
+
+#[test]
+fn serve_http_files_unknown_catalog_file_returns_not_found_envelope() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+
+    let mut child = spawn_serve(dir.path());
+    let response = wait_for_http_response(&bind, "/api/v1/files?path=missing.py&language=python");
+    stop_serve(&mut child);
+    let response = response.expect("HTTP /api/v1/files error response");
+
+    assert_eq!(response.status_code, 404);
+    assert_eq!(response.body["code"], "NOT_FOUND");
+    assert!(
+        response.body["error"].as_str().is_some(),
+        "error envelope must include a string message: {:?}",
+        response
+    );
+}
+
+#[test]
+fn serve_http_files_storage_failure_returns_closed_error_without_raw_detail() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+    let source_path = dir.path().join("missing-on-disk.py");
+    fs::write(&source_path, "def missing():\n    return 1\n").expect("write source");
+    let canonical_path = source_path
+        .canonicalize()
+        .expect("canonical source path")
+        .display()
+        .to_string();
+    let db_path = dir.path().join(".clarion/clarion.db");
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, created_at, updated_at
+         ) VALUES (
+            'core:file:missing-on-disk.py', 'core', 'file',
+            'missing-on-disk.py', 'missing-on-disk.py', ?1,
+            1, 2, '{}',
+            '2026-05-19T00:00:00.000Z', '2026-05-19T00:00:00.000Z'
+         )",
+        params![canonical_path],
+    )
+    .expect("insert file entity without cached hash");
+    drop(conn);
+    fs::remove_file(&source_path).expect("remove cataloged file to force storage failure");
+
+    let mut child = spawn_serve(dir.path());
+    let capabilities = wait_for_http_response(&bind, "/api/v1/_capabilities");
+    let response = wait_for_http_response(
+        &bind,
+        "/api/v1/files?path=missing-on-disk.py&language=python",
+    );
+    stop_serve(&mut child);
+    let capabilities = capabilities.expect("HTTP /api/v1/_capabilities response");
+    assert_eq!(capabilities.status_code, 200);
+    let response = response.expect("HTTP /api/v1/files storage error response");
+
+    assert!(
+        response.status_code == 500 || response.status_code == 503,
+        "storage failures must be 500-class: {:?}",
+        response
+    );
+    assert!(
+        response.body["code"] == "STORAGE_ERROR" || response.body["code"] == "INTERNAL",
+        "unexpected storage failure code: {:?}",
+        response
+    );
+    let body = response.body.to_string();
+    assert!(!body.to_ascii_lowercase().contains("sqlite"));
+    assert!(!body.contains("not a database"));
+    assert!(!body.contains("No such file"));
+    assert!(!body.contains("no such column"));
+    assert!(!body.contains("no such table"));
+    assert!(!body.contains(&dir.path().display().to_string()));
 }
 
 #[test]
@@ -667,11 +818,22 @@ fn stop_serve(child: &mut Child) {
 }
 
 fn wait_for_http_json(bind: &str, path: &str) -> Result<Value, String> {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let response = wait_for_http_response(bind, path)?;
+    if response.status_code != 200 {
+        return Err(format!(
+            "unexpected HTTP status {}; body: {}",
+            response.status_code, response.body
+        ));
+    }
+    Ok(response.body)
+}
+
+fn wait_for_http_response(bind: &str, path: &str) -> Result<HttpJsonResponse, String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
     let mut last_error = String::new();
     while Instant::now() < deadline {
-        match http_get_json(bind, path) {
-            Ok(value) => return Ok(value),
+        match http_get_response(bind, path) {
+            Ok(response) => return Ok(response),
             Err(err) => last_error = err,
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -679,31 +841,65 @@ fn wait_for_http_json(bind: &str, path: &str) -> Result<Value, String> {
     Err(last_error)
 }
 
-fn http_get_json(bind: &str, path: &str) -> Result<Value, String> {
+fn http_get_response(bind: &str, path: &str) -> Result<HttpJsonResponse, String> {
     let addr = bind
         .parse()
         .map_err(|err| format!("parse bind address {bind}: {err}"))?;
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(100))
         .map_err(|err| format!("connect to {bind}: {err}"))?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(1)))
+        .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|err| format!("set read timeout: {err}"))?;
     write!(
         stream,
         "GET {path} HTTP/1.1\r\nHost: {bind}\r\nConnection: close\r\n\r\n"
     )
     .map_err(|err| format!("write request: {err}"))?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|err| format!("read response: {err}"))?;
-    let (head, body) = response
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| format!("malformed HTTP response: {response}"))?;
-    if !head.starts_with("HTTP/1.1 200") {
-        return Err(format!(
-            "unexpected HTTP response head: {head}; body: {body}"
-        ));
+    let mut reader = std::io::BufReader::new(stream);
+    let mut status_line = String::new();
+    reader
+        .read_line(&mut status_line)
+        .map_err(|err| format!("read status line: {err}"))?;
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| format!("malformed HTTP status line: {status_line}"))?
+        .parse::<u16>()
+        .map_err(|err| format!("parse HTTP status from {status_line:?}: {err}"))?;
+    let mut content_length = None;
+    let mut header = String::new();
+    loop {
+        header.clear();
+        reader
+            .read_line(&mut header)
+            .map_err(|err| format!("read header: {err}"))?;
+        if header == "\r\n" || header == "\n" || header.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = header.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|err| format!("parse content-length from {header:?}: {err}"))?,
+            );
+        }
     }
-    serde_json::from_str(body).map_err(|err| format!("parse json body {body:?}: {err}"))
+    let mut body = String::new();
+    if let Some(content_length) = content_length {
+        let mut bytes = vec![0_u8; content_length];
+        reader
+            .read_exact(&mut bytes)
+            .map_err(|err| format!("read response body: {err}"))?;
+        body = String::from_utf8(bytes).map_err(|err| format!("response body is utf8: {err}"))?;
+    } else {
+        reader
+            .read_to_string(&mut body)
+            .map_err(|err| format!("read response body: {err}"))?;
+    }
+    let body =
+        serde_json::from_str(&body).map_err(|err| format!("parse json body {body:?}: {err}"))?;
+    Ok(HttpJsonResponse { status_code, body })
 }
