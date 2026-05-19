@@ -1,13 +1,147 @@
 {
-  "request": {
-    "method": "GET",
-    "path": "/api/v1/files?path=demo.py&language=python"
+  "_meta": {
+    "contract": "clarion-http-read-api",
+    "endpoint": "GET /api/v1/files",
+    "api_version": 1,
+    "fixture_version": 2,
+    "normative": true,
+    "updated": "2026-05-19",
+    "description": "Contract examples for Clarion file identity resolution consumed by Filigree registry backends."
   },
-  "response": {
-    "entity_id": "core:file:hash-demo@demo.py",
-    "content_hash": "hash-demo-file",
-    "canonical_path": "demo.py",
-    "language": "python"
-  }
+  "shape_decl": {
+    "kind": "clarion-http-fixture-shapes",
+    "shapes": {
+      "file_resolution": {
+        "status": 200,
+        "required_fields": {
+          "entity_id": {
+            "type": "adr003_file_entity_id"
+          },
+          "content_hash": {
+            "type": "non_empty_string"
+          },
+          "canonical_path": {
+            "type": "project_relative_path"
+          },
+          "language": {
+            "type": "non_empty_string"
+          }
+        },
+        "forbidden_fields": [
+          "error",
+          "code"
+        ],
+        "allow_extra_fields": false
+      },
+      "error_envelope": {
+        "status_any": [
+          400,
+          404,
+          500,
+          503
+        ],
+        "required_fields": {
+          "error": {
+            "type": "non_empty_string"
+          },
+          "code": {
+            "type": "non_empty_string",
+            "enum": [
+              "INVALID_PATH",
+              "PATH_OUTSIDE_PROJECT",
+              "NOT_FOUND",
+              "STORAGE_ERROR",
+              "INTERNAL"
+            ]
+          }
+        },
+        "forbidden_fields": [
+          "entity_id",
+          "content_hash",
+          "canonical_path",
+          "language"
+        ],
+        "allow_extra_fields": false
+      }
+    }
+  },
+  "examples": [
+    {
+      "name": "happy_path_200",
+      "request": {
+        "method": "GET",
+        "path": "/api/v1/files?path=demo.py&language=python"
+      },
+      "response": {
+        "status": 200,
+        "shape": "file_resolution",
+        "body": {
+          "entity_id": "core:file:demo.py",
+          "content_hash": "hash-demo-file",
+          "canonical_path": "demo.py",
+          "language": "python"
+        }
+      }
+    },
+    {
+      "name": "not_known_404",
+      "request": {
+        "method": "GET",
+        "path": "/api/v1/files?path=missing.py&language=python"
+      },
+      "response": {
+        "status": 404,
+        "shape": "error_envelope",
+        "body": {
+          "error": "file is not known to Clarion",
+          "code": "NOT_FOUND"
+        }
+      }
+    },
+    {
+      "name": "blank_path_400",
+      "request": {
+        "method": "GET",
+        "path": "/api/v1/files?path=&language=python"
+      },
+      "response": {
+        "status": 400,
+        "shape": "error_envelope",
+        "body": {
+          "error": "path query parameter must not be blank",
+          "code": "INVALID_PATH"
+        }
+      }
+    },
+    {
+      "name": "outside_root_400",
+      "request": {
+        "method": "GET",
+        "path": "/api/v1/files?path=../outside.py&language=python"
+      },
+      "response": {
+        "status": 400,
+        "shape": "error_envelope",
+        "body": {
+          "error": "path is outside project root",
+          "code": "PATH_OUTSIDE_PROJECT"
+        }
+      }
+    },
+    {
+      "name": "storage_error_500",
+      "request": {
+        "method": "GET",
+        "path": "/api/v1/files?path=missing-on-disk.py&language=python"
+      },
+      "response": {
+        "status": 500,
+        "shape": "error_envelope",
+        "body": {
+          "error": "file lookup failed",
+          "code": "STORAGE_ERROR"
+        }
+      }
+    }
+  ]
 }
-

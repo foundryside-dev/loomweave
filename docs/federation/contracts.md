@@ -67,10 +67,11 @@ Semantics:
 - If no file-kind entity row exists for the path, Clarion returns
   `404` with `code: "NOT_FOUND"` instead of synthesizing a file ID.
 
-The RC1 fixture at
+The contract fixture at
 [`fixtures/get-api-v1-files.demo-python.json`](./fixtures/get-api-v1-files.demo-python.json)
-still captures the pre-hardening response shape. It is intentionally not the
-normative contract for this section until the C3 fixture gate upgrades it.
+is normative for this section. It includes `_meta`, `shape_decl`, and examples
+for the happy path, not-known, blank path, outside-root, and storage-error
+responses.
 
 ### `GET /api/v1/_capabilities`
 
@@ -100,7 +101,7 @@ in `.clarion/instance_id`. Filigree should treat a changed `instance_id` for a
 previously known endpoint as evidence that it is now talking to a different
 Clarion project instance.
 
-The RC1 fixture at
+The contract fixture at
 [`fixtures/get-api-v1-capabilities.json`](./fixtures/get-api-v1-capabilities.json)
-still captures the pre-hardening response shape. It is intentionally not the
-normative contract for this section until the C3 fixture gate upgrades it.
+is normative for this section. Its shape declaration pins `api_version` and
+asserts that `instance_id` is a UUID; the example uses a seeded stable ID.

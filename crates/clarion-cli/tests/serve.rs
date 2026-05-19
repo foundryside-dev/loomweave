@@ -15,6 +15,8 @@ use rusqlite::{Connection, params};
 use serde_json::Value;
 use uuid::Uuid;
 
+const STABLE_INSTANCE_ID: &str = "9bd7234e-6d44-4a38-9ae4-76f912a10221";
+
 #[derive(Debug)]
 struct HttpJsonResponse {
     status_code: u16,
@@ -94,6 +96,39 @@ fn serve_stdio_initialize_round_trip() {
 }
 
 #[test]
+fn serve_http_responses_match_federation_fixture_contracts() {
+    let files_fixture = load_contract_fixture(
+        "get-api-v1-files.demo-python.json",
+        include_str!("../../../docs/federation/fixtures/get-api-v1-files.demo-python.json"),
+    );
+    let capabilities_fixture = load_contract_fixture(
+        "get-api-v1-capabilities.json",
+        include_str!("../../../docs/federation/fixtures/get-api-v1-capabilities.json"),
+    );
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    fs::write(
+        dir.path().join(".clarion/instance_id"),
+        format!("{STABLE_INSTANCE_ID}\n"),
+    )
+    .expect("seed stable instance ID");
+    seed_file_entity(dir.path());
+    seed_storage_failure_file_entity(dir.path());
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+
+    let mut child = spawn_serve(dir.path());
+    validate_fixture_examples(&bind, &files_fixture, "get-api-v1-files.demo-python.json");
+    validate_fixture_examples(&bind, &capabilities_fixture, "get-api-v1-capabilities.json");
+    stop_serve(&mut child);
+}
+
+#[test]
 fn serve_http_files_endpoint_resolves_known_file_on_configured_port() {
     let dir = tempfile::tempdir().expect("temp project");
     clarion_bin()
@@ -119,7 +154,7 @@ fn serve_http_files_endpoint_resolves_known_file_on_configured_port() {
     assert_eq!(response["content_hash"], content_hash);
     assert_eq!(response["canonical_path"], canonical_path);
     assert_eq!(response["language"], "python");
-    assert_eq!(response, fixture["response"]);
+    assert_eq!(&response, fixture_example_body(&fixture, "happy_path_200"));
 }
 
 #[test]
@@ -278,7 +313,7 @@ fn serve_http_capabilities_and_mcp_stdio_coexist() {
         .success();
     fs::write(
         dir.path().join(".clarion/instance_id"),
-        "9bd7234e-6d44-4a38-9ae4-76f912a10221\n",
+        format!("{STABLE_INSTANCE_ID}\n"),
     )
     .expect("seed stable instance ID");
     let bind = free_loopback_bind();
@@ -300,7 +335,10 @@ fn serve_http_capabilities_and_mcp_stdio_coexist() {
         "../../../docs/federation/fixtures/get-api-v1-capabilities.json"
     ))
     .expect("parse capabilities fixture");
-    assert_eq!(capabilities, fixture["response"]);
+    assert_eq!(
+        &capabilities,
+        fixture_example_body(&fixture, "capabilities_200")
+    );
 
     {
         let stdin = child.stdin.as_mut().expect("child stdin");
@@ -902,6 +940,285 @@ fn call_summary_through_serve(project_root: &Path) -> Value {
     serde_json::from_str(tool_text).expect("tool envelope")
 }
 
+fn load_contract_fixture(fixture_name: &str, source: &str) -> Value {
+    let fixture: Value = serde_json::from_str(source).expect("parse contract fixture");
+    assert!(
+        fixture.get("_meta").and_then(Value::as_object).is_some(),
+        "{fixture_name} missing top-level _meta object"
+    );
+    assert!(
+        fixture
+            .pointer("/shape_decl/shapes")
+            .and_then(Value::as_object)
+            .is_some(),
+        "{fixture_name} missing top-level shape_decl.shapes object"
+    );
+    let examples = fixture
+        .get("examples")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("{fixture_name} missing top-level examples array"));
+    assert!(
+        !examples.is_empty(),
+        "{fixture_name} must declare at least one example"
+    );
+    fixture
+}
+
+fn fixture_example_body<'a>(fixture: &'a Value, example_name: &str) -> &'a Value {
+    let examples = fixture
+        .get("examples")
+        .and_then(Value::as_array)
+        .expect("examples array");
+    examples
+        .iter()
+        .find(|example| example.get("name").and_then(Value::as_str) == Some(example_name))
+        .and_then(|example| example.pointer("/response/body"))
+        .unwrap_or_else(|| panic!("missing fixture example body {example_name}"))
+}
+
+fn validate_fixture_examples(bind: &str, fixture: &Value, fixture_name: &str) {
+    let shapes = fixture
+        .pointer("/shape_decl/shapes")
+        .and_then(Value::as_object)
+        .expect("shape_decl.shapes object");
+    let examples = fixture
+        .get("examples")
+        .and_then(Value::as_array)
+        .expect("examples array");
+    for example in examples {
+        let example_name = example
+            .get("name")
+            .and_then(Value::as_str)
+            .expect("example name");
+        let method = example
+            .pointer("/request/method")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("{fixture_name}:{example_name} missing request.method"));
+        assert_eq!(method, "GET", "{fixture_name}:{example_name} method");
+        let path = example
+            .pointer("/request/path")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("{fixture_name}:{example_name} missing request.path"));
+        let expected_status = example
+            .pointer("/response/status")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("{fixture_name}:{example_name} missing response.status"));
+        let expected_body = example
+            .pointer("/response/body")
+            .unwrap_or_else(|| panic!("{fixture_name}:{example_name} missing response.body"));
+        let shape_name = example
+            .pointer("/response/shape")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("{fixture_name}:{example_name} missing response.shape"));
+
+        let response = wait_for_http_response(bind, path).unwrap_or_else(|err| {
+            panic!("{fixture_name}:{example_name} HTTP request failed: {err}")
+        });
+
+        assert_eq!(
+            u64::from(response.status_code),
+            expected_status,
+            "{fixture_name}:{example_name} status mismatch"
+        );
+        let shape = shapes
+            .get(shape_name)
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("{fixture_name}:{example_name} missing shape {shape_name}"));
+        assert_status_allowed(shape, response.status_code, fixture_name, example_name);
+        assert_body_matches_shape(
+            shape,
+            &response.body,
+            fixture_name,
+            example_name,
+            shape_name,
+        );
+        assert_normative_example_fields(
+            &response.body,
+            expected_body,
+            shape_name,
+            fixture_name,
+            example_name,
+        );
+    }
+}
+
+fn assert_normative_example_fields(
+    actual: &Value,
+    expected: &Value,
+    shape_name: &str,
+    fixture_name: &str,
+    example_name: &str,
+) {
+    if shape_name == "error_envelope" {
+        assert_eq!(
+            actual.get("code"),
+            expected.get("code"),
+            "{fixture_name}:{example_name} error code mismatch"
+        );
+        return;
+    }
+    assert_eq!(
+        actual, expected,
+        "{fixture_name}:{example_name} body mismatch"
+    );
+}
+
+fn assert_status_allowed(
+    shape: &serde_json::Map<String, Value>,
+    status_code: u16,
+    fixture_name: &str,
+    example_name: &str,
+) {
+    if let Some(status) = shape.get("status").and_then(Value::as_u64) {
+        assert_eq!(
+            status,
+            u64::from(status_code),
+            "{fixture_name}:{example_name} status is not allowed by shape"
+        );
+        return;
+    }
+    let allowed = shape
+        .get("status_any")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("{fixture_name}:{example_name} shape missing status/status_any"));
+    assert!(
+        allowed
+            .iter()
+            .any(|candidate| candidate.as_u64() == Some(u64::from(status_code))),
+        "{fixture_name}:{example_name} status {status_code} is not in status_any {allowed:?}"
+    );
+}
+
+fn assert_body_matches_shape(
+    shape: &serde_json::Map<String, Value>,
+    body: &Value,
+    fixture_name: &str,
+    example_name: &str,
+    shape_name: &str,
+) {
+    let body = body
+        .as_object()
+        .unwrap_or_else(|| panic!("{fixture_name}:{example_name} body is not an object"));
+    let required_fields = shape
+        .get("required_fields")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| {
+            panic!("{fixture_name}:{example_name} shape {shape_name} missing required_fields")
+        });
+    for (field, field_decl) in required_fields {
+        let value = body
+            .get(field)
+            .unwrap_or_else(|| panic!("{fixture_name}:{example_name} missing field {field}"));
+        assert_value_matches_decl(value, field_decl, fixture_name, example_name, field);
+    }
+    if let Some(forbidden_fields) = shape.get("forbidden_fields").and_then(Value::as_array) {
+        for field in forbidden_fields {
+            let field = field.as_str().unwrap_or_else(|| {
+                panic!("{fixture_name}:{example_name} forbidden field entry is not a string")
+            });
+            assert!(
+                !body.contains_key(field),
+                "{fixture_name}:{example_name} field {field} is forbidden by {shape_name}"
+            );
+        }
+    }
+    let allow_extra_fields = shape
+        .get("allow_extra_fields")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !allow_extra_fields {
+        for field in body.keys() {
+            assert!(
+                required_fields.contains_key(field),
+                "{fixture_name}:{example_name} unexpected field {field}"
+            );
+        }
+    }
+}
+
+fn assert_value_matches_decl(
+    value: &Value,
+    field_decl: &Value,
+    fixture_name: &str,
+    example_name: &str,
+    field: &str,
+) {
+    if let Some(expected) = field_decl.get("const") {
+        assert_eq!(
+            value, expected,
+            "{fixture_name}:{example_name} field {field} const mismatch"
+        );
+    }
+    if let Some(allowed) = field_decl.get("enum").and_then(Value::as_array) {
+        assert!(
+            allowed.iter().any(|candidate| candidate == value),
+            "{fixture_name}:{example_name} field {field} value {value:?} not in {allowed:?}"
+        );
+    }
+    let type_name = field_decl
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("{fixture_name}:{example_name} field {field} missing type"));
+    match type_name {
+        "boolean" => {
+            assert!(
+                value.as_bool().is_some(),
+                "{fixture_name}:{example_name} field {field} is not a boolean"
+            );
+        }
+        "integer" => {
+            assert!(
+                value.as_i64().is_some() || value.as_u64().is_some(),
+                "{fixture_name}:{example_name} field {field} is not an integer"
+            );
+        }
+        "non_empty_string" => {
+            let value = value.as_str().unwrap_or_else(|| {
+                panic!("{fixture_name}:{example_name} field {field} is not a string")
+            });
+            assert!(
+                !value.is_empty(),
+                "{fixture_name}:{example_name} field {field} is empty"
+            );
+        }
+        "uuid" => {
+            let value = value.as_str().unwrap_or_else(|| {
+                panic!("{fixture_name}:{example_name} field {field} is not a string")
+            });
+            Uuid::parse_str(value)
+                .unwrap_or_else(|err| panic!("{fixture_name}:{example_name} invalid UUID: {err}"));
+        }
+        "adr003_file_entity_id" => {
+            let value = value.as_str().unwrap_or_else(|| {
+                panic!("{fixture_name}:{example_name} field {field} is not a string")
+            });
+            assert!(
+                value
+                    .strip_prefix("core:file:")
+                    .is_some_and(|qualified_name| {
+                        !qualified_name.is_empty()
+                            && !qualified_name.contains('@')
+                            && !qualified_name.contains('\\')
+                    }),
+                "{fixture_name}:{example_name} field {field} is not an ADR-003 file ID"
+            );
+        }
+        "project_relative_path" => {
+            let value = value.as_str().unwrap_or_else(|| {
+                panic!("{fixture_name}:{example_name} field {field} is not a string")
+            });
+            assert!(
+                !value.is_empty()
+                    && !value.starts_with('/')
+                    && !value.starts_with("./")
+                    && !value.contains('\\'),
+                "{fixture_name}:{example_name} field {field} is not a project-relative path"
+            );
+        }
+        other => panic!("{fixture_name}:{example_name} unknown field type {other} for {field}"),
+    }
+}
+
 fn seed_file_entity(project_root: &Path) -> (String, String, String) {
     let source_path = project_root.join("demo.py");
     fs::write(&source_path, "def entry():\n    return 1\n").expect("write source");
@@ -911,7 +1228,7 @@ fn seed_file_entity(project_root: &Path) -> (String, String, String) {
         .display()
         .to_string();
     let content_hash = "hash-demo-file".to_owned();
-    let file_id = "core:file:hash-demo@demo.py".to_owned();
+    let file_id = "core:file:demo.py".to_owned();
     let db_path = project_root.join(".clarion/clarion.db");
     let conn = Connection::open(&db_path).expect("open sqlite");
     conn.execute(
@@ -927,6 +1244,33 @@ fn seed_file_entity(project_root: &Path) -> (String, String, String) {
     )
     .expect("insert file entity");
     (file_id, content_hash, "demo.py".to_owned())
+}
+
+fn seed_storage_failure_file_entity(project_root: &Path) {
+    let source_path = project_root.join("missing-on-disk.py");
+    fs::write(&source_path, "def missing():\n    return 1\n").expect("write source");
+    let canonical_path = source_path
+        .canonicalize()
+        .expect("canonical source path")
+        .display()
+        .to_string();
+    let db_path = project_root.join(".clarion/clarion.db");
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, created_at, updated_at
+         ) VALUES (
+            'core:file:missing-on-disk.py', 'core', 'file',
+            'missing-on-disk.py', 'missing-on-disk.py', ?1,
+            1, 2, '{}',
+            '2026-05-19T00:00:00.000Z', '2026-05-19T00:00:00.000Z'
+         )",
+        params![canonical_path],
+    )
+    .expect("insert file entity without cached hash");
+    drop(conn);
+    fs::remove_file(&source_path).expect("remove cataloged file to force storage failure");
 }
 
 fn free_loopback_bind() -> String {
