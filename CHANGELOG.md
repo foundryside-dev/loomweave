@@ -121,9 +121,11 @@ normative.
 - Design ladder under [`docs/clarion/1.0/`](docs/clarion/1.0/) — `requirements.md`,
   `system-design.md`, `detailed-design.md`.
 - ADRs under [`docs/clarion/adr/`](docs/clarion/adr/) — 28 Accepted at 1.0
-  (through ADR-033). ADR-008 is superseded by ADR-014; four ADRs
-  (ADR-009, ADR-010, ADR-019, ADR-020) remain Backlog and are tracked
-  inside `system-design.md` §12 / `detailed-design.md` §11 until promoted.
+  (through ADR-034). ADR-012 is superseded by ADR-014, whose Security
+  Posture and Error Envelope are in turn partially extended by ADR-034
+  for the Sprint 3 federation hardening. Four ADRs (ADR-009, ADR-010,
+  ADR-019, ADR-020) remain Backlog and are tracked inside
+  `system-design.md` §12 / `detailed-design.md` §11 until promoted.
 - Loom-suite doctrine at [`docs/suite/loom.md`](docs/suite/loom.md).
 - Federation contract surface at [`docs/federation/contracts.md`](docs/federation/contracts.md).
 - Operator guides under [`docs/operator/`](docs/operator/) — getting-started,

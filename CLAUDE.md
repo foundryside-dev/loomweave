@@ -97,7 +97,7 @@ docs/
 
 When the same fact appears in multiple files, this is the precedence:
 
-1. **Accepted ADRs** in `docs/clarion/adr/` — the locked decisions. 28 are Accepted at 1.0; four remain Backlog (ADR-009, ADR-010, ADR-019, ADR-020) and are tracked inside `system-design.md` §12 / `detailed-design.md` §11 until promoted. ADR-008 was superseded by ADR-014.
+1. **Accepted ADRs** in `docs/clarion/adr/` — the locked decisions. 28 are Accepted at 1.0 (ADR-001…ADR-007, ADR-011, ADR-013…ADR-018, ADR-021…ADR-034); four remain Backlog (ADR-009, ADR-010, ADR-019, ADR-020) and are tracked inside `system-design.md` §12 / `detailed-design.md` §11 until promoted. ADR-012 was superseded by ADR-014 (which is in turn partially extended by ADR-034 for the federation read-API security posture and error envelope).
 2. **`requirements.md`** — REQ-/NFR-/CON-/NG- IDs are stable and load-bearing (filigree issues and commit messages cite them by ID; never reuse a retired ID).
 3. **`system-design.md`** — `Addresses:` headers on each §2–§11 section define the requirement acceptance surface for that subsystem.
 4. **`detailed-design.md`** — exact schemas, rule catalogues, appendices.

@@ -57,6 +57,9 @@ jobs:
           python scripts/check-migration-retirement.py --self-test
           python scripts/check-migration-retirement.py
 
+      - name: cross-workspace version lockstep
+        run: python scripts/check-workspace-version-lockstep.py
+
       - name: rust clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 

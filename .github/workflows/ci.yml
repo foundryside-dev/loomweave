@@ -34,6 +34,9 @@ jobs:
           python scripts/check-migration-retirement.py --self-test
           python scripts/check-migration-retirement.py
 
+      - name: cross-workspace version lockstep
+        run: python scripts/check-workspace-version-lockstep.py
+
       - name: clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -52,6 +55,8 @@ jobs:
 
       - name: doc
         run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
 
       - name: install cargo-deny
         uses: taiki-e/install-action@cargo-deny
