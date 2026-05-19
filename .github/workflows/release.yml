@@ -1,19 +1,18 @@
 name: Release
 
 # Per ADR-033 — pushed tags matching v* trigger a multi-platform binary build
-# plus Python plugin sdist, attached to a GitHub Release.
+# plus Python plugin sdist, attached to a GitHub Release. Build jobs run only
+# after the `verify` gate (mirroring ci.yml) is green, so a broken commit
+# cannot publish a Release with `draft: false`.
 on:
   push:
     tags:
       - "v*"
-  # Manual dispatch lets us produce pre-release artifacts (e.g. v1.0.0-rc1)
-  # without pushing a tag for full validation of the workflow.
+  # Manual dispatch produces build artifacts on the workflow run for inspection.
+  # The `release` job is gated on event_name == 'push', so workflow_dispatch
+  # never publishes a public Release — it only validates that the build/verify
+  # plumbing is healthy before a tag push.
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Pre-release tag name (used as the GH Release name; e.g. v1.0.0-rc1)"
-        required: true
-        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,7 +22,98 @@ permissions:
   contents: write
 
 jobs:
+  verify:
+    # Pre-release gate: must mirror ci.yml so a broken commit cannot reach the
+    # build/publish jobs. Duplicated rather than refactored into a reusable
+    # workflow on the eve of 1.0; that refactor is post-release scope.
+    name: Verify (pre-release gates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-verify
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: cache pyright runtime
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pyright-python/
+          key: pyright-python-1.1.409-${{ runner.os }}
+
+      - name: rust fmt
+        run: cargo fmt --all -- --check
+
+      - name: migration retirement guard
+        run: |
+          python scripts/check-migration-retirement.py --self-test
+          python scripts/check-migration-retirement.py
+
+      - name: rust clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: install cargo-nextest
+        uses: taiki-e/install-action@cargo-nextest
+
+      - name: rust build workspace bins
+        run: cargo build --workspace --bins
+
+      - name: rust nextest
+        run: cargo nextest run --workspace --all-features --no-tests=pass
+
+      - name: rust doc
+        run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+      - name: install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
+      - name: cargo deny
+        run: cargo deny check
+
+      - name: check B.4* gate result freshness
+        run: python scripts/check-b4-gate-result.py
+
+      - name: check Python ontology version lockstep
+        run: |
+          python scripts/check-python-ontology-version.py --self-test
+          python scripts/check-python-ontology-version.py
+
+      - name: install plugin (dev extras)
+        run: python -m pip install -e 'plugins/python[dev]'
+
+      - name: ruff check
+        run: ruff check plugins/python
+
+      - name: ruff format check
+        run: ruff format --check plugins/python
+
+      - name: mypy
+        run: mypy --strict plugins/python
+
+      - name: pytest
+        run: pytest plugins/python
+
+      - name: install sqlite3 cli
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends sqlite3
+
+      - name: walking skeleton (end-to-end)
+        run: bash tests/e2e/sprint_1_walking_skeleton.sh
+
+      - name: WP5 secret scanner smoke
+        run: CARGO_BUILD=0 bash tests/e2e/wp5_secret_scan.sh
+
   build-rust:
+    needs: [verify]
     name: Build clarion (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -61,7 +151,13 @@ jobs:
           if [ -f LICENSE ]; then cp LICENSE "$STAGE/"; fi
           ARCHIVE="$STAGE.tar.gz"
           tar czf "$ARCHIVE" "$STAGE"
-          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+          # Portable across the runner matrix: macOS images ship `shasum`, not
+          # GNU `sha256sum`. Both emit the same `<hex>  <filename>` line.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+          else
+            shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+          fi
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
@@ -74,6 +170,7 @@ jobs:
           retention-days: 7
 
   build-plugin:
+    needs: [verify]
     name: Build Python plugin sdist
     runs-on: ubuntu-latest
     steps:
@@ -148,6 +245,18 @@ jobs:
         run: |
           set -euo pipefail
           PREV="${{ steps.prev.outputs.previous }}"
+          # Derive the actual sdist filename from the staged artifact rather
+          # than hard-coding it: PEP 625 (and the hatchling build backend)
+          # normalize the project name and embed the version, so any version
+          # bump or normalization-rule change would invalidate a literal URL.
+          # `|| true` so `set -e` does not abort the script when the glob
+          # is empty — we want to fall through to the explicit error below.
+          SDIST_PATH=$(ls release/clarion[-_]plugin[-_]python*.tar.gz 2>/dev/null | head -n1 || true)
+          if [ -z "$SDIST_PATH" ]; then
+            echo "::error::no Python plugin sdist found in release/ — refusing to publish notes with a broken install link" >&2
+            exit 1
+          fi
+          SDIST_NAME=$(basename "$SDIST_PATH")
           {
             echo "## Clarion ${GITHUB_REF_NAME}"
             echo ""
@@ -163,7 +272,7 @@ jobs:
             echo "install clarion-x86_64-unknown-linux-gnu/clarion ~/.local/bin/"
             echo ""
             echo "pipx install \\"
-            echo "  https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/clarion-plugin-python-1.0.0.tar.gz"
+            echo "  https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${SDIST_NAME}"
             echo "\`\`\`"
             echo ""
             echo "Full walkthrough: [docs/operator/getting-started.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/docs/operator/getting-started.md)."
