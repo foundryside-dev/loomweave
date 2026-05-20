@@ -268,7 +268,7 @@ def check_governance(
     active_rulesets = [
         repository_ruleset_detail(request_json, repository, item)
         for item in rule_summaries
-        if item.get("enforcement") != "disabled" and ruleset_targets_branch(item, branch)
+        if item.get("enforcement") == "active" and ruleset_targets_branch(item, branch)
     ]
 
     protected_path_ok = False
@@ -471,6 +471,48 @@ def run_self_test() -> None:
         assert "do not require both pull-request flow and the release CI checks" in str(exc)
     else:
         raise AssertionError("weak ruleset fixture should fail")
+
+    responses["/repos/acme/clarion/rulesets"] = ApiResponse(
+        200,
+        [
+            {
+                "id": 44,
+                "name": "evaluating release gate",
+                "target": "branch",
+                "enforcement": "evaluate",
+                "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
+            }
+        ],
+    )
+    responses["/repos/acme/clarion/rulesets/44"] = ApiResponse(
+        200,
+        {
+            "id": 44,
+            "name": "evaluating release gate",
+            "target": "branch",
+            "enforcement": "evaluate",
+            "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
+            "rules": [
+                {"type": "pull_request", "parameters": {"required_approving_review_count": 0}},
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "required_status_checks": [
+                            {"context": "Rust"},
+                            {"context": "Python plugin"},
+                            {"context": "Sprint 1 walking skeleton (end-to-end)"},
+                        ]
+                    },
+                },
+            ],
+        },
+    )
+    try:
+        check_governance(fake_get, "acme/clarion", "main")
+    except CheckError as exc:
+        assert "no branch protection" in str(exc)
+    else:
+        raise AssertionError("evaluate-mode ruleset fixture should fail")
 
     responses["/repos/acme/clarion/rulesets"] = ApiResponse(
         200,
