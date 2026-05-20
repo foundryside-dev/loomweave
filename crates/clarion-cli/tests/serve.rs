@@ -1781,9 +1781,7 @@ fn validate_fixture_examples(bind: &str, fixture: &Value, fixture_name: &str) {
             "POST" => {
                 let body = example
                     .pointer("/request/body")
-                    .unwrap_or_else(|| {
-                        panic!("{fixture_name}:{example_name} missing request.body")
-                    })
+                    .unwrap_or_else(|| panic!("{fixture_name}:{example_name} missing request.body"))
                     .to_string();
                 wait_for_http_post_json(bind, path, &body, &[]).unwrap_or_else(|err| {
                     panic!("{fixture_name}:{example_name} HTTP POST request failed: {err}")

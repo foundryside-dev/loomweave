@@ -109,12 +109,12 @@ normative.
   Clarion-generated findings into Filigree's intake (WP9-B) is deferred per
   the [Sprint 2 scope amendment](docs/implementation/sprint-2/scope-amendment-2026-05.md).
   `issues_for(id)` (the WP9-A binding for reading from Filigree) ships in 1.0.
-- **HTTP file language inference** uses stored plugin identity plus a narrow
-  core-extension fallback; persistent manifest language registry on the
-  `/api/v1/files` read path is deferred post-1.0.
-- **Cooperative HMAC inbound auth** is post-1.0; bearer tokens are the
-  documented v1.0 wire surface and are forward-compatible with HMAC via the
-  same `Authorization:` header carrier.
+- **HTTP file language inference** uses persisted plugin manifest language when
+  available, with a narrow core-extension fallback for files that predate
+  manifest capture.
+- **Cooperative HMAC inbound auth** ships for the HTTP read API via
+  `serve.http.identity_token_env` and `X-Loom-Component: clarion:<hmac>`.
+  The older bearer-token path remains available for compatibility.
 
 ### Documentation
 
