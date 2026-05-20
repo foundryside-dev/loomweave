@@ -120,6 +120,13 @@ Do not introduce new cross-product coupling to make an implementation easier.
 If a sibling integration becomes necessary for semantics, stop and reconcile the
 design with the Loom doctrine before coding.
 
+Use focused subagents when they materially improve confidence or throughput.
+For release reviews, broad audits, multi-surface debugging, and independent
+implementation slices, split the work by boundary and dispatch subagents without
+asking for another permission round. Keep each subagent prompt self-contained,
+give it a narrow scope, avoid overlapping write sets, and integrate its findings
+against the live tree before reporting or closing work.
+
 ## Verification Gates
 
 ADR-023 sets the CI floor. Run the narrowest useful gate while iterating, then
