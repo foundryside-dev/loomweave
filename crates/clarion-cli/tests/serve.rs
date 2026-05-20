@@ -122,6 +122,10 @@ fn serve_http_responses_match_federation_fixture_contracts() {
         "get-api-v1-capabilities.json",
         include_str!("../../../docs/federation/fixtures/get-api-v1-capabilities.json"),
     );
+    let files_resolve_fixture = load_contract_fixture(
+        "post-api-v1-files-resolve.batch.json",
+        include_str!("../../../docs/federation/fixtures/post-api-v1-files-resolve.batch.json"),
+    );
     let dir = tempfile::tempdir().expect("temp project");
     clarion_bin()
         .args(["install", "--path"])
@@ -142,6 +146,11 @@ fn serve_http_responses_match_federation_fixture_contracts() {
 
     let mut child = spawn_serve(dir.path());
     validate_fixture_examples(&bind, &files_fixture, "get-api-v1-files.demo-python.json");
+    validate_fixture_examples(
+        &bind,
+        &files_resolve_fixture,
+        "post-api-v1-files-resolve.batch.json",
+    );
     validate_fixture_examples(&bind, &capabilities_fixture, "get-api-v1-capabilities.json");
     stop_serve(&mut child);
 }
@@ -800,6 +809,107 @@ fn serve_http_batch_endpoint_resolves_mixed_paths() {
     assert_eq!(outside["code"], "PATH_OUTSIDE_PROJECT");
     let blank = by_path.get("  ").expect("blank-path error entry");
     assert_eq!(blank["code"], "INVALID_PATH");
+}
+
+#[test]
+fn serve_http_files_resolve_endpoint_returns_per_path_results() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    seed_file_entity(dir.path());
+    seed_briefing_blocked_file_entity(dir.path());
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+
+    let mut child = spawn_serve(dir.path());
+    let body = serde_json::json!({
+        "paths": [
+            {"path": "demo.py", "language": "python"},
+            {"path": "missing.py"},
+            {"path": "blocked.py", "language": "python"},
+            {"path": "../escapes.py", "language": "python"},
+            {"path": "  "}
+        ]
+    })
+    .to_string();
+    let response = wait_for_http_post_json(&bind, "/api/v1/files:resolve", &body, &[]);
+    stop_serve(&mut child);
+    let response = response.expect("files:resolve response");
+
+    assert_eq!(response.status_code, 200);
+    let results = response.body["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 5, "{response:?}");
+
+    assert_eq!(results[0]["path"], "demo.py");
+    assert_eq!(results[0]["response"]["status"], "resolved");
+    assert_eq!(
+        results[0]["response"]["body"]["entity_id"],
+        "core:file:demo.py"
+    );
+    assert_eq!(
+        results[0]["response"]["body"]["content_hash"],
+        "hash-demo-file"
+    );
+    assert_eq!(results[0]["response"]["body"]["canonical_path"], "demo.py");
+    assert_eq!(results[0]["response"]["body"]["language"], "python");
+
+    assert_eq!(results[1]["path"], "missing.py");
+    assert_eq!(results[1]["response"]["status"], "not_found");
+    assert_eq!(results[1]["response"]["body"]["code"], "NOT_FOUND");
+
+    assert_eq!(results[2]["path"], "blocked.py");
+    assert_eq!(results[2]["response"]["status"], "blocked");
+    assert_eq!(results[2]["response"]["body"]["code"], "BRIEFING_BLOCKED");
+
+    assert_eq!(results[3]["path"], "../escapes.py");
+    assert_eq!(results[3]["response"]["status"], "error");
+    assert_eq!(
+        results[3]["response"]["body"]["code"],
+        "PATH_OUTSIDE_PROJECT"
+    );
+
+    assert_eq!(results[4]["path"], "  ");
+    assert_eq!(results[4]["response"]["status"], "error");
+    assert_eq!(results[4]["response"]["body"]["code"], "INVALID_PATH");
+}
+
+#[test]
+fn serve_http_files_resolve_rejects_over_1000_paths() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+
+    let paths: Vec<Value> = (0..1001).map(|_| serde_json::json!({"path": ""})).collect();
+    let body = serde_json::json!({"paths": paths}).to_string();
+    assert!(
+        body.len() <= 16 * 1024,
+        "test body should fit under the transport cap: {} bytes",
+        body.len()
+    );
+
+    let mut child = spawn_serve(dir.path());
+    let response = wait_for_http_post_json(&bind, "/api/v1/files:resolve", &body, &[]);
+    stop_serve(&mut child);
+    let response = response.expect("files:resolve over-limit response");
+
+    assert_eq!(response.status_code, 400);
+    assert_eq!(response.body["code"], "INVALID_PATH");
+    assert!(
+        response.body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("1000")),
+        "error message should cite the 1000-path ceiling: {response:?}"
+    );
 }
 
 #[test]
@@ -1648,7 +1758,6 @@ fn validate_fixture_examples(bind: &str, fixture: &Value, fixture_name: &str) {
             .pointer("/request/method")
             .and_then(Value::as_str)
             .unwrap_or_else(|| panic!("{fixture_name}:{example_name} missing request.method"));
-        assert_eq!(method, "GET", "{fixture_name}:{example_name} method");
         let path = example
             .pointer("/request/path")
             .and_then(Value::as_str)
@@ -1665,9 +1774,23 @@ fn validate_fixture_examples(bind: &str, fixture: &Value, fixture_name: &str) {
             .and_then(Value::as_str)
             .unwrap_or_else(|| panic!("{fixture_name}:{example_name} missing response.shape"));
 
-        let response = wait_for_http_response(bind, path).unwrap_or_else(|err| {
-            panic!("{fixture_name}:{example_name} HTTP request failed: {err}")
-        });
+        let response = match method {
+            "GET" => wait_for_http_response(bind, path).unwrap_or_else(|err| {
+                panic!("{fixture_name}:{example_name} HTTP request failed: {err}")
+            }),
+            "POST" => {
+                let body = example
+                    .pointer("/request/body")
+                    .unwrap_or_else(|| {
+                        panic!("{fixture_name}:{example_name} missing request.body")
+                    })
+                    .to_string();
+                wait_for_http_post_json(bind, path, &body, &[]).unwrap_or_else(|err| {
+                    panic!("{fixture_name}:{example_name} HTTP POST request failed: {err}")
+                })
+            }
+            other => panic!("{fixture_name}:{example_name} unsupported method {other}"),
+        };
 
         assert_eq!(
             u64::from(response.status_code),
@@ -1824,6 +1947,12 @@ fn assert_value_matches_decl(
             assert!(
                 value.as_i64().is_some() || value.as_u64().is_some(),
                 "{fixture_name}:{example_name} field {field} is not an integer"
+            );
+        }
+        "array" => {
+            assert!(
+                value.as_array().is_some(),
+                "{fixture_name}:{example_name} field {field} is not an array"
             );
         }
         "non_empty_string" => {

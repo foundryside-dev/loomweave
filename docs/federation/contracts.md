@@ -138,6 +138,79 @@ is normative for this section. It includes `_meta`, `shape_decl`, and examples
 for the happy path, not-known, blank path, outside-root, briefing-blocked,
 and storage-error responses.
 
+### `POST /api/v1/files:resolve`
+
+Resolves up to **1000** file paths in one request while preserving one response
+slot per input path. This is an optimization for high-volume callers that want
+single-GET semantics without one HTTP round trip per path.
+
+Request body (`application/json`, max 16 KiB):
+
+```json
+{
+  "paths": [
+    {"path": "src/foo.py", "language": "python"},
+    {"path": "src/bar.py"}
+  ]
+}
+```
+
+Successful response (`200 OK`):
+
+```json
+{
+  "results": [
+    {
+      "path": "src/foo.py",
+      "response": {
+        "status": "resolved",
+        "body": {
+          "entity_id": "core:file:src/foo.py",
+          "content_hash": "<hash>",
+          "canonical_path": "src/foo.py",
+          "language": "python"
+        }
+      }
+    },
+    {
+      "path": "src/missing.py",
+      "response": {
+        "status": "not_found",
+        "body": {
+          "error": "file is not known to Clarion",
+          "code": "NOT_FOUND"
+        }
+      }
+    }
+  ]
+}
+```
+
+Per-path `response.status` is one of:
+
+- `resolved` — `body` is the same shape as `GET /api/v1/files`.
+- `not_found` — no file-kind entity row exists.
+- `blocked` — the entity is known but `briefing_blocked`; identity fields are
+  withheld, matching the single-file `403 BRIEFING_BLOCKED` posture.
+- `error` — per-path validation or storage error; switch on `body.code`.
+
+Envelope-level failures:
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `INVALID_PATH` | Body is not a valid `{"paths": [...]}` object or `paths.len() > 1000`. |
+| 401 | `UNAUTHENTICATED` | HMAC or bearer auth missing or wrong (when configured — see §Authentication). |
+| 413 | n/a | Request body exceeds the 16 KiB cap. |
+| 500/503 | `STORAGE_ERROR` / `INTERNAL` | Whole-batch storage failure. |
+
+ETag is not applied to this endpoint. `GET /api/v1/files` remains the
+canonical per-URI resolution model; `files:resolve` is a batch transport
+optimization.
+
+The contract fixture at
+[`fixtures/post-api-v1-files-resolve.batch.json`](./fixtures/post-api-v1-files-resolve.batch.json)
+is normative for this section.
+
 ### `POST /api/v1/files/batch`
 
 Resolves up to **256** file paths in a single request. Filigree's

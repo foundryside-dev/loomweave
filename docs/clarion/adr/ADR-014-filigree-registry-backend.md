@@ -67,6 +67,24 @@ Clarion must not synthesize a `core:file:{content_hash}@{canonical_path}`
 identity. That pattern violates ADR-003's entity-ID grammar and creates shadow
 IDs that will not match future file-discovery rows.
 
+### Batch Resolution Amendment
+
+Clarion also exposes `POST /api/v1/files:resolve` for callers that need to
+resolve many file paths without N HTTP round trips. The request body is
+`{"paths": [{"path": "...", "language": "..."}, ...]}` with a fixed
+1000-path envelope cap plus the normal HTTP body limit. The response preserves
+input order as `results[]`, where each entry carries the original `path` and a
+`response` object:
+
+- `status: "resolved"` with the same body shape as `GET /api/v1/files`.
+- `status: "not_found"` with the `NOT_FOUND` error envelope.
+- `status: "blocked"` with the `BRIEFING_BLOCKED` error envelope and no file
+  identity fields.
+- `status: "error"` with a per-path error envelope.
+
+This endpoint is a transport optimization, not a replacement for the single
+`GET /api/v1/files` URI model. ETag semantics remain single-GET only.
+
 ### Canonical Path Semantics
 
 `canonical_path` is the normalized project-relative POSIX path for the file:

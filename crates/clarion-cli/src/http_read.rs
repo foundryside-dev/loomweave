@@ -347,6 +347,7 @@ fn build_http_runtime() -> Result<tokio::runtime::Runtime> {
 fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/v1/files", get(get_file))
+        .route("/api/v1/files:resolve", post(post_files_resolve))
         .route("/api/v1/files/batch", post(post_files_batch))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -583,6 +584,7 @@ enum ErrorCode {
 /// constant so the contract docs, the validator, and tests all point at
 /// the same number.
 const BATCH_MAX_QUERIES: usize = 256;
+const RESOLVE_MAX_PATHS: usize = 1000;
 const HTTP_BODY_LIMIT_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Deserialize)]
@@ -622,6 +624,47 @@ struct BatchFileResponse {
     not_found: Vec<String>,
     briefing_blocked: Vec<String>,
     errors: Vec<BatchErrorItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolveFileQuery {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    language: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolveFilesRequest {
+    paths: Vec<ResolveFileQuery>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResolveFilesResponse {
+    results: Vec<ResolveFileResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResolveFileResult {
+    path: String,
+    response: ResolveFileItemResponse,
+}
+
+#[derive(Debug, Serialize)]
+struct ResolveFileItemResponse {
+    status: ResolveFileStatus,
+    body: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ResolveFileStatus {
+    Resolved,
+    NotFound,
+    Blocked,
+    Error,
 }
 
 async fn get_file(
@@ -838,6 +881,115 @@ async fn post_files_batch(
     match catalog_result {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(err) => json_read_error(&err),
+    }
+}
+
+async fn post_files_resolve(
+    State(state): State<AppState>,
+    body: Result<Json<ResolveFilesRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(request)) = body else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidPath,
+            "request body must be a JSON object {\"paths\": [...]}",
+        );
+    };
+    if request.paths.len() > RESOLVE_MAX_PATHS {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidPath,
+            "paths[] exceeds the per-batch maximum of 1000 entries",
+        );
+    }
+    let project_root = state.project_root.clone();
+    let paths = request.paths;
+    let catalog_result = state
+        .readers
+        .with_reader(move |conn| {
+            let results = paths
+                .into_iter()
+                .map(|query| {
+                    let response =
+                        resolve_file_query_item(conn, &project_root, &query.path, &query.language);
+                    ResolveFileResult {
+                        path: query.path,
+                        response,
+                    }
+                })
+                .collect();
+            Ok::<_, StorageError>(ResolveFilesResponse { results })
+        })
+        .await;
+    match catalog_result {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => json_read_error(&err),
+    }
+}
+
+fn resolve_file_query_item(
+    conn: &rusqlite::Connection,
+    project_root: &std::path::Path,
+    path: &str,
+    language: &str,
+) -> ResolveFileItemResponse {
+    if path.trim().is_empty() {
+        return resolve_error_response(
+            ResolveFileStatus::Error,
+            ErrorCode::InvalidPath,
+            "path must not be blank",
+        );
+    }
+    match resolve_file_catalog_entry(conn, project_root, path, language) {
+        Ok(Some(entry)) => match entry.into_resolved_file() {
+            Ok(file) => {
+                if file.briefing_blocked.is_some() {
+                    resolve_error_response(
+                        ResolveFileStatus::Blocked,
+                        ErrorCode::BriefingBlocked,
+                        "entity is briefing-blocked and cannot be exposed",
+                    )
+                } else {
+                    ResolveFileItemResponse {
+                        status: ResolveFileStatus::Resolved,
+                        body: serde_json::to_value(FileResponse {
+                            entity_id: file.entity_id,
+                            content_hash: file.content_hash,
+                            canonical_path: file.canonical_path,
+                            language: file.language,
+                        })
+                        .expect("FileResponse serializes"),
+                    }
+                }
+            }
+            Err(err) => resolve_read_error_response(&err),
+        },
+        Ok(None) => resolve_error_response(
+            ResolveFileStatus::NotFound,
+            ErrorCode::NotFound,
+            "file is not known to Clarion",
+        ),
+        Err(err) => resolve_read_error_response(&err),
+    }
+}
+
+fn resolve_read_error_response(err: &StorageError) -> ResolveFileItemResponse {
+    let error = classify_read_error(err);
+    resolve_error_response(ResolveFileStatus::Error, error.code, error.message)
+}
+
+fn resolve_error_response(
+    status: ResolveFileStatus,
+    code: ErrorCode,
+    message: &str,
+) -> ResolveFileItemResponse {
+    ResolveFileItemResponse {
+        status,
+        body: serde_json::to_value(ErrorResponse {
+            error: message.to_owned(),
+            code,
+        })
+        .expect("ErrorResponse serializes"),
     }
 }
 
