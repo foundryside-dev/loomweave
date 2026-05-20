@@ -53,9 +53,14 @@ of grep-and-read:
 ## Quick start
 
 ```bash
-# 1. Install (see docs/operator/getting-started.md for the full setup)
-cargo install --git https://github.com/tachyon-beep/clarion clarion-cli
-pipx install git+https://github.com/tachyon-beep/clarion#subdirectory=plugins/python
+# 1. Install from the v1.0 GitHub Release
+TAG=v1.0.0
+curl -L -o clarion-x86_64-unknown-linux-gnu.tar.gz \
+  "https://github.com/tachyon-beep/clarion/releases/download/${TAG}/clarion-x86_64-unknown-linux-gnu.tar.gz"
+tar xzf clarion-x86_64-unknown-linux-gnu.tar.gz
+install clarion-x86_64-unknown-linux-gnu/clarion ~/.local/bin/
+pipx install \
+  "https://github.com/tachyon-beep/clarion/releases/download/${TAG}/clarion-plugin-python-1.0.0.tar.gz"
 
 # 2. Initialise a project
 cd /path/to/your/python/repo

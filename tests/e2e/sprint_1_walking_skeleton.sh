@@ -92,9 +92,11 @@ clarion analyze .
 log "verifying persisted entity via sqlite3 ..."
 RESULT=$(sqlite3 "$DEMO_DIR/.clarion/clarion.db" "select id, kind from entities order by id;")
 # B.2 (Sprint 2): every analyzed file emits a module entity in addition to
-# its function/class entities. B.4* adds direct and dict-dispatch call sites.
+# its function/class entities. v1.0 also mints a core file entity for file
+# identity and federation reads. B.4* adds direct and dict-dispatch call sites.
 # B.5* adds a local annotation reference and a module-level name reference.
-EXPECTED="python:class:demo.Marker|class
+EXPECTED="core:file:demo.py|file
+python:class:demo.Marker|class
 python:function:demo.annotated|function
 python:function:demo.hello|function
 python:function:demo.via_dispatch|function

@@ -44,11 +44,23 @@ have a cached summary.
 
 ## 1. Install
 
-> Once the v1.0 release artifacts ship via GitHub Releases (per
-> [ADR-033](../clarion/adr/ADR-033-v1.0-distribution.md)), the install
-> commands below collapse to a single `curl | sh` plus
-> `pipx install ./clarion-plugin-python-*.tar.gz`. Until the first tag fires,
-> install from source.
+Tagged v1.0 releases ship a platform archive for the Rust binary and a Python
+sdist for the language plugin via GitHub Releases (per
+[ADR-033](../clarion/adr/ADR-033-v1.0-distribution.md)). Until the first tag
+fires, use the source-install fallback below.
+
+```bash
+TAG=v1.0.0
+curl -L -o clarion-x86_64-unknown-linux-gnu.tar.gz \
+  "https://github.com/tachyon-beep/clarion/releases/download/${TAG}/clarion-x86_64-unknown-linux-gnu.tar.gz"
+tar xzf clarion-x86_64-unknown-linux-gnu.tar.gz
+install clarion-x86_64-unknown-linux-gnu/clarion ~/.local/bin/
+
+pipx install \
+  "https://github.com/tachyon-beep/clarion/releases/download/${TAG}/clarion-plugin-python-1.0.0.tar.gz"
+```
+
+Source-install fallback:
 
 ```bash
 # Rust core
@@ -85,9 +97,9 @@ slsa-verifier verify-artifact \
   clarion-x86_64-unknown-linux-gnu.tar.gz
 ```
 
-Stable `v*` tags without a pre-release suffix also publish
-`clarion-plugin-python` to PyPI via trusted publishing; release candidates keep
-the Python sdist on the GitHub Release only.
+The v1.0 release deliberately does not publish to PyPI or crates.io. GitHub
+Release assets are the source of truth until public registries are introduced
+by a later ADR.
 
 **`$PATH` discipline matters.** Clarion's plugin host (per
 [ADR-002](../clarion/adr/ADR-002-plugin-transport-json-rpc.md)) discovers
@@ -302,14 +314,14 @@ config). Live LLM calls are also gated by `llm_policy.enabled: true` and
 Expected when Filigree is not reachable. Filigree integration is
 *enrich-only* per the Loom federation axiom — Clarion's structural answers
 are unaffected. See
-[CON-FILIGREE-02](../clarion/v0.1/requirements.md#con-filigree-02--file-registry-displacement-is-deferred-to-v02)
+[CON-FILIGREE-02](../clarion/1.0/requirements.md#con-filigree-02--file-registry-displacement-is-deferred-to-v02)
 for the v1.0 → v2.0 trajectory.
 
 ## Where to go next
 
 - [Operator notes index](./README.md) — OpenRouter, runtime topology,
   secret scanning, federation contracts, coding-agent LLM providers.
-- [Design ladder](../clarion/v0.1/README.md) — requirements → system-design →
+- [Design ladder](../clarion/1.0/README.md) — requirements → system-design →
   detailed-design.
 - [ADR index](../clarion/adr/README.md) — accepted architecture decisions.
 - [CLAUDE.md](../../CLAUDE.md) — repository conventions.

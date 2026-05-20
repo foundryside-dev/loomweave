@@ -19,7 +19,7 @@
 
 ### What this document is
 
-This is Clarion v0.1's **detailed design reference** — implementation-level depth. Everything here is concrete: Rust struct definitions, the full SQL schema, the complete `clarion.yaml` example, the exhaustive Phase-7 rule catalogue with thresholds, the complete MCP tool list, severity mapping tables, the `scan_run_id` lifecycle, the dedup collision policy, SARIF property-bag translation rules, full Filigree/Wardline prerequisite lists (with specific file references and ADR citations), the testing strategy, the ADR backlog with full priorities, and the appendices (future direction, glossary, Rust stack).
+This is Clarion v1.0's **detailed design reference** — implementation-level depth. Everything here is concrete: Rust struct definitions, the full SQL schema, the complete `clarion.yaml` example, the exhaustive Phase-7 rule catalogue with thresholds, the complete MCP tool list, severity mapping tables, the `scan_run_id` lifecycle, the dedup collision policy, SARIF property-bag translation rules, full Filigree/Wardline prerequisite lists (with specific file references and ADR citations), the testing strategy, the ADR backlog with full priorities, and the appendices (future direction, glossary, Rust stack).
 
 ### What moved up
 
@@ -40,7 +40,7 @@ Sections 1-11 are implementation detail by subsystem, mirroring the natural orde
 
 ## 1. Plugin Implementation Detail
 
-### Plugin packaging (v0.1)
+### Plugin packaging (v1.0)
 
 Each plugin is a separately-installable Python package that provides an executable entry point matching the Clarion plugin protocol. Core finds plugins via `~/.config/clarion/plugins.toml` or via the project's `clarion.yaml`.
 
@@ -1847,4 +1847,4 @@ The Rev 2 → Rev 3 transition is the classic layered-review problem. Rev 2 corr
 
 ---
 
-**End of Clarion v0.1 detailed design reference.**
+**End of Clarion v1.0 detailed design reference.**

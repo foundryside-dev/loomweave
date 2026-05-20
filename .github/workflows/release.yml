@@ -19,9 +19,7 @@ env:
   RUSTFLAGS: "-D warnings"
 
 permissions:
-  actions: read
-  contents: write
-  id-token: write
+  contents: read
 
 jobs:
   verify:
@@ -127,24 +125,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-            apt_packages: ""
-            linker_env: ""
-            linker: ""
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
-            apt_packages: gcc-aarch64-linux-gnu
-            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
-            linker: aarch64-linux-gnu-gcc
           - target: x86_64-apple-darwin
             runner: macos-13
-            apt_packages: ""
-            linker_env: ""
-            linker: ""
           - target: aarch64-apple-darwin
             runner: macos-14
-            apt_packages: ""
-            linker_env: ""
-            linker: ""
     steps:
       - uses: actions/checkout@v4
 
@@ -156,18 +140,9 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      - name: install linux cross linker
-        if: matrix.apt_packages != ''
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ${{ matrix.apt_packages }}
-
       - name: build release
         run: |
           set -euo pipefail
-          if [ -n "${{ matrix.linker_env }}" ]; then
-            export "${{ matrix.linker_env }}=${{ matrix.linker }}"
-          fi
           cargo build --release --locked --bin clarion --target ${{ matrix.target }}
 
       - name: package
@@ -188,6 +163,10 @@ jobs:
           else
             shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
           fi
+          SMOKE_DIR="$(mktemp -d)"
+          tar xzf "$ARCHIVE" -C "$SMOKE_DIR"
+          "$SMOKE_DIR/$STAGE/clarion" --version
+          "$SMOKE_DIR/$STAGE/clarion" --help >/dev/null
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
@@ -204,6 +183,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build-rust, build-plugin]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      actions: read
+      contents: read
     outputs:
       rust-subjects: ${{ steps.subjects.outputs.rust-subjects }}
     steps:
@@ -239,6 +221,16 @@ jobs:
       - name: build sdist
         run: python -m build --sdist --outdir dist plugins/python
 
+      - name: smoke install sdist
+        run: |
+          set -euo pipefail
+          python -m venv .venv-smoke
+          . .venv-smoke/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install dist/*.tar.gz
+          python -c "import clarion_plugin_python; assert clarion_plugin_python.__version__ == '1.0.0'"
+          command -v clarion-plugin-python
+
       - name: checksum
         run: |
           set -euo pipefail
@@ -263,6 +255,10 @@ jobs:
     # Only publish to a Release when a real tag pushed; workflow_dispatch leaves
     # artifacts on the workflow run for inspection without creating a public Release.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -391,24 +387,3 @@ jobs:
       upload-assets: true
       upload-tag-name: ${{ github.ref_name }}
       provenance-name: clarion-rust-binaries.intoto.jsonl
-
-  publish-plugin-pypi:
-    name: Publish Python plugin to PyPI
-    runs-on: ubuntu-latest
-    needs: [release, build-plugin]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: clarion-plugin-python-sdist
-          path: dist
-
-      - name: keep only Python distributions
-        run: rm -f dist/*.sha256
-
-      - name: publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist

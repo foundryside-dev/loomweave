@@ -17,13 +17,13 @@
 
 ### What this document is
 
-This is the requirements specification for Clarion v0.1 — the *what*: capabilities, constraints, quality attributes, and explicit non-goals. The *how* (architecture, mechanisms, diagrams) lives in the system-design; the *implementation detail* (SQL schemas, Rust crate selection, rule-ID catalogues) lives in the detailed-design.
+This is the requirements specification for Clarion v1.0 — the *what*: capabilities, constraints, quality attributes, and explicit non-goals. The *how* (architecture, mechanisms, diagrams) lives in the system-design; the *implementation detail* (SQL schemas, Rust crate selection, rule-ID catalogues) lives in the detailed-design.
 
 ### How to read this
 
 - Each requirement has a stable ID (`REQ-*`, `NFR-*`, `CON-*`, `NG-*`), a plain-English statement, a rationale, a verification method, and a **See** line pointing to the system-design section that addresses it.
 - Requirement IDs are load-bearing: filigree issues cite them by ID in descriptions and commit messages; code review references them when discussing implementation. IDs are stable across rev bumps unless a requirement is fully retired (in which case the ID is never reused).
-- "Clarion" throughout means Clarion v0.1 specifically. Where v0.2+ behaviour is deliberately different, it's named as a non-goal (`NG-*`) in the Non-Goals section of this document.
+- "Clarion" throughout means Clarion v1.0 specifically. Where v2.0+ behaviour is deliberately different, it's named as a non-goal (`NG-*`) in the Non-Goals section of this document.
 
 ### Relationship to Loom
 
@@ -1177,4 +1177,4 @@ Wardline shipping a YAML/JSON descriptor of its REGISTRY (instead of requiring d
 
 ---
 
-**End of Clarion v0.1 requirements specification.**
+**End of Clarion v1.0 requirements specification.**

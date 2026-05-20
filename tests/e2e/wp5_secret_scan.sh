@@ -100,7 +100,7 @@ PATH="$PLUGIN_DIR" "$CLARION_BIN" analyze "$DEMO_DIR"
 
 DB="$DEMO_DIR/.clarion/clarion.db"
 BLOCKED=$(sqlite3 "$DB" "select count(*) from entities where json_extract(properties, '\$.briefing_blocked') = 'secret_present';")
-[ "$BLOCKED" = "2" ] || fail "expected two briefing_blocked secret_present entities, got $BLOCKED"
+[ "$BLOCKED" = "3" ] || fail "expected three briefing_blocked secret_present entities (core file + plugin source entity + dotenv anchor), got $BLOCKED"
 
 FINDINGS=$(sqlite3 "$DB" "select count(*) from findings where rule_id = 'CLA-SEC-SECRET-DETECTED';")
 [ "$FINDINGS" = "2" ] || fail "expected two CLA-SEC-SECRET-DETECTED findings, got $FINDINGS"
@@ -197,7 +197,7 @@ printf "aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n" > "$RETRY_DIR/leaky.sec"
 PATH="$PLUGIN_DIR" "$CLARION_BIN" analyze "$RETRY_DIR"
 RDB="$RETRY_DIR/.clarion/clarion.db"
 R_BLOCKED_BEFORE=$(sqlite3 "$RDB" "select count(*) from entities where json_extract(properties, '\$.briefing_blocked') = 'secret_present';")
-[ "$R_BLOCKED_BEFORE" = "1" ] || fail "retry: first run must block, got $R_BLOCKED_BEFORE"
+[ "$R_BLOCKED_BEFORE" = "2" ] || fail "retry: first run must block the source file entity and plugin entity, got $R_BLOCKED_BEFORE"
 # Operator commits a baseline acknowledging the example key.
 cat > "$RETRY_DIR/.clarion/secrets-baseline.yaml" <<YAML
 version: "1.0"

@@ -14,7 +14,7 @@
 
 ### What this document is
 
-This is Clarion v0.1's **system design** at mid-level technical depth. It describes how Clarion realises the requirements: component topology, data structures at a conceptual level, key mechanisms, integration contracts, and architectural decisions. It stops before implementation detail — SQL schemas, Rust crate choices, exact rule-ID catalogues, full YAML config examples, and JSON-RPC wire specifics live in the detailed-design reference.
+This is Clarion v1.0's **system design** at mid-level technical depth. It describes how Clarion realises the requirements: component topology, data structures at a conceptual level, key mechanisms, integration contracts, and architectural decisions. It stops before implementation detail — SQL schemas, Rust crate choices, exact rule-ID catalogues, full YAML config examples, and JSON-RPC wire specifics live in the detailed-design reference.
 
 ### How to read this
 
@@ -199,7 +199,12 @@ Key fields:
 
 ### Plugin packaging
 
-v0.1 plugins distribute via their language's own packaging (Python → PyPI). Installation via `pipx install clarion-plugin-python` into an isolated venv so plugin dependencies don't conflict with the analysed project's. A user-level `~/.config/clarion/plugins.toml` records the resolved executable path plus the Python version requirement. Plugin hash-pinning is deferred (NG-16).
+v1.0 plugins distribute as GitHub Release assets. The Python plugin ships as a
+source distribution installed with `pipx install <release-asset-url>` into an
+isolated venv so plugin dependencies don't conflict with the analysed project's.
+A user-level `~/.config/clarion/plugins.toml` records the resolved executable
+path plus the Python version requirement. Public registry publishing and plugin
+hash-pinning are deferred (NG-16).
 
 ### Python plugin specifics
 
@@ -1259,4 +1264,4 @@ See [detailed-design.md](./detailed-design.md) Appendix B for the full glossary.
 
 ---
 
-**End of Clarion v0.1 system design.**
+**End of Clarion v1.0 system design.**

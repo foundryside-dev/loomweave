@@ -1,6 +1,6 @@
-# Clarion v0.1 Docset
+# Clarion v1.0 Docset
 
-This folder is the canonical Clarion v0.1 document set.
+This folder is the canonical Clarion v1.0 document set.
 
 ## Canonical design docs
 
