@@ -44,7 +44,19 @@ MAX_PYRIGHT_RESTARTS_PER_RUN = 3
 MAX_REFERENCE_SITES_PER_FILE = 2000
 PYRIGHT_INIT_TIMEOUT_SECS = 30.0
 PYRIGHT_CALL_TIMEOUT_SECS = 5.0
+PYRIGHT_FILE_TIMEOUT_SECS = 3.0
 STDERR_TAIL_LIMIT = 65536
+PYRIGHT_EXCLUDE_PATTERNS = [
+    "**/.clarion/**",
+    "**/.git/**",
+    "**/.hg/**",
+    "**/.svn/**",
+    "**/.jj/**",
+    "**/.venv/**",
+    "**/__pycache__/**",
+    "**/node_modules/**",
+]
+PROJECT_LOCAL_EXTERNAL_DIRS = {".clarion", ".git", ".hg", ".svn", ".jj", ".venv", "node_modules"}
 
 
 if TYPE_CHECKING:
@@ -125,6 +137,7 @@ class PyrightSession:
         install_check: Callable[[str], bool] | None = None,
         init_timeout_secs: float = PYRIGHT_INIT_TIMEOUT_SECS,
         call_timeout_secs: float = PYRIGHT_CALL_TIMEOUT_SECS,
+        file_timeout_secs: float = PYRIGHT_FILE_TIMEOUT_SECS,
         max_restarts_per_run: int = MAX_PYRIGHT_RESTARTS_PER_RUN,
         max_reference_sites_per_file: int = MAX_REFERENCE_SITES_PER_FILE,
     ) -> None:
@@ -134,6 +147,7 @@ class PyrightSession:
         self.install_check = install_check
         self.init_timeout_secs = init_timeout_secs
         self.call_timeout_secs = call_timeout_secs
+        self.file_timeout_secs = file_timeout_secs
         self.max_restarts_per_run = max_restarts_per_run
         self.max_reference_sites_per_file = max_reference_sites_per_file
         self._process: subprocess.Popen[bytes] | None = None
@@ -145,6 +159,7 @@ class PyrightSession:
         self._findings: list[Finding] = []
         self._function_indexes: dict[Path, _FunctionIndex] = {}
         self._index_parse_latency_ms: list[int] = []
+        self._file_deadlines: dict[Path, float] = {}
 
     def __enter__(self) -> Self:
         return self
@@ -204,9 +219,15 @@ class PyrightSession:
                 findings=self._pop_findings(),
             )
 
+        deadline = self._deadline_for_file(path)
         latency_started = time.perf_counter()
         try:
-            edges, unresolved, unresolved_sites = self._resolve_with_pyright(path, index, requested)
+            edges, unresolved, unresolved_sites = self._resolve_with_pyright(
+                path,
+                index,
+                requested,
+                deadline,
+            )
         except LspTimeoutError as exc:
             self._record_finding(
                 FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT,
@@ -267,12 +288,14 @@ class PyrightSession:
                 findings=self._pop_findings(),
             )
 
+        deadline = self._deadline_for_file(path)
         latency_started = time.perf_counter()
         try:
             edges, resolved, skipped_external, unresolved = self._resolve_references_with_pyright(
                 path,
                 index,
                 sites,
+                deadline,
             )
         except LspTimeoutError as exc:
             self._record_finding(
@@ -290,6 +313,8 @@ class PyrightSession:
             resolved = 0
             skipped_external = 0
             unresolved = reference_sites_total
+        finally:
+            self._file_deadlines.pop(path, None)
         latency_ms = max(1, math.ceil((time.perf_counter() - latency_started) * 1000))
 
         return ReferenceResolutionResult(
@@ -308,6 +333,7 @@ class PyrightSession:
         path: Path,
         index: _FunctionIndex,
         functions: Sequence[_FunctionInfo],
+        deadline: float,
     ) -> tuple[list[CallsRawEdge], int, list[UnresolvedCallSite]]:
         uri = path.as_uri()
         self._notify(
@@ -326,6 +352,7 @@ class PyrightSession:
             unresolved_total = 0
             unresolved_sites: list[UnresolvedCallSite] = []
             for function in functions:
+                self._ensure_file_budget(deadline)
                 grouped: dict[tuple[int, int, int, int], set[str]] = {}
                 prepared = self._request(
                     "textDocument/prepareCallHierarchy",
@@ -333,14 +360,15 @@ class PyrightSession:
                         "textDocument": {"uri": uri},
                         "position": {"line": function.line, "character": function.character},
                     },
-                    self.call_timeout_secs,
+                    self._budgeted_timeout(deadline),
                 )
                 items = prepared if isinstance(prepared, list) else []
                 for item in items:
+                    self._ensure_file_budget(deadline)
                     outgoing = self._request(
                         "callHierarchy/outgoingCalls",
                         {"item": item},
-                        self.call_timeout_secs,
+                        self._budgeted_timeout(deadline),
                     )
                     calls = outgoing if isinstance(outgoing, list) else []
                     for call in calls:
@@ -397,6 +425,7 @@ class PyrightSession:
         path: Path,
         index: _FunctionIndex,
         sites: Sequence[ReferenceSite],
+        deadline: float,
     ) -> tuple[list[ReferencesRawEdge], int, int, int]:
         uri = path.as_uri()
         self._notify(
@@ -417,17 +446,30 @@ class PyrightSession:
             resolved_total = 0
             skipped_external_total = 0
             unresolved_total = 0
-            for site in sites:
+            for site_index, site in enumerate(sites):
+                if self._file_budget_expired(deadline):
+                    unresolved_total += len(sites) - site_index
+                    self._record_finding(
+                        FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT,
+                        "pyright reference query timed out: analyze_file budget",
+                        method="analyze_file budget",
+                    )
+                    break
                 cache_key = _reference_lookup_cache_key(site, source_bytes)
                 cached = lookup_cache.get(cache_key)
                 if cached is None:
                     try:
-                        candidate_ids, saw_external = self._reference_target_ids(uri, site)
+                        candidate_ids, saw_external = self._reference_target_ids(
+                            uri,
+                            site,
+                            deadline=deadline,
+                        )
                         if not candidate_ids and site.kind == "annotation" and not saw_external:
                             candidate_ids, fallback_external = self._reference_target_ids(
                                 uri,
                                 site,
                                 method="textDocument/typeDefinition",
+                                deadline=deadline,
                             )
                             saw_external = saw_external or fallback_external
                     except LspTimeoutError as exc:
@@ -469,6 +511,7 @@ class PyrightSession:
         uri: str,
         site: ReferenceSite,
         *,
+        deadline: float,
         method: str = "textDocument/definition",
     ) -> tuple[list[str], bool]:
         result = self._request(
@@ -477,9 +520,30 @@ class PyrightSession:
                 "textDocument": {"uri": uri},
                 "position": {"line": site.line, "character": site.character},
             },
-            self.call_timeout_secs,
+            self._budgeted_timeout(deadline),
         )
         return self._target_ids_from_locations(result)
+
+    def _deadline_for_file(self, path: Path) -> float:
+        return self._file_deadlines.setdefault(
+            path,
+            time.monotonic() + self.file_timeout_secs,
+        )
+
+    def _budgeted_timeout(self, deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            method = "analyze_file budget"
+            raise LspTimeoutError(method)
+        return min(self.call_timeout_secs, remaining)
+
+    def _ensure_file_budget(self, deadline: float) -> None:
+        if self._file_budget_expired(deadline):
+            method = "analyze_file budget"
+            raise LspTimeoutError(method)
+
+    def _file_budget_expired(self, deadline: float) -> bool:
+        return deadline - time.monotonic() <= 0
 
     def _target_ids_from_locations(self, result: object) -> tuple[list[str], bool]:
         locations = result if isinstance(result, list) else [result]
@@ -507,7 +571,7 @@ class PyrightSession:
         target_path = _path_from_uri(raw_uri)
         if target_path is None:
             return None, False
-        if not target_path.is_relative_to(self.project_root):
+        if not self._is_internal_project_path(target_path):
             return None, True
         target_index = self._function_index_for_path(target_path)
         key = _range_start_key(raw_range)
@@ -620,7 +684,7 @@ class PyrightSession:
                 "workspaceFolders": [
                     {"uri": self.project_root.as_uri(), "name": self.project_root.name},
                 ],
-                "capabilities": {},
+                "capabilities": {"workspace": {"configuration": True}},
                 "clientInfo": {"name": "clarion-plugin-python", "version": __version__},
             },
             self.init_timeout_secs,
@@ -675,12 +739,49 @@ class PyrightSession:
         )
         while True:
             response = self._read_message(timeout_secs)
+            if "method" in response:
+                self._handle_server_message(response)
+                continue
             if response.get("id") != request_id:
                 continue
             if "error" in response:
                 raise LspTransportClosedError(str(response["error"]))
             process.poll()
             return response.get("result")
+
+    def _handle_server_message(self, message: dict[str, Any]) -> None:
+        if "id" not in message:
+            return
+        request_id = message["id"]
+        method = message.get("method")
+        if method == "workspace/configuration":
+            result = self._workspace_configuration_result(message)
+        else:
+            result = None
+        self._write_message({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+    def _workspace_configuration_result(self, message: dict[str, Any]) -> list[object]:
+        params = message.get("params")
+        items = params.get("items") if isinstance(params, dict) else None
+        if not isinstance(items, list):
+            return []
+        return [self._configuration_for_section(item) for item in items]
+
+    def _configuration_for_section(self, item: object) -> object:
+        section = item.get("section") if isinstance(item, dict) else None
+        analysis = {
+            "diagnosticMode": "openFilesOnly",
+            "exclude": PYRIGHT_EXCLUDE_PATTERNS,
+            "indexing": False,
+            "useLibraryCodeForTypes": False,
+        }
+        if section == "python":
+            return {"analysis": analysis}
+        if section == "python.analysis":
+            return analysis
+        if section == "pyright":
+            return {}
+        return None
 
     def _notify(self, method: str, params: dict[str, object]) -> None:
         self._live_process()
@@ -720,6 +821,9 @@ class PyrightSession:
                 raise LspTransportClosedError(message)
             name, value = line.decode("ascii").strip().split(":", 1)
             headers[name.lower()] = value.strip()
+        if "content-length" not in headers:
+            message = f"missing LSP Content-Length header: {headers!r}"
+            raise LspTransportClosedError(message)
         length = int(headers["content-length"])
         body = _read_exact(fd, length, deadline)
         parsed: dict[str, Any] = json.loads(body)
@@ -736,13 +840,19 @@ class PyrightSession:
         target_path = _path_from_uri(raw_uri)
         if target_path is None:
             return None
-        if not target_path.is_relative_to(self.project_root):
+        if not self._is_internal_project_path(target_path):
             return None
         index = self._function_index_for_path(target_path)
         key = _range_start_key(raw_selection)
         if key is not None and key in index.by_name_position:
             return index.by_name_position[key].entity_id
         return _containing_function_id(index, raw_selection)
+
+    def _is_internal_project_path(self, path: Path) -> bool:
+        if not path.is_relative_to(self.project_root):
+            return False
+        relative = path.relative_to(self.project_root)
+        return not any(part in PROJECT_LOCAL_EXTERNAL_DIRS for part in relative.parts)
 
     def _function_index_for_path(self, path: Path) -> _FunctionIndex:
         resolved = path.resolve()

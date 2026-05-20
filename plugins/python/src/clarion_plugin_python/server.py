@@ -46,6 +46,7 @@ WARDLINE_MAX_VERSION = "2.0.0"
 # default (8 MiB) so the plugin never emits a frame the host would kill us
 # for. Oversize outbound payloads trip this before reaching the wire.
 MAX_CONTENT_LENGTH = 8 * 1024 * 1024
+MAX_FILES_PER_PYRIGHT_SESSION = 25
 
 # JSON-RPC 2.0 error codes (§5.1) plus LSP-style server extensions.
 _ERR_INVALID_REQUEST = -32600
@@ -66,6 +67,7 @@ class ServerState:
     shutdown_requested: bool = False
     project_root: Path | None = field(default=None)
     pyright: PyrightSession | None = field(default=None)
+    pyright_files_since_restart: int = 0
 
 
 def read_frame(stream: IO[bytes]) -> dict[str, Any] | None:
@@ -210,6 +212,11 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
         call_resolver=state.pyright,
         reference_resolver=state.pyright,
     )
+    state.pyright_files_since_restart += 1
+    if state.pyright_files_since_restart >= MAX_FILES_PER_PYRIGHT_SESSION:
+        state.pyright.close()
+        state.pyright = None
+        state.pyright_files_since_restart = 0
     stats = {
         "unresolved_call_sites_total": result.stats.unresolved_call_sites_total,
         "unresolved_call_sites": result.stats.unresolved_call_sites,

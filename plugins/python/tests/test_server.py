@@ -393,6 +393,55 @@ def test_analyze_file_reports_call_resolver_stats(
     assert any(edge["kind"] == "references" for edge in response["edges"])
 
 
+def test_analyze_file_restarts_pyright_after_file_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions: list[Any] = []
+
+    class FakePyrightSession:
+        def __init__(self, project_root: Path) -> None:
+            self.project_root = project_root
+            self.closed = False
+            sessions.append(self)
+
+        def resolve_calls(
+            self,
+            file_path: str,
+            function_ids: list[str],
+        ) -> CallResolutionResult:
+            _ = (file_path, function_ids)
+            return CallResolutionResult()
+
+        def resolve_references(
+            self,
+            file_path: str,
+            sites: Sequence[ReferenceSite],
+        ) -> ReferenceResolutionResult:
+            _ = (file_path, sites)
+            return ReferenceResolutionResult()
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(server_module, "PyrightSession", FakePyrightSession, raising=False)
+    monkeypatch.setattr(server_module, "MAX_FILES_PER_PYRIGHT_SESSION", 2)
+    demo = tmp_path / "demo.py"
+    demo.write_text("def hello():\n    pass\n", encoding="utf-8")
+    state = server_module.ServerState(initialized=True, project_root=tmp_path)
+
+    server_module.handle_analyze_file({"file_path": str(demo)}, state)
+    assert state.pyright is sessions[0]
+    first_session = cast("Any", sessions[0])
+    assert first_session.closed is False
+
+    server_module.handle_analyze_file({"file_path": str(demo)}, state)
+    assert first_session.closed is True
+    assert len(sessions) == 1
+    assert state.pyright is None
+    assert state.pyright_files_since_restart == 0
+
+
 def test_shutdown_closes_pyright_session() -> None:
     class FakePyrightSession:
         def __init__(self) -> None:
