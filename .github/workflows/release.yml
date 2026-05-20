@@ -117,8 +117,25 @@ jobs:
       - name: WP5 secret scanner smoke
         run: CARGO_BUILD=0 bash tests/e2e/wp5_secret_scan.sh
 
+  release-governance:
+    name: GitHub release governance
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: enforce repository release controls
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_GOVERNANCE_TOKEN }}
+        run: |
+          set -euo pipefail
+          python scripts/check-github-release-governance.py \
+            --repository "${GITHUB_REPOSITORY}" \
+            --branch main
+
   build-rust:
-    needs: [verify]
+    needs: [verify, release-governance]
     name: Build clarion (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -208,7 +225,7 @@ jobs:
           echo "rust-subjects=$(base64 -w0 rust-subjects.txt)" >> "$GITHUB_OUTPUT"
 
   build-plugin:
-    needs: [verify]
+    needs: [verify, release-governance]
     name: Build Python plugin sdist
     runs-on: ubuntu-latest
     steps:
