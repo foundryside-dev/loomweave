@@ -11,7 +11,11 @@ use std::{
     fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
 };
 
 mod anchors;
@@ -156,21 +160,20 @@ pub(crate) fn pre_ingest(
     let mut baseline_matches = Vec::new();
     let mut scanned_files = BTreeSet::new();
     let mut scanned_sidecars = BTreeSet::new();
+    let scans = scan_source_files_parallel(source_files, |buf| scanner.scan_bytes(buf))?;
 
-    for file in source_files {
-        let canonical_file = canonical_or_original(file);
+    for scan in scans {
+        let canonical_file = scan.canonical_file;
         scanned_files.insert(canonical_file.clone());
         if files::is_secret_scan_sidecar(&canonical_file) {
             scanned_sidecars.insert(canonical_file.clone());
         }
-        let buf = fs::read(file).with_context(|| format!("read {}", file.display()))?;
-        let detections = scanner.scan_bytes(&buf);
         let baseline_file = project_relative_path(project_root, &canonical_file);
         let SuppressionResult {
             allowed,
             fired_entries,
             ..
-        } = baseline.suppress(detections, &baseline_file);
+        } = baseline.suppress(scan.detections, &baseline_file);
         if !allowed.is_empty() {
             all_allowed.extend(
                 allowed
@@ -262,6 +265,76 @@ pub(crate) fn pre_ingest(
     })
 }
 
+#[derive(Debug)]
+struct SourceFileScan {
+    canonical_file: PathBuf,
+    detections: Vec<Detection>,
+}
+
+fn scan_source_files_parallel<F>(
+    source_files: &[PathBuf],
+    scan_bytes: F,
+) -> Result<Vec<SourceFileScan>>
+where
+    F: Fn(&[u8]) -> Vec<Detection> + Sync,
+{
+    if source_files.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let worker_count = source_files.len().min(
+        thread::available_parallelism()
+            .map_or(1, usize::from)
+            .max(1),
+    );
+    let next_file = AtomicUsize::new(0);
+    let results = (0..source_files.len())
+        .map(|_| Mutex::new(None))
+        .collect::<Vec<_>>();
+
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let next_file = &next_file;
+            let results = &results;
+            let scan_bytes = &scan_bytes;
+            scope.spawn(move || {
+                loop {
+                    let idx = next_file.fetch_add(1, Ordering::Relaxed);
+                    let Some(file) = source_files.get(idx) else {
+                        break;
+                    };
+                    let result = scan_one_source_file(file, scan_bytes);
+                    *results[idx]
+                        .lock()
+                        .expect("parallel secret-scan result lock poisoned") = Some(result);
+                }
+            });
+        }
+    });
+
+    results
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .expect("parallel secret-scan result lock poisoned")
+                .expect("parallel secret-scan worker did not fill result")
+        })
+        .collect()
+}
+
+fn scan_one_source_file<F>(file: &Path, scan_bytes: &F) -> Result<SourceFileScan>
+where
+    F: Fn(&[u8]) -> Vec<Detection> + Sync + ?Sized,
+{
+    let canonical_file = canonical_or_original(file);
+    let buf = fs::read(file).with_context(|| format!("read {}", file.display()))?;
+    let detections = scan_bytes(&buf);
+    Ok(SourceFileScan {
+        canonical_file,
+        detections,
+    })
+}
+
 fn confirm_override_if_needed(
     project_root: &Path,
     allowed: &[(PathBuf, Detection)],
@@ -347,7 +420,8 @@ fn relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::display_relative;
+    use super::{display_relative, scan_source_files_parallel};
+    use std::sync::{Arc, Mutex};
 
     #[cfg(unix)]
     #[test]
@@ -362,5 +436,48 @@ mod tests {
         let canonical_file = file.canonicalize().expect("canonical file");
 
         assert_eq!(display_relative(&link_root, &canonical_file), ".env");
+    }
+
+    #[test]
+    fn scan_source_files_parallel_scans_on_workers_and_preserves_input_order() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let files = (0..8)
+            .map(|idx| {
+                let path = tmp.path().join(format!("{idx}.txt"));
+                std::fs::write(&path, format!("file-{idx}\n")).expect("write scan file");
+                path
+            })
+            .collect::<Vec<_>>();
+        let caller_thread = std::thread::current().id();
+        let scan_threads = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&scan_threads);
+
+        let scans = scan_source_files_parallel(&files, |buf| {
+            seen.lock()
+                .expect("record thread")
+                .push(std::thread::current().id());
+            assert!(buf.starts_with(b"file-"));
+            Vec::new()
+        })
+        .expect("parallel scan");
+
+        assert_eq!(
+            scans
+                .iter()
+                .map(|scan| scan.canonical_file.clone())
+                .collect::<Vec<_>>(),
+            files
+                .iter()
+                .map(|file| file.canonicalize().expect("canonical test file"))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            scan_threads
+                .lock()
+                .expect("scan threads")
+                .iter()
+                .any(|thread_id| *thread_id != caller_thread),
+            "expected at least one scan to run on a worker thread"
+        );
     }
 }
