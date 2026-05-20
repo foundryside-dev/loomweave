@@ -1056,6 +1056,47 @@ fn analyze_stats_reports_ambiguous_edges_total() {
 
 #[cfg(unix)]
 #[test]
+fn analyze_mints_core_file_entity_for_registry_resolution() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_ambiguous_calls_plugin(plugin_dir.path());
+
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    std::fs::write(project_dir.path().join("demo.call"), b"caller callee\n")
+        .expect("write demo.call");
+
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    clarion_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    let resolved = clarion_storage::resolve_file(&conn, project_dir.path(), "demo.call", "")
+        .expect("resolve_file should not error")
+        .expect("analyzed ordinary source file should resolve as a core file entity");
+
+    assert_eq!(resolved.entity_id, "core:file:demo.call");
+    assert_eq!(resolved.canonical_path.as_str(), "demo.call");
+    assert_eq!(
+        resolved.language, "callsfixture",
+        "HTTP file resolution must use the plugin manifest language, not a hardcoded extension fallback"
+    );
+    assert_eq!(
+        resolved.content_hash,
+        blake3::hash(b"caller callee\n").to_hex().to_string()
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn analyze_filters_external_import_edges_before_writer_insert() {
     let project_dir = tempfile::tempdir().unwrap();
     let plugin_dir = tempfile::tempdir().unwrap();

@@ -212,6 +212,28 @@ fn serve_http_files_endpoint_resolves_known_file_on_configured_port() {
 }
 
 #[test]
+fn serve_http_files_endpoint_prefers_stored_manifest_language() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    seed_custom_language_file_entity(dir.path());
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+
+    let mut child = spawn_serve(dir.path());
+    let response = wait_for_http_json(&bind, "/api/v1/files?path=demo.custom&language=requested");
+    stop_serve(&mut child);
+    let response = response.expect("HTTP /api/v1/files response");
+
+    assert_eq!(response["entity_id"], "core:file:demo.custom");
+    assert_eq!(response["language"], "manifestlang");
+}
+
+#[test]
 fn serve_http_files_etag_round_trip_and_if_none_match_returns_304() {
     let dir = tempfile::tempdir().expect("temp project");
     clarion_bin()
@@ -1777,6 +1799,30 @@ fn seed_file_entity(project_root: &Path) -> (String, String, String) {
     )
     .expect("insert file entity");
     (file_id, content_hash, "demo.py".to_owned())
+}
+
+fn seed_custom_language_file_entity(project_root: &Path) {
+    let source_path = project_root.join("demo.custom");
+    fs::write(&source_path, "custom source\n").expect("write custom source");
+    let canonical_path = source_path
+        .canonicalize()
+        .expect("canonical source path")
+        .display()
+        .to_string();
+    let db_path = project_root.join(".clarion/clarion.db");
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            'core:file:demo.custom', 'core', 'file', 'demo.custom', 'demo.custom', ?1,
+            1, 1, '{\"language\":\"manifestlang\"}', 'hash-demo-custom',
+            '2026-05-19T00:00:00.000Z', '2026-05-19T00:00:00.000Z'
+         )",
+        params![canonical_path],
+    )
+    .expect("insert custom language file entity");
 }
 
 fn seed_briefing_blocked_file_entity(project_root: &Path) {

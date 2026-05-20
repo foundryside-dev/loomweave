@@ -299,7 +299,8 @@ fn plugin_entity_for_unscanned_source_is_briefing_blocked() {
 
     let blocked: String = conn(project.path())
         .query_row(
-            "SELECT json_extract(properties, '$.briefing_blocked') FROM entities",
+            "SELECT json_extract(properties, '$.briefing_blocked') FROM entities \
+             WHERE plugin_id = 'secretfixture'",
             [],
             |row| row.get(0),
         )
@@ -795,7 +796,8 @@ fn only_secret_bearing_file_is_blocked_in_multi_file_project() {
 
     let blocked_count: i64 = conn(project.path())
         .query_row(
-            "SELECT COUNT(*) FROM entities WHERE json_extract(properties, '$.briefing_blocked') = 'secret_present'",
+            "SELECT COUNT(DISTINCT source_file_path) FROM entities \
+             WHERE json_extract(properties, '$.briefing_blocked') = 'secret_present'",
             [],
             |row| row.get(0),
         )

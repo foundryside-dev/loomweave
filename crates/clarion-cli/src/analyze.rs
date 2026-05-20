@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use ignore::{DirEntry, WalkBuilder};
@@ -245,6 +246,8 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let mut run_outcome: RunOutcome = RunOutcome::Completed;
     let mut breaker = CrashLoopBreaker::default();
     let mut crash_reasons: Vec<String> = Vec::new();
+    let briefing_blocks = Arc::clone(&secret_scan_outcome.briefing_blocks);
+    let scanned_files = secret_scan_outcome.scanned_files_shared();
     'plugins: for plugin in plugins {
         let plugin_id = plugin.manifest.plugin.plugin_id.clone();
         let plugin_extensions: BTreeSet<String> = plugin
@@ -284,8 +287,8 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         let pid_clone = plugin_id.clone();
         let exec_clone = plugin.executable.clone();
         let files_clone = plugin_files.clone();
-        let briefing_blocks_clone = secret_scan_outcome.briefing_blocks.clone();
-        let scanned_files_clone = secret_scan_outcome.scanned_files().clone();
+        let briefing_blocks_clone = Arc::clone(&briefing_blocks);
+        let scanned_files_clone = Arc::clone(&scanned_files);
 
         // A JoinError here means the blocking task panicked (OOM, stack
         // overflow, internal unwrap, abort — anything that unwinds past the
@@ -1184,17 +1187,19 @@ type Collected = (
 /// via `child.kill()` + `child.wait()`. `std::process::Child::Drop` does NOT
 /// kill or reap on Unix, so discarding `child` without `wait()` would leak a
 /// zombie into the kernel process table per spawn.
+#[allow(clippy::too_many_lines)]
 fn run_plugin_blocking(
     manifest: clarion_core::Manifest,
     project_root: &Path,
     plugin_id: &str,
     executable: &Path,
     files: &[PathBuf],
-    briefing_blocks: &BTreeMap<PathBuf, clarion_core::BriefingBlockReason>,
-    scanned_source_files: &BTreeSet<PathBuf>,
+    briefing_blocks: &Arc<BTreeMap<PathBuf, clarion_core::BriefingBlockReason>>,
+    scanned_source_files: &Arc<BTreeSet<PathBuf>>,
 ) -> Result<BatchResult, PluginRunError> {
     use clarion_core::PluginHost;
 
+    let manifest_language = manifest.plugin.language.clone();
     let (mut host, mut child) =
         PluginHost::spawn(manifest, project_root, executable).map_err(|e| match e {
             HostError::Spawn(msg) => {
@@ -1207,8 +1212,8 @@ fn run_plugin_blocking(
                 PluginRunError::new(format!("plugin {plugin_id} spawn/handshake error: {other}"))
             }
         })?;
-    host.set_briefing_blocks(briefing_blocks.clone());
-    host.set_scanned_source_files(scanned_source_files.clone());
+    host.set_briefing_blocks(Arc::clone(briefing_blocks));
+    host.set_scanned_source_files(Arc::clone(scanned_source_files));
 
     let work_result: Result<Collected, String> = (|| {
         let mut collected_entities: Vec<(String, EntityRecord)> = Vec::new();
@@ -1247,6 +1252,16 @@ fn run_plugin_blocking(
                 .find(|entity| entity.kind == "module")
                 .map(|entity| entity.id.to_string());
             let mut file_entities: Vec<(String, EntityRecord)> = Vec::new();
+            let (file_entity_id, file_record) = core_file_entity_record(
+                project_root,
+                file,
+                &manifest_language,
+                briefing_blocks,
+                scanned_source_files,
+            )
+            .map_err(|e| format!("core file entity for {}: {e:#}", file.display()))?;
+            file_entities.push((file_entity_id.clone(), file_record.clone()));
+            collected_entities.push((file_entity_id, file_record));
             for entity in &entities {
                 let id_str = entity.id.to_string();
                 let record = map_entity_to_record(entity, plugin_id, source_file_id.clone());
@@ -1518,6 +1533,118 @@ fn absolute_from_import_submodule_target(
     module_entity_ids
         .contains(candidate.as_str())
         .then_some(candidate)
+}
+
+fn core_file_entity_record(
+    project_root: &Path,
+    file: &Path,
+    manifest_language: &str,
+    briefing_blocks: &BTreeMap<PathBuf, clarion_core::BriefingBlockReason>,
+    scanned_source_files: &BTreeSet<PathBuf>,
+) -> Result<(String, EntityRecord)> {
+    let canonical_root = project_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize project root {}", project_root.display()))?;
+    let canonical_file = file
+        .canonicalize()
+        .with_context(|| format!("canonicalize source file {}", file.display()))?;
+    let relative = canonical_file
+        .strip_prefix(&canonical_root)
+        .with_context(|| {
+            format!(
+                "source file {} is outside project root {}",
+                canonical_file.display(),
+                canonical_root.display()
+            )
+        })?;
+    let qualified_name = project_relative_posix(relative)?;
+    let id = clarion_core::entity_id::entity_id("core", "file", &qualified_name)?.to_string();
+    let briefing_blocked = briefing_blocks.get(&canonical_file).copied().or_else(|| {
+        (!scanned_source_files.contains(&canonical_file))
+            .then_some(clarion_core::BriefingBlockReason::UnscannedSource)
+    });
+    let source_file_path = canonical_file
+        .into_os_string()
+        .into_string()
+        .map_err(|path| {
+            anyhow::anyhow!("source file path is not valid UTF-8: {}", path.display())
+        })?;
+    let short_name = Path::new(&source_file_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&qualified_name)
+        .to_owned();
+    let content_hash = fs::read(&source_file_path)
+        .with_context(|| format!("read source file {source_file_path}"))
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())?;
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "language".to_owned(),
+        serde_json::Value::String(manifest_language.to_owned()),
+    );
+    if let Some(reason) = briefing_blocked {
+        properties.insert(
+            "briefing_blocked".to_owned(),
+            serde_json::Value::String(reason.as_str().to_owned()),
+        );
+    }
+    let properties_json = serde_json::Value::Object(properties).to_string();
+    let now = iso8601_now();
+
+    Ok((
+        id.clone(),
+        EntityRecord {
+            id,
+            plugin_id: "core".to_owned(),
+            kind: "file".to_owned(),
+            name: qualified_name,
+            short_name,
+            parent_id: None,
+            source_file_id: None,
+            source_file_path: Some(source_file_path),
+            source_byte_start: None,
+            source_byte_end: None,
+            source_line_start: None,
+            source_line_end: None,
+            properties_json,
+            content_hash: Some(content_hash),
+            summary_json: None,
+            wardline_json: None,
+            first_seen_commit: None,
+            last_seen_commit: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    ))
+}
+
+fn project_relative_posix(path: &Path) -> Result<String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                let part = part.to_str().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "source file path component is not valid UTF-8: {}",
+                        part.display()
+                    )
+                })?;
+                parts.push(part);
+            }
+            std::path::Component::CurDir => {}
+            _ => {
+                bail!(
+                    "source file path is not project-relative: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    let relative = parts.join("/");
+    if relative.is_empty() {
+        bail!("source file path must not resolve to the project root");
+    }
+    Ok(relative)
 }
 
 /// Map an `AcceptedEntity` to an `EntityRecord` for the writer-actor.

@@ -277,7 +277,12 @@ pub fn resolve_file_catalog_entry(
             entity_id: entity.id,
             content_hash: entity.content_hash,
             canonical_path,
-            language: resolved_language(language, &entity.plugin_id, &lookup_path),
+            language: resolved_language(
+                language,
+                &entity.plugin_id,
+                &entity.properties_json,
+                &lookup_path,
+            ),
             briefing_blocked,
             content_hash_path: lookup_path,
         }));
@@ -380,7 +385,15 @@ fn file_content_hash(path: &Path) -> std::io::Result<String> {
     fs::read(path).map(|bytes| blake3::hash(&bytes).to_hex().to_string())
 }
 
-fn resolved_language(requested: &str, plugin_id: &str, path: &Path) -> String {
+fn resolved_language(
+    requested: &str,
+    plugin_id: &str,
+    properties_json: &str,
+    path: &Path,
+) -> String {
+    if let Some(language) = stored_language(properties_json) {
+        return language;
+    }
     if plugin_id != "core" {
         return plugin_id.to_owned();
     }
@@ -388,6 +401,16 @@ fn resolved_language(requested: &str, plugin_id: &str, path: &Path) -> String {
         return inferred;
     }
     requested.trim().to_owned()
+}
+
+fn stored_language(properties_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(properties_json)
+        .ok()?
+        .get("language")?
+        .as_str()
+        .map(str::trim)
+        .filter(|language| !language.is_empty())
+        .map(str::to_owned)
 }
 
 fn language_for_extension(path: &Path) -> Option<String> {

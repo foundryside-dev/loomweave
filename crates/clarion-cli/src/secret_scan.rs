@@ -11,6 +11,7 @@ use std::{
     fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 mod anchors;
@@ -81,11 +82,11 @@ impl std::fmt::Display for OverrideConfirmationError {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SecretScanOutcome {
-    pub(crate) briefing_blocks: BTreeMap<PathBuf, BriefingBlockReason>,
+    pub(crate) briefing_blocks: Arc<BTreeMap<PathBuf, BriefingBlockReason>>,
     findings: Vec<PendingFinding>,
     finding_anchors: BTreeMap<PathBuf, String>,
     override_files: Vec<PathBuf>,
-    scanned_files: BTreeSet<PathBuf>,
+    scanned_files: Arc<BTreeSet<PathBuf>>,
     // Subset of `scanned_files` restricted to paths matched by
     // `files::is_secret_scan_sidecar` (e.g. `.env`, `.env.*`, `*.env`).
     // These paths have no plugin coverage by design, so their `core:file`
@@ -96,8 +97,8 @@ pub(crate) struct SecretScanOutcome {
 }
 
 impl SecretScanOutcome {
-    pub(crate) fn scanned_files(&self) -> &BTreeSet<PathBuf> {
-        &self.scanned_files
+    pub(crate) fn scanned_files_shared(&self) -> Arc<BTreeSet<PathBuf>> {
+        Arc::clone(&self.scanned_files)
     }
 
     pub(crate) fn scanned_sidecars(&self) -> &BTreeSet<PathBuf> {
@@ -252,11 +253,11 @@ pub(crate) fn pre_ingest(
     }
 
     Ok(SecretScanOutcome {
-        briefing_blocks,
+        briefing_blocks: Arc::new(briefing_blocks),
         findings,
         finding_anchors: BTreeMap::new(),
         override_files: override_files.into_iter().collect(),
-        scanned_files,
+        scanned_files: Arc::new(scanned_files),
         scanned_sidecars,
     })
 }

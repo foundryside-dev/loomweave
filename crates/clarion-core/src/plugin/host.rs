@@ -30,6 +30,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -413,11 +414,11 @@ where
     /// `None`. Capacity is [`STDERR_TAIL_BYTES`]; oldest bytes are
     /// discarded on overflow so the plugin cannot back-pressure the host
     /// via stderr writes.
-    stderr_tail: Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>>,
+    stderr_tail: Option<Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>>,
     /// Canonical source paths whose entities must not be sent for LLM briefing.
-    briefing_blocks: BTreeMap<PathBuf, BriefingBlockReason>,
+    briefing_blocks: Arc<BTreeMap<PathBuf, BriefingBlockReason>>,
     /// Canonical source paths that were covered by the core pre-ingest scanner.
-    scanned_source_files: BTreeSet<PathBuf>,
+    scanned_source_files: Arc<BTreeSet<PathBuf>>,
 }
 
 /// File-level reason an entity must not be dispatched for LLM briefing.
@@ -449,7 +450,7 @@ pub const STDERR_TAIL_BYTES: usize = 64 * 1024;
 #[cfg(unix)]
 fn drain_stderr_into_ring(
     mut stderr: std::process::ChildStderr,
-    ring: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
+    ring: &Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
 ) {
     use std::io::Read;
     let mut buf = [0u8; 4096];
@@ -682,8 +683,8 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
             terminated: false,
             ontology_version: None,
             stderr_tail: None,
-            briefing_blocks: BTreeMap::new(),
-            scanned_source_files: BTreeSet::new(),
+            briefing_blocks: Arc::new(BTreeMap::new()),
+            scanned_source_files: Arc::new(BTreeSet::new()),
         }
     }
 
@@ -714,7 +715,7 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
     /// Install file-level briefing blocks produced by the core pre-ingest
     /// scanner. Keys are canonical source paths and values are typed policy
     /// reasons rendered into `properties_json` by [`BriefingBlockReason::as_str`].
-    pub fn set_briefing_blocks(&mut self, blocks: BTreeMap<PathBuf, BriefingBlockReason>) {
+    pub fn set_briefing_blocks(&mut self, blocks: Arc<BTreeMap<PathBuf, BriefingBlockReason>>) {
         self.briefing_blocks = blocks;
     }
 
@@ -723,7 +724,7 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
     /// If a plugin returns an entity for a jailed in-project path that is not in
     /// this set, the entity is policy-blocked from LLM briefing because its file
     /// bytes have not passed the scanner.
-    pub fn set_scanned_source_files(&mut self, files: BTreeSet<PathBuf>) {
+    pub fn set_scanned_source_files(&mut self, files: Arc<BTreeSet<PathBuf>>) {
         self.scanned_source_files = files;
     }
 
