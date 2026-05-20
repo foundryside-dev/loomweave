@@ -17,12 +17,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 
@@ -32,6 +35,10 @@ class CheckError(Exception):
 
 class UsageError(Exception):
     """Raised when the guard cannot query GitHub correctly."""
+
+
+FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+USES_RE = re.compile(r"^\s*(?:-\s*)?uses:\s*(?P<target>\S+)\s*$")
 
 
 @dataclass(frozen=True)
@@ -179,6 +186,36 @@ def check_governance(
     return notes
 
 
+def check_workflow_action_pins(repo_root: Path) -> list[str]:
+    workflow_dir = repo_root / ".github" / "workflows"
+    if not workflow_dir.is_dir():
+        raise UsageError(f"workflow directory not found: {workflow_dir}")
+
+    failures: list[str] = []
+    checked = 0
+    for workflow in sorted([*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml")]):
+        for line_number, line in enumerate(workflow.read_text(encoding="utf-8").splitlines(), 1):
+            match = USES_RE.match(line)
+            if match is None:
+                continue
+            target = match.group("target")
+            if target.startswith(("./", "docker://")):
+                continue
+            if "@" not in target:
+                failures.append(f"{workflow}:{line_number}: external action is not pinned: {target}")
+                continue
+            ref = target.rsplit("@", maxsplit=1)[1]
+            checked += 1
+            if not FULL_SHA_RE.fullmatch(ref):
+                failures.append(
+                    f"{workflow}:{line_number}: action ref is not a full commit SHA: {target}"
+                )
+
+    if failures:
+        raise CheckError("\n".join(failures))
+    return [f"workflow action refs are full-length commit SHAs ({checked} uses entries checked)"]
+
+
 def run_self_test() -> None:
     responses: dict[str, ApiResponse] = {
         "/repos/acme/clarion/branches/main/protection": ApiResponse(
@@ -221,6 +258,32 @@ def run_self_test() -> None:
     notes = check_governance(fake_get, "acme/clarion", "main")
     assert any("active repository ruleset" in note for note in notes)
 
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        workflow = root / ".github" / "workflows" / "ci.yml"
+        workflow.parent.mkdir(parents=True)
+        workflow.write_text(
+            "jobs:\n"
+            "  ok:\n"
+            "    steps:\n"
+            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5\n",
+            encoding="utf-8",
+        )
+        assert check_workflow_action_pins(root)
+        workflow.write_text(
+            "jobs:\n"
+            "  bad:\n"
+            "    steps:\n"
+            "      - uses: actions/checkout@v4\n",
+            encoding="utf-8",
+        )
+        try:
+            check_workflow_action_pins(root)
+        except CheckError as exc:
+            assert "not a full commit SHA" in str(exc)
+        else:
+            raise AssertionError("tag-pinned fixture should fail")
+
     print("GitHub release governance guard self-test passed")
 
 
@@ -249,6 +312,12 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--branch", default="main", help="release branch to inspect")
     parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=Path.cwd(),
+        help="repository root for static workflow-pin checks",
+    )
+    parser.add_argument(
         "--api-base",
         default=os.environ.get("GITHUB_API_URL", "https://api.github.com"),
         help="GitHub API base URL",
@@ -259,6 +328,16 @@ def main(argv: list[str]) -> int:
     if args.self_test:
         run_self_test()
         return 0
+
+    try:
+        static_notes = check_workflow_action_pins(args.repo_root)
+    except CheckError as exc:
+        print("GitHub release governance guard failed:", file=sys.stderr)
+        print(str(exc), file=sys.stderr)
+        return 1
+    except UsageError as exc:
+        print(f"GitHub release governance guard could not run: {exc}", file=sys.stderr)
+        return 2
 
     token = resolve_token()
     if not args.repository:
@@ -276,7 +355,7 @@ def main(argv: list[str]) -> int:
 
     client = GitHubClient(token=token, api_base=args.api_base)
     try:
-        notes = check_governance(client.get, args.repository, args.branch)
+        notes = [*static_notes, *check_governance(client.get, args.repository, args.branch)]
     except CheckError as exc:
         print("GitHub release governance guard failed:", file=sys.stderr)
         print(str(exc), file=sys.stderr)
