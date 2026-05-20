@@ -40,6 +40,7 @@ class UsageError(Exception):
 
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 USES_RE = re.compile(r"^\s*(?:-\s*)?uses:\s*(?P<target>\S+)\s*$")
+JOB_RE = re.compile(r"^  (?P<name>[A-Za-z0-9_-]+):\s*(?:#.*)?$")
 REQUIRED_STATUS_CHECKS = frozenset(
     {
         "Rust",
@@ -406,6 +407,81 @@ def check_dependabot_github_actions_updates(repo_root: Path) -> list[str]:
     )
 
 
+def release_workflow_job_blocks(workflow: Path) -> dict[str, list[str]]:
+    jobs: dict[str, list[str]] = {}
+    current_job: str | None = None
+    in_jobs = False
+
+    for raw_line in workflow.read_text(encoding="utf-8").splitlines():
+        if raw_line == "jobs:":
+            in_jobs = True
+            current_job = None
+            continue
+        if in_jobs and raw_line and not raw_line.startswith((" ", "#")):
+            break
+        if not in_jobs:
+            continue
+
+        match = JOB_RE.match(raw_line)
+        if match is not None:
+            current_job = match.group("name")
+            jobs[current_job] = []
+            continue
+        if current_job is not None:
+            jobs[current_job].append(raw_line)
+
+    return jobs
+
+
+def release_workflow_needs(job_lines: list[str]) -> set[str]:
+    needs: set[str] = set()
+    in_needs_block = False
+    for line in job_lines:
+        stripped = line.strip()
+        if stripped.startswith("needs:"):
+            in_needs_block = True
+            value = stripped.split(":", maxsplit=1)[1].strip()
+            if value.startswith("[") and value.endswith("]"):
+                needs.update(
+                    item.strip(" '\"") for item in value[1:-1].split(",") if item.strip()
+                )
+            elif value:
+                needs.add(value.strip(" '\""))
+            continue
+        if in_needs_block:
+            if stripped.startswith("- "):
+                needs.add(stripped[2:].strip(" '\""))
+                continue
+            if line.startswith("    ") and not line.startswith("      "):
+                in_needs_block = False
+    return needs
+
+
+def check_release_workflow_governance_gate(repo_root: Path) -> list[str]:
+    workflow = repo_root / ".github" / "workflows" / "release.yml"
+    if not workflow.is_file():
+        raise CheckError(f"{workflow}: release workflow is missing")
+
+    jobs = release_workflow_job_blocks(workflow)
+    failures: list[str] = []
+    if "release-governance" not in jobs:
+        failures.append(f"{workflow}: missing release-governance job")
+
+    for job_name in ("build-rust", "build-plugin"):
+        if job_name not in jobs:
+            failures.append(f"{workflow}: missing {job_name} job")
+            continue
+        needs = release_workflow_needs(jobs[job_name])
+        if "release-governance" not in needs:
+            failures.append(
+                f"{workflow}: {job_name} must need release-governance before release artifacts build"
+            )
+
+    if failures:
+        raise CheckError("\n".join(failures))
+    return ["release workflow build jobs require the GitHub governance gate"]
+
+
 def run_self_test() -> None:
     responses: dict[str, ApiResponse] = {
         "/repos/acme/clarion/branches/main/protection": ApiResponse(
@@ -602,6 +678,45 @@ def run_self_test() -> None:
         else:
             raise AssertionError("missing github-actions Dependabot fixture should fail")
 
+        release_workflow = workflow.parent / "release.yml"
+        release_workflow.write_text(
+            "jobs:\n"
+            "  verify:\n"
+            "    steps: []\n"
+            "  release-governance:\n"
+            "    steps: []\n"
+            "  build-rust:\n"
+            "    needs: [verify]\n"
+            "    steps: []\n"
+            "  build-plugin:\n"
+            "    needs: [verify]\n"
+            "    steps: []\n",
+            encoding="utf-8",
+        )
+        try:
+            check_release_workflow_governance_gate(root)
+        except CheckError as exc:
+            assert "build-rust" in str(exc)
+            assert "release-governance" in str(exc)
+        else:
+            raise AssertionError("ungated release-build fixture should fail")
+
+        release_workflow.write_text(
+            "jobs:\n"
+            "  verify:\n"
+            "    steps: []\n"
+            "  release-governance:\n"
+            "    steps: []\n"
+            "  build-rust:\n"
+            "    needs: [verify, release-governance]\n"
+            "    steps: []\n"
+            "  build-plugin:\n"
+            "    needs: [verify, release-governance]\n"
+            "    steps: []\n",
+            encoding="utf-8",
+        )
+        assert check_release_workflow_governance_gate(root)
+
     print("GitHub release governance guard self-test passed")
 
 
@@ -641,6 +756,11 @@ def main(argv: list[str]) -> int:
         help="GitHub API base URL",
     )
     parser.add_argument("--self-test", action="store_true", help="run built-in tests")
+    parser.add_argument(
+        "--static-only",
+        action="store_true",
+        help="run source-tree checks and skip live GitHub API checks",
+    )
     args = parser.parse_args(argv)
 
     if args.self_test:
@@ -651,6 +771,7 @@ def main(argv: list[str]) -> int:
         static_notes = [
             *check_workflow_action_pins(args.repo_root),
             *check_dependabot_github_actions_updates(args.repo_root),
+            *check_release_workflow_governance_gate(args.repo_root),
         ]
     except CheckError as exc:
         print("GitHub release governance guard failed:", file=sys.stderr)
@@ -659,6 +780,11 @@ def main(argv: list[str]) -> int:
     except UsageError as exc:
         print(f"GitHub release governance guard could not run: {exc}", file=sys.stderr)
         return 2
+
+    if args.static_only:
+        for note in static_notes:
+            print(f"ok: {note}")
+        return 0
 
     token = resolve_token()
     if not args.repository:

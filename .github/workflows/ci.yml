@@ -44,6 +44,11 @@ jobs:
           python scripts/check-migration-retirement.py --self-test
           python scripts/check-migration-retirement.py
 
+      - name: release governance static guard
+        run: |
+          python scripts/check-github-release-governance.py --self-test
+          python scripts/check-github-release-governance.py --static-only
+
       - name: cross-workspace version lockstep
         run: python scripts/check-workspace-version-lockstep.py
 
