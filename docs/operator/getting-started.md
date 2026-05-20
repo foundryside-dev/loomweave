@@ -65,6 +65,30 @@ which clarion                     # e.g. ~/.cargo/bin/clarion
 which clarion-plugin-python       # e.g. ~/.local/bin/clarion-plugin-python
 ```
 
+### Verifying release artifacts
+
+Tagged releases publish platform archives, SHA256 files, keyless cosign
+signatures/certificates, and SLSA provenance. For a downloaded archive:
+
+```bash
+sha256sum -c clarion-x86_64-unknown-linux-gnu.tar.gz.sha256
+cosign verify-blob \
+  --certificate clarion-x86_64-unknown-linux-gnu.tar.gz.pem \
+  --signature clarion-x86_64-unknown-linux-gnu.tar.gz.sig \
+  --certificate-identity-regexp 'https://github.com/.+/.github/workflows/release.yml@refs/tags/v.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  clarion-x86_64-unknown-linux-gnu.tar.gz
+slsa-verifier verify-artifact \
+  --provenance-path clarion-rust-binaries.intoto.jsonl \
+  --source-uri github.com/tachyon-beep/clarion \
+  --source-tag "$TAG" \
+  clarion-x86_64-unknown-linux-gnu.tar.gz
+```
+
+Stable `v*` tags without a pre-release suffix also publish
+`clarion-plugin-python` to PyPI via trusted publishing; release candidates keep
+the Python sdist on the GitHub Release only.
+
 **`$PATH` discipline matters.** Clarion's plugin host (per
 [ADR-002](../clarion/adr/ADR-002-plugin-transport-json-rpc.md)) discovers
 plugins by walking `$PATH` for executables matching `clarion-plugin-*`. If

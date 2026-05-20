@@ -19,7 +19,9 @@ env:
   RUSTFLAGS: "-D warnings"
 
 permissions:
+  actions: read
   contents: write
+  id-token: write
 
 jobs:
   verify:
@@ -125,10 +127,24 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
+            apt_packages: ""
+            linker_env: ""
+            linker: ""
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            apt_packages: gcc-aarch64-linux-gnu
+            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
+            linker: aarch64-linux-gnu-gcc
           - target: x86_64-apple-darwin
             runner: macos-13
+            apt_packages: ""
+            linker_env: ""
+            linker: ""
           - target: aarch64-apple-darwin
             runner: macos-14
+            apt_packages: ""
+            linker_env: ""
+            linker: ""
     steps:
       - uses: actions/checkout@v4
 
@@ -140,8 +156,19 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
+      - name: install linux cross linker
+        if: matrix.apt_packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.apt_packages }}
+
       - name: build release
-        run: cargo build --release --locked --bin clarion --target ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [ -n "${{ matrix.linker_env }}" ]; then
+            export "${{ matrix.linker_env }}=${{ matrix.linker }}"
+          fi
+          cargo build --release --locked --bin clarion --target ${{ matrix.target }}
 
       - name: package
         id: package
@@ -171,6 +198,29 @@ jobs:
             ${{ steps.package.outputs.archive }}.sha256
           if-no-files-found: error
           retention-days: 7
+
+  release-subjects:
+    name: Derive release artifact subjects
+    runs-on: ubuntu-latest
+    needs: [build-rust, build-plugin]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    outputs:
+      rust-subjects: ${{ steps.subjects.outputs.rust-subjects }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: compute Rust archive subjects
+        id: subjects
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' asset; do
+            digest=$(sha256sum "$asset" | cut -d' ' -f1)
+            printf '%s  %s\n' "$digest" "$(basename "$asset")"
+          done < <(find artifacts -name 'clarion-*.tar.gz' -print0 | sort -z) > rust-subjects.txt
+          test -s rust-subjects.txt
+          echo "rust-subjects=$(base64 -w0 rust-subjects.txt)" >> "$GITHUB_OUTPUT"
 
   build-plugin:
     needs: [verify]
@@ -229,6 +279,32 @@ jobs:
           find artifacts -name '*.tar.gz' -o -name '*.tar.gz.sha256' \
             | xargs -I{} cp {} release/
           ls -la release/
+
+      - name: install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: sign release archives
+        run: |
+          set -euo pipefail
+          for asset in release/*.tar.gz; do
+            cosign sign-blob --yes \
+              --output-signature "$asset.sig" \
+              --output-certificate "$asset.pem" \
+              "$asset"
+          done
+          ls -la release/
+
+      - name: smoke-verify release archive signatures
+        run: |
+          set -euo pipefail
+          for asset in release/*.tar.gz; do
+            cosign verify-blob \
+              --certificate "$asset.pem" \
+              --signature "$asset.sig" \
+              --certificate-identity-regexp "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/v.*" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "$asset"
+          done
 
       - name: derive previous tag
         id: prev
@@ -300,3 +376,39 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') }}
           files: release/*
           fail_on_unmatched_files: true
+
+  provenance:
+    name: Generate SLSA provenance
+    needs: [release, release-subjects]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.release-subjects.outputs.rust-subjects }}
+      upload-assets: true
+      upload-tag-name: ${{ github.ref_name }}
+      provenance-name: clarion-rust-binaries.intoto.jsonl
+
+  publish-plugin-pypi:
+    name: Publish Python plugin to PyPI
+    runs-on: ubuntu-latest
+    needs: [release, build-plugin]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: clarion-plugin-python-sdist
+          path: dist
+
+      - name: keep only Python distributions
+        run: rm -f dist/*.sha256
+
+      - name: publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
