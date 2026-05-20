@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import shutil
 import stat
 import sys
@@ -20,6 +21,11 @@ from clarion_plugin_python.pyright_session import (
     FINDING_PYRIGHT_UNAVAILABLE,
     LspTimeoutError,
     PyrightSession,
+    _CallSite,
+    _FunctionIndex,
+    _FunctionInfo,
+    _unresolved_call_site_total_for_function,
+    _unresolved_call_sites_for_function,
 )
 from clarion_plugin_python.reference_resolver import ReferenceSite, ReferenceSiteKind
 
@@ -44,6 +50,50 @@ def _write_module(tmp_path: Path, source: str, name: str = "demo.py") -> Path:
     path = tmp_path / name
     path.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
     return path
+
+
+def test_unresolved_call_site_details_omit_expressions_over_host_cap() -> None:
+    callee_expr = "factory." + ".".join(f"method_{idx:03d}" for idx in range(80))
+    assert len(callee_expr.encode("utf-8")) > 512
+    source = f"def caller():\n    {callee_expr}()\n"
+    tree = ast.parse(source)
+    function_node = cast("ast.FunctionDef", tree.body[0])
+    index = _FunctionIndex(
+        source=source,
+        line_starts=(0, len(b"def caller():\n")),
+        parse_latency_ms=0,
+        module_id="python:module:demo",
+        by_id={},
+        by_name_position={},
+        entity_by_name_position={},
+        by_short_name={},
+        dunder_call_by_class={},
+        functions=(),
+        entities=(),
+        tree=tree,
+    )
+    function = _FunctionInfo(
+        entity_id="python:function:demo.caller",
+        qualified_name="demo.caller",
+        name="caller",
+        line=0,
+        character=4,
+        end_line=1,
+        end_character=8,
+        call_sites=(
+            _CallSite(
+                line=1,
+                character=4,
+                end_line=1,
+                end_character=4 + len(callee_expr),
+                callee_expr=callee_expr,
+            ),
+        ),
+        node=function_node,
+    )
+
+    assert _unresolved_call_site_total_for_function(function, set()) == 1
+    assert _unresolved_call_sites_for_function(index, function, set()) == []
 
 
 def _finding_codes(result_findings: Sequence[Finding]) -> set[str]:

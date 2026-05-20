@@ -40,6 +40,7 @@ FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT = "CLA-PY-CALL-RESOLUTION-TIMEOUT"
 FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT = "CLA-PY-REFERENCE-RESOLUTION-TIMEOUT"
 FINDING_PYRIGHT_REFERENCE_SITE_CAP = "CLA-PY-REFERENCE-SITE-CAP"
 
+MAX_UNRESOLVED_CALLEE_EXPR_BYTES = 512
 MAX_PYRIGHT_RESTARTS_PER_RUN = 3
 MAX_REFERENCE_SITES_PER_FILE = 2000
 PYRIGHT_INIT_TIMEOUT_SECS = 30.0
@@ -414,7 +415,10 @@ class PyrightSession:
                     function,
                     set(grouped),
                 )
-                unresolved_total += len(function_unresolved_sites)
+                unresolved_total += _unresolved_call_site_total_for_function(
+                    function,
+                    set(grouped),
+                )
                 unresolved_sites.extend(function_unresolved_sites)
             return edges, unresolved_total, unresolved_sites
         finally:
@@ -1075,6 +1079,23 @@ def _function_call_sites(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[_
     return visitor.call_sites
 
 
+def _unresolved_call_site_total_for_function(
+    function: _FunctionInfo,
+    resolved_ranges: set[tuple[int, int, int, int]],
+) -> int:
+    return sum(
+        1
+        for call_site in function.call_sites
+        if (
+            call_site.line,
+            call_site.character,
+            call_site.end_line,
+            call_site.end_character,
+        )
+        not in resolved_ranges
+    )
+
+
 def _unresolved_call_sites_for_function(
     index: _FunctionIndex,
     function: _FunctionInfo,
@@ -1089,6 +1110,8 @@ def _unresolved_call_sites_for_function(
             call_site.end_character,
         )
         if range_key in resolved_ranges:
+            continue
+        if len(call_site.callee_expr.encode("utf-8")) > MAX_UNRESOLVED_CALLEE_EXPR_BYTES:
             continue
         start_byte = _position_to_byte(index, call_site.line, call_site.character)
         end_byte = _position_to_byte(index, call_site.end_line, call_site.end_character)
