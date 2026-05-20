@@ -163,13 +163,16 @@ fn id_confidence_schema() -> Value {
 ///
 /// Storage-backed tool calls require [`ServerState::handle_json_rpc`].
 #[must_use]
-pub fn handle_json_rpc(request: &Value) -> Value {
+pub fn handle_json_rpc(request: &Value) -> Option<Value> {
+    if is_json_rpc_notification(request) {
+        return None;
+    }
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let Some(method) = request.get("method").and_then(Value::as_str) else {
-        return error_response(&id, -32600, "invalid request");
+        return Some(error_response(&id, -32600, "invalid request"));
     };
 
-    match method {
+    Some(match method {
         "initialize" => result_response(&id, &initialize_result()),
         "tools/list" => result_response(&id, &json!({"tools": list_tools()})),
         "tools/call" => error_response(
@@ -178,7 +181,7 @@ pub fn handle_json_rpc(request: &Value) -> Value {
             "tools/call requires ServerState::handle_json_rpc",
         ),
         _ => error_response(&id, -32601, "method not found"),
-    }
+    })
 }
 
 pub struct ServerState {
@@ -240,18 +243,21 @@ impl ServerState {
         self
     }
 
-    pub async fn handle_json_rpc(&self, request: &Value) -> Value {
+    pub async fn handle_json_rpc(&self, request: &Value) -> Option<Value> {
+        if is_json_rpc_notification(request) {
+            return None;
+        }
         let id = request.get("id").cloned().unwrap_or(Value::Null);
         let Some(method) = request.get("method").and_then(Value::as_str) else {
-            return error_response(&id, -32600, "invalid request");
+            return Some(error_response(&id, -32600, "invalid request"));
         };
 
-        match method {
+        Some(match method {
             "initialize" => result_response(&id, &initialize_result()),
             "tools/list" => result_response(&id, &json!({"tools": list_tools()})),
             "tools/call" => self.handle_tool_call(&id, request.get("params")).await,
             _ => error_response(&id, -32601, "method not found"),
-        }
+        })
     }
 
     async fn handle_tool_call(&self, id: &Value, params: Option<&Value>) -> Value {
@@ -1876,23 +1882,128 @@ pub enum McpError {
 /// Decode and handle a state-free MCP frame.
 ///
 /// Storage-backed tool calls require [`handle_frame_with_state`].
-pub fn handle_frame(frame: &Frame) -> Result<Frame, McpError> {
+pub fn handle_frame(frame: &Frame) -> Result<Option<Frame>, McpError> {
     let request = serde_json::from_slice(&frame.body)?;
-    let response = handle_json_rpc(&request);
-    Ok(Frame {
-        body: serde_json::to_vec(&response)?,
-    })
+    let Some(response) = handle_json_rpc(&request) else {
+        return Ok(None);
+    };
+    Ok(Some(encode_response_frame(&response)?))
 }
 
 pub async fn handle_frame_with_state(
     state: &ServerState,
     frame: &Frame,
-) -> Result<Frame, McpError> {
+) -> Result<Option<Frame>, McpError> {
     let request = serde_json::from_slice(&frame.body)?;
-    let response = state.handle_json_rpc(&request).await;
+    let Some(response) = state.handle_json_rpc(&request).await else {
+        return Ok(None);
+    };
+    Ok(Some(encode_response_frame(&response)?))
+}
+
+fn handle_stdio_frame(frame: &Frame) -> Result<Option<Frame>, McpError> {
+    handle_frame(frame)
+}
+
+async fn handle_stdio_frame_with_state(
+    state: &ServerState,
+    frame: &Frame,
+) -> Result<Option<Frame>, McpError> {
+    handle_frame_with_state(state, frame).await
+}
+
+fn encode_response_frame(response: &Value) -> Result<Frame, McpError> {
     Ok(Frame {
-        body: serde_json::to_vec(&response)?,
+        body: serde_json::to_vec(response)?,
     })
+}
+
+fn is_json_rpc_notification(request: &Value) -> bool {
+    request
+        .as_object()
+        .is_some_and(|object| object.get("method").is_some() && object.get("id").is_none())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdioFraming {
+    ContentLength,
+    JsonLine,
+}
+
+struct StdioFrame {
+    body: Vec<u8>,
+    framing: StdioFraming,
+}
+
+fn read_stdio_frame(reader: &mut impl std::io::BufRead) -> Result<Option<StdioFrame>, McpError> {
+    let Some(first_byte) = peek_stdio_frame_start(reader)? else {
+        return Ok(None);
+    };
+    if first_byte == b'{' || first_byte == b'[' || first_byte.is_ascii_whitespace() {
+        return Ok(Some(read_json_line_frame(reader)?));
+    }
+    match clarion_core::plugin::read_frame(reader, ContentLengthCeiling::DEFAULT) {
+        Ok(frame) => Ok(Some(StdioFrame {
+            body: frame.body,
+            framing: StdioFraming::ContentLength,
+        })),
+        Err(TransportError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn peek_stdio_frame_start(reader: &mut impl std::io::BufRead) -> Result<Option<u8>, McpError> {
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(None);
+        }
+        let blank_prefix = buffer
+            .iter()
+            .take_while(|byte| matches!(byte, b'\r' | b'\n'))
+            .count();
+        if blank_prefix == 0 {
+            return Ok(Some(buffer[0]));
+        }
+        reader.consume(blank_prefix);
+    }
+}
+
+fn read_json_line_frame(reader: &mut impl std::io::BufRead) -> Result<StdioFrame, McpError> {
+    let mut body = Vec::new();
+    let read = std::io::BufRead::read_until(reader, b'\n', &mut body)?;
+    if read == 0 {
+        return Err(TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "EOF while reading MCP JSON line",
+        ))
+        .into());
+    }
+    while matches!(body.last(), Some(b'\n' | b'\r')) {
+        body.pop();
+    }
+    Ok(StdioFrame {
+        body,
+        framing: StdioFraming::JsonLine,
+    })
+}
+
+fn write_stdio_response(
+    writer: &mut impl std::io::Write,
+    response: &Frame,
+    framing: StdioFraming,
+) -> Result<(), McpError> {
+    match framing {
+        StdioFraming::ContentLength => {
+            clarion_core::plugin::write_frame(writer, response)?;
+        }
+        StdioFraming::JsonLine => {
+            writer.write_all(&response.body)?;
+            writer.write_all(b"\n")?;
+            writer.flush()?;
+        }
+    }
+    Ok(())
 }
 
 /// Serve state-free MCP protocol metadata over stdio.
@@ -1903,15 +2014,13 @@ pub fn serve_stdio(
     writer: &mut impl std::io::Write,
 ) -> Result<(), McpError> {
     loop {
-        let frame = match clarion_core::plugin::read_frame(reader, ContentLengthCeiling::DEFAULT) {
-            Ok(frame) => frame,
-            Err(TransportError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok(());
-            }
-            Err(err) => return Err(err.into()),
+        let Some(frame) = read_stdio_frame(reader)? else {
+            return Ok(());
         };
-        let response = handle_frame(&frame)?;
-        clarion_core::plugin::write_frame(writer, &response)?;
+        let framing = frame.framing;
+        if let Some(response) = handle_stdio_frame(&Frame { body: frame.body })? {
+            write_stdio_response(writer, &response, framing)?;
+        }
     }
 }
 
@@ -1934,15 +2043,16 @@ pub fn serve_stdio_with_state_on_runtime(
 ) -> Result<(), McpError> {
     let _guard = runtime.enter();
     loop {
-        let frame = match clarion_core::plugin::read_frame(reader, ContentLengthCeiling::DEFAULT) {
-            Ok(frame) => frame,
-            Err(TransportError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok(());
-            }
-            Err(err) => return Err(err.into()),
+        let Some(frame) = read_stdio_frame(reader)? else {
+            return Ok(());
         };
-        let response = runtime.block_on(handle_frame_with_state(state, &frame))?;
-        clarion_core::plugin::write_frame(writer, &response)?;
+        let framing = frame.framing;
+        if let Some(response) = runtime.block_on(handle_stdio_frame_with_state(
+            state,
+            &Frame { body: frame.body },
+        ))? {
+            write_stdio_response(writer, &response, framing)?;
+        }
     }
 }
 
@@ -2799,7 +2909,8 @@ mod tests {
                 "capabilities": {},
                 "clientInfo": {"name": "test-client", "version": "0.0.0"}
             }
-        }));
+        }))
+        .expect("initialize request returns a response");
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], 1);
@@ -2818,7 +2929,8 @@ mod tests {
             "id": "tools-1",
             "method": "tools/list",
             "params": {}
-        }));
+        }))
+        .expect("tools/list request returns a response");
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], "tools-1");
@@ -2834,9 +2946,21 @@ mod tests {
             "id": 7,
             "method": "not/real",
             "params": {}
-        }));
+        }))
+        .expect("unknown request returns a JSON-RPC error response");
 
         assert_eq!(response["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn json_rpc_notification_does_not_return_response() {
+        let response = super::handle_json_rpc(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        }));
+
+        assert!(response.is_none());
     }
 
     #[test]
@@ -2846,7 +2970,8 @@ mod tests {
             "id": 8,
             "method": "tools/call",
             "params": {"name": "not_a_tool", "arguments": {}}
-        }));
+        }))
+        .expect("tools/call request returns a response");
 
         assert_eq!(response["error"]["code"], -32601);
         assert_eq!(
@@ -2862,7 +2987,8 @@ mod tests {
             "id": 88,
             "method": "tools/call",
             "params": {"name": "summary", "arguments": {"id": "python:function:demo.entry"}}
-        }));
+        }))
+        .expect("tools/call request returns a response");
 
         assert_eq!(response["error"]["code"], -32601);
         assert!(
@@ -2880,7 +3006,8 @@ mod tests {
             "id": 9,
             "method": "tools/call",
             "params": {"arguments": {}}
-        }));
+        }))
+        .expect("tools/call request returns a response");
 
         assert_eq!(response["error"]["code"], -32601);
         assert_eq!(
@@ -2901,12 +3028,30 @@ mod tests {
             .unwrap(),
         };
 
-        let response = super::handle_frame(&frame).unwrap();
+        let response = super::handle_frame(&frame)
+            .unwrap()
+            .expect("request frame returns a response");
         let decoded: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
 
         assert_eq!(decoded["jsonrpc"], "2.0");
         assert_eq!(decoded["id"], 10);
         assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn frame_dispatch_returns_none_for_json_rpc_notifications() {
+        let frame = clarion_core::plugin::Frame {
+            body: serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {}
+            }))
+            .unwrap(),
+        };
+
+        let response = super::handle_frame(&frame).unwrap();
+
+        assert!(response.is_none());
     }
 
     #[test]
@@ -2966,6 +3111,183 @@ mod tests {
         assert_eq!(first_json["result"]["serverInfo"]["name"], "clarion");
         assert_eq!(second_json["id"], 12);
         assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn serve_stdio_ignores_json_rpc_notifications() {
+        let input = notification_sequence_input(13, 14);
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(input));
+        let mut output = Vec::new();
+
+        super::serve_stdio(&mut reader, &mut output).unwrap();
+        assert_notification_sequence_responses(output, 13, 14);
+    }
+
+    #[test]
+    fn serve_stdio_with_state_ignores_json_rpc_notifications() {
+        let project = tempfile::tempdir().expect("temp project");
+        let db_path = project.path().join("clarion.db");
+        let mut conn = Connection::open(&db_path).expect("open sqlite");
+        pragma::apply_write_pragmas(&conn).expect("write pragmas");
+        schema::apply_migrations(&mut conn).expect("apply migrations");
+        drop(conn);
+
+        let readers = ReaderPool::open(&db_path, 1).expect("reader pool");
+        let state = ServerState::new(project.path().to_path_buf(), readers);
+        let input = notification_sequence_input(15, 16);
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(input));
+        let mut output = Vec::new();
+
+        super::serve_stdio_with_state(&state, &mut reader, &mut output).unwrap();
+        assert_notification_sequence_responses(output, 15, 16);
+    }
+
+    #[test]
+    fn serve_stdio_with_state_uses_json_line_transport_for_json_line_requests() {
+        let project = tempfile::tempdir().expect("temp project");
+        let db_path = project.path().join("clarion.db");
+        let mut conn = Connection::open(&db_path).expect("open sqlite");
+        pragma::apply_write_pragmas(&conn).expect("write pragmas");
+        schema::apply_migrations(&mut conn).expect("apply migrations");
+        drop(conn);
+
+        let readers = ReaderPool::open(&db_path, 1).expect("reader pool");
+        let state = ServerState::new(project.path().to_path_buf(), readers);
+        let input = notification_sequence_json_lines(17, 18);
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(input));
+        let mut output = Vec::new();
+
+        super::serve_stdio_with_state(&state, &mut reader, &mut output).unwrap();
+        assert_notification_sequence_json_lines(output, 17, 18);
+    }
+
+    fn notification_sequence_input(initialize_id: u64, tools_list_id: u64) -> Vec<u8> {
+        let mut input = Vec::new();
+        clarion_core::plugin::write_frame(
+            &mut input,
+            &clarion_core::plugin::Frame {
+                body: serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": initialize_id,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": {"name": "test-client", "version": "0.0.0"}
+                    }
+                }))
+                .unwrap(),
+            },
+        )
+        .unwrap();
+        clarion_core::plugin::write_frame(
+            &mut input,
+            &clarion_core::plugin::Frame {
+                body: serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                    "params": {}
+                }))
+                .unwrap(),
+            },
+        )
+        .unwrap();
+        clarion_core::plugin::write_frame(
+            &mut input,
+            &clarion_core::plugin::Frame {
+                body: serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": tools_list_id,
+                    "method": "tools/list",
+                    "params": {}
+                }))
+                .unwrap(),
+            },
+        )
+        .unwrap();
+        input
+    }
+
+    fn assert_notification_sequence_responses(
+        output: Vec<u8>,
+        initialize_id: u64,
+        tools_list_id: u64,
+    ) {
+        let mut response_reader = std::io::BufReader::new(std::io::Cursor::new(output));
+        let first = clarion_core::plugin::read_frame(
+            &mut response_reader,
+            clarion_core::plugin::ContentLengthCeiling::new(usize::MAX),
+        )
+        .unwrap();
+        let second = clarion_core::plugin::read_frame(
+            &mut response_reader,
+            clarion_core::plugin::ContentLengthCeiling::new(usize::MAX),
+        )
+        .unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first.body).unwrap();
+        let second_json: serde_json::Value = serde_json::from_slice(&second.body).unwrap();
+
+        assert_eq!(first_json["id"], initialize_id);
+        assert_eq!(second_json["id"], tools_list_id);
+        assert!(
+            clarion_core::plugin::read_frame(
+                &mut response_reader,
+                clarion_core::plugin::ContentLengthCeiling::new(usize::MAX),
+            )
+            .is_err(),
+            "notifications must not produce JSON-RPC response frames"
+        );
+    }
+
+    fn notification_sequence_json_lines(initialize_id: u64, tools_list_id: u64) -> Vec<u8> {
+        let messages = [
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": initialize_id,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test-client", "version": "0.0.0"}
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {}
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": tools_list_id,
+                "method": "tools/list",
+                "params": {}
+            }),
+        ];
+        let mut input = Vec::new();
+        for message in messages {
+            serde_json::to_writer(&mut input, &message).expect("serialize json line");
+            input.push(b'\n');
+        }
+        input
+    }
+
+    fn assert_notification_sequence_json_lines(
+        output: Vec<u8>,
+        initialize_id: u64,
+        tools_list_id: u64,
+    ) {
+        let output = String::from_utf8(output).expect("json lines are utf8");
+        let lines: Vec<_> = output.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "notifications must not produce JSON-RPC response lines"
+        );
+        let first_json: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let second_json: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+
+        assert_eq!(first_json["id"], initialize_id);
+        assert_eq!(second_json["id"], tools_list_id);
     }
 
     #[tokio::test]

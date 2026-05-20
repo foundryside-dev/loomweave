@@ -17,7 +17,7 @@ Material is kept rather than deleted because the [ADRs](../clarion/adr/README.md
 | [sprint-3/](./sprint-3/) | Sprint 3 scope amendment. |
 | [handoffs/](./handoffs/) | Dated agent-to-agent handoff notes (formerly `docs/superpowers/handoffs/`). |
 | [agent-plans/](./agent-plans/) | TDD-grain plan files used by individual agent runs (formerly `docs/superpowers/plans/`). |
-| [arch-analysis-2026-05-18-1244/](./arch-analysis-2026-05-18-1244/) | One-shot architecture-archaeology output: discovery findings, subsystem catalogue, diagrams, final report. |
+| [arch-analysis-2026-05-20-2124/](./arch-analysis-2026-05-20-2124/) | RC1 root-and-branch architecture archaeology output: discovery findings, subsystem catalogue, diagrams, final report, quality/security/release/test/dependency analysis, and architect handoff. |
 
 ## Relationship to release-facing docs
 

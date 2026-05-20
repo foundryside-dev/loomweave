@@ -1,0 +1,11 @@
+# Project-local Codex MCP configuration.
+# Codex does not read .mcp.json, so mirror this project's stdio MCP servers here.
+
+[mcp_servers.filigree]
+command = "/home/john/.local/bin/filigree-mcp"
+args = ["--project", "/home/john/clarion"]
+
+[mcp_servers.clarion-dogfood]
+command = "/home/john/clarion/target/release/clarion"
+args = ["serve", "--path", "/home/john/clarion"]
+env = { PATH = "/home/john/clarion/plugins/python/.venv/bin:/home/john/.local/bin:/home/john/elspeth/.venv/bin:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:/home/john/.cargo/bin:/home/john/.nvm/versions/node/v20.19.3/bin:/home/john/miniconda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }

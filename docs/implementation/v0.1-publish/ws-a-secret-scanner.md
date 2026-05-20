@@ -1023,5 +1023,5 @@ off via the criteria in §9.
 - [Thread 1 — Pre-publish blockers (program of work)](./thread-1-pre-publish-blockers.md) — the umbrella program.
 - [v0.1-plan.md — WP5 scope](../v0.1-plan.md#wp5--pre-ingest-secret-scanner) — original work-package definition.
 - [Sprint 2 scope amendment — WP5 deferral rationale](../sprint-2/scope-amendment-2026-05.md) — "production deployment against unknown corpora gates on this returning."
-- [Arch-analysis final report §7 follow-ups](../arch-analysis-2026-05-18-1244/04-final-report.md) — H-1 (`SoftFailed` coverage) coverage now closed via `clarion-141ca7de30`; relevant precondition for Task 3.
+- [Arch-analysis final report](../arch-analysis-2026-05-20-2124/04-final-report.md) — current RC1 architecture report; historical H-1 (`SoftFailed` coverage) coverage remains closed via `clarion-141ca7de30` and is a relevant precondition for Task 3.
 - [`detect-secrets` baseline format](https://github.com/Yelp/detect-secrets/blob/master/README.md#baseline-file) — the format Task 2 matches.

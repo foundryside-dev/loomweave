@@ -694,7 +694,8 @@ async fn call_tool(state: &ServerState, name: &str, arguments: Value) -> Value {
             "method": "tools/call",
             "params": {"name": name, "arguments": arguments}
         }))
-        .await;
+        .await
+        .expect("tools/call request returns a response");
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], "tool-test");
     let text = response["result"]["content"][0]["text"]

@@ -4,6 +4,8 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Child, Command as StdCommand, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
@@ -110,6 +112,84 @@ fn serve_stdio_initialize_round_trip() {
     assert_eq!(response["id"], 1);
     assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
     assert_eq!(response["result"]["serverInfo"]["name"], "clarion");
+}
+
+#[test]
+fn serve_stdio_accepts_mcp_json_line_initialize_without_stdin_eof() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+
+    let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("clarion"))
+        .args(["serve", "--path"])
+        .arg(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn clarion serve");
+
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let stdout = child.stdout.take().expect("child stdout");
+    let (response_tx, response_rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut stdout = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        let result = stdout.read_line(&mut line).map(|_| line);
+        let _ = response_tx.send(result);
+    });
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "codex-rmcp-smoke", "version": "0.0.0"}
+        }
+    });
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::to_string(&request).expect("serialize request")
+    )
+    .expect("write initialize json line");
+    stdin.flush().expect("flush initialize json line");
+
+    let line = match response_rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(result) => result.expect("read initialize response line"),
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("clarion serve did not answer newline-delimited MCP initialize: {err}");
+        }
+    };
+    let response: Value = serde_json::from_str(line.trim_end()).expect("response line is json");
+
+    drop(stdin);
+    let status = child.wait().expect("wait for clarion serve");
+    reader.join().expect("stdout reader thread");
+
+    assert!(
+        status.success(),
+        "serve failed with status {status}: {}",
+        read_child_stderr(&mut child)
+    );
+    assert_eq!(response["id"], 7);
+    assert_eq!(response["result"]["serverInfo"]["name"], "clarion");
+}
+
+fn read_child_stderr(child: &mut Child) -> String {
+    let mut stderr = String::new();
+    if let Some(mut stream) = child.stderr.take() {
+        let _ = stream.read_to_string(&mut stderr);
+    }
+    stderr
 }
 
 #[test]
