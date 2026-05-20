@@ -216,6 +216,39 @@ def check_workflow_action_pins(repo_root: Path) -> list[str]:
     return [f"workflow action refs are full-length commit SHAs ({checked} uses entries checked)"]
 
 
+def check_dependabot_github_actions_updates(repo_root: Path) -> list[str]:
+    config = repo_root / ".github" / "dependabot.yml"
+    if not config.is_file():
+        raise CheckError(f"{config}: Dependabot config is missing")
+
+    current: dict[str, str] = {}
+    entries: list[dict[str, str]] = []
+    for raw_line in config.read_text(encoding="utf-8").splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith("- package-ecosystem:"):
+            if current:
+                entries.append(current)
+            current = {"package-ecosystem": stripped.split(":", maxsplit=1)[1].strip(" '\"")}
+        elif current and stripped.startswith("directory:"):
+            current["directory"] = stripped.split(":", maxsplit=1)[1].strip(" '\"")
+        elif current and stripped.startswith("interval:"):
+            current["interval"] = stripped.split(":", maxsplit=1)[1].strip(" '\"")
+    if current:
+        entries.append(current)
+
+    for entry in entries:
+        if entry.get("package-ecosystem") == "github-actions" and entry.get("directory") == "/":
+            interval = entry.get("interval")
+            if not interval:
+                raise CheckError(f"{config}: github-actions Dependabot entry has no schedule interval")
+            return [f"Dependabot watches GitHub Actions pins on / ({interval})"]
+
+    raise CheckError(
+        f"{config}: missing package-ecosystem=github-actions entry for directory=/; "
+        "pinned workflow actions need a scheduled update path"
+    )
+
+
 def run_self_test() -> None:
     responses: dict[str, ApiResponse] = {
         "/repos/acme/clarion/branches/main/protection": ApiResponse(
@@ -269,7 +302,18 @@ def run_self_test() -> None:
             "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5\n",
             encoding="utf-8",
         )
+        dependabot = root / ".github" / "dependabot.yml"
+        dependabot.write_text(
+            'version: 2\n'
+            'updates:\n'
+            '  - package-ecosystem: "github-actions"\n'
+            '    directory: "/"\n'
+            '    schedule:\n'
+            '      interval: "weekly"\n',
+            encoding="utf-8",
+        )
         assert check_workflow_action_pins(root)
+        assert check_dependabot_github_actions_updates(root)
         workflow.write_text(
             "jobs:\n"
             "  bad:\n"
@@ -283,6 +327,19 @@ def run_self_test() -> None:
             assert "not a full commit SHA" in str(exc)
         else:
             raise AssertionError("tag-pinned fixture should fail")
+        dependabot.write_text(
+            'version: 2\n'
+            'updates:\n'
+            '  - package-ecosystem: "pip"\n'
+            '    directory: "/plugins/python"\n',
+            encoding="utf-8",
+        )
+        try:
+            check_dependabot_github_actions_updates(root)
+        except CheckError as exc:
+            assert "missing package-ecosystem=github-actions" in str(exc)
+        else:
+            raise AssertionError("missing github-actions Dependabot fixture should fail")
 
     print("GitHub release governance guard self-test passed")
 
@@ -330,7 +387,10 @@ def main(argv: list[str]) -> int:
         return 0
 
     try:
-        static_notes = check_workflow_action_pins(args.repo_root)
+        static_notes = [
+            *check_workflow_action_pins(args.repo_root),
+            *check_dependabot_github_actions_updates(args.repo_root),
+        ]
     except CheckError as exc:
         print("GitHub release governance guard failed:", file=sys.stderr)
         print(str(exc), file=sys.stderr)
