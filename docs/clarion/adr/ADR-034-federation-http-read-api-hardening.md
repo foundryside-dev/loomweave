@@ -1,4 +1,4 @@
-# ADR-034: Federation HTTP Read API Hardening — Bearer Auth, Batch Resolution, `BRIEFING_BLOCKED`, Instance ID
+# ADR-034: Federation HTTP Read API Hardening — Identity Auth, Batch Resolution, `BRIEFING_BLOCKED`, Instance ID
 
 **Status**: Accepted
 **Date**: 2026-05-19
@@ -8,7 +8,7 @@
 
 ## Summary
 
-Sprint 3 hardens Clarion's HTTP read API beyond ADR-014's original posture: protected routes require an `Authorization: Bearer` token resolved from an operator-named environment variable, a new `POST /api/v1/files/batch` endpoint handles bulk path resolution in a single round trip, a distinct `403 BRIEFING_BLOCKED` response distinguishes blocked entities from "not found" entities without leaking identity, and `GET /api/v1/_capabilities` echoes a stable per-project `instance_id` so siblings can detect endpoint rebinding. These additions extend ADR-014's wire-contract surface without breaking it — `api_version` remains `1`.
+Sprint 3 hardens Clarion's HTTP read API beyond ADR-014's original posture: protected routes can require Loom component identity via `X-Loom-Component: clarion:<hmac>` resolved from an operator-named environment variable, a new `POST /api/v1/files/batch` endpoint handles bulk path resolution in a single round trip, a distinct `403 BRIEFING_BLOCKED` response distinguishes blocked entities from "not found" entities without leaking identity, and `GET /api/v1/_capabilities` echoes a stable per-project `instance_id` so siblings can detect endpoint rebinding. These additions extend ADR-014's wire-contract surface without breaking it — `api_version` remains `1`.
 
 ## Context
 
@@ -23,24 +23,28 @@ Sprint 3 implemented these four hardenings (`1109560`, `acbf465`, `eb6200d`, `2c
 
 ## Decision
 
-### 1. Bearer authentication on protected routes
+### 1. Loom component identity on protected routes
 
-`/api/v1/files`-family endpoints require `Authorization: Bearer <token>` when Clarion has resolved a token at startup. `/api/v1/_capabilities` is **always** unauthenticated so siblings can probe the API surface before they hold a secret.
+`/api/v1/files`-family endpoints require `X-Loom-Component: clarion:<hmac>` when Clarion has resolved `serve.http.identity_token_env` at startup. `/api/v1/_capabilities` is **always** unauthenticated so siblings can probe the API surface before they hold a secret.
+
+The HMAC is lowercase hex HMAC-SHA256 over a newline-separated canonical message: request method, path plus query string, and SHA-256 hex of the request body. This signs the request line and body digest without turning the shared secret into a bearer credential on the wire. Clarion preserves the older `serve.http.token_env` bearer-token mode for compatibility when `identity_token_env` is not configured.
 
 Token-resolution and bind-policy trust matrix, enforced at startup by `HttpReadConfig::validate_auth_trust` before the listener binds:
 
-| Bind | `token_env` resolved | Behaviour |
-|---|---|---|
-| Loopback | unset | Unauthenticated; allow all requests (matches ADR-014's original posture for the loopback case). |
-| Loopback | set | Bearer required on protected routes; capabilities always allowed. |
-| Non-loopback | unset | **Refuse to start** with `CLA-CONFIG-HTTP-NO-AUTH`. |
-| Non-loopback | set | Bearer required on protected routes. |
+| Bind | `identity_token_env` resolved | `token_env` resolved | Behaviour |
+|---|---|---|---|
+| Loopback | unset | unset | Unauthenticated; allow all requests (matches ADR-014's original posture for the loopback case). |
+| Loopback | set | any | HMAC required on protected routes; capabilities always allowed. |
+| Loopback | configured but env missing | any | **Refuse to start** with `CLA-CONFIG-HTTP-IDENTITY-MISSING`. |
+| Non-loopback | set | any | HMAC required on protected routes. |
+| Non-loopback | unset | set | Bearer required on protected routes. |
+| Non-loopback | unset | unset | **Refuse to start** with `CLA-CONFIG-HTTP-NO-AUTH`. |
 
-Non-loopback-without-auth refusal extends ADR-014's `allow_non_loopback` opt-in: there is no longer a "non-loopback unauthenticated" mode. Non-loopback binds require **both** `allow_non_loopback: true` **and** a resolved `token_env`; either alone is insufficient. The opt-in remains the gate that admits non-loopback binds at all, but it no longer admits them unauthenticated.
+Non-loopback-without-auth refusal extends ADR-014's `allow_non_loopback` opt-in: there is no longer a "non-loopback unauthenticated" mode. Non-loopback binds require **both** `allow_non_loopback: true` **and** a resolved HMAC identity secret or legacy bearer token; either alone is insufficient. The opt-in remains the gate that admits non-loopback binds at all, but it no longer admits them unauthenticated.
 
-Bearer rejection (any of: header absent, wrong scheme, wrong token, blank token) returns `401 Unauthorized` with the standard error envelope and `code: "UNAUTHORIZED"`. Token comparison is constant-time so a wrong-length-token client cannot distinguish "header absent" from "token mismatch" via timing. The token value is never logged; the bind-time log line records `auth=bearer` or `auth=none`, not the token itself.
+Authentication rejection (any of: header absent, wrong scheme/prefix, wrong token or signature, blank token or signature) returns `401 Unauthorized` with the standard error envelope and `code: "UNAUTHENTICATED"`. Secret comparison is constant-time so a wrong-length client cannot distinguish "header absent" from "secret mismatch" via timing. The secret value is never logged; the bind-time log line records `auth=hmac`, `auth=bearer`, or `auth=none`, not the secret itself.
 
-The token is resolved from an operator-named environment variable; the config field is `serve.http.token_env` (default `CLARION_LOOM_TOKEN`, matching Filigree's pinned client default). The token value itself never appears in `clarion.yaml`.
+The preferred secret is resolved from an operator-named environment variable; the config field is `serve.http.identity_token_env`. The legacy bearer-token config field is `serve.http.token_env` (default `CLARION_LOOM_TOKEN`, matching Filigree's pinned client default). Secret values never appear in `clarion.yaml`.
 
 ### 2. `POST /api/v1/files/batch`
 
@@ -80,7 +84,7 @@ ADR-014's original error-code set is extended to:
 
 ```
 INVALID_PATH | PATH_OUTSIDE_PROJECT | NOT_FOUND |
-BRIEFING_BLOCKED | UNAUTHORIZED | STORAGE_ERROR |
+BRIEFING_BLOCKED | UNAUTHENTICATED | STORAGE_ERROR |
 BATCH_TOO_LARGE | INTERNAL
 ```
 
@@ -105,9 +109,13 @@ The set remains closed. Clients must switch on `code`, not on `error` text.
 
 ## Alternatives Considered
 
-### Alternative 1: HMAC signatures instead of bearer tokens
+### Alternative 1: Bearer-only authentication
 
-Better cryptographic story (per-request authentication, replay resistance, no shared-secret leakage on `GET` URLs), but considerably more client-side complexity. Filigree's `ClarionRegistry` would need an HMAC helper, and the operator deployment story would require signing-key rotation discipline. Sprint 3 needed *some* authentication on the wire — bearer tokens are the path of least resistance and the v1.0 federation surface is small enough that a coarse "any reader, full access" trust model is acceptable. HMAC is tracked as post-1.0 hardening (filigree `clarion-6814b2ad90`).
+Bearer-only authentication was the first Sprint 3 hardening because it was simple
+to operate. It is retained for compatibility through `serve.http.token_env`, but
+new Loom deployments should prefer `identity_token_env`: the HMAC shape
+authenticates the request line and body digest instead of sending the shared
+secret as the credential on every request.
 
 ### Alternative 2: Unix Domain Socket-only auth (ADR-012's original posture)
 
@@ -133,8 +141,8 @@ The Sprint 3 tasking doc originally proposed pinning these decisions into ADR-01
 ### Negative
 
 - Operators upgrading from ADR-014's unauthenticated posture to a non-loopback federation deployment must now provide a token at startup. The `CLA-CONFIG-HTTP-NO-AUTH` startup refusal makes this a fail-closed migration, not a silent one, but the operator-facing diff is non-trivial.
-- Bearer tokens are coarser than HMAC. Any client that holds the token has full read access to the federation surface, and a token leak requires a rotation across both Clarion and every Filigree client. Post-1.0 hardening (HMAC, key rotation) is required for richer deployments.
-- The error-code enum is now wider than ADR-014's original. Filigree's `code`-switch logic must handle `BRIEFING_BLOCKED`, `UNAUTHORIZED`, and `BATCH_TOO_LARGE` in addition to the original five. The federation contract documents this; clients that ignore the new codes will surface them as unhandled errors rather than misinterpret them.
+- HMAC identity still uses a shared secret; a leak requires rotation across both Clarion and every sibling client. Replay windows, key identifiers, and rotation metadata remain future hardening.
+- The error-code enum is now wider than ADR-014's original. Filigree's `code`-switch logic must handle `BRIEFING_BLOCKED`, `UNAUTHENTICATED`, and `BATCH_TOO_LARGE` in addition to the original five. The federation contract documents this; clients that ignore the new codes will surface them as unhandled errors rather than misinterpret them.
 
 ### Neutral
 
@@ -155,5 +163,6 @@ The Sprint 3 tasking doc originally proposed pinning these decisions into ADR-01
 - Implementing commits:
   - `1109560` feat(http_read): return 403 BRIEFING_BLOCKED for blocked entities
   - `acbf465` feat(http_read): require Authorization: Bearer for /api/v1/files
+  - C-4 follow-up: prefer `X-Loom-Component: clarion:<hmac>` when `serve.http.identity_token_env` is configured
   - `eb6200d` feat(http_read): add POST /api/v1/files/batch + document path normalization
   - `2c3311a` feat(http_read): formatting / fix(instance): UUID generation comments / test(serve)

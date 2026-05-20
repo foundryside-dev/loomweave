@@ -105,6 +105,7 @@ The initial `ErrorCode` enum is closed to:
 - `INVALID_PATH`
 - `PATH_OUTSIDE_PROJECT`
 - `NOT_FOUND`
+- `UNAUTHENTICATED`
 - `STORAGE_ERROR`
 - `INTERNAL`
 
@@ -112,11 +113,17 @@ Clients must switch on `code`, not on human-readable `error` text.
 
 ### Security Posture
 
-The HTTP read API is unauthenticated and loopback-only by default. Clarion
-refuses non-loopback HTTP binds unless `serve.http.allow_non_loopback: true` is
-set. When that opt-in is present, startup logs must warn that the HTTP read API
-surface is unauthenticated and must be protected by operator-managed network
-controls.
+The HTTP read API is loopback-only by default and may remain unauthenticated for
+local sidecar workflows. Authenticated deployments configure
+`serve.http.identity_token_env`; Clarion refuses to start if that env var is
+missing, and protected read routes require
+`X-Loom-Component: clarion:<hmac>`.
+
+The HMAC is lowercase hex HMAC-SHA256 over `METHOD`, `PATH_AND_QUERY`, and the
+SHA-256 request-body hash separated by newlines. Clarion refuses non-loopback
+HTTP binds unless `serve.http.allow_non_loopback: true` is set, and a
+non-loopback bind must have either the HMAC identity secret or the legacy bearer
+token resolved at startup.
 
 ## Alternatives Considered
 

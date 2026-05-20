@@ -6,19 +6,43 @@ the [federation contracts](../federation/contracts.md).
 
 ## Trust Model
 
-The HTTP read API is unauthenticated. By default, `clarion serve` binds it only
-to loopback addresses so it is reachable from local processes on the same host,
-not from the network.
+By default, `clarion serve` binds the HTTP read API only to loopback addresses so
+it is reachable from local processes on the same host, not from the network. A
+loopback-only API may run without authentication for local sidecar workflows.
 
-Do not bind the HTTP read API to a non-loopback address unless an authenticated
-reverse proxy or equivalent access-control layer is in front of it. Clarion
-refuses non-loopback binds unless `serve.http.allow_non_loopback: true` is set.
-That opt-in is an operator assertion that the unauthenticated Clarion HTTP
-surface is protected outside Clarion.
+For authenticated mode, set `serve.http.identity_token_env` to the name of an
+environment variable that contains the shared Loom component secret:
 
-Startup logs for non-loopback opt-in must warn that the API is unauthenticated.
-Treat the endpoint as source-code metadata exposure: anyone who can reach it can
-read Clarion's catalog responses for the project.
+```yaml
+serve:
+  http:
+    enabled: true
+    bind: 127.0.0.1:9111
+    identity_token_env: CLARION_LOOM_IDENTITY_SECRET
+```
+
+When `identity_token_env` is configured, Clarion refuses to start unless the env
+var is present and non-empty. Protected `/api/v1/files` routes then require
+`X-Loom-Component: clarion:<hmac>`. The HMAC is lowercase hex HMAC-SHA256 over:
+
+```text
+<METHOD>
+<PATH_AND_QUERY>
+<SHA256_HEX_OF_REQUEST_BODY>
+```
+
+For example, a GET of `/api/v1/files?path=demo.py&language=python` signs the
+method `GET`, that exact path-and-query string, and the SHA-256 hash of an empty
+body. `GET /api/v1/_capabilities` stays unauthenticated so siblings can probe
+the API surface before sending protected reads.
+
+Clarion still accepts the older `serve.http.token_env` bearer-token path for
+compatibility. Prefer `identity_token_env` for new deployments.
+
+Clarion refuses non-loopback binds unless `serve.http.allow_non_loopback: true`
+is set. Non-loopback deployments must also configure authentication; otherwise
+Clarion refuses to bind. Treat the endpoint as source-code metadata exposure:
+anyone who can reach it can read Clarion's catalog responses for the project.
 
 ## Contract Summary
 

@@ -256,6 +256,11 @@ pub struct HttpReadConfig {
     /// refuses to start (`CLA-CONFIG-HTTP-NO-AUTH`). Default
     /// `CLARION_LOOM_TOKEN` matches Filigree's pinned client default.
     pub token_env: String,
+    /// Optional env var holding the Loom component identity HMAC secret.
+    /// When configured, `clarion serve` refuses to start unless the env var
+    /// exists and protected HTTP read routes require
+    /// `X-Loom-Component: clarion:<hmac>`.
+    pub identity_token_env: Option<String>,
 }
 
 impl Default for HttpReadConfig {
@@ -265,6 +270,7 @@ impl Default for HttpReadConfig {
             bind: SocketAddr::from(([127, 0, 0, 1], 9111)),
             allow_non_loopback: false,
             token_env: "CLARION_LOOM_TOKEN".to_owned(),
+            identity_token_env: None,
         }
     }
 }
@@ -288,7 +294,28 @@ impl HttpReadConfig {
     where
         F: Fn(&str) -> Option<String>,
     {
-        if !self.enabled || self.is_loopback_bind() {
+        if !self.enabled {
+            return Ok(());
+        }
+        let has_identity_secret = match self.identity_token_env.as_deref() {
+            Some(env_var) => {
+                let has_secret = env_lookup(env_var)
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty());
+                if !has_secret {
+                    return Err(ConfigError::MissingHttpIdentitySecret {
+                        code: "CLA-CONFIG-HTTP-IDENTITY-MISSING",
+                        token_env: env_var.to_owned(),
+                    });
+                }
+                true
+            }
+            None => false,
+        };
+        if self.is_loopback_bind() {
+            return Ok(());
+        }
+        if has_identity_secret {
             return Ok(());
         }
         let has_token = env_lookup(&self.token_env)
@@ -442,6 +469,15 @@ pub enum ConfigError {
     NonLoopbackHttpNoAuth {
         code: &'static str,
         bind: SocketAddr,
+        token_env: String,
+    },
+
+    #[error(
+        "{code}: serve.http.identity_token_env names ${token_env}, but that env var is unset; \
+         refusing to start an HTTP read API with incomplete Loom component identity configuration."
+    )]
+    MissingHttpIdentitySecret {
+        code: &'static str,
         token_env: String,
     },
 
@@ -777,6 +813,25 @@ serve:
         .expect("parse HTTP allow_non_loopback");
 
         assert!(cfg.serve.http.allow_non_loopback);
+    }
+
+    #[test]
+    fn http_identity_token_env_is_parsed_when_config_loads() {
+        let cfg = McpConfig::from_yaml_str(
+            r#"
+serve:
+  http:
+    enabled: true
+    bind: "127.0.0.1:0"
+    identity_token_env: CLARION_TEST_IDENTITY
+"#,
+        )
+        .expect("parse HTTP identity_token_env");
+
+        assert_eq!(
+            cfg.serve.http.identity_token_env.as_deref(),
+            Some("CLARION_TEST_IDENTITY")
+        );
     }
 
     #[test]

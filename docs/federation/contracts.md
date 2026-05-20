@@ -12,8 +12,11 @@ serve:
   http:
     enabled: true
     bind: 127.0.0.1:9111
+    # Preferred 1.0 identity mode. Optional on loopback, required for
+    # authenticated Loom component requests.
+    identity_token_env: CLARION_LOOM_IDENTITY_SECRET
     # Name of the env var holding the inbound bearer token. Optional on a
-    # loopback bind, required on a non-loopback bind. Default
+    # loopback bind, accepted for compatibility on non-loopback binds. Default
     # `CLARION_LOOM_TOKEN` matches Filigree's pinned client default.
     token_env: CLARION_LOOM_TOKEN
 ```
@@ -24,34 +27,47 @@ read-only and uses Clarion's existing SQLite reader pool.
 ### Authentication
 
 The `/api/v1/files`-family endpoints require
-`Authorization: Bearer <token>` when Clarion has resolved a token at
-startup; `/api/v1/_capabilities` is **always** unauthenticated so
-siblings can probe the API surface pre-auth.
+`X-Loom-Component: clarion:<hmac>` when Clarion has resolved
+`serve.http.identity_token_env` at startup. The HMAC is lowercase hex
+HMAC-SHA256 over the canonical message:
+
+```text
+<METHOD>
+<PATH_AND_QUERY>
+<SHA256_HEX_OF_REQUEST_BODY>
+```
+
+`/api/v1/_capabilities` is **always** unauthenticated so siblings can probe the
+API surface pre-auth. Clarion still accepts the older
+`Authorization: Bearer <token>` path when `token_env` resolves and
+`identity_token_env` is not configured.
 
 Trust matrix (enforced by `HttpReadConfig::validate_auth_trust` at
 startup, before binding):
 
-| Bind | `token_env` resolved | Behaviour |
-|---|---|---|
-| Loopback | unset | Unauthenticated; allow all requests. |
-| Loopback | set | Bearer required on protected routes; capabilities always allowed. |
-| Non-loopback | unset | **Refuse to start** with `CLA-CONFIG-HTTP-NO-AUTH`. |
-| Non-loopback | set | Bearer required on protected routes. |
+| Bind | `identity_token_env` resolved | `token_env` resolved | Behaviour |
+|---|---|---|---|
+| Loopback | unset | unset | Unauthenticated; allow all requests. |
+| Loopback | set | any | HMAC required on protected routes; capabilities always allowed. |
+| Loopback | configured but env missing | any | **Refuse to start** with `CLA-CONFIG-HTTP-IDENTITY-MISSING`. |
+| Non-loopback | set | any | HMAC required on protected routes. |
+| Non-loopback | unset | set | Bearer required on protected routes. |
+| Non-loopback | unset | unset | **Refuse to start** with `CLA-CONFIG-HTTP-NO-AUTH`. |
 
-Bearer rejection (any of: header absent, wrong scheme, wrong token,
-blank token) returns:
+Authentication rejection (header absent, wrong scheme/prefix, wrong token or
+signature, blank token or signature) returns:
 
 ```http
 HTTP/1.1 401 Unauthorized
 Content-Type: application/json
 
-{"error": "authentication required", "code": "UNAUTHORIZED"}
+{"error": "authentication required", "code": "UNAUTHENTICATED"}
 ```
 
-Token comparison is constant-time so a wrong-length-token client cannot
-distinguish "header absent" from "token mismatch" via timing. The token
-itself is never logged; the bind-time log line records
-`auth=bearer` or `auth=none`, not the token value.
+Secret comparison is constant-time so a wrong-length client cannot distinguish
+"header absent" from "secret mismatch" via timing. The secret itself is never
+logged; the bind-time log line records `auth=hmac`, `auth=bearer`, or
+`auth=none`, not the secret value.
 
 All non-2xx responses use this closed JSON error envelope:
 
@@ -63,7 +79,7 @@ All non-2xx responses use this closed JSON error envelope:
 ```
 
 The initial `code` enum is closed to `INVALID_PATH`,
-`PATH_OUTSIDE_PROJECT`, `NOT_FOUND`, `BRIEFING_BLOCKED`, `UNAUTHORIZED`,
+`PATH_OUTSIDE_PROJECT`, `NOT_FOUND`, `BRIEFING_BLOCKED`, `UNAUTHENTICATED`,
 `STORAGE_ERROR`, `BATCH_TOO_LARGE`, and `INTERNAL`. Clients must switch
 on `code`; `error` is human-readable diagnostic text. `BATCH_TOO_LARGE`
 is only emitted by `POST /api/v1/files/batch` (see the batch endpoint
@@ -184,7 +200,7 @@ Failure modes (envelope-level):
 |---|---|---|
 | 400 | `INVALID_PATH` | Body is not a valid `{"queries": [...]}` JSON object. |
 | 400 | `BATCH_TOO_LARGE` | `queries.len() > 256`. Filigree must split client-side. |
-| 401 | `UNAUTHORIZED` | Bearer auth missing or wrong (when configured — see §Authentication). |
+| 401 | `UNAUTHENTICATED` | HMAC or bearer auth missing or wrong (when configured — see §Authentication). |
 | 413 | n/a | Request body exceeds the 16 KiB cap (transport-level). |
 | 500/503 | `STORAGE_ERROR` / `INTERNAL` | Whole-batch storage failure. |
 

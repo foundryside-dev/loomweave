@@ -56,7 +56,7 @@
               "PATH_OUTSIDE_PROJECT",
               "NOT_FOUND",
               "BRIEFING_BLOCKED",
-              "UNAUTHORIZED",
+              "UNAUTHENTICATED",
               "STORAGE_ERROR",
               "INTERNAL"
             ]

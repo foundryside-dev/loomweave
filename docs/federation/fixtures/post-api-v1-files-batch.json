@@ -52,7 +52,7 @@
             "enum": [
               "INVALID_PATH",
               "BATCH_TOO_LARGE",
-              "UNAUTHORIZED",
+              "UNAUTHENTICATED",
               "STORAGE_ERROR",
               "INTERNAL"
             ]
@@ -132,14 +132,14 @@
         "body": {
           "queries": [{"path": "demo.py", "language": "python"}]
         },
-        "note": "Authorization header missing or wrong; applies when serve.http.token_env resolves at startup."
+        "note": "Identity header missing or wrong; applies when serve.http.identity_token_env resolves at startup. Legacy bearer mode has the same error envelope."
       },
       "response": {
         "status": 401,
         "shape": "batch_envelope_error",
         "body": {
           "error": "authentication required",
-          "code": "UNAUTHORIZED"
+          "code": "UNAUTHENTICATED"
         }
       }
     }

@@ -13,6 +13,7 @@ use clarion_core::{
 };
 use rusqlite::{Connection, params};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const STABLE_INSTANCE_ID: &str = "9bd7234e-6d44-4a38-9ae4-76f912a10221";
@@ -871,7 +872,7 @@ fn serve_http_batch_requires_auth_when_configured() {
     let authenticated = authenticated.expect("authenticated batch");
 
     assert_eq!(unauthenticated.status_code, 401);
-    assert_eq!(unauthenticated.body["code"], "UNAUTHORIZED");
+    assert_eq!(unauthenticated.body["code"], "UNAUTHENTICATED");
     assert_eq!(authenticated.status_code, 200);
     let resolved = authenticated.body["resolved"]
         .as_array()
@@ -909,7 +910,7 @@ fn serve_http_files_endpoint_requires_bearer_token_when_configured() {
     let authenticated = authenticated.expect("authenticated probe response");
 
     assert_eq!(unauthenticated.status_code, 401);
-    assert_eq!(unauthenticated.body["code"], "UNAUTHORIZED");
+    assert_eq!(unauthenticated.body["code"], "UNAUTHENTICATED");
     assert_eq!(authenticated.status_code, 200);
     let body: Value =
         serde_json::from_str(&authenticated.body).expect("authenticated body is JSON");
@@ -961,8 +962,74 @@ fn serve_http_files_endpoint_rejects_wrong_token() {
         assert_eq!(response.status_code, 401, "{name}: {response:?}");
         let body: Value = serde_json::from_str(&response.body)
             .unwrap_or_else(|err| panic!("{name} body parse: {err}; raw={:?}", response.body));
-        assert_eq!(body["code"], "UNAUTHORIZED", "{name}");
+        assert_eq!(body["code"], "UNAUTHENTICATED", "{name}");
     }
+}
+
+#[test]
+fn serve_http_files_endpoint_requires_hmac_identity_when_configured() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    seed_file_entity(dir.path());
+    let bind = free_loopback_bind();
+    write_http_config_with_identity_token_env(dir.path(), &bind, "CLARION_TEST_LOOM_IDENTITY_REQ");
+
+    let mut child = spawn_serve_with_env(
+        dir.path(),
+        &[("CLARION_TEST_LOOM_IDENTITY_REQ", "shared-secret")],
+    );
+    let path = "/api/v1/files?path=demo.py&language=python";
+    let missing = wait_for_http_raw_response(&bind, path, &[]);
+    let signed_header = hmac_component_header("shared-secret", "GET", path, b"");
+    let signed = wait_for_http_raw_response(&bind, path, &[("X-Loom-Component", &signed_header)]);
+    stop_serve(&mut child);
+    let missing = missing.expect("missing identity response");
+    let signed = signed.expect("signed identity response");
+
+    assert_eq!(missing.status_code, 401);
+    let missing_body: Value =
+        serde_json::from_str(&missing.body).expect("missing identity body is JSON");
+    assert_eq!(missing_body["code"], "UNAUTHENTICATED");
+    assert_eq!(signed.status_code, 200);
+    let signed_body: Value = serde_json::from_str(&signed.body).expect("signed body is JSON");
+    assert_eq!(signed_body["entity_id"], "core:file:demo.py");
+}
+
+#[test]
+fn serve_http_files_endpoint_rejects_wrong_hmac_identity() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    seed_file_entity(dir.path());
+    let bind = free_loopback_bind();
+    write_http_config_with_identity_token_env(
+        dir.path(),
+        &bind,
+        "CLARION_TEST_LOOM_IDENTITY_WRONG",
+    );
+
+    let mut child = spawn_serve_with_env(
+        dir.path(),
+        &[("CLARION_TEST_LOOM_IDENTITY_WRONG", "shared-secret")],
+    );
+    let path = "/api/v1/files?path=demo.py&language=python";
+    let wrong_header = hmac_component_header("other-secret", "GET", path, b"");
+    let response = wait_for_http_raw_response(&bind, path, &[("X-Loom-Component", &wrong_header)]);
+    stop_serve(&mut child);
+    let response = response.expect("wrong identity response");
+    let body: Value = serde_json::from_str(&response.body).expect("wrong identity body is JSON");
+
+    assert_eq!(response.status_code, 401);
+    assert_eq!(body["code"], "UNAUTHENTICATED");
 }
 
 #[test]
@@ -1021,6 +1088,38 @@ fn serve_http_refuses_startup_on_non_loopback_without_token() {
     assert!(
         stderr.contains("CLARION_TEST_LOOM_TOKEN_REFUSE"),
         "error should name the configured token_env: {stderr}"
+    );
+}
+
+#[test]
+fn serve_http_refuses_startup_when_identity_env_is_missing() {
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let bind = free_loopback_bind();
+    write_http_config_with_identity_token_env(
+        dir.path(),
+        &bind,
+        "CLARION_TEST_LOOM_IDENTITY_MISSING",
+    );
+
+    let child = spawn_serve_with_env(dir.path(), &[]);
+    let output = wait_for_child_exit(child, Duration::from_secs(2))
+        .expect("serve should refuse to start when identity env is missing");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("CLA-CONFIG-HTTP-IDENTITY-MISSING"),
+        "error should cite CLA-CONFIG-HTTP-IDENTITY-MISSING: {stderr}"
+    );
+    assert!(
+        stderr.contains("CLARION_TEST_LOOM_IDENTITY_MISSING"),
+        "error should name the configured identity_token_env: {stderr}"
     );
 }
 
@@ -1900,6 +1999,69 @@ fn write_http_config_with_token_env(project_root: &Path, bind: &str, token_env: 
         ),
     )
     .expect("write HTTP serve config with token_env");
+}
+
+fn write_http_config_with_identity_token_env(project_root: &Path, bind: &str, token_env: &str) {
+    fs::write(
+        project_root.join("clarion.yaml"),
+        format!(
+            "version: 1\nserve:\n  http:\n    enabled: true\n    bind: \"{bind}\"\n    identity_token_env: \"{token_env}\"\n"
+        ),
+    )
+    .expect("write HTTP serve config with identity_token_env");
+}
+
+fn hmac_component_header(secret: &str, method: &str, path_and_query: &str, body: &[u8]) -> String {
+    format!(
+        "clarion:{}",
+        hmac_sha256_hex(
+            secret.as_bytes(),
+            canonical_hmac_message(method, path_and_query, body).as_bytes()
+        )
+    )
+}
+
+fn canonical_hmac_message(method: &str, path_and_query: &str, body: &[u8]) -> String {
+    format!(
+        "{}\n{}\n{}",
+        method,
+        path_and_query,
+        hex_lower(&Sha256::digest(body))
+    )
+}
+
+fn hmac_sha256_hex(secret: &[u8], message: &[u8]) -> String {
+    const BLOCK_SIZE: usize = 64;
+    let mut key = [0_u8; BLOCK_SIZE];
+    if secret.len() > BLOCK_SIZE {
+        key[..32].copy_from_slice(&Sha256::digest(secret));
+    } else {
+        key[..secret.len()].copy_from_slice(secret);
+    }
+    let mut ipad = [0x36_u8; BLOCK_SIZE];
+    let mut opad = [0x5c_u8; BLOCK_SIZE];
+    for index in 0..BLOCK_SIZE {
+        ipad[index] ^= key[index];
+        opad[index] ^= key[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(message);
+    let inner = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner);
+    hex_lower(&outer.finalize())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 struct ServeChild {
