@@ -25,6 +25,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,13 @@ class UsageError(Exception):
 
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 USES_RE = re.compile(r"^\s*(?:-\s*)?uses:\s*(?P<target>\S+)\s*$")
+REQUIRED_STATUS_CHECKS = frozenset(
+    {
+        "Rust",
+        "Python plugin",
+        "Sprint 1 walking skeleton (end-to-end)",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -99,17 +107,16 @@ def api_message(payload: Any) -> str:
     return repr(payload)
 
 
-def branch_has_protection(
+def branch_protection(
     request_json: Callable[[str], ApiResponse],
     repository: str,
     branch: str,
-) -> bool:
+) -> dict[str, Any] | None:
     response = request_json(f"/repos/{repository}/branches/{branch}/protection")
     if response.status == 200:
-        require_mapping(response.payload, "branch protection")
-        return True
+        return require_mapping(response.payload, "branch protection")
     if response.status == 404:
-        return False
+        return None
     raise UsageError(
         f"cannot inspect branch protection for {repository}@{branch}: "
         f"HTTP {response.status} {api_message(response.payload)}"
@@ -130,6 +137,23 @@ def repository_rulesets(
     return [require_mapping(item, "repository ruleset") for item in rulesets]
 
 
+def repository_ruleset_detail(
+    request_json: Callable[[str], ApiResponse],
+    repository: str,
+    ruleset: dict[str, Any],
+) -> dict[str, Any]:
+    ruleset_id = ruleset.get("id")
+    if not isinstance(ruleset_id, int):
+        return ruleset
+    response = request_json(f"/repos/{repository}/rulesets/{ruleset_id}")
+    if response.status != 200:
+        raise UsageError(
+            f"cannot inspect repository ruleset {ruleset_id} for {repository}: "
+            f"HTTP {response.status} {api_message(response.payload)}"
+        )
+    return require_mapping(response.payload, "repository ruleset detail")
+
+
 def actions_permissions(
     request_json: Callable[[str], ApiResponse],
     repository: str,
@@ -143,6 +167,94 @@ def actions_permissions(
     return require_mapping(response.payload, "Actions permissions")
 
 
+def branch_pattern_matches(pattern: str, branch: str) -> bool:
+    if pattern in {branch, f"refs/heads/{branch}", "~DEFAULT_BRANCH"}:
+        return True
+    normalized = pattern.removeprefix("refs/heads/")
+    return fnmatchcase(branch, normalized)
+
+
+def ruleset_targets_branch(ruleset: dict[str, Any], branch: str) -> bool:
+    target = ruleset.get("target")
+    if target not in {None, "branch"}:
+        return False
+
+    conditions = ruleset.get("conditions")
+    if not isinstance(conditions, dict):
+        return True
+    ref_name = conditions.get("ref_name")
+    if not isinstance(ref_name, dict):
+        return True
+
+    exclude = ref_name.get("exclude")
+    if isinstance(exclude, list) and any(
+        isinstance(pattern, str) and branch_pattern_matches(pattern, branch)
+        for pattern in exclude
+    ):
+        return False
+
+    include = ref_name.get("include")
+    if not isinstance(include, list) or not include:
+        return True
+    return any(
+        isinstance(pattern, str) and branch_pattern_matches(pattern, branch)
+        for pattern in include
+    )
+
+
+def branch_protection_status_checks(protection: dict[str, Any]) -> set[str]:
+    required = protection.get("required_status_checks")
+    if not isinstance(required, dict):
+        return set()
+
+    contexts = {
+        context
+        for context in required.get("contexts", [])
+        if isinstance(context, str)
+    }
+    checks = {
+        check.get("context")
+        for check in required.get("checks", [])
+        if isinstance(check, dict) and isinstance(check.get("context"), str)
+    }
+    return contexts | checks
+
+
+def ruleset_status_checks(ruleset: dict[str, Any]) -> set[str]:
+    checks: set[str] = set()
+    rules = ruleset.get("rules")
+    if not isinstance(rules, list):
+        return checks
+
+    for rule in rules:
+        if not isinstance(rule, dict) or rule.get("type") != "required_status_checks":
+            continue
+        parameters = rule.get("parameters")
+        if not isinstance(parameters, dict):
+            continue
+        for check in parameters.get("required_status_checks", []):
+            if isinstance(check, dict) and isinstance(check.get("context"), str):
+                checks.add(check["context"])
+            elif isinstance(check, str):
+                checks.add(check)
+    return checks
+
+
+def ruleset_requires_pull_request(ruleset: dict[str, Any]) -> bool:
+    rules = ruleset.get("rules")
+    if not isinstance(rules, list):
+        return False
+    return any(isinstance(rule, dict) and rule.get("type") == "pull_request" for rule in rules)
+
+
+def protection_requires_pull_request(protection: dict[str, Any]) -> bool:
+    return isinstance(protection.get("required_pull_request_reviews"), dict)
+
+
+def missing_required_status_checks(actual: set[str]) -> set[str]:
+    return REQUIRED_STATUS_CHECKS - actual
+
+
 def check_governance(
     request_json: Callable[[str], ApiResponse],
     repository: str,
@@ -151,17 +263,62 @@ def check_governance(
     failures: list[str] = []
     notes: list[str] = []
 
-    protected = branch_has_protection(request_json, repository, branch)
-    rulesets = repository_rulesets(request_json, repository)
-    active_rulesets = [item for item in rulesets if item.get("enforcement") != "disabled"]
-    if protected:
-        notes.append(f"{branch}: branch protection is enabled")
-    if active_rulesets:
-        notes.append(f"{repository}: {len(active_rulesets)} active repository ruleset(s)")
-    if not protected and not active_rulesets:
+    protection = branch_protection(request_json, repository, branch)
+    rule_summaries = repository_rulesets(request_json, repository)
+    active_rulesets = [
+        repository_ruleset_detail(request_json, repository, item)
+        for item in rule_summaries
+        if item.get("enforcement") != "disabled" and ruleset_targets_branch(item, branch)
+    ]
+
+    protected_path_ok = False
+    if protection is not None:
+        missing_checks = missing_required_status_checks(branch_protection_status_checks(protection))
+        if missing_checks:
+            failures.append(
+                f"{branch}: branch protection is missing required CI checks: "
+                f"{', '.join(sorted(missing_checks))}"
+            )
+        elif not protection_requires_pull_request(protection):
+            failures.append(
+                f"{branch}: branch protection does not require pull-request review flow; "
+                "direct pushes can bypass the release PR path"
+            )
+        else:
+            protected_path_ok = True
+            notes.append(
+                f"{branch}: branch protection requires pull-request flow and "
+                f"{len(REQUIRED_STATUS_CHECKS)} release CI checks"
+            )
+
+    ruleset_path_ok = False
+    for ruleset in active_rulesets:
+        name = ruleset.get("name", "<unnamed ruleset>")
+        if not isinstance(name, str):
+            name = "<unnamed ruleset>"
+        missing_checks = missing_required_status_checks(ruleset_status_checks(ruleset))
+        has_pr_rule = ruleset_requires_pull_request(ruleset)
+        if not missing_checks and has_pr_rule:
+            ruleset_path_ok = True
+            notes.append(
+                f"{repository}: active ruleset {name!r} requires pull-request flow and "
+                f"{len(REQUIRED_STATUS_CHECKS)} release CI checks"
+            )
+
+    if active_rulesets and not ruleset_path_ok:
+        failures.append(
+            f"{repository}: active repository rulesets targeting {branch} do not require "
+            "both pull-request flow and the release CI checks"
+        )
+    if protection is None and not active_rulesets:
         failures.append(
             f"{branch}: no branch protection and no active repository rulesets; "
             "tag provenance can bypass the reviewed PR path"
+        )
+    elif not protected_path_ok and not ruleset_path_ok:
+        failures.append(
+            f"{branch}: no branch protection or ruleset currently proves the reviewed "
+            "release PR path"
         )
 
     permissions = actions_permissions(request_json, repository)
@@ -277,9 +434,6 @@ def run_self_test() -> None:
     else:
         raise AssertionError("permissive fixture should fail")
 
-    responses["/repos/acme/clarion/rulesets"] = ApiResponse(
-        200, [{"name": "main release gate", "enforcement": "active"}]
-    )
     responses["/repos/acme/clarion/actions/permissions"] = ApiResponse(
         200,
         {
@@ -288,8 +442,73 @@ def run_self_test() -> None:
             "sha_pinning_required": True,
         },
     )
+    responses["/repos/acme/clarion/rulesets"] = ApiResponse(
+        200,
+        [
+            {
+                "id": 42,
+                "name": "weak release gate",
+                "target": "branch",
+                "enforcement": "active",
+                "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
+            }
+        ],
+    )
+    responses["/repos/acme/clarion/rulesets/42"] = ApiResponse(
+        200,
+        {
+            "id": 42,
+            "name": "weak release gate",
+            "target": "branch",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
+            "rules": [{"type": "pull_request", "parameters": {}}],
+        },
+    )
+    try:
+        check_governance(fake_get, "acme/clarion", "main")
+    except CheckError as exc:
+        assert "do not require both pull-request flow and the release CI checks" in str(exc)
+    else:
+        raise AssertionError("weak ruleset fixture should fail")
+
+    responses["/repos/acme/clarion/rulesets"] = ApiResponse(
+        200,
+        [
+            {
+                "id": 43,
+                "name": "main release gate",
+                "target": "branch",
+                "enforcement": "active",
+                "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
+            }
+        ],
+    )
+    responses["/repos/acme/clarion/rulesets/43"] = ApiResponse(
+        200,
+        {
+            "id": 43,
+            "name": "main release gate",
+            "target": "branch",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
+            "rules": [
+                {"type": "pull_request", "parameters": {"required_approving_review_count": 0}},
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "required_status_checks": [
+                            {"context": "Rust"},
+                            {"context": "Python plugin"},
+                            {"context": "Sprint 1 walking skeleton (end-to-end)"},
+                        ]
+                    },
+                },
+            ],
+        },
+    )
     notes = check_governance(fake_get, "acme/clarion", "main")
-    assert any("active repository ruleset" in note for note in notes)
+    assert any("active ruleset 'main release gate'" in note for note in notes)
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
