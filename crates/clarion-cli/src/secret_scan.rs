@@ -29,7 +29,7 @@ use clarion_scanner::{Detection, Scanner, SuppressionResult};
 use clarion_storage::{Writer, commands::EntityRecord};
 pub(crate) use files::collect_scan_files;
 use findings::{
-    FindingConfidenceBasis, FindingKind, FindingSeverity, PendingFinding, secret_detected_finding,
+    FindingConfidence, FindingKind, FindingSeverity, PendingFinding, secret_detected_finding,
 };
 use serde_json::json;
 
@@ -86,10 +86,9 @@ impl std::fmt::Display for OverrideConfirmationError {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SecretScanOutcome {
-    pub(crate) briefing_blocks: Arc<BTreeMap<PathBuf, BriefingBlockReason>>,
+    per_file_outcomes: Vec<PerFileOutcome>,
     findings: Vec<PendingFinding>,
     finding_anchors: BTreeMap<PathBuf, String>,
-    override_files: Vec<PathBuf>,
     scanned_files: Arc<BTreeSet<PathBuf>>,
     // Subset of `scanned_files` restricted to paths matched by
     // `files::is_secret_scan_sidecar` (e.g. `.env`, `.env.*`, `*.env`).
@@ -100,7 +99,55 @@ pub(crate) struct SecretScanOutcome {
     scanned_sidecars: BTreeSet<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PerFileOutcome {
+    Clean {
+        file: PathBuf,
+    },
+    Blocked {
+        file: PathBuf,
+        reason: BriefingBlockReason,
+        findings: Vec<Detection>,
+    },
+    Overridden {
+        file: PathBuf,
+        findings: Vec<Detection>,
+    },
+}
+
 impl SecretScanOutcome {
+    #[cfg(test)]
+    pub(crate) fn per_file_outcomes(&self) -> &[PerFileOutcome] {
+        &self.per_file_outcomes
+    }
+
+    pub(crate) fn briefing_blocks_shared(&self) -> Arc<BTreeMap<PathBuf, BriefingBlockReason>> {
+        Arc::new(
+            self.per_file_outcomes
+                .iter()
+                .filter_map(|outcome| match outcome {
+                    PerFileOutcome::Blocked { file, reason, .. } => Some((file.clone(), *reason)),
+                    PerFileOutcome::Clean { .. } | PerFileOutcome::Overridden { .. } => None,
+                })
+                .collect(),
+        )
+    }
+
+    pub(crate) fn briefing_block_for(&self, file: &Path) -> Option<BriefingBlockReason> {
+        self.per_file_outcomes
+            .iter()
+            .find_map(|outcome| match outcome {
+                PerFileOutcome::Blocked {
+                    file: blocked_file,
+                    reason,
+                    ..
+                } if blocked_file == file => Some(*reason),
+                PerFileOutcome::Clean { .. }
+                | PerFileOutcome::Blocked { .. }
+                | PerFileOutcome::Overridden { .. } => None,
+            })
+    }
+
     pub(crate) fn scanned_files_shared(&self) -> Arc<BTreeSet<PathBuf>> {
         Arc::clone(&self.scanned_files)
     }
@@ -117,12 +164,20 @@ impl SecretScanOutcome {
     }
 
     pub(crate) fn augment_stats(&self, stats: &mut serde_json::Value) {
-        if self.override_files.is_empty() {
+        let override_files = self
+            .per_file_outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                PerFileOutcome::Overridden { file, .. } => Some(file),
+                PerFileOutcome::Clean { .. } | PerFileOutcome::Blocked { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        if override_files.is_empty() {
             return;
         }
         stats["secret_override_used"] = json!(true);
         stats["secret_override_files_affected"] = json!(
-            self.override_files
+            override_files
                 .iter()
                 .map(|path| path.display().to_string())
                 .collect::<Vec<_>>()
@@ -187,8 +242,7 @@ pub(crate) fn pre_ingest(
             rule_id: baseline::baseline_match_rule_id(),
             kind: FindingKind::Fact,
             severity: FindingSeverity::Info,
-            confidence: Some(1.0),
-            confidence_basis: Some(FindingConfidenceBasis::Baseline),
+            confidence: FindingConfidence::Baseline,
             message: format!(
                 "Secret baseline entry matched {}:{}",
                 entry.file_path.display(),
@@ -204,13 +258,13 @@ pub(crate) fn pre_ingest(
     }
 
     let override_confirmed = confirm_override_if_needed(project_root, &all_allowed, options);
-    let mut briefing_blocks = BTreeMap::new();
-    let mut override_files = BTreeSet::new();
+    let mut per_file_outcomes = Vec::new();
     let mut override_detections = BTreeMap::<PathBuf, Vec<Detection>>::new();
     findings.extend(baseline_matches);
 
     for (file, allowed) in per_file {
         if allowed.is_empty() {
+            per_file_outcomes.push(PerFileOutcome::Clean { file });
             continue;
         }
         // ADR-013 §"Override — --allow-unredacted-secrets": each detection
@@ -227,22 +281,28 @@ pub(crate) fn pre_ingest(
                 .map(|detection| secret_detected_finding(&file, detection)),
         );
         if override_confirmed {
-            override_files.insert(file.clone());
-            override_detections.insert(file, allowed);
+            override_detections.insert(file.clone(), allowed.clone());
+            per_file_outcomes.push(PerFileOutcome::Overridden {
+                file,
+                findings: allowed,
+            });
         } else {
-            briefing_blocks.insert(file, BriefingBlockReason::SecretPresent);
+            per_file_outcomes.push(PerFileOutcome::Blocked {
+                file,
+                reason: BriefingBlockReason::SecretPresent,
+                findings: allowed,
+            });
         }
     }
 
-    for file in &override_files {
+    for file in override_detections.keys() {
         let detections = override_detections.get(file).map_or(&[][..], Vec::as_slice);
         findings.push(PendingFinding {
             file_path: file.clone(),
             rule_id: SECRET_OVERRIDE_ALLOWED,
             kind: FindingKind::Defect,
             severity: FindingSeverity::Error,
-            confidence: Some(1.0),
-            confidence_basis: Some(FindingConfidenceBasis::OperatorOverride),
+            confidence: FindingConfidence::OperatorOverride,
             message: format!(
                 "Operator allowed unredacted secrets in {}",
                 display_relative(project_root, file)
@@ -256,10 +316,9 @@ pub(crate) fn pre_ingest(
     }
 
     Ok(SecretScanOutcome {
-        briefing_blocks: Arc::new(briefing_blocks),
+        per_file_outcomes,
         findings,
         finding_anchors: BTreeMap::new(),
-        override_files: override_files.into_iter().collect(),
         scanned_files: Arc::new(scanned_files),
         scanned_sidecars,
     })
@@ -420,7 +479,10 @@ fn relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{display_relative, scan_source_files_parallel};
+    use super::{
+        ConfirmToken, OverridePolicy, PerFileOutcome, SecretScanOptions, display_relative,
+        pre_ingest, scan_source_files_parallel,
+    };
     use std::sync::{Arc, Mutex};
 
     #[cfg(unix)]
@@ -479,5 +541,34 @@ mod tests {
                 .any(|thread_id| *thread_id != caller_thread),
             "expected at least one scan to run on a worker thread"
         );
+    }
+
+    #[test]
+    fn pre_ingest_records_file_outcomes_without_side_channel_state() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let clean = tmp.path().join("clean.txt");
+        let secret = tmp.path().join("secret.txt");
+        std::fs::write(&clean, b"hello\n").expect("write clean");
+        std::fs::write(&secret, b"key = 'AKIAIOSFODNN7EXAMPLE'\n").expect("write secret");
+
+        let outcome = pre_ingest(
+            tmp.path(),
+            &[clean.clone(), secret.clone()],
+            &SecretScanOptions {
+                override_policy: OverridePolicy::Preconfirmed(ConfirmToken),
+            },
+        )
+        .expect("pre-ingest");
+
+        assert!(matches!(
+            outcome.per_file_outcomes()[0],
+            PerFileOutcome::Clean { .. }
+        ));
+        let PerFileOutcome::Overridden { file, findings } = &outcome.per_file_outcomes()[1] else {
+            panic!("secret file should be recorded as overridden");
+        };
+        assert_eq!(file, &secret.canonicalize().expect("canonical secret"));
+        assert_eq!(findings.len(), 1);
+        assert!(outcome.briefing_blocks_shared().is_empty());
     }
 }

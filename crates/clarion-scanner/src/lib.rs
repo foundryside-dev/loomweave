@@ -137,6 +137,26 @@ impl DetectSecretsRule {
             Self::HexHighEntropyString => "Hex High Entropy String",
         }
     }
+
+    #[must_use]
+    pub fn rule_id(self) -> &'static str {
+        match self {
+            Self::AwsAccessKey => "AwsAccessKeyId",
+            Self::AwsSecretAccessKey => "AwsSecretAccessKey",
+            Self::GitHubToken => "GitHubPat",
+            Self::GitHubFineGrainedToken => "GitHubFineGrainedPat",
+            Self::GitHubOAuthToken => "GitHubOAuth",
+            Self::AnthropicApiKey => "AnthropicApiKey",
+            Self::OpenAiApiKey => "OpenAiApiKey",
+            Self::StripeApiKey => "StripeApiKey",
+            Self::SlackToken => "SlackToken",
+            Self::JwtToken => "JwtToken",
+            Self::PrivateKey => "PrivateKeyHeader",
+            Self::KeywordDetector => "ContextualCredential",
+            Self::Base64HighEntropyString => "HighEntropyBase64",
+            Self::HexHighEntropyString => "HighEntropyHex",
+        }
+    }
 }
 
 impl fmt::Display for DetectSecretsRule {

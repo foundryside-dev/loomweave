@@ -98,7 +98,7 @@ async fn upsert_finding_anchor(
         .to_owned();
     let mut properties = serde_json::Map::new();
     properties.insert("finding_anchor".to_owned(), serde_json::json!(true));
-    if let Some(reason) = outcome.briefing_blocks.get(&key) {
+    if let Some(reason) = outcome.briefing_block_for(&key) {
         properties.insert(
             "briefing_blocked".to_owned(),
             serde_json::Value::String(reason.as_str().to_owned()),

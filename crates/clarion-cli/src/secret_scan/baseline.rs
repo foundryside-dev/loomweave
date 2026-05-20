@@ -6,7 +6,7 @@ use serde_json::json;
 
 use super::normalize_project_path;
 use crate::secret_scan::findings::{
-    FindingConfidenceBasis, FindingKind, FindingSeverity, PendingFinding,
+    FindingConfidence, FindingKind, FindingSeverity, PendingFinding,
 };
 
 const BASELINE_NO_JUSTIFICATION: &str = "CLA-INFRA-SECRET-BASELINE-NO-JUSTIFICATION";
@@ -25,8 +25,7 @@ pub(super) fn load_for_scan(project_root: &Path) -> Result<(Baseline, Vec<Pendin
                     rule_id: BASELINE_NO_JUSTIFICATION,
                     kind: FindingKind::Defect,
                     severity: FindingSeverity::Error,
-                    confidence: Some(1.0),
-                    confidence_basis: Some(FindingConfidenceBasis::BaselineSchema),
+                    confidence: FindingConfidence::Schema,
                     message: format!(
                         "Secret baseline entry missing justification at {}:{}",
                         entry.file.display(),

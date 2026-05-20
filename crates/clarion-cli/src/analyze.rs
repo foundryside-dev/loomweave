@@ -246,7 +246,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let mut run_outcome: RunOutcome = RunOutcome::Completed;
     let mut breaker = CrashLoopBreaker::default();
     let mut crash_reasons: Vec<String> = Vec::new();
-    let briefing_blocks = Arc::clone(&secret_scan_outcome.briefing_blocks);
+    let briefing_blocks = secret_scan_outcome.briefing_blocks_shared();
     let scanned_files = secret_scan_outcome.scanned_files_shared();
     'plugins: for plugin in plugins {
         let plugin_id = plugin.manifest.plugin.plugin_id.clone();

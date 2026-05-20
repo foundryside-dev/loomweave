@@ -1,5 +1,5 @@
 use clarion_scanner::{
-    Baseline, BaselineError, EntropyTuning, HashedSecret, Scanner, load_baseline,
+    Baseline, BaselineError, DetectSecretsRule, EntropyTuning, HashedSecret, Scanner, load_baseline,
 };
 use sha1::{Digest, Sha1};
 
@@ -21,6 +21,16 @@ fn assert_not_detects(input: &str, rule_id: &str) {
     assert!(
         !rules.contains(&rule_id),
         "{rule_id} unexpectedly found in {rules:?}"
+    );
+}
+
+#[test]
+fn detect_secrets_rule_owns_rule_id_strings() {
+    assert_eq!(DetectSecretsRule::AwsAccessKey.rule_id(), "AwsAccessKeyId");
+    assert_eq!(DetectSecretsRule::OpenAiApiKey.rule_id(), "OpenAiApiKey");
+    assert_eq!(
+        DetectSecretsRule::Base64HighEntropyString.rule_id(),
+        "HighEntropyBase64"
     );
 }
 
