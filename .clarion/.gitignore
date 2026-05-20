@@ -1,0 +1,22 @@
+# Clarion .gitignore — ADR-005 tracked-vs-excluded list.
+# Tracked (committed): clarion.db, config.json, .gitignore itself.
+# Excluded (ignored): WAL sidecars, shadow DB, per-run logs, tmp scratch.
+
+# SQLite write-ahead files never belong in the repo.
+*-wal
+*-shm
+*.db-wal
+*.db-shm
+
+# Shadow DB intermediate (ADR-011 --shadow-db).
+*.shadow.db
+*.db.new
+
+# Scratch / temp space.
+tmp/
+
+# Per-run log directories (see detailed-design §File layout). The run dir
+# metadata (config.yaml, stats.json, partial.json) is tracked; only the
+# raw LLM request/response log is excluded.
+logs/
+runs/*/log.jsonl

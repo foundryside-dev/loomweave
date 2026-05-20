@@ -232,7 +232,7 @@ fn default_pattern_meta() -> Vec<PatternMeta> {
         PatternMeta {
             detect_secrets_type: DetectSecretsRule::OpenAiApiKey,
             category: SecretCategory::AiProviderCredential,
-            pattern: r"\bsk-[A-Za-z0-9]{48}\b",
+            pattern: r"\bsk-(?:[A-Za-z0-9]{48}|(?:proj|svcacct)-[A-Za-z0-9_-]{20,})\b",
             capture_group: None,
         },
         PatternMeta {

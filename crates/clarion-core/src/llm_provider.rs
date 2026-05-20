@@ -513,7 +513,7 @@ impl CodexCliProvider {
         let usage = parse_codex_jsonl_usage(&stdout);
         let input_tokens = usage
             .input_tokens
-            .unwrap_or_else(|| estimate_text_tokens(&request.prompt));
+            .unwrap_or_else(|| estimate_text_tokens(&provider_prompt));
         let output_tokens = usage
             .output_tokens
             .unwrap_or_else(|| estimate_text_tokens(&output_json));
@@ -719,7 +719,7 @@ impl LlmProvider for ClaudeCliProvider {
         let input_tokens = parsed
             .usage
             .input_tokens
-            .unwrap_or_else(|| estimate_text_tokens(&request.prompt));
+            .unwrap_or_else(|| estimate_text_tokens(&provider_prompt));
         let output_tokens = parsed
             .usage
             .output_tokens
@@ -1904,6 +1904,68 @@ printf '%s' '{{"purpose":"via codex","behavior":"ran fake CLI","relationships":"
     }
 
     #[test]
+    fn codex_cli_provider_fallback_usage_counts_wrapped_prompt() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir(&project_root).expect("project root");
+        let fake_codex = temp.path().join("codex");
+        let script = r#"#!/usr/bin/env bash
+set -euo pipefail
+out=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output-last-message)
+      out="$2"
+      shift 2
+      ;;
+    --sandbox|--cd|--output-schema|--model|--profile|-c)
+      shift 2
+      ;;
+    -)
+      cat >/dev/null
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+printf '%s' '{"purpose":"via codex","behavior":"ran fake CLI","relationships":"","risks":""}' > "$out"
+"#;
+        fs::write(&fake_codex, script).expect("write fake codex");
+        let mut permissions = fs::metadata(&fake_codex).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex");
+
+        let provider = CodexCliProvider::from_config(CodexCliProviderConfig {
+            executable: fake_codex.display().to_string(),
+            project_root,
+            model_id: "codex-cli-default".to_owned(),
+            model: None,
+            profile: None,
+            sandbox: "read-only".to_owned(),
+            timeout_seconds: 5,
+        })
+        .expect("construct Codex CLI provider");
+        let request = LlmRequest {
+            purpose: LlmPurpose::Summary,
+            model_id: "codex-cli-default".to_owned(),
+            prompt_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+            prompt: "short raw prompt".to_owned(),
+            max_output_tokens: 512,
+        };
+        let expected_input_tokens =
+            estimate_text_tokens(&build_coding_agent_provider_prompt(&request));
+
+        let response = provider.invoke(request).expect("invoke fake Codex CLI");
+
+        assert_eq!(response.input_tokens, expected_input_tokens);
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn claude_cli_provider_invokes_print_mode_with_schema_and_usage() {
         use std::fs;
@@ -2078,6 +2140,66 @@ printf '%s\n' '{{"type":"result","subtype":"success","structured_output":{{"purp
         assert!(log.contains("slash_disabled=1"));
         assert!(log.contains("no_session_persistence=1"));
         assert!(log.contains("exclude_dynamic=1"));
+    }
+
+    #[test]
+    fn claude_cli_provider_fallback_usage_counts_wrapped_prompt() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir(&project_root).expect("project root");
+        let fake_claude = temp.path().join("claude");
+        let script = r#"#!/usr/bin/env bash
+set -euo pipefail
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p|--print|--output-format|--json-schema|--permission-mode|--max-turns|--mcp-config|--tools|--model)
+      shift 2
+      ;;
+    --strict-mcp-config|--disable-slash-commands|--no-session-persistence|--exclude-dynamic-system-prompt-sections)
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+cat >/dev/null
+printf '%s\n' '{"type":"result","subtype":"success","structured_output":{"purpose":"via claude","behavior":"ran fake CLI","relationships":"","risks":""},"total_cost_usd":0.0}'
+"#;
+        fs::write(&fake_claude, script).expect("write fake claude");
+        let mut permissions = fs::metadata(&fake_claude).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_claude, permissions).expect("chmod fake claude");
+
+        let provider = ClaudeCliProvider::from_config(ClaudeCliProviderConfig {
+            executable: fake_claude.display().to_string(),
+            project_root,
+            model_id: "claude-code-default".to_owned(),
+            model: None,
+            permission_mode: "plan".to_owned(),
+            tools: Vec::new(),
+            timeout_seconds: 5,
+            max_turns: 2,
+            no_session_persistence: true,
+            exclude_dynamic_system_prompt_sections: true,
+        })
+        .expect("construct Claude CLI provider");
+        let request = LlmRequest {
+            purpose: LlmPurpose::Summary,
+            model_id: "claude-code-default".to_owned(),
+            prompt_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+            prompt: "short raw prompt".to_owned(),
+            max_output_tokens: 512,
+        };
+        let expected_input_tokens =
+            estimate_text_tokens(&build_coding_agent_provider_prompt(&request));
+
+        let response = provider.invoke(request).expect("invoke fake Claude CLI");
+
+        assert_eq!(response.input_tokens, expected_input_tokens);
     }
 
     #[test]

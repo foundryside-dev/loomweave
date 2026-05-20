@@ -61,6 +61,14 @@ fn named_patterns_detect_expected_credentials() {
         "AnthropicApiKey",
     );
     assert_detects(&format!("key = 'sk-{}'", "A".repeat(48)), "OpenAiApiKey");
+    assert_detects(
+        &format!("key = 'sk-proj-{}'", "A_b-".repeat(16)),
+        "OpenAiApiKey",
+    );
+    assert_detects(
+        &format!("key = 'sk-svcacct-{}'", "Z_y-".repeat(16)),
+        "OpenAiApiKey",
+    );
     assert_detects("stripe = 'sk_live_abcdefghijklmnop'", "StripeApiKey");
     assert_detects("slack = 'xoxb-123456789012-abcdefghi'", "SlackToken");
     assert_detects(
