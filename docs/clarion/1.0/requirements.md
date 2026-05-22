@@ -558,19 +558,28 @@ Clarion exposes read-only HTTP endpoints: `GET /api/v1/entities`, `GET /api/v1/e
 #### REQ-HTTP-03 — Registry-backend HTTP trust model
 
 For Filigree `registry_backend: clarion`, Clarion's HTTP read API is
-unauthenticated and loopback-only by default. Non-loopback binds are refused
-unless `serve.http.allow_non_loopback: true` is set; that opt-in requires an
-authenticated reverse proxy or equivalent operator-managed access-control layer
-outside Clarion.
+loopback-only by default. Non-loopback binds require **both**
+`serve.http.allow_non_loopback: true` **and** a resolved authentication secret
+— either HMAC identity via `serve.http.identity_token_env` (preferred per
+ADR-034) or a legacy bearer token via `serve.http.token_env`. A non-loopback
+bind with the opt-in but no resolved secret is refused at startup with
+`CLA-CONFIG-HTTP-NO-AUTH`. The loopback-without-token mode remains
+unauthenticated and emits a startup warning that any local process can read the
+catalogue; non-loopback no longer has an unauthenticated mode.
 
 **Rationale**: the ADR-014 read surface is a bounded local federation contract,
-not the earlier broad HTTP API. The implementation prevents accidental network
-exposure mechanically and leaves intentional non-loopback exposure to deployment
-controls.
-**Verification**: loopback bind starts without extra flags; non-loopback bind is
-rejected without `allow_non_loopback`; non-loopback opt-in logs an
-unauthenticated-surface warning.
-**See**: System Design §9 (Integrations, HTTP Read API), ADR-014.
+not the earlier broad HTTP API. ADR-034 closes the original gap that permitted
+unauthenticated non-loopback binds behind the `allow_non_loopback` opt-in
+alone. The implementation prevents accidental network exposure mechanically and
+makes intentional non-loopback exposure fail closed without an authentication
+secret rather than silently warn-and-bind.
+**Verification**: `crates/clarion-cli/tests/serve.rs` covers the loopback
+default (line 1457), the loopback `identity_token_env`-resolution-failure
+refusal (line 1495), the non-loopback-without-auth startup refusal (line 1547),
+the non-loopback HMAC-required path (line 1579), and the non-loopback
+legacy-bearer path (line 1614). The loopback startup-warning surface is covered
+by config-layer tests.
+**See**: System Design §9 (Integrations, HTTP Read API), ADR-014, ADR-034.
 
 #### REQ-HTTP-04 — ETag-style response caching
 
@@ -770,17 +779,29 @@ Clarion structures prompts with explicit `<file_content trusted="false">...</fil
 
 #### NFR-SEC-03 — Non-loopback HTTP read API guard
 
-Clarion refuses to start the ADR-014 HTTP read API on a non-loopback bind unless
-`serve.http.allow_non_loopback: true` is set. When enabled, startup logs a
-warning that the endpoint is unauthenticated and must be protected outside
-Clarion.
+Clarion refuses to start the HTTP read API on a non-loopback bind unless **both**
+`serve.http.allow_non_loopback: true` is set **and** an authentication secret is
+resolved at startup — either an HMAC identity secret via
+`serve.http.identity_token_env` (preferred, per ADR-034) or a legacy bearer
+token via `serve.http.token_env`. A non-loopback bind with neither secret
+resolved fails closed at startup with `CLA-CONFIG-HTTP-NO-AUTH`. The
+startup-warning surface (endpoint unauthenticated; protect outside Clarion)
+applies only to the loopback-without-token mode, which remains the ADR-014
+default for the local sidecar case.
 
 **Rationale**: loopback is not a complete security boundary, but accidental
-network exposure is the highest-risk failure mode for the registry-backend
-surface. The guard makes that exposure explicit.
-**Verification**: config tests cover the default, refusal, and opt-in warning
-paths.
-**See**: System Design §9 (HTTP Read API), §10 (Security), ADR-014.
+network *exposure* without authentication is the highest-risk failure mode for
+the registry-backend surface. ADR-034 closes the original ADR-014 gap that
+permitted unauthenticated non-loopback binds behind the `allow_non_loopback`
+opt-in alone; the opt-in remains the gate that admits non-loopback binds at all
+but no longer admits them unauthenticated.
+**Verification**: `crates/clarion-cli/tests/serve.rs` covers the loopback
+default (line 1457), the loopback `identity_token_env`-set-but-env-missing
+refusal (line 1495), the non-loopback-without-auth refusal (line 1547), the
+non-loopback HMAC-required path (line 1579), and the non-loopback legacy-bearer
+path (line 1614). Config-layer tests cover the loopback startup-warning
+surface.
+**See**: System Design §9 (HTTP Read API), §10 (Security), ADR-014, ADR-034.
 
 #### NFR-SEC-04 — Audit surface — security events as findings
 

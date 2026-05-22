@@ -141,7 +141,12 @@ Open issues for the v1.0 known limitations and any post-release follow-ups live 
 
 - **WP9-B (Filigree finding emission)** — deferred from 1.0 per the [Sprint 2 scope amendment](docs/implementation/sprint-2/scope-amendment-2026-05.md#4-v01-planmd-resequencing).
 - **HTTP file language manifest registry** — narrow core-extension fallback at 1.0; persistent registry is a post-1.0 task.
-- **HMAC inbound auth (C-4)** — bearer is the 1.0 wire surface; HMAC is forward-compatible and tracked for post-1.0 hardening.
+- **HMAC inbound auth (C-4)** — HMAC (`X-Loom-Component: clarion:<hmac>`) is the
+  preferred non-loopback authentication mechanism in v1.0 per ADR-034,
+  configured via `serve.http.identity_token_env`. The legacy bearer-token path
+  (`serve.http.token_env`) remains supported for compatibility. Replay
+  protection (timestamp + nonce window) is ADR-034 forward-work tracked for
+  post-1.0 hardening.
 
 <!-- filigree:instructions:v2.0.3:d454f2c2 -->
 ## Filigree Issue Tracker
