@@ -101,6 +101,14 @@ is at [docs/clarion/adr/README.md](docs/clarion/adr/README.md). The Loom
 federation doctrine that anchors every cross-product decision is in
 [docs/suite/loom.md](docs/suite/loom.md).
 
+## Storage and operations
+
+Clarion v1.0 keeps all state in a project-local `.clarion/` directory.
+The local-first storage model, the no-NFS constraint, the no-double-analyze
+constraint (fs2 advisory lock), and the v1.0 backup/restore procedure are
+documented in
+[docs/clarion/1.0/operations.md](docs/clarion/1.0/operations.md).
+
 ## Contributing
 
 Read [CLAUDE.md](CLAUDE.md) for repository conventions, work-package

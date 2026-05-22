@@ -57,8 +57,8 @@ normative.
   discover the surface pre-auth.
 - `GET /api/v1/files?path=&language=` — single-file identity resolution.
   Closed error envelope `{error, code}` with codes `INVALID_PATH`,
-  `PATH_OUTSIDE_PROJECT`, `NOT_FOUND`, `BRIEFING_BLOCKED`, `UNAUTHORIZED`,
-  `STORAGE_ERROR`, `INTERNAL`. ETag / `If-None-Match` supported.
+  `PATH_OUTSIDE_PROJECT`, `NOT_FOUND`, `BRIEFING_BLOCKED`, `UNAUTHENTICATED`,
+  `BATCH_TOO_LARGE`, `STORAGE_ERROR`, `INTERNAL`. ETag / `If-None-Match` supported.
 - `POST /api/v1/files/batch` — bulk resolution, up to 256 queries per
   request, single pooled `ReaderPool` checkout per batch. Four-way
   partitioning: `resolved` / `not_found` / `briefing_blocked` / `errors`.
@@ -105,9 +105,9 @@ normative.
 ### Known v1.0 limitations
 
 - **Python only.** Other-language plugins (`NG-15`) are v2.0+ scope.
-- **Filigree finding emission deferred to v0.2.** Cross-product POSTing of
-  Clarion-generated findings into Filigree's intake (WP9-B) is deferred per
-  the [Sprint 2 scope amendment](docs/implementation/sprint-2/scope-amendment-2026-05.md).
+- **Filigree finding emission deferred to a future release (tracked under
+  `release:v1.1`).** Cross-product POSTing of Clarion-generated findings into
+  Filigree's intake (WP9-B) is deferred per the [Sprint 2 scope amendment](docs/implementation/sprint-2/scope-amendment-2026-05.md).
   `issues_for(id)` (the WP9-A binding for reading from Filigree) ships in 1.0.
 - **HTTP file language inference** uses persisted plugin manifest language when
   available, with a narrow core-extension fallback for files that predate
@@ -115,13 +115,28 @@ normative.
 - **Cooperative HMAC inbound auth** ships for the HTTP read API via
   `serve.http.identity_token_env` and `X-Loom-Component: clarion:<hmac>`.
   The older bearer-token path remains available for compatibility.
+- **Python plugin imports `wardline.core.registry.REGISTRY` at startup**
+  (loom.md §5 asterisk 2). Initialization coupling scoped to the
+  Wardline-aware plugin only; Clarion core and non-Wardline-aware plugins are
+  unaffected. *Retirement condition*: Wardline ships a stable runtime probe
+  API.
+- **Pre-WP5 catalogue upgrade requirement.** Briefing-blocked annotations
+  are stored as a JSON property on file entities at v1.0 (v1.1 promotes
+  the field to a typed column). A v1.0 binary opening a `.clarion/clarion.db`
+  produced by a pre-WP5 binary finds no `briefing_blocked` properties —
+  pre-WP5 analyzers never wrote them — and will serve the entire catalogue
+  without refusal. Operators upgrading from a pre-WP5 install MUST run
+  `clarion analyze` (scanner active by default) against the project root
+  before exposing the HTTP read API or calling the `summary` MCP tool. See
+  [`docs/operator/secret-scanning.md`](docs/operator/secret-scanning.md#pre-wp5-catalogue-upgrade-requirement).
 
 ### Documentation
 
 - Design ladder under [`docs/clarion/1.0/`](docs/clarion/1.0/) — `requirements.md`,
   `system-design.md`, `detailed-design.md`.
 - ADRs under [`docs/clarion/adr/`](docs/clarion/adr/) — 28 Accepted at 1.0
-  (through ADR-034). ADR-012 is superseded by ADR-014, whose Security
+  (ADR-001…ADR-034 with the documented Backlog/Superseded subset excluded).
+  ADR-012 is superseded by ADR-014, whose Security
   Posture and Error Envelope are in turn partially extended by ADR-034
   for the Sprint 3 federation hardening. Four ADRs (ADR-009, ADR-010,
   ADR-019, ADR-020) remain Backlog and are tracked inside

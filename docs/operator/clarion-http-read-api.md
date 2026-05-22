@@ -54,3 +54,31 @@ is available.
 to the entity ID and project-relative canonical path Filigree should store. It
 fails closed when the path is invalid, outside the project, missing from the
 catalog, or unavailable because of storage errors.
+
+## Trust assumption: loopback-no-token mode
+
+When both `serve.http.token_env` (legacy bearer) and
+`serve.http.identity_token_env` (HMAC, preferred per
+[ADR-034](../clarion/adr/ADR-034-federation-hardening.md)) are unset and the
+bind is loopback (default: `127.0.0.1:9111`), the HTTP read API serves
+unauthenticated. This is the intended single-user developer-workstation
+trust model — the loopback socket is reachable only from processes on the
+same host, and Clarion's catalogue is no more sensitive than the project
+source those processes can already read.
+
+**On a multi-tenant developer host or shared CI runner this trust model
+does not hold.** Any local process — any UID with read access to the
+loopback bind socket — can read the entire non-blocked catalogue,
+including every file's `entity_id`, `canonical_path`, `language`, and
+`content_hash`. This is the documented v1.0 trust matrix and is not a
+defect, but operators on multi-tenant hosts must configure authentication
+before binding.
+
+Multi-tenant operators MUST set `identity_token_env` (HMAC, preferred) or
+`token_env` (bearer, legacy) before running `clarion serve`. The HMAC
+configuration shape is documented in the [Trust Model](#trust-model)
+section above.
+
+The Clarion `serve` startup banner emits a `[TRUST]` line warning when
+loopback-no-token mode is active (forward-reference: the banner code is a
+SEC-02 follow-up PR; the trust assumption itself is current as of v1.0).

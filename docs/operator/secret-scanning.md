@@ -80,6 +80,63 @@ Filigree integration for scanner findings is planned for v0.2. Until then, the l
 
 The scanner is pattern-based. It can miss novel internal key formats and it can flag high-entropy test data. Use a justified baseline for reviewed false positives, and disable LLM dispatch entirely for repos where any source disclosure would be unacceptable — set `llm.allow_live_provider: false` in `clarion.yaml` (or leave `CLARION_LLM_LIVE` unset) so the recording provider is the only path Clarion will take.
 
-Contextual credential suppression only recognises shell/Python `#` comments in v0.1. It does not recognise `//` or `/* */` comments; use a justified baseline entry for reviewed non-Python test fixtures.
+Contextual credential suppression currently recognises shell/Python `#` comments only. It does not recognise `//` or `/* */` comments; use a justified baseline entry for reviewed non-Python test fixtures.
 
 See [ADR-013](../clarion/adr/ADR-013-pre-ingest-secret-scanner.md) for design rationale.
+
+## Trust assumption: loopback-no-token mode
+
+The pre-ingest scanner's briefing-blocked annotations are only effective if
+the HTTP read API also refuses to surface blocked entities to unauthorised
+callers. The v1.0 HTTP API has one mode where it serves any local caller
+without authentication: **loopback bind with no token configured.**
+
+When both `serve.http.token_env` (legacy bearer) and `serve.http.identity_token_env`
+(HMAC, preferred per [ADR-034](../clarion/adr/ADR-034-federation-hardening.md))
+are unset and the bind is loopback (default: `127.0.0.1:9111`), the HTTP read
+API serves unauthenticated. On a single-user developer workstation this is
+the intended trust model: the loopback socket is reachable only from
+processes on that host, and Clarion's catalogue is no more sensitive than
+the project source those processes can already read.
+
+**On a multi-tenant developer host or shared CI runner the trust model is
+different.** Any local process — any UID with read access to the loopback
+bind socket — can read the entire non-blocked catalogue, including every
+file's `entity_id`, `canonical_path`, `language`, and `content_hash`. This
+is the documented v1.0 trust matrix; it is not a defect, but it is a
+constraint operators must understand.
+
+Multi-tenant operators MUST set `identity_token_env` (HMAC, preferred) or
+`token_env` (bearer, legacy) before running `clarion serve`. See
+[`clarion-http-read-api.md`](./clarion-http-read-api.md) for the
+configuration shape.
+
+The Clarion `serve` startup banner emits a `[TRUST]` line warning when
+loopback-no-token mode is active (forward-reference: SEC-02 banner code
+ships in a follow-up PR; the trust assumption itself is current).
+
+## Pre-WP5 catalogue upgrade requirement
+
+The WP5 pre-ingest secret scanner ships in v1.0. Briefing-blocked entities
+are marked by writing `briefing_blocked: <reason>` into the file entity's
+`properties` JSON column. v1.1 will promote `briefing_blocked` to a typed
+column on `entities`; v1.0 carries it as a JSON property.
+
+**A v1.0 binary opening a `.clarion/clarion.db` produced by a pre-WP5
+Clarion binary will find no `briefing_blocked` properties on any row.**
+Pre-WP5 binaries never ran the scanner and never wrote the property; the
+1.0 binary cannot retroactively discover which files contained secrets at
+that earlier scan time. The HTTP read API will serve the entire catalogue
+without refusal because every row's `briefing_blocked` is structurally
+absent.
+
+**Required upgrade procedure:** after installing the v1.0 binary against
+a project root that was previously analyzed by a pre-WP5 binary, run
+`clarion analyze` (with the secret scanner active, which is the default)
+against the project root **before** exposing the HTTP read API or calling
+the `summary` MCP tool. The re-analyze produces a fresh briefing-blocked
+annotation pass over all current file entities.
+
+This applies only to upgrades from a Clarion binary built before WP5
+landed. A v1.0 installation that has never been opened by a pre-WP5
+binary is unaffected.
