@@ -1060,10 +1060,23 @@ fn entity_briefing_block_reason_parses_property_and_tolerates_garbage() {
         entity_briefing_block_reason(r#"{"briefing_blocked":42}"#),
         None,
     );
-    // Malformed JSON must not panic.
-    assert_eq!(entity_briefing_block_reason(""), None);
-    assert_eq!(entity_briefing_block_reason("not json"), None);
-    // Non-object root.
+}
+
+#[test]
+fn entity_briefing_block_reason_fails_closed_on_malformed_json() {
+    // Fail-closed contract (SEC-01): a plugin emitting malformed
+    // properties JSON must not be able to silently unblock the entity
+    // through the federation read paths. Any parse failure returns
+    // Some("malformed_properties_json") so callers treat the row as
+    // briefing-blocked.
+    let expected = Some("malformed_properties_json".to_owned());
+    assert_eq!(entity_briefing_block_reason(""), expected);
+    assert_eq!(entity_briefing_block_reason("not json"), expected);
+    assert_eq!(entity_briefing_block_reason(r#"{"unterminated"#), expected);
+    assert_eq!(entity_briefing_block_reason(r#"{"x":}"#), expected);
+    // Valid JSON whose root is not an object still parses and follows the
+    // non-malformed path (no `briefing_blocked` key on a JSON `null`/array,
+    // so the reason is `None`).
     assert_eq!(entity_briefing_block_reason("null"), None);
     assert_eq!(entity_briefing_block_reason("[]"), None);
 }

@@ -294,11 +294,11 @@ pub fn resolve_file_catalog_entry(
 /// column. Shared with `clarion-mcp` (which makes the same call inline) so
 /// federation read surfaces enforce the block uniformly.
 pub fn entity_briefing_block_reason(properties_json: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(properties_json)
-        .ok()?
-        .get("briefing_blocked")?
-        .as_str()
-        .map(str::to_owned)
+    // Fail-closed: malformed properties JSON treated as briefing-blocked to prevent secret exposure.
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(properties_json) else {
+        return Some("malformed_properties_json".to_owned());
+    };
+    value.get("briefing_blocked")?.as_str().map(str::to_owned)
 }
 
 fn source_entity_for_path(

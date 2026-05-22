@@ -192,6 +192,13 @@ where
         && !config.is_loopback_bind()
         && auth_token.is_none()
         && identity_secret.is_none();
+    // SEC-02: operator-visible signal that the HTTP API will admit any
+    // local request because both auth knobs are unset and the bind is
+    // loopback. On a shared developer host or CI runner this means any
+    // local process can read the (non-blocked) catalogue.
+    let warn_unauthenticated_loopback = config.is_loopback_bind()
+        && auth_token.is_none()
+        && identity_secret.is_none();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<HttpReadReady>>();
     let (failure_tx, failure_rx) = mpsc::channel();
@@ -232,6 +239,15 @@ where
             bind = %local_addr,
             auth = %auth,
             "Clarion HTTP read API listening on non-loopback interface without authentication"
+        );
+    }
+    if warn_unauthenticated_loopback {
+        tracing::warn!(
+            bind = %local_addr,
+            auth = %auth,
+            "[TRUST] HTTP API serving on loopback without authentication; any \
+             local process on this host can read the catalogue. Set \
+             identity_token_env or token_env for multi-tenant safety."
         );
     }
     tracing::info!(bind = %local_addr, auth = %auth, "Clarion HTTP read API listening");
@@ -424,10 +440,16 @@ async fn require_hmac_identity(
         return unauthenticated_response();
     };
     let Ok(body_bytes) = to_bytes(body, HTTP_BODY_LIMIT_BYTES).await else {
+        // CI-02 fix: a body read failure here is not a path-validation
+        // problem. The outer `RequestBodyLimitLayer` already rejects
+        // oversized bodies with the framework's 413; reaching this branch
+        // means a transport-layer IO failure or a body that could not be
+        // collected. Surface as Internal (500) so federation clients
+        // routing on `code` do not mis-classify it as a path defect.
         return json_error(
-            StatusCode::BAD_REQUEST,
-            ErrorCode::InvalidPath,
-            "request body is invalid",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            "request body could not be read",
         );
     };
     let expected = component_hmac_hex(secret.as_bytes(), &method, &path_and_query, &body_bytes);
@@ -1460,6 +1482,174 @@ mod tests {
             serde_json::from_slice(&body).expect("response body is JSON");
         assert_eq!(parsed["error"], "internal panic");
         assert_eq!(parsed["code"], "INTERNAL");
+    }
+
+    /// CI-02 fix: a body-read failure inside HMAC verification must not
+    /// surface as `INVALID_PATH`. Federation clients switch on `code`; a
+    /// transport/IO failure mis-routed as a path-validation defect would
+    /// be a contract bug.
+    #[test]
+    fn hmac_middleware_body_read_failure_is_not_invalid_path() {
+        use axum::Router;
+        use axum::body::{Body, to_bytes};
+        use axum::http::Request;
+        use axum::routing::post;
+        use tower::ServiceExt;
+
+        async fn never_called(_request: Request<Body>) -> Response {
+            unreachable!("inner handler must not run when body read fails")
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let (status, body) = runtime.block_on(async {
+            // Body that exceeds HTTP_BODY_LIMIT_BYTES so `to_bytes(body, HTTP_BODY_LIMIT_BYTES)`
+            // returns Err with a LengthLimitError. This is the same Err path
+            // a transport-level body-read failure would take.
+            let oversize = vec![b'x'; HTTP_BODY_LIMIT_BYTES + 16];
+            let request = Request::builder()
+                .method("POST")
+                .uri("/api/v1/files/batch")
+                .header("X-Loom-Component", "clarion:deadbeef")
+                .body(Body::from(oversize))
+                .expect("request");
+
+            // Drive `require_hmac_identity` directly. axum's `Next` is not
+            // publicly constructible from outside middleware composition, so
+            // we exercise the function via a single-route Router with the
+            // middleware layered on top.
+            let app: Router<()> = Router::new()
+                .route("/api/v1/files/batch", post(never_called))
+                .layer(axum::middleware::from_fn(|request, next| async move {
+                    require_hmac_identity("test-secret", request, next).await
+                }));
+
+            let response = app.oneshot(request).await.expect("oneshot response");
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 4096)
+                .await
+                .expect("read response body");
+            (status, bytes)
+        });
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("response body is JSON");
+        // The exact code is `INTERNAL` (the CI-02 fix); the load-bearing
+        // assertion is that it is NOT `INVALID_PATH`.
+        assert_ne!(
+            parsed["code"], "INVALID_PATH",
+            "body-read failure must not surface as INVALID_PATH (CI-02): got status={status}, body={parsed}"
+        );
+        assert_eq!(
+            parsed["code"], "INTERNAL",
+            "expected INTERNAL on body-read failure inside HMAC middleware"
+        );
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// SEC-02: when the HTTP API binds to loopback and neither
+    /// `identity_token_env` nor `token_env` resolves to a non-empty
+    /// secret, the surface admits any local request. The operator must
+    /// see an unmissable startup warning that names "loopback" and
+    /// "without authentication".
+    #[test]
+    fn spawn_emits_loopback_no_token_trust_warning() {
+        use clarion_mcp::config::HttpReadConfig;
+        use clarion_storage::ReaderPool;
+        use std::io;
+        use std::net::{SocketAddr, TcpListener};
+        use std::sync::Mutex;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct CaptureWriter {
+            buffer: Arc<Mutex<Vec<u8>>>,
+        }
+
+        impl io::Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.buffer.lock().expect("capture lock").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for CaptureWriter {
+            type Writer = CaptureWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CaptureWriter {
+            buffer: buffer.clone(),
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_target(false)
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+
+        // Drive `spawn_with_env` under the capturing subscriber so the
+        // startup warning lands in `buffer`. Use `with_default` so the
+        // capture is scoped to this test and does not leak into peers.
+        tracing::subscriber::with_default(subscriber, || {
+            let probe = TcpListener::bind(("127.0.0.1", 0)).expect("probe bind");
+            let bind: SocketAddr = probe.local_addr().expect("probe local addr");
+            drop(probe);
+
+            let tempdir = tempfile::tempdir().expect("temp project root");
+            let db_path = tempdir.path().join("clarion.db");
+            let readers = ReaderPool::open(&db_path, 4).expect("open reader pool");
+
+            let config = HttpReadConfig {
+                enabled: true,
+                bind,
+                allow_non_loopback: false,
+                token_env: "CLARION_LOOPBACK_NO_TOKEN_TEST_UNSET".to_owned(),
+                identity_token_env: None,
+            };
+            let instance_id = crate::instance::parse_instance_id_for_test(
+                "00000000-0000-4000-8000-000000000002",
+            )
+            .expect("parse synthetic instance id");
+
+            // Env lookup that returns None for every variable — emulates
+            // the operator running `clarion serve` on loopback with no
+            // tokens configured.
+            let env_lookup = |_: &str| -> Option<String> { None };
+
+            let server = spawn_with_env(
+                tempdir.path().to_path_buf(),
+                readers,
+                instance_id,
+                &config,
+                env_lookup,
+            )
+            .expect("spawn HTTP read API")
+            .expect("config.enabled = true implies Some(server)");
+            // Shut down so the test thread does not leak the HTTP server.
+            server.shutdown().expect("shutdown HTTP read API");
+        });
+
+        let captured = String::from_utf8(buffer.lock().expect("capture lock").clone())
+            .expect("captured tracing output is UTF-8");
+
+        assert!(
+            captured.contains("loopback"),
+            "expected loopback-no-token warning to mention 'loopback'; captured: {captured}"
+        );
+        assert!(
+            captured.contains("without authentication"),
+            "expected loopback-no-token warning to mention 'without authentication'; captured: {captured}"
+        );
     }
 
     /// C8 supervisor end-to-end. Trips the test-only
