@@ -40,6 +40,23 @@ FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT = "CLA-PY-CALL-RESOLUTION-TIMEOUT"
 FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT = "CLA-PY-REFERENCE-RESOLUTION-TIMEOUT"
 FINDING_PYRIGHT_REFERENCE_SITE_CAP = "CLA-PY-REFERENCE-SITE-CAP"
 
+
+@dataclass
+class PyrightRunState:
+    """Run-wide pyright health budget, shared across session recycles.
+
+    A ``PyrightSession`` is recycled every ``MAX_FILES_PER_PYRIGHT_SESSION``
+    files to bound memory growth. Without a shared budget the 3-restart cap
+    resets at every recycle boundary, letting a crash-looping pyright silently
+    consume ``ceil(N/25) * 3`` restarts instead of 3 for an entire analysis
+    run. Pass the same ``PyrightRunState`` instance to every successive
+    ``PyrightSession`` so the budget is enforced across the full run.
+    """
+
+    restart_count: int = 0
+    disabled: bool = False
+
+
 MAX_UNRESOLVED_CALLEE_EXPR_BYTES = 512
 MAX_PYRIGHT_RESTARTS_PER_RUN = 3
 MAX_REFERENCE_SITES_PER_FILE = 2000
@@ -141,6 +158,7 @@ class PyrightSession:
         file_timeout_secs: float = PYRIGHT_FILE_TIMEOUT_SECS,
         max_restarts_per_run: int = MAX_PYRIGHT_RESTARTS_PER_RUN,
         max_reference_sites_per_file: int = MAX_REFERENCE_SITES_PER_FILE,
+        run_state: PyrightRunState | None = None,
     ) -> None:
         self.project_root = Path(project_root).resolve()
         self.executable = executable
@@ -151,12 +169,15 @@ class PyrightSession:
         self.file_timeout_secs = file_timeout_secs
         self.max_restarts_per_run = max_restarts_per_run
         self.max_reference_sites_per_file = max_reference_sites_per_file
+        # Run-wide health budget: shared across session recycles when the caller
+        # passes an explicit ``run_state``; isolated (per-instance) otherwise,
+        # which preserves the existing contract for code that constructs
+        # ``PyrightSession`` directly without going through ``ServerState``.
+        self._run_state = run_state if run_state is not None else PyrightRunState()
         self._process: subprocess.Popen[bytes] | None = None
         self._stderr_thread: threading.Thread | None = None
         self._stderr_tail = bytearray()
         self._next_id = 1
-        self._restart_count = 0
-        self._disabled = False
         self._findings: list[Finding] = []
         self._function_indexes: dict[Path, _FunctionIndex] = {}
         self._index_parse_latency_ms: list[int] = []
@@ -584,7 +605,7 @@ class PyrightSession:
         return target_index.module_id, False
 
     def _ensure_process(self) -> bool:
-        if self._disabled:
+        if self._run_state.disabled:
             return False
         if self._process is None:
             return self._start_process()
@@ -592,32 +613,32 @@ class PyrightSession:
             return True
         self._process = None
         self._record_restart_or_poison("pyright subprocess exited")
-        if self._disabled:
+        if self._run_state.disabled:
             return False
         return self._start_process()
 
     def _record_restart_or_poison(self, reason: str) -> None:
-        self._restart_count += 1
-        if self._restart_count > self.max_restarts_per_run:
-            self._disabled = True
+        self._run_state.restart_count += 1
+        if self._run_state.restart_count > self.max_restarts_per_run:
+            self._run_state.disabled = True
             self._record_finding(
                 FINDING_PYRIGHT_POISON_FRAME,
                 "pyright restart cap exceeded; skipping call resolution",
-                restart_count=self._restart_count,
+                restart_count=self._run_state.restart_count,
                 reason=reason,
             )
             return
         self._record_finding(
             FINDING_PYRIGHT_RESTART,
             "pyright subprocess died and was restarted",
-            restart_count=self._restart_count,
+            restart_count=self._run_state.restart_count,
             reason=reason,
         )
 
     def _start_process(self) -> bool:
         executable = self._resolve_executable()
         if executable is None:
-            self._disabled = True
+            self._run_state.disabled = True
             self._record_finding(
                 FINDING_PYRIGHT_UNAVAILABLE,
                 "pyright-langserver is not available",
@@ -625,7 +646,7 @@ class PyrightSession:
             )
             return False
         if self.install_check is not None and not self.install_check(executable):
-            self._disabled = True
+            self._run_state.disabled = True
             self._record_finding(
                 FINDING_PYRIGHT_INSTALL_FAILURE,
                 "pyright-langserver executability check failed",
@@ -643,7 +664,7 @@ class PyrightSession:
                 stderr=subprocess.PIPE,
             )
         except OSError as exc:
-            self._disabled = True
+            self._run_state.disabled = True
             self._record_finding(
                 FINDING_PYRIGHT_INSTALL_FAILURE,
                 "pyright-langserver failed to start",
@@ -657,7 +678,7 @@ class PyrightSession:
         try:
             self._initialize()
         except LspTimeoutError:
-            self._disabled = True
+            self._run_state.disabled = True
             self._record_finding(
                 FINDING_PYRIGHT_INIT_TIMEOUT,
                 "pyright initialize handshake timed out",
@@ -667,7 +688,7 @@ class PyrightSession:
             process.wait(timeout=2)
             return False
         except (LspTransportClosedError, BrokenPipeError, OSError) as exc:
-            self._disabled = True
+            self._run_state.disabled = True
             self._record_finding(
                 FINDING_PYRIGHT_UNAVAILABLE,
                 "pyright initialize handshake failed",

@@ -29,7 +29,7 @@ from typing import IO, Any
 
 from clarion_plugin_python import __version__
 from clarion_plugin_python.extractor import extract_with_stats
-from clarion_plugin_python.pyright_session import PyrightSession
+from clarion_plugin_python.pyright_session import PyrightRunState, PyrightSession
 from clarion_plugin_python.stdout_guard import install_stdio
 from clarion_plugin_python.wardline_probe import probe as wardline_probe
 
@@ -68,6 +68,7 @@ class ServerState:
     project_root: Path | None = field(default=None)
     pyright: PyrightSession | None = field(default=None)
     pyright_files_since_restart: int = 0
+    pyright_run_state: PyrightRunState = field(default_factory=PyrightRunState)
 
 
 def read_frame(stream: IO[bytes]) -> dict[str, Any] | None:
@@ -195,7 +196,10 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
         return {"entities": [], "edges": [], "stats": empty_stats}
     path = Path(file_path_raw)
     if state.pyright is None:
-        state.pyright = PyrightSession(state.project_root or path.parent)
+        state.pyright = PyrightSession(
+            state.project_root or path.parent,
+            run_state=state.pyright_run_state,
+        )
     try:
         source = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:

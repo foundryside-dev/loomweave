@@ -1072,6 +1072,19 @@ fn classify_read_error(err: &StorageError) -> ReadError {
             code: ErrorCode::StorageError,
             message: "file lookup failed",
         },
+        // STO-02 (ADR-035): the on-disk file is not a Clarion database, or
+        // was written by a newer build. Either condition is fatal for the
+        // server; the writer-actor refuses to spawn against it. Surfacing
+        // 500 here is defensive — in practice the HTTP API does not open
+        // its own writer, but the reader pool can encounter the same file
+        // header mismatches and we want a clear distinct response code.
+        StorageError::ForeignDatabase { .. } | StorageError::FutureUserVersion { .. } => {
+            ReadError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: ErrorCode::StorageError,
+                message: "file lookup storage rejected database header",
+            }
+        }
         StorageError::PoolInteract(_)
         | StorageError::WriterGone
         | StorageError::WriterProtocol(_)

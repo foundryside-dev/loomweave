@@ -6,7 +6,7 @@
 
 use rusqlite::{Connection, params};
 
-use clarion_storage::{pragma, schema};
+use clarion_storage::{Writer, error::StorageError, pragma, schema};
 
 fn open_fresh(tempdir: &tempfile::TempDir) -> Connection {
     let path = tempdir.path().join("clarion.db");
@@ -917,4 +917,135 @@ fn runs_status_check_accepts_all_documented_values() {
         )
         .unwrap_or_else(|err| panic!("runs.status={status} rejected unexpectedly: {err}"));
     }
+}
+
+// ----------------------------------------------------------------------------
+// STO-02 (gap-register.md): the writer must self-identify Clarion databases
+// via SQLite's `application_id` header and refuse forward-incompatible
+// `user_version` values. These tests pin the open-time contract.
+// ----------------------------------------------------------------------------
+
+/// Spawn a writer, immediately shut it down, and return whatever Result the
+/// blocking task produced. Used to assert refuse-on-open behaviour without
+/// leaking the spawned task.
+fn spawn_writer_and_drain(path: std::path::PathBuf) -> Result<(), StorageError> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async move {
+        let (writer, handle) = Writer::spawn(path, 50, 256)?;
+        // Close the command channel so the actor (if it reached the loop)
+        // exits cleanly; the join then surfaces the open-time error if any.
+        drop(writer);
+        handle.await.expect("writer task did not panic")
+    })
+}
+
+#[test]
+fn open_refuses_db_with_foreign_application_id() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("foreign.db");
+    {
+        let conn = Connection::open(&path).unwrap();
+        // `PRAGMA application_id` only writes the header page to disk once
+        // the database file has been materialised by some other write. Touch
+        // a temporary table to force the file out of zero-bytes state.
+        conn.execute_batch(
+            "PRAGMA application_id = 0x7AFEBABE; \
+             CREATE TABLE _touch (x INTEGER); DROP TABLE _touch;",
+        )
+        .expect("set foreign application_id");
+    }
+    let err = spawn_writer_and_drain(path).expect_err(
+        "Writer::spawn must refuse a SQLite file carrying a non-Clarion application_id",
+    );
+    assert!(
+        matches!(
+            err,
+            StorageError::ForeignDatabase {
+                application_id: 0x7AFE_BABE,
+            }
+        ),
+        "expected ForeignDatabase {{ application_id: 0x7AFEBABE }}, got {err:?}"
+    );
+}
+
+#[test]
+fn open_refuses_db_from_future_user_version() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("future.db");
+    // Open the file via the normal writer path first so it carries the
+    // Clarion application_id and the v1 schema (the migration runner sets
+    // user_version=1 on apply). Then bump user_version past current and
+    // re-open via the writer — must refuse.
+    {
+        let mut conn = Connection::open(&path).unwrap();
+        pragma::apply_write_pragmas(&conn).unwrap();
+        schema::apply_migrations(&mut conn).unwrap();
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA user_version = {};",
+            schema::CURRENT_SCHEMA_VERSION + 1
+        ))
+        .expect("bump user_version");
+    }
+
+    let err = spawn_writer_and_drain(path)
+        .expect_err("Writer::spawn must refuse a future-versioned database");
+    let expected_found = schema::CURRENT_SCHEMA_VERSION + 1;
+    let expected_current = schema::CURRENT_SCHEMA_VERSION;
+    assert!(
+        matches!(
+            err,
+            StorageError::FutureUserVersion { found, current }
+                if found == expected_found && current == expected_current
+        ),
+        "expected FutureUserVersion {{ found: {expected_found}, current: \
+         {expected_current} }}, got {err:?}"
+    );
+}
+
+#[test]
+fn open_sets_application_id_on_legacy_db() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("legacy.db");
+    // Touch a SQLite file with no application_id set (default 0). Open as a
+    // raw connection so we leave the header at its zero default — no
+    // `apply_write_pragmas` here.
+    {
+        let conn = Connection::open(&path).unwrap();
+        let raw: i64 = conn
+            .query_row("PRAGMA application_id", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(raw, 0, "fresh SQLite files start at application_id=0");
+        // Force the file to materialise on disk by writing a table; this also
+        // guarantees the header page exists.
+        conn.execute_batch("CREATE TABLE _touch (x INTEGER); DROP TABLE _touch;")
+            .unwrap();
+    }
+
+    // First open via the writer should set the Clarion application_id.
+    spawn_writer_and_drain(path.clone())
+        .expect("Writer::spawn must accept a legacy (application_id=0) file");
+    {
+        let conn = Connection::open(&path).unwrap();
+        let raw: i64 = conn
+            .query_row("PRAGMA application_id", [], |row| row.get(0))
+            .unwrap();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let observed = raw as u32;
+        assert_eq!(
+            observed,
+            pragma::CLARION_APPLICATION_ID,
+            "writer must stamp Clarion application_id on a legacy DB"
+        );
+    }
+
+    // Re-open: must not refuse, application_id is now recognised.
+    spawn_writer_and_drain(path)
+        .expect("Writer::spawn must accept a database it has already stamped");
 }
