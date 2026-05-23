@@ -218,4 +218,16 @@ if [ "$REFERENCE_SITES" -lt 2 ] || [ "$REFERENCES_RESOLVED" -lt 2 ]; then
     fail "expected reference_sites_total and references_resolved_total >= 2; got sites=$REFERENCE_SITES resolved=$REFERENCES_RESOLVED"
 fi
 
-log "PASS: walking skeleton persisted module + function/class entities + source metadata + contains + calls + references edges"
+# ── 14. Verify SQLite database integrity (STO-04) ────────────────────────────
+# Closes gap-register STO-04: every walking-skeleton run must exit cleanly
+# against `PRAGMA integrity_check` so a v1.0-shipped binary cannot leave a
+# corrupt `.clarion/clarion.db` on the operator's disk without a CI signal.
+log "verifying SQLite integrity_check returns ok ..."
+INTEGRITY_RESULT=$(sqlite3 "$DEMO_DIR/.clarion/clarion.db" "PRAGMA integrity_check;")
+if [ "$INTEGRITY_RESULT" != "ok" ]; then
+    log "integrity_check failed; full output:"
+    sqlite3 "$DEMO_DIR/.clarion/clarion.db" "PRAGMA integrity_check;" >&2 || true
+    fail "expected PRAGMA integrity_check == 'ok'; got '$INTEGRITY_RESULT'"
+fi
+
+log "PASS: walking skeleton persisted module + function/class entities + source metadata + contains + calls + references edges; SQLite integrity_check ok"
