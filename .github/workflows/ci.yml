@@ -153,3 +153,13 @@ jobs:
 
       - name: run WP5 secret scanner smoke
         run: CARGO_BUILD=0 bash tests/e2e/wp5_secret_scan.sh
+
+      - name: Sprint 2 MCP surface
+        run: bash tests/e2e/sprint_2_mcp_surface.sh
+        env:
+          CARGO_BUILD: "0"
+
+      - name: Phase 3 subsystem clustering determinism
+        run: bash tests/e2e/phase3_subsystems.sh
+        env:
+          CARGO_BUILD: "0"
