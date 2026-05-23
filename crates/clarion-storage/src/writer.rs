@@ -29,6 +29,7 @@ use crate::commands::{
 };
 use crate::error::{Result, StorageError};
 use crate::pragma;
+use crate::schema;
 use crate::unresolved::replace_unresolved_call_sites_for_caller;
 
 /// Default transaction batch size per ADR-011.
@@ -86,6 +87,11 @@ impl Writer {
         let handle = tokio::task::spawn_blocking(move || -> Result<()> {
             let mut conn = Connection::open(&db_path)?;
             pragma::apply_write_pragmas(&conn)?;
+            // STO-02: refuse a database whose `user_version` is strictly greater
+            // than CURRENT_SCHEMA_VERSION. Equal/less are normal — equal is the
+            // already-migrated steady state, less is handled by the migration
+            // runner (which `install` calls before the writer ever spawns).
+            schema::verify_user_version(&conn)?;
             run_actor(
                 rx,
                 &mut conn,

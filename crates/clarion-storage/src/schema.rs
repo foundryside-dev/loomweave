@@ -20,16 +20,39 @@ const MIGRATIONS: &[Migration] = &[Migration {
     sql: include_str!("../migrations/0001_initial_schema.sql"),
 }];
 
+/// Highest migration version known to this build. Mirrored into the
+/// `SQLite` `user_version` header (STO-02) so a future-built database is
+/// refused at open instead of silently corrupting state.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+const _CURRENT_SCHEMA_VERSION_MATCHES_LAST_MIGRATION: () = {
+    // Compile-time check: `CURRENT_SCHEMA_VERSION` must equal the highest
+    // version in `MIGRATIONS`. If a new migration is added without bumping
+    // the constant (or vice versa), this assertion fails to compile.
+    assert!(
+        MIGRATIONS[MIGRATIONS.len() - 1].version == CURRENT_SCHEMA_VERSION,
+        "CURRENT_SCHEMA_VERSION must equal the highest MIGRATIONS[].version"
+    );
+};
+
 /// Apply every migration not already recorded in `schema_migrations`.
 ///
 /// The first migration creates the `schema_migrations` table itself, so the
 /// initial lookup tolerates its absence.
 ///
+/// After all pending migrations apply, the `SQLite` header `user_version` is
+/// written to [`CURRENT_SCHEMA_VERSION`]. A `user_version` strictly greater
+/// than [`CURRENT_SCHEMA_VERSION`] at entry is refused via
+/// [`verify_user_version`] (closes STO-02 forward-incompatibility check).
+///
 /// # Errors
 ///
+/// Returns [`StorageError::FutureUserVersion`] if the database was written
+/// by a newer Clarion build.
 /// Returns [`StorageError::Migration`] with the failing version on SQL error
 /// during apply. Returns [`StorageError::Sqlite`] on bookkeeping failures.
 pub fn apply_migrations(conn: &mut Connection) -> Result<()> {
+    verify_user_version(conn)?;
     let applied = read_applied_versions(conn)?;
     for m in MIGRATIONS {
         if applied.contains(&m.version) {
@@ -38,6 +61,49 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<()> {
         }
         apply_one(conn, m)?;
     }
+    apply_user_version(conn)?;
+    Ok(())
+}
+
+/// Refuse to operate on a database whose `user_version` is strictly greater
+/// than [`CURRENT_SCHEMA_VERSION`].
+///
+/// Equal or less is accepted: equal means the schema is current, less means
+/// either a fresh DB (`user_version=0`) or a DB awaiting in-flight migrations
+/// — both are handled by [`apply_migrations`]. The writer-actor calls this
+/// directly (without invoking the migration runner) so a forward-incompatible
+/// file is rejected at `Writer::spawn` time.
+///
+/// # Errors
+///
+/// Returns [`StorageError::FutureUserVersion`] when `user_version >
+/// CURRENT_SCHEMA_VERSION`. Returns [`StorageError::Sqlite`] if the PRAGMA
+/// query fails.
+pub fn verify_user_version(conn: &Connection) -> Result<()> {
+    let raw: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    // SQLite stores user_version as a 32-bit integer; rusqlite returns i64.
+    // Negative values are unreachable in normal use (we only set u32 values);
+    // clamp via `try_from` so an out-of-range value surfaces explicitly
+    // rather than silently truncating.
+    let found = u32::try_from(raw).map_err(|_| {
+        StorageError::PragmaInvariant(format!(
+            "PRAGMA user_version returned out-of-range value {raw}; expected 0..=u32::MAX"
+        ))
+    })?;
+    if found > CURRENT_SCHEMA_VERSION {
+        return Err(StorageError::FutureUserVersion {
+            found,
+            current: CURRENT_SCHEMA_VERSION,
+        });
+    }
+    Ok(())
+}
+
+/// Write `PRAGMA user_version = CURRENT_SCHEMA_VERSION`. Idempotent — writing
+/// the same value is cheap (it touches the `SQLite` header page). Called after
+/// the migration runner has applied every pending migration.
+fn apply_user_version(conn: &Connection) -> Result<()> {
+    conn.execute_batch(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION};"))?;
     Ok(())
 }
 

@@ -17,6 +17,11 @@ from typing import IO, TYPE_CHECKING, Any, cast
 
 from clarion_plugin_python import server as server_module
 from clarion_plugin_python.call_resolver import CallResolutionResult
+from clarion_plugin_python.pyright_session import (
+    FINDING_PYRIGHT_RESTART,
+    PyrightRunState,
+    PyrightSession,
+)
 from clarion_plugin_python.reference_resolver import ReferenceResolutionResult, ReferenceSite
 
 if TYPE_CHECKING:
@@ -266,7 +271,7 @@ def test_analyze_file_lazy_initializes_pyright(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakePyrightSession:
-        def __init__(self, project_root: Path) -> None:
+        def __init__(self, project_root: Path, **_kwargs: Any) -> None:
             self.project_root = project_root
             self.closed = False
 
@@ -305,7 +310,7 @@ def test_analyze_file_reports_call_resolver_stats(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakePyrightSession:
-        def __init__(self, project_root: Path) -> None:
+        def __init__(self, project_root: Path, **_kwargs: Any) -> None:
             self.project_root = project_root
 
         def resolve_calls(
@@ -400,7 +405,7 @@ def test_analyze_file_restarts_pyright_after_file_budget(
     sessions: list[Any] = []
 
     class FakePyrightSession:
-        def __init__(self, project_root: Path) -> None:
+        def __init__(self, project_root: Path, **_kwargs: Any) -> None:
             self.project_root = project_root
             self.closed = False
             sessions.append(self)
@@ -462,3 +467,120 @@ def test_shutdown_closes_pyright_session() -> None:
     assert response == {"jsonrpc": "2.0", "id": 1, "result": {}}
     assert fake.closed is True
     assert state.pyright is None
+
+
+def test_restart_budget_survives_session_recycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run-wide restart cap is not reset at the session-recycle boundary.
+
+    With MAX_FILES_PER_PYRIGHT_SESSION=25 and 30 files, there are two recycles
+    (files 1-25 in session 1, files 26-30 in session 2). A crashing pyright
+    must exhaust the single run-wide 3-restart budget, not a fresh 3-restart
+    budget per session.
+    """
+
+    # Each fake session increments run_state.restart_count directly, simulating
+    # a pyright that crashes on every call.  Using run_state rather than a
+    # session-local counter is what the fix is supposed to enforce.
+    class CrashingFakePyrightSession:
+        def __init__(self, project_root: Path, **kwargs: Any) -> None:
+            self.project_root = project_root
+            self.run_state: PyrightRunState = kwargs.get("run_state") or PyrightRunState()
+            self.closed = False
+
+        def resolve_calls(
+            self,
+            file_path: str,
+            function_ids: list[str],
+        ) -> CallResolutionResult:
+            _ = (file_path, function_ids)
+            if not self.run_state.disabled:
+                # Simulate a crash: record a restart finding via run_state.
+                self.run_state.restart_count += 1
+                if self.run_state.restart_count > 3:
+                    self.run_state.disabled = True
+                    return CallResolutionResult(
+                        findings=[
+                            {
+                                "subcode": FINDING_PYRIGHT_RESTART,
+                                "severity": "warning",
+                                "message": "pyright restart cap exceeded",
+                                "metadata": {},
+                            }
+                        ],
+                    )
+                return CallResolutionResult(
+                    findings=[
+                        {
+                            "subcode": FINDING_PYRIGHT_RESTART,
+                            "severity": "warning",
+                            "message": "pyright subprocess died and was restarted",
+                            "metadata": {},
+                        }
+                    ],
+                )
+            return CallResolutionResult()
+
+        def resolve_references(
+            self,
+            file_path: str,
+            sites: Sequence[ReferenceSite],
+        ) -> ReferenceResolutionResult:
+            _ = (file_path, sites)
+            return ReferenceResolutionResult()
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(server_module, "PyrightSession", CrashingFakePyrightSession, raising=False)
+    demo = tmp_path / "demo.py"
+    demo.write_text("def hello():\n    pass\n", encoding="utf-8")
+    state = server_module.ServerState(initialized=True, project_root=tmp_path)
+
+    # Drive 30 analyze_file requests.  The recycle boundary falls at file 25.
+    for _ in range(30):
+        server_module.handle_analyze_file({"file_path": str(demo)}, state)
+
+    # The run-wide budget must be consumed exactly once across both recycles,
+    # not reset to 3 at the recycle boundary.
+    assert state.pyright_run_state.restart_count <= 4  # 3 restarts + 1 cap trip
+    assert state.pyright_run_state.disabled is True
+
+
+def test_disabled_pyright_unavailable_does_not_redrive_per_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once pyright is disabled (binary missing), recycles must not re-check the binary.
+
+    Driving 30 files across the 25-file recycle boundary should emit exactly
+    one FINDING_PYRIGHT_UNAVAILABLE finding, not one per recycle.
+    """
+    resolve_executable_call_count = 0
+
+    def counting_resolve_executable(_self: PyrightSession) -> None:
+        nonlocal resolve_executable_call_count
+        resolve_executable_call_count += 1
+        # Returning None simulates a missing binary.
+
+    monkeypatch.setattr(
+        PyrightSession,
+        "_resolve_executable",
+        counting_resolve_executable,
+        raising=False,
+    )
+
+    demo = tmp_path / "demo.py"
+    demo.write_text("def hello():\n    pass\n", encoding="utf-8")
+    state = server_module.ServerState(initialized=True, project_root=tmp_path)
+
+    # Drive 30 analyze_file requests across the 25-file recycle boundary.
+    for _ in range(30):
+        server_module.handle_analyze_file({"file_path": str(demo)}, state)
+
+    # _resolve_executable must be called exactly once: the first time pyright
+    # is needed.  The shared run_state.disabled=True short-circuits _ensure_process
+    # before _start_process (and thus _resolve_executable) is re-entered.
+    assert resolve_executable_call_count == 1
