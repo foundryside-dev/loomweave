@@ -121,10 +121,31 @@ fn run_mcp_stdio(
         .build()
         .context("create MCP runtime")?;
     let _runtime_guard = runtime.enter();
+    // Compute the project root from the db_path (db_path is
+    // `<root>/.clarion/clarion.db`; pop twice). `project_root` was
+    // moved into `ServerState::new` below, so we recover it from
+    // `db_path` rather than cloning the original argument and adding a
+    // borrow gymnastics.
+    let project_root_for_lock = db_path
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow!("derive project root from db path {}", db_path.display()))?;
     let mut state = clarion_mcp::ServerState::new(project_root, readers);
     let mut llm_writer = None;
     let mut llm_writer_join = None;
+    // Cross-process writer lock (gap-register STO-01). Only acquired
+    // when the MCP server actually opens a writer-actor (the
+    // summary-cache writer for the LLM provider). A read-only `serve`
+    // (no LLM provider) intentionally does NOT hold the lock — the
+    // reader pool and HTTP read API may run concurrently with each
+    // other and with an `analyze` invocation; only writer-mode
+    // operations contend.
+    let mut _llm_writer_lock: Option<crate::project_lock::ProjectLock> = None;
     if let Some(provider) = llm_provider {
+        _llm_writer_lock = Some(crate::project_lock::acquire_project_lock(
+            &project_root_for_lock,
+        )?);
         let (writer, handle) = Writer::spawn(
             db_path.to_owned(),
             DEFAULT_BATCH_SIZE,

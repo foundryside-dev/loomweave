@@ -60,3 +60,10 @@ xgraph = "2.0.0"
 assert_cmd = "2"
 tempfile = "3"
 nix = { version = "0.28", default-features = false, features = ["resource"] }
+# fs2 provides a portable advisory-lock wrapper around POSIX flock(2)
+# (Linux/macOS) and Windows LockFileEx. Used by the cross-process
+# project-lock (STO-01, gap-register entry; ADR-035 declaration discipline
+# for the new lockfile constant). The 0.4 series has been API-stable for
+# years; the crate is lightly maintained upstream but the surface we use
+# (`FileExt::try_lock_exclusive` / `unlock`) is settled.
+fs2 = "0.4"

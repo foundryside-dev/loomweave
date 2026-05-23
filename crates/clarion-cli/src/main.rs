@@ -5,6 +5,7 @@ mod config;
 mod http_read;
 mod install;
 mod instance;
+mod project_lock;
 mod run_lifecycle;
 mod secret_scan;
 mod serve;

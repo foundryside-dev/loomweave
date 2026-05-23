@@ -196,9 +196,8 @@ where
     // local request because both auth knobs are unset and the bind is
     // loopback. On a shared developer host or CI runner this means any
     // local process can read the (non-blocked) catalogue.
-    let warn_unauthenticated_loopback = config.is_loopback_bind()
-        && auth_token.is_none()
-        && identity_secret.is_none();
+    let warn_unauthenticated_loopback =
+        config.is_loopback_bind() && auth_token.is_none() && identity_secret.is_none();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<HttpReadReady>>();
     let (failure_tx, failure_rx) = mpsc::channel();
@@ -1571,7 +1570,10 @@ mod tests {
 
         impl io::Write for CaptureWriter {
             fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.buffer.lock().expect("capture lock").extend_from_slice(buf);
+                self.buffer
+                    .lock()
+                    .expect("capture lock")
+                    .extend_from_slice(buf);
                 Ok(buf.len())
             }
             fn flush(&mut self) -> io::Result<()> {
@@ -1616,10 +1618,9 @@ mod tests {
                 token_env: "CLARION_LOOPBACK_NO_TOKEN_TEST_UNSET".to_owned(),
                 identity_token_env: None,
             };
-            let instance_id = crate::instance::parse_instance_id_for_test(
-                "00000000-0000-4000-8000-000000000002",
-            )
-            .expect("parse synthetic instance id");
+            let instance_id =
+                crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-000000000002")
+                    .expect("parse synthetic instance id");
 
             // Env lookup that returns None for every variable — emulates
             // the operator running `clarion serve` on loopback with no

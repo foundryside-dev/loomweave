@@ -23,6 +23,7 @@ clarion-mcp = { path = "../clarion-mcp", version = "1.0.0" }
 clarion-scanner = { path = "../clarion-scanner", version = "1.0.0" }
 clarion-storage = { path = "../clarion-storage", version = "1.0.0" }
 dotenvy.workspace = true
+fs2.workspace = true
 ignore.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
@@ -41,6 +42,7 @@ xgraph.workspace = true
 [dev-dependencies]
 assert_cmd.workspace = true
 clarion-plugin-fixture = { path = "../clarion-plugin-fixture", version = "1.0.0" }
+fs2.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 sha1.workspace = true

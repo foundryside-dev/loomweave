@@ -84,6 +84,19 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let analyze_config = AnalyzeConfig::load(&project_root, options.config_path.as_deref())?;
     let analyze_config_json = analyze_config.to_json_string()?;
 
+    // ── Cross-process writer lock (gap-register STO-01) ───────────────────────
+    // Acquire the project-wide advisory lock BEFORE spawning the writer-actor
+    // so two concurrent `clarion analyze` invocations against the same
+    // project root cannot interleave their write transactions. The guard
+    // must outlive `handle.await` at every exit path; binding to a local
+    // here lets it drop with this function's stack frame regardless of
+    // which `return Ok(())` / `bail!` path the run takes.
+    //
+    // The lock is taken AFTER the `.clarion/` directory existence check
+    // above so the "no install" error message remains the user-facing
+    // diagnostic for that case, rather than a lockfile-creation failure.
+    let _project_lock = crate::project_lock::acquire_project_lock(&project_root)?;
+
     // ── Writer actor ──────────────────────────────────────────────────────────
     let (writer, handle) = Writer::spawn(
         db_path.clone(),
