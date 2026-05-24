@@ -209,6 +209,25 @@ fn migration_0001_extends_summary_cache_for_mcp_staleness_tracking() {
         );
     }
 
+    // summary_cache.entity_id has an FK to entities(id) per V11-STO-03;
+    // seed the parent row first so the INSERT below isn't FK-rejected.
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
+         created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            "python:function:demo.hello",
+            "python",
+            "function",
+            "demo.hello",
+            "hello",
+            "{}",
+            "2026-05-17T00:00:00.000Z",
+            "2026-05-17T00:00:00.000Z",
+        ],
+    )
+    .expect("seed summary_cache parent entity");
+
     conn.execute(
         "INSERT INTO summary_cache ( \
             entity_id, content_hash, prompt_template_id, model_tier, \

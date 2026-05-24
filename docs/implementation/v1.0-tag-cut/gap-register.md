@@ -509,8 +509,12 @@ Filed as Filigree issues with `release:v1.1` label so they don't get lost.
 **Storage hardening (deep-dive-db):**
 1. `runs.owner_pid` + `heartbeat_at` columns and refined recovery WHERE-clause.
 2. `clarion db backup` subcommand via `rusqlite::backup::Backup`.
-3. `summary_cache.entity_id` FK via table-rebuild migration (confirmed
-   bug — not intentional asymmetry).
+3. ~~`summary_cache.entity_id` FK via table-rebuild migration (confirmed
+   bug — not intentional asymmetry).~~ **Closed in v1.0 (2026-05-24)**:
+   landed in-place in migration `0001_initial_schema.sql` under
+   ADR-024's pre-tag edit-in-place policy (no published build exists
+   yet, so no `schema_migrations` ledger needs the table-rebuild
+   ceremony). See clarion-4c49ccf5d0.
 4. `briefing_blocked` generated column + partial index (federation
    read-API hot path).
 5. `BEGIN IMMEDIATE` + `SQLITE_BUSY` retry helper across the writer.
@@ -522,7 +526,10 @@ Filed as Filigree issues with `release:v1.1` label so they don't get lost.
 1. HMAC replay protection (timestamp + nonce window). Already called
    out in ADR-034 forward-work.
 2. Mandatory authentication on loopback binds (doctrine change).
-3. Make pyright-langserver-missing a CI hard-fail, not a silent skip.
+3. ~~Make pyright-langserver-missing a CI hard-fail, not a silent skip.~~
+   **Closed in v1.0 (2026-05-24)**: pyright-langserver fixture in
+   `test_pyright_session.py` and `test_extractor.py` now calls
+   `pytest.fail()` instead of `pytest.skip()`. See clarion-dc99115f5d.
 
 **CI / release hardening (deep-dive-pipeline):**
 1. Refactor `release.yml verify` into a reusable workflow shared with

@@ -11,9 +11,10 @@
 -- as long as no external operator has produced a `.clarion/clarion.db` from
 -- a published Clarion build. The retirement trigger names exactly that
 -- condition; once it fires, all schema changes stack as 0002_*.sql etc.
--- The 2026-05-03 edits (guidance vocabulary rename per ADR-024) and the
+-- The 2026-05-03 edits (guidance vocabulary rename per ADR-024), the
 -- 2026-05-18 edits (CHECK constraints on closed-vocabulary TEXT columns per
--- ADR-031) were both applied under this policy.
+-- ADR-031), and the 2026-05-24 edit (summary_cache.entity_id FK per
+-- V11-STO-03) were all applied under this policy.
 -- ============================================================================
 
 BEGIN;
@@ -140,7 +141,12 @@ CREATE INDEX ix_findings_status    ON findings(status);
 
 -- Summary cache
 CREATE TABLE summary_cache (
-    entity_id             TEXT NOT NULL,
+    -- FK matches the sibling caches (inferred_edge_cache.caller_entity_id,
+    -- entity_unresolved_call_sites.caller_entity_id). Added in-place per
+    -- ADR-024 on 2026-05-24 (V11-STO-03 closure) — the prior absence was a
+    -- bug, not intentional asymmetry. ON DELETE CASCADE so removing an
+    -- entity (re-analyze, rename) clears its cached summaries.
+    entity_id             TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
     content_hash          TEXT NOT NULL,
     prompt_template_id    TEXT NOT NULL,
     model_tier            TEXT NOT NULL,

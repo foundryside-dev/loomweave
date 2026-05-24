@@ -22,6 +22,31 @@ fn prepared_db(dir: &tempfile::TempDir) -> std::path::PathBuf {
     path
 }
 
+/// Direct-SQL entity seed for tests that need an `entities` row but must
+/// bypass the writer's `BeginRun → InsertEntity` protocol (e.g. tests
+/// verifying that non-analyze writer commands work without an active run).
+fn seed_entity_row(path: &std::path::Path, id: &str) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute(
+        "INSERT INTO entities ( \
+            id, plugin_id, kind, name, short_name, properties, \
+            content_hash, created_at, updated_at \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            id,
+            "python",
+            "function",
+            id,
+            id.rsplit('.').next().unwrap_or(id),
+            "{}",
+            format!("hash-{id}"),
+            now_iso(),
+            now_iso(),
+        ],
+    )
+    .expect("seed entity row");
+}
+
 fn now_iso() -> String {
     "2026-04-18T00:00:00.000Z".to_owned()
 }
@@ -258,6 +283,12 @@ async fn send<T>(
 async fn summary_cache_writer_commands_do_not_require_active_analyze_run() {
     let dir = tempfile::tempdir().unwrap();
     let path = prepared_db(&dir);
+    // summary_cache.entity_id has an FK to entities(id) (V11-STO-03). Seed the
+    // referenced entity directly so the FK is satisfied without going through
+    // the writer's BeginRun → InsertEntity protocol — the whole point of this
+    // test is that summary_cache writer commands work *without* an active
+    // analyze run.
+    seed_entity_row(&path, "python:function:demo.hello");
     let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
     let tx = writer.sender();
 
