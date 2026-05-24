@@ -81,6 +81,12 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         );
     }
     let db_path = clarion_dir.join("clarion.db");
+
+    // Cross-process advisory lock (STO-01). Must outlive the writer-actor's
+    // `handle.await` at the bottom of this function — see the drop-order
+    // note on `AnalyzeLockGuard`. Drop on function exit releases the lock.
+    let _analyze_lock = crate::analyze_lock::acquire_analyze_lock(&clarion_dir)?;
+
     let analyze_config = AnalyzeConfig::load(&project_root, options.config_path.as_deref())?;
     let analyze_config_json = analyze_config.to_json_string()?;
 

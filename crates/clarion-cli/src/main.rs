@@ -1,4 +1,5 @@
 mod analyze;
+mod analyze_lock;
 mod cli;
 mod clustering;
 mod config;
