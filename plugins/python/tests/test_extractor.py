@@ -84,7 +84,12 @@ def pyright_langserver() -> str:
         return str(venv_candidate)
     resolved = shutil.which("pyright-langserver")
     if resolved is None:
-        pytest.skip("pyright-langserver is not installed")
+        pytest.fail(
+            "pyright-langserver not found on PATH or in the active virtualenv. "
+            "It is a hard runtime dependency of clarion-plugin-python "
+            "(pyproject.toml `dependencies`); a missing executable means the "
+            "install is broken. Skipping these tests would mask a regression.",
+        )
     return resolved
 
 
