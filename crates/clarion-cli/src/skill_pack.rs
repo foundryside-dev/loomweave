@@ -22,9 +22,12 @@ pub const SKILL_PACK: &[(&str, &str)] = &[(
 pub const PACK_DIR_NAME: &str = "clarion-workflow";
 
 /// Deterministic blake3 hex digest over the pack's `(rel_path, contents)`
-/// entries. Order-stable because `SKILL_PACK` is a fixed slice. Used as the
-/// drift sentinel: a `.fingerprint` file written next to the installed pack
-/// records the version on disk.
+/// entries. Order-stable because `SKILL_PACK` is a fixed slice. This is the
+/// drift sentinel: [`installed_fingerprint`] recomputes the same digest over
+/// the files actually on disk and re-copies when they differ. A `.fingerprint`
+/// file is also written next to the installed pack as a human-readable
+/// provenance marker, but it is informational only — it is not read back as
+/// the drift signal (a stale sidecar cannot mask content corruption).
 #[must_use]
 pub fn pack_fingerprint() -> String {
     let mut hasher = blake3::Hasher::new();
@@ -57,8 +60,10 @@ pub struct SkillInstallReport {
 ///
 /// For each root, the pack lands at `<root>/clarion-workflow/`. A
 /// `.fingerprint` file recording [`pack_fingerprint`] is written alongside the
-/// pack files. If every root's `.fingerprint` already equals the embedded
-/// fingerprint, the call is a no-op (`copied: false`).
+/// pack files as a provenance marker. If the digest recomputed from the files
+/// on disk in every root (see [`installed_fingerprint`]) already equals the
+/// embedded fingerprint, the call is a no-op (`copied: false`); any content
+/// drift or missing file triggers a re-copy.
 ///
 /// Writes are atomic: each pack is staged into a sibling temp directory in the
 /// same skill root (so `rename` stays on one filesystem), then `rename`d over
