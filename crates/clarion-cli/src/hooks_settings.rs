@@ -280,6 +280,26 @@ mod tests {
     }
 
     #[test]
+    fn install_refuses_to_rewrite_non_array_session_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"hooks": {"SessionStart": "nope"}}"#,
+        )
+        .unwrap();
+        let result = super::install_session_start_hook(dir.path());
+        assert!(
+            result.is_err(),
+            "should refuse to clobber a non-array SessionStart value"
+        );
+        // File must be untouched.
+        let raw = std::fs::read_to_string(claude.join("settings.json")).unwrap();
+        assert_eq!(raw.trim(), r#"{"hooks": {"SessionStart": "nope"}}"#);
+    }
+
+    #[test]
     fn install_is_idempotent_on_disk() {
         let dir = tempfile::tempdir().unwrap();
 
