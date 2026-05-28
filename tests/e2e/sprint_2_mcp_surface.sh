@@ -359,6 +359,15 @@ requests: list[tuple[str, dict[str, object]]] = [
             "params": {"name": "issues_for", "arguments": {"id": "python:module:demo"}},
         },
     ),
+    (
+        "context",
+        {
+            "jsonrpc": "2.0",
+            "id": "context",
+            "method": "resources/read",
+            "params": {"uri": "clarion://context"},
+        },
+    ),
 ]
 
 responses: dict[str, dict[str, object]] = {}
@@ -377,6 +386,10 @@ finally:
     assert status == 0, f"clarion serve exited {status}; stderr={stderr}"
 
 assert responses["initialize"]["result"]["protocolVersion"] == "2025-11-25"
+init_result = responses["initialize"]["result"]
+assert "clarion-workflow" in init_result["instructions"], init_result.get("instructions")
+assert isinstance(init_result["capabilities"]["resources"], dict), init_result["capabilities"]
+assert isinstance(init_result["capabilities"]["prompts"], dict), init_result["capabilities"]
 tools = responses["tools"]["result"]["tools"]
 assert len(tools) == 8, tools
 assert [tool["name"] for tool in tools] == [
@@ -439,6 +452,13 @@ assert "filigree-hello-drifted" in drifted_ids, issues
 assert issues["stats_delta"]["filigree_requests_total"] >= 2, issues
 assert "python:function:demo.world" in filigree_requests, filigree_requests
 assert "python:function:demo.hello" in filigree_requests, filigree_requests
+
+context = responses["context"]["result"]
+ctx_text = context["contents"][0]["text"]
+ctx = json.loads(ctx_text)
+assert ctx["db_present"] is True, ctx
+assert ctx["entity_count"] >= 1, ctx
+assert "staleness" in ctx, ctx
 PY
 
 log "PASS: MCP stdio surface returned eight tool definitions and seven tool responses"
