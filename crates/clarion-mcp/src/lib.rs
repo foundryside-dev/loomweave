@@ -3099,6 +3099,69 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn resources_read_returns_context_snapshot_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("clarion.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            pragma::apply_write_pragmas(&conn).unwrap();
+            schema::apply_migrations(&mut conn).unwrap();
+            conn.execute(
+                "INSERT INTO entities \
+                 (id, plugin_id, kind, name, short_name, properties, created_at, updated_at) \
+                 VALUES ('python:module:m','python','module','m','m','{}', \
+                         '2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')",
+                [],
+            )
+            .unwrap();
+        }
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        let state = ServerState::new(dir.path().to_path_buf(), readers);
+
+        let response = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "resources/read",
+                "params": {"uri": "clarion://context"}
+            }))
+            .await
+            .expect("response");
+
+        let text = response["result"]["contents"][0]["text"]
+            .as_str()
+            .expect("snapshot text");
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["db_present"], true);
+        assert_eq!(parsed["entity_count"], 1);
+        assert_eq!(parsed["staleness"], "never_analyzed");
+    }
+
+    #[tokio::test]
+    async fn resources_read_rejects_unknown_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("clarion.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            pragma::apply_write_pragmas(&conn).unwrap();
+            schema::apply_migrations(&mut conn).unwrap();
+        }
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        let state = ServerState::new(dir.path().to_path_buf(), readers);
+
+        let response = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "resources/read",
+                "params": {"uri": "clarion://nope"}
+            }))
+            .await
+            .expect("response");
+        assert!(response["error"].is_object(), "expected an error envelope");
+    }
+
     #[test]
     fn tools_list_request_wraps_all_tools() {
         let response = super::handle_json_rpc(&serde_json::json!({
