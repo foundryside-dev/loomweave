@@ -1,8 +1,8 @@
 //! `.claude/settings.json` SessionStart-hook merge.
 //!
-//! Merge semantics (never clobber): parse existing JSON, append a SessionStart
+//! Merge semantics (never clobber): parse existing JSON, append a `SessionStart`
 //! matcher-group running `clarion hook session-start` only if no existing
-//! SessionStart entry already runs that command, and preserve every other key.
+//! `SessionStart` entry already runs that command, and preserve every other key.
 //!
 //! Verified against the Claude Code settings schema: `hooks.SessionStart` is an
 //! array of matcher-groups, each `{ "matcher"?, "hooks": [ {type,command} ] }`.
@@ -13,10 +13,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::{Map, Value, json};
 
-/// Substring that identifies Clarion's own SessionStart hook command.
+/// Substring that identifies Clarion's own `SessionStart` hook command.
 pub const HOOK_COMMAND: &str = "clarion hook session-start";
 
-/// Merge Clarion's SessionStart hook into a parsed settings `Value` in place.
+/// Merge Clarion's `SessionStart` hook into a parsed settings `Value` in place.
 /// Returns `true` if a change was made, `false` if the hook was already present.
 #[must_use]
 pub fn merge_session_start_hook(settings: &mut Value) -> bool {
@@ -69,7 +69,7 @@ pub fn merge_session_start_hook(settings: &mut Value) -> bool {
 }
 
 /// Read `.claude/settings.json` under `project_root` (creating an empty object
-/// if absent), merge Clarion's SessionStart hook, and write it back
+/// if absent), merge Clarion's `SessionStart` hook, and write it back
 /// pretty-printed. Returns `true` if the file changed.
 ///
 /// # Errors
@@ -98,10 +98,9 @@ pub fn install_session_start_hook(project_root: &Path) -> Result<bool> {
         return Ok(false);
     }
 
-    fs::create_dir_all(&claude_dir)
-        .with_context(|| format!("mkdir {}", claude_dir.display()))?;
-    let serialized = serde_json::to_string_pretty(&settings)
-        .context("serialize .claude/settings.json")?;
+    fs::create_dir_all(&claude_dir).with_context(|| format!("mkdir {}", claude_dir.display()))?;
+    let serialized =
+        serde_json::to_string_pretty(&settings).context("serialize .claude/settings.json")?;
     fs::write(&settings_path, format!("{serialized}\n"))
         .with_context(|| format!("write {}", settings_path.display()))?;
     Ok(true)

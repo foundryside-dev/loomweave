@@ -82,7 +82,10 @@ fn install_hooks_merges_session_start_without_clobbering() {
         .flat_map(|g| g["hooks"].as_array().unwrap())
         .map(|h| h["command"].as_str().unwrap().to_string())
         .collect();
-    assert!(cmds.iter().any(|c| c.contains("clarion hook session-start")));
+    assert!(
+        cmds.iter()
+            .any(|c| c.contains("clarion hook session-start"))
+    );
     assert!(!dir.path().join(".clarion").exists());
 }
 
