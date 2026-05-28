@@ -148,47 +148,61 @@ pub fn run(path: &Path, force: bool, components: InstallComponents) -> Result<()
 
     if components.init_clarion {
         let clarion_dir = project_root.join(".clarion");
-        if clarion_dir.exists() {
-            if !force {
+        let exists = clarion_dir.exists();
+        // A bare `clarion install` (no other components requested) refuses to
+        // clobber an existing .clarion/. Under `--all` (other idempotent
+        // components requested) an already-initialised project is not an error:
+        // we keep the existing index and apply the remaining components.
+        let bare_init = !components.skills && !components.hooks;
+        if exists && !force {
+            if bare_init {
                 bail!(
                     ".clarion/ already exists at {}. Delete it or pass --force to overwrite it.",
                     clarion_dir.display()
                 );
             }
-            if !clarion_dir.is_dir() {
-                bail!(
-                    "--force can only overwrite an existing .clarion/ directory; \
-                     found non-directory at {}.",
-                    clarion_dir.display()
-                );
+            println!(
+                "{} already initialised; skipping .clarion/ init (pass --force to recreate).",
+                clarion_dir.display()
+            );
+        } else {
+            if exists {
+                // --force overwrite path.
+                if !clarion_dir.is_dir() {
+                    bail!(
+                        "--force can only overwrite an existing .clarion/ directory; \
+                         found non-directory at {}.",
+                        clarion_dir.display()
+                    );
+                }
+                fs::remove_dir_all(&clarion_dir)
+                    .with_context(|| format!("remove existing {}", clarion_dir.display()))?;
             }
-            fs::remove_dir_all(&clarion_dir)
-                .with_context(|| format!("remove existing {}", clarion_dir.display()))?;
-        }
 
-        fs::create_dir_all(&clarion_dir)
-            .with_context(|| format!("mkdir {}", clarion_dir.display()))?;
+            fs::create_dir_all(&clarion_dir)
+                .with_context(|| format!("mkdir {}", clarion_dir.display()))?;
 
-        // Cleanup guard: if any post-mkdir step fails, remove .clarion/ before
-        // bubbling the error so the next install attempt isn't blocked by the
-        // "already exists" check (clarion-ed5017139f).
-        if let Err(err) = populate_after_mkdir(&clarion_dir, &project_root) {
-            if let Err(cleanup_err) = fs::remove_dir_all(&clarion_dir) {
-                tracing::warn!(
-                    clarion_dir = %clarion_dir.display(),
-                    error = %cleanup_err,
-                    "install failed and cleanup of partial .clarion/ also failed; \
-                     manual rm -rf may be required"
-                );
+            // Cleanup guard: if any post-mkdir step fails, remove .clarion/ before
+            // bubbling the error so the next install attempt isn't blocked by the
+            // "already exists" check (clarion-ed5017139f).
+            if let Err(err) = populate_after_mkdir(&clarion_dir, &project_root) {
+                if let Err(cleanup_err) = fs::remove_dir_all(&clarion_dir) {
+                    tracing::warn!(
+                        clarion_dir = %clarion_dir.display(),
+                        error = %cleanup_err,
+                        "install failed and cleanup of partial .clarion/ also failed; \
+                         manual rm -rf may be required"
+                    );
+                }
+                return Err(err);
             }
-            return Err(err);
-        }
 
-        tracing::info!(
-            clarion_dir = %clarion_dir.display(),
-            "clarion install complete"
-        );
-        println!("Initialised {}", clarion_dir.display());
+            tracing::info!(
+                clarion_dir = %clarion_dir.display(),
+                "clarion install complete"
+            );
+            println!("Initialised {}", clarion_dir.display());
+        }
     }
 
     if components.skills {

@@ -108,3 +108,39 @@ fn install_all_does_init_skills_and_hooks() {
     let raw = fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
     assert!(raw.contains("clarion hook session-start"), "no hook: {raw}");
 }
+
+#[test]
+fn install_all_is_rerunnable_and_preserves_index() {
+    let dir = tempfile::tempdir().unwrap();
+    // First --all: full setup.
+    clarion_bin()
+        .args(["install", "--all", "--path"])
+        .arg(dir.path())
+        .assert()
+        .success();
+    let db = dir.path().join(".clarion/clarion.db");
+    assert!(db.exists(), "first --all did not create db");
+    // Mark the db so we can prove the second run did NOT recreate it.
+    let before = std::fs::metadata(&db).unwrap().modified().unwrap();
+
+    // Second --all: must succeed (not bail), keep the index, re-apply skills/hooks.
+    clarion_bin()
+        .args(["install", "--all", "--path"])
+        .arg(dir.path())
+        .assert()
+        .success();
+    assert!(db.exists(), "second --all destroyed the db");
+    let after = std::fs::metadata(&db).unwrap().modified().unwrap();
+    assert_eq!(
+        before, after,
+        "second --all recreated the db (index not preserved)"
+    );
+    assert!(
+        dir.path()
+            .join(".claude/skills/clarion-workflow/SKILL.md")
+            .exists(),
+        "skill missing after rerun"
+    );
+    let raw = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+    assert!(raw.contains("clarion hook session-start"), "hook missing after rerun");
+}
