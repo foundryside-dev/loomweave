@@ -20,8 +20,15 @@ pub const HOOK_COMMAND: &str = "clarion hook session-start";
 /// Returns `true` if a change was made, `false` if the hook was already present.
 #[must_use]
 pub fn merge_session_start_hook(settings: &mut Value) -> bool {
+    // Coercion-after-parse: a successfully-parsed but malformed shape (a wrong
+    // JSON type where we expect object/object/array) is rewritten to the
+    // default shape rather than erroring. This is correct, but surface it so a
+    // clobbered hand-authored shape is observable.
+    let mut coerced = false;
+
     if !settings.is_object() {
         *settings = Value::Object(Map::new());
+        coerced = true;
     }
     let obj = settings.as_object_mut().expect("settings is object");
 
@@ -30,6 +37,7 @@ pub fn merge_session_start_hook(settings: &mut Value) -> bool {
         .or_insert_with(|| Value::Object(Map::new()));
     if !hooks.is_object() {
         *hooks = Value::Object(Map::new());
+        coerced = true;
     }
     let hooks = hooks.as_object_mut().expect("hooks is object");
 
@@ -38,8 +46,17 @@ pub fn merge_session_start_hook(settings: &mut Value) -> bool {
         .or_insert_with(|| Value::Array(Vec::new()));
     if !groups.is_array() {
         *groups = Value::Array(Vec::new());
+        coerced = true;
     }
     let groups = groups.as_array_mut().expect("SessionStart is array");
+
+    if coerced {
+        tracing::warn!(
+            "malformed .claude/settings.json shape (non-object settings/hooks or \
+             non-array SessionStart) was rewritten to the expected shape before \
+             merging the clarion SessionStart hook"
+        );
+    }
 
     let already_present = groups.iter().any(|group| {
         group
@@ -101,16 +118,34 @@ pub fn install_session_start_hook(project_root: &Path) -> Result<bool> {
     fs::create_dir_all(&claude_dir).with_context(|| format!("mkdir {}", claude_dir.display()))?;
     let serialized =
         serde_json::to_string_pretty(&settings).context("serialize .claude/settings.json")?;
-    fs::write(&settings_path, format!("{serialized}\n"))
-        .with_context(|| format!("write {}", settings_path.display()))?;
+
+    // Atomic write: stage into a sibling temp file in the same directory, then
+    // rename over the destination (same-filesystem atomic swap). This protects
+    // the user's hand-authored settings.json from truncation/corruption on a
+    // crash or concurrent install mid-write. Mirrors skill_pack::stage_and_swap.
+    let tmp = claude_dir.join(format!(".settings.json.tmp-{}", std::process::id()));
+    if let Err(err) = write_and_swap(&tmp, &settings_path, &serialized) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
     Ok(true)
+}
+
+fn write_and_swap(tmp: &Path, dest: &Path, serialized: &str) -> Result<()> {
+    fs::write(tmp, format!("{serialized}\n"))
+        .with_context(|| format!("write staging {}", tmp.display()))?;
+    fs::rename(tmp, dest)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), dest.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use serde_json::json;
 
-    use super::{HOOK_COMMAND, merge_session_start_hook};
+    use super::{HOOK_COMMAND, install_session_start_hook, merge_session_start_hook};
 
     #[test]
     fn adds_hook_to_empty_settings() {
@@ -165,5 +200,33 @@ mod tests {
             .collect();
         assert!(cmds.iter().any(|c| c.contains("unrelated-greeting")));
         assert!(cmds.iter().any(|c| c.contains(HOOK_COMMAND)));
+    }
+
+    #[test]
+    fn install_errors_on_unparseable_existing_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        fs::write(claude.join("settings.json"), "{not json").unwrap();
+
+        let result = install_session_start_hook(dir.path());
+        assert!(result.is_err(), "expected parse error, got {result:?}");
+    }
+
+    #[test]
+    fn install_is_idempotent_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // First install writes and reports a change.
+        assert!(install_session_start_hook(dir.path()).unwrap());
+        // Second install is a no-op (no write, no change).
+        assert!(!install_session_start_hook(dir.path()).unwrap());
+
+        let raw = fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+        assert_eq!(
+            raw.matches(HOOK_COMMAND).count(),
+            1,
+            "must contain exactly one hook entry; file was: {raw}"
+        );
     }
 }
