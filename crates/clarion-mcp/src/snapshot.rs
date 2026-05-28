@@ -215,4 +215,55 @@ mod tests {
         // run, so staleness degrades to Unknown (stat failure folds to Unknown).
         assert_eq!(snap.staleness, Staleness::Unknown);
     }
+
+    #[test]
+    fn never_analyzed_when_no_completed_run() {
+        let (_dir, conn) = migrated_conn();
+        insert_entity(&conn, "python:module:a", "module", Some("a.py"));
+        let snap = project_snapshot(&conn, std::path::Path::new("/tmp"));
+        assert_eq!(snap.staleness, Staleness::NeverAnalyzed);
+        assert!(snap.last_analyzed_at.is_none());
+    }
+
+    #[test]
+    fn fresh_when_all_sources_older_than_run() {
+        let (_dir, conn) = migrated_conn();
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.py");
+        std::fs::write(&src, "x = 1\n").unwrap();
+
+        insert_entity(&conn, "python:module:a", "module", Some("a.py"));
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+             VALUES ('r', '2099-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z', '{}', '{}', 'completed')",
+            [],
+        )
+        .unwrap();
+
+        let snap = project_snapshot(&conn, dir.path());
+        assert_eq!(snap.staleness, Staleness::Fresh, "{snap:?}");
+        assert_eq!(
+            snap.last_analyzed_at.as_deref(),
+            Some("2099-01-01T00:00:00.000Z")
+        );
+    }
+
+    #[test]
+    fn stale_when_a_source_is_newer_than_run() {
+        let (_dir, conn) = migrated_conn();
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.py");
+        std::fs::write(&src, "x = 1\n").unwrap();
+
+        insert_entity(&conn, "python:module:a", "module", Some("a.py"));
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+             VALUES ('r', '2000-01-01T00:00:00.000Z', '2000-01-01T00:00:00.000Z', '{}', '{}', 'completed')",
+            [],
+        )
+        .unwrap();
+
+        let snap = project_snapshot(&conn, dir.path());
+        assert_eq!(snap.staleness, Staleness::Stale, "{snap:?}");
+    }
 }
