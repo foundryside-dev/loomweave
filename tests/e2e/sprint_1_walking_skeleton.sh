@@ -88,6 +88,15 @@ clarion install
 log "running: clarion analyze ."
 clarion analyze .
 
+# ── 6b. Verify database integrity (STO-04) ───────────────────────────────────
+log "verifying database integrity via PRAGMA integrity_check ..."
+INTEGRITY=$(sqlite3 "$DEMO_DIR/.clarion/clarion.db" "PRAGMA integrity_check;")
+if [ "$INTEGRITY" != "ok" ]; then
+    log "integrity_check output:"
+    printf '%s\n' "$INTEGRITY" >&2
+    fail "expected PRAGMA integrity_check to report exactly 'ok'; got $INTEGRITY"
+fi
+
 # ── 7. Verify entity via sqlite3 ─────────────────────────────────────────────
 log "verifying persisted entity via sqlite3 ..."
 RESULT=$(sqlite3 "$DEMO_DIR/.clarion/clarion.db" "select id, kind from entities order by id;")

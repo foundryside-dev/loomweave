@@ -74,7 +74,7 @@ from entities
 where json_extract(properties, '$.briefing_blocked') is not null;
 ```
 
-Filigree integration for scanner findings is planned for v0.2. Until then, the local `findings` table is the authoritative scanner audit surface.
+Filigree integration for scanner findings (WP9-B finding emission) is deferred to v1.1. Until then, the local `findings` table is the authoritative scanner audit surface.
 
 ## Limitations
 
@@ -112,8 +112,10 @@ Multi-tenant operators MUST set `identity_token_env` (HMAC, preferred) or
 configuration shape.
 
 The Clarion `serve` startup banner emits a `[TRUST]` line warning when
-loopback-no-token mode is active (forward-reference: SEC-02 banner code
-ships in a follow-up PR; the trust assumption itself is current).
+loopback-no-token mode is active: `HTTP API serving on loopback without
+authentication; any local process on this host can read the catalogue.`
+This warning is logged at `WARN` level at startup whenever both auth knobs
+are unset and the bind is loopback.
 
 ## Pre-WP5 catalogue upgrade requirement
 

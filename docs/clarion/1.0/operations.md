@@ -101,6 +101,14 @@ is no live `clarion db backup` subcommand at v1.0 (deferred to v1.1, §6).
    `TRUNCATE` mode is the strongest checkpoint — it flushes the WAL into
    `clarion.db` and resets `clarion.db-wal` to zero length.
 
+   **Why this step matters:** in WAL mode, committed pages live in
+   `clarion.db-wal` until a checkpoint folds them back into `clarion.db`. A
+   naive `cp .clarion/clarion.db backup.db` during (or shortly after) a live
+   `analyze` therefore captures a *torn* copy — the main database file is
+   missing the most recent committed transactions, which are still sitting in
+   the separate `-wal` file. Forcing a `TRUNCATE` checkpoint first guarantees
+   `clarion.db` is self-contained before the copy.
+
 4. **Copy `.clarion/` to the backup location** with any standard tool
    (`cp -a`, `rsync -a`, `tar`). All three of `clarion.db`,
    `clarion.db-wal`, and `clarion.db-shm` should be present in the copy;

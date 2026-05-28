@@ -80,5 +80,7 @@ configuration shape is documented in the [Trust Model](#trust-model)
 section above.
 
 The Clarion `serve` startup banner emits a `[TRUST]` line warning when
-loopback-no-token mode is active (forward-reference: the banner code is a
-SEC-02 follow-up PR; the trust assumption itself is current as of v1.0).
+loopback-no-token mode is active: `HTTP API serving on loopback without
+authentication; any local process on this host can read the catalogue.`
+The warning is logged at `WARN` level at startup whenever both auth knobs
+are unset and the bind is loopback.
