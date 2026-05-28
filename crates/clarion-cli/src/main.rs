@@ -9,6 +9,7 @@ mod instance;
 mod run_lifecycle;
 mod secret_scan;
 mod serve;
+mod skill_pack;
 mod stats;
 
 use anyhow::Result;
