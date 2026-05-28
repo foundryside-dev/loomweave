@@ -114,18 +114,60 @@ fn stage_and_swap(root: &Path, dest: &Path, fingerprint: &str) -> Result<()> {
     }
     fs::create_dir_all(&staging).with_context(|| format!("mkdir {}", staging.display()))?;
 
-    // Cleanup guard: if any write/swap step fails, remove the staging dir
+    // Cleanup guard: if writing the staged files fails, remove the staging dir
     // before bubbling the error so we don't leak a `.clarion-workflow.tmp-*`
     // sibling. Matches the partial-state-cleanup precedent on the `.clarion/`
     // path in install.rs. The original error is preserved.
-    if let Err(err) = write_and_swap(&staging, dest, fingerprint) {
+    if let Err(err) = write_staged_pack(&staging, fingerprint) {
         let _ = fs::remove_dir_all(&staging);
         return Err(err);
     }
-    Ok(())
+
+    // Crash-safe swap: move the existing pack aside, rename the staged pack
+    // into place, then drop the backup. On failure, restore the backup so the
+    // project is never left without an installed skill.
+    //
+    // The only remaining failure window is between the two renames (back up,
+    // then move the staged pack in). If the second rename fails we restore the
+    // backup, so the previously-installed pack is always recoverable; we never
+    // delete `dest` ahead of a rename that might not happen.
+    let had_existing = dest.exists();
+    let backup = root.join(format!(".clarion-workflow.bak-{}", std::process::id()));
+    if had_existing {
+        if backup.exists() {
+            fs::remove_dir_all(&backup)
+                .with_context(|| format!("clear stale backup {}", backup.display()))?;
+        }
+        fs::rename(dest, &backup).with_context(|| {
+            format!(
+                "back up existing {} -> {}",
+                dest.display(),
+                backup.display()
+            )
+        })?;
+    }
+    match fs::rename(&staging, dest) {
+        Ok(()) => {
+            if had_existing {
+                let _ = fs::remove_dir_all(&backup);
+            }
+            Ok(())
+        }
+        Err(err) => {
+            // Restore the previous pack so orientation is never left broken.
+            if had_existing {
+                let _ = fs::rename(&backup, dest);
+            }
+            let _ = fs::remove_dir_all(&staging);
+            Err(anyhow::Error::new(err))
+                .with_context(|| format!("swap staged pack into {}", dest.display()))
+        }
+    }
 }
 
-fn write_and_swap(staging: &Path, dest: &Path, fingerprint: &str) -> Result<()> {
+/// Write every pack file plus the `.fingerprint` sidecar into `staging`. Does
+/// not touch `dest`; the crash-safe swap is performed by the caller.
+fn write_staged_pack(staging: &Path, fingerprint: &str) -> Result<()> {
     for (rel, contents) in SKILL_PACK {
         let target = staging.join(rel);
         if let Some(parent) = target.parent() {
@@ -135,18 +177,6 @@ fn write_and_swap(staging: &Path, dest: &Path, fingerprint: &str) -> Result<()> 
     }
     fs::write(staging.join(FINGERPRINT_FILE), fingerprint)
         .with_context(|| format!("write fingerprint in {}", staging.display()))?;
-    // Remove any prior install, then move the staged pack into place.
-    //
-    // Non-self-healing window: a crash between this remove and the rename below
-    // leaves the pack absent. The session-start hook's resync only fires when
-    // the skill is *already present* (`resync_skill_if_present` in hook.rs), so
-    // it will NOT re-create a pack that vanished here. Recovery in that rare
-    // case is an explicit `clarion install --skills`, not automatic.
-    if dest.exists() {
-        fs::remove_dir_all(dest).with_context(|| format!("remove old {}", dest.display()))?;
-    }
-    fs::rename(staging, dest)
-        .with_context(|| format!("rename {} -> {}", staging.display(), dest.display()))?;
     Ok(())
 }
 
@@ -203,6 +233,27 @@ mod tests {
         assert!(first.copied);
         let second = install_skill_pack(dir.path()).unwrap();
         assert!(!second.copied, "second install should be a no-op on match");
+    }
+
+    #[test]
+    fn install_leaves_no_backup_dir_after_successful_recopy() {
+        use super::install_skill_pack;
+        let dir = tempfile::tempdir().unwrap();
+        install_skill_pack(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join(".claude/skills/clarion-workflow/SKILL.md"),
+            "STALE",
+        )
+        .unwrap();
+        install_skill_pack(dir.path()).unwrap(); // triggers the swap
+        let root = dir.path().join(".claude/skills");
+        for entry in std::fs::read_dir(&root).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(
+                !name.to_string_lossy().contains(".clarion-workflow.bak-"),
+                "leftover backup dir: {name:?}"
+            );
+        }
     }
 
     #[test]
