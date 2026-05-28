@@ -286,6 +286,10 @@ impl ServerState {
             "initialize" => result_response(&id, &initialize_result()),
             "tools/list" => result_response(&id, &json!({"tools": list_tools()})),
             "tools/call" => self.handle_tool_call(&id, request.get("params")).await,
+            "resources/list" => result_response(&id, &resources_list()),
+            "resources/read" => self.handle_resources_read(&id, request.get("params")).await,
+            "prompts/list" => result_response(&id, &prompts_list()),
+            "prompts/get" => prompts_get(&id, request.get("params")),
             _ => error_response(&id, -32601, "method not found"),
         })
     }
@@ -346,6 +350,56 @@ impl ServerState {
         };
 
         tool_json_rpc_response(id, &envelope)
+    }
+
+    async fn handle_resources_read(&self, id: &Value, params: Option<&Value>) -> Value {
+        let Some(uri) = params
+            .and_then(Value::as_object)
+            .and_then(|p| p.get("uri"))
+            .and_then(Value::as_str)
+        else {
+            return error_response(id, -32602, "invalid resources/read params: missing uri");
+        };
+        if uri != "clarion://context" {
+            return error_response(id, -32602, &format!("unknown resource: {uri}"));
+        }
+        let snapshot_json = self.context_snapshot_json().await;
+        result_response(
+            id,
+            &json!({
+                "contents": [
+                    {
+                        "uri": "clarion://context",
+                        "mimeType": "application/json",
+                        "text": snapshot_json
+                    }
+                ]
+            }),
+        )
+    }
+
+    async fn context_snapshot_json(&self) -> String {
+        let project_root = self.project_root.clone();
+        let snapshot = self
+            .readers
+            .with_reader(move |conn| Ok(crate::snapshot::project_snapshot(conn, &project_root)))
+            .await;
+        match snapshot {
+            Ok(snap) => serde_json::to_string(&snap)
+                .unwrap_or_else(|_| "{\"db_present\":true,\"staleness\":\"unknown\"}".to_owned()),
+            Err(err) => {
+                tracing::warn!(error = %err, "clarion://context snapshot failed");
+                serde_json::json!({
+                    "db_present": true,
+                    "entity_count": 0,
+                    "subsystem_count": 0,
+                    "finding_count": 0,
+                    "staleness": "unknown",
+                    "last_analyzed_at": serde_json::Value::Null
+                })
+                .to_string()
+            }
+        }
     }
 
     async fn tool_entity_at(
@@ -2102,6 +2156,52 @@ fn initialize_result() -> Value {
     })
 }
 
+fn resources_list() -> Value {
+    json!({
+        "resources": [
+            {
+                "uri": "clarion://context",
+                "name": "Clarion project context",
+                "description": "Live entity / subsystem / finding counts and index freshness for this project.",
+                "mimeType": "application/json"
+            }
+        ]
+    })
+}
+
+fn prompts_list() -> Value {
+    json!({
+        "prompts": [
+            {
+                "name": "clarion-workflow",
+                "description": "How to use Clarion's MCP tools to navigate this codebase."
+            }
+        ]
+    })
+}
+
+fn prompts_get(id: &Value, params: Option<&Value>) -> Value {
+    let name = params
+        .and_then(Value::as_object)
+        .and_then(|p| p.get("name"))
+        .and_then(Value::as_str);
+    if name != Some("clarion-workflow") {
+        return error_response(id, -32602, "unknown prompt");
+    }
+    result_response(
+        id,
+        &json!({
+            "description": "How to use Clarion's MCP tools to navigate this codebase.",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": { "type": "text", "text": CLARION_WORKFLOW_SKILL }
+                }
+            ]
+        }),
+    )
+}
+
 #[derive(Debug)]
 struct ParamError {
     message: String,
@@ -2968,6 +3068,35 @@ mod tests {
         // Prompts + resources capabilities advertised alongside tools.
         assert!(response["result"]["capabilities"]["prompts"].is_object());
         assert!(response["result"]["capabilities"]["resources"].is_object());
+    }
+
+    #[tokio::test]
+    async fn resources_list_includes_clarion_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("clarion.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            pragma::apply_write_pragmas(&conn).unwrap();
+            schema::apply_migrations(&mut conn).unwrap();
+        }
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        let state = ServerState::new(dir.path().to_path_buf(), readers);
+
+        let response = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "resources/list",
+                "params": {}
+            }))
+            .await
+            .expect("response");
+
+        let resources = response["result"]["resources"].as_array().unwrap();
+        assert!(
+            resources.iter().any(|r| r["uri"] == "clarion://context"),
+            "clarion://context not listed: {resources:?}"
+        );
     }
 
     #[test]
