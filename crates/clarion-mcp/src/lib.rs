@@ -3162,6 +3162,58 @@ mod tests {
         assert!(response["error"].is_object(), "expected an error envelope");
     }
 
+    #[tokio::test]
+    async fn prompts_get_returns_skill_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("clarion.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            pragma::apply_write_pragmas(&conn).unwrap();
+            schema::apply_migrations(&mut conn).unwrap();
+        }
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        let state = ServerState::new(dir.path().to_path_buf(), readers);
+
+        let response = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "prompts/get",
+                "params": {"name": "clarion-workflow"}
+            }))
+            .await
+            .expect("response");
+        let text = response["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("name: clarion-workflow"), "not the skill text");
+    }
+
+    #[tokio::test]
+    async fn prompts_list_includes_clarion_workflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("clarion.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            pragma::apply_write_pragmas(&conn).unwrap();
+            schema::apply_migrations(&mut conn).unwrap();
+        }
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        let state = ServerState::new(dir.path().to_path_buf(), readers);
+
+        let response = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "prompts/list",
+                "params": {}
+            }))
+            .await
+            .expect("response");
+        let prompts = response["result"]["prompts"].as_array().unwrap();
+        assert!(prompts.iter().any(|p| p["name"] == "clarion-workflow"));
+    }
+
     #[test]
     fn tools_list_request_wraps_all_tools() {
         let response = super::handle_json_rpc(&serde_json::json!({
