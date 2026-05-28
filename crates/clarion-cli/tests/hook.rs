@@ -42,6 +42,24 @@ fn hook_session_start_prints_counts_for_installed_project() {
 }
 
 #[test]
+fn hook_session_start_exits_zero_with_corrupt_db() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".clarion")).unwrap();
+    // Garbage where clarion.db should be — not a valid SQLite file.
+    std::fs::write(dir.path().join(".clarion/clarion.db"), b"NOT A SQLITE DB").unwrap();
+    let assert = clarion_bin()
+        .args(["hook", "session-start", "--path"])
+        .arg(dir.path())
+        .assert()
+        .success(); // fail-soft: must exit 0
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        out.contains("could not be opened") || out.contains("corrupt"),
+        "expected a present-but-unreadable nudge, got: {out}"
+    );
+}
+
+#[test]
 fn hook_session_start_resyncs_skill_when_present_and_drifted() {
     let dir = tempfile::tempdir().unwrap();
     clarion_bin()

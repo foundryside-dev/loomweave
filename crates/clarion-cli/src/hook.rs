@@ -21,9 +21,24 @@ pub fn session_start(path: &Path) -> anyhow::Result<()> {
     resync_skill_if_present(path);
 
     // (2) Snapshot.
-    let snapshot = load_snapshot(path);
-    print_snapshot(path, &snapshot);
+    let outcome = load_snapshot(path);
+    print_snapshot(path, &outcome);
     Ok(())
+}
+
+/// What [`load_snapshot`] could establish about the `.clarion/` index.
+///
+/// A *missing* db and a *present-but-unreadable* db are deliberately distinct:
+/// the missing case nudges toward `install` + `analyze`, but that advice is
+/// wrong for a present-but-corrupt/locked db (`install` refuses while `.clarion/`
+/// exists; `analyze` cannot repair corruption). See [`print_snapshot`].
+enum SnapshotOutcome {
+    /// Either the db file is absent (a `missing_db_snapshot()`) or it opened and
+    /// read cleanly (a real [`project_snapshot`]).
+    Ready(ProjectSnapshot),
+    /// The db file is present but could not be opened or read back — corrupt,
+    /// locked by another process, or otherwise unreadable.
+    DbUnreadable,
 }
 
 fn resync_skill_if_present(project_root: &Path) {
@@ -41,26 +56,49 @@ fn resync_skill_if_present(project_root: &Path) {
     }
 }
 
-fn load_snapshot(project_root: &Path) -> ProjectSnapshot {
+fn load_snapshot(project_root: &Path) -> SnapshotOutcome {
     let db_path = project_root.join(".clarion").join("clarion.db");
     if !db_path.exists() {
-        return missing_db_snapshot();
+        return SnapshotOutcome::Ready(missing_db_snapshot());
     }
-    match Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
-        Ok(conn) => {
-            let root = project_root
-                .canonicalize()
-                .unwrap_or_else(|_| project_root.to_path_buf());
-            project_snapshot(&conn, &root)
-        }
+    let conn = match Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(conn) => conn,
         Err(err) => {
             tracing::warn!(error = %err, "open .clarion/clarion.db read-only failed");
-            missing_db_snapshot()
+            return SnapshotOutcome::DbUnreadable;
         }
+    };
+    // `Connection::open_with_flags(.. READ_ONLY)` lazily succeeds even on a
+    // non-SQLite file ("NOT A SQLITE DB" opens fine); the corruption only
+    // surfaces at first read. Probe with a cheap query so a present-but-corrupt
+    // db is classified as unreadable rather than silently reported as 0 counts
+    // (which would otherwise print the wrong "no analysis yet" nudge).
+    if let Err(err) = conn.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0)) {
+        tracing::warn!(error = %err, "probe read of .clarion/clarion.db failed");
+        return SnapshotOutcome::DbUnreadable;
     }
+    let root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    SnapshotOutcome::Ready(project_snapshot(&conn, &root))
 }
 
-fn print_snapshot(project_root: &Path, snapshot: &ProjectSnapshot) {
+fn print_snapshot(project_root: &Path, outcome: &SnapshotOutcome) {
+    let snapshot = match outcome {
+        SnapshotOutcome::Ready(snapshot) => snapshot,
+        SnapshotOutcome::DbUnreadable => {
+            let db_path = project_root.join(".clarion").join("clarion.db");
+            println!(
+                "Clarion: an index exists at {} but could not be opened (it may be \
+                 corrupt, locked by another process, or unreadable). Check permissions, \
+                 ensure no other clarion process holds it, or remove .clarion/ and re-run \
+                 `clarion install` + `clarion analyze`. (Run with RUST_LOG=warn for the \
+                 open error.)",
+                db_path.display()
+            );
+            return;
+        }
+    };
     if !snapshot.db_present {
         println!(
             "Clarion: no index at {}/.clarion/clarion.db. \
