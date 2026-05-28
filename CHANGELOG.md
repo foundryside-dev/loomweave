@@ -120,6 +120,13 @@ normative.
   Wardline-aware plugin only; Clarion core and non-Wardline-aware plugins are
   unaffected. *Retirement condition*: Wardline ships a stable runtime probe
   API.
+- **Wardline state-file ingest deferred to a future release (tracked under
+  `release:v1.1`).** Only the `wardline.core.registry.REGISTRY` version-pin
+  probe ships in v1.0; the state-file readers for `wardline.yaml` + overlays,
+  `wardline.fingerprint.json`, `wardline.exceptions.json`, the
+  `wardline.sarif.baseline.json` translator baseline, and the three-scheme
+  identity-reconciliation oracle (REQ-INTEG-WARDLINE-02 through -06) all land
+  with WP9-B / WP10.
 - **Pre-WP5 catalogue upgrade requirement.** Briefing-blocked annotations
   are stored as a JSON property on file entities at v1.0 (v1.1 promotes
   the field to a typed column). A v1.0 binary opening a `.clarion/clarion.db`

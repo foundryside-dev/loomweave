@@ -195,6 +195,8 @@ Structured summaries produced for each entity at policy-defined levels.
 
 #### REQ-BRIEFING-01 — Structured, not prose
 
+> **v1.0 ships a 4-field on-demand summary** (`purpose`, `behavior`, `relationships`, `risks`) per [ADR-030](../adr/ADR-030-on-demand-summary-scope.md) (WP6 narrowed to leaf-tier on-demand `summary(id)`). The 9-field `EntityBriefing` schema below — `maturity` / `maturity_reasoning` / `patterns` / `antipatterns` / `knowledge_basis` / `notes` plus the `CLA-INFRA-BRIEFING-INVALID` retry path — is the v1.1 target when the briefing pipeline (Phases 4–6) lands per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md).
+
 Briefings follow a fixed schema (`purpose`, `maturity`, `maturity_reasoning`, `risks`, `patterns`, `antipatterns`, `relationships`, `knowledge_basis`, `notes`). Free-form prose is not an acceptable briefing output.
 
 **Rationale**: Principle 2 (exploration elimination) + Principle 4 (finding as fact exchange). LLM agents consume briefings as structured data to drive further navigation; prose requires re-parsing and is an order of magnitude worse for composability.
@@ -202,6 +204,8 @@ Briefings follow a fixed schema (`purpose`, `maturity`, `maturity_reasoning`, `r
 **See**: System Design §3 (Data Model, Entity Briefing).
 
 #### REQ-BRIEFING-02 — Controlled vocabulary for `patterns` / `antipatterns` / risk tags
+
+> **Deferred to v1.1** per [ADR-030](../adr/ADR-030-on-demand-summary-scope.md) + [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md). The `patterns` / `antipatterns` fields belong to the 9-field `EntityBriefing` schema deferred in [REQ-BRIEFING-01](#req-briefing-01--structured-not-prose); the `CLA-FACT-VOCABULARY-CANDIDATE` rule and adversarial-docstring containment land with that pipeline.
 
 `patterns` and `antipatterns` fields draw from a controlled vocabulary (core base set + plugin extensions). Novel tags proposed by the LLM are accepted once but logged as `CLA-FACT-VOCABULARY-CANDIDATE` for human review; they do not silently promote into future prompts.
 
@@ -219,6 +223,8 @@ Generated briefings are cached by `(entity_id, content_hash, prompt_template_id,
 
 #### REQ-BRIEFING-04 — `knowledge_basis` field per briefing
 
+> **Deferred to v1.1** per [ADR-030](../adr/ADR-030-on-demand-summary-scope.md) + [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md). `knowledge_basis` depends on the guidance system ([REQ-GUIDANCE-*](#guidance-system-req-guidance-), WP7 deferred) for the guidance-authored path and on Filigree triage-state feedback ([REQ-INTEG-FILIGREE-02](#req-integ-filigree-02--observation-emission-http-preferred-mcp-fallback), WP9-B deferred) for the acknowledged-finding path. Both inputs are v1.1.
+
 Every briefing carries `knowledge_basis: static_only | runtime_informed | human_verified`. Default is `static_only`; promotion to `human_verified` requires (a) a guidance sheet authored or reviewed against the entity in the last 90 days OR (b) a finding with `status ∈ {suppressed, acknowledged}` carrying a non-empty reason.
 
 **Rationale**: Agents consuming briefings need to calibrate how much to trust the `risks` / `patterns` claims. A briefing derived purely from static analysis + LLM synthesis should be treated as a hypothesis; one validated by human curation (guidance or triage) earns more trust.
@@ -227,6 +233,8 @@ Every briefing carries `knowledge_basis: static_only | runtime_informed | human_
 
 #### REQ-BRIEFING-05 — Triage-state feedback from Filigree
 
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B finding emission + WP7 guidance both deferred). Triage feedback requires Clarion-Filigree finding-state plumbing that does not ship in v1.0; the guidance-fingerprint side is moot until [REQ-GUIDANCE-02](#req-guidance-02--composition-algorithm) composition ships. `EMPTY_GUIDANCE_FINGERPRINT` is the v1.0 placeholder.
+
 When rendering a briefing, Clarion queries Filigree for findings on this entity with `status ∈ {suppressed, acknowledged}` and a non-empty reason, and surfaces those as either inline notes (≤3) or a synthetic `RiskItem` with `tag: operator-acknowledged` (>3). The guidance fingerprint incorporates the set of acknowledged finding IDs.
 
 **Rationale**: Operator triage decisions (suppressions, acknowledgements) are institutional knowledge in the same shape as guidance; they must flow back into briefings so the next LLM agent sees "this was already decided" rather than re-opening the conversation.
@@ -234,6 +242,8 @@ When rendering a briefing, Clarion queries Filigree for findings on this entity 
 **See**: System Design §7 (Guidance System, Triage-state feedback).
 
 #### REQ-BRIEFING-06 — Detail levels: short / medium / full / exhaustive
+
+> **Deferred to v1.1** per [ADR-030](../adr/ADR-030-on-demand-summary-scope.md) + [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md). Detail-level tiers are part of the deferred briefing pipeline; v1.0 `summary(id)` returns a single un-tiered shape per ADR-030. Per-tool token-budget contracts in [REQ-MCP-04](#req-mcp-04--bounded-response-sizes) reference these tiers and are correspondingly deferred.
 
 Briefings are renderable at four detail levels with token ceilings: `short` ≤100 tokens, `medium` ≤400, `full` ≤1,500, `exhaustive` ≤3,600. The ≤ figures are enforced hard limits that trigger truncation; typical briefings target roughly half these values (see System Design §3). Implementations must treat the ≤ figures as the contract.
 
@@ -246,6 +256,8 @@ Briefings are renderable at four detail levels with token ceilings: `short` ≤1
 ### Guidance System (`REQ-GUIDANCE-*`)
 
 Institutional knowledge attached to entities and composed into prompts.
+
+> **Whole subsystem deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP7 deferred in full). The `guidance_sheets` view substrate exists in the v1.0 storage schema (kind reservation, ADR-024 vocabulary), but no authoring path, composition algorithm, wardline-derivation, staleness signals, or export/import surface ships. `EMPTY_GUIDANCE_FINGERPRINT` is hard-coded into every summary-cache key as a placeholder. REQ-GUIDANCE-01 through REQ-GUIDANCE-06 below describe the v1.1 target.
 
 #### REQ-GUIDANCE-01 — Guidance sheets as first-class entities
 
@@ -319,7 +331,7 @@ Clarion's rule IDs follow the `CLA-*` namespace: `CLA-PY-*` for Python-plugin st
 
 #### REQ-FINDING-03 — Emit findings to Filigree
 
-> **Deferred to v0.2** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). Clarion v0.1 emits findings to its own SQLite `findings` table; cross-product emission to Filigree lands with WP9-B.
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). Clarion v0.1 emits findings to its own SQLite `findings` table; cross-product emission to Filigree lands with WP9-B.
 
 Clarion POSTs findings to Filigree via `POST /api/v1/scan-results` using Filigree's native intake schema. Clarion's richer fields (`kind`, `confidence`, `confidence_basis`, `supports`/`supported_by`, `related_entities`, internal severity, internal status) nest inside each finding's `metadata.clarion.*`.
 
@@ -329,7 +341,7 @@ Clarion POSTs findings to Filigree via `POST /api/v1/scan-results` using Filigre
 
 #### REQ-FINDING-04 — General-purpose SARIF → Filigree translator
 
-> **Deferred to v0.2** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP10). The SARIF translator is independent of MCP surface delivery and lands with the v0.2 cross-product work.
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP10). The SARIF translator is independent of MCP surface delivery and lands with the v1.1 cross-product work.
 
 Clarion ships `clarion sarif import <file> [--scan-source <name>]` that translates any SARIF v2.1.0 emitter (Wardline, Semgrep, CodeQL, Trivy) to Filigree's scan-results format, preserving `result.properties` into `metadata.<driver>_properties.*`.
 
@@ -339,7 +351,7 @@ Clarion ships `clarion sarif import <file> [--scan-source <name>]` that translat
 
 #### REQ-FINDING-05 — `scan_run_id` lifecycle
 
-> **Deferred to v0.2** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). Lands with REQ-FINDING-03 (findings emission to Filigree).
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). Lands with REQ-FINDING-03 (findings emission to Filigree).
 
 Clarion's `run_id` maps 1:1 onto Filigree's `scan_run_id`. Phase 0 of `clarion analyze` creates the scan run; Phase 8 closes it with `complete_scan_run=true`. Resume (`--resume`) reuses the same `run_id` and posts with `mark_unseen=false`.
 
@@ -349,7 +361,7 @@ Clarion's `run_id` maps 1:1 onto Filigree's `scan_run_id`. Phase 0 of `clarion a
 
 #### REQ-FINDING-06 — Dedup policy for moved entities
 
-> **Deferred to v0.2** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). Concerns Filigree-side dedup; lands with REQ-FINDING-03 (findings emission).
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). Concerns Filigree-side dedup; lands with REQ-FINDING-03 (findings emission).
 
 Clarion POSTs findings with `mark_unseen=true` by default so that old-position findings for the same rule on the same file transition to `unseen_in_latest` when the entity moves within the file. `clarion analyze --prune-unseen` removes `unseen_in_latest` findings older than 30 days (configurable).
 
@@ -365,6 +377,8 @@ The MCP tool surface exposed by `clarion serve` for consult-mode LLM agents.
 
 #### REQ-MCP-01 — Cursor-based session model
 
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §3 (Box B.6 narrowed the MCP surface)](../../implementation/sprint-2/scope-amendment-2026-05.md). The cursor-based Navigation model is one of the categories explicitly removed from the v1.0 MVP surface; v1.0 tools take explicit `id` arguments per-call. Cursor + breadcrumbs + scope-lens land with the broader catalogue.
+
 Every MCP session has server-held state: cursor (`EntityId`), breadcrumb history, scope lens, session cost accumulator, tracked observations / proposals. Navigation tools update the cursor; inspection tools default to operating on the cursor.
 
 **Rationale**: Cursor-based navigation eliminates the need to pass `entity_id` to every call — an agent says `goto(id)`, then `summary()`, `neighbors()`, `callers()` all operate on the current entity. Reduces parent-context token consumption (`NFR-PERF-03`) and models the "I'm looking at this entity" conversational stance naturally.
@@ -372,6 +386,8 @@ Every MCP session has server-held state: cursor (`EntityId`), breadcrumb history
 **See**: System Design §8 (MCP Consult Surface, Cursor model).
 
 #### REQ-MCP-02 — Navigation and inspection tool catalogue
+
+> **v1.0 ships an 8-tool MVP subset** per the [Sprint 2 scope amendment §3 (Box B.6)](../../implementation/sprint-2/scope-amendment-2026-05.md): `entity_at`, `find_entity`, `callers_of`, `execution_paths_from`, `summary`, `issues_for`, `neighborhood`, plus `subsystem_members` (added in Sprint 3 with WP4 Phase-3 clustering). The remaining categories listed below — the cursor-based Navigation model, write-effect Inspection tools, Search, Findings operations, Guidance (deferred with WP7), and Session/scope — are deferred to v1.1 per the same amendment §4. The catalogue paragraph below documents the v1.1 target surface.
 
 Clarion exposes MCP tools in the documented categories: Navigation (`goto`, `goto_path`, `back`, `zoom_out`, `zoom_in`, `breadcrumbs`); Inspection (`summary`, `source`, `metadata`, `guidance_for`, `findings_for`, `wardline_for`); Neighbours (`neighbors`, `callers`, `callees`, `children`, `imports_from`, `imported_by`, `in_subsystem`, `subsystem_members`); Search (`search_structural`, `search_semantic`, `find_by_tag`, `find_by_wardline`, `find_by_kind`); Findings & observability (`list_findings`, `emit_observation`, `promote_observation`, `cost_report`); Guidance (`show_guidance`, `list_guidance`, `propose_guidance`, `promote_guidance`); Session/scope (`set_scope_lens`, `session_info`).
 
@@ -381,6 +397,8 @@ Clarion exposes MCP tools in the documented categories: Navigation (`goto`, `got
 
 #### REQ-MCP-03 — Exploration-elimination shortcuts
 
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §3 (Box B.6 — narrowed MCP surface)](../../implementation/sprint-2/scope-amendment-2026-05.md) and §4 (WP4 Phase-7 cross-cutting analysis deferred to v1.1). Exploration shortcuts are populated by pre-computation during batched Phase-7 analysis; v1.0 ships on-demand `summary` only ([ADR-030](../adr/ADR-030-on-demand-summary-scope.md)) and has no batched pre-computation pass to feed the shortcut indices.
+
 Clarion exposes pre-computed shortcuts operationalising common exploration queries: `find_entry_points`, `find_http_routes`, `find_cli_commands`, `find_data_models`, `find_config_loaders`, `find_tests`, `find_fixtures`, `find_deprecations`, `find_todos`, `find_dead_code`, `find_circular_imports`, `find_coupling_hotspots`, `recently_changed`, `high_churn`, `what_tests_this`. Each accepts an optional `scope` (entity ID or path glob).
 
 **Rationale**: Each of these is an "explore-agent spawn" an LLM would otherwise perform by walking the graph — and each can be pre-computed during batch analysis and cached. Principle 2 says those spawns are a failure mode; the shortcuts are the remedy.
@@ -388,6 +406,8 @@ Clarion exposes pre-computed shortcuts operationalising common exploration queri
 **See**: System Design §8 (MCP Consult Surface, Exploration-elimination).
 
 #### REQ-MCP-04 — Bounded response sizes
+
+> **v1.0 ships intrinsic bounds on the 8-tool MVP subset** (`max_depth`, `limit`, server-side `edge_cap` of 500 on `execution_paths_from`, pagination on `find_entity`). Per-tool token-budget contracts (`summary(short/medium/full) ≤100/≤400/≤1,500`) and the per-session `set_budget(tool, max_tokens)` API are deferred to v1.1 — they reference catalogue surface ([REQ-MCP-02](#req-mcp-02--navigation-and-inspection-tool-catalogue)) and detail levels ([REQ-BRIEFING-06](#req-briefing-06--detail-levels-short--medium--full--exhaustive)) that are themselves deferred per the [Sprint 2 scope amendment](../../implementation/sprint-2/scope-amendment-2026-05.md) + [ADR-030](../adr/ADR-030-on-demand-summary-scope.md).
 
 MCP tool responses respect per-tool token budgets: `summary(short) ≤100`, `summary(medium) ≤400`, `summary(full) ≤1,500`, `neighbors / callers / callees / children ≤20 results × ≤50 tokens each`, `source` paginated above 2,000 tokens, `search_*` ≤10 results. Budgets are configurable per-session via `set_budget(tool, max_tokens)`.
 
@@ -397,6 +417,8 @@ MCP tool responses respect per-tool token budgets: `summary(short) ≤100`, `sum
 
 #### REQ-MCP-05 — Consent gates on write-effect tools
 
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §3 (Box B.6 narrowed the MCP surface to 8 read-only tools)](../../implementation/sprint-2/scope-amendment-2026-05.md). The write-effect tools this requirement governs (`emit_observation`, `promote_observation`, `propose_guidance`, `promote_guidance`) are not in the v1.0 MVP surface; consent-gate semantics land with the broader catalogue and the WP7 guidance system.
+
 Write-effect tools (`emit_observation`, `promote_observation`, `propose_guidance`, `promote_guidance`) return a draft for human confirmation by default. Headless agent-walk mode enables direct writes via client-declared `capabilities: { auto_emit: true }`.
 
 **Rationale**: Consult sessions are often human-in-the-loop; surprise writes erode trust. Explicit consent via draft-then-confirm matches how human operators expect agent tools to behave; headless mode opts out for fully-automated pipelines.
@@ -404,6 +426,8 @@ Write-effect tools (`emit_observation`, `promote_observation`, `propose_guidance
 **See**: System Design §8 (MCP Consult Surface, Consent gates).
 
 #### REQ-MCP-06 — Session persistence and lifecycle
+
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §3 (Box B.6)](../../implementation/sprint-2/scope-amendment-2026-05.md). Session persistence is the cursor-based Navigation model deferred with [REQ-MCP-01](#req-mcp-01--cursor-based-session-model); v1.0 tools take explicit `id` arguments per-call and hold no per-session state beyond the request scope.
 
 Sessions are created on MCP `initialize`, idle-timeout after 1 hour (configurable), and persist to `.clarion/sessions/<id>.json` for reconnection. `clarion sessions list` and `clarion sessions close <id>` provide admin surfaces.
 
@@ -419,6 +443,8 @@ Human-readable outputs from `clarion analyze`.
 
 #### REQ-ARTEFACT-01 — JSON catalog output
 
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §3 (Box B.4 removed)](../../implementation/sprint-2/scope-amendment-2026-05.md). The `catalog.json` artefact has no consumer in the v1.0 MVP MCP surface; the MCP tools query the SQLite store directly.
+
 `clarion analyze` emits `.clarion/catalog.json` — a deterministic, stable-shape dump of the entity catalog, edges, subsystems, and findings at run completion.
 
 **Rationale**: JSON is the universal interchange format; downstream consumers (dashboards, bespoke scripts, CI gates) can read the catalog without speaking SQLite. Deterministic output means git diffs reflect real changes, not run-to-run noise.
@@ -426,6 +452,8 @@ Human-readable outputs from `clarion analyze`.
 **See**: System Design §6 (Analysis Pipeline, Emission).
 
 #### REQ-ARTEFACT-02 — Per-subsystem markdown + top-level index
+
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §3 (Box B.5 removed)](../../implementation/sprint-2/scope-amendment-2026-05.md). Subsystem rendering lands with WP4 in v1.1.
 
 `clarion analyze` emits `.clarion/catalog/<subsystem>.md` (one markdown file per subsystem) plus `.clarion/catalog/index.md` (top-level navigation). Markdown is generated from the store, not authored.
 
@@ -449,6 +477,8 @@ Clarion reads project configuration from `clarion.yaml` at the repository root, 
 
 #### REQ-CONFIG-02 — Profile presets (budget / default / deep / custom)
 
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP6 narrowed to on-demand `summary(id)` per [ADR-030](../adr/ADR-030-on-demand-summary-scope.md)). Profile presets sit on top of the LLM dispatch + per-level policy that v1.0 does not ship.
+
 Clarion ships three named profiles (`budget`, `default`, `deep`) and supports `custom`. Each profile specifies per-level mode / model_tier / summary_length; `clarion.yaml:llm_policy.profile` picks one; `overrides` layer on top.
 
 **Rationale**: Named profiles make cost trade-offs legible. An operator saying "use `budget`" and getting 4× cost reduction with predictable depth loss is faster than tuning six per-level parameters; `custom` is the escape hatch for teams with specific needs.
@@ -457,6 +487,8 @@ Clarion ships three named profiles (`budget`, `default`, `deep`) and supports `c
 
 #### REQ-CONFIG-03 — Budget enforcement with preflight
 
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP6 narrowed; the Phase 0 dry-run / preflight estimator + run-level budget gate are part of the deferred batched pipeline). v1.0 reaches LLM cost only lazily via MCP `summary` per [ADR-030](../adr/ADR-030-on-demand-summary-scope.md); there is no batch run for a preflight to estimate.
+
 `clarion analyze` computes a cost estimate from the dry-run and confirms with the user before dispatching (default `dry_run_first: true`). During the run, budget watchers enforce `max_usd_per_run` and `max_minutes`; exceeding either with `on_exceed: stop` halts dispatch and writes a partial manifest.
 
 **Rationale**: LLM cost surprise is a common failure mode for teams adopting LLM-assisted tooling. Preflight prevents "I just spent $400 to analyse my monorepo" incidents; in-flight enforcement bounds the worst case when estimates are wrong.
@@ -464,6 +496,8 @@ Clarion ships three named profiles (`budget`, `default`, `deep`) and supports `c
 **See**: System Design §5 (Policy Engine, Budget).
 
 #### REQ-CONFIG-04 — Per-level LLM policy
+
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP6 narrowed to on-demand `summary(id)` per [ADR-030](../adr/ADR-030-on-demand-summary-scope.md)). Per-level policy is meaningful only when batched module/subsystem-tier summarisation exists.
 
 `clarion.yaml:llm_policy.levels.<level>` specifies `mode` (`batch | on_demand | off`), `model_tier` (`haiku | sonnet | opus`), and `summary_length`. Overrides match on `path` / `subsystem` / other criteria and layer per-level.
 
@@ -541,6 +575,8 @@ The read-only HTTP surface exposed by `clarion serve`.
 
 #### REQ-HTTP-01 — Read endpoints for entities, findings, wardline, state
 
+> **v1.0 ships the [ADR-014](../adr/ADR-014-filigree-registry-backend.md) file-registry subset only**: `GET /api/v1/files`, `POST /api/v1/files:resolve`, `POST /api/v1/files/batch`, `GET /api/v1/_capabilities` (plus the ADR-034 authentication surface — see [REQ-HTTP-03](#req-http-03--registry-backend-http-trust-model)). The broader `/entities*`, `/findings`, `/wardline/declared`, `/state`, `/health`, `/metrics` catalogue documented below is deferred to v1.1 per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B for findings/wardline/entities; WP10 for `/state`, `/health`, `/metrics`). The endpoint list below documents the v1.1 target surface.
+
 Clarion exposes read-only HTTP endpoints: `GET /api/v1/entities`, `GET /api/v1/entities/{id}`, `GET /api/v1/entities/{id}/neighbors`, `GET /api/v1/entities/{id}/summary`, `GET /api/v1/entities/{id}/guidance`, `GET /api/v1/entities/{id}/findings`, `GET /api/v1/findings`, `GET /api/v1/wardline/declared`, `GET /api/v1/state`, `GET /api/v1/health`, `GET /api/v1/metrics` (Prometheus-compatible).
 
 **Rationale**: Sibling tools (Wardline in v0.2+, future dashboards, CI gates) consume Clarion's catalog via HTTP; MCP is not appropriate for cross-process state pulls. Read-only in v0.1 keeps the surface small.
@@ -548,6 +584,8 @@ Clarion exposes read-only HTTP endpoints: `GET /api/v1/entities`, `GET /api/v1/e
 **See**: System Design §9 (Integrations, HTTP Read API).
 
 #### REQ-HTTP-02 — Entity resolution oracle
+
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B Wardline state-file ingest + WP10 broader HTTP surface). The full multi-scheme oracle depends on Wardline state-file ingest landing for `wardline_qualname` / `wardline_exception_location` / `sarif_logical_location`; v1.0 resolves the `file_path` scheme only via [REQ-HTTP-01](#req-http-01--read-endpoints-for-entities-findings-wardline-state)'s `POST /api/v1/files:resolve` and `POST /api/v1/files/batch` per [ADR-014](../adr/ADR-014-filigree-registry-backend.md).
 
 `GET /api/v1/entities/resolve?scheme=<scheme>&value=<value>` translates from sibling-tool identity schemes (`wardline_qualname`, `wardline_exception_location`, `file_path`, `sarif_logical_location`) to Clarion entity IDs. Returns `{entity_id, kind, resolution_confidence: exact|heuristic|none, alternatives}`.
 
@@ -597,7 +635,7 @@ Clarion's side of Filigree integration.
 
 #### REQ-INTEG-FILIGREE-01 — Findings via scan-results intake
 
-> **Deferred to v0.2** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). Lands with REQ-FINDING-03.
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). Lands with REQ-FINDING-03.
 
 Clarion POSTs findings to Filigree's `POST /api/v1/scan-results` using the native schema (see `REQ-FINDING-03`) with `scan_source: "clarion"`. Clarion inspects `response.warnings[]` on every POST for silent coercion / unknown-key drops.
 
@@ -607,7 +645,7 @@ Clarion POSTs findings to Filigree's `POST /api/v1/scan-results` using the nativ
 
 #### REQ-INTEG-FILIGREE-02 — Observation emission (HTTP preferred, MCP fallback)
 
-> **Deferred to v0.2** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). Clarion v0.1 surfaces structural and security findings via its own MCP `issues_for` tool (WP9-A); cross-product observation emission to Filigree lands with WP9-B.
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). Clarion v0.1 surfaces structural and security findings via its own MCP `issues_for` tool (WP9-A); cross-product observation emission to Filigree lands with WP9-B.
 
 Clarion emits observations to Filigree via `POST /api/v1/observations` when available; falls back to MCP-client transport (spawning `filigree mcp` as subprocess) when the HTTP endpoint is absent. The fallback is signalled in the capability compat report.
 
@@ -617,7 +655,7 @@ Clarion emits observations to Filigree via `POST /api/v1/observations` when avai
 
 #### REQ-INTEG-FILIGREE-03 — Registry-backend consumption
 
-> **Deferred to v0.2** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B/WP10) and reflected in [CON-FILIGREE-02](#con-filigree-02--file-registry-displacement-is-deferred-to-v02). Filigree's `registry_backend` flag shipped (ADR-014); Clarion's read-side `RegistryProtocol` implementation is the v0.2 work. Clarion v0.1 ships shadow-registry only.
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B/WP10) and reflected in [CON-FILIGREE-02](#con-filigree-02--file-registry-displacement-is-deferred-to-v02). Filigree's `registry_backend` flag shipped (ADR-014); Clarion's read-side `RegistryProtocol` implementation is the v1.1 work. Clarion v0.1 ships shadow-registry only.
 
 When Filigree's `registry_backend` flag is set to `clarion`, Clarion serves as Filigree's file registry: Filigree consults Clarion's HTTP read API for file ID resolution; auto-create paths route through `RegistryProtocol` to Clarion. Absent the flag, Clarion operates in shadow-registry mode (findings POSTed normally; Filigree auto-creates `file_records` under its native rules).
 
@@ -627,7 +665,7 @@ When Filigree's `registry_backend` flag is set to `clarion`, Clarion serves as F
 
 #### REQ-INTEG-FILIGREE-04 — `scan_source` namespace + schema pin test
 
-> **Deferred to v0.2** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). Lands with REQ-FINDING-03 (findings emission to Filigree); schema-pin test is moot until Clarion is actually POSTing.
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). Lands with REQ-FINDING-03 (findings emission to Filigree); schema-pin test is moot until Clarion is actually POSTing.
 
 Clarion uses `scan_source: "clarion"` for emissions; CI runs a schema-compatibility test against a Filigree release's `GET /api/files/_schema` output to detect drift in `valid_severities`, `valid_finding_statuses`, `valid_association_types`.
 
@@ -637,7 +675,7 @@ Clarion uses `scan_source: "clarion"` for emissions; CI runs a schema-compatibil
 
 #### REQ-INTEG-FILIGREE-05 — Capability-negotiation probe
 
-> **Deferred to v0.2** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). The capability probe is meaningful only once Clarion is talking to Filigree via the v0.2 cross-product surfaces (REQ-FINDING-03, REQ-INTEG-FILIGREE-02/03).
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). The capability probe is meaningful only once Clarion is talking to Filigree via the v1.1 cross-product surfaces (REQ-FINDING-03, REQ-INTEG-FILIGREE-02/03).
 
 At `clarion analyze` startup, Clarion probes Filigree's presence, version, `registry_backend` setting, and `/api/v1/observations` availability via `GET /api/files/_schema` + `HEAD` checks. Results emit in a single `CLA-INFRA-SUITE-COMPAT-REPORT` finding.
 
@@ -661,6 +699,8 @@ Clarion's Python plugin imports `wardline.core.registry.REGISTRY` at startup and
 
 #### REQ-INTEG-WARDLINE-02 — Manifest + overlay ingest
 
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B Wardline-config ingest). v1.0 ships only the [REQ-INTEG-WARDLINE-01](#req-integ-wardline-01--direct-registry-import-with-version-pin) runtime REGISTRY probe; state-file ingest (`wardline.yaml` + overlays) lands with the Wardline read-side bundle in v1.1.
+
 Clarion reads `wardline.yaml` and overlay files matching `src/**/wardline.overlay.yaml` at analyse time; declared tiers, groups, and boundary contracts become `WardlineMeta` properties on affected entities.
 
 **Rationale**: The manifest is Wardline's declarative source of truth; ingesting it makes tier/group/contract declarations available as entity metadata without re-implementing Wardline's parsing. Overlays let per-subsystem declarations compose cleanly.
@@ -668,6 +708,8 @@ Clarion reads `wardline.yaml` and overlay files matching `src/**/wardline.overla
 **See**: System Design §9 (Integrations, Wardline).
 
 #### REQ-INTEG-WARDLINE-03 — Fingerprint ingest
+
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B Wardline-config ingest). Fingerprint ingest depends on the same state-file reader path deferred for [REQ-INTEG-WARDLINE-02](#req-integ-wardline-02--manifest--overlay-ingest); v1.0 has no `WardlineMeta.annotation_hash` population path.
 
 Clarion reads `wardline.fingerprint.json` at analyse time; each per-function `FingerprintEntry` becomes `WardlineMeta.annotation_hash` + `wardline_qualname` on the resolved entity. Unresolved fingerprint entries emit `CLA-INFRA-WARDLINE-FINGERPRINT-UNRESOLVED`.
 
@@ -677,6 +719,8 @@ Clarion reads `wardline.fingerprint.json` at analyse time; each per-function `Fi
 
 #### REQ-INTEG-WARDLINE-04 — Exceptions ingest
 
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B Wardline-config ingest). Exceptions ingest depends on the same state-file reader path deferred for [REQ-INTEG-WARDLINE-02](#req-integ-wardline-02--manifest--overlay-ingest); v1.0 carries no `wardline.excepted` tag on briefings.
+
 Clarion reads `wardline.exceptions.json` at analyse time; entities referenced by active exceptions are tagged `wardline.excepted`. Unresolvable exception `location` strings emit `CLA-INFRA-WARDLINE-EXCEPTION-UNRESOLVED` and persist as dangling records with `entity_id: null`.
 
 **Rationale**: Exceptions are operator-curated decisions ("this finding is accepted"). Agents reading briefings for excepted entities should see "this has an active exception" as part of the picture; unresolvable exceptions are operator bugs that need visibility.
@@ -685,6 +729,8 @@ Clarion reads `wardline.exceptions.json` at analyse time; entities referenced by
 
 #### REQ-INTEG-WARDLINE-05 — SARIF baseline ingest for translator
 
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP10 SARIF translator). The translator surface (`clarion sarif import`) itself is deferred — see [REQ-INTEG-FILIGREE-04](#req-integ-filigree-04--sarif-import-translator) — so the baseline-ingest path it feeds is moot until WP10 lands.
+
 Clarion reads `wardline.sarif.baseline.json` (read-only) for the `clarion sarif import` translator path — the 663-result baseline is the source for Wardline-to-Filigree finding flow in v0.1.
 
 **Rationale**: Translator ownership lives Clarion-side in v0.1 (ADR-015); reading the baseline from disk keeps Wardline's dependency graph unchanged until it ships a native Filigree emitter in v0.2+.
@@ -692,6 +738,8 @@ Clarion reads `wardline.sarif.baseline.json` (read-only) for the `clarion sarif 
 **See**: System Design §9 (Integrations, SARIF translator).
 
 #### REQ-INTEG-WARDLINE-06 — Identity reconciliation across three schemes
+
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B Wardline-config ingest). The three-scheme oracle depends on fingerprint + exceptions ingest ([REQ-INTEG-WARDLINE-03](#req-integ-wardline-03--fingerprint-ingest) / [-04](#req-integ-wardline-04--exceptions-ingest)) populating `wardline_qualname` and `wardline_exception_location`; v1.0 resolves the `file_path` scheme only via [REQ-HTTP-01](#req-http-01--read-endpoints-for-entities-findings-wardline-state)'s `POST /api/v1/files:resolve` and `POST /api/v1/files/batch` per [ADR-014](../adr/ADR-014-filigree-registry-backend.md).
 
 Clarion maintains translation between three identity schemes: Clarion `EntityId`, Wardline `qualname`, Wardline exception-register `location` string. Reconciliation uses Wardline's `module_file_map` (from `ScanContext`) plus parsed location strings.
 
@@ -706,6 +754,8 @@ Clarion maintains translation between three identity schemes: Clarion `EntityId`
 ### Performance (`NFR-PERF-*`)
 
 #### NFR-PERF-01 — Elspeth-scale wall-clock budget
+
+> **Deferred to v1.1** per [ADR-030](../adr/ADR-030-on-demand-summary-scope.md) + [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md). The 60-min target includes Phase 4–6 LLM summarisation wall-clock, which is the deferred batched pipeline; v1.0 `clarion analyze` ends at Phase 3 and is bounded by Python plugin extraction + Leiden clustering only. Remains the v1.1 acceptance criterion when phases 4–6 land.
 
 `clarion analyze /home/john/elspeth` completes in ≤60 minutes (target ~38 minutes) on a representative developer machine (8+ cores, SSD, ≥16GB RAM).
 
@@ -795,12 +845,22 @@ the registry-backend surface. ADR-034 closes the original ADR-014 gap that
 permitted unauthenticated non-loopback binds behind the `allow_non_loopback`
 opt-in alone; the opt-in remains the gate that admits non-loopback binds at all
 but no longer admits them unauthenticated.
-**Verification**: `crates/clarion-cli/tests/serve.rs` covers the loopback
-default (line 1457), the loopback `identity_token_env`-set-but-env-missing
-refusal (line 1495), the non-loopback-without-auth refusal (line 1547), the
-non-loopback HMAC-required path (line 1579), and the non-loopback legacy-bearer
-path (line 1614). Config-layer tests cover the loopback startup-warning
-surface.
+**Verification**: `crates/clarion-cli/tests/serve.rs` covers the
+non-loopback-bind-without-opt-in refusal
+(`serve_rejects_non_loopback_http_bind_before_binding_without_opt_in`), the
+non-loopback-without-auth refusal
+(`serve_http_refuses_startup_on_non_loopback_without_token`), the
+`identity_token_env`-set-but-env-missing refusal
+(`serve_http_refuses_startup_when_identity_env_is_missing`), the HMAC-required
+request path (`serve_http_files_endpoint_requires_hmac_identity_when_configured`
+plus the wrong-secret rejection
+`serve_http_files_endpoint_rejects_wrong_hmac_identity`), the legacy-bearer
+request path (`serve_http_files_endpoint_requires_bearer_token_when_configured`
+plus the wrong-token rejection `serve_http_files_endpoint_rejects_wrong_token`
+and the batch-endpoint variant `serve_http_batch_requires_auth_when_configured`),
+and the unauthenticated `_capabilities` carve-out
+(`serve_http_capabilities_does_not_require_token`). Config-layer tests cover the
+loopback startup-warning surface.
 **See**: System Design §9 (HTTP Read API), §10 (Security), ADR-014, ADR-034.
 
 #### NFR-SEC-04 — Audit surface — security events as findings
@@ -897,6 +957,8 @@ Every `clarion analyze` emits exactly one `CLA-INFRA-SUITE-COMPAT-REPORT` findin
 
 #### NFR-COST-01 — Elspeth run budget target
 
+> **Deferred to v1.1** per [ADR-030](../adr/ADR-030-on-demand-summary-scope.md) + [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md). The $15 ± 50% target measures a full batched run including phases 4–6 LLM spend; v1.0 reaches LLM cost only lazily through MCP `summary`. Remains the v1.1 acceptance criterion when the batched pipeline lands.
+
 `clarion analyze /home/john/elspeth` costs $15 ± 50% in LLM spend (range: $7.50 - $22.50) at default profile with current Anthropic pricing.
 
 **Rationale**: Matches the detailed-design's example run. The ±50% band reflects estimator uncertainty (subsystem synthesis cost varies with clustering) plus pricing volatility; wider bands undermine operator trust.
@@ -912,6 +974,8 @@ After three consecutive runs without source or guidance changes, summary cache h
 **See**: System Design §5 (Policy Engine, Caching).
 
 #### NFR-COST-03 — Preflight cost estimate accuracy ±50%
+
+> **Deferred to v1.1** per [ADR-030](../adr/ADR-030-on-demand-summary-scope.md) + [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md). Preflight estimation lives in Phase 0 (dry-run) of the batched pipeline; v1.0 has no batch run to preflight. Couples to [REQ-CONFIG-03](#req-config-03--budget-enforcement-with-preflight).
 
 The dry-run cost estimate is within ±50% of actual spend on representative projects. Systematic under-estimation is worse than over-estimation (preflight should not encourage false confidence).
 

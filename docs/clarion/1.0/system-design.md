@@ -100,8 +100,8 @@ flowchart TB
 | Mode | Surface | Purpose | v0.1 status |
 |---|---|---|---|
 | MCP-for-LLM | `clarion serve` over stdio | First-class product surface — consult-mode agents hold a cursor, navigate the graph, emit observations to Filigree | Primary |
-| Catalog artefacts | `clarion analyze` writes `.clarion/catalog.json` + per-subsystem markdown | "I want to read the output" cases | Shipped |
-| Semi-dynamic wiki | HTML served by `clarion serve` | Live finding list, in-browser guidance editing, consult entry points | v0.2 (deferred — NG-13) |
+| Catalog artefacts | `clarion analyze` writes `.clarion/catalog.json` + per-subsystem markdown | "I want to read the output" cases | v1.1 (deferred — Sprint 2 amendment §3 removed boxes B.4/B.5; see [REQ-ARTEFACT-01](requirements.md#req-artefact-01--json-catalog-output) / [REQ-ARTEFACT-02](requirements.md#req-artefact-02--per-subsystem-markdown--top-level-index)) |
+| Semi-dynamic wiki | HTML served by `clarion serve` | Live finding list, in-browser guidance editing, consult entry points | v1.1 (deferred — NG-13) |
 
 ### Boundary contracts with the Loom siblings
 
@@ -770,6 +770,8 @@ The scope lens shapes neighbour queries without changing their signatures:
 
 ### Tool catalogue by category
 
+> **v1.0 ships an 8-tool subset of this catalogue** per the [Sprint 2 scope amendment §3 (Box B.6)](../../implementation/sprint-2/scope-amendment-2026-05.md): `entity_at(file, line)`, `find_entity(pattern)`, `callers_of(id, confidence)`, `execution_paths_from(id, max_depth, confidence)`, `summary(id)`, `issues_for(id, include_contained)`, `neighborhood(id, confidence)`, plus `subsystem_members(id)` (added in Sprint 3 with WP4 Phase-3 clustering). The full categorical catalogue below — including the cursor-based Navigation model, write-effect Inspection tools, Search, Findings ops, Guidance (deferred with WP7), Session/scope — is the v1.1 target surface and is not present in v1.0. See [REQ-MCP-02](requirements.md#req-mcp-02--navigation-and-inspection-tool-catalogue) for the row-level deferral notice.
+
 **Navigation**: `goto(id)`, `goto_path(path, line?)`, `back()`, `zoom_out()`, `zoom_in(child_id)`, `breadcrumbs()`
 
 **Inspection**: `summary(id?, detail?)`, `source(id?, range?)`, `metadata(id?)`, `guidance_for(id?)`, `findings_for(id?, filter?)`, `wardline_for(id?)`
@@ -785,6 +787,8 @@ The scope lens shapes neighbour queries without changing their signatures:
 **Scope / session**: `set_scope_lens(lens)`, `session_info()`
 
 ### Exploration-elimination shortcuts (Principle 2)
+
+> **Deferred to v1.1** per the [Sprint 2 scope amendment](../../implementation/sprint-2/scope-amendment-2026-05.md) (Box B.6 narrowed the v1.0 MCP surface; WP4 Phase-7 cross-cutting analysis deferred). Shortcuts depend on batched pre-computation during analyze; v1.0 ships on-demand `summary` only ([ADR-030](../adr/ADR-030-on-demand-summary-scope.md)).
 
 Every common explore-agent question is a pre-computed shortcut:
 
@@ -980,6 +984,8 @@ Translator behaviour:
 `clarion serve` hosts a read-only HTTP API on `127.0.0.1` (configurable bind).
 
 #### Endpoints
+
+> **v1.0 ships the [ADR-014](../adr/ADR-014-filigree-registry-backend.md) file-registry subset only**: `GET /api/v1/files`, `POST /api/v1/files:resolve`, `POST /api/v1/files/batch`, `GET /api/v1/_capabilities` (plus the [ADR-034](../adr/ADR-034-federation-http-read-api-hardening.md) authentication surface). The `/entities*` / `/findings` / `/wardline/declared` / `/state` / `/health` / `/metrics` catalogue below is the v1.1 target — deferred per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B for entities/findings/wardline; WP10 for `/state`, `/health`, `/metrics`). The entity-resolve oracle ships only for the `file_path` scheme via `POST /api/v1/files:resolve`; the multi-scheme oracle below is also v1.1. See [REQ-HTTP-01](requirements.md#req-http-01--read-endpoints-for-entities-findings-wardline-state) and [REQ-HTTP-02](requirements.md#req-http-02--entity-resolution-oracle) for the row-level deferral notices.
 
 ```
 GET  /api/v1/entities?file=<path>&kind=<kind>&tag=<tag>
