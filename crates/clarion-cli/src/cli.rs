@@ -74,4 +74,21 @@ pub enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+
+    /// Agent-lifecycle hook entrypoints. Always exit 0 (fail-soft) so a
+    /// misbehaving hook never blocks session start.
+    Hook {
+        #[command(subcommand)]
+        command: HookCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum HookCommand {
+    /// Print a project snapshot and re-sync the skill pack on drift.
+    SessionStart {
+        /// Project directory containing .clarion/clarion.db.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
 }

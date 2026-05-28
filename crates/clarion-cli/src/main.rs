@@ -3,6 +3,7 @@ mod analyze_lock;
 mod cli;
 mod clustering;
 mod config;
+mod hook;
 mod http_read;
 mod install;
 mod instance;
@@ -74,6 +75,9 @@ fn main() -> Result<()> {
             ))
         }
         cli::Command::Serve { path, config } => serve::run(&path, config.as_deref()),
+        cli::Command::Hook { command } => match command {
+            cli::HookCommand::SessionStart { path } => hook::session_start(&path),
+        },
     }
 }
 
