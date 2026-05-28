@@ -11,7 +11,12 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Initialise .clarion/ in the current directory.
+    /// Initialise .clarion/ and/or install agent-orientation assets.
+    ///
+    /// Bare `clarion install` initialises .clarion/ only (refuses if it
+    /// already exists). `--skills` and `--hooks` install the orientation
+    /// assets and do NOT initialise .clarion/. `--all` does init + skills +
+    /// hooks.
     Install {
         /// Overwrite an existing .clarion/ directory.
         #[arg(long)]
@@ -20,6 +25,19 @@ pub enum Command {
         /// Directory to install into (default: current directory).
         #[arg(long, default_value = ".")]
         path: PathBuf,
+
+        /// Install the bundled clarion-workflow skill pack into
+        /// .claude/skills/ and .agents/skills/.
+        #[arg(long)]
+        skills: bool,
+
+        /// Merge a SessionStart hook into .claude/settings.json.
+        #[arg(long)]
+        hooks: bool,
+
+        /// Do everything: .clarion/ init + --skills + --hooks.
+        #[arg(long)]
+        all: bool,
     },
 
     /// Run an analysis pass: walk the source tree, dispatch discovered plugins

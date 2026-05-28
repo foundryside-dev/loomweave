@@ -27,7 +27,17 @@ fn main() -> Result<()> {
     }
     init_tracing();
     match cli.command {
-        cli::Command::Install { force, path } => install::run(&path, force),
+        cli::Command::Install {
+            force,
+            path,
+            skills,
+            hooks,
+            all,
+        } => install::run(
+            &path,
+            force,
+            install::InstallComponents::from_flags(skills, hooks, all),
+        ),
         cli::Command::Analyze {
             path,
             config,

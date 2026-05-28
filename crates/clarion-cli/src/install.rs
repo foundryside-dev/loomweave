@@ -97,6 +97,37 @@ logs/
 runs/*/log.jsonl
 ";
 
+/// Which install components to perform. Resolved from CLI flags in
+/// [`InstallComponents::from_flags`] per the flag semantics in the agent-
+/// orientation plan: bare install = init only; `--skills`/`--hooks` are
+/// independent and do NOT init; `--all` = init + skills + hooks.
+#[derive(Debug, Clone, Copy)]
+pub struct InstallComponents {
+    pub init_clarion: bool,
+    pub skills: bool,
+    pub hooks: bool,
+}
+
+impl InstallComponents {
+    #[must_use]
+    pub fn from_flags(skills: bool, hooks: bool, all: bool) -> Self {
+        if all {
+            return Self {
+                init_clarion: true,
+                skills: true,
+                hooks: true,
+            };
+        }
+        let any_component = skills || hooks;
+        Self {
+            // Bare install (no component flags) keeps today's behavior: init.
+            init_clarion: !any_component,
+            skills,
+            hooks,
+        }
+    }
+}
+
 /// Run the `install` subcommand.
 ///
 /// # Errors
@@ -104,7 +135,7 @@ runs/*/log.jsonl
 /// Returns an error if `.clarion/` already exists without `--force`, if the
 /// target directory cannot be canonicalised, or if any filesystem or database
 /// operation fails.
-pub fn run(path: &Path, force: bool) -> Result<()> {
+pub fn run(path: &Path, force: bool, components: InstallComponents) -> Result<()> {
     if !path.exists() {
         bail!(
             "target directory does not exist: {}. Create it first or pass a valid --path.",
@@ -114,47 +145,68 @@ pub fn run(path: &Path, force: bool) -> Result<()> {
     let project_root = path
         .canonicalize()
         .with_context(|| format!("cannot canonicalise --path {}", path.display()))?;
-    let clarion_dir = project_root.join(".clarion");
-    if clarion_dir.exists() {
-        if !force {
-            bail!(
-                ".clarion/ already exists at {}. Delete it or pass --force to overwrite it.",
-                clarion_dir.display()
-            );
+
+    if components.init_clarion {
+        let clarion_dir = project_root.join(".clarion");
+        if clarion_dir.exists() {
+            if !force {
+                bail!(
+                    ".clarion/ already exists at {}. Delete it or pass --force to overwrite it.",
+                    clarion_dir.display()
+                );
+            }
+            if !clarion_dir.is_dir() {
+                bail!(
+                    "--force can only overwrite an existing .clarion/ directory; \
+                     found non-directory at {}.",
+                    clarion_dir.display()
+                );
+            }
+            fs::remove_dir_all(&clarion_dir)
+                .with_context(|| format!("remove existing {}", clarion_dir.display()))?;
         }
-        if !clarion_dir.is_dir() {
-            bail!(
-                "--force can only overwrite an existing .clarion/ directory; \
-                 found non-directory at {}.",
-                clarion_dir.display()
-            );
+
+        fs::create_dir_all(&clarion_dir)
+            .with_context(|| format!("mkdir {}", clarion_dir.display()))?;
+
+        // Cleanup guard: if any post-mkdir step fails, remove .clarion/ before
+        // bubbling the error so the next install attempt isn't blocked by the
+        // "already exists" check (clarion-ed5017139f).
+        if let Err(err) = populate_after_mkdir(&clarion_dir, &project_root) {
+            if let Err(cleanup_err) = fs::remove_dir_all(&clarion_dir) {
+                tracing::warn!(
+                    clarion_dir = %clarion_dir.display(),
+                    error = %cleanup_err,
+                    "install failed and cleanup of partial .clarion/ also failed; \
+                     manual rm -rf may be required"
+                );
+            }
+            return Err(err);
         }
-        fs::remove_dir_all(&clarion_dir)
-            .with_context(|| format!("remove existing {}", clarion_dir.display()))?;
+
+        tracing::info!(
+            clarion_dir = %clarion_dir.display(),
+            "clarion install complete"
+        );
+        println!("Initialised {}", clarion_dir.display());
     }
 
-    fs::create_dir_all(&clarion_dir).with_context(|| format!("mkdir {}", clarion_dir.display()))?;
-
-    // Cleanup guard: if any post-mkdir step fails, remove .clarion/ before
-    // bubbling the error so the next install attempt isn't blocked by the
-    // "already exists" check (clarion-ed5017139f).
-    if let Err(err) = populate_after_mkdir(&clarion_dir, &project_root) {
-        if let Err(cleanup_err) = fs::remove_dir_all(&clarion_dir) {
-            tracing::warn!(
-                clarion_dir = %clarion_dir.display(),
-                error = %cleanup_err,
-                "install failed and cleanup of partial .clarion/ also failed; \
-                 manual rm -rf may be required"
+    if components.skills {
+        let report = crate::skill_pack::install_skill_pack(&project_root)
+            .context("install clarion-workflow skill pack")?;
+        if report.copied {
+            println!(
+                "Installed clarion-workflow skill into {}/.claude/skills and {}/.agents/skills",
+                project_root.display(),
+                project_root.display()
             );
+        } else {
+            println!("clarion-workflow skill already up to date");
         }
-        return Err(err);
     }
 
-    tracing::info!(
-        clarion_dir = %clarion_dir.display(),
-        "clarion install complete"
-    );
-    println!("Initialised {}", clarion_dir.display());
+    // --hooks wired in Phase 4.
+
     Ok(())
 }
 
