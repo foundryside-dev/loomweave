@@ -107,7 +107,11 @@ pub struct InstallComponents {
     pub skills: bool,
     // Read by the --hooks merge wired in Phase 4; carried through now so the
     // CLI flag plumbing lands with the rest of the install-component surface.
-    #[allow(dead_code)]
+    // `expect` applies only in non-test builds: the from_flags truth-table
+    // test reads `hooks`, so the production-only dead_code lint is the real
+    // signal — it auto-fails once Phase 4 reads the field, forcing this
+    // attribute's removal.
+    #[cfg_attr(not(test), expect(dead_code))]
     pub hooks: bool,
 }
 
@@ -244,4 +248,42 @@ fn initialise_db(path: &Path) -> Result<()> {
     pragma::apply_write_pragmas(&conn).map_err(|e| anyhow::anyhow!("{e}"))?;
     schema::apply_migrations(&mut conn).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InstallComponents;
+
+    #[test]
+    fn from_flags_truth_table() {
+        // Bare install: no component flags -> init only.
+        let bare = InstallComponents::from_flags(false, false, false);
+        assert!(bare.init_clarion);
+        assert!(!bare.skills);
+        assert!(!bare.hooks);
+
+        // --skills: skills only, no init.
+        let skills = InstallComponents::from_flags(true, false, false);
+        assert!(!skills.init_clarion);
+        assert!(skills.skills);
+        assert!(!skills.hooks);
+
+        // --hooks: hooks only, no init.
+        let hooks = InstallComponents::from_flags(false, true, false);
+        assert!(!hooks.init_clarion);
+        assert!(!hooks.skills);
+        assert!(hooks.hooks);
+
+        // --all: everything (component flags ignored).
+        let all = InstallComponents::from_flags(false, false, true);
+        assert!(all.init_clarion);
+        assert!(all.skills);
+        assert!(all.hooks);
+
+        // --skills --hooks: both components, still no init.
+        let both = InstallComponents::from_flags(true, true, false);
+        assert!(!both.init_clarion);
+        assert!(both.skills);
+        assert!(both.hooks);
+    }
 }

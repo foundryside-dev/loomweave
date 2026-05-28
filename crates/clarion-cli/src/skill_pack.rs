@@ -7,6 +7,11 @@
 //! logic change. The fingerprint over the pack bytes drives drift-aware
 //! re-copy (Phase 3 hook resync + `--skills` idempotency).
 
+use std::fs;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+
 /// `(relative_path, contents)` for every file in the bundled skill pack.
 pub const SKILL_PACK: &[(&str, &str)] = &[(
     "SKILL.md",
@@ -31,11 +36,6 @@ pub fn pack_fingerprint() -> String {
     }
     hasher.finalize().to_hex().to_string()
 }
-
-use std::fs;
-use std::path::Path;
-
-use anyhow::{Context, Result};
 
 /// The two skill roots Clarion installs into, relative to the project root.
 /// `.claude/skills/` is read by Claude Code; `.agents/skills/` is the
@@ -98,6 +98,19 @@ fn stage_and_swap(root: &Path, dest: &Path, fingerprint: &str) -> Result<()> {
             .with_context(|| format!("clear stale staging {}", staging.display()))?;
     }
     fs::create_dir_all(&staging).with_context(|| format!("mkdir {}", staging.display()))?;
+
+    // Cleanup guard: if any write/swap step fails, remove the staging dir
+    // before bubbling the error so we don't leak a `.clarion-workflow.tmp-*`
+    // sibling. Matches the partial-state-cleanup precedent on the `.clarion/`
+    // path in install.rs. The original error is preserved.
+    if let Err(err) = write_and_swap(&staging, dest, fingerprint) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn write_and_swap(staging: &Path, dest: &Path, fingerprint: &str) -> Result<()> {
     for (rel, contents) in SKILL_PACK {
         let target = staging.join(rel);
         if let Some(parent) = target.parent() {
@@ -111,7 +124,7 @@ fn stage_and_swap(root: &Path, dest: &Path, fingerprint: &str) -> Result<()> {
     if dest.exists() {
         fs::remove_dir_all(dest).with_context(|| format!("remove old {}", dest.display()))?;
     }
-    fs::rename(&staging, dest)
+    fs::rename(staging, dest)
         .with_context(|| format!("rename {} -> {}", staging.display(), dest.display()))?;
     Ok(())
 }
