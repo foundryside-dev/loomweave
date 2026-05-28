@@ -3186,7 +3186,10 @@ mod tests {
         let text = response["result"]["messages"][0]["content"]["text"]
             .as_str()
             .unwrap();
-        assert!(text.contains("name: clarion-workflow"), "not the skill text");
+        assert!(
+            text.contains("name: clarion-workflow"),
+            "not the skill text"
+        );
     }
 
     #[tokio::test]
