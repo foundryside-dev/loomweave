@@ -391,7 +391,7 @@ assert "clarion-workflow" in init_result["instructions"], init_result.get("instr
 assert isinstance(init_result["capabilities"]["resources"], dict), init_result["capabilities"]
 assert isinstance(init_result["capabilities"]["prompts"], dict), init_result["capabilities"]
 tools = responses["tools"]["result"]["tools"]
-assert len(tools) == 8, tools
+assert len(tools) == 9, tools
 assert [tool["name"] for tool in tools] == [
     "entity_at",
     "find_entity",
@@ -401,6 +401,7 @@ assert [tool["name"] for tool in tools] == [
     "issues_for",
     "neighborhood",
     "subsystem_members",
+    "project_status",
 ]
 assert "leaf scope only" in tools[4]["description"]
 
@@ -461,4 +462,4 @@ assert ctx["entity_count"] >= 1, ctx
 assert "staleness" in ctx, ctx
 PY
 
-log "PASS: MCP stdio surface returned eight tool definitions and seven tool responses"
+log "PASS: MCP stdio surface returned nine tool definitions and seven tool responses"

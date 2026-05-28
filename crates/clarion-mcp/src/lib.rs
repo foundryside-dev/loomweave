@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod filigree;
+pub mod filigree_url;
 pub mod snapshot;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -59,9 +60,10 @@ almost never type IDs — get one from `find_entity` or `entity_at`, then copy i
 verbatim into the next tool.
 
 Tools: find_entity, entity_at, callers_of, neighborhood, execution_paths_from, \
-subsystem_members, summary, issues_for. `callers_of` / `neighborhood` / \
-`execution_paths_from` take a `confidence` tier (resolved | ambiguous | \
-inferred; default resolved).
+subsystem_members, summary, issues_for, project_status. `callers_of` / \
+`neighborhood` / `execution_paths_from` take a `confidence` tier (resolved | \
+ambiguous | inferred; default resolved). `project_status` reports index \
+freshness, counts, LLM policy, and the resolved Filigree endpoint.
 
 For the full workflow see the clarion-workflow skill (installed by \
 `clarion install --skills`), or read the `clarion-workflow` prompt. Live \
@@ -155,6 +157,15 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             description: "List module entities assigned to a subsystem entity.",
             input_schema: id_schema(),
         },
+        ToolDefinition {
+            name: "project_status",
+            description: "Return deterministic Clarion diagnostics: repo root, db path, latest run (id/status/started/completed), entity/subsystem/edge/finding counts, index staleness, per-plugin entity counts from the current index, LLM policy (provider/live/cache), and the resolved Filigree endpoint (configured vs resolved URL + resolution source). Answers \"is the graph fresh, plugin-less, LLM-live, Filigree-reachable?\" without shelling out. No LLM call.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -218,6 +229,32 @@ pub fn handle_json_rpc(request: &Value) -> Option<Value> {
     })
 }
 
+/// Deterministic, non-storage diagnostics threaded in at server construction so
+/// `project_status` can report the LLM policy and the resolved Filigree
+/// endpoint without re-reading config or re-running URL resolution. Optional:
+/// servers built via [`ServerState::new`] (e.g. storage-only tests) omit it and
+/// `project_status` reports those blocks as unconfigured.
+#[derive(Debug, Clone)]
+pub struct DiagnosticsContext {
+    pub llm: LlmDiagnostics,
+    pub filigree: crate::filigree_url::FiligreeUrlResolution,
+}
+
+/// The LLM policy posture, captured at construction. `live` reflects whether a
+/// provider is actually wired (vs. merely permitted by config).
+#[derive(Debug, Clone)]
+pub struct LlmDiagnostics {
+    /// Provider label, e.g. `"openrouter"`, `"codex_cli"`, `"recording"`, or
+    /// `"disabled"` when no provider is wired.
+    pub provider: String,
+    /// A live provider is wired and summaries will dispatch to it.
+    pub live: bool,
+    /// Whether config permits a live provider at all (`llm.allow_live_provider`).
+    pub allow_live_provider: bool,
+    /// Summary-cache freshness horizon in days (`llm.cache_max_age_days`).
+    pub cache_max_age_days: u32,
+}
+
 pub struct ServerState {
     project_root: PathBuf,
     readers: ReaderPool,
@@ -227,6 +264,7 @@ pub struct ServerState {
     budget: Arc<Mutex<BudgetLedger>>,
     inferred_inflight: InferredInflight,
     filigree_client: Option<Arc<dyn FiligreeLookup>>,
+    diagnostics: Option<DiagnosticsContext>,
 }
 
 impl ServerState {
@@ -241,6 +279,7 @@ impl ServerState {
             budget: Arc::new(Mutex::new(BudgetLedger::default())),
             inferred_inflight: Arc::new(AsyncMutex::new(HashMap::new())),
             filigree_client: None,
+            diagnostics: None,
         }
     }
 
@@ -274,6 +313,12 @@ impl ServerState {
     #[must_use]
     pub fn with_filigree_client(mut self, client: Arc<dyn FiligreeLookup>) -> Self {
         self.filigree_client = Some(client);
+        self
+    }
+
+    #[must_use]
+    pub fn with_diagnostics(mut self, diagnostics: DiagnosticsContext) -> Self {
+        self.diagnostics = Some(diagnostics);
         self
     }
 
@@ -347,6 +392,10 @@ impl ServerState {
                 Err(response) => return response.to_json_rpc(id),
             },
             "subsystem_members" => match self.tool_subsystem_members(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "project_status" => match self.tool_project_status(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
@@ -824,6 +873,84 @@ impl ServerState {
             })
             .await;
         Ok(flatten_storage_envelope_result(result))
+    }
+
+    async fn tool_project_status(
+        &self,
+        _arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let db_path = self.project_root.join(".clarion").join("clarion.db");
+        let root_display = self.project_root.display().to_string();
+
+        let project_root = self.project_root.clone();
+        let storage = self
+            .readers
+            .with_reader(move |conn| {
+                let snapshot = crate::snapshot::project_snapshot(conn, &project_root);
+                let edge_count = scalar_count_fail_soft(conn, "SELECT COUNT(*) FROM edges");
+                let plugins = plugin_entity_counts(conn);
+                let latest_run = latest_run_row(conn);
+                Ok((snapshot, edge_count, plugins, latest_run))
+            })
+            .await;
+
+        let (snapshot, edge_count, plugins, latest_run) = match storage {
+            Ok(tuple) => tuple,
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    "storage-error",
+                    &err.to_string(),
+                    storage_retryable(&err),
+                ));
+            }
+        };
+
+        let result = json!({
+            "project_root": root_display,
+            "db_path": db_path.display().to_string(),
+            "db_present": snapshot.db_present,
+            "latest_run": latest_run,
+            "counts": {
+                "entities": snapshot.entity_count,
+                "subsystems": snapshot.subsystem_count,
+                "edges": edge_count,
+                "findings": snapshot.finding_count,
+            },
+            "staleness": serde_json::to_value(snapshot.staleness).unwrap_or(Value::Null),
+            "last_analyzed_at": snapshot.last_analyzed_at,
+            // No analyze-time git SHA is persisted and Clarion has no git
+            // integration; report null rather than fabricate one.
+            "git_sha": Value::Null,
+            "plugins": plugins,
+            "llm": self.llm_diagnostics_json(),
+            "filigree": self.filigree_diagnostics_json(),
+        });
+
+        Ok(success_envelope(result))
+    }
+
+    fn llm_diagnostics_json(&self) -> Value {
+        match &self.diagnostics {
+            Some(diag) => json!({
+                "provider": diag.llm.provider,
+                "live": diag.llm.live,
+                "allow_live_provider": diag.llm.allow_live_provider,
+                "cache_max_age_days": diag.llm.cache_max_age_days,
+            }),
+            None => Value::Null,
+        }
+    }
+
+    fn filigree_diagnostics_json(&self) -> Value {
+        match &self.diagnostics {
+            Some(diag) => json!({
+                "enabled": diag.filigree.enabled,
+                "configured_url": diag.filigree.configured_url,
+                "resolved_url": diag.filigree.resolved_url,
+                "resolution_source": diag.filigree.source,
+            }),
+            None => Value::Null,
+        }
     }
 
     async fn read_issues_for_entities(
@@ -2358,6 +2485,70 @@ fn envelope_from_storage_result(result: Result<Value, StorageError>) -> Value {
     }
 }
 
+/// Fail-soft scalar count for `project_status`: a query hiccup degrades to 0
+/// (logged), never failing the diagnostics tool. Matches `snapshot.rs`'s policy.
+fn scalar_count_fail_soft(conn: &rusqlite::Connection, sql: &str) -> i64 {
+    conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+        .unwrap_or_else(|err| {
+            tracing::warn!(error = %err, sql, "project_status count query failed; reporting 0");
+            0
+        })
+}
+
+/// Per-plugin entity counts from the current index (`entities.plugin_id`), the
+/// queryable proxy for "which plugins produced this graph." Fail-soft: any
+/// query error degrades to an empty array (logged).
+fn plugin_entity_counts(conn: &rusqlite::Connection) -> Value {
+    let mut stmt = match conn
+        .prepare("SELECT plugin_id, COUNT(*) FROM entities GROUP BY plugin_id ORDER BY plugin_id")
+    {
+        Ok(stmt) => stmt,
+        Err(err) => {
+            tracing::warn!(error = %err, "project_status plugin-count prepare failed");
+            return Value::Array(Vec::new());
+        }
+    };
+    let rows = stmt.query_map([], |row| {
+        Ok(json!({
+            "plugin_id": row.get::<_, String>(0)?,
+            "entity_count": row.get::<_, i64>(1)?,
+        }))
+    });
+    match rows {
+        Ok(mapped) => Value::Array(mapped.filter_map(Result::ok).collect()),
+        Err(err) => {
+            tracing::warn!(error = %err, "project_status plugin-count query failed");
+            Value::Array(Vec::new())
+        }
+    }
+}
+
+/// The most-recent run by `started_at`, regardless of terminal status, so a
+/// `skipped_no_plugins` or `failed` run is visible (not just the last
+/// `completed` one). Fail-soft: no rows or a query error → `null`.
+fn latest_run_row(conn: &rusqlite::Connection) -> Value {
+    match conn.query_row(
+        "SELECT id, status, started_at, completed_at FROM runs \
+         ORDER BY started_at DESC LIMIT 1",
+        [],
+        |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "status": row.get::<_, String>(1)?,
+                "started_at": row.get::<_, String>(2)?,
+                "completed_at": row.get::<_, Option<String>>(3)?,
+            }))
+        },
+    ) {
+        Ok(value) => value,
+        Err(rusqlite::Error::QueryReturnedNoRows) => Value::Null,
+        Err(err) => {
+            tracing::warn!(error = %err, "project_status latest-run query failed");
+            Value::Null
+        }
+    }
+}
+
 fn flatten_storage_envelope_result(result: Result<Value, StorageError>) -> Value {
     match result {
         Ok(envelope) => envelope,
@@ -3007,7 +3198,7 @@ mod tests {
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
@@ -3047,6 +3238,11 @@ mod tests {
         assert_eq!(
             tools[7].description,
             "List module entities assigned to a subsystem entity."
+        );
+        assert_eq!(tools[8].name, "project_status");
+        assert_eq!(
+            tools[8].description,
+            "Return deterministic Clarion diagnostics: repo root, db path, latest run (id/status/started/completed), entity/subsystem/edge/finding counts, index staleness, per-plugin entity counts from the current index, LLM policy (provider/live/cache), and the resolved Filigree endpoint (configured vs resolved URL + resolution source). Answers \"is the graph fresh, plugin-less, LLM-live, Filigree-reachable?\" without shelling out. No LLM call."
         );
     }
 
@@ -3328,7 +3524,7 @@ mod tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], "tools-1");
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 9);
         assert_eq!(response["result"]["tools"][0]["name"], "entity_at");
         assert_eq!(response["result"]["tools"][7]["name"], "subsystem_members");
     }
@@ -3429,7 +3625,7 @@ mod tests {
 
         assert_eq!(decoded["jsonrpc"], "2.0");
         assert_eq!(decoded["id"], 10);
-        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 9);
     }
 
     #[test]
@@ -3504,7 +3700,7 @@ mod tests {
         assert_eq!(first_json["id"], 11);
         assert_eq!(first_json["result"]["serverInfo"]["name"], "clarion");
         assert_eq!(second_json["id"], 12);
-        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 9);
     }
 
     #[test]

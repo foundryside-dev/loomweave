@@ -37,11 +37,30 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
         McpConfig::default()
     };
     let provider_selection = select_provider_with_env(&config, |name| std::env::var(name).ok())?;
+    let llm_diagnostics = llm_diagnostics(&provider_selection, &config.llm);
     let llm_provider = build_llm_provider(&config, provider_selection, &project_root)?;
-    let filigree_client = FiligreeHttpClient::from_config(&config.integrations.filigree, |name| {
-        std::env::var(name).ok()
-    })
-    .context("build Filigree HTTP client")?;
+
+    // Resolve where Filigree actually listens — prefer the live ethereal port
+    // published in `.filigree/ephemeral.port` over the static configured port
+    // (which goes stale, the dogfood bug) — then build the client against the
+    // resolved URL so `issues_for` reaches the running dashboard. The same
+    // resolution is surfaced by `project_status`.
+    let filigree_resolution = clarion_mcp::filigree_url::resolve_filigree_url(
+        &config.integrations.filigree,
+        &project_root,
+    );
+    let mut filigree_config = config.integrations.filigree.clone();
+    if let Some(resolved) = &filigree_resolution.resolved_url {
+        filigree_config.base_url.clone_from(resolved);
+    }
+    let filigree_client =
+        FiligreeHttpClient::from_config(&filigree_config, |name| std::env::var(name).ok())
+            .context("build Filigree HTTP client")?;
+
+    let diagnostics = clarion_mcp::DiagnosticsContext {
+        llm: llm_diagnostics,
+        filigree: filigree_resolution,
+    };
 
     let readers = ReaderPool::open(&db_path, 16)
         .map_err(|err| anyhow!("open reader pool for {}: {err}", db_path.display()))?;
@@ -69,8 +88,28 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
         config.llm.clone(),
         llm_provider,
         filigree_client,
+        diagnostics,
     )?;
     supervise_stdio_with_http(stdio, http_server)
+}
+
+/// Capture the LLM policy posture for `project_status`. `live` means a provider
+/// that actually dispatches (`OpenRouter` / Codex / Claude CLIs); the recording
+/// fixture and the disabled state are not live.
+fn llm_diagnostics(selection: &ProviderSelection, llm: &LlmConfig) -> clarion_mcp::LlmDiagnostics {
+    let (provider, live) = match selection {
+        ProviderSelection::Disabled => ("disabled", false),
+        ProviderSelection::Recording => ("recording", false),
+        ProviderSelection::OpenRouter { .. } => ("openrouter", true),
+        ProviderSelection::CodexCli => ("codex_cli", true),
+        ProviderSelection::ClaudeCli => ("claude_cli", true),
+    };
+    clarion_mcp::LlmDiagnostics {
+        provider: provider.to_owned(),
+        live,
+        allow_live_provider: llm.allow_live_provider,
+        cache_max_age_days: llm.cache_max_age_days,
+    }
 }
 
 struct StdioServe {
@@ -85,6 +124,7 @@ fn spawn_mcp_stdio(
     llm_config: LlmConfig,
     llm_provider: Option<Arc<dyn LlmProvider>>,
     filigree_client: Option<FiligreeHttpClient>,
+    diagnostics: clarion_mcp::DiagnosticsContext,
 ) -> Result<StdioServe> {
     let (result_tx, result_rx) = mpsc::channel();
     let join = thread::Builder::new()
@@ -97,6 +137,7 @@ fn spawn_mcp_stdio(
                 llm_config,
                 llm_provider,
                 filigree_client,
+                diagnostics,
             );
             let _ = result_tx.send(result);
         })
@@ -111,6 +152,7 @@ fn run_mcp_stdio(
     llm_config: LlmConfig,
     llm_provider: Option<Arc<dyn LlmProvider>>,
     filigree_client: Option<FiligreeHttpClient>,
+    diagnostics: clarion_mcp::DiagnosticsContext,
 ) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -138,6 +180,7 @@ fn run_mcp_stdio(
     if let Some(client) = filigree_client {
         state = state.with_filigree_client(Arc::new(client));
     }
+    state = state.with_diagnostics(diagnostics);
 
     let serve_result =
         clarion_mcp::serve_stdio_with_state_on_runtime(&runtime, &state, &mut reader, &mut writer)

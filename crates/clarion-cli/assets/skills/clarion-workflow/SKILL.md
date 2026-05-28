@@ -49,6 +49,7 @@ Every entity has an ID: `{plugin}:{kind}:{qualified_name}`
 | `subsystem_members` | modules in a subsystem | `{"id": "core:subsystem:<hash>"}` |
 | `summary` | on-demand prose summary of one entity | `{"id": "<id>"}` |
 | `issues_for` | Filigree issues attached to an entity | `{"id": "<id>"}` |
+| `project_status` | index freshness, counts, LLM + Filigree status | `{}` |
 
 `callers_of` / `neighborhood` / `execution_paths_from` take a `confidence`
 tier — one of `"resolved"` (default; only high-confidence edges),

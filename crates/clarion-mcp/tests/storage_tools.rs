@@ -12,11 +12,12 @@ use clarion_core::{
     RecordingProvider, build_inferred_calls_prompt, build_leaf_summary_prompt,
 };
 use clarion_mcp::{
-    ServerState,
-    config::{LlmConfig, LlmProviderKind},
+    DiagnosticsContext, LlmDiagnostics, ServerState,
+    config::{FiligreeConfig, LlmConfig, LlmProviderKind},
     filigree::{
         EntityAssociation, EntityAssociationsResponse, FiligreeClientError, FiligreeLookup,
     },
+    filigree_url::{SOURCE_CONFIG, SOURCE_EPHEMERAL_PORT, resolve_filigree_url},
     list_tools,
 };
 use clarion_storage::{
@@ -2230,4 +2231,217 @@ async fn neighborhood_returns_one_hop_graph_sections() {
         envelope["result"]["references_in"][0]["entity"]["id"],
         "python:function:demo.entry"
     );
+}
+
+// ── project_status diagnostics tool (clarion-084e82250c) ─────────────────────
+
+fn insert_run(
+    conn: &Connection,
+    id: &str,
+    started_at: &str,
+    status: &str,
+    completed: Option<&str>,
+) {
+    conn.execute(
+        "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+         VALUES (?1, ?2, ?3, '{}', '{}', ?4)",
+        params![id, started_at, completed, status],
+    )
+    .expect("insert run");
+}
+
+fn insert_finding(conn: &Connection, id: &str, run_id: &str, entity_id: &str) {
+    conn.execute(
+        "INSERT INTO findings \
+         (id, tool, tool_version, run_id, rule_id, kind, severity, entity_id, \
+          related_entities, message, evidence, properties, supports, supported_by, \
+          status, created_at, updated_at) \
+         VALUES (?1,'clarion','1.0',?2,'R1','defect','WARN',?3,'[]','m','{}','{}','[]','[]', \
+                 'open','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')",
+        params![id, run_id, entity_id],
+    )
+    .expect("insert finding");
+}
+
+#[test]
+fn tools_list_includes_project_status() {
+    let tools = list_tools();
+    let tool = tools
+        .iter()
+        .find(|tool| tool.name == "project_status")
+        .expect("project_status tool definition");
+    assert_eq!(
+        tool.input_schema,
+        json!({"type": "object", "properties": {}, "additionalProperties": false})
+    );
+}
+
+#[tokio::test]
+async fn project_status_reports_counts_latest_run_and_plugins() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    seed_subsystem(&conn, project.path());
+    insert_run(
+        &conn,
+        "run-1",
+        "2026-02-02T00:00:00.000Z",
+        "completed",
+        Some("2026-02-02T00:00:00.000Z"),
+    );
+    insert_finding(&conn, "f-1", "run-1", "python:function:demo.entry");
+    drop(conn);
+
+    let state = state_for(project.path(), &db_path);
+    let envelope = call_tool(&state, "project_status", json!({})).await;
+    assert_eq!(envelope["ok"], true);
+    let result = &envelope["result"];
+
+    assert!(result["counts"]["entities"].as_i64().unwrap() >= 4);
+    assert_eq!(result["counts"]["subsystems"], 1);
+    assert!(result["counts"]["edges"].as_i64().unwrap() >= 1);
+    assert_eq!(result["counts"]["findings"], 1);
+
+    // AC#1: latest completed run + counts.
+    assert_eq!(result["latest_run"]["id"], "run-1");
+    assert_eq!(result["latest_run"]["status"], "completed");
+    assert_eq!(
+        result["latest_run"]["completed_at"],
+        "2026-02-02T00:00:00.000Z"
+    );
+    assert_eq!(result["last_analyzed_at"], "2026-02-02T00:00:00.000Z");
+
+    let plugin_ids: Vec<&str> = result["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|plugin| plugin["plugin_id"].as_str().unwrap())
+        .collect();
+    assert!(plugin_ids.contains(&"python"), "plugins: {plugin_ids:?}");
+
+    assert!(
+        result["db_path"]
+            .as_str()
+            .unwrap()
+            .ends_with(".clarion/clarion.db")
+    );
+    // No analyze-time git SHA is persisted; reported as null, not fabricated.
+    assert_eq!(result["git_sha"], Value::Null);
+    // A bare ServerState carries no diagnostics context.
+    assert_eq!(result["llm"], Value::Null);
+    assert_eq!(result["filigree"], Value::Null);
+}
+
+#[tokio::test]
+async fn project_status_marks_skipped_no_plugins_run() {
+    // AC#2: a skipped_no_plugins run is unmistakable as no index refresh.
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    insert_run(
+        &conn,
+        "run-skip",
+        "2026-02-03T00:00:00.000Z",
+        "skipped_no_plugins",
+        Some("2026-02-03T00:00:00.000Z"),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db_path);
+    let envelope = call_tool(&state, "project_status", json!({})).await;
+    assert_eq!(
+        envelope["result"]["latest_run"]["status"],
+        "skipped_no_plugins"
+    );
+}
+
+#[tokio::test]
+async fn project_status_skipped_run_keeps_prior_completed_index_visible() {
+    // The real dogfood shape: a skipped_no_plugins run AFTER a completed one.
+    // latest_run.status flags the skip, while last_analyzed_at + counts still
+    // describe the older, usable index ("your last attempt skipped — here's the
+    // index from before").
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    insert_run(
+        &conn,
+        "run-old",
+        "2026-01-01T00:00:00.000Z",
+        "completed",
+        Some("2026-01-15T00:00:00.000Z"),
+    );
+    insert_run(
+        &conn,
+        "run-skip",
+        "2026-02-01T00:00:00.000Z",
+        "skipped_no_plugins",
+        Some("2026-02-01T00:00:00.000Z"),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db_path);
+    let result = call_tool(&state, "project_status", json!({})).await["result"].clone();
+
+    assert_eq!(result["latest_run"]["id"], "run-skip");
+    assert_eq!(result["latest_run"]["status"], "skipped_no_plugins");
+    // last_analyzed_at tracks the latest *completed* run, not the skip.
+    assert_eq!(result["last_analyzed_at"], "2026-01-15T00:00:00.000Z");
+    assert!(result["counts"]["entities"].as_i64().unwrap() >= 3);
+}
+
+#[tokio::test]
+async fn project_status_resolves_live_filigree_endpoint() {
+    // AC#3: the live ethereal port (.filigree/ephemeral.port) is reported as
+    // the resolution source, overriding the stale configured port.
+    let (project, db_path) = open_project();
+    let filigree_dir = project.path().join(".filigree");
+    fs::create_dir_all(&filigree_dir).unwrap();
+    fs::write(filigree_dir.join("ephemeral.port"), "8542").unwrap();
+
+    let config = FiligreeConfig {
+        enabled: true,
+        ..FiligreeConfig::default()
+    };
+    let diagnostics = DiagnosticsContext {
+        llm: LlmDiagnostics {
+            provider: "disabled".to_owned(),
+            live: false,
+            allow_live_provider: false,
+            cache_max_age_days: 180,
+        },
+        filigree: resolve_filigree_url(&config, project.path()),
+    };
+    let state = state_for(project.path(), &db_path).with_diagnostics(diagnostics);
+
+    let envelope = call_tool(&state, "project_status", json!({})).await;
+    let filigree = &envelope["result"]["filigree"];
+    assert_eq!(filigree["enabled"], true);
+    assert_eq!(filigree["configured_url"], "http://127.0.0.1:8766");
+    assert_eq!(filigree["resolved_url"], "http://127.0.0.1:8542");
+    assert_eq!(filigree["resolution_source"], SOURCE_EPHEMERAL_PORT);
+
+    let llm = &envelope["result"]["llm"];
+    assert_eq!(llm["provider"], "disabled");
+    assert_eq!(llm["live"], false);
+    assert_eq!(llm["cache_max_age_days"], 180);
+}
+
+#[tokio::test]
+async fn project_status_filigree_falls_back_to_config_without_port_file() {
+    let (project, db_path) = open_project();
+    let config = FiligreeConfig {
+        enabled: true,
+        ..FiligreeConfig::default()
+    };
+    let diagnostics = DiagnosticsContext {
+        llm: LlmDiagnostics {
+            provider: "openrouter".to_owned(),
+            live: true,
+            allow_live_provider: true,
+            cache_max_age_days: 7,
+        },
+        filigree: resolve_filigree_url(&config, project.path()),
+    };
+    let state = state_for(project.path(), &db_path).with_diagnostics(diagnostics);
+    let envelope = call_tool(&state, "project_status", json!({})).await;
+    let filigree = &envelope["result"]["filigree"];
+    assert_eq!(filigree["resolved_url"], "http://127.0.0.1:8766");
+    assert_eq!(filigree["resolution_source"], SOURCE_CONFIG);
+    assert_eq!(envelope["result"]["llm"]["live"], true);
 }

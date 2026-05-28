@@ -85,7 +85,7 @@ fills it into the generated results file.
 | 2 | Install the Python plugin via `pipx` per the tutorial | `which clarion-plugin-python` resolves; the binary is on `$PATH` | ✅ |
 | 3 | `clarion install` against a small Python project (the harness uses `psf/requests` at a pinned tag) | `.clarion/` exists; `.clarion/clarion.db` exists; init log line emitted | ✅ |
 | 4.1 | `clarion analyze` | Exit 0; entity count > 0 | ✅ |
-| 4.2 | Start `clarion serve`; connect MCP client | MCP `tools/list` returns the 8 tools (`entity_at`, `find_entity`, `callers_of`, `execution_paths_from`, `summary`, `issues_for`, `neighborhood`, `subsystem_members`) | ✅ |
+| 4.2 | Start `clarion serve`; connect MCP client | MCP `tools/list` returns the 9 tools (`entity_at`, `find_entity`, `callers_of`, `execution_paths_from`, `summary`, `issues_for`, `neighborhood`, `subsystem_members`, `project_status`) | ✅ |
 | 4.3 | Three MCP queries against analyzed corpus: <br>(a) `find_entity(pattern="Session")` lists module-level matches <br>(b) `callers_of(id=<highest-in-degree function>)` returns a non-empty list <br>(c) `summary(id=<any function>)` returns a paragraph | (a) and (b) return non-empty; (c) returns a paragraph (live LLM) or is skipped when `OPENROUTER_API_KEY` is absent | ✅ |
 | 5 | Re-run `clarion analyze` | Idempotent: entity/edge counts on the second run match the first | ✅ |
 | 6 | Plant `.env` with `AWS_ACCESS_KEY_ID=AKIA0123456789ABCDEF`; re-run `clarion analyze` | `briefing_blocked` entities count > 0; `CLA-SEC-SECRET-DETECTED` finding emitted | ✅ |

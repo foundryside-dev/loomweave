@@ -231,9 +231,10 @@ try:
     listed = read_frame(proc)
     tools = [t["name"] for t in listed.get("result", {}).get("tools", [])]
     required = {"entity_at", "find_entity", "callers_of", "execution_paths_from",
-                "summary", "issues_for", "neighborhood", "subsystem_members"}
+                "summary", "issues_for", "neighborhood", "subsystem_members",
+                "project_status"}
     if required.issubset(set(tools)):
-        report["step_4_2"] = f"PASS: tools/list returned {len(tools)} tools including all 8 required"
+        report["step_4_2"] = f"PASS: tools/list returned {len(tools)} tools including all {len(required)} required"
     else:
         missing = required - set(tools)
         report["step_4_2"] = f"FAIL: tools/list missing {sorted(missing)}"
