@@ -4,6 +4,7 @@ mod cli;
 mod clustering;
 mod config;
 mod hook;
+mod hooks_settings;
 mod http_read;
 mod install;
 mod instance;
