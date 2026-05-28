@@ -1,8 +1,9 @@
 //! `.claude/settings.json` SessionStart-hook merge.
 //!
 //! Merge semantics (never clobber): parse existing JSON, append a `SessionStart`
-//! matcher-group running `clarion hook session-start` only if no existing
-//! `SessionStart` entry already runs that command, and preserve every other key.
+//! matcher-group running `clarion hook session-start --path "<project>"` only if
+//! no existing `SessionStart` entry already runs `clarion hook session-start`
+//! (regardless of its `--path`), and preserve every other key.
 //!
 //! Verified against the Claude Code settings schema: `hooks.SessionStart` is an
 //! array of matcher-groups, each `{ "matcher"?, "hooks": [ {type,command} ] }`.
@@ -16,10 +17,16 @@ use serde_json::{Map, Value, json};
 /// Substring that identifies Clarion's own `SessionStart` hook command.
 pub const HOOK_COMMAND: &str = "clarion hook session-start";
 
-/// Merge Clarion's `SessionStart` hook into a parsed settings `Value` in place.
-/// Returns `true` if a change was made, `false` if the hook was already present.
+/// Merge Clarion's `SessionStart` hook into a parsed settings `Value` in place,
+/// inserting the supplied `command` (which must contain [`HOOK_COMMAND`] so the
+/// idempotency predicate recognises it). Returns `true` if a change was made,
+/// `false` if a clarion session-start hook was already present.
+///
+/// The idempotency predicate keys on the [`HOOK_COMMAND`] substring, so any
+/// existing clarion session-start hook — regardless of its `--path` argument —
+/// is detected and not duplicated.
 #[must_use]
-pub fn merge_session_start_hook(settings: &mut Value) -> bool {
+pub fn merge_session_start_hook(settings: &mut Value, command: &str) -> bool {
     // Coercion-after-parse: a successfully-parsed but malformed shape (a wrong
     // JSON type where we expect object/object/array) is rewritten to the
     // default shape rather than erroring. This is correct, but surface it so a
@@ -78,7 +85,7 @@ pub fn merge_session_start_hook(settings: &mut Value) -> bool {
         "hooks": [
             {
                 "type": "command",
-                "command": "clarion hook session-start"
+                "command": command
             }
         ]
     }));
@@ -142,7 +149,20 @@ pub fn install_session_start_hook(project_root: &Path) -> Result<bool> {
         }
     }
 
-    let changed = merge_session_start_hook(&mut settings);
+    // Embed the resolved project path so the installed hook orients THIS
+    // project no matter what working directory Claude Code runs it from.
+    // `install::run` canonicalizes before calling, so `project_root` is already
+    // absolute; canonicalize defensively in case another caller is not. The
+    // path is shell-quoted because Claude runs hook commands via a shell.
+    let canonical = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let command = format!(
+        "clarion hook session-start --path \"{}\"",
+        canonical.display()
+    );
+
+    let changed = merge_session_start_hook(&mut settings, &command);
     if !changed {
         return Ok(false);
     }
@@ -179,24 +199,27 @@ mod tests {
 
     use super::{HOOK_COMMAND, install_session_start_hook, merge_session_start_hook};
 
+    const TEST_COMMAND: &str = "clarion hook session-start --path \"/some/project\"";
+
     #[test]
     fn adds_hook_to_empty_settings() {
         let mut settings = json!({});
-        let changed = merge_session_start_hook(&mut settings);
+        let changed = merge_session_start_hook(&mut settings, TEST_COMMAND);
         assert!(changed, "should report a change");
         let groups = settings["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(groups.len(), 1);
         let cmd = groups[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains(HOOK_COMMAND), "command was: {cmd}");
+        assert!(cmd.contains("--path"), "command should pin --path: {cmd}");
         assert_eq!(groups[0]["hooks"][0]["type"], "command");
     }
 
     #[test]
     fn is_idempotent_when_hook_already_present() {
         let mut settings = json!({});
-        assert!(merge_session_start_hook(&mut settings));
+        assert!(merge_session_start_hook(&mut settings, TEST_COMMAND));
         // Second merge must be a no-op.
-        assert!(!merge_session_start_hook(&mut settings));
+        assert!(!merge_session_start_hook(&mut settings, TEST_COMMAND));
         let groups = settings["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(groups.len(), 1, "must not duplicate the hook");
     }
@@ -215,7 +238,7 @@ mod tests {
             }
         });
 
-        let changed = merge_session_start_hook(&mut settings);
+        let changed = merge_session_start_hook(&mut settings, TEST_COMMAND);
         assert!(changed);
 
         assert_eq!(settings["model"], "opus");
@@ -297,6 +320,29 @@ mod tests {
         // File must be untouched.
         let raw = std::fs::read_to_string(claude.join("settings.json")).unwrap();
         assert_eq!(raw.trim(), r#"{"hooks": {"SessionStart": "nope"}}"#);
+    }
+
+    #[test]
+    fn installed_hook_command_embeds_resolved_project_path() {
+        let dir = tempfile::tempdir().unwrap();
+        super::install_session_start_hook(dir.path()).unwrap();
+        let raw = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let cmd = parsed["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(cmd.contains("clarion hook session-start"), "cmd: {cmd}");
+        assert!(
+            cmd.contains("--path"),
+            "installed hook must pin --path: {cmd}"
+        );
+        // The path must reference this project's directory, not be path-less.
+        let canon = dir.path().canonicalize().unwrap();
+        assert!(
+            cmd.contains(&canon.display().to_string()),
+            "cmd should contain {} : {cmd}",
+            canon.display()
+        );
     }
 
     #[test]
