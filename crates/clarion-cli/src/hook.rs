@@ -1,6 +1,6 @@
 //! `clarion hook session-start` — fail-soft session-start orientation.
 //!
-//! Never returns an error to the caller: the SessionStart hook must never
+//! Never returns an error to the caller: the `SessionStart` hook must never
 //! block an agent's session start. All failures degrade to a printed note.
 
 use std::path::Path;
@@ -9,6 +9,11 @@ use clarion_mcp::snapshot::{ProjectSnapshot, Staleness, missing_db_snapshot, pro
 use rusqlite::{Connection, OpenFlags};
 
 /// Run `clarion hook session-start`. Always returns `Ok(())`.
+///
+/// The `anyhow::Result` return type is intentional even though no `Err` is
+/// ever produced: it keeps the `main.rs` dispatch arm uniform with the other
+/// subcommands and documents the fail-soft contract at the type level.
+#[allow(clippy::unnecessary_wraps)]
 pub fn session_start(path: &Path) -> anyhow::Result<()> {
     // (1) Re-sync the skill pack ONLY if it's already installed and drifted.
     //     We don't install where absent — that's `clarion install --skills`'s
