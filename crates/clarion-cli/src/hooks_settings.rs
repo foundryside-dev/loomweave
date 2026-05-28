@@ -10,7 +10,7 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
 /// Substring that identifies Clarion's own `SessionStart` hook command.
@@ -109,6 +109,38 @@ pub fn install_session_start_hook(project_root: &Path) -> Result<bool> {
     } else {
         Value::Object(Map::new())
     };
+
+    // Never-clobber on the write path. `merge_session_start_hook` will happily
+    // coerce a parseable-but-wrong-type shape (a top-level array, a non-object
+    // `hooks`, a non-array `SessionStart`) to the default shape — fine for the
+    // in-memory/unit-test callers, but on disk that would silently overwrite
+    // hand-authored user content. Refuse to rewrite such a file; preserve it.
+    if !settings.is_object() {
+        bail!(
+            "refusing to rewrite {}: top-level JSON is not an object (the file is \
+             preserved unchanged). Fix or remove it, then re-run.",
+            settings_path.display()
+        );
+    }
+    if let Some(hooks) = settings.get("hooks") {
+        if !hooks.is_object() {
+            bail!(
+                "refusing to rewrite {}: `hooks` is present but is not an object \
+                 (the file is preserved unchanged). Fix or remove it, then re-run.",
+                settings_path.display()
+            );
+        }
+        if let Some(session_start) = hooks.get("SessionStart") {
+            if !session_start.is_array() {
+                bail!(
+                    "refusing to rewrite {}: `hooks.SessionStart` is present but is not \
+                     an array (the file is preserved unchanged). Fix or remove it, then \
+                     re-run.",
+                    settings_path.display()
+                );
+            }
+        }
+    }
 
     let changed = merge_session_start_hook(&mut settings);
     if !changed {
@@ -211,6 +243,36 @@ mod tests {
 
         let result = install_session_start_hook(dir.path());
         assert!(result.is_err(), "expected parse error, got {result:?}");
+    }
+
+    #[test]
+    fn install_refuses_to_rewrite_top_level_non_object_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        // Parseable JSON, but a top-level array — hand-authored user content we must not clobber.
+        std::fs::write(claude.join("settings.json"), "[1, 2, 3]").unwrap();
+        let result = super::install_session_start_hook(dir.path());
+        assert!(
+            result.is_err(),
+            "should refuse to clobber a non-object settings.json"
+        );
+        // File must be untouched.
+        let raw = std::fs::read_to_string(claude.join("settings.json")).unwrap();
+        assert_eq!(raw.trim(), "[1, 2, 3]");
+    }
+
+    #[test]
+    fn install_refuses_to_rewrite_wrong_type_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("settings.json"), r#"{"hooks": "not-an-object"}"#).unwrap();
+        let result = super::install_session_start_hook(dir.path());
+        assert!(
+            result.is_err(),
+            "should refuse to clobber a wrong-type hooks value"
+        );
     }
 
     #[test]
