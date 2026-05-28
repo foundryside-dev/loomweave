@@ -38,9 +38,10 @@ export OPENROUTER_API_KEY=sk-or-v1-...
 
 `clarion analyze` (step 2) and the structural MCP tools (`entity_at`,
 `find_entity`, `callers_of`, `execution_paths_from`, `issues_for`,
-`neighborhood`) work without any LLM credentials — the key is only consulted
-when an MCP client calls `summary(id)` against an entity that does not yet
-have a cached summary.
+`neighborhood`, `subsystem_members`) work without any LLM credentials — seven
+of the eight MCP tools are credential-free. The key is only consulted when an
+MCP client calls `summary(id)` against an entity that does not yet have a
+cached summary.
 
 ## 1. Install
 
@@ -217,13 +218,15 @@ llm_policy:
 `OPENROUTER_API_KEY` must also be exported in the environment that
 `clarion serve` (or your MCP client wrapper) inherits — see the
 prerequisites section above. Skip this block if you don't have a key; the
-first six tools still work, only `summary` will return an "LLM disabled"
+other seven tools still work, only `summary` will return an "LLM disabled"
 envelope.
 
-### The seven tools
+### The MCP tools
 
-The MCP surface exposes seven primary tools (plus `subsystem_members` for
-clustering output). Each is a structured graph query, not free-text grep.
+The MCP surface exposes eight tools: seven primary tools (in the table below)
+plus `subsystem_members` for clustering output. Seven of the eight are
+credential-free; only `summary` needs the live LLM. Each is a structured graph
+query, not free-text grep.
 
 | Tool | Example invocation |
 |---|---|
