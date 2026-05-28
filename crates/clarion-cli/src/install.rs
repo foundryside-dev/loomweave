@@ -7,7 +7,10 @@
 //! - `<path>/clarion.yaml`        (user-edited config stub at project root;
 //!   see detailed-design.md §File layout)
 //!
-//! Refuses if `.clarion/` already exists unless `--force` is passed.
+//! A bare `clarion install` refuses if `.clarion/` already exists unless
+//! `--force` is passed. Under `--skills`/`--hooks`/`--all`, an existing
+//! `.clarion/` is left in place (init is skipped) rather than treated as an
+//! error, so the requested idempotent components can still be applied.
 
 use std::fs;
 use std::path::Path;
@@ -145,6 +148,16 @@ pub fn run(path: &Path, force: bool, components: InstallComponents) -> Result<()
     let project_root = path
         .canonicalize()
         .with_context(|| format!("cannot canonicalise --path {}", path.display()))?;
+
+    // The CLI flag parser cannot produce an all-false `components` (a bare
+    // `clarion install` sets `init_clarion`), but the struct is representable,
+    // so guard the do-nothing state defensively rather than silently succeeding.
+    if !components.init_clarion && !components.skills && !components.hooks {
+        bail!(
+            "nothing to install: pass --skills, --hooks, or --all, \
+             or run bare `clarion install` to initialise .clarion/."
+        );
+    }
 
     if components.init_clarion {
         let clarion_dir = project_root.join(".clarion");

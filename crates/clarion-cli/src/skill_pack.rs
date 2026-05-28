@@ -136,6 +136,12 @@ fn write_and_swap(staging: &Path, dest: &Path, fingerprint: &str) -> Result<()> 
     fs::write(staging.join(FINGERPRINT_FILE), fingerprint)
         .with_context(|| format!("write fingerprint in {}", staging.display()))?;
     // Remove any prior install, then move the staged pack into place.
+    //
+    // Non-self-healing window: a crash between this remove and the rename below
+    // leaves the pack absent. The session-start hook's resync only fires when
+    // the skill is *already present* (`resync_skill_if_present` in hook.rs), so
+    // it will NOT re-create a pack that vanished here. Recovery in that rare
+    // case is an explicit `clarion install --skills`, not automatic.
     if dest.exists() {
         fs::remove_dir_all(dest).with_context(|| format!("remove old {}", dest.display()))?;
     }
