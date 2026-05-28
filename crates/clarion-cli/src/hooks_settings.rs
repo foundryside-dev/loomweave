@@ -130,15 +130,15 @@ pub fn install_session_start_hook(project_root: &Path) -> Result<bool> {
                 settings_path.display()
             );
         }
-        if let Some(session_start) = hooks.get("SessionStart") {
-            if !session_start.is_array() {
-                bail!(
-                    "refusing to rewrite {}: `hooks.SessionStart` is present but is not \
-                     an array (the file is preserved unchanged). Fix or remove it, then \
-                     re-run.",
-                    settings_path.display()
-                );
-            }
+        if let Some(session_start) = hooks.get("SessionStart")
+            && !session_start.is_array()
+        {
+            bail!(
+                "refusing to rewrite {}: `hooks.SessionStart` is present but is not \
+                 an array (the file is preserved unchanged). Fix or remove it, then \
+                 re-run.",
+                settings_path.display()
+            );
         }
     }
 
@@ -267,7 +267,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let claude = dir.path().join(".claude");
         std::fs::create_dir_all(&claude).unwrap();
-        std::fs::write(claude.join("settings.json"), r#"{"hooks": "not-an-object"}"#).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"hooks": "not-an-object"}"#,
+        )
+        .unwrap();
         let result = super::install_session_start_hook(dir.path());
         assert!(
             result.is_err(),
