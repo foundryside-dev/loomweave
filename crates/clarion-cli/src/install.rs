@@ -105,13 +105,6 @@ runs/*/log.jsonl
 pub struct InstallComponents {
     pub init_clarion: bool,
     pub skills: bool,
-    // Read by the --hooks merge wired in Phase 4; carried through now so the
-    // CLI flag plumbing lands with the rest of the install-component surface.
-    // `expect` applies only in non-test builds: the from_flags truth-table
-    // test reads `hooks`, so the production-only dead_code lint is the real
-    // signal — it auto-fails once Phase 4 reads the field, forcing this
-    // attribute's removal.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub hooks: bool,
 }
 
@@ -212,7 +205,18 @@ pub fn run(path: &Path, force: bool, components: InstallComponents) -> Result<()
         }
     }
 
-    // --hooks wired in Phase 4.
+    if components.hooks {
+        let changed = crate::hooks_settings::install_session_start_hook(&project_root)
+            .context("merge SessionStart hook into .claude/settings.json")?;
+        if changed {
+            println!(
+                "Added clarion SessionStart hook to {}/.claude/settings.json",
+                project_root.display()
+            );
+        } else {
+            println!("clarion SessionStart hook already present");
+        }
+    }
 
     Ok(())
 }
