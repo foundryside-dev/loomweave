@@ -194,8 +194,8 @@ fn id_confidence_schema() -> Value {
 /// Storage-backed tool calls require [`ServerState::handle_json_rpc`]. The
 /// `resources/*` and `prompts/*` RPCs are likewise served ONLY by
 /// [`ServerState::handle_json_rpc`] (the production `clarion serve` path); a
-/// caller using this free function gets a deliberately narrower server even
-/// though `initialize` here still advertises those capabilities.
+/// caller using this free function gets a deliberately narrower server, and its
+/// `initialize` advertises only the `tools` capability it actually serves.
 #[must_use]
 pub fn handle_json_rpc(request: &Value) -> Option<Value> {
     if is_json_rpc_notification(request) {
@@ -207,7 +207,7 @@ pub fn handle_json_rpc(request: &Value) -> Option<Value> {
     };
 
     Some(match method {
-        "initialize" => result_response(&id, &initialize_result()),
+        "initialize" => result_response(&id, &initialize_result(false)),
         "tools/list" => result_response(&id, &json!({"tools": list_tools()})),
         "tools/call" => error_response(
             &id,
@@ -287,7 +287,7 @@ impl ServerState {
         };
 
         Some(match method {
-            "initialize" => result_response(&id, &initialize_result()),
+            "initialize" => result_response(&id, &initialize_result(true)),
             "tools/list" => result_response(&id, &json!({"tools": list_tools()})),
             "tools/call" => self.handle_tool_call(&id, request.get("params")).await,
             "resources/list" => result_response(&id, &resources_list()),
@@ -2152,14 +2152,21 @@ pub fn serve_stdio_with_state_on_runtime(
     }
 }
 
-fn initialize_result() -> Value {
+/// Build the `initialize` result, advertising only the capabilities the
+/// handling path actually serves. The stateless free [`handle_json_rpc`] serves
+/// `tools` only (it returns method-not-found for `resources/*` and `prompts/*`),
+/// so it passes `stateful = false`; [`ServerState::handle_json_rpc`] serves the
+/// full surface and passes `stateful = true`. The `instructions` field is static
+/// orientation guidance (not a capability) and is included in both.
+fn initialize_result(stateful: bool) -> Value {
+    let capabilities = if stateful {
+        json!({ "tools": {}, "prompts": {}, "resources": {} })
+    } else {
+        json!({ "tools": {} })
+    };
     json!({
         "protocolVersion": MCP_PROTOCOL_VERSION,
-        "capabilities": {
-            "tools": {},
-            "prompts": {},
-            "resources": {}
-        },
+        "capabilities": capabilities,
         "serverInfo": {
             "name": "clarion",
             "version": env!("CARGO_PKG_VERSION")
@@ -3077,9 +3084,63 @@ mod tests {
             instructions.contains("entity"),
             "instructions should describe the entity model"
         );
-        // Prompts + resources capabilities advertised alongside tools.
-        assert!(response["result"]["capabilities"]["prompts"].is_object());
-        assert!(response["result"]["capabilities"]["resources"].is_object());
+        // The stateless free handler does NOT serve resources/* or prompts/*,
+        // so it must not advertise those capabilities (a client enabling those
+        // flows against the stateless server would otherwise fail).
+        assert!(
+            response["result"]["capabilities"]["prompts"].is_null(),
+            "stateless initialize must not advertise prompts: {response:?}"
+        );
+        assert!(
+            response["result"]["capabilities"]["resources"].is_null(),
+            "stateless initialize must not advertise resources: {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stateful_initialize_advertises_prompts_and_resources() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("clarion.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            pragma::apply_write_pragmas(&conn).unwrap();
+            schema::apply_migrations(&mut conn).unwrap();
+        }
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        let state = ServerState::new(dir.path().to_path_buf(), readers);
+
+        let response = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test-client", "version": "0.0.0"}
+                }
+            }))
+            .await
+            .expect("initialize request returns a response");
+
+        // The production (ServerState) path serves prompts/* and resources/*,
+        // so its initialize must advertise the full capability surface.
+        assert!(response["result"]["capabilities"]["tools"].is_object());
+        assert!(
+            response["result"]["capabilities"]["prompts"].is_object(),
+            "stateful initialize must advertise prompts: {response:?}"
+        );
+        assert!(
+            response["result"]["capabilities"]["resources"].is_object(),
+            "stateful initialize must advertise resources: {response:?}"
+        );
+        let instructions = response["result"]["instructions"]
+            .as_str()
+            .expect("initialize result has instructions");
+        assert!(
+            instructions.contains("clarion-workflow"),
+            "instructions should point at the skill"
+        );
     }
 
     #[tokio::test]
