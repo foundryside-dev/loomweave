@@ -106,16 +106,14 @@ fn compute_staleness(
         return Staleness::Unknown;
     };
 
-    let mut stmt = match conn.prepare(
+    let Ok(mut stmt) = conn.prepare(
         "SELECT DISTINCT source_file_path FROM entities \
          WHERE source_file_path IS NOT NULL",
-    ) {
-        Ok(stmt) => stmt,
-        Err(_) => return Staleness::Unknown,
+    ) else {
+        return Staleness::Unknown;
     };
-    let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
-        Ok(rows) => rows,
-        Err(_) => return Staleness::Unknown,
+    let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+        return Staleness::Unknown;
     };
 
     let mut saw_any_file = false;
