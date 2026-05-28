@@ -191,7 +191,11 @@ fn id_confidence_schema() -> Value {
 
 /// Handle state-free MCP requests such as `initialize` and `tools/list`.
 ///
-/// Storage-backed tool calls require [`ServerState::handle_json_rpc`].
+/// Storage-backed tool calls require [`ServerState::handle_json_rpc`]. The
+/// `resources/*` and `prompts/*` RPCs are likewise served ONLY by
+/// [`ServerState::handle_json_rpc`] (the production `clarion serve` path); a
+/// caller using this free function gets a deliberately narrower server even
+/// though `initialize` here still advertises those capabilities.
 #[must_use]
 pub fn handle_json_rpc(request: &Value) -> Option<Value> {
     if is_json_rpc_notification(request) {
@@ -379,25 +383,33 @@ impl ServerState {
     }
 
     async fn context_snapshot_json(&self) -> String {
+        use crate::snapshot::{ProjectSnapshot, Staleness};
+
+        // Single fallback used by both the reader-error and serialize-error
+        // branches: serialize a real `ProjectSnapshot` so the shape stays in
+        // lock-step with the type as it gains fields.
+        let fallback = || {
+            let snap = ProjectSnapshot {
+                db_present: true,
+                entity_count: 0,
+                subsystem_count: 0,
+                finding_count: 0,
+                staleness: Staleness::Unknown,
+                last_analyzed_at: None,
+            };
+            serde_json::to_string(&snap).unwrap_or_default()
+        };
+
         let project_root = self.project_root.clone();
         let snapshot = self
             .readers
             .with_reader(move |conn| Ok(crate::snapshot::project_snapshot(conn, &project_root)))
             .await;
         match snapshot {
-            Ok(snap) => serde_json::to_string(&snap)
-                .unwrap_or_else(|_| "{\"db_present\":true,\"staleness\":\"unknown\"}".to_owned()),
+            Ok(snap) => serde_json::to_string(&snap).unwrap_or_else(|_| fallback()),
             Err(err) => {
                 tracing::warn!(error = %err, "clarion://context snapshot failed");
-                serde_json::json!({
-                    "db_present": true,
-                    "entity_count": 0,
-                    "subsystem_count": 0,
-                    "finding_count": 0,
-                    "staleness": "unknown",
-                    "last_analyzed_at": serde_json::Value::Null
-                })
-                .to_string()
+                fallback()
             }
         }
     }
@@ -3160,6 +3172,32 @@ mod tests {
             .await
             .expect("response");
         assert!(response["error"].is_object(), "expected an error envelope");
+        assert_eq!(response["error"]["code"], -32602, "{response:?}");
+    }
+
+    #[tokio::test]
+    async fn prompts_get_rejects_unknown_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("clarion.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            pragma::apply_write_pragmas(&conn).unwrap();
+            schema::apply_migrations(&mut conn).unwrap();
+        }
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        let state = ServerState::new(dir.path().to_path_buf(), readers);
+
+        let response = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "prompts/get",
+                "params": {"name": "nope"}
+            }))
+            .await
+            .expect("response");
+        assert!(response["error"].is_object(), "expected an error envelope");
+        assert_eq!(response["error"]["code"], -32602, "{response:?}");
     }
 
     #[tokio::test]
