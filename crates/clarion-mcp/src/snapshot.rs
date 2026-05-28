@@ -3,7 +3,9 @@
 //! One function, two callers: the `clarion hook session-start` subcommand and
 //! the MCP `clarion://context` resource. Infallible by design — every failure
 //! folds into the snapshot (zero counts, `Staleness::Unknown`) so the fail-soft
-//! hook never has to handle an error.
+//! hook never has to handle an error. Degrade, but don't go quiet: a real query
+//! failure is `tracing::warn!`-logged before it folds, so a populated index
+//! reporting 0 leaves a trace (run with `RUST_LOG=warn`).
 
 use std::path::Path;
 use std::time::SystemTime;
@@ -22,7 +24,7 @@ pub enum Staleness {
     Stale,
     /// No ingested source file is newer than the latest run.
     Fresh,
-    /// Could not determine (stat/parse/IO error) — degrade, don't fail.
+    /// Could not determine (stat/parse/IO error) — degrade, don't fail (and log).
     Unknown,
 }
 
@@ -79,19 +81,30 @@ pub fn missing_db_snapshot() -> ProjectSnapshot {
 }
 
 fn scalar_count(conn: &Connection, sql: &str) -> i64 {
-    conn.query_row(sql, [], |row| row.get::<_, i64>(0))
-        .unwrap_or(0)
+    match conn.query_row(sql, [], |row| row.get::<_, i64>(0)) {
+        Ok(n) => n,
+        Err(err) => {
+            tracing::warn!(error = %err, sql, "clarion snapshot count query failed; reporting 0");
+            0
+        }
+    }
 }
 
 fn latest_completed_run(conn: &Connection) -> Option<String> {
-    conn.query_row(
+    match conn.query_row(
         "SELECT completed_at FROM runs \
          WHERE completed_at IS NOT NULL AND status = 'completed' \
          ORDER BY completed_at DESC LIMIT 1",
         [],
         |row| row.get::<_, String>(0),
-    )
-    .ok()
+    ) {
+        Ok(s) => Some(s),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(err) => {
+            tracing::warn!(error = %err, "clarion latest-completed-run query failed");
+            None
+        }
+    }
 }
 
 fn compute_staleness(
