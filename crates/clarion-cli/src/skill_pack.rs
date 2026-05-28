@@ -83,10 +83,20 @@ pub fn install_skill_pack(project_root: &Path) -> Result<SkillInstallReport> {
     Ok(SkillInstallReport { copied })
 }
 
+/// Recompute the fingerprint from the pack files actually on disk under
+/// `dest`, so drift detection catches *content* corruption (a hand-edited or
+/// truncated `SKILL.md`), not merely a stale `.fingerprint` sidecar. Returns
+/// `None` if any pack file is missing or unreadable, which forces a rewrite.
 fn installed_fingerprint(dest: &Path) -> Option<String> {
-    fs::read_to_string(dest.join(FINGERPRINT_FILE))
-        .ok()
-        .map(|s| s.trim().to_owned())
+    let mut hasher = blake3::Hasher::new();
+    for (rel, _) in SKILL_PACK {
+        let contents = fs::read(dest.join(rel)).ok()?;
+        hasher.update(rel.as_bytes());
+        hasher.update(&[0u8]);
+        hasher.update(&contents);
+        hasher.update(&[0u8]);
+    }
+    Some(hasher.finalize().to_hex().to_string())
 }
 
 fn stage_and_swap(root: &Path, dest: &Path, fingerprint: &str) -> Result<()> {
