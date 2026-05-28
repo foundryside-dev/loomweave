@@ -181,6 +181,25 @@ documented options:
 
 Pick whichever you have; the questions in step 4 are client-agnostic.
 
+### Agent orientation (optional but recommended)
+
+Give consult-mode agents a head start:
+
+```bash
+clarion install --skills --path /tmp/requests-2.32.4   # bundle the clarion-workflow skill
+clarion install --hooks --path /tmp/requests-2.32.4    # add a SessionStart snapshot hook
+clarion install --all   --path /tmp/requests-2.32.4    # .clarion/ init + skills + hooks
+```
+
+`--skills` writes `.claude/skills/clarion-workflow/` and `.agents/skills/clarion-workflow/`.
+`--hooks` merges a SessionStart entry into `.claude/settings.json` (existing
+hooks are preserved) that runs `clarion hook session-start` — a fail-soft
+command printing live entity/subsystem/finding counts and index freshness.
+
+Over MCP, the same orientation is available without install: the `initialize`
+result carries an `instructions` field, the `clarion://context` resource returns
+the live snapshot, and the `clarion-workflow` prompt returns the skill text.
+
 ## 4. Ask
 
 ### Enable live LLM (one-time)
