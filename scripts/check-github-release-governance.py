@@ -203,6 +203,44 @@ def ruleset_targets_branch(ruleset: dict[str, Any], branch: str) -> bool:
     )
 
 
+def ruleset_targets_tag(ruleset: dict[str, Any], tag_pattern: str) -> bool:
+    """True when an active tag ruleset's include patterns cover ``tag_pattern``.
+
+    GitHub tag rulesets carry ``target == "tag"`` and condition their
+    ``ref_name`` on ``refs/tags/`` globs. We accept a ruleset if it either
+    has no narrowing ``include`` list (covers all tags) or names an include
+    pattern that the desired ``tag_pattern`` (e.g. ``refs/tags/v*``) satisfies.
+    """
+    if ruleset.get("target") != "tag":
+        return False
+
+    conditions = ruleset.get("conditions")
+    if not isinstance(conditions, dict):
+        return True
+    ref_name = conditions.get("ref_name")
+    if not isinstance(ref_name, dict):
+        return True
+
+    include = ref_name.get("include")
+    if not isinstance(include, list) or not include:
+        return True
+    # The desired pattern is itself a glob (refs/tags/v*); treat an include
+    # entry as covering it when the strings match, when the include is the
+    # all-tags wildcard, or when the include glob matches the literal prefix
+    # of the desired pattern.
+    desired = tag_pattern.removeprefix("refs/tags/")
+    for pattern in include:
+        if not isinstance(pattern, str):
+            continue
+        normalized = pattern.removeprefix("refs/tags/")
+        if pattern in {tag_pattern, "~ALL"} or normalized in {desired, "*"}:
+            return True
+        # An include like `v*` matches the concrete tag families we cut.
+        if fnmatchcase("v1.0.0", normalized) or fnmatchcase(desired, normalized):
+            return True
+    return False
+
+
 def branch_protection_status_checks(protection: dict[str, Any]) -> set[str]:
     required = protection.get("required_status_checks")
     if not isinstance(required, dict):
@@ -320,6 +358,31 @@ def check_governance(
         failures.append(
             f"{branch}: no branch protection or ruleset currently proves the reviewed "
             "release PR path"
+        )
+
+    # Tag protection (GOV-02): an active ruleset must target `refs/tags/v*` so
+    # that a tag-push cannot point a release tag at an arbitrary commit. The
+    # legacy `tags/protection` endpoint is deprecated; a tag ruleset is the
+    # modern mechanism. We assert on the ruleset summaries (no detail fetch is
+    # needed for a presence check).
+    tag_pattern = "refs/tags/v*"
+    active_tag_rulesets = [
+        item.get("name", "<unnamed ruleset>")
+        for item in rule_summaries
+        if item.get("enforcement") == "active" and ruleset_targets_tag(item, tag_pattern)
+    ]
+    if active_tag_rulesets:
+        names = ", ".join(
+            name if isinstance(name, str) else "<unnamed ruleset>"
+            for name in active_tag_rulesets
+        )
+        notes.append(
+            f"{repository}: active tag ruleset(s) protect {tag_pattern} ({names})"
+        )
+    else:
+        failures.append(
+            f"{repository}: no active repository ruleset protects {tag_pattern}; "
+            "a tag-push can point a release tag at an arbitrary commit"
         )
 
     permissions = actions_permissions(request_json, repository)
@@ -599,7 +662,14 @@ def run_self_test() -> None:
                 "target": "branch",
                 "enforcement": "active",
                 "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
-            }
+            },
+            {
+                "id": 50,
+                "name": "release tag gate",
+                "target": "tag",
+                "enforcement": "active",
+                "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+            },
         ],
     )
     responses["/repos/acme/clarion/rulesets/43"] = ApiResponse(
@@ -627,6 +697,29 @@ def run_self_test() -> None:
     )
     notes = check_governance(fake_get, "acme/clarion", "main")
     assert any("active ruleset 'main release gate'" in note for note in notes)
+    assert any("active tag ruleset(s) protect refs/tags/v*" in note for note in notes)
+
+    # Tag protection absent (GOV-02): a fully-protected branch but no tag
+    # ruleset must still fail — a tag-push could point a release tag at an
+    # arbitrary commit.
+    responses["/repos/acme/clarion/rulesets"] = ApiResponse(
+        200,
+        [
+            {
+                "id": 43,
+                "name": "main release gate",
+                "target": "branch",
+                "enforcement": "active",
+                "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
+            }
+        ],
+    )
+    try:
+        check_governance(fake_get, "acme/clarion", "main")
+    except CheckError as exc:
+        assert "no active repository ruleset protects refs/tags/v*" in str(exc)
+    else:
+        raise AssertionError("missing tag ruleset fixture should fail")
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)

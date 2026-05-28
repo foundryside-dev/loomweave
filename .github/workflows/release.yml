@@ -31,6 +31,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+
+      - name: Assert tagged commit is on main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || \
+            { echo "::error::tag does not point to a commit on main"; exit 1; }
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
@@ -116,6 +124,12 @@ jobs:
 
       - name: WP5 secret scanner smoke
         run: CARGO_BUILD=0 bash tests/e2e/wp5_secret_scan.sh
+
+      - name: Sprint 2 MCP surface
+        run: CARGO_BUILD=0 bash tests/e2e/sprint_2_mcp_surface.sh
+
+      - name: Phase 3 subsystems
+        run: CARGO_BUILD=0 bash tests/e2e/phase3_subsystems.sh
 
   release-governance:
     name: GitHub release governance
@@ -220,7 +234,7 @@ jobs:
           while IFS= read -r -d '' asset; do
             digest=$(sha256sum "$asset" | cut -d' ' -f1)
             printf '%s  %s\n' "$digest" "$(basename "$asset")"
-          done < <(find artifacts -name 'clarion-*.tar.gz' -print0 | sort -z) > rust-subjects.txt
+          done < <(find artifacts \( -name 'clarion-*.tar.gz' -o -name 'clarion_plugin_python*.tar.gz' \) -print0 | sort -z) > rust-subjects.txt
           test -s rust-subjects.txt
           echo "rust-subjects=$(base64 -w0 rust-subjects.txt)" >> "$GITHUB_OUTPUT"
 
@@ -407,3 +421,69 @@ jobs:
       upload-assets: true
       upload-tag-name: ${{ github.ref_name }}
       provenance-name: clarion-rust-binaries.intoto.jsonl
+
+  verify-published-release:
+    name: Verify published release assets
+    needs: [release]
+    runs-on: ubuntu-latest
+    # Post-publish gate: prove the assets actually served from the public
+    # GitHub Release match the signed local copies. The in-`release`-job
+    # `cosign verify-blob` only proves signing worked on the build runner; it
+    # does not prove the published download matches. This job downloads the
+    # public assets, recomputes SHA256 against the published `.sha256`
+    # sidecars, and re-verifies the cosign signatures against the public Rekor
+    # entries.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+    steps:
+      - name: install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
+
+      - name: download published assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p published
+          cd published
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern '*.tar.gz' \
+            --pattern '*.tar.gz.sha256' \
+            --pattern '*.tar.gz.sig' \
+            --pattern '*.tar.gz.pem'
+          ls -la
+
+      - name: recompute SHA256 against published checksums
+        run: |
+          set -euo pipefail
+          cd published
+          shopt -s nullglob
+          checksums=(*.tar.gz.sha256)
+          if [ ${#checksums[@]} -eq 0 ]; then
+            echo "::error::no .sha256 sidecars found in the published release" >&2
+            exit 1
+          fi
+          for sum in "${checksums[@]}"; do
+            sha256sum -c "$sum"
+          done
+
+      - name: cosign verify published archives against Rekor
+        run: |
+          set -euo pipefail
+          cd published
+          shopt -s nullglob
+          archives=(*.tar.gz)
+          if [ ${#archives[@]} -eq 0 ]; then
+            echo "::error::no .tar.gz archives found in the published release" >&2
+            exit 1
+          fi
+          for asset in "${archives[@]}"; do
+            cosign verify-blob \
+              --certificate "$asset.pem" \
+              --signature "$asset.sig" \
+              --certificate-identity-regexp "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/v.*" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "$asset"
+          done
