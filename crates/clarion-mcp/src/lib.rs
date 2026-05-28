@@ -38,6 +38,35 @@ use crate::filigree::{EntityAssociation, EntityAssociationsResponse, FiligreeLoo
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 const EMPTY_GUIDANCE_FINGERPRINT: &str = "guidance-empty";
 
+/// The bundled clarion-workflow skill text, embedded for the `prompts/get`
+/// surface and reused as the canonical orientation reference. Same file the
+/// CLI installs on disk.
+pub const CLARION_WORKFLOW_SKILL: &str =
+    include_str!("../../clarion-cli/assets/skills/clarion-workflow/SKILL.md");
+
+/// Static orientation text returned in the MCP `initialize` result's
+/// `instructions` field. Kept consistent with `list_tools()` and the
+/// clarion-workflow skill.
+const SERVER_INSTRUCTIONS: &str = "\
+Clarion is a code-archaeology server: it has pre-extracted this project into a \
+queryable map of entities (functions, classes, modules, files), the call / \
+reference / import edges between them, and subsystem clusters. Ask Clarion \
+instead of re-reading or grepping the tree.
+
+Entity IDs are `{plugin}:{kind}:{qualified_name}` (e.g. \
+`python:function:pkg.mod.func`); subsystems are `core:subsystem:{hash}`. You \
+almost never type IDs — get one from `find_entity` or `entity_at`, then copy it \
+verbatim into the next tool.
+
+Tools: find_entity, entity_at, callers_of, neighborhood, execution_paths_from, \
+subsystem_members, summary, issues_for. `callers_of` / `neighborhood` / \
+`execution_paths_from` take a `confidence` tier (resolved | ambiguous | \
+inferred; default resolved).
+
+For the full workflow see the clarion-workflow skill (installed by \
+`clarion install --skills`), or read the `clarion-workflow` prompt. Live \
+project counts and index freshness are in the `clarion://context` resource.";
+
 type InferredInflight =
     Arc<AsyncMutex<HashMap<InferredEdgeCacheKey, broadcast::Sender<InferredDispatchOutcome>>>>;
 
@@ -2061,12 +2090,15 @@ fn initialize_result() -> Value {
     json!({
         "protocolVersion": MCP_PROTOCOL_VERSION,
         "capabilities": {
-            "tools": {}
+            "tools": {},
+            "prompts": {},
+            "resources": {}
         },
         "serverInfo": {
             "name": "clarion",
             "version": env!("CARGO_PKG_VERSION")
-        }
+        },
+        "instructions": SERVER_INSTRUCTIONS
     })
 }
 
@@ -2921,6 +2953,21 @@ mod tests {
         );
         assert_eq!(response["result"]["serverInfo"]["name"], "clarion");
         assert!(response["result"]["capabilities"]["tools"].is_object());
+        // Orientation instructions present and mention the skill + entity model.
+        let instructions = response["result"]["instructions"]
+            .as_str()
+            .expect("initialize result has instructions");
+        assert!(
+            instructions.contains("clarion-workflow"),
+            "instructions should point at the skill"
+        );
+        assert!(
+            instructions.contains("entity"),
+            "instructions should describe the entity model"
+        );
+        // Prompts + resources capabilities advertised alongside tools.
+        assert!(response["result"]["capabilities"]["prompts"].is_object());
+        assert!(response["result"]["capabilities"]["resources"].is_object());
     }
 
     #[test]
