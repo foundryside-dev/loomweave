@@ -142,5 +142,8 @@ fn install_all_is_rerunnable_and_preserves_index() {
         "skill missing after rerun"
     );
     let raw = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
-    assert!(raw.contains("clarion hook session-start"), "hook missing after rerun");
+    assert!(
+        raw.contains("clarion hook session-start"),
+        "hook missing after rerun"
+    );
 }
