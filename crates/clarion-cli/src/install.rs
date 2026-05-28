@@ -105,6 +105,9 @@ runs/*/log.jsonl
 pub struct InstallComponents {
     pub init_clarion: bool,
     pub skills: bool,
+    // Read by the --hooks merge wired in Phase 4; carried through now so the
+    // CLI flag plumbing lands with the rest of the install-component surface.
+    #[allow(dead_code)]
     pub hooks: bool,
 }
 

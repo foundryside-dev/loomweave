@@ -101,8 +101,7 @@ fn stage_and_swap(root: &Path, dest: &Path, fingerprint: &str) -> Result<()> {
     for (rel, contents) in SKILL_PACK {
         let target = staging.join(rel);
         if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("mkdir {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
         }
         fs::write(&target, contents).with_context(|| format!("write {}", target.display()))?;
     }
@@ -178,9 +177,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         install_skill_pack(dir.path()).unwrap();
         // Corrupt one installed copy + its fingerprint to simulate drift.
-        let skill = dir
-            .path()
-            .join(".claude/skills/clarion-workflow/SKILL.md");
+        let skill = dir.path().join(".claude/skills/clarion-workflow/SKILL.md");
         std::fs::write(&skill, "STALE").unwrap();
         let fp = dir
             .path()
@@ -190,6 +187,9 @@ mod tests {
         let report = install_skill_pack(dir.path()).unwrap();
         assert!(report.copied, "drift should trigger re-copy");
         let body = std::fs::read_to_string(&skill).unwrap();
-        assert!(body.contains("name: clarion-workflow"), "drift not repaired");
+        assert!(
+            body.contains("name: clarion-workflow"),
+            "drift not repaired"
+        );
     }
 }

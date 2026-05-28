@@ -31,7 +31,7 @@ pub enum Command {
         #[arg(long)]
         skills: bool,
 
-        /// Merge a SessionStart hook into .claude/settings.json.
+        /// Merge a `SessionStart` hook into .claude/settings.json.
         #[arg(long)]
         hooks: bool,
 

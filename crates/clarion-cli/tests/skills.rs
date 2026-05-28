@@ -46,9 +46,7 @@ fn install_skills_is_idempotent() {
             .assert()
             .success();
     }
-    let body = fs::read_to_string(
-        dir.path().join(".claude/skills/clarion-workflow/SKILL.md"),
-    )
-    .unwrap();
+    let body =
+        fs::read_to_string(dir.path().join(".claude/skills/clarion-workflow/SKILL.md")).unwrap();
     assert!(body.contains("name: clarion-workflow"));
 }
