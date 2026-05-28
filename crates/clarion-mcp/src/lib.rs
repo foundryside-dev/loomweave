@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod filigree;
+pub mod snapshot;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
