@@ -180,6 +180,48 @@ async fn analyze_start_rejects_a_second_concurrent_run() {
     call_tool(&state, "analyze_cancel", json!({"run_id": &run_id})).await;
 }
 
+/// Seed a `runs` row directly, bypassing the registry, so `analyze_status`
+/// takes the `Absent → read_run_row → terminal_status_envelope` path.
+fn seed_run(db_path: &Path, id: &str, run_status: &str, stats_json: &str) {
+    let conn = Connection::open(db_path).expect("open db");
+    conn.execute(
+        "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+         VALUES (?1, '2026-01-01T00:00:00.000Z', '2026-01-01T00:01:00.000Z', '{}', ?2, ?3)",
+        rusqlite::params![id, stats_json, run_status],
+    )
+    .expect("insert runs row");
+}
+
+#[tokio::test]
+async fn analyze_status_maps_terminal_run_states_from_the_runs_table() {
+    let (project, db_path) = open_project();
+    let stub = write_stub(project.path());
+    let state = state_for(project.path(), &db_path, &stub);
+
+    seed_run(&db_path, "r-done", "completed", "{}");
+    seed_run(&db_path, "r-fail", "failed", "{}");
+    seed_run(&db_path, "r-skip", "skipped_no_plugins", "{}");
+    // A cancelled run is recorded as `failed` + stats.terminal_reason; the
+    // status tool must surface it as cancelled, not failed (decomposition B).
+    seed_run(
+        &db_path,
+        "r-cancel",
+        "failed",
+        r#"{"terminal_reason":"cancelled"}"#,
+    );
+
+    for (id, expected) in [
+        ("r-done", "completed"),
+        ("r-fail", "failed"),
+        ("r-skip", "skipped_no_plugins"),
+        ("r-cancel", "cancelled"),
+    ] {
+        let resp = call_tool(&state, "analyze_status", json!({"run_id": id})).await;
+        assert_eq!(resp["ok"], true, "{resp:?}");
+        assert_eq!(resp["result"]["status"], expected, "run {id}: {resp:?}");
+    }
+}
+
 #[tokio::test]
 async fn analyze_status_for_unknown_run_is_not_found() {
     let (project, db_path) = open_project();
