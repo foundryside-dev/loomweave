@@ -80,6 +80,16 @@ pub enum Command {
         #[arg(long, value_name = "RUN_ID", conflicts_with = "run_id")]
         resume: Option<String>,
 
+        /// After emitting findings, ask Filigree to soft-archive its own
+        /// `unseen_in_latest` Clarion findings older than
+        /// `integrations.filigree.prune_unseen_days` (default 30)
+        /// (REQ-FINDING-06). Opt-in retention sweep; enrich-only — a Filigree
+        /// outage or the integration being disabled never fails the run. The
+        /// sweep is `scan_source`-scoped server-side, so it only touches
+        /// Clarion's findings.
+        #[arg(long)]
+        prune_unseen: bool,
+
         /// Write structured progress (phase, current plugin, processed/total
         /// files, current file, heartbeat) to this path as the run proceeds,
         /// so `analyze_status` can report progress without log scraping.

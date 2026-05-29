@@ -1,17 +1,36 @@
 # Request to Filigree — `scan_source`-scoped finding retention/prune surface (+ scan-run-create contract decision)
 
-**Status:** Request / open (2026-05-30)
+> **⚠️ PRUNE ASK WITHDRAWN / SUPERSEDED (2026-05-30).** The prune surface this
+> memo requested **already exists** in Filigree:
+> `POST /api/loom/findings/clean-stale` with body
+> `{"scan_source": "clarion", "older_than_days": 30, "actor": "…"}` →
+> `{"findings_fixed": N, "scan_source": "…", "older_than_days": N}`. It
+> soft-archives `unseen_in_latest` findings to `fixed` (auto-reopen on
+> reappearance; Filigree ADR-015), `scan_source` required server-side as an
+> accident-guard. Verified against Filigree's handler
+> (`src/filigree/dashboard_routes/files.py`) and its API tests. Clarion's
+> `--prune-unseen` now consumes it directly (REQ-FINDING-06 done); the contract
+> is pinned in `docs/federation/contracts.md` → "Consumed Filigree route:
+> clean-stale retention". My §1–§3 and §5 below (asking Filigree to *design and
+> build* a prune surface) are therefore **moot** — the original "no prune route
+> exists" premise was wrong. **§4 (scan-run-create contract decision) is the
+> only live ask** and remains open.
+
+**Status:** Prune ask withdrawn; §4 (scan-run-create) open (2026-05-30)
 **Author side:** Clarion
-**Tracking issue (Clarion):** `clarion-dd29e69e0e` (REQ-FINDING-05/-06 lifecycle tail)
-**Blocks (Clarion-side):** `clarion analyze --prune-unseen` (REQ-FINDING-06); informs the Phase-0 scan-run-create decision (REQ-FINDING-05).
+**Tracking issue (Clarion):** §4 tracked under a `release:1.1` issue (Phase-0 scan-run-create handshake); the prune/`--prune-unseen` piece of `clarion-dd29e69e0e` is done.
 **Sibling docs:**
-- Clarion `docs/federation/contracts.md` → "Consumed Filigree route: scan-results intake (finding emission)" — the wire shape Clarion emits against today.
+- Clarion `docs/federation/contracts.md` → "Consumed Filigree route: clean-stale retention" (the route Clarion now consumes) and "…: scan-results intake".
 - Clarion `docs/clarion/1.0/requirements.md` → REQ-FINDING-05, REQ-FINDING-06.
 - Filigree intake handler for reference: `db.process_scan_results` (`db_files.py:857-926`, per ADR-014).
 
 > **Note on placement.** This is a Clarion-authored *request to* Filigree, kept here for Clarion's reference. The authoritative Filigree-side artifact (design + implementation) should live in the Filigree repo; refresh `docs/federation/filigree-side/` with a mirror once Filigree drafts its response.
 
 ---
+
+> The §1–§3 / §5 prune-design sections below are retained only as a record of
+> the (mistaken) original request; see the withdrawal banner above. Skip to §4
+> for the live question.
 
 ## 1. Problem in one paragraph
 

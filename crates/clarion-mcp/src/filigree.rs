@@ -7,7 +7,8 @@ use thiserror::Error;
 
 use crate::config::FiligreeConfig;
 use crate::scan_results::{
-    ScanResultsRequest, ScanResultsResponse, parse_scan_results_response, scan_results_url,
+    CleanStaleRequest, CleanStaleResponse, ScanResultsRequest, ScanResultsResponse,
+    clean_stale_url, parse_clean_stale_response, parse_scan_results_response, scan_results_url,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -58,6 +59,12 @@ pub enum FiligreeClientError {
 
     #[error("invalid Filigree scan-results response: {0}")]
     InvalidScanResultsResponse(#[source] serde_json::Error),
+
+    #[error("POST Filigree clean-stale: {0}")]
+    CleanStaleRequest(#[source] reqwest::Error),
+
+    #[error("invalid Filigree clean-stale response: {0}")]
+    InvalidCleanStaleResponse(#[source] serde_json::Error),
 
     #[error(transparent)]
     Contract(#[from] FiligreeContractError),
@@ -154,6 +161,49 @@ impl FiligreeHttpClient {
             });
         }
         parse_scan_results_response(&body).map_err(FiligreeClientError::InvalidScanResultsResponse)
+    }
+
+    /// POST a retention sweep to Filigree's `clean-stale` route (REQ-FINDING-06,
+    /// `--prune-unseen`). One-way Clarion→Filigree call; Filigree soft-archives
+    /// its own `unseen_in_latest` findings for the given `scan_source`. The
+    /// `scan_source` scoping is enforced server-side, so this can only sweep
+    /// Clarion's findings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FiligreeClientError::CleanStaleRequest`] on transport failure,
+    /// [`FiligreeClientError::HttpStatus`] on a non-success response, or
+    /// [`FiligreeClientError::InvalidCleanStaleResponse`] when the body is not
+    /// the expected shape.
+    pub fn post_clean_stale(
+        &self,
+        request: &CleanStaleRequest,
+    ) -> Result<CleanStaleResponse, FiligreeClientError> {
+        let mut http_request = self
+            .client
+            .post(clean_stale_url(&self.base_url))
+            .header("accept", "application/json")
+            .json(request);
+        if !self.actor.trim().is_empty() {
+            http_request = http_request.header("x-filigree-actor", self.actor.as_str());
+        }
+        if let Some(token) = &self.token {
+            http_request = http_request.bearer_auth(token);
+        }
+        let response = http_request
+            .send()
+            .map_err(FiligreeClientError::CleanStaleRequest)?;
+        let status = response.status();
+        let body = response
+            .text()
+            .map_err(FiligreeClientError::CleanStaleRequest)?;
+        if !status.is_success() {
+            return Err(FiligreeClientError::HttpStatus {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        parse_clean_stale_response(&body).map_err(FiligreeClientError::InvalidCleanStaleResponse)
     }
 }
 
@@ -339,6 +389,7 @@ mod tests {
             token_env: "TEST_FILIGREE_TOKEN".to_owned(),
             timeout_seconds: 1,
             emit_findings: true,
+            prune_unseen_days: 30,
         };
         let client = FiligreeHttpClient::from_config(&config, |name| {
             (name == "TEST_FILIGREE_TOKEN").then(|| "secret-token".to_owned())
@@ -482,6 +533,7 @@ mod tests {
             token_env: "TEST_FILIGREE_TOKEN".to_owned(),
             timeout_seconds: 1,
             emit_findings: true,
+            prune_unseen_days: 30,
         };
         let client = FiligreeHttpClient::from_config(&config, |name| {
             (name == "TEST_FILIGREE_TOKEN").then(|| "secret-token".to_owned())
@@ -568,6 +620,7 @@ mod tests {
             token_env: "TEST_FILIGREE_TOKEN".to_owned(),
             timeout_seconds: 1,
             emit_findings: true,
+            prune_unseen_days: 30,
         };
         FiligreeHttpClient::from_config(&config, |_| None)
             .expect("build client")

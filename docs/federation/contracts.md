@@ -513,10 +513,12 @@ POST {filigree_base}/api/v1/scan-results
     batch. **`--resume` is implemented** (REQ-FINDING-05): it reopens the prior
     run's `runs` row instead of inserting a fresh one and re-walks idempotently
     (entities and run-scoped findings UPSERT). It re-walks the tree from scratch
-    (not incremental recovery) and assumes an unchanged corpus — findings that
-    no longer fire are not pruned from the resumed run (that is the deferred
-    `--prune-unseen` surface). The emitted `mark_unseen` value is recorded in
-    the run's `stats.json` `filigree_emission` block.
+    (not incremental recovery) and assumes an unchanged corpus. Because a resume
+    emits `mark_unseen=false`, it never creates `unseen_in_latest` state, so the
+    `--prune-unseen` sweep (below) does not interact with resumes — prune is
+    meaningful only after normal `mark_unseen=true` runs. The emitted
+    `mark_unseen` value is recorded in the run's `stats.json` `filigree_emission`
+    block.
   - `create_observations` is always `false` — Clarion emits findings, not
     observations.
   - `severity` is the **wire** vocabulary, mapped from Clarion's internal value:
@@ -571,3 +573,66 @@ coercion rule and the response fields); there is **no recurring end-to-end test
 against a live Filigree**. A shape change on Filigree's side would be caught by
 re-probing, not by CI — re-pin `parses_live_response_shape` if the live intake
 changes.
+
+## Consumed Filigree route: clean-stale retention (`--prune-unseen`)
+
+`clarion analyze --prune-unseen` asks Filigree to run a retention sweep over its
+own findings (REQ-FINDING-06). This is a **loom-generation** route, distinct
+from the classic `/api/v1/scan-results` emission intake.
+
+```
+POST {filigree_base}/api/loom/findings/clean-stale
+```
+
+- **Headers** — `accept: application/json`, optional `x-filigree-actor` and
+  `Authorization: Bearer <token>` (same posture as scan-results; Filigree's
+  trust boundary for this route is loopback binding, not inbound auth).
+- **Request body**
+
+  ```json
+  {
+    "scan_source": "clarion",
+    "older_than_days": 30,
+    "actor": "clarion-mcp"
+  }
+  ```
+
+  - `scan_source` is **required** server-side as an accident-guard (Filigree's
+    core treats absent as "all sources", which the route refuses to expose).
+    Clarion always sends `"clarion"`, so the sweep can only touch Clarion's
+    findings — it can never affect Wardline's or any other tool's.
+  - `older_than_days` comes from `integrations.filigree.prune_unseen_days`
+    (default 30); a non-negative integer. `0` sweeps the whole current unseen
+    backlog.
+  - `actor` is Clarion's configured actor, for Filigree's audit trail.
+
+- **Semantics — soft-archive, not delete.** Filigree moves its
+  `unseen_in_latest` findings older than the threshold to `fixed` status
+  (audit-preserving); a finding that reappears in a later scan auto-reopens
+  (`fixed` → `open`) with its `seen_count` intact. Filigree owns the finding
+  lifecycle and chose this audit-preserving policy; REQ-FINDING-06's "removes"
+  is realised as soft-archive. See Filigree ADR-015.
+
+- **`200` response body** — parsed with unknown fields ignored / missing fields
+  defaulted:
+
+  ```json
+  { "findings_fixed": 4, "scan_source": "clarion", "older_than_days": 30 }
+  ```
+
+- **Enrich-only.** The sweep runs after emission (Phase 8b) for the same
+  non-hard-failed outcomes. A Filigree outage, a non-`2xx`, or the integration
+  being disabled is recorded in the `filigree_prune` stats blob (status
+  `unreachable` / `skipped`) and the `CLA-INFRA-FILIGREE-UNREACHABLE` log — the
+  analyze run still completes successfully. Prune keys on `unseen_in_latest`,
+  which only `mark_unseen=true` (normal) runs create; a `--resume`
+  (`mark_unseen=false`) run produces no unseen state for prune to sweep.
+
+**Verification scope.** Same posture as the emission intake: the wire shape is
+checked by `clean_stale_*` unit tests in
+[`scan_results.rs`](../../crates/clarion-mcp/src/scan_results.rs) and exercised
+end-to-end against a *mock* Filigree (`analyze_prune_unseen_*` in
+[`analyze.rs`](../../crates/clarion-cli/tests/analyze.rs), covering the
+post-after-emission path, the unreachable degrade, and the disabled no-op). The
+route shape was read from Filigree's own handler + API tests; there is **no
+recurring end-to-end test against a live Filigree**.

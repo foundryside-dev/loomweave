@@ -211,6 +211,52 @@ pub fn scan_results_url(base_url: &str) -> String {
     format!("{}/api/v1/scan-results", base_url.trim_end_matches('/'))
 }
 
+/// The retention-sweep URL for a Filigree base URL (REQ-FINDING-06,
+/// `--prune-unseen`). This is a **loom-generation** route (`/api/loom/…`),
+/// unlike the classic `/api/v1/scan-results` emission intake — do not derive it
+/// from [`scan_results_url`]. Verified against Filigree's own route handler and
+/// API tests.
+#[must_use]
+pub fn clean_stale_url(base_url: &str) -> String {
+    format!(
+        "{}/api/loom/findings/clean-stale",
+        base_url.trim_end_matches('/')
+    )
+}
+
+/// The `POST /api/loom/findings/clean-stale` request body (REQ-FINDING-06).
+/// Filigree **soft-archives** `unseen_in_latest` findings older than
+/// `older_than_days`, scoped to `scan_source`, moving them to `fixed` status
+/// (they auto-reopen if a later scan re-detects them — see Filigree ADR-015).
+/// `scan_source` is required server-side as an accident-guard so a caller
+/// cannot sweep every tool's findings; Clarion always sends `"clarion"`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CleanStaleRequest {
+    pub scan_source: String,
+    pub older_than_days: u32,
+    pub actor: String,
+}
+
+/// Filigree's clean-stale response. `#[serde(default)]` keeps the read tolerant
+/// of added fields / missing keys so Filigree can grow the route.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct CleanStaleResponse {
+    pub findings_fixed: u64,
+    pub scan_source: String,
+    pub older_than_days: u64,
+}
+
+/// Parse Filigree's clean-stale response body.
+///
+/// # Errors
+///
+/// Returns the underlying [`serde_json::Error`] if the body is not the expected
+/// shape.
+pub fn parse_clean_stale_response(body: &str) -> Result<CleanStaleResponse, serde_json::Error> {
+    serde_json::from_str(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,5 +482,52 @@ mod tests {
             scan_results_url("http://127.0.0.1:8542"),
             "http://127.0.0.1:8542/api/v1/scan-results"
         );
+    }
+
+    #[test]
+    fn clean_stale_url_targets_the_loom_route() {
+        // Prune is a loom-generation route, distinct from the classic
+        // /api/v1 emission intake.
+        assert_eq!(
+            clean_stale_url("http://127.0.0.1:8542/"),
+            "http://127.0.0.1:8542/api/loom/findings/clean-stale"
+        );
+        assert_eq!(
+            clean_stale_url("http://127.0.0.1:8542"),
+            "http://127.0.0.1:8542/api/loom/findings/clean-stale"
+        );
+    }
+
+    #[test]
+    fn clean_stale_request_serializes_to_filigree_wire_shape() {
+        let request = CleanStaleRequest {
+            scan_source: CLARION_SCAN_SOURCE.to_owned(),
+            older_than_days: 30,
+            actor: "clarion-mcp".to_owned(),
+        };
+        let value = serde_json::to_value(&request).expect("serialize clean-stale request");
+        assert_eq!(value["scan_source"], json!("clarion"));
+        assert_eq!(value["older_than_days"], json!(30));
+        assert_eq!(value["actor"], json!("clarion-mcp"));
+    }
+
+    #[test]
+    fn parses_clean_stale_response_shape() {
+        // Pinned to Filigree's clean-stale handler response.
+        let response = parse_clean_stale_response(
+            r#"{"findings_fixed": 4, "scan_source": "clarion", "older_than_days": 30}"#,
+        )
+        .expect("parse clean-stale response");
+        assert_eq!(response.findings_fixed, 4);
+        assert_eq!(response.scan_source, "clarion");
+        assert_eq!(response.older_than_days, 30);
+    }
+
+    #[test]
+    fn clean_stale_response_tolerates_missing_and_extra_fields() {
+        let response = parse_clean_stale_response(r#"{"findings_fixed": 1, "future_field": true}"#)
+            .expect("parse forward-compatible clean-stale response");
+        assert_eq!(response.findings_fixed, 1);
+        assert_eq!(response.older_than_days, 0);
     }
 }

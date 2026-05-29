@@ -1468,3 +1468,192 @@ fn analyze_resume_reuses_run_row_and_emits_mark_unseen_false() {
         "stats.json records the resume emit ran with mark_unseen=false: {stats}",
     );
 }
+
+/// REQ-FINDING-06 `--prune-unseen`: after emission, analyze POSTs a retention
+/// sweep to Filigree's loom `clean-stale` route, scoped to `scan_source=clarion`,
+/// and records the soft-archive count in `stats.json`. End-to-end through a mock
+/// Filigree that accepts both the emission POST and the prune POST.
+#[cfg(unix)]
+#[test]
+fn analyze_prune_unseen_posts_clean_stale_after_emission() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock filigree");
+    let addr = listener.local_addr().expect("local addr");
+    // One body satisfies both parsers (serde(default) ignores the other's
+    // fields): scan-results counts + clean-stale counts.
+    let server = std::thread::spawn(move || {
+        let body = r#"{"files_created":0,"files_updated":0,"findings_created":0,"findings_updated":0,"new_finding_ids":[],"observations_created":0,"observations_failed":0,"warnings":[],"findings_fixed":2,"scan_source":"clarion","older_than_days":30}"#;
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept POST");
+            let mut buf = [0_u8; 8192];
+            let read = stream.read(&mut buf).expect("read request");
+            requests.push(String::from_utf8_lossy(&buf[..read]).into_owned());
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write response");
+        }
+        requests
+    });
+
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_phase3_plugin(plugin_dir.path());
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    for stem in ["weak_a", "weak_b"] {
+        std::fs::write(project_dir.path().join(format!("{stem}.p3")), b"module\n")
+            .expect("write phase3 fixture file");
+    }
+    let config_path = project_dir.path().join("phase3-clarion.yaml");
+    std::fs::write(
+        &config_path,
+        phase3_config_with_filigree(2, &format!("http://{addr}")),
+    )
+    .expect("write phase3 config");
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+
+    clarion_bin()
+        .args(["analyze", "--config"])
+        .arg(&config_path)
+        .arg("--prune-unseen")
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    let requests = server.join().expect("mock server thread");
+    assert!(
+        requests[0].contains("POST /api/v1/scan-results HTTP/1.1"),
+        "first POST is the emission intake: {}",
+        requests[0],
+    );
+    assert!(
+        requests[1].contains("POST /api/loom/findings/clean-stale HTTP/1.1"),
+        "second POST is the loom clean-stale sweep: {}",
+        requests[1],
+    );
+    assert!(
+        requests[1].contains("\"scan_source\":\"clarion\""),
+        "prune is scoped to scan_source=clarion: {}",
+        requests[1],
+    );
+
+    let stats = latest_run_stats(project_dir.path());
+    assert_eq!(
+        stats["filigree_prune"]["status"].as_str(),
+        Some("pruned"),
+        "stats.json records the prune sweep: {stats}",
+    );
+    assert_eq!(
+        stats["filigree_prune"]["findings_fixed"].as_u64(),
+        Some(2),
+        "prune records Filigree's soft-archive count: {stats}",
+    );
+}
+
+/// REQ-FINDING-06 `--prune-unseen` is enrich-only: with Filigree unreachable the
+/// analyze run still completes and the sweep failure is recorded in `stats.json`
+/// as `CLA-INFRA-FILIGREE-UNREACHABLE` — never failing the run.
+#[cfg(unix)]
+#[test]
+fn analyze_prune_unseen_is_best_effort_when_filigree_unreachable() {
+    let project_dir = run_phase3_fixture(
+        &["weak_a", "weak_b"],
+        &phase3_config_with_filigree(2, "http://127.0.0.1:1"),
+    );
+
+    // run_phase3_fixture does not pass --prune-unseen; re-run analyze with it.
+    // (A second run is fine — analyze is idempotent.) Filigree is unreachable
+    // (port 1), so both emission and prune fail soft.
+    let plugin = tempfile::tempdir().unwrap();
+    write_phase3_plugin(plugin.path());
+    let config_path = project_dir.path().join("phase3-clarion.yaml");
+    let plugin_path = std::env::join_paths(std::iter::once(plugin.path().to_path_buf())).unwrap();
+    clarion_bin()
+        .args(["analyze", "--config"])
+        .arg(&config_path)
+        .arg("--prune-unseen")
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    let run_status: String = conn
+        .query_row(
+            "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        run_status, "completed",
+        "Filigree being unreachable must not fail the prune run",
+    );
+    let stats = latest_run_stats(project_dir.path());
+    assert_eq!(
+        stats["filigree_prune"]["status"].as_str(),
+        Some("unreachable"),
+        "prune failure recorded, not propagated: {stats}",
+    );
+    assert_eq!(
+        stats["filigree_prune"]["rule_id"].as_str(),
+        Some("CLA-INFRA-FILIGREE-UNREACHABLE"),
+    );
+}
+
+/// `--prune-unseen` with the Filigree integration disabled is a logged no-op,
+/// not an error: the run completes and `stats.json` records the skip.
+#[cfg(unix)]
+#[test]
+fn analyze_prune_unseen_noops_when_filigree_disabled() {
+    // phase3_config (no `integrations.filigree`) leaves the integration
+    // disabled by default.
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_phase3_plugin(plugin_dir.path());
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    for stem in ["weak_a", "weak_b"] {
+        std::fs::write(project_dir.path().join(format!("{stem}.p3")), b"module\n")
+            .expect("write phase3 fixture file");
+    }
+    let config_path = project_dir.path().join("phase3-clarion.yaml");
+    std::fs::write(&config_path, phase3_config(2)).expect("write phase3 config");
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+
+    clarion_bin()
+        .args(["analyze", "--config"])
+        .arg(&config_path)
+        .arg("--prune-unseen")
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    let stats = latest_run_stats(project_dir.path());
+    assert_eq!(
+        stats["filigree_prune"]["status"].as_str(),
+        Some("skipped"),
+        "prune is a no-op when Filigree is disabled: {stats}",
+    );
+    assert_eq!(
+        stats["filigree_prune"]["reason"].as_str(),
+        Some("filigree_disabled"),
+    );
+}

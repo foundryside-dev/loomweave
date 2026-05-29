@@ -361,7 +361,7 @@ Clarion's `run_id` maps 1:1 onto Filigree's `scan_run_id`. Phase 0 of `clarion a
 
 #### REQ-FINDING-06 — Dedup policy for moved entities
 
-> **Partially implemented (WP9-B core, post-1.0 `release:1.1`).** Clarion POSTs with `mark_unseen=true` by default (Phase 8), so old-position findings transition to `unseen_in_latest`. **Deferred (tracked under [clarion-dd29e69e0e](#)):** the `--prune-unseen` flag is absent. It is blocked on a Filigree-side prune/retention surface — no delete/prune-unseen route exists in `FiligreeHttpClient` or the pinned federation contract — so it cannot be implemented Clarion-side alone.
+> **Implemented (WP9-B, post-1.0 `release:1.1`).** Clarion POSTs with `mark_unseen=true` by default (Phase 8), so old-position findings transition to `unseen_in_latest`. `clarion analyze --prune-unseen` (Phase 8b) then POSTs Filigree's `POST /api/loom/findings/clean-stale` retention route (contract pinned in [`docs/federation/contracts.md`](../../federation/contracts.md)), scoped to `scan_source=clarion`, with the age threshold from `integrations.filigree.prune_unseen_days` (default 30). **Note — soft-archive, not delete:** Filigree owns the finding lifecycle and realises "removes" as an audit-preserving soft-archive (`unseen_in_latest` → `fixed`, auto-reopens on reappearance; Filigree ADR-015). Enrich-only: a Filigree outage or disabled integration is recorded in `stats.json` (`filigree_prune`), never fails the run.
 
 Clarion POSTs findings with `mark_unseen=true` by default so that old-position findings for the same rule on the same file transition to `unseen_in_latest` when the entity moves within the file. `clarion analyze --prune-unseen` removes `unseen_in_latest` findings older than 30 days (configurable).
 

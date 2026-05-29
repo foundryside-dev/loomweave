@@ -48,6 +48,7 @@ fn main() -> Result<()> {
             confirm_allow_unredacted_secrets,
             run_id,
             resume,
+            prune_unseen,
             progress_file,
         } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -70,6 +71,7 @@ fn main() -> Result<()> {
                     secret_scan,
                     run_id,
                     resume_run_id: resume,
+                    prune_unseen,
                     progress_file,
                 },
             ))

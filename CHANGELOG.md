@@ -57,12 +57,22 @@ only when an incompatible change is made to that surface. See
   idempotent: entities and run-scoped findings now both UPSERT on `id`
   (previously only entities did), so a resumed run reproduces the same durable
   graph as the original. The emitted `mark_unseen` value is recorded in
-  `stats.json`. Tracked under clarion-dd29e69e0e. **Still deferred from that
-  issue:** the Phase-0 scan-run create handshake (an open contract question with
-  Filigree — Clarion currently relies on the peer tolerating an unknown
-  `scan_run_id`) and `--prune-unseen` (REQ-FINDING-06), which is blocked on a
-  Filigree-side prune/retention surface that does not yet exist (request filed
-  in [`docs/federation/2026-05-30-prune-unseen-filigree-request.md`](docs/federation/2026-05-30-prune-unseen-filigree-request.md)).
+  `stats.json`. Tracked under clarion-dd29e69e0e.
+- **`clarion analyze --prune-unseen` (WP9-B, REQ-FINDING-06).** After emission
+  (Phase 8b), POSTs Filigree's `POST /api/loom/findings/clean-stale` retention
+  route, scoped to `scan_source=clarion`, asking it to soft-archive its own
+  `unseen_in_latest` Clarion findings older than
+  `integrations.filigree.prune_unseen_days` (default 30). Soft-archive, not
+  delete: Filigree moves them to `fixed` and auto-reopens on reappearance
+  (Filigree ADR-015). Enrich-only — a Filigree outage or the integration being
+  disabled is recorded in `stats.json` (`filigree_prune`) and never fails the
+  run; the `scan_source` scoping is enforced server-side so the sweep can only
+  touch Clarion's findings. (Closes the REQ-FINDING-06 piece of
+  clarion-dd29e69e0e; the route was found to already exist in Filigree, so the
+  earlier "file a request" memo is superseded — see its withdrawal banner.) The
+  remaining Phase-0 scan-run-create handshake is an open contract question with
+  Filigree (Clarion relies on the peer tolerating an unknown `scan_run_id`),
+  tracked separately under `release:1.1`.
 
 ### Changed
 

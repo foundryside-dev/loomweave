@@ -363,6 +363,12 @@ pub struct FiligreeConfig {
     /// start outbound emission — the operator opts into the write direction
     /// separately by setting `emit_findings: true`.
     pub emit_findings: bool,
+    /// Age threshold (days) for `clarion analyze --prune-unseen` (REQ-FINDING-06):
+    /// findings Filigree has marked `unseen_in_latest` and that are older than
+    /// this are soft-archived (`fixed`) by the retention sweep. Default 30.
+    /// Only consulted when `--prune-unseen` is passed; the sweep itself is
+    /// opt-in per invocation, not on by default.
+    pub prune_unseen_days: u32,
 }
 
 impl Default for FiligreeConfig {
@@ -374,6 +380,7 @@ impl Default for FiligreeConfig {
             token_env: "FILIGREE_API_TOKEN".to_owned(),
             timeout_seconds: 5,
             emit_findings: false,
+            prune_unseen_days: 30,
         }
     }
 }

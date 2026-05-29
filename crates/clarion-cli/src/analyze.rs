@@ -36,7 +36,8 @@ use clarion_mcp::config::McpConfig;
 use clarion_mcp::filigree::FiligreeHttpClient;
 use clarion_mcp::filigree_url::resolve_filigree_url;
 use clarion_mcp::scan_results::{
-    EmitOptions, ScanResultsResponse, prepare_batch, scan_results_url,
+    CLARION_SCAN_SOURCE, CleanStaleRequest, CleanStaleResponse, EmitOptions, ScanResultsResponse,
+    clean_stale_url, prepare_batch, scan_results_url,
 };
 
 use crate::clustering::{ClusterConfig, ModuleEdge, ModuleGraph, cluster_hash, cluster_modules};
@@ -147,6 +148,10 @@ pub(crate) struct AnalyzeOptions {
     /// re-emit does not flip the prior run's findings to `unseen_in_latest` on
     /// the Filigree peer. Takes precedence over `run_id` as the run identifier.
     pub(crate) resume_run_id: Option<String>,
+    /// `--prune-unseen` (REQ-FINDING-06): after emission, ask Filigree to
+    /// soft-archive its stale `unseen_in_latest` Clarion findings. Enrich-only:
+    /// a failure or a disabled integration never fails the run.
+    pub(crate) prune_unseen: bool,
     /// When set, structured progress is written here as the run proceeds.
     pub(crate) progress_file: Option<PathBuf>,
 }
@@ -646,6 +651,25 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         serde_json::Value::Null
     };
 
+    // Phase 8b (WP9-B, REQ-FINDING-06): `--prune-unseen` retention sweep. Runs
+    // after emission for the same non-hard-failed outcomes, so a fresh run's
+    // `mark_unseen=true` has just (re)established the unseen set the sweep
+    // archives. Best-effort and enrich-only, exactly like emission.
+    let filigree_prune = if matches!(
+        run_outcome,
+        RunOutcome::Completed | RunOutcome::SoftFailed { .. }
+    ) {
+        prune_unseen_findings_in_filigree(
+            &project_root,
+            &run_id,
+            options.prune_unseen,
+            options.config_path.as_deref(),
+        )
+        .await
+    } else {
+        serde_json::Value::Null
+    };
+
     let completed_at = iso8601_now();
     // Snapshot the writer's process-lifetime dropped-edges counter so the
     // run's durable stats record the dedupe count (B.3 §6). Read BEFORE
@@ -690,6 +714,9 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             if !filigree_emission.is_null() {
                 stats_json["filigree_emission"] = filigree_emission;
             }
+            if !filigree_prune.is_null() {
+                stats_json["filigree_prune"] = filigree_prune;
+            }
             let stats_json = stats_json.to_string();
             writer
                 .send_wait(|ack| WriterCmd::CommitRun {
@@ -729,6 +756,9 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             secret_scan_outcome.augment_stats(&mut stats_json);
             if !filigree_emission.is_null() {
                 stats_json["filigree_emission"] = filigree_emission;
+            }
+            if !filigree_prune.is_null() {
+                stats_json["filigree_prune"] = filigree_prune;
             }
             let stats_json = stats_json.to_string();
             writer
@@ -1335,6 +1365,114 @@ fn unreachable_stats(
         "findings_total": total_findings,
         "emitted_attempted": emitted,
         "skipped_no_path": skipped_no_path,
+        "error": error,
+    })
+}
+
+/// `--prune-unseen` retention sweep (WP9-B, REQ-FINDING-06): asks Filigree to
+/// soft-archive its own `unseen_in_latest` Clarion findings older than the
+/// configured age. Returns [`serde_json::Value::Null`] when not requested;
+/// otherwise a `filigree_prune` stats object folded into `stats.json`. Like
+/// emission, this is enrich-only — a disabled integration or a Filigree outage
+/// is recorded in stats, never fails the run. `scan_source` scoping is enforced
+/// by Filigree, so the sweep can only touch Clarion's findings.
+async fn prune_unseen_findings_in_filigree(
+    project_root: &Path,
+    run_id: &str,
+    prune_unseen: bool,
+    config_path: Option<&Path>,
+) -> serde_json::Value {
+    if !prune_unseen {
+        return serde_json::Value::Null;
+    }
+    let mcp_config = load_mcp_config(project_root, config_path);
+    let filigree_cfg = &mcp_config.integrations.filigree;
+    if !filigree_cfg.enabled {
+        tracing::info!(
+            run_id,
+            "--prune-unseen requested but Filigree integration disabled; skipping"
+        );
+        return serde_json::json!({"status": "skipped", "reason": "filigree_disabled"});
+    }
+    let older_than_days = filigree_cfg.prune_unseen_days;
+
+    // Resolve the live Filigree URL (ephemeral port over stale config), the
+    // same resolution emission uses.
+    let resolution = resolve_filigree_url(filigree_cfg, project_root);
+    let mut resolved_cfg = filigree_cfg.clone();
+    if let Some(url) = resolution.resolved_url {
+        resolved_cfg.base_url = url;
+    }
+    let endpoint = clean_stale_url(&resolved_cfg.base_url);
+    let request = CleanStaleRequest {
+        scan_source: CLARION_SCAN_SOURCE.to_owned(),
+        older_than_days,
+        actor: resolved_cfg.actor.clone(),
+    };
+
+    // Same blocking-reqwest-on-a-plain-OS-thread dance as emission: build → POST
+    // → drop the client off the tokio executor so the inner runtime drop is safe.
+    let thread_cfg = resolved_cfg;
+    let worker = std::thread::spawn(move || -> Result<CleanStaleResponse, String> {
+        let client = FiligreeHttpClient::from_config(&thread_cfg, |name| std::env::var(name).ok())
+            .map_err(|err| format!("build Filigree client: {err}"))?
+            .ok_or_else(|| "Filigree integration disabled".to_owned())?;
+        client
+            .post_clean_stale(&request)
+            .map_err(|err| err.to_string())
+    });
+    let joined = tokio::task::spawn_blocking(move || worker.join()).await;
+
+    match joined {
+        Ok(Ok(Ok(response))) => {
+            tracing::info!(
+                run_id,
+                endpoint = %endpoint,
+                findings_fixed = response.findings_fixed,
+                older_than_days,
+                "pruned unseen findings in Filigree",
+            );
+            serde_json::json!({
+                "status": "pruned",
+                "endpoint": endpoint,
+                "findings_fixed": response.findings_fixed,
+                "older_than_days": older_than_days,
+            })
+        }
+        Ok(Ok(Err(err))) => prune_unreachable_stats(run_id, &endpoint, older_than_days, &err),
+        Ok(Err(_panic)) => {
+            prune_unreachable_stats(run_id, &endpoint, older_than_days, "prune thread panicked")
+        }
+        Err(err) => prune_unreachable_stats(
+            run_id,
+            &endpoint,
+            older_than_days,
+            &format!("prune task: {err}"),
+        ),
+    }
+}
+
+/// Build the `filigree_prune` stats blob for a failed sweep and log it as
+/// `CLA-INFRA-FILIGREE-UNREACHABLE` — the enrich-only degrade, identical in
+/// spirit to [`unreachable_stats`] for emission.
+fn prune_unreachable_stats(
+    run_id: &str,
+    endpoint: &str,
+    older_than_days: u32,
+    error: &str,
+) -> serde_json::Value {
+    tracing::warn!(
+        run_id,
+        endpoint,
+        rule_id = "CLA-INFRA-FILIGREE-UNREACHABLE",
+        error,
+        "could not prune unseen findings in Filigree; continuing (enrich-only)",
+    );
+    serde_json::json!({
+        "status": "unreachable",
+        "rule_id": "CLA-INFRA-FILIGREE-UNREACHABLE",
+        "endpoint": endpoint,
+        "older_than_days": older_than_days,
         "error": error,
     })
 }
