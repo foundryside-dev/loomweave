@@ -483,6 +483,91 @@ pub fn entity_at_line(
         .map_err(StorageError::from)
 }
 
+/// Every entity whose source span contains `line` in `source_file_path`,
+/// innermost first.
+///
+/// Same ordering as [`entity_at_line`] (smallest span first, then a stable
+/// kind/id tie-break) but without the `LIMIT 1`, so the caller sees the full
+/// containing set: the winner is the first row, and any later row sharing the
+/// winner's span length is a genuine ambiguity alternative (overlapping
+/// entities at the same granularity), while strictly larger spans are the
+/// nesting stack. Read-only.
+///
+/// # Errors
+///
+/// Returns [`StorageError::InvalidQuery`] for a non-positive `line`, or a
+/// `SQLite` error if the query fails.
+pub fn entities_containing_line(
+    conn: &Connection,
+    source_file_path: &str,
+    line: i64,
+) -> Result<Vec<EntityRow>> {
+    if line <= 0 {
+        return Err(StorageError::InvalidQuery(
+            "line must be a positive one-based integer".to_owned(),
+        ));
+    }
+    let sql = format!(
+        "SELECT {ENTITY_COLUMNS} \
+         FROM entities \
+         WHERE source_file_path = ?1 \
+           AND source_line_start IS NOT NULL \
+           AND source_line_end IS NOT NULL \
+           AND source_line_start <= ?2 \
+           AND source_line_end >= ?2 \
+         ORDER BY (source_line_end - source_line_start) ASC, \
+                  CASE kind \
+                    WHEN 'function' THEN 0 \
+                    WHEN 'class' THEN 1 \
+                    WHEN 'module' THEN 2 \
+                    ELSE 3 \
+                  END ASC, \
+                  id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![source_file_path, line], map_entity_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The chain of ancestor entities of `entity_id`, immediate parent first up
+/// to the root (module) entity, following each row's `parent_id`.
+///
+/// Used to render the authoritative containing stack for `entity_at`
+/// (module → class → function) independent of span arithmetic. The walk is
+/// bounded by `MAX_ANCESTOR_DEPTH` so a malformed `parent_id` cycle cannot
+/// loop forever. Read-only.
+///
+/// # Errors
+///
+/// Returns a `SQLite` error if a lookup fails. A dangling `parent_id` (parent
+/// row absent) simply ends the chain.
+pub fn ancestor_chain(conn: &Connection, entity_id: &str) -> Result<Vec<EntityRow>> {
+    let mut chain = Vec::new();
+    let mut current = entity_by_id(conn, entity_id)?;
+    let mut depth = 0;
+    while let Some(row) = current {
+        let Some(parent_id) = row.parent_id.clone() else {
+            break;
+        };
+        depth += 1;
+        if depth > MAX_ANCESTOR_DEPTH {
+            break;
+        }
+        let parent = entity_by_id(conn, &parent_id)?;
+        if let Some(parent_row) = &parent {
+            chain.push(parent_row.clone());
+        }
+        current = parent;
+    }
+    Ok(chain)
+}
+
+/// Upper bound on the parent-id ancestor walk in [`ancestor_chain`]. Real
+/// Python nesting is shallow; this only guards against a malformed cycle.
+const MAX_ANCESTOR_DEPTH: usize = 64;
+
 pub fn find_entities(
     conn: &Connection,
     pattern: &str,

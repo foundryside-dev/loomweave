@@ -24,12 +24,13 @@ use clarion_core::plugin::{ContentLengthCeiling, Frame, TransportError};
 use clarion_storage::{
     CallEdgeMatch, EntityRow, InferredCallEdgeRecord, InferredEdgeCacheEntry, InferredEdgeCacheKey,
     InferredEdgeWriteStats, ReaderPool, ReferenceDirection, ReferenceEdgeMatch, StorageError,
-    SummaryCacheEntry, SummaryCacheKey, UnresolvedCallSiteRow, WriterCmd, call_edges_from,
-    call_edges_targeting, candidate_entities_for_unresolved_sites, child_entity_ids,
-    contained_entity_ids, entity_at_line, entity_by_id, existing_entity_ids, find_entities,
-    import_edges_for_entity, inferred_edge_cache_key_id, inferred_edge_cache_lookup,
-    normalize_source_path, reference_edges_for_entity, subsystem_members, subsystem_of_entity,
-    summary_cache_lookup, unresolved_call_sites_for_caller, unresolved_callers_for_target,
+    SummaryCacheEntry, SummaryCacheKey, UnresolvedCallSiteRow, WriterCmd, ancestor_chain,
+    call_edges_from, call_edges_targeting, candidate_entities_for_unresolved_sites,
+    child_entity_ids, contained_entity_ids, entities_containing_line, entity_by_id,
+    existing_entity_ids, find_entities, import_edges_for_entity, inferred_edge_cache_key_id,
+    inferred_edge_cache_lookup, normalize_source_path, reference_edges_for_entity,
+    subsystem_members, subsystem_of_entity, summary_cache_lookup, unresolved_call_sites_for_caller,
+    unresolved_callers_for_target,
 };
 
 use crate::config::LlmConfig;
@@ -96,7 +97,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "entity_at",
-            description: "Return the innermost Clarion entity whose source range contains a file and line. Paths are normalized relative to the project root. Returns no match rather than guessing when ranges are absent.",
+            description: "Return the innermost Clarion entity whose source range contains a file and line, plus an `entity_context` evidence block: match_reason (decorator_range / declaration / body_range / containing_range / no_match) explaining why the line matched, the module→entity containing stack, the matched entity's decl/body/decorator sub-ranges, any same-granularity ambiguity alternatives, and index freshness. Paths are normalized relative to the project root. A blank or comment line that only a module spans reports containing_range — never a fabricated exact match.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -547,11 +548,29 @@ impl ServerState {
                 return Ok(tool_error_envelope("invalid-path", &err.to_string(), false));
             }
         };
+        let project_root = self.project_root.clone();
         let result = self
             .readers
             .with_reader(move |conn| {
-                let entity = entity_at_line(conn, &normalized, line)?;
-                Ok(json!({"entity": entity.as_ref().map(entity_json)}))
+                // Every entity whose span contains the line, innermost first
+                // (same ordering as the legacy single-row `entity_at_line`).
+                let candidates = entities_containing_line(conn, &normalized, line)?;
+                let matched = candidates.first().cloned();
+                let stack = match &matched {
+                    Some(entity) => ancestor_chain(conn, &entity.id)?,
+                    None => Vec::new(),
+                };
+                let snapshot = crate::snapshot::project_snapshot(conn, &project_root);
+                Ok(json!({
+                    "entity": matched.as_ref().map(entity_json),
+                    "entity_context": entity_context_json(
+                        line,
+                        matched.as_ref(),
+                        &candidates,
+                        &stack,
+                        &snapshot,
+                    ),
+                }))
             })
             .await;
         Ok(envelope_from_storage_result(result))
@@ -3399,6 +3418,160 @@ fn entity_properties_json(entity: &EntityRow) -> Value {
         .expect("entity properties_json should be valid JSON")
 }
 
+/// Maximum number of ambiguity alternatives `entity_at` reports. Genuine
+/// same-granularity overlaps are rare; this only bounds a pathological file.
+const ENTITY_CONTEXT_MAX_ALTERNATIVES: usize = 8;
+
+/// The decorator/declaration/body sub-ranges a plugin records for a
+/// function/class entity in `properties_json.definition` (clarion-460def6a51).
+/// All optional: older indexes, modules, and plugins that don't emit the block
+/// leave every field `None`.
+struct DefinitionSpan {
+    decl_line: Option<i64>,
+    body_line_start: Option<i64>,
+    decorator_line_start: Option<i64>,
+    decorator_line_end: Option<i64>,
+}
+
+impl DefinitionSpan {
+    fn from_entity(entity: &EntityRow) -> Self {
+        let def = serde_json::from_str::<Value>(&entity.properties_json)
+            .ok()
+            .and_then(|props| props.get("definition").cloned());
+        let get = |key: &str| -> Option<i64> {
+            def.as_ref()
+                .and_then(|d| d.get(key))
+                .and_then(Value::as_i64)
+        };
+        Self {
+            decl_line: get("decl_line"),
+            body_line_start: get("body_line_start"),
+            decorator_line_start: get("decorator_line_start"),
+            decorator_line_end: get("decorator_line_end"),
+        }
+    }
+}
+
+/// Classify *why* `line` resolved to `entity`: a decorator line, the
+/// declaration/signature, the body, or merely a containing scope (module, or
+/// an entity without recorded sub-ranges). Honest by construction — a blank or
+/// comment line that only the module spans reports `containing_range`, never a
+/// fabricated exact match (clarion-460def6a51 acceptance #3).
+fn match_reason_for(line: i64, entity: &EntityRow) -> &'static str {
+    if entity.kind == "module" {
+        return "containing_range";
+    }
+    let def = DefinitionSpan::from_entity(entity);
+    let Some(decl_line) = def.decl_line else {
+        return "containing_range";
+    };
+    if let Some(decorator_start) = def.decorator_line_start
+        && line >= decorator_start
+        && line < decl_line
+    {
+        return "decorator_range";
+    }
+    if let Some(body_line_start) = def.body_line_start {
+        if line >= body_line_start {
+            return "body_range";
+        }
+        return "declaration";
+    }
+    if line == decl_line {
+        return "declaration";
+    }
+    "containing_range"
+}
+
+/// Span length in lines used to detect same-granularity ambiguity. `None` when
+/// either bound is missing.
+fn span_len(entity: &EntityRow) -> Option<i64> {
+    Some(entity.source_line_end? - entity.source_line_start?)
+}
+
+/// Compact entity descriptor for the containing stack — enough to orient
+/// without the full `entity_json` payload.
+fn stack_entity_json(entity: &EntityRow) -> Value {
+    json!({
+        "id": entity.id,
+        "kind": entity.kind,
+        "short_name": entity.short_name,
+        "name": entity.name,
+        "source_line_start": entity.source_line_start,
+        "source_line_end": entity.source_line_end,
+    })
+}
+
+/// Build the additive `entity_context` evidence block for `entity_at`
+/// (clarion-460def6a51): the match reason, the module→entity containing stack,
+/// the matched entity's sub-ranges, same-granularity ambiguity alternatives,
+/// and index freshness. Returns a `no_match` shell when no entity spans the
+/// line (e.g. an unindexed file).
+fn entity_context_json(
+    line: i64,
+    matched: Option<&EntityRow>,
+    candidates: &[EntityRow],
+    ancestors: &[EntityRow],
+    snapshot: &crate::snapshot::ProjectSnapshot,
+) -> Value {
+    let freshness = json!({
+        "staleness": snapshot.staleness(),
+        "last_analyzed_at": snapshot.last_analyzed_at(),
+        "degraded": snapshot.degraded(),
+    });
+
+    let Some(matched) = matched else {
+        return json!({
+            "query_line": line,
+            "match_reason": "no_match",
+            "containing_stack": [],
+            "ranges": Value::Null,
+            "alternatives": [],
+            "freshness": freshness,
+        });
+    };
+
+    // Containing stack outermost (module) → matched entity, inclusive.
+    let mut containing_stack: Vec<Value> = ancestors.iter().rev().map(stack_entity_json).collect();
+    containing_stack.push(stack_entity_json(matched));
+
+    let def = DefinitionSpan::from_entity(matched);
+    let ranges = json!({
+        "source_line_start": matched.source_line_start,
+        "source_line_end": matched.source_line_end,
+        "decl_line": def.decl_line,
+        "body_line_start": def.body_line_start,
+        "decorator_line_start": def.decorator_line_start,
+        "decorator_line_end": def.decorator_line_end,
+    });
+
+    // Ambiguity: other candidates sharing the winner's span length are genuine
+    // same-granularity overlaps. Strictly larger spans are the nesting stack
+    // already captured above, so they are not alternatives.
+    let matched_len = span_len(matched);
+    let alternatives: Vec<Value> = candidates
+        .iter()
+        .skip(1)
+        .filter(|cand| matched_len.is_some() && span_len(cand) == matched_len)
+        .take(ENTITY_CONTEXT_MAX_ALTERNATIVES)
+        .map(|cand| {
+            json!({
+                "entity": entity_json(cand),
+                "match_reason": match_reason_for(line, cand),
+            })
+        })
+        .collect();
+
+    json!({
+        "query_line": line,
+        "match_reason": match_reason_for(line, matched),
+        "containing_stack": containing_stack,
+        "ranges": ranges,
+        "alternatives": alternatives,
+        "freshness": freshness,
+    })
+}
+
 /// Maximum number of (span + context) lines `source_for_entity` will emit
 /// before truncating, so a pathologically large entity never floods an agent's
 /// context. The span itself is bounded by the entity; this caps the total.
@@ -4227,7 +4400,7 @@ mod tests {
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
-            "Return the innermost Clarion entity whose source range contains a file and line. Paths are normalized relative to the project root. Returns no match rather than guessing when ranges are absent."
+            "Return the innermost Clarion entity whose source range contains a file and line, plus an `entity_context` evidence block: match_reason (decorator_range / declaration / body_range / containing_range / no_match) explaining why the line matched, the module→entity containing stack, the matched entity's decl/body/decorator sub-ranges, any same-granularity ambiguity alternatives, and index freshness. Paths are normalized relative to the project root. A blank or comment line that only a module spans reports containing_range — never a fabricated exact match."
         );
         assert_eq!(tools[1].name, "find_entity");
         assert_eq!(

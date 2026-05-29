@@ -192,6 +192,42 @@ fn insert_entity(
     .expect("insert entity");
 }
 
+/// Insert an entity carrying a non-empty `properties` JSON blob (e.g. the
+/// `definition` sub-range evidence the Python plugin records). Mirrors
+/// [`insert_entity`] but lets a test seed `properties_json` directly.
+fn insert_entity_with_properties(
+    conn: &Connection,
+    id: &str,
+    kind: &str,
+    source_path: &std::path::Path,
+    range: Option<(i64, i64)>,
+    parent_id: Option<&str>,
+    properties_json: &str,
+) {
+    let content_hash = fixture_content_hash(kind, source_path, range);
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, parent_id, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            ?1, 'python', ?2, ?1, ?1, ?3, ?4, ?5, ?6, ?8, ?7,
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        params![
+            id,
+            kind,
+            parent_id,
+            source_path.display().to_string(),
+            range.map(|(start, _)| start),
+            range.map(|(_, end)| end),
+            content_hash,
+            properties_json,
+        ],
+    )
+    .expect("insert entity with properties");
+}
+
 fn fixture_content_hash(
     kind: &str,
     source_path: &std::path::Path,
@@ -1879,9 +1915,165 @@ async fn entity_at_returns_innermost_entity_and_empty_match() {
     assert_eq!(hit["ok"], true);
     assert_eq!(hit["result"]["entity"]["id"], "python:function:demo.entry");
 
+    // entity_context evidence: the containing stack runs module → matched
+    // entity, and without recorded sub-ranges the reason is the honest
+    // containing_range (the seed fixture carries no `definition` block).
+    let ctx = &hit["result"]["entity_context"];
+    assert_eq!(ctx["query_line"], 1);
+    assert_eq!(ctx["match_reason"], "containing_range");
+    let stack = ctx["containing_stack"].as_array().expect("stack array");
+    assert_eq!(stack.first().unwrap()["id"], "python:module:demo");
+    assert_eq!(stack.last().unwrap()["id"], "python:function:demo.entry");
+    assert!(ctx["freshness"].is_object());
+
     let miss = call_tool(&state, "entity_at", json!({"file": "demo.py", "line": 99})).await;
     assert_eq!(miss["ok"], true);
     assert!(miss["result"]["entity"].is_null());
+    assert_eq!(miss["result"]["entity_context"]["match_reason"], "no_match");
+    assert!(
+        miss["result"]["entity_context"]["containing_stack"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn entity_at_blank_line_reports_containing_range_not_a_fabricated_match() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    // Line 3 of demo.py is the blank line between demo.entry (1-2) and
+    // demo.mid (4-5). Only the module spans it, so the honest answer is the
+    // module with match_reason=containing_range — never a nearby function
+    // dressed up as an exact match (clarion-460def6a51 acceptance #3).
+    let resp = call_tool(&state, "entity_at", json!({"file": "demo.py", "line": 3})).await;
+    assert_eq!(resp["ok"], true, "{resp:?}");
+    assert_eq!(resp["result"]["entity"]["id"], "python:module:demo");
+    assert_eq!(resp["result"]["entity"]["kind"], "module");
+    assert_eq!(
+        resp["result"]["entity_context"]["match_reason"],
+        "containing_range"
+    );
+}
+
+#[tokio::test]
+async fn entity_at_reports_same_span_ambiguity_alternatives() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    // demo.target and demo.alt_target both span lines 7-8 in the seed graph.
+    // The innermost winner is chosen by the id tie-break; the other surfaces
+    // as a same-granularity ambiguity alternative.
+    let resp = call_tool(&state, "entity_at", json!({"file": "demo.py", "line": 7})).await;
+    assert_eq!(resp["ok"], true, "{resp:?}");
+    assert_eq!(
+        resp["result"]["entity"]["id"],
+        "python:function:demo.alt_target"
+    );
+    let alternatives = resp["result"]["entity_context"]["alternatives"]
+        .as_array()
+        .expect("alternatives array");
+    let alt_ids: Vec<&str> = alternatives
+        .iter()
+        .map(|a| a["entity"]["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(alt_ids, vec!["python:function:demo.target"]);
+}
+
+#[tokio::test]
+async fn entity_at_explains_decorator_declaration_and_body_matches() {
+    let (project, db_path) = open_project();
+
+    // A decorated class in runtime.py: `@dataclass` on line 1, `class Config:`
+    // on line 2, the field body on line 3. The plugin expands the span to the
+    // decorator line and records the sub-ranges in `properties.definition`.
+    let source = "@dataclass\nclass Config:\n    retries: int = 3\n";
+    let runtime_path = project.path().join("runtime.py");
+    std::fs::write(&runtime_path, source).expect("write runtime.py");
+    {
+        let conn = Connection::open(&db_path).expect("open db");
+        insert_entity_with_properties(
+            &conn,
+            "python:module:runtime",
+            "module",
+            &runtime_path,
+            Some((1, 3)),
+            None,
+            "{}",
+        );
+        insert_entity_with_properties(
+            &conn,
+            "python:class:runtime.Config",
+            "class",
+            &runtime_path,
+            Some((1, 3)),
+            Some("python:module:runtime"),
+            &json!({
+                "definition": {
+                    "decl_line": 2,
+                    "body_line_start": 3,
+                    "decorator_line_start": 1,
+                    "decorator_line_end": 1
+                }
+            })
+            .to_string(),
+        );
+    }
+    let state = state_for(project.path(), &db_path);
+
+    // Decorator line resolves to the class, explained as decorator_range.
+    let decorator_hit = call_tool(
+        &state,
+        "entity_at",
+        json!({"file": "runtime.py", "line": 1}),
+    )
+    .await;
+    assert_eq!(decorator_hit["ok"], true, "{decorator_hit:?}");
+    assert_eq!(
+        decorator_hit["result"]["entity"]["id"],
+        "python:class:runtime.Config"
+    );
+    assert_eq!(
+        decorator_hit["result"]["entity_context"]["match_reason"],
+        "decorator_range"
+    );
+    assert_eq!(
+        decorator_hit["result"]["entity_context"]["ranges"]["decl_line"],
+        2
+    );
+
+    // The declaration line resolves to the same class with a distinct reason.
+    let declaration_hit = call_tool(
+        &state,
+        "entity_at",
+        json!({"file": "runtime.py", "line": 2}),
+    )
+    .await;
+    assert_eq!(
+        declaration_hit["result"]["entity"]["id"],
+        "python:class:runtime.Config"
+    );
+    assert_eq!(
+        declaration_hit["result"]["entity_context"]["match_reason"],
+        "declaration"
+    );
+
+    // The body line is classified as body_range.
+    let body_hit = call_tool(
+        &state,
+        "entity_at",
+        json!({"file": "runtime.py", "line": 3}),
+    )
+    .await;
+    assert_eq!(
+        body_hit["result"]["entity"]["id"],
+        "python:class:runtime.Config"
+    );
+    assert_eq!(
+        body_hit["result"]["entity_context"]["match_reason"],
+        "body_range"
+    );
 }
 
 #[tokio::test]
