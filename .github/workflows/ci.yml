@@ -62,6 +62,11 @@ jobs:
           python scripts/check-wardline-version-bounds.py --self-test
           python scripts/check-wardline-version-bounds.py
 
+      - name: entity-cap ADR/code lockstep
+        run: |
+          python scripts/check-entity-cap-lockstep.py --self-test
+          python scripts/check-entity-cap-lockstep.py
+
       - name: clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
