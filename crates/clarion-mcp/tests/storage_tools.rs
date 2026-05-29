@@ -2243,6 +2243,75 @@ async fn orientation_pack_rejects_ambiguous_input_form() {
 }
 
 #[tokio::test]
+async fn orientation_pack_for_module_rolls_up_references() {
+    // The packet-assembly path must also roll up module references and surface
+    // `via`, not just `neighborhood` (clarion-79d0ff6e14 review).
+    let (project, db_path) = open_project();
+    {
+        let conn = Connection::open(&db_path).expect("reopen db");
+        let source_path = project.path().join("consumer.py");
+        std::fs::write(
+            &source_path,
+            "import demo\n\ndef use():\n    return demo.target()\n",
+        )
+        .expect("write consumer source");
+        insert_entity(
+            &conn,
+            "python:module:consumer",
+            "module",
+            &source_path,
+            Some((1, 4)),
+            None,
+        );
+        insert_entity(
+            &conn,
+            "python:function:consumer.use",
+            "function",
+            &source_path,
+            Some((3, 4)),
+            Some("python:module:consumer"),
+        );
+        insert_edge(
+            &conn,
+            "contains",
+            "python:module:consumer",
+            "python:function:consumer.use",
+            "resolved",
+            None,
+        );
+        insert_edge(
+            &conn,
+            "references",
+            "python:function:consumer.use",
+            "python:function:demo.target",
+            "resolved",
+            None,
+        );
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:module:demo"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp:?}");
+    let neighbors = &resp["result"]["neighbors"];
+    assert_eq!(neighbors["references_rolled_up"], true);
+    let refs_in = neighbors["references_in"]
+        .as_array()
+        .expect("references_in");
+    assert_eq!(
+        refs_in.len(),
+        1,
+        "external referencer rolls up: {refs_in:?}"
+    );
+    assert_eq!(refs_in[0]["entity"]["id"], "python:function:consumer.use");
+    assert_eq!(refs_in[0]["via"]["id"], "python:function:demo.target");
+}
+
+#[tokio::test]
 async fn source_for_entity_returns_span_with_line_numbers_and_context() {
     let (project, db_path) = open_project();
     let state = state_for(project.path(), &db_path);

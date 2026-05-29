@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use clarion_storage::StorageError;
+use clarion_storage::{StorageError, normalize_source_path};
 
 /// Default per-list cap so a pathological repo cannot produce an unbounded
 /// packet. Overridable via the `limit` argument.
@@ -89,8 +89,17 @@ pub(crate) fn gather_git_facts(project_root: &Path) -> GitFacts {
     let head_commit = run(&["rev-parse", "HEAD"]);
     // `%cI` is strict ISO-8601 (RFC3339) with the committer's UTC offset.
     let head_committed_at = run(&["log", "-1", "--format=%cI", "HEAD"]);
-    let dirty = run(&["status", "--porcelain=v1"])
-        .map(|out| parse_porcelain(&out))
+    // Read status raw: porcelain's leading X-column space is significant, so it
+    // must NOT be trimmed off the front (the `run` closure trims the whole
+    // blob, which would shift every column left and corrupt the path).
+    let dirty = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["status", "--porcelain=v1"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| parse_porcelain(&String::from_utf8_lossy(&out.stdout)))
         .unwrap_or_default();
 
     GitFacts {
@@ -299,19 +308,25 @@ pub(crate) fn build_report(
     };
 
     // Per-file drift: stat each indexed file once.
-    let indexed_abs: BTreeSet<String> = state
+    let file_drift = compute_file_drift(project_root, state, analyzed_time);
+
+    // Indexed source paths (absolute) normalized to canonical project-relative
+    // form, so a git-relative dirty path matches regardless of the project_root
+    // shape (`.` vs absolute) or symlinks. A raw join + string-eq would never
+    // match (clarion-326b01ffd0 review).
+    let indexed_rel: BTreeSet<String> = state
         .files
         .iter()
-        .map(|f| absolute(project_root, &f.source_file_path))
+        .filter_map(|f| normalize_source_path(project_root, &f.source_file_path).ok())
         .collect();
-    let file_drift = compute_file_drift(project_root, state, analyzed_time);
 
     // Dirty working-tree files, flagged when they touch an indexed path.
     let mut dirty = Vec::new();
     let mut dirty_indexed_count = 0usize;
     for entry in &git.dirty {
-        let abs = absolute(project_root, &entry.rel_path);
-        let indexed = indexed_abs.contains(&abs);
+        let indexed = normalize_source_path(project_root, &entry.rel_path)
+            .ok()
+            .is_some_and(|rel| indexed_rel.contains(&rel));
         if indexed {
             dirty_indexed_count += 1;
         }
@@ -346,6 +361,10 @@ pub(crate) fn build_report(
     let mut notes = vec![
         "analyzed_commit is null: Clarion does not persist an analyze-time SHA; \
          HEAD-vs-analyze staleness uses HEAD committer date vs run completion time"
+            .to_owned(),
+        "added (never-indexed) source files are not enumerated here beyond the \
+         git dirty set; a new commit still flips head_newer_than_analyze \
+         (broader added/removed blindness: clarion-e687941a8c)"
             .to_owned(),
     ];
     if file_drift.stat_failures > 0 {
