@@ -402,3 +402,38 @@ ships, the fixture above is the contract: validate against it offline. Building
 the endpoint ahead of a shipped Wardline consumer would be speculative
 forward-work (loom.md §5 — Clarion translates qualnames because it owns the
 catalog, but only when a consumer needs it).
+
+## Consumed Filigree route: issue detail (enrichment)
+
+The contracts above pin the surface Clarion *exposes*. This one pins the single
+Filigree route Clarion *consumes* to enrich an entity-association match — the
+read behind `issues_for`'s per-match `issue` block (clarion-51a2868c86). It is
+strictly *enrich-only*: if the route is absent or unreachable, the match still
+resolves with `issue: null`, and Clarion's semantics are unaffected (loom.md §5).
+
+```text
+GET {filigree_base}/api/loom/issues/{issue_id}
+```
+
+- `{issue_id}` is percent-encoded as a path-segment value.
+- **Request headers:** `accept: application/json`; `x-filigree-actor: <actor>`
+  when an actor is configured; `Authorization: Bearer <token>` when a bearer
+  token is configured. (HMAC is not used on this *outbound* read; it is an
+  inbound-auth mechanism on Clarion's own exposed routes.)
+- **`200` response body** — only these fields are read; **unknown fields are
+  ignored** so Filigree may grow the route without breaking the consumer:
+
+  ```json
+  { "title": "string", "status": "string", "priority": 0 }
+  ```
+
+  `priority` is an integer (Clarion's `IssueDetail.priority: i64`).
+- **`404`** — the issue, or the whole route, is absent. Treated as the enrich-only
+  degrade signal (`Ok(None)` → `issue: null`), **not** an error.
+- **Any other non-`2xx`** — surfaced as a client error; the enrichment for that
+  match degrades to `issue: null` rather than failing the `issues_for` call.
+
+There is no normative fixture for this route yet; the shape above is the
+contract. The `parse_issue_detail_response` shape test in
+[`filigree.rs`](../../crates/clarion-mcp/src/filigree.rs) is the executable
+check.

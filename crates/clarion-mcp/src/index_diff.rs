@@ -113,8 +113,8 @@ pub(crate) fn gather_git_facts(project_root: &Path) -> GitFacts {
 }
 
 /// Parse `git status --porcelain=v1` output into per-path entries. Renames
-/// (`R  old -> new`) collapse to the new path; surrounding quotes (git's
-/// rendering of paths with special chars) are stripped best-effort.
+/// (`R  old -> new`) collapse to the new path; git's C-style quoting of paths
+/// with special bytes is decoded (see [`unquote_c_path`]).
 fn parse_porcelain(out: &str) -> Vec<DirtyEntry> {
     out.lines()
         .filter_map(|line| {
@@ -126,10 +126,78 @@ fn parse_porcelain(out: &str) -> Vec<DirtyEntry> {
             let path = rest.rsplit(" -> ").next().unwrap_or(rest);
             Some(DirtyEntry {
                 status,
-                rel_path: path.trim_matches('"').to_owned(),
+                rel_path: unquote_c_path(path),
             })
         })
         .collect()
+}
+
+/// Decode git's C-style path quoting back to a real path. With the default
+/// `core.quotePath=true`, git renders any path containing a control byte, a
+/// backslash, a double-quote, or a non-ASCII byte as a double-quoted string
+/// with C escapes: `\\`, `\"`, `\t`/`\n`/`\r`/`\a`/`\b`/`\f`/`\v`, and `\NNN`
+/// octal *byte* escapes (e.g. `"\303\251.py"` for `é.py`). Octal escapes are
+/// emitted one per UTF-8 byte, so they must be reassembled into bytes before
+/// the result is decoded — `trim_matches('"')` alone would leave
+/// `\303\251.py` literal and never correlate against an indexed path.
+///
+/// A path with no special bytes is emitted bare (no surrounding quotes) and is
+/// returned unchanged. Best-effort and panic-free: an unrecognised escape keeps
+/// its literal `\x`, a dangling trailing backslash is preserved, and invalid
+/// UTF-8 decodes lossily.
+fn unquote_c_path(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    // Bare (unquoted) paths pass through untouched.
+    if bytes.len() < 2 || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
+        return raw.to_owned();
+    }
+    let inner = &bytes[1..bytes.len() - 1];
+    let mut out: Vec<u8> = Vec::with_capacity(inner.len());
+    let mut i = 0;
+    while i < inner.len() {
+        if inner[i] != b'\\' {
+            out.push(inner[i]);
+            i += 1;
+            continue;
+        }
+        // Consume the backslash; decode the escape that follows.
+        i += 1;
+        let Some(&escape) = inner.get(i) else {
+            // Dangling trailing backslash — keep it verbatim.
+            out.push(b'\\');
+            break;
+        };
+        match escape {
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b't' => out.push(b'\t'),
+            b'n' => out.push(b'\n'),
+            b'v' => out.push(0x0b),
+            b'f' => out.push(0x0c),
+            b'r' => out.push(b'\r'),
+            b'"' => out.push(b'"'),
+            b'\\' => out.push(b'\\'),
+            b'0'..=b'7' => {
+                // Up to three octal digits → one byte (git emits \000..\377).
+                let mut value: u8 = 0;
+                let mut digits = 0;
+                while digits < 3 && inner.get(i).is_some_and(|b| (b'0'..=b'7').contains(b)) {
+                    value = value.wrapping_mul(8).wrapping_add(inner[i] - b'0');
+                    i += 1;
+                    digits += 1;
+                }
+                out.push(value);
+                continue; // `i` already advanced past the octal run.
+            }
+            other => {
+                // Unrecognised escape: preserve `\` + the char.
+                out.push(b'\\');
+                out.push(other);
+            }
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Index state read from the DB inside the reader.
@@ -443,6 +511,34 @@ mod tests {
     #[test]
     fn parse_porcelain_skips_blank_and_short_lines() {
         assert!(parse_porcelain("\n \nM\n").is_empty());
+    }
+
+    #[test]
+    fn parse_porcelain_decodes_c_quoted_non_ascii_path() {
+        // git quotes `café.py` (and emits its UTF-8 bytes as octal escapes)
+        // under the default core.quotePath=true.
+        let out = " M \"caf\\303\\251.py\"\n";
+        let entries = parse_porcelain(out);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, "M");
+        assert_eq!(
+            entries[0].rel_path, "café.py",
+            "octal-escaped UTF-8 bytes must decode to the real path"
+        );
+    }
+
+    #[test]
+    fn unquote_c_path_handles_escapes_quotes_and_bare_paths() {
+        // Bare path: returned untouched.
+        assert_eq!(unquote_c_path("src/lib.rs"), "src/lib.rs");
+        // Quoted with an escaped quote and backslash.
+        assert_eq!(unquote_c_path(r#""a\"b\\c.py""#), "a\"b\\c.py");
+        // Quoted with a tab escape.
+        assert_eq!(unquote_c_path(r#""a\tb.py""#), "a\tb.py");
+        // Octal byte escapes reassemble into a multi-byte UTF-8 char.
+        assert_eq!(unquote_c_path(r#""\360\237\232\200.py""#), "🚀.py");
+        // A leading-quote-only string is not a valid quoted path → unchanged.
+        assert_eq!(unquote_c_path("\"unterminated"), "\"unterminated");
     }
 
     fn git_facts(head_committed_at: Option<&str>, dirty: &[(&str, &str)]) -> GitFacts {
