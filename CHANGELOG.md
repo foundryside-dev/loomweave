@@ -28,6 +28,14 @@ only when an incompatible change is made to that surface. See
   (`missing`/`no_range`/`binary`/`drifted`) rather than a misleading stale
   snippet when the on-disk source no longer matches the indexed `content_hash`.
   The MCP surface now exposes twelve tools (clarion-6077738f1c).
+- `call_sites(id, role=caller|callee, kind?, confidence?, path?)` MCP tool —
+  shows the actual source sites behind `calls`/`references` edges (file, line,
+  byte column, line text, edge kind, confidence) so an agent can see *why*
+  Clarion believes an edge exists. Statically-unbindable calls are returned in
+  a separate `unresolved_sites` list, never mixed with resolved evidence.
+  Filterable by edge kind and a documented best-effort production/test path
+  heuristic. No LLM call. The MCP surface now exposes thirteen tools
+  (clarion-9392f74881).
 
 ### Changed
 

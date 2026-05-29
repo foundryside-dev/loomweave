@@ -90,6 +90,8 @@ pub struct ToolDefinition {
 }
 
 #[must_use]
+// A flat registry of tool definitions; length tracks the tool count by design.
+#[allow(clippy::too_many_lines)]
 pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
@@ -194,6 +196,22 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "properties": {
                     "id": {"type": "string", "minLength": 1},
                     "context_lines": {"type": "integer", "minimum": 0, "maximum": 200}
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "call_sites",
+            description: "Show the actual source sites behind calls/references edges, so an agent can see WHY Clarion believes an edge exists rather than trusting it blind. role=caller (default) returns this entity's outgoing sites (what it calls/references); role=callee returns incoming sites (who calls/references it). Each site carries the file path, 1-based line, byte column, the source line text, edge kind, confidence, and a resolution of resolved | ambiguous (with candidate ids) | unresolved (a static call Clarion could not bind, kept separate so it is never mixed with resolved evidence). Filter by edge kind (`calls`/`references`) and by a best-effort production/test path heuristic (`all`/`production`/`test`; path partitioning is not indexed — the heuristic matches conventional test paths). Output is bounded; truncated flags when the site cap trims. No LLM call.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "minLength": 1},
+                    "role": {"type": "string", "enum": ["caller", "callee"], "default": "caller"},
+                    "kind": {"type": "string", "enum": ["calls", "references"]},
+                    "confidence": confidence_schema(),
+                    "path": {"type": "string", "enum": ["all", "production", "test"], "default": "all"}
                 },
                 "required": ["id"],
                 "additionalProperties": false
@@ -449,6 +467,10 @@ impl ServerState {
                 Err(response) => return response.to_json_rpc(id),
             },
             "source_for_entity" => match self.tool_source_for_entity(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "call_sites" => match self.tool_call_sites(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
@@ -1004,6 +1026,56 @@ impl ServerState {
             })
             .await;
         Ok(flatten_storage_envelope_result(result))
+    }
+
+    async fn tool_call_sites(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let entity_id = required_str(arguments, "id")?.to_owned();
+        let role = match arguments.get("role") {
+            None | Some(Value::Null) => CallSiteRole::Caller,
+            Some(Value::String(s)) if s == "caller" => CallSiteRole::Caller,
+            Some(Value::String(s)) if s == "callee" => CallSiteRole::Callee,
+            _ => return Err(ParamError::new("role must be \"caller\" or \"callee\"")),
+        };
+        let kind = match arguments.get("kind") {
+            None | Some(Value::Null) => CallSiteKind::Both,
+            Some(Value::String(s)) if s == "calls" => CallSiteKind::Calls,
+            Some(Value::String(s)) if s == "references" => CallSiteKind::References,
+            _ => return Err(ParamError::new("kind must be \"calls\" or \"references\"")),
+        };
+        let path = match arguments.get("path") {
+            None | Some(Value::Null) => PathScope::All,
+            Some(Value::String(s)) if s == "all" => PathScope::All,
+            Some(Value::String(s)) if s == "production" => PathScope::Production,
+            Some(Value::String(s)) if s == "test" => PathScope::Test,
+            _ => {
+                return Err(ParamError::new(
+                    "path must be \"all\", \"production\", or \"test\"",
+                ));
+            }
+        };
+        let confidence = optional_confidence(arguments)?;
+        let result = self
+            .readers
+            .with_reader(move |conn| {
+                build_call_sites(conn, &entity_id, role, kind, confidence, path)
+            })
+            .await;
+        match result {
+            Ok(Some(value)) => Ok(success_envelope(value)),
+            Ok(None) => Ok(tool_error_envelope(
+                "not-found",
+                "no entity with the given id",
+                false,
+            )),
+            Err(err) => Ok(tool_error_envelope(
+                "storage-error",
+                &err.to_string(),
+                storage_retryable(&err),
+            )),
+        }
     }
 
     async fn tool_source_for_entity(
@@ -3315,6 +3387,339 @@ fn entity_properties_json(entity: &EntityRow) -> Value {
 /// context. The span itself is bounded by the entity; this caps the total.
 const SOURCE_FOR_ENTITY_MAX_LINES: usize = 2_000;
 
+/// Direction for `call_sites`: outgoing (this entity is the caller) or incoming
+/// (this entity is the callee).
+#[derive(Clone, Copy)]
+enum CallSiteRole {
+    Caller,
+    Callee,
+}
+
+/// Edge-kind filter for `call_sites`.
+#[derive(Clone, Copy)]
+enum CallSiteKind {
+    Both,
+    Calls,
+    References,
+}
+
+impl CallSiteKind {
+    fn includes_calls(self) -> bool {
+        matches!(self, Self::Both | Self::Calls)
+    }
+    fn includes_references(self) -> bool {
+        matches!(self, Self::Both | Self::References)
+    }
+}
+
+/// Production/test path scope for `call_sites`. Best-effort: source-file
+/// production/test partitioning is not indexed, so this is a heuristic over the
+/// file path (documented as such in the tool description).
+#[derive(Clone, Copy)]
+enum PathScope {
+    All,
+    Production,
+    Test,
+}
+
+impl PathScope {
+    fn admits(self, path: Option<&str>) -> bool {
+        match (self, path) {
+            (Self::All, _) => true,
+            // A site whose owning file can't be resolved is excluded from a
+            // narrowed scope rather than guessed into it.
+            (_, None) => false,
+            (Self::Test, Some(p)) => is_test_path(p),
+            (Self::Production, Some(p)) => !is_test_path(p),
+        }
+    }
+}
+
+/// Conventional Python test-path heuristic (pytest/unittest layouts). Not a
+/// substitute for indexed metadata — see `PathScope`.
+fn is_test_path(path: &str) -> bool {
+    let lower = path.replace('\\', "/").to_ascii_lowercase();
+    let file = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    lower.contains("/tests/")
+        || lower.contains("/test/")
+        || file.starts_with("test_")
+        || file.ends_with("_test.py")
+        || file == "conftest.py"
+}
+
+/// Per-call cap on each of the resolved and unresolved site lists.
+const CALL_SITES_MAX: usize = 200;
+
+/// 1-based line and 0-based byte column for a byte offset into `content`.
+// The slices are a single source file; a dependency on `bytecount` for the
+// newline count is not warranted here.
+#[allow(clippy::naive_bytecount)]
+fn byte_line_col(content: &str, byte_offset: i64) -> Option<(i64, i64)> {
+    let off = usize::try_from(byte_offset).ok()?;
+    let bytes = content.as_bytes();
+    if off > bytes.len() {
+        return None;
+    }
+    let line = bytes[..off].iter().filter(|&&b| b == b'\n').count() + 1;
+    let line_start = bytes[..off]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |p| p + 1);
+    Some((
+        i64::try_from(line).ok()?,
+        i64::try_from(off - line_start).ok()?,
+    ))
+}
+
+/// The text of `line` (1-based) in `content`, or empty if out of range.
+fn line_text_at(content: &str, line: i64) -> String {
+    let idx = usize::try_from(line - 1).unwrap_or(usize::MAX);
+    content.lines().nth(idx).unwrap_or("").to_owned()
+}
+
+/// One resolved call/reference site before file resolution.
+struct ResolvedSite {
+    owner_id: String,
+    edge_kind: &'static str,
+    other_id: String,
+    confidence: EdgeConfidence,
+    byte_start: Option<i64>,
+    byte_end: Option<i64>,
+}
+
+/// One static call Clarion could not bind (kept separate from resolved sites).
+struct UnboundSite {
+    owner_id: String,
+    callee_expr: String,
+    byte_start: i64,
+    byte_end: i64,
+}
+
+/// Gather the resolved and unbound (statically-unbindable) call/reference sites
+/// for `entity` in the requested direction, applying the edge-kind and
+/// confidence filters. File/line resolution happens in [`build_call_sites`].
+fn collect_call_sites(
+    conn: &rusqlite::Connection,
+    entity: &EntityRow,
+    role: CallSiteRole,
+    kind: CallSiteKind,
+    confidence: EdgeConfidence,
+) -> Result<(Vec<ResolvedSite>, Vec<UnboundSite>), StorageError> {
+    let mut resolved: Vec<ResolvedSite> = Vec::new();
+    let mut unbound: Vec<UnboundSite> = Vec::new();
+
+    match role {
+        CallSiteRole::Caller => {
+            if kind.includes_calls() {
+                for edge in call_edges_from(conn, &entity.id, confidence)? {
+                    resolved.push(ResolvedSite {
+                        owner_id: entity.id.clone(),
+                        edge_kind: "calls",
+                        other_id: edge.to_id,
+                        confidence: edge.confidence,
+                        byte_start: edge.source_byte_start,
+                        byte_end: edge.source_byte_end,
+                    });
+                }
+                for site in unresolved_call_sites_for_caller(conn, &entity.id, CALL_SITES_MAX)? {
+                    unbound.push(UnboundSite {
+                        owner_id: entity.id.clone(),
+                        callee_expr: site.callee_expr,
+                        byte_start: site.source_byte_start,
+                        byte_end: site.source_byte_end,
+                    });
+                }
+            }
+            if kind.includes_references() {
+                for r in reference_edges_for_entity(conn, &entity.id, ReferenceDirection::Out)? {
+                    if r.confidence <= confidence {
+                        resolved.push(ResolvedSite {
+                            owner_id: entity.id.clone(),
+                            edge_kind: "references",
+                            other_id: r.neighbor_id,
+                            confidence: r.confidence,
+                            byte_start: r.source_byte_start,
+                            byte_end: r.source_byte_end,
+                        });
+                    }
+                }
+            }
+        }
+        CallSiteRole::Callee => {
+            if kind.includes_calls() {
+                for edge in call_edges_targeting(conn, &entity.id, confidence)? {
+                    resolved.push(ResolvedSite {
+                        owner_id: edge.from_id.clone(),
+                        edge_kind: "calls",
+                        other_id: edge.from_id,
+                        confidence: edge.confidence,
+                        byte_start: edge.source_byte_start,
+                        byte_end: edge.source_byte_end,
+                    });
+                }
+                for site in unresolved_callers_for_target(conn, entity, CALL_SITES_MAX)? {
+                    unbound.push(UnboundSite {
+                        owner_id: site.caller_entity_id,
+                        callee_expr: site.callee_expr,
+                        byte_start: site.source_byte_start,
+                        byte_end: site.source_byte_end,
+                    });
+                }
+            }
+            if kind.includes_references() {
+                for r in reference_edges_for_entity(conn, &entity.id, ReferenceDirection::In)? {
+                    if r.confidence <= confidence {
+                        resolved.push(ResolvedSite {
+                            owner_id: r.neighbor_id.clone(),
+                            edge_kind: "references",
+                            other_id: r.neighbor_id,
+                            confidence: r.confidence,
+                            byte_start: r.source_byte_start,
+                            byte_end: r.source_byte_end,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((resolved, unbound))
+}
+
+/// Build the `call_sites` payload. Returns `Ok(None)` when the entity does not
+/// exist (so the caller can emit a not-found envelope).
+fn build_call_sites(
+    conn: &rusqlite::Connection,
+    entity_id: &str,
+    role: CallSiteRole,
+    kind: CallSiteKind,
+    confidence: EdgeConfidence,
+    path: PathScope,
+) -> Result<Option<Value>, StorageError> {
+    let Some(entity) = entity_by_id(conn, entity_id)? else {
+        return Ok(None);
+    };
+
+    let (resolved, unbound) = collect_call_sites(conn, &entity, role, kind, confidence)?;
+
+    // Resolve each site's owning file once, mapping the byte anchor to a line.
+    let mut owner_path: HashMap<String, Option<String>> = HashMap::new();
+    let mut file_content: HashMap<String, Option<String>> = HashMap::new();
+    // The queried entity's own path is known without a lookup.
+    owner_path.insert(entity.id.clone(), entity.source_file_path.clone());
+
+    let mut site_values = Vec::new();
+    let mut truncated = false;
+    for site in resolved {
+        if site_values.len() >= CALL_SITES_MAX {
+            truncated = true;
+            break;
+        }
+        let path_str = resolve_owner_path(conn, &mut owner_path, &site.owner_id)?;
+        if !path.admits(path_str.as_deref()) {
+            continue;
+        }
+        let (line, column, line_text) =
+            anchor_line(&mut file_content, path_str.as_deref(), site.byte_start);
+        site_values.push(json!({
+            "edge_kind": site.edge_kind,
+            "other_id": site.other_id,
+            "confidence": site.confidence.as_str(),
+            "file": path_str,
+            "line": line,
+            "column": column,
+            "line_text": line_text,
+            "byte_start": site.byte_start,
+            "byte_end": site.byte_end
+        }));
+    }
+
+    let mut unresolved_values = Vec::new();
+    for site in unbound {
+        if unresolved_values.len() >= CALL_SITES_MAX {
+            truncated = true;
+            break;
+        }
+        let path_str = resolve_owner_path(conn, &mut owner_path, &site.owner_id)?;
+        if !path.admits(path_str.as_deref()) {
+            continue;
+        }
+        let (line, column, line_text) = anchor_line(
+            &mut file_content,
+            path_str.as_deref(),
+            Some(site.byte_start),
+        );
+        unresolved_values.push(json!({
+            "callee_expr": site.callee_expr,
+            "file": path_str,
+            "line": line,
+            "column": column,
+            "line_text": line_text,
+            "byte_start": site.byte_start,
+            "byte_end": site.byte_end
+        }));
+    }
+
+    Ok(Some(json!({
+        "entity": entity_json(&entity),
+        "role": match role { CallSiteRole::Caller => "caller", CallSiteRole::Callee => "callee" },
+        "filters": {
+            "kind": match kind {
+                CallSiteKind::Both => "both",
+                CallSiteKind::Calls => "calls",
+                CallSiteKind::References => "references",
+            },
+            "confidence": confidence.as_str(),
+            "path": match path {
+                PathScope::All => "all",
+                PathScope::Production => "production",
+                PathScope::Test => "test",
+            }
+        },
+        "sites": site_values,
+        "unresolved_sites": unresolved_values,
+        "truncated": truncated,
+        "scope_excludes": call_graph_scope_excludes(confidence)
+    })))
+}
+
+/// Memoized lookup of an owner entity's source file path.
+fn resolve_owner_path(
+    conn: &rusqlite::Connection,
+    cache: &mut HashMap<String, Option<String>>,
+    owner_id: &str,
+) -> Result<Option<String>, StorageError> {
+    if let Some(path) = cache.get(owner_id) {
+        return Ok(path.clone());
+    }
+    let path = entity_by_id(conn, owner_id)?.and_then(|e| e.source_file_path);
+    cache.insert(owner_id.to_owned(), path.clone());
+    Ok(path)
+}
+
+/// Map a byte anchor to (line, column, `line_text`), reading + caching the file.
+/// Any piece that can't be resolved degrades to JSON null / empty rather than
+/// failing the whole query.
+fn anchor_line(
+    file_content: &mut HashMap<String, Option<String>>,
+    path: Option<&str>,
+    byte_start: Option<i64>,
+) -> (Value, Value, String) {
+    let (Some(path), Some(byte_start)) = (path, byte_start) else {
+        return (Value::Null, Value::Null, String::new());
+    };
+    let content = file_content
+        .entry(path.to_owned())
+        .or_insert_with(|| std::fs::read_to_string(path).ok());
+    let Some(content) = content.as_deref() else {
+        return (Value::Null, Value::Null, String::new());
+    };
+    match byte_line_col(content, byte_start) {
+        Some((line, column)) => (json!(line), json!(column), line_text_at(content, line)),
+        None => (Value::Null, Value::Null, String::new()),
+    }
+}
+
 /// Build the `source_for_entity` payload: the entity's exact indexed line span
 /// plus `context_lines` of surrounding context, line-numbered and drift-checked.
 ///
@@ -3801,7 +4206,7 @@ mod tests {
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 13);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
@@ -3861,6 +4266,11 @@ mod tests {
         assert_eq!(
             tools[11].description,
             "Return the exact indexed source span for one entity (its source_line_start..source_line_end, which includes any decorators/signature/docstring the plugin captured) plus a bounded window of surrounding context, as line-numbered lines each flagged in_entity true/false. No LLM call. Lets an agent read and trust the entity without shelling out. source_status reports `ok`, or — instead of a misleading stale snippet — `missing` (file gone), `no_range`/`no_source_path` (entity has no anchor), `binary` (non-UTF-8), or `drifted` (the file no longer matches the indexed content_hash; rerun `clarion analyze`). context_lines defaults to 10."
+        );
+        assert_eq!(tools[12].name, "call_sites");
+        assert_eq!(
+            tools[12].description,
+            "Show the actual source sites behind calls/references edges, so an agent can see WHY Clarion believes an edge exists rather than trusting it blind. role=caller (default) returns this entity's outgoing sites (what it calls/references); role=callee returns incoming sites (who calls/references it). Each site carries the file path, 1-based line, byte column, the source line text, edge kind, confidence, and a resolution of resolved | ambiguous (with candidate ids) | unresolved (a static call Clarion could not bind, kept separate so it is never mixed with resolved evidence). Filter by edge kind (`calls`/`references`) and by a best-effort production/test path heuristic (`all`/`production`/`test`; path partitioning is not indexed — the heuristic matches conventional test paths). Output is bounded; truncated flags when the site cap trims. No LLM call."
         );
     }
 
@@ -4164,7 +4574,7 @@ mod tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], "tools-1");
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 12);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 13);
         assert_eq!(response["result"]["tools"][0]["name"], "entity_at");
         assert_eq!(response["result"]["tools"][7]["name"], "subsystem_members");
     }
@@ -4265,7 +4675,7 @@ mod tests {
 
         assert_eq!(decoded["jsonrpc"], "2.0");
         assert_eq!(decoded["id"], 10);
-        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 12);
+        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 13);
     }
 
     #[test]
@@ -4340,7 +4750,7 @@ mod tests {
         assert_eq!(first_json["id"], 11);
         assert_eq!(first_json["result"]["serverInfo"]["name"], "clarion");
         assert_eq!(second_json["id"], 12);
-        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 12);
+        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 13);
     }
 
     #[test]

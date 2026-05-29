@@ -372,6 +372,18 @@ requests: list[tuple[str, dict[str, object]]] = [
         },
     ),
     (
+        "call-sites",
+        {
+            "jsonrpc": "2.0",
+            "id": "call-sites",
+            "method": "tools/call",
+            "params": {
+                "name": "call_sites",
+                "arguments": {"id": "python:function:demo.hello", "role": "caller"},
+            },
+        },
+    ),
+    (
         "context",
         {
             "jsonrpc": "2.0",
@@ -417,6 +429,7 @@ assert tool_names == [
     "project_status",
     "summary_preview_cost",
     "source_for_entity",
+    "call_sites",
 ], tool_names
 # Single-source check (clarion-71f0d6c3dd): the initialize `instructions` tool
 # enumeration is derived from list_tools(), so every advertised tool must appear
@@ -442,6 +455,15 @@ sfe_lines = sfe_result["lines"]
 assert sfe_lines, source_for_entity
 assert all("number" in line and "in_entity" in line for line in sfe_lines), source_for_entity
 assert any(line["in_entity"] for line in sfe_lines), source_for_entity
+
+call_sites = assert_tool_ok(responses["call-sites"])
+cs_result = call_sites["result"]
+assert cs_result["role"] == "caller", call_sites
+assert "sites" in cs_result and "unresolved_sites" in cs_result, call_sites
+# Every resolved site carries its edge kind, confidence, and source line text.
+for site in cs_result["sites"]:
+    assert site["edge_kind"] in ("calls", "references"), call_sites
+    assert "confidence" in site and "line_text" in site, call_sites
 
 find_result = assert_tool_ok(responses["find"])
 assert len(find_result["result"]["entities"]) == 2, find_result
@@ -508,4 +530,4 @@ assert "staleness" in ctx, ctx
 assert ctx["degraded"] is False, ctx
 PY
 
-log "PASS: MCP stdio surface returned twelve tool definitions and eight tool responses"
+log "PASS: MCP stdio surface returned thirteen tool definitions and nine tool responses"

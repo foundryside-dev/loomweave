@@ -1972,6 +1972,127 @@ async fn source_for_entity_reports_missing_file_and_unknown_entity() {
 }
 
 #[tokio::test]
+async fn call_sites_caller_shows_calls_and_references_with_line_text() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    // demo.entry calls mid (resolved) and target (ambiguous, candidate
+    // alt_target), and references target (resolved).
+    let resp = call_tool(
+        &state,
+        "call_sites",
+        json!({"id": "python:function:demo.entry", "confidence": "ambiguous"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp:?}");
+    assert_eq!(resp["result"]["role"], "caller");
+
+    let sites = resp["result"]["sites"].as_array().expect("sites array");
+    assert!(!sites.is_empty(), "{resp:?}");
+    // Every site carries the evidence fields, with a resolved byte->line map.
+    for site in sites {
+        assert!(site["edge_kind"].is_string(), "{site:?}");
+        assert!(site["confidence"].is_string(), "{site:?}");
+        assert!(
+            site["file"].as_str().unwrap().ends_with("demo.py"),
+            "{site:?}"
+        );
+        assert!(site["line"].as_i64().unwrap() >= 1, "{site:?}");
+        assert!(site["line_text"].is_string(), "{site:?}");
+    }
+
+    let kinds: std::collections::BTreeSet<&str> = sites
+        .iter()
+        .map(|s| s["edge_kind"].as_str().unwrap())
+        .collect();
+    assert!(
+        kinds.contains("calls") && kinds.contains("references"),
+        "{kinds:?}"
+    );
+
+    let confidences: std::collections::BTreeSet<&str> = sites
+        .iter()
+        .map(|s| s["confidence"].as_str().unwrap())
+        .collect();
+    assert!(
+        confidences.contains("resolved") && confidences.contains("ambiguous"),
+        "expected both resolved and ambiguous evidence: {confidences:?}"
+    );
+
+    let targets: std::collections::BTreeSet<&str> = sites
+        .iter()
+        .map(|s| s["other_id"].as_str().unwrap())
+        .collect();
+    assert!(targets.contains("python:function:demo.mid"), "{targets:?}");
+}
+
+#[tokio::test]
+async fn call_sites_kind_filter_limits_to_one_edge_kind() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "call_sites",
+        json!({"id": "python:function:demo.entry", "kind": "references"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp:?}");
+    let sites = resp["result"]["sites"].as_array().expect("sites");
+    assert!(!sites.is_empty(), "{resp:?}");
+    assert!(
+        sites.iter().all(|s| s["edge_kind"] == "references"),
+        "kind=references leaked other edge kinds: {resp:?}"
+    );
+}
+
+#[tokio::test]
+async fn call_sites_marks_unresolved_separately_and_rejects_unknown_entity() {
+    let (project, db_path) = open_project();
+    // Seed an unresolved (statically unbindable) call site for demo.entry.
+    {
+        let conn = Connection::open(&db_path).expect("open");
+        insert_unresolved_call_site(
+            &conn,
+            "python:function:demo.entry",
+            "site-dynamic",
+            "ctx.handler.dispatch",
+        );
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "call_sites",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp:?}");
+    let unresolved = resp["result"]["unresolved_sites"]
+        .as_array()
+        .expect("unresolved_sites");
+    assert_eq!(unresolved.len(), 1, "{resp:?}");
+    assert_eq!(unresolved[0]["callee_expr"], "ctx.handler.dispatch");
+    // Unresolved evidence must not be mixed into the resolved `sites` list.
+    let resolved_exprs: Vec<&str> = resp["result"]["sites"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["callee_expr"].as_str())
+        .collect();
+    assert!(resolved_exprs.is_empty(), "{resp:?}");
+
+    let unknown = call_tool(
+        &state,
+        "call_sites",
+        json!({"id": "python:function:does.not.exist"}),
+    )
+    .await;
+    assert_eq!(unknown["ok"], false, "{unknown:?}");
+    assert_eq!(unknown["error"]["code"], "not-found");
+}
+
+#[tokio::test]
 async fn find_entity_paginates_and_searches_punctuation_heavy_ids() {
     let (project, db_path) = open_project();
     let state = state_for(project.path(), &db_path);

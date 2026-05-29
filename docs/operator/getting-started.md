@@ -39,8 +39,8 @@ export OPENROUTER_API_KEY=sk-or-v1-...
 `clarion analyze` (step 2) and the structural MCP tools (`entity_at`,
 `find_entity`, `callers_of`, `execution_paths_from`, `issues_for`,
 `neighborhood`, `subsystem_members`, `subsystem_of`, `project_status`,
-`summary_preview_cost`, `source_for_entity`) work without any LLM credentials —
-eleven of the twelve MCP tools are credential-free. The
+`summary_preview_cost`, `source_for_entity`, `call_sites`) work without any LLM
+credentials — twelve of the thirteen MCP tools are credential-free. The
 key is only consulted when an MCP client calls `summary(id)` against an entity that does not
 yet have a cached summary.
 
@@ -224,12 +224,13 @@ envelope.
 
 ### The MCP tools
 
-The MCP surface exposes twelve tools: seven primary tools (in the table below)
+The MCP surface exposes thirteen tools: seven primary tools (in the table below)
 plus `subsystem_members` and `subsystem_of` for clustering output,
 `project_status` for deterministic diagnostics, `summary_preview_cost` to
-preview a summary's cache status and cost before spending, and
+preview a summary's cache status and cost before spending,
 `source_for_entity` to read an entity's exact indexed source span (with bounded
-context and drift detection) without shelling out. Eleven of the twelve are
+context and drift detection) without shelling out, and `call_sites` to see the
+actual source line(s) behind a calls/references edge. Twelve of the thirteen are
 credential-free; only `summary` needs the live LLM. Each is a structured graph
 query, not free-text grep.
 
@@ -246,6 +247,7 @@ query, not free-text grep.
 | `project_status()` | `project_status()` — index diagnostics: latest run, entity/edge/finding counts, staleness, per-plugin counts, LLM policy, and the resolved Filigree endpoint. No arguments, no LLM. |
 | `summary_preview_cost(id)` | `summary_preview_cost(id="python:function:requests.sessions.Session.send")` — preview a `summary` call before spending: cache hit/expired/miss, cached tokens/cost/age, an input-token estimate on a miss, LLM policy, and whether a live call would spend. Never calls the LLM. |
 | `source_for_entity(id, context_lines)` | `source_for_entity(id="python:function:requests.sessions.Session.send", context_lines=10)` — the entity's exact indexed source span plus bounded line-numbered context, each line flagged `in_entity`. Reports `source_status` (`ok`/`missing`/`drifted`/…) instead of a stale snippet. No LLM. |
+| `call_sites(id, role)` | `call_sites(id="python:function:requests.sessions.Session.send", role="caller")` — the actual source line(s) behind calls/references edges: file, line, line text, edge kind, confidence, and resolved/ambiguous/unresolved classification. `role="callee"` shows incoming sites. No LLM. |
 
 The three questions to walk through with your agent:
 
