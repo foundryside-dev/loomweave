@@ -54,15 +54,24 @@ pub enum Staleness {
 
 /// Counts + freshness for one Clarion project, safe to serialize into the MCP
 /// resource or print from the hook.
+///
+/// Fields are private and read through accessors so the documented invariant —
+/// `db_present == false` implies zero counts and [`Staleness::NeverAnalyzed`] —
+/// cannot be violated: the only ways to build one are the three constructors in
+/// this module ([`project_snapshot`], [`missing_db_snapshot`],
+/// [`unreadable_db_snapshot`]), each of which upholds it. No external caller can
+/// assemble a `db_present: false` snapshot carrying non-zero counts
+/// (clarion-e0a4937d89). Serialization is unaffected — serde uses the field
+/// names regardless of visibility, so the wire shape is identical.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectSnapshot {
-    pub db_present: bool,
-    pub entity_count: i64,
-    pub subsystem_count: i64,
-    pub finding_count: i64,
-    pub staleness: Staleness,
+    db_present: bool,
+    entity_count: i64,
+    subsystem_count: i64,
+    finding_count: i64,
+    staleness: Staleness,
     /// Latest run `completed_at` (ISO-8601) if any, else `None`.
-    pub last_analyzed_at: Option<String>,
+    last_analyzed_at: Option<String>,
     /// `true` when this snapshot was produced from a *failure* rather than a
     /// healthy read: at least one backing SQL query failed unexpectedly and was
     /// folded to a safe default (a count to `0`, the run lookup to `None`, or
@@ -73,7 +82,58 @@ pub struct ProjectSnapshot {
     /// `staleness: unknown`). Environmental staleness (a missing/unstat-able
     /// source file folding to `Unknown`) is *not* degradation — that is a normal
     /// outcome signalled by `staleness` itself, not a DB-machinery failure.
-    pub degraded: bool,
+    degraded: bool,
+}
+
+impl ProjectSnapshot {
+    /// Whether a readable `.clarion/clarion.db` was found. When `false`, every
+    /// count is `0` and `staleness` is [`Staleness::NeverAnalyzed`].
+    #[must_use]
+    pub fn db_present(&self) -> bool {
+        self.db_present
+    }
+
+    /// Total entity rows (subsystems included — see [`subsystem_count`]).
+    ///
+    /// [`subsystem_count`]: ProjectSnapshot::subsystem_count
+    #[must_use]
+    pub fn entity_count(&self) -> i64 {
+        self.entity_count
+    }
+
+    /// Entities of kind `subsystem` — a *subset* of [`entity_count`], not a
+    /// disjoint category.
+    ///
+    /// [`entity_count`]: ProjectSnapshot::entity_count
+    #[must_use]
+    pub fn subsystem_count(&self) -> i64 {
+        self.subsystem_count
+    }
+
+    /// Total finding rows.
+    #[must_use]
+    pub fn finding_count(&self) -> i64 {
+        self.finding_count
+    }
+
+    /// Index freshness verdict.
+    #[must_use]
+    pub fn staleness(&self) -> Staleness {
+        self.staleness
+    }
+
+    /// Latest run `completed_at` (ISO-8601) if any.
+    #[must_use]
+    pub fn last_analyzed_at(&self) -> Option<&str> {
+        self.last_analyzed_at.as_deref()
+    }
+
+    /// `true` when this snapshot was folded from a backing-query failure — see
+    /// the field-level note for the precise contract.
+    #[must_use]
+    pub fn degraded(&self) -> bool {
+        self.degraded
+    }
 }
 
 /// Build a snapshot from an already-open migrated `Connection`.
@@ -124,6 +184,26 @@ pub fn missing_db_snapshot() -> ProjectSnapshot {
         staleness: Staleness::NeverAnalyzed,
         last_analyzed_at: None,
         degraded: false,
+    }
+}
+
+/// A degraded snapshot for a database that *is* present but could not be read
+/// or serialized (the MCP `clarion://context` reader-pool / serialize-error
+/// fallback): `db_present: true`, all counts `0`, [`Staleness::Unknown`], no
+/// timestamp, and `degraded: true` so a consumer never mistakes the zero counts
+/// for a genuinely empty index. The single construction site for this case,
+/// replacing the inline struct literal that the private fields now forbid
+/// (clarion-e0a4937d89).
+#[must_use]
+pub fn unreadable_db_snapshot() -> ProjectSnapshot {
+    ProjectSnapshot {
+        db_present: true,
+        entity_count: 0,
+        subsystem_count: 0,
+        finding_count: 0,
+        staleness: Staleness::Unknown,
+        last_analyzed_at: None,
+        degraded: true,
     }
 }
 

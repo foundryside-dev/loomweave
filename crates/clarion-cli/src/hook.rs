@@ -103,7 +103,7 @@ fn print_snapshot(project_root: &Path, outcome: &SnapshotOutcome) {
             return;
         }
     };
-    if !snapshot.db_present {
+    if !snapshot.db_present() {
         println!(
             "Clarion: no index at {}/.clarion/clarion.db. \
              Run `clarion install --path {}` then `clarion analyze {}`.",
@@ -118,9 +118,11 @@ fn print_snapshot(project_root: &Path, outcome: &SnapshotOutcome) {
     // as disjoint (clarion-e4e80eff3f).
     println!(
         "Clarion index: {} entities (incl. {} subsystems), {} findings.",
-        snapshot.entity_count, snapshot.subsystem_count, snapshot.finding_count
+        snapshot.entity_count(),
+        snapshot.subsystem_count(),
+        snapshot.finding_count()
     );
-    if snapshot.degraded {
+    if snapshot.degraded() {
         // A backing query folded to a safe default, so the counts above may
         // understate a populated index. Distinct from the present-but-empty
         // case (which is not degraded). Operator detail is in the warn log.
@@ -129,12 +131,12 @@ fn print_snapshot(project_root: &Path, outcome: &SnapshotOutcome) {
              the counts above may be incomplete. (Run with RUST_LOG=warn for details.)"
         );
     }
-    match snapshot.staleness {
+    match snapshot.staleness() {
         Staleness::Fresh => {
             println!(
                 "Index is fresh (last analyzed {}). Ask Clarion before re-exploring \
                  the tree; see the clarion-workflow skill.",
-                snapshot.last_analyzed_at.as_deref().unwrap_or("unknown")
+                snapshot.last_analyzed_at().unwrap_or("unknown")
             );
         }
         Staleness::Stale => {
@@ -155,7 +157,7 @@ fn print_snapshot(project_root: &Path, outcome: &SnapshotOutcome) {
                 "Index freshness not checked: no ingested entity has a recorded \
                  source path to compare against (last analyzed {}). The index is \
                  present and queryable.",
-                snapshot.last_analyzed_at.as_deref().unwrap_or("unknown")
+                snapshot.last_analyzed_at().unwrap_or("unknown")
             );
         }
         Staleness::Unknown => {

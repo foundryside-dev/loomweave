@@ -468,8 +468,6 @@ impl ServerState {
     }
 
     async fn context_snapshot_json(&self) -> String {
-        use crate::snapshot::{ProjectSnapshot, Staleness};
-
         // Single fallback used by both the reader-error and serialize-error
         // branches: serialize a real `ProjectSnapshot` so the shape stays in
         // lock-step with the type as it gains fields. `degraded: true` — this
@@ -477,15 +475,7 @@ impl ServerState {
         // snapshot failed to serialize, so the consumer must not read the zero
         // counts as a genuinely empty index.
         let fallback = || {
-            let snap = ProjectSnapshot {
-                db_present: true,
-                entity_count: 0,
-                subsystem_count: 0,
-                finding_count: 0,
-                staleness: Staleness::Unknown,
-                last_analyzed_at: None,
-                degraded: true,
-            };
+            let snap = crate::snapshot::unreadable_db_snapshot();
             serde_json::to_string(&snap).unwrap_or_default()
         };
 
@@ -1153,7 +1143,9 @@ impl ServerState {
         // A served index that has a completed run but no entities is almost
         // always a wrong/empty/swapped corpus — surface it in the log so an
         // operator notices even without reading the diagnostics (clarion-22c18fdb34).
-        if snapshot.db_present && snapshot.entity_count == 0 && snapshot.last_analyzed_at.is_some()
+        if snapshot.db_present()
+            && snapshot.entity_count() == 0
+            && snapshot.last_analyzed_at().is_some()
         {
             tracing::warn!(
                 db_path = %db_path.display(),
@@ -1164,20 +1156,20 @@ impl ServerState {
         let result = json!({
             "project_root": root_display,
             "db_path": db_path.display().to_string(),
-            "db_present": snapshot.db_present,
+            "db_present": snapshot.db_present(),
             "db_identity": {
                 "db_size_bytes": db_size_bytes,
                 "data_version": data_version,
             },
             "latest_run": latest_run,
             "counts": {
-                "entities": snapshot.entity_count,
-                "subsystems": snapshot.subsystem_count,
+                "entities": snapshot.entity_count(),
+                "subsystems": snapshot.subsystem_count(),
                 "edges": edge_count,
-                "findings": snapshot.finding_count,
+                "findings": snapshot.finding_count(),
             },
-            "staleness": serde_json::to_value(snapshot.staleness).unwrap_or(Value::Null),
-            "last_analyzed_at": snapshot.last_analyzed_at,
+            "staleness": serde_json::to_value(snapshot.staleness()).unwrap_or(Value::Null),
+            "last_analyzed_at": snapshot.last_analyzed_at(),
             // No analyze-time git SHA is persisted and Clarion has no git
             // integration; report null rather than fabricate one.
             "git_sha": Value::Null,
