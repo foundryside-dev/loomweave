@@ -176,7 +176,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "project_status",
-            description: "Return deterministic Clarion diagnostics: repo root, db path, latest run (id/status/started/completed), entity/subsystem/edge/finding counts, index staleness, per-plugin entity counts from the current index, LLM policy (provider/live/cache), and the resolved Filigree endpoint (configured vs resolved URL + resolution source). Answers \"is the graph fresh, plugin-less, LLM-live, Filigree-reachable?\" without shelling out. No LLM call.",
+            description: "Return deterministic Clarion diagnostics: repo root, db path, latest run (id/status/started/completed), entity/subsystem/edge/finding/briefing-blocked counts, index staleness, per-plugin entity counts from the current index, LLM policy (provider/live/cache), and the resolved Filigree endpoint (configured vs resolved URL + resolution source). Answers \"is the graph fresh, plugin-less, LLM-live, Filigree-reachable?\" without shelling out. No LLM call.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -1241,26 +1241,42 @@ impl ServerState {
             .with_reader(move |conn| {
                 let snapshot = crate::snapshot::project_snapshot(conn, &project_root);
                 let edge_count = scalar_count_fail_soft(conn, "SELECT COUNT(*) FROM edges");
+                // Entities withheld from briefings/federation exposure (secret
+                // scan set `briefing_blocked`). Served by the partial index
+                // ix_entities_briefing_blocked over the generated column
+                // (clarion-bdabfd6bca) — no per-row JSON parse.
+                let briefing_blocked = scalar_count_fail_soft(
+                    conn,
+                    "SELECT COUNT(*) FROM entities WHERE briefing_blocked IS NOT NULL",
+                );
                 let plugins = plugin_entity_counts(conn);
                 let latest_run = latest_run_row(conn);
                 // SQLite's data_version increments when another connection commits
                 // to the DB, so a consult agent can detect that the index changed
                 // under it across calls (clarion-22c18fdb34).
                 let data_version = scalar_count_fail_soft(conn, "PRAGMA data_version");
-                Ok((snapshot, edge_count, plugins, latest_run, data_version))
+                Ok((
+                    snapshot,
+                    edge_count,
+                    briefing_blocked,
+                    plugins,
+                    latest_run,
+                    data_version,
+                ))
             })
             .await;
 
-        let (snapshot, edge_count, plugins, latest_run, data_version) = match storage {
-            Ok(tuple) => tuple,
-            Err(err) => {
-                return Ok(tool_error_envelope(
-                    "storage-error",
-                    &err.to_string(),
-                    storage_retryable(&err),
-                ));
-            }
-        };
+        let (snapshot, edge_count, briefing_blocked, plugins, latest_run, data_version) =
+            match storage {
+                Ok(tuple) => tuple,
+                Err(err) => {
+                    return Ok(tool_error_envelope(
+                        "storage-error",
+                        &err.to_string(),
+                        storage_retryable(&err),
+                    ));
+                }
+            };
 
         // The on-disk size, paired with data_version, exposes a swapped or
         // truncated DB the server may still be serving from a stale handle.
@@ -1293,6 +1309,7 @@ impl ServerState {
                 "subsystems": snapshot.subsystem_count(),
                 "edges": edge_count,
                 "findings": snapshot.finding_count(),
+                "briefing_blocked": briefing_blocked,
             },
             "staleness": serde_json::to_value(snapshot.staleness()).unwrap_or(Value::Null),
             "last_analyzed_at": snapshot.last_analyzed_at(),
@@ -4255,7 +4272,7 @@ mod tests {
         assert_eq!(tools[9].name, "project_status");
         assert_eq!(
             tools[9].description,
-            "Return deterministic Clarion diagnostics: repo root, db path, latest run (id/status/started/completed), entity/subsystem/edge/finding counts, index staleness, per-plugin entity counts from the current index, LLM policy (provider/live/cache), and the resolved Filigree endpoint (configured vs resolved URL + resolution source). Answers \"is the graph fresh, plugin-less, LLM-live, Filigree-reachable?\" without shelling out. No LLM call."
+            "Return deterministic Clarion diagnostics: repo root, db path, latest run (id/status/started/completed), entity/subsystem/edge/finding/briefing-blocked counts, index staleness, per-plugin entity counts from the current index, LLM policy (provider/live/cache), and the resolved Filigree endpoint (configured vs resolved URL + resolution source). Answers \"is the graph fresh, plugin-less, LLM-live, Filigree-reachable?\" without shelling out. No LLM call."
         );
         assert_eq!(tools[10].name, "summary_preview_cost");
         assert_eq!(

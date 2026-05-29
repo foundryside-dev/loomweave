@@ -406,7 +406,11 @@ fn migration_0001_creates_partial_indexes() {
     let tempdir = tempfile::tempdir().unwrap();
     let conn = open_fresh(&tempdir);
     let indexes = index_names(&conn);
-    for expected in &["ix_entities_churn", "ix_entities_scope_rank"] {
+    for expected in &[
+        "ix_entities_churn",
+        "ix_entities_scope_rank",
+        "ix_entities_briefing_blocked",
+    ] {
         assert!(
             indexes.iter().any(|i| i == expected),
             "missing index {expected} in {indexes:?}"
@@ -449,6 +453,59 @@ fn entity_generated_columns_extract_from_properties_json() {
     assert_eq!(scope_level.as_deref(), Some("subsystem"));
     assert_eq!(scope_rank, Some(2));
     assert_eq!(churn, Some(42));
+}
+
+#[test]
+fn briefing_blocked_generated_column_reflects_property_and_partial_index() {
+    // The briefing_blocked generated column extracts $.briefing_blocked, is NULL
+    // when the property is absent (so the partial index stays small), and the
+    // partial index query counts exactly the blocked entities (clarion-bdabfd6bca).
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+
+    let insert = |id: &str, props: &str| {
+        conn.execute(
+            "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
+             created_at, updated_at) \
+             VALUES (?1, 'python', 'function', ?1, ?1, ?2, \
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            params![id, props],
+        )
+        .unwrap();
+    };
+    insert(
+        "python:function:demo.blocked",
+        r#"{"briefing_blocked": "secret_detected"}"#,
+    );
+    insert("python:function:demo.clear", "{}");
+
+    let blocked: Option<String> = conn
+        .query_row(
+            "SELECT briefing_blocked FROM entities WHERE id = ?1",
+            params!["python:function:demo.blocked"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(blocked.as_deref(), Some("secret_detected"));
+
+    let clear: Option<String> = conn
+        .query_row(
+            "SELECT briefing_blocked FROM entities WHERE id = ?1",
+            params!["python:function:demo.clear"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(clear, None);
+
+    // The partial index serves "how many entities are withheld" in SQL.
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE briefing_blocked IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
 }
 
 #[test]

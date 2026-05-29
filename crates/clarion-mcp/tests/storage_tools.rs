@@ -3215,6 +3215,18 @@ async fn project_status_reports_counts_latest_run_and_plugins() {
         Some("2026-02-02T00:00:00.000Z"),
     );
     insert_finding(&conn, "f-1", "run-1", "python:function:demo.entry");
+    // One entity withheld from briefings (secret scan set briefing_blocked).
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
+         created_at, updated_at) \
+         VALUES (?1, 'python', 'function', ?1, ?1, ?2, \
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        rusqlite::params![
+            "python:function:demo.secret",
+            r#"{"briefing_blocked": "secret_detected"}"#
+        ],
+    )
+    .expect("insert briefing-blocked entity");
     drop(conn);
 
     let state = state_for(project.path(), &db_path);
@@ -3226,6 +3238,9 @@ async fn project_status_reports_counts_latest_run_and_plugins() {
     assert_eq!(result["counts"]["subsystems"], 1);
     assert!(result["counts"]["edges"].as_i64().unwrap() >= 1);
     assert_eq!(result["counts"]["findings"], 1);
+    // The briefing_blocked count is served by the partial index over the
+    // generated column (clarion-bdabfd6bca).
+    assert_eq!(result["counts"]["briefing_blocked"], 1);
 
     // AC#1: latest completed run + counts.
     assert_eq!(result["latest_run"]["id"], "run-1");

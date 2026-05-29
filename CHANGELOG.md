@@ -39,6 +39,15 @@ only when an incompatible change is made to that surface. See
 
 ### Changed
 
+- `entities` gains a `briefing_blocked` VIRTUAL generated column
+  (`json_extract(properties, '$.briefing_blocked')`) plus a partial index
+  (`ix_entities_briefing_blocked WHERE briefing_blocked IS NOT NULL`), so the
+  federation read-API hot path can filter entities withheld from briefings in
+  SQL instead of parsing every row's properties JSON. `project_status` now
+  reports a `counts.briefing_blocked` diagnostic (how many entities are
+  withheld), served by the new index. Edit-in-place in migration `0001` per
+  ADR-024 (no published build). Closes gap-register STO-04 / V11-STO-04
+  (clarion-bdabfd6bca).
 - The writer actor now opens its batch transactions with `BEGIN IMMEDIATE`
   (via a new `clarion_storage::retry::begin_immediate` helper with bounded
   `SQLITE_BUSY`/`SQLITE_LOCKED` retry + exponential backoff) instead of a
