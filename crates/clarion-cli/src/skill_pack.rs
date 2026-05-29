@@ -2,7 +2,10 @@
 //!
 //! The pack is compiled into the binary with `include_str!` (matching the
 //! `include_str!` migration-embedding convention in
-//! `clarion-storage/src/schema.rs`). Each entry is `(relative_path, contents)`;
+//! `clarion-storage/src/schema.rs`). The asset itself is owned by
+//! `clarion-mcp` (which this crate depends on), so the embed below reaches
+//! *down* the dependency edge rather than inverting it (clarion-04391392c7).
+//! Each entry is `(relative_path, contents)`;
 //! growing the pack with a `references/` directory is a data change here, not a
 //! logic change. The fingerprint over the pack bytes drives drift-aware
 //! re-copy (Phase 3 hook resync + `--skills` idempotency).
@@ -15,7 +18,7 @@ use anyhow::{Context, Result};
 /// `(relative_path, contents)` for every file in the bundled skill pack.
 pub const SKILL_PACK: &[(&str, &str)] = &[(
     "SKILL.md",
-    include_str!("../assets/skills/clarion-workflow/SKILL.md"),
+    include_str!("../../clarion-mcp/assets/skills/clarion-workflow/SKILL.md"),
 )];
 
 /// The on-disk subdirectory name the pack installs into.

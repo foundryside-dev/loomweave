@@ -44,10 +44,11 @@ pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 const EMPTY_GUIDANCE_FINGERPRINT: &str = "guidance-empty";
 
 /// The bundled clarion-workflow skill text, embedded for the `prompts/get`
-/// surface and reused as the canonical orientation reference. Same file the
-/// CLI installs on disk.
-pub const CLARION_WORKFLOW_SKILL: &str =
-    include_str!("../../clarion-cli/assets/skills/clarion-workflow/SKILL.md");
+/// surface and reused as the canonical orientation reference. The asset lives
+/// in this crate's own tree; the CLI (which depends on clarion-mcp) reaches
+/// down into it to embed the same bytes for its on-disk `install --skills`
+/// copy (clarion-04391392c7).
+pub const CLARION_WORKFLOW_SKILL: &str = include_str!("../assets/skills/clarion-workflow/SKILL.md");
 
 /// Orientation text returned in the MCP `initialize` result's `instructions`
 /// field. The `Tools:` enumeration is derived from [`list_tools`] (the single
