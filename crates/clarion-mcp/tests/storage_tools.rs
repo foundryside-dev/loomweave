@@ -2462,6 +2462,75 @@ async fn neighborhood_returns_one_hop_graph_sections() {
     );
 }
 
+#[tokio::test]
+async fn neighborhood_surfaces_import_edges_for_reverse_import_lookup() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    // demo imports `other`; `client` imports demo. The reverse-import question
+    // ("who imports demo?") is answerable only if neighborhood surfaces the
+    // distinct `imports` edge kind, not just `references` (clarion-79d0ff6e14).
+    std::fs::write(project.path().join("other.py"), "x = 1\n").unwrap();
+    std::fs::write(project.path().join("client.py"), "import demo\n").unwrap();
+    insert_entity(
+        &conn,
+        "python:module:other",
+        "module",
+        &project.path().join("other.py"),
+        Some((1, 1)),
+        None,
+    );
+    insert_entity(
+        &conn,
+        "python:module:client",
+        "module",
+        &project.path().join("client.py"),
+        Some((1, 1)),
+        None,
+    );
+    insert_edge(
+        &conn,
+        "imports",
+        "python:module:demo",
+        "python:module:other",
+        "resolved",
+        None,
+    );
+    insert_edge(
+        &conn,
+        "imports",
+        "python:module:client",
+        "python:module:demo",
+        "resolved",
+        None,
+    );
+    drop(conn);
+
+    let state = state_for(project.path(), &db_path);
+    let envelope = call_tool(&state, "neighborhood", json!({"id": "python:module:demo"})).await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    let imports_out: Vec<&str> = envelope["result"]["imports_out"]
+        .as_array()
+        .expect("imports_out array")
+        .iter()
+        .map(|n| n["entity"]["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        imports_out.contains(&"python:module:other"),
+        "imports_out should list what demo imports: {envelope}"
+    );
+    let imports_in: Vec<&str> = envelope["result"]["imports_in"]
+        .as_array()
+        .expect("imports_in array")
+        .iter()
+        .map(|n| n["entity"]["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        imports_in.contains(&"python:module:client"),
+        "imports_in should list who imports demo: {envelope}"
+    );
+}
+
 // ── scope_excludes on graph-query results (clarion-0d204a3f16) ───────────────
 
 #[tokio::test]

@@ -676,22 +676,42 @@ pub fn reference_edges_for_entity(
     entity_id: &str,
     direction: ReferenceDirection,
 ) -> Result<Vec<ReferenceEdgeMatch>> {
+    directed_edges_for_entity(conn, entity_id, direction, "references")
+}
+
+/// `imports` edges (module → module). Direction `In` answers "who imports this
+/// module" — the reverse-import lookup neighborhood previously could not serve
+/// because it only read `references` edges (clarion-79d0ff6e14).
+pub fn import_edges_for_entity(
+    conn: &Connection,
+    entity_id: &str,
+    direction: ReferenceDirection,
+) -> Result<Vec<ReferenceEdgeMatch>> {
+    directed_edges_for_entity(conn, entity_id, direction, "imports")
+}
+
+fn directed_edges_for_entity(
+    conn: &Connection,
+    entity_id: &str,
+    direction: ReferenceDirection,
+    kind: &str,
+) -> Result<Vec<ReferenceEdgeMatch>> {
     let sql = match direction {
         ReferenceDirection::In => {
             "SELECT from_id, confidence, source_file_id, source_byte_start, source_byte_end \
              FROM edges \
-             WHERE kind = 'references' AND to_id = ?1 \
+             WHERE kind = ?1 AND to_id = ?2 \
              ORDER BY from_id, source_byte_start, source_byte_end"
         }
         ReferenceDirection::Out => {
             "SELECT to_id, confidence, source_file_id, source_byte_start, source_byte_end \
              FROM edges \
-             WHERE kind = 'references' AND from_id = ?1 \
+             WHERE kind = ?1 AND from_id = ?2 \
              ORDER BY to_id, source_byte_start, source_byte_end"
         }
     };
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(params![entity_id], map_reference_edge_match)?;
+    let rows = stmt.query_map(params![kind, entity_id], map_reference_edge_match)?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(StorageError::from)
 }

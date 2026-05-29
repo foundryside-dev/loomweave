@@ -23,13 +23,13 @@ use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot};
 use clarion_core::plugin::{ContentLengthCeiling, Frame, TransportError};
 use clarion_storage::{
     CallEdgeMatch, EntityRow, InferredCallEdgeRecord, InferredEdgeCacheEntry, InferredEdgeCacheKey,
-    InferredEdgeWriteStats, ReaderPool, ReferenceDirection, StorageError, SummaryCacheEntry,
-    SummaryCacheKey, UnresolvedCallSiteRow, WriterCmd, call_edges_from, call_edges_targeting,
-    candidate_entities_for_unresolved_sites, child_entity_ids, contained_entity_ids,
-    entity_at_line, entity_by_id, existing_entity_ids, find_entities, inferred_edge_cache_key_id,
-    inferred_edge_cache_lookup, normalize_source_path, reference_edges_for_entity,
-    subsystem_members, summary_cache_lookup, unresolved_call_sites_for_caller,
-    unresolved_callers_for_target,
+    InferredEdgeWriteStats, ReaderPool, ReferenceDirection, ReferenceEdgeMatch, StorageError,
+    SummaryCacheEntry, SummaryCacheKey, UnresolvedCallSiteRow, WriterCmd, call_edges_from,
+    call_edges_targeting, candidate_entities_for_unresolved_sites, child_entity_ids,
+    contained_entity_ids, entity_at_line, entity_by_id, existing_entity_ids, find_entities,
+    import_edges_for_entity, inferred_edge_cache_key_id, inferred_edge_cache_lookup,
+    normalize_source_path, reference_edges_for_entity, subsystem_members, summary_cache_lookup,
+    unresolved_call_sites_for_caller, unresolved_callers_for_target,
 };
 
 use crate::config::LlmConfig;
@@ -149,7 +149,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "neighborhood",
-            description: "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, and references. Default confidence is resolved; ambiguous and inferred calls are opt-in. References are not execution flow. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls; module-level-reference-rollup when the entity is a module) so empty sections are never read as guaranteed true negatives.",
+            description: "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, references, and imports (imports_in = who imports this module, imports_out = what it imports; module-to-module). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls; module-level-reference-rollup when the entity is a module) so empty sections are never read as guaranteed true negatives.",
             input_schema: id_confidence_schema(),
         },
         ToolDefinition {
@@ -763,6 +763,8 @@ impl ServerState {
                 let references_in = reference_neighbors(conn, &entity_id, ReferenceDirection::In)?;
                 let references_out =
                     reference_neighbors(conn, &entity_id, ReferenceDirection::Out)?;
+                let imports_in = import_neighbors(conn, &entity_id, ReferenceDirection::In)?;
+                let imports_out = import_neighbors(conn, &entity_id, ReferenceDirection::Out)?;
                 let mut scope_excludes = call_graph_scope_excludes(confidence);
                 scope_excludes.extend(reference_scope_excludes(&entity.kind));
                 Ok(success_envelope(json!({
@@ -773,6 +775,8 @@ impl ServerState {
                     "contained": contained_entities,
                     "references_in": references_in,
                     "references_out": references_out,
+                    "imports_in": imports_in,
+                    "imports_out": imports_out,
                     "scope_excludes": scope_excludes,
                 })))
             })
@@ -3306,8 +3310,28 @@ fn reference_neighbors(
     entity_id: &str,
     direction: ReferenceDirection,
 ) -> Result<Vec<Value>, StorageError> {
+    edge_neighbors_json(
+        conn,
+        reference_edges_for_entity(conn, entity_id, direction)?,
+    )
+}
+
+/// `imports`-edge neighbors for a module entity (clarion-79d0ff6e14). Direction
+/// `In` is the reverse-import lookup ("who imports this module").
+fn import_neighbors(
+    conn: &rusqlite::Connection,
+    entity_id: &str,
+    direction: ReferenceDirection,
+) -> Result<Vec<Value>, StorageError> {
+    edge_neighbors_json(conn, import_edges_for_entity(conn, entity_id, direction)?)
+}
+
+fn edge_neighbors_json(
+    conn: &rusqlite::Connection,
+    edges: Vec<ReferenceEdgeMatch>,
+) -> Result<Vec<Value>, StorageError> {
     let mut neighbors = Vec::new();
-    for edge in reference_edges_for_entity(conn, entity_id, direction)? {
+    for edge in edges {
         if let Some(entity) = entity_by_id(conn, &edge.neighbor_id)? {
             neighbors.push(json!({
                 "entity": entity_json(&entity),
@@ -3391,7 +3415,7 @@ mod tests {
         assert_eq!(tools[6].name, "neighborhood");
         assert_eq!(
             tools[6].description,
-            "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, and references. Default confidence is resolved; ambiguous and inferred calls are opt-in. References are not execution flow. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls; module-level-reference-rollup when the entity is a module) so empty sections are never read as guaranteed true negatives."
+            "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, references, and imports (imports_in = who imports this module, imports_out = what it imports; module-to-module). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls; module-level-reference-rollup when the entity is a module) so empty sections are never read as guaranteed true negatives."
         );
         assert_eq!(tools[7].name, "subsystem_members");
         assert_eq!(

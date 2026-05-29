@@ -44,7 +44,7 @@ Every entity has an ID: `{plugin}:{kind}:{qualified_name}`
 | `find_entity` | locate an entity by name/text | `{"pattern": "<name>"}` |
 | `entity_at` | what's at a file:line | `{"file": "rel/path.py", "line": 42}` |
 | `callers_of` | what calls this entity | `{"id": "<id>"}` |
-| `neighborhood` | one-hop callers+callees+container+contained | `{"id": "<id>"}` |
+| `neighborhood` | one-hop callers+callees+container+contained+references+imports | `{"id": "<id>"}` |
 | `execution_paths_from` | bounded call paths out of an entity | `{"id": "<id>", "max_depth": 5}` |
 | `subsystem_members` | modules in a subsystem | `{"id": "core:subsystem:<hash>"}` |
 | `summary` | on-demand prose summary of one entity | `{"id": "<id>"}` |
