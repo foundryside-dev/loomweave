@@ -444,7 +444,10 @@ impl ServerState {
 
         // Single fallback used by both the reader-error and serialize-error
         // branches: serialize a real `ProjectSnapshot` so the shape stays in
-        // lock-step with the type as it gains fields.
+        // lock-step with the type as it gains fields. `degraded: true` — this
+        // path is only reached when the reader pool errored or a healthy
+        // snapshot failed to serialize, so the consumer must not read the zero
+        // counts as a genuinely empty index.
         let fallback = || {
             let snap = ProjectSnapshot {
                 db_present: true,
@@ -453,6 +456,7 @@ impl ServerState {
                 finding_count: 0,
                 staleness: Staleness::Unknown,
                 last_analyzed_at: None,
+                degraded: true,
             };
             serde_json::to_string(&snap).unwrap_or_default()
         };
@@ -3611,6 +3615,12 @@ mod tests {
         assert_eq!(parsed["db_present"], true);
         assert_eq!(parsed["entity_count"], 1);
         assert_eq!(parsed["staleness"], "never_analyzed");
+        // A healthy read carries `degraded: false`, distinguishing it from the
+        // reader-error fallback which sets `degraded: true`.
+        assert_eq!(
+            parsed["degraded"], false,
+            "healthy snapshot must not be degraded"
+        );
     }
 
     #[tokio::test]

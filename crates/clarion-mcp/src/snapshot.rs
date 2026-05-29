@@ -51,6 +51,17 @@ pub struct ProjectSnapshot {
     pub staleness: Staleness,
     /// Latest run `completed_at` (ISO-8601) if any, else `None`.
     pub last_analyzed_at: Option<String>,
+    /// `true` when this snapshot was produced from a *failure* rather than a
+    /// healthy read: at least one backing SQL query failed unexpectedly and was
+    /// folded to a safe default (a count to `0`, the run lookup to `None`, or
+    /// the staleness scan to [`Staleness::Unknown`]), or the snapshot was built
+    /// by a caller's reader-pool fallback. Lets an MCP consumer distinguish
+    /// "machinery broke" from a genuinely empty-but-present index, which
+    /// otherwise serialize byte-identically (`db_present: true`, all counts `0`,
+    /// `staleness: unknown`). Environmental staleness (a missing/unstat-able
+    /// source file folding to `Unknown`) is *not* degradation — that is a normal
+    /// outcome signalled by `staleness` itself, not a DB-machinery failure.
+    pub degraded: bool,
 }
 
 /// Build a snapshot from an already-open migrated `Connection`.
@@ -59,15 +70,25 @@ pub struct ProjectSnapshot {
 /// `false` case is produced by the caller when the db file is missing.
 #[must_use]
 pub fn project_snapshot(conn: &Connection, project_root: &Path) -> ProjectSnapshot {
-    let entity_count = scalar_count(conn, "SELECT COUNT(*) FROM entities");
+    // Accumulates any SQL-machinery failure folded below into a wire-visible
+    // `degraded` flag, so the consumer can tell a broken read from an empty one.
+    let mut degraded = false;
+
+    let entity_count = scalar_count(conn, "SELECT COUNT(*) FROM entities", &mut degraded);
     let subsystem_count = scalar_count(
         conn,
         "SELECT COUNT(*) FROM entities WHERE kind = 'subsystem'",
+        &mut degraded,
     );
-    let finding_count = scalar_count(conn, "SELECT COUNT(*) FROM findings");
+    let finding_count = scalar_count(conn, "SELECT COUNT(*) FROM findings", &mut degraded);
 
-    let last_analyzed_at = latest_completed_run(conn);
-    let staleness = compute_staleness(conn, project_root, last_analyzed_at.as_deref());
+    let last_analyzed_at = latest_completed_run(conn, &mut degraded);
+    let staleness = compute_staleness(
+        conn,
+        project_root,
+        last_analyzed_at.as_deref(),
+        &mut degraded,
+    );
 
     ProjectSnapshot {
         db_present: true,
@@ -76,6 +97,7 @@ pub fn project_snapshot(conn: &Connection, project_root: &Path) -> ProjectSnapsh
         finding_count,
         staleness,
         last_analyzed_at,
+        degraded,
     }
 }
 
@@ -89,20 +111,27 @@ pub fn missing_db_snapshot() -> ProjectSnapshot {
         finding_count: 0,
         staleness: Staleness::NeverAnalyzed,
         last_analyzed_at: None,
+        degraded: false,
     }
 }
 
-fn scalar_count(conn: &Connection, sql: &str) -> i64 {
+/// Run a scalar `COUNT(*)` query. On failure, log, fold to `0`, and set
+/// `*degraded` so the caller can mark the whole snapshot as a degraded read.
+fn scalar_count(conn: &Connection, sql: &str, degraded: &mut bool) -> i64 {
     match conn.query_row(sql, [], |row| row.get::<_, i64>(0)) {
         Ok(n) => n,
         Err(err) => {
             tracing::warn!(error = %err, sql, "clarion snapshot count query failed; reporting 0");
+            *degraded = true;
             0
         }
     }
 }
 
-fn latest_completed_run(conn: &Connection) -> Option<String> {
+/// Look up the latest completed run's `completed_at`. `QueryReturnedNoRows` is a
+/// normal "never analyzed" outcome and does *not* degrade; any other error is a
+/// machinery failure that folds to `None` and sets `*degraded`.
+fn latest_completed_run(conn: &Connection, degraded: &mut bool) -> Option<String> {
     match conn.query_row(
         "SELECT completed_at FROM runs \
          WHERE completed_at IS NOT NULL AND status = 'completed' \
@@ -114,6 +143,7 @@ fn latest_completed_run(conn: &Connection) -> Option<String> {
         Err(rusqlite::Error::QueryReturnedNoRows) => None,
         Err(err) => {
             tracing::warn!(error = %err, "clarion latest-completed-run query failed");
+            *degraded = true;
             None
         }
     }
@@ -123,11 +153,15 @@ fn compute_staleness(
     conn: &Connection,
     project_root: &Path,
     last_analyzed_at: Option<&str>,
+    degraded: &mut bool,
 ) -> Staleness {
     let Some(run_iso) = last_analyzed_at else {
         return Staleness::NeverAnalyzed;
     };
     let Some(run_time) = parse_iso8601_to_systemtime(run_iso) else {
+        // A run timestamp we can't parse is a data/machinery fault, not an
+        // environmental one — mark degraded alongside the Unknown verdict.
+        *degraded = true;
         return Staleness::Unknown;
     };
 
@@ -135,9 +169,11 @@ fn compute_staleness(
         "SELECT DISTINCT source_file_path FROM entities \
          WHERE source_file_path IS NOT NULL",
     ) else {
+        *degraded = true;
         return Staleness::Unknown;
     };
     let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+        *degraded = true;
         return Staleness::Unknown;
     };
 
@@ -288,5 +324,84 @@ mod tests {
 
         let snap = project_snapshot(&conn, dir.path());
         assert_eq!(snap.staleness, Staleness::Stale, "{snap:?}");
+    }
+
+    #[test]
+    fn healthy_empty_index_is_not_degraded() {
+        let (_dir, conn) = migrated_conn();
+        let snap = project_snapshot(&conn, std::path::Path::new("/tmp"));
+        // All counts 0 and staleness NeverAnalyzed, but every query succeeded —
+        // this is a genuinely empty index, NOT a degraded read.
+        assert!(
+            !snap.degraded,
+            "healthy empty index must not be degraded: {snap:?}"
+        );
+        assert!(snap.db_present);
+    }
+
+    #[test]
+    fn healthy_populated_index_is_not_degraded() {
+        let (_dir, conn) = migrated_conn();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "x = 1\n").unwrap();
+        insert_entity(&conn, "python:module:a", "module", Some("a.py"));
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+             VALUES ('r', '2099-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z', '{}', '{}', 'completed')",
+            [],
+        )
+        .unwrap();
+        let snap = project_snapshot(&conn, dir.path());
+        assert_eq!(snap.staleness, Staleness::Fresh, "{snap:?}");
+        assert!(
+            !snap.degraded,
+            "fresh healthy read must not be degraded: {snap:?}"
+        );
+    }
+
+    #[test]
+    fn degraded_when_a_count_query_fails() {
+        let (_dir, conn) = migrated_conn();
+        // Simulate machinery failure: drop a table a count query depends on so
+        // the `findings` COUNT(*) errors and folds to 0 via scalar_count.
+        conn.execute("DROP TABLE findings", []).unwrap();
+        let snap = project_snapshot(&conn, std::path::Path::new("/tmp"));
+        assert!(
+            snap.degraded,
+            "a failed count query must mark the snapshot degraded: {snap:?}"
+        );
+        // The fold itself still produces a safe 0 — degraded is the ONLY signal
+        // that distinguishes this from a real empty index.
+        assert_eq!(snap.finding_count, 0);
+        assert!(snap.db_present);
+    }
+
+    #[test]
+    fn stat_failure_unknown_is_not_degraded() {
+        // Environmental Unknown (a recorded source file that no longer exists on
+        // disk) is a normal outcome signalled by `staleness`, NOT a DB-machinery
+        // failure — it must leave `degraded` false so the two stay distinct.
+        let (_dir, conn) = migrated_conn();
+        insert_entity(&conn, "python:module:a", "module", Some("gone.py"));
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+             VALUES ('r', '2026-01-01T00:00:00.000Z', '2026-01-02T00:00:00.000Z', '{}', '{}', 'completed')",
+            [],
+        )
+        .unwrap();
+        let snap = project_snapshot(&conn, std::path::Path::new("/nonexistent-root"));
+        assert_eq!(snap.staleness, Staleness::Unknown, "{snap:?}");
+        assert!(
+            !snap.degraded,
+            "stat-failure Unknown is environmental, not degraded: {snap:?}"
+        );
+    }
+
+    #[test]
+    fn degraded_field_serializes() {
+        let (_dir, conn) = migrated_conn();
+        let snap = project_snapshot(&conn, std::path::Path::new("/tmp"));
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["degraded"], serde_json::Value::Bool(false));
     }
 }

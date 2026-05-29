@@ -117,6 +117,15 @@ fn print_snapshot(project_root: &Path, outcome: &SnapshotOutcome) {
         "Clarion index: {} entities, {} subsystems, {} findings.",
         snapshot.entity_count, snapshot.subsystem_count, snapshot.finding_count
     );
+    if snapshot.degraded {
+        // A backing query folded to a safe default, so the counts above may
+        // understate a populated index. Distinct from the present-but-empty
+        // case (which is not degraded). Operator detail is in the warn log.
+        println!(
+            "Clarion: ⚠ snapshot is degraded — at least one index query failed and \
+             the counts above may be incomplete. (Run with RUST_LOG=warn for details.)"
+        );
+    }
     match snapshot.staleness {
         Staleness::Fresh => {
             println!(

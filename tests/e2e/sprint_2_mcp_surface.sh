@@ -466,6 +466,9 @@ ctx = json.loads(ctx_text)
 assert ctx["db_present"] is True, ctx
 assert ctx["entity_count"] >= 1, ctx
 assert "staleness" in ctx, ctx
+# A live, healthy snapshot must report degraded=false; the field is always
+# present so a consumer can tell a broken read from a genuinely empty index.
+assert ctx["degraded"] is False, ctx
 PY
 
 log "PASS: MCP stdio surface returned nine tool definitions and seven tool responses"
