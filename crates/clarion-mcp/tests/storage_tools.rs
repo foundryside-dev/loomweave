@@ -1885,6 +1885,93 @@ async fn entity_at_returns_innermost_entity_and_empty_match() {
 }
 
 #[tokio::test]
+async fn source_for_entity_returns_span_with_line_numbers_and_context() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    // demo.mid is indexed at lines 4-5 of demo.py.
+    let resp = call_tool(
+        &state,
+        "source_for_entity",
+        json!({"id": "python:function:demo.mid", "context_lines": 1}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp:?}");
+    let result = &resp["result"];
+    assert_eq!(result["source_status"], "ok");
+    assert_eq!(result["line_start"], 4);
+    assert_eq!(result["line_end"], 5);
+    assert_eq!(result["truncated"], false);
+
+    // context_lines=1 widens the window to lines 3..6.
+    let lines = result["lines"].as_array().expect("lines array");
+    assert_eq!(lines.first().unwrap()["number"], 3);
+    assert_eq!(lines.last().unwrap()["number"], 6);
+
+    // The entity's own lines carry the exact source text and in_entity=true;
+    // the context lines are flagged in_entity=false.
+    let by_number = |n: i64| lines.iter().find(|l| l["number"] == n).unwrap();
+    assert_eq!(by_number(4)["text"], "def mid():");
+    assert_eq!(by_number(4)["in_entity"], true);
+    assert_eq!(by_number(5)["text"], "    return target()");
+    assert_eq!(by_number(5)["in_entity"], true);
+    assert_eq!(by_number(3)["in_entity"], false);
+    assert_eq!(by_number(6)["in_entity"], false);
+}
+
+#[tokio::test]
+async fn source_for_entity_reports_drift_instead_of_stale_snippet() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    // Mutate the source after indexing so the file no longer matches the
+    // stored content_hash.
+    std::fs::write(
+        project.path().join("demo.py"),
+        "def entry():\n    return mid()\n\ndef mid():\n    return target()  # changed\n\ndef target():\n    return 1\n",
+    )
+    .expect("rewrite source");
+
+    let resp = call_tool(
+        &state,
+        "source_for_entity",
+        json!({"id": "python:function:demo.mid"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp:?}");
+    assert_eq!(resp["result"]["source_status"], "drifted");
+    assert!(resp["result"]["drift"]["stored_content_hash"].is_string());
+    assert!(resp["result"]["drift"]["current_content_hash"].is_string());
+    // No source lines are handed back when the snippet would be stale.
+    assert!(resp["result"].get("lines").is_none());
+}
+
+#[tokio::test]
+async fn source_for_entity_reports_missing_file_and_unknown_entity() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    std::fs::remove_file(project.path().join("demo.py")).expect("remove source");
+    let missing = call_tool(
+        &state,
+        "source_for_entity",
+        json!({"id": "python:function:demo.mid"}),
+    )
+    .await;
+    assert_eq!(missing["ok"], true, "{missing:?}");
+    assert_eq!(missing["result"]["source_status"], "missing");
+
+    let unknown = call_tool(
+        &state,
+        "source_for_entity",
+        json!({"id": "python:function:does.not.exist"}),
+    )
+    .await;
+    assert_eq!(unknown["ok"], false, "{unknown:?}");
+    assert_eq!(unknown["error"]["code"], "not-found");
+}
+
+#[tokio::test]
 async fn find_entity_paginates_and_searches_punctuation_heavy_ids() {
     let (project, db_path) = open_project();
     let state = state_for(project.path(), &db_path);

@@ -360,6 +360,18 @@ requests: list[tuple[str, dict[str, object]]] = [
         },
     ),
     (
+        "source-for-entity",
+        {
+            "jsonrpc": "2.0",
+            "id": "source-for-entity",
+            "method": "tools/call",
+            "params": {
+                "name": "source_for_entity",
+                "arguments": {"id": "python:function:demo.hello", "context_lines": 1},
+            },
+        },
+    ),
+    (
         "context",
         {
             "jsonrpc": "2.0",
@@ -404,6 +416,7 @@ assert tool_names == [
     "subsystem_of",
     "project_status",
     "summary_preview_cost",
+    "source_for_entity",
 ], tool_names
 # Single-source check (clarion-71f0d6c3dd): the initialize `instructions` tool
 # enumeration is derived from list_tools(), so every advertised tool must appear
@@ -419,6 +432,16 @@ assert entity_hit["truncated"] is False
 
 entity_miss = assert_tool_ok(responses["entity-miss"])
 assert entity_miss["result"]["entity"] is None, entity_miss
+
+source_for_entity = assert_tool_ok(responses["source-for-entity"])
+sfe_result = source_for_entity["result"]
+assert sfe_result["source_status"] == "ok", source_for_entity
+assert sfe_result["entity"]["id"] == "python:function:demo.hello", source_for_entity
+# Line-numbered lines, with the entity's own lines flagged in_entity=True.
+sfe_lines = sfe_result["lines"]
+assert sfe_lines, source_for_entity
+assert all("number" in line and "in_entity" in line for line in sfe_lines), source_for_entity
+assert any(line["in_entity"] for line in sfe_lines), source_for_entity
 
 find_result = assert_tool_ok(responses["find"])
 assert len(find_result["result"]["entities"]) == 2, find_result
@@ -485,4 +508,4 @@ assert "staleness" in ctx, ctx
 assert ctx["degraded"] is False, ctx
 PY
 
-log "PASS: MCP stdio surface returned eleven tool definitions and seven tool responses"
+log "PASS: MCP stdio surface returned twelve tool definitions and eight tool responses"

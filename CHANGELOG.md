@@ -21,6 +21,13 @@ only when an incompatible change is made to that surface. See
   refuses to clobber without `--force`, and verifies the copy with
   `PRAGMA integrity_check` before promoting it. Closes gap-register STO-04
   (clarion-6d433b61ba).
+- `source_for_entity(id, context_lines=10)` MCP tool — returns an entity's
+  exact indexed source span (decorators/signature/docstring included as
+  captured) plus a bounded window of line-numbered context, each line flagged
+  `in_entity`. No LLM call. Reports an explicit `source_status`
+  (`missing`/`no_range`/`binary`/`drifted`) rather than a misleading stale
+  snippet when the on-disk source no longer matches the indexed `content_hash`.
+  The MCP surface now exposes twelve tools (clarion-6077738f1c).
 
 ### Changed
 

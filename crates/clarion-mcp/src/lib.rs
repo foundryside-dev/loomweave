@@ -186,6 +186,19 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             description: "Preview what calling summary(id) would cost BEFORE spending. Reports cache_status (hit | expired | miss), the cached row's real tokens/cost/age on a hit, an input-token estimate on a miss, the configured model, the LLM policy (provider/live/allow_live_provider/cache horizon), and live_spend_would_occur — true only when no fresh cache row exists AND a live provider is wired. A disabled/unconfigured LLM is reported distinctly from a cache miss. Never invokes the LLM provider.",
             input_schema: id_schema(),
         },
+        ToolDefinition {
+            name: "source_for_entity",
+            description: "Return the exact indexed source span for one entity (its source_line_start..source_line_end, which includes any decorators/signature/docstring the plugin captured) plus a bounded window of surrounding context, as line-numbered lines each flagged in_entity true/false. No LLM call. Lets an agent read and trust the entity without shelling out. source_status reports `ok`, or — instead of a misleading stale snippet — `missing` (file gone), `no_range`/`no_source_path` (entity has no anchor), `binary` (non-UTF-8), or `drifted` (the file no longer matches the indexed content_hash; rerun `clarion analyze`). context_lines defaults to 10.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "minLength": 1},
+                    "context_lines": {"type": "integer", "minimum": 0, "maximum": 200}
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -432,6 +445,10 @@ impl ServerState {
                 Err(response) => return response.to_json_rpc(id),
             },
             "summary_preview_cost" => match self.tool_summary_preview_cost(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "source_for_entity" => match self.tool_source_for_entity(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
@@ -987,6 +1004,43 @@ impl ServerState {
             })
             .await;
         Ok(flatten_storage_envelope_result(result))
+    }
+
+    async fn tool_source_for_entity(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let entity_id = required_str(arguments, "id")?.to_owned();
+        // Bounded context window; the schema caps at 200 but clamp defensively.
+        let context_lines = optional_usize(arguments, "context_lines")?
+            .unwrap_or(10)
+            .min(200);
+        let id_for_reader = entity_id.clone();
+        let entity = self
+            .readers
+            .with_reader(move |conn| entity_by_id(conn, &id_for_reader))
+            .await;
+        let entity = match entity {
+            Ok(Some(entity)) => entity,
+            Ok(None) => {
+                return Ok(tool_error_envelope(
+                    "not-found",
+                    &format!("no entity with id {entity_id}"),
+                    false,
+                ));
+            }
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    "storage-error",
+                    &err.to_string(),
+                    storage_retryable(&err),
+                ));
+            }
+        };
+        Ok(success_envelope(source_for_entity_json(
+            &entity,
+            context_lines,
+        )))
     }
 
     async fn tool_summary_preview_cost(
@@ -3256,6 +3310,107 @@ fn entity_properties_json(entity: &EntityRow) -> Value {
         .expect("entity properties_json should be valid JSON")
 }
 
+/// Maximum number of (span + context) lines `source_for_entity` will emit
+/// before truncating, so a pathologically large entity never floods an agent's
+/// context. The span itself is bounded by the entity; this caps the total.
+const SOURCE_FOR_ENTITY_MAX_LINES: usize = 2_000;
+
+/// Build the `source_for_entity` payload: the entity's exact indexed line span
+/// plus `context_lines` of surrounding context, line-numbered and drift-checked.
+///
+/// Returns an explicit `source_status` rather than a stale or misleading
+/// snippet when the source cannot be trusted: `missing` (file gone),
+/// `no_source_path` / `no_range` (no anchor to read), `binary` (non-UTF-8), or
+/// `drifted` (the file no longer hashes to the indexed `content_hash`).
+fn source_for_entity_json(entity: &EntityRow, context_lines: usize) -> Value {
+    let identity = entity_json(entity);
+
+    let Some(path) = entity.source_file_path.as_deref() else {
+        return json!({"entity": identity, "source_status": "no_source_path"});
+    };
+    let (Some(start_line), Some(end_line)) = (entity.source_line_start, entity.source_line_end)
+    else {
+        return json!({
+            "entity": identity,
+            "source_file_path": path,
+            "source_status": "no_range"
+        });
+    };
+
+    let Ok(bytes) = std::fs::read(path) else {
+        return json!({
+            "entity": identity,
+            "source_file_path": path,
+            "source_status": "missing"
+        });
+    };
+    let Ok(source) = String::from_utf8(bytes.clone()) else {
+        return json!({
+            "entity": identity,
+            "source_file_path": path,
+            "source_status": "binary"
+        });
+    };
+
+    // Refuse to hand back a snippet that no longer matches what was indexed.
+    if let (Some(stored), Some(current)) = (
+        entity.content_hash.as_deref(),
+        current_source_content_hash(entity, &bytes, Some(&source)),
+    ) && stored != current
+    {
+        return json!({
+            "entity": identity,
+            "source_file_path": path,
+            "source_status": "drifted",
+            "drift": {
+                "stored_content_hash": stored,
+                "current_content_hash": current
+            }
+        });
+    }
+
+    let lines: Vec<&str> = source.lines().collect();
+    let total = i64::try_from(lines.len()).unwrap_or(i64::MAX);
+    // Clamp the span to the file, then widen by the context window. 1-based,
+    // inclusive on both ends.
+    let span_start = start_line.max(1);
+    let span_end = end_line.min(total).max(span_start);
+    let ctx = i64::try_from(context_lines).unwrap_or(i64::MAX);
+    let window_start = (span_start - ctx).max(1);
+    let window_end = (span_end + ctx).min(total);
+
+    let mut emitted = Vec::new();
+    let mut truncated = false;
+    let mut number = window_start;
+    while number <= window_end {
+        if emitted.len() >= SOURCE_FOR_ENTITY_MAX_LINES {
+            truncated = true;
+            break;
+        }
+        let idx = usize::try_from(number - 1).unwrap_or(usize::MAX);
+        let text = lines.get(idx).copied().unwrap_or("");
+        emitted.push(json!({
+            "number": number,
+            "text": text,
+            "in_entity": number >= span_start && number <= span_end
+        }));
+        number += 1;
+    }
+
+    json!({
+        "entity": identity,
+        "source_file_path": path,
+        "source_status": "ok",
+        "line_start": span_start,
+        "line_end": span_end,
+        "context_lines": context_lines,
+        "window_start": window_start,
+        "window_end": window_end,
+        "lines": emitted,
+        "truncated": truncated
+    })
+}
+
 fn verified_source_excerpt(entity: &EntityRow) -> Result<String, SourceExcerptError> {
     let Some(path) = entity.source_file_path.as_deref() else {
         return Ok(String::new());
@@ -3646,7 +3801,7 @@ mod tests {
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 12);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
@@ -3701,6 +3856,11 @@ mod tests {
         assert_eq!(
             tools[10].description,
             "Preview what calling summary(id) would cost BEFORE spending. Reports cache_status (hit | expired | miss), the cached row's real tokens/cost/age on a hit, an input-token estimate on a miss, the configured model, the LLM policy (provider/live/allow_live_provider/cache horizon), and live_spend_would_occur — true only when no fresh cache row exists AND a live provider is wired. A disabled/unconfigured LLM is reported distinctly from a cache miss. Never invokes the LLM provider."
+        );
+        assert_eq!(tools[11].name, "source_for_entity");
+        assert_eq!(
+            tools[11].description,
+            "Return the exact indexed source span for one entity (its source_line_start..source_line_end, which includes any decorators/signature/docstring the plugin captured) plus a bounded window of surrounding context, as line-numbered lines each flagged in_entity true/false. No LLM call. Lets an agent read and trust the entity without shelling out. source_status reports `ok`, or — instead of a misleading stale snippet — `missing` (file gone), `no_range`/`no_source_path` (entity has no anchor), `binary` (non-UTF-8), or `drifted` (the file no longer matches the indexed content_hash; rerun `clarion analyze`). context_lines defaults to 10."
         );
     }
 
@@ -4004,7 +4164,7 @@ mod tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], "tools-1");
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 11);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 12);
         assert_eq!(response["result"]["tools"][0]["name"], "entity_at");
         assert_eq!(response["result"]["tools"][7]["name"], "subsystem_members");
     }
@@ -4105,7 +4265,7 @@ mod tests {
 
         assert_eq!(decoded["jsonrpc"], "2.0");
         assert_eq!(decoded["id"], 10);
-        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 11);
+        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 12);
     }
 
     #[test]
@@ -4180,7 +4340,7 @@ mod tests {
         assert_eq!(first_json["id"], 11);
         assert_eq!(first_json["result"]["serverInfo"]["name"], "clarion");
         assert_eq!(second_json["id"], 12);
-        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 11);
+        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 12);
     }
 
     #[test]
