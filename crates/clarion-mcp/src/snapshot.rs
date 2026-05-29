@@ -326,6 +326,64 @@ mod tests {
         assert_eq!(snap.staleness, Staleness::Stale, "{snap:?}");
     }
 
+    // `compute_staleness` reaches `Unknown` three ways: (a) the run timestamp
+    // fails to parse; (b) a completed run exists but no entity has a resolvable
+    // source_file_path (`saw_any_file == false`); (c) a stat/`modified()` error.
+    // `counts_entities_subsystems_and_findings` and `stat_failure_unknown_is_not_degraded`
+    // cover (c); the two tests below lock (a) and (b), and pin which of them
+    // count as DB-machinery degradation (a yes, b no).
+
+    #[test]
+    fn unknown_and_degraded_when_run_timestamp_unparseable() {
+        // (a) An unparseable `completed_at` is a data/machinery fault: Unknown
+        // staleness AND degraded. (`completed_at` is plain TEXT — no format
+        // CHECK — so a garbage value is insertable.)
+        let (_dir, conn) = migrated_conn();
+        insert_entity(&conn, "python:module:a", "module", Some("a.py"));
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+             VALUES ('r', '2026-01-01T00:00:00.000Z', 'not-a-timestamp', '{}', '{}', 'completed')",
+            [],
+        )
+        .unwrap();
+
+        let snap = project_snapshot(&conn, std::path::Path::new("/tmp"));
+        assert_eq!(snap.staleness, Staleness::Unknown, "{snap:?}");
+        assert!(
+            snap.degraded,
+            "an unparseable run timestamp is a machinery fault: {snap:?}"
+        );
+        // The raw (unparseable) value is still surfaced verbatim as last_analyzed_at.
+        assert_eq!(snap.last_analyzed_at.as_deref(), Some("not-a-timestamp"));
+    }
+
+    #[test]
+    fn unknown_not_degraded_when_no_entity_has_a_source_file() {
+        // (b) The realistic case: a completed run exists, but every entity is
+        // subsystem-only (NULL source_file_path), so the DISTINCT scan returns
+        // no rows and `saw_any_file` stays false. That folds to Unknown but is
+        // NOT degradation — no query or stat failed.
+        let (_dir, conn) = migrated_conn();
+        insert_entity(&conn, "core:subsystem:abc", "subsystem", None);
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+             VALUES ('r', '2026-01-01T00:00:00.000Z', '2026-01-02T00:00:00.000Z', '{}', '{}', 'completed')",
+            [],
+        )
+        .unwrap();
+
+        let snap = project_snapshot(&conn, std::path::Path::new("/tmp"));
+        assert_eq!(snap.staleness, Staleness::Unknown, "{snap:?}");
+        assert!(
+            !snap.degraded,
+            "no-resolvable-source-files is environmental, not degraded: {snap:?}"
+        );
+        assert_eq!(
+            snap.last_analyzed_at.as_deref(),
+            Some("2026-01-02T00:00:00.000Z")
+        );
+    }
+
     #[test]
     fn healthy_empty_index_is_not_degraded() {
         let (_dir, conn) = migrated_conn();
