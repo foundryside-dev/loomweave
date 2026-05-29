@@ -218,7 +218,7 @@ llm_policy:
 `OPENROUTER_API_KEY` must also be exported in the environment that
 `clarion serve` (or your MCP client wrapper) inherits — see the
 prerequisites section above. Skip this block if you don't have a key; the
-other seven tools still work, only `summary` will return an "LLM disabled"
+other eight tools still work, only `summary` will return an "LLM disabled"
 envelope.
 
 ### The MCP tools

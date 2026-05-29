@@ -391,8 +391,8 @@ assert "clarion-workflow" in init_result["instructions"], init_result.get("instr
 assert isinstance(init_result["capabilities"]["resources"], dict), init_result["capabilities"]
 assert isinstance(init_result["capabilities"]["prompts"], dict), init_result["capabilities"]
 tools = responses["tools"]["result"]["tools"]
-assert len(tools) == 9, tools
-assert [tool["name"] for tool in tools] == [
+tool_names = [tool["name"] for tool in tools]
+assert tool_names == [
     "entity_at",
     "find_entity",
     "callers_of",
@@ -402,7 +402,13 @@ assert [tool["name"] for tool in tools] == [
     "neighborhood",
     "subsystem_members",
     "project_status",
-]
+], tool_names
+# Single-source check (clarion-71f0d6c3dd): the initialize `instructions` tool
+# enumeration is derived from list_tools(), so every advertised tool must appear
+# in it. This catches drift between the tool set and the orientation prose
+# without a second hardcoded list.
+for name in tool_names:
+    assert name in init_result["instructions"], (name, init_result["instructions"])
 assert "leaf scope only" in tools[4]["description"]
 
 entity_hit = assert_tool_ok(responses["entity-hit"])

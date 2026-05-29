@@ -45,29 +45,38 @@ const EMPTY_GUIDANCE_FINGERPRINT: &str = "guidance-empty";
 pub const CLARION_WORKFLOW_SKILL: &str =
     include_str!("../../clarion-cli/assets/skills/clarion-workflow/SKILL.md");
 
-/// Static orientation text returned in the MCP `initialize` result's
-/// `instructions` field. Kept consistent with `list_tools()` and the
-/// clarion-workflow skill.
-const SERVER_INSTRUCTIONS: &str = "\
-Clarion is a code-archaeology server: it has pre-extracted this project into a \
-queryable map of entities (functions, classes, modules, files), the call / \
-reference / import edges between them, and subsystem clusters. Ask Clarion \
+/// Orientation text returned in the MCP `initialize` result's `instructions`
+/// field. The `Tools:` enumeration is derived from [`list_tools`] (the single
+/// source of truth) so it can never drift from the advertised tool set as tools
+/// are added or removed; the surrounding prose is static. Kept consistent with
+/// the clarion-workflow skill.
+fn server_instructions() -> String {
+    let tool_names = list_tools()
+        .iter()
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Clarion is a code-archaeology server: it has pre-extracted this project \
+into a queryable map of entities (functions, classes, modules, files), the call \
+/ reference / import edges between them, and subsystem clusters. Ask Clarion \
 instead of re-reading or grepping the tree.
 
-Entity IDs are `{plugin}:{kind}:{qualified_name}` (e.g. \
-`python:function:pkg.mod.func`); subsystems are `core:subsystem:{hash}`. You \
+Entity IDs are `{{plugin}}:{{kind}}:{{qualified_name}}` (e.g. \
+`python:function:pkg.mod.func`); subsystems are `core:subsystem:{{hash}}`. You \
 almost never type IDs — get one from `find_entity` or `entity_at`, then copy it \
 verbatim into the next tool.
 
-Tools: find_entity, entity_at, callers_of, neighborhood, execution_paths_from, \
-subsystem_members, summary, issues_for, project_status. `callers_of` / \
-`neighborhood` / `execution_paths_from` take a `confidence` tier (resolved | \
-ambiguous | inferred; default resolved). `project_status` reports index \
-freshness, counts, LLM policy, and the resolved Filigree endpoint.
+Tools: {tool_names}. `callers_of` / `neighborhood` / `execution_paths_from` \
+take a `confidence` tier (resolved | ambiguous | inferred; default resolved). \
+`project_status` reports index freshness, counts, LLM policy, and the resolved \
+Filigree endpoint.
 
 For the full workflow see the clarion-workflow skill (installed by \
 `clarion install --skills`), or read the `clarion-workflow` prompt. Live \
-project counts and index freshness are in the `clarion://context` resource.";
+project counts and index freshness are in the `clarion://context` resource."
+    )
+}
 
 type InferredInflight =
     Arc<AsyncMutex<HashMap<InferredEdgeCacheKey, broadcast::Sender<InferredDispatchOutcome>>>>;
@@ -2377,7 +2386,7 @@ fn initialize_result(stateful: bool) -> Value {
             "name": "clarion",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": SERVER_INSTRUCTIONS
+        "instructions": server_instructions()
     })
 }
 
@@ -3454,6 +3463,22 @@ mod tests {
             tools[8].description,
             "Return deterministic Clarion diagnostics: repo root, db path, latest run (id/status/started/completed), entity/subsystem/edge/finding counts, index staleness, per-plugin entity counts from the current index, LLM policy (provider/live/cache), and the resolved Filigree endpoint (configured vs resolved URL + resolution source). Answers \"is the graph fresh, plugin-less, LLM-live, Filigree-reachable?\" without shelling out. No LLM call."
         );
+    }
+
+    #[test]
+    fn server_instructions_enumerate_every_tool() {
+        // Single-source guard (clarion-71f0d6c3dd): the `instructions` tool list
+        // is derived from list_tools(), so every advertised tool must appear in
+        // it. If a tool is added/removed and this drifts, the instructions would
+        // otherwise silently misdescribe the surface.
+        let instructions = super::server_instructions();
+        for tool in super::list_tools() {
+            assert!(
+                instructions.contains(tool.name),
+                "instructions omit tool {:?}; instructions were:\n{instructions}",
+                tool.name
+            );
+        }
     }
 
     #[test]
