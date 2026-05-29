@@ -148,7 +148,7 @@ Open issues for the v1.0 known limitations and any post-release follow-ups live 
   protection (timestamp + nonce window) is ADR-034 forward-work tracked for
   post-1.0 hardening.
 
-<!-- filigree:instructions:v2.1.0:d454f2c2 -->
+<!-- filigree:instructions:v2.1.0:857eb216 -->
 ## Filigree Issue Tracker
 
 `filigree` tracks tasks for this project. Data lives in `.filigree/`. Prefer
@@ -235,7 +235,9 @@ Pass `--actor <name>` (CLI) so events attribute to your agent identity.
 Errors return `{error: str, code: ErrorCode, details?: dict}`. Switch on
 `code`, not on message text. Codes: `VALIDATION`, `NOT_FOUND`, `CONFLICT`,
 `INVALID_TRANSITION`, `PERMISSION`, `NOT_INITIALIZED`, `IO`,
-`INVALID_API_URL`, `STOP_FAILED`, `SCHEMA_MISMATCH`, `INTERNAL`.
+`INVALID_API_URL`, `FILE_REGISTRY_DISPLACED`, `REGISTRY_UNAVAILABLE`,
+`CLARION_REGISTRY_VERSION_MISMATCH`, `BRIEFING_BLOCKED`, `STOP_FAILED`,
+`SCHEMA_MISMATCH`, `INTERNAL`.
 
 On `INVALID_TRANSITION`, call `get_valid_transitions` (MCP) or
 `filigree transitions <id>` to see what the workflow allows from here.

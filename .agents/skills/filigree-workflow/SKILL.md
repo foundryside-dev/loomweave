@@ -176,7 +176,9 @@ When parsing `--json` output or MCP responses, expect these unified envelopes:
   `next_offset` only appears when there is a next page.
 - **Errors** → `{error: str, code: ErrorCode, details?: dict}`. `code` is
   one of: `VALIDATION`, `NOT_FOUND`, `CONFLICT`, `INVALID_TRANSITION`,
-  `PERMISSION`, `NOT_INITIALIZED`, `IO`, `INVALID_API_URL`, `STOP_FAILED`,
+  `PERMISSION`, `NOT_INITIALIZED`, `IO`, `INVALID_API_URL`,
+  `FILE_REGISTRY_DISPLACED`, `REGISTRY_UNAVAILABLE`,
+  `CLARION_REGISTRY_VERSION_MISMATCH`, `BRIEFING_BLOCKED`, `STOP_FAILED`,
   `SCHEMA_MISMATCH`, `INTERNAL`. Branch on `code` for retry policy
   (`CONFLICT` → exit 4, retryable; everything at exit 1 needs operator
   intervention).
