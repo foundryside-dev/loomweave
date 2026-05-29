@@ -4,6 +4,7 @@ mod analyze_runs;
 pub mod config;
 pub mod filigree;
 pub mod filigree_url;
+mod index_diff;
 pub mod snapshot;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -263,6 +264,17 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "run_id": {"type": "string", "minLength": 1}
                 },
                 "required": ["run_id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "index_diff",
+            description: "Report what changed since the last analyze and whether this checkout is newer than the graph — so an agent need not hand-roll git + mtime freshness checks. Compares: analyzed_at (last completed run) vs current git HEAD (with head_newer_than_analyze derived from HEAD's committer date vs run completion, true even when source mtimes are ambiguous); indexed source files modified or now-missing since analyze; dirty working-tree files flagged when they touch an indexed path; and per-run aggregate plugin skip/drop counters. Git is read at query time, read-only, and fail-soft: a missing git binary or non-repo dir degrades to git.available=false with a reason rather than failing. analyzed_commit is null by design (Clarion persists no analyze-time SHA). overall is fresh | drift | unknown | never_analyzed; lists are bounded with an `omitted` block. entity-level add/remove/change diff is unavailable in v0.1 (only the current graph is retained). No LLM call.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 2000}
+                },
                 "additionalProperties": false
             }),
         },
@@ -552,6 +564,10 @@ impl ServerState {
                 Err(response) => return response.to_json_rpc(id),
             },
             "analyze_cancel" => match self.tool_analyze_cancel(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "index_diff" => match self.tool_index_diff(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
@@ -2077,6 +2093,46 @@ impl ServerState {
         });
 
         Ok(success_envelope(result))
+    }
+
+    async fn tool_index_diff(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let cap = optional_usize(arguments, "limit")?
+            .filter(|n| *n > 0)
+            .unwrap_or(index_diff::DEFAULT_MAX_ENTRIES);
+
+        // Git is read read-only and fail-soft, off the async runtime since it
+        // shells out.
+        let git_root = self.project_root.clone();
+        let git = match tokio::task::spawn_blocking(move || index_diff::gather_git_facts(&git_root))
+            .await
+        {
+            Ok(facts) => facts,
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    "internal",
+                    &format!("git fact-gathering task failed: {err}"),
+                    true,
+                ));
+            }
+        };
+
+        let project_root = self.project_root.clone();
+        let result = self
+            .readers
+            .with_reader(move |conn| {
+                let state = index_diff::read_index_state(conn)?;
+                Ok(success_envelope(index_diff::build_report(
+                    &project_root,
+                    &state,
+                    &git,
+                    cap,
+                )))
+            })
+            .await;
+        Ok(flatten_storage_envelope_result(result))
     }
 
     fn llm_diagnostics_json(&self) -> Value {
@@ -5365,7 +5421,7 @@ mod tests {
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 18);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
@@ -5451,6 +5507,7 @@ mod tests {
             tools[16].description,
             "Cancel a running analyze. SIGKILLs the run's whole process group — terminating the language plugin and its pyright-langserver child — then marks the run terminal (status `cancelled`) so it is never left dangling as `running`. Idempotent: cancelling an already-terminal run reports its current state. Partial work already written is kept (cancel discards in-flight work, not the index)."
         );
+        assert_eq!(tools[17].name, "index_diff");
     }
 
     #[test]
@@ -5753,7 +5810,7 @@ mod tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], "tools-1");
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 17);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 18);
         assert_eq!(response["result"]["tools"][0]["name"], "entity_at");
         assert_eq!(response["result"]["tools"][7]["name"], "subsystem_members");
     }
@@ -5854,7 +5911,7 @@ mod tests {
 
         assert_eq!(decoded["jsonrpc"], "2.0");
         assert_eq!(decoded["id"], 10);
-        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 17);
+        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 18);
     }
 
     #[test]
@@ -5929,7 +5986,7 @@ mod tests {
         assert_eq!(first_json["id"], 11);
         assert_eq!(first_json["result"]["serverInfo"]["name"], "clarion");
         assert_eq!(second_json["id"], 12);
-        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 17);
+        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 18);
     }
 
     #[test]

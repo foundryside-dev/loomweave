@@ -3631,6 +3631,54 @@ async fn neighborhood_module_rollup_surfaces_external_reverse_import() {
     );
 }
 
+#[tokio::test]
+async fn index_diff_is_reachable_over_mcp_and_reports_freshness() {
+    // AC: index_diff output is available over MCP. A completed run dated far in
+    // the future keeps the just-written demo.py un-modified, so the verdict is
+    // deterministic regardless of the (non-repo) tempdir's git environment.
+    let (project, db_path) = open_project();
+    {
+        let conn = Connection::open(&db_path).expect("reopen db");
+        insert_run(
+            &conn,
+            "run-fresh",
+            "2999-01-01T00:00:00.000Z",
+            "completed",
+            Some("2999-01-01T00:00:05.000Z"),
+        );
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(&state, "index_diff", json!({})).await;
+
+    assert_eq!(envelope["ok"], true);
+    let result = &envelope["result"];
+    assert_eq!(result["overall"], "fresh");
+    assert_eq!(result["drift_detected"], false);
+    // analyzed_commit is null by design; the git block is always present.
+    assert_eq!(result["analyzed_commit"], Value::Null);
+    assert!(result["git"]["available"].is_boolean());
+    assert_eq!(result["analyzed_at"], "2999-01-01T00:00:05.000Z");
+    assert_eq!(
+        result["indexed_files"], 1,
+        "the seeded graph has a single source file (demo.py)"
+    );
+    assert_eq!(result["modified_since_analyze"], json!([]));
+}
+
+#[tokio::test]
+async fn index_diff_reports_never_analyzed_without_a_completed_run() {
+    // open_project seeds entities but no run row.
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(&state, "index_diff", json!({})).await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["result"]["overall"], "never_analyzed");
+    assert_eq!(envelope["result"]["drift_detected"], false);
+}
+
 // ── project_status diagnostics tool (clarion-084e82250c) ─────────────────────
 
 fn insert_run(
