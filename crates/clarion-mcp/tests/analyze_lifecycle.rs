@@ -1,0 +1,192 @@
+//! MCP analyze lifecycle tools: `analyze_start` / `analyze_status` /
+//! `analyze_cancel` (clarion-7e0c21558a).
+//!
+//! These drive the tools against a stub launcher injected via
+//! `with_analyze_command`, so the lifecycle (background start, live status,
+//! group-kill cancel) is exercised without a real multi-minute analyze. The
+//! stub spawns a grandchild `sleep` and records its pid, letting the cancel
+//! test assert the whole process group — not just the launcher — is killed.
+
+#![cfg(unix)]
+
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use clarion_mcp::ServerState;
+use clarion_storage::{ReaderPool, pragma, schema};
+use rusqlite::Connection;
+use serde_json::{Value, json};
+
+fn open_project() -> (tempfile::TempDir, PathBuf) {
+    let project = tempfile::tempdir().expect("temp project");
+    let clarion_dir = project.path().join(".clarion");
+    std::fs::create_dir(&clarion_dir).expect("create .clarion");
+    let db_path = clarion_dir.join("clarion.db");
+    let mut conn = Connection::open(&db_path).expect("open sqlite");
+    pragma::apply_write_pragmas(&conn).expect("write pragmas");
+    schema::apply_migrations(&mut conn).expect("apply migrations");
+    drop(conn);
+    (project, db_path)
+}
+
+fn state_for(project_root: &Path, db_path: &Path, stub: &Path) -> ServerState {
+    let pool = ReaderPool::open(db_path, 2).expect("reader pool");
+    ServerState::new(project_root.to_path_buf(), pool).with_analyze_command(stub.to_path_buf())
+}
+
+/// Write an executable stub that stands in for `clarion analyze`: it parses
+/// `--progress-file`, spawns a grandchild `sleep` (a stand-in for the plugin /
+/// pyright subtree) and records its pid, writes one progress snapshot, then
+/// blocks on the grandchild until the group is killed.
+fn write_stub(dir: &Path) -> PathBuf {
+    let path = dir.join("analyze-stub.sh");
+    let script = r#"#!/bin/sh
+PF=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --progress-file) PF="$2"; shift 2;;
+    *) shift;;
+  esac
+done
+sleep 600 &
+CHILD=$!
+echo "$CHILD" > "${PF}.child"
+HB=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+printf '{"run_id":"stub","pid":%d,"phase":"analyzing","current_plugin":"slowfix","processed_files":1,"total_files":3,"current_file":"src/a.py","heartbeat_at":"%s"}' "$$" "$HB" > "$PF"
+wait "$CHILD"
+"#;
+    std::fs::write(&path, script).expect("write stub");
+    let mut perms = std::fs::metadata(&path)
+        .expect("stub metadata")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).expect("chmod stub");
+    path
+}
+
+async fn call_tool(state: &ServerState, name: &str, arguments: Value) -> Value {
+    let response = state
+        .handle_json_rpc(&json!({
+            "jsonrpc": "2.0",
+            "id": "tool-test",
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        }))
+        .await
+        .expect("tools/call returns a response");
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool content text");
+    serde_json::from_str(text).expect("tool envelope JSON")
+}
+
+/// Poll `analyze_status` until `status` matches `want` or the deadline elapses.
+async fn poll_until_status(state: &ServerState, run_id: &str, want: &str) -> Value {
+    for _ in 0..100 {
+        let resp = call_tool(state, "analyze_status", json!({"run_id": run_id})).await;
+        if resp["result"]["status"] == want {
+            return resp;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("analyze_status never reached {want} for {run_id}");
+}
+
+fn pid_alive(pid: i32) -> bool {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    // Signal 0 probes existence without delivering a signal.
+    kill(Pid::from_raw(pid), None).is_ok()
+}
+
+#[tokio::test]
+async fn analyze_start_runs_in_background_status_reports_progress_then_cancel_kills_group() {
+    let (project, db_path) = open_project();
+    let stub = write_stub(project.path());
+    let state = state_for(project.path(), &db_path, &stub);
+
+    // Start returns a handle immediately without blocking on the run.
+    let started = call_tool(&state, "analyze_start", json!({})).await;
+    assert_eq!(started["ok"], true, "{started:?}");
+    let run_id = started["result"]["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_owned();
+    let progress_file = started["result"]["progress_file"]
+        .as_str()
+        .expect("progress_file")
+        .to_owned();
+    assert_eq!(started["result"]["status"], "started");
+
+    // Status flips to running and exposes structured progress (no log scraping).
+    let running = poll_until_status(&state, &run_id, "running").await;
+    let result = &running["result"];
+    assert_eq!(result["phase"], "analyzing");
+    assert_eq!(result["current_plugin"], "slowfix");
+    assert_eq!(result["processed_files"], 1);
+    assert_eq!(result["total_files"], 3);
+    assert_eq!(result["current_file"], "src/a.py");
+    assert!(result["heartbeat_at"].as_str().is_some());
+    assert_eq!(result["progress_observed"], true, "{running:?}");
+
+    // The stub recorded its grandchild (stand-in for plugin/pyright) pid.
+    let child_pid: i32 = std::fs::read_to_string(format!("{progress_file}.child"))
+        .expect("child pid file")
+        .trim()
+        .parse()
+        .expect("child pid");
+    assert!(pid_alive(child_pid), "grandchild should be alive mid-run");
+
+    // Cancel marks the run cancelled and group-kills the subtree.
+    let cancelled = call_tool(&state, "analyze_cancel", json!({"run_id": &run_id})).await;
+    assert_eq!(cancelled["ok"], true, "{cancelled:?}");
+    assert_eq!(cancelled["result"]["status"], "cancelled");
+
+    // The grandchild is terminated by the process-group kill.
+    let mut gone = false;
+    for _ in 0..100 {
+        if !pid_alive(child_pid) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        gone,
+        "cancel must terminate the grandchild process (pid {child_pid})"
+    );
+
+    // Status after cancel is terminal-cancelled.
+    let after = call_tool(&state, "analyze_status", json!({"run_id": &run_id})).await;
+    assert_eq!(after["result"]["status"], "cancelled", "{after:?}");
+}
+
+#[tokio::test]
+async fn analyze_start_rejects_a_second_concurrent_run() {
+    let (project, db_path) = open_project();
+    let stub = write_stub(project.path());
+    let state = state_for(project.path(), &db_path, &stub);
+
+    let first = call_tool(&state, "analyze_start", json!({})).await;
+    let run_id = first["result"]["run_id"].as_str().unwrap().to_owned();
+    poll_until_status(&state, &run_id, "running").await;
+
+    let second = call_tool(&state, "analyze_start", json!({})).await;
+    assert_eq!(second["ok"], false, "{second:?}");
+    assert_eq!(second["error"]["code"], "analyze-already-running");
+
+    // Clean up the background run.
+    call_tool(&state, "analyze_cancel", json!({"run_id": &run_id})).await;
+}
+
+#[tokio::test]
+async fn analyze_status_for_unknown_run_is_not_found() {
+    let (project, db_path) = open_project();
+    let stub = write_stub(project.path());
+    let state = state_for(project.path(), &db_path, &stub);
+
+    let resp = call_tool(&state, "analyze_status", json!({"run_id": "no-such-run"})).await;
+    assert_eq!(resp["ok"], false, "{resp:?}");
+    assert_eq!(resp["error"]["code"], "run-not-found");
+}

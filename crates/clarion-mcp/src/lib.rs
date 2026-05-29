@@ -1,5 +1,6 @@
 //! MCP protocol surface for Clarion.
 
+mod analyze_runs;
 pub mod config;
 pub mod filigree;
 pub mod filigree_url;
@@ -231,6 +232,39 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "additionalProperties": false
             }),
         },
+        ToolDefinition {
+            name: "analyze_start",
+            description: "Start a `clarion analyze` run over this project in the background and return its run handle immediately — do not block on the (possibly many-minute) run. Re-indexes the source tree and refreshes entities/edges/subsystems. Returns run_id, status (`started`), and the progress-file path. Only one analyze may run per project at a time (a cross-process lock enforces it); a second start while one is active is rejected. Poll analyze_status for progress; analyze_cancel to stop. No arguments.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "analyze_status",
+            description: "Report the live status of an analyze run started via analyze_start. status is one of queued (spawned, not yet recording) | running | completed | failed | cancelled | skipped_no_plugins. While running it exposes phase (discovering / analyzing / clustering), current_plugin, processed_files / total_files, current_file, the latest heartbeat_at, elapsed_seconds, and progress_observed (false when the heartbeat has gone stale — the run may be wedged). On a terminal status it carries the recorded run stats. Reads structured progress, never logs.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string", "minLength": 1}
+                },
+                "required": ["run_id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "analyze_cancel",
+            description: "Cancel a running analyze. SIGKILLs the run's whole process group — terminating the language plugin and its pyright-langserver child — then marks the run terminal (status `cancelled`) so it is never left dangling as `running`. Idempotent: cancelling an already-terminal run reports its current state. Partial work already written is kept (cancel discards in-flight work, not the index).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string", "minLength": 1}
+                },
+                "required": ["run_id"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -331,6 +365,11 @@ pub struct ServerState {
     inferred_inflight: InferredInflight,
     filigree_client: Option<Arc<dyn FiligreeLookup>>,
     diagnostics: Option<DiagnosticsContext>,
+    /// Supervised `clarion analyze` runs launched via `analyze_start`.
+    analyze_runs: crate::analyze_runs::RunRegistry,
+    /// Launcher for `analyze_start` to spawn. `None` → `current_exe()`; tests
+    /// inject a stub via [`ServerState::with_analyze_command`].
+    analyze_program: Option<PathBuf>,
 }
 
 impl ServerState {
@@ -347,7 +386,18 @@ impl ServerState {
             inferred_inflight: Arc::new(AsyncMutex::new(HashMap::new())),
             filigree_client: None,
             diagnostics: None,
+            analyze_runs: Arc::new(Mutex::new(HashMap::new())),
+            analyze_program: None,
         }
+    }
+
+    /// Override the program `analyze_start` launches (default: `current_exe()`).
+    /// Tests inject a stub binary so the lifecycle can be exercised without a
+    /// full analyze run.
+    #[must_use]
+    pub fn with_analyze_command(mut self, program: PathBuf) -> Self {
+        self.analyze_program = Some(program);
+        self
     }
 
     #[must_use]
@@ -489,6 +539,18 @@ impl ServerState {
                 Err(response) => return response.to_json_rpc(id),
             },
             "orientation_pack" => match self.tool_orientation_pack(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "analyze_start" => match self.tool_analyze_start(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "analyze_status" => match self.tool_analyze_status(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "analyze_cancel" => match self.tool_analyze_cancel(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
@@ -1445,6 +1507,304 @@ impl ServerState {
             packet,
             truncated.then_some("orientation-pack-bounds"),
         ))
+    }
+
+    // Uniform async dispatch with the other tools; the body is sync (spawn +
+    // registry insert), hence no await.
+    #[allow(clippy::unused_async)]
+    async fn tool_analyze_start(
+        &self,
+        _arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let program = match &self.analyze_program {
+            Some(program) => program.clone(),
+            None => match std::env::current_exe() {
+                Ok(path) => path,
+                Err(err) => {
+                    return Ok(tool_error_envelope(
+                        "spawn-failed",
+                        &format!("cannot resolve the clarion executable to launch analyze: {err}"),
+                        false,
+                    ));
+                }
+            },
+        };
+
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let runs_dir = self.project_root.join(".clarion").join("runs");
+        if let Err(err) = std::fs::create_dir_all(&runs_dir) {
+            return Ok(tool_error_envelope(
+                "io-error",
+                &format!("create runs directory {}: {err}", runs_dir.display()),
+                false,
+            ));
+        }
+        let progress_path = runs_dir.join(format!("{run_id}.progress.json"));
+        let started_at = (self.clock)();
+
+        let mut registry = self
+            .analyze_runs
+            .lock()
+            .expect("analyze run registry mutex");
+        // Reject a concurrent run: a second `clarion analyze` would fail to
+        // acquire the project's cross-process lock anyway, so surface it as a
+        // clear error rather than spawning a doomed child.
+        let already_active = registry
+            .values_mut()
+            .any(|handle| !handle.cancelled && matches!(handle.child.try_wait(), Ok(None)));
+        if already_active {
+            return Ok(tool_error_envelope(
+                "analyze-already-running",
+                "an analyze run is already active for this project; cancel it or wait for it to finish",
+                true,
+            ));
+        }
+
+        let handle = match crate::analyze_runs::spawn_analyze(
+            &program,
+            &self.project_root,
+            &run_id,
+            &progress_path,
+            started_at,
+        ) {
+            Ok(handle) => handle,
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    "spawn-failed",
+                    &format!("failed to spawn `clarion analyze`: {err}"),
+                    false,
+                ));
+            }
+        };
+        let pid = handle.child.id();
+        registry.insert(run_id.clone(), handle);
+        drop(registry);
+
+        Ok(success_envelope(json!({
+            "run_id": run_id,
+            "status": "started",
+            "pid": pid,
+            "progress_file": progress_path.display().to_string(),
+        })))
+    }
+
+    async fn tool_analyze_status(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let run_id = required_str(arguments, "run_id")?.to_owned();
+        let now = (self.clock)();
+
+        // Snapshot the live state under the lock; reap on exit.
+        let live = {
+            let mut registry = self
+                .analyze_runs
+                .lock()
+                .expect("analyze run registry mutex");
+            match registry.get_mut(&run_id) {
+                Some(handle) => match handle.child.try_wait() {
+                    Ok(None) => LiveRun::Alive {
+                        started_at: handle.started_at.clone(),
+                        progress_path: handle.progress_path.clone(),
+                    },
+                    Ok(Some(_)) | Err(_) => LiveRun::Exited {
+                        started_at: handle.started_at.clone(),
+                        cancelled: handle.cancelled,
+                    },
+                },
+                None => LiveRun::Absent,
+            }
+        };
+
+        match live {
+            LiveRun::Alive {
+                started_at,
+                progress_path,
+            } => {
+                let elapsed = elapsed_seconds(&started_at, &now);
+                let progress = read_progress_snapshot(&progress_path);
+                let (status, heartbeat_at) = match &progress {
+                    Some(snapshot) => (
+                        "running",
+                        snapshot.get("heartbeat_at").and_then(Value::as_str),
+                    ),
+                    // Spawned but no progress recorded yet (still in discovery /
+                    // before the first write).
+                    None => ("queued", None),
+                };
+                let observed = heartbeat_at
+                    .is_some_and(|hb| progress_observed(hb, &now, ANALYZE_HEARTBEAT_STALE_SECS));
+                Ok(success_envelope(json!({
+                    "run_id": run_id,
+                    "status": status,
+                    "phase": progress.as_ref().and_then(|p| p.get("phase").cloned()),
+                    "current_plugin": progress.as_ref().and_then(|p| p.get("current_plugin").cloned()),
+                    "processed_files": progress.as_ref().and_then(|p| p.get("processed_files").cloned()),
+                    "total_files": progress.as_ref().and_then(|p| p.get("total_files").cloned()),
+                    "current_file": progress.as_ref().and_then(|p| p.get("current_file").cloned()),
+                    "heartbeat_at": heartbeat_at,
+                    "elapsed_seconds": elapsed,
+                    "progress_observed": observed,
+                })))
+            }
+            LiveRun::Exited {
+                started_at,
+                cancelled,
+            } => {
+                let row = self.read_run_row(&run_id).await;
+                Ok(self.terminal_status_envelope(&run_id, cancelled, Some(&started_at), &now, row))
+            }
+            LiveRun::Absent => {
+                // Not in the registry — may be a run from a prior session.
+                let row = self.read_run_row(&run_id).await;
+                match &row {
+                    Ok(Some(_)) => {
+                        Ok(self.terminal_status_envelope(&run_id, false, None, &now, row))
+                    }
+                    Ok(None) => Ok(tool_error_envelope(
+                        "run-not-found",
+                        &format!("no analyze run with id {run_id}"),
+                        false,
+                    )),
+                    Err(err) => Ok(tool_error_envelope(
+                        "storage-error",
+                        &err.to_string(),
+                        storage_retryable(err),
+                    )),
+                }
+            }
+        }
+    }
+
+    async fn tool_analyze_cancel(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let run_id = required_str(arguments, "run_id")?.to_owned();
+        let now = (self.clock)();
+
+        let outcome = {
+            let mut registry = self
+                .analyze_runs
+                .lock()
+                .expect("analyze run registry mutex");
+            match registry.get_mut(&run_id) {
+                Some(handle) => match handle.child.try_wait() {
+                    Ok(None) => {
+                        crate::analyze_runs::kill_run(handle);
+                        CancelOutcome::Cancelled
+                    }
+                    Ok(Some(_)) | Err(_) => CancelOutcome::AlreadyExited {
+                        cancelled: handle.cancelled,
+                    },
+                },
+                None => CancelOutcome::Absent,
+            }
+        };
+
+        match outcome {
+            CancelOutcome::Cancelled => {
+                let db_path = self.project_root.join(".clarion").join("clarion.db");
+                crate::analyze_runs::mark_run_cancelled_in_db(&db_path, &run_id, &now);
+                Ok(success_envelope(json!({
+                    "run_id": run_id,
+                    "status": "cancelled",
+                })))
+            }
+            // Idempotent: the run already finished — report its real terminal
+            // state rather than pretending we cancelled it.
+            CancelOutcome::AlreadyExited { cancelled } => {
+                let row = self.read_run_row(&run_id).await;
+                Ok(self.terminal_status_envelope(&run_id, cancelled, None, &now, row))
+            }
+            CancelOutcome::Absent => {
+                let row = self.read_run_row(&run_id).await;
+                match &row {
+                    Ok(Some(_)) => {
+                        Ok(self.terminal_status_envelope(&run_id, false, None, &now, row))
+                    }
+                    Ok(None) => Ok(tool_error_envelope(
+                        "run-not-found",
+                        &format!("no analyze run with id {run_id}"),
+                        false,
+                    )),
+                    Err(err) => Ok(tool_error_envelope(
+                        "storage-error",
+                        &err.to_string(),
+                        storage_retryable(err),
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Read a run's `(status, stats)` from the `runs` table via the reader pool.
+    async fn read_run_row(
+        &self,
+        run_id: &str,
+    ) -> std::result::Result<Option<(String, String)>, StorageError> {
+        let run_id = run_id.to_owned();
+        self.readers
+            .with_reader(move |conn| {
+                match conn.query_row(
+                    "SELECT status, stats FROM runs WHERE id = ?1",
+                    rusqlite::params![run_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                ) {
+                    Ok(tuple) => Ok(Some(tuple)),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(err) => Err(StorageError::from(err)),
+                }
+            })
+            .await
+    }
+
+    /// Build a terminal `analyze_status` envelope from the DB row, honoring a
+    /// registry cancel flag and surfacing recorded stats.
+    #[allow(clippy::unused_self)]
+    fn terminal_status_envelope(
+        &self,
+        run_id: &str,
+        cancelled: bool,
+        started_at: Option<&str>,
+        now: &str,
+        row: std::result::Result<Option<(String, String)>, StorageError>,
+    ) -> Value {
+        let (db_status, stats) = match row {
+            Ok(Some((db_status, stats))) => (Some(db_status), stats),
+            Ok(None) => (None, "{}".to_owned()),
+            Err(err) => {
+                return tool_error_envelope(
+                    "storage-error",
+                    &err.to_string(),
+                    storage_retryable(&err),
+                );
+            }
+        };
+        let mapped_status = if cancelled || run_stats_is_cancelled(&stats) {
+            "cancelled"
+        } else {
+            match &db_status {
+                Some(value) => map_run_status(value, &stats),
+                // Process exited but never recorded a run row.
+                None => "failed",
+            }
+        };
+        let stats_value = serde_json::from_str::<Value>(&stats).unwrap_or(Value::Null);
+        json!({
+            "ok": true,
+            "result": {
+                "run_id": run_id,
+                "status": mapped_status,
+                "elapsed_seconds": started_at.and_then(|start| elapsed_seconds(start, now)),
+                "stats": stats_value,
+            },
+            "error": null,
+            "diagnostics": [],
+            "truncated": false,
+            "truncation_reason": null,
+            "stats_delta": {}
+        })
     }
 
     async fn tool_source_for_entity(
@@ -4037,6 +4397,88 @@ fn orientation_suggested_reads(
     reads
 }
 
+/// How recently the analyze progress file must have been stamped for
+/// `analyze_status` to call progress "observed" rather than possibly stalled.
+const ANALYZE_HEARTBEAT_STALE_SECS: i64 = 30;
+
+/// Live state of a registry-tracked analyze run, captured under the lock.
+enum LiveRun {
+    Alive {
+        started_at: String,
+        progress_path: PathBuf,
+    },
+    Exited {
+        started_at: String,
+        cancelled: bool,
+    },
+    Absent,
+}
+
+/// Result of an `analyze_cancel` attempt against the registry.
+enum CancelOutcome {
+    Cancelled,
+    AlreadyExited { cancelled: bool },
+    Absent,
+}
+
+/// Read and parse the analyze progress snapshot, if present and valid JSON.
+fn read_progress_snapshot(path: &std::path::Path) -> Option<Value> {
+    let body = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&body).ok()
+}
+
+/// Parse a timestamp to Unix seconds, accepting both the MCP clock's
+/// `unix:<seconds>` form and the RFC3339 form analyze writes into the progress
+/// file's `heartbeat_at`. `None` if neither parses.
+fn parse_to_unix_seconds(value: &str) -> Option<i64> {
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+    if let Some(rest) = value.strip_prefix("unix:") {
+        return rest.trim().parse().ok();
+    }
+    OffsetDateTime::parse(value, &Rfc3339)
+        .ok()
+        .map(OffsetDateTime::unix_timestamp)
+}
+
+/// Whole seconds between two timestamps (`now - start`), or `None` if either
+/// fails to parse. Accepts mixed `unix:`/RFC3339 forms.
+fn elapsed_seconds(start: &str, now: &str) -> Option<i64> {
+    Some(parse_to_unix_seconds(now)? - parse_to_unix_seconds(start)?)
+}
+
+/// Whether the heartbeat is recent enough to treat the run as actively
+/// progressing (heartbeat age within `max_age_secs`).
+fn progress_observed(heartbeat: &str, now: &str, max_age_secs: i64) -> bool {
+    elapsed_seconds(heartbeat, now).is_some_and(|age| (0..=max_age_secs).contains(&age))
+}
+
+/// True when a run's `stats` JSON marks it as cancelled (vs an ordinary
+/// failure) — the MCP writes `terminal_reason="cancelled"` on cancel.
+fn run_stats_is_cancelled(stats_json: &str) -> bool {
+    serde_json::from_str::<Value>(stats_json)
+        .ok()
+        .and_then(|stats| {
+            stats
+                .get("terminal_reason")
+                .and_then(Value::as_str)
+                .map(|reason| reason == "cancelled")
+        })
+        .unwrap_or(false)
+}
+
+/// Map a `runs.status` value to the `analyze_status` vocabulary. A row still
+/// reading `running` after the process exited is abnormal (the process died
+/// without finalizing) and reported as `failed`.
+fn map_run_status(db_status: &str, stats_json: &str) -> &'static str {
+    match db_status {
+        "completed" => "completed",
+        "skipped_no_plugins" => "skipped_no_plugins",
+        "failed" if run_stats_is_cancelled(stats_json) => "cancelled",
+        _ => "failed",
+    }
+}
+
 /// Maximum number of (span + context) lines `source_for_entity` will emit
 /// before truncating, so a pathologically large entity never floods an agent's
 /// context. The span itself is bounded by the entity; this caps the total.
@@ -4861,7 +5303,7 @@ mod tests {
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 17);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
@@ -4931,6 +5373,21 @@ mod tests {
         assert_eq!(
             tools[13].description,
             "Assemble one deterministic orientation packet for a code location — the replacement for hand-composing find_entity + entity_at + source reads + neighborhood + issues_for + freshness on every question. Resolve EITHER by `entity` id OR by `file`+`line` (exactly one form). The packet bundles: the primary entity, the entity_context evidence (match_reason / containing stack / decl-body-decorator ranges — so a decorator-line query is explained, not guessed), a compact source-span summary, one-hop neighbors (callers, callees, container, contained, references, imports), compact resolved execution paths, related Filigree issues, index/Filigree/LLM health, warnings, and suggested next reads. No LLM summary is invoked. Every list is bounded; an `omitted` block reports per-section truncation counts and `degraded` sections name surfaces that were unavailable (e.g. Filigree down) so an empty section is never read as a guaranteed negative."
+        );
+        assert_eq!(tools[14].name, "analyze_start");
+        assert_eq!(
+            tools[14].description,
+            "Start a `clarion analyze` run over this project in the background and return its run handle immediately — do not block on the (possibly many-minute) run. Re-indexes the source tree and refreshes entities/edges/subsystems. Returns run_id, status (`started`), and the progress-file path. Only one analyze may run per project at a time (a cross-process lock enforces it); a second start while one is active is rejected. Poll analyze_status for progress; analyze_cancel to stop. No arguments."
+        );
+        assert_eq!(tools[15].name, "analyze_status");
+        assert_eq!(
+            tools[15].description,
+            "Report the live status of an analyze run started via analyze_start. status is one of queued (spawned, not yet recording) | running | completed | failed | cancelled | skipped_no_plugins. While running it exposes phase (discovering / analyzing / clustering), current_plugin, processed_files / total_files, current_file, the latest heartbeat_at, elapsed_seconds, and progress_observed (false when the heartbeat has gone stale — the run may be wedged). On a terminal status it carries the recorded run stats. Reads structured progress, never logs."
+        );
+        assert_eq!(tools[16].name, "analyze_cancel");
+        assert_eq!(
+            tools[16].description,
+            "Cancel a running analyze. SIGKILLs the run's whole process group — terminating the language plugin and its pyright-langserver child — then marks the run terminal (status `cancelled`) so it is never left dangling as `running`. Idempotent: cancelling an already-terminal run reports its current state. Partial work already written is kept (cancel discards in-flight work, not the index)."
         );
     }
 
@@ -5234,7 +5691,7 @@ mod tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], "tools-1");
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 14);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 17);
         assert_eq!(response["result"]["tools"][0]["name"], "entity_at");
         assert_eq!(response["result"]["tools"][7]["name"], "subsystem_members");
     }
@@ -5335,7 +5792,7 @@ mod tests {
 
         assert_eq!(decoded["jsonrpc"], "2.0");
         assert_eq!(decoded["id"], 10);
-        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 14);
+        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 17);
     }
 
     #[test]
@@ -5410,7 +5867,7 @@ mod tests {
         assert_eq!(first_json["id"], 11);
         assert_eq!(first_json["result"]["serverInfo"]["name"], "clarion");
         assert_eq!(second_json["id"], 12);
-        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 14);
+        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 17);
     }
 
     #[test]
