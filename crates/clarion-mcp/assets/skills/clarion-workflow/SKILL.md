@@ -51,6 +51,13 @@ Every entity has an ID: `{plugin}:{kind}:{qualified_name}`
 | `summary` | on-demand prose summary of one entity | `{"id": "<id>"}` |
 | `summary_preview_cost` | preview a `summary` call's cache status / cost before spending | `{"id": "<id>"}` |
 | `issues_for` | Filigree issues attached to an entity | `{"id": "<id>"}` |
+| `source_for_entity` | an entity's exact indexed source span + bounded context | `{"id": "<id>", "context_lines": 10}` |
+| `call_sites` | the source line(s) behind a calls/references edge | `{"id": "<id>", "role": "caller"}` |
+| `orientation_pack` | one deterministic orientation packet for an entity or file:line (entity + context + neighbors + paths + issues + freshness) | `{"file": "rel/path.py", "line": 42}` |
+| `index_diff` | index freshness / drift vs. the current working tree | `{}` |
+| `analyze_start` | launch a background re-index, return its `run_id` | `{}` |
+| `analyze_status` | poll a started analyze (queued/running/terminal + progress) | `{"run_id": "<id>"}` |
+| `analyze_cancel` | stop a running analyze (group-kills plugin + Pyright) | `{"run_id": "<id>"}` |
 | `project_status` | index freshness, counts, LLM + Filigree status | `{}` |
 
 `callers_of` / `neighborhood` / `execution_paths_from` take a `confidence`
@@ -62,7 +69,7 @@ the true caller set.
 
 These three tools also return a `scope_excludes` array listing static blind
 spots the query did **not** search (e.g. `"attribute-receiver-calls"` like
-`ctx.svc.run()`; `"module-level-reference-rollup"` on a module). A non-empty
+`ctx.svc.run()`). A non-empty
 `scope_excludes` means an empty/short result is **not** a guaranteed true
 negative — re-query at `"inferred"` (which searches those categories and returns
 `scope_excludes: []`) before concluding "nothing calls this."
@@ -76,7 +83,10 @@ re-reading each path element. `truncated`/`truncation_reason` report `edge-cap`
 ## Workflow: orient, then navigate
 
 1. **Anchor.** `find_entity` by name (or `entity_at` for a file:line) to get the
-   entity and its `id`.
+   entity and its `id`. For a code location you're about to dig into, prefer
+   `orientation_pack` — it returns the entity, its context, one-hop neighbors,
+   execution paths, attached issues, and index freshness in one deterministic
+   call, instead of hand-composing those queries.
 2. **Navigate.** Feed that `id` into `callers_of`, `neighborhood`,
    `execution_paths_from`, or `summary`. Chain results' IDs to keep walking.
 

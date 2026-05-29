@@ -225,19 +225,18 @@ envelope.
 
 ### The MCP tools
 
-The MCP surface exposes eighteen tools: seven primary tools (in the table below)
-plus `subsystem_members` and `subsystem_of` for clustering output,
-`project_status` for deterministic diagnostics, `summary_preview_cost` to
-preview a summary's cache status and cost before spending,
-`source_for_entity` to read an entity's exact indexed source span (with bounded
-context and drift detection) without shelling out, `call_sites` to see the
-actual source line(s) behind a calls/references edge, `orientation_pack` to
-assemble a complete orientation packet for one location in a single call, the
-`analyze_start` / `analyze_status` / `analyze_cancel` lifecycle to launch and
-supervise a background re-index over MCP, and `index_diff` for a freshness /
-drift report against the current working tree. Seventeen of the eighteen are
-credential-free; only `summary` needs the live LLM. Each is a structured graph
-query, not free-text grep.
+The MCP surface exposes eighteen tools: the seventeen in the table below, plus
+`subsystem_members` (the modules in a subsystem — the forward direction of
+`subsystem_of`). The table spans entity lookup and navigation
+(`entity_at`/`find_entity`/`callers_of`/`execution_paths_from`/`neighborhood`),
+clustering (`subsystem_of`), source and edge inspection
+(`source_for_entity`/`call_sites`), the one-call orientation packet
+(`orientation_pack`), diagnostics (`project_status`/`index_diff`), the
+`summary` LLM path plus its `summary_preview_cost` estimator, Filigree
+enrichment (`issues_for`), and the background re-index lifecycle
+(`analyze_start`/`analyze_status`/`analyze_cancel`). Seventeen of the eighteen
+are credential-free; only `summary` needs the live LLM. Each is a structured
+graph query, not free-text grep.
 
 | Tool | Example invocation |
 |---|---|
