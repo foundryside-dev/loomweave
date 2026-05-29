@@ -2047,6 +2047,47 @@ async fn call_sites_kind_filter_limits_to_one_edge_kind() {
 }
 
 #[tokio::test]
+async fn call_sites_path_scope_filters_by_test_heuristic() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    // The seed lives in demo.py (not a conventional test path), so the unfiltered
+    // and production scopes agree and the test scope filters everything out.
+    let unfiltered = call_tool(
+        &state,
+        "call_sites",
+        json!({"id": "python:function:demo.entry", "confidence": "ambiguous"}),
+    )
+    .await;
+    let production = call_tool(
+        &state,
+        "call_sites",
+        json!({"id": "python:function:demo.entry", "confidence": "ambiguous", "path": "production"}),
+    )
+    .await;
+    let test = call_tool(
+        &state,
+        "call_sites",
+        json!({"id": "python:function:demo.entry", "confidence": "ambiguous", "path": "test"}),
+    )
+    .await;
+    assert_eq!(production["ok"], true, "{production:?}");
+    assert_eq!(test["ok"], true, "{test:?}");
+
+    let n_unfiltered = unfiltered["result"]["sites"].as_array().unwrap().len();
+    let n_production = production["result"]["sites"].as_array().unwrap().len();
+    assert!(n_unfiltered > 0, "{unfiltered:?}");
+    assert_eq!(
+        n_production, n_unfiltered,
+        "production scope should keep all demo.py sites"
+    );
+    assert!(
+        test["result"]["sites"].as_array().unwrap().is_empty(),
+        "test scope should exclude the non-test demo.py sites: {test:?}"
+    );
+}
+
+#[tokio::test]
 async fn call_sites_marks_unresolved_separately_and_rejects_unknown_entity() {
     let (project, db_path) = open_project();
     // Seed an unresolved (statically unbindable) call site for demo.entry.
