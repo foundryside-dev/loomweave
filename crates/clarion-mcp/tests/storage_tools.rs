@@ -1740,6 +1740,9 @@ async fn callers_of_inferred_dispatches_and_materializes_recording_result() {
         envelope["result"]["callers"][0]["edge_confidence"],
         "inferred"
     );
+    // Inferred (LLM) dispatch attempts the attribute-receiver cases, so nothing
+    // is excluded from the search (clarion-0d204a3f16).
+    assert_eq!(envelope["result"]["scope_excludes"], json!([]));
     assert_eq!(envelope["stats_delta"]["inferred_dispatch_misses_total"], 1);
     assert_eq!(provider.invocations().len(), 1);
     assert_eq!(provider.invocations()[0].purpose, LlmPurpose::InferredEdges);
@@ -1756,6 +1759,82 @@ async fn callers_of_inferred_dispatches_and_materializes_recording_result() {
     .await;
     assert_eq!(warm["ok"], true);
     assert_eq!(provider.invocations().len(), 1);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attribute_receiver_call_is_excluded_at_resolved_but_attempted_at_inferred() {
+    // Attribute-receiver call `ctx.dynamic()` (callee_expr `ctx.dynamic`): the
+    // static resolver cannot bind the `ctx` receiver, but the site IS recorded as
+    // unresolved, so inferred (LLM) dispatch — which keys off the method name —
+    // can recover it. This mirrors the motivating elspeth case `ctx.orchestrator
+    // .resume()` (callee_expr `orchestrator.resume`, recovered when resolving a
+    // target named `resume`). Resolved/ambiguous must FLAG the blind spot;
+    // inferred must not, because it actually searches the category
+    // (clarion-0d204a3f16).
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    add_dynamic_source(project.path());
+    let source_path = project.path().join("demo.py");
+    insert_entity(
+        &conn,
+        "python:function:demo.dynamic",
+        "function",
+        &source_path,
+        Some((9, 10)),
+        Some("python:module:demo"),
+    );
+    insert_unresolved_call_site(
+        &conn,
+        "python:function:demo.entry",
+        "site-attr",
+        "ctx.dynamic",
+    );
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnyInferredProvider::new(
+        r#"{"edges":[{"site_key":"site-attr","target_id":"python:function:demo.dynamic","confidence":0.9,"rationale":"attribute receiver"}]}"#,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    // Resolved: the attribute-receiver caller is not bound, and the blind spot is flagged.
+    let resolved = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.dynamic"}),
+    )
+    .await;
+    assert_eq!(resolved["ok"], true);
+    assert_eq!(resolved["result"]["callers"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        resolved["result"]["scope_excludes"],
+        json!(["attribute-receiver-calls"])
+    );
+
+    // Inferred: LLM dispatch recovers the attribute-receiver caller, so nothing is
+    // excluded — the empty-vs-complete distinction is honest, not wallpaper.
+    let inferred = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.dynamic", "confidence": "inferred"}),
+    )
+    .await;
+    assert_eq!(inferred["ok"], true);
+    assert_eq!(
+        inferred["result"]["callers"][0]["entity"]["id"],
+        "python:function:demo.entry"
+    );
+    assert_eq!(inferred["result"]["scope_excludes"], json!([]));
 
     drop(state);
     drop(writer);
@@ -2230,6 +2309,93 @@ async fn neighborhood_returns_one_hop_graph_sections() {
     assert_eq!(
         envelope["result"]["references_in"][0]["entity"]["id"],
         "python:function:demo.entry"
+    );
+}
+
+// ── scope_excludes on graph-query results (clarion-0d204a3f16) ───────────────
+
+#[tokio::test]
+async fn callers_of_resolved_flags_attribute_receiver_scope_exclusion() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.target"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(
+        envelope["result"]["scope_excludes"],
+        json!(["attribute-receiver-calls"])
+    );
+}
+
+#[tokio::test]
+async fn execution_paths_from_resolved_flags_attribute_receiver_scope_exclusion() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "execution_paths_from",
+        json!({"id": "python:function:demo.entry", "confidence": "ambiguous"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(
+        envelope["result"]["scope_excludes"],
+        json!(["attribute-receiver-calls"])
+    );
+}
+
+#[tokio::test]
+async fn neighborhood_module_flags_reference_rollup_and_attribute_scope() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:module:demo", "confidence": "resolved"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    let excludes = envelope["result"]["scope_excludes"]
+        .as_array()
+        .expect("scope_excludes array");
+    assert!(
+        excludes.iter().any(|v| v == "attribute-receiver-calls"),
+        "module neighborhood must flag attribute-receiver-calls, got {excludes:?}"
+    );
+    assert!(
+        excludes
+            .iter()
+            .any(|v| v == "module-level-reference-rollup"),
+        "module neighborhood must flag module-level-reference-rollup, got {excludes:?}"
+    );
+}
+
+#[tokio::test]
+async fn neighborhood_function_omits_module_reference_rollup_exclusion() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:demo.target", "confidence": "resolved"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(
+        envelope["result"]["scope_excludes"],
+        json!(["attribute-receiver-calls"])
     );
 }
 

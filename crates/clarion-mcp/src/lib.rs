@@ -112,12 +112,12 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "callers_of",
-            description: "Return entities that call the given entity. Default confidence is resolved, so ambiguous static candidates and LLM-inferred edges are excluded unless explicitly requested. Ambiguous edges expand all candidates; inferred edges may trigger bounded LLM dispatch.",
+            description: "Return entities that call the given entity. Default confidence is resolved, so ambiguous static candidates and LLM-inferred edges are excluded unless explicitly requested. Ambiguous edges expand all candidates; inferred edges may trigger bounded LLM dispatch. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls) so an empty callers list is never read as a guaranteed true negative.",
             input_schema: id_confidence_schema(),
         },
         ToolDefinition {
             name: "execution_paths_from",
-            description: "Return bounded calls-only execution paths starting at an entity. Default confidence is resolved. max_depth defaults to 3 and traversal also stops at the server edge cap; responses say when they are truncated.",
+            description: "Return bounded calls-only execution paths starting at an entity. Default confidence is resolved. max_depth defaults to 3 and traversal also stops at the server edge cap; responses say when they are truncated. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -149,7 +149,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "neighborhood",
-            description: "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, and references. Default confidence is resolved; ambiguous and inferred calls are opt-in. References are not execution flow.",
+            description: "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, and references. Default confidence is resolved; ambiguous and inferred calls are opt-in. References are not execution flow. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls; module-level-reference-rollup when the entity is a module) so empty sections are never read as guaranteed true negatives.",
             input_schema: id_confidence_schema(),
         },
         ToolDefinition {
@@ -552,7 +552,10 @@ impl ServerState {
                     .filter_map(|edge| caller_json(conn, &edge).transpose())
                     .collect::<Result<Vec<_>, StorageError>>()?;
                 Ok(success_envelope_with_stats(
-                    json!({"callers": callers}),
+                    json!({
+                        "callers": callers,
+                        "scope_excludes": call_graph_scope_excludes(confidence),
+                    }),
                     stats_delta,
                 ))
             })
@@ -594,7 +597,8 @@ impl ServerState {
                 Ok(success_envelope_with_truncation(
                     json!({
                         "paths": paths,
-                        "edge_count_visited": traversal.edge_count_visited
+                        "edge_count_visited": traversal.edge_count_visited,
+                        "scope_excludes": call_graph_scope_excludes(confidence),
                     }),
                     traversal.truncated.then_some("edge-cap"),
                 ))
@@ -692,7 +696,8 @@ impl ServerState {
             Ok(paths) => success_envelope_with_truncation_and_stats(
                 json!({
                     "paths": paths,
-                    "edge_count_visited": edge_count_visited
+                    "edge_count_visited": edge_count_visited,
+                    "scope_excludes": call_graph_scope_excludes(EdgeConfidence::Inferred),
                 }),
                 truncated.then_some("edge-cap"),
                 stats.to_json(),
@@ -750,6 +755,8 @@ impl ServerState {
                 let references_in = reference_neighbors(conn, &entity_id, ReferenceDirection::In)?;
                 let references_out =
                     reference_neighbors(conn, &entity_id, ReferenceDirection::Out)?;
+                let mut scope_excludes = call_graph_scope_excludes(confidence);
+                scope_excludes.extend(reference_scope_excludes(&entity.kind));
                 Ok(success_envelope(json!({
                     "entity": entity_json(&entity),
                     "callers": inbound_callers,
@@ -757,7 +764,8 @@ impl ServerState {
                     "container": container_entity,
                     "contained": contained_entities,
                     "references_in": references_in,
-                    "references_out": references_out
+                    "references_out": references_out,
+                    "scope_excludes": scope_excludes,
                 })))
             })
             .await;
@@ -2478,6 +2486,30 @@ fn optional_confidence(
     }
 }
 
+/// Call-graph blind spots a query did **not** search, so a consumer never reads
+/// an empty or partial caller/path result as a true negative (clarion-0d204a3f16).
+/// The static resolver cannot bind a call made through an attribute receiver
+/// (e.g. `ctx.orchestrator.resume()`); only `inferred` (LLM) dispatch attempts
+/// those, so `resolved`/`ambiguous` queries exclude them and `inferred` does not.
+fn call_graph_scope_excludes(confidence: EdgeConfidence) -> Vec<&'static str> {
+    match confidence {
+        EdgeConfidence::Resolved | EdgeConfidence::Ambiguous => vec!["attribute-receiver-calls"],
+        EdgeConfidence::Inferred => Vec::new(),
+    }
+}
+
+/// Reference-graph blind spots for a `neighborhood` query. References are tracked
+/// symbol-to-symbol; a module entity does not roll up the reference edges of the
+/// symbols it contains, so "who references this module" can read empty even when
+/// contained symbols are referenced (clarion-0d204a3f16, see clarion-79d0ff6e14).
+fn reference_scope_excludes(entity_kind: &str) -> Vec<&'static str> {
+    if entity_kind == "module" {
+        vec!["module-level-reference-rollup"]
+    } else {
+        Vec::new()
+    }
+}
+
 fn envelope_from_storage_result(result: Result<Value, StorageError>) -> Value {
     match result {
         Ok(result) => success_envelope(result),
@@ -3212,12 +3244,12 @@ mod tests {
         assert_eq!(tools[2].name, "callers_of");
         assert_eq!(
             tools[2].description,
-            "Return entities that call the given entity. Default confidence is resolved, so ambiguous static candidates and LLM-inferred edges are excluded unless explicitly requested. Ambiguous edges expand all candidates; inferred edges may trigger bounded LLM dispatch."
+            "Return entities that call the given entity. Default confidence is resolved, so ambiguous static candidates and LLM-inferred edges are excluded unless explicitly requested. Ambiguous edges expand all candidates; inferred edges may trigger bounded LLM dispatch. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls) so an empty callers list is never read as a guaranteed true negative."
         );
         assert_eq!(tools[3].name, "execution_paths_from");
         assert_eq!(
             tools[3].description,
-            "Return bounded calls-only execution paths starting at an entity. Default confidence is resolved. max_depth defaults to 3 and traversal also stops at the server edge cap; responses say when they are truncated."
+            "Return bounded calls-only execution paths starting at an entity. Default confidence is resolved. max_depth defaults to 3 and traversal also stops at the server edge cap; responses say when they are truncated. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls)."
         );
         assert_eq!(tools[4].name, "summary");
         assert_eq!(
@@ -3232,7 +3264,7 @@ mod tests {
         assert_eq!(tools[6].name, "neighborhood");
         assert_eq!(
             tools[6].description,
-            "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, and references. Default confidence is resolved; ambiguous and inferred calls are opt-in. References are not execution flow."
+            "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, and references. Default confidence is resolved; ambiguous and inferred calls are opt-in. References are not execution flow. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls; module-level-reference-rollup when the entity is a module) so empty sections are never read as guaranteed true negatives."
         );
         assert_eq!(tools[7].name, "subsystem_members");
         assert_eq!(
