@@ -944,6 +944,71 @@ async fn issues_for_returns_unavailable_when_filigree_disabled() {
     assert_eq!(envelope["ok"], true);
     assert_eq!(envelope["result"]["available"], false);
     assert_eq!(envelope["result"]["reason"], "filigree-disabled");
+    // Unavailable is now an explicit result_kind, distinct from no_matches.
+    assert_eq!(envelope["result"]["result_kind"], "unavailable");
+}
+
+#[tokio::test]
+async fn issues_for_reports_resolved_endpoint_and_result_kind() {
+    // AC#1/#2: issues_for surfaces the configured vs resolved (ethereal-port)
+    // endpoint, and distinguishes reachable-but-empty (no_matches) from a
+    // populated result (matched) — without the agent curling ports by hand.
+    let (project, db_path) = open_project();
+    let filigree_dir = project.path().join(".filigree");
+    fs::create_dir_all(&filigree_dir).unwrap();
+    fs::write(filigree_dir.join("ephemeral.port"), "8542").unwrap();
+    let config = FiligreeConfig {
+        enabled: true,
+        ..FiligreeConfig::default()
+    };
+    let diagnostics = DiagnosticsContext {
+        llm: LlmDiagnostics {
+            provider: "disabled".to_owned(),
+            live: false,
+            allow_live_provider: false,
+            cache_max_age_days: 180,
+        },
+        filigree: resolve_filigree_url(&config, project.path()),
+    };
+
+    // Reachable but no associations for this entity -> no_matches.
+    let empty_client = Arc::new(FakeFiligreeClient::default());
+    let state = state_for_filigree(project.path(), &db_path, empty_client)
+        .with_diagnostics(diagnostics.clone());
+    let envelope = call_tool(
+        &state,
+        "issues_for",
+        json!({"id": "python:function:demo.entry", "include_contained": false}),
+    )
+    .await;
+    assert_eq!(envelope["result"]["available"], true);
+    assert_eq!(envelope["result"]["result_kind"], "no_matches");
+    let endpoint = &envelope["result"]["filigree_endpoint"];
+    assert_eq!(endpoint["configured_url"], "http://127.0.0.1:8766");
+    assert_eq!(endpoint["resolved_url"], "http://127.0.0.1:8542");
+    assert_eq!(endpoint["resolution_source"], SOURCE_EPHEMERAL_PORT);
+
+    // A populated result -> matched, same endpoint block.
+    let client = Arc::new(FakeFiligreeClient::default().with_response(
+        "python:function:demo.entry",
+        vec![association(
+            "filigree-fresh",
+            "python:function:demo.entry",
+            &expected_content_hash(project.path(), "python:function:demo.entry"),
+        )],
+    ));
+    let state = state_for_filigree(project.path(), &db_path, client).with_diagnostics(diagnostics);
+    let envelope = call_tool(
+        &state,
+        "issues_for",
+        json!({"id": "python:function:demo.entry", "include_contained": false}),
+    )
+    .await;
+    assert_eq!(envelope["result"]["result_kind"], "matched");
+    assert_eq!(
+        envelope["result"]["filigree_endpoint"]["resolved_url"],
+        "http://127.0.0.1:8542"
+    );
 }
 
 #[tokio::test]

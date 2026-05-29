@@ -463,6 +463,12 @@ matched_ids = {item["issue_id"] for item in issues["result"]["matched"]}
 drifted_ids = {item["issue_id"] for item in issues["result"]["drifted"]}
 assert "filigree-world" in matched_ids, issues
 assert "filigree-hello-drifted" in drifted_ids, issues
+# issues_for surfaces the resolved Filigree endpoint + a result_kind taxonomy
+# (clarion-318f1254eb): a populated result is "matched" and reports the endpoint
+# it was served from.
+assert issues["result"]["result_kind"] == "matched", issues
+assert issues["result"]["filigree_endpoint"]["enabled"] is True, issues
+assert issues["result"]["filigree_endpoint"]["resolved_url"], issues
 assert issues["stats_delta"]["filigree_requests_total"] >= 2, issues
 assert "python:function:demo.world" in filigree_requests, filigree_requests
 assert "python:function:demo.hello" in filigree_requests, filigree_requests

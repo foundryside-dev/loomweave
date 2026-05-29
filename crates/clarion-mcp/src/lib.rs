@@ -146,7 +146,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "issues_for",
-            description: "Return Filigree issues attached to this Clarion entity, optionally including issues attached to contained entities. Filigree is an enrichment source; if unavailable, the tool returns an unavailable envelope instead of failing Clarion.",
+            description: "Return Filigree issues attached to this Clarion entity, optionally including issues attached to contained entities. Filigree is an enrichment source; if unavailable, the tool returns an unavailable envelope instead of failing Clarion. The result carries a result_kind (matched | no_matches | unavailable) so a reachable-but-empty Filigree is distinct from an unreachable one, and a filigree_endpoint block (configured vs resolved URL + resolution_source) so you can see which endpoint — e.g. a live ethereal port — the answer came from.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -830,8 +830,15 @@ impl ServerState {
     ) -> std::result::Result<Value, ParamError> {
         let entity_id = required_str(arguments, "id")?.to_owned();
         let include_contained = optional_bool(arguments, "include_contained")?.unwrap_or(true);
+        // Surface the same configured-vs-resolved Filigree endpoint block that
+        // `project_status` reports, so an agent can see WHICH endpoint a result
+        // came from (e.g. an ethereal port resolved from
+        // `.filigree/ephemeral.port`) instead of curling ports by hand. Null on
+        // storage-only servers built without a diagnostics context.
+        let endpoint = self.filigree_diagnostics_json();
         let Some(client) = self.filigree_client.clone() else {
             return Ok(issues_unavailable(
+                &endpoint,
                 "filigree-disabled",
                 "Filigree integration is disabled",
             ));
@@ -843,6 +850,7 @@ impl ServerState {
             Ok(Some(read)) => read,
             Ok(None) => {
                 return Ok(issues_unavailable(
+                    &endpoint,
                     "entity-not-found",
                     "Clarion entity was not found",
                 ));
@@ -867,10 +875,15 @@ impl ServerState {
             {
                 Ok(Ok(response)) => response,
                 Ok(Err(err)) => {
-                    return Ok(issues_unavailable("filigree-unreachable", &err.to_string()));
+                    return Ok(issues_unavailable(
+                        &endpoint,
+                        "filigree-unreachable",
+                        &err.to_string(),
+                    ));
                 }
                 Err(err) => {
                     return Ok(issues_unavailable(
+                        &endpoint,
                         "filigree-client-error",
                         &format!("Filigree client task failed: {err}"),
                     ));
@@ -886,7 +899,7 @@ impl ServerState {
                 break;
             }
         }
-        Ok(accumulator.into_envelope(read.entity_cap_truncated, requests_total))
+        Ok(accumulator.into_envelope(read.entity_cap_truncated, requests_total, &endpoint))
     }
 
     async fn tool_subsystem_members(
@@ -1961,15 +1974,32 @@ impl IssuesForAccumulator {
         }
     }
 
-    fn into_envelope(self, entity_cap_truncated: bool, requests_total: usize) -> Value {
+    fn into_envelope(
+        self,
+        entity_cap_truncated: bool,
+        requests_total: usize,
+        filigree_endpoint: &Value,
+    ) -> Value {
         let truncation_reason = if self.issue_cap_truncated {
             Some("issue-cap")
         } else {
             entity_cap_truncated.then_some("entity-cap")
         };
+        // result_kind lets a consumer act on the outcome without re-deriving it
+        // from array lengths, and — paired with `available: false` from
+        // `issues_unavailable` — distinguishes "Filigree reachable but no issues
+        // are attached" (no_matches) from "Filigree unreachable/disabled"
+        // (unavailable).
+        let result_kind = if self.matched.is_empty() && self.drifted.is_empty() {
+            "no_matches"
+        } else {
+            "matched"
+        };
         let mut envelope = success_envelope_with_truncation_and_stats(
             json!({
                 "available": true,
+                "result_kind": result_kind,
+                "filigree_endpoint": filigree_endpoint,
                 "matched": self.matched,
                 "drifted": self.drifted,
                 "not_found": self.not_found
@@ -2900,9 +2930,11 @@ fn token_ceiling_envelope(message: &str) -> Value {
     })
 }
 
-fn issues_unavailable(reason: &str, message: &str) -> Value {
+fn issues_unavailable(filigree_endpoint: &Value, reason: &str, message: &str) -> Value {
     success_envelope(json!({
         "available": false,
+        "result_kind": "unavailable",
+        "filigree_endpoint": filigree_endpoint,
         "reason": reason,
         "message": message,
         "matched": [],
@@ -3515,7 +3547,7 @@ mod tests {
         assert_eq!(tools[5].name, "issues_for");
         assert_eq!(
             tools[5].description,
-            "Return Filigree issues attached to this Clarion entity, optionally including issues attached to contained entities. Filigree is an enrichment source; if unavailable, the tool returns an unavailable envelope instead of failing Clarion."
+            "Return Filigree issues attached to this Clarion entity, optionally including issues attached to contained entities. Filigree is an enrichment source; if unavailable, the tool returns an unavailable envelope instead of failing Clarion. The result carries a result_kind (matched | no_matches | unavailable) so a reachable-but-empty Filigree is distinct from an unreachable one, and a filigree_endpoint block (configured vs resolved URL + resolution_source) so you can see which endpoint — e.g. a live ethereal port — the answer came from."
         );
         assert_eq!(tools[6].name, "neighborhood");
         assert_eq!(
