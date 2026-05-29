@@ -9,7 +9,7 @@ use clarion_storage::{
     entity_briefing_block_reason, entity_by_id, find_entities, findings_for_emit,
     module_dependency_edges, module_reference_rollup, normalize_source_path, pragma,
     reference_edges_for_entity, resolve_file, resolve_file_catalog_entry, schema,
-    subsystem_for_member, subsystem_members, subsystem_of_entity,
+    containing_module_id, subsystem_for_member, subsystem_members, subsystem_of_entity,
 };
 use rusqlite::{Connection, params};
 
@@ -1462,4 +1462,42 @@ fn findings_for_emit_scopes_to_run_id() {
     let rows = findings_for_emit(&conn, "run-1").expect("findings_for_emit");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id, "f-run1");
+}
+
+#[test]
+fn containing_module_id_walks_up_to_the_nearest_module() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+
+    // module -> class -> method nesting via `contains`.
+    insert_entity(&conn, "python:module:pkg.mod", "module");
+    insert_entity(&conn, "python:class:pkg.mod.Cls", "class");
+    insert_entity(&conn, "python:function:pkg.mod.Cls.method", "function");
+    insert_contains_edge(&conn, "python:module:pkg.mod", "python:class:pkg.mod.Cls");
+    insert_contains_edge(
+        &conn,
+        "python:class:pkg.mod.Cls",
+        "python:function:pkg.mod.Cls.method",
+    );
+
+    // A nested method resolves up through its class to the module.
+    assert_eq!(
+        containing_module_id(&conn, "python:function:pkg.mod.Cls.method")
+            .expect("query")
+            .as_deref(),
+        Some("python:module:pkg.mod"),
+    );
+    // A module resolves to itself (depth 0).
+    assert_eq!(
+        containing_module_id(&conn, "python:module:pkg.mod")
+            .expect("query")
+            .as_deref(),
+        Some("python:module:pkg.mod"),
+    );
+    // A symbol with no module ancestor returns None.
+    insert_entity(&conn, "python:function:orphan", "function");
+    assert_eq!(
+        containing_module_id(&conn, "python:function:orphan").expect("query"),
+        None,
+    );
 }

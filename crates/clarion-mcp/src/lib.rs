@@ -30,7 +30,7 @@ use clarion_storage::{
     RolledUpReferenceEdge, StorageError, SummaryCacheEntry, SummaryCacheKey, UnresolvedCallSiteRow,
     WriterCmd, ancestor_chain, call_edges_from, call_edges_targeting,
     candidate_entities_for_unresolved_sites, child_entity_ids, contained_entity_ids,
-    entities_containing_line, entity_by_id, existing_entity_ids, find_entities,
+    containing_module_id, entities_containing_line, entity_by_id, existing_entity_ids, find_entities,
     import_edges_for_entity, inferred_edge_cache_key_id, inferred_edge_cache_lookup,
     module_reference_rollup, normalize_source_path, reference_edges_for_entity, subsystem_members,
     subsystem_of_entity, summary_cache_lookup, unresolved_call_sites_for_caller,
@@ -167,7 +167,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "neighborhood",
-            description: "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, references, and imports (imports_in = who imports this module, imports_out = what it imports; module-to-module). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls) so empty sections are never read as guaranteed true negatives.",
+            description: "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, references, and imports (imports_in = who imports this module, imports_out = what it imports; module-to-module). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. On references_in each rolled-up neighbor also carries `importer_module` — the importing symbol's containing module — so reverse-import names importing modules, not just symbols. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls) so empty sections are never read as guaranteed true negatives.",
             input_schema: id_confidence_schema(),
         },
         ToolDefinition {
@@ -5440,7 +5440,7 @@ fn reference_neighbors_for(
 ) -> Result<(Vec<Value>, bool), StorageError> {
     if entity_kind == "module" {
         let edges = module_reference_rollup(conn, entity_id, direction)?;
-        Ok((rolled_up_neighbors_json(conn, edges)?, true))
+        Ok((rolled_up_neighbors_json(conn, edges, direction)?, true))
     } else {
         Ok((reference_neighbors(conn, entity_id, direction)?, false))
     }
@@ -5449,21 +5449,45 @@ fn reference_neighbors_for(
 fn rolled_up_neighbors_json(
     conn: &rusqlite::Connection,
     edges: Vec<RolledUpReferenceEdge>,
+    direction: ReferenceDirection,
 ) -> Result<Vec<Value>, StorageError> {
     let mut neighbors = Vec::new();
     for edge in edges {
         if let Some(entity) = entity_by_id(conn, &edge.neighbor_id)? {
             let via = entity_by_id(conn, &edge.via_id)?;
-            neighbors.push(json!({
-                "entity": entity_json(&entity),
-                "edge_confidence": edge.confidence.as_str(),
-                "source_byte_start": edge.source_byte_start,
-                "source_byte_end": edge.source_byte_end,
-                // The module-contained symbol this edge actually touches, so a
-                // rolled-up "who imports this module" answer names the importer
-                // (entity) AND the imported symbol (via).
-                "via": via.as_ref().map(entity_json),
-            }));
+            let mut object = serde_json::Map::new();
+            object.insert("entity".to_owned(), entity_json(&entity));
+            object.insert(
+                "edge_confidence".to_owned(),
+                json!(edge.confidence.as_str()),
+            );
+            object.insert("source_byte_start".to_owned(), json!(edge.source_byte_start));
+            object.insert("source_byte_end".to_owned(), json!(edge.source_byte_end));
+            // The module-contained symbol this edge actually touches, so a
+            // rolled-up "who imports this module" answer names the importer
+            // (entity) AND the imported symbol (via).
+            object.insert(
+                "via".to_owned(),
+                via.as_ref().map(entity_json).unwrap_or(Value::Null),
+            );
+            // Reverse-import altitude (clarion-79d0ff6e14): the edge is recorded
+            // against the importing *symbol*, but "who imports this module /
+            // contract" is a module-altitude question, so name the importer's
+            // containing module too. Only meaningful for the `In` direction
+            // (the neighbor is the importer); `Out` neighbors are referenced
+            // symbols, not importers. `null` for an importer with no module
+            // ancestor.
+            if direction == ReferenceDirection::In {
+                let importer_module = match containing_module_id(conn, &edge.neighbor_id)? {
+                    Some(module_id) => entity_by_id(conn, &module_id)?,
+                    None => None,
+                };
+                object.insert(
+                    "importer_module".to_owned(),
+                    importer_module.as_ref().map(entity_json).unwrap_or(Value::Null),
+                );
+            }
+            neighbors.push(Value::Object(object));
         }
     }
     Ok(neighbors)
@@ -5558,7 +5582,7 @@ mod tests {
         assert_eq!(tools[6].name, "neighborhood");
         assert_eq!(
             tools[6].description,
-            "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, references, and imports (imports_in = who imports this module, imports_out = what it imports; module-to-module). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls) so empty sections are never read as guaranteed true negatives."
+            "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, references, and imports (imports_in = who imports this module, imports_out = what it imports; module-to-module). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. On references_in each rolled-up neighbor also carries `importer_module` — the importing symbol's containing module — so reverse-import names importing modules, not just symbols. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls) so empty sections are never read as guaranteed true negatives."
         );
         assert_eq!(tools[7].name, "subsystem_members");
         assert_eq!(

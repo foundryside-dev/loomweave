@@ -1124,6 +1124,38 @@ pub fn subsystem_of_entity(conn: &Connection, entity_id: &str) -> Result<Option<
     .map_err(StorageError::from)
 }
 
+/// Resolve the module that contains `entity_id`: the nearest `module`-kind
+/// ancestor reached by walking `contains` edges upward, or the entity itself
+/// when it is already a module (depth 0).
+///
+/// Used to lift a reverse-import (`who imports this`) result to module altitude
+/// (clarion-79d0ff6e14). A `references` edge is recorded against the importing
+/// *symbol* (`from pkg.contracts import X` binds to the class `X`), but the
+/// reverse-import contract names importing *modules* — so a consumer resolves
+/// each importer to its module here. Returns `None` for a symbol with no module
+/// ancestor within [`MODULE_ANCESTOR_MAX_DEPTH`].
+pub fn containing_module_id(conn: &Connection, entity_id: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "WITH RECURSIVE ancestors(id, depth) AS ( \
+             SELECT ?1, 0 \
+             UNION ALL \
+             SELECT parent.from_id, ancestors.depth + 1 \
+             FROM edges parent \
+             JOIN ancestors ON parent.to_id = ancestors.id \
+             WHERE parent.kind = 'contains' AND ancestors.depth < ?2 \
+         ) \
+         SELECT m.id \
+         FROM ancestors \
+         JOIN entities m ON m.id = ancestors.id AND m.kind = 'module' \
+         ORDER BY ancestors.depth \
+         LIMIT 1",
+        params![entity_id, MODULE_ANCESTOR_MAX_DEPTH],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(StorageError::from)
+}
+
 pub fn subsystem_for_member(conn: &Connection, module_id: &str) -> Result<Option<String>> {
     // Reserved for v0.2 neighborhood / issues_for enrichment. v0.1's MCP
     // surface exposes subsystem_members, but keeping this inverse lookup here

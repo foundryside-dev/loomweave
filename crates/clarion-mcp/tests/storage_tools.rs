@@ -3791,6 +3791,14 @@ async fn neighborhood_module_rollup_surfaces_external_reverse_import() {
         refs_in[0]["via"]["id"], "python:function:demo.target",
         "via names the contained symbol the import touched"
     );
+    // Reverse-import names importing MODULES, not just symbols
+    // (clarion-79d0ff6e14 AC): the importing symbol's containing module is
+    // surfaced alongside the symbol, so "who imports this" is answerable at
+    // module altitude.
+    assert_eq!(
+        refs_in[0]["importer_module"]["id"], "python:module:consumer",
+        "importer_module rolls the importing symbol up to its module"
+    );
 }
 
 #[tokio::test]
