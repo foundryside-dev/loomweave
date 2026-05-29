@@ -62,7 +62,10 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
         filigree: filigree_resolution,
     };
 
-    let readers = ReaderPool::open(&db_path, 16)
+    // Eagerly validate the DB at boot so a missing/corrupt index fails fast
+    // here rather than deferring to the first reader (or lazily creating an
+    // empty DB) — clarion-e74b6e69e5.
+    let readers = ReaderPool::open_validated(&db_path, 16)
         .map_err(|err| anyhow!("open reader pool for {}: {err}", db_path.display()))?;
     let http_project_root = project_root.clone();
     let http_server = crate::http_read::spawn(

@@ -246,3 +246,53 @@ async fn reader_panic_is_caught_as_pool_interact_and_pool_remains_usable() {
         .expect("subsequent reader after a panic should succeed");
     assert_eq!(ok, 99);
 }
+
+// ── eager validation (clarion-e74b6e69e5) ────────────────────────────────────
+
+#[tokio::test]
+async fn open_validated_succeeds_and_reads_on_prepared_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+
+    let pool = ReaderPool::open_validated(&path, 2).expect("validated pool");
+    let n: i64 = pool
+        .with_reader(|conn| Ok(conn.query_row("SELECT 7", [], |row| row.get(0))?))
+        .await
+        .expect("reader");
+    assert_eq!(n, 7);
+}
+
+#[tokio::test]
+async fn open_validated_fails_fast_on_missing_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("does-not-exist.db");
+
+    // Eager validation rejects a missing file up front. (ReaderPool is not
+    // Debug, so we match rather than unwrap_err / format the Result.)
+    match ReaderPool::open_validated(&missing, 2) {
+        Err(clarion_storage::StorageError::Sqlite(_)) => {}
+        Err(other) => panic!("expected a Sqlite error for a missing DB, got {other:?}"),
+        Ok(_) => panic!("open_validated must reject a missing DB"),
+    }
+    // ...whereas the lazy open() happily builds a pool against nothing (the
+    // gap this validation closes): pool construction never touches the file.
+    assert!(
+        ReaderPool::open(&missing, 2).is_ok(),
+        "lazy open() is expected to defer the missing-file error"
+    );
+}
+
+#[tokio::test]
+async fn open_validated_fails_on_corrupt_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("corrupt.db");
+    // A non-empty, non-SQLite file: open succeeds lazily but the header read
+    // inside the probe fails — the same surface clarion hook session-start hits.
+    std::fs::write(&path, b"this is definitely not a sqlite database").unwrap();
+
+    match ReaderPool::open_validated(&path, 2) {
+        Err(clarion_storage::StorageError::Sqlite(_)) => {}
+        Err(other) => panic!("expected a Sqlite error for a corrupt DB, got {other:?}"),
+        Ok(_) => panic!("open_validated must reject a corrupt DB"),
+    }
+}
