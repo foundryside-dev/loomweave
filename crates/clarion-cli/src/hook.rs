@@ -15,9 +15,13 @@ use rusqlite::{Connection, OpenFlags};
 /// subcommands and documents the fail-soft contract at the type level.
 #[allow(clippy::unnecessary_wraps)]
 pub fn session_start(path: &Path) -> anyhow::Result<()> {
-    // (1) Re-sync the skill pack ONLY if it's already installed and drifted.
-    //     We don't install where absent — that's `clarion install --skills`'s
-    //     job. A drift repair keeps an installed copy honest across upgrades.
+    // (1) Re-sync the skill pack ONLY if it's already installed in at least one
+    //     skill root, and drifted. A bare session-start never bootstraps a
+    //     never-installed project — that's `clarion install --skills`'s job. Note
+    //     the resync normalises BOTH roots once triggered: if a project installed
+    //     only `.claude/skills`, a drift repair also (re)creates
+    //     `.agents/skills`, keeping the two roots in lock-step. A drift repair
+    //     keeps installed copies honest across upgrades.
     resync_skill_if_present(path);
 
     // (2) Snapshot.

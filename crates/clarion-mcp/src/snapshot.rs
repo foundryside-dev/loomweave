@@ -15,14 +15,26 @@ use serde::Serialize;
 
 /// Freshness of the `.clarion/` index relative to the source files Clarion
 /// ingested. See the plan's Decision Point (b) for the algorithm.
+///
+/// Freshness is computed by stat-ing only the files already recorded in
+/// `entities.source_file_path`, so it detects *modified* ingested files but is
+/// blind to files *added* (not yet ingested, so absent from the table) or
+/// *deleted* since the last run. A repo that gained or lost source files
+/// without touching any ingested file can therefore still report [`Fresh`]; the
+/// verdict is a best-effort nudge, not a guarantee. Added/removed-file
+/// detection is tracked as a `release:1.1` follow-up.
+///
+/// [`Fresh`]: Staleness::Fresh
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Staleness {
     /// No completed analyze run has ever been recorded.
     NeverAnalyzed,
-    /// At least one ingested source file is newer than the latest run.
+    /// At least one ingested source file is newer than the latest run. (Does
+    /// not account for added/removed files — see the type-level note.)
     Stale,
-    /// No ingested source file is newer than the latest run.
+    /// No ingested source file is newer than the latest run. (Does not account
+    /// for added/removed files — see the type-level note.)
     Fresh,
     /// Could not determine (stat/parse/IO error) — degrade, don't fail (and log).
     Unknown,
