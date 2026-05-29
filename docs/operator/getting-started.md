@@ -39,9 +39,10 @@ export OPENROUTER_API_KEY=sk-or-v1-...
 `clarion analyze` (step 2) and the structural MCP tools (`entity_at`,
 `find_entity`, `callers_of`, `execution_paths_from`, `issues_for`,
 `neighborhood`, `subsystem_members`, `subsystem_of`, `project_status`,
-`summary_preview_cost`, `source_for_entity`, `call_sites`) work without any LLM
-credentials — twelve of the thirteen MCP tools are credential-free. The
-key is only consulted when an MCP client calls `summary(id)` against an entity that does not
+`summary_preview_cost`, `source_for_entity`, `call_sites`, `orientation_pack`,
+`analyze_start`, `analyze_status`, `analyze_cancel`, `index_diff`) work without
+any LLM credentials — seventeen of the eighteen MCP tools are credential-free.
+The key is only consulted when an MCP client calls `summary(id)` against an entity that does not
 yet have a cached summary.
 
 ## 1. Install
@@ -219,18 +220,22 @@ llm_policy:
 `OPENROUTER_API_KEY` must also be exported in the environment that
 `clarion serve` (or your MCP client wrapper) inherits — see the
 prerequisites section above. Skip this block if you don't have a key; the
-other ten tools still work, only `summary` will return an "LLM disabled"
+other seventeen tools still work, only `summary` will return an "LLM disabled"
 envelope.
 
 ### The MCP tools
 
-The MCP surface exposes thirteen tools: seven primary tools (in the table below)
+The MCP surface exposes eighteen tools: seven primary tools (in the table below)
 plus `subsystem_members` and `subsystem_of` for clustering output,
 `project_status` for deterministic diagnostics, `summary_preview_cost` to
 preview a summary's cache status and cost before spending,
 `source_for_entity` to read an entity's exact indexed source span (with bounded
-context and drift detection) without shelling out, and `call_sites` to see the
-actual source line(s) behind a calls/references edge. Twelve of the thirteen are
+context and drift detection) without shelling out, `call_sites` to see the
+actual source line(s) behind a calls/references edge, `orientation_pack` to
+assemble a complete orientation packet for one location in a single call, the
+`analyze_start` / `analyze_status` / `analyze_cancel` lifecycle to launch and
+supervise a background re-index over MCP, and `index_diff` for a freshness /
+drift report against the current working tree. Seventeen of the eighteen are
 credential-free; only `summary` needs the live LLM. Each is a structured graph
 query, not free-text grep.
 
@@ -248,6 +253,11 @@ query, not free-text grep.
 | `summary_preview_cost(id)` | `summary_preview_cost(id="python:function:requests.sessions.Session.send")` — preview a `summary` call before spending: cache hit/expired/miss, cached tokens/cost/age, an input-token estimate on a miss, LLM policy, and whether a live call would spend. Never calls the LLM. |
 | `source_for_entity(id, context_lines)` | `source_for_entity(id="python:function:requests.sessions.Session.send", context_lines=10)` — the entity's exact indexed source span plus bounded line-numbered context, each line flagged `in_entity`. Reports `source_status` (`ok`/`missing`/`drifted`/…) instead of a stale snippet. No LLM. |
 | `call_sites(id, role)` | `call_sites(id="python:function:requests.sessions.Session.send", role="caller")` — the actual source line(s) behind calls/references edges: file, line, line text, edge kind, confidence, and resolved/ambiguous/unresolved classification. `role="callee"` shows incoming sites. No LLM. |
+| `orientation_pack(entity \| file, line)` | `orientation_pack(file="requests/sessions.py", line=480)` — one deterministic packet for a location: primary entity, `entity_context` evidence, source-span summary, one-hop neighbors, compact execution paths, related Filigree issues, index/Filigree/LLM health, and suggested next reads. Resolve by `entity` id or by `file`+`line`. No LLM. |
+| `analyze_start()` | `analyze_start()` — launch a background `clarion analyze` re-index and return its `run_id` immediately. One run per project (cross-process lock). No arguments, no LLM. |
+| `analyze_status(run_id)` | `analyze_status(run_id="…")` — live status of a run: `queued`/`running`/`completed`/`failed`/`cancelled`/`skipped_no_plugins`, phase, processed/total files, heartbeat, and recorded stats on a terminal status. No LLM. |
+| `analyze_cancel(run_id)` | `analyze_cancel(run_id="…")` — SIGKILL a running analyze's process group (plugin + Pyright) and record its terminal state. No LLM. |
+| `index_diff()` | `index_diff()` — freshness / drift report: latest completed run, indexed-file drift (mtime vs. index), and git working-tree changes correlated against indexed paths. No arguments, no LLM. |
 
 The three questions to walk through with your agent:
 
