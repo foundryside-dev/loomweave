@@ -46,6 +46,8 @@ fn main() -> Result<()> {
             config,
             allow_unredacted_secrets,
             confirm_allow_unredacted_secrets,
+            run_id,
+            progress_file,
         } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -60,19 +62,13 @@ fn main() -> Result<()> {
                     std::process::exit(78);
                 }
             };
-            if config.is_none()
-                && matches!(
-                    secret_scan.override_policy,
-                    secret_scan::OverridePolicy::Forbid
-                )
-            {
-                return rt.block_on(analyze::run(path));
-            }
             rt.block_on(analyze::run_with_options(
                 path,
                 analyze::AnalyzeOptions {
                     config_path: config,
                     secret_scan,
+                    run_id,
+                    progress_file,
                 },
             ))
         }

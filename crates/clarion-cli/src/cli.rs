@@ -62,6 +62,19 @@ pub enum Command {
         /// Non-TTY confirmation token for --allow-unredacted-secrets.
         #[arg(long, value_name = "TOKEN", requires = "allow_unredacted_secrets")]
         confirm_allow_unredacted_secrets: Option<String>,
+
+        /// Use this run id instead of generating one. Internal: set by the MCP
+        /// `analyze_start` tool so it can return the handle before the run
+        /// records its `runs` row. Hidden from `--help`.
+        #[arg(long, hide = true)]
+        run_id: Option<String>,
+
+        /// Write structured progress (phase, current plugin, processed/total
+        /// files, current file, heartbeat) to this path as the run proceeds,
+        /// so `analyze_status` can report progress without log scraping.
+        /// Internal: set by the MCP `analyze_start` tool. Hidden from `--help`.
+        #[arg(long, hide = true)]
+        progress_file: Option<PathBuf>,
     },
 
     /// Run the MCP stdio server.

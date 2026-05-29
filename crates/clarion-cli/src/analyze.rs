@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use ignore::{DirEntry, WalkBuilder};
@@ -37,22 +38,105 @@ use crate::stats::P95Accumulator;
 
 const WEAK_MODULARITY_RULE_ID: &str = "CLA-FACT-CLUSTERING-WEAK-MODULARITY";
 
+/// Writes structured run progress to a JSON file for the MCP `analyze_status`
+/// tool (clarion-7e0c21558a). A no-op unless `analyze_start` passed a
+/// `--progress-file` path, so the normal CLI path pays nothing. Each write
+/// stamps a fresh `heartbeat_at`, letting a reader tell "still making progress"
+/// from "stalled" without scraping logs. Writes are best-effort and
+/// last-write-wins via an atomic temp-file rename; a failed write is logged and
+/// dropped (progress is advisory, never run-fatal).
+struct ProgressReporter {
+    inner: Option<ProgressInner>,
+}
+
+struct ProgressInner {
+    path: PathBuf,
+    run_id: String,
+    pid: u32,
+    total_files: AtomicU64,
+    processed_files: AtomicU64,
+}
+
+impl ProgressReporter {
+    fn new(progress_file: Option<PathBuf>, run_id: String) -> Self {
+        Self {
+            inner: progress_file.map(|path| ProgressInner {
+                path,
+                run_id,
+                pid: std::process::id(),
+                total_files: AtomicU64::new(0),
+                processed_files: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    /// Record the total file count discovered for the run (denominator for
+    /// `processed_files`).
+    fn set_total(&self, total: u64) {
+        if let Some(inner) = &self.inner {
+            inner.total_files.store(total, Ordering::Relaxed);
+        }
+    }
+
+    /// Write a snapshot for a phase boundary (`discovering`, `analyzing`,
+    /// `clustering`). `current_plugin`/`current_file` are `None` between
+    /// plugins.
+    fn phase(&self, phase: &str, current_plugin: Option<&str>, current_file: Option<&str>) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let snapshot = serde_json::json!({
+            "run_id": inner.run_id,
+            "pid": inner.pid,
+            "phase": phase,
+            "current_plugin": current_plugin,
+            "current_file": current_file,
+            "processed_files": inner.processed_files.load(Ordering::Relaxed),
+            "total_files": inner.total_files.load(Ordering::Relaxed),
+            "heartbeat_at": iso8601_now(),
+        });
+        self.write_atomic(&snapshot);
+    }
+
+    /// Snapshot at the start of a file (so `current_file` reflects in-flight
+    /// work); the file is counted as processed by [`Self::file_completed`].
+    fn file_started(&self, plugin_id: &str, file: &str) {
+        self.phase("analyzing", Some(plugin_id), Some(file));
+    }
+
+    /// Increment the processed-file counter after a file finishes.
+    fn file_completed(&self) {
+        if let Some(inner) = &self.inner {
+            inner.processed_files.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn write_atomic(&self, snapshot: &serde_json::Value) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let body = snapshot.to_string();
+        let tmp = inner.path.with_extension("json.tmp");
+        if let Err(err) = fs::write(&tmp, &body).and_then(|()| fs::rename(&tmp, &inner.path)) {
+            tracing::debug!(
+                error = %err,
+                path = %inner.path.display(),
+                "failed to write analyze progress snapshot (advisory; ignored)",
+            );
+        }
+    }
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AnalyzeOptions {
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) secret_scan: crate::secret_scan::SecretScanOptions,
-}
-
-/// Run the analyze command against `project_path`.
-///
-/// # Errors
-///
-/// Returns an error if the target directory does not exist, has no `.clarion/`
-/// directory, or if the writer actor fails to start or process commands.
-pub async fn run(project_path: PathBuf) -> Result<()> {
-    run_with_options(project_path, AnalyzeOptions::default()).await
+    /// Caller-supplied run id (MCP `analyze_start`); `None` generates one.
+    pub(crate) run_id: Option<String>,
+    /// When set, structured progress is written here as the run proceeds.
+    pub(crate) progress_file: Option<PathBuf>,
 }
 
 /// Run the analyze command against `project_path` with resolved CLI options.
@@ -98,8 +182,18 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
     .context("spawn writer actor")?;
-    let run_id = Uuid::new_v4().to_string();
+    let run_id = options
+        .run_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let started_at = iso8601_now();
+    // Structured progress sink (MCP `analyze_start` sets `progress_file`); a
+    // no-op when absent so the normal CLI path is unchanged.
+    let progress = Arc::new(ProgressReporter::new(
+        options.progress_file.clone(),
+        run_id.clone(),
+    ));
+    progress.phase("discovering", None, None);
 
     // ── Discover plugins ──────────────────────────────────────────────────────
     let discovery_results = discover();
@@ -215,6 +309,8 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // ── Walk the source tree (once, union of all extensions) ─────────────────
     let source_files = collect_source_files(&project_root, &wanted_extensions);
     tracing::info!(file_count = source_files.len(), "source tree walk complete");
+    progress.set_total(source_files.len() as u64);
+    progress.phase("analyzing", None, None);
 
     let secret_scan_files = crate::secret_scan::collect_scan_files(&project_root, &source_files);
     tracing::info!(
@@ -295,6 +391,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         let files_clone = plugin_files.clone();
         let briefing_blocks_clone = Arc::clone(&briefing_blocks);
         let scanned_files_clone = Arc::clone(&scanned_files);
+        let progress_clone = Arc::clone(&progress);
 
         // A JoinError here means the blocking task panicked (OOM, stack
         // overflow, internal unwrap, abort — anything that unwinds past the
@@ -314,6 +411,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     &files_clone,
                     &briefing_blocks_clone,
                     &scanned_files_clone,
+                    &progress_clone,
                 )
             })
             .await,
@@ -479,6 +577,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         };
     }
 
+    progress.phase("clustering", None, None);
     let phase3_output = if matches!(run_outcome, RunOutcome::HardFailed { .. }) {
         Phase3Output::not_run()
     } else {
@@ -1202,6 +1301,7 @@ fn run_plugin_blocking(
     files: &[PathBuf],
     briefing_blocks: &Arc<BTreeMap<PathBuf, clarion_core::BriefingBlockReason>>,
     scanned_source_files: &Arc<BTreeSet<PathBuf>>,
+    progress: &ProgressReporter,
 ) -> Result<BatchResult, PluginRunError> {
     use clarion_core::PluginHost;
 
@@ -1227,6 +1327,7 @@ fn run_plugin_blocking(
         let mut collected_unresolved_call_sites: Vec<PendingUnresolvedCallSites> = Vec::new();
         let mut collected_stats = BatchStats::default();
         for file in files {
+            progress.file_started(plugin_id, &file.to_string_lossy());
             let AnalyzeFileOutcome {
                 entities,
                 edges,
@@ -1234,6 +1335,7 @@ fn run_plugin_blocking(
             } = host
                 .analyze_file(file)
                 .map_err(|e| classify_host_error(plugin_id, e))?;
+            progress.file_completed();
             collected_stats.unresolved_call_sites_total += stats.unresolved_call_sites_total;
             collected_stats.reference_sites_total += stats.reference_sites_total;
             collected_stats.references_resolved_total += stats.references_resolved_total;
@@ -1978,6 +2080,51 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use std::fs;
+
+    #[test]
+    fn progress_reporter_is_noop_without_a_path() {
+        // No progress file → no panics, no writes; the normal CLI path.
+        let reporter = ProgressReporter::new(None, "run-x".to_owned());
+        reporter.set_total(10);
+        reporter.phase("analyzing", Some("python"), Some("a.py"));
+        reporter.file_started("python", "a.py");
+        reporter.file_completed();
+    }
+
+    #[test]
+    fn progress_reporter_writes_phase_and_counters_with_heartbeat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("runs").join("run-1.progress.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let reporter = ProgressReporter::new(Some(path.clone()), "run-1".to_owned());
+
+        reporter.set_total(3);
+        reporter.file_started("python", "src/a.py");
+        reporter.file_completed();
+        reporter.file_started("python", "src/b.py");
+
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("progress file")).unwrap();
+        assert_eq!(snapshot["run_id"], "run-1");
+        assert_eq!(snapshot["phase"], "analyzing");
+        assert_eq!(snapshot["current_plugin"], "python");
+        assert_eq!(snapshot["current_file"], "src/b.py");
+        assert_eq!(snapshot["processed_files"], 1);
+        assert_eq!(snapshot["total_files"], 3);
+        assert!(
+            snapshot["heartbeat_at"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "heartbeat_at must be a non-empty timestamp"
+        );
+
+        // A later phase write overwrites with the new phase (last-write-wins).
+        reporter.phase("clustering", None, None);
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("progress file")).unwrap();
+        assert_eq!(snapshot["phase"], "clustering");
+        assert!(snapshot["current_plugin"].is_null());
+    }
 
     #[test]
     fn subsystem_entity_id_rejects_invalid_hash_segment() {
