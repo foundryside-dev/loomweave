@@ -39,7 +39,7 @@ deadpool-sqlite = { version = "0.8", features = ["rt_tokio_1"] }
 dotenvy = "0.15"
 fs2 = "0.4"
 ignore = "0.4"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled", "backup"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }

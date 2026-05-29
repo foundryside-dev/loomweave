@@ -12,8 +12,15 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
-(none yet — see [`docs/implementation/`](docs/implementation/) for in-flight
-sprint planning.)
+### Added
+
+- `clarion db backup <output>` — a consistent, WAL-safe online backup of
+  `.clarion/clarion.db` via `rusqlite::backup::Backup`. Safe to run during a
+  live `clarion analyze` (captures outstanding WAL frames into a standalone
+  single-file copy, unlike `cp`), writes atomically (temp sibling + rename),
+  refuses to clobber without `--force`, and verifies the copy with
+  `PRAGMA integrity_check` before promoting it. Closes gap-register STO-04
+  (clarion-6d433b61ba).
 
 ## [1.0.0] — 2026-05-19
 

@@ -3,6 +3,7 @@ mod analyze_lock;
 mod cli;
 mod clustering;
 mod config;
+mod db;
 mod hook;
 mod hooks_settings;
 mod http_read;
@@ -78,6 +79,13 @@ fn main() -> Result<()> {
         cli::Command::Serve { path, config } => serve::run(&path, config.as_deref()),
         cli::Command::Hook { command } => match command {
             cli::HookCommand::SessionStart { path } => hook::session_start(&path),
+        },
+        cli::Command::Db { command } => match command {
+            cli::DbCommand::Backup {
+                output,
+                path,
+                force,
+            } => db::backup(&path, &output, force),
         },
     }
 }

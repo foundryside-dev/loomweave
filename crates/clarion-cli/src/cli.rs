@@ -81,6 +81,32 @@ pub enum Command {
         #[command(subcommand)]
         command: HookCommand,
     },
+
+    /// Local database maintenance.
+    Db {
+        #[command(subcommand)]
+        command: DbCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DbCommand {
+    /// Take a consistent, WAL-safe online backup of `.clarion/clarion.db`.
+    ///
+    /// Unlike `cp`, this captures outstanding WAL frames into a standalone
+    /// single-file copy, so it is safe to run during a live `clarion analyze`.
+    Backup {
+        /// Destination file for the backup copy.
+        output: PathBuf,
+
+        /// Project directory containing .clarion/clarion.db (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Overwrite the output file if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
