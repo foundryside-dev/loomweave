@@ -181,6 +181,11 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "additionalProperties": false
             }),
         },
+        ToolDefinition {
+            name: "summary_preview_cost",
+            description: "Preview what calling summary(id) would cost BEFORE spending. Reports cache_status (hit | expired | miss), the cached row's real tokens/cost/age on a hit, an input-token estimate on a miss, the configured model, the LLM policy (provider/live/allow_live_provider/cache horizon), and live_spend_would_occur — true only when no fresh cache row exists AND a live provider is wired. A disabled/unconfigured LLM is reported distinctly from a cache miss. Never invokes the LLM provider.",
+            input_schema: id_schema(),
+        },
     ]
 }
 
@@ -423,6 +428,10 @@ impl ServerState {
                 Err(response) => return response.to_json_rpc(id),
             },
             "project_status" => match self.tool_project_status(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "summary_preview_cost" => match self.tool_summary_preview_cost(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
@@ -988,6 +997,119 @@ impl ServerState {
             })
             .await;
         Ok(flatten_storage_envelope_result(result))
+    }
+
+    async fn tool_summary_preview_cost(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let entity_id = required_str(arguments, "id")?.to_owned();
+        let now = (self.clock)();
+        let read = match self
+            .read_summary_inputs(entity_id, self.summary_model_id())
+            .await
+        {
+            Ok(read) => read,
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    "storage-error",
+                    &err.to_string(),
+                    storage_retryable(&err),
+                ));
+            }
+        };
+        // Non-summarizable entities (missing, subsystem, briefing-blocked,
+        // no-content-hash) reuse the same reasons summary() reports.
+        let SummaryRead::Ready(ready) = read else {
+            return Ok(summary_read_error(read));
+        };
+
+        // LLM policy posture (no provider call). `live` means a provider is
+        // wired AND config permits it; that is what makes a miss spend. A
+        // disabled/unconfigured LLM is therefore distinct from a cache miss.
+        let llm_enabled = self
+            .summary_llm
+            .as_ref()
+            .is_some_and(|llm| llm.config.enabled);
+        let live = self.summary_llm.is_some() && llm_enabled;
+        let allow_live_provider = self
+            .summary_llm
+            .as_ref()
+            .is_some_and(|llm| llm.config.allow_live_provider);
+        let provider = self.diagnostics.as_ref().map_or_else(
+            || if live { "configured" } else { "disabled" }.to_owned(),
+            |diag| diag.llm.provider.clone(),
+        );
+
+        // Cache status without spending: a fresh row is a hit; a present-but-
+        // expired row would be re-billed; absence is a miss.
+        let (cache_status, cached_json) = match ready.cached.as_ref() {
+            Some(cached) => {
+                let expired = summary_cache_expired(
+                    &cached.created_at,
+                    &now,
+                    self.summary_cache_max_age_days(),
+                );
+                let age_days = timestamp_day_index(&now)
+                    .zip(timestamp_day_index(&cached.created_at))
+                    .map(|(current, created)| current.saturating_sub(created));
+                let json = json!({
+                    "created_at": cached.created_at,
+                    "last_accessed_at": cached.last_accessed_at,
+                    "age_days": age_days,
+                    "model_id": cached.key.model_tier,
+                    "tokens_input": cached.tokens_input,
+                    "tokens_output": cached.tokens_output,
+                    "cost_usd": cached.cost_usd,
+                    "stale_semantic": cached.stale_semantic,
+                });
+                (if expired { "expired" } else { "hit" }, json)
+            }
+            None => ("miss", Value::Null),
+        };
+
+        // On a miss/expired row a fresh call estimates input tokens from the
+        // leaf prompt (chars/4 heuristic — no provider, no spend). A hit needs
+        // no estimate: the cached row already carries the real token counts.
+        let estimated_input_tokens = if cache_status == "hit" {
+            None
+        } else {
+            verified_source_excerpt(&ready.entity)
+                .ok()
+                .map(|source_excerpt| {
+                    let prompt = build_leaf_summary_prompt(&LeafSummaryPromptInput {
+                        entity_id: ready.entity.id.clone(),
+                        kind: ready.entity.kind.clone(),
+                        name: ready.entity.name.clone(),
+                        source_excerpt,
+                    });
+                    estimate_tokens_from_chars(&prompt.body)
+                })
+        };
+
+        let live_spend_would_occur = cache_status != "hit" && live;
+
+        Ok(success_envelope(json!({
+            "entity": {"id": ready.entity.id, "kind": ready.entity.kind},
+            "cache_status": cache_status,
+            "cached": cached_json,
+            "model_id": self.summary_model_id(),
+            "estimated_input_tokens": estimated_input_tokens,
+            // summary() caps output at 512 tokens; report it as the ceiling, not
+            // a prediction of actual output length.
+            "estimated_output_tokens": SUMMARY_MAX_OUTPUT_TOKENS,
+            // No per-model pricing table at v1.0 — cost is reported only for
+            // cache hits/expired rows (the cached row carries a real cost_usd).
+            "estimated_cost_usd": Value::Null,
+            "policy": {
+                "enabled": llm_enabled,
+                "live": live,
+                "allow_live_provider": allow_live_provider,
+                "provider": provider,
+                "cache_max_age_days": self.summary_cache_max_age_days(),
+            },
+            "live_spend_would_occur": live_spend_would_occur,
+        })))
     }
 
     async fn tool_project_status(
@@ -3337,6 +3459,20 @@ fn timestamp_day_index(raw: &str) -> Option<i64> {
     Some(i64::from(date.to_julian_day() - unix_epoch.to_julian_day()))
 }
 
+/// The `max_output_tokens` ceiling a leaf summary request reserves. Reported by
+/// `summary_preview_cost` as the output ceiling (not a length prediction).
+const SUMMARY_MAX_OUTPUT_TOKENS: i64 = 512;
+
+/// A provider-free, deterministic input-token estimate for `summary_preview_cost`:
+/// roughly four characters per token. Intended only as a pre-spend order-of-
+/// magnitude hint, not an exact count (the real count is recorded on the cache
+/// row once a summary has actually run).
+fn estimate_tokens_from_chars(text: &str) -> i64 {
+    let chars = i64::try_from(text.chars().count()).unwrap_or(i64::MAX);
+    // ceil(chars / 4) without the unstable i64::div_ceil.
+    chars.saturating_add(3) / 4
+}
+
 fn default_now_string() -> String {
     let seconds = OffsetDateTime::now_utc().unix_timestamp();
     format!("unix:{seconds}")
@@ -3518,7 +3654,7 @@ mod tests {
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
@@ -3568,6 +3704,11 @@ mod tests {
         assert_eq!(
             tools[9].description,
             "Return deterministic Clarion diagnostics: repo root, db path, latest run (id/status/started/completed), entity/subsystem/edge/finding counts, index staleness, per-plugin entity counts from the current index, LLM policy (provider/live/cache), and the resolved Filigree endpoint (configured vs resolved URL + resolution source). Answers \"is the graph fresh, plugin-less, LLM-live, Filigree-reachable?\" without shelling out. No LLM call."
+        );
+        assert_eq!(tools[10].name, "summary_preview_cost");
+        assert_eq!(
+            tools[10].description,
+            "Preview what calling summary(id) would cost BEFORE spending. Reports cache_status (hit | expired | miss), the cached row's real tokens/cost/age on a hit, an input-token estimate on a miss, the configured model, the LLM policy (provider/live/allow_live_provider/cache horizon), and live_spend_would_occur — true only when no fresh cache row exists AND a live provider is wired. A disabled/unconfigured LLM is reported distinctly from a cache miss. Never invokes the LLM provider."
         );
     }
 
@@ -3871,7 +4012,7 @@ mod tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], "tools-1");
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 10);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 11);
         assert_eq!(response["result"]["tools"][0]["name"], "entity_at");
         assert_eq!(response["result"]["tools"][7]["name"], "subsystem_members");
     }
@@ -3972,7 +4113,7 @@ mod tests {
 
         assert_eq!(decoded["jsonrpc"], "2.0");
         assert_eq!(decoded["id"], 10);
-        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 10);
+        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 11);
     }
 
     #[test]
@@ -4047,7 +4188,7 @@ mod tests {
         assert_eq!(first_json["id"], 11);
         assert_eq!(first_json["result"]["serverInfo"]["name"], "clarion");
         assert_eq!(second_json["id"], 12);
-        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 10);
+        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 11);
     }
 
     #[test]

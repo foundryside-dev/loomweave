@@ -38,8 +38,9 @@ export OPENROUTER_API_KEY=sk-or-v1-...
 
 `clarion analyze` (step 2) and the structural MCP tools (`entity_at`,
 `find_entity`, `callers_of`, `execution_paths_from`, `issues_for`,
-`neighborhood`, `subsystem_members`, `subsystem_of`, `project_status`) work
-without any LLM credentials — nine of the ten MCP tools are credential-free. The
+`neighborhood`, `subsystem_members`, `subsystem_of`, `project_status`,
+`summary_preview_cost`) work without any LLM credentials — ten of the eleven MCP
+tools are credential-free. The
 key is only consulted when an MCP client calls `summary(id)` against an entity that does not
 yet have a cached summary.
 
@@ -218,14 +219,15 @@ llm_policy:
 `OPENROUTER_API_KEY` must also be exported in the environment that
 `clarion serve` (or your MCP client wrapper) inherits — see the
 prerequisites section above. Skip this block if you don't have a key; the
-other nine tools still work, only `summary` will return an "LLM disabled"
+other ten tools still work, only `summary` will return an "LLM disabled"
 envelope.
 
 ### The MCP tools
 
-The MCP surface exposes ten tools: seven primary tools (in the table below)
-plus `subsystem_members` and `subsystem_of` for clustering output and
-`project_status` for deterministic diagnostics. Nine of the ten are
+The MCP surface exposes eleven tools: seven primary tools (in the table below)
+plus `subsystem_members` and `subsystem_of` for clustering output,
+`project_status` for deterministic diagnostics, and `summary_preview_cost` to
+preview a summary's cache status and cost before spending. Ten of the eleven are
 credential-free; only `summary` needs the live LLM. Each is a structured graph
 query, not free-text grep.
 
@@ -240,6 +242,7 @@ query, not free-text grep.
 | `neighborhood(id)` | `neighborhood(id="python:function:requests.sessions.Session.send")` — callers, callees, container, contained entities, and references in one hop. |
 | `subsystem_of(id)` | `subsystem_of(id="python:module:requests.sessions")` — the subsystem an entity belongs to (reverse of `subsystem_members`); a function/class resolves through its containing module. |
 | `project_status()` | `project_status()` — index diagnostics: latest run, entity/edge/finding counts, staleness, per-plugin counts, LLM policy, and the resolved Filigree endpoint. No arguments, no LLM. |
+| `summary_preview_cost(id)` | `summary_preview_cost(id="python:function:requests.sessions.Session.send")` — preview a `summary` call before spending: cache hit/expired/miss, cached tokens/cost/age, an input-token estimate on a miss, LLM policy, and whether a live call would spend. Never calls the LLM. |
 
 The three questions to walk through with your agent:
 

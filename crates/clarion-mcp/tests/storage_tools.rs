@@ -1520,6 +1520,143 @@ async fn summary_cache_hit_reports_stale_semantic_when_graph_counts_drift() {
     handle.await.unwrap().unwrap();
 }
 
+#[tokio::test]
+async fn summary_preview_cost_reports_cache_hit_without_llm_call() {
+    // AC: a cached summary reports cache_hit (with the row's real tokens/cost)
+    // and never dispatches to the provider.
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    upsert_summary_cache(
+        &conn,
+        &SummaryCacheEntry {
+            key: SummaryCacheKey {
+                entity_id: "python:function:demo.entry".to_owned(),
+                content_hash: expected_content_hash(project.path(), "python:function:demo.entry"),
+                prompt_template_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+                model_tier: "anthropic/claude-sonnet-4.6".to_owned(),
+                guidance_fingerprint: "guidance-empty".to_owned(),
+            },
+            summary_json: r#"{"purpose":"cached"}"#.to_owned(),
+            cost_usd: 0.0021,
+            tokens_input: 123,
+            tokens_output: 45,
+            caller_count: 0,
+            fan_out: 0,
+            stale_semantic: false,
+            created_at: "2026-05-17T00:00:00.000Z".to_owned(),
+            last_accessed_at: "2026-05-17T00:00:00.000Z".to_owned(),
+        },
+    )
+    .unwrap();
+    drop(conn);
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(RecordingProvider::from_recordings(Vec::new()));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "summary_preview_cost",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["result"]["cache_status"], "hit");
+    assert_eq!(envelope["result"]["cached"]["tokens_input"], 123);
+    assert_eq!(envelope["result"]["cached"]["tokens_output"], 45);
+    assert_eq!(envelope["result"]["cached"]["cost_usd"], 0.0021);
+    assert_eq!(envelope["result"]["cached"]["age_days"], 0);
+    assert_eq!(envelope["result"]["live_spend_would_occur"], false);
+    // No estimate needed on a hit, and crucially: no provider call.
+    assert!(envelope["result"]["estimated_input_tokens"].is_null());
+    assert!(
+        provider.invocations().is_empty(),
+        "preview must never call the LLM provider"
+    );
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn summary_preview_cost_reports_miss_estimate_and_live_spend() {
+    // AC: a cache miss reports provider/model + a token estimate, flags that a
+    // live call would spend, and still never calls the provider.
+    let (project, db_path) = open_project();
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(RecordingProvider::from_recordings(Vec::new()));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "summary_preview_cost",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["result"]["cache_status"], "miss");
+    assert!(envelope["result"]["cached"].is_null());
+    assert_eq!(
+        envelope["result"]["model_id"],
+        "anthropic/claude-sonnet-4.6"
+    );
+    assert!(
+        envelope["result"]["estimated_input_tokens"]
+            .as_i64()
+            .is_some_and(|tokens| tokens > 0),
+        "miss should carry a positive input-token estimate: {envelope:?}"
+    );
+    assert_eq!(envelope["result"]["estimated_output_tokens"], 512);
+    assert_eq!(envelope["result"]["policy"]["live"], true);
+    assert_eq!(envelope["result"]["live_spend_would_occur"], true);
+    assert!(
+        provider.invocations().is_empty(),
+        "preview must never call the LLM provider"
+    );
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn summary_preview_cost_disabled_llm_is_distinct_from_miss() {
+    // AC: a disabled/unconfigured LLM is reported distinctly from a cache miss —
+    // a miss with no live provider would NOT spend.
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path); // no LLM wired
+
+    let envelope = call_tool(
+        &state,
+        "summary_preview_cost",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["result"]["cache_status"], "miss");
+    assert_eq!(envelope["result"]["policy"]["live"], false);
+    assert_eq!(envelope["result"]["policy"]["enabled"], false);
+    assert_eq!(
+        envelope["result"]["live_spend_would_occur"], false,
+        "a miss with no live provider must not be flagged as spending: {envelope:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn summary_expired_cache_row_is_refreshed_by_recording_provider() {
     let (project, db_path) = open_project();

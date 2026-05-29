@@ -403,6 +403,7 @@ assert tool_names == [
     "subsystem_members",
     "subsystem_of",
     "project_status",
+    "summary_preview_cost",
 ], tool_names
 # Single-source check (clarion-71f0d6c3dd): the initialize `instructions` tool
 # enumeration is derived from list_tools(), so every advertised tool must appear
@@ -484,4 +485,4 @@ assert "staleness" in ctx, ctx
 assert ctx["degraded"] is False, ctx
 PY
 
-log "PASS: MCP stdio surface returned ten tool definitions and seven tool responses"
+log "PASS: MCP stdio surface returned eleven tool definitions and seven tool responses"

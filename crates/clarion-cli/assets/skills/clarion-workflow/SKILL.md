@@ -49,6 +49,7 @@ Every entity has an ID: `{plugin}:{kind}:{qualified_name}`
 | `subsystem_members` | modules in a subsystem | `{"id": "core:subsystem:<hash>"}` |
 | `subsystem_of` | the subsystem an entity belongs to (reverse of `subsystem_members`) | `{"id": "<id>"}` |
 | `summary` | on-demand prose summary of one entity | `{"id": "<id>"}` |
+| `summary_preview_cost` | preview a `summary` call's cache status / cost before spending | `{"id": "<id>"}` |
 | `issues_for` | Filigree issues attached to an entity | `{"id": "<id>"}` |
 | `project_status` | index freshness, counts, LLM + Filigree status | `{}` |
 
