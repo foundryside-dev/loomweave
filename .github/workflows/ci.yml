@@ -52,6 +52,11 @@ jobs:
       - name: cross-workspace version lockstep
         run: python scripts/check-workspace-version-lockstep.py
 
+      - name: pyright pin lockstep
+        run: |
+          python scripts/check-pyright-pin-lockstep.py --self-test
+          python scripts/check-pyright-pin-lockstep.py
+
       - name: clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
