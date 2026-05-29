@@ -3490,7 +3490,12 @@ async fn execution_paths_from_resolved_flags_attribute_receiver_scope_exclusion(
 }
 
 #[tokio::test]
-async fn neighborhood_module_flags_reference_rollup_and_attribute_scope() {
+async fn neighborhood_module_rolls_up_references_and_flags_attribute_scope() {
+    // The module now rolls up contained symbols' reference edges instead of
+    // flagging the rollup as a blind spot (clarion-79d0ff6e14). The seeded
+    // graph's only `references` edge (entry -> target) is intra-module, so it
+    // is correctly excluded — references_in/out are empty but the response
+    // signals the rollup happened.
     let (project, db_path) = open_project();
     let state = state_for(project.path(), &db_path);
 
@@ -3502,6 +3507,10 @@ async fn neighborhood_module_flags_reference_rollup_and_attribute_scope() {
     .await;
 
     assert_eq!(envelope["ok"], true);
+    assert_eq!(
+        envelope["result"]["references_rolled_up"], true,
+        "module neighborhood must signal references are rolled up to module altitude"
+    );
     let excludes = envelope["result"]["scope_excludes"]
         .as_array()
         .expect("scope_excludes array");
@@ -3510,15 +3519,20 @@ async fn neighborhood_module_flags_reference_rollup_and_attribute_scope() {
         "module neighborhood must flag attribute-receiver-calls, got {excludes:?}"
     );
     assert!(
-        excludes
+        !excludes
             .iter()
             .any(|v| v == "module-level-reference-rollup"),
-        "module neighborhood must flag module-level-reference-rollup, got {excludes:?}"
+        "module rollup is now implemented; the blind-spot marker must be gone, got {excludes:?}"
+    );
+    assert_eq!(
+        envelope["result"]["references_in"],
+        json!([]),
+        "the only seeded reference is intra-module and must be excluded from the rollup"
     );
 }
 
 #[tokio::test]
-async fn neighborhood_function_omits_module_reference_rollup_exclusion() {
+async fn neighborhood_function_references_are_not_rolled_up() {
     let (project, db_path) = open_project();
     let state = state_for(project.path(), &db_path);
 
@@ -3531,8 +3545,89 @@ async fn neighborhood_function_omits_module_reference_rollup_exclusion() {
 
     assert_eq!(envelope["ok"], true);
     assert_eq!(
+        envelope["result"]["references_rolled_up"], false,
+        "symbol-level references are direct, not rolled up"
+    );
+    assert_eq!(
         envelope["result"]["scope_excludes"],
         json!(["attribute-receiver-calls"])
+    );
+}
+
+#[tokio::test]
+async fn neighborhood_module_rollup_surfaces_external_reverse_import() {
+    // Seed an external module symbol that references a symbol contained in
+    // `demo`, then confirm the module-altitude rollup answers "who imports this
+    // module / contract?" with the referencer tagged by the `via` symbol
+    // (clarion-79d0ff6e14).
+    let (project, db_path) = open_project();
+    {
+        let conn = Connection::open(&db_path).expect("reopen db");
+        let source_path = project.path().join("consumer.py");
+        std::fs::write(
+            &source_path,
+            "import demo\n\ndef use():\n    return demo.target()\n",
+        )
+        .expect("write consumer source");
+        insert_entity(
+            &conn,
+            "python:module:consumer",
+            "module",
+            &source_path,
+            Some((1, 4)),
+            None,
+        );
+        insert_entity(
+            &conn,
+            "python:function:consumer.use",
+            "function",
+            &source_path,
+            Some((3, 4)),
+            Some("python:module:consumer"),
+        );
+        insert_edge(
+            &conn,
+            "contains",
+            "python:module:consumer",
+            "python:function:consumer.use",
+            "resolved",
+            None,
+        );
+        insert_edge(
+            &conn,
+            "references",
+            "python:function:consumer.use",
+            "python:function:demo.target",
+            "resolved",
+            None,
+        );
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:module:demo", "confidence": "resolved"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["result"]["references_rolled_up"], true);
+    let refs_in = envelope["result"]["references_in"]
+        .as_array()
+        .expect("references_in array");
+    assert_eq!(
+        refs_in.len(),
+        1,
+        "external referencer must roll up: {refs_in:?}"
+    );
+    assert_eq!(
+        refs_in[0]["entity"]["id"], "python:function:consumer.use",
+        "neighbor is the external referencer (who imports)"
+    );
+    assert_eq!(
+        refs_in[0]["via"]["id"], "python:function:demo.target",
+        "via names the contained symbol the import touched"
     );
 }
 

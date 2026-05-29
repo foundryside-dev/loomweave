@@ -124,6 +124,23 @@ pub struct ReferenceEdgeMatch {
     pub source_byte_end: Option<i64>,
 }
 
+/// One rolled-up reference edge for a module-altitude query: a `references`
+/// edge into or out of a symbol the module contains, attributed to the
+/// contained `via` symbol it actually touches (clarion-79d0ff6e14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RolledUpReferenceEdge {
+    /// The entity on the far side of the edge — the referencer for `In`
+    /// (who imports a contained symbol), the referenced symbol for `Out`.
+    pub neighbor_id: String,
+    /// The module-contained symbol whose edge this is. For a module's own
+    /// direct reference edge (rare) this equals the module id.
+    pub via_id: String,
+    pub confidence: EdgeConfidence,
+    pub source_file_id: Option<String>,
+    pub source_byte_start: Option<i64>,
+    pub source_byte_end: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleDependencyEdge {
     pub from_module_id: String,
@@ -826,6 +843,80 @@ fn directed_edges_for_entity(
     let rows = stmt.query_map(params![kind, entity_id], map_reference_edge_match)?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(StorageError::from)
+}
+
+/// Aggregate the `references` edges of every entity transitively contained in
+/// `module_id` (via `contains`), for module-altitude reference rollup and the
+/// reverse-import lookup ("who imports this module / contract?").
+///
+/// A Python `from pkg.contracts import RunStatus` is recorded as a `references`
+/// edge to the *class*, not the module — so a module's OWN reference edges are
+/// almost always empty and "who references this module?" answered `[]`
+/// (clarion-79d0ff6e14). This rolls the contained symbols' edges up to the
+/// module: direction `In` lists external referencers (who imports a contained
+/// symbol), `Out` lists what contained symbols reference outside the module.
+///
+/// Intra-module edges (both endpoints contained in the same module) are
+/// excluded — they are internal wiring, not a reverse-import answer. Results
+/// are ordered deterministically. The recursive CTE uses `UNION` (not `UNION
+/// ALL`), so a pathological `contains` cycle terminates instead of looping.
+pub fn module_reference_rollup(
+    conn: &Connection,
+    module_id: &str,
+    direction: ReferenceDirection,
+) -> Result<Vec<RolledUpReferenceEdge>> {
+    // Column 0 is always the far-side neighbor, column 1 the contained `via`
+    // symbol, so `map_rolled_up_reference_edge` is direction-agnostic.
+    let sql = match direction {
+        ReferenceDirection::In => {
+            "WITH RECURSIVE contained(id) AS ( \
+                 SELECT ?1 \
+                 UNION \
+                 SELECT child.to_id FROM edges child \
+                 JOIN contained ON contained.id = child.from_id \
+                 WHERE child.kind = 'contains' \
+             ) \
+             SELECT ed.from_id, ed.to_id, ed.confidence, ed.source_file_id, \
+                    ed.source_byte_start, ed.source_byte_end \
+             FROM edges ed \
+             JOIN contained ON contained.id = ed.to_id \
+             WHERE ed.kind = 'references' \
+               AND ed.from_id NOT IN (SELECT id FROM contained) \
+             ORDER BY ed.from_id, ed.to_id, ed.source_byte_start, ed.source_byte_end"
+        }
+        ReferenceDirection::Out => {
+            "WITH RECURSIVE contained(id) AS ( \
+                 SELECT ?1 \
+                 UNION \
+                 SELECT child.to_id FROM edges child \
+                 JOIN contained ON contained.id = child.from_id \
+                 WHERE child.kind = 'contains' \
+             ) \
+             SELECT ed.to_id, ed.from_id, ed.confidence, ed.source_file_id, \
+                    ed.source_byte_start, ed.source_byte_end \
+             FROM edges ed \
+             JOIN contained ON contained.id = ed.from_id \
+             WHERE ed.kind = 'references' \
+               AND ed.to_id NOT IN (SELECT id FROM contained) \
+             ORDER BY ed.to_id, ed.from_id, ed.source_byte_start, ed.source_byte_end"
+        }
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![module_id], map_rolled_up_reference_edge)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+fn map_rolled_up_reference_edge(row: &Row<'_>) -> rusqlite::Result<RolledUpReferenceEdge> {
+    let raw_confidence: String = row.get(2)?;
+    Ok(RolledUpReferenceEdge {
+        neighbor_id: row.get(0)?,
+        via_id: row.get(1)?,
+        confidence: parse_confidence(&raw_confidence)?,
+        source_file_id: row.get(3)?,
+        source_byte_start: row.get(4)?,
+        source_byte_end: row.get(5)?,
+    })
 }
 
 pub fn module_dependency_edges(

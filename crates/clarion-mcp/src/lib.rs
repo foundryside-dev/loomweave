@@ -24,13 +24,14 @@ use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot};
 use clarion_core::plugin::{ContentLengthCeiling, Frame, TransportError};
 use clarion_storage::{
     CallEdgeMatch, EntityRow, InferredCallEdgeRecord, InferredEdgeCacheEntry, InferredEdgeCacheKey,
-    InferredEdgeWriteStats, ReaderPool, ReferenceDirection, ReferenceEdgeMatch, StorageError,
-    SummaryCacheEntry, SummaryCacheKey, UnresolvedCallSiteRow, WriterCmd, ancestor_chain,
-    call_edges_from, call_edges_targeting, candidate_entities_for_unresolved_sites,
-    child_entity_ids, contained_entity_ids, entities_containing_line, entity_by_id,
-    existing_entity_ids, find_entities, import_edges_for_entity, inferred_edge_cache_key_id,
-    inferred_edge_cache_lookup, normalize_source_path, reference_edges_for_entity,
-    subsystem_members, subsystem_of_entity, summary_cache_lookup, unresolved_call_sites_for_caller,
+    InferredEdgeWriteStats, ReaderPool, ReferenceDirection, ReferenceEdgeMatch,
+    RolledUpReferenceEdge, StorageError, SummaryCacheEntry, SummaryCacheKey, UnresolvedCallSiteRow,
+    WriterCmd, ancestor_chain, call_edges_from, call_edges_targeting,
+    candidate_entities_for_unresolved_sites, child_entity_ids, contained_entity_ids,
+    entities_containing_line, entity_by_id, existing_entity_ids, find_entities,
+    import_edges_for_entity, inferred_edge_cache_key_id, inferred_edge_cache_lookup,
+    module_reference_rollup, normalize_source_path, reference_edges_for_entity, subsystem_members,
+    subsystem_of_entity, summary_cache_lookup, unresolved_call_sites_for_caller,
     unresolved_callers_for_target,
 };
 
@@ -163,7 +164,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "neighborhood",
-            description: "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, references, and imports (imports_in = who imports this module, imports_out = what it imports; module-to-module). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls; module-level-reference-rollup when the entity is a module) so empty sections are never read as guaranteed true negatives.",
+            description: "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, references, and imports (imports_in = who imports this module, imports_out = what it imports; module-to-module). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls) so empty sections are never read as guaranteed true negatives.",
             input_schema: id_confidence_schema(),
         },
         ToolDefinition {
@@ -221,7 +222,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "orientation_pack",
-            description: "Assemble one deterministic orientation packet for a code location — the replacement for hand-composing find_entity + entity_at + source reads + neighborhood + issues_for + freshness on every question. Resolve EITHER by `entity` id OR by `file`+`line` (exactly one form). The packet bundles: the primary entity, the entity_context evidence (match_reason / containing stack / decl-body-decorator ranges — so a decorator-line query is explained, not guessed), a compact source-span summary, one-hop neighbors (callers, callees, container, contained, references, imports), compact resolved execution paths, related Filigree issues, index/Filigree/LLM health, warnings, and suggested next reads. No LLM summary is invoked. Every list is bounded; an `omitted` block reports per-section truncation counts and `degraded` sections name surfaces that were unavailable (e.g. Filigree down) so an empty section is never read as a guaranteed negative.",
+            description: "Assemble one deterministic orientation packet for a code location — the replacement for hand-composing find_entity + entity_at + source reads + neighborhood + issues_for + freshness on every question. Resolve EITHER by `entity` id OR by `file`+`line` (exactly one form). The packet bundles: the primary entity, the entity_context evidence (match_reason / containing stack / decl-body-decorator ranges — so a decorator-line query is explained, not guessed), a compact source-span summary, one-hop neighbors (callers, callees, container, contained, references, imports — for a module, references_in/out are rolled up over contained symbols with references_rolled_up=true), compact resolved execution paths, related Filigree issues, index/Filigree/LLM health, warnings, and suggested next reads. No LLM summary is invoked. Every list is bounded; an `omitted` block reports per-section truncation counts and `degraded` sections name surfaces that were unavailable (e.g. Filigree down) so an empty section is never read as a guaranteed negative.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -936,13 +937,21 @@ impl ServerState {
                     .filter_map(|child_id| entity_by_id(conn, child_id).transpose())
                     .map(|row| row.map(|entity| entity_json(&entity)))
                     .collect::<Result<Vec<_>, StorageError>>()?;
-                let references_in = reference_neighbors(conn, &entity_id, ReferenceDirection::In)?;
-                let references_out =
-                    reference_neighbors(conn, &entity_id, ReferenceDirection::Out)?;
+                let (references_in, references_rolled_up) = reference_neighbors_for(
+                    conn,
+                    &entity_id,
+                    &entity.kind,
+                    ReferenceDirection::In,
+                )?;
+                let (references_out, _) = reference_neighbors_for(
+                    conn,
+                    &entity_id,
+                    &entity.kind,
+                    ReferenceDirection::Out,
+                )?;
                 let imports_in = import_neighbors(conn, &entity_id, ReferenceDirection::In)?;
                 let imports_out = import_neighbors(conn, &entity_id, ReferenceDirection::Out)?;
-                let mut scope_excludes = call_graph_scope_excludes(confidence);
-                scope_excludes.extend(reference_scope_excludes(&entity.kind));
+                let scope_excludes = call_graph_scope_excludes(confidence);
                 Ok(success_envelope(json!({
                     "entity": entity_json(&entity),
                     "callers": inbound_callers,
@@ -951,6 +960,11 @@ impl ServerState {
                     "contained": contained_entities,
                     "references_in": references_in,
                     "references_out": references_out,
+                    // True when the entity is a module and references_in/out
+                    // aggregate contained symbols' edges (each neighbor tagged
+                    // with a `via` symbol); false for symbol-level entities
+                    // whose references are direct (clarion-79d0ff6e14).
+                    "references_rolled_up": references_rolled_up,
                     "imports_in": imports_in,
                     "imports_out": imports_out,
                     "scope_excludes": scope_excludes,
@@ -1306,8 +1320,18 @@ impl ServerState {
                     .filter_map(|child_id| entity_by_id(conn, child_id).transpose())
                     .map(|row| row.map(|entity| entity_json(&entity)))
                     .collect::<Result<Vec<_>, StorageError>>()?;
-                let refs_in = reference_neighbors(conn, &entity.id, ReferenceDirection::In)?;
-                let refs_out = reference_neighbors(conn, &entity.id, ReferenceDirection::Out)?;
+                let (refs_in, references_rolled_up) = reference_neighbors_for(
+                    conn,
+                    &entity.id,
+                    &entity.kind,
+                    ReferenceDirection::In,
+                )?;
+                let (refs_out, _) = reference_neighbors_for(
+                    conn,
+                    &entity.id,
+                    &entity.kind,
+                    ReferenceDirection::Out,
+                )?;
                 let imports_in = import_neighbors(conn, &entity.id, ReferenceDirection::In)?;
                 let imports_out = import_neighbors(conn, &entity.id, ReferenceDirection::Out)?;
 
@@ -1320,8 +1344,7 @@ impl ServerState {
                 let (imports_in, imports_in_omitted) = cap_neighbor_list(imports_in, cap);
                 let (imports_out, imports_out_omitted) = cap_neighbor_list(imports_out, cap);
 
-                let mut scope_excludes = call_graph_scope_excludes(confidence);
-                scope_excludes.extend(reference_scope_excludes(&entity.kind));
+                let scope_excludes = call_graph_scope_excludes(confidence);
 
                 let neighbors = json!({
                     "callers": callers,
@@ -1330,6 +1353,9 @@ impl ServerState {
                     "contained": contained,
                     "references_in": references_in,
                     "references_out": references_out,
+                    // See `tool_neighborhood`: module references_in/out are
+                    // rolled up over contained symbols (clarion-79d0ff6e14).
+                    "references_rolled_up": references_rolled_up,
                     "imports_in": imports_in,
                     "imports_out": imports_out,
                     "scope_excludes": scope_excludes,
@@ -3663,18 +3689,6 @@ fn call_graph_scope_excludes(confidence: EdgeConfidence) -> Vec<&'static str> {
     }
 }
 
-/// Reference-graph blind spots for a `neighborhood` query. References are tracked
-/// symbol-to-symbol; a module entity does not roll up the reference edges of the
-/// symbols it contains, so "who references this module" can read empty even when
-/// contained symbols are referenced (clarion-0d204a3f16, see clarion-79d0ff6e14).
-fn reference_scope_excludes(entity_kind: &str) -> Vec<&'static str> {
-    if entity_kind == "module" {
-        vec!["module-level-reference-rollup"]
-    } else {
-        Vec::new()
-    }
-}
-
 fn envelope_from_storage_result(result: Result<Value, StorageError>) -> Value {
     match result {
         Ok(result) => success_envelope(result),
@@ -5248,6 +5262,54 @@ fn import_neighbors(
     edge_neighbors_json(conn, import_edges_for_entity(conn, entity_id, direction)?)
 }
 
+/// Reference neighbors for `neighborhood` / `orientation_pack`, rolled up to
+/// module altitude when the entity is a module (clarion-79d0ff6e14).
+///
+/// References are tracked symbol-to-symbol, so a module's OWN reference edges
+/// are almost always empty — "who imports this module / contract?" used to
+/// answer `[]`. For a module we instead aggregate the `references` edges of
+/// every transitively contained symbol (excluding intra-module wiring) and tag
+/// each neighbor with the contained `via` symbol it touches. For any other
+/// kind the direct symbol-level edges are returned unchanged (no `via`).
+///
+/// Returns `(neighbors, rolled_up)`; `rolled_up` is true only for modules.
+fn reference_neighbors_for(
+    conn: &rusqlite::Connection,
+    entity_id: &str,
+    entity_kind: &str,
+    direction: ReferenceDirection,
+) -> Result<(Vec<Value>, bool), StorageError> {
+    if entity_kind == "module" {
+        let edges = module_reference_rollup(conn, entity_id, direction)?;
+        Ok((rolled_up_neighbors_json(conn, edges)?, true))
+    } else {
+        Ok((reference_neighbors(conn, entity_id, direction)?, false))
+    }
+}
+
+fn rolled_up_neighbors_json(
+    conn: &rusqlite::Connection,
+    edges: Vec<RolledUpReferenceEdge>,
+) -> Result<Vec<Value>, StorageError> {
+    let mut neighbors = Vec::new();
+    for edge in edges {
+        if let Some(entity) = entity_by_id(conn, &edge.neighbor_id)? {
+            let via = entity_by_id(conn, &edge.via_id)?;
+            neighbors.push(json!({
+                "entity": entity_json(&entity),
+                "edge_confidence": edge.confidence.as_str(),
+                "source_byte_start": edge.source_byte_start,
+                "source_byte_end": edge.source_byte_end,
+                // The module-contained symbol this edge actually touches, so a
+                // rolled-up "who imports this module" answer names the importer
+                // (entity) AND the imported symbol (via).
+                "via": via.as_ref().map(entity_json),
+            }));
+        }
+    }
+    Ok(neighbors)
+}
+
 fn edge_neighbors_json(
     conn: &rusqlite::Connection,
     edges: Vec<ReferenceEdgeMatch>,
@@ -5337,7 +5399,7 @@ mod tests {
         assert_eq!(tools[6].name, "neighborhood");
         assert_eq!(
             tools[6].description,
-            "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, references, and imports (imports_in = who imports this module, imports_out = what it imports; module-to-module). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls; module-level-reference-rollup when the entity is a module) so empty sections are never read as guaranteed true negatives."
+            "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, references, and imports (imports_in = who imports this module, imports_out = what it imports; module-to-module). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls) so empty sections are never read as guaranteed true negatives."
         );
         assert_eq!(tools[7].name, "subsystem_members");
         assert_eq!(
@@ -5372,7 +5434,7 @@ mod tests {
         assert_eq!(tools[13].name, "orientation_pack");
         assert_eq!(
             tools[13].description,
-            "Assemble one deterministic orientation packet for a code location — the replacement for hand-composing find_entity + entity_at + source reads + neighborhood + issues_for + freshness on every question. Resolve EITHER by `entity` id OR by `file`+`line` (exactly one form). The packet bundles: the primary entity, the entity_context evidence (match_reason / containing stack / decl-body-decorator ranges — so a decorator-line query is explained, not guessed), a compact source-span summary, one-hop neighbors (callers, callees, container, contained, references, imports), compact resolved execution paths, related Filigree issues, index/Filigree/LLM health, warnings, and suggested next reads. No LLM summary is invoked. Every list is bounded; an `omitted` block reports per-section truncation counts and `degraded` sections name surfaces that were unavailable (e.g. Filigree down) so an empty section is never read as a guaranteed negative."
+            "Assemble one deterministic orientation packet for a code location — the replacement for hand-composing find_entity + entity_at + source reads + neighborhood + issues_for + freshness on every question. Resolve EITHER by `entity` id OR by `file`+`line` (exactly one form). The packet bundles: the primary entity, the entity_context evidence (match_reason / containing stack / decl-body-decorator ranges — so a decorator-line query is explained, not guessed), a compact source-span summary, one-hop neighbors (callers, callees, container, contained, references, imports — for a module, references_in/out are rolled up over contained symbols with references_rolled_up=true), compact resolved execution paths, related Filigree issues, index/Filigree/LLM health, warnings, and suggested next reads. No LLM summary is invoked. Every list is bounded; an `omitted` block reports per-section truncation counts and `degraded` sections name surfaces that were unavailable (e.g. Filigree down) so an empty section is never read as a guaranteed negative."
         );
         assert_eq!(tools[14].name, "analyze_start");
         assert_eq!(

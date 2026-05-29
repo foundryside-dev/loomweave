@@ -7,8 +7,8 @@ use clarion_storage::{
     ModuleDependencyEdge, ReferenceDirection, SubsystemMember, call_edges_from,
     call_edges_targeting, child_entity_ids, contained_entity_ids, entity_at_line,
     entity_briefing_block_reason, entity_by_id, find_entities, module_dependency_edges,
-    normalize_source_path, pragma, reference_edges_for_entity, resolve_file,
-    resolve_file_catalog_entry, schema, subsystem_for_member, subsystem_members,
+    module_reference_rollup, normalize_source_path, pragma, reference_edges_for_entity,
+    resolve_file, resolve_file_catalog_entry, schema, subsystem_for_member, subsystem_members,
     subsystem_of_entity,
 };
 use rusqlite::{Connection, params};
@@ -512,6 +512,123 @@ fn reference_edges_for_entity_returns_directional_neighbors() {
     assert_eq!(outbound[0].confidence, EdgeConfidence::Ambiguous);
     assert_eq!(outbound[0].source_byte_start, Some(30));
     assert_eq!(outbound[0].source_byte_end, Some(39));
+}
+
+#[test]
+fn module_reference_rollup_aggregates_contained_symbol_edges_excluding_internal() {
+    // A `from pkg.contracts import RunStatus` records a `references` edge to the
+    // class, not the module — so the module's own edges are empty and the
+    // rollup must aggregate contained symbols' edges (clarion-79d0ff6e14).
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+
+    // Module under query, with two contained classes.
+    insert_entity(&conn, "python:module:pkg.contracts", "module");
+    insert_entity(&conn, "python:class:pkg.contracts.RunStatus", "class");
+    insert_entity(&conn, "python:class:pkg.contracts.Helper", "class");
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.contracts",
+        "python:class:pkg.contracts.RunStatus",
+    );
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.contracts",
+        "python:class:pkg.contracts.Helper",
+    );
+
+    // An external module whose function imports RunStatus (reverse-import In).
+    insert_entity(&conn, "python:module:pkg.consumer", "module");
+    insert_entity(&conn, "python:function:pkg.consumer.use", "function");
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.consumer",
+        "python:function:pkg.consumer.use",
+    );
+    insert_references_edge(
+        &conn,
+        "python:function:pkg.consumer.use",
+        "python:class:pkg.contracts.RunStatus",
+        EdgeConfidence::Resolved,
+        20,
+        25,
+    );
+
+    // A symbol the module's class references outward (rollup Out).
+    insert_entity(&conn, "python:module:pkg.other", "module");
+    insert_entity(&conn, "python:class:pkg.other.Thing", "class");
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.other",
+        "python:class:pkg.other.Thing",
+    );
+    insert_references_edge(
+        &conn,
+        "python:class:pkg.contracts.RunStatus",
+        "python:class:pkg.other.Thing",
+        EdgeConfidence::Resolved,
+        30,
+        40,
+    );
+
+    // Intra-module reference (RunStatus -> Helper): internal wiring, must be
+    // excluded from BOTH directions of the rollup.
+    insert_references_edge(
+        &conn,
+        "python:class:pkg.contracts.RunStatus",
+        "python:class:pkg.contracts.Helper",
+        EdgeConfidence::Resolved,
+        50,
+        55,
+    );
+
+    let inbound =
+        module_reference_rollup(&conn, "python:module:pkg.contracts", ReferenceDirection::In)
+            .expect("rollup inbound");
+    assert_eq!(
+        inbound.len(),
+        1,
+        "only the external referencer rolls up: {inbound:?}"
+    );
+    assert_eq!(inbound[0].neighbor_id, "python:function:pkg.consumer.use");
+    assert_eq!(inbound[0].via_id, "python:class:pkg.contracts.RunStatus");
+    assert_eq!(inbound[0].confidence, EdgeConfidence::Resolved);
+    assert_eq!(inbound[0].source_byte_start, Some(20));
+
+    let outbound = module_reference_rollup(
+        &conn,
+        "python:module:pkg.contracts",
+        ReferenceDirection::Out,
+    )
+    .expect("rollup outbound");
+    assert_eq!(
+        outbound.len(),
+        1,
+        "only the external reference rolls up: {outbound:?}"
+    );
+    assert_eq!(outbound[0].neighbor_id, "python:class:pkg.other.Thing");
+    assert_eq!(outbound[0].via_id, "python:class:pkg.contracts.RunStatus");
+}
+
+#[test]
+fn module_reference_rollup_returns_empty_for_module_with_no_contained_edges() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity(&conn, "python:module:pkg.lonely", "module");
+    insert_entity(&conn, "python:class:pkg.lonely.Isolated", "class");
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.lonely",
+        "python:class:pkg.lonely.Isolated",
+    );
+
+    let inbound =
+        module_reference_rollup(&conn, "python:module:pkg.lonely", ReferenceDirection::In)
+            .expect("rollup inbound");
+    assert!(
+        inbound.is_empty(),
+        "no references means an empty rollup, not an error"
+    );
 }
 
 #[test]
