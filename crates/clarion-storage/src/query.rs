@@ -1238,6 +1238,18 @@ pub fn contained_entity_ids(
 /// batch. Findings whose anchor entity has no `source_file_path` are returned
 /// with `source_file_path: None`; the emitter skips them (Filigree requires a
 /// `path`).
+///
+/// Findings anchored to a `briefing_blocked` entity are excluded: emission is a
+/// one-way path/line egress to a sibling, and the federation read API
+/// (`GET /api/v1/files`) already refuses briefing-blocked entities and omits
+/// their identity fields. Without this guard the write direction would leak the
+/// very path/line the read direction is engineered to withhold — e.g. a
+/// secret-scanner `CLA-SEC-SECRET-DETECTED` finding on a still-blocked
+/// secret-bearing file. The filter is safe for the ADR-013 audit trail: an
+/// operator override (`--allow-unredacted-secrets`) records the file as
+/// `Overridden`, not `Blocked`, so its anchor entity carries no
+/// `briefing_blocked` reason and the `CLA-SEC-UNREDACTED-SECRETS-ALLOWED` audit
+/// finding still emits.
 pub fn findings_for_emit(conn: &Connection, run_id: &str) -> Result<Vec<FindingForEmitRow>> {
     let mut stmt = conn.prepare(
         "SELECT f.id, f.rule_id, f.kind, f.severity, f.confidence, \
@@ -1247,6 +1259,7 @@ pub fn findings_for_emit(conn: &Connection, run_id: &str) -> Result<Vec<FindingF
          FROM findings f \
          JOIN entities e ON e.id = f.entity_id \
          WHERE f.run_id = ?1 \
+           AND e.briefing_blocked IS NULL \
          ORDER BY f.id",
     )?;
     let rows = stmt.query_map(params![run_id], |row| {

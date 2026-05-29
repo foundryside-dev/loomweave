@@ -997,7 +997,7 @@ integrations:
     enabled: true
     server_url: "stdio:filigree-mcp"
     emit_observations: true
-    emit_findings: true              # v0.1: posts to POST /api/v1/scan-results (Filigree-native schema; see §7)
+    emit_findings: true              # opt-in (default false): POSTs findings to POST /api/v1/scan-results (Filigree-native schema; see §7). One-way egress, decoupled from `enabled` so turning on read enrichment never silently starts outbound emission.
   wardline:
     enabled: true
     manifest_path: "wardline.yaml"

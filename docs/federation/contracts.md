@@ -437,3 +437,124 @@ There is no normative fixture for this route yet; the shape above is the
 contract. The `parse_issue_detail_response` shape test in
 [`filigree.rs`](../../crates/clarion-mcp/src/filigree.rs) is the executable
 check.
+
+## Consumed Filigree route: scan-results intake (finding emission)
+
+This pins the Filigree route Clarion *consumes* to emit findings — WP9-B,
+REQ-FINDING-03, ADR-004. `clarion analyze` Phase 8 POSTs this run's persisted
+findings on completion via
+[`FiligreeHttpClient::post_scan_results`](../../crates/clarion-mcp/src/filigree.rs).
+It is *enrich-only*: emission is gated behind
+`integrations.filigree.{enabled,emit_findings}` (both default `false`), and any
+failure — Filigree down, transport error, build error — is recorded in
+`stats.json` and logged as `CLA-INFRA-FILIGREE-UNREACHABLE`, never propagated.
+The analyze run never fails because a sibling is unreachable (loom.md §5).
+
+```text
+POST {filigree_base}/api/v1/scan-results
+```
+
+- **Request headers:** `content-type: application/json`;
+  `x-filigree-actor: <actor>` when configured; `Authorization: Bearer <token>`
+  when a bearer token is configured. (HMAC is inbound-only, on Clarion's own
+  exposed routes; this outbound POST uses bearer.)
+- **Request body** — only the keys below are sent. Filigree silently drops any
+  top-level finding key outside its enumerated set, so Clarion's richer fields
+  nest under `metadata` and the Clarion-owned `metadata.clarion.*` slot (ADR-004,
+  detailed-design §7) where verbatim preservation is verified:
+
+  ```json
+  {
+    "scan_source": "clarion",
+    "scan_run_id": "<run_id>",
+    "mark_unseen": true,
+    "create_observations": false,
+    "complete_scan_run": true,
+    "findings": [
+      {
+        "path": "src/auth/tokens.py",
+        "rule_id": "CLA-PY-STRUCTURE-001",
+        "message": "Circular import detected",
+        "severity": "medium",
+        "line_start": 12,
+        "line_end": 12,
+        "metadata": {
+          "kind": "defect",
+          "confidence": 0.95,
+          "confidence_basis": "ast_match",
+          "clarion": {
+            "entity_id": "python:class:auth.tokens::TokenManager",
+            "related_entities": ["python:class:auth.sessions::SessionStore"],
+            "supports": [],
+            "supported_by": [],
+            "internal_severity": "WARN",
+            "internal_status": "open"
+          }
+        }
+      }
+    ]
+  }
+  ```
+
+  - `scan_source` is always `"clarion"`; it is part of Filigree's dedup key, so
+    it is stable across runs.
+  - `scan_run_id` carries Clarion's `run_id`. It is omitted entirely when unset;
+    an unknown id is tolerated by Filigree (it warns and proceeds), which is how
+    REQ-FINDING-05's wire shape ships without a pre-create handshake.
+  - `mark_unseen` is `true` for a normal full run (old-position findings for the
+    same rule/file transition to `unseen_in_latest`); a `--resume` run sets it
+    `false`. `complete_scan_run` is `true` on the final (here: only) batch.
+  - `create_observations` is always `false` — Clarion emits findings, not
+    observations.
+  - `severity` is the **wire** vocabulary, mapped from Clarion's internal value:
+    `CRITICAL→critical`, `ERROR→high`, `WARN→medium`, everything else
+    (`INFO`, `NONE`, unknown) `→info`. This mirrors Filigree's own server-side
+    coercion but is done client-side so the original survives under
+    `metadata.clarion.internal_severity`.
+  - `line_start` / `line_end` are omitted when the anchor entity has no line
+    range. A finding whose anchor entity has **no `path`** is skipped (and
+    counted in `stats.json`); Filigree rejects path-less findings with
+    `400 VALIDATION`.
+  - **briefing-blocked exclusion:** findings anchored to a `briefing_blocked`
+    entity are **never emitted** (clarion-8b32ba0d02). This matches the
+    fail-closed read posture — `GET /api/v1/files` refuses the same entities —
+    so the write direction cannot leak a path/line the read direction withholds.
+
+- **`200` response body** — parsed with unknown fields ignored and missing
+  fields defaulted, so Filigree may grow the response without breaking the
+  consumer. REQ-FINDING-03 requires the emitter to **parse** `warnings`, not
+  just count them; each is logged against the run:
+
+  ```json
+  {
+    "files_created": 1,
+    "files_updated": 0,
+    "findings_created": 1,
+    "findings_updated": 0,
+    "observations_created": 0,
+    "observations_failed": 0,
+    "new_finding_ids": ["clarion-sf-2f4cf9ca1b"],
+    "warnings": ["Unknown severity 'WARN' for finding at probe/sev.py, mapped to 'info'"]
+  }
+  ```
+
+- **Any non-`2xx`** — surfaced as a transport/HTTP error, folded into the
+  `filigree_emission` stats blob and the `CLA-INFRA-FILIGREE-UNREACHABLE` log;
+  the analyze run still completes successfully.
+
+There is no normative fixture for this route yet; the shapes above are the
+contract. The `request_serializes_to_filigree_wire_shape` and
+`parses_live_response_shape` tests in
+[`scan_results.rs`](../../crates/clarion-mcp/src/scan_results.rs) — the latter
+pinned to a real captured Filigree response — are the executable checks.
+
+**Verification scope.** CI exercises the emitter against a *mock* HTTP server
+(`post_scan_results_sends_batch_and_parses_response` in
+[`filigree.rs`](../../crates/clarion-mcp/src/filigree.rs)), and the
+`analyze`-level test asserts the enrich-only degrade when Filigree is
+unreachable. The wire shapes pinned above were captured from a **one-time live
+probe** against a running Filigree intake (the source of the `severity`
+coercion rule and the response fields); there is **no recurring end-to-end test
+against a live Filigree**. A shape change on Filigree's side would be caught by
+re-probing, not by CI — re-pin `parses_live_response_shape` if the live intake
+changes.

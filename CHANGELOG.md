@@ -36,6 +36,21 @@ only when an incompatible change is made to that surface. See
   Filterable by edge kind and a documented best-effort production/test path
   heuristic. No LLM call. The MCP surface now exposes thirteen tools
   (clarion-9392f74881).
+- **Filigree finding emission (WP9-B core, REQ-FINDING-03).** `clarion analyze`
+  Phase 8 POSTs the run's persisted findings to Filigree's
+  `POST /api/v1/scan-results` intake, with Clarion's richer fields nested under
+  `metadata.clarion.*` (wire contract pinned in
+  [`docs/federation/contracts.md`](docs/federation/contracts.md)). Emission is
+  enrich-only — gated behind `integrations.filigree.{enabled,emit_findings}`
+  (now **both default `false`**, so enabling Filigree for `issues_for` reads
+  never silently starts outbound emission — clarion-a26de2f368), and any
+  Filigree-side failure is recorded in `stats.json`
+  (`CLA-INFRA-FILIGREE-UNREACHABLE`) instead of failing the run. Findings
+  anchored to a `briefing_blocked` entity are excluded, matching the fail-closed
+  read posture (clarion-8b32ba0d02). Resolves the 1.0 "finding emission
+  deferred" limitation below. The REQ-FINDING-05/-06 lifecycle tail (Phase-0
+  create handshake + `--resume`; `--prune-unseen`, which needs a Filigree-side
+  prune surface) remains deferred — tracked under clarion-dd29e69e0e.
 
 ### Changed
 
@@ -150,6 +165,8 @@ normative.
   `release:v1.1`).** Cross-product POSTing of Clarion-generated findings into
   Filigree's intake (WP9-B) is deferred per the [Sprint 2 scope amendment](docs/implementation/sprint-2/scope-amendment-2026-05.md).
   `issues_for(id)` (the WP9-A binding for reading from Filigree) ships in 1.0.
+  *(WP9-B core shipped post-1.0 — see the Filigree-finding-emission entry under
+  [Unreleased]; only the REQ-FINDING-05/-06 lifecycle tail remains deferred.)*
 - **HTTP file language inference** uses persisted plugin manifest language when
   available, with a narrow core-extension fallback for files that predate
   manifest capture.

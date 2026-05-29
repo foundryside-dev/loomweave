@@ -331,7 +331,7 @@ Clarion's rule IDs follow the `CLA-*` namespace: `CLA-PY-*` for Python-plugin st
 
 #### REQ-FINDING-03 — Emit findings to Filigree
 
-> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). Clarion v0.1 emits findings to its own SQLite `findings` table; cross-product emission to Filigree lands with WP9-B.
+> **Implemented (WP9-B core, post-1.0 `release:1.1`).** `clarion analyze` Phase 8 POSTs persisted findings to Filigree's `POST /api/v1/scan-results` intake; the wire contract is pinned in [`docs/federation/contracts.md`](../../federation/contracts.md#consumed-filigree-route-scan-results-intake-finding-emission). Emission is enrich-only and opt-in: gated behind `integrations.filigree.{enabled,emit_findings}`, **both default `false`**, and any Filigree-side failure is recorded in `stats.json` (`CLA-INFRA-FILIGREE-UNREACHABLE`) rather than failing the run. Findings anchored to a `briefing_blocked` entity are excluded, matching the fail-closed read posture. Clarion still emits to its own SQLite `findings` table regardless.
 
 Clarion POSTs findings to Filigree via `POST /api/v1/scan-results` using Filigree's native intake schema. Clarion's richer fields (`kind`, `confidence`, `confidence_basis`, `supports`/`supported_by`, `related_entities`, internal severity, internal status) nest inside each finding's `metadata.clarion.*`.
 
@@ -351,7 +351,7 @@ Clarion ships `clarion sarif import <file> [--scan-source <name>]` that translat
 
 #### REQ-FINDING-05 — `scan_run_id` lifecycle
 
-> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). Lands with REQ-FINDING-03 (findings emission to Filigree).
+> **Partially implemented (WP9-B core, post-1.0 `release:1.1`).** The wire shape ships: Clarion's `run_id` maps 1:1 onto Filigree's `scan_run_id`, and Phase 8 closes the run with `complete_scan_run=true`. **Deferred (lifecycle tail, tracked under [clarion-dd29e69e0e](#)):** there is no Phase-0 pre-create handshake — emission relies on Filigree tolerating an unknown `scan_run_id` (it warns and proceeds) — and there is no `--resume` path. A correct `--resume` needs a writer-level row-reuse (`BeginRun` currently `INSERT`s and conflicts on an existing `run_id`) plus run identification, beyond CLI-flag wiring.
 
 Clarion's `run_id` maps 1:1 onto Filigree's `scan_run_id`. Phase 0 of `clarion analyze` creates the scan run; Phase 8 closes it with `complete_scan_run=true`. Resume (`--resume`) reuses the same `run_id` and posts with `mark_unseen=false`.
 
@@ -361,7 +361,7 @@ Clarion's `run_id` maps 1:1 onto Filigree's `scan_run_id`. Phase 0 of `clarion a
 
 #### REQ-FINDING-06 — Dedup policy for moved entities
 
-> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B). Concerns Filigree-side dedup; lands with REQ-FINDING-03 (findings emission).
+> **Partially implemented (WP9-B core, post-1.0 `release:1.1`).** Clarion POSTs with `mark_unseen=true` by default (Phase 8), so old-position findings transition to `unseen_in_latest`. **Deferred (tracked under [clarion-dd29e69e0e](#)):** the `--prune-unseen` flag is absent. It is blocked on a Filigree-side prune/retention surface — no delete/prune-unseen route exists in `FiligreeHttpClient` or the pinned federation contract — so it cannot be implemented Clarion-side alone.
 
 Clarion POSTs findings with `mark_unseen=true` by default so that old-position findings for the same rule on the same file transition to `unseen_in_latest` when the entity moves within the file. `clarion analyze --prune-unseen` removes `unseen_in_latest` findings older than 30 days (configurable).
 

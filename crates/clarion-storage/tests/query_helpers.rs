@@ -1464,6 +1464,105 @@ fn findings_for_emit_scopes_to_run_id() {
     assert_eq!(rows[0].id, "f-run1");
 }
 
+/// Regression for clarion-8b32ba0d02: emission must not leak the path/line of a
+/// `briefing_blocked` entity to Filigree (the read API refuses these; the write
+/// direction must match). A finding on a still-blocked secret-bearing file is
+/// excluded, while an ordinary finding — and the ADR-013 override audit finding,
+/// which rides a *non-blocked* `Overridden` anchor — still emit.
+#[test]
+fn findings_for_emit_excludes_briefing_blocked_anchors() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let conn = open_fresh(&tempdir);
+
+    insert_run(&conn, "run-1");
+
+    // A clean function entity — ordinary finding, must emit.
+    insert_entity_with_range(
+        &conn,
+        "python:function:auth.tokens.refresh",
+        "function",
+        Path::new("src/auth/tokens.py"),
+        12,
+        20,
+    );
+
+    // A secret-scanner anchor for a file the operator OVERRODE
+    // (`--allow-unredacted-secrets`): recorded as Overridden, so its anchor
+    // carries no briefing_blocked reason. The CLA-SEC-UNREDACTED-SECRETS-ALLOWED
+    // audit finding on it must still reach Filigree (ADR-013 audit trail).
+    insert_entity_with_range(
+        &conn,
+        "core:file:allowed.env",
+        "file",
+        Path::new("allowed.env"),
+        1,
+        1,
+    );
+
+    // A secret-scanner anchor for a file that is still BLOCKED (no override):
+    // briefing_blocked = secret_present. Its finding points at the secret's
+    // path/line and must be withheld.
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            'core:file:secret.env', 'core', 'file', 'secret.env', 'secret.env', 'secret.env',
+            7, 7, '{\"briefing_blocked\":\"secret_present\"}', 'hash-secret-file',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        [],
+    )
+    .expect("insert briefing-blocked entity");
+
+    insert_finding(
+        &conn,
+        "core:finding:run-1:a-defect",
+        "run-1",
+        "CLA-PY-STRUCTURE-001",
+        "defect",
+        "WARN",
+        "python:function:auth.tokens.refresh",
+        "[]",
+    );
+    insert_finding(
+        &conn,
+        "core:finding:run-1:b-override-allowed",
+        "run-1",
+        "CLA-SEC-UNREDACTED-SECRETS-ALLOWED",
+        "defect",
+        "ERROR",
+        "core:file:allowed.env",
+        "[]",
+    );
+    insert_finding(
+        &conn,
+        "core:finding:run-1:c-secret-detected",
+        "run-1",
+        "CLA-SEC-SECRET-DETECTED",
+        "defect",
+        "ERROR",
+        "core:file:secret.env",
+        "[]",
+    );
+
+    let rows = findings_for_emit(&conn, "run-1").expect("findings_for_emit");
+    let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![
+            "core:finding:run-1:a-defect",
+            "core:finding:run-1:b-override-allowed",
+        ],
+        "non-blocked findings (incl. the ADR-013 override audit) emit; the \
+         briefing_blocked secret finding is excluded: {rows:?}"
+    );
+    assert!(
+        !ids.contains(&"core:finding:run-1:c-secret-detected"),
+        "finding on a briefing_blocked entity must not be emitted"
+    );
+}
+
 #[test]
 fn containing_module_id_walks_up_to_the_nearest_module() {
     let tempdir = tempfile::tempdir().unwrap();

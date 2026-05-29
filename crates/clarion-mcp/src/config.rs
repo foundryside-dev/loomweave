@@ -356,9 +356,12 @@ pub struct FiligreeConfig {
     pub timeout_seconds: u64,
     /// Whether `clarion analyze` POSTs its findings to Filigree's
     /// `POST /api/v1/scan-results` intake on completion (WP9-B,
-    /// REQ-FINDING-03). Gated behind `enabled`: emission happens only when the
-    /// Filigree integration is on *and* this flag is set, so the `enabled:
-    /// false` default keeps Clarion solo-useful with no outbound traffic.
+    /// REQ-FINDING-03). Emission is a one-way Clarion→Filigree data egress, so
+    /// it is its own explicit opt-in: it requires both `enabled` *and* this
+    /// flag, and **both default `false`**. Enabling the integration for the
+    /// read side (`issues_for` reverse-lookup) therefore does not silently
+    /// start outbound emission — the operator opts into the write direction
+    /// separately by setting `emit_findings: true`.
     pub emit_findings: bool,
 }
 
@@ -370,7 +373,7 @@ impl Default for FiligreeConfig {
             actor: "clarion-mcp".to_owned(),
             token_env: "FILIGREE_API_TOKEN".to_owned(),
             timeout_seconds: 5,
-            emit_findings: true,
+            emit_findings: false,
         }
     }
 }
@@ -573,6 +576,35 @@ integrations:
         assert_eq!(cfg.integrations.filigree.actor, "clarion-test");
         assert_eq!(cfg.integrations.filigree.token_env, "TEST_FILIGREE_TOKEN");
         assert_eq!(cfg.integrations.filigree.timeout_seconds, 2);
+    }
+
+    #[test]
+    fn filigree_emission_is_opt_in_independent_of_enabled() {
+        // clarion-a26de2f368: outbound finding emission is a one-way egress and
+        // must not piggyback on enabling Filigree for read enrichment. Both
+        // knobs default false so flipping `enabled` for `issues_for` never
+        // silently starts POSTing findings.
+        let defaults = FiligreeConfig::default();
+        assert!(!defaults.enabled);
+        assert!(
+            !defaults.emit_findings,
+            "emit_findings must default false (explicit write opt-in)"
+        );
+
+        // Turning on the read side alone leaves emission off.
+        let read_only = McpConfig::from_yaml_str(
+            r"
+integrations:
+  filigree:
+    enabled: true
+",
+        )
+        .expect("parse config");
+        assert!(read_only.integrations.filigree.enabled);
+        assert!(
+            !read_only.integrations.filigree.emit_findings,
+            "enabling Filigree for reads must not turn on outbound emission"
+        );
     }
 
     #[test]
