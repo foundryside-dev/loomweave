@@ -277,4 +277,80 @@ mod tests {
             "drift not repaired"
         );
     }
+
+    /// True when the filesystem actually enforces directory write permissions
+    /// for this process. Returns `false` when running as root (DAC checks are
+    /// bypassed), so permission-based failure injection below can be skipped
+    /// rather than misreported as a pass. (clarion-86f4614c0b)
+    #[cfg(unix)]
+    fn perms_enforced() -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let probe = tempfile::tempdir().unwrap();
+        let ro = probe.path().join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // If we can still create a file inside a read-only dir, perms are not
+        // enforced for us (root) and the injection would not actually fail.
+        std::fs::write(ro.join("probe"), b"x").is_err()
+    }
+
+    /// A failed re-install must be crash-safe: it surfaces the error, leaks no
+    /// `.clarion-workflow.tmp-*` / `.bak-*` sibling, and never destroys the
+    /// already-installed pack (the guarantee the stage/backup/restore cleanup
+    /// code exists to protect). The failure is the only portable injection
+    /// point — `stage_and_swap` clears any pre-seeded staging dir on entry — so
+    /// we make the skill root read-only and force a drift re-copy into it.
+    /// (clarion-86f4614c0b)
+    #[cfg(unix)]
+    #[test]
+    fn failed_reinstall_is_crash_safe_and_leaks_no_temp() {
+        use super::install_skill_pack;
+        use std::os::unix::fs::PermissionsExt;
+
+        if !perms_enforced() {
+            eprintln!("skipping: directory permissions not enforced (running as root?)");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        install_skill_pack(dir.path()).expect("first install ok");
+        let root = dir.path().join(".claude/skills");
+        let skill_md = root.join("clarion-workflow/SKILL.md");
+
+        // Force a drift so the next install attempts a swap, then make the skill
+        // root read-only so staging the new pack into it fails with EACCES.
+        // Drift is detected from pack *content* (installed_fingerprint rehashes
+        // SKILL.md), so corrupt SKILL.md itself; the clarion-workflow child dir
+        // stays writable, so this write succeeds before we lock the root.
+        std::fs::write(&skill_md, "STALE — drifted content").unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = install_skill_pack(dir.path());
+
+        let leaked: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                name.starts_with(".clarion-workflow.tmp-")
+                    || name.starts_with(".clarion-workflow.bak-")
+            })
+            .collect();
+
+        // Restore perms so tempdir cleanup succeeds.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "re-install into a read-only skill root must fail, not silently succeed"
+        );
+        assert!(
+            leaked.is_empty(),
+            "a failed re-install must leak no staging/backup sibling, found: {leaked:?}"
+        );
+        assert!(
+            skill_md.exists(),
+            "a failed re-install must not destroy the already-installed pack"
+        );
+    }
 }

@@ -361,4 +361,72 @@ mod tests {
             "must contain exactly one hook entry; file was: {raw}"
         );
     }
+
+    /// True when the filesystem enforces directory write permissions for this
+    /// process (false as root, where DAC is bypassed). (clarion-86f4614c0b)
+    #[cfg(unix)]
+    fn perms_enforced() -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let probe = tempfile::tempdir().unwrap();
+        let ro = probe.path().join("ro");
+        fs::create_dir(&ro).unwrap();
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::write(ro.join("probe"), b"x").is_err()
+    }
+
+    /// The atomic-write cleanup guard: when the staged write fails, the install
+    /// must (a) surface the error, (b) leave the user's existing settings.json
+    /// untouched, and (c) leak no `.settings.json.tmp-*` sibling. Triggered
+    /// portably by making `.claude` read-only so the staged write fails with
+    /// EACCES. (clarion-86f4614c0b)
+    #[cfg(unix)]
+    #[test]
+    fn failed_install_preserves_settings_and_leaks_no_temp() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !perms_enforced() {
+            eprintln!("skipping: directory permissions not enforced (running as root?)");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        // Hand-authored settings WITHOUT the clarion hook, so the install will
+        // try to add it (changed = true) and reach the staged write.
+        let settings_path = claude_dir.join("settings.json");
+        let original = "{\n  \"model\": \"opus\"\n}\n";
+        fs::write(&settings_path, original).unwrap();
+
+        // Make .claude read-only: the existing settings still reads (r-x), but
+        // staging a temp file inside it fails.
+        fs::set_permissions(&claude_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = install_session_start_hook(dir.path());
+
+        // Inspect before restoring perms only where needed.
+        let leaked: Vec<String> = fs::read_dir(&claude_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".settings.json.tmp-"))
+            .collect();
+
+        // Restore perms so tempdir cleanup succeeds.
+        fs::set_permissions(&claude_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "install into a read-only .claude must fail, not silently no-op"
+        );
+        assert!(
+            leaked.is_empty(),
+            "cleanup guard must leave no staging temp behind, found: {leaked:?}"
+        );
+        let after = fs::read_to_string(&settings_path).unwrap();
+        assert_eq!(
+            after, original,
+            "a failed install must leave the user's settings.json byte-for-byte intact"
+        );
+    }
 }
