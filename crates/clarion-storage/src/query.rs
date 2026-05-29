@@ -488,10 +488,22 @@ pub fn find_entities(
     pattern: &str,
     limit: usize,
     offset: usize,
+    kind: Option<&str>,
 ) -> Result<Vec<EntityRow>> {
     if pattern.trim().is_empty() {
         return Err(StorageError::InvalidQuery(
             "entity search pattern must not be blank".to_owned(),
+        ));
+    }
+    // The `kind` filter is an optional exact-match on `entities.kind`. Kinds are
+    // plugin-owned (ADR-003/ADR-022), so we don't validate against a hardcoded
+    // allowlist — an unknown kind simply matches no rows. Reject only a blank
+    // string, which is never a real kind and signals a malformed request.
+    if let Some(kind) = kind
+        && kind.trim().is_empty()
+    {
+        return Err(StorageError::InvalidQuery(
+            "entity search kind filter must not be blank".to_owned(),
         ));
     }
     let limit = limit.clamp(1, 100);
@@ -500,35 +512,50 @@ pub fn find_entities(
     let offset_i64 = i64::try_from(offset)
         .map_err(|_| StorageError::InvalidQuery("entity search offset is too large".to_owned()))?;
     if is_fts_safe(pattern) {
+        let kind_clause = if kind.is_some() {
+            "AND e.kind = ?4 "
+        } else {
+            ""
+        };
         let sql = format!(
             "SELECT e.{columns} \
              FROM entity_fts f \
              JOIN entities e ON e.id = f.entity_id \
-             WHERE entity_fts MATCH ?1 \
+             WHERE entity_fts MATCH ?1 {kind_clause}\
              ORDER BY bm25(entity_fts), e.id \
              LIMIT ?2 OFFSET ?3",
             columns = ENTITY_COLUMNS.replace(", ", ", e.")
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![pattern, limit_i64, offset_i64], map_entity_row)?;
+        let rows = match kind {
+            Some(kind) => stmt.query_map(
+                params![pattern, limit_i64, offset_i64, kind],
+                map_entity_row,
+            )?,
+            None => stmt.query_map(params![pattern, limit_i64, offset_i64], map_entity_row)?,
+        };
         return rows
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(StorageError::from);
     }
 
     let like = format!("%{}%", escape_like(pattern));
+    let kind_clause = if kind.is_some() { "AND kind = ?4 " } else { "" };
     let sql = format!(
         "SELECT {ENTITY_COLUMNS} \
          FROM entities \
-         WHERE id LIKE ?1 ESCAPE '\\' \
+         WHERE (id LIKE ?1 ESCAPE '\\' \
             OR name LIKE ?1 ESCAPE '\\' \
             OR short_name LIKE ?1 ESCAPE '\\' \
-            OR COALESCE(summary, '') LIKE ?1 ESCAPE '\\' \
+            OR COALESCE(summary, '') LIKE ?1 ESCAPE '\\') {kind_clause}\
          ORDER BY id \
          LIMIT ?2 OFFSET ?3"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![like, limit_i64, offset_i64], map_entity_row)?;
+    let rows = match kind {
+        Some(kind) => stmt.query_map(params![like, limit_i64, offset_i64, kind], map_entity_row)?,
+        None => stmt.query_map(params![like, limit_i64, offset_i64], map_entity_row)?,
+    };
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(StorageError::from)
 }

@@ -80,11 +80,13 @@ re-reading each path element. `truncated`/`truncation_reason` report `edge-cap`
 
 ## Gotchas (read before hunting for a subsystem)
 
-- **To find a package's subsystem, search the package NAME, not "subsystem".**
+- **To find a package's subsystem, search the package NAME with `kind`.**
   Subsystems are *named after* their dominant package (e.g. `mypkg`), so
   `find_entity {"pattern":"subsystem"}` returns nothing. Search the package name
-  and pick the result whose `kind` is `subsystem`, then call `subsystem_members`.
-- **There is no module→subsystem reverse lookup and no kind filter.**
+  and pass `{"kind":"subsystem"}` to return only subsystem entities, then call
+  `subsystem_members`. (`find_entity` accepts an optional `kind` filter —
+  `"subsystem"`, `"function"`, `"class"`, `"module"`, …; omit it for no filter.)
+- **There is no module→subsystem reverse lookup.**
   `neighborhood` does **not** return the entity's subsystem. Membership is only
   reachable forward via `subsystem_members(subsystem_id)`.
 - **`find_entity` is paginated** (~20/page, `next_cursor`); narrow the pattern

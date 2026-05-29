@@ -660,14 +660,70 @@ fn entity_lookup_and_search_cover_id_and_fts_paths() {
         .expect("entity should exist");
     assert_eq!(entity.kind, "function");
 
-    let fts_results = find_entities(&conn, "TokenManager", 20, 0).expect("FTS search");
+    let fts_results = find_entities(&conn, "TokenManager", 20, 0, None).expect("FTS search");
     assert_eq!(fts_results.len(), 1);
     assert_eq!(fts_results[0].id, "python:function:demo.TokenManager");
 
-    let like_results = find_entities(&conn, "python:function:demo.TokenManager", 20, 0)
+    let like_results = find_entities(&conn, "python:function:demo.TokenManager", 20, 0, None)
         .expect("punctuation-heavy ID search");
     assert_eq!(like_results.len(), 1);
     assert_eq!(like_results[0].id, "python:function:demo.TokenManager");
+}
+
+#[test]
+fn find_entities_kind_filter_constrains_results() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    // Two entities sharing a search term but differing in kind, plus a subsystem
+    // named after the same package (the realistic "find the subsystem" case).
+    insert_entity(&conn, "python:module:demo", "module");
+    insert_entity(&conn, "python:function:demo.run", "function");
+    insert_entity(&conn, "core:subsystem:demo", "subsystem");
+
+    // Unfiltered: all three "demo" entities match (FTS or LIKE path).
+    let all = find_entities(&conn, "demo", 20, 0, None).expect("unfiltered search");
+    assert_eq!(all.len(), 3, "{all:?}");
+
+    // kind=subsystem returns only the subsystem entity.
+    let subs = find_entities(&conn, "demo", 20, 0, Some("subsystem")).expect("kind=subsystem");
+    assert_eq!(subs.len(), 1, "{subs:?}");
+    assert_eq!(subs[0].id, "core:subsystem:demo");
+    assert_eq!(subs[0].kind, "subsystem");
+
+    // kind=function returns only the function.
+    let funcs = find_entities(&conn, "demo", 20, 0, Some("function")).expect("kind=function");
+    assert_eq!(funcs.len(), 1, "{funcs:?}");
+    assert_eq!(funcs[0].id, "python:function:demo.run");
+
+    // An unknown (but well-formed) kind simply matches nothing.
+    let none = find_entities(&conn, "demo", 20, 0, Some("nonesuch")).expect("unknown kind");
+    assert!(none.is_empty(), "{none:?}");
+
+    // A blank kind is rejected as a malformed request.
+    assert!(find_entities(&conn, "demo", 20, 0, Some("  ")).is_err());
+}
+
+#[test]
+fn find_entities_kind_filter_applies_on_punctuation_like_path() {
+    // The punctuation-heavy ID search takes the LIKE branch (not FTS); the kind
+    // filter must apply there too, and bind correctly against the OR-group.
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity(&conn, "python:module:pkg.svc", "module");
+    insert_entity(&conn, "python:function:pkg.svc", "function");
+
+    let like_all = find_entities(&conn, "python:module:pkg.svc", 20, 0, None).expect("like search");
+    assert_eq!(like_all.len(), 1);
+
+    let like_module = find_entities(&conn, "pkg.svc", 20, 0, Some("module")).expect("like+kind");
+    assert!(
+        like_module.iter().all(|e| e.kind == "module"),
+        "{like_module:?}"
+    );
+    assert!(
+        like_module.iter().any(|e| e.id == "python:module:pkg.svc"),
+        "{like_module:?}"
+    );
 }
 
 #[test]

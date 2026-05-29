@@ -1708,6 +1708,62 @@ async fn find_entity_paginates_and_searches_punctuation_heavy_ids() {
 }
 
 #[tokio::test]
+async fn find_entity_kind_filter_returns_only_that_kind() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    // Unfiltered "demo" search returns the module AND its functions.
+    let unfiltered = call_tool(
+        &state,
+        "find_entity",
+        json!({"pattern": "demo", "limit": 100}),
+    )
+    .await;
+    assert_eq!(unfiltered["ok"], true);
+    let kinds: std::collections::BTreeSet<String> = unfiltered["result"]["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(
+        kinds.contains("module") && kinds.contains("function"),
+        "{kinds:?}"
+    );
+
+    // kind=module returns only modules.
+    let modules = call_tool(
+        &state,
+        "find_entity",
+        json!({"pattern": "demo", "limit": 100, "kind": "module"}),
+    )
+    .await;
+    assert_eq!(modules["ok"], true);
+    let module_entities = modules["result"]["entities"].as_array().unwrap();
+    assert!(!module_entities.is_empty(), "{modules:?}");
+    assert!(
+        module_entities.iter().all(|e| e["kind"] == "module"),
+        "kind filter leaked non-module entities: {modules:?}"
+    );
+
+    // A blank kind is a malformed request — it surfaces as a JSON-RPC error,
+    // not a tool envelope, so drive handle_json_rpc directly here.
+    let blank = state
+        .handle_json_rpc(&json!({
+            "jsonrpc": "2.0",
+            "id": "blank-kind",
+            "method": "tools/call",
+            "params": {"name": "find_entity", "arguments": {"pattern": "demo", "kind": "  "}}
+        }))
+        .await
+        .expect("response");
+    assert!(
+        blank["error"].is_object(),
+        "blank kind should be a param error: {blank:?}"
+    );
+}
+
+#[tokio::test]
 async fn callers_of_defaults_to_resolved_and_expands_ambiguous_candidates() {
     let (project, db_path) = open_project();
     let state = state_for(project.path(), &db_path);

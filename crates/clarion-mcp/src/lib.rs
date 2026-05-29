@@ -107,13 +107,14 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "find_entity",
-            description: "Search Clarion entities by id, name, short name, and summary text stored on entity rows. Results are paginated and ranked by FTS match where possible. This does not traverse the graph and does not search on-demand summary_cache entries.",
+            description: "Search Clarion entities by id, name, short name, and summary text stored on entity rows. Results are paginated and ranked by FTS match where possible. This does not traverse the graph and does not search on-demand summary_cache entries. Pass an optional `kind` (e.g. \"subsystem\", \"function\", \"class\", \"module\") to return only entities of that kind — the way to locate a subsystem without visually filtering results.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "minLength": 1},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "cursor": {"type": ["string", "null"]}
+                    "cursor": {"type": ["string", "null"]},
+                    "kind": {"type": "string", "minLength": 1}
                 },
                 "required": ["pattern"],
                 "additionalProperties": false
@@ -524,10 +525,27 @@ impl ServerState {
                 .map_err(|_| ParamError::new("cursor must be a numeric offset"))?,
             _ => return Err(ParamError::new("cursor must be a string or null")),
         };
+        // Optional exact-match entity-kind filter (e.g. "subsystem"). Omitting it
+        // preserves the unfiltered search. Validated as a non-blank string here;
+        // unknown kinds simply match nothing (kinds are plugin-owned).
+        let kind = match arguments.get("kind") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(kind)) if !kind.trim().is_empty() => Some(kind.clone()),
+            Some(Value::String(_)) => {
+                return Err(ParamError::new("kind must be a non-empty string"));
+            }
+            _ => return Err(ParamError::new("kind must be a string or null")),
+        };
         let result = self
             .readers
             .with_reader(move |conn| {
-                let mut rows = find_entities(conn, &pattern, limit.saturating_add(1), offset)?;
+                let mut rows = find_entities(
+                    conn,
+                    &pattern,
+                    limit.saturating_add(1),
+                    offset,
+                    kind.as_deref(),
+                )?;
                 let has_more = rows.len() > limit;
                 rows.truncate(limit);
                 let next_cursor = if has_more {
@@ -3426,7 +3444,7 @@ mod tests {
         assert_eq!(tools[1].name, "find_entity");
         assert_eq!(
             tools[1].description,
-            "Search Clarion entities by id, name, short name, and summary text stored on entity rows. Results are paginated and ranked by FTS match where possible. This does not traverse the graph and does not search on-demand summary_cache entries."
+            "Search Clarion entities by id, name, short name, and summary text stored on entity rows. Results are paginated and ranked by FTS match where possible. This does not traverse the graph and does not search on-demand summary_cache entries. Pass an optional `kind` (e.g. \"subsystem\", \"function\", \"class\", \"module\") to return only entities of that kind — the way to locate a subsystem without visually filtering results."
         );
         assert_eq!(tools[2].name, "callers_of");
         assert_eq!(
