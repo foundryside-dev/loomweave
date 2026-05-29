@@ -354,6 +354,12 @@ pub struct FiligreeConfig {
     pub actor: String,
     pub token_env: String,
     pub timeout_seconds: u64,
+    /// Whether `clarion analyze` POSTs its findings to Filigree's
+    /// `POST /api/v1/scan-results` intake on completion (WP9-B,
+    /// REQ-FINDING-03). Gated behind `enabled`: emission happens only when the
+    /// Filigree integration is on *and* this flag is set, so the `enabled:
+    /// false` default keeps Clarion solo-useful with no outbound traffic.
+    pub emit_findings: bool,
 }
 
 impl Default for FiligreeConfig {
@@ -364,6 +370,7 @@ impl Default for FiligreeConfig {
             actor: "clarion-mcp".to_owned(),
             token_env: "FILIGREE_API_TOKEN".to_owned(),
             timeout_seconds: 5,
+            emit_findings: true,
         }
     }
 }

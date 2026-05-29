@@ -1219,3 +1219,131 @@ fn analyze_failrun_exits_nonzero_with_run_row_marked_failed() {
         "run row must be marked 'failed' to stay consistent with exit code"
     );
 }
+
+#[cfg(unix)]
+fn phase3_config_with_filigree(min_cluster_size: u64, base_url: &str) -> String {
+    format!(
+        r"
+analysis:
+  clustering:
+    min_cluster_size: {min_cluster_size}
+integrations:
+  filigree:
+    enabled: true
+    emit_findings: true
+    base_url: {base_url}
+    timeout_seconds: 1
+"
+    )
+}
+
+/// WP9-B: emission is best-effort. With Filigree enabled but unreachable, the
+/// analyze run must still complete (exit 0, run row `completed`) and record the
+/// failure in `stats.json` as `CLA-INFRA-FILIGREE-UNREACHABLE` — the enrich-only
+/// federation contract: a sibling being down never changes Clarion's outcome.
+#[cfg(unix)]
+#[test]
+fn analyze_finding_emission_is_best_effort_when_filigree_unreachable() {
+    // Port 1 is not listening: connection refused, fast.
+    let project_dir = run_phase3_fixture(
+        &["weak_a", "weak_b"],
+        &phase3_config_with_filigree(2, "http://127.0.0.1:1"),
+    );
+
+    // run_phase3_fixture already asserted the analyze invocation `.success()`;
+    // confirm the run row landed `completed` despite the emission failure.
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query run status");
+    assert_eq!(
+        status, "completed",
+        "Filigree being unreachable must not fail the analyze run",
+    );
+
+    let run_stats = latest_run_stats(project_dir.path());
+    let emission = &run_stats["filigree_emission"];
+    assert_eq!(
+        emission["status"].as_str(),
+        Some("unreachable"),
+        "emission recorded as unreachable: {run_stats}",
+    );
+    assert_eq!(
+        emission["rule_id"].as_str(),
+        Some("CLA-INFRA-FILIGREE-UNREACHABLE"),
+    );
+    assert!(
+        emission["endpoint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("127.0.0.1:1"),
+        "endpoint records the target: {emission}",
+    );
+    // The weak-modularity finding anchors to a subsystem (no source path), so
+    // it is skipped, not emitted.
+    assert_eq!(
+        emission["skipped_no_path"].as_u64(),
+        Some(1),
+        "path-less finding skipped: {emission}",
+    );
+    assert_eq!(emission["emitted_attempted"].as_u64(), Some(0));
+}
+
+/// WP9-B: the happy path — analyze actually POSTs to a listening Filigree and
+/// records `status: "emitted"` with the parsed response counts in `stats.json`.
+/// A one-shot mock server stands in for Filigree's `/api/v1/scan-results`.
+#[cfg(unix)]
+#[test]
+fn analyze_finding_emission_posts_and_records_emitted_on_success() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock filigree");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept scan-results POST");
+        let mut buf = [0_u8; 8192];
+        let read = stream.read(&mut buf).expect("read request");
+        let request = String::from_utf8_lossy(&buf[..read]).into_owned();
+        let body = r#"{"files_created":0,"files_updated":0,"findings_created":0,"findings_updated":0,"new_finding_ids":[],"observations_created":0,"observations_failed":0,"warnings":[]}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write response");
+        request
+    });
+
+    let project_dir = run_phase3_fixture(
+        &["weak_a", "weak_b"],
+        &phase3_config_with_filigree(2, &format!("http://{addr}")),
+    );
+
+    let request = server.join().expect("mock server thread");
+    assert!(
+        request.contains("POST /api/v1/scan-results HTTP/1.1"),
+        "analyze POSTed to the scan-results route: {request}",
+    );
+    assert!(
+        request.contains("\"scan_source\":\"clarion\""),
+        "request body carries scan_source: {request}",
+    );
+
+    let stats = latest_run_stats(project_dir.path());
+    let emission = &stats["filigree_emission"];
+    assert_eq!(
+        emission["status"].as_str(),
+        Some("emitted"),
+        "emission succeeded: {stats}",
+    );
+    assert_eq!(emission["findings_created"].as_u64(), Some(0));
+    // The only persisted finding (weak-modularity) is path-less → skipped.
+    assert_eq!(emission["skipped_no_path"].as_u64(), Some(1), "{emission}");
+    assert_eq!(emission["emitted"].as_u64(), Some(0));
+}

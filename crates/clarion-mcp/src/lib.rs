@@ -5,6 +5,7 @@ pub mod config;
 pub mod filigree;
 pub mod filigree_url;
 mod index_diff;
+pub mod scan_results;
 pub mod snapshot;
 
 use std::collections::{BTreeSet, HashMap, HashSet};

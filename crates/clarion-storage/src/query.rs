@@ -149,6 +149,37 @@ pub struct ModuleDependencyEdge {
     pub edge_kinds: Vec<String>,
 }
 
+/// One persisted finding joined to its anchoring entity's source location, in
+/// the shape the cross-product emitter (`clarion-mcp` scan-results POST,
+/// WP9-B) needs: the Clarion-internal severity/kind vocabulary plus the
+/// entity's `source_file_path` / `source_line_*` that become Filigree's wire
+/// `path` / `line_start` / `line_end`. `source_file_path` is `None` for
+/// findings anchored to entities with no source location (e.g. a
+/// `core:subsystem:*` anchor); the emitter skips those because Filigree
+/// requires `path`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FindingForEmitRow {
+    pub id: String,
+    pub rule_id: String,
+    pub kind: String,
+    /// Clarion-internal severity: `INFO` | `WARN` | `ERROR` | `CRITICAL` |
+    /// `NONE`. Mapped to Filigree's wire vocabulary by the emitter.
+    pub severity: String,
+    pub confidence: Option<f64>,
+    pub confidence_basis: Option<String>,
+    pub message: String,
+    pub entity_id: String,
+    /// JSON array text as stored in `findings.related_entities`.
+    pub related_entities_json: String,
+    /// JSON array text as stored in `findings.supports`.
+    pub supports_json: String,
+    /// JSON array text as stored in `findings.supported_by`.
+    pub supported_by_json: String,
+    pub source_file_path: Option<String>,
+    pub source_line_start: Option<i64>,
+    pub source_line_end: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedFile {
     pub entity_id: String,
@@ -1167,6 +1198,45 @@ pub fn contained_entity_ids(
         entity_ids,
         truncated: false,
     })
+}
+
+/// All findings recorded under `run_id`, joined to their anchoring entity's
+/// source location, ordered by finding id for deterministic emission. Used by
+/// the WP9-B cross-product emitter to build a `POST /api/v1/scan-results`
+/// batch. Findings whose anchor entity has no `source_file_path` are returned
+/// with `source_file_path: None`; the emitter skips them (Filigree requires a
+/// `path`).
+pub fn findings_for_emit(conn: &Connection, run_id: &str) -> Result<Vec<FindingForEmitRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.id, f.rule_id, f.kind, f.severity, f.confidence, \
+                f.confidence_basis, f.message, f.entity_id, f.related_entities, \
+                f.supports, f.supported_by, \
+                e.source_file_path, e.source_line_start, e.source_line_end \
+         FROM findings f \
+         JOIN entities e ON e.id = f.entity_id \
+         WHERE f.run_id = ?1 \
+         ORDER BY f.id",
+    )?;
+    let rows = stmt.query_map(params![run_id], |row| {
+        Ok(FindingForEmitRow {
+            id: row.get(0)?,
+            rule_id: row.get(1)?,
+            kind: row.get(2)?,
+            severity: row.get(3)?,
+            confidence: row.get(4)?,
+            confidence_basis: row.get(5)?,
+            message: row.get(6)?,
+            entity_id: row.get(7)?,
+            related_entities_json: row.get(8)?,
+            supports_json: row.get(9)?,
+            supported_by_json: row.get(10)?,
+            source_file_path: row.get(11)?,
+            source_line_start: row.get(12)?,
+            source_line_end: row.get(13)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
 }
 
 fn map_entity_row(row: &Row<'_>) -> rusqlite::Result<EntityRow> {

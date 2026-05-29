@@ -6,10 +6,10 @@ use clarion_core::EdgeConfidence;
 use clarion_storage::{
     ModuleDependencyEdge, ReferenceDirection, SubsystemMember, call_edges_from,
     call_edges_targeting, child_entity_ids, contained_entity_ids, entity_at_line,
-    entity_briefing_block_reason, entity_by_id, find_entities, module_dependency_edges,
-    module_reference_rollup, normalize_source_path, pragma, reference_edges_for_entity,
-    resolve_file, resolve_file_catalog_entry, schema, subsystem_for_member, subsystem_members,
-    subsystem_of_entity,
+    entity_briefing_block_reason, entity_by_id, find_entities, findings_for_emit,
+    module_dependency_edges, module_reference_rollup, normalize_source_path, pragma,
+    reference_edges_for_entity, resolve_file, resolve_file_catalog_entry, schema,
+    subsystem_for_member, subsystem_members, subsystem_of_entity,
 };
 use rusqlite::{Connection, params};
 
@@ -1300,4 +1300,166 @@ fn entity_briefing_block_reason_fails_closed_on_malformed_json() {
     // so the reason is `None`).
     assert_eq!(entity_briefing_block_reason("null"), None);
     assert_eq!(entity_briefing_block_reason("[]"), None);
+}
+
+fn insert_run(conn: &Connection, run_id: &str) {
+    conn.execute(
+        "INSERT INTO runs (id, started_at, config, stats, status) \
+         VALUES (?1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), '{}', '{}', 'running')",
+        params![run_id],
+    )
+    .expect("insert run");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_finding(
+    conn: &Connection,
+    id: &str,
+    run_id: &str,
+    rule_id: &str,
+    kind: &str,
+    severity: &str,
+    entity_id: &str,
+    related_entities: &str,
+) {
+    conn.execute(
+        "INSERT INTO findings (
+            id, tool, tool_version, run_id, rule_id, kind, severity, confidence,
+            confidence_basis, entity_id, related_entities, message, evidence,
+            properties, supports, supported_by, status, created_at, updated_at
+         ) VALUES (
+            ?1, 'clarion', '1.0.0', ?2, ?3, ?4, ?5, 0.9,
+            'ast_match', ?6, ?7, 'msg', '{}',
+            '{}', '[]', '[]', 'open',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        params![
+            id,
+            run_id,
+            rule_id,
+            kind,
+            severity,
+            entity_id,
+            related_entities
+        ],
+    )
+    .expect("insert finding");
+}
+
+#[test]
+fn findings_for_emit_joins_entity_path_and_preserves_nullable_location() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let conn = open_fresh(&tempdir);
+
+    insert_run(&conn, "run-1");
+    // A defect anchored to a function with a source location.
+    insert_entity_with_range(
+        &conn,
+        "python:function:auth.tokens.refresh",
+        "function",
+        Path::new("src/auth/tokens.py"),
+        12,
+        20,
+    );
+    // A fact anchored to a subsystem entity — no source_file_path.
+    insert_named_entity(
+        &conn,
+        "core:subsystem:abcd",
+        "subsystem",
+        "abcd",
+        "abcd",
+        None,
+    );
+
+    insert_finding(
+        &conn,
+        "core:finding:run-1:defect",
+        "run-1",
+        "CLA-PY-STRUCTURE-001",
+        "defect",
+        "WARN",
+        "python:function:auth.tokens.refresh",
+        r#"["python:class:auth.sessions::SessionStore"]"#,
+    );
+    insert_finding(
+        &conn,
+        "core:finding:run-1:weak-modularity",
+        "run-1",
+        "CLA-FACT-CLUSTERING-WEAK-MODULARITY",
+        "fact",
+        "INFO",
+        "core:subsystem:abcd",
+        "[]",
+    );
+
+    let rows = findings_for_emit(&conn, "run-1").expect("findings_for_emit");
+    assert_eq!(rows.len(), 2, "both findings returned: {rows:?}");
+
+    // Ordered by finding id: "defect" sorts before "weak-modularity".
+    let defect = &rows[0];
+    assert_eq!(defect.id, "core:finding:run-1:defect");
+    assert_eq!(defect.rule_id, "CLA-PY-STRUCTURE-001");
+    assert_eq!(defect.kind, "defect");
+    assert_eq!(defect.severity, "WARN");
+    assert_eq!(defect.entity_id, "python:function:auth.tokens.refresh");
+    assert_eq!(
+        defect.source_file_path.as_deref(),
+        Some("src/auth/tokens.py")
+    );
+    assert_eq!(defect.source_line_start, Some(12));
+    assert_eq!(defect.source_line_end, Some(20));
+    assert_eq!(defect.confidence, Some(0.9));
+    assert_eq!(
+        defect.related_entities_json,
+        r#"["python:class:auth.sessions::SessionStore"]"#
+    );
+
+    // The subsystem-anchored fact has no source path — the emitter will skip it.
+    let fact = &rows[1];
+    assert_eq!(fact.id, "core:finding:run-1:weak-modularity");
+    assert_eq!(fact.entity_id, "core:subsystem:abcd");
+    assert_eq!(fact.source_file_path, None);
+    assert_eq!(fact.source_line_start, None);
+}
+
+#[test]
+fn findings_for_emit_scopes_to_run_id() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let conn = open_fresh(&tempdir);
+
+    insert_run(&conn, "run-1");
+    insert_run(&conn, "run-2");
+    insert_entity_with_range(
+        &conn,
+        "python:function:demo.f",
+        "function",
+        Path::new("demo.py"),
+        1,
+        2,
+    );
+    insert_finding(
+        &conn,
+        "f-run1",
+        "run-1",
+        "CLA-PY-X",
+        "defect",
+        "WARN",
+        "python:function:demo.f",
+        "[]",
+    );
+    insert_finding(
+        &conn,
+        "f-run2",
+        "run-2",
+        "CLA-PY-X",
+        "defect",
+        "WARN",
+        "python:function:demo.f",
+        "[]",
+    );
+
+    let rows = findings_for_emit(&conn, "run-1").expect("findings_for_emit");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "f-run1");
 }

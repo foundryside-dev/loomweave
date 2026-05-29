@@ -32,6 +32,13 @@ use clarion_storage::{
     module_dependency_edges,
 };
 
+use clarion_mcp::config::McpConfig;
+use clarion_mcp::filigree::FiligreeHttpClient;
+use clarion_mcp::filigree_url::resolve_filigree_url;
+use clarion_mcp::scan_results::{
+    EmitOptions, ScanResultsResponse, prepare_batch, scan_results_url,
+};
+
 use crate::clustering::{ClusterConfig, ModuleEdge, ModuleGraph, cluster_hash, cluster_modules};
 use crate::config::{AnalyzeConfig, ClusteringConfig};
 use crate::stats::P95Accumulator;
@@ -600,6 +607,25 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         }
     };
 
+    // Phase 8 (WP9-B): emit findings to Filigree for non-hard-failed runs,
+    // before CommitRun so the emission outcome rides along in `stats.json`.
+    // Best-effort: a Filigree outage never changes the run's own outcome.
+    let filigree_emission = if matches!(
+        run_outcome,
+        RunOutcome::Completed | RunOutcome::SoftFailed { .. }
+    ) {
+        emit_findings_to_filigree(
+            &writer,
+            &db_path,
+            &project_root,
+            &run_id,
+            options.config_path.as_deref(),
+        )
+        .await
+    } else {
+        serde_json::Value::Null
+    };
+
     let completed_at = iso8601_now();
     // Snapshot the writer's process-lifetime dropped-edges counter so the
     // run's durable stats record the dedupe count (B.3 §6). Read BEFORE
@@ -641,6 +667,9 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "clustering": phase3_output.clustering_stats.clone(),
             });
             secret_scan_outcome.augment_stats(&mut stats_json);
+            if !filigree_emission.is_null() {
+                stats_json["filigree_emission"] = filigree_emission;
+            }
             let stats_json = stats_json.to_string();
             writer
                 .send_wait(|ack| WriterCmd::CommitRun {
@@ -678,6 +707,9 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "failure_reason": reason,
             });
             secret_scan_outcome.augment_stats(&mut stats_json);
+            if !filigree_emission.is_null() {
+                stats_json["filigree_emission"] = filigree_emission;
+            }
             let stats_json = stats_json.to_string();
             writer
                 .send_wait(|ack| WriterCmd::CommitRun {
@@ -1092,6 +1124,197 @@ async fn insert_weak_modularity_finding(
         .map_err(|e| anyhow::anyhow!("{e}"))
         .with_context(|| format!("InsertFinding {finding_id}"))?;
     Ok(true)
+}
+
+/// Load the MCP-side config (Filigree integration) from the same `clarion.yaml`
+/// `clarion serve` reads. A missing or unparseable file falls back to the
+/// default (Filigree disabled), so a config problem never fails the run — it
+/// just means no emission.
+fn load_mcp_config(project_root: &Path, config_path: Option<&Path>) -> McpConfig {
+    let path = config_path.map_or_else(|| project_root.join("clarion.yaml"), Path::to_path_buf);
+    if !path.exists() {
+        return McpConfig::default();
+    }
+    McpConfig::from_path(&path).unwrap_or_else(|err| {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "load MCP config for finding emission failed; emission disabled",
+        );
+        McpConfig::default()
+    })
+}
+
+/// Phase 8 (WP9-B, REQ-FINDING-03): POST this run's persisted findings to
+/// Filigree's native `POST /api/v1/scan-results` intake.
+///
+/// Best-effort and enrich-only: gated behind
+/// `integrations.filigree.{enabled,emit_findings}`, and any failure (Filigree
+/// down, transport error, build error) is recorded in the returned stats blob
+/// and logged as `CLA-INFRA-FILIGREE-UNREACHABLE` rather than propagated — the
+/// analyze run never fails because a sibling tool is unreachable. Returns
+/// [`serde_json::Value::Null`] when emission is disabled; otherwise a
+/// `filigree_emission` stats object folded into `stats.json`.
+///
+/// Findings written during the run (including the phase-3 weak-modularity fact)
+/// are flushed before reading so the emission batch is complete.
+async fn emit_findings_to_filigree(
+    writer: &Writer,
+    db_path: &Path,
+    project_root: &Path,
+    run_id: &str,
+    config_path: Option<&Path>,
+) -> serde_json::Value {
+    let mcp_config = load_mcp_config(project_root, config_path);
+    let filigree_cfg = &mcp_config.integrations.filigree;
+    if !filigree_cfg.enabled || !filigree_cfg.emit_findings {
+        return serde_json::Value::Null;
+    }
+
+    // Make findings durable so a fresh read connection observes them.
+    if let Err(err) = writer
+        .send_wait(|ack| WriterCmd::FlushRunBatch { ack })
+        .await
+    {
+        tracing::warn!(run_id, error = %err, "flush before finding emission failed; skipping emission");
+        return serde_json::json!({"status": "skipped", "reason": "flush_failed"});
+    }
+
+    let rows = match Connection::open(db_path) {
+        Ok(conn) => match clarion_storage::findings_for_emit(&conn, run_id) {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(run_id, error = %err, "read findings for emission failed; skipping emission");
+                return serde_json::json!({"status": "skipped", "reason": "read_failed"});
+            }
+        },
+        Err(err) => {
+            tracing::warn!(run_id, error = %err, "open read conn for emission failed; skipping emission");
+            return serde_json::json!({"status": "skipped", "reason": "read_open_failed"});
+        }
+    };
+    let total_findings = rows.len();
+
+    let batch = prepare_batch(
+        &rows,
+        &EmitOptions {
+            scan_run_id: Some(run_id.to_owned()),
+            mark_unseen: true,
+            complete_scan_run: true,
+        },
+    );
+    let emitted = batch.emitted;
+    let skipped_no_path = batch.skipped_no_path;
+
+    // Resolve the live Filigree URL (ephemeral port over stale config), the same
+    // resolution `clarion serve` and `project_status` use.
+    let resolution = resolve_filigree_url(filigree_cfg, project_root);
+    let mut resolved_cfg = filigree_cfg.clone();
+    if let Some(url) = resolution.resolved_url {
+        resolved_cfg.base_url = url;
+    }
+    let endpoint = scan_results_url(&resolved_cfg.base_url);
+
+    // `reqwest::blocking` builds and drops its own inner tokio runtime; doing
+    // that on a tokio worker — even inside `spawn_blocking`, which still carries
+    // an ambient runtime handle — panics on drop. Run the whole client
+    // lifecycle (build → POST → drop) on a plain OS thread with no ambient
+    // runtime, and join it off the async executor.
+    let request = batch.request;
+    let thread_cfg = resolved_cfg;
+    let worker = std::thread::spawn(move || -> Result<ScanResultsResponse, String> {
+        let client = FiligreeHttpClient::from_config(&thread_cfg, |name| std::env::var(name).ok())
+            .map_err(|err| format!("build Filigree client: {err}"))?
+            .ok_or_else(|| "Filigree integration disabled".to_owned())?;
+        client
+            .post_scan_results(&request)
+            .map_err(|err| err.to_string())
+    });
+    let joined = tokio::task::spawn_blocking(move || worker.join()).await;
+
+    match joined {
+        Ok(Ok(Ok(response))) => {
+            for warning in &response.warnings {
+                tracing::warn!(run_id, warning = %warning, "Filigree scan-results intake warning");
+            }
+            tracing::info!(
+                run_id,
+                endpoint = %endpoint,
+                emitted,
+                skipped_no_path,
+                created = response.findings_created,
+                updated = response.findings_updated,
+                warnings = response.warnings.len(),
+                "posted findings to Filigree",
+            );
+            serde_json::json!({
+                "status": "emitted",
+                "endpoint": endpoint,
+                "findings_total": total_findings,
+                "emitted": emitted,
+                "skipped_no_path": skipped_no_path,
+                "findings_created": response.findings_created,
+                "findings_updated": response.findings_updated,
+                "warnings": response.warnings,
+            })
+        }
+        Ok(Ok(Err(err))) => unreachable_stats(
+            run_id,
+            &endpoint,
+            total_findings,
+            emitted,
+            skipped_no_path,
+            &err,
+        ),
+        Ok(Err(_panic)) => unreachable_stats(
+            run_id,
+            &endpoint,
+            total_findings,
+            emitted,
+            skipped_no_path,
+            "emission thread panicked",
+        ),
+        Err(err) => unreachable_stats(
+            run_id,
+            &endpoint,
+            total_findings,
+            emitted,
+            skipped_no_path,
+            &format!("emission task: {err}"),
+        ),
+    }
+}
+
+/// Build the `filigree_emission` stats blob for a failed POST and log it as
+/// `CLA-INFRA-FILIGREE-UNREACHABLE`. The infra finding is recorded in
+/// `stats.json` and the log (two of the three surfaces REQ-ANALYZE-06 names);
+/// the local `findings` table is not used because its `entity_id` is a
+/// non-null FK to `entities` and an infra finding has no anchor entity — the
+/// same reason every other `CLA-INFRA-*` finding is log-only today.
+fn unreachable_stats(
+    run_id: &str,
+    endpoint: &str,
+    total_findings: usize,
+    emitted: usize,
+    skipped_no_path: usize,
+    error: &str,
+) -> serde_json::Value {
+    tracing::warn!(
+        run_id,
+        endpoint,
+        rule_id = "CLA-INFRA-FILIGREE-UNREACHABLE",
+        error,
+        "could not post findings to Filigree; continuing (enrich-only)",
+    );
+    serde_json::json!({
+        "status": "unreachable",
+        "rule_id": "CLA-INFRA-FILIGREE-UNREACHABLE",
+        "endpoint": endpoint,
+        "findings_total": total_findings,
+        "emitted_attempted": emitted,
+        "skipped_no_path": skipped_no_path,
+        "error": error,
+    })
 }
 
 fn module_entity_ids(conn: &Connection) -> Result<Vec<String>> {
