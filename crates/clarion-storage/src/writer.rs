@@ -168,6 +168,9 @@ fn run_actor(
                     begin_run(conn, &mut state, &run_id, &config_json, &started_at),
                 );
             }
+            WriterCmd::ResumeRun { run_id, ack } => {
+                reply(ack, resume_run(conn, &mut state, &run_id));
+            }
             WriterCmd::InsertEntity { entity, ack } => {
                 let res = insert_entity(conn, &mut state, &entity, commits_observed);
                 reply(ack, res);
@@ -352,6 +355,37 @@ fn begin_run(
          VALUES (?1, ?2, NULL, ?3, '{}', 'running')",
         params![run_id, started_at, config_json],
     )?;
+    begin_write_tx(conn, state)?;
+    state.in_tx = true;
+    state.writes_in_batch = 0;
+    state.current_run = Some(run_id.to_owned());
+    Ok(())
+}
+
+/// Reopen an existing run row instead of inserting a new one (the `--resume`
+/// path, REQ-FINDING-05). `begin_run` does an `INSERT` that fails on the run
+/// PK when handed an existing id; `resume_run` `UPDATE`s the row back to
+/// `running` and clears `completed_at`, then binds it as the active run and
+/// opens the write transaction exactly as `begin_run` does. The subsequent
+/// re-walk upserts entities/edges idempotently (see
+/// `insert_entity_is_idempotent_across_runs`), so a resumed run reproduces the
+/// same durable graph as the original — `--resume` is a re-emit-without-flip
+/// path, not an incremental checkpoint-recovery one.
+fn resume_run(conn: &mut Connection, state: &mut ActorState, run_id: &str) -> Result<()> {
+    if state.current_run.is_some() {
+        return Err(StorageError::WriterProtocol(
+            "ResumeRun received while a run is already in progress".to_owned(),
+        ));
+    }
+    let reopened = conn.execute(
+        "UPDATE runs SET status = 'running', completed_at = NULL WHERE id = ?1",
+        params![run_id],
+    )?;
+    if reopened == 0 {
+        return Err(StorageError::WriterProtocol(format!(
+            "ResumeRun: no run with id {run_id} to resume"
+        )));
+    }
     begin_write_tx(conn, state)?;
     state.in_tx = true;
     state.writes_in_batch = 0;
@@ -672,6 +706,16 @@ fn insert_finding(
         begin_write_tx(conn, state)?;
         state.in_tx = true;
     }
+    // ON CONFLICT(id) DO UPDATE makes the finding path idempotent under
+    // `--resume`: a finding id embeds its run_id (`core:finding:{run_id}:…`),
+    // so cross-run ids never collide and a fresh run only ever INSERTs. A
+    // resume re-walks under the *same* run_id and re-generates the same ids;
+    // without the upsert it would fail on `UNIQUE constraint: findings.id`.
+    // The conflict clause refreshes analysis-derived columns from the re-walk
+    // but PRESERVES the lifecycle columns (`status`, `suppression_reason`,
+    // `filigree_issue_id`) and `created_at` — the same first-seen-preserving
+    // discipline `insert_entity` applies. (These lifecycle columns are never
+    // mutated locally today; preserving them keeps that invariant if they are.)
     conn.execute(
         "INSERT INTO findings ( \
             id, tool, tool_version, run_id, rule_id, kind, severity, confidence, \
@@ -683,7 +727,24 @@ fn insert_finding(
             ?9, ?10, ?11, ?12, ?13, \
             ?14, ?15, ?16, 'open', NULL, \
             NULL, ?17, ?18 \
-         )",
+         ) \
+         ON CONFLICT(id) DO UPDATE SET \
+            tool = excluded.tool, \
+            tool_version = excluded.tool_version, \
+            run_id = excluded.run_id, \
+            rule_id = excluded.rule_id, \
+            kind = excluded.kind, \
+            severity = excluded.severity, \
+            confidence = excluded.confidence, \
+            confidence_basis = excluded.confidence_basis, \
+            entity_id = excluded.entity_id, \
+            related_entities = excluded.related_entities, \
+            message = excluded.message, \
+            evidence = excluded.evidence, \
+            properties = excluded.properties, \
+            supports = excluded.supports, \
+            supported_by = excluded.supported_by, \
+            updated_at = excluded.updated_at",
         params![
             finding.id,
             finding.tool,

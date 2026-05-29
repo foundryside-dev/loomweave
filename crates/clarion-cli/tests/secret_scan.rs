@@ -214,6 +214,85 @@ fn secret_file_persists_finding_and_briefing_block() {
 }
 
 #[test]
+fn resume_does_not_duplicate_secret_findings() {
+    // REQ-FINDING-05 `--resume`: secret-finding ids are deterministic and
+    // run-scoped, so re-walking under the same run_id upserts the same row
+    // rather than inserting a duplicate (a random-UUID id would duplicate on
+    // every resume). Regression for the gap that the phase3 weak-modularity
+    // finding alone did not cover.
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    std::fs::write(
+        project.path().join("leaky.sec"),
+        b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n",
+    )
+    .unwrap();
+
+    // Fresh run.
+    clarion_bin()
+        .arg("analyze")
+        .arg(project.path())
+        .env("PATH", plugin_path(plugin.path()))
+        .assert()
+        .success();
+
+    let (run_id, first_id): (String, String) = {
+        let db = conn(project.path());
+        let run_id = db
+            .query_row(
+                "SELECT id FROM runs ORDER BY started_at DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let first_id = db
+            .query_row(
+                "SELECT id FROM findings WHERE rule_id = 'CLA-SEC-SECRET-DETECTED'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (run_id, first_id)
+    };
+
+    // Resume the same run.
+    clarion_bin()
+        .arg("analyze")
+        .args(["--resume", &run_id])
+        .arg(project.path())
+        .env("PATH", plugin_path(plugin.path()))
+        .assert()
+        .success();
+
+    let db = conn(project.path());
+    let count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'CLA-SEC-SECRET-DETECTED'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "resume must not duplicate the secret finding");
+    let after_id: String = db
+        .query_row(
+            "SELECT id FROM findings WHERE rule_id = 'CLA-SEC-SECRET-DETECTED'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        after_id, first_id,
+        "the resumed secret finding keeps its deterministic run-scoped id",
+    );
+    let run_rows: i64 = db
+        .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(run_rows, 1, "resume reuses the run row");
+}
+
+#[test]
 fn dotenv_sidecar_persists_finding_with_core_file_anchor() {
     let project = tempfile::tempdir().unwrap();
     let plugin = tempfile::tempdir().unwrap();

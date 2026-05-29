@@ -142,6 +142,11 @@ pub(crate) struct AnalyzeOptions {
     pub(crate) secret_scan: crate::secret_scan::SecretScanOptions,
     /// Caller-supplied run id (MCP `analyze_start`); `None` generates one.
     pub(crate) run_id: Option<String>,
+    /// `--resume RUN_ID` (REQ-FINDING-05): reopen this prior run's row instead
+    /// of opening a fresh one, and emit findings with `mark_unseen=false` so a
+    /// re-emit does not flip the prior run's findings to `unseen_in_latest` on
+    /// the Filigree peer. Takes precedence over `run_id` as the run identifier.
+    pub(crate) resume_run_id: Option<String>,
     /// When set, structured progress is written here as the run proceeds.
     pub(crate) progress_file: Option<PathBuf>,
 }
@@ -189,9 +194,13 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
     .context("spawn writer actor")?;
+    // `--resume RUN_ID` reuses the prior run's id (and reopens its row below);
+    // absent that, the hidden MCP `--run-id` is honoured, else a fresh id.
+    let resume = options.resume_run_id.is_some();
     let run_id = options
-        .run_id
+        .resume_run_id
         .clone()
+        .or_else(|| options.run_id.clone())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let started_at = iso8601_now();
     // Structured progress sink (MCP `analyze_start` sets `progress_file`); a
@@ -236,8 +245,14 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 discovery_errors.join("; ")
             );
             tracing::error!(run_id = %run_id, reason = %reason, "failing run: discovery errors");
-            crate::run_lifecycle::begin_run(&writer, &run_id, &analyze_config_json, &started_at)
-                .await?;
+            crate::run_lifecycle::open_run(
+                &writer,
+                resume,
+                &run_id,
+                &analyze_config_json,
+                &started_at,
+            )
+            .await?;
             let completed_at = iso8601_now();
             writer
                 .send_wait(|ack| WriterCmd::FailRun {
@@ -264,7 +279,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         }
 
         tracing::warn!(run_id = %run_id, "no plugins discovered");
-        crate::run_lifecycle::begin_run(&writer, &run_id, &analyze_config_json, &started_at)
+        crate::run_lifecycle::open_run(&writer, resume, &run_id, &analyze_config_json, &started_at)
             .await?;
         let completed_at = iso8601_now();
         writer
@@ -326,7 +341,8 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     );
     let mut secret_scan_outcome =
         crate::secret_scan::pre_ingest(&project_root, &secret_scan_files, &options.secret_scan)?;
-    crate::run_lifecycle::begin_run(&writer, &run_id, &analyze_config_json, &started_at).await?;
+    crate::run_lifecycle::open_run(&writer, resume, &run_id, &analyze_config_json, &started_at)
+        .await?;
 
     // ── Per-plugin processing ─────────────────────────────────────────────────
     //
@@ -619,6 +635,10 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             &db_path,
             &project_root,
             &run_id,
+            // `--resume` re-emits without marking the prior run's findings
+            // unseen (REQ-FINDING-05); a fresh run marks them unseen so a
+            // dropped finding transitions to `unseen_in_latest` on the peer.
+            !resume,
             options.config_path.as_deref(),
         )
         .await
@@ -1163,6 +1183,7 @@ async fn emit_findings_to_filigree(
     db_path: &Path,
     project_root: &Path,
     run_id: &str,
+    mark_unseen: bool,
     config_path: Option<&Path>,
 ) -> serde_json::Value {
     let mcp_config = load_mcp_config(project_root, config_path);
@@ -1199,7 +1220,7 @@ async fn emit_findings_to_filigree(
         &rows,
         &EmitOptions {
             scan_run_id: Some(run_id.to_owned()),
-            mark_unseen: true,
+            mark_unseen,
             complete_scan_run: true,
         },
     );
@@ -1253,6 +1274,7 @@ async fn emit_findings_to_filigree(
                 "findings_total": total_findings,
                 "emitted": emitted,
                 "skipped_no_path": skipped_no_path,
+                "mark_unseen": mark_unseen,
                 "findings_created": response.findings_created,
                 "findings_updated": response.findings_updated,
                 "warnings": response.warnings,

@@ -69,6 +69,17 @@ pub enum Command {
         #[arg(long, hide = true)]
         run_id: Option<String>,
 
+        /// Resume a prior run: reuse `RUN_ID` (reopening its `runs` row instead
+        /// of starting fresh) and emit findings to Filigree with
+        /// `mark_unseen=false`, so re-emitting does not flip the prior run's
+        /// findings to `unseen_in_latest` on the peer (REQ-FINDING-05). The
+        /// run id is the UUID a normal `clarion analyze` reports on completion.
+        /// This re-walks the tree from scratch (it is not incremental recovery)
+        /// and assumes the corpus is unchanged; findings that no longer fire are
+        /// not pruned from the resumed run.
+        #[arg(long, value_name = "RUN_ID", conflicts_with = "run_id")]
+        resume: Option<String>,
+
         /// Write structured progress (phase, current plugin, processed/total
         /// files, current file, heartbeat) to this path as the run proceeds,
         /// so `analyze_status` can report progress without log scraping.

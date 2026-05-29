@@ -48,9 +48,21 @@ only when an incompatible change is made to that surface. See
   (`CLA-INFRA-FILIGREE-UNREACHABLE`) instead of failing the run. Findings
   anchored to a `briefing_blocked` entity are excluded, matching the fail-closed
   read posture (clarion-8b32ba0d02). Resolves the 1.0 "finding emission
-  deferred" limitation below. The REQ-FINDING-05/-06 lifecycle tail (Phase-0
-  create handshake + `--resume`; `--prune-unseen`, which needs a Filigree-side
-  prune surface) remains deferred — tracked under clarion-dd29e69e0e.
+  deferred" limitation below.
+- **`clarion analyze --resume RUN_ID` (WP9-B, REQ-FINDING-05).** Reopens a prior
+  run's `runs` row (a new `WriterCmd::ResumeRun` `UPDATE`s it back to `running`
+  instead of `INSERT`ing, which conflicted on the existing run PK), re-walks the
+  tree, and emits findings to Filigree with `mark_unseen=false` so the re-emit
+  does not flip the prior run's findings to `unseen_in_latest`. The re-walk is
+  idempotent: entities and run-scoped findings now both UPSERT on `id`
+  (previously only entities did), so a resumed run reproduces the same durable
+  graph as the original. The emitted `mark_unseen` value is recorded in
+  `stats.json`. Tracked under clarion-dd29e69e0e. **Still deferred from that
+  issue:** the Phase-0 scan-run create handshake (an open contract question with
+  Filigree — Clarion currently relies on the peer tolerating an unknown
+  `scan_run_id`) and `--prune-unseen` (REQ-FINDING-06), which is blocked on a
+  Filigree-side prune/retention surface that does not yet exist (request filed
+  in [`docs/federation/2026-05-30-prune-unseen-filigree-request.md`](docs/federation/2026-05-30-prune-unseen-filigree-request.md)).
 
 ### Changed
 

@@ -145,6 +145,14 @@ pub enum WriterCmd {
         started_at: String,
         ack: Ack<()>,
     },
+    /// Reopen an existing run row for the `--resume` path (REQ-FINDING-05).
+    /// `BeginRun` does an `INSERT` that conflicts on the run PK when handed an
+    /// id that already exists; `ResumeRun` instead `UPDATE`s the row back to
+    /// `running` (clearing `completed_at`), then binds it as the active run and
+    /// opens the write transaction exactly as `BeginRun` does. Errors if no row
+    /// with `run_id` exists. A re-walk upserts entities/edges idempotently, so
+    /// a resumed run reproduces the same durable graph as the original.
+    ResumeRun { run_id: String, ack: Ack<()> },
     /// Insert an entity; also advances the per-batch write counter and
     /// commits the in-flight transaction if the batch boundary is crossed.
     InsertEntity {
@@ -158,7 +166,10 @@ pub enum WriterCmd {
     /// write counter — edges and entities share one batch boundary.
     InsertEdge { edge: Box<EdgeRecord>, ack: Ack<()> },
     /// Insert one finding. The writer initializes lifecycle status to `open`
-    /// and leaves suppression / Filigree-link fields empty.
+    /// and leaves suppression / Filigree-link fields empty. Idempotent on
+    /// `id` (ON CONFLICT DO UPDATE): a `--resume` re-walk regenerates the same
+    /// run-scoped finding ids and refreshes the analysis-derived columns while
+    /// preserving `created_at` and the lifecycle columns.
     InsertFinding {
         finding: Box<FindingRecord>,
         ack: Ack<()>,

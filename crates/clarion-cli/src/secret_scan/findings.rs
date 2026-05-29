@@ -10,7 +10,6 @@ use clarion_storage::{
     commands::{FindingRecord, WriterCmd},
 };
 use serde_json::json;
-use uuid::Uuid;
 
 use super::SecretScanOutcome;
 
@@ -115,7 +114,21 @@ pub(crate) async fn emit_findings(
             finding_entity_id(&pending.file_path, entity_anchors).with_context(|| {
                 format!("anchor secret finding for {}", pending.file_path.display())
             })?;
-        let finding_id = Uuid::new_v4().to_string();
+        // Deterministic, run-scoped id so a `--resume` re-walk regenerates the
+        // SAME id and `InsertFinding`'s upsert is idempotent (REQ-FINDING-05).
+        // A random UUID would instead create a duplicate finding row on every
+        // resume (the id never collides, so the upsert never fires). The digest
+        // covers the anchor entity, rule, and evidence (file + line + hashed
+        // secret), which uniquely identify a detection within a run.
+        let discriminator = blake3::hash(
+            format!(
+                "{entity_id}\u{0}{}\u{0}{}",
+                pending.rule_id, pending.evidence
+            )
+            .as_bytes(),
+        )
+        .to_hex();
+        let finding_id = format!("core:finding:{run_id}:secret:{discriminator}");
         writer
             .send_wait(|ack| WriterCmd::InsertFinding {
                 finding: Box::new(FindingRecord {

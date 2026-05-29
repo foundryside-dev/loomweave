@@ -500,10 +500,23 @@ POST {filigree_base}/api/v1/scan-results
     it is stable across runs.
   - `scan_run_id` carries Clarion's `run_id`. It is omitted entirely when unset;
     an unknown id is tolerated by Filigree (it warns and proceeds), which is how
-    REQ-FINDING-05's wire shape ships without a pre-create handshake.
+    REQ-FINDING-05's wire shape ships without a pre-create handshake. **Clarion's
+    posture** is to depend on this tolerate-unknown behavior and emit no Phase-0
+    `scan-runs` create call; whether that is Filigree's *intended permanent*
+    contract (vs. an explicit create endpoint) is the open §4 question in
+    [`2026-05-30-prune-unseen-filigree-request.md`](2026-05-30-prune-unseen-filigree-request.md),
+    pending Filigree's confirmation.
   - `mark_unseen` is `true` for a normal full run (old-position findings for the
-    same rule/file transition to `unseen_in_latest`); a `--resume` run sets it
-    `false`. `complete_scan_run` is `true` on the final (here: only) batch.
+    same rule/file transition to `unseen_in_latest`); a `--resume RUN_ID` run
+    sets it `false` so the re-emit does not flip the prior run's findings to
+    `unseen_in_latest`. `complete_scan_run` is `true` on the final (here: only)
+    batch. **`--resume` is implemented** (REQ-FINDING-05): it reopens the prior
+    run's `runs` row instead of inserting a fresh one and re-walks idempotently
+    (entities and run-scoped findings UPSERT). It re-walks the tree from scratch
+    (not incremental recovery) and assumes an unchanged corpus — findings that
+    no longer fire are not pruned from the resumed run (that is the deferred
+    `--prune-unseen` surface). The emitted `mark_unseen` value is recorded in
+    the run's `stats.json` `filigree_emission` block.
   - `create_observations` is always `false` — Clarion emits findings, not
     observations.
   - `severity` is the **wire** vocabulary, mapped from Clarion's internal value:
