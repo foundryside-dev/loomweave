@@ -305,6 +305,11 @@ struct ActorState {
     in_tx: bool,
     /// The run currently in progress, if any.
     current_run: Option<String>,
+    /// Retry schedule for acquiring the write transaction (STO-05). Batch
+    /// transactions open with `BEGIN IMMEDIATE` so cross-process write
+    /// contention is resolved at lock-acquire (where `busy_timeout` is honored)
+    /// rather than failing mid-statement on a deferred-lock upgrade.
+    retry_policy: crate::retry::RetryPolicy,
 }
 
 impl ActorState {
@@ -314,8 +319,20 @@ impl ActorState {
             writes_in_batch: 0,
             in_tx: false,
             current_run: None,
+            retry_policy: crate::retry::RetryPolicy::writer_default(),
         }
     }
+}
+
+/// Open the write transaction for the current batch.
+///
+/// Uses `BEGIN IMMEDIATE` with the actor's retry policy (STO-05) rather than a
+/// deferred `BEGIN`: the actor always writes inside the transaction, so taking
+/// the write lock up front lets cross-process contention be resolved at
+/// lock-acquire (where `busy_timeout` and our retry apply) instead of failing
+/// mid-statement on a deferred-lock upgrade that the busy handler cannot serve.
+fn begin_write_tx(conn: &Connection, state: &ActorState) -> Result<()> {
+    crate::retry::begin_immediate(conn, &state.retry_policy)
 }
 
 fn begin_run(
@@ -335,7 +352,7 @@ fn begin_run(
          VALUES (?1, ?2, NULL, ?3, '{}', 'running')",
         params![run_id, started_at, config_json],
     )?;
-    conn.execute_batch("BEGIN")?;
+    begin_write_tx(conn, state)?;
     state.in_tx = true;
     state.writes_in_batch = 0;
     state.current_run = Some(run_id.to_owned());
@@ -355,7 +372,7 @@ fn insert_entity(
     }
     enforce_entity_kind_contract(entity)?;
     if !state.in_tx {
-        conn.execute_batch("BEGIN")?;
+        begin_write_tx(conn, state)?;
         state.in_tx = true;
     }
     validate_entity_source_file_anchor(conn, entity)?;
@@ -605,7 +622,7 @@ fn insert_edge(
         return Err(err);
     }
     if !state.in_tx {
-        conn.execute_batch("BEGIN")?;
+        begin_write_tx(conn, state)?;
         state.in_tx = true;
     }
     validate_source_file_anchor(
@@ -652,7 +669,7 @@ fn insert_finding(
         ));
     }
     if !state.in_tx {
-        conn.execute_batch("BEGIN")?;
+        begin_write_tx(conn, state)?;
         state.in_tx = true;
     }
     conn.execute(
@@ -790,7 +807,7 @@ fn replace_unresolved_call_sites_in_run(
         ));
     }
     if !state.in_tx {
-        conn.execute_batch("BEGIN")?;
+        begin_write_tx(conn, state)?;
         state.in_tx = true;
     }
     for site in sites {
@@ -823,7 +840,7 @@ fn bump_writes_and_maybe_commit(
         commits_observed.fetch_add(1, Ordering::Relaxed);
         // Open the next batch eagerly so the next write doesn't pay
         // another `BEGIN` round-trip.
-        conn.execute_batch("BEGIN")?;
+        begin_write_tx(conn, state)?;
         state.in_tx = true;
     }
     Ok(())
@@ -853,7 +870,7 @@ fn flush_run_batch(
         conn.execute_batch("COMMIT")?;
         commits_observed.fetch_add(1, Ordering::Relaxed);
     }
-    conn.execute_batch("BEGIN")?;
+    begin_write_tx(conn, state)?;
     state.in_tx = true;
     Ok(())
 }
@@ -875,7 +892,7 @@ fn query_time_write<T>(
     let result = write(conn);
 
     if reopen_run_transaction {
-        conn.execute_batch("BEGIN")?;
+        begin_write_tx(conn, state)?;
         state.in_tx = true;
     }
 

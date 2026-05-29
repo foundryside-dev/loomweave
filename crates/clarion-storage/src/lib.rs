@@ -10,6 +10,7 @@ pub mod error;
 pub mod pragma;
 pub mod query;
 pub mod reader;
+pub mod retry;
 pub mod schema;
 pub mod unresolved;
 pub mod writer;
@@ -37,6 +38,7 @@ pub use query::{
     unresolved_callers_for_target,
 };
 pub use reader::ReaderPool;
+pub use retry::{RetryPolicy, begin_immediate};
 pub use unresolved::{UnresolvedCallSiteRecord, replace_unresolved_call_sites_for_caller};
 pub use writer::{
     DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, Writer, known_scan_time_edge_kinds,

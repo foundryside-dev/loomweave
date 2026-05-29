@@ -22,6 +22,16 @@ only when an incompatible change is made to that surface. See
   `PRAGMA integrity_check` before promoting it. Closes gap-register STO-04
   (clarion-6d433b61ba).
 
+### Changed
+
+- The writer actor now opens its batch transactions with `BEGIN IMMEDIATE`
+  (via a new `clarion_storage::retry::begin_immediate` helper with bounded
+  `SQLITE_BUSY`/`SQLITE_LOCKED` retry + exponential backoff) instead of a
+  deferred `BEGIN`. Taking the write lock up front resolves cross-process
+  write contention at lock-acquire — where `busy_timeout` is honored — rather
+  than failing mid-statement on a deferred-lock upgrade the busy handler
+  cannot serve. Closes gap-register STO-05 (clarion-bbb3365920).
+
 ## [1.0.0] — 2026-05-19
 
 First publishable release. Clarion ships as a Rust core (`clarion` binary, five
