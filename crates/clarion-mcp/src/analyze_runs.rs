@@ -109,6 +109,51 @@ pub(crate) fn kill_run(handle: &mut RunHandle) {
     handle.cancelled = true;
 }
 
+/// Best-effort delete a finished run's progress file as its handle is evicted
+/// from the registry. A missing file is success — a run may exit before writing
+/// one. Keeps `.clarion/runs/*.progress.json` from accumulating across a
+/// long-lived `clarion serve` (clarion-7e0c21558a).
+pub(crate) fn reap_progress_file(path: &std::path::Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                path = %path.display(),
+                "reap analyze progress file failed (left on disk)",
+            );
+        }
+    }
+}
+
+/// Evict every terminal handle from the registry and reap its progress file,
+/// returning the number removed. A still-running handle (`try_wait` ==
+/// `Ok(None)`) is retained; an exited or already-cancelled handle is dropped.
+///
+/// Called at the head of `analyze_start`: since every run begins with a start,
+/// sweeping there bounds the registry (and the `runs/` progress directory) to
+/// the live run plus the one about to spawn, however many analyses a
+/// long-lived `serve` runs over its lifetime (clarion-7e0c21558a).
+pub(crate) fn reap_terminal_runs(registry: &mut HashMap<String, RunHandle>) -> usize {
+    let dead: Vec<String> = registry
+        .iter_mut()
+        .filter_map(|(id, handle)| match handle.child.try_wait() {
+            // Still running — keep it.
+            Ok(None) => None,
+            // Exited, or `try_wait` errored (already reaped after a cancel) —
+            // evict it.
+            Ok(Some(_)) | Err(_) => Some(id.clone()),
+        })
+        .collect();
+    for id in &dead {
+        if let Some(handle) = registry.remove(id) {
+            reap_progress_file(&handle.progress_path);
+        }
+    }
+    dead.len()
+}
+
 /// Mark a cancelled run terminal in the database. The narrow single write this
 /// module owns (see the module note): a guarded UPDATE that only touches a row
 /// still in `running` — so a run that finished a beat before the cancel keeps

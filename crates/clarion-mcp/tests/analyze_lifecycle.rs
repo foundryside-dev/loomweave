@@ -65,6 +65,31 @@ wait "$CHILD"
     path
 }
 
+/// A stub that writes one progress snapshot and exits immediately (no
+/// grandchild, no blocking) — stands in for an analyze run that finishes on its
+/// own, so the reaping path can be exercised.
+fn write_quick_stub(dir: &Path) -> PathBuf {
+    let path = dir.join("analyze-quick-stub.sh");
+    let script = r#"#!/bin/sh
+PF=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --progress-file) PF="$2"; shift 2;;
+    *) shift;;
+  esac
+done
+printf '{"run_id":"stub","phase":"analyzing","heartbeat_at":"2026-01-01T00:00:00.000Z"}' > "$PF"
+exit 0
+"#;
+    std::fs::write(&path, script).expect("write quick stub");
+    let mut perms = std::fs::metadata(&path)
+        .expect("stub metadata")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).expect("chmod quick stub");
+    path
+}
+
 async fn call_tool(state: &ServerState, name: &str, arguments: Value) -> Value {
     let response = state
         .handle_json_rpc(&json!({
@@ -220,6 +245,47 @@ async fn analyze_status_maps_terminal_run_states_from_the_runs_table() {
         assert_eq!(resp["ok"], true, "{resp:?}");
         assert_eq!(resp["result"]["status"], expected, "run {id}: {resp:?}");
     }
+}
+
+#[tokio::test]
+async fn analyze_start_reaps_finished_runs_and_their_progress_files() {
+    let (project, db_path) = open_project();
+    let stub = write_quick_stub(project.path());
+    let state = state_for(project.path(), &db_path, &stub);
+
+    // First run finishes on its own (quick stub exits 0).
+    let first = call_tool(&state, "analyze_start", json!({})).await;
+    let first_id = first["result"]["run_id"].as_str().unwrap().to_owned();
+    let first_progress = PathBuf::from(first["result"]["progress_file"].as_str().unwrap());
+    assert_eq!(state.tracked_analyze_runs(), 1, "handle tracked after start");
+
+    // Wait for it to reach a terminal status (it writes no runs row, so the
+    // terminal mapping is `failed` — what matters here is that it exited).
+    poll_until_status(&state, &first_id, "failed").await;
+    assert_eq!(
+        state.tracked_analyze_runs(),
+        1,
+        "status read does not evict — eviction is swept on the next start"
+    );
+
+    // A second start sweeps the finished first run out of the registry and
+    // reaps its progress file before spawning.
+    let second = call_tool(&state, "analyze_start", json!({})).await;
+    assert_eq!(second["ok"], true, "{second:?}");
+    let second_id = second["result"]["run_id"].as_str().unwrap().to_owned();
+    assert_ne!(first_id, second_id);
+
+    assert_eq!(
+        state.tracked_analyze_runs(),
+        1,
+        "only the second run remains; the finished first was evicted"
+    );
+    assert!(
+        !first_progress.exists(),
+        "the finished run's progress file must be reaped on the next start"
+    );
+
+    poll_until_status(&state, &second_id, "failed").await;
 }
 
 #[tokio::test]

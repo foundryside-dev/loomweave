@@ -415,6 +415,18 @@ impl ServerState {
         self
     }
 
+    /// Test-only: number of analyze run handles currently held in the registry.
+    /// Lets a test assert that finished runs are evicted (clarion-7e0c21558a)
+    /// rather than accumulating across a long-lived `serve`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn tracked_analyze_runs(&self) -> usize {
+        self.analyze_runs
+            .lock()
+            .expect("analyze run registry mutex")
+            .len()
+    }
+
     #[must_use]
     pub fn with_edge_cap(mut self, execution_edge_cap: usize) -> Self {
         self.execution_edge_cap = execution_edge_cap;
@@ -1633,6 +1645,11 @@ impl ServerState {
             .analyze_runs
             .lock()
             .expect("analyze run registry mutex");
+        // Evict finished handles (and reap their progress files) before
+        // spawning, so a long-lived `serve` doing many analyses does not
+        // accumulate dead entries / `runs/*.progress.json` files
+        // (clarion-7e0c21558a).
+        crate::analyze_runs::reap_terminal_runs(&mut registry);
         // Reject a concurrent run: a second `clarion analyze` would fail to
         // acquire the project's cross-process lock anyway, so surface it as a
         // clear error rather than spawning a doomed child.
