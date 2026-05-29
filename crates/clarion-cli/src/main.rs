@@ -38,7 +38,7 @@ fn main() -> Result<()> {
         } => install::run(
             &path,
             force,
-            install::InstallComponents::from_flags(skills, hooks, all),
+            install::InstallPlan::from_flags(skills, hooks, all),
         ),
         cli::Command::Analyze {
             path,

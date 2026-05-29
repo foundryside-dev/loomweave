@@ -100,34 +100,61 @@ logs/
 runs/*/log.jsonl
 ";
 
-/// Which install components to perform. Resolved from CLI flags in
-/// [`InstallComponents::from_flags`] per the flag semantics in the agent-
+/// What `clarion install` should do, resolved from the CLI flags per the agent-
 /// orientation plan: bare install = init only; `--skills`/`--hooks` are
 /// independent and do NOT init; `--all` = init + skills + hooks.
-#[derive(Debug, Clone, Copy)]
-pub struct InstallComponents {
-    pub init_clarion: bool,
-    pub skills: bool,
-    pub hooks: bool,
+///
+/// Modeled as an enum rather than three independent bools so the derived and
+/// illegal states the bool form allowed are unrepresentable: `init_clarion` is
+/// no longer a peer field that can contradict an explicit component request,
+/// and the do-nothing `{false, false, false}` state (which PR #21 had to guard
+/// against at the `run()` entry) cannot be produced by [`InstallPlan::from_flags`]
+/// at all (clarion-c6b8dc27f3). The three booleans are derived on demand via
+/// [`init_clarion`](Self::init_clarion) / [`skills`](Self::skills) /
+/// [`hooks`](Self::hooks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallPlan {
+    /// Bare `clarion install`: initialise `.clarion/` only.
+    Bare,
+    /// `--skills` and/or `--hooks` without `--all`: apply the named components
+    /// and do NOT initialise `.clarion/`. `from_flags` only constructs this
+    /// when at least one field is `true`.
+    Components { skills: bool, hooks: bool },
+    /// `--all`: initialise `.clarion/` + skills + hooks.
+    All,
 }
 
-impl InstallComponents {
+impl InstallPlan {
+    /// Resolve the CLI flags into a plan. `--all` wins; otherwise any of
+    /// `--skills`/`--hooks` selects [`Components`](Self::Components); no flag
+    /// selects [`Bare`](Self::Bare). Never yields a do-nothing plan.
     #[must_use]
     pub fn from_flags(skills: bool, hooks: bool, all: bool) -> Self {
         if all {
-            return Self {
-                init_clarion: true,
-                skills: true,
-                hooks: true,
-            };
+            Self::All
+        } else if skills || hooks {
+            Self::Components { skills, hooks }
+        } else {
+            Self::Bare
         }
-        let any_component = skills || hooks;
-        Self {
-            // Bare install (no component flags) keeps today's behavior: init.
-            init_clarion: !any_component,
-            skills,
-            hooks,
-        }
+    }
+
+    /// Whether to initialise `.clarion/` (the index). True for `Bare` and `All`.
+    #[must_use]
+    pub fn init_clarion(self) -> bool {
+        matches!(self, Self::Bare | Self::All)
+    }
+
+    /// Whether to install the `clarion-workflow` skill pack.
+    #[must_use]
+    pub fn skills(self) -> bool {
+        matches!(self, Self::All | Self::Components { skills: true, .. })
+    }
+
+    /// Whether to install the `SessionStart` hook.
+    #[must_use]
+    pub fn hooks(self) -> bool {
+        matches!(self, Self::All | Self::Components { hooks: true, .. })
     }
 }
 
@@ -138,7 +165,7 @@ impl InstallComponents {
 /// Returns an error if `.clarion/` already exists without `--force`, if the
 /// target directory cannot be canonicalised, or if any filesystem or database
 /// operation fails.
-pub fn run(path: &Path, force: bool, components: InstallComponents) -> Result<()> {
+pub fn run(path: &Path, force: bool, plan: InstallPlan) -> Result<()> {
     if !path.exists() {
         bail!(
             "target directory does not exist: {}. Create it first or pass a valid --path.",
@@ -149,24 +176,24 @@ pub fn run(path: &Path, force: bool, components: InstallComponents) -> Result<()
         .canonicalize()
         .with_context(|| format!("cannot canonicalise --path {}", path.display()))?;
 
-    // The CLI flag parser cannot produce an all-false `components` (a bare
-    // `clarion install` sets `init_clarion`), but the struct is representable,
-    // so guard the do-nothing state defensively rather than silently succeeding.
-    if !components.init_clarion && !components.skills && !components.hooks {
+    // `from_flags` cannot produce a do-nothing plan, but a hand-built
+    // `Components { skills: false, hooks: false }` still could, so keep a
+    // defensive guard rather than silently succeeding.
+    if !plan.init_clarion() && !plan.skills() && !plan.hooks() {
         bail!(
             "nothing to install: pass --skills, --hooks, or --all, \
              or run bare `clarion install` to initialise .clarion/."
         );
     }
 
-    if components.init_clarion {
+    if plan.init_clarion() {
         let clarion_dir = project_root.join(".clarion");
         let exists = clarion_dir.exists();
         // A bare `clarion install` (no other components requested) refuses to
         // clobber an existing .clarion/. Under `--all` (other idempotent
         // components requested) an already-initialised project is not an error:
         // we keep the existing index and apply the remaining components.
-        let bare_init = !components.skills && !components.hooks;
+        let bare_init = !plan.skills() && !plan.hooks();
         if exists && !force {
             if bare_init {
                 bail!(
@@ -218,7 +245,7 @@ pub fn run(path: &Path, force: bool, components: InstallComponents) -> Result<()
         }
     }
 
-    if components.skills {
+    if plan.skills() {
         let report = crate::skill_pack::install_skill_pack(&project_root)
             .context("install clarion-workflow skill pack")?;
         if report.copied {
@@ -232,7 +259,7 @@ pub fn run(path: &Path, force: bool, components: InstallComponents) -> Result<()
         }
     }
 
-    if components.hooks {
+    if plan.hooks() {
         let changed = crate::hooks_settings::install_session_start_hook(&project_root)
             .context("merge SessionStart hook into .claude/settings.json")?;
         if changed {
@@ -283,38 +310,80 @@ fn initialise_db(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::InstallComponents;
+    use super::InstallPlan;
 
     #[test]
     fn from_flags_truth_table() {
         // Bare install: no component flags -> init only.
-        let bare = InstallComponents::from_flags(false, false, false);
-        assert!(bare.init_clarion);
-        assert!(!bare.skills);
-        assert!(!bare.hooks);
+        let bare = InstallPlan::from_flags(false, false, false);
+        assert_eq!(bare, InstallPlan::Bare);
+        assert!(bare.init_clarion());
+        assert!(!bare.skills());
+        assert!(!bare.hooks());
 
         // --skills: skills only, no init.
-        let skills = InstallComponents::from_flags(true, false, false);
-        assert!(!skills.init_clarion);
-        assert!(skills.skills);
-        assert!(!skills.hooks);
+        let skills = InstallPlan::from_flags(true, false, false);
+        assert_eq!(
+            skills,
+            InstallPlan::Components {
+                skills: true,
+                hooks: false
+            }
+        );
+        assert!(!skills.init_clarion());
+        assert!(skills.skills());
+        assert!(!skills.hooks());
 
         // --hooks: hooks only, no init.
-        let hooks = InstallComponents::from_flags(false, true, false);
-        assert!(!hooks.init_clarion);
-        assert!(!hooks.skills);
-        assert!(hooks.hooks);
+        let hooks = InstallPlan::from_flags(false, true, false);
+        assert_eq!(
+            hooks,
+            InstallPlan::Components {
+                skills: false,
+                hooks: true
+            }
+        );
+        assert!(!hooks.init_clarion());
+        assert!(!hooks.skills());
+        assert!(hooks.hooks());
 
         // --all: everything (component flags ignored).
-        let all = InstallComponents::from_flags(false, false, true);
-        assert!(all.init_clarion);
-        assert!(all.skills);
-        assert!(all.hooks);
+        let all = InstallPlan::from_flags(false, false, true);
+        assert_eq!(all, InstallPlan::All);
+        assert!(all.init_clarion());
+        assert!(all.skills());
+        assert!(all.hooks());
 
         // --skills --hooks: both components, still no init.
-        let both = InstallComponents::from_flags(true, true, false);
-        assert!(!both.init_clarion);
-        assert!(both.skills);
-        assert!(both.hooks);
+        let both = InstallPlan::from_flags(true, true, false);
+        assert_eq!(
+            both,
+            InstallPlan::Components {
+                skills: true,
+                hooks: true
+            }
+        );
+        assert!(!both.init_clarion());
+        assert!(both.skills());
+        assert!(both.hooks());
+    }
+
+    #[test]
+    fn from_flags_never_yields_a_do_nothing_plan() {
+        // The do-nothing {false,false,false} state that PR #21 guarded against
+        // at run() entry is now unreachable through the only public constructor
+        // (clarion-c6b8dc27f3): every flag combination resolves to a plan that
+        // does at least one thing.
+        for skills in [false, true] {
+            for hooks in [false, true] {
+                for all in [false, true] {
+                    let plan = InstallPlan::from_flags(skills, hooks, all);
+                    assert!(
+                        plan.init_clarion() || plan.skills() || plan.hooks(),
+                        "from_flags({skills},{hooks},{all}) produced a do-nothing plan: {plan:?}"
+                    );
+                }
+            }
+        }
     }
 }
