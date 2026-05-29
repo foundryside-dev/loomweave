@@ -7,7 +7,9 @@
 //! failure is `tracing::warn!`-logged before it folds, so a populated index
 //! reporting 0 leaves a trace (run with `RUST_LOG=warn`).
 
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use rusqlite::Connection;
@@ -16,25 +18,45 @@ use serde::Serialize;
 /// Freshness of the `.clarion/` index relative to the source files Clarion
 /// ingested. See the plan's Decision Point (b) for the algorithm.
 ///
-/// Freshness is computed by stat-ing only the files already recorded in
-/// `entities.source_file_path`, so it detects *modified* ingested files but is
-/// blind to files *added* (not yet ingested, so absent from the table) or
-/// *deleted* since the last run. A repo that gained or lost source files
-/// without touching any ingested file can therefore still report [`Fresh`]; the
-/// verdict is a best-effort nudge, not a guarantee. Added/removed-file
-/// detection is tracked as a `release:1.1` follow-up.
+/// Freshness combines two passes over the files recorded in
+/// `entities.source_file_path` (clarion-e687941a8c):
+///
+/// 1. **Structural drift** — added / removed / renamed source files. Adding or
+///    removing a directory entry bumps the *parent directory's* mtime, so a
+///    watched source directory whose mtime is newer than the latest run means
+///    its file set changed since analyze, even when no ingested file's own
+///    mtime did. This is a conservative nudge: unrelated churn in a source
+///    directory (Python's `__pycache__`, an editor's swap/backup file, a
+///    `.DS_Store`) also bumps its mtime and can therefore report [`Stale`]
+///    when no tracked source actually changed. The watch set is the *direct
+///    parents* of ingested files, so an addition/removal in any directory that
+///    is not such a parent goes undetected — always including the project root
+///    itself, which is deliberately never watched (`analyze` writes `.clarion/`
+///    under it, which would otherwise wedge every check to a permanent Stale).
+/// 2. **In-place modification** — an ingested file edited since the run. This
+///    needs one `stat` per file and is bounded by `MAX_MODIFICATION_STAT_FILES`
+///    so `clarion hook session-start` stays cheap on large repos
+///    (clarion-93465ff89e); the structural pass runs first and short-circuits
+///    the common "repo changed" case before any file is stat-ed.
+///
+/// The verdict is a best-effort nudge, not a guarantee.
 ///
 /// [`Fresh`]: Staleness::Fresh
+/// [`Stale`]: Staleness::Stale
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Staleness {
     /// No completed analyze run has ever been recorded.
     NeverAnalyzed,
-    /// At least one ingested source file is newer than the latest run. (Does
-    /// not account for added/removed files — see the type-level note.)
+    /// The index is out of date: a watched source directory's mtime is newer
+    /// than the latest run (a file was added / removed / renamed), an ingested
+    /// file was modified or deleted since the run, or both. See the type-level
+    /// note for the conservative-nudge caveat.
     Stale,
-    /// No ingested source file is newer than the latest run. (Does not account
-    /// for added/removed files — see the type-level note.)
+    /// No structural drift in a watched directory and no ingested file newer
+    /// than (or missing since) the latest run. Subject to the bounded
+    /// modification scan and the unwatched-project-root caveat in the
+    /// type-level note.
     Fresh,
     /// A completed run exists, but no ingested entity has a resolvable
     /// `source_file_path` to stat — there is *nothing to compare against*, so
@@ -241,6 +263,22 @@ fn latest_completed_run(conn: &Connection, degraded: &mut bool) -> Option<String
     }
 }
 
+/// Upper bound on per-file `stat` syscalls in one staleness check — a backstop
+/// against pathological repositories. In-place modification detection
+/// inherently needs one `stat` per ingested file, and `clarion hook
+/// session-start` runs at the top of every agent session, so an unbounded scan
+/// is O(files) syscalls per session start (clarion-93465ff89e). Structural
+/// drift (added / removed / renamed files) is detected first and *exhaustively*
+/// from directory mtimes — O(dirs) ≪ O(files) — which also short-circuits the
+/// common "repo changed since analyze" case before any file is stat-ed. Only a
+/// genuinely-fresh repo falls through to the bounded per-file scan; if it
+/// exceeds this cap the overflow is logged and pure in-place edits to files
+/// past the cap may report [`Staleness::Fresh`] until the next analyze. Sized
+/// well above realistic targets (the elspeth corpus, ~425k LOC, is a few
+/// thousand files) so no real project is sampled — the cap only bites a
+/// pathological monorepo.
+const MAX_MODIFICATION_STAT_FILES: usize = 20_000;
+
 fn compute_staleness(
     conn: &Connection,
     project_root: &Path,
@@ -257,43 +295,120 @@ fn compute_staleness(
         return Staleness::Unknown;
     };
 
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT DISTINCT source_file_path FROM entities \
-         WHERE source_file_path IS NOT NULL",
-    ) else {
-        *degraded = true;
-        return Staleness::Unknown;
-    };
-    let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
-        *degraded = true;
+    let Some((files, dirs)) = ingested_files_and_dirs(conn, project_root, degraded) else {
+        // A query/prepare failure already set `degraded` and folds to Unknown.
         return Staleness::Unknown;
     };
 
-    let mut saw_any_file = false;
+    // (1) Structural drift: any watched source directory newer than the run
+    // means a file was added / removed / renamed in it. Exhaustive over dirs
+    // and far cheaper than the per-file scan, so it runs first.
+    if directory_structural_drift(&dirs, run_time) {
+        return Staleness::Stale;
+    }
+
+    // (2) In-place modification: one stat per ingested file, bounded.
+    match file_modification_drift(&files, run_time) {
+        Some(staleness) => staleness,
+        None => {
+            if files.is_empty() {
+                // A completed run with no resolvable source file to stat:
+                // nothing to compare, NOT an error. Kept distinct from the
+                // error folds so `Unknown` means strictly "a query/parse/stat
+                // failed" (clarion-22add08e98).
+                Staleness::NoSourcePaths
+            } else {
+                Staleness::Fresh
+            }
+        }
+    }
+}
+
+/// Resolve every distinct ingested `source_file_path` to an absolute path, and
+/// collect the distinct parent directories to watch for structural drift. The
+/// project root itself is deliberately excluded from the watch set: `analyze`
+/// writes `.clarion/clarion.db` under it, so the root's mtime is always newer
+/// than the run and would wedge every check to a permanent false [`Stale`]
+/// (the footgun the type-level note records). Returns `None` only on a
+/// query/prepare failure, having set `*degraded`.
+///
+/// [`Stale`]: Staleness::Stale
+fn ingested_files_and_dirs(
+    conn: &Connection,
+    project_root: &Path,
+    degraded: &mut bool,
+) -> Option<(Vec<PathBuf>, BTreeSet<PathBuf>)> {
+    let mut stmt = match conn.prepare(
+        "SELECT DISTINCT source_file_path FROM entities \
+         WHERE source_file_path IS NOT NULL",
+    ) {
+        Ok(stmt) => stmt,
+        Err(err) => {
+            tracing::warn!(error = %err, "clarion staleness source-path query failed");
+            *degraded = true;
+            return None;
+        }
+    };
+    let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+        *degraded = true;
+        return None;
+    };
+
+    let mut files = Vec::new();
+    let mut dirs = BTreeSet::new();
     for rel in rows.flatten() {
         let abs = if Path::new(&rel).is_absolute() {
-            std::path::PathBuf::from(&rel)
+            PathBuf::from(&rel)
         } else {
             project_root.join(&rel)
         };
+        if let Some(parent) = abs.parent()
+            && parent != project_root
+        {
+            dirs.insert(parent.to_path_buf());
+        }
+        files.push(abs);
+    }
+    Some((files, dirs))
+}
+
+/// `true` if any watched directory's mtime is newer than the run, or a watched
+/// directory is gone (a removed package) — both are structural drift. Other
+/// dir-stat errors are environmental and skipped (best-effort, never degrade).
+fn directory_structural_drift(dirs: &BTreeSet<PathBuf>, run_time: SystemTime) -> bool {
+    dirs.iter()
+        .any(|dir| match dir.metadata().and_then(|m| m.modified()) {
+            Ok(mtime) => mtime > run_time,
+            Err(err) => err.kind() == ErrorKind::NotFound,
+        })
+}
+
+/// Scan up to [`MAX_MODIFICATION_STAT_FILES`] ingested files for in-place
+/// edits. Returns `Some(Stale)` on the first file newer-than or deleted-since
+/// the run, `Some(Unknown)` on a non-`NotFound` stat error (environmental, not
+/// degraded), or `None` when every stat-ed file is older than the run (the
+/// caller decides Fresh vs. `NoSourcePaths`). A deleted ingested file
+/// (`NotFound`) is staleness, not an error (clarion-e687941a8c) — the
+/// structural pass usually catches it via the parent directory first, but a
+/// top-level deletion (parent is the unwatched project root) lands here.
+fn file_modification_drift(files: &[PathBuf], run_time: SystemTime) -> Option<Staleness> {
+    for abs in files.iter().take(MAX_MODIFICATION_STAT_FILES) {
         match abs.metadata().and_then(|m| m.modified()) {
-            Ok(mtime) => {
-                saw_any_file = true;
-                if mtime > run_time {
-                    return Staleness::Stale;
-                }
-            }
-            Err(_) => return Staleness::Unknown,
+            Ok(mtime) if mtime > run_time => return Some(Staleness::Stale),
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => return Some(Staleness::Stale),
+            Err(_) => return Some(Staleness::Unknown),
         }
     }
-    if saw_any_file {
-        Staleness::Fresh
-    } else {
-        // A completed run with no resolvable source file to stat: nothing to
-        // compare, NOT an error. Kept distinct from the error folds above so
-        // `Unknown` means strictly "a query/parse/stat failed" (clarion-22add08e98).
-        Staleness::NoSourcePaths
+    if files.len() > MAX_MODIFICATION_STAT_FILES {
+        tracing::warn!(
+            ingested_files = files.len(),
+            cap = MAX_MODIFICATION_STAT_FILES,
+            "clarion staleness: ingested-file count exceeds the modification-scan cap; \
+             in-place edits beyond the cap may go unnoticed until the next analyze"
+        );
     }
+    None
 }
 
 /// Parse a strict RFC3339 UTC timestamp (the format
@@ -326,6 +441,18 @@ mod tests {
         pragma::apply_write_pragmas(&conn).unwrap();
         schema::apply_migrations(&mut conn).unwrap();
         (dir, conn)
+    }
+
+    /// Set a file's or directory's mtime deterministically (no flaky sleeps).
+    /// Opening a directory read-only and calling `set_modified` issues
+    /// `futimens` on the dir fd, which is permitted on Linux.
+    fn set_mtime(path: &std::path::Path, when: std::time::SystemTime) {
+        std::fs::File::options()
+            .read(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
     }
 
     fn insert_entity(conn: &Connection, id: &str, kind: &str, source_file_path: Option<&str>) {
@@ -365,9 +492,11 @@ mod tests {
         assert_eq!(snap.entity_count, 3);
         assert_eq!(snap.subsystem_count, 1);
         assert_eq!(snap.finding_count, 1);
-        // No source files exist under /nonexistent-root, but there IS a completed
-        // run, so staleness degrades to Unknown (stat failure folds to Unknown).
-        assert_eq!(snap.staleness, Staleness::Unknown);
+        // The ingested `a.py` does not exist under /nonexistent-root and sits at
+        // the (unwatched) project root, so the per-file scan stats it, gets
+        // NotFound, and reports the file as deleted-since-analyze → Stale
+        // (clarion-e687941a8c).
+        assert_eq!(snap.staleness, Staleness::Stale);
     }
 
     #[test]
@@ -421,13 +550,13 @@ mod tests {
         assert_eq!(snap.staleness, Staleness::Stale, "{snap:?}");
     }
 
-    // `compute_staleness` has two error folds to `Unknown` — (a) the run
-    // timestamp fails to parse; (c) a stat/`modified()` error — plus one
-    // non-error fold, (b) a completed run exists but no entity has a resolvable
-    // source_file_path (`saw_any_file == false`), which is its own
-    // `NoSourcePaths` variant (clarion-22add08e98). `counts_entities_subsystems_and_findings`
-    // and `stat_failure_unknown_is_not_degraded` cover (c); the two tests below
-    // lock (a) → Unknown+degraded and (b) → NoSourcePaths (never degraded).
+    // `compute_staleness` folds: (a) an unparseable run timestamp → Unknown +
+    // degraded; (b) a completed run with no resolvable source path →
+    // NoSourcePaths (never degraded, clarion-22add08e98); (c) a *non*-NotFound
+    // stat error → Unknown (environmental, never degraded). A deleted ingested
+    // file (NotFound) is no longer (c) — it now reports Stale
+    // (clarion-e687941a8c). `non_notfound_stat_error_folds_to_unknown_not_stale`
+    // covers (c); the tests below lock (a) and (b).
 
     #[test]
     fn unknown_and_degraded_when_run_timestamp_unparseable() {
@@ -540,10 +669,12 @@ mod tests {
     }
 
     #[test]
-    fn stat_failure_unknown_is_not_degraded() {
-        // Environmental Unknown (a recorded source file that no longer exists on
-        // disk) is a normal outcome signalled by `staleness`, NOT a DB-machinery
-        // failure — it must leave `degraded` false so the two stay distinct.
+    fn deleted_top_level_source_file_reports_stale() {
+        // A recorded source file that no longer exists on disk was deleted since
+        // the last analyze: that is staleness, not Unknown (clarion-e687941a8c).
+        // `gone.py` sits at the (unwatched) project root, so the structural pass
+        // can't see it and the per-file scan's NotFound drives the verdict. A
+        // deletion is environmental, so `degraded` stays false.
         let (_dir, conn) = migrated_conn();
         insert_entity(&conn, "python:module:a", "module", Some("gone.py"));
         conn.execute(
@@ -553,10 +684,78 @@ mod tests {
         )
         .unwrap();
         let snap = project_snapshot(&conn, std::path::Path::new("/nonexistent-root"));
+        assert_eq!(snap.staleness, Staleness::Stale, "{snap:?}");
+        assert!(
+            !snap.degraded,
+            "a deleted source file is environmental, not degraded: {snap:?}"
+        );
+    }
+
+    #[test]
+    fn added_file_in_watched_dir_reports_stale_via_directory_mtime() {
+        // A brand-new file the last analyze never ingested is invisible to the
+        // per-file scan (it is absent from `entities`), but adding it bumped its
+        // parent directory's mtime — which the structural pass catches. Pin the
+        // ingested file OLDER than the run and the directory NEWER, so ONLY the
+        // structural pass can produce Stale: if detection regressed to files
+        // alone this would wrongly report Fresh (clarion-e687941a8c).
+        use super::parse_iso8601_to_systemtime;
+        let (_dir, conn) = migrated_conn();
+        let root = tempfile::tempdir().unwrap();
+        let pkg = root.path().join("pkg");
+        std::fs::create_dir(&pkg).unwrap();
+        let a = pkg.join("a.py");
+        std::fs::write(&a, "x = 1\n").unwrap();
+
+        let run_iso = "2026-06-15T00:00:00.000Z";
+        let run_time = parse_iso8601_to_systemtime(run_iso).unwrap();
+        let day = std::time::Duration::from_secs(86_400);
+        set_mtime(&a, run_time - day); // ingested file untouched since the run
+        set_mtime(&pkg, run_time + day); // a sibling file was added after the run
+
+        insert_entity(&conn, "python:module:pkg.a", "module", Some("pkg/a.py"));
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+             VALUES ('r', ?1, ?1, '{}', '{}', 'completed')",
+            rusqlite::params![run_iso],
+        )
+        .unwrap();
+
+        let snap = project_snapshot(&conn, root.path());
+        assert_eq!(snap.staleness, Staleness::Stale, "{snap:?}");
+        assert!(
+            !snap.degraded,
+            "structural drift is environmental, not degraded: {snap:?}"
+        );
+    }
+
+    #[test]
+    fn non_notfound_stat_error_folds_to_unknown_not_stale() {
+        // A stat failure that is NOT "file missing" — here ENOTDIR, a path whose
+        // parent component is a regular file — is environmental machinery we
+        // cannot read: it folds to Unknown, never Stale, and never sets
+        // `degraded`. This is the fold a deleted file (NotFound -> Stale) is now
+        // distinguished from.
+        let (_dir, conn) = migrated_conn();
+        let root = tempfile::tempdir().unwrap();
+        // A regular file where a directory is expected: stat("blocker/child.py")
+        // returns ENOTDIR, not NotFound.
+        std::fs::write(root.path().join("blocker"), "not a dir\n").unwrap();
+        insert_entity(&conn, "python:module:x", "module", Some("blocker/child.py"));
+        // Run far in the future so the structural pass (which stats the parent
+        // "blocker", a real file with a ~now mtime) finds nothing newer and falls
+        // through to the per-file scan where the ENOTDIR fold happens.
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+             VALUES ('r', '2099-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z', '{}', '{}', 'completed')",
+            [],
+        )
+        .unwrap();
+        let snap = project_snapshot(&conn, root.path());
         assert_eq!(snap.staleness, Staleness::Unknown, "{snap:?}");
         assert!(
             !snap.degraded,
-            "stat-failure Unknown is environmental, not degraded: {snap:?}"
+            "an environmental stat error is not degraded: {snap:?}"
         );
     }
 

@@ -363,8 +363,7 @@ pub(crate) fn build_report(
          HEAD-vs-analyze staleness uses HEAD committer date vs run completion time"
             .to_owned(),
         "added (never-indexed) source files are not enumerated here beyond the \
-         git dirty set; a new commit still flips head_newer_than_analyze \
-         (broader added/removed blindness: clarion-e687941a8c)"
+         git dirty set; a new commit still flips head_newer_than_analyze"
             .to_owned(),
     ];
     if file_drift.stat_failures > 0 {
