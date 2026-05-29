@@ -910,11 +910,15 @@ impl ServerState {
                 let edge_count = scalar_count_fail_soft(conn, "SELECT COUNT(*) FROM edges");
                 let plugins = plugin_entity_counts(conn);
                 let latest_run = latest_run_row(conn);
-                Ok((snapshot, edge_count, plugins, latest_run))
+                // SQLite's data_version increments when another connection commits
+                // to the DB, so a consult agent can detect that the index changed
+                // under it across calls (clarion-22c18fdb34).
+                let data_version = scalar_count_fail_soft(conn, "PRAGMA data_version");
+                Ok((snapshot, edge_count, plugins, latest_run, data_version))
             })
             .await;
 
-        let (snapshot, edge_count, plugins, latest_run) = match storage {
+        let (snapshot, edge_count, plugins, latest_run, data_version) = match storage {
             Ok(tuple) => tuple,
             Err(err) => {
                 return Ok(tool_error_envelope(
@@ -925,10 +929,29 @@ impl ServerState {
             }
         };
 
+        // The on-disk size, paired with data_version, exposes a swapped or
+        // truncated DB the server may still be serving from a stale handle.
+        let db_size_bytes = std::fs::metadata(&db_path).map(|meta| meta.len()).ok();
+
+        // A served index that has a completed run but no entities is almost
+        // always a wrong/empty/swapped corpus — surface it in the log so an
+        // operator notices even without reading the diagnostics (clarion-22c18fdb34).
+        if snapshot.db_present && snapshot.entity_count == 0 && snapshot.last_analyzed_at.is_some()
+        {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                "project_status: served index has a completed run but zero entities (possible empty or swapped DB)"
+            );
+        }
+
         let result = json!({
             "project_root": root_display,
             "db_path": db_path.display().to_string(),
             "db_present": snapshot.db_present,
+            "db_identity": {
+                "db_size_bytes": db_size_bytes,
+                "data_version": data_version,
+            },
             "latest_run": latest_run,
             "counts": {
                 "entities": snapshot.entity_count,

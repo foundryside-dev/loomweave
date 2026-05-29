@@ -2662,6 +2662,28 @@ fn tools_list_includes_project_status() {
 }
 
 #[tokio::test]
+async fn project_status_reports_db_identity_for_drift_detection() {
+    // A swapped/stale DB is otherwise invisible to a consult agent. Report a
+    // db_identity block (on-disk size + SQLite data_version) so drift is
+    // detectable across calls (clarion-22c18fdb34).
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(&state, "project_status", json!({})).await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    let identity = &envelope["result"]["db_identity"];
+    assert!(
+        identity["db_size_bytes"].as_u64().is_some_and(|n| n > 0),
+        "db_size_bytes should reflect the served file: {envelope}"
+    );
+    assert!(
+        identity["data_version"].as_i64().is_some(),
+        "data_version should be reported for drift detection: {envelope}"
+    );
+}
+
+#[tokio::test]
 async fn project_status_reports_counts_latest_run_and_plugins() {
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).expect("open sqlite");
