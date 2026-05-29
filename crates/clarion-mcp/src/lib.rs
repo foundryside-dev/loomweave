@@ -131,7 +131,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "summary",
-            description: "Return an on-demand cached summary for one entity. In v0.1 this is leaf scope only: module summaries describe the module docstring and top-level members, not an aggregation of contained function/class summaries.",
+            description: "Return an on-demand cached summary for one entity. In v0.1 this is leaf scope only: module summaries describe the module docstring and top-level members, not an aggregation of contained function/class summaries. If the LLM returns non-JSON the response degrades to a deterministic structural summary (kind: structural-fallback) built from the entity source, and that fallback is cached so a retry is a free cache hit rather than a re-billed failure.",
             input_schema: id_schema(),
         },
         ToolDefinition {
@@ -1478,7 +1478,7 @@ impl ServerState {
             entity_id: ready.entity.id.clone(),
             kind: ready.entity.kind.clone(),
             name: ready.entity.name.clone(),
-            source_excerpt,
+            source_excerpt: source_excerpt.clone(),
         });
         let request = LlmRequest {
             purpose: LlmPurpose::Summary,
@@ -1512,16 +1512,48 @@ impl ServerState {
         }
 
         if serde_json::from_str::<Value>(&response.output_json).is_err() {
-            return tool_error_envelope_with_diagnostics(
-                "llm-invalid-json",
-                "summary provider returned non-JSON output",
-                true,
-                summary_usage_stats(&response, true),
-                vec![json!({
-                    "code": "CLA-LLM-INVALID-JSON",
-                    "message": "summary provider returned non-JSON output",
-                    "usage": llm_usage_json(&response)
-                })],
+            // The provider returned non-JSON — a deterministic failure for this
+            // input. Rather than bill the caller for an error and force the same
+            // paid failure on every retry, fall back to a structural summary
+            // built from the entity's own source and cache it, so the next
+            // request is a free cache hit (clarion-ed246ca3aa).
+            let mut stats_delta = summary_usage_stats(&response, true);
+            if let Some(object) = stats_delta.as_object_mut() {
+                object.insert("summary_structural_fallback_total".to_owned(), json!(1));
+            }
+            let cached_input_tokens = i64::from(response.cached_input_tokens);
+            let entry = SummaryCacheEntry {
+                key: ready.key,
+                summary_json: structural_summary_json(&ready.entity, &source_excerpt),
+                cost_usd: response.cost_usd,
+                tokens_input: i64::from(response.input_tokens),
+                tokens_output: i64::from(response.output_tokens),
+                caller_count: ready.caller_count,
+                fan_out: ready.fan_out,
+                stale_semantic: false,
+                created_at: now.clone(),
+                last_accessed_at: now,
+            };
+            if let Err(err) = self
+                .send_writer(&summary_llm.writer, |ack| WriterCmd::UpsertSummaryCache {
+                    entry: Box::new(entry.clone()),
+                    ack,
+                })
+                .await
+            {
+                return tool_error_envelope(
+                    "storage-error",
+                    &err.to_string(),
+                    storage_retryable(&err),
+                );
+            }
+            return summary_success_envelope(
+                &ready.entity,
+                &entry,
+                false,
+                false,
+                Some(cached_input_tokens),
+                stats_delta,
             );
         }
 
@@ -2830,6 +2862,33 @@ impl SourceExcerptError {
     }
 }
 
+/// Deterministic structural summary used when the LLM returns non-JSON
+/// (clarion-ed246ca3aa). Carries the entity's identity plus a bounded head of
+/// its own source (where the signature and docstring live), so the caller gets
+/// usable orientation instead of a billed error. `kind: structural-fallback`
+/// lets consumers distinguish it from a real LLM summary.
+fn structural_summary_json(entity: &EntityRow, source_excerpt: &str) -> String {
+    const STRUCTURAL_SUMMARY_MAX_CHARS: usize = 1200;
+    let mut source_head: String = source_excerpt
+        .chars()
+        .take(STRUCTURAL_SUMMARY_MAX_CHARS)
+        .collect();
+    let source_truncated = source_excerpt.chars().count() > STRUCTURAL_SUMMARY_MAX_CHARS;
+    if source_truncated {
+        source_head.push('…');
+    }
+    serde_json::to_string(&json!({
+        "kind": "structural-fallback",
+        "note": "LLM summary unavailable (provider returned non-JSON); deterministic structural summary derived from the entity source.",
+        "entity_kind": entity.kind,
+        "short_name": entity.short_name,
+        "qualified_name": entity.name,
+        "source_head": source_head,
+        "source_truncated": source_truncated
+    }))
+    .expect("structural summary serializes")
+}
+
 fn summary_success_envelope(
     entity: &EntityRow,
     entry: &SummaryCacheEntry,
@@ -3322,7 +3381,7 @@ mod tests {
         assert_eq!(tools[4].name, "summary");
         assert_eq!(
             tools[4].description,
-            "Return an on-demand cached summary for one entity. In v0.1 this is leaf scope only: module summaries describe the module docstring and top-level members, not an aggregation of contained function/class summaries."
+            "Return an on-demand cached summary for one entity. In v0.1 this is leaf scope only: module summaries describe the module docstring and top-level members, not an aggregation of contained function/class summaries. If the LLM returns non-JSON the response degrades to a deterministic structural summary (kind: structural-fallback) built from the entity source, and that fallback is cached so a retry is a free cache hit rather than a re-billed failure."
         );
         assert_eq!(tools[5].name, "issues_for");
         assert_eq!(

@@ -1161,7 +1161,7 @@ async fn summary_cold_miss_records_provider_response_then_hits_cache() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn summary_invalid_json_preserves_usage_accounting() {
+async fn summary_invalid_json_falls_back_to_structural_summary() {
     let (project, db_path) = open_project();
     let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
     let provider = Arc::new(AnySummaryProvider::new_output("not-json", 120, 0.012));
@@ -1180,15 +1180,69 @@ async fn summary_invalid_json_preserves_usage_accounting() {
     )
     .await;
 
-    assert_eq!(envelope["ok"], false);
-    assert_eq!(envelope["error"]["code"], "llm-invalid-json");
-    assert_eq!(envelope["stats_delta"]["summary_cache_misses_total"], 1);
-    assert_eq!(envelope["stats_delta"]["summary_tokens_input"], 100);
-    assert_eq!(envelope["stats_delta"]["summary_tokens_output"], 20);
-    assert_eq!(envelope["stats_delta"]["summary_tokens_total"], 120);
+    // Invalid provider JSON degrades to a deterministic structural summary
+    // instead of an error (clarion-ed246ca3aa).
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(envelope["result"]["available"], true);
+    assert_eq!(envelope["result"]["summary"]["kind"], "structural-fallback");
+    assert!(envelope["result"]["summary"]["source_head"].is_string());
+    // The single real call is still accounted (honest), flagged as a fallback.
     assert_eq!(envelope["stats_delta"]["summary_cost_usd"], 0.012);
     assert_eq!(envelope["stats_delta"]["llm_invalid_json_total"], 1);
+    assert_eq!(
+        envelope["stats_delta"]["summary_structural_fallback_total"],
+        1
+    );
     assert_eq!(provider.invocations().len(), 1);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_invalid_json_fallback_is_cached_and_not_rebilled() {
+    let (project, db_path) = open_project();
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnySummaryProvider::new_output("not-json", 120, 0.012));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let first = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(first["ok"], true, "{first}");
+    assert_eq!(provider.invocations().len(), 1);
+
+    // A repeat request must hit the cached fallback: no second LLM call, no
+    // second bill — the deterministic-failure billing loop is closed.
+    let second = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(second["ok"], true, "{second}");
+    assert_eq!(second["result"]["cache"]["hit"], true);
+    assert_eq!(second["result"]["summary"]["kind"], "structural-fallback");
+    assert_eq!(second["stats_delta"]["summary_cache_hits_total"], 1);
+    assert!(
+        second["stats_delta"].get("summary_cost_usd").is_none(),
+        "cache hit must not bill again: {second}"
+    );
+    assert_eq!(
+        provider.invocations().len(),
+        1,
+        "no second provider invocation"
+    );
 
     drop(state);
     drop(writer);
