@@ -218,6 +218,19 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "additionalProperties": false
             }),
         },
+        ToolDefinition {
+            name: "orientation_pack",
+            description: "Assemble one deterministic orientation packet for a code location — the replacement for hand-composing find_entity + entity_at + source reads + neighborhood + issues_for + freshness on every question. Resolve EITHER by `entity` id OR by `file`+`line` (exactly one form). The packet bundles: the primary entity, the entity_context evidence (match_reason / containing stack / decl-body-decorator ranges — so a decorator-line query is explained, not guessed), a compact source-span summary, one-hop neighbors (callers, callees, container, contained, references, imports), compact resolved execution paths, related Filigree issues, index/Filigree/LLM health, warnings, and suggested next reads. No LLM summary is invoked. Every list is bounded; an `omitted` block reports per-section truncation counts and `degraded` sections name surfaces that were unavailable (e.g. Filigree down) so an empty section is never read as a guaranteed negative.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "entity": {"type": "string", "minLength": 1},
+                    "file": {"type": "string", "minLength": 1},
+                    "line": {"type": "integer", "minimum": 1}
+                },
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -475,6 +488,10 @@ impl ServerState {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
+            "orientation_pack" => match self.tool_orientation_pack(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
             _ => unreachable!("known tools checked above"),
         };
 
@@ -564,7 +581,7 @@ impl ServerState {
                 Ok(json!({
                     "entity": matched.as_ref().map(entity_json),
                     "entity_context": entity_context_json(
-                        line,
+                        Some(line),
                         matched.as_ref(),
                         &candidates,
                         &stack,
@@ -1095,6 +1112,339 @@ impl ServerState {
                 storage_retryable(&err),
             )),
         }
+    }
+
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    async fn tool_orientation_pack(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        // Exactly one resolution form: an `entity` id, or a `file` + `line`.
+        let entity_arg = arguments
+            .get("entity")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        let file_arg = arguments
+            .get("file")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        let has_line = arguments.get("line").is_some();
+
+        // `query_line == Some` selects the file/line form; `None` the entity form.
+        let (query_line, normalized_path, entity_id_arg) = match (entity_arg, file_arg, has_line) {
+            (Some(id), None, false) => (None, None, Some(id.to_owned())),
+            (None, Some(file), true) => {
+                let line = required_i64(arguments, "line")?;
+                if line <= 0 {
+                    return Err(ParamError::new("line must be a positive integer"));
+                }
+                match normalize_source_path(&self.project_root, file) {
+                    Ok(path) => (Some(line), Some(path), None),
+                    Err(err) => {
+                        return Ok(tool_error_envelope("invalid-path", &err.to_string(), false));
+                    }
+                }
+            }
+            _ => {
+                return Err(ParamError::new(
+                    "provide exactly one of: `entity` (id), or `file` + `line`",
+                ));
+            }
+        };
+
+        let project_root = self.project_root.clone();
+        let edge_cap = self.execution_edge_cap;
+        let path_cap = self.execution_path_cap;
+
+        let core = self
+            .readers
+            .with_reader(move |conn| {
+                // Resolve the primary entity. The file/line form additionally
+                // yields the containing candidate set for ambiguity reporting.
+                let (matched, candidates) = if let Some(line) = query_line {
+                    let path = normalized_path.as_deref().unwrap_or_default();
+                    let candidates = entities_containing_line(conn, path, line)?;
+                    (candidates.first().cloned(), candidates)
+                } else {
+                    let id = entity_id_arg.as_deref().unwrap_or_default();
+                    match entity_by_id(conn, id)? {
+                        Some(entity) => (Some(entity.clone()), vec![entity]),
+                        None => (None, Vec::new()),
+                    }
+                };
+
+                let snapshot = crate::snapshot::project_snapshot(conn, &project_root);
+                let freshness = json!({
+                    "staleness": snapshot.staleness(),
+                    "last_analyzed_at": snapshot.last_analyzed_at(),
+                    "degraded": snapshot.degraded(),
+                });
+                let staleness_stale =
+                    matches!(snapshot.staleness(), crate::snapshot::Staleness::Stale);
+
+                let Some(entity) = matched else {
+                    return Ok(OrientationCore {
+                        primary_id: None,
+                        primary_kind: None,
+                        lookup_was_id: query_line.is_none(),
+                        packet: json!({
+                            "primary_entity": Value::Null,
+                            "entity_context":
+                                entity_context_json(query_line, None, &[], &[], &snapshot),
+                            "source": Value::Null,
+                            "neighbors": Value::Null,
+                            "execution_paths": Value::Null,
+                        }),
+                        freshness,
+                        staleness_stale,
+                        neighbors_omitted: serde_json::Map::new(),
+                        paths_truncation_reason: None,
+                    });
+                };
+
+                let ancestors = ancestor_chain(conn, &entity.id)?;
+                let entity_context = entity_context_json(
+                    query_line,
+                    Some(&entity),
+                    &candidates,
+                    &ancestors,
+                    &snapshot,
+                );
+
+                let source = json!({
+                    "source_file_path": entity.source_file_path,
+                    "source_line_start": entity.source_line_start,
+                    "source_line_end": entity.source_line_end,
+                    "line_count": match (entity.source_line_start, entity.source_line_end) {
+                        (Some(start), Some(end)) if end >= start => Some(end - start + 1),
+                        _ => None,
+                    },
+                    "content_hash": entity.content_hash,
+                });
+
+                // One-hop neighbors at resolved confidence, each bounded.
+                let confidence = EdgeConfidence::Resolved;
+                let callers_all = call_edges_targeting(conn, &entity.id, confidence)?
+                    .into_iter()
+                    .filter_map(|edge| caller_json(conn, &edge).transpose())
+                    .collect::<Result<Vec<_>, StorageError>>()?;
+                let callees_all = call_edges_from(conn, &entity.id, confidence)?
+                    .into_iter()
+                    .filter_map(|edge| callee_json(conn, &edge).transpose())
+                    .collect::<Result<Vec<_>, StorageError>>()?;
+                let container = entity
+                    .parent_id
+                    .as_deref()
+                    .and_then(|parent_id| entity_by_id(conn, parent_id).transpose())
+                    .transpose()?
+                    .as_ref()
+                    .map(entity_json);
+                let contained_all = child_entity_ids(conn, &entity.id)?
+                    .iter()
+                    .filter_map(|child_id| entity_by_id(conn, child_id).transpose())
+                    .map(|row| row.map(|entity| entity_json(&entity)))
+                    .collect::<Result<Vec<_>, StorageError>>()?;
+                let refs_in = reference_neighbors(conn, &entity.id, ReferenceDirection::In)?;
+                let refs_out = reference_neighbors(conn, &entity.id, ReferenceDirection::Out)?;
+                let imports_in = import_neighbors(conn, &entity.id, ReferenceDirection::In)?;
+                let imports_out = import_neighbors(conn, &entity.id, ReferenceDirection::Out)?;
+
+                let cap = ORIENTATION_PACK_MAX_NEIGHBORS;
+                let (callers, callers_omitted) = cap_neighbor_list(callers_all, cap);
+                let (callees, callees_omitted) = cap_neighbor_list(callees_all, cap);
+                let (contained, contained_omitted) = cap_neighbor_list(contained_all, cap);
+                let (references_in, refs_in_omitted) = cap_neighbor_list(refs_in, cap);
+                let (references_out, refs_out_omitted) = cap_neighbor_list(refs_out, cap);
+                let (imports_in, imports_in_omitted) = cap_neighbor_list(imports_in, cap);
+                let (imports_out, imports_out_omitted) = cap_neighbor_list(imports_out, cap);
+
+                let mut scope_excludes = call_graph_scope_excludes(confidence);
+                scope_excludes.extend(reference_scope_excludes(&entity.kind));
+
+                let neighbors = json!({
+                    "callers": callers,
+                    "callees": callees,
+                    "container": container,
+                    "contained": contained,
+                    "references_in": references_in,
+                    "references_out": references_out,
+                    "imports_in": imports_in,
+                    "imports_out": imports_out,
+                    "scope_excludes": scope_excludes,
+                });
+
+                // Compact resolved execution paths.
+                let mut traversal = PathTraversal::new(edge_cap);
+                let mut path = vec![entity.id.clone()];
+                traversal.walk(
+                    conn,
+                    &entity.id,
+                    &mut path,
+                    ORIENTATION_PACK_PATH_DEPTH,
+                    confidence,
+                )?;
+                let edge_truncated = traversal.truncated;
+                let edge_count_visited = traversal.edge_count_visited;
+                let compact = compact_execution_paths(conn, traversal.paths, path_cap)?;
+                let paths_truncation_reason =
+                    path_truncation_reason(edge_truncated, compact.path_cap_truncated);
+                let execution_paths = json!({
+                    "root": entity.id,
+                    "nodes": compact.nodes,
+                    "paths": compact.paths,
+                    "edge_count_visited": edge_count_visited,
+                    "truncated": paths_truncation_reason.is_some(),
+                    "truncation_reason": paths_truncation_reason,
+                });
+
+                let mut neighbors_omitted = serde_json::Map::new();
+                for (key, omitted) in [
+                    ("callers", callers_omitted),
+                    ("callees", callees_omitted),
+                    ("contained", contained_omitted),
+                    ("references_in", refs_in_omitted),
+                    ("references_out", refs_out_omitted),
+                    ("imports_in", imports_in_omitted),
+                    ("imports_out", imports_out_omitted),
+                ] {
+                    neighbors_omitted.insert(key.to_owned(), json!(omitted));
+                }
+
+                Ok(OrientationCore {
+                    primary_id: Some(entity.id.clone()),
+                    primary_kind: Some(entity.kind.clone()),
+                    lookup_was_id: query_line.is_none(),
+                    packet: json!({
+                        "primary_entity": entity_json(&entity),
+                        "entity_context": entity_context,
+                        "source": source,
+                        "neighbors": neighbors,
+                        "execution_paths": execution_paths,
+                    }),
+                    freshness,
+                    staleness_stale,
+                    neighbors_omitted,
+                    paths_truncation_reason: paths_truncation_reason.map(str::to_owned),
+                })
+            })
+            .await;
+
+        let core = match core {
+            Ok(core) => core,
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    "storage-error",
+                    &err.to_string(),
+                    storage_retryable(&err),
+                ));
+            }
+        };
+
+        // An `entity`-id lookup that resolved to nothing is a hard error; a
+        // file/line lookup that spans nothing degrades to a no_match packet.
+        if core.primary_id.is_none() && core.lookup_was_id {
+            return Ok(tool_error_envelope(
+                "entity-not-found",
+                "no entity with the given id",
+                false,
+            ));
+        }
+
+        // Related Filigree issues — reuse `issues_for` so its disabled /
+        // unreachable degradation paths are shared. Bounded to the primary
+        // entity (no contained fan-out) to keep the packet small.
+        let issues = if let Some(primary_id) = &core.primary_id {
+            let mut issue_args = serde_json::Map::new();
+            issue_args.insert("id".to_owned(), json!(primary_id));
+            issue_args.insert("include_contained".to_owned(), json!(false));
+            match self.tool_issues_for(&issue_args).await {
+                Ok(envelope) => envelope.get("result").cloned().unwrap_or(Value::Null),
+                Err(_) => json!({"available": false, "reason": "issues lookup failed"}),
+            }
+        } else {
+            json!({"available": false, "reason": "no primary entity at this location"})
+        };
+
+        let health = json!({
+            "index": core.freshness,
+            "filigree": self.filigree_diagnostics_json(),
+            "llm": self.llm_diagnostics_json(),
+        });
+
+        let neighbors_truncated = core
+            .neighbors_omitted
+            .values()
+            .any(|value| value.as_u64().unwrap_or(0) > 0);
+        let paths_truncated = core.paths_truncation_reason.is_some();
+
+        let mut warnings: Vec<String> = Vec::new();
+        if core.primary_id.is_none() {
+            warnings.push(
+                "No entity spans this location; only the enclosing scope (if any) is reported — \
+                 not a guaranteed absence of code."
+                    .to_owned(),
+            );
+        }
+        if core.staleness_stale {
+            warnings.push(
+                "Index is stale: at least one ingested source file is newer than the last \
+                 analyze run. Re-run `clarion analyze`."
+                    .to_owned(),
+            );
+        }
+        if issues.get("available") == Some(&Value::Bool(false)) {
+            let reason = issues
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unavailable");
+            warnings.push(format!(
+                "Filigree issues unavailable ({reason}); the related-issues section is empty for \
+                 lack of data, not lack of issues."
+            ));
+        }
+        if neighbors_truncated {
+            warnings
+                .push("Some neighbor lists were truncated; see `omitted` for counts.".to_owned());
+        }
+        if paths_truncated {
+            warnings.push(
+                "Execution paths were truncated; see `omitted.execution_paths_truncation_reason`."
+                    .to_owned(),
+            );
+        }
+
+        let suggested = orientation_suggested_reads(
+            &core.packet,
+            core.primary_id.as_deref(),
+            core.primary_kind.as_deref(),
+        );
+
+        let mut omitted = core.neighbors_omitted.clone();
+        omitted.insert(
+            "execution_paths_truncated".to_owned(),
+            json!(paths_truncated),
+        );
+        omitted.insert(
+            "execution_paths_truncation_reason".to_owned(),
+            json!(core.paths_truncation_reason),
+        );
+
+        let truncated = neighbors_truncated || paths_truncated;
+
+        let mut packet = core.packet;
+        let object = packet
+            .as_object_mut()
+            .expect("orientation packet is an object");
+        object.insert("issues".to_owned(), issues);
+        object.insert("health".to_owned(), health);
+        object.insert("warnings".to_owned(), json!(warnings));
+        object.insert("suggested_next_reads".to_owned(), json!(suggested));
+        object.insert("omitted".to_owned(), Value::Object(omitted));
+
+        Ok(success_envelope_with_truncation(
+            packet,
+            truncated.then_some("orientation-pack-bounds"),
+        ))
     }
 
     async fn tool_source_for_entity(
@@ -3508,7 +3858,7 @@ fn stack_entity_json(entity: &EntityRow) -> Value {
 /// and index freshness. Returns a `no_match` shell when no entity spans the
 /// line (e.g. an unindexed file).
 fn entity_context_json(
-    line: i64,
+    line: Option<i64>,
     matched: Option<&EntityRow>,
     candidates: &[EntityRow],
     ancestors: &[EntityRow],
@@ -3547,29 +3897,144 @@ fn entity_context_json(
 
     // Ambiguity: other candidates sharing the winner's span length are genuine
     // same-granularity overlaps. Strictly larger spans are the nesting stack
-    // already captured above, so they are not alternatives.
+    // already captured above, so they are not alternatives. Only meaningful for
+    // a line query; an `entity`-id lookup has no line to disambiguate.
     let matched_len = span_len(matched);
-    let alternatives: Vec<Value> = candidates
-        .iter()
-        .skip(1)
-        .filter(|cand| matched_len.is_some() && span_len(cand) == matched_len)
-        .take(ENTITY_CONTEXT_MAX_ALTERNATIVES)
-        .map(|cand| {
-            json!({
-                "entity": entity_json(cand),
-                "match_reason": match_reason_for(line, cand),
+    let alternatives: Vec<Value> = match line {
+        Some(line) => candidates
+            .iter()
+            .skip(1)
+            .filter(|cand| matched_len.is_some() && span_len(cand) == matched_len)
+            .take(ENTITY_CONTEXT_MAX_ALTERNATIVES)
+            .map(|cand| {
+                json!({
+                    "entity": entity_json(cand),
+                    "match_reason": match_reason_for(line, cand),
+                })
             })
-        })
-        .collect();
+            .collect(),
+        None => Vec::new(),
+    };
+
+    // For a line query, explain why that line matched; for a direct `entity`-id
+    // lookup there is no line, so the reason is simply "entity".
+    let match_reason = match line {
+        Some(line) => match_reason_for(line, matched),
+        None => "entity",
+    };
 
     json!({
         "query_line": line,
-        "match_reason": match_reason_for(line, matched),
+        "match_reason": match_reason,
         "containing_stack": containing_stack,
         "ranges": ranges,
         "alternatives": alternatives,
         "freshness": freshness,
     })
+}
+
+/// Per-section neighbor cap for `orientation_pack` — keeps the packet bounded
+/// while still surfacing the most relevant edges; overflow is reported in
+/// `omitted`.
+const ORIENTATION_PACK_MAX_NEIGHBORS: usize = 10;
+
+/// Call-graph traversal depth for `orientation_pack`'s compact execution paths.
+/// Matches the `execution_paths_from` default so the packet's paths line up
+/// with a follow-up call to that tool.
+const ORIENTATION_PACK_PATH_DEPTH: usize = 3;
+
+/// Sync portion of an `orientation_pack`: everything one reader snapshot can
+/// produce, plus the flags the async assembly stage needs for warnings and the
+/// `omitted` block. Issues + health are layered on afterward.
+struct OrientationCore {
+    primary_id: Option<String>,
+    primary_kind: Option<String>,
+    /// True when the request used the `entity`-id form (so a `None`
+    /// `primary_id` is a hard not-found, not a graceful `no_match`).
+    lookup_was_id: bool,
+    packet: Value,
+    freshness: Value,
+    staleness_stale: bool,
+    neighbors_omitted: serde_json::Map<String, Value>,
+    paths_truncation_reason: Option<String>,
+}
+
+/// Sort a neighbor list by entity id (stable, deterministic) and cap it,
+/// returning the kept list and how many were dropped.
+fn cap_neighbor_list(mut list: Vec<Value>, cap: usize) -> (Vec<Value>, usize) {
+    list.sort_by(|a, b| neighbor_sort_key(a).cmp(neighbor_sort_key(b)));
+    let omitted = list.len().saturating_sub(cap);
+    list.truncate(cap);
+    (list, omitted)
+}
+
+/// Entity id of a neighbor JSON record (`{"entity": {"id": ...}, ...}` or a
+/// bare entity object), used as a deterministic sort key.
+fn neighbor_sort_key(value: &Value) -> &str {
+    value
+        .get("entity")
+        .and_then(|entity| entity.get("id"))
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+/// Deterministic follow-up reads for an `orientation_pack`. Suggests the full
+/// source, a pre-spend cost preview, the owning subsystem, and a drill-down
+/// into the first callee (by sorted id) when one exists. Empty when there is no
+/// primary entity.
+fn orientation_suggested_reads(
+    packet: &Value,
+    primary_id: Option<&str>,
+    primary_kind: Option<&str>,
+) -> Vec<Value> {
+    let Some(primary_id) = primary_id else {
+        return Vec::new();
+    };
+    let mut reads = vec![
+        json!({
+            "tool": "source_for_entity",
+            "args": {"id": primary_id},
+            "why": "read the entity's source with line numbers",
+        }),
+        json!({
+            "tool": "summary_preview_cost",
+            "args": {"id": primary_id},
+            "why": "estimate the cost of an LLM briefing before spending",
+        }),
+    ];
+    // A subsystem's useful drill-down is its members; for any other kind it is
+    // the owning subsystem.
+    if primary_kind == Some("subsystem") {
+        reads.push(json!({
+            "tool": "subsystem_members",
+            "args": {"id": primary_id},
+            "why": "list the entities clustered into this subsystem",
+        }));
+    } else {
+        reads.push(json!({
+            "tool": "subsystem_of",
+            "args": {"id": primary_id},
+            "why": "see which subsystem this entity belongs to",
+        }));
+    }
+    // Drill into the first callee (lists are already id-sorted), if any.
+    if let Some(callee_id) = packet
+        .get("neighbors")
+        .and_then(|neighbors| neighbors.get("callees"))
+        .and_then(Value::as_array)
+        .and_then(|callees| callees.first())
+        .and_then(|callee| callee.get("entity"))
+        .and_then(|entity| entity.get("id"))
+        .and_then(Value::as_str)
+    {
+        reads.push(json!({
+            "tool": "orientation_pack",
+            "args": {"entity": callee_id},
+            "why": "orient on the primary callee",
+        }));
+    }
+    reads
 }
 
 /// Maximum number of (span + context) lines `source_for_entity` will emit
@@ -4396,7 +4861,7 @@ mod tests {
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 14);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
@@ -4461,6 +4926,11 @@ mod tests {
         assert_eq!(
             tools[12].description,
             "Show the actual source sites behind calls/references edges, so an agent can see WHY Clarion believes an edge exists rather than trusting it blind. role=caller (default) returns this entity's outgoing sites (what it calls/references); role=callee returns incoming sites (who calls/references it). Each site carries the file path, 1-based line, byte column, the source line text, edge kind, confidence, and a resolution of resolved | ambiguous (with candidate ids) | unresolved (a static call Clarion could not bind, kept separate so it is never mixed with resolved evidence). Filter by edge kind (`calls`/`references`) and by a best-effort production/test path heuristic (`all`/`production`/`test`; path partitioning is not indexed — the heuristic matches conventional test paths). Output is bounded; truncated flags when the site cap trims. No LLM call."
+        );
+        assert_eq!(tools[13].name, "orientation_pack");
+        assert_eq!(
+            tools[13].description,
+            "Assemble one deterministic orientation packet for a code location — the replacement for hand-composing find_entity + entity_at + source reads + neighborhood + issues_for + freshness on every question. Resolve EITHER by `entity` id OR by `file`+`line` (exactly one form). The packet bundles: the primary entity, the entity_context evidence (match_reason / containing stack / decl-body-decorator ranges — so a decorator-line query is explained, not guessed), a compact source-span summary, one-hop neighbors (callers, callees, container, contained, references, imports), compact resolved execution paths, related Filigree issues, index/Filigree/LLM health, warnings, and suggested next reads. No LLM summary is invoked. Every list is bounded; an `omitted` block reports per-section truncation counts and `degraded` sections name surfaces that were unavailable (e.g. Filigree down) so an empty section is never read as a guaranteed negative."
         );
     }
 
@@ -4764,7 +5234,7 @@ mod tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], "tools-1");
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 13);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 14);
         assert_eq!(response["result"]["tools"][0]["name"], "entity_at");
         assert_eq!(response["result"]["tools"][7]["name"], "subsystem_members");
     }
@@ -4865,7 +5335,7 @@ mod tests {
 
         assert_eq!(decoded["jsonrpc"], "2.0");
         assert_eq!(decoded["id"], 10);
-        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 13);
+        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 14);
     }
 
     #[test]
@@ -4940,7 +5410,7 @@ mod tests {
         assert_eq!(first_json["id"], 11);
         assert_eq!(first_json["result"]["serverInfo"]["name"], "clarion");
         assert_eq!(second_json["id"], 12);
-        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 13);
+        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 14);
     }
 
     #[test]

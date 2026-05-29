@@ -2077,6 +2077,172 @@ async fn entity_at_explains_decorator_declaration_and_body_matches() {
 }
 
 #[tokio::test]
+async fn orientation_pack_for_entity_bundles_all_sections_deterministically() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp:?}");
+    let result = &resp["result"];
+
+    // Primary entity + source location.
+    assert_eq!(result["primary_entity"]["id"], "python:function:demo.entry");
+    assert_eq!(result["source"]["source_line_start"], 1);
+    assert!(
+        result["source"]["source_file_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("demo.py")
+    );
+
+    // Neighbors: resolved callee demo.mid and the module container.
+    let callee_ids: Vec<&str> = result["neighbors"]["callees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap())
+        .collect();
+    assert!(callee_ids.contains(&"python:function:demo.mid"), "{resp:?}");
+    assert_eq!(result["neighbors"]["container"]["id"], "python:module:demo");
+
+    // Compact execution paths reach downstream of entry.
+    assert!(
+        !result["execution_paths"]["paths"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // issues_for state, index health, and bounded-output bookkeeping are all
+    // present in the one response.
+    assert!(result["issues"].get("available").is_some());
+    assert!(result["health"]["index"].is_object());
+    assert!(result["omitted"].is_object());
+    let suggested = result["suggested_next_reads"].as_array().unwrap();
+    assert_eq!(suggested[0]["tool"], "source_for_entity");
+
+    // Filigree is disabled in this fixture → a clear degradation warning, not a
+    // silent empty section.
+    let warnings: Vec<&str> = result["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w.as_str().unwrap())
+        .collect();
+    assert!(warnings.iter().any(|w| w.contains("Filigree")), "{resp:?}");
+
+    // Deterministic: the same request yields a byte-identical packet.
+    let again = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(resp, again);
+}
+
+#[tokio::test]
+async fn orientation_pack_explains_decorator_line_match() {
+    let (project, db_path) = open_project();
+
+    // Decorated class: `@dataclass` on line 1, `class Config:` on line 2.
+    let source = "@dataclass\nclass Config:\n    retries: int = 3\n";
+    let runtime_path = project.path().join("runtime.py");
+    std::fs::write(&runtime_path, source).expect("write runtime.py");
+    {
+        let conn = Connection::open(&db_path).expect("open db");
+        insert_entity_with_properties(
+            &conn,
+            "python:module:runtime",
+            "module",
+            &runtime_path,
+            Some((1, 3)),
+            None,
+            "{}",
+        );
+        insert_entity_with_properties(
+            &conn,
+            "python:class:runtime.Config",
+            "class",
+            &runtime_path,
+            Some((1, 3)),
+            Some("python:module:runtime"),
+            &json!({
+                "definition": {
+                    "decl_line": 2,
+                    "body_line_start": 3,
+                    "decorator_line_start": 1,
+                    "decorator_line_end": 1
+                }
+            })
+            .to_string(),
+        );
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"file": "runtime.py", "line": 1}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp:?}");
+    assert_eq!(
+        resp["result"]["primary_entity"]["id"],
+        "python:class:runtime.Config"
+    );
+    assert_eq!(
+        resp["result"]["entity_context"]["match_reason"],
+        "decorator_range"
+    );
+}
+
+#[tokio::test]
+async fn orientation_pack_degrades_when_no_entity_spans_the_line() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    // demo.py has no entity spanning line 99.
+    let resp = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"file": "demo.py", "line": 99}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp:?}");
+    assert!(resp["result"]["primary_entity"].is_null());
+    assert_eq!(resp["result"]["entity_context"]["match_reason"], "no_match");
+    assert!(!resp["result"]["warnings"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn orientation_pack_rejects_ambiguous_input_form() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    // Supplying both `entity` and `file`+`line` is invalid; the dispatcher
+    // returns a JSON-RPC error rather than a tool envelope.
+    let response = state
+        .handle_json_rpc(&json!({
+            "jsonrpc": "2.0",
+            "id": "ambiguous",
+            "method": "tools/call",
+            "params": {
+                "name": "orientation_pack",
+                "arguments": {"entity": "python:function:demo.entry", "file": "demo.py", "line": 1}
+            }
+        }))
+        .await
+        .expect("response");
+    assert!(response.get("error").is_some(), "{response:?}");
+}
+
+#[tokio::test]
 async fn source_for_entity_returns_span_with_line_numbers_and_context() {
     let (project, db_path) = open_project();
     let state = state_for(project.path(), &db_path);
