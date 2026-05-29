@@ -16,6 +16,7 @@ use clarion_mcp::{
     config::{FiligreeConfig, LlmConfig, LlmProviderKind},
     filigree::{
         EntityAssociation, EntityAssociationsResponse, FiligreeClientError, FiligreeLookup,
+        IssueDetail,
     },
     filigree_url::{SOURCE_CONFIG, SOURCE_EPHEMERAL_PORT, resolve_filigree_url},
     list_tools,
@@ -673,6 +674,10 @@ impl LlmProvider for AnyInferredProvider {
 struct FakeFiligreeClient {
     responses: Mutex<std::collections::HashMap<String, EntityAssociationsResponse>>,
     calls: Mutex<Vec<String>>,
+    /// `issue_id` -> detail returned by `issue_detail`; absent ids yield `Ok(None)`.
+    details: Mutex<std::collections::HashMap<String, IssueDetail>>,
+    /// `issue_id`s `issue_detail` was called with, in order — proves dedup/N+1.
+    detail_calls: Mutex<Vec<String>>,
 }
 
 impl FakeFiligreeClient {
@@ -684,8 +689,27 @@ impl FakeFiligreeClient {
         self
     }
 
+    fn with_detail(mut self, issue_id: &str, title: &str, status: &str, priority: i64) -> Self {
+        self.details.get_mut().unwrap().insert(
+            issue_id.to_owned(),
+            IssueDetail {
+                title: title.to_owned(),
+                status: status.to_owned(),
+                priority,
+            },
+        );
+        self
+    }
+
     fn calls(&self) -> Vec<String> {
         self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn detail_calls(&self) -> Vec<String> {
+        self.detail_calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -710,6 +734,19 @@ impl FiligreeLookup for FakeFiligreeClient {
             .unwrap_or_else(|| EntityAssociationsResponse {
                 associations: Vec::new(),
             }))
+    }
+
+    fn issue_detail(&self, issue_id: &str) -> Result<Option<IssueDetail>, FiligreeClientError> {
+        self.detail_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(issue_id.to_owned());
+        Ok(self
+            .details
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(issue_id)
+            .cloned())
     }
 }
 
@@ -1092,6 +1129,62 @@ async fn issues_for_includes_contained_entities_and_flags_drift() {
         client
             .calls()
             .contains(&"python:function:demo.mid".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn issues_for_enriches_matched_and_drifted_with_issue_detail() {
+    // AC: matched/drifted entries carry title/status/priority fetched from
+    // Filigree, batched to one request per distinct issue (no N+1), and degrade
+    // to a null `issue` when the detail route has no entry for that issue
+    // (clarion-51a2868c86).
+    let (project, db_path) = open_project();
+    let client = Arc::new(
+        FakeFiligreeClient::default()
+            .with_response(
+                "python:function:demo.entry",
+                vec![association(
+                    "filigree-fresh",
+                    "python:function:demo.entry",
+                    &expected_content_hash(project.path(), "python:function:demo.entry"),
+                )],
+            )
+            .with_response(
+                "python:function:demo.mid",
+                vec![association(
+                    "filigree-drifted",
+                    "python:function:demo.mid",
+                    "old-hash",
+                )],
+            )
+            // Detail present for the matched issue, absent for the drifted one.
+            .with_detail("filigree-fresh", "Refresh tokens", "building", 1),
+    );
+    let state = state_for_filigree(project.path(), &db_path, client.clone());
+
+    let envelope = call_tool(&state, "issues_for", json!({"id": "python:module:demo"})).await;
+
+    assert_eq!(envelope["ok"], true);
+    // Matched entry carries the fetched detail.
+    let matched = &envelope["result"]["matched"][0];
+    assert_eq!(matched["issue_id"], "filigree-fresh");
+    assert_eq!(matched["issue"]["title"], "Refresh tokens");
+    assert_eq!(matched["issue"]["status"], "building");
+    assert_eq!(matched["issue"]["priority"], 1);
+    // Drifted entry has no configured detail → null, but still resolves.
+    let drifted = &envelope["result"]["drifted"][0];
+    assert_eq!(drifted["issue_id"], "filigree-drifted");
+    assert_eq!(drifted["issue"], Value::Null);
+    // Each distinct issue is fetched exactly once (no N+1).
+    let mut detail_calls = client.detail_calls();
+    detail_calls.sort();
+    assert_eq!(
+        detail_calls,
+        vec!["filigree-drifted".to_owned(), "filigree-fresh".to_owned()]
+    );
+    assert_eq!(
+        envelope["stats_delta"]["filigree_detail_requests_total"], 2,
+        "two distinct issues -> two detail requests: {envelope}"
     );
 }
 

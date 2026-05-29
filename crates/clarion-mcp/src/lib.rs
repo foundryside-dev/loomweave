@@ -37,7 +37,7 @@ use clarion_storage::{
 };
 
 use crate::config::LlmConfig;
-use crate::filigree::{EntityAssociation, EntityAssociationsResponse, FiligreeLookup};
+use crate::filigree::{EntityAssociation, EntityAssociationsResponse, FiligreeLookup, IssueDetail};
 
 /// MCP protocol revision supported by the B.6 stdio server.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -153,7 +153,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "issues_for",
-            description: "Return Filigree issues attached to this Clarion entity, optionally including issues attached to contained entities. Filigree is an enrichment source; if unavailable, the tool returns an unavailable envelope instead of failing Clarion. The result carries a result_kind (matched | no_matches | unavailable) so a reachable-but-empty Filigree is distinct from an unreachable one, and a filigree_endpoint block (configured vs resolved URL + resolution_source) so you can see which endpoint — e.g. a live ethereal port — the answer came from.",
+            description: "Return Filigree issues attached to this Clarion entity, optionally including issues attached to contained entities. Filigree is an enrichment source; if unavailable, the tool returns an unavailable envelope instead of failing Clarion. The result carries a result_kind (matched | no_matches | unavailable) so a reachable-but-empty Filigree is distinct from an unreachable one, and a filigree_endpoint block (configured vs resolved URL + resolution_source) so you can see which endpoint — e.g. a live ethereal port — the answer came from. Each matched/drifted entry carries an `issue` object with the issue's title, status, and priority (fetched once per distinct issue, no N+1); `issue` is null when the issue-detail route is unavailable, so the match still resolves without a second hop into Filigree.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1066,7 +1066,50 @@ impl ServerState {
                 break;
             }
         }
-        Ok(accumulator.into_envelope(read.entity_cap_truncated, requests_total, &endpoint))
+        // Enrich matched/drifted entries with each issue's title/status/priority.
+        // Every unique issue is fetched exactly once (the accumulator already
+        // dedupes issue_ids, so this is N requests for N distinct issues, never
+        // per-entity N+1). Enrichment is best-effort and enrich-only: a 404
+        // (issue/route absent) leaves that entry's `issue` null, and the first
+        // transport/HTTP failure trips `route_down` so we stop hammering an
+        // endpoint that has gone away rather than failing the whole call.
+        let detail_ids = accumulator.enrichable_issue_ids();
+        let mut details: HashMap<String, Option<IssueDetail>> = HashMap::new();
+        let mut detail_requests_total = 0_usize;
+        let mut route_down = false;
+        for issue_id in detail_ids {
+            if route_down {
+                details.insert(issue_id, None);
+                continue;
+            }
+            let client = client.clone();
+            let id_for_task = issue_id.clone();
+            let fetched =
+                tokio::task::spawn_blocking(move || client.issue_detail(&id_for_task)).await;
+            detail_requests_total += 1;
+            match fetched {
+                Ok(Ok(detail)) => {
+                    details.insert(issue_id, detail);
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(error = %err, "clarion issues_for detail fetch failed; degrading to issue-id-only");
+                    route_down = true;
+                    details.insert(issue_id, None);
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "clarion issues_for detail task failed; degrading to issue-id-only");
+                    route_down = true;
+                    details.insert(issue_id, None);
+                }
+            }
+        }
+        accumulator.apply_issue_details(&details);
+        Ok(accumulator.into_envelope(
+            read.entity_cap_truncated,
+            requests_total,
+            detail_requests_total,
+            &endpoint,
+        ))
     }
 
     async fn tool_subsystem_members(
@@ -3043,10 +3086,47 @@ impl IssuesForAccumulator {
         }
     }
 
+    /// Unique `issue_id`s across matched + drifted entries, in first-seen
+    /// order. `add_response` already dedupes `issue_id`s globally, so this is
+    /// the set of distinct issues to fetch detail for — one request each (no
+    /// N+1).
+    fn enrichable_issue_ids(&self) -> Vec<String> {
+        let mut seen = BTreeSet::new();
+        let mut ids = Vec::new();
+        for entry in self.matched.iter().chain(self.drifted.iter()) {
+            if let Some(id) = entry.get("issue_id").and_then(Value::as_str)
+                && seen.insert(id.to_owned())
+            {
+                ids.push(id.to_owned());
+            }
+        }
+        ids
+    }
+
+    /// Attach an `issue` field (title/status/priority) to every matched and
+    /// drifted entry. The value is the fetched [`IssueDetail`] when available,
+    /// else `null` — a stable shape that signals "enrichment attempted, no
+    /// detail" without forcing the consumer to probe for a missing key.
+    fn apply_issue_details(&mut self, details: &HashMap<String, Option<IssueDetail>>) {
+        for entry in self.matched.iter_mut().chain(self.drifted.iter_mut()) {
+            let issue_value = entry
+                .get("issue_id")
+                .and_then(Value::as_str)
+                .and_then(|id| details.get(id))
+                .and_then(Option::as_ref)
+                .and_then(|detail| serde_json::to_value(detail).ok())
+                .unwrap_or(Value::Null);
+            if let Some(object) = entry.as_object_mut() {
+                object.insert("issue".to_owned(), issue_value);
+            }
+        }
+    }
+
     fn into_envelope(
         self,
         entity_cap_truncated: bool,
         requests_total: usize,
+        detail_requests_total: usize,
         filigree_endpoint: &Value,
     ) -> Value {
         let truncation_reason = if self.issue_cap_truncated {
@@ -3076,7 +3156,8 @@ impl IssuesForAccumulator {
             truncation_reason,
             json!({
                 "filigree_requests_total": requests_total,
-                "filigree_issues_returned_total": self.emitted
+                "filigree_issues_returned_total": self.emitted,
+                "filigree_detail_requests_total": detail_requests_total
             }),
         );
         if let Some(object) = envelope.as_object_mut()
@@ -5451,7 +5532,7 @@ mod tests {
         assert_eq!(tools[5].name, "issues_for");
         assert_eq!(
             tools[5].description,
-            "Return Filigree issues attached to this Clarion entity, optionally including issues attached to contained entities. Filigree is an enrichment source; if unavailable, the tool returns an unavailable envelope instead of failing Clarion. The result carries a result_kind (matched | no_matches | unavailable) so a reachable-but-empty Filigree is distinct from an unreachable one, and a filigree_endpoint block (configured vs resolved URL + resolution_source) so you can see which endpoint — e.g. a live ethereal port — the answer came from."
+            "Return Filigree issues attached to this Clarion entity, optionally including issues attached to contained entities. Filigree is an enrichment source; if unavailable, the tool returns an unavailable envelope instead of failing Clarion. The result carries a result_kind (matched | no_matches | unavailable) so a reachable-but-empty Filigree is distinct from an unreachable one, and a filigree_endpoint block (configured vs resolved URL + resolution_source) so you can see which endpoint — e.g. a live ethereal port — the answer came from. Each matched/drifted entry carries an `issue` object with the issue's title, status, and priority (fetched once per distinct issue, no N+1); `issue` is null when the issue-detail route is unavailable, so the match still resolves without a second hop into Filigree."
         );
         assert_eq!(tools[6].name, "neighborhood");
         assert_eq!(
