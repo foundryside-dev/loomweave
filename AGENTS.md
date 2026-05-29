@@ -231,7 +231,7 @@ When you are unsure, say what evidence is missing and go get it if it is cheap.
 When evidence is expensive or requires credentials, explain the limitation and
 the next command a maintainer can run.
 
-<!-- filigree:instructions:v2.0.3:d454f2c2 -->
+<!-- filigree:instructions:v2.1.0:d454f2c2 -->
 ## Filigree Issue Tracker
 
 `filigree` tracks tasks for this project. Data lives in `.filigree/`. Prefer

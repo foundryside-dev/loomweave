@@ -36,7 +36,19 @@ pub enum Staleness {
     /// No ingested source file is newer than the latest run. (Does not account
     /// for added/removed files — see the type-level note.)
     Fresh,
-    /// Could not determine (stat/parse/IO error) — degrade, don't fail (and log).
+    /// A completed run exists, but no ingested entity has a resolvable
+    /// `source_file_path` to stat — there is *nothing to compare against*, so
+    /// freshness is neither Fresh nor Stale. A normal outcome (e.g. a project
+    /// whose only entities are subsystems), distinct from [`Unknown`]: no query
+    /// or stat failed, so it never sets `degraded`.
+    ///
+    /// [`Unknown`]: Staleness::Unknown
+    NoSourcePaths,
+    /// Could not determine because a query/parse/stat *failed* — degrade, don't
+    /// fail (and log). Strictly the error fold: "nothing to compare" is
+    /// [`NoSourcePaths`], not `Unknown`.
+    ///
+    /// [`NoSourcePaths`]: Staleness::NoSourcePaths
     Unknown,
 }
 
@@ -197,7 +209,10 @@ fn compute_staleness(
     if saw_any_file {
         Staleness::Fresh
     } else {
-        Staleness::Unknown
+        // A completed run with no resolvable source file to stat: nothing to
+        // compare, NOT an error. Kept distinct from the error folds above so
+        // `Unknown` means strictly "a query/parse/stat failed" (clarion-22add08e98).
+        Staleness::NoSourcePaths
     }
 }
 
@@ -326,12 +341,13 @@ mod tests {
         assert_eq!(snap.staleness, Staleness::Stale, "{snap:?}");
     }
 
-    // `compute_staleness` reaches `Unknown` three ways: (a) the run timestamp
-    // fails to parse; (b) a completed run exists but no entity has a resolvable
-    // source_file_path (`saw_any_file == false`); (c) a stat/`modified()` error.
-    // `counts_entities_subsystems_and_findings` and `stat_failure_unknown_is_not_degraded`
-    // cover (c); the two tests below lock (a) and (b), and pin which of them
-    // count as DB-machinery degradation (a yes, b no).
+    // `compute_staleness` has two error folds to `Unknown` — (a) the run
+    // timestamp fails to parse; (c) a stat/`modified()` error — plus one
+    // non-error fold, (b) a completed run exists but no entity has a resolvable
+    // source_file_path (`saw_any_file == false`), which is its own
+    // `NoSourcePaths` variant (clarion-22add08e98). `counts_entities_subsystems_and_findings`
+    // and `stat_failure_unknown_is_not_degraded` cover (c); the two tests below
+    // lock (a) → Unknown+degraded and (b) → NoSourcePaths (never degraded).
 
     #[test]
     fn unknown_and_degraded_when_run_timestamp_unparseable() {
@@ -358,11 +374,11 @@ mod tests {
     }
 
     #[test]
-    fn unknown_not_degraded_when_no_entity_has_a_source_file() {
+    fn no_source_paths_when_no_entity_has_a_source_file() {
         // (b) The realistic case: a completed run exists, but every entity is
         // subsystem-only (NULL source_file_path), so the DISTINCT scan returns
-        // no rows and `saw_any_file` stays false. That folds to Unknown but is
-        // NOT degradation — no query or stat failed.
+        // no rows and `saw_any_file` stays false. That is NOT an error fold to
+        // Unknown — it is its own `NoSourcePaths` verdict, and never degraded.
         let (_dir, conn) = migrated_conn();
         insert_entity(&conn, "core:subsystem:abc", "subsystem", None);
         conn.execute(
@@ -373,15 +389,24 @@ mod tests {
         .unwrap();
 
         let snap = project_snapshot(&conn, std::path::Path::new("/tmp"));
-        assert_eq!(snap.staleness, Staleness::Unknown, "{snap:?}");
+        assert_eq!(snap.staleness, Staleness::NoSourcePaths, "{snap:?}");
         assert!(
             !snap.degraded,
-            "no-resolvable-source-files is environmental, not degraded: {snap:?}"
+            "no-resolvable-source-files is not a failure, never degraded: {snap:?}"
         );
         assert_eq!(
             snap.last_analyzed_at.as_deref(),
             Some("2026-01-02T00:00:00.000Z")
         );
+    }
+
+    #[test]
+    fn no_source_paths_serializes_to_snake_case() {
+        // The new wire value is `"no_source_paths"` (serde rename_all =
+        // "snake_case"); pin it so the clarion://context / project_status
+        // vocabulary can't drift silently.
+        let json = serde_json::to_value(Staleness::NoSourcePaths).unwrap();
+        assert_eq!(json, serde_json::Value::String("no_source_paths".into()));
     }
 
     #[test]

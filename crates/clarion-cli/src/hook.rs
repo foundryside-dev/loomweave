@@ -113,8 +113,11 @@ fn print_snapshot(project_root: &Path, outcome: &SnapshotOutcome) {
         );
         return;
     }
+    // Subsystems ARE entities (kind = 'subsystem'), so subsystem_count is a
+    // subset of entity_count, not a parallel category — say so, or the two read
+    // as disjoint (clarion-e4e80eff3f).
     println!(
-        "Clarion index: {} entities, {} subsystems, {} findings.",
+        "Clarion index: {} entities (incl. {} subsystems), {} findings.",
         snapshot.entity_count, snapshot.subsystem_count, snapshot.finding_count
     );
     if snapshot.degraded {
@@ -147,10 +150,18 @@ fn print_snapshot(project_root: &Path, outcome: &SnapshotOutcome) {
                 project_root.display()
             );
         }
+        Staleness::NoSourcePaths => {
+            println!(
+                "Index freshness not checked: no ingested entity has a recorded \
+                 source path to compare against (last analyzed {}). The index is \
+                 present and queryable.",
+                snapshot.last_analyzed_at.as_deref().unwrap_or("unknown")
+            );
+        }
         Staleness::Unknown => {
             println!(
-                "Index freshness unknown. If briefings look empty, run \
-                 `clarion analyze {}`.",
+                "Index freshness unknown (a freshness check failed). If briefings \
+                 look empty, run `clarion analyze {}`.",
                 project_root.display()
             );
         }

@@ -20,6 +20,18 @@ fn hook_session_start_exits_zero_without_clarion_db() {
         out.contains("clarion analyze"),
         "missing analyze nudge in: {out}"
     );
+    // Installing a skill into a project that never had one is `clarion install
+    // --skills`'s job, NOT the hook's. The hook only re-syncs a skill that is
+    // already present, so a bare project must come away with no skill roots
+    // created (clarion-ac0fc3bd86).
+    assert!(
+        !dir.path().join(".claude/skills").exists(),
+        "hook must not create .claude/skills when no skill is present"
+    );
+    assert!(
+        !dir.path().join(".agents/skills").exists(),
+        "hook must not create .agents/skills when no skill is present"
+    );
 }
 
 #[test]

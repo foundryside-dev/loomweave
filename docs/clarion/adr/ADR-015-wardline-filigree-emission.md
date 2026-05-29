@@ -1,6 +1,6 @@
 # ADR-015: Wardline→Filigree Emission Ownership — Clarion-Side Translator (v0.1), Native Wardline Emitter (v0.2)
 
-**Status**: Accepted
+**Status**: Accepted (Revision 2, 2026-05-29 — native Wardline emitter promoted to the production path; Clarion off the transport path. See [Revision 2](#revision-2-2026-05-29--wardline-ships-native-clarion-off-the-transport-path).)
 **Date**: 2026-04-18
 **Deciders**: qacona@gmail.com
 **Context**: Wardline has no HTTP client today; getting its findings into Filigree needs an owner for v0.1 and a retirement plan for v0.2
@@ -82,6 +82,22 @@ A research pass (code inspection only, no implementation) against `/home/john/wa
 **Decision (2026-04-18)**: ADR-015 stands as-is — **v0.1 = Clarion SARIF translator, v0.2 = Wardline native emitter**. Rationale: the research-level estimate is bounded but the v0.1 sprint is already loaded with 10 ADRs + auth flip + secret scanner implementation; adding 1 day of Wardline-side refactor plus its own cross-tool integration tests is a scope delta the user may choose to take on, but defaulting to the v0.2 commitment preserves the documented scope-commitment shape. The spike result is recorded here so a later decision to flip can cite concrete evidence without re-running the research.
 
 Operators or maintainers reviewing this decision later: if the Wardline-native emitter is implemented as part of Clarion v0.1 work, revise this ADR with a dated "Revision 2" section, delete the `loom.md` §5 asterisk 1, and update the briefing's "Wardline-sourced findings" data-flow row.
+
+## Revision 2 (2026-05-29) — Wardline ships native; Clarion off the transport path
+
+**Trigger.** The 2026-05-29 Wardline ↔ Loom integration brief states that the generic Wardline rebuild intends to ship the **native Filigree emitter directly** (Wardline-side), emitting findings to `POST /api/v1/scan-results` from its own scanner path. This is the ~1-day emitter the 2026-04-18 spike already costed — now taken on Wardline-side rather than as Clarion v0.1 work. This revision records the flip the original decision and its closing note anticipated.
+
+**Position flip.** Option B (native Wardline emitter) becomes the production path for the (Wardline, Filigree) pair. **Clarion is no longer on the transport path for that pair.** The decision in §"v0.1 position — Clarion-side SARIF translator" is superseded for Wardline specifically; it stands unchanged for every other SARIF source.
+
+**What changes:**
+
+- **Clarion's role becomes pure enrichment.** Clarion reconciles Wardline findings to `EntityId`s via the qualname carried on the finding (`metadata.wardline.qualname`), per [ADR-018](./ADR-018-identity-reconciliation.md) and its 2026-05-29 amendment. It is no longer a bridge — it adds entity context to findings that reach Filigree on their own.
+- **The SARIF translator stays, general-purpose.** `clarion sarif import <file> --scan-source <name>` continues to serve Semgrep, CodeQL, Trivy, and any other SARIF emitter. `--scan-source wardline` remains usable for re-ingesting historical Wardline SARIF baselines, but is no longer the production Wardline path.
+- **Severity mapping moves off Clarion for Wardline.** The Wardline 4-level → Filigree 5-level mapping (integration brief §5: `CRITICAL→critical`, `ERROR→high`, `WARN→medium`, `INFO→low`, `NONE→info`) is now a direct Wardline→Filigree concern applied by the native emitter. [ADR-017](./ADR-017-severity-and-dedup.md)'s severity/rule-ID rules continue to apply to the translator for *other* SARIF sources; their role as the Wardline translation step retires with the transport path.
+
+**Asterisk-1 retirement — on ship, not on agreement.** `loom.md` §5 asterisk 1 (pipeline coupling of the (Wardline, Filigree) pair through Clarion) **is not deleted by this revision.** Wardline's generic build is in flight and the native emitter is not yet shipped or verified in production. Per `loom.md` §5 ("Asterisks are acceptable only with a written retirement condition"), deleting the asterisk on a promise is itself the failure mode the section guards against. This revision instead **rewrites the asterisk's retirement mechanism**: the native emitter is now Wardline-side (this brief), not the previously-planned Clarion-side v0.2 work. The asterisk stays live, tracked under `release:1.1`, and retires when the emitter ships and Wardline→Filigree composition is verified without Clarion present. At that point: delete asterisk 1 from `loom.md` §5 and update the briefing's "Wardline-sourced findings" data-flow row.
+
+**Open contract back to Wardline (does not block this decision).** Reconciliation correctness now depends on Wardline composing the dotted `module.qualified_name` with rules byte-identical to Clarion's `module_dotted_name()` — see the [ADR-018](./ADR-018-identity-reconciliation.md) 2026-05-29 amendment for the contract and the failure mode (silent degradation to `resolution_confidence: none` on nested-class and closure entities). This is an enrichment-quality concern, not a transport-path concern; the (Wardline, Filigree) pair composes regardless.
 
 ## Alternatives Considered
 

@@ -148,7 +148,7 @@ Open issues for the v1.0 known limitations and any post-release follow-ups live 
   protection (timestamp + nonce window) is ADR-034 forward-work tracked for
   post-1.0 hardening.
 
-<!-- filigree:instructions:v2.0.3:d454f2c2 -->
+<!-- filigree:instructions:v2.1.0:d454f2c2 -->
 ## Filigree Issue Tracker
 
 `filigree` tracks tasks for this project. Data lives in `.filigree/`. Prefer

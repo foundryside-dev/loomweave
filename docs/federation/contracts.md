@@ -352,3 +352,53 @@ Reference implementation: `clarion-storage::query::normalize_lookup_path`
 The function signature is stable for the lifetime of `api_version: 1`;
 the *implementation* is free to change as long as the lexical /
 no-disk-touch / forward-slash / under-root contract holds.
+
+## Wardline qualname normalization (entity reconciliation)
+
+This contract governs how a sibling that emits Findings against Python code
+(Wardline's native Filigree emitter, per ADR-018's 2026-05-29 amendment and the
+2026-05-29 integration brief §4.A) must spell the entity it references so Clarion
+can reconcile it. It is *enrich-only*: when the contract is honored, Clarion
+attaches the entity's structural context to the Finding; when it is not, Clarion
+degrades to `resolution_confidence: heuristic|none` — there is no error and no
+broken state, only a worse match. Filigree's own ticket lifecycle is unaffected
+either way (loom.md §5).
+
+**The composed form.** A Finding carries `metadata.wardline.qualname` as the
+**pre-composed** dotted name (Clarion's L7 `canonical_qualified_name`), not a
+`(file, bare-qualname)` pair. The composition is two parts:
+
+```text
+metadata.wardline.qualname = module_dotted_name(file_path) + "." + __qualname__
+```
+
+- `module_dotted_name(file_path)` is Clarion's module-prefix rule. Its canonical
+  implementation and tests are
+  [`module_dotted_name`](../../plugins/python/src/clarion_plugin_python/extractor.py)
+  and `test_module_dotted_name_helper` in
+  [`test_extractor.py`](../../plugins/python/tests/test_extractor.py). The rule:
+  strip a leading `src/` **only at position 0**; drop the `.py` suffix; collapse
+  an `__init__` filename to its package; join the rest with `.`. No other root
+  marker (`lib/`, `app/`, the project name, …) is stripped, and a top-level
+  `__init__.py` normalizes to the empty string and is **not emitted** (Clarion
+  rejects an empty qualified name).
+- `__qualname__` is copied **verbatim** — `<locals>` closure markers and dotted
+  nested-class chains are preserved, never rewritten.
+
+**Normative vectors.** The byte-exact `(file_path, qualname) → dotted form`
+parity set lives in
+[`fixtures/wardline-qualname-normalization.json`](./fixtures/wardline-qualname-normalization.json).
+It is a standalone spec vector in the same spirit as the cross-language
+`fixtures/entity_id.json`: it deliberately includes the divergence traps where
+naive composition silently mismatches (non-`src` roots, `src` not at position 0,
+`<locals>` closures, nested-class chains, namespace-package layouts, the rejected
+top-level `__init__.py`). A conformant emitter reproduces every vector exactly.
+
+**Conformance oracle (deferred).** A live check —
+`GET /api/v1/entities/resolve?scheme=wardline_qualname`, which would return
+`exact | heuristic | none` for a candidate qualname — is named in ADR-018 as the
+eventual conformance surface but is **not implemented at release:1.1**. Until it
+ships, the fixture above is the contract: validate against it offline. Building
+the endpoint ahead of a shipped Wardline consumer would be speculative
+forward-work (loom.md §5 — Clarion translates qualnames because it owns the
+catalog, but only when a consumer needs it).
