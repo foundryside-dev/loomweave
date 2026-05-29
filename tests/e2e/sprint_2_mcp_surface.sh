@@ -3,7 +3,7 @@
 #
 # Builds a real demo Clarion database through `clarion analyze`, starts
 # `clarion serve`, and sends Content-Length framed MCP JSON-RPC requests for
-# the eight MCP navigation tools. Filigree is represented by a local HTTP
+# the MCP navigation tools. Filigree is represented by a local HTTP
 # server that implements the B.7 reverse entity-association route.
 
 set -euo pipefail
@@ -401,6 +401,7 @@ assert tool_names == [
     "issues_for",
     "neighborhood",
     "subsystem_members",
+    "subsystem_of",
     "project_status",
 ], tool_names
 # Single-source check (clarion-71f0d6c3dd): the initialize `instructions` tool
@@ -477,4 +478,4 @@ assert "staleness" in ctx, ctx
 assert ctx["degraded"] is False, ctx
 PY
 
-log "PASS: MCP stdio surface returned nine tool definitions and seven tool responses"
+log "PASS: MCP stdio surface returned ten tool definitions and seven tool responses"

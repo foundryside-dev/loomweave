@@ -1764,6 +1764,59 @@ async fn find_entity_kind_filter_returns_only_that_kind() {
 }
 
 #[tokio::test]
+async fn subsystem_of_resolves_module_and_contained_function() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    let subsystem_id = seed_subsystem(&conn, project.path());
+    drop(conn);
+    let state = state_for(project.path(), &db_path);
+
+    // A module resolves directly.
+    let from_module = call_tool(&state, "subsystem_of", json!({"id": "python:module:demo"})).await;
+    assert_eq!(from_module["ok"], true);
+    assert_eq!(from_module["result"]["subsystem"]["id"], subsystem_id);
+    assert_eq!(from_module["result"]["via_module_id"], "python:module:demo");
+
+    // A contained function resolves through its module ancestor.
+    let from_fn = call_tool(
+        &state,
+        "subsystem_of",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(from_fn["ok"], true);
+    assert_eq!(from_fn["result"]["subsystem"]["id"], subsystem_id);
+    assert_eq!(
+        from_fn["result"]["subsystem"]["name"],
+        "Subsystem abc123def456"
+    );
+    assert_eq!(from_fn["result"]["via_module_id"], "python:module:demo");
+}
+
+#[tokio::test]
+async fn subsystem_of_reports_null_subsystem_and_missing_entity() {
+    // No seed_subsystem: the demo module exists but is in no subsystem.
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    // Entity exists but has no subsystem -> ok with subsystem: null (a fact,
+    // distinguishable from a missing entity).
+    let no_sub = call_tool(&state, "subsystem_of", json!({"id": "python:module:demo"})).await;
+    assert_eq!(no_sub["ok"], true);
+    assert!(no_sub["result"]["subsystem"].is_null(), "{no_sub:?}");
+    assert!(no_sub["result"]["via_module_id"].is_null(), "{no_sub:?}");
+
+    // Missing entity -> ok:false entity-not-found envelope.
+    let missing = call_tool(
+        &state,
+        "subsystem_of",
+        json!({"id": "python:function:does.not.exist"}),
+    )
+    .await;
+    assert_ne!(missing["ok"], true, "{missing:?}");
+}
+
+#[tokio::test]
 async fn callers_of_defaults_to_resolved_and_expands_ambiguous_candidates() {
     let (project, db_path) = open_project();
     let state = state_for(project.path(), &db_path);

@@ -47,6 +47,7 @@ Every entity has an ID: `{plugin}:{kind}:{qualified_name}`
 | `neighborhood` | one-hop callers+callees+container+contained+references+imports | `{"id": "<id>"}` |
 | `execution_paths_from` | bounded call paths out of an entity | `{"id": "<id>", "max_depth": 5}` |
 | `subsystem_members` | modules in a subsystem | `{"id": "core:subsystem:<hash>"}` |
+| `subsystem_of` | the subsystem an entity belongs to (reverse of `subsystem_members`) | `{"id": "<id>"}` |
 | `summary` | on-demand prose summary of one entity | `{"id": "<id>"}` |
 | `issues_for` | Filigree issues attached to an entity | `{"id": "<id>"}` |
 | `project_status` | index freshness, counts, LLM + Filigree status | `{}` |
@@ -86,9 +87,11 @@ re-reading each path element. `truncated`/`truncation_reason` report `edge-cap`
   and pass `{"kind":"subsystem"}` to return only subsystem entities, then call
   `subsystem_members`. (`find_entity` accepts an optional `kind` filter —
   `"subsystem"`, `"function"`, `"class"`, `"module"`, …; omit it for no filter.)
-- **There is no module→subsystem reverse lookup.**
-  `neighborhood` does **not** return the entity's subsystem. Membership is only
-  reachable forward via `subsystem_members(subsystem_id)`.
+- **To go from an entity to its subsystem, use `subsystem_of`.**
+  `neighborhood` does **not** return the entity's subsystem. Call
+  `subsystem_of {"id": "<entity-id>"}` — it accepts any entity (a function/class
+  resolves through its containing module) and returns the subsystem plus the
+  module it resolved through. `subsystem_members` is the forward direction.
 - **`find_entity` is paginated** (~20/page, `next_cursor`); narrow the pattern
   rather than paging if you can.
 

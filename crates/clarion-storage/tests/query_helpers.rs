@@ -9,6 +9,7 @@ use clarion_storage::{
     entity_briefing_block_reason, entity_by_id, find_entities, module_dependency_edges,
     normalize_source_path, pragma, reference_edges_for_entity, resolve_file,
     resolve_file_catalog_entry, schema, subsystem_for_member, subsystem_members,
+    subsystem_of_entity,
 };
 use rusqlite::{Connection, params};
 
@@ -668,6 +669,53 @@ fn entity_lookup_and_search_cover_id_and_fts_paths() {
         .expect("punctuation-heavy ID search");
     assert_eq!(like_results.len(), 1);
     assert_eq!(like_results[0].id, "python:function:demo.TokenManager");
+}
+
+#[test]
+fn subsystem_of_entity_resolves_module_and_nested_entities() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity(&conn, "core:subsystem:abc", "subsystem");
+    insert_entity(&conn, "python:module:pkg.mod", "module");
+    insert_entity(&conn, "python:class:pkg.mod.Cls", "class");
+    insert_entity(&conn, "python:function:pkg.mod.Cls.method", "function");
+    insert_in_subsystem_edge(&conn, "python:module:pkg.mod", "core:subsystem:abc");
+    insert_contains_edge(&conn, "python:module:pkg.mod", "python:class:pkg.mod.Cls");
+    insert_contains_edge(
+        &conn,
+        "python:class:pkg.mod.Cls",
+        "python:function:pkg.mod.Cls.method",
+    );
+
+    // A module resolves directly (depth 0).
+    let from_module = subsystem_of_entity(&conn, "python:module:pkg.mod")
+        .unwrap()
+        .expect("module should resolve");
+    assert_eq!(from_module.subsystem_id, "core:subsystem:abc");
+    assert_eq!(from_module.via_module_id, "python:module:pkg.mod");
+
+    // A method nested module -> class -> function resolves via its module
+    // ancestor (exercises the recursive walk past a non-module container).
+    let from_method = subsystem_of_entity(&conn, "python:function:pkg.mod.Cls.method")
+        .unwrap()
+        .expect("nested method should resolve");
+    assert_eq!(from_method.subsystem_id, "core:subsystem:abc");
+    assert_eq!(from_method.via_module_id, "python:module:pkg.mod");
+
+    // A module not assigned to any subsystem -> None.
+    insert_entity(&conn, "python:module:orphan", "module");
+    assert!(
+        subsystem_of_entity(&conn, "python:module:orphan")
+            .unwrap()
+            .is_none()
+    );
+
+    // An unknown entity id -> None (no error).
+    assert!(
+        subsystem_of_entity(&conn, "python:function:does.not.exist")
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]

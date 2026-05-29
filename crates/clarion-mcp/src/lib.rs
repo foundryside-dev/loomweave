@@ -28,8 +28,8 @@ use clarion_storage::{
     call_edges_targeting, candidate_entities_for_unresolved_sites, child_entity_ids,
     contained_entity_ids, entity_at_line, entity_by_id, existing_entity_ids, find_entities,
     import_edges_for_entity, inferred_edge_cache_key_id, inferred_edge_cache_lookup,
-    normalize_source_path, reference_edges_for_entity, subsystem_members, summary_cache_lookup,
-    unresolved_call_sites_for_caller, unresolved_callers_for_target,
+    normalize_source_path, reference_edges_for_entity, subsystem_members, subsystem_of_entity,
+    summary_cache_lookup, unresolved_call_sites_for_caller, unresolved_callers_for_target,
 };
 
 use crate::config::LlmConfig;
@@ -165,6 +165,11 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "subsystem_members",
             description: "List module entities assigned to a subsystem entity.",
+            input_schema: id_schema(),
+        },
+        ToolDefinition {
+            name: "subsystem_of",
+            description: "Return the subsystem an entity belongs to — the reverse of subsystem_members. Accepts any entity id: a module resolves directly, while a function/class resolves through its nearest containing module. Returns the subsystem id/name and the module the membership was resolved through, or a no-subsystem result when the entity has no subsystem-assigned module ancestor.",
             input_schema: id_schema(),
         },
         ToolDefinition {
@@ -410,6 +415,10 @@ impl ServerState {
                 Err(response) => return response.to_json_rpc(id),
             },
             "subsystem_members" => match self.tool_subsystem_members(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "subsystem_of" => match self.tool_subsystem_of(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
@@ -920,6 +929,48 @@ impl ServerState {
                         "properties": entity_properties_json(&subsystem)
                     },
                     "members": members
+                })))
+            })
+            .await;
+        Ok(flatten_storage_envelope_result(result))
+    }
+
+    async fn tool_subsystem_of(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let entity_id = required_str(arguments, "id")?.to_owned();
+        let result = self
+            .readers
+            .with_reader(move |conn| {
+                let Some(entity) = entity_by_id(conn, &entity_id)? else {
+                    return Ok(tool_error_envelope(
+                        "entity-not-found",
+                        &format!("entity {entity_id} was not found"),
+                        false,
+                    ));
+                };
+                let Some(found) = subsystem_of_entity(conn, &entity.id)? else {
+                    // Entity exists but has no subsystem-assigned module ancestor.
+                    // A structural fact, not an error — return a success envelope
+                    // with subsystem: null so an agent can distinguish it from a
+                    // missing entity.
+                    return Ok(success_envelope(json!({
+                        "entity": {"id": entity.id, "kind": entity.kind},
+                        "subsystem": Value::Null,
+                        "via_module_id": Value::Null
+                    })));
+                };
+                let subsystem = entity_by_id(conn, &found.subsystem_id)?;
+                Ok(success_envelope(json!({
+                    "entity": {"id": entity.id, "kind": entity.kind},
+                    "subsystem": subsystem.as_ref().map(|s| json!({
+                        "id": s.id,
+                        "name": s.name,
+                        "short_name": s.short_name,
+                        "properties": entity_properties_json(s)
+                    })),
+                    "via_module_id": found.via_module_id
                 })))
             })
             .await;
@@ -3435,7 +3486,7 @@ mod tests {
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
@@ -3476,9 +3527,14 @@ mod tests {
             tools[7].description,
             "List module entities assigned to a subsystem entity."
         );
-        assert_eq!(tools[8].name, "project_status");
+        assert_eq!(tools[8].name, "subsystem_of");
         assert_eq!(
             tools[8].description,
+            "Return the subsystem an entity belongs to — the reverse of subsystem_members. Accepts any entity id: a module resolves directly, while a function/class resolves through its nearest containing module. Returns the subsystem id/name and the module the membership was resolved through, or a no-subsystem result when the entity has no subsystem-assigned module ancestor."
+        );
+        assert_eq!(tools[9].name, "project_status");
+        assert_eq!(
+            tools[9].description,
             "Return deterministic Clarion diagnostics: repo root, db path, latest run (id/status/started/completed), entity/subsystem/edge/finding counts, index staleness, per-plugin entity counts from the current index, LLM policy (provider/live/cache), and the resolved Filigree endpoint (configured vs resolved URL + resolution source). Answers \"is the graph fresh, plugin-less, LLM-live, Filigree-reachable?\" without shelling out. No LLM call."
         );
     }
@@ -3783,7 +3839,7 @@ mod tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], "tools-1");
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 10);
         assert_eq!(response["result"]["tools"][0]["name"], "entity_at");
         assert_eq!(response["result"]["tools"][7]["name"], "subsystem_members");
     }
@@ -3884,7 +3940,7 @@ mod tests {
 
         assert_eq!(decoded["jsonrpc"], "2.0");
         assert_eq!(decoded["id"], 10);
-        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 10);
     }
 
     #[test]
@@ -3959,7 +4015,7 @@ mod tests {
         assert_eq!(first_json["id"], 11);
         assert_eq!(first_json["result"]["serverInfo"]["name"], "clarion");
         assert_eq!(second_json["id"], 12);
-        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 10);
     }
 
     #[test]

@@ -872,6 +872,51 @@ pub fn subsystem_members(conn: &Connection, subsystem_id: &str) -> Result<Vec<Su
         .map_err(StorageError::from)
 }
 
+/// The subsystem an entity belongs to, plus the module the membership was
+/// resolved through (the entity itself when it is a module).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntitySubsystem {
+    pub subsystem_id: String,
+    pub via_module_id: String,
+}
+
+/// Resolve the subsystem an arbitrary entity belongs to — the reverse of
+/// [`subsystem_members`].
+///
+/// `in_subsystem` edges connect *modules* to subsystems, so for a non-module
+/// entity (function, class, …) this walks up `contains` edges to the nearest
+/// module ancestor and follows that module's `in_subsystem` edge. A module
+/// entity resolves directly (depth 0). Returns the nearest match, or `None` if
+/// the entity has no module ancestor that is assigned to a subsystem.
+pub fn subsystem_of_entity(conn: &Connection, entity_id: &str) -> Result<Option<EntitySubsystem>> {
+    conn.query_row(
+        "WITH RECURSIVE ancestors(id, depth) AS ( \
+             SELECT ?1, 0 \
+             UNION ALL \
+             SELECT parent.from_id, ancestors.depth + 1 \
+             FROM edges parent \
+             JOIN ancestors ON parent.to_id = ancestors.id \
+             WHERE parent.kind = 'contains' AND ancestors.depth < ?2 \
+         ) \
+         SELECT m.id, sub.to_id \
+         FROM ancestors \
+         JOIN entities m ON m.id = ancestors.id AND m.kind = 'module' \
+         JOIN edges sub ON sub.kind = 'in_subsystem' AND sub.from_id = m.id \
+         JOIN entities s ON s.id = sub.to_id AND s.kind = 'subsystem' \
+         ORDER BY ancestors.depth, sub.to_id \
+         LIMIT 1",
+        params![entity_id, MODULE_ANCESTOR_MAX_DEPTH],
+        |row| {
+            Ok(EntitySubsystem {
+                via_module_id: row.get(0)?,
+                subsystem_id: row.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(StorageError::from)
+}
+
 pub fn subsystem_for_member(conn: &Connection, module_id: &str) -> Result<Option<String>> {
     // Reserved for v0.2 neighborhood / issues_for enrichment. v0.1's MCP
     // surface exposes subsystem_members, but keeping this inverse lookup here

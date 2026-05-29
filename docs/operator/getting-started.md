@@ -38,9 +38,9 @@ export OPENROUTER_API_KEY=sk-or-v1-...
 
 `clarion analyze` (step 2) and the structural MCP tools (`entity_at`,
 `find_entity`, `callers_of`, `execution_paths_from`, `issues_for`,
-`neighborhood`, `subsystem_members`, `project_status`) work without any LLM
-credentials — eight of the nine MCP tools are credential-free. The key is only
-consulted when an MCP client calls `summary(id)` against an entity that does not
+`neighborhood`, `subsystem_members`, `subsystem_of`, `project_status`) work
+without any LLM credentials — nine of the ten MCP tools are credential-free. The
+key is only consulted when an MCP client calls `summary(id)` against an entity that does not
 yet have a cached summary.
 
 ## 1. Install
@@ -218,16 +218,16 @@ llm_policy:
 `OPENROUTER_API_KEY` must also be exported in the environment that
 `clarion serve` (or your MCP client wrapper) inherits — see the
 prerequisites section above. Skip this block if you don't have a key; the
-other eight tools still work, only `summary` will return an "LLM disabled"
+other nine tools still work, only `summary` will return an "LLM disabled"
 envelope.
 
 ### The MCP tools
 
-The MCP surface exposes nine tools: seven primary tools (in the table below)
-plus `subsystem_members` for clustering output and `project_status` for
-deterministic diagnostics. Eight of the nine are credential-free; only
-`summary` needs the live LLM. Each is a structured graph query, not free-text
-grep.
+The MCP surface exposes ten tools: seven primary tools (in the table below)
+plus `subsystem_members` and `subsystem_of` for clustering output and
+`project_status` for deterministic diagnostics. Nine of the ten are
+credential-free; only `summary` needs the live LLM. Each is a structured graph
+query, not free-text grep.
 
 | Tool | Example invocation |
 |---|---|
@@ -238,6 +238,7 @@ grep.
 | `summary(id)` | `summary(id="python:function:requests.sessions.Session.send")` — structured LLM summary with `purpose` / `behavior` / `relationships` / `risks` fields. Requires the live-LLM opt-in above plus `OPENROUTER_API_KEY`. First call dispatches the LLM and caches; subsequent calls hit the cache. |
 | `issues_for(id)` | `issues_for(id="python:module:requests.sessions")` — Filigree issues attached to this entity, if Filigree is reachable. Returns an `unavailable` envelope if not (Filigree is enrich-only). |
 | `neighborhood(id)` | `neighborhood(id="python:function:requests.sessions.Session.send")` — callers, callees, container, contained entities, and references in one hop. |
+| `subsystem_of(id)` | `subsystem_of(id="python:module:requests.sessions")` — the subsystem an entity belongs to (reverse of `subsystem_members`); a function/class resolves through its containing module. |
 | `project_status()` | `project_status()` — index diagnostics: latest run, entity/edge/finding counts, staleness, per-plugin counts, LLM policy, and the resolved Filigree endpoint. No arguments, no LLM. |
 
 The three questions to walk through with your agent:
