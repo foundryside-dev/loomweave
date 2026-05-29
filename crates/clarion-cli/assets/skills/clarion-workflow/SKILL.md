@@ -58,6 +58,19 @@ edge is missing (e.g. dynamic dispatch), re-query at `"ambiguous"` and
 `"inferred"` and union the results — a default `resolved` count can understate
 the true caller set.
 
+These three tools also return a `scope_excludes` array listing static blind
+spots the query did **not** search (e.g. `"attribute-receiver-calls"` like
+`ctx.svc.run()`; `"module-level-reference-rollup"` on a module). A non-empty
+`scope_excludes` means an empty/short result is **not** a guaranteed true
+negative — re-query at `"inferred"` (which searches those categories and returns
+`scope_excludes: []`) before concluding "nothing calls this."
+
+`execution_paths_from` returns a compact shape: `root`, a deduplicated `nodes`
+table (id + short_name + location, each node once), and `paths` as arrays of
+node-id strings ranked longest-first. Resolve a path id against `nodes`, not by
+re-reading each path element. `truncated`/`truncation_reason` report `edge-cap`
+(traversal stopped early) or `path-cap` (ranked output trimmed for size).
+
 ## Workflow: orient, then navigate
 
 1. **Anchor.** `find_entity` by name (or `entity_at` for a file:line) to get the

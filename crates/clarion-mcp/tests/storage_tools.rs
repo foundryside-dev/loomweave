@@ -2166,6 +2166,102 @@ async fn execution_paths_from_reports_edge_cap_truncation() {
     assert_eq!(envelope["result"]["edge_count_visited"], 2);
 }
 
+// ── compact ranked execution paths (clarion-5b3eff9a91 + clarion-23ae24358c) ──
+
+#[tokio::test]
+async fn execution_paths_from_returns_compact_node_table_and_id_paths() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "execution_paths_from",
+        json!({"id": "python:function:demo.entry", "max_depth": 3}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    let result = &envelope["result"];
+    assert_eq!(result["root"], "python:function:demo.entry");
+
+    // paths are arrays of node-id strings, not re-serialized node objects.
+    let paths = result["paths"].as_array().expect("paths array");
+    assert!(!paths.is_empty());
+    for path in paths {
+        for node in path.as_array().unwrap() {
+            assert!(
+                node.is_string(),
+                "path element must be a node-id string, got {node:?}"
+            );
+        }
+    }
+
+    // nodes is a deduplicated table: each id once, no content_hash bloat,
+    // short_name retained for readability.
+    let nodes = result["nodes"].as_array().expect("nodes array");
+    let ids: Vec<&str> = nodes.iter().map(|n| n["id"].as_str().unwrap()).collect();
+    let mut deduped = ids.clone();
+    deduped.sort_unstable();
+    deduped.dedup();
+    assert_eq!(ids.len(), deduped.len(), "node table must be deduplicated");
+    assert!(
+        nodes.iter().all(|n| n.get("content_hash").is_none()),
+        "compact nodes must drop content_hash"
+    );
+    assert!(nodes.iter().all(|n| n.get("short_name").is_some()));
+
+    // every id referenced by a path resolves in the node table.
+    let node_ids: std::collections::HashSet<&str> = ids.into_iter().collect();
+    for path in paths {
+        for node in path.as_array().unwrap() {
+            assert!(
+                node_ids.contains(node.as_str().unwrap()),
+                "path references node {node:?} absent from the node table"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn execution_paths_from_ranks_longest_paths_first() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "execution_paths_from",
+        json!({"id": "python:function:demo.entry", "max_depth": 3}),
+    )
+    .await;
+
+    let paths = envelope["result"]["paths"].as_array().unwrap();
+    let lengths: Vec<usize> = paths.iter().map(|p| p.as_array().unwrap().len()).collect();
+    let mut descending = lengths.clone();
+    descending.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(
+        lengths, descending,
+        "paths must be ranked longest-first, got {lengths:?}"
+    );
+}
+
+#[tokio::test]
+async fn execution_paths_from_path_cap_sets_truncated() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path).with_path_cap(1);
+
+    let envelope = call_tool(
+        &state,
+        "execution_paths_from",
+        json!({"id": "python:function:demo.entry", "max_depth": 3, "confidence": "ambiguous"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["truncated"], true);
+    assert_eq!(envelope["truncation_reason"], "path-cap");
+    assert_eq!(envelope["result"]["paths"].as_array().unwrap().len(), 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn execution_paths_from_inferred_dispatches_start_caller() {
     let (project, db_path) = open_project();
@@ -2217,7 +2313,7 @@ async fn execution_paths_from_inferred_dispatches_start_caller() {
                 path.as_array()
                     .unwrap()
                     .iter()
-                    .any(|node| node["id"] == "python:function:demo.dynamic")
+                    .any(|node_id| node_id == "python:function:demo.dynamic")
             })
     );
     assert_eq!(provider.invocations().len(), 1);
@@ -2277,7 +2373,7 @@ async fn execution_paths_from_inferred_dispatches_reached_callers() {
                 path.as_array()
                     .unwrap()
                     .iter()
-                    .any(|node| node["id"] == "python:function:demo.dynamic")
+                    .any(|node_id| node_id == "python:function:demo.dynamic")
             })
     );
     assert_eq!(provider.invocations().len(), 1);

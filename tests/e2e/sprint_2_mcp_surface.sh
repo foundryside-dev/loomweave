@@ -426,8 +426,14 @@ ambiguous_ids = {item["entity"]["id"] for item in ambiguous_callers["result"]["c
 assert "python:function:demo.via_dispatch" in ambiguous_ids, ambiguous_callers
 
 paths = assert_tool_ok(responses["paths"])
-path_ids = [[node["id"] for node in path] for path in paths["result"]["paths"]]
+# Compact shape (clarion-5b3eff9a91): paths are arrays of node-id strings into a
+# deduplicated node table; the queried entity is echoed as root.
+path_ids = paths["result"]["paths"]
 assert ["python:function:demo.hello", "python:function:demo.world"] in path_ids, paths
+assert paths["result"]["root"] == "python:function:demo.hello", paths
+node_ids = {node["id"] for node in paths["result"]["nodes"]}
+assert "python:function:demo.world" in node_ids, paths
+assert all("content_hash" not in node for node in paths["result"]["nodes"]), paths
 assert paths["truncated"] is False, paths
 
 neighborhood = assert_tool_ok(responses["neighborhood"])

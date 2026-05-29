@@ -117,7 +117,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "execution_paths_from",
-            description: "Return bounded calls-only execution paths starting at an entity. Default confidence is resolved. max_depth defaults to 3 and traversal also stops at the server edge cap; responses say when they are truncated. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls).",
+            description: "Return bounded calls-only execution paths starting at an entity. Default confidence is resolved. max_depth defaults to 3. Results are compact: a deduplicated nodes table plus paths as arrays of node ids (under a root), ranked longest-first. Traversal stops at the server edge cap and the response is capped at a maximum number of ranked paths; truncated/truncation_reason report edge-cap or path-cap when either trims. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -259,6 +259,7 @@ pub struct ServerState {
     project_root: PathBuf,
     readers: ReaderPool,
     execution_edge_cap: usize,
+    execution_path_cap: usize,
     summary_llm: Option<SummaryLlmState>,
     clock: Arc<dyn Fn() -> String + Send + Sync>,
     budget: Arc<Mutex<BudgetLedger>>,
@@ -274,6 +275,7 @@ impl ServerState {
             project_root,
             readers,
             execution_edge_cap: 500,
+            execution_path_cap: 200,
             summary_llm: None,
             clock: Arc::new(default_now_string),
             budget: Arc::new(Mutex::new(BudgetLedger::default())),
@@ -286,6 +288,12 @@ impl ServerState {
     #[must_use]
     pub fn with_edge_cap(mut self, execution_edge_cap: usize) -> Self {
         self.execution_edge_cap = execution_edge_cap;
+        self
+    }
+
+    #[must_use]
+    pub fn with_path_cap(mut self, execution_path_cap: usize) -> Self {
+        self.execution_path_cap = execution_path_cap;
         self
     }
 
@@ -576,6 +584,7 @@ impl ServerState {
             return Ok(self.inferred_execution_paths(entity_id, max_depth).await);
         }
         let edge_cap = self.execution_edge_cap;
+        let path_cap = self.execution_path_cap;
         let result = self
             .readers
             .with_reader(move |conn| {
@@ -589,18 +598,18 @@ impl ServerState {
                 let mut traversal = PathTraversal::new(edge_cap);
                 let mut path = vec![entity_id.clone()];
                 traversal.walk(conn, &entity_id, &mut path, max_depth, confidence)?;
-                let paths = traversal
-                    .paths
-                    .iter()
-                    .map(|path| path_json(conn, path))
-                    .collect::<Result<Vec<_>, StorageError>>()?;
+                let edge_truncated = traversal.truncated;
+                let edge_count_visited = traversal.edge_count_visited;
+                let compact = compact_execution_paths(conn, traversal.paths, path_cap)?;
                 Ok(success_envelope_with_truncation(
                     json!({
-                        "paths": paths,
-                        "edge_count_visited": traversal.edge_count_visited,
+                        "root": entity_id,
+                        "nodes": compact.nodes,
+                        "paths": compact.paths,
+                        "edge_count_visited": edge_count_visited,
                         "scope_excludes": call_graph_scope_excludes(confidence),
                     }),
-                    traversal.truncated.then_some("edge-cap"),
+                    path_truncation_reason(edge_truncated, compact.path_cap_truncated),
                 ))
             })
             .await;
@@ -633,6 +642,7 @@ impl ServerState {
             }
         }
 
+        let root = entity_id.clone();
         let mut stats = InferredDispatchStats::default();
         let mut dispatched_callers = BTreeSet::new();
         let mut stack = vec![(entity_id.clone(), vec![entity_id], max_depth)];
@@ -683,23 +693,21 @@ impl ServerState {
             }
         }
 
-        let resolved_paths = self
+        let path_cap = self.execution_path_cap;
+        let compacted = self
             .readers
-            .with_reader(move |conn| {
-                paths
-                    .iter()
-                    .map(|path| path_json(conn, path))
-                    .collect::<Result<Vec<_>, StorageError>>()
-            })
+            .with_reader(move |conn| compact_execution_paths(conn, paths, path_cap))
             .await;
-        match resolved_paths {
-            Ok(paths) => success_envelope_with_truncation_and_stats(
+        match compacted {
+            Ok(compact) => success_envelope_with_truncation_and_stats(
                 json!({
-                    "paths": paths,
+                    "root": root,
+                    "nodes": compact.nodes,
+                    "paths": compact.paths,
                     "edge_count_visited": edge_count_visited,
                     "scope_excludes": call_graph_scope_excludes(EdgeConfidence::Inferred),
                 }),
-                truncated.then_some("edge-cap"),
+                path_truncation_reason(truncated, compact.path_cap_truncated),
                 stats.to_json(),
             ),
             Err(err) => {
@@ -3165,13 +3173,73 @@ fn callee_json(
     }))
 }
 
-fn path_json(conn: &rusqlite::Connection, path: &[String]) -> Result<Value, StorageError> {
-    let entities = path
+/// Compacted execution-path payload: a deduplicated node table, id-only ranked
+/// paths, and whether the path cap trimmed the ranked set.
+struct CompactPaths {
+    nodes: Vec<Value>,
+    paths: Vec<Vec<String>>,
+    path_cap_truncated: bool,
+}
+
+/// Compact, ranked execution-path payload (clarion-5b3eff9a91). Ranks paths
+/// longest-first (deepest reachable flow) with a lexicographic tie-break for
+/// determinism, applies the server path cap (clarion-23ae24358c), then emits a
+/// deduplicated node table so each entity is serialized once instead of once per
+/// path occurrence — the old per-path re-serialization produced responses that
+/// blew the transport budget.
+fn compact_execution_paths(
+    conn: &rusqlite::Connection,
+    mut paths: Vec<Vec<String>>,
+    path_cap: usize,
+) -> Result<CompactPaths, StorageError> {
+    paths.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    let path_cap_truncated = paths.len() > path_cap;
+    paths.truncate(path_cap);
+
+    let mut node_ids: BTreeSet<String> = BTreeSet::new();
+    for path in &paths {
+        for id in path {
+            node_ids.insert(id.clone());
+        }
+    }
+    let nodes = node_ids
         .iter()
-        .filter_map(|entity_id| entity_by_id(conn, entity_id).transpose())
-        .map(|row| row.map(|entity| entity_json(&entity)))
+        .filter_map(|id| entity_by_id(conn, id).transpose())
+        .map(|row| row.map(|entity| compact_node_json(&entity)))
         .collect::<Result<Vec<_>, StorageError>>()?;
-    Ok(Value::Array(entities))
+    Ok(CompactPaths {
+        nodes,
+        paths,
+        path_cap_truncated,
+    })
+}
+
+/// Truncation reason for an execution-path response. `edge-cap` (traversal
+/// stopped early, so the graph itself is incomplete) takes precedence over
+/// `path-cap` (traversal finished but the ranked output was trimmed for size,
+/// clarion-23ae24358c).
+fn path_truncation_reason(edge_truncated: bool, path_cap_truncated: bool) -> Option<&'static str> {
+    if edge_truncated {
+        Some("edge-cap")
+    } else if path_cap_truncated {
+        Some("path-cap")
+    } else {
+        None
+    }
+}
+
+/// A path node trimmed for token economy: identity + location only. The full id
+/// already encodes the qualified name; `content_hash` and the redundant `name`
+/// are dropped (clarion-5b3eff9a91).
+fn compact_node_json(entity: &EntityRow) -> Value {
+    json!({
+        "id": entity.id,
+        "kind": entity.kind,
+        "short_name": entity.short_name,
+        "source_file_path": entity.source_file_path,
+        "source_line_start": entity.source_line_start,
+        "source_line_end": entity.source_line_end
+    })
 }
 
 fn reference_neighbors(
@@ -3249,7 +3317,7 @@ mod tests {
         assert_eq!(tools[3].name, "execution_paths_from");
         assert_eq!(
             tools[3].description,
-            "Return bounded calls-only execution paths starting at an entity. Default confidence is resolved. max_depth defaults to 3 and traversal also stops at the server edge cap; responses say when they are truncated. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls)."
+            "Return bounded calls-only execution paths starting at an entity. Default confidence is resolved. max_depth defaults to 3. Results are compact: a deduplicated nodes table plus paths as arrays of node ids (under a root), ranked longest-first. Traversal stops at the server edge cap and the response is capped at a maximum number of ranked paths; truncated/truncation_reason report edge-cap or path-cap when either trims. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls)."
         );
         assert_eq!(tools[4].name, "summary");
         assert_eq!(
