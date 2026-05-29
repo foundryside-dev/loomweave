@@ -1327,6 +1327,7 @@ impl ServerState {
                     "staleness": snapshot.staleness(),
                     "last_analyzed_at": snapshot.last_analyzed_at(),
                     "degraded": snapshot.degraded(),
+                    "scan_truncated": snapshot.scan_truncated(),
                 });
                 let staleness_stale =
                     matches!(snapshot.staleness(), crate::snapshot::Staleness::Stale);
@@ -2145,6 +2146,7 @@ impl ServerState {
                 "briefing_blocked": briefing_blocked,
             },
             "staleness": serde_json::to_value(snapshot.staleness()).unwrap_or(Value::Null),
+            "scan_truncated": snapshot.scan_truncated(),
             "last_analyzed_at": snapshot.last_analyzed_at(),
             // No analyze-time git SHA is persisted and Clarion has no git
             // integration; report null rather than fabricate one.
@@ -4398,6 +4400,7 @@ fn entity_context_json(
         "staleness": snapshot.staleness(),
         "last_analyzed_at": snapshot.last_analyzed_at(),
         "degraded": snapshot.degraded(),
+        "scan_truncated": snapshot.scan_truncated(),
     });
 
     let Some(matched) = matched else {

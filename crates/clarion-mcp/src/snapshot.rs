@@ -105,6 +105,17 @@ pub struct ProjectSnapshot {
     /// source file folding to `Unknown`) is *not* degradation — that is a normal
     /// outcome signalled by `staleness` itself, not a DB-machinery failure.
     degraded: bool,
+    /// `true` when the in-place modification scan stopped at
+    /// [`MAX_MODIFICATION_STAT_FILES`] without finding drift: the index has more
+    /// ingested files than the per-check `stat` cap, so a [`Staleness::Fresh`]
+    /// verdict on this snapshot is only proven for the files that were scanned —
+    /// an edit beyond the cap may go unnoticed until the next analyze. A
+    /// consumer on a very large repo can read this to know a `Fresh` result is
+    /// bounded rather than exhaustive (clarion-e687941a8c). Always `false` for a
+    /// `Stale`/`Unknown`/`NeverAnalyzed`/`NoSourcePaths` verdict.
+    ///
+    /// [`Fresh`]: Staleness::Fresh
+    scan_truncated: bool,
 }
 
 impl ProjectSnapshot {
@@ -156,6 +167,15 @@ impl ProjectSnapshot {
     pub fn degraded(&self) -> bool {
         self.degraded
     }
+
+    /// `true` when a [`Staleness::Fresh`] verdict rests on a modification scan
+    /// that hit the per-check `stat` cap — see the field-level note.
+    ///
+    /// [`Fresh`]: Staleness::Fresh
+    #[must_use]
+    pub fn scan_truncated(&self) -> bool {
+        self.scan_truncated
+    }
 }
 
 /// Build a snapshot from an already-open migrated `Connection`.
@@ -177,11 +197,13 @@ pub fn project_snapshot(conn: &Connection, project_root: &Path) -> ProjectSnapsh
     let finding_count = scalar_count(conn, "SELECT COUNT(*) FROM findings", &mut degraded);
 
     let last_analyzed_at = latest_completed_run(conn, &mut degraded);
+    let mut scan_truncated = false;
     let staleness = compute_staleness(
         conn,
         project_root,
         last_analyzed_at.as_deref(),
         &mut degraded,
+        &mut scan_truncated,
     );
 
     ProjectSnapshot {
@@ -192,6 +214,7 @@ pub fn project_snapshot(conn: &Connection, project_root: &Path) -> ProjectSnapsh
         staleness,
         last_analyzed_at,
         degraded,
+        scan_truncated,
     }
 }
 
@@ -206,6 +229,7 @@ pub fn missing_db_snapshot() -> ProjectSnapshot {
         staleness: Staleness::NeverAnalyzed,
         last_analyzed_at: None,
         degraded: false,
+        scan_truncated: false,
     }
 }
 
@@ -226,6 +250,7 @@ pub fn unreadable_db_snapshot() -> ProjectSnapshot {
         staleness: Staleness::Unknown,
         last_analyzed_at: None,
         degraded: true,
+        scan_truncated: false,
     }
 }
 
@@ -284,6 +309,7 @@ fn compute_staleness(
     project_root: &Path,
     last_analyzed_at: Option<&str>,
     degraded: &mut bool,
+    scan_truncated: &mut bool,
 ) -> Staleness {
     let Some(run_iso) = last_analyzed_at else {
         return Staleness::NeverAnalyzed;
@@ -308,7 +334,7 @@ fn compute_staleness(
     }
 
     // (2) In-place modification: one stat per ingested file, bounded.
-    match file_modification_drift(&files, run_time) {
+    match file_modification_drift(&files, run_time, scan_truncated) {
         Some(staleness) => staleness,
         None => {
             if files.is_empty() {
@@ -391,7 +417,11 @@ fn directory_structural_drift(dirs: &BTreeSet<PathBuf>, run_time: SystemTime) ->
 /// (`NotFound`) is staleness, not an error (clarion-e687941a8c) — the
 /// structural pass usually catches it via the parent directory first, but a
 /// top-level deletion (parent is the unwatched project root) lands here.
-fn file_modification_drift(files: &[PathBuf], run_time: SystemTime) -> Option<Staleness> {
+fn file_modification_drift(
+    files: &[PathBuf],
+    run_time: SystemTime,
+    scan_truncated: &mut bool,
+) -> Option<Staleness> {
     for abs in files.iter().take(MAX_MODIFICATION_STAT_FILES) {
         match abs.metadata().and_then(|m| m.modified()) {
             Ok(mtime) if mtime > run_time => return Some(Staleness::Stale),
@@ -400,7 +430,12 @@ fn file_modification_drift(files: &[PathBuf], run_time: SystemTime) -> Option<St
             Err(_) => return Some(Staleness::Unknown),
         }
     }
+    // Reached only when no drift was found in the scanned prefix. If the index
+    // has more files than the cap, the resulting `Fresh` verdict is bounded:
+    // record it on the snapshot (not just the log) so a consumer can tell a
+    // proven-fresh index from a fresh-as-far-as-scanned one (clarion-e687941a8c).
     if files.len() > MAX_MODIFICATION_STAT_FILES {
+        *scan_truncated = true;
         tracing::warn!(
             ingested_files = files.len(),
             cap = MAX_MODIFICATION_STAT_FILES,
@@ -427,7 +462,9 @@ mod tests {
 
     use clarion_storage::{pragma, schema};
 
-    use super::{Staleness, project_snapshot};
+    use std::time::Duration;
+
+    use super::{MAX_MODIFICATION_STAT_FILES, Staleness, file_modification_drift, project_snapshot};
 
     // `apply_write_pragmas` enforces ADR-011's WAL journal-mode invariant, which
     // an in-memory connection cannot satisfy (`journal_mode=memory`). Back the
@@ -548,6 +585,56 @@ mod tests {
 
         let snap = project_snapshot(&conn, dir.path());
         assert_eq!(snap.staleness, Staleness::Stale, "{snap:?}");
+    }
+
+    #[test]
+    fn fresh_within_cap_is_not_scan_truncated() {
+        let (_dir, conn) = migrated_conn();
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.py");
+        std::fs::write(&src, "x = 1\n").unwrap();
+        set_mtime(&src, std::time::UNIX_EPOCH + Duration::from_secs(1_000_000));
+
+        insert_entity(&conn, "python:module:a", "module", Some("a.py"));
+        // Run far after the file mtime → Fresh, and only one file → exhaustive.
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+             VALUES ('r', '2099-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z', '{}', '{}', 'completed')",
+            [],
+        )
+        .unwrap();
+
+        let snap = project_snapshot(&conn, dir.path());
+        assert_eq!(snap.staleness, Staleness::Fresh, "{snap:?}");
+        assert!(
+            !snap.scan_truncated,
+            "a within-cap scan is exhaustive, not truncated: {snap:?}"
+        );
+    }
+
+    #[test]
+    fn scan_truncated_set_when_file_count_exceeds_cap_without_drift() {
+        // Drive the bounded modification scan directly: one real, old file
+        // repeated past the cap. The surplus entries are never stat-ed (the
+        // scan stops at the cap), but their presence means the resulting
+        // no-drift verdict is bounded — exactly the false-negative risk the
+        // flag warns about (clarion-e687941a8c). Repeating one path keeps the
+        // test cheap instead of materialising 20k files.
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old.py");
+        std::fs::write(&old, "x = 1\n").unwrap();
+        // A run a year in the future: the file is unambiguously older, so every
+        // scanned stat is Fresh and the loop runs to the cap.
+        let run_time = std::time::SystemTime::now() + Duration::from_secs(60 * 60 * 24 * 365);
+        let files = vec![old; MAX_MODIFICATION_STAT_FILES + 1];
+
+        let mut scan_truncated = false;
+        let verdict = file_modification_drift(&files, run_time, &mut scan_truncated);
+        assert_eq!(verdict, None, "no drift among the scanned prefix");
+        assert!(
+            scan_truncated,
+            "exceeding the per-check stat cap must set scan_truncated"
+        );
     }
 
     // `compute_staleness` folds: (a) an unparseable run timestamp → Unknown +
