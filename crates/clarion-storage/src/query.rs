@@ -1133,7 +1133,7 @@ pub fn subsystem_of_entity(conn: &Connection, entity_id: &str) -> Result<Option<
 /// *symbol* (`from pkg.contracts import X` binds to the class `X`), but the
 /// reverse-import contract names importing *modules* — so a consumer resolves
 /// each importer to its module here. Returns `None` for a symbol with no module
-/// ancestor within [`MODULE_ANCESTOR_MAX_DEPTH`].
+/// ancestor within `MODULE_ANCESTOR_MAX_DEPTH`.
 pub fn containing_module_id(conn: &Connection, entity_id: &str) -> Result<Option<String>> {
     conn.query_row(
         "WITH RECURSIVE ancestors(id, depth) AS ( \

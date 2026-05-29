@@ -257,7 +257,11 @@ async fn analyze_start_reaps_finished_runs_and_their_progress_files() {
     let first = call_tool(&state, "analyze_start", json!({})).await;
     let first_id = first["result"]["run_id"].as_str().unwrap().to_owned();
     let first_progress = PathBuf::from(first["result"]["progress_file"].as_str().unwrap());
-    assert_eq!(state.tracked_analyze_runs(), 1, "handle tracked after start");
+    assert_eq!(
+        state.tracked_analyze_runs(),
+        1,
+        "handle tracked after start"
+    );
 
     // Wait for it to reach a terminal status (it writes no runs row, so the
     // terminal mapping is `failed` — what matters here is that it exited).

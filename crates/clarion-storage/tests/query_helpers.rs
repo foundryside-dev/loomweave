@@ -5,11 +5,11 @@ use std::path::Path;
 use clarion_core::EdgeConfidence;
 use clarion_storage::{
     ModuleDependencyEdge, ReferenceDirection, SubsystemMember, call_edges_from,
-    call_edges_targeting, child_entity_ids, contained_entity_ids, entity_at_line,
-    entity_briefing_block_reason, entity_by_id, find_entities, findings_for_emit,
+    call_edges_targeting, child_entity_ids, contained_entity_ids, containing_module_id,
+    entity_at_line, entity_briefing_block_reason, entity_by_id, find_entities, findings_for_emit,
     module_dependency_edges, module_reference_rollup, normalize_source_path, pragma,
     reference_edges_for_entity, resolve_file, resolve_file_catalog_entry, schema,
-    containing_module_id, subsystem_for_member, subsystem_members, subsystem_of_entity,
+    subsystem_for_member, subsystem_members, subsystem_of_entity,
 };
 use rusqlite::{Connection, params};
 

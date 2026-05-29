@@ -464,7 +464,9 @@ mod tests {
 
     use std::time::Duration;
 
-    use super::{MAX_MODIFICATION_STAT_FILES, Staleness, file_modification_drift, project_snapshot};
+    use super::{
+        MAX_MODIFICATION_STAT_FILES, Staleness, file_modification_drift, project_snapshot,
+    };
 
     // `apply_write_pragmas` enforces ADR-011's WAL journal-mode invariant, which
     // an in-memory connection cannot satisfy (`journal_mode=memory`). Back the

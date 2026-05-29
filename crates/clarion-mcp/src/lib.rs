@@ -30,8 +30,8 @@ use clarion_storage::{
     RolledUpReferenceEdge, StorageError, SummaryCacheEntry, SummaryCacheKey, UnresolvedCallSiteRow,
     WriterCmd, ancestor_chain, call_edges_from, call_edges_targeting,
     candidate_entities_for_unresolved_sites, child_entity_ids, contained_entity_ids,
-    containing_module_id, entities_containing_line, entity_by_id, existing_entity_ids, find_entities,
-    import_edges_for_entity, inferred_edge_cache_key_id, inferred_edge_cache_lookup,
+    containing_module_id, entities_containing_line, entity_by_id, existing_entity_ids,
+    find_entities, import_edges_for_entity, inferred_edge_cache_key_id, inferred_edge_cache_lookup,
     module_reference_rollup, normalize_source_path, reference_edges_for_entity, subsystem_members,
     subsystem_of_entity, summary_cache_lookup, unresolved_call_sites_for_caller,
     unresolved_callers_for_target,
@@ -5461,14 +5461,17 @@ fn rolled_up_neighbors_json(
                 "edge_confidence".to_owned(),
                 json!(edge.confidence.as_str()),
             );
-            object.insert("source_byte_start".to_owned(), json!(edge.source_byte_start));
+            object.insert(
+                "source_byte_start".to_owned(),
+                json!(edge.source_byte_start),
+            );
             object.insert("source_byte_end".to_owned(), json!(edge.source_byte_end));
             // The module-contained symbol this edge actually touches, so a
             // rolled-up "who imports this module" answer names the importer
             // (entity) AND the imported symbol (via).
             object.insert(
                 "via".to_owned(),
-                via.as_ref().map(entity_json).unwrap_or(Value::Null),
+                via.as_ref().map_or(Value::Null, entity_json),
             );
             // Reverse-import altitude (clarion-79d0ff6e14): the edge is recorded
             // against the importing *symbol*, but "who imports this module /
@@ -5484,7 +5487,7 @@ fn rolled_up_neighbors_json(
                 };
                 object.insert(
                     "importer_module".to_owned(),
-                    importer_module.as_ref().map(entity_json).unwrap_or(Value::Null),
+                    importer_module.as_ref().map_or(Value::Null, entity_json),
                 );
             }
             neighbors.push(Value::Object(object));
