@@ -4183,7 +4183,8 @@ async fn project_status_filigree_falls_back_to_config_without_port_file() {
 // ---------------------------------------------------------------------------
 
 /// Build a `WardlineFinding` with `metadata.wardline.qualname` set — models a
-/// finding that can be reconciled to a named entity.
+/// finding that can be reconciled to a named entity. The wardline block carries
+/// only `qualname`; use `wf_full` when you need the full block for assertions.
 fn wf(qualname: &str, rule_id: &str) -> WardlineFinding {
     WardlineFinding {
         rule_id: rule_id.to_owned(),
@@ -4195,6 +4196,30 @@ fn wf(qualname: &str, rule_id: &str) -> WardlineFinding {
         fingerprint: Some(format!("fp-{rule_id}")),
         file_id: Some("file-test".to_owned()),
         metadata: serde_json::json!({ "wardline": { "qualname": qualname } }),
+    }
+}
+
+/// Build a `WardlineFinding` with a full `metadata.wardline` block —
+/// kind/confidence/suppression/qualname — for assertions that the wardline
+/// sub-object is surfaced verbatim in section items.
+fn wf_full(qualname: &str, rule_id: &str) -> WardlineFinding {
+    WardlineFinding {
+        rule_id: rule_id.to_owned(),
+        message: format!("taint finding for {qualname}"),
+        severity: Some("high".to_owned()),
+        status: Some("open".to_owned()),
+        line_start: Some(10),
+        line_end: Some(12),
+        fingerprint: Some(format!("fp-{rule_id}")),
+        file_id: Some("file-test".to_owned()),
+        metadata: serde_json::json!({
+            "wardline": {
+                "qualname": qualname,
+                "kind": "taint",
+                "confidence": "high",
+                "suppression": null
+            }
+        }),
     }
 }
 
@@ -4425,4 +4450,224 @@ async fn orientation_pack_includes_wardline_findings() {
         out["result"]["issues"].get("wardline_findings").is_none(),
         "wardline_findings must not appear inside the issues section"
     );
+}
+
+// ---------------------------------------------------------------------------
+// FIX 1: metadata.wardline block surfaced in items
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn issues_for_section_item_carries_wardline_metadata_block() {
+    // AC (FIX 1): each item in `wardline_findings.items` includes a `wardline`
+    // key with the full wardline sub-object from `metadata.wardline` —
+    // kind, confidence, suppression, qualname. The block is passed through
+    // verbatim; Clarion does not selectively strip or rename fields.
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, parent_id, source_file_path,
+            source_line_start, source_line_end, properties, content_hash,
+            created_at, updated_at
+         ) VALUES (
+            'python:function:demo.hello', 'python', 'function',
+            'python:function:demo.hello', 'demo.hello', NULL,
+            'src/demo.py', 1, 3, '{}', 'fake-hash-wf-meta',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        [],
+    )
+    .expect("insert demo.hello entity");
+    drop(conn);
+
+    let client = Arc::new(
+        FakeFiligreeClient::default()
+            .with_wardline_findings(vec![wf_full("demo.hello", "WLN-TAINT-001")]),
+    );
+    let state = state_for_filigree(project.path(), &db_path, client);
+
+    let envelope = call_tool(
+        &state,
+        "issues_for",
+        json!({"id": "python:function:demo.hello", "include_contained": false}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    let section = &envelope["result"]["wardline_findings"];
+    assert_eq!(section["result_kind"], "matched", "section: {section}");
+    let items = section["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1, "one matched finding");
+    // The wardline sub-object must be present and carry kind/confidence/suppression.
+    let wb = &items[0]["wardline"];
+    assert_eq!(wb["kind"], "taint", "wardline.kind in item: {wb}");
+    assert_eq!(
+        wb["confidence"], "high",
+        "wardline.confidence in item: {wb}"
+    );
+    assert_eq!(
+        wb["suppression"],
+        Value::Null,
+        "wardline.suppression null: {wb}"
+    );
+    assert_eq!(
+        wb["qualname"], "demo.hello",
+        "wardline.qualname in item: {wb}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX 4: coverage gaps
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn issues_for_no_path_entity_returns_no_matches_without_fetch() {
+    // AC (FIX 4a): entity with source_file_path IS NULL → section is
+    // `no_matches` (empty) and the wardline client route is NOT invoked.
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    // Insert an entity with source_file_path NULL.
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, parent_id, source_file_path,
+            source_line_start, source_line_end, properties, content_hash,
+            created_at, updated_at
+         ) VALUES (
+            'python:function:demo.nopath', 'python', 'function',
+            'python:function:demo.nopath', 'demo.nopath', NULL,
+            NULL, NULL, NULL, '{}', 'fake-hash-nopath',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        [],
+    )
+    .expect("insert demo.nopath entity");
+    drop(conn);
+
+    // Client has findings — these must NOT be fetched for a no-path entity.
+    let client = Arc::new(
+        FakeFiligreeClient::default()
+            .with_wardline_findings(vec![wf("demo.nopath", "WLN-TAINT-777")]),
+    );
+    let state = state_for_filigree(project.path(), &db_path, client);
+
+    let envelope = call_tool(
+        &state,
+        "issues_for",
+        json!({"id": "python:function:demo.nopath", "include_contained": false}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    let section = &envelope["result"]["wardline_findings"];
+    assert_eq!(
+        section["result_kind"], "no_matches",
+        "no-path entity must produce no_matches: {section}"
+    );
+    let items = section["items"].as_array().expect("items array");
+    assert!(items.is_empty(), "no items for no-path entity");
+}
+
+#[tokio::test]
+async fn issues_for_multiple_matching_findings_all_included() {
+    // AC (FIX 4b): when two findings both match the entity's qualname (two
+    // different rule_ids on the same entity), both are surfaced in items.
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, parent_id, source_file_path,
+            source_line_start, source_line_end, properties, content_hash,
+            created_at, updated_at
+         ) VALUES (
+            'python:function:demo.hello', 'python', 'function',
+            'python:function:demo.hello', 'demo.hello', NULL,
+            'src/demo.py', 1, 3, '{}', 'fake-hash-multi',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        [],
+    )
+    .expect("insert demo.hello entity");
+    drop(conn);
+
+    let client = Arc::new(FakeFiligreeClient::default().with_wardline_findings(vec![
+        wf("demo.hello", "WLN-TAINT-001"),
+        wf("demo.hello", "WLN-TAINT-002"),
+    ]));
+    let state = state_for_filigree(project.path(), &db_path, client);
+
+    let envelope = call_tool(
+        &state,
+        "issues_for",
+        json!({"id": "python:function:demo.hello", "include_contained": false}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    let section = &envelope["result"]["wardline_findings"];
+    assert_eq!(section["result_kind"], "matched", "section: {section}");
+    let items = section["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 2, "both findings must be surfaced: {section}");
+    let rule_ids: Vec<&str> = items
+        .iter()
+        .map(|it| it["rule_id"].as_str().expect("rule_id string"))
+        .collect();
+    assert!(
+        rule_ids.contains(&"WLN-TAINT-001"),
+        "WLN-TAINT-001 missing: {rule_ids:?}"
+    );
+    assert!(
+        rule_ids.contains(&"WLN-TAINT-002"),
+        "WLN-TAINT-002 missing: {rule_ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn issues_for_dotted_method_qualname_reconciles_end_to_end() {
+    // AC (FIX 4c): entity `python:function:demo.Foo.bar` at src/demo.py; the
+    // client returns a finding with qualname "demo.Foo.bar". The section must
+    // be `matched` and the item present — proving dotted method qualnames
+    // reconcile through the full dispatch path (spec §6).
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, parent_id, source_file_path,
+            source_line_start, source_line_end, properties, content_hash,
+            created_at, updated_at
+         ) VALUES (
+            'python:function:demo.Foo.bar', 'python', 'function',
+            'python:function:demo.Foo.bar', 'demo.Foo.bar', NULL,
+            'src/demo.py', 10, 12, '{}', 'fake-hash-foo-bar',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        [],
+    )
+    .expect("insert demo.Foo.bar entity");
+    drop(conn);
+
+    let client = Arc::new(
+        FakeFiligreeClient::default().with_wardline_findings(vec![wf("demo.Foo.bar", "WLN-X")]),
+    );
+    let state = state_for_filigree(project.path(), &db_path, client);
+
+    let envelope = call_tool(
+        &state,
+        "issues_for",
+        json!({"id": "python:function:demo.Foo.bar", "include_contained": false}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    let section = &envelope["result"]["wardline_findings"];
+    assert_eq!(
+        section["result_kind"], "matched",
+        "dotted method qualname must reconcile: {section}"
+    );
+    let items = section["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1, "one matched finding: {section}");
+    assert_eq!(items[0]["rule_id"], "WLN-X");
 }

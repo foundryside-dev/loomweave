@@ -853,7 +853,12 @@ is unreachable the `wardline_findings` section degrades to
 
 Clarion reads only the first page of each list response (it does not follow
 `has_more`); for a single source file the expected file/finding volume fits one
-Filigree page. Multi-page following is a documented v1 limitation.
+Filigree page. Multi-page following is a documented v1 limitation. If the
+prefix query for hop-1 returns a page that does not contain the exact-path
+match **and** `has_more` is true, Clarion cannot conclude the file is absent —
+the match may be on a later page. In that case `wardline_findings_for_path`
+returns an error and the `wardline_findings` section degrades to
+`result_kind: "unavailable"` (honest) rather than a false `no_matches`.
 
 **Reconciliation.** `metadata.wardline.qualname` is matched byte-exact against
 the entity_id's segment-3 `canonical_qualified_name`

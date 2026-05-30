@@ -84,6 +84,12 @@ pub struct LoomFileRecord {
 pub struct LoomFilesResponse {
     #[serde(default)]
     pub items: Vec<LoomFileRecord>,
+    /// True when more pages follow. When the exact-path match is absent and
+    /// `has_more` is true, the result is indeterminate — the file may be on a
+    /// later page — so callers must degrade to `unavailable` rather than
+    /// concluding `no_matches`.
+    #[serde(default)]
+    pub has_more: bool,
 }
 
 pub fn parse_wardline_findings_response(
@@ -371,12 +377,19 @@ impl FiligreeLookup for FiligreeHttpClient {
         // take only the row whose path is byte-exact.
         let files: LoomFilesResponse =
             self.get_json(&loom_files_url(&self.base_url, "wardline", path))?;
-        let Some(file_id) = files
-            .items
-            .into_iter()
-            .find(|f| f.path == path)
-            .map(|f| f.file_id)
-        else {
+        let exact = files.items.into_iter().find(|f| f.path == path);
+        let Some(file_id) = exact.map(|f| f.file_id) else {
+            // No exact match on this page. If has_more is true the result is
+            // indeterminate — the file may be on a later page — so degrade to
+            // unavailable rather than falsely concluding no_matches.
+            if files.has_more {
+                return Err(FiligreeClientError::HttpStatus {
+                    status: 0,
+                    body:
+                        "loom/files truncated before exact path match; cannot conclude no findings"
+                            .to_owned(),
+                });
+            }
             return Ok(Vec::new());
         };
         // Hop 2: file_id -> wardline findings.
@@ -868,6 +881,54 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, "WLN-TAINT-001");
         handle.join().expect("server thread");
+    }
+
+    /// FIX 3: when hop-1 returns items that don't include the exact path AND
+    /// `has_more` is true, `wardline_findings_for_path` must return `Err` rather
+    /// than `Ok(empty)` — a truncated page is indeterminate, not "no file found".
+    #[test]
+    fn wardline_findings_for_path_errors_when_hop1_truncated_before_exact_match() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            // Hop 1: page does NOT contain src/demo.py but has_more is true —
+            // the exact path may be on a later page.
+            let (mut s1, _) = listener.accept().expect("accept files");
+            let mut buf = [0_u8; 4096];
+            let n = s1.read(&mut buf).expect("read files req");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.contains(
+                "GET /api/loom/files?scan_source=wardline&path_prefix=src%2Fdemo.py HTTP/1.1"
+            ));
+            // Return a page that omits the target path with has_more:true.
+            let body = r#"{"items":[{"file_id":"file-1","path":"src/demo_other.py","language":"python","file_type":"source"}],"has_more":true}"#;
+            write!(
+                s1,
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            // No hop-2 — the function must error before making a second request.
+        });
+        let config = FiligreeConfig {
+            enabled: true,
+            base_url: format!("http://{addr}"),
+            actor: "clarion-test".to_owned(),
+            token_env: "TEST_FILIGREE_TOKEN".to_owned(),
+            timeout_seconds: 5,
+            emit_findings: true,
+            prune_unseen_days: 30,
+        };
+        let client = FiligreeHttpClient::from_config(&config, |_| None)
+            .expect("build client")
+            .expect("enabled client");
+        let result = client.wardline_findings_for_path("src/demo.py");
+        handle.join().expect("server thread");
+        assert!(
+            result.is_err(),
+            "truncated hop-1 without exact match must be Err, not Ok: {result:?}"
+        );
     }
 
     fn detail_test_client(addr: std::net::SocketAddr) -> FiligreeHttpClient {
