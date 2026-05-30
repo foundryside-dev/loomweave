@@ -74,7 +74,10 @@ pub fn reconcile_for_entity(entity_id: &str, findings: Vec<WardlineFinding>) -> 
             Some(qn) => {
                 let confidence = resolution_confidence(target, qn);
                 if confidence != ResolutionConfidence::None {
-                    result.matched.push(MatchedFinding { finding, resolution_confidence: confidence });
+                    result.matched.push(MatchedFinding {
+                        finding,
+                        resolution_confidence: confidence,
+                    });
                 }
             }
             None => result.omitted_no_qualname += 1,
@@ -108,7 +111,10 @@ mod tests {
 
     #[test]
     fn extracts_segment_three_qualname_incl_locals_and_nested() {
-        assert_eq!(entity_qualname("python:function:demo.Foo.bar"), Some("demo.Foo.bar"));
+        assert_eq!(
+            entity_qualname("python:function:demo.Foo.bar"),
+            Some("demo.Foo.bar")
+        );
         assert_eq!(
             entity_qualname("python:function:demo.outer.<locals>.inner"),
             Some("demo.outer.<locals>.inner")
@@ -126,7 +132,10 @@ mod tests {
             vec![finding(Some("demo.Foo.bar")), finding(Some("demo.other"))],
         );
         assert_eq!(r.matched.len(), 1);
-        assert_eq!(r.matched[0].resolution_confidence, ResolutionConfidence::Exact);
+        assert_eq!(
+            r.matched[0].resolution_confidence,
+            ResolutionConfidence::Exact
+        );
         assert_eq!(r.omitted_no_qualname, 0);
     }
 

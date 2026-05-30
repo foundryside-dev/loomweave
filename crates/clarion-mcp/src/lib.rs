@@ -1137,10 +1137,12 @@ impl ServerState {
                 wardline_section_for_entity(&client, &entity_id, path.as_deref())
             })
             .await
-            .unwrap_or_else(|err| serde_json::json!({
-                "result_kind": "unavailable", "items": [], "omitted_no_qualname": 0,
-                "reason": format!("wardline task failed: {err}"),
-            }));
+            .unwrap_or_else(|err| {
+                serde_json::json!({
+                    "result_kind": "unavailable", "items": [], "omitted_no_qualname": 0,
+                    "reason": format!("wardline task failed: {err}"),
+                })
+            });
             if let Some(result) = envelope.get_mut("result").and_then(Value::as_object_mut) {
                 result.insert("wardline_findings".to_owned(), section);
             }
@@ -4154,7 +4156,11 @@ fn wardline_section_for_entity(
                     })
                 })
                 .collect();
-            let result_kind = if items.is_empty() { "no_matches" } else { "matched" };
+            let result_kind = if items.is_empty() {
+                "no_matches"
+            } else {
+                "matched"
+            };
             serde_json::json!({
                 "result_kind": result_kind,
                 "items": items,

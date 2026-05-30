@@ -4242,13 +4242,11 @@ async fn issues_for_attaches_exact_wardline_findings() {
     .expect("insert demo.hello entity");
     drop(conn);
 
-    let client = Arc::new(
-        FakeFiligreeClient::default().with_wardline_findings(vec![
-            wf("demo.hello", "WLN-TAINT-001"),  // exact match -> attached
-            wf("demo.other", "WLN-TAINT-002"),  // different entity -> NOT attached
-            wf_no_qualname("WLN-METRIC-001"),   // no qualname -> omitted
-        ]),
-    );
+    let client = Arc::new(FakeFiligreeClient::default().with_wardline_findings(vec![
+        wf("demo.hello", "WLN-TAINT-001"), // exact match -> attached
+        wf("demo.other", "WLN-TAINT-002"), // different entity -> NOT attached
+        wf_no_qualname("WLN-METRIC-001"),  // no qualname -> omitted
+    ]));
     let state = state_for_filigree(project.path(), &db_path, client);
 
     let envelope = call_tool(
@@ -4260,10 +4258,7 @@ async fn issues_for_attaches_exact_wardline_findings() {
 
     assert_eq!(envelope["ok"], true);
     let section = &envelope["result"]["wardline_findings"];
-    assert_eq!(
-        section["result_kind"], "matched",
-        "section: {section}"
-    );
+    assert_eq!(section["result_kind"], "matched", "section: {section}");
     let items = section["items"].as_array().expect("items array");
     assert_eq!(items.len(), 1, "only the exact-match finding is included");
     assert_eq!(items[0]["rule_id"], "WLN-TAINT-001");
@@ -4308,7 +4303,10 @@ async fn issues_for_degrades_when_wardline_fetch_errors() {
     )
     .await;
 
-    assert_eq!(envelope["ok"], true, "tool must succeed even on wardline error");
+    assert_eq!(
+        envelope["ok"], true,
+        "tool must succeed even on wardline error"
+    );
     let section = &envelope["result"]["wardline_findings"];
     assert_eq!(
         section["result_kind"], "unavailable",

@@ -296,7 +296,10 @@ impl FiligreeHttpClient {
         let status = response.status();
         let body = response.text().map_err(FiligreeClientError::Request)?;
         if !status.is_success() {
-            return Err(FiligreeClientError::HttpStatus { status: status.as_u16(), body });
+            return Err(FiligreeClientError::HttpStatus {
+                status: status.as_u16(),
+                body,
+            });
         }
         serde_json::from_str(&body)
             .map_err(|e| FiligreeClientError::Contract(FiligreeContractError::from(e)))
@@ -368,7 +371,11 @@ impl FiligreeLookup for FiligreeHttpClient {
         // take only the row whose path is byte-exact.
         let files: LoomFilesResponse =
             self.get_json(&loom_files_url(&self.base_url, "wardline", path))?;
-        let Some(file_id) = files.items.into_iter().find(|f| f.path == path).map(|f| f.file_id)
+        let Some(file_id) = files
+            .items
+            .into_iter()
+            .find(|f| f.path == path)
+            .map(|f| f.file_id)
         else {
             return Ok(Vec::new());
         };
@@ -763,7 +770,10 @@ mod tests {
         assert_eq!(f.fingerprint.as_deref(), Some("fp-abc"));
         assert_eq!(f.line_start, Some(12));
         assert_eq!(
-            f.metadata.get("wardline").and_then(|w| w.get("qualname")).and_then(|q| q.as_str()),
+            f.metadata
+                .get("wardline")
+                .and_then(|w| w.get("qualname"))
+                .and_then(|q| q.as_str()),
             Some("demo.Foo.bar")
         );
     }
@@ -805,21 +815,37 @@ mod tests {
             let mut buf = [0_u8; 4096];
             let n = s1.read(&mut buf).expect("read files req");
             let req = String::from_utf8_lossy(&buf[..n]);
-            assert!(req.contains("GET /api/loom/files?scan_source=wardline&path_prefix=src%2Fdemo.py HTTP/1.1"));
+            assert!(req.contains(
+                "GET /api/loom/files?scan_source=wardline&path_prefix=src%2Fdemo.py HTTP/1.1"
+            ));
             let body = r#"{"items":[{"file_id":"file-9","path":"src/demo.py","language":"python","file_type":"source"},{"file_id":"file-10","path":"src/demo.py.bak","language":"python","file_type":"source"}],"has_more":false}"#;
             // connection: close forces reqwest to open a fresh TCP connection for
             // hop 2, so the listener's second accept() receives it (the blocking
             // client would otherwise pool/reuse hop-1's socket and hop-2's
             // accept() would hang).
-            write!(s1, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}", body.len(), body).unwrap();
+            write!(
+                s1,
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
 
             // Hop 2: GET /api/loom/findings for file-9.
             let (mut s2, _) = listener.accept().expect("accept findings");
             let n = s2.read(&mut buf).expect("read findings req");
             let req = String::from_utf8_lossy(&buf[..n]);
-            assert!(req.contains("GET /api/loom/findings?scan_source=wardline&file_id=file-9 HTTP/1.1"));
+            assert!(
+                req.contains("GET /api/loom/findings?scan_source=wardline&file_id=file-9 HTTP/1.1")
+            );
             let body = r#"{"items":[{"finding_id":"f-1","file_id":"file-9","severity":"high","status":"open","scan_source":"wardline","rule_id":"WLN-TAINT-001","message":"sink","suggestion":"","scan_run_id":"r-1","line_start":12,"line_end":12,"fingerprint":"fp","issue_id":null,"seen_count":1,"metadata":{"wardline":{"qualname":"demo.Foo.bar"}},"data_warnings":[]}],"has_more":false}"#;
-            write!(s2, "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}", body.len(), body).unwrap();
+            write!(
+                s2,
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
         });
         // Not detail_test_client(addr): the two-hop test does two sequential TCP
         // accepts, so use a more generous timeout to avoid CI scheduling jitter
