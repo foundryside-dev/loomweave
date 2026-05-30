@@ -4315,3 +4315,55 @@ async fn issues_for_degrades_when_wardline_fetch_errors() {
     let items = section["items"].as_array().expect("items array");
     assert!(items.is_empty(), "no items when unavailable");
 }
+
+#[tokio::test]
+async fn issues_for_wardline_no_matches_when_no_qualname_reconciles() {
+    // AC (no-fabrication axiom): when Filigree returns findings but NONE
+    // reconcile to the requested entity (they target a different qualname), the
+    // section is `no_matches` with an empty items array — Clarion never invents
+    // a match. The findings have qualnames, so omitted_no_qualname stays 0.
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, parent_id, source_file_path,
+            source_line_start, source_line_end, properties, content_hash,
+            created_at, updated_at
+         ) VALUES (
+            'python:function:demo.hello', 'python', 'function',
+            'python:function:demo.hello', 'demo.hello', NULL,
+            'src/demo.py', 1, 3, '{}', 'fake-hash-wf-test',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        [],
+    )
+    .expect("insert demo.hello entity");
+    drop(conn);
+
+    let client = Arc::new(
+        FakeFiligreeClient::default()
+            .with_wardline_findings(vec![wf("demo.other", "WLN-TAINT-999")]),
+    );
+    let state = state_for_filigree(project.path(), &db_path, client);
+
+    let envelope = call_tool(
+        &state,
+        "issues_for",
+        json!({"id": "python:function:demo.hello", "include_contained": false}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    let section = &envelope["result"]["wardline_findings"];
+    assert_eq!(
+        section["result_kind"], "no_matches",
+        "no finding reconciles to the entity: {section}"
+    );
+    let items = section["items"].as_array().expect("items array");
+    assert!(items.is_empty(), "no fabricated matches");
+    assert_eq!(
+        section["omitted_no_qualname"], 0,
+        "the finding had a qualname, just a non-matching one"
+    );
+}

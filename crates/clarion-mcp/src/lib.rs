@@ -1137,12 +1137,7 @@ impl ServerState {
                 wardline_section_for_entity(&client, &entity_id, path.as_deref())
             })
             .await
-            .unwrap_or_else(|err| {
-                serde_json::json!({
-                    "result_kind": "unavailable", "items": [], "omitted_no_qualname": 0,
-                    "reason": format!("wardline task failed: {err}"),
-                })
-            });
+            .unwrap_or_else(|err| wardline_unavailable(&format!("wardline task failed: {err}")));
             if let Some(result) = envelope.get_mut("result").and_then(Value::as_object_mut) {
                 result.insert("wardline_findings".to_owned(), section);
             }
@@ -4126,6 +4121,18 @@ fn issues_unavailable(filigree_endpoint: &Value, reason: &str, message: &str) ->
     }))
 }
 
+/// The degraded `wardline_findings` section returned when the findings cannot
+/// be fetched (transport/HTTP error) or the blocking task panicked. Single
+/// source of truth for the four-key `unavailable` shape.
+fn wardline_unavailable(reason: &str) -> Value {
+    serde_json::json!({
+        "result_kind": "unavailable",
+        "items": [],
+        "omitted_no_qualname": 0,
+        "reason": reason,
+    })
+}
+
 /// Build the `wardline_findings` enrich section for one entity. Enrich-only:
 /// a fetch error degrades to `result_kind: "unavailable"` rather than failing
 /// the tool.
@@ -4167,12 +4174,7 @@ fn wardline_section_for_entity(
                 "omitted_no_qualname": result.omitted_no_qualname,
             })
         }
-        Err(err) => serde_json::json!({
-            "result_kind": "unavailable",
-            "items": [],
-            "omitted_no_qualname": 0,
-            "reason": err.to_string(),
-        }),
+        Err(err) => wardline_unavailable(&err.to_string()),
     }
 }
 
