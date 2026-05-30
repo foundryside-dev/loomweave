@@ -5000,6 +5000,19 @@ fn anchor_line(
 fn source_for_entity_json(entity: &EntityRow, context_lines: usize) -> Value {
     let identity = entity_json(entity);
 
+    // Refuse to read or return bytes for an entity whose file the pre-ingest
+    // scanner marked `briefing_blocked`. Without this guard, an agent holding
+    // the id of a function/class in a secret-bearing file could use
+    // source_for_entity to disclose exactly the bytes the scanner policy
+    // withholds (the summary / HTTP read surfaces already refuse these).
+    if let Some(reason) = briefing_block_reason(entity) {
+        return json!({
+            "entity": identity,
+            "source_status": "briefing_blocked",
+            "briefing_blocked": reason
+        });
+    }
+
     let Some(path) = entity.source_file_path.as_deref() else {
         return json!({"entity": identity, "source_status": "no_source_path"});
     };
@@ -6412,6 +6425,33 @@ mod tests {
             content_hash: content_hash.map(str::to_owned),
             summary_json: None,
         }
+    }
+
+    #[test]
+    fn source_for_entity_blocks_briefing_blocked_file_without_leaking_bytes() {
+        // An entity whose source file the pre-ingest scanner marked
+        // briefing_blocked must never have its bytes returned by
+        // source_for_entity — that path would otherwise bypass the
+        // secret-redaction policy the scanner enforces.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.py");
+        std::fs::write(&path, "API_KEY = 'super-secret-value'\n").unwrap();
+        let mut entity = entity_row("python:function:demo.secret", "secret", None);
+        entity.source_file_path = Some(path.to_string_lossy().into_owned());
+        entity.source_line_start = Some(1);
+        entity.source_line_end = Some(1);
+        entity.properties_json =
+            r#"{"briefing_blocked":"secret detected by pre-ingest scanner"}"#.to_owned();
+
+        let out = super::source_for_entity_json(&entity, 10);
+
+        assert_eq!(out["source_status"], "briefing_blocked");
+        assert_eq!(out["briefing_blocked"], "secret detected by pre-ingest scanner");
+        assert!(out.get("lines").is_none(), "must not return source lines: {out}");
+        assert!(
+            !out.to_string().contains("super-secret-value"),
+            "leaked briefing-blocked bytes: {out}"
+        );
     }
 
     struct BlockingProvider {
