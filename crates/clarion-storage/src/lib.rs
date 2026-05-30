@@ -13,6 +13,7 @@ pub mod reader;
 pub mod retry;
 pub mod schema;
 pub mod unresolved;
+pub mod wardline_taint;
 pub mod writer;
 
 pub use cache::{
@@ -41,6 +42,10 @@ pub use query::{
 pub use reader::ReaderPool;
 pub use retry::{RetryPolicy, begin_immediate};
 pub use unresolved::{UnresolvedCallSiteRecord, replace_unresolved_call_sites_for_caller};
+pub use wardline_taint::{
+    Resolution, ResolutionConfidence, TaintFact, TaintFactRow, get_taint_facts,
+    resolve_wardline_qualname, resolve_wardline_qualnames, upsert_taint_fact,
+};
 pub use writer::{
     DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, Writer, known_scan_time_edge_kinds,
 };
