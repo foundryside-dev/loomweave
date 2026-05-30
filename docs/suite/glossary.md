@@ -81,6 +81,18 @@ These entries record the resolution per the `renamed` verdict (see ADR-acceptanc
 | `finding` (record vs. wire) | Clarion + Wardline (record); Filigree (wire) | Clarion and Wardline both produce `finding` records with internal vocabulary. The wire shape that crosses into Filigree is the managed-clash form documented above. Locally each product's `Finding` struct has product-specific fields beyond the wire schema. |
 | `run` / `run_id` | Clarion + Wardline | Each product has its own analyse/scan run lifecycle. The `run_id` field on a finding is namespaced by emitter (per `provenance.tool`); the strings are not assumed cross-product-meaningful. |
 
+### SP9 Wardline taint-store wire terms (ADR-036)
+
+These terms cross the Wardline↔Clarion wire in the SP9 taint-store contract (`/api/wardline/*` routes). All are `no clash`: each is either Wardline-namespaced or a field name unique to this Clarion surface, and none collides with an existing sibling term. Per the ADR-acceptance rule, recorded here as part of ADR-036's acceptance evidence. (The Clarion-internal table name `wardline_taint_facts` and config key `serve.http.wardline_taint_write` are deliberately omitted — they never cross the wire to Wardline.)
+
+| Term | Products | Semantics | Authority |
+|---|---|---|---|
+| `wardline_json` | Clarion ↔ Wardline | The taint/provenance fact blob. **Opaque to Clarion and Wardline-owned**: Clarion stores and returns it verbatim, never parses, validates, or depends on its contents. All taint semantics stay Wardline-side. | [ADR-036](../clarion/adr/ADR-036-wardline-taint-fact-store.md) — `no clash` |
+| `scan_id` | Clarion ↔ Wardline | Wardline's scan generation identifier for a taint fact, accepted as a queryable column for observability + an optional future prune-by-scan. Wardline-namespaced; not assumed cross-product-meaningful (cf. the `run`/`run_id` entry above). | [ADR-036](../clarion/adr/ADR-036-wardline-taint-fact-store.md) — `no clash` |
+| `content_hash_at_compute` | Clarion ↔ Wardline | The containing-file content hash Wardline recorded **at compute time** (whole-file `blake3`, hex — Clarion's existing definition). Stored as a queryable column; Wardline compares it against `current_content_hash` to decide freshness. | [ADR-036](../clarion/adr/ADR-036-wardline-taint-fact-store.md) — `no clash` |
+| `current_content_hash` | Clarion ↔ Wardline | The entity's containing-file content hash **as derived now** at read time (same whole-file `blake3` definition), returned on fetch. Match with `content_hash_at_compute` → fact is fresh; mismatch/absent → stale → Wardline recomputes. | [ADR-036](../clarion/adr/ADR-036-wardline-taint-fact-store.md) — `no clash` |
+| `unresolved_qualnames` | Clarion ↔ Wardline | The list of pre-composed qualnames a batch write could **not** resolve to an `exact` Clarion entity (heuristic/none are never written); returned so Wardline can fall back rather than guess. Distinct from the deferred L7-qualname-format clash below. | [ADR-036](../clarion/adr/ADR-036-wardline-taint-fact-store.md) — `no clash` |
+
 ### Deferred clashes (tracked, not resolved)
 
 | Term | Products | Status | Tracked by |
@@ -106,3 +118,4 @@ Shuttle is not in flight. When Shuttle's design begins, the first design-review 
 
 - **2026-05-03** — Glossary created during the v0.1 skeleton audit (Sprint 2 kickoff). Seeded with the three managed ADR-mediated clashes, the three open clashes resolved by ADR-024, the no-clash informational entries, and the deferred ADR-018 amendment trigger.
 - **2026-05-03** — ADR-024 Accepted; the `priority`/`critical`/`source` rows moved from `open` to `renamed` (see "Renamed clashes" section). Schema migration `0001_initial_schema.sql` edited in place per the policy named in ADR-024.
+- **2026-05-31** — ADR-036 Accepted; added the SP9 Wardline taint-store wire terms (`wardline_json`, `scan_id`, `content_hash_at_compute`, `current_content_hash`, `unresolved_qualnames`) as `no clash` informational entries, recorded as ADR-acceptance evidence.
