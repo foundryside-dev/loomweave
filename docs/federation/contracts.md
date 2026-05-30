@@ -1,10 +1,17 @@
 # Clarion Federation Contracts
 
-This file pins Clarion's federation contracts in both directions: the read-side
-surface Clarion *exposes* to sibling products (the initial consumer is Filigree's
-`ClarionRegistry` from ADR-014), and the conventions and routes Clarion
-*consumes* from Filigree. Every consume-side coupling here is enrich-only and
-fail-soft — Clarion stays solo-useful when Filigree is absent (loom.md §5).
+This file pins Clarion's federation contracts in both directions: the surface
+Clarion *exposes* to sibling products, and the conventions and routes Clarion
+*consumes* from Filigree. The exposed surface was historically read-only — the
+file-resolution read API consumed by Filigree's `ClarionRegistry` (ADR-014). At
+release:1.1 it also includes one **write** surface: the Wardline taint-fact store
+(ADR-036), a disabled-by-default `/api/wardline/*` sub-router that lets Wardline
+persist per-entity taint facts into Clarion's catalog so briefings can carry them.
+That write surface is enrich-only in the loom.md §5 sense — it is off unless
+explicitly enabled, Clarion never requires Wardline to be present, and Clarion's
+own semantics never depend on a taint fact existing. Every consume-side coupling
+here is likewise enrich-only and fail-soft — Clarion stays solo-useful when
+Filigree is absent (loom.md §5).
 
 ## HTTP Read API
 
@@ -24,8 +31,12 @@ serve:
     token_env: CLARION_LOOM_TOKEN
 ```
 
-The MCP stdio server remains available on stdin/stdout. The HTTP surface is
-read-only and uses Clarion's existing SQLite reader pool.
+The MCP stdio server remains available on stdin/stdout. The `/api/v1/*` read API
+is read-only and uses Clarion's existing SQLite reader pool. The `/api/wardline/*`
+sub-router (see [Wardline taint-fact store](#wardline-taint-fact-store-sp9)) adds
+one write path — `POST /api/wardline/taint-facts` — which is disabled by default
+and, when enabled, routes through Clarion's writer-actor rather than the reader
+pool; its read paths still use the reader pool.
 
 ### Authentication
 
@@ -81,12 +92,16 @@ All non-2xx responses use this closed JSON error envelope:
 }
 ```
 
-The initial `code` enum is closed to `INVALID_PATH`,
+The `code` enum is closed to `INVALID_PATH`,
 `PATH_OUTSIDE_PROJECT`, `NOT_FOUND`, `BRIEFING_BLOCKED`, `UNAUTHENTICATED`,
-`STORAGE_ERROR`, `BATCH_TOO_LARGE`, and `INTERNAL`. Clients must switch
-on `code`; `error` is human-readable diagnostic text. `BATCH_TOO_LARGE`
-is only emitted by `POST /api/v1/files/batch` (see the batch endpoint
-section below).
+`STORAGE_ERROR`, `BATCH_TOO_LARGE`, `WRITE_DISABLED`, `PROJECT_MISMATCH`,
+and `INTERNAL`. Clients must switch on `code`; `error` is human-readable
+diagnostic text. `WRITE_DISABLED` and `PROJECT_MISMATCH` are emitted only by
+the `/api/wardline/*` routes (see
+[Wardline taint-fact store](#wardline-taint-fact-store-sp9)). `BATCH_TOO_LARGE`
+is emitted by `POST /api/v1/files/batch` (as `400`) and by the `/api/wardline/*`
+batch routes (as `413`) — the same `code` carries a **different HTTP status by
+endpoint**, so a client must route on `code`, not on status.
 
 ### `GET /api/v1/files?path=&language=`
 
@@ -399,12 +414,298 @@ top-level `__init__.py`). A conformant emitter reproduces every vector exactly.
 
 **Conformance oracle (deferred).** A live check —
 `GET /api/v1/entities/resolve?scheme=wardline_qualname`, which would return
-`exact | heuristic | none` for a candidate qualname — is named in ADR-018 as the
-eventual conformance surface but is **not implemented at release:1.1**. Until it
-ships, the fixture above is the contract: validate against it offline. Building
-the endpoint ahead of a shipped Wardline consumer would be speculative
-forward-work (loom.md §5 — Clarion translates qualnames because it owns the
-catalog, but only when a consumer needs it).
+`exact | heuristic | none` for a candidate qualname *with normalization* — is
+named in ADR-018 as the eventual conformance surface but is **not implemented at
+release:1.1**. Until it ships, the fixture above is the contract: validate against
+it offline. Building the endpoint ahead of a shipped Wardline consumer would be
+speculative forward-work (loom.md §5 — Clarion translates qualnames because it owns
+the catalog, but only when a consumer needs it). What *did* ship is the narrower,
+exact-tier `POST /api/wardline/resolve` (see
+[Wardline taint-fact store](#wardline-taint-fact-store-sp9)), which takes
+**pre-composed** dotted qualnames and does a direct existence lookup with no
+normalization. The heuristic resolution tier and the normalizing raw-qualname
+conformance oracle both remain deferred to Flow B B.2 (`clarion-ca2d26ffbe`); B.2
+extends the same resolver rather than reimplementing it.
+
+## Wardline taint-fact store (SP9)
+
+This pins the `/api/wardline/*` sub-router Clarion *exposes* to Wardline (ADR-036;
+design spec
+[`2026-05-30-clarion-wardline-taint-store-design.md`](../superpowers/specs/2026-05-30-clarion-wardline-taint-store-design.md)).
+Wardline computes per-entity taint facts and persists them into Clarion's catalog
+so Clarion can fold them into briefings; Clarion treats every fact's payload as an
+**opaque blob** and never asserts whether it is fresh. This is enrich-only and
+disabled-by-default (loom.md §5): the write path is off unless explicitly enabled,
+and Clarion's own semantics never depend on a stored fact.
+
+**Per-project isolation.** One `clarion serve` process serves exactly one project
+(the `.clarion/` store under that project root). The `project` request field is a
+**guard, not a selector** — it does not choose among projects; it only lets a
+client assert which project it believes it is talking to. The handle is the
+project-root directory name. An **empty** `project` is always accepted (no
+assertion); a **non-empty** value that does not match the served project's
+directory name returns `403` with `code: "PROJECT_MISMATCH"`. (Reference:
+`AppState::reject_project_mismatch` in
+[`http_read.rs`](../../crates/clarion-cli/src/http_read.rs).)
+
+### Sub-router framing, auth, and limits
+
+The `/api/wardline/*` routes sit behind the **same identity middleware** as the
+protected `/api/v1/*` routes (HMAC `X-Loom-Component: clarion:<hmac>` preferred per
+ADR-034, legacy `Authorization: Bearer` accepted as fallback, loopback-unauth
+allowed; see [Authentication](#authentication)). The only difference is the body
+limit used while reading the request to verify the HMAC signature: the wardline
+guard reads up to **4 MiB** (`WARDLINE_BODY_LIMIT_BYTES`) rather than the
+`/api/v1/*` 16 KiB, because batched resolves/writes carry thousands of qualnames.
+
+| Property | `/api/v1/*` | `/api/wardline/*` |
+|---|---|---|
+| Body limit | 16 KiB | **4 MiB** |
+| Per-request batch cap | 256 (`files/batch`) / 1000 (`files:resolve`) | **2000** facts/qualnames (`WARDLINE_TAINT_BATCH_MAX`) |
+| Over-cap status | `400 BATCH_TOO_LARGE` | **`413 BATCH_TOO_LARGE`** |
+
+Two distinct `413` sources on these routes — a client seeing `413` **must** check
+for a JSON envelope to tell them apart:
+
+- **Batch cap** — more than `2000` facts/qualnames in one request returns `413`
+  with the JSON envelope `{"error": …, "code": "BATCH_TOO_LARGE"}`. Wardline
+  chunks client-side against `2000`.
+- **Raw body cap** — a request body over `4 MiB` is rejected at the transport layer
+  with a `413` and **no JSON `code`** (same posture as the existing
+  "413 | n/a" rows for `/api/v1/*`).
+
+`GET /api/v1/_capabilities` does **not** advertise the taint store or whether the
+write path is enabled (its response carries only `api_version`, `instance_id`,
+`registry_backend`, `file_registry`). A Wardline client discovers the write API is
+disabled by receiving `403 WRITE_DISABLED` from the write route, not by probing
+capabilities.
+
+### `POST /api/wardline/resolve`
+
+Exact-tier resolution of **pre-composed** dotted qualnames to Clarion entity IDs.
+No `&file=` disambiguator and no normalization: Wardline has already shaped each
+qualname to byte-match Clarion's `canonical_qualified_name`, and Clarion does a
+direct existence lookup of the candidate `python:function:<qualname>` (taint facts
+are function/method-scoped; methods are `python:function:` in Clarion's ontology
+per ADR-022).
+
+Request body (`application/json`, max 4 MiB):
+
+```json
+{
+  "project": "clarion",
+  "qualnames": ["auth.tokens.refresh", "auth.sessions.SessionStore.load"]
+}
+```
+
+`project` is optional (the guard above). Successful response (`200 OK`):
+
+```json
+{
+  "resolved": {"auth.tokens.refresh": "python:function:auth.tokens.refresh"},
+  "unresolved": ["auth.sessions.SessionStore.load"]
+}
+```
+
+- `resolved` is a `{qualname: entity_id}` object, only for exact matches.
+- `unresolved` lists every qualname with no matching `python:function:` entity.
+- Resolution is **exact-only**: there is no heuristic tier and no error for an
+  unresolved name — it simply lands in `unresolved`.
+
+Failure modes:
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `INVALID_PATH` | Body is not a valid `{"qualnames": [...]}` object. |
+| 401 | `UNAUTHENTICATED` | HMAC/bearer auth missing or wrong (when configured). |
+| 403 | `PROJECT_MISMATCH` | Non-empty `project` does not match the served project. |
+| 413 | `BATCH_TOO_LARGE` | `qualnames.len() > 2000`. |
+| 413 | n/a | Request body exceeds the 4 MiB cap (transport-level). |
+| 500/503 | `STORAGE_ERROR` / `INTERNAL` | Storage failure. |
+
+### `POST /api/wardline/taint-facts` (write)
+
+Persists a batch of taint facts. **Disabled by default** — only reachable when
+`serve.http.wardline_taint_write: true` has spawned the optional writer-actor:
+
+```yaml
+serve:
+  http:
+    enabled: true
+    wardline_taint_write: true   # default false; off ⇒ 403 WRITE_DISABLED
+```
+
+When disabled, the route returns `403` with `code: "WRITE_DISABLED"` **before**
+parsing the body. Request body (`application/json`, max 4 MiB):
+
+```json
+{
+  "project": "clarion",
+  "scan_id": "wardline-scan-2026-05-30",
+  "facts": [
+    {
+      "qualname": "auth.tokens.refresh",
+      "wardline_json": {"taint": "tainted", "sources": ["request.body"]},
+      "scan_id": "wardline-scan-2026-05-30",
+      "content_hash_at_compute": "9c1185a5c5e9fc54612808977ee8f548b2258d31"
+    }
+  ]
+}
+```
+
+- `wardline_json` is **opaque** to Clarion (see [Opacity contract](#opacity-contract)).
+- `scan_id` and `content_hash_at_compute` are accepted as **top-level fields**
+  (queryable columns); Clarion does **not** parse them out of the blob. The
+  per-fact `scan_id` falls back to the batch-level `scan_id` when absent. Both are
+  optional.
+
+Successful response (`200 OK`):
+
+```json
+{
+  "written": 1,
+  "unresolved_qualnames": ["auth.sessions.SessionStore.load"]
+}
+```
+
+- **Exact-only writes.** A fact whose qualname does not resolve exact-tier is
+  reported in `unresolved_qualnames` and **never written** — there is no
+  heuristic/none write path. `written` counts only persisted facts.
+- **Per-entity replace (idempotent).** A write replaces the row keyed on the
+  resolved `entity_id` (`ON CONFLICT(entity_id) DO UPDATE`), so re-posting the same
+  qualname overwrites rather than duplicating.
+
+Failure modes:
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `INVALID_PATH` | Body is not a valid `{"facts": [...]}` object. |
+| 401 | `UNAUTHENTICATED` | HMAC/bearer auth missing or wrong (when configured). |
+| 403 | `WRITE_DISABLED` | `serve.http.wardline_taint_write` is not `true`. |
+| 403 | `PROJECT_MISMATCH` | Non-empty `project` does not match the served project. |
+| 413 | `BATCH_TOO_LARGE` | `facts.len() > 2000`. |
+| 413 | n/a | Request body exceeds the 4 MiB cap (transport-level). |
+| 500/503 | `STORAGE_ERROR` / `INTERNAL` | Writer-actor unavailable or write failed. |
+
+### `GET /api/wardline/taint-facts?project=&qualname=` (read, single) and `POST /api/wardline/taint-facts:batch-get` (read, batch)
+
+Both read paths are served **regardless of whether the write API is enabled**.
+They return the **same per-entity view shape**; the only difference is cardinality.
+
+`GET` query parameters: `project` (optional guard), `qualname` (required, must not
+be blank). The single GET returns **one** view object:
+
+```json
+{
+  "qualname": "auth.tokens.refresh",
+  "wardline_json": {"taint": "tainted", "sources": ["request.body"]},
+  "current_content_hash": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9",
+  "exists": true
+}
+```
+
+The batch read body is `{ "project"?, "qualnames": [..] }`; it returns a **bare
+JSON array** of view objects, **one per input qualname, in input order** (not an
+object wrapper):
+
+```json
+[
+  {
+    "qualname": "auth.tokens.refresh",
+    "wardline_json": {"taint": "tainted"},
+    "current_content_hash": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9",
+    "exists": true
+  },
+  {"qualname": "auth.sessions.SessionStore.load", "exists": false}
+]
+```
+
+The view has **exactly four fields**:
+
+- `qualname` — echoed back so the client correlates without re-ordering.
+- `exists` — `true` when a stored fact exists for the resolved entity; `false` when
+  the qualname does not resolve exact-tier **or** resolves but has no stored fact.
+- `wardline_json` — the stored blob, returned **byte-verbatim** (see
+  [Opacity contract](#opacity-contract)). **Field-absent** (not `null`) when
+  `exists` is `false`.
+- `current_content_hash` — the **live** freshness signal (see
+  [Freshness contract](#freshness-contract)). **Field-absent** when `exists` is
+  `false`, and also field-absent when `exists` is `true` but the containing file is
+  deleted/unreadable at request time.
+
+Note what is **not** echoed: the write-time `scan_id` and `content_hash_at_compute`
+columns are **never returned by the read**. Wardline reads its own
+`content_hash_at_compute` from *inside* the opaque `wardline_json` blob, not from a
+Clarion-returned field (see the freshness contract).
+
+Failure modes:
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `INVALID_PATH` | Blank/missing `qualname` (GET) or invalid `{"qualnames": [...]}` body (batch). |
+| 401 | `UNAUTHENTICATED` | HMAC/bearer auth missing or wrong (when configured). |
+| 403 | `PROJECT_MISMATCH` | Non-empty `project` does not match the served project. |
+| 413 | `BATCH_TOO_LARGE` | `qualnames.len() > 2000` (batch). |
+| 413 | n/a | Request body exceeds the 4 MiB cap (batch, transport-level). |
+| 500/503 | `STORAGE_ERROR` / `INTERNAL` | Storage failure. |
+
+### Freshness contract
+
+`current_content_hash` is the load-bearing field of this whole surface, so its
+definition is pinned exactly:
+
+- It is the **blake3** hash of the entity's **containing file** — **whole file, raw
+  bytes, lowercase hex**. It is **not** sha256, **not** LF-normalized, and **not**
+  span-scoped to the entity's line range. (The stored `entities.content_hash` is
+  deliberately *not* reused: for function entities that value is span-scoped and
+  LF-normalized, and even a stored whole-file hash reflects the last analyze, not
+  current disk.)
+- It is computed by a **live filesystem read at request time**, not read from a
+  stored value, so it reflects the file's current on-disk bytes.
+- If the containing file is **deleted or unreadable** at request time,
+  `current_content_hash` is **omitted** (field absent). `exists` still reflects the
+  stored fact (it can be `true` with no `current_content_hash`).
+
+  Reference: `clarion_storage::current_file_hash` in
+  [`query.rs`](../../crates/clarion-storage/src/query.rs).
+
+**Who decides freshness.** Wardline stamps `content_hash_at_compute` *inside* the
+opaque `wardline_json` blob when it computes a fact, then on read compares that
+stamp to Clarion's returned `current_content_hash`: equal ⇒ the fact is fresh;
+mismatch, or `exists: false`, or `current_content_hash` absent ⇒ Wardline
+recomputes. **Wardline owns the fresh/stale decision; Clarion never asserts a
+freshness verdict** — it only reports the live hash and lets Wardline compare.
+
+### Opacity contract
+
+`wardline_json` is stored and returned **byte-verbatim**. Clarion holds it as a
+serde_json `RawValue` on both the write and read paths, so object key order and
+whitespace are preserved exactly — `{"b":2,"a":1}` is *not* re-emitted as
+`{"a":1,"b":2}`. Clarion **never parses or validates** the blob's contents. The
+only fields Clarion reads structurally are the top-level `scan_id` /
+`content_hash_at_compute` accompanying a write (stored as queryable columns) — they
+are taken from the request envelope, **not** parsed out of the blob.
+
+### Verification scope
+
+The contracts above are pinned by the W.1–W.4 tests; there is no new wire fixture
+for these routes (the prose shapes here are the contract).
+
+- The **qualname conformance oracle** is the existing fixture
+  [`fixtures/wardline-qualname-normalization.json`](./fixtures/wardline-qualname-normalization.json)
+  (see [Wardline qualname normalization](#wardline-qualname-normalization-entity-reconciliation));
+  `resolve_wardline_qualnames` is exercised against its vectors by
+  `resolves_fixture_vectors_exact` in
+  [`wardline_taint.rs`](../../crates/clarion-storage/src/wardline_taint.rs).
+- The **whole-file-vs-span freshness** definition is pinned by the
+  `current_file_hash` tests in
+  [`query.rs`](../../crates/clarion-storage/src/query.rs) (asserting whole-file
+  blake3, not the span-scoped LF-normalized hash).
+- The **route behaviour** — exact resolve + unresolved, project-guard mismatch,
+  `WRITE_DISABLED`, per-entity replace, byte-verbatim storage, the live whole-file
+  hash, deleted-file ⇒ absent hash, the bare-array batch read, and the over-cap
+  `413` — is pinned by the `wardline_*` async handler tests in
+  [`http_read.rs`](../../crates/clarion-cli/src/http_read.rs).
 
 ## Consumed Filigree convention: ephemeral-port endpoint discovery
 
