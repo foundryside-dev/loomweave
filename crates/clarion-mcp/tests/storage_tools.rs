@@ -16,7 +16,7 @@ use clarion_mcp::{
     config::{FiligreeConfig, LlmConfig, LlmProviderKind},
     filigree::{
         EntityAssociation, EntityAssociationsResponse, FiligreeClientError, FiligreeLookup,
-        IssueDetail,
+        IssueDetail, WardlineFinding,
     },
     filigree_url::{SOURCE_CONFIG, SOURCE_EPHEMERAL_PORT, resolve_filigree_url},
     list_tools,
@@ -678,6 +678,10 @@ struct FakeFiligreeClient {
     details: Mutex<std::collections::HashMap<String, IssueDetail>>,
     /// `issue_id`s `issue_detail` was called with, in order — proves dedup/N+1.
     detail_calls: Mutex<Vec<String>>,
+    /// Wardline findings returned by `wardline_findings_for_path`.
+    wardline_findings: Mutex<Vec<WardlineFinding>>,
+    /// When true, `wardline_findings_for_path` returns an `HttpStatus` 503 error.
+    wardline_error: Mutex<bool>,
 }
 
 impl FakeFiligreeClient {
@@ -698,6 +702,16 @@ impl FakeFiligreeClient {
                 priority,
             },
         );
+        self
+    }
+
+    fn with_wardline_findings(mut self, findings: Vec<WardlineFinding>) -> Self {
+        *self.wardline_findings.get_mut().unwrap() = findings;
+        self
+    }
+
+    fn with_wardline_error(mut self) -> Self {
+        *self.wardline_error.get_mut().unwrap() = true;
         self
     }
 
@@ -747,6 +761,27 @@ impl FiligreeLookup for FakeFiligreeClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(issue_id)
             .cloned())
+    }
+
+    fn wardline_findings_for_path(
+        &self,
+        _path: &str,
+    ) -> Result<Vec<WardlineFinding>, FiligreeClientError> {
+        if *self
+            .wardline_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return Err(FiligreeClientError::HttpStatus {
+                status: 503,
+                body: "down".to_owned(),
+            });
+        }
+        Ok(self
+            .wardline_findings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone())
     }
 }
 
@@ -4141,4 +4176,144 @@ async fn project_status_filigree_falls_back_to_config_without_port_file() {
     assert_eq!(filigree["resolved_url"], "http://127.0.0.1:8766");
     assert_eq!(filigree["resolution_source"], SOURCE_CONFIG);
     assert_eq!(envelope["result"]["llm"]["live"], true);
+}
+
+// ---------------------------------------------------------------------------
+// Wardline Flow B helpers and tests
+// ---------------------------------------------------------------------------
+
+/// Build a `WardlineFinding` with `metadata.wardline.qualname` set — models a
+/// finding that can be reconciled to a named entity.
+fn wf(qualname: &str, rule_id: &str) -> WardlineFinding {
+    WardlineFinding {
+        rule_id: rule_id.to_owned(),
+        message: format!("taint finding for {qualname}"),
+        severity: Some("high".to_owned()),
+        status: Some("open".to_owned()),
+        line_start: Some(10),
+        line_end: Some(12),
+        fingerprint: Some(format!("fp-{rule_id}")),
+        file_id: Some("file-test".to_owned()),
+        metadata: serde_json::json!({ "wardline": { "qualname": qualname } }),
+    }
+}
+
+/// Build a `WardlineFinding` without a qualname in metadata — counted as
+/// `omitted_no_qualname` by the reconciler.
+fn wf_no_qualname(rule_id: &str) -> WardlineFinding {
+    WardlineFinding {
+        rule_id: rule_id.to_owned(),
+        message: "metric finding without qualname".to_owned(),
+        severity: Some("info".to_owned()),
+        status: Some("open".to_owned()),
+        line_start: None,
+        line_end: None,
+        fingerprint: None,
+        file_id: Some("file-test".to_owned()),
+        metadata: serde_json::json!({ "wardline": { "kind": "METRIC" } }),
+    }
+}
+
+#[tokio::test]
+async fn issues_for_attaches_exact_wardline_findings() {
+    // AC: `wardline_findings` section is attached to the `issues_for` result for
+    // the requested entity. Exact-match finding is included; a finding for a
+    // different qualname is not; a finding with no qualname is omitted and
+    // counted.
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    // Insert the entity under test with a known source_file_path. Use a raw
+    // INSERT because we only need the row to exist for issues_for dispatch; we
+    // do not need a correct content_hash for the wardline section itself.
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, parent_id, source_file_path,
+            source_line_start, source_line_end, properties, content_hash,
+            created_at, updated_at
+         ) VALUES (
+            'python:function:demo.hello', 'python', 'function',
+            'python:function:demo.hello', 'demo.hello', NULL,
+            'src/demo.py', 1, 3, '{}', 'fake-hash-wf-test',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        [],
+    )
+    .expect("insert demo.hello entity");
+    drop(conn);
+
+    let client = Arc::new(
+        FakeFiligreeClient::default().with_wardline_findings(vec![
+            wf("demo.hello", "WLN-TAINT-001"),  // exact match -> attached
+            wf("demo.other", "WLN-TAINT-002"),  // different entity -> NOT attached
+            wf_no_qualname("WLN-METRIC-001"),   // no qualname -> omitted
+        ]),
+    );
+    let state = state_for_filigree(project.path(), &db_path, client);
+
+    let envelope = call_tool(
+        &state,
+        "issues_for",
+        json!({"id": "python:function:demo.hello", "include_contained": false}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    let section = &envelope["result"]["wardline_findings"];
+    assert_eq!(
+        section["result_kind"], "matched",
+        "section: {section}"
+    );
+    let items = section["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1, "only the exact-match finding is included");
+    assert_eq!(items[0]["rule_id"], "WLN-TAINT-001");
+    assert_eq!(items[0]["resolution_confidence"], "exact");
+    assert_eq!(
+        section["omitted_no_qualname"], 1,
+        "one finding had no qualname"
+    );
+}
+
+#[tokio::test]
+async fn issues_for_degrades_when_wardline_fetch_errors() {
+    // AC: when `wardline_findings_for_path` returns an error, the section
+    // degrades to `result_kind: "unavailable"` and items is empty — the tool
+    // itself still succeeds.
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, parent_id, source_file_path,
+            source_line_start, source_line_end, properties, content_hash,
+            created_at, updated_at
+         ) VALUES (
+            'python:function:demo.hello', 'python', 'function',
+            'python:function:demo.hello', 'demo.hello', NULL,
+            'src/demo.py', 1, 3, '{}', 'fake-hash-wf-test',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        [],
+    )
+    .expect("insert demo.hello entity");
+    drop(conn);
+
+    let client = Arc::new(FakeFiligreeClient::default().with_wardline_error());
+    let state = state_for_filigree(project.path(), &db_path, client);
+
+    let envelope = call_tool(
+        &state,
+        "issues_for",
+        json!({"id": "python:function:demo.hello", "include_contained": false}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "tool must succeed even on wardline error");
+    let section = &envelope["result"]["wardline_findings"];
+    assert_eq!(
+        section["result_kind"], "unavailable",
+        "section degrades on error: {section}"
+    );
+    let items = section["items"].as_array().expect("items array");
+    assert!(items.is_empty(), "no items when unavailable");
 }

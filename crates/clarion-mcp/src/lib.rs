@@ -1005,6 +1005,7 @@ impl ServerState {
         Ok(flatten_storage_envelope_result(result))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn tool_issues_for(
         &self,
         arguments: &serde_json::Map<String, Value>,
@@ -1024,6 +1025,9 @@ impl ServerState {
                 "Filigree integration is disabled",
             ));
         };
+        // Capture the requested entity ID before it is moved into the storage
+        // query for the wardline section lookup below.
+        let requested_id = entity_id.clone();
         let read = match self
             .read_issues_for_entities(entity_id, include_contained)
             .await
@@ -1118,12 +1122,30 @@ impl ServerState {
             }
         }
         accumulator.apply_issue_details(&details);
-        Ok(accumulator.into_envelope(
+        let mut envelope = accumulator.into_envelope(
             read.entity_cap_truncated,
             requests_total,
             detail_requests_total,
             &endpoint,
-        ))
+        );
+        // Flow B: attach Wardline findings reconciled to the requested entity.
+        if let Some(entity) = read.entities.iter().find(|e| e.id == requested_id) {
+            let client = client.clone();
+            let entity_id = entity.id.clone();
+            let path = entity.source_file_path.clone();
+            let section = tokio::task::spawn_blocking(move || {
+                wardline_section_for_entity(&client, &entity_id, path.as_deref())
+            })
+            .await
+            .unwrap_or_else(|err| serde_json::json!({
+                "result_kind": "unavailable", "items": [], "omitted_no_qualname": 0,
+                "reason": format!("wardline task failed: {err}"),
+            }));
+            if let Some(result) = envelope.get_mut("result").and_then(Value::as_object_mut) {
+                result.insert("wardline_findings".to_owned(), section);
+            }
+        }
+        Ok(envelope)
     }
 
     async fn tool_subsystem_members(
@@ -4100,6 +4122,52 @@ fn issues_unavailable(filigree_endpoint: &Value, reason: &str, message: &str) ->
         "drifted": [],
         "not_found": []
     }))
+}
+
+/// Build the `wardline_findings` enrich section for one entity. Enrich-only:
+/// a fetch error degrades to `result_kind: "unavailable"` rather than failing
+/// the tool.
+fn wardline_section_for_entity(
+    client: &std::sync::Arc<dyn crate::filigree::FiligreeLookup>,
+    entity_id: &str,
+    source_file_path: Option<&str>,
+) -> Value {
+    let Some(path) = source_file_path else {
+        return serde_json::json!({ "result_kind": "no_matches", "items": [], "omitted_no_qualname": 0 });
+    };
+    match client.wardline_findings_for_path(path) {
+        Ok(findings) => {
+            let result = crate::wardline_reconcile::reconcile_for_entity(entity_id, findings);
+            let items: Vec<Value> = result
+                .matched
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "rule_id": m.finding.rule_id,
+                        "message": m.finding.message,
+                        "severity": m.finding.severity,
+                        "status": m.finding.status,
+                        "line_start": m.finding.line_start,
+                        "line_end": m.finding.line_end,
+                        "fingerprint": m.finding.fingerprint,
+                        "resolution_confidence": m.resolution_confidence,
+                    })
+                })
+                .collect();
+            let result_kind = if items.is_empty() { "no_matches" } else { "matched" };
+            serde_json::json!({
+                "result_kind": result_kind,
+                "items": items,
+                "omitted_no_qualname": result.omitted_no_qualname,
+            })
+        }
+        Err(err) => serde_json::json!({
+            "result_kind": "unavailable",
+            "items": [],
+            "omitted_no_qualname": 0,
+            "reason": err.to_string(),
+        }),
+    }
 }
 
 fn association_json(
