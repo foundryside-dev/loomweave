@@ -111,3 +111,7 @@ re-reading each path element. `truncated`/`truncation_reason` report `edge-cap`
 `clarion serve --path <dir>` where `<dir>` contains `.clarion/clarion.db`
 (built by `clarion analyze <dir>`). In an MCP client the tools appear as
 `mcp__clarion__find_entity`, etc.
+
+Besides the tools, the server exposes a `clarion://context` **resource** — live
+entity/subsystem/finding counts and index freshness as JSON, a lightweight read
+when you only want the numbers (`project_status` is the fuller tool-based view).
