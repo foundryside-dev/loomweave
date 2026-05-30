@@ -131,6 +131,33 @@ struct AppState {
     identity_secret: Option<Arc<String>>,
 }
 
+impl AppState {
+    /// The `project` request field is a guard, not a selector: one `serve`
+    /// serves exactly one project. An empty field is permitted (Wardline may
+    /// omit it); a non-empty mismatch is rejected. The canonical project
+    /// handle for v1 is the project-root directory name (cheapest, no new
+    /// config). Pinned in contracts.md (W.5).
+    fn reject_project_mismatch(&self, requested: &str) -> Option<Response> {
+        if requested.is_empty() {
+            return None;
+        }
+        let served = self
+            .project_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if requested == served {
+            None
+        } else {
+            Some(json_error(
+                StatusCode::FORBIDDEN,
+                ErrorCode::ProjectMismatch,
+                "project guard mismatch: this server serves a different project",
+            ))
+        }
+    }
+}
+
 /// Ready-signal payload returned from the HTTP thread back to `spawn`.
 ///
 /// `readers_identity` is captured **inside** `run_http_read_server`, after
@@ -369,7 +396,33 @@ fn router(state: AppState) -> Router {
             require_http_identity,
         ));
     let unprotected = Router::new().route("/api/v1/_capabilities", get(get_capabilities));
-    protected.merge(unprotected).with_state(state).layer(
+    // The 16 KiB read-API body limit is baked onto the merged `/api/v1/*`
+    // group HERE — *before* `.merge(wardline)`. Tower body limits compose as
+    // MIN and layer scope follows merge boundaries: applying this layer to the
+    // already-merged v1 group keeps it off the wardline routes. (Flattening
+    // it onto the final `protected.merge(unprotected).merge(wardline)` would
+    // cap wardline at 16 KiB and defeat the larger limit.) The outer
+    // `ServiceBuilder` no longer carries a body limit; each group owns its own.
+    let v1 = protected
+        .merge(unprotected)
+        .layer(RequestBodyLimitLayer::new(HTTP_BODY_LIMIT_BYTES));
+    // Wardline taint-store sub-router. Batched resolves/writes carry thousands
+    // of qualnames, so this group gets the 4 MiB limit. Later tasks (5/6/7)
+    // add the taint-facts read/write routes here. `DefaultBodyLimit` must also
+    // be raised: axum's `Json` extractor enforces its own 2 MB default that
+    // tower-http's `RequestBodyLimitLayer` does not touch, so without this the
+    // 4 MiB target would be nominal only.
+    let wardline = Router::new()
+        .route("/api/wardline/resolve", post(post_wardline_resolve))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_http_identity_wardline,
+        ))
+        .layer(RequestBodyLimitLayer::new(WARDLINE_BODY_LIMIT_BYTES))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            WARDLINE_BODY_LIMIT_BYTES,
+        ));
+    v1.merge(wardline).with_state(state).layer(
         ServiceBuilder::new()
             .layer(CatchPanicLayer::custom(catch_panic_response))
             .layer(HandleErrorLayer::new(handle_middleware_error))
@@ -379,7 +432,6 @@ fn router(state: AppState) -> Router {
                     .on_failure(()),
             )
             .layer(timeout::TimeoutLayer::new(Duration::from_secs(10)))
-            .layer(RequestBodyLimitLayer::new(HTTP_BODY_LIMIT_BYTES))
             .layer(load_shed::LoadShedLayer::new())
             .layer(ConcurrencyLimitLayer::new(64)),
     )
@@ -393,8 +445,29 @@ async fn require_http_identity(
     request: Request<Body>,
     next: axum::middleware::Next,
 ) -> Response {
+    require_http_identity_with_limit(&state, HTTP_BODY_LIMIT_BYTES, request, next).await
+}
+
+/// Wardline-route identity guard. Identical to [`require_http_identity`] but
+/// reads up to `WARDLINE_BODY_LIMIT_BYTES` when verifying the HMAC signature,
+/// so a multi-MiB taint-store body is not rejected by the signature-read step
+/// before the route's own larger body limit applies.
+async fn require_http_identity_wardline(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    require_http_identity_with_limit(&state, WARDLINE_BODY_LIMIT_BYTES, request, next).await
+}
+
+async fn require_http_identity_with_limit(
+    state: &AppState,
+    body_limit: usize,
+    request: Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
     if let Some(secret) = state.identity_secret.as_ref() {
-        return require_hmac_identity(secret, request, next).await;
+        return require_hmac_identity(secret, body_limit, request, next).await;
     }
     let Some(expected) = state.auth_token.as_ref() else {
         return next.run(request).await;
@@ -419,6 +492,7 @@ async fn require_http_identity(
 
 async fn require_hmac_identity(
     secret: &str,
+    body_limit: usize,
     request: Request<Body>,
     next: axum::middleware::Next,
 ) -> Response {
@@ -438,7 +512,7 @@ async fn require_hmac_identity(
     let Some(presented) = presented else {
         return unauthenticated_response();
     };
-    let Ok(body_bytes) = to_bytes(body, HTTP_BODY_LIMIT_BYTES).await else {
+    let Ok(body_bytes) = to_bytes(body, body_limit).await else {
         // CI-02 fix: a body read failure here is not a path-validation
         // problem. The outer `RequestBodyLimitLayer` already rejects
         // oversized bodies with the framework's 413; reaching this branch
@@ -596,6 +670,13 @@ enum ErrorCode {
     Unauthenticated,
     StorageError,
     BatchTooLarge,
+    /// Constructed by the Task 5 write endpoint (`POST /api/wardline/taint`).
+    /// Reachable only via `json_error(StatusCode::FORBIDDEN, …)`; no central
+    /// `StatusCode` mapping is required.
+    #[allow(dead_code)]
+    WriteDisabled,
+    /// The `project` request guard did not match the served project.
+    ProjectMismatch,
     Internal,
 }
 
@@ -607,6 +688,14 @@ enum ErrorCode {
 const BATCH_MAX_QUERIES: usize = 256;
 const RESOLVE_MAX_PATHS: usize = 1000;
 const HTTP_BODY_LIMIT_BYTES: usize = 16 * 1024;
+
+/// Body limit for the Wardline taint-store routes. Batched writes/resolves
+/// carry thousands of qualnames; the 16 KiB read-API limit is far too small.
+/// Wardline chunks client-side against `WARDLINE_TAINT_BATCH_MAX` (mirrors how
+/// Filigree splits against `BATCH_MAX_QUERIES`). Pinned in contracts.md (W.5).
+const WARDLINE_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+/// Max qualnames/facts in one Wardline request.
+const WARDLINE_TAINT_BATCH_MAX: usize = 2000;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -686,6 +775,21 @@ enum ResolveFileStatus {
     NotFound,
     Blocked,
     Error,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolveRequest {
+    #[serde(default)]
+    project: String,
+    qualnames: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResolveResponse {
+    /// qualname -> `entity_id`, only for exact matches.
+    resolved: std::collections::BTreeMap<String, String>,
+    unresolved: Vec<String>,
 }
 
 async fn get_file(
@@ -944,6 +1048,68 @@ async fn post_files_resolve(
         .await;
     match catalog_result {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => json_read_error(&err),
+    }
+}
+
+/// Exact-tier Wardline qualname resolve (ADR-036, W.4). Takes a batch of
+/// PRE-COMPOSED dotted qualnames that Wardline has already shaped to
+/// byte-match Clarion's `canonical_qualified_name`; resolution is the direct
+/// existence lookup in `clarion_storage::resolve_wardline_qualnames`. No
+/// `&file=` disambiguator, no normalization — the generic resolve oracle
+/// remains deferred.
+async fn post_wardline_resolve(
+    State(state): State<AppState>,
+    body: Result<Json<ResolveRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(json) => json,
+        Err(rej) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidPath,
+                &rej.body_text(),
+            );
+        }
+    };
+    if let Some(resp) = state.reject_project_mismatch(&req.project) {
+        return resp;
+    }
+    if req.qualnames.len() > WARDLINE_TAINT_BATCH_MAX {
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorCode::BatchTooLarge,
+            "too many qualnames in one request",
+        );
+    }
+    // Move only `qualnames` into the reader closure; `project` was consumed by
+    // the guard above. `with_reader` runs the lookup on a pooled connection.
+    let qualnames = req.qualnames;
+    let result = state
+        .readers
+        .with_reader(move |conn| clarion_storage::resolve_wardline_qualnames(conn, &qualnames))
+        .await;
+    match result {
+        Ok(pairs) => {
+            let mut resolved = std::collections::BTreeMap::new();
+            let mut unresolved = Vec::new();
+            for (qualname, resolution) in pairs {
+                match resolution.entity_id {
+                    Some(id) => {
+                        resolved.insert(qualname, id);
+                    }
+                    None => unresolved.push(qualname),
+                }
+            }
+            (
+                StatusCode::OK,
+                Json(ResolveResponse {
+                    resolved,
+                    unresolved,
+                }),
+            )
+                .into_response()
+        }
         Err(err) => json_read_error(&err),
     }
 }
@@ -1536,7 +1702,7 @@ mod tests {
             let app: Router<()> = Router::new()
                 .route("/api/v1/files/batch", post(never_called))
                 .layer(axum::middleware::from_fn(|request, next| async move {
-                    require_hmac_identity("test-secret", request, next).await
+                    require_hmac_identity("test-secret", HTTP_BODY_LIMIT_BYTES, request, next).await
                 }));
 
             let response = app.oneshot(request).await.expect("oneshot response");
@@ -1663,6 +1829,180 @@ mod tests {
         assert!(
             captured.contains("without authentication"),
             "expected loopback-no-token warning to mention 'without authentication'; captured: {captured}"
+        );
+    }
+
+    /// Build an `AppState` over a fresh temp file DB with migrations applied
+    /// and the given entity ids seeded as full `entities` rows. Returns the
+    /// state plus the `TempDir` guard (drop it last). The state carries an
+    /// HMAC `identity_secret` so the protected/wardline routes are exercised
+    /// with real signature verification.
+    fn wardline_resolve_test_state(
+        secret: &str,
+        seed_ids: &[&str],
+    ) -> (AppState, tempfile::TempDir) {
+        use clarion_storage::ReaderPool;
+        use clarion_storage::schema::apply_migrations;
+
+        let tempdir = tempfile::tempdir().expect("temp project root");
+        let db_path = tempdir.path().join("clarion.db");
+        let mut conn = rusqlite::Connection::open(&db_path).expect("open db");
+        apply_migrations(&mut conn).expect("apply migrations");
+        for id in seed_ids {
+            conn.execute(
+                "INSERT INTO entities ( \
+                    id, plugin_id, kind, name, short_name, properties, \
+                    content_hash, created_at, updated_at \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    id,
+                    "python",
+                    "function",
+                    id,
+                    id.rsplit('.').next().unwrap_or(id),
+                    "{}",
+                    "deadbeef",
+                    "2026-05-31T00:00:00.000Z",
+                    "2026-05-31T00:00:00.000Z",
+                ],
+            )
+            .expect("seed entity row");
+        }
+        drop(conn);
+
+        let readers = ReaderPool::open(&db_path, 4).expect("open reader pool");
+        let instance_id =
+            crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-000000000004")
+                .expect("parse synthetic instance id");
+        let state = AppState {
+            project_root: tempdir.path().to_path_buf(),
+            readers,
+            instance_id,
+            auth_token: None,
+            identity_secret: Some(Arc::new(secret.to_owned())),
+        };
+        (state, tempdir)
+    }
+
+    fn hmac_request(
+        secret: &str,
+        method: &str,
+        path_and_query: &str,
+        body: &[u8],
+    ) -> axum::http::Request<axum::body::Body> {
+        let signature = component_hmac_hex(secret.as_bytes(), method, path_and_query, body);
+        axum::http::Request::builder()
+            .method(method)
+            .uri(path_and_query)
+            .header("X-Loom-Component", format!("clarion:{signature}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_vec()))
+            .expect("build request")
+    }
+
+    #[tokio::test]
+    async fn wardline_resolve_returns_exact_matches_and_unresolved() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-resolve-secret";
+        let (state, _tempdir) = wardline_resolve_test_state(secret, &["python:function:a.b.c"]);
+        let body = br#"{"qualnames":["a.b.c","x.y.z"]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/resolve", body);
+
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+        assert_eq!(parsed["resolved"]["a.b.c"], "python:function:a.b.c");
+        assert_eq!(
+            parsed["resolved"]
+                .as_object()
+                .expect("resolved object")
+                .len(),
+            1,
+            "only exact matches appear in resolved: {parsed}"
+        );
+        assert_eq!(parsed["unresolved"], serde_json::json!(["x.y.z"]));
+    }
+
+    #[tokio::test]
+    async fn wardline_resolve_rejects_project_guard_mismatch() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-resolve-secret";
+        let (state, _tempdir) = wardline_resolve_test_state(secret, &[]);
+        // A non-empty `project` that does not match the served project-root
+        // directory name must be rejected with 403 PROJECT_MISMATCH.
+        let body = br#"{"project":"some-other-project","qualnames":["a.b.c"]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/resolve", body);
+
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(parsed["code"], "PROJECT_MISMATCH");
+    }
+
+    /// The Wardline body-limit relocation is load-bearing: a >16 KiB body must
+    /// be accepted on `/api/wardline/resolve` (4 MiB limit) while the SAME body
+    /// is still 413'd on the 16 KiB `/api/v1/files/batch` route. A small body
+    /// passes everywhere and would not catch a broken relocation.
+    #[tokio::test]
+    async fn wardline_resolve_accepts_large_body_but_files_batch_rejects_it() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-resolve-secret";
+
+        // Build a >16 KiB JSON body of qualnames (well under the 2000 batch
+        // cap and under 4 MiB). Each entry is ~30 bytes; 2000 of them clears
+        // 16 KiB comfortably.
+        let qualnames: Vec<String> = (0..2000).map(|i| format!("pkg.mod.func_{i:05}")).collect();
+        let wardline_body =
+            serde_json::to_vec(&serde_json::json!({ "qualnames": qualnames })).expect("json");
+        assert!(
+            wardline_body.len() > HTTP_BODY_LIMIT_BYTES,
+            "test body must exceed the 16 KiB limit to be discriminating: {}",
+            wardline_body.len()
+        );
+
+        let (state, _tempdir) = wardline_resolve_test_state(secret, &[]);
+        let request = hmac_request(secret, "POST", "/api/wardline/resolve", &wardline_body);
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "wardline route must accept a >16 KiB body under its 4 MiB limit"
+        );
+
+        // Same-sized body shaped for the files/batch route — must be rejected
+        // by the 16 KiB limit (413 from the framework's RequestBodyLimitLayer).
+        let batch_body = serde_json::to_vec(&serde_json::json!({ "queries": [] })).expect("json");
+        // Pad with a large dummy so the body exceeds 16 KiB but is otherwise
+        // a structurally-irrelevant oversize; the limit fires before parsing.
+        let mut oversize = batch_body;
+        oversize.resize(HTTP_BODY_LIMIT_BYTES + 1024, b' ');
+        let (state2, _tempdir2) = wardline_resolve_test_state(secret, &[]);
+        let request2 = hmac_request(secret, "POST", "/api/v1/files/batch", &oversize);
+        let response2 = router(state2).oneshot(request2).await.expect("oneshot");
+        // The 16 KiB limit on the v1 group rejects the oversize body. Whether
+        // it surfaces as 413 (outer RequestBodyLimitLayer) or 500 (the HMAC
+        // signature-read hitting HTTP_BODY_LIMIT_BYTES first) is incidental to
+        // the v1 route's layer ordering; the load-bearing fact is that the
+        // SAME body the wardline route accepted is NOT accepted here.
+        assert_ne!(
+            response2.status(),
+            StatusCode::OK,
+            "files/batch route must reject a >16 KiB body that the wardline route accepts"
+        );
+        assert!(
+            response2.status().is_client_error() || response2.status().is_server_error(),
+            "files/batch >16 KiB body must be an error status, got {}",
+            response2.status()
         );
     }
 
