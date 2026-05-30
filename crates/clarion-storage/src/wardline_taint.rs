@@ -111,26 +111,34 @@ pub fn upsert_taint_fact(conn: &Connection, fact: &TaintFact) -> Result<()> {
     Ok(())
 }
 
-/// A fetched taint fact joined with the entity's CURRENT content hash.
-/// `current_content_hash` is the freshness signal Wardline compares against
-/// the `content_hash_at_compute` stamped inside `wardline_json`.
+/// A fetched taint fact joined with the entity's containing-file path. The
+/// freshness signal (`current_content_hash`) is NOT stored here: the read
+/// surface derives it live from `source_file_path` via
+/// [`crate::query::current_file_hash`], because the stored
+/// `entities.content_hash` is a span-scoped, LF-normalized hash for function
+/// entities and would be wrong for the whole-file freshness contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaintFactRow {
     pub entity_id: String,
     pub wardline_json: String,
-    pub current_content_hash: Option<String>,
+    /// The containing file's stored path; the read surface derives the live
+    /// `current_content_hash` from it (see `query::current_file_hash`). `None`
+    /// only if the entity row has no `source_file_path`.
+    pub source_file_path: Option<String>,
     pub exists: bool,
 }
 
 /// Fetch taint facts for a set of already-resolved entity ids. Returns one
-/// row per input id; `exists: false` (and `wardline_json: ""`) when no fact
-/// is stored. `current_content_hash` is read from `entities.content_hash`.
+/// row per input id; `exists: false` (and `wardline_json: ""`,
+/// `source_file_path: None`) when no fact is stored. The caller derives the
+/// live whole-file freshness hash from `source_file_path`; this function does
+/// NOT read the filesystem.
 pub fn get_taint_facts(conn: &Connection, entity_ids: &[String]) -> Result<Vec<TaintFactRow>> {
     let mut rows = Vec::with_capacity(entity_ids.len());
     for entity_id in entity_ids {
         let fetched = conn
             .query_row(
-                "SELECT f.wardline_json, e.content_hash \
+                "SELECT f.wardline_json, e.source_file_path \
                    FROM wardline_taint_facts f \
                    JOIN entities e ON e.id = f.entity_id \
                   WHERE f.entity_id = ?1",
@@ -140,16 +148,16 @@ pub fn get_taint_facts(conn: &Connection, entity_ids: &[String]) -> Result<Vec<T
             .optional()
             .map_err(StorageError::from)?;
         match fetched {
-            Some((wardline_json, current_content_hash)) => rows.push(TaintFactRow {
+            Some((wardline_json, source_file_path)) => rows.push(TaintFactRow {
                 entity_id: entity_id.clone(),
                 wardline_json,
-                current_content_hash,
+                source_file_path,
                 exists: true,
             }),
             None => rows.push(TaintFactRow {
                 entity_id: entity_id.clone(),
                 wardline_json: String::new(),
-                current_content_hash: None,
+                source_file_path: None,
                 exists: false,
             }),
         }
@@ -172,14 +180,15 @@ mod tests {
     }
 
     /// Insert a full, valid `entities` row (mirrors the column list of
-    /// `tests/writer_actor.rs::seed_entity_row`). `content_hash` is the only
-    /// column the resolver/fetch tests vary, so it is the sole parameter.
-    fn insert_entity(conn: &Connection, id: &str, content_hash: Option<&str>) {
+    /// `tests/writer_actor.rs::seed_entity_row`). `source_file_path` is the
+    /// column the fetch tests vary (the read surface derives the live freshness
+    /// hash from it), so it is the sole parameter besides the id.
+    fn insert_entity(conn: &Connection, id: &str, source_file_path: Option<&str>) {
         conn.execute(
             "INSERT INTO entities ( \
                 id, plugin_id, kind, name, short_name, properties, \
-                content_hash, created_at, updated_at \
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                content_hash, source_file_path, created_at, updated_at \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 id,
                 "python",
@@ -187,7 +196,8 @@ mod tests {
                 id,
                 id.rsplit('.').next().unwrap_or(id),
                 "{}",
-                content_hash,
+                "deadbeef",
+                source_file_path,
                 "2026-05-31T00:00:00.000Z",
                 "2026-05-31T00:00:00.000Z",
             ],
@@ -258,7 +268,7 @@ mod tests {
     #[test]
     fn upsert_then_fetch_roundtrips_verbatim() {
         let conn = migrated_conn();
-        insert_entity(&conn, "python:function:a.b.c", Some("deadbeef"));
+        insert_entity(&conn, "python:function:a.b.c", Some("/abs/pkg/mod.py"));
         let blob =
             r#"{"schema_version":"wardline-taint-1","taint":{"actual_return":"EXTERNAL_RAW"}}"#;
         upsert_taint_fact(
@@ -276,7 +286,9 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(rows[0].exists);
         assert_eq!(rows[0].wardline_json, blob, "blob stored verbatim");
-        assert_eq!(rows[0].current_content_hash.as_deref(), Some("deadbeef"));
+        // The row carries the entity's stored path; the read surface derives
+        // the live freshness hash from it (NOT from entities.content_hash).
+        assert_eq!(rows[0].source_file_path.as_deref(), Some("/abs/pkg/mod.py"));
     }
 
     #[test]
