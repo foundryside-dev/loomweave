@@ -1184,12 +1184,16 @@ fn analyze_failrun_exits_nonzero_with_run_row_marked_failed() {
     )
     .expect("write malformed plugin.toml");
 
-    let current_path = std::env::var_os("PATH").unwrap_or_default();
-    let new_path = std::env::join_paths(
-        std::iter::once(plugin_dir.path().to_path_buf())
-            .chain(std::env::split_paths(&current_path)),
-    )
-    .expect("join_paths");
+    // Scrub the ambient PATH — build the child's PATH from ONLY the
+    // broken-plugin dir. If we inherited the parent's PATH, a real
+    // `clarion-plugin-*` binary installed on the developer's machine
+    // (e.g. `clarion-plugin-python` under ~/.local/bin) would be
+    // discovered, the run would complete cleanly, and this FailRun test
+    // would fail with "Unexpected success". The sibling tests
+    // (`analyze_resume_*`, `analyze_prune_unseen_*`) build their PATH the
+    // same single-dir way.
+    let new_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).expect("join_paths");
 
     let out = clarion_bin()
         .args(["analyze"])
@@ -1222,6 +1226,15 @@ fn analyze_failrun_exits_nonzero_with_run_row_marked_failed() {
 
 #[cfg(unix)]
 fn phase3_config_with_filigree(min_cluster_size: u64, base_url: &str) -> String {
+    phase3_config_with_filigree_emit(min_cluster_size, base_url, true)
+}
+
+#[cfg(unix)]
+fn phase3_config_with_filigree_emit(
+    min_cluster_size: u64,
+    base_url: &str,
+    emit_findings: bool,
+) -> String {
     format!(
         r"
 analysis:
@@ -1230,7 +1243,7 @@ analysis:
 integrations:
   filigree:
     enabled: true
-    emit_findings: true
+    emit_findings: {emit_findings}
     base_url: {base_url}
     timeout_seconds: 1
 "
@@ -1548,6 +1561,15 @@ fn analyze_prune_unseen_posts_clean_stale_after_emission() {
         "prune is scoped to scan_source=clarion: {}",
         requests[1],
     );
+    // Guard the wire field name: the live Filigree clean-stale route silently
+    // ignores a `days` field — only `older_than_days` takes effect. Assert the
+    // request carries the correct key (default 30) so a serde rename can't
+    // regress the retention window to a no-op.
+    assert!(
+        requests[1].contains("\"older_than_days\":30"),
+        "prune sends older_than_days (not `days`): {}",
+        requests[1],
+    );
 
     let stats = latest_run_stats(project_dir.path());
     assert_eq!(
@@ -1606,6 +1628,146 @@ fn analyze_prune_unseen_is_best_effort_when_filigree_unreachable() {
         stats["filigree_prune"]["status"].as_str(),
         Some("unreachable"),
         "prune failure recorded, not propagated: {stats}",
+    );
+    assert_eq!(
+        stats["filigree_prune"]["rule_id"].as_str(),
+        Some("CLA-INFRA-FILIGREE-UNREACHABLE"),
+    );
+}
+
+/// WP9-B: with Filigree `enabled: true` but `emit_findings: false`, analyze
+/// makes ZERO scan-results POST. The emission gate short-circuits before any
+/// network I/O (no finding flush, no client build), so a listening mock must
+/// see no connection at all. `stats.json` carries no `filigree_emission` blob
+/// (the emit helper returns null, which is not folded in).
+#[cfg(unix)]
+#[test]
+fn analyze_does_not_emit_when_emit_findings_false() {
+    use std::net::TcpListener;
+
+    // Bind a listener but never accept on a thread — analyze must not connect.
+    // Set non-blocking so the post-run `accept()` returns `WouldBlock`
+    // immediately rather than hanging, and inspect the accept queue directly.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock filigree");
+    listener
+        .set_nonblocking(true)
+        .expect("set listener non-blocking");
+    let addr = listener.local_addr().expect("local addr");
+
+    let project_dir = run_phase3_fixture(
+        &["weak_a", "weak_b"],
+        &phase3_config_with_filigree_emit(2, &format!("http://{addr}"), false),
+    );
+
+    // No client ever connected — a completed connection would sit in the accept
+    // queue even if closed, so `WouldBlock` proves zero POSTs were made.
+    match listener.accept() {
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("emit_findings=false must make no POST, but got: {other:?}"),
+    }
+
+    // The emission helper returns null when `emit_findings` is off, and a null
+    // emission is never folded into `stats.json`.
+    let stats = latest_run_stats(project_dir.path());
+    assert!(
+        stats["filigree_emission"].is_null(),
+        "no emission blob recorded when emit_findings=false: {stats}",
+    );
+}
+
+/// REQ-FINDING-06 `--prune-unseen` is enrich-only against a non-2xx response,
+/// not just connection refusal: when Filigree answers the clean-stale POST with
+/// HTTP 500, analyze still exits 0 with the run row `completed`, and the sweep
+/// failure is recorded in `stats.json` as `CLA-INFRA-FILIGREE-UNREACHABLE`. The
+/// 500 is well-formed (content-length present) so it exercises the client's
+/// `!status.is_success()` branch rather than a torn-connection error.
+#[cfg(unix)]
+#[test]
+fn analyze_prune_unseen_is_best_effort_on_non_2xx() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock filigree");
+    let addr = listener.local_addr().expect("local addr");
+    // Accept both POSTs: 200 to the emission intake (POST 1), then 500 to the
+    // clean-stale sweep (POST 2).
+    let server = std::thread::spawn(move || {
+        let ok_body = r#"{"files_created":0,"files_updated":0,"findings_created":0,"findings_updated":0,"new_finding_ids":[],"observations_created":0,"observations_failed":0,"warnings":[]}"#;
+        let err_body = r#"{"error":"boom"}"#;
+        for i in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept POST");
+            let mut buf = [0_u8; 8192];
+            let _ = stream.read(&mut buf).expect("read request");
+            if i == 0 {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    ok_body.len(),
+                    ok_body
+                )
+                .expect("write emission response");
+            } else {
+                write!(
+                    stream,
+                    "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    err_body.len(),
+                    err_body
+                )
+                .expect("write clean-stale 500");
+            }
+        }
+    });
+
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_phase3_plugin(plugin_dir.path());
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    for stem in ["weak_a", "weak_b"] {
+        std::fs::write(project_dir.path().join(format!("{stem}.p3")), b"module\n")
+            .expect("write phase3 fixture file");
+    }
+    let config_path = project_dir.path().join("phase3-clarion.yaml");
+    std::fs::write(
+        &config_path,
+        phase3_config_with_filigree(2, &format!("http://{addr}")),
+    )
+    .expect("write phase3 config");
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+
+    clarion_bin()
+        .args(["analyze", "--config"])
+        .arg(&config_path)
+        .arg("--prune-unseen")
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    server.join().expect("mock server thread");
+
+    // A non-2xx clean-stale response must never fail the run.
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    let run_status: String = conn
+        .query_row(
+            "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        run_status, "completed",
+        "a 500 from the clean-stale route must not fail the prune run",
+    );
+    let stats = latest_run_stats(project_dir.path());
+    assert_eq!(
+        stats["filigree_prune"]["status"].as_str(),
+        Some("unreachable"),
+        "non-2xx prune failure recorded, not propagated: {stats}",
     );
     assert_eq!(
         stats["filigree_prune"]["rule_id"].as_str(),
