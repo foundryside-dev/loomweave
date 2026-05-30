@@ -1535,16 +1535,34 @@ impl ServerState {
         // Related Filigree issues — reuse `issues_for` so its disabled /
         // unreachable degradation paths are shared. Bounded to the primary
         // entity (no contained fan-out) to keep the packet small.
-        let issues = if let Some(primary_id) = &core.primary_id {
+        let (issues, wardline_findings) = if let Some(primary_id) = &core.primary_id {
             let mut issue_args = serde_json::Map::new();
             issue_args.insert("id".to_owned(), json!(primary_id));
             issue_args.insert("include_contained".to_owned(), json!(false));
             match self.tool_issues_for(&issue_args).await {
-                Ok(envelope) => envelope.get("result").cloned().unwrap_or(Value::Null),
-                Err(_) => json!({"available": false, "reason": "issues lookup failed"}),
+                Ok(mut envelope) => {
+                    // Flow B: lift the wardline_findings section out of the nested
+                    // issues result so the pack surfaces it as a top-level section
+                    // (issues_for nests it under `result`). Reuses the reconciliation
+                    // issues_for already did for this same primary entity — no second
+                    // Filigree fetch.
+                    let wardline = envelope
+                        .get_mut("result")
+                        .and_then(Value::as_object_mut)
+                        .and_then(|result| result.remove("wardline_findings"));
+                    let issues = envelope.get("result").cloned().unwrap_or(Value::Null);
+                    (issues, wardline)
+                }
+                Err(_) => (
+                    json!({"available": false, "reason": "issues lookup failed"}),
+                    None,
+                ),
             }
         } else {
-            json!({"available": false, "reason": "no primary entity at this location"})
+            (
+                json!({"available": false, "reason": "no primary entity at this location"}),
+                None,
+            )
         };
 
         let health = json!({
@@ -1618,6 +1636,9 @@ impl ServerState {
             .as_object_mut()
             .expect("orientation packet is an object");
         object.insert("issues".to_owned(), issues);
+        if let Some(wardline) = wardline_findings {
+            object.insert("wardline_findings".to_owned(), wardline);
+        }
         object.insert("health".to_owned(), health);
         object.insert("warnings".to_owned(), json!(warnings));
         object.insert("suggested_next_reads".to_owned(), json!(suggested));

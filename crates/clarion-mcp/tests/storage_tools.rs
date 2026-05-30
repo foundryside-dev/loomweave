@@ -4367,3 +4367,62 @@ async fn issues_for_wardline_no_matches_when_no_qualname_reconciles() {
         "the finding had a qualname, just a non-matching one"
     );
 }
+
+#[tokio::test]
+async fn orientation_pack_includes_wardline_findings() {
+    // AC: `wardline_findings` is lifted out of the delegated `issues_for` result
+    // and surfaced as a top-level section of the orientation pack — no second
+    // Filigree fetch, no direct client call. The section must NOT appear inside
+    // `issues` (it was removed from there).
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, parent_id, source_file_path,
+            source_line_start, source_line_end, properties, content_hash,
+            created_at, updated_at
+         ) VALUES (
+            'python:function:demo.hello', 'python', 'function',
+            'python:function:demo.hello', 'demo.hello', NULL,
+            'src/demo.py', 1, 3, '{}', 'fake-hash-orient-wf',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        [],
+    )
+    .expect("insert demo.hello entity");
+    drop(conn);
+
+    let client = Arc::new(
+        FakeFiligreeClient::default()
+            .with_wardline_findings(vec![wf("demo.hello", "WLN-TAINT-001")]),
+    );
+    let state = state_for_filigree(project.path(), &db_path, client);
+
+    let out = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.hello"}),
+    )
+    .await;
+
+    assert_eq!(out["ok"], true, "{out:?}");
+
+    // wardline_findings is a top-level section of the pack (sibling of issues,
+    // health, etc.), under out["result"] because orientation_pack uses
+    // success_envelope_with_truncation.
+    let wf_section = &out["result"]["wardline_findings"];
+    assert_eq!(
+        wf_section["result_kind"], "matched",
+        "wardline_findings section: {wf_section}"
+    );
+    let items = wf_section["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1, "one matched finding");
+    assert_eq!(items[0]["rule_id"], "WLN-TAINT-001");
+
+    // The section must NOT be duplicated inside issues (it was lifted out).
+    assert!(
+        out["result"]["issues"].get("wardline_findings").is_none(),
+        "wardline_findings must not appear inside the issues section"
+    );
+}
