@@ -24,7 +24,7 @@ Wardline's SP9 request (`wardline/docs/integration/2026-05-30-wardline-clarion-t
 ### Where Clarion stands today
 
 - Clarion's HTTP API is **read-only**. ADR-014 introduced the federation read API; ADR-034 hardened it (HMAC inbound auth, batch resolution, `BRIEFING_BLOCKED`, stable per-project `instance_id`). No write path is exposed over HTTP.
-- Writes to the `.clarion/` SQLite DB go exclusively through the ADR-011 writer-actor, which today is held only by `clarion analyze`. `clarion serve` opens only the `ReaderPool`.
+- Writes to the `.clarion/` SQLite DB go through the ADR-011 writer-actor. `clarion analyze` holds one for the duration of a run. `clarion serve` opens the `ReaderPool` for queries and *additionally* spawns an optional MCP query-time writer-actor when an LLM summary provider is configured (`serve.rs`, for the summary/inferred-edge caches). No write path is exposed over HTTP today.
 - The schema-reserved `wardline TEXT` column on `entities` is **orthogonal** to this work — it was reserved for the fingerprint/qualname reverse-map (`WardlineMeta`, `detailed-design.md` §7), a different and smaller dataset. It is not the taint store and is left as-is. Crucially, `clarion analyze` rebuilds every `EntityRecord` with `wardline_json: None` and the `entities` UPSERT sets `wardline = excluded.wardline`, so any taint fact stored in that column would be silently wiped on the next re-analyze. A separate table is the only clobber-safe home.
 
 ### Why this needs a decision, not just an implementation
@@ -54,7 +54,7 @@ Resolution is **exact-tier only for writes**: a write requires an `exact` match;
 
 ### 4. Concurrency posture (ADR-011)
 
-A write-enabled `serve` and a concurrent `analyze` are **not expected** to write the same `.clarion/` DB at the same time; this is an operational expectation, documented rather than enforced beyond the SQLite lock. Cross-process contention is handled by the existing `PRAGMA busy_timeout=5000` plus the `clarion-storage::retry` capped-backoff layer. A write that still cannot land after retry **fails as a retryable error**, and Wardline degrades to its SP8 stateless re-run. Per-entity replace is atomic at the row level, so Clarion never corrupts or partially merges two scans for the same entity.
+In-process, a write-enabled `serve` may run **two** ADR-011 writer-actors against the same DB at once — the optional MCP summary writer (when an LLM provider is configured) and the taint-store writer — each on its own connection. This is a deliberate, bounded relaxation of ADR-011's single-writer-per-process expectation: the two write *streams* are independent (summary/inferred-edge caches vs. Wardline taint facts), and every writer opens its batch with `BEGIN IMMEDIATE` under the same `PRAGMA busy_timeout=5000` + `clarion-storage::retry` capped-backoff layer, so they serialize at the SQLite write lock rather than corrupting. The same mechanism covers **cross-process** contention: a write-enabled `serve` and a concurrent `analyze` are **not expected** to write the same `.clarion/` DB at the same time (an operational expectation, documented rather than enforced beyond the SQLite lock), but if they do, the busy-timeout + retry resolves it. A write that still cannot land after retry **fails as a retryable error**, and Wardline degrades to its SP8 stateless re-run. Per-entity replace is atomic at the row level, so Clarion never corrupts or partially merges two scans for the same entity.
 
 ### 5. The federation guard (load-bearing, verbatim)
 
@@ -87,7 +87,7 @@ Because this integration **passes** the failure test — rather than accepting a
 ### Negative / costs
 
 - Clarion's HTTP API gains a write posture for the first time, widening the security surface that ADR-034's HMAC auth and the operator trust model must cover. Mitigation: the write path is **off by default** (`serve.http.wardline_taint_write = false`) and HMAC-gated; with the knob off, `serve` is byte-for-byte today's read-only posture.
-- `serve` gains an optional ADR-011 writer-actor and the cross-process contention surface that comes with a second writer against the DB. Mitigation: `PRAGMA busy_timeout=5000` + the `clarion-storage::retry` capped-backoff layer; a write that cannot land fails retryably and Wardline degrades to SP8 (enrich-only, never corruption).
+- `serve` gains an optional ADR-011 writer-actor, adding both an **in-process** contention surface (it coexists with the optional MCP summary writer — two writer-actors on one DB, §4) and the **cross-process** surface (vs. a concurrent `analyze`). Mitigation: every writer uses `BEGIN IMMEDIATE` + `PRAGMA busy_timeout=5000` + the `clarion-storage::retry` capped-backoff layer; a write that cannot land fails retryably and Wardline degrades to SP8 (enrich-only, never corruption).
 
 ### What ships (artifact inventory)
 

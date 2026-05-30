@@ -337,6 +337,13 @@ fn run_http_read_server(
             readers_identity,
         }));
         // Optional ADR-011 writer-actor for the Wardline taint-store WRITE API.
+        // Note: when an LLM summary provider is configured, `serve` already
+        // runs a second writer-actor (the MCP summary/inferred-edge writer in
+        // serve.rs). Two writer-actors on one DB is a bounded relaxation of
+        // ADR-011's single-writer expectation (ADR-036 §4): the streams are
+        // independent and every writer opens `BEGIN IMMEDIATE` under
+        // busy_timeout=5000 + capped-backoff retry, so they serialize at the
+        // SQLite write lock rather than corrupting.
         // Spawned INSIDE the HTTP runtime (`Writer::spawn` uses `spawn_blocking`,
         // which needs a runtime). We keep ONLY `writer.sender()` — the `Writer`
         // handle is dropped at the end of this block so that the AppState's
