@@ -11,7 +11,7 @@
       "args": [
         "serve",
         "--path",
-        "/home/john/elspeth"
+        "/home/john/clarion"
       ],
       "env": {}
     }
