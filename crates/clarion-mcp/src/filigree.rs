@@ -807,6 +807,10 @@ mod tests {
             let req = String::from_utf8_lossy(&buf[..n]);
             assert!(req.contains("GET /api/loom/files?scan_source=wardline&path_prefix=src%2Fdemo.py HTTP/1.1"));
             let body = r#"{"items":[{"file_id":"file-9","path":"src/demo.py","language":"python","file_type":"source"},{"file_id":"file-10","path":"src/demo.py.bak","language":"python","file_type":"source"}],"has_more":false}"#;
+            // connection: close forces reqwest to open a fresh TCP connection for
+            // hop 2, so the listener's second accept() receives it (the blocking
+            // client would otherwise pool/reuse hop-1's socket and hop-2's
+            // accept() would hang).
             write!(s1, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}", body.len(), body).unwrap();
 
             // Hop 2: GET /api/loom/findings for file-9.
@@ -817,6 +821,9 @@ mod tests {
             let body = r#"{"items":[{"finding_id":"f-1","file_id":"file-9","severity":"high","status":"open","scan_source":"wardline","rule_id":"WLN-TAINT-001","message":"sink","suggestion":"","scan_run_id":"r-1","line_start":12,"line_end":12,"fingerprint":"fp","issue_id":null,"seen_count":1,"metadata":{"wardline":{"qualname":"demo.Foo.bar"}},"data_warnings":[]}],"has_more":false}"#;
             write!(s2, "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}", body.len(), body).unwrap();
         });
+        // Not detail_test_client(addr): the two-hop test does two sequential TCP
+        // accepts, so use a more generous timeout to avoid CI scheduling jitter
+        // between hops.
         let config = FiligreeConfig {
             enabled: true,
             base_url: format!("http://{addr}"),
