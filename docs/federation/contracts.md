@@ -834,6 +834,54 @@ contract. The `parse_issue_detail_response` shape test in
 [`filigree.rs`](../../crates/clarion-mcp/src/filigree.rs) is the executable
 check.
 
+## Consumed Filigree routes: Wardline findings (Flow B read-time reconciliation)
+
+Flow B (read-time Wardline finding reconciliation) consumes two existing Filigree
+*loom* read routes — no new route is requested. Both are enrich-only: if either
+is unreachable the `wardline_findings` section degrades to
+`result_kind: "unavailable"` and the tool returns normally (loom.md §5).
+
+1. `GET {filigree_base}/api/loom/files?scan_source=wardline&path_prefix=<rel-path>` →
+   a list envelope `{items, has_more}`. Clarion takes the item whose `path` is
+   byte-exact (the filter is a prefix query; Clarion performs the exact-match
+   itself to get Filigree's `file_id`).
+2. `GET {filigree_base}/api/loom/findings?scan_source=wardline&file_id=<file_id>` →
+   a list envelope of findings. Clarion reads `rule_id`, `message`, `severity`,
+   `status`, `line_start`/`line_end`, `fingerprint`, and `metadata` (the
+   reconciliation key is `metadata.wardline.qualname`). Unknown fields are ignored
+   so Filigree may grow the row without breaking this consumer.
+
+**Reconciliation.** `metadata.wardline.qualname` is matched byte-exact against
+the entity_id's segment-3 `canonical_qualified_name`
+(`python:function:<qualname>`), per
+[Wardline qualname normalization](#wardline-qualname-normalization-entity-reconciliation).
+A matching qualname is surfaced with `resolution_confidence: exact`; a
+non-matching qualname is not surfaced (dropped); findings carrying no
+`metadata.wardline.qualname` are counted in `omitted_no_qualname`. `heuristic`
+is reserved but never returned in v1.1 (`wardline_reconcile.rs`).
+
+Flow B does not use `POST /api/v1/files:resolve`; it uses the two `loom` GET
+routes above (`POST /api/v1/files:resolve` is a route Clarion *exposes*, not
+one it consumes — see [`POST /api/v1/files:resolve`](#post-apiv1filesresolve)).
+
+The section is surfaced under `result.wardline_findings` in `issues_for` and as
+a top-level field of the orientation pack.
+
+**Verification scope.** There is no normative wire fixture for these routes —
+the prose above is the contract. Executable checks:
+
+- `loom_files_url` / `loom_findings_url` / `parse_wardline_findings_response`
+  / `wardline_findings_for_path_does_two_hops_and_exact_path_filter` in
+  [`filigree.rs`](../../crates/clarion-mcp/src/filigree.rs) pin the URL shape,
+  response parsing, and exact-path-filter logic.
+- `reconcile_for_entity` tests in
+  [`wardline_reconcile.rs`](../../crates/clarion-mcp/src/wardline_reconcile.rs)
+  pin the exact-tier match and the omitted-no-qualname count.
+- `issues_for_attaches_exact_wardline_findings` and
+  `orientation_pack_includes_wardline_findings` in
+  [`storage_tools.rs`](../../crates/clarion-mcp/tests/storage_tools.rs) pin
+  the end-to-end section attachment and the `result_kind: "unavailable"` degrade.
+
 ## Consumed Filigree route: scan-results intake (finding emission)
 
 This pins the Filigree route Clarion *consumes* to emit findings — WP9-B,
