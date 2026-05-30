@@ -201,10 +201,13 @@ pub fn run(path: &Path, force: bool, plan: InstallPlan) -> Result<()> {
                     clarion_dir.display()
                 );
             }
-            // A non-bare init (--all / --skills / --hooks) treats an existing
-            // .clarion/ as already-initialised and keeps it. But a non-directory
-            // .clarion is not a usable index — refuse rather than "succeed" with
-            // skills/hooks installed atop a project that has no clarion.db.
+            // Only `--all` reaches here: a bare install bailed above, and
+            // `--skills`/`--hooks` alone are `Components` (init_clarion() ==
+            // false) that skip this whole block. `--all` treats an existing
+            // .clarion/ as already-initialised and keeps it — but a
+            // non-directory .clarion is not a usable index, so refuse rather
+            // than "succeed" with skills/hooks atop a project that has no
+            // clarion.db.
             if !clarion_dir.is_dir() {
                 bail!(
                     "found a non-directory at {}; expected an initialised .clarion/ \

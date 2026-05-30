@@ -98,6 +98,27 @@ fn install_all_rejects_non_directory_clarion() {
 }
 
 #[test]
+fn install_force_rejects_non_directory_clarion() {
+    // The --force overwrite path has its own non-directory guard (distinct from
+    // the --all skip-init guard): it can only remove an existing .clarion/
+    // *directory*, never a regular file masquerading as one.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".clarion"), "i am a file, not a dir").unwrap();
+
+    let out = clarion_bin()
+        .args(["install", "--force", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("can only overwrite an existing .clarion/ directory"),
+        "error did not mention the --force non-directory guard: {stderr}"
+    );
+}
+
+#[test]
 fn install_refuses_to_overwrite_existing_clarion_dir() {
     let dir = tempfile::tempdir().unwrap();
     clarion_bin()
