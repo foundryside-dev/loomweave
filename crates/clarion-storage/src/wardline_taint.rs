@@ -160,19 +160,50 @@ pub fn get_taint_facts(conn: &Connection, entity_ids: &[String]) -> Result<Vec<T
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::apply_migrations;
+
+    /// In-memory connection with the REAL schema applied (entities +
+    /// `wardline_taint_facts` from migration 0003 + `schema_migrations`). Tests
+    /// build from the migration runner so they cannot drift from the DDL.
+    fn migrated_conn() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut conn).unwrap();
+        conn
+    }
+
+    /// Insert a full, valid `entities` row (mirrors the column list of
+    /// `tests/writer_actor.rs::seed_entity_row`). `content_hash` is the only
+    /// column the resolver/fetch tests vary, so it is the sole parameter.
+    fn insert_entity(conn: &Connection, id: &str, content_hash: Option<&str>) {
+        conn.execute(
+            "INSERT INTO entities ( \
+                id, plugin_id, kind, name, short_name, properties, \
+                content_hash, created_at, updated_at \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                id,
+                "python",
+                "function",
+                id,
+                id.rsplit('.').next().unwrap_or(id),
+                "{}",
+                content_hash,
+                "2026-05-31T00:00:00.000Z",
+                "2026-05-31T00:00:00.000Z",
+            ],
+        )
+        .unwrap();
+    }
 
     fn seed(conn: &Connection, ids: &[&str]) {
-        conn.execute_batch("CREATE TABLE entities (id TEXT PRIMARY KEY);")
-            .unwrap();
         for id in ids {
-            conn.execute("INSERT INTO entities (id) VALUES (?1)", params![id])
-                .unwrap();
+            insert_entity(conn, id, None);
         }
     }
 
     #[test]
     fn resolves_fixture_vectors_exact() {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = migrated_conn();
         // expected_entity_id values copied verbatim from
         // fixtures/wardline-qualname-normalization.json qualified_name_vectors.
         seed(
@@ -205,7 +236,7 @@ mod tests {
 
     #[test]
     fn unknown_qualname_resolves_none() {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = migrated_conn();
         seed(&conn, &["python:function:auth.tokens.TokenManager.verify"]);
         let r = resolve_wardline_qualname(&conn, "auth.tokens.does_not_exist").unwrap();
         assert_eq!(r.confidence, ResolutionConfidence::None);
@@ -214,7 +245,7 @@ mod tests {
 
     #[test]
     fn batch_preserves_input_order_and_mixed_results() {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = migrated_conn();
         seed(&conn, &["python:function:a.b.c"]);
         let qs = vec!["a.b.c".to_owned(), "x.y.z".to_owned(), "a.b.c".to_owned()];
         let out = resolve_wardline_qualnames(&conn, &qs).unwrap();
@@ -224,30 +255,10 @@ mod tests {
         assert_eq!(out[2].1.confidence, ResolutionConfidence::Exact);
     }
 
-    fn seed_with_hash(conn: &Connection, id: &str, hash: Option<&str>) {
-        conn.execute(
-            "INSERT INTO entities (id, content_hash) VALUES (?1, ?2)",
-            params![id, hash],
-        )
-        .unwrap();
-    }
-
-    fn create_tables(conn: &Connection) {
-        conn.execute_batch(
-            "CREATE TABLE entities (id TEXT PRIMARY KEY, content_hash TEXT); \
-             CREATE TABLE wardline_taint_facts ( \
-                entity_id TEXT PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE, \
-                wardline_json TEXT NOT NULL, scan_id TEXT, \
-                content_hash_at_compute TEXT, updated_at TEXT NOT NULL);",
-        )
-        .unwrap();
-    }
-
     #[test]
     fn upsert_then_fetch_roundtrips_verbatim() {
-        let conn = Connection::open_in_memory().unwrap();
-        create_tables(&conn);
-        seed_with_hash(&conn, "python:function:a.b.c", Some("deadbeef"));
+        let conn = migrated_conn();
+        insert_entity(&conn, "python:function:a.b.c", Some("deadbeef"));
         let blob =
             r#"{"schema_version":"wardline-taint-1","taint":{"actual_return":"EXTERNAL_RAW"}}"#;
         upsert_taint_fact(
@@ -270,9 +281,8 @@ mod tests {
 
     #[test]
     fn upsert_replaces_per_entity() {
-        let conn = Connection::open_in_memory().unwrap();
-        create_tables(&conn);
-        seed_with_hash(&conn, "python:function:a.b.c", None);
+        let conn = migrated_conn();
+        insert_entity(&conn, "python:function:a.b.c", None);
         let mk = |json: &str| TaintFact {
             entity_id: "python:function:a.b.c".to_owned(),
             wardline_json: json.to_owned(),
@@ -288,8 +298,7 @@ mod tests {
 
     #[test]
     fn fetch_absent_entity_reports_not_exists() {
-        let conn = Connection::open_in_memory().unwrap();
-        create_tables(&conn);
+        let conn = migrated_conn();
         let rows = get_taint_facts(&conn, &["python:function:missing".to_owned()]).unwrap();
         assert!(!rows[0].exists);
         assert_eq!(rows[0].wardline_json, "");
