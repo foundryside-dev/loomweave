@@ -847,7 +847,11 @@ struct ResolveResponse {
 #[serde(deny_unknown_fields)]
 struct TaintFactInput {
     qualname: String,
-    wardline_json: serde_json::Value,
+    /// `RawValue` captures the ORIGINAL bytes of this JSON sub-value exactly —
+    /// `serde_json::Value` would normalize (object keys are a `BTreeMap`, so
+    /// `{"b":2,"a":1}` would re-emit as `{"a":1,"b":2}`). The federation
+    /// contract is "stored and returned verbatim", so we preserve the bytes.
+    wardline_json: Box<serde_json::value::RawValue>,
     #[serde(default)]
     scan_id: Option<String>,
     #[serde(default)]
@@ -1256,9 +1260,11 @@ async fn post_wardline_taint_facts(
         };
         let taint_fact = clarion_storage::TaintFact {
             entity_id,
-            // Opaque: re-serialize the verbatim JSON value. Do NOT parse out
-            // scan_id/content_hash from inside the blob; do NOT validate it.
-            wardline_json: fact.wardline_json.to_string(),
+            // Opaque + byte-verbatim: `RawValue::get()` returns the original
+            // bytes of the blob exactly as the client sent them (no key
+            // reordering). Do NOT parse out scan_id/content_hash from inside
+            // the blob; do NOT validate it.
+            wardline_json: fact.wardline_json.get().to_owned(),
             scan_id: fact.scan_id.or_else(|| batch_scan_id.clone()),
             content_hash_at_compute: fact.content_hash_at_compute.clone(),
             updated_at: updated_at.clone(),
@@ -2267,11 +2273,18 @@ mod tests {
         let secret = "wardline-write-secret";
         let (state, db_path, writer, _tempdir) =
             wardline_write_test_state(secret, &["python:function:a.b.c"]);
-        let body = br#"{"facts":[
-            {"qualname":"a.b.c","wardline_json":{"schema":"w-1","taint":{"ret":"RAW"}}},
-            {"qualname":"x.y.z","wardline_json":{"v":2}}
-        ]}"#;
-        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body);
+        // The resolved blob's keys are in NON-alphabetical order
+        // (`b` before `a`, `schema` before `ret`). Under the old
+        // `Value::to_string()` path serde's BTreeMap would re-emit them
+        // alphabetized; `RawValue` preserves the original bytes exactly.
+        let resolved_blob = r#"{"b":2,"a":1,"taint":{"ret":"RAW","schema":"w-1"}}"#;
+        let body = format!(
+            r#"{{"facts":[
+            {{"qualname":"a.b.c","wardline_json":{resolved_blob}}},
+            {{"qualname":"x.y.z","wardline_json":{{"v":2}}}}
+        ]}}"#
+        );
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body.as_bytes());
 
         let response = router(state).oneshot(request).await.expect("oneshot");
         assert_eq!(response.status(), StatusCode::OK);
@@ -2283,10 +2296,13 @@ mod tests {
         assert_eq!(parsed["unresolved_qualnames"], serde_json::json!(["x.y.z"]));
 
         // The ack we awaited inside the handler confirms durability; the blob
-        // must round-trip verbatim (re-serialized from the JSON value).
+        // must round-trip BYTE-EXACT — key order preserved, NOT alphabetized.
+        // This assertion fails under the old `Value::to_string()` path.
         let stored = read_taint_blob(&db_path, "python:function:a.b.c").expect("fact stored");
-        let expected = serde_json::json!({"schema":"w-1","taint":{"ret":"RAW"}}).to_string();
-        assert_eq!(stored, expected, "wardline_json stored verbatim");
+        assert_eq!(
+            stored, resolved_blob,
+            "wardline_json stored byte-verbatim (key order preserved)"
+        );
         drop(writer);
     }
 
