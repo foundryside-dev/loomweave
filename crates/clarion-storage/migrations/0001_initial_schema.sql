@@ -267,15 +267,10 @@ ALTER TABLE entities ADD COLUMN git_churn_count INTEGER
     GENERATED ALWAYS AS (json_extract(properties, '$.git_churn_count')) VIRTUAL;
 CREATE INDEX ix_entities_churn ON entities(git_churn_count) WHERE git_churn_count IS NOT NULL;
 
--- briefing_blocked (per ADR-024): a secret-scan-set property that withholds an
--- entity from briefings / federation exposure. Promoting it to a generated
--- column + partial index lets the federation read-API hot path filter blocked
--- entities in SQL instead of parsing every row's properties JSON. NULL when
--- absent (the common case), so the partial index stays small.
-ALTER TABLE entities ADD COLUMN briefing_blocked TEXT
-    GENERATED ALWAYS AS (json_extract(properties, '$.briefing_blocked')) VIRTUAL;
-CREATE INDEX ix_entities_briefing_blocked ON entities(briefing_blocked)
-    WHERE briefing_blocked IS NOT NULL;
+-- NOTE: the `briefing_blocked` generated column + partial index live in
+-- migration 0002, NOT here. They were briefly added in place to 0001, which
+-- meant existing databases already stamped at schema_migrations.version=1
+-- skipped them; 0002 adds them on upgrade. Do not move them back.
 
 -- View for guidance resolver. detailed-design.md §3 references a bare `tags`
 -- column on `entities` that does not exist under the normalised tag schema;

@@ -14,16 +14,23 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "0001_initial_schema",
-    sql: include_str!("../migrations/0001_initial_schema.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "0001_initial_schema",
+        sql: include_str!("../migrations/0001_initial_schema.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "0002_briefing_blocked",
+        sql: include_str!("../migrations/0002_briefing_blocked.sql"),
+    },
+];
 
 /// Highest migration version known to this build. Mirrored into the
 /// `SQLite` `user_version` header (STO-02) so a future-built database is
 /// refused at open instead of silently corrupting state.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 const _CURRENT_SCHEMA_VERSION_MATCHES_LAST_MIGRATION: () = {
     // Compile-time check: `CURRENT_SCHEMA_VERSION` must equal the highest
@@ -193,6 +200,38 @@ fn migration_count_to_u32(n: i64) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entities_has_briefing_blocked(conn: &Connection) -> bool {
+        conn.prepare("SELECT 1 FROM pragma_table_xinfo('entities') WHERE name = 'briefing_blocked'")
+            .and_then(|mut stmt| stmt.exists([]))
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn briefing_blocked_is_added_by_an_upgrade_migration_not_the_initial() {
+        // An existing v1 database (created before briefing_blocked) must gain
+        // the column on upgrade. If the column lives in the already-applied
+        // initial migration, existing DBs at schema_migrations.version=1 skip
+        // it forever and project_status hits `no such column`. Reproduce: apply
+        // only the initial migration, confirm the column is absent, then run
+        // the full migration runner and confirm an upgrade migration adds it.
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_one(&mut conn, &MIGRATIONS[0]).expect("apply initial migration");
+        assert!(
+            !entities_has_briefing_blocked(&conn),
+            "briefing_blocked must not be defined by the initial migration (0001)"
+        );
+
+        apply_migrations(&mut conn).expect("apply pending migrations");
+        assert!(
+            entities_has_briefing_blocked(&conn),
+            "an upgrade migration must add briefing_blocked to an existing v1 DB"
+        );
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(user_version, i64::from(CURRENT_SCHEMA_VERSION));
+    }
 
     #[test]
     fn migration_count_conversion_rejects_overflow() {

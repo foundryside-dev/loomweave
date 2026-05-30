@@ -775,13 +775,13 @@ fn migrations_are_idempotent() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut conn = open_fresh(&tempdir);
     schema::apply_migrations(&mut conn).expect("second apply should be a no-op");
-    assert_eq!(schema::applied_count(&conn).unwrap(), 1);
+    assert_eq!(schema::applied_count(&conn).unwrap(), 2);
     let tables_after = table_names(&conn);
     assert!(tables_after.contains(&"entities".to_owned()));
 }
 
 #[test]
-fn schema_migrations_records_one_row() {
+fn schema_migrations_records_each_applied_migration() {
     let tempdir = tempfile::tempdir().unwrap();
     let conn = open_fresh(&tempdir);
     let count: i64 = conn
@@ -789,15 +789,15 @@ fn schema_migrations_records_one_row() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(count, 1);
-    let name: String = conn
-        .query_row(
-            "SELECT name FROM schema_migrations WHERE version = 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(name, "0001_initial_schema");
+    assert_eq!(count, 2);
+    let names: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM schema_migrations ORDER BY version")
+            .unwrap();
+        let rows = stmt.query_map([], |row| row.get(0)).unwrap();
+        rows.map(std::result::Result::unwrap).collect()
+    };
+    assert_eq!(names, vec!["0001_initial_schema", "0002_briefing_blocked"]);
 }
 
 // ----------------------------------------------------------------------------
