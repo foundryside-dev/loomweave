@@ -1989,11 +1989,13 @@ mod tests {
         let (state2, _tempdir2) = wardline_resolve_test_state(secret, &[]);
         let request2 = hmac_request(secret, "POST", "/api/v1/files/batch", &oversize);
         let response2 = router(state2).oneshot(request2).await.expect("oneshot");
-        // The 16 KiB limit on the v1 group rejects the oversize body. Whether
-        // it surfaces as 413 (outer RequestBodyLimitLayer) or 500 (the HMAC
-        // signature-read hitting HTTP_BODY_LIMIT_BYTES first) is incidental to
-        // the v1 route's layer ordering; the load-bearing fact is that the
-        // SAME body the wardline route accepted is NOT accepted here.
+        // In HMAC mode the v1 route has TWO oversize-body rejecters: the
+        // `RequestBodyLimitLayer(16 KiB)` on the v1 group (→ 413) and the HMAC
+        // middleware's own `to_bytes(_, HTTP_BODY_LIMIT_BYTES)` (→ 500). The
+        // HMAC read fires first, so this half only proves the SAME body the
+        // wardline route accepted is NOT accepted here — it does NOT prove the
+        // v1 `RequestBodyLimitLayer` is wired. The no-auth assertion below
+        // closes that gap.
         assert_ne!(
             response2.status(),
             StatusCode::OK,
@@ -2003,6 +2005,30 @@ mod tests {
             response2.status().is_client_error() || response2.status().is_server_error(),
             "files/batch >16 KiB body must be an error status, got {}",
             response2.status()
+        );
+
+        // Regression guard for the v1 `RequestBodyLimitLayer` itself. With NO
+        // identity configured (loopback trust), the auth middleware is a plain
+        // passthrough and never reads the body, so the ONLY thing that can cap
+        // an oversize v1 body is the group's `RequestBodyLimitLayer(16 KiB)`.
+        // If that layer were removed in a future refactor, this assertion would
+        // flip from 413 to 200 (oversize read silently let through) — which the
+        // HMAC-mode half above cannot detect.
+        let (mut state3, _tempdir3) = wardline_resolve_test_state(secret, &[]);
+        state3.identity_secret = None;
+        state3.auth_token = None;
+        let request3 = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/files/batch")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_LENGTH, oversize.len().to_string())
+            .body(axum::body::Body::from(oversize.clone()))
+            .expect("build request");
+        let response3 = router(state3).oneshot(request3).await.expect("oneshot");
+        assert_eq!(
+            response3.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "v1 RequestBodyLimitLayer must 413 a >16 KiB body on the no-auth path"
         );
     }
 
