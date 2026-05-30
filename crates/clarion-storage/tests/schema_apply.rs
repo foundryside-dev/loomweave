@@ -6,7 +6,7 @@
 
 use rusqlite::{Connection, params};
 
-use clarion_storage::{pragma, schema};
+use clarion_storage::{Writer, error::StorageError, pragma, schema};
 
 fn open_fresh(tempdir: &tempfile::TempDir) -> Connection {
     let path = tempdir.path().join("clarion.db");
@@ -209,6 +209,25 @@ fn migration_0001_extends_summary_cache_for_mcp_staleness_tracking() {
         );
     }
 
+    // summary_cache.entity_id has an FK to entities(id) per V11-STO-03;
+    // seed the parent row first so the INSERT below isn't FK-rejected.
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
+         created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            "python:function:demo.hello",
+            "python",
+            "function",
+            "demo.hello",
+            "hello",
+            "{}",
+            "2026-05-17T00:00:00.000Z",
+            "2026-05-17T00:00:00.000Z",
+        ],
+    )
+    .expect("seed summary_cache parent entity");
+
     conn.execute(
         "INSERT INTO summary_cache ( \
             entity_id, content_hash, prompt_template_id, model_tier, \
@@ -387,7 +406,11 @@ fn migration_0001_creates_partial_indexes() {
     let tempdir = tempfile::tempdir().unwrap();
     let conn = open_fresh(&tempdir);
     let indexes = index_names(&conn);
-    for expected in &["ix_entities_churn", "ix_entities_scope_rank"] {
+    for expected in &[
+        "ix_entities_churn",
+        "ix_entities_scope_rank",
+        "ix_entities_briefing_blocked",
+    ] {
         assert!(
             indexes.iter().any(|i| i == expected),
             "missing index {expected} in {indexes:?}"
@@ -430,6 +453,59 @@ fn entity_generated_columns_extract_from_properties_json() {
     assert_eq!(scope_level.as_deref(), Some("subsystem"));
     assert_eq!(scope_rank, Some(2));
     assert_eq!(churn, Some(42));
+}
+
+#[test]
+fn briefing_blocked_generated_column_reflects_property_and_partial_index() {
+    // The briefing_blocked generated column extracts $.briefing_blocked, is NULL
+    // when the property is absent (so the partial index stays small), and the
+    // partial index query counts exactly the blocked entities (clarion-bdabfd6bca).
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+
+    let insert = |id: &str, props: &str| {
+        conn.execute(
+            "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
+             created_at, updated_at) \
+             VALUES (?1, 'python', 'function', ?1, ?1, ?2, \
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            params![id, props],
+        )
+        .unwrap();
+    };
+    insert(
+        "python:function:demo.blocked",
+        r#"{"briefing_blocked": "secret_detected"}"#,
+    );
+    insert("python:function:demo.clear", "{}");
+
+    let blocked: Option<String> = conn
+        .query_row(
+            "SELECT briefing_blocked FROM entities WHERE id = ?1",
+            params!["python:function:demo.blocked"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(blocked.as_deref(), Some("secret_detected"));
+
+    let clear: Option<String> = conn
+        .query_row(
+            "SELECT briefing_blocked FROM entities WHERE id = ?1",
+            params!["python:function:demo.clear"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(clear, None);
+
+    // The partial index serves "how many entities are withheld" in SQL.
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE briefing_blocked IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
 }
 
 #[test]
@@ -699,13 +775,13 @@ fn migrations_are_idempotent() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut conn = open_fresh(&tempdir);
     schema::apply_migrations(&mut conn).expect("second apply should be a no-op");
-    assert_eq!(schema::applied_count(&conn).unwrap(), 1);
+    assert_eq!(schema::applied_count(&conn).unwrap(), 2);
     let tables_after = table_names(&conn);
     assert!(tables_after.contains(&"entities".to_owned()));
 }
 
 #[test]
-fn schema_migrations_records_one_row() {
+fn schema_migrations_records_each_applied_migration() {
     let tempdir = tempfile::tempdir().unwrap();
     let conn = open_fresh(&tempdir);
     let count: i64 = conn
@@ -713,15 +789,15 @@ fn schema_migrations_records_one_row() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(count, 1);
-    let name: String = conn
-        .query_row(
-            "SELECT name FROM schema_migrations WHERE version = 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(name, "0001_initial_schema");
+    assert_eq!(count, 2);
+    let names: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM schema_migrations ORDER BY version")
+            .unwrap();
+        let rows = stmt.query_map([], |row| row.get(0)).unwrap();
+        rows.map(std::result::Result::unwrap).collect()
+    };
+    assert_eq!(names, vec!["0001_initial_schema", "0002_briefing_blocked"]);
 }
 
 // ----------------------------------------------------------------------------
@@ -898,4 +974,135 @@ fn runs_status_check_accepts_all_documented_values() {
         )
         .unwrap_or_else(|err| panic!("runs.status={status} rejected unexpectedly: {err}"));
     }
+}
+
+// ----------------------------------------------------------------------------
+// STO-02 (gap-register.md): the writer must self-identify Clarion databases
+// via SQLite's `application_id` header and refuse forward-incompatible
+// `user_version` values. These tests pin the open-time contract.
+// ----------------------------------------------------------------------------
+
+/// Spawn a writer, immediately shut it down, and return whatever Result the
+/// blocking task produced. Used to assert refuse-on-open behaviour without
+/// leaking the spawned task.
+fn spawn_writer_and_drain(path: std::path::PathBuf) -> Result<(), StorageError> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async move {
+        let (writer, handle) = Writer::spawn(path, 50, 256)?;
+        // Close the command channel so the actor (if it reached the loop)
+        // exits cleanly; the join then surfaces the open-time error if any.
+        drop(writer);
+        handle.await.expect("writer task did not panic")
+    })
+}
+
+#[test]
+fn open_refuses_db_with_foreign_application_id() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("foreign.db");
+    {
+        let conn = Connection::open(&path).unwrap();
+        // `PRAGMA application_id` only writes the header page to disk once
+        // the database file has been materialised by some other write. Touch
+        // a temporary table to force the file out of zero-bytes state.
+        conn.execute_batch(
+            "PRAGMA application_id = 0x7AFEBABE; \
+             CREATE TABLE _touch (x INTEGER); DROP TABLE _touch;",
+        )
+        .expect("set foreign application_id");
+    }
+    let err = spawn_writer_and_drain(path).expect_err(
+        "Writer::spawn must refuse a SQLite file carrying a non-Clarion application_id",
+    );
+    assert!(
+        matches!(
+            err,
+            StorageError::ForeignDatabase {
+                application_id: 0x7AFE_BABE,
+            }
+        ),
+        "expected ForeignDatabase {{ application_id: 0x7AFEBABE }}, got {err:?}"
+    );
+}
+
+#[test]
+fn open_refuses_db_from_future_user_version() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("future.db");
+    // Open the file via the normal writer path first so it carries the
+    // Clarion application_id and the v1 schema (the migration runner sets
+    // user_version=1 on apply). Then bump user_version past current and
+    // re-open via the writer — must refuse.
+    {
+        let mut conn = Connection::open(&path).unwrap();
+        pragma::apply_write_pragmas(&conn).unwrap();
+        schema::apply_migrations(&mut conn).unwrap();
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA user_version = {};",
+            schema::CURRENT_SCHEMA_VERSION + 1
+        ))
+        .expect("bump user_version");
+    }
+
+    let err = spawn_writer_and_drain(path)
+        .expect_err("Writer::spawn must refuse a future-versioned database");
+    let expected_found = schema::CURRENT_SCHEMA_VERSION + 1;
+    let expected_current = schema::CURRENT_SCHEMA_VERSION;
+    assert!(
+        matches!(
+            err,
+            StorageError::FutureUserVersion { found, current }
+                if found == expected_found && current == expected_current
+        ),
+        "expected FutureUserVersion {{ found: {expected_found}, current: \
+         {expected_current} }}, got {err:?}"
+    );
+}
+
+#[test]
+fn open_sets_application_id_on_legacy_db() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("legacy.db");
+    // Touch a SQLite file with no application_id set (default 0). Open as a
+    // raw connection so we leave the header at its zero default — no
+    // `apply_write_pragmas` here.
+    {
+        let conn = Connection::open(&path).unwrap();
+        let raw: i64 = conn
+            .query_row("PRAGMA application_id", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(raw, 0, "fresh SQLite files start at application_id=0");
+        // Force the file to materialise on disk by writing a table; this also
+        // guarantees the header page exists.
+        conn.execute_batch("CREATE TABLE _touch (x INTEGER); DROP TABLE _touch;")
+            .unwrap();
+    }
+
+    // First open via the writer should set the Clarion application_id.
+    spawn_writer_and_drain(path.clone())
+        .expect("Writer::spawn must accept a legacy (application_id=0) file");
+    {
+        let conn = Connection::open(&path).unwrap();
+        let raw: i64 = conn
+            .query_row("PRAGMA application_id", [], |row| row.get(0))
+            .unwrap();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let observed = raw as u32;
+        assert_eq!(
+            observed,
+            pragma::CLARION_APPLICATION_ID,
+            "writer must stamp Clarion application_id on a legacy DB"
+        );
+    }
+
+    // Re-open: must not refuse, application_id is now recognised.
+    spawn_writer_and_drain(path)
+        .expect("Writer::spawn must accept a database it has already stamped");
 }

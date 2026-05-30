@@ -84,7 +84,12 @@ def pyright_langserver() -> str:
         return str(venv_candidate)
     resolved = shutil.which("pyright-langserver")
     if resolved is None:
-        pytest.skip("pyright-langserver is not installed")
+        pytest.fail(
+            "pyright-langserver not found on PATH or in the active virtualenv. "
+            "It is a hard runtime dependency of clarion-plugin-python "
+            "(pyproject.toml `dependencies`); a missing executable means the "
+            "install is broken. Skipping these tests would mask a regression.",
+        )
     return resolved
 
 
@@ -736,6 +741,61 @@ def test_source_range_end_fields_populated() -> None:
     assert source_range["start_col"] == 0
     assert source_range["end_line"] == 2
     assert source_range["end_col"] >= 0
+
+
+def test_definition_metadata_undecorated_function() -> None:
+    """Undecorated entities carry decl/body sub-ranges but no decorator keys.
+
+    The span still starts at the ``def`` keyword line (entity_context
+    evidence, clarion-460def6a51).
+    """
+    entities, _ = extract("def f():\n    return 1\n", "d.py")
+    fn = next(e for e in entities if e["kind"] == "function")
+    assert fn["source"]["source_range"]["start_line"] == 1
+    definition = fn["definition"]
+    assert definition["decl_line"] == 1
+    assert definition["body_line_start"] == 2
+    assert "decorator_line_start" not in definition
+    assert "decorator_line_end" not in definition
+
+
+def test_definition_metadata_decorated_class_expands_span_to_decorator() -> None:
+    """A decorated class's span starts at the decorator line so an
+    ``entity_at`` query on that line resolves to the class; ``definition``
+    records the decorator range and the ``class`` declaration line.
+    """
+    source = "import dataclasses\n\n\n@dataclasses.dataclass\nclass Config:\n    retries: int = 3\n"
+    entities, _ = extract(source, "runtime.py")
+    cls = next(e for e in entities if e["kind"] == "class")
+    # Decorator on line 4, `class Config:` on line 5.
+    assert cls["source"]["source_range"]["start_line"] == 4
+    definition = cls["definition"]
+    assert definition["decorator_line_start"] == 4
+    assert definition["decorator_line_end"] == 4
+    assert definition["decl_line"] == 5
+    assert definition["body_line_start"] == 6
+
+
+def test_definition_metadata_decorated_function_expands_span() -> None:
+    source = "import functools\n\n\n@functools.cache\ndef compute():\n    return 1\n"
+    entities, _ = extract(source, "d.py")
+    fn = next(e for e in entities if e["kind"] == "function")
+    assert fn["source"]["source_range"]["start_line"] == 4
+    definition = fn["definition"]
+    assert definition["decorator_line_start"] == 4
+    assert definition["decl_line"] == 5
+
+
+def test_definition_metadata_multiple_decorators_uses_topmost() -> None:
+    source = "import functools\n\n@staticmethod\n@functools.cache\ndef compute():\n    return 1\n"
+    # Module-level function with two stacked decorators (lines 3 and 4).
+    entities, _ = extract(source, "d.py")
+    fn = next(e for e in entities if e["kind"] == "function")
+    assert fn["source"]["source_range"]["start_line"] == 3
+    definition = fn["definition"]
+    assert definition["decorator_line_start"] == 3
+    assert definition["decorator_line_end"] == 4
+    assert definition["decl_line"] == 5
 
 
 def test_module_source_range_no_trailing_newline() -> None:

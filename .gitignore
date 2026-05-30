@@ -23,3 +23,6 @@ htmlcov/
 .claude/
 
 .env
+
+# Smoke-test result artifacts (per-run; archived separately at tag-cut)
+tests/e2e/external-operator-smoke-results-*.md

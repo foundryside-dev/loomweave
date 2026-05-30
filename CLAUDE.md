@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-**Sprint 1 is closed.** The walking skeleton is tagged at `v0.1-sprint-1` (merge commit `48b9bb0` on `main`). All nine Sprint-1 lock-ins (L1–L9) are ratified; `clarion analyze` end-to-end persists `python:function:demo.hello|function` against a fixture project. See `docs/implementation/sprint-1/signoffs.md` for the closed Tier-A ladder.
+**v1.0.0 — first publishable release.** Targets the `v1.0.0` tag (cut once release blockers are green; pre-release working tags `v0.1-sprint-1` and `v0.1-sprint-2` remain in the repo as historical anchors). Workspace + Python plugin are at 1.0.0; ADR-014 federation HTTP read API ships with bearer auth, batch resolution, briefing-blocked propagation, and stable per-project `instance_id`. See [`CHANGELOG.md`](CHANGELOG.md) for the full 1.0 scope and [`docs/implementation/`](docs/implementation/) for sprint-closure artifacts.
 
-### Layout (post-Sprint-1)
+### Layout (post-1.0)
 
 - **Rust workspace** at repo root (`Cargo.toml`, `crates/`):
   - `crates/clarion-core/` — entity-ID assembler, plugin host (`plugin/host.rs`), JSON-RPC transport, manifest parser, jail + limits, discovery, breaker.
@@ -61,7 +61,7 @@ The Loom federation axiom in `docs/suite/loom.md` (especially §3–§5) is **lo
 
 Before proposing or accepting any change that adds a new dependency, "lightweight glue layer," shared registry, or cross-product mediator, run it against the §5 failure test (semantic / initialization / pipeline coupling). Centralisation creeps back in naturally; treat any "wouldn't it be easier if we just..." proposal as suspicious.
 
-Two named v0.1 asterisks (Wardline→Filigree pipeline coupling via Clarion; Python plugin's `wardline.core.registry.REGISTRY` import) have written retirement conditions in `loom.md` §5. Do not add new asterisks without the same.
+Two named asterisks (Wardline→Filigree pipeline coupling via Clarion; Python plugin's `wardline.core.registry.REGISTRY` import) have written retirement conditions in `loom.md` §5. Both persist into v1.0 and retire post-release per the conditions named there. Do not add new asterisks without the same discipline.
 
 ## Documentation map
 
@@ -71,21 +71,25 @@ docs/
 │   ├── briefing.md                5-minute introduction
 │   └── loom.md                    Founding doctrine, federation axiom, go/no-go test
 ├── clarion/
-│   ├── v0.1/                      Canonical product docset for the current version
+│   ├── 1.0/                       Canonical product docset for the 1.0 release
+│   │   ├── README.md              Reading-order map for the design ladder
 │   │   ├── requirements.md        The WHAT — REQ-/NFR-/CON-/NG- IDs, baselined
 │   │   ├── system-design.md       The HOW — architecture, mechanisms, §2–§11 with `Addresses:` headers
-│   │   ├── detailed-design.md     Implementation reference — schemas, rule catalogs, appendices
-│   │   ├── plans/                 Scope memo (v0.1-scope-commitments.md)
-│   │   └── reviews/               Retained historical reviews (supporting context, not normative)
-│   └── adr/                       Authored architecture decision records (ADR-001 … ADR-022)
-└── implementation/                Work-package sequencing (lives ABOVE v0.1/ because WPs span siblings)
+│   │   └── detailed-design.md     Implementation reference — schemas, rule catalogs, appendices
+│   └── adr/                       Authored architecture decision records (ADR-001 … ADR-031)
+├── federation/                    Cross-product wire contracts + normative fixtures
+│   ├── contracts.md               Pinned HTTP read API + auth + path-normalization
+│   └── fixtures/                  Normative request/response fixtures
+└── implementation/                Work-package sequencing (lives ABOVE the docset because WPs span siblings)
     ├── v0.1-plan.md               11 WPs in dependency order, with anchoring docs/ADRs per WP
-    └── sprint-1/                  Per-sprint execution plan (walking-skeleton: WP1+WP2+WP3)
+    ├── sprint-1/                  Walking-skeleton sprint (WP1+WP2+WP3)
+    ├── sprint-2/                  B-track + scanner sprint
+    └── sprint-3/                  Loom federation hardening sprint (ADR-014)
 ```
 
 ### Reading order by intent
 
-- **New to the project**: `docs/suite/briefing.md` → `docs/suite/loom.md` → `docs/clarion/v0.1/README.md`.
+- **New to the project**: `docs/suite/briefing.md` → `docs/suite/loom.md` → `docs/clarion/1.0/README.md`.
 - **Implementing**: `requirements.md` → `system-design.md` → `detailed-design.md` → relevant ADRs → the WP doc under `docs/implementation/`.
 - **Reviewing a design proposal**: read the requirement IDs it cites, then the system-design section listed in those requirements' `See` lines, then check whether any Accepted ADR already constrains the answer.
 
@@ -93,11 +97,11 @@ docs/
 
 When the same fact appears in multiple files, this is the precedence:
 
-1. **Accepted ADRs** in `docs/clarion/adr/` — the locked decisions. 16 are Accepted at v0.1; six remain Backlog and are tracked inside `system-design.md` §12 / `detailed-design.md` §11 until promoted.
+1. **Accepted ADRs** in `docs/clarion/adr/` — the locked decisions. 28 are Accepted at 1.0 (ADR-001…ADR-007, ADR-011, ADR-013…ADR-018, ADR-021…ADR-034); four remain Backlog (ADR-009, ADR-010, ADR-019, ADR-020) and are tracked inside `system-design.md` §12 / `detailed-design.md` §11 until promoted. ADR-012 was superseded by ADR-014 (which is in turn partially extended by ADR-034 for the federation read-API security posture and error envelope).
 2. **`requirements.md`** — REQ-/NFR-/CON-/NG- IDs are stable and load-bearing (filigree issues and commit messages cite them by ID; never reuse a retired ID).
 3. **`system-design.md`** — `Addresses:` headers on each §2–§11 section define the requirement acceptance surface for that subsystem.
 4. **`detailed-design.md`** — exact schemas, rule catalogues, appendices.
-5. Reviews under `docs/clarion/v0.1/reviews/` are supporting context only, not normative. Do not cite a review as the source of a current decision; cite the ADR or design doc that absorbed it.
+5. Reviews under `docs/clarion/1.0/reviews/` are supporting context only, not normative. Do not cite a review as the source of a current decision; cite the ADR or design doc that absorbed it.
 
 If `requirements.md` and `system-design.md` disagree, the requirement wins and the design doc is the bug. If an ADR exists, it overrides both.
 
@@ -128,18 +132,23 @@ Avoid: "Loom platform," "Loom runtime," "Loom broker," "Loom store" — Loom is 
 
 `filigree` is the issue tracker for this project (config in `.filigree/`, MCP server registered in `.mcp.json`). The global `~/CLAUDE.md` file describes the workflow and CLI/MCP commands; do not duplicate that here. Project-specific notes:
 
-- Sprint 1 issues (`WP1`, `WP2`, `WP3`, Sprint-1-close) are all `delivered`/`closed`. Sprint 2 issues should follow the same `release:v0.1`, `sprint:N`, `wp:N`, `adr:NNN` label scheme.
+- Sprint 1 / Sprint 2 / Sprint 3 issues are all `delivered`/`closed` at 1.0. Post-1.0 issues should follow the same `release:1.0`-style label scheme using whatever release tag (`release:1.1`, `release:2.0`) the work targets.
 - Filigree issue bodies should cite `REQ-*` / `NFR-*` / ADR IDs verbatim — those IDs are how design docs and tracker stay linked.
 
-### Live carryover from Sprint 1
+### Post-1.0 follow-up tracking
 
-These were filed during Sprint 1 with explicit deferral rationale and are ready for Sprint 2 triage:
+Open issues for the v1.0 known limitations and any post-release follow-ups live in `filigree` under the `release:1.1` (and beyond) label. `filigree get-ready` / `filigree session-context` are authoritative for what's currently actionable. Notable themes:
 
-- `clarion-889200006a` (P3, sprint:2 / wp:9) — ADR-018 amendment: L7 qualname divergence with Wardline `FingerprintEntry`. Triggers when WP9 attempts the first cross-product join.
-- WP2 deferred items: `clarion-48c5d06578` (supervisor drain/discard), `clarion-928349b60f` (jail TOCTOU on briefing read), `clarion-35688034f0` (read_frame deadline), `clarion-c0977ac293` (RLIMIT_AS observed end-to-end), `clarion-adeff0916d` (fixture-binary self-build).
-- WP1 review-2 P2 bugs: `clarion-5e03cfdd21`, `clarion-ed5017139f`, `clarion-b5b1029f5a`, `clarion-4cd11905e2` — good Sprint-2 warm-up before Tier-B feature work.
+- **WP9-B (Filigree finding emission)** — deferred from 1.0 per the [Sprint 2 scope amendment](docs/implementation/sprint-2/scope-amendment-2026-05.md#4-v01-planmd-resequencing).
+- **HTTP file language manifest registry** — narrow core-extension fallback at 1.0; persistent registry is a post-1.0 task.
+- **HMAC inbound auth (C-4)** — HMAC (`X-Loom-Component: clarion:<hmac>`) is the
+  preferred non-loopback authentication mechanism in v1.0 per ADR-034,
+  configured via `serve.http.identity_token_env`. The legacy bearer-token path
+  (`serve.http.token_env`) remains supported for compatibility. Replay
+  protection (timestamp + nonce window) is ADR-034 forward-work tracked for
+  post-1.0 hardening.
 
-<!-- filigree:instructions:v2.0.3:d454f2c2 -->
+<!-- filigree:instructions:v2.1.0:9dff6e6d -->
 ## Filigree Issue Tracker
 
 `filigree` tracks tasks for this project. Data lives in `.filigree/`. Prefer
@@ -152,7 +161,7 @@ CLI otherwise.
 # At session start
 filigree session-context                            # ready / in-progress / critical path
 
-# Pick up the next ready issue (atomic claim + transition to in_progress)
+# Pick up the next startable issue (atomic claim + transition into its working status)
 filigree start-next-work --assignee <name>
 # ...or claim a specific issue
 filigree start-work <id> --assignee <name>
@@ -166,6 +175,15 @@ Use the atomic claim+transition verbs — `start_work` / `start_next_work`
 `claim_issue` (MCP) or `filigree claim` (CLI) with a subsequent status
 update — the two-step form races against other agents; the combined verb is
 atomic.
+
+**Ready ≠ startable.** The working status is type-specific (tasks →
+`in_progress`, features → `building`). Bugs start at `triage`, which has no
+single-hop transition into work (`triage → confirmed → fixing`), so a triage
+bug is *ready* but not directly *startable*: `start_work` on one returns
+`INVALID_TRANSITION` naming the next status, and `start_next_work` skips it.
+`get_ready` items carry a `startable` flag (plus a `next_action` hint when
+false). Pass `advance=true` (MCP) / `--advance` (CLI) to walk the soft
+transitions to the nearest working status automatically.
 
 ### Observations: when (and when not) to use them
 
@@ -202,6 +220,8 @@ either catalogue. The verbs you will reach for most:
 - **Find work:** `get_ready`, `get_blocked`, `list_issues`, `search_issues`
 - **Claim work:** `start_work`, `start_next_work`
 - **Update:** `add_comment`, `add_label`, `update_issue`, `close_issue`
+- **Admin (irreversible):** `delete_issue` (MCP) / `delete-issue` (CLI) —
+  hard-deletes a terminal issue and its rows; `undo_last` cannot reverse it.
 - **Scratchpad:** `observe`, `list_observations`, `promote_observation`, `dismiss_observation`
 - **Cross-product entity bindings (ADR-029):** `add_entity_association`,
   `remove_entity_association`, `list_entity_associations`,
@@ -219,14 +239,19 @@ either catalogue. The verbs you will reach for most:
   and `GET /api/entity-associations?entity_id=…`.
 - **Health:** `get_stats`, `get_metrics`, `get_mcp_status`
 
-Pass `--actor <name>` (CLI) so events attribute to your agent identity.
+Pass `--actor <name>` (CLI) so events attribute to your agent identity. It
+works in either position — before the verb (`filigree --actor X update …`) or
+after it (`filigree update … --actor X`); the post-verb value overrides the
+group-level one.
 
 ### Error handling
 
 Errors return `{error: str, code: ErrorCode, details?: dict}`. Switch on
 `code`, not on message text. Codes: `VALIDATION`, `NOT_FOUND`, `CONFLICT`,
 `INVALID_TRANSITION`, `PERMISSION`, `NOT_INITIALIZED`, `IO`,
-`INVALID_API_URL`, `STOP_FAILED`, `SCHEMA_MISMATCH`, `INTERNAL`.
+`INVALID_API_URL`, `FILE_REGISTRY_DISPLACED`, `REGISTRY_UNAVAILABLE`,
+`CLARION_REGISTRY_VERSION_MISMATCH`, `BRIEFING_BLOCKED`, `STOP_FAILED`,
+`SCHEMA_MISMATCH`, `INTERNAL`.
 
 On `INVALID_TRANSITION`, call `get_valid_transitions` (MCP) or
 `filigree transitions <id>` to see what the workflow allows from here.

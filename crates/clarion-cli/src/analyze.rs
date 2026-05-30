@@ -12,6 +12,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use ignore::{DirEntry, WalkBuilder};
@@ -30,27 +32,128 @@ use clarion_storage::{
     module_dependency_edges,
 };
 
+use clarion_mcp::config::McpConfig;
+use clarion_mcp::filigree::FiligreeHttpClient;
+use clarion_mcp::filigree_url::resolve_filigree_url;
+use clarion_mcp::scan_results::{
+    CLARION_SCAN_SOURCE, CleanStaleRequest, CleanStaleResponse, EmitOptions, ScanResultsResponse,
+    clean_stale_url, prepare_batch, scan_results_url,
+};
+
 use crate::clustering::{ClusterConfig, ModuleEdge, ModuleGraph, cluster_hash, cluster_modules};
 use crate::config::{AnalyzeConfig, ClusteringConfig};
 use crate::stats::P95Accumulator;
 
 const WEAK_MODULARITY_RULE_ID: &str = "CLA-FACT-CLUSTERING-WEAK-MODULARITY";
 
+/// Writes structured run progress to a JSON file for the MCP `analyze_status`
+/// tool (clarion-7e0c21558a). A no-op unless `analyze_start` passed a
+/// `--progress-file` path, so the normal CLI path pays nothing. Each write
+/// stamps a fresh `heartbeat_at`, letting a reader tell "still making progress"
+/// from "stalled" without scraping logs. Writes are best-effort and
+/// last-write-wins via an atomic temp-file rename; a failed write is logged and
+/// dropped (progress is advisory, never run-fatal).
+struct ProgressReporter {
+    inner: Option<ProgressInner>,
+}
+
+struct ProgressInner {
+    path: PathBuf,
+    run_id: String,
+    pid: u32,
+    total_files: AtomicU64,
+    processed_files: AtomicU64,
+}
+
+impl ProgressReporter {
+    fn new(progress_file: Option<PathBuf>, run_id: String) -> Self {
+        Self {
+            inner: progress_file.map(|path| ProgressInner {
+                path,
+                run_id,
+                pid: std::process::id(),
+                total_files: AtomicU64::new(0),
+                processed_files: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    /// Record the total file count discovered for the run (denominator for
+    /// `processed_files`).
+    fn set_total(&self, total: u64) {
+        if let Some(inner) = &self.inner {
+            inner.total_files.store(total, Ordering::Relaxed);
+        }
+    }
+
+    /// Write a snapshot for a phase boundary (`discovering`, `analyzing`,
+    /// `clustering`). `current_plugin`/`current_file` are `None` between
+    /// plugins.
+    fn phase(&self, phase: &str, current_plugin: Option<&str>, current_file: Option<&str>) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let snapshot = serde_json::json!({
+            "run_id": inner.run_id,
+            "pid": inner.pid,
+            "phase": phase,
+            "current_plugin": current_plugin,
+            "current_file": current_file,
+            "processed_files": inner.processed_files.load(Ordering::Relaxed),
+            "total_files": inner.total_files.load(Ordering::Relaxed),
+            "heartbeat_at": iso8601_now(),
+        });
+        self.write_atomic(&snapshot);
+    }
+
+    /// Snapshot at the start of a file (so `current_file` reflects in-flight
+    /// work); the file is counted as processed by [`Self::file_completed`].
+    fn file_started(&self, plugin_id: &str, file: &str) {
+        self.phase("analyzing", Some(plugin_id), Some(file));
+    }
+
+    /// Increment the processed-file counter after a file finishes.
+    fn file_completed(&self) {
+        if let Some(inner) = &self.inner {
+            inner.processed_files.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn write_atomic(&self, snapshot: &serde_json::Value) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let body = snapshot.to_string();
+        let tmp = inner.path.with_extension("json.tmp");
+        if let Err(err) = fs::write(&tmp, &body).and_then(|()| fs::rename(&tmp, &inner.path)) {
+            tracing::debug!(
+                error = %err,
+                path = %inner.path.display(),
+                "failed to write analyze progress snapshot (advisory; ignored)",
+            );
+        }
+    }
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AnalyzeOptions {
     pub(crate) config_path: Option<PathBuf>,
-}
-
-/// Run the analyze command against `project_path`.
-///
-/// # Errors
-///
-/// Returns an error if the target directory does not exist, has no `.clarion/`
-/// directory, or if the writer actor fails to start or process commands.
-pub async fn run(project_path: PathBuf) -> Result<()> {
-    run_with_options(project_path, AnalyzeOptions::default()).await
+    pub(crate) secret_scan: crate::secret_scan::SecretScanOptions,
+    /// Caller-supplied run id (MCP `analyze_start`); `None` generates one.
+    pub(crate) run_id: Option<String>,
+    /// `--resume RUN_ID` (REQ-FINDING-05): reopen this prior run's row instead
+    /// of opening a fresh one, and emit findings with `mark_unseen=false` so a
+    /// re-emit does not flip the prior run's findings to `unseen_in_latest` on
+    /// the Filigree peer. Takes precedence over `run_id` as the run identifier.
+    pub(crate) resume_run_id: Option<String>,
+    /// `--prune-unseen` (REQ-FINDING-06): after emission, ask Filigree to
+    /// soft-archive its stale `unseen_in_latest` Clarion findings. Enrich-only:
+    /// a failure or a disabled integration never fails the run.
+    pub(crate) prune_unseen: bool,
+    /// When set, structured progress is written here as the run proceeds.
+    pub(crate) progress_file: Option<PathBuf>,
 }
 
 /// Run the analyze command against `project_path` with resolved CLI options.
@@ -79,6 +182,12 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         );
     }
     let db_path = clarion_dir.join("clarion.db");
+
+    // Cross-process advisory lock (STO-01). Must outlive the writer-actor's
+    // `handle.await` at the bottom of this function — see the drop-order
+    // note on `AnalyzeLockGuard`. Drop on function exit releases the lock.
+    let _analyze_lock = crate::analyze_lock::acquire_analyze_lock(&clarion_dir)?;
+
     let analyze_config = AnalyzeConfig::load(&project_root, options.config_path.as_deref())?;
     let analyze_config_json = analyze_config.to_json_string()?;
 
@@ -90,19 +199,22 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
     .context("spawn writer actor")?;
-    let run_id = Uuid::new_v4().to_string();
+    // `--resume RUN_ID` reuses the prior run's id (and reopens its row below);
+    // absent that, the hidden MCP `--run-id` is honoured, else a fresh id.
+    let resume = options.resume_run_id.is_some();
+    let run_id = options
+        .resume_run_id
+        .clone()
+        .or_else(|| options.run_id.clone())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let started_at = iso8601_now();
-
-    writer
-        .send_wait(|ack| WriterCmd::BeginRun {
-            run_id: run_id.clone(),
-            config_json: analyze_config_json.clone(),
-            started_at: started_at.clone(),
-            ack,
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("BeginRun")?;
+    // Structured progress sink (MCP `analyze_start` sets `progress_file`); a
+    // no-op when absent so the normal CLI path is unchanged.
+    let progress = Arc::new(ProgressReporter::new(
+        options.progress_file.clone(),
+        run_id.clone(),
+    ));
+    progress.phase("discovering", None, None);
 
     // ── Discover plugins ──────────────────────────────────────────────────────
     let discovery_results = discover();
@@ -138,6 +250,14 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 discovery_errors.join("; ")
             );
             tracing::error!(run_id = %run_id, reason = %reason, "failing run: discovery errors");
+            crate::run_lifecycle::open_run(
+                &writer,
+                resume,
+                &run_id,
+                &analyze_config_json,
+                &started_at,
+            )
+            .await?;
             let completed_at = iso8601_now();
             writer
                 .send_wait(|ack| WriterCmd::FailRun {
@@ -164,6 +284,8 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         }
 
         tracing::warn!(run_id = %run_id, "no plugins discovered");
+        crate::run_lifecycle::open_run(&writer, resume, &run_id, &analyze_config_json, &started_at)
+            .await?;
         let completed_at = iso8601_now();
         writer
             .send_wait(|ack| WriterCmd::CommitRun {
@@ -214,6 +336,18 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // ── Walk the source tree (once, union of all extensions) ─────────────────
     let source_files = collect_source_files(&project_root, &wanted_extensions);
     tracing::info!(file_count = source_files.len(), "source tree walk complete");
+    progress.set_total(source_files.len() as u64);
+    progress.phase("analyzing", None, None);
+
+    let secret_scan_files = crate::secret_scan::collect_scan_files(&project_root, &source_files);
+    tracing::info!(
+        file_count = secret_scan_files.len(),
+        "secret scan file walk complete"
+    );
+    let mut secret_scan_outcome =
+        crate::secret_scan::pre_ingest(&project_root, &secret_scan_files, &options.secret_scan)?;
+    crate::run_lifecycle::open_run(&writer, resume, &run_id, &analyze_config_json, &started_at)
+        .await?;
 
     // ── Per-plugin processing ─────────────────────────────────────────────────
     //
@@ -242,7 +376,8 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let mut run_outcome: RunOutcome = RunOutcome::Completed;
     let mut breaker = CrashLoopBreaker::default();
     let mut crash_reasons: Vec<String> = Vec::new();
-
+    let briefing_blocks = secret_scan_outcome.briefing_blocks_shared();
+    let scanned_files = secret_scan_outcome.scanned_files_shared();
     'plugins: for plugin in plugins {
         let plugin_id = plugin.manifest.plugin.plugin_id.clone();
         let plugin_extensions: BTreeSet<String> = plugin
@@ -282,6 +417,9 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         let pid_clone = plugin_id.clone();
         let exec_clone = plugin.executable.clone();
         let files_clone = plugin_files.clone();
+        let briefing_blocks_clone = Arc::clone(&briefing_blocks);
+        let scanned_files_clone = Arc::clone(&scanned_files);
+        let progress_clone = Arc::clone(&progress);
 
         // A JoinError here means the blocking task panicked (OOM, stack
         // overflow, internal unwrap, abort — anything that unwinds past the
@@ -299,6 +437,9 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     &pid_clone,
                     &exec_clone,
                     &files_clone,
+                    &briefing_blocks_clone,
+                    &scanned_files_clone,
+                    &progress_clone,
                 )
             })
             .await,
@@ -361,6 +502,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 // edge FK references resolve at insert time (B.3 §5).
                 let entity_count = entities.len() as u64;
                 let edge_count = edges.len() as u64;
+                secret_scan_outcome.remember_finding_anchors(&entities);
                 let mut insert_err: Option<anyhow::Error> = None;
                 for (id_str, record) in entities {
                     let res = writer
@@ -435,6 +577,17 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         }
     }
 
+    if !matches!(run_outcome, RunOutcome::HardFailed { .. })
+        && let Err(e) = secret_scan_outcome
+            .persist_findings(&writer, &run_id, &project_root, &started_at)
+            .await
+    {
+        tracing::error!(run_id = %run_id, error = %e, "secret finding persistence failed");
+        run_outcome = RunOutcome::HardFailed {
+            reason: format!("secret finding persistence failed: {e:#}"),
+        };
+    }
+
     // ── Commit or fail the run ────────────────────────────────────────────────
     //
     // Writer-actor failures set `run_outcome = HardFailed` above (and break).
@@ -452,6 +605,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         };
     }
 
+    progress.phase("clustering", None, None);
     let phase3_output = if matches!(run_outcome, RunOutcome::HardFailed { .. }) {
         Phase3Output::not_run()
     } else {
@@ -472,6 +626,48 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 Phase3Output::not_run()
             }
         }
+    };
+
+    // Phase 8 (WP9-B): emit findings to Filigree for non-hard-failed runs,
+    // before CommitRun so the emission outcome rides along in `stats.json`.
+    // Best-effort: a Filigree outage never changes the run's own outcome.
+    let filigree_emission = if matches!(
+        run_outcome,
+        RunOutcome::Completed | RunOutcome::SoftFailed { .. }
+    ) {
+        emit_findings_to_filigree(
+            &writer,
+            &db_path,
+            &project_root,
+            &run_id,
+            // `--resume` re-emits without marking the prior run's findings
+            // unseen (REQ-FINDING-05); a fresh run marks them unseen so a
+            // dropped finding transitions to `unseen_in_latest` on the peer.
+            !resume,
+            options.config_path.as_deref(),
+        )
+        .await
+    } else {
+        serde_json::Value::Null
+    };
+
+    // Phase 8b (WP9-B, REQ-FINDING-06): `--prune-unseen` retention sweep. Runs
+    // after emission for the same non-hard-failed outcomes, so a fresh run's
+    // `mark_unseen=true` has just (re)established the unseen set the sweep
+    // archives. Best-effort and enrich-only, exactly like emission.
+    let filigree_prune = if matches!(
+        run_outcome,
+        RunOutcome::Completed | RunOutcome::SoftFailed { .. }
+    ) {
+        prune_unseen_findings_in_filigree(
+            &project_root,
+            &run_id,
+            options.prune_unseen,
+            options.config_path.as_deref(),
+        )
+        .await
+    } else {
+        serde_json::Value::Null
     };
 
     let completed_at = iso8601_now();
@@ -497,7 +693,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
 
     match run_outcome {
         RunOutcome::Completed => {
-            let stats_json = serde_json::json!({
+            let mut stats_json = serde_json::json!({
                 "entities_inserted": total_entity_count,
                 "edges_inserted": total_edge_count,
                 "dropped_edges_total": dropped_edges_total,
@@ -513,8 +709,15 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "pyright_index_parse_latency_p95_ms": pyright_index_parse_latency_p95_ms,
                 "extractor_parse_latency_p95_ms": extractor_parse_latency_p95_ms,
                 "clustering": phase3_output.clustering_stats.clone(),
-            })
-            .to_string();
+            });
+            secret_scan_outcome.augment_stats(&mut stats_json);
+            if !filigree_emission.is_null() {
+                stats_json["filigree_emission"] = filigree_emission;
+            }
+            if !filigree_prune.is_null() {
+                stats_json["filigree_prune"] = filigree_prune;
+            }
+            let stats_json = stats_json.to_string();
             writer
                 .send_wait(|ack| WriterCmd::CommitRun {
                     run_id: run_id.clone(),
@@ -532,7 +735,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             // failed, atomically (writer folds the UPDATE into the open tx).
             // The stats JSON carries both fields so operators can see what
             // was persisted alongside the failure reason.
-            let stats_json = serde_json::json!({
+            let mut stats_json = serde_json::json!({
                 "entities_inserted": total_entity_count,
                 "edges_inserted": total_edge_count,
                 "dropped_edges_total": dropped_edges_total,
@@ -549,8 +752,15 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "extractor_parse_latency_p95_ms": extractor_parse_latency_p95_ms,
                 "clustering": phase3_output.clustering_stats.clone(),
                 "failure_reason": reason,
-            })
-            .to_string();
+            });
+            secret_scan_outcome.augment_stats(&mut stats_json);
+            if !filigree_emission.is_null() {
+                stats_json["filigree_emission"] = filigree_emission;
+            }
+            if !filigree_prune.is_null() {
+                stats_json["filigree_prune"] = filigree_prune;
+            }
+            let stats_json = stats_json.to_string();
             writer
                 .send_wait(|ack| WriterCmd::CommitRun {
                     run_id: run_id.clone(),
@@ -966,6 +1176,307 @@ async fn insert_weak_modularity_finding(
     Ok(true)
 }
 
+/// Load the MCP-side config (Filigree integration) from the same `clarion.yaml`
+/// `clarion serve` reads. A missing or unparseable file falls back to the
+/// default (Filigree disabled), so a config problem never fails the run — it
+/// just means no emission.
+fn load_mcp_config(project_root: &Path, config_path: Option<&Path>) -> McpConfig {
+    let path = config_path.map_or_else(|| project_root.join("clarion.yaml"), Path::to_path_buf);
+    if !path.exists() {
+        return McpConfig::default();
+    }
+    McpConfig::from_path(&path).unwrap_or_else(|err| {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "load MCP config for finding emission failed; emission disabled",
+        );
+        McpConfig::default()
+    })
+}
+
+/// Phase 8 (WP9-B, REQ-FINDING-03): POST this run's persisted findings to
+/// Filigree's native `POST /api/v1/scan-results` intake.
+///
+/// Best-effort and enrich-only: gated behind
+/// `integrations.filigree.{enabled,emit_findings}`, and any failure (Filigree
+/// down, transport error, build error) is recorded in the returned stats blob
+/// and logged as `CLA-INFRA-FILIGREE-UNREACHABLE` rather than propagated — the
+/// analyze run never fails because a sibling tool is unreachable. Returns
+/// [`serde_json::Value::Null`] when emission is disabled; otherwise a
+/// `filigree_emission` stats object folded into `stats.json`.
+///
+/// Findings written during the run (including the phase-3 weak-modularity fact)
+/// are flushed before reading so the emission batch is complete.
+async fn emit_findings_to_filigree(
+    writer: &Writer,
+    db_path: &Path,
+    project_root: &Path,
+    run_id: &str,
+    mark_unseen: bool,
+    config_path: Option<&Path>,
+) -> serde_json::Value {
+    let mcp_config = load_mcp_config(project_root, config_path);
+    let filigree_cfg = &mcp_config.integrations.filigree;
+    if !filigree_cfg.enabled || !filigree_cfg.emit_findings {
+        return serde_json::Value::Null;
+    }
+
+    // Make findings durable so a fresh read connection observes them.
+    if let Err(err) = writer
+        .send_wait(|ack| WriterCmd::FlushRunBatch { ack })
+        .await
+    {
+        tracing::warn!(run_id, error = %err, "flush before finding emission failed; skipping emission");
+        return serde_json::json!({"status": "skipped", "reason": "flush_failed"});
+    }
+
+    let rows = match Connection::open(db_path) {
+        Ok(conn) => match clarion_storage::findings_for_emit(&conn, run_id) {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(run_id, error = %err, "read findings for emission failed; skipping emission");
+                return serde_json::json!({"status": "skipped", "reason": "read_failed"});
+            }
+        },
+        Err(err) => {
+            tracing::warn!(run_id, error = %err, "open read conn for emission failed; skipping emission");
+            return serde_json::json!({"status": "skipped", "reason": "read_open_failed"});
+        }
+    };
+    let total_findings = rows.len();
+
+    let batch = prepare_batch(
+        &rows,
+        &EmitOptions {
+            scan_run_id: Some(run_id.to_owned()),
+            mark_unseen,
+            complete_scan_run: true,
+        },
+    );
+    let emitted = batch.emitted;
+    let skipped_no_path = batch.skipped_no_path;
+
+    // Resolve the live Filigree URL (ephemeral port over stale config), the same
+    // resolution `clarion serve` and `project_status` use.
+    let resolution = resolve_filigree_url(filigree_cfg, project_root);
+    let mut resolved_cfg = filigree_cfg.clone();
+    if let Some(url) = resolution.resolved_url {
+        resolved_cfg.base_url = url;
+    }
+    let endpoint = scan_results_url(&resolved_cfg.base_url);
+
+    // `reqwest::blocking` builds and drops its own inner tokio runtime; doing
+    // that on a tokio worker — even inside `spawn_blocking`, which still carries
+    // an ambient runtime handle — panics on drop. Run the whole client
+    // lifecycle (build → POST → drop) on a plain OS thread with no ambient
+    // runtime, and join it off the async executor.
+    let request = batch.request;
+    let thread_cfg = resolved_cfg;
+    let worker = std::thread::spawn(move || -> Result<ScanResultsResponse, String> {
+        let client = FiligreeHttpClient::from_config(&thread_cfg, |name| std::env::var(name).ok())
+            .map_err(|err| format!("build Filigree client: {err}"))?
+            .ok_or_else(|| "Filigree integration disabled".to_owned())?;
+        client
+            .post_scan_results(&request)
+            .map_err(|err| err.to_string())
+    });
+    let joined = tokio::task::spawn_blocking(move || worker.join()).await;
+
+    match joined {
+        Ok(Ok(Ok(response))) => {
+            for warning in &response.warnings {
+                tracing::warn!(run_id, warning = %warning, "Filigree scan-results intake warning");
+            }
+            tracing::info!(
+                run_id,
+                endpoint = %endpoint,
+                emitted,
+                skipped_no_path,
+                created = response.findings_created,
+                updated = response.findings_updated,
+                warnings = response.warnings.len(),
+                "posted findings to Filigree",
+            );
+            serde_json::json!({
+                "status": "emitted",
+                "endpoint": endpoint,
+                "findings_total": total_findings,
+                "emitted": emitted,
+                "skipped_no_path": skipped_no_path,
+                "mark_unseen": mark_unseen,
+                "findings_created": response.findings_created,
+                "findings_updated": response.findings_updated,
+                "warnings": response.warnings,
+            })
+        }
+        Ok(Ok(Err(err))) => unreachable_stats(
+            run_id,
+            &endpoint,
+            total_findings,
+            emitted,
+            skipped_no_path,
+            &err,
+        ),
+        Ok(Err(_panic)) => unreachable_stats(
+            run_id,
+            &endpoint,
+            total_findings,
+            emitted,
+            skipped_no_path,
+            "emission thread panicked",
+        ),
+        Err(err) => unreachable_stats(
+            run_id,
+            &endpoint,
+            total_findings,
+            emitted,
+            skipped_no_path,
+            &format!("emission task: {err}"),
+        ),
+    }
+}
+
+/// Build the `filigree_emission` stats blob for a failed POST and log it as
+/// `CLA-INFRA-FILIGREE-UNREACHABLE`. The infra finding is recorded in
+/// `stats.json` and the log (two of the three surfaces REQ-ANALYZE-06 names);
+/// the local `findings` table is not used because its `entity_id` is a
+/// non-null FK to `entities` and an infra finding has no anchor entity — the
+/// same reason every other `CLA-INFRA-*` finding is log-only today.
+fn unreachable_stats(
+    run_id: &str,
+    endpoint: &str,
+    total_findings: usize,
+    emitted: usize,
+    skipped_no_path: usize,
+    error: &str,
+) -> serde_json::Value {
+    tracing::warn!(
+        run_id,
+        endpoint,
+        rule_id = "CLA-INFRA-FILIGREE-UNREACHABLE",
+        error,
+        "could not post findings to Filigree; continuing (enrich-only)",
+    );
+    serde_json::json!({
+        "status": "unreachable",
+        "rule_id": "CLA-INFRA-FILIGREE-UNREACHABLE",
+        "endpoint": endpoint,
+        "findings_total": total_findings,
+        "emitted_attempted": emitted,
+        "skipped_no_path": skipped_no_path,
+        "error": error,
+    })
+}
+
+/// `--prune-unseen` retention sweep (WP9-B, REQ-FINDING-06): asks Filigree to
+/// soft-archive its own `unseen_in_latest` Clarion findings older than the
+/// configured age. Returns [`serde_json::Value::Null`] when not requested;
+/// otherwise a `filigree_prune` stats object folded into `stats.json`. Like
+/// emission, this is enrich-only — a disabled integration or a Filigree outage
+/// is recorded in stats, never fails the run. `scan_source` scoping is enforced
+/// by Filigree, so the sweep can only touch Clarion's findings.
+async fn prune_unseen_findings_in_filigree(
+    project_root: &Path,
+    run_id: &str,
+    prune_unseen: bool,
+    config_path: Option<&Path>,
+) -> serde_json::Value {
+    if !prune_unseen {
+        return serde_json::Value::Null;
+    }
+    let mcp_config = load_mcp_config(project_root, config_path);
+    let filigree_cfg = &mcp_config.integrations.filigree;
+    if !filigree_cfg.enabled {
+        tracing::info!(
+            run_id,
+            "--prune-unseen requested but Filigree integration disabled; skipping"
+        );
+        return serde_json::json!({"status": "skipped", "reason": "filigree_disabled"});
+    }
+    let older_than_days = filigree_cfg.prune_unseen_days;
+
+    // Resolve the live Filigree URL (ephemeral port over stale config), the
+    // same resolution emission uses.
+    let resolution = resolve_filigree_url(filigree_cfg, project_root);
+    let mut resolved_cfg = filigree_cfg.clone();
+    if let Some(url) = resolution.resolved_url {
+        resolved_cfg.base_url = url;
+    }
+    let endpoint = clean_stale_url(&resolved_cfg.base_url);
+    let request = CleanStaleRequest {
+        scan_source: CLARION_SCAN_SOURCE.to_owned(),
+        older_than_days,
+        actor: resolved_cfg.actor.clone(),
+    };
+
+    // Same blocking-reqwest-on-a-plain-OS-thread dance as emission: build → POST
+    // → drop the client off the tokio executor so the inner runtime drop is safe.
+    let thread_cfg = resolved_cfg;
+    let worker = std::thread::spawn(move || -> Result<CleanStaleResponse, String> {
+        let client = FiligreeHttpClient::from_config(&thread_cfg, |name| std::env::var(name).ok())
+            .map_err(|err| format!("build Filigree client: {err}"))?
+            .ok_or_else(|| "Filigree integration disabled".to_owned())?;
+        client
+            .post_clean_stale(&request)
+            .map_err(|err| err.to_string())
+    });
+    let joined = tokio::task::spawn_blocking(move || worker.join()).await;
+
+    match joined {
+        Ok(Ok(Ok(response))) => {
+            tracing::info!(
+                run_id,
+                endpoint = %endpoint,
+                findings_fixed = response.findings_fixed,
+                older_than_days,
+                "pruned unseen findings in Filigree",
+            );
+            serde_json::json!({
+                "status": "pruned",
+                "endpoint": endpoint,
+                "findings_fixed": response.findings_fixed,
+                "older_than_days": older_than_days,
+            })
+        }
+        Ok(Ok(Err(err))) => prune_unreachable_stats(run_id, &endpoint, older_than_days, &err),
+        Ok(Err(_panic)) => {
+            prune_unreachable_stats(run_id, &endpoint, older_than_days, "prune thread panicked")
+        }
+        Err(err) => prune_unreachable_stats(
+            run_id,
+            &endpoint,
+            older_than_days,
+            &format!("prune task: {err}"),
+        ),
+    }
+}
+
+/// Build the `filigree_prune` stats blob for a failed sweep and log it as
+/// `CLA-INFRA-FILIGREE-UNREACHABLE` — the enrich-only degrade, identical in
+/// spirit to [`unreachable_stats`] for emission.
+fn prune_unreachable_stats(
+    run_id: &str,
+    endpoint: &str,
+    older_than_days: u32,
+    error: &str,
+) -> serde_json::Value {
+    tracing::warn!(
+        run_id,
+        endpoint,
+        rule_id = "CLA-INFRA-FILIGREE-UNREACHABLE",
+        error,
+        "could not prune unseen findings in Filigree; continuing (enrich-only)",
+    );
+    serde_json::json!({
+        "status": "unreachable",
+        "rule_id": "CLA-INFRA-FILIGREE-UNREACHABLE",
+        "endpoint": endpoint,
+        "older_than_days": older_than_days,
+        "error": error,
+    })
+}
+
 fn module_entity_ids(conn: &Connection) -> Result<Vec<String>> {
     let mut stmt = conn
         .prepare("SELECT id FROM entities WHERE kind = 'module' ORDER BY id")
@@ -1164,15 +1675,20 @@ type Collected = (
 /// via `child.kill()` + `child.wait()`. `std::process::Child::Drop` does NOT
 /// kill or reap on Unix, so discarding `child` without `wait()` would leak a
 /// zombie into the kernel process table per spawn.
+#[allow(clippy::too_many_lines)]
 fn run_plugin_blocking(
     manifest: clarion_core::Manifest,
     project_root: &Path,
     plugin_id: &str,
     executable: &Path,
     files: &[PathBuf],
+    briefing_blocks: &Arc<BTreeMap<PathBuf, clarion_core::BriefingBlockReason>>,
+    scanned_source_files: &Arc<BTreeSet<PathBuf>>,
+    progress: &ProgressReporter,
 ) -> Result<BatchResult, PluginRunError> {
     use clarion_core::PluginHost;
 
+    let manifest_language = manifest.plugin.language.clone();
     let (mut host, mut child) =
         PluginHost::spawn(manifest, project_root, executable).map_err(|e| match e {
             HostError::Spawn(msg) => {
@@ -1185,6 +1701,8 @@ fn run_plugin_blocking(
                 PluginRunError::new(format!("plugin {plugin_id} spawn/handshake error: {other}"))
             }
         })?;
+    host.set_briefing_blocks(Arc::clone(briefing_blocks));
+    host.set_scanned_source_files(Arc::clone(scanned_source_files));
 
     let work_result: Result<Collected, String> = (|| {
         let mut collected_entities: Vec<(String, EntityRecord)> = Vec::new();
@@ -1192,6 +1710,7 @@ fn run_plugin_blocking(
         let mut collected_unresolved_call_sites: Vec<PendingUnresolvedCallSites> = Vec::new();
         let mut collected_stats = BatchStats::default();
         for file in files {
+            progress.file_started(plugin_id, &file.to_string_lossy());
             let AnalyzeFileOutcome {
                 entities,
                 edges,
@@ -1199,6 +1718,7 @@ fn run_plugin_blocking(
             } = host
                 .analyze_file(file)
                 .map_err(|e| classify_host_error(plugin_id, e))?;
+            progress.file_completed();
             collected_stats.unresolved_call_sites_total += stats.unresolved_call_sites_total;
             collected_stats.reference_sites_total += stats.reference_sites_total;
             collected_stats.references_resolved_total += stats.references_resolved_total;
@@ -1223,6 +1743,16 @@ fn run_plugin_blocking(
                 .find(|entity| entity.kind == "module")
                 .map(|entity| entity.id.to_string());
             let mut file_entities: Vec<(String, EntityRecord)> = Vec::new();
+            let (file_entity_id, file_record) = core_file_entity_record(
+                project_root,
+                file,
+                &manifest_language,
+                briefing_blocks,
+                scanned_source_files,
+            )
+            .map_err(|e| format!("core file entity for {}: {e:#}", file.display()))?;
+            file_entities.push((file_entity_id.clone(), file_record.clone()));
+            collected_entities.push((file_entity_id, file_record));
             for entity in &entities {
                 let id_str = entity.id.to_string();
                 let record = map_entity_to_record(entity, plugin_id, source_file_id.clone());
@@ -1494,6 +2024,118 @@ fn absolute_from_import_submodule_target(
     module_entity_ids
         .contains(candidate.as_str())
         .then_some(candidate)
+}
+
+fn core_file_entity_record(
+    project_root: &Path,
+    file: &Path,
+    manifest_language: &str,
+    briefing_blocks: &BTreeMap<PathBuf, clarion_core::BriefingBlockReason>,
+    scanned_source_files: &BTreeSet<PathBuf>,
+) -> Result<(String, EntityRecord)> {
+    let canonical_root = project_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize project root {}", project_root.display()))?;
+    let canonical_file = file
+        .canonicalize()
+        .with_context(|| format!("canonicalize source file {}", file.display()))?;
+    let relative = canonical_file
+        .strip_prefix(&canonical_root)
+        .with_context(|| {
+            format!(
+                "source file {} is outside project root {}",
+                canonical_file.display(),
+                canonical_root.display()
+            )
+        })?;
+    let qualified_name = project_relative_posix(relative)?;
+    let id = clarion_core::entity_id::entity_id("core", "file", &qualified_name)?.to_string();
+    let briefing_blocked = briefing_blocks.get(&canonical_file).copied().or_else(|| {
+        (!scanned_source_files.contains(&canonical_file))
+            .then_some(clarion_core::BriefingBlockReason::UnscannedSource)
+    });
+    let source_file_path = canonical_file
+        .into_os_string()
+        .into_string()
+        .map_err(|path| {
+            anyhow::anyhow!("source file path is not valid UTF-8: {}", path.display())
+        })?;
+    let short_name = Path::new(&source_file_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&qualified_name)
+        .to_owned();
+    let content_hash = fs::read(&source_file_path)
+        .with_context(|| format!("read source file {source_file_path}"))
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())?;
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "language".to_owned(),
+        serde_json::Value::String(manifest_language.to_owned()),
+    );
+    if let Some(reason) = briefing_blocked {
+        properties.insert(
+            "briefing_blocked".to_owned(),
+            serde_json::Value::String(reason.as_str().to_owned()),
+        );
+    }
+    let properties_json = serde_json::Value::Object(properties).to_string();
+    let now = iso8601_now();
+
+    Ok((
+        id.clone(),
+        EntityRecord {
+            id,
+            plugin_id: "core".to_owned(),
+            kind: "file".to_owned(),
+            name: qualified_name,
+            short_name,
+            parent_id: None,
+            source_file_id: None,
+            source_file_path: Some(source_file_path),
+            source_byte_start: None,
+            source_byte_end: None,
+            source_line_start: None,
+            source_line_end: None,
+            properties_json,
+            content_hash: Some(content_hash),
+            summary_json: None,
+            wardline_json: None,
+            first_seen_commit: None,
+            last_seen_commit: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    ))
+}
+
+fn project_relative_posix(path: &Path) -> Result<String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                let part = part.to_str().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "source file path component is not valid UTF-8: {}",
+                        part.display()
+                    )
+                })?;
+                parts.push(part);
+            }
+            std::path::Component::CurDir => {}
+            _ => {
+                bail!(
+                    "source file path is not project-relative: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    let relative = parts.join("/");
+    if relative.is_empty() {
+        bail!("source file path must not resolve to the project root");
+    }
+    Ok(relative)
 }
 
 /// Map an `AcceptedEntity` to an `EntityRecord` for the writer-actor.
@@ -1821,6 +2463,51 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use std::fs;
+
+    #[test]
+    fn progress_reporter_is_noop_without_a_path() {
+        // No progress file → no panics, no writes; the normal CLI path.
+        let reporter = ProgressReporter::new(None, "run-x".to_owned());
+        reporter.set_total(10);
+        reporter.phase("analyzing", Some("python"), Some("a.py"));
+        reporter.file_started("python", "a.py");
+        reporter.file_completed();
+    }
+
+    #[test]
+    fn progress_reporter_writes_phase_and_counters_with_heartbeat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("runs").join("run-1.progress.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let reporter = ProgressReporter::new(Some(path.clone()), "run-1".to_owned());
+
+        reporter.set_total(3);
+        reporter.file_started("python", "src/a.py");
+        reporter.file_completed();
+        reporter.file_started("python", "src/b.py");
+
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("progress file")).unwrap();
+        assert_eq!(snapshot["run_id"], "run-1");
+        assert_eq!(snapshot["phase"], "analyzing");
+        assert_eq!(snapshot["current_plugin"], "python");
+        assert_eq!(snapshot["current_file"], "src/b.py");
+        assert_eq!(snapshot["processed_files"], 1);
+        assert_eq!(snapshot["total_files"], 3);
+        assert!(
+            snapshot["heartbeat_at"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "heartbeat_at must be a non-empty timestamp"
+        );
+
+        // A later phase write overwrites with the new phase (last-write-wins).
+        reporter.phase("clustering", None, None);
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("progress file")).unwrap();
+        assert_eq!(snapshot["phase"], "clustering");
+        assert!(snapshot["current_plugin"].is_null());
+    }
 
     #[test]
     fn subsystem_entity_id_rejects_invalid_hash_segment() {

@@ -12,11 +12,12 @@ pub mod plugin;
 
 pub use entity_id::{EntityId, EntityIdError, entity_id};
 pub use llm_provider::{
-    CachingModel, INFERRED_CALLS_PROMPT_VERSION, InferredCallsPromptInput,
+    CachingModel, ClaudeCliProvider, ClaudeCliProviderConfig, CodexCliProvider,
+    CodexCliProviderConfig, INFERRED_CALLS_PROMPT_VERSION, InferredCallsPromptInput,
     LEAF_SUMMARY_PROMPT_TEMPLATE_ID, LeafSummaryPromptInput, LlmProvider, LlmProviderError,
     LlmPurpose, LlmRequest, LlmResponse, OpenRouterProvider, OpenRouterProviderConfig,
-    PromptTemplate, Recording, RecordingProvider, build_inferred_calls_prompt,
-    build_leaf_summary_prompt,
+    PromptTemplate, Recording, RecordingProvider, build_coding_agent_provider_prompt,
+    build_inferred_calls_prompt, build_leaf_summary_prompt,
 };
 pub use plugin::{
     // host (Task 6) — facade for callers that spawn/connect plugins
@@ -24,6 +25,7 @@ pub use plugin::{
     AcceptedEntity,
     AnalyzeFileOutcome,
     AnalyzeFileStats,
+    BriefingBlockReason,
     CapExceeded,
     // breaker (Task 7) — callers drive crash-loop accounting
     CrashLoopBreaker,

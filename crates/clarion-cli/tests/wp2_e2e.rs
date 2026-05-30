@@ -194,7 +194,7 @@ fn wp2_e2e_smoke_fixture_plugin_round_trip() {
         "run status must be 'completed'; got {run_status:?}"
     );
 
-    // Assert 3: stats JSON reports entities_inserted = 1.
+    // Assert 3: stats JSON reports the fixture entity plus the core file identity.
     let stats_raw: String = conn
         .query_row("SELECT stats FROM runs LIMIT 1", [], |row| row.get(0))
         .expect("query runs.stats");
@@ -202,24 +202,35 @@ fn wp2_e2e_smoke_fixture_plugin_round_trip() {
         serde_json::from_str(&stats_raw).expect("stats column must be valid JSON");
     assert_eq!(
         stats["entities_inserted"],
-        serde_json::Value::Number(1.into()),
-        "stats must report entities_inserted = 1; got {stats_raw:?}"
+        serde_json::Value::Number(2.into()),
+        "stats must report entities_inserted = 2; got {stats_raw:?}"
     );
 
-    // Assert 4: exactly one entity row.
+    // Assert 4: exactly one fixture entity and one core file identity row.
     let entity_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))
         .expect("query entities count");
 
     assert_eq!(
-        entity_count, 1,
-        "expected exactly one entity row; got {entity_count}"
+        entity_count, 2,
+        "expected exactly two entity rows; got {entity_count}"
+    );
+    let file_entity_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE plugin_id = 'core' AND kind = 'file'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query core file entity count");
+    assert_eq!(
+        file_entity_count, 1,
+        "expected exactly one core file identity row; got {file_entity_count}"
     );
 
     // Asserts 5–8: the persisted row matches the fixture's declared emission.
     let (entity_id, entity_kind, entity_plugin_id, entity_name): (String, String, String, String) =
         conn.query_row(
-            "SELECT id, kind, plugin_id, name FROM entities LIMIT 1",
+            "SELECT id, kind, plugin_id, name FROM entities WHERE plugin_id = 'fixture'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
@@ -409,17 +420,34 @@ ontology_version = "0.1.0"
 
     // This is the behavioural assertion that matters: the fixture plugin's
     // entity is persisted even though `broken` crashed earlier in the run.
-    let entity_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))
-        .expect("query entities count");
+    let fixture_entity_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE plugin_id = 'fixture'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query fixture entities count");
     assert_eq!(
-        entity_count, 1,
-        "fixture plugin's entity must still be persisted despite broken plugin's crash; got {entity_count}",
+        fixture_entity_count, 1,
+        "fixture plugin's entity must still be persisted despite broken plugin's crash; got {fixture_entity_count}",
+    );
+    let file_entity_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE plugin_id = 'core' AND kind = 'file'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query core file entity count");
+    assert_eq!(
+        file_entity_count, 1,
+        "core file identity must be persisted for the surviving source file; got {file_entity_count}",
     );
     let entity_plugin_id: String = conn
-        .query_row("SELECT plugin_id FROM entities LIMIT 1", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT plugin_id FROM entities WHERE plugin_id = 'fixture'",
+            [],
+            |row| row.get(0),
+        )
         .expect("query entity plugin_id");
     assert_eq!(
         entity_plugin_id, "fixture",

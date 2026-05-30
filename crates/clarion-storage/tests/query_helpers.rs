@@ -5,9 +5,11 @@ use std::path::Path;
 use clarion_core::EdgeConfidence;
 use clarion_storage::{
     ModuleDependencyEdge, ReferenceDirection, SubsystemMember, call_edges_from,
-    call_edges_targeting, child_entity_ids, contained_entity_ids, entity_at_line, entity_by_id,
-    find_entities, module_dependency_edges, normalize_source_path, pragma,
-    reference_edges_for_entity, schema, subsystem_for_member, subsystem_members,
+    call_edges_targeting, child_entity_ids, contained_entity_ids, containing_module_id,
+    entity_at_line, entity_briefing_block_reason, entity_by_id, find_entities, findings_for_emit,
+    module_dependency_edges, module_reference_rollup, normalize_source_path, pragma,
+    reference_edges_for_entity, resolve_file, resolve_file_catalog_entry, schema,
+    subsystem_for_member, subsystem_members, subsystem_of_entity,
 };
 use rusqlite::{Connection, params};
 
@@ -513,6 +515,123 @@ fn reference_edges_for_entity_returns_directional_neighbors() {
 }
 
 #[test]
+fn module_reference_rollup_aggregates_contained_symbol_edges_excluding_internal() {
+    // A `from pkg.contracts import RunStatus` records a `references` edge to the
+    // class, not the module — so the module's own edges are empty and the
+    // rollup must aggregate contained symbols' edges (clarion-79d0ff6e14).
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+
+    // Module under query, with two contained classes.
+    insert_entity(&conn, "python:module:pkg.contracts", "module");
+    insert_entity(&conn, "python:class:pkg.contracts.RunStatus", "class");
+    insert_entity(&conn, "python:class:pkg.contracts.Helper", "class");
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.contracts",
+        "python:class:pkg.contracts.RunStatus",
+    );
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.contracts",
+        "python:class:pkg.contracts.Helper",
+    );
+
+    // An external module whose function imports RunStatus (reverse-import In).
+    insert_entity(&conn, "python:module:pkg.consumer", "module");
+    insert_entity(&conn, "python:function:pkg.consumer.use", "function");
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.consumer",
+        "python:function:pkg.consumer.use",
+    );
+    insert_references_edge(
+        &conn,
+        "python:function:pkg.consumer.use",
+        "python:class:pkg.contracts.RunStatus",
+        EdgeConfidence::Resolved,
+        20,
+        25,
+    );
+
+    // A symbol the module's class references outward (rollup Out).
+    insert_entity(&conn, "python:module:pkg.other", "module");
+    insert_entity(&conn, "python:class:pkg.other.Thing", "class");
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.other",
+        "python:class:pkg.other.Thing",
+    );
+    insert_references_edge(
+        &conn,
+        "python:class:pkg.contracts.RunStatus",
+        "python:class:pkg.other.Thing",
+        EdgeConfidence::Resolved,
+        30,
+        40,
+    );
+
+    // Intra-module reference (RunStatus -> Helper): internal wiring, must be
+    // excluded from BOTH directions of the rollup.
+    insert_references_edge(
+        &conn,
+        "python:class:pkg.contracts.RunStatus",
+        "python:class:pkg.contracts.Helper",
+        EdgeConfidence::Resolved,
+        50,
+        55,
+    );
+
+    let inbound =
+        module_reference_rollup(&conn, "python:module:pkg.contracts", ReferenceDirection::In)
+            .expect("rollup inbound");
+    assert_eq!(
+        inbound.len(),
+        1,
+        "only the external referencer rolls up: {inbound:?}"
+    );
+    assert_eq!(inbound[0].neighbor_id, "python:function:pkg.consumer.use");
+    assert_eq!(inbound[0].via_id, "python:class:pkg.contracts.RunStatus");
+    assert_eq!(inbound[0].confidence, EdgeConfidence::Resolved);
+    assert_eq!(inbound[0].source_byte_start, Some(20));
+
+    let outbound = module_reference_rollup(
+        &conn,
+        "python:module:pkg.contracts",
+        ReferenceDirection::Out,
+    )
+    .expect("rollup outbound");
+    assert_eq!(
+        outbound.len(),
+        1,
+        "only the external reference rolls up: {outbound:?}"
+    );
+    assert_eq!(outbound[0].neighbor_id, "python:class:pkg.other.Thing");
+    assert_eq!(outbound[0].via_id, "python:class:pkg.contracts.RunStatus");
+}
+
+#[test]
+fn module_reference_rollup_returns_empty_for_module_with_no_contained_edges() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity(&conn, "python:module:pkg.lonely", "module");
+    insert_entity(&conn, "python:class:pkg.lonely.Isolated", "class");
+    insert_contains_edge(
+        &conn,
+        "python:module:pkg.lonely",
+        "python:class:pkg.lonely.Isolated",
+    );
+
+    let inbound =
+        module_reference_rollup(&conn, "python:module:pkg.lonely", ReferenceDirection::In)
+            .expect("rollup inbound");
+    assert!(
+        inbound.is_empty(),
+        "no references means an empty rollup, not an error"
+    );
+}
+
+#[test]
 fn call_edges_targeting_expands_candidate_only_ambiguous_targets() {
     let tempdir = tempfile::tempdir().unwrap();
     let conn = open_fresh(&tempdir);
@@ -659,14 +778,117 @@ fn entity_lookup_and_search_cover_id_and_fts_paths() {
         .expect("entity should exist");
     assert_eq!(entity.kind, "function");
 
-    let fts_results = find_entities(&conn, "TokenManager", 20, 0).expect("FTS search");
+    let fts_results = find_entities(&conn, "TokenManager", 20, 0, None).expect("FTS search");
     assert_eq!(fts_results.len(), 1);
     assert_eq!(fts_results[0].id, "python:function:demo.TokenManager");
 
-    let like_results = find_entities(&conn, "python:function:demo.TokenManager", 20, 0)
+    let like_results = find_entities(&conn, "python:function:demo.TokenManager", 20, 0, None)
         .expect("punctuation-heavy ID search");
     assert_eq!(like_results.len(), 1);
     assert_eq!(like_results[0].id, "python:function:demo.TokenManager");
+}
+
+#[test]
+fn subsystem_of_entity_resolves_module_and_nested_entities() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity(&conn, "core:subsystem:abc", "subsystem");
+    insert_entity(&conn, "python:module:pkg.mod", "module");
+    insert_entity(&conn, "python:class:pkg.mod.Cls", "class");
+    insert_entity(&conn, "python:function:pkg.mod.Cls.method", "function");
+    insert_in_subsystem_edge(&conn, "python:module:pkg.mod", "core:subsystem:abc");
+    insert_contains_edge(&conn, "python:module:pkg.mod", "python:class:pkg.mod.Cls");
+    insert_contains_edge(
+        &conn,
+        "python:class:pkg.mod.Cls",
+        "python:function:pkg.mod.Cls.method",
+    );
+
+    // A module resolves directly (depth 0).
+    let from_module = subsystem_of_entity(&conn, "python:module:pkg.mod")
+        .unwrap()
+        .expect("module should resolve");
+    assert_eq!(from_module.subsystem_id, "core:subsystem:abc");
+    assert_eq!(from_module.via_module_id, "python:module:pkg.mod");
+
+    // A method nested module -> class -> function resolves via its module
+    // ancestor (exercises the recursive walk past a non-module container).
+    let from_method = subsystem_of_entity(&conn, "python:function:pkg.mod.Cls.method")
+        .unwrap()
+        .expect("nested method should resolve");
+    assert_eq!(from_method.subsystem_id, "core:subsystem:abc");
+    assert_eq!(from_method.via_module_id, "python:module:pkg.mod");
+
+    // A module not assigned to any subsystem -> None.
+    insert_entity(&conn, "python:module:orphan", "module");
+    assert!(
+        subsystem_of_entity(&conn, "python:module:orphan")
+            .unwrap()
+            .is_none()
+    );
+
+    // An unknown entity id -> None (no error).
+    assert!(
+        subsystem_of_entity(&conn, "python:function:does.not.exist")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn find_entities_kind_filter_constrains_results() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    // Two entities sharing a search term but differing in kind, plus a subsystem
+    // named after the same package (the realistic "find the subsystem" case).
+    insert_entity(&conn, "python:module:demo", "module");
+    insert_entity(&conn, "python:function:demo.run", "function");
+    insert_entity(&conn, "core:subsystem:demo", "subsystem");
+
+    // Unfiltered: all three "demo" entities match (FTS or LIKE path).
+    let all = find_entities(&conn, "demo", 20, 0, None).expect("unfiltered search");
+    assert_eq!(all.len(), 3, "{all:?}");
+
+    // kind=subsystem returns only the subsystem entity.
+    let subs = find_entities(&conn, "demo", 20, 0, Some("subsystem")).expect("kind=subsystem");
+    assert_eq!(subs.len(), 1, "{subs:?}");
+    assert_eq!(subs[0].id, "core:subsystem:demo");
+    assert_eq!(subs[0].kind, "subsystem");
+
+    // kind=function returns only the function.
+    let funcs = find_entities(&conn, "demo", 20, 0, Some("function")).expect("kind=function");
+    assert_eq!(funcs.len(), 1, "{funcs:?}");
+    assert_eq!(funcs[0].id, "python:function:demo.run");
+
+    // An unknown (but well-formed) kind simply matches nothing.
+    let none = find_entities(&conn, "demo", 20, 0, Some("nonesuch")).expect("unknown kind");
+    assert!(none.is_empty(), "{none:?}");
+
+    // A blank kind is rejected as a malformed request.
+    assert!(find_entities(&conn, "demo", 20, 0, Some("  ")).is_err());
+}
+
+#[test]
+fn find_entities_kind_filter_applies_on_punctuation_like_path() {
+    // The punctuation-heavy ID search takes the LIKE branch (not FTS); the kind
+    // filter must apply there too, and bind correctly against the OR-group.
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity(&conn, "python:module:pkg.svc", "module");
+    insert_entity(&conn, "python:function:pkg.svc", "function");
+
+    let like_all = find_entities(&conn, "python:module:pkg.svc", 20, 0, None).expect("like search");
+    assert_eq!(like_all.len(), 1);
+
+    let like_module = find_entities(&conn, "pkg.svc", 20, 0, Some("module")).expect("like+kind");
+    assert!(
+        like_module.iter().all(|e| e.kind == "module"),
+        "{like_module:?}"
+    );
+    assert!(
+        like_module.iter().any(|e| e.id == "python:module:pkg.svc"),
+        "{like_module:?}"
+    );
 }
 
 #[test]
@@ -749,5 +971,632 @@ fn normalize_source_path_accepts_project_relative_paths_and_rejects_escape() {
     assert!(
         escaped.to_string().contains("invalid source path"),
         "unexpected error: {escaped}"
+    );
+}
+
+#[test]
+fn resolve_file_surfaces_briefing_blocked_reason_from_properties() {
+    let tempdir = tempfile::tempdir().expect("temp project root");
+    let project_root = tempdir.path();
+    let source_path = project_root.join("secret.env");
+    std::fs::write(&source_path, "TOKEN=AKIAIOSFODNN7EXAMPLE\n").expect("write source");
+    let canonical = source_path.canonicalize().expect("canonical source");
+
+    let conn = open_fresh(&tempdir);
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            'core:file:hash-secret@secret.env', 'core', 'file', 'secret.env', 'secret.env', ?1,
+            1, 1, '{\"briefing_blocked\":\"secret_present\"}', 'hash-secret-file',
+            '2026-05-19T00:00:00.000Z', '2026-05-19T00:00:00.000Z'
+         )",
+        params![canonical.display().to_string()],
+    )
+    .expect("insert briefing-blocked entity");
+
+    let resolved = resolve_file(&conn, project_root, "secret.env", "env")
+        .expect("resolve_file")
+        .expect("entity is known");
+
+    assert_eq!(
+        resolved.briefing_blocked.as_deref(),
+        Some("secret_present"),
+        "resolve_file must surface briefing_blocked reason so federation read \
+         surfaces (HTTP /api/v1/files) can refuse to expose blocked entities"
+    );
+}
+
+#[test]
+fn resolve_file_returns_none_when_no_file_kind_entity_exists() {
+    let tempdir = tempfile::tempdir().expect("temp project root");
+    let project_root = tempdir.path();
+    let source_path = project_root.join("src").join("demo.py");
+    std::fs::create_dir_all(source_path.parent().unwrap()).expect("create source dir");
+    std::fs::write(&source_path, "def entry():\n    return 1\n").expect("write source");
+    let canonical = source_path.canonicalize().expect("canonical source");
+
+    let conn = open_fresh(&tempdir);
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            'python:module:demo', 'python', 'module', 'demo', 'demo', ?1,
+            1, 2, '{}', 'hash-demo-module',
+            '2026-05-19T00:00:00.000Z', '2026-05-19T00:00:00.000Z'
+         )",
+        params![canonical.display().to_string()],
+    )
+    .expect("insert module entity");
+
+    let resolved =
+        resolve_file(&conn, project_root, "src/demo.py", "python").expect("resolve_file");
+
+    assert!(
+        resolved.is_none(),
+        "resolve_file must fail closed instead of synthesizing a file identity from a module row"
+    );
+}
+
+#[test]
+fn resolve_file_returns_none_briefing_blocked_for_clean_entity() {
+    let tempdir = tempfile::tempdir().expect("temp project root");
+    let project_root = tempdir.path();
+    let source_path = project_root.join("src").join("demo.py");
+    std::fs::create_dir_all(source_path.parent().unwrap()).expect("create source dir");
+    std::fs::write(&source_path, "def entry():\n    return 1\n").expect("write source");
+    let canonical = source_path.canonicalize().expect("canonical source");
+
+    let conn = open_fresh(&tempdir);
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            'python:file:demo', 'python', 'file', 'demo.py', 'demo.py', ?1,
+            1, 2, '{}', 'hash-demo',
+            '2026-05-19T00:00:00.000Z', '2026-05-19T00:00:00.000Z'
+         )",
+        params![canonical.display().to_string()],
+    )
+    .expect("insert clean entity");
+
+    let resolved = resolve_file(&conn, project_root, "src/demo.py", "python")
+        .expect("resolve_file")
+        .expect("entity is known");
+
+    assert_eq!(resolved.canonical_path.as_str(), "src/demo.py");
+    assert!(
+        !resolved.canonical_path.as_str().starts_with('/')
+            && !resolved.canonical_path.as_str().starts_with("./")
+            && !resolved.canonical_path.as_str().starts_with("../"),
+        "canonical path must be project-relative POSIX: {:?}",
+        resolved.canonical_path
+    );
+    assert!(
+        resolved.briefing_blocked.is_none(),
+        "clean entity must not surface a briefing_blocked reason; got {:?}",
+        resolved.briefing_blocked
+    );
+}
+
+#[test]
+fn resolve_file_deleted_on_disk_but_cataloged_row_resolves() {
+    let tempdir = tempfile::tempdir().expect("temp project root");
+    let project_root = tempdir.path();
+    let source_path = project_root.join("src").join("deleted.py");
+    std::fs::create_dir_all(source_path.parent().unwrap()).expect("create source dir");
+    std::fs::write(&source_path, "def gone():\n    return 1\n").expect("write source");
+    let canonical = source_path.canonicalize().expect("canonical source");
+
+    let conn = open_fresh(&tempdir);
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            'python:file:deleted', 'python', 'file', 'deleted.py', 'deleted.py', ?1,
+            1, 2, '{}', 'hash-deleted',
+            '2026-05-19T00:00:00.000Z', '2026-05-19T00:00:00.000Z'
+         )",
+        params![canonical.display().to_string()],
+    )
+    .expect("insert deleted entity");
+    std::fs::remove_file(&source_path).expect("delete source after cataloging");
+
+    let resolved = resolve_file(&conn, project_root, "src/deleted.py", "python")
+        .expect("resolve_file should use catalog row without requiring disk file")
+        .expect("entity is known");
+
+    assert_eq!(resolved.entity_id, "python:file:deleted");
+    assert_eq!(resolved.content_hash, "hash-deleted");
+    assert_eq!(resolved.canonical_path.as_str(), "src/deleted.py");
+    assert!(
+        !resolved.canonical_path.as_str().starts_with('/')
+            && !resolved.canonical_path.as_str().starts_with("./")
+            && !resolved.canonical_path.as_str().starts_with("../"),
+        "canonical path must be project-relative POSIX: {:?}",
+        resolved.canonical_path
+    );
+}
+
+#[test]
+fn resolve_file_catalog_entry_returns_missing_hash_without_reading_disk() {
+    let tempdir = tempfile::tempdir().expect("temp project root");
+    let project_root = tempdir.path();
+    let source_path = project_root.join("src").join("missing-hash.py");
+    std::fs::create_dir_all(source_path.parent().unwrap()).expect("create source dir");
+    std::fs::write(&source_path, "def missing_hash():\n    return 1\n").expect("write source");
+    let canonical = source_path.canonicalize().expect("canonical source");
+
+    let conn = open_fresh(&tempdir);
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            'python:file:missing_hash', 'python', 'file', 'missing-hash.py', 'missing-hash.py', ?1,
+            1, 2, '{}', NULL,
+            '2026-05-19T00:00:00.000Z', '2026-05-19T00:00:00.000Z'
+         )",
+        params![canonical.display().to_string()],
+    )
+    .expect("insert file entity without cached hash");
+    std::fs::remove_file(&source_path).expect("delete source after cataloging");
+
+    let entry = resolve_file_catalog_entry(&conn, project_root, "src/missing-hash.py", "python")
+        .expect("catalog lookup should not read deleted source")
+        .expect("entity is known");
+
+    assert_eq!(entry.entity_id, "python:file:missing_hash");
+    assert_eq!(entry.content_hash, None);
+    assert_eq!(entry.canonical_path.as_str(), "src/missing-hash.py");
+    assert_eq!(entry.language, "python");
+}
+
+#[test]
+#[cfg(unix)]
+fn resolve_file_unreadable_hash_failure_propagates() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tempdir = tempfile::tempdir().expect("temp project root");
+    let project_root = tempdir.path();
+    let source_path = project_root.join("src").join("unreadable.py");
+    std::fs::create_dir_all(source_path.parent().unwrap()).expect("create source dir");
+    std::fs::write(&source_path, "def unreadable():\n    return 1\n").expect("write source");
+    let canonical = source_path.canonicalize().expect("canonical source");
+
+    let conn = open_fresh(&tempdir);
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            'python:file:unreadable', 'python', 'file', 'unreadable.py', 'unreadable.py', ?1,
+            1, 2, '{}', NULL,
+            '2026-05-19T00:00:00.000Z', '2026-05-19T00:00:00.000Z'
+         )",
+        params![canonical.display().to_string()],
+    )
+    .expect("insert unreadable entity");
+    let original_permissions = std::fs::metadata(&source_path)
+        .expect("source metadata")
+        .permissions();
+    std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(0o000))
+        .expect("make source unreadable");
+
+    if std::fs::read(&source_path).is_ok() {
+        std::fs::set_permissions(&source_path, original_permissions).expect("restore source perms");
+        eprintln!("skipping unreadable-file assertion because this runner can read 0o000 files");
+        return;
+    }
+
+    let result = resolve_file(&conn, project_root, "src/unreadable.py", "python");
+
+    std::fs::set_permissions(&source_path, original_permissions).expect("restore source perms");
+    let error = result.expect_err("missing catalog hash must propagate hash fallback read failure");
+    assert!(
+        error.to_string().contains("io error"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn resolve_file_does_not_echo_invalid_requested_language_over_catalog_inference() {
+    let tempdir = tempfile::tempdir().expect("temp project root");
+    let project_root = tempdir.path();
+    let source_path = project_root.join("src").join("demo.py");
+    std::fs::create_dir_all(source_path.parent().unwrap()).expect("create source dir");
+    std::fs::write(&source_path, "def entry():\n    return 1\n").expect("write source");
+    let canonical = source_path.canonicalize().expect("canonical source");
+
+    let conn = open_fresh(&tempdir);
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            'python:file:demo-language', 'python', 'file', 'demo.py', 'demo.py', ?1,
+            1, 2, '{}', 'hash-demo-language',
+            '2026-05-19T00:00:00.000Z', '2026-05-19T00:00:00.000Z'
+         )",
+        params![canonical.display().to_string()],
+    )
+    .expect("insert python entity");
+
+    let resolved = resolve_file(&conn, project_root, "src/demo.py", "javascript")
+        .expect("resolve_file")
+        .expect("entity is known");
+
+    assert_eq!(resolved.language, "python");
+}
+
+#[test]
+fn resolve_file_prefers_core_extension_inference_over_requested_language() {
+    let tempdir = tempfile::tempdir().expect("temp project root");
+    let project_root = tempdir.path();
+    let source_path = project_root.join("src").join("demo.py");
+    std::fs::create_dir_all(source_path.parent().unwrap()).expect("create source dir");
+    std::fs::write(&source_path, "def entry():\n    return 1\n").expect("write source");
+    let canonical = source_path.canonicalize().expect("canonical source");
+
+    let conn = open_fresh(&tempdir);
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            'core:file:src/demo.py', 'core', 'file', 'demo.py', 'demo.py', ?1,
+            1, 2, '{}', 'hash-core-demo',
+            '2026-05-19T00:00:00.000Z', '2026-05-19T00:00:00.000Z'
+         )",
+        params![canonical.display().to_string()],
+    )
+    .expect("insert core file entity");
+
+    let resolved = resolve_file(&conn, project_root, "src/demo.py", "javascript")
+        .expect("resolve_file")
+        .expect("entity is known");
+
+    assert_eq!(resolved.language, "python");
+}
+
+#[test]
+fn entity_briefing_block_reason_parses_property_and_tolerates_garbage() {
+    assert_eq!(
+        entity_briefing_block_reason(r#"{"briefing_blocked":"secret_present"}"#),
+        Some("secret_present".to_owned()),
+    );
+    assert_eq!(
+        entity_briefing_block_reason(r#"{"briefing_blocked":"unscanned_source"}"#),
+        Some("unscanned_source".to_owned()),
+    );
+    // No key.
+    assert_eq!(entity_briefing_block_reason("{}"), None);
+    assert_eq!(entity_briefing_block_reason(r#"{"other":"x"}"#), None);
+    // Wrong type — key present but not a string.
+    assert_eq!(
+        entity_briefing_block_reason(r#"{"briefing_blocked":42}"#),
+        None,
+    );
+}
+
+#[test]
+fn entity_briefing_block_reason_fails_closed_on_malformed_json() {
+    // Fail-closed contract (SEC-01): a plugin emitting malformed
+    // properties JSON must not be able to silently unblock the entity
+    // through the federation read paths. Any parse failure returns
+    // Some("malformed_properties_json") so callers treat the row as
+    // briefing-blocked.
+    let expected = Some("malformed_properties_json".to_owned());
+    assert_eq!(entity_briefing_block_reason(""), expected);
+    assert_eq!(entity_briefing_block_reason("not json"), expected);
+    assert_eq!(entity_briefing_block_reason(r#"{"unterminated"#), expected);
+    assert_eq!(entity_briefing_block_reason(r#"{"x":}"#), expected);
+    // Valid JSON whose root is not an object still parses and follows the
+    // non-malformed path (no `briefing_blocked` key on a JSON `null`/array,
+    // so the reason is `None`).
+    assert_eq!(entity_briefing_block_reason("null"), None);
+    assert_eq!(entity_briefing_block_reason("[]"), None);
+}
+
+fn insert_run(conn: &Connection, run_id: &str) {
+    conn.execute(
+        "INSERT INTO runs (id, started_at, config, stats, status) \
+         VALUES (?1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), '{}', '{}', 'running')",
+        params![run_id],
+    )
+    .expect("insert run");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_finding(
+    conn: &Connection,
+    id: &str,
+    run_id: &str,
+    rule_id: &str,
+    kind: &str,
+    severity: &str,
+    entity_id: &str,
+    related_entities: &str,
+) {
+    conn.execute(
+        "INSERT INTO findings (
+            id, tool, tool_version, run_id, rule_id, kind, severity, confidence,
+            confidence_basis, entity_id, related_entities, message, evidence,
+            properties, supports, supported_by, status, created_at, updated_at
+         ) VALUES (
+            ?1, 'clarion', '1.0.0', ?2, ?3, ?4, ?5, 0.9,
+            'ast_match', ?6, ?7, 'msg', '{}',
+            '{}', '[]', '[]', 'open',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        params![
+            id,
+            run_id,
+            rule_id,
+            kind,
+            severity,
+            entity_id,
+            related_entities
+        ],
+    )
+    .expect("insert finding");
+}
+
+#[test]
+fn findings_for_emit_joins_entity_path_and_preserves_nullable_location() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let conn = open_fresh(&tempdir);
+
+    insert_run(&conn, "run-1");
+    // A defect anchored to a function with a source location.
+    insert_entity_with_range(
+        &conn,
+        "python:function:auth.tokens.refresh",
+        "function",
+        Path::new("src/auth/tokens.py"),
+        12,
+        20,
+    );
+    // A fact anchored to a subsystem entity — no source_file_path.
+    insert_named_entity(
+        &conn,
+        "core:subsystem:abcd",
+        "subsystem",
+        "abcd",
+        "abcd",
+        None,
+    );
+
+    insert_finding(
+        &conn,
+        "core:finding:run-1:defect",
+        "run-1",
+        "CLA-PY-STRUCTURE-001",
+        "defect",
+        "WARN",
+        "python:function:auth.tokens.refresh",
+        r#"["python:class:auth.sessions::SessionStore"]"#,
+    );
+    insert_finding(
+        &conn,
+        "core:finding:run-1:weak-modularity",
+        "run-1",
+        "CLA-FACT-CLUSTERING-WEAK-MODULARITY",
+        "fact",
+        "INFO",
+        "core:subsystem:abcd",
+        "[]",
+    );
+
+    let rows = findings_for_emit(&conn, "run-1").expect("findings_for_emit");
+    assert_eq!(rows.len(), 2, "both findings returned: {rows:?}");
+
+    // Ordered by finding id: "defect" sorts before "weak-modularity".
+    let defect = &rows[0];
+    assert_eq!(defect.id, "core:finding:run-1:defect");
+    assert_eq!(defect.rule_id, "CLA-PY-STRUCTURE-001");
+    assert_eq!(defect.kind, "defect");
+    assert_eq!(defect.severity, "WARN");
+    assert_eq!(defect.entity_id, "python:function:auth.tokens.refresh");
+    assert_eq!(
+        defect.source_file_path.as_deref(),
+        Some("src/auth/tokens.py")
+    );
+    assert_eq!(defect.source_line_start, Some(12));
+    assert_eq!(defect.source_line_end, Some(20));
+    assert_eq!(defect.confidence, Some(0.9));
+    assert_eq!(
+        defect.related_entities_json,
+        r#"["python:class:auth.sessions::SessionStore"]"#
+    );
+
+    // The subsystem-anchored fact has no source path — the emitter will skip it.
+    let fact = &rows[1];
+    assert_eq!(fact.id, "core:finding:run-1:weak-modularity");
+    assert_eq!(fact.entity_id, "core:subsystem:abcd");
+    assert_eq!(fact.source_file_path, None);
+    assert_eq!(fact.source_line_start, None);
+}
+
+#[test]
+fn findings_for_emit_scopes_to_run_id() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let conn = open_fresh(&tempdir);
+
+    insert_run(&conn, "run-1");
+    insert_run(&conn, "run-2");
+    insert_entity_with_range(
+        &conn,
+        "python:function:demo.f",
+        "function",
+        Path::new("demo.py"),
+        1,
+        2,
+    );
+    insert_finding(
+        &conn,
+        "f-run1",
+        "run-1",
+        "CLA-PY-X",
+        "defect",
+        "WARN",
+        "python:function:demo.f",
+        "[]",
+    );
+    insert_finding(
+        &conn,
+        "f-run2",
+        "run-2",
+        "CLA-PY-X",
+        "defect",
+        "WARN",
+        "python:function:demo.f",
+        "[]",
+    );
+
+    let rows = findings_for_emit(&conn, "run-1").expect("findings_for_emit");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "f-run1");
+}
+
+/// Regression for clarion-8b32ba0d02: emission must not leak the path/line of a
+/// `briefing_blocked` entity to Filigree (the read API refuses these; the write
+/// direction must match). A finding on a still-blocked secret-bearing file is
+/// excluded, while an ordinary finding — and the ADR-013 override audit finding,
+/// which rides a *non-blocked* `Overridden` anchor — still emit.
+#[test]
+fn findings_for_emit_excludes_briefing_blocked_anchors() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let conn = open_fresh(&tempdir);
+
+    insert_run(&conn, "run-1");
+
+    // A clean function entity — ordinary finding, must emit.
+    insert_entity_with_range(
+        &conn,
+        "python:function:auth.tokens.refresh",
+        "function",
+        Path::new("src/auth/tokens.py"),
+        12,
+        20,
+    );
+
+    // A secret-scanner anchor for a file the operator OVERRODE
+    // (`--allow-unredacted-secrets`): recorded as Overridden, so its anchor
+    // carries no briefing_blocked reason. The CLA-SEC-UNREDACTED-SECRETS-ALLOWED
+    // audit finding on it must still reach Filigree (ADR-013 audit trail).
+    insert_entity_with_range(
+        &conn,
+        "core:file:allowed.env",
+        "file",
+        Path::new("allowed.env"),
+        1,
+        1,
+    );
+
+    // A secret-scanner anchor for a file that is still BLOCKED (no override):
+    // briefing_blocked = secret_present. Its finding points at the secret's
+    // path/line and must be withheld.
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at
+         ) VALUES (
+            'core:file:secret.env', 'core', 'file', 'secret.env', 'secret.env', 'secret.env',
+            7, 7, '{\"briefing_blocked\":\"secret_present\"}', 'hash-secret-file',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        [],
+    )
+    .expect("insert briefing-blocked entity");
+
+    insert_finding(
+        &conn,
+        "core:finding:run-1:a-defect",
+        "run-1",
+        "CLA-PY-STRUCTURE-001",
+        "defect",
+        "WARN",
+        "python:function:auth.tokens.refresh",
+        "[]",
+    );
+    insert_finding(
+        &conn,
+        "core:finding:run-1:b-override-allowed",
+        "run-1",
+        "CLA-SEC-UNREDACTED-SECRETS-ALLOWED",
+        "defect",
+        "ERROR",
+        "core:file:allowed.env",
+        "[]",
+    );
+    insert_finding(
+        &conn,
+        "core:finding:run-1:c-secret-detected",
+        "run-1",
+        "CLA-SEC-SECRET-DETECTED",
+        "defect",
+        "ERROR",
+        "core:file:secret.env",
+        "[]",
+    );
+
+    let rows = findings_for_emit(&conn, "run-1").expect("findings_for_emit");
+    let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![
+            "core:finding:run-1:a-defect",
+            "core:finding:run-1:b-override-allowed",
+        ],
+        "non-blocked findings (incl. the ADR-013 override audit) emit; the \
+         briefing_blocked secret finding is excluded: {rows:?}"
+    );
+    assert!(
+        !ids.contains(&"core:finding:run-1:c-secret-detected"),
+        "finding on a briefing_blocked entity must not be emitted"
+    );
+}
+
+#[test]
+fn containing_module_id_walks_up_to_the_nearest_module() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+
+    // module -> class -> method nesting via `contains`.
+    insert_entity(&conn, "python:module:pkg.mod", "module");
+    insert_entity(&conn, "python:class:pkg.mod.Cls", "class");
+    insert_entity(&conn, "python:function:pkg.mod.Cls.method", "function");
+    insert_contains_edge(&conn, "python:module:pkg.mod", "python:class:pkg.mod.Cls");
+    insert_contains_edge(
+        &conn,
+        "python:class:pkg.mod.Cls",
+        "python:function:pkg.mod.Cls.method",
+    );
+
+    // A nested method resolves up through its class to the module.
+    assert_eq!(
+        containing_module_id(&conn, "python:function:pkg.mod.Cls.method")
+            .expect("query")
+            .as_deref(),
+        Some("python:module:pkg.mod"),
+    );
+    // A module resolves to itself (depth 0).
+    assert_eq!(
+        containing_module_id(&conn, "python:module:pkg.mod")
+            .expect("query")
+            .as_deref(),
+        Some("python:module:pkg.mod"),
+    );
+    // A symbol with no module ancestor returns None.
+    insert_entity(&conn, "python:function:orphan", "function");
+    assert_eq!(
+        containing_module_id(&conn, "python:function:orphan").expect("query"),
+        None,
     );
 }

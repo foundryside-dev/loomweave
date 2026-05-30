@@ -10,12 +10,12 @@ This `docs/` tree is organized by reader intent:
 
 - New to the suite: [suite/briefing.md](./suite/briefing.md)
 - Evaluating the Loom doctrine: [suite/loom.md](./suite/loom.md)
-- Starting Clarion v0.1: [clarion/v0.1/README.md](./clarion/v0.1/README.md)
+- Starting Clarion v1.0: [clarion/1.0/README.md](./clarion/1.0/README.md)
 - Configuring OpenRouter: [operator/openrouter.md](./operator/openrouter.md)
 
 ## Canonical vs supporting docs
 
 - Canonical suite docs live in [suite/](./suite/README.md).
-- Canonical Clarion v0.1 design docs live in [clarion/v0.1/](./clarion/v0.1/README.md).
-- Supporting reviews and planning history live alongside the relevant version under `reviews/` and `plans/`.
+- Canonical Clarion v0.1 design docs live in [clarion/v0.1/](./clarion/1.0/README.md).
 - Architecture decisions live in [clarion/adr/](./clarion/adr/README.md).
+- Supporting reviews, scope memos, sprint plans, and agent handoffs are archived under [implementation/](./implementation/README.md) — non-normative.

@@ -29,7 +29,7 @@ from typing import IO, Any
 
 from clarion_plugin_python import __version__
 from clarion_plugin_python.extractor import extract_with_stats
-from clarion_plugin_python.pyright_session import PyrightSession
+from clarion_plugin_python.pyright_session import PyrightRunState, PyrightSession
 from clarion_plugin_python.stdout_guard import install_stdio
 from clarion_plugin_python.wardline_probe import probe as wardline_probe
 
@@ -46,6 +46,7 @@ WARDLINE_MAX_VERSION = "2.0.0"
 # default (8 MiB) so the plugin never emits a frame the host would kill us
 # for. Oversize outbound payloads trip this before reaching the wire.
 MAX_CONTENT_LENGTH = 8 * 1024 * 1024
+MAX_FILES_PER_PYRIGHT_SESSION = 25
 
 # JSON-RPC 2.0 error codes (§5.1) plus LSP-style server extensions.
 _ERR_INVALID_REQUEST = -32600
@@ -66,6 +67,8 @@ class ServerState:
     shutdown_requested: bool = False
     project_root: Path | None = field(default=None)
     pyright: PyrightSession | None = field(default=None)
+    pyright_files_since_restart: int = 0
+    pyright_run_state: PyrightRunState = field(default_factory=PyrightRunState)
 
 
 def read_frame(stream: IO[bytes]) -> dict[str, Any] | None:
@@ -193,7 +196,10 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
         return {"entities": [], "edges": [], "stats": empty_stats}
     path = Path(file_path_raw)
     if state.pyright is None:
-        state.pyright = PyrightSession(state.project_root or path.parent)
+        state.pyright = PyrightSession(
+            state.project_root or path.parent,
+            run_state=state.pyright_run_state,
+        )
     try:
         source = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
@@ -210,6 +216,11 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
         call_resolver=state.pyright,
         reference_resolver=state.pyright,
     )
+    state.pyright_files_since_restart += 1
+    if state.pyright_files_since_restart >= MAX_FILES_PER_PYRIGHT_SESSION:
+        state.pyright.close()
+        state.pyright = None
+        state.pyright_files_since_restart = 0
     stats = {
         "unresolved_call_sites_total": result.stats.unresolved_call_sites_total,
         "unresolved_call_sites": result.stats.unresolved_call_sites,

@@ -140,6 +140,6 @@ Document that the field exists; let each plugin pick its own version semantics.
 
 - [B.2 design doc](../../implementation/sprint-2/b2-class-module-entities.md) §5 — first ontology_version bump cite.
 - [B.3 design doc](../../implementation/sprint-2/b3-contains-edges.md) §7 — second ontology_version bump cite.
-- [Sprint-2 kickoff handoff](../../superpowers/handoffs/2026-04-30-sprint-2-kickoff.md) §"`ontology_version` bump policy" — the original ambiguous formulation that motivated this ADR.
+- [Sprint-2 kickoff handoff](../../implementation/handoffs/2026-04-30-sprint-2-kickoff.md) §"`ontology_version` bump policy" — the original ambiguous formulation that motivated this ADR.
 - [Filigree clarion-8befae708b](.) — CI lint guard for plugin.toml ↔ server.py ONTOLOGY_VERSION drift (P3 follow-up; not blocking).
 - [Semver 2.0.0](https://semver.org) — the broader convention this ADR adopts.

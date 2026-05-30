@@ -27,9 +27,10 @@
 //! only calls `setrlimit(2)`, which is async-signal-safe per POSIX.1-2017
 //! §2.4.3. The `unsafe` block is the minimum required by the `pre_exec` API.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -413,7 +414,28 @@ where
     /// `None`. Capacity is [`STDERR_TAIL_BYTES`]; oldest bytes are
     /// discarded on overflow so the plugin cannot back-pressure the host
     /// via stderr writes.
-    stderr_tail: Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>>,
+    stderr_tail: Option<Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>>,
+    /// Canonical source paths whose entities must not be sent for LLM briefing.
+    briefing_blocks: Arc<BTreeMap<PathBuf, BriefingBlockReason>>,
+    /// Canonical source paths that were covered by the core pre-ingest scanner.
+    scanned_source_files: Arc<BTreeSet<PathBuf>>,
+}
+
+/// File-level reason an entity must not be dispatched for LLM briefing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BriefingBlockReason {
+    SecretPresent,
+    UnscannedSource,
+}
+
+impl BriefingBlockReason {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SecretPresent => "secret_present",
+            Self::UnscannedSource => "unscanned_source",
+        }
+    }
 }
 
 /// Size of the stderr ring buffer kept for diagnostics. 64 KiB holds
@@ -428,7 +450,7 @@ pub const STDERR_TAIL_BYTES: usize = 64 * 1024;
 #[cfg(unix)]
 fn drain_stderr_into_ring(
     mut stderr: std::process::ChildStderr,
-    ring: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
+    ring: &Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
 ) {
     use std::io::Read;
     let mut buf = [0u8; 4096];
@@ -661,6 +683,8 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
             terminated: false,
             ontology_version: None,
             stderr_tail: None,
+            briefing_blocks: Arc::new(BTreeMap::new()),
+            scanned_source_files: Arc::new(BTreeSet::new()),
         }
     }
 
@@ -686,6 +710,22 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
     /// keying (ADR-007).
     pub fn ontology_version(&self) -> Option<&str> {
         self.ontology_version.as_deref()
+    }
+
+    /// Install file-level briefing blocks produced by the core pre-ingest
+    /// scanner. Keys are canonical source paths and values are typed policy
+    /// reasons rendered into `properties_json` by [`BriefingBlockReason::as_str`].
+    pub fn set_briefing_blocks(&mut self, blocks: Arc<BTreeMap<PathBuf, BriefingBlockReason>>) {
+        self.briefing_blocks = blocks;
+    }
+
+    /// Install canonical source paths covered by the pre-ingest scanner.
+    ///
+    /// If a plugin returns an entity for a jailed in-project path that is not in
+    /// this set, the entity is policy-blocked from LLM briefing because its file
+    /// bytes have not passed the scanner.
+    pub fn set_scanned_source_files(&mut self, files: Arc<BTreeSet<PathBuf>>) {
+        self.scanned_source_files = files;
     }
 
     /// Perform the `initialize` → `initialized` handshake.
@@ -824,7 +864,7 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
         let mut accepted = Vec::new();
 
         for raw_val in afr.entities {
-            let raw: RawEntity = match serde_json::from_value(raw_val) {
+            let mut raw: RawEntity = match serde_json::from_value(raw_val) {
                 Ok(e) => e,
                 Err(e) => {
                     // Drop the entity, but record the serde error so operators
@@ -923,6 +963,8 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
                 return Err(HostError::EntityCapExceeded(e));
             }
 
+            self.apply_briefing_block(&mut raw, &jailed);
+
             accepted.push(AcceptedEntity {
                 id: expected_id,
                 kind: raw.kind.clone(),
@@ -940,6 +982,25 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
             edges: accepted_edges,
             stats,
         })
+    }
+
+    fn apply_briefing_block(&self, raw: &mut RawEntity, jailed: &str) {
+        let jailed_path = Path::new(jailed);
+        let reason = self.briefing_blocks.get(jailed_path).copied().or_else(|| {
+            (!self.scanned_source_files.contains(jailed_path))
+                .then_some(BriefingBlockReason::UnscannedSource)
+        });
+        // Scanner is the sole authority over `briefing_blocked`. Strip any
+        // plugin-supplied value first so a malicious or buggy plugin cannot
+        // unblock an entity by emitting `"briefing_blocked": <anything>`, and
+        // cannot over-block by injecting a reason the scanner did not assign.
+        raw.extra.remove("briefing_blocked");
+        if let Some(reason) = reason {
+            raw.extra.insert(
+                "briefing_blocked".to_owned(),
+                serde_json::Value::String(reason.as_str().to_owned()),
+            );
+        }
     }
 
     /// B.3: per-edge validation pipeline. Mirrors the entity loop's

@@ -3,7 +3,7 @@
 **Status**: Accepted
 **Date**: 2026-05-05
 **Deciders**: qacona@gmail.com
-**Context**: B.3 (Sprint 2 Tier B) introduces the first edge kind Clarion has ever persisted (`contains`). Sprint-1 locked entity wire shape but explicitly deferred edge wire shape: the kickoff handoff at `docs/superpowers/handoffs/2026-04-30-sprint-2-kickoff.md` §"Edge wire shape" states "B.3's first edge will define the protocol-level wire shape". Three coupled decisions arise — the wire envelope, the edge-row identity in storage, and the per-kind contract for `source_byte_start/end`. Locking them together prevents the four later edge kinds (`calls`, `imports`, `decorates`, `inherits_from`) from inheriting an under-specified precedent.
+**Context**: B.3 (Sprint 2 Tier B) introduces the first edge kind Clarion has ever persisted (`contains`). Sprint-1 locked entity wire shape but explicitly deferred edge wire shape: the kickoff handoff at `docs/implementation/handoffs/2026-04-30-sprint-2-kickoff.md` §"Edge wire shape" states "B.3's first edge will define the protocol-level wire shape". Three coupled decisions arise — the wire envelope, the edge-row identity in storage, and the per-kind contract for `source_byte_start/end`. Locking them together prevents the four later edge kinds (`calls`, `imports`, `decorates`, `inherits_from`) from inheriting an under-specified precedent.
 
 ## Summary
 
@@ -192,6 +192,6 @@ Instead of typed `source_byte_start/end` columns, edges carry a `properties: { s
 ## References
 
 - [B.3 design doc](../../implementation/sprint-2/b3-contains-edges.md) — wire shape, emission policy, parent_id provenance, manifest bump, test plan.
-- [Sprint-2 kickoff handoff §"Edge wire shape"](../../superpowers/handoffs/2026-04-30-sprint-2-kickoff.md) — the deferral this ADR resolves.
+- [Sprint-2 kickoff handoff §"Edge wire shape"](../../implementation/handoffs/2026-04-30-sprint-2-kickoff.md) — the deferral this ADR resolves.
 - [Sprint-1 walking-skeleton e2e](../../../tests/e2e/sprint_1_walking_skeleton.sh) — extends to assert at least one edge row post-B.3.
 - Five-reviewer panel transcripts (in B.3 brainstorming conversation log on `sprint-2/b3-design` branch).

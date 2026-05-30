@@ -1,11 +1,20 @@
 # ADR-012: HTTP Read-API Authentication — Unix Domain Socket Default with Token Fallback
 
-**Status**: Accepted
+**Status**: Superseded for the ADR-014 registry-backend HTTP read API
 **Date**: 2026-04-18
 **Deciders**: qacona@gmail.com
 **Context**: `clarion serve` exposes the read API to sibling tools; v0.1 panel threat-model scored the original `auth: none` default at risk 9 (T-02)
 
 ## Summary
+
+**2026-05-19 supersession note**: ADR-014 now owns the security posture for the
+Clarion HTTP read API used by Filigree's `registry_backend: clarion` mode. That
+surface is unauthenticated and loopback-only by default, refuses non-loopback
+binds unless `serve.http.allow_non_loopback: true`, and relies on an
+operator-managed authenticated reverse proxy or equivalent access-control layer
+for non-loopback exposure. The UDS/token design below remains historical context
+for the earlier broad v0.1 HTTP API proposal; it is not the implementation
+contract for the ADR-014 federation read surface.
 
 `clarion serve` defaults to **Unix domain socket** at `.clarion/socket` (mode 0600, owner = current UID). Filesystem permissions are the auth; no network bind, no Bearer tokens, no CAP_NET_BIND_SERVICE surface. When a UDS is unavailable (Windows, SSH-port-forwarded remote access, cross-UID-namespace containers), `serve.auth: token` falls back to TCP on `127.0.0.1:8765` + a Bearer token auto-minted at `.clarion/auth.token` (mode 0600). `serve.auth: none` remains configurable for operators who explicitly accept the unauthenticated-loopback posture, but now emits `CLA-INFRA-HTTP-AUTH-DISABLED` (severity ERROR) per serve startup and shows a persistent banner in logs. The default flip closes T-02 and structurally reduces T-05 (DNS rebinding) by eliminating the TCP bind in the primary path.
 
@@ -148,13 +157,13 @@ v0.1 tokens carry scope claims — read-only catalog, read-only findings, submit
 
 ## Related Decisions
 
-- ADR-005 (pending; see the [ADR index backlog](./README.md)) — `.clarion/` git-committable by default, but `.clarion/socket` and `.clarion/auth.token` are runtime artifacts that must be excluded. ADR-005 picks the `.gitignore` rules that protect against both.
+- [ADR-005](./ADR-005-clarion-dir-tracking.md) — `.clarion/` git-committable by default, but `.clarion/socket` and `.clarion/auth.token` are runtime artifacts that must be excluded. ADR-005 picks the `.gitignore` rules that protect against both.
 - [ADR-021](./ADR-021-plugin-authority-hybrid.md) — closes the plugin-side attack surface (T-01, T-08, T-11, T-12); this ADR closes the HTTP-side attack surface (T-02, T-05). Together they are the panel's "three non-negotiable v0.1 controls" (third being ADR-013, secret scanner).
 
 ## References
 
-- [Clarion v0.1 panel threat model T-02](../v0.1/reviews/panel-2026-04-17/09-threat-model.md) (line 233) — original risk scoring.
-- [Panel threat model §12 recommendation 1](../v0.1/reviews/panel-2026-04-17/09-threat-model.md) (line 298) — the specific "authenticated or not listening" prescription.
+- [Clarion v0.1 panel threat model T-02](../../implementation/v0.1-reviews/panel-2026-04-17/09-threat-model.md) (line 233) — original risk scoring.
+- [Panel threat model §12 recommendation 1](../../implementation/v0.1-reviews/panel-2026-04-17/09-threat-model.md) (line 298) — the specific "authenticated or not listening" prescription.
 - [Clarion v0.1 system design §10 "Loopback is not a security boundary"](../v0.1/system-design.md) — the paragraph this ADR flips; updated in the same commit.
-- [Clarion v0.1 detailed design §7 Token auth — full spec](../v0.1/detailed-design.md) (lines 1286-1304) — the token machinery this ADR reuses as the fallback.
-- [Clarion v0.1 scope commitments — action 5](../v0.1/plans/v0.1-scope-commitments.md) (line 199) — the commitment mandate.
+- [ADR-014](./ADR-014-filigree-registry-backend.md) — supersedes this ADR for the active registry-backend HTTP read API trust model.
+- [Clarion v0.1 scope commitments — action 5](../../implementation/v0.1-scope-plans/v0.1-scope-commitments.md) (line 199) — the commitment mandate.

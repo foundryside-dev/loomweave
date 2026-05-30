@@ -22,6 +22,31 @@ fn prepared_db(dir: &tempfile::TempDir) -> std::path::PathBuf {
     path
 }
 
+/// Direct-SQL entity seed for tests that need an `entities` row but must
+/// bypass the writer's `BeginRun → InsertEntity` protocol (e.g. tests
+/// verifying that non-analyze writer commands work without an active run).
+fn seed_entity_row(path: &std::path::Path, id: &str) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute(
+        "INSERT INTO entities ( \
+            id, plugin_id, kind, name, short_name, properties, \
+            content_hash, created_at, updated_at \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            id,
+            "python",
+            "function",
+            id,
+            id.rsplit('.').next().unwrap_or(id),
+            "{}",
+            format!("hash-{id}"),
+            now_iso(),
+            now_iso(),
+        ],
+    )
+    .expect("seed entity row");
+}
+
 fn now_iso() -> String {
     "2026-04-18T00:00:00.000Z".to_owned()
 }
@@ -258,6 +283,12 @@ async fn send<T>(
 async fn summary_cache_writer_commands_do_not_require_active_analyze_run() {
     let dir = tempfile::tempdir().unwrap();
     let path = prepared_db(&dir);
+    // summary_cache.entity_id has an FK to entities(id) (V11-STO-03). Seed the
+    // referenced entity directly so the FK is satisfied without going through
+    // the writer's BeginRun → InsertEntity protocol — the whole point of this
+    // test is that summary_cache writer commands work *without* an active
+    // analyze run.
+    seed_entity_row(&path, "python:function:demo.hello");
     let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
     let tx = writer.sender();
 
@@ -543,6 +574,258 @@ async fn round_trip_insert_persists_entity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn insert_entity_is_idempotent_across_runs() {
+    // Regression: `clarion analyze` re-runs against an unchanged corpus
+    // must not crash with `UNIQUE constraint failed: entities.id`. The
+    // insert path UPSERTs on `id`, preserving `created_at`/`first_seen_commit`
+    // and updating the rest from the new run. WS-D smoke gate.
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    let entity_id = "python:function:demo.hello";
+    let first_created = "2026-05-01T00:00:00Z".to_owned();
+    let first_updated = "2026-05-01T00:00:00Z".to_owned();
+    let second_updated = "2026-05-02T00:00:00Z".to_owned();
+
+    // Run 1: insert.
+    send::<()>(&tx, |ack| WriterCmd::BeginRun {
+        run_id: "run-1".into(),
+        config_json: "{}".into(),
+        started_at: now_iso(),
+        ack,
+    })
+    .await
+    .unwrap();
+    let mut e = make_entity(entity_id);
+    e.created_at = first_created.clone();
+    e.updated_at = first_updated.clone();
+    e.first_seen_commit = Some("commit-abc".to_owned());
+    e.last_seen_commit = Some("commit-abc".to_owned());
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(e),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-1".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    // Run 2: re-insert same id with refreshed fields. Must not raise UNIQUE.
+    send::<()>(&tx, |ack| WriterCmd::BeginRun {
+        run_id: "run-2".into(),
+        config_json: "{}".into(),
+        started_at: now_iso(),
+        ack,
+    })
+    .await
+    .unwrap();
+    let mut e2 = make_entity(entity_id);
+    e2.short_name = "hello-v2".to_owned();
+    e2.created_at = "2026-12-31T00:00:00Z".to_owned();
+    e2.updated_at = second_updated.clone();
+    e2.first_seen_commit = Some("commit-NEW-should-be-ignored".to_owned());
+    e2.last_seen_commit = Some("commit-xyz".to_owned());
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(e2),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-2".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let pool = ReaderPool::open(&path, 2).unwrap();
+    let (count, short_name, created_at, updated_at, first_commit, last_commit): (
+        i64,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = pool
+        .with_reader(move |conn| {
+            let n: i64 = conn.query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))?;
+            let row = conn.query_row(
+                "SELECT short_name, created_at, updated_at, first_seen_commit, last_seen_commit \
+                 FROM entities WHERE id = ?1",
+                rusqlite::params![entity_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )?;
+            Ok((n, row.0, row.1, row.2, row.3, row.4))
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "second InsertEntity must not duplicate the row");
+    assert_eq!(
+        short_name, "hello-v2",
+        "mutable fields refresh on re-insert"
+    );
+    assert_eq!(
+        created_at, first_created,
+        "created_at is preserved across re-insert"
+    );
+    assert_eq!(
+        updated_at, second_updated,
+        "updated_at refreshes to latest run's value"
+    );
+    assert_eq!(
+        first_commit, "commit-abc",
+        "first_seen_commit is preserved across re-insert"
+    );
+    assert_eq!(
+        last_commit, "commit-xyz",
+        "last_seen_commit refreshes to latest run's value"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_run_reopens_existing_row_without_pk_conflict() {
+    // REQ-FINDING-05 `--resume`: reopening a prior run must reuse its `runs`
+    // row, not `INSERT` a second one (which would fail on the run PK — the
+    // documented blocker that made `--resume` more than flag-wiring). After a
+    // completed run, `ResumeRun` flips the row back to `running` / clears
+    // `completed_at`, a re-walk upserts entities, and a second `CommitRun`
+    // finalizes the *same* row.
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    // Original run: begin → insert → complete.
+    send::<()>(&tx, |ack| WriterCmd::BeginRun {
+        run_id: "run-1".into(),
+        config_json: "{}".into(),
+        started_at: now_iso(),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(make_entity("python:function:demo.hello")),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-1".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    // Resume the same run id: must NOT raise `UNIQUE constraint failed: runs.id`.
+    send::<()>(&tx, |ack| WriterCmd::ResumeRun {
+        run_id: "run-1".into(),
+        ack,
+    })
+    .await
+    .expect("ResumeRun must reuse the existing run row, not insert a duplicate");
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(make_entity("python:function:demo.world")),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-1".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let pool = ReaderPool::open(&path, 2).unwrap();
+    let (run_rows, status, entity_count): (i64, String, i64) = pool
+        .with_reader(|conn| {
+            let run_rows: i64 =
+                conn.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))?;
+            let status: String =
+                conn.query_row("SELECT status FROM runs WHERE id = 'run-1'", [], |row| {
+                    row.get(0)
+                })?;
+            let entity_count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))?;
+            Ok((run_rows, status, entity_count))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        run_rows, 1,
+        "resume reuses the run row — no second `runs` row"
+    );
+    assert_eq!(
+        status, "completed",
+        "the resumed run finalizes to completed"
+    );
+    assert_eq!(
+        entity_count, 2,
+        "both walks' entities persist under one run"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_run_errors_when_run_id_unknown() {
+    // Resuming a run id that was never begun is a caller error, not a silent
+    // no-op or an accidental insert.
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    let err = send::<()>(&tx, |ack| WriterCmd::ResumeRun {
+        run_id: "never-begun".into(),
+        ack,
+    })
+    .await
+    .expect_err("resuming an unknown run id must error");
+    assert!(
+        matches!(err, clarion_storage::StorageError::WriterProtocol(ref m) if m.contains("never-begun")),
+        "error names the missing run id: {err}"
+    );
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn non_core_plugin_cannot_insert_reserved_entity_kind() {
     let dir = tempfile::tempdir().unwrap();
     let path = prepared_db(&dir);
@@ -702,6 +985,134 @@ async fn writer_inserts_fact_findings() {
             "[]".to_owned(),
             "[]".to_owned(),
         )
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn insert_finding_is_idempotent_on_resume() {
+    // REQ-FINDING-05 `--resume`: a finding id embeds its run_id, so a resume
+    // re-walk regenerates the same id. `InsertFinding` must UPSERT (refresh
+    // analysis-derived fields, preserve `created_at` and lifecycle) rather than
+    // fail on `UNIQUE constraint: findings.id`.
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    let finding = |message: &str, created_at: &str, updated_at: &str| FindingRecord {
+        id: "core:finding:run-resume:weak-modularity".to_owned(),
+        tool: "clarion".to_owned(),
+        tool_version: "1.0.0".to_owned(),
+        run_id: "run-resume".to_owned(),
+        rule_id: "CLA-FACT-CLUSTERING-WEAK-MODULARITY".to_owned(),
+        kind: "fact".to_owned(),
+        severity: "INFO".to_owned(),
+        confidence: Some(0.9),
+        confidence_basis: Some("deterministic".to_owned()),
+        entity_id: "python:module:demo".to_owned(),
+        related_entities_json: r#"["python:module:demo"]"#.to_owned(),
+        message: message.to_owned(),
+        evidence_json: r#"{"modularity_score":0.0}"#.to_owned(),
+        properties_json: r#"{"threshold":0.25}"#.to_owned(),
+        supports_json: "[]".to_owned(),
+        supported_by_json: "[]".to_owned(),
+        created_at: created_at.to_owned(),
+        updated_at: updated_at.to_owned(),
+    };
+
+    // Original run: insert the finding.
+    begin_demo_run(&tx, "run-resume").await;
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(make_module_entity("python:module:demo")),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::InsertFinding {
+        finding: Box::new(finding(
+            "first message",
+            "2026-05-01T00:00:00Z",
+            "2026-05-01T00:00:00Z",
+        )),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-resume".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    // Resume: re-insert the same finding id with a refreshed message. Must not
+    // raise UNIQUE; must refresh `message`/`updated_at`, preserve `created_at`.
+    send::<()>(&tx, |ack| WriterCmd::ResumeRun {
+        run_id: "run-resume".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::InsertFinding {
+        finding: Box::new(finding(
+            "refreshed message",
+            "2099-01-01T00:00:00Z",
+            "2026-05-02T00:00:00Z",
+        )),
+        ack,
+    })
+    .await
+    .expect("re-inserting a run-scoped finding id on resume must upsert, not error");
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-resume".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let conn = Connection::open(path).unwrap();
+    let (count, message, status, created_at, updated_at): (i64, String, String, String, String) =
+        conn.query_row(
+            "SELECT COUNT(*), MAX(message), MAX(status), MAX(created_at), MAX(updated_at) \
+             FROM findings WHERE id = 'core:finding:run-resume:weak-modularity'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(count, 1, "resume upserts the finding — no duplicate row");
+    assert_eq!(
+        message, "refreshed message",
+        "analysis-derived fields refresh"
+    );
+    assert_eq!(
+        status, "open",
+        "lifecycle status is preserved across resume"
+    );
+    assert_eq!(
+        created_at, "2026-05-01T00:00:00Z",
+        "created_at (first-seen) is preserved across resume",
+    );
+    assert_eq!(
+        updated_at, "2026-05-02T00:00:00Z",
+        "updated_at refreshes to the resume walk's value",
     );
 }
 

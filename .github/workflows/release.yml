@@ -1,0 +1,489 @@
+name: Release
+
+# Per ADR-033 — pushed tags matching v* trigger a multi-platform binary build
+# plus Python plugin sdist, attached to a GitHub Release. Build jobs run only
+# after the `verify` gate (mirroring ci.yml) is green, so a broken commit
+# cannot publish a Release with `draft: false`.
+on:
+  push:
+    tags:
+      - "v*"
+  # Manual dispatch produces build artifacts on the workflow run for inspection.
+  # The `release` job is gated on event_name == 'push', so workflow_dispatch
+  # never publishes a public Release — it only validates that the build/verify
+  # plumbing is healthy before a tag push.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RUSTFLAGS: "-D warnings"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    # Pre-release gate: must mirror ci.yml so a broken commit cannot reach the
+    # build/publish jobs. Duplicated rather than refactored into a reusable
+    # workflow on the eve of 1.0; that refactor is post-release scope.
+    name: Verify (pre-release gates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+
+      - name: Assert tagged commit is on main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || \
+            { echo "::error::tag does not point to a commit on main"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          key: release-verify
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+
+      - name: cache pyright runtime
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ~/.cache/pyright-python/
+          key: pyright-python-1.1.409-${{ runner.os }}
+
+      - name: rust fmt
+        run: cargo fmt --all -- --check
+
+      - name: migration retirement guard
+        run: |
+          python scripts/check-migration-retirement.py --self-test
+          python scripts/check-migration-retirement.py
+
+      - name: cross-workspace version lockstep
+        run: python scripts/check-workspace-version-lockstep.py
+
+      - name: rust clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: install cargo-nextest
+        uses: taiki-e/install-action@e310bff3ef77234d477d6bb655da153a5c49d1db
+
+      - name: rust build workspace bins
+        run: cargo build --workspace --bins
+
+      - name: rust nextest
+        run: cargo nextest run --workspace --all-features --no-tests=pass
+
+      - name: rust doc
+        run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+      - name: install cargo-deny
+        uses: taiki-e/install-action@2e721ffcfc34740897fc3130e2dd782b1c136896
+
+      - name: cargo deny
+        run: cargo deny check
+
+      - name: check B.4* gate result freshness
+        run: python scripts/check-b4-gate-result.py
+
+      - name: check Python ontology version lockstep
+        run: |
+          python scripts/check-python-ontology-version.py --self-test
+          python scripts/check-python-ontology-version.py
+
+      - name: install plugin (dev extras)
+        run: python -m pip install -e 'plugins/python[dev]'
+
+      - name: ruff check
+        run: ruff check plugins/python
+
+      - name: ruff format check
+        run: ruff format --check plugins/python
+
+      - name: mypy
+        run: mypy --strict plugins/python
+
+      - name: pytest
+        run: pytest plugins/python
+
+      - name: install sqlite3 cli
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends sqlite3
+
+      - name: walking skeleton (end-to-end)
+        run: bash tests/e2e/sprint_1_walking_skeleton.sh
+
+      - name: WP5 secret scanner smoke
+        run: CARGO_BUILD=0 bash tests/e2e/wp5_secret_scan.sh
+
+      - name: Sprint 2 MCP surface
+        run: CARGO_BUILD=0 bash tests/e2e/sprint_2_mcp_surface.sh
+
+      - name: Phase 3 subsystems
+        run: CARGO_BUILD=0 bash tests/e2e/phase3_subsystems.sh
+
+  release-governance:
+    name: GitHub release governance
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: enforce repository release controls
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_GOVERNANCE_TOKEN }}
+        run: |
+          set -euo pipefail
+          python scripts/check-github-release-governance.py \
+            --repository "${GITHUB_REPOSITORY}" \
+            --branch main
+
+  build-rust:
+    needs: [verify, release-governance]
+    name: Build clarion (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: aarch64-apple-darwin
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: build release
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --bin clarion --target ${{ matrix.target }}
+
+      - name: package
+        id: package
+        run: |
+          set -euo pipefail
+          STAGE="clarion-${{ matrix.target }}"
+          mkdir -p "$STAGE"
+          cp "target/${{ matrix.target }}/release/clarion" "$STAGE/"
+          cp README.md "$STAGE/"
+          if [ -f LICENSE ]; then cp LICENSE "$STAGE/"; fi
+          ARCHIVE="$STAGE.tar.gz"
+          tar czf "$ARCHIVE" "$STAGE"
+          # Portable across the runner matrix: macOS images ship `shasum`, not
+          # GNU `sha256sum`. Both emit the same `<hex>  <filename>` line.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+          else
+            shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+          fi
+          SMOKE_DIR="$(mktemp -d)"
+          tar xzf "$ARCHIVE" -C "$SMOKE_DIR"
+          "$SMOKE_DIR/$STAGE/clarion" --version
+          "$SMOKE_DIR/$STAGE/clarion" --help >/dev/null
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: clarion-${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release-subjects:
+    name: Derive release artifact subjects
+    runs-on: ubuntu-latest
+    needs: [build-rust, build-plugin]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      rust-subjects: ${{ steps.subjects.outputs.rust-subjects }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: artifacts
+
+      - name: compute Rust archive subjects
+        id: subjects
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' asset; do
+            digest=$(sha256sum "$asset" | cut -d' ' -f1)
+            printf '%s  %s\n' "$digest" "$(basename "$asset")"
+          done < <(find artifacts \( -name 'clarion-*.tar.gz' -o -name 'clarion_plugin_python*.tar.gz' \) -print0 | sort -z) > rust-subjects.txt
+          test -s rust-subjects.txt
+          echo "rust-subjects=$(base64 -w0 rust-subjects.txt)" >> "$GITHUB_OUTPUT"
+
+  build-plugin:
+    needs: [verify, release-governance]
+    name: Build Python plugin sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+
+      - name: install build
+        run: python -m pip install --upgrade build
+
+      - name: build sdist
+        run: python -m build --sdist --outdir dist plugins/python
+
+      - name: smoke install sdist
+        run: |
+          set -euo pipefail
+          python -m venv .venv-smoke
+          . .venv-smoke/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install dist/*.tar.gz
+          python -c "import clarion_plugin_python; assert clarion_plugin_python.__version__ == '1.0.0'"
+          command -v clarion-plugin-python
+
+      - name: checksum
+        run: |
+          set -euo pipefail
+          cd dist
+          for f in *.tar.gz; do
+            sha256sum "$f" > "$f.sha256"
+          done
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: clarion-plugin-python-sdist
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-rust, build-plugin]
+    # Only publish to a Release when a real tag pushed; workflow_dispatch leaves
+    # artifacts on the workflow run for inspection without creating a public Release.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: artifacts
+
+      - name: stage release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find artifacts -name '*.tar.gz' -o -name '*.tar.gz.sha256' \
+            | xargs -I{} cp {} release/
+          ls -la release/
+
+      - name: install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
+
+      - name: sign release archives
+        run: |
+          set -euo pipefail
+          for asset in release/*.tar.gz; do
+            cosign sign-blob --yes \
+              --output-signature "$asset.sig" \
+              --output-certificate "$asset.pem" \
+              "$asset"
+          done
+          ls -la release/
+
+      - name: smoke-verify release archive signatures
+        run: |
+          set -euo pipefail
+          for asset in release/*.tar.gz; do
+            cosign verify-blob \
+              --certificate "$asset.pem" \
+              --signature "$asset.sig" \
+              --certificate-identity-regexp "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/v.*" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "$asset"
+          done
+
+      - name: derive previous tag
+        id: prev
+        run: |
+          set -euo pipefail
+          PREV=$(git tag --sort=-v:refname | grep -v "^${GITHUB_REF_NAME}\$" | head -n1 || true)
+          if [ -z "$PREV" ]; then
+            echo "previous=" >> "$GITHUB_OUTPUT"
+            echo "No previous tag found (first release)."
+          else
+            echo "previous=$PREV" >> "$GITHUB_OUTPUT"
+            echo "Previous tag: $PREV"
+          fi
+
+      - name: generate notes
+        id: notes
+        run: |
+          set -euo pipefail
+          PREV="${{ steps.prev.outputs.previous }}"
+          # Derive the actual sdist filename from the staged artifact rather
+          # than hard-coding it: PEP 625 (and the hatchling build backend)
+          # normalize the project name and embed the version, so any version
+          # bump or normalization-rule change would invalidate a literal URL.
+          # `|| true` so `set -e` does not abort the script when the glob
+          # is empty — we want to fall through to the explicit error below.
+          SDIST_PATH=$(ls release/clarion[-_]plugin[-_]python*.tar.gz 2>/dev/null | head -n1 || true)
+          if [ -z "$SDIST_PATH" ]; then
+            echo "::error::no Python plugin sdist found in release/ — refusing to publish notes with a broken install link" >&2
+            exit 1
+          fi
+          SDIST_NAME=$(basename "$SDIST_PATH")
+          {
+            echo "## Clarion ${GITHUB_REF_NAME}"
+            echo ""
+            echo "### Install"
+            echo ""
+            echo "Pick the archive for your platform from the Assets list below."
+            echo "Verify the SHA256, extract, and place \`clarion\` on your \`\$PATH\`."
+            echo ""
+            echo "\`\`\`bash"
+            echo "curl -L -o clarion.tar.gz \\"
+            echo "  https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/clarion-x86_64-unknown-linux-gnu.tar.gz"
+            echo "tar xzf clarion.tar.gz"
+            echo "install clarion-x86_64-unknown-linux-gnu/clarion ~/.local/bin/"
+            echo ""
+            echo "pipx install \\"
+            echo "  https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${SDIST_NAME}"
+            echo "\`\`\`"
+            echo ""
+            echo "Full walkthrough: [docs/operator/getting-started.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/docs/operator/getting-started.md)."
+            echo ""
+            echo "### Changes"
+            echo ""
+            if [ -n "$PREV" ]; then
+              git log --merges --pretty='- %s (%h)' "${PREV}..${GITHUB_REF_NAME}" || true
+            else
+              echo "First release — see git history."
+            fi
+          } > NOTES.md
+          echo "notes-file=NOTES.md" >> "$GITHUB_OUTPUT"
+
+      - name: create release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Clarion ${{ github.ref_name }}
+          body_path: ${{ steps.notes.outputs.notes-file }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') }}
+          files: release/*
+          fail_on_unmatched_files: true
+
+  provenance:
+    name: Generate SLSA provenance
+    needs: [release, release-subjects]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a
+    with:
+      base64-subjects: ${{ needs.release-subjects.outputs.rust-subjects }}
+      upload-assets: true
+      upload-tag-name: ${{ github.ref_name }}
+      provenance-name: clarion-rust-binaries.intoto.jsonl
+
+  verify-published-release:
+    name: Verify published release assets
+    needs: [release]
+    runs-on: ubuntu-latest
+    # Post-publish gate: prove the assets actually served from the public
+    # GitHub Release match the signed local copies. The in-`release`-job
+    # `cosign verify-blob` only proves signing worked on the build runner; it
+    # does not prove the published download matches. This job downloads the
+    # public assets, recomputes SHA256 against the published `.sha256`
+    # sidecars, and re-verifies the cosign signatures against the public Rekor
+    # entries.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+    steps:
+      - name: install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
+
+      - name: download published assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p published
+          cd published
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern '*.tar.gz' \
+            --pattern '*.tar.gz.sha256' \
+            --pattern '*.tar.gz.sig' \
+            --pattern '*.tar.gz.pem'
+          ls -la
+
+      - name: recompute SHA256 against published checksums
+        run: |
+          set -euo pipefail
+          cd published
+          shopt -s nullglob
+          checksums=(*.tar.gz.sha256)
+          if [ ${#checksums[@]} -eq 0 ]; then
+            echo "::error::no .sha256 sidecars found in the published release" >&2
+            exit 1
+          fi
+          for sum in "${checksums[@]}"; do
+            sha256sum -c "$sum"
+          done
+
+      - name: cosign verify published archives against Rekor
+        run: |
+          set -euo pipefail
+          cd published
+          shopt -s nullglob
+          archives=(*.tar.gz)
+          if [ ${#archives[@]} -eq 0 ]; then
+            echo "::error::no .tar.gz archives found in the published release" >&2
+            exit 1
+          fi
+          for asset in "${archives[@]}"; do
+            cosign verify-blob \
+              --certificate "$asset.pem" \
+              --signature "$asset.sig" \
+              --certificate-identity-regexp "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/v.*" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "$asset"
+          done

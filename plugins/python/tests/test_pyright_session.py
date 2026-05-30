@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import shutil
 import stat
 import sys
@@ -20,6 +21,11 @@ from clarion_plugin_python.pyright_session import (
     FINDING_PYRIGHT_UNAVAILABLE,
     LspTimeoutError,
     PyrightSession,
+    _CallSite,
+    _FunctionIndex,
+    _FunctionInfo,
+    _unresolved_call_site_total_for_function,
+    _unresolved_call_sites_for_function,
 )
 from clarion_plugin_python.reference_resolver import ReferenceSite, ReferenceSiteKind
 
@@ -36,7 +42,12 @@ def pyright_langserver() -> str:
         return str(venv_candidate)
     resolved = shutil.which("pyright-langserver")
     if resolved is None:
-        pytest.skip("pyright-langserver is not installed")
+        pytest.fail(
+            "pyright-langserver not found on PATH or in the active virtualenv. "
+            "It is a hard runtime dependency of clarion-plugin-python "
+            "(pyproject.toml `dependencies`); a missing executable means the "
+            "install is broken. Skipping these tests would mask a regression.",
+        )
     return resolved
 
 
@@ -44,6 +55,50 @@ def _write_module(tmp_path: Path, source: str, name: str = "demo.py") -> Path:
     path = tmp_path / name
     path.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
     return path
+
+
+def test_unresolved_call_site_details_omit_expressions_over_host_cap() -> None:
+    callee_expr = "factory." + ".".join(f"method_{idx:03d}" for idx in range(80))
+    assert len(callee_expr.encode("utf-8")) > 512
+    source = f"def caller():\n    {callee_expr}()\n"
+    tree = ast.parse(source)
+    function_node = cast("ast.FunctionDef", tree.body[0])
+    index = _FunctionIndex(
+        source=source,
+        line_starts=(0, len(b"def caller():\n")),
+        parse_latency_ms=0,
+        module_id="python:module:demo",
+        by_id={},
+        by_name_position={},
+        entity_by_name_position={},
+        by_short_name={},
+        dunder_call_by_class={},
+        functions=(),
+        entities=(),
+        tree=tree,
+    )
+    function = _FunctionInfo(
+        entity_id="python:function:demo.caller",
+        qualified_name="demo.caller",
+        name="caller",
+        line=0,
+        character=4,
+        end_line=1,
+        end_character=8,
+        call_sites=(
+            _CallSite(
+                line=1,
+                character=4,
+                end_line=1,
+                end_character=4 + len(callee_expr),
+                callee_expr=callee_expr,
+            ),
+        ),
+        node=function_node,
+    )
+
+    assert _unresolved_call_site_total_for_function(function, set()) == 1
+    assert _unresolved_call_sites_for_function(index, function, set()) == []
 
 
 def _finding_codes(result_findings: Sequence[Finding]) -> set[str]:
@@ -304,6 +359,20 @@ def test_pyright_session_reference_unavailable_binary_missing(tmp_path: Path) ->
     assert FINDING_PYRIGHT_UNAVAILABLE in _finding_codes(result.findings)
 
 
+def test_pyright_session_treats_project_local_venv_targets_as_external(tmp_path: Path) -> None:
+    target = tmp_path / ".venv" / "lib" / "python3.12" / "site-packages" / "demo.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("def helper():\n    pass\n", encoding="utf-8")
+    location = {
+        "uri": target.as_uri(),
+        "range": {"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 10}},
+    }
+
+    session = PyrightSession(tmp_path, executable=sys.executable)
+
+    assert session._target_id_from_location(location) == (None, True)  # noqa: SLF001
+
+
 def test_pyright_session_reference_site_cap(tmp_path: Path) -> None:
     source = "def world():\n    pass\n\nCONST_REF = world\n"
     module = _write_module(tmp_path, source)
@@ -354,9 +423,10 @@ class PartialReferenceTimeoutSession(PyrightSession):
         uri: str,
         site: ReferenceSite,
         *,
+        deadline: float,
         method: str = "textDocument/definition",
     ) -> tuple[list[str], bool]:
-        _ = (uri, method)
+        _ = (uri, deadline, method)
         self.requested_starts.append(site.source_byte_start)
         if site.source_byte_start == self.timeout_start:
             raise LspTimeoutError(method)
@@ -380,9 +450,10 @@ class CountingReferenceSession(PyrightSession):
         uri: str,
         site: ReferenceSite,
         *,
+        deadline: float,
         method: str = "textDocument/definition",
     ) -> tuple[list[str], bool]:
-        _ = (uri, method)
+        _ = (uri, deadline, method)
         self.requested_starts.append(site.source_byte_start)
         return [self.target_id], False
 
@@ -687,6 +758,29 @@ class TimeoutSession(PyrightSession):
         return super()._request(method, params, timeout_secs)
 
 
+class BudgetProbeSession(PyrightSession):
+    def __init__(self, project_root: Path) -> None:
+        super().__init__(
+            project_root,
+            executable=sys.executable,
+            call_timeout_secs=10.0,
+            file_timeout_secs=0.01,
+        )
+        self.request_timeouts: list[float] = []
+
+    def _ensure_process(self) -> bool:
+        return True
+
+    def _notify(self, method: str, params: dict[str, object]) -> None:
+        _ = (method, params)
+
+    def _request(self, method: str, params: dict[str, object], timeout_secs: float) -> object:
+        _ = (method, params)
+        self.request_timeouts.append(timeout_secs)
+        timeout_method = "budget probe"
+        raise LspTimeoutError(timeout_method)
+
+
 @pytest.mark.pyright
 def test_pyright_session_call_resolution_timeout(tmp_path: Path, pyright_langserver: str) -> None:
     module = _write_module(
@@ -704,6 +798,24 @@ def test_pyright_session_call_resolution_timeout(tmp_path: Path, pyright_langser
         result = session.resolve_calls(module, ["python:function:demo.caller"])
 
     assert result.edges == []
+    assert FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT in _finding_codes(result.findings)
+
+
+def test_pyright_session_caps_per_file_pyright_budget(tmp_path: Path) -> None:
+    module = _write_module(
+        tmp_path,
+        """
+        def caller():
+            print('x')
+        """,
+    )
+
+    with BudgetProbeSession(tmp_path) as session:
+        result = session.resolve_calls(module, ["python:function:demo.caller"])
+
+    assert result.edges == []
+    assert session.request_timeouts
+    assert max(session.request_timeouts) <= 0.01
     assert FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT in _finding_codes(result.findings)
 
 
@@ -764,3 +876,93 @@ def test_pyright_session_stderr_drain(tmp_path: Path) -> None:
 
     assert result.edges == []
     assert session.stderr_thread_alive is False
+
+
+def test_pyright_session_answers_workspace_configuration_requests(tmp_path: Path) -> None:
+    marker = tmp_path / "config-marker.txt"
+    script = _write_executable(
+        tmp_path,
+        textwrap.dedent(
+            """
+            #!/usr/bin/env python3
+            import json
+            import os
+            import sys
+            from pathlib import Path
+
+            def read_frame():
+                headers = {}
+                while True:
+                    line = sys.stdin.buffer.readline()
+                    if not line:
+                        return None
+                    if line == b"\\r\\n":
+                        break
+                    name, value = line.decode("ascii").strip().split(":", 1)
+                    headers[name.lower()] = value.strip()
+                return json.loads(sys.stdin.buffer.read(int(headers["content-length"])))
+
+            def write_frame(message):
+                body = json.dumps(message).encode("utf-8")
+                sys.stdout.buffer.write(
+                    b"Content-Length: " + str(len(body)).encode("ascii") + b"\\r\\n\\r\\n"
+                )
+                sys.stdout.buffer.write(body)
+                sys.stdout.buffer.flush()
+
+            initialize = read_frame()
+            write_frame(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "method": "workspace/configuration",
+                    "params": {
+                        "items": [
+                            {"section": "python"},
+                            {"section": "python.analysis"},
+                            {"section": "pyright"},
+                        ],
+                    },
+                },
+            )
+            config = read_frame()
+            result = config.get("result", [])
+            python = result[0].get("analysis", {}) if len(result) > 0 else {}
+            analysis = result[1] if len(result) > 1 else {}
+            ok = (
+                python.get("diagnosticMode") == "openFilesOnly"
+                and python.get("indexing") is False
+                and "**/.venv/**" in python.get("exclude", [])
+                and analysis.get("diagnosticMode") == "openFilesOnly"
+                and analysis.get("indexing") is False
+                and result[2] == {}
+            )
+            Path(os.environ["CONFIG_MARKER"]).write_text("ok" if ok else repr(config))
+            write_frame({"jsonrpc": "2.0", "id": initialize["id"], "result": {}})
+
+            while True:
+                frame = read_frame()
+                if frame is None:
+                    break
+                method = frame.get("method")
+                if method == "textDocument/prepareCallHierarchy":
+                    write_frame({"jsonrpc": "2.0", "id": frame["id"], "result": []})
+                elif method == "shutdown":
+                    write_frame({"jsonrpc": "2.0", "id": frame["id"], "result": {}})
+                elif method == "exit":
+                    break
+            """,
+        ).lstrip(),
+    )
+    module = _write_module(tmp_path, "def caller():\n    print('x')\n")
+
+    with PyrightSession(
+        tmp_path,
+        executable=str(script),
+        env={"CONFIG_MARKER": str(marker)},
+        init_timeout_secs=1.0,
+    ) as session:
+        result = session.resolve_calls(module, ["python:function:demo.caller"])
+
+    assert result.edges == []
+    assert marker.read_text(encoding="utf-8") == "ok"

@@ -15,12 +15,15 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 blake3.workspace = true
 clap.workspace = true
-clarion-core = { path = "../clarion-core", version = "0.1.0-dev" }
-clarion-mcp = { path = "../clarion-mcp", version = "0.1.0-dev" }
-clarion-storage = { path = "../clarion-storage", version = "0.1.0-dev" }
+clarion-core = { path = "../clarion-core", version = "1.0.0" }
+clarion-mcp = { path = "../clarion-mcp", version = "1.0.0" }
+clarion-scanner = { path = "../clarion-scanner", version = "1.0.0" }
+clarion-storage = { path = "../clarion-storage", version = "1.0.0" }
 dotenvy.workspace = true
+fs2.workspace = true
 ignore.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
@@ -29,6 +32,8 @@ serde_norway.workspace = true
 sha2.workspace = true
 time.workspace = true
 tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
@@ -36,7 +41,8 @@ xgraph.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
-clarion-plugin-fixture = { path = "../clarion-plugin-fixture", version = "0.1.0-dev" }
+clarion-plugin-fixture = { path = "../clarion-plugin-fixture", version = "1.0.0" }
 rusqlite.workspace = true
 serde_json.workspace = true
+sha1.workspace = true
 tempfile.workspace = true

@@ -88,13 +88,24 @@ clarion install
 log "running: clarion analyze ."
 clarion analyze .
 
+# ── 6b. Verify database integrity (STO-04) ───────────────────────────────────
+log "verifying database integrity via PRAGMA integrity_check ..."
+INTEGRITY=$(sqlite3 "$DEMO_DIR/.clarion/clarion.db" "PRAGMA integrity_check;")
+if [ "$INTEGRITY" != "ok" ]; then
+    log "integrity_check output:"
+    printf '%s\n' "$INTEGRITY" >&2
+    fail "expected PRAGMA integrity_check to report exactly 'ok'; got $INTEGRITY"
+fi
+
 # ── 7. Verify entity via sqlite3 ─────────────────────────────────────────────
 log "verifying persisted entity via sqlite3 ..."
 RESULT=$(sqlite3 "$DEMO_DIR/.clarion/clarion.db" "select id, kind from entities order by id;")
 # B.2 (Sprint 2): every analyzed file emits a module entity in addition to
-# its function/class entities. B.4* adds direct and dict-dispatch call sites.
+# its function/class entities. v1.0 also mints a core file entity for file
+# identity and federation reads. B.4* adds direct and dict-dispatch call sites.
 # B.5* adds a local annotation reference and a module-level name reference.
-EXPECTED="python:class:demo.Marker|class
+EXPECTED="core:file:demo.py|file
+python:class:demo.Marker|class
 python:function:demo.annotated|function
 python:function:demo.hello|function
 python:function:demo.via_dispatch|function

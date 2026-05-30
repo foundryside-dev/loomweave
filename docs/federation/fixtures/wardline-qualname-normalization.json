@@ -1,0 +1,144 @@
+{
+  "$comment": [
+    "Normative parity fixture for the Wardline -> Clarion entity-reconciliation",
+    "contract (ADR-018 2026-05-29 amendment, integration brief §4.A).",
+    "Wardline's native Filigree emitter sets metadata.wardline.qualname to the",
+    "PRE-COMPOSED dotted form so it byte-matches Clarion's canonical_qualified_name.",
+    "Each vector below is a (file_path, qualname) input and the exact dotted form",
+    "Wardline must emit. Divergence on any vector silently degrades reconciliation",
+    "to resolution_confidence: heuristic|none — there is no error, only a worse match.",
+    "This file is the STANDALONE spec vector; the live conformance oracle",
+    "(GET /api/v1/entities/resolve?scheme=wardline_qualname) is DEFERRED and not",
+    "implemented as of release:1.1. Mirrors the role of fixtures/entity_id.json."
+  ],
+  "rules_source": {
+    "module_normalization_fn": "plugins/python/src/clarion_plugin_python/extractor.py::module_dotted_name",
+    "module_normalization_tests": "plugins/python/tests/test_extractor.py::test_module_dotted_name_helper",
+    "composition": "expected_qualified_name = module_dotted_name(file_path) + '.' + qualname  (qualname is Python __qualname__, copied verbatim incl. '<locals>' and dotted class chains)",
+    "module_rules": [
+      "A leading 'src/' segment is stripped ONLY when it is the first path segment (UQ-WP3-05).",
+      "The '.py' suffix is dropped.",
+      "An '__init__' filename collapses to its containing package (UQ-WP3-06).",
+      "Remaining path separators become '.'.",
+      "No other root marker (lib/, app/, tests/, the project name, ...) is stripped.",
+      "A top-level '__init__.py' normalizes to '' and is REJECTED by entity_id() — Clarion skips the file; Wardline must not emit such an entity."
+    ],
+    "conformance_oracle": "GET /api/v1/entities/resolve?scheme=wardline_qualname (DEFERRED; not implemented at release:1.1)"
+  },
+  "module_normalization_vectors": [
+    {
+      "description": "src/-rooted module path",
+      "file_path": "src/auth/tokens.py",
+      "expected_module": "auth.tokens"
+    },
+    {
+      "description": "flat (non-src) layout — same file, no src/ prefix",
+      "file_path": "auth/tokens.py",
+      "expected_module": "auth.tokens"
+    },
+    {
+      "description": "package __init__ under src/ collapses to the package",
+      "file_path": "src/pkg/__init__.py",
+      "expected_module": "pkg"
+    },
+    {
+      "description": "package __init__ without src/ collapses to the package",
+      "file_path": "pkg/__init__.py",
+      "expected_module": "pkg"
+    },
+    {
+      "description": "nested module under src/",
+      "file_path": "src/pkg/sub/mod.py",
+      "expected_module": "pkg.sub.mod"
+    },
+    {
+      "description": "DIVERGENCE TRAP: non-src root 'lib/' is NOT stripped",
+      "file_path": "lib/foo.py",
+      "expected_module": "lib.foo",
+      "note": "An emitter that strips a generic 'source root' marker would wrongly produce 'foo'. Only a leading 'src/' is stripped."
+    },
+    {
+      "description": "DIVERGENCE TRAP: non-src root 'app/' is NOT stripped",
+      "file_path": "app/service.py",
+      "expected_module": "app.service"
+    },
+    {
+      "description": "DIVERGENCE TRAP: 'src' not at position 0 is NOT stripped",
+      "file_path": "a/src/b.py",
+      "expected_module": "a.src.b"
+    },
+    {
+      "description": "flat root-level module",
+      "file_path": "service.py",
+      "expected_module": "service"
+    },
+    {
+      "description": "namespace-package-style layout (no src/, implicit namespace dirs)",
+      "file_path": "myns/pkg/mod.py",
+      "expected_module": "myns.pkg.mod"
+    },
+    {
+      "description": "REJECTED: top-level __init__.py normalizes to empty and is skipped",
+      "file_path": "__init__.py",
+      "expected_module": "",
+      "note": "entity_id() rejects an empty qualified_name (crates/clarion-core/src/entity_id.rs). Clarion emits no entity for this file; a conformant Wardline emitter must not emit one either."
+    },
+    {
+      "description": "REJECTED: src/__init__.py normalizes to empty after src-strip",
+      "file_path": "src/__init__.py",
+      "expected_module": "",
+      "note": "Same as above — no package name survives."
+    }
+  ],
+  "qualified_name_vectors": [
+    {
+      "description": "class method",
+      "kind": "function",
+      "file_path": "src/auth/tokens.py",
+      "qualname": "TokenManager.verify",
+      "expected_qualified_name": "auth.tokens.TokenManager.verify",
+      "expected_entity_id": "python:function:auth.tokens.TokenManager.verify"
+    },
+    {
+      "description": "DIVERGENCE TRAP: closure carries Python '<locals>' marker verbatim",
+      "kind": "function",
+      "file_path": "src/auth/tokens.py",
+      "qualname": "refresh.<locals>.helper",
+      "expected_qualified_name": "auth.tokens.refresh.<locals>.helper",
+      "expected_entity_id": "python:function:auth.tokens.refresh.<locals>.helper",
+      "note": "The '<locals>' segment is part of __qualname__ and must be preserved, not stripped or rewritten."
+    },
+    {
+      "description": "DIVERGENCE TRAP: nested-class chain preserved verbatim",
+      "kind": "function",
+      "file_path": "src/pkg/sub/mod.py",
+      "qualname": "Outer.Inner.method",
+      "expected_qualified_name": "pkg.sub.mod.Outer.Inner.method",
+      "expected_entity_id": "python:function:pkg.sub.mod.Outer.Inner.method"
+    },
+    {
+      "description": "DIVERGENCE TRAP: non-src root preserved in the module prefix of a method",
+      "kind": "function",
+      "file_path": "lib/foo.py",
+      "qualname": "Service.handle",
+      "expected_qualified_name": "lib.foo.Service.handle",
+      "expected_entity_id": "python:function:lib.foo.Service.handle"
+    },
+    {
+      "description": "namespace-package module prefix on a top-level function",
+      "kind": "function",
+      "file_path": "myns/pkg/mod.py",
+      "qualname": "widget",
+      "expected_qualified_name": "myns.pkg.mod.widget",
+      "expected_entity_id": "python:function:myns.pkg.mod.widget"
+    },
+    {
+      "description": "module entity — no qualname; the module dotted name IS the qualified_name",
+      "kind": "module",
+      "file_path": "src/pkg/__init__.py",
+      "qualname": null,
+      "expected_qualified_name": "pkg",
+      "expected_entity_id": "python:module:pkg"
+    }
+  ]
+}

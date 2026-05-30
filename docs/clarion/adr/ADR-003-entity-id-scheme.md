@@ -24,6 +24,14 @@ Path-embedded IDs make routine moves and re-exports detach cross-tool references
 
 We will identify source entities as `{plugin_id}:{kind}:{canonical_qualified_name}` and keep file path as a property rather than as part of the primary ID.
 
+File-kind entities use the same grammar. The core file entity ID is
+`core:file:{qualified_name}`. For file entities, `{qualified_name}` is the
+canonical project-relative file qualified name; it must not contain `@`.
+Content-hash-plus-path forms such as
+`core:file:{content_hash}@{canonical_path}` are non-conforming because they
+embed path and drift state into the primary ID instead of storing those values
+as entity properties.
+
 For v0.1:
 
 - definition site wins for canonical naming
@@ -97,4 +105,4 @@ For later versions:
 
 - [Clarion v0.1 system design](../v0.1/system-design.md)
 - [Clarion v0.1 detailed design](../v0.1/detailed-design.md)
-- [Clarion v0.1 design review](../v0.1/reviews/pre-restructure/design-review.md)
+- [Clarion v0.1 design review](../../implementation/v0.1-reviews/pre-restructure/design-review.md)

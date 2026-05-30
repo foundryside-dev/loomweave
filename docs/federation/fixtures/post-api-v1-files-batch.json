@@ -1,0 +1,147 @@
+{
+  "_meta": {
+    "contract": "clarion-http-read-api",
+    "endpoint": "POST /api/v1/files/batch",
+    "api_version": 1,
+    "fixture_version": 1,
+    "stability": "normative",
+    "authority": "Clarion ADR-014 federation registry-backend contract (CONTRACT-1)",
+    "verification": "cargo test -p clarion-cli --test serve",
+    "normative": true,
+    "updated": "2026-05-19",
+    "description": "Contract examples for Clarion bulk file identity resolution consumed by Filigree registry backends. The batch endpoint runs all lookups inside a single ReaderPool checkout; ETag is intentionally not applied; auth (CONTRACT-2) applies."
+  },
+  "shape_decl": {
+    "kind": "clarion-http-fixture-shapes",
+    "shapes": {
+      "batch_resolution": {
+        "status": 200,
+        "required_fields": {
+          "resolved": {
+            "type": "array_of_resolved_items"
+          },
+          "not_found": {
+            "type": "array_of_strings"
+          },
+          "briefing_blocked": {
+            "type": "array_of_strings"
+          },
+          "errors": {
+            "type": "array_of_error_items"
+          }
+        },
+        "forbidden_fields": [
+          "error",
+          "code"
+        ],
+        "allow_extra_fields": false
+      },
+      "batch_envelope_error": {
+        "status_any": [
+          400,
+          401,
+          500,
+          503
+        ],
+        "required_fields": {
+          "error": {
+            "type": "non_empty_string"
+          },
+          "code": {
+            "type": "non_empty_string",
+            "enum": [
+              "INVALID_PATH",
+              "BATCH_TOO_LARGE",
+              "UNAUTHENTICATED",
+              "STORAGE_ERROR",
+              "INTERNAL"
+            ]
+          }
+        },
+        "forbidden_fields": [
+          "resolved",
+          "not_found",
+          "briefing_blocked",
+          "errors"
+        ],
+        "allow_extra_fields": false
+      }
+    }
+  },
+  "examples": [
+    {
+      "name": "batch_mixed_200",
+      "request": {
+        "method": "POST",
+        "path": "/api/v1/files/batch",
+        "body": {
+          "queries": [
+            {"path": "demo.py", "language": "python"},
+            {"path": "missing.py", "language": ""},
+            {"path": "blocked.py", "language": "python"},
+            {"path": "../escapes.py", "language": "python"}
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "shape": "batch_resolution",
+        "body": {
+          "resolved": [
+            {
+              "requested_path": "demo.py",
+              "entity_id": "core:file:demo.py",
+              "content_hash": "hash-demo-file",
+              "canonical_path": "demo.py",
+              "language": "python"
+            }
+          ],
+          "not_found": ["missing.py"],
+          "briefing_blocked": ["blocked.py"],
+          "errors": [
+            {
+              "requested_path": "../escapes.py",
+              "code": "PATH_OUTSIDE_PROJECT",
+              "message": "path is outside project root"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "batch_too_large_400",
+      "request": {
+        "method": "POST",
+        "path": "/api/v1/files/batch",
+        "body": "elided — request carries more than 256 entries in queries[]"
+      },
+      "response": {
+        "status": 400,
+        "shape": "batch_envelope_error",
+        "body": {
+          "error": "queries[] exceeds the per-batch maximum of 256 entries",
+          "code": "BATCH_TOO_LARGE"
+        }
+      }
+    },
+    {
+      "name": "batch_unauthorized_401",
+      "request": {
+        "method": "POST",
+        "path": "/api/v1/files/batch",
+        "body": {
+          "queries": [{"path": "demo.py", "language": "python"}]
+        },
+        "note": "Identity header missing or wrong; applies when serve.http.identity_token_env resolves at startup. Legacy bearer mode has the same error envelope."
+      },
+      "response": {
+        "status": 401,
+        "shape": "batch_envelope_error",
+        "body": {
+          "error": "authentication required",
+          "code": "UNAUTHENTICATED"
+        }
+      }
+    }
+  ]
+}

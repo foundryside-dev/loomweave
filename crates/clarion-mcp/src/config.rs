@@ -1,5 +1,5 @@
-use std::fs;
 use std::path::Path;
+use std::{fs, net::SocketAddr};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -10,6 +10,7 @@ pub struct McpConfig {
     #[serde(alias = "llm_policy")]
     pub llm: LlmConfig,
     pub integrations: IntegrationsConfig,
+    pub serve: ServeConfig,
 }
 
 impl McpConfig {
@@ -25,6 +26,7 @@ impl McpConfig {
         if raw.trim().is_empty() {
             return Ok(Self::default());
         }
+        reject_llm_policy_alias_collision(raw)?;
         let config: Self =
             serde_norway::from_str(raw).map_err(|err| ConfigError::Yaml(err.to_string()))?;
         config.validate()?;
@@ -45,6 +47,7 @@ impl McpConfig {
                 code: "CLA-CONFIG-FILIGREE-ACTOR-BLANK",
             });
         }
+        self.serve.http.validate_loopback_trust()?;
         Ok(())
     }
 }
@@ -58,6 +61,8 @@ pub struct LlmConfig {
     pub session_token_ceiling: u64,
     pub model_id: String,
     pub openrouter: OpenRouterConfig,
+    pub codex_cli: CodexCliConfig,
+    pub claude_cli: ClaudeCliConfig,
     pub recording_fixture_path: Option<String>,
     pub max_inferred_edges_per_caller: u32,
     pub cache_max_age_days: u32,
@@ -73,6 +78,8 @@ impl Default for LlmConfig {
             session_token_ceiling: 1_000_000,
             model_id: "anthropic/claude-sonnet-4.6".to_owned(),
             openrouter: OpenRouterConfig::default(),
+            codex_cli: CodexCliConfig::default(),
+            claude_cli: ClaudeCliConfig::default(),
             recording_fixture_path: None,
             max_inferred_edges_per_caller: 8,
             cache_max_age_days: 180,
@@ -86,6 +93,10 @@ impl Default for LlmConfig {
 pub enum LlmProviderKind {
     #[serde(rename = "openrouter", alias = "open_router")]
     OpenRouter,
+    #[serde(rename = "codex_cli", alias = "codex")]
+    CodexCli,
+    #[serde(rename = "claude_cli", alias = "claude_code")]
+    ClaudeCli,
     Anthropic,
     Recording,
 }
@@ -118,8 +129,101 @@ pub struct OpenRouterAttributionConfig {
 impl Default for OpenRouterAttributionConfig {
     fn default() -> Self {
         Self {
-            referer: "https://github.com/qacona/clarion".to_owned(),
+            referer: "https://github.com/tachyon-beep/clarion".to_owned(),
             title: "Clarion".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct CodexCliConfig {
+    pub executable: String,
+    pub model: Option<String>,
+    pub profile: Option<String>,
+    pub sandbox: CodexSandboxMode,
+    pub timeout_seconds: u64,
+}
+
+impl Default for CodexCliConfig {
+    fn default() -> Self {
+        Self {
+            executable: "codex".to_owned(),
+            model: None,
+            profile: None,
+            sandbox: CodexSandboxMode::ReadOnly,
+            timeout_seconds: 300,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexSandboxMode {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+impl CodexSandboxMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::WorkspaceWrite => "workspace-write",
+            Self::DangerFullAccess => "danger-full-access",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct ClaudeCliConfig {
+    pub executable: String,
+    pub model: Option<String>,
+    pub permission_mode: ClaudePermissionMode,
+    pub tools: Vec<String>,
+    pub timeout_seconds: u64,
+    pub max_turns: u32,
+    pub no_session_persistence: bool,
+    pub exclude_dynamic_system_prompt_sections: bool,
+}
+
+impl Default for ClaudeCliConfig {
+    fn default() -> Self {
+        Self {
+            executable: "claude".to_owned(),
+            model: None,
+            permission_mode: ClaudePermissionMode::Plan,
+            tools: Vec::new(),
+            timeout_seconds: 300,
+            max_turns: 2,
+            no_session_persistence: true,
+            exclude_dynamic_system_prompt_sections: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum ClaudePermissionMode {
+    #[serde(rename = "plan")]
+    Plan,
+    #[serde(rename = "default")]
+    Default,
+    #[serde(rename = "acceptEdits")]
+    AcceptEdits,
+    #[serde(rename = "bypassPermissions")]
+    BypassPermissions,
+}
+
+impl ClaudePermissionMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Default => "default",
+            Self::AcceptEdits => "acceptEdits",
+            Self::BypassPermissions => "bypassPermissions",
         }
     }
 }
@@ -130,6 +234,118 @@ pub struct IntegrationsConfig {
     pub filigree: FiligreeConfig,
 }
 
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct ServeConfig {
+    pub http: HttpReadConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct HttpReadConfig {
+    pub enabled: bool,
+    #[serde(deserialize_with = "deserialize_socket_addr")]
+    pub bind: SocketAddr,
+    pub allow_non_loopback: bool,
+    /// Name of the env var holding the inbound bearer token. When the env
+    /// var is set, every `/api/v1/files`-family request must carry
+    /// `Authorization: Bearer <that-value>`; the capabilities probe is
+    /// always unauthenticated. When the env var is unset on a loopback
+    /// bind, the surface stays unauthenticated (the v0.1 trust model).
+    /// When the env var is unset on a non-loopback bind, `clarion serve`
+    /// refuses to start (`CLA-CONFIG-HTTP-NO-AUTH`). Default
+    /// `CLARION_LOOM_TOKEN` matches Filigree's pinned client default.
+    pub token_env: String,
+    /// Optional env var holding the Loom component identity HMAC secret.
+    /// When configured, `clarion serve` refuses to start unless the env var
+    /// exists and protected HTTP read routes require
+    /// `X-Loom-Component: clarion:<hmac>`.
+    pub identity_token_env: Option<String>,
+}
+
+impl Default for HttpReadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: SocketAddr::from(([127, 0, 0, 1], 9111)),
+            allow_non_loopback: false,
+            token_env: "CLARION_LOOM_TOKEN".to_owned(),
+            identity_token_env: None,
+        }
+    }
+}
+
+impl HttpReadConfig {
+    pub fn validate_loopback_trust(&self) -> Result<(), ConfigError> {
+        if self.enabled && !self.allow_non_loopback && !self.is_loopback_bind() {
+            return Err(ConfigError::NonLoopbackHttpBind {
+                code: "CLA-CONFIG-HTTP-NON-LOOPBACK",
+                bind: self.bind,
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuse to start a non-loopback HTTP read API when the inbound bearer
+    /// token env var is unset. Loopback binds with the env var unset stay
+    /// unauthenticated (v0.1 trust matrix); the failure case is the explicit
+    /// `allow_non_loopback: true` opt-in plus an unset `token_env`.
+    pub fn validate_auth_trust<F>(&self, env_lookup: F) -> Result<(), ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        if !self.enabled {
+            return Ok(());
+        }
+        let has_identity_secret = match self.identity_token_env.as_deref() {
+            Some(env_var) => {
+                let has_secret = env_lookup(env_var)
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty());
+                if !has_secret {
+                    return Err(ConfigError::MissingHttpIdentitySecret {
+                        code: "CLA-CONFIG-HTTP-IDENTITY-MISSING",
+                        token_env: env_var.to_owned(),
+                    });
+                }
+                true
+            }
+            None => false,
+        };
+        if self.is_loopback_bind() {
+            return Ok(());
+        }
+        if has_identity_secret {
+            return Ok(());
+        }
+        let has_token = env_lookup(&self.token_env)
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+        if has_token {
+            return Ok(());
+        }
+        Err(ConfigError::NonLoopbackHttpNoAuth {
+            code: "CLA-CONFIG-HTTP-NO-AUTH",
+            bind: self.bind,
+            token_env: self.token_env.clone(),
+        })
+    }
+
+    #[must_use]
+    pub fn is_loopback_bind(&self) -> bool {
+        self.bind.ip().is_loopback()
+    }
+}
+
+fn deserialize_socket_addr<'de, D>(deserializer: D) -> Result<SocketAddr, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    raw.parse()
+        .map_err(|err| serde::de::Error::custom(format!("invalid serve.http.bind {raw:?}: {err}")))
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct FiligreeConfig {
@@ -138,6 +354,21 @@ pub struct FiligreeConfig {
     pub actor: String,
     pub token_env: String,
     pub timeout_seconds: u64,
+    /// Whether `clarion analyze` POSTs its findings to Filigree's
+    /// `POST /api/v1/scan-results` intake on completion (WP9-B,
+    /// REQ-FINDING-03). Emission is a one-way Clarion→Filigree data egress, so
+    /// it is its own explicit opt-in: it requires both `enabled` *and* this
+    /// flag, and **both default `false`**. Enabling the integration for the
+    /// read side (`issues_for` reverse-lookup) therefore does not silently
+    /// start outbound emission — the operator opts into the write direction
+    /// separately by setting `emit_findings: true`.
+    pub emit_findings: bool,
+    /// Age threshold (days) for `clarion analyze --prune-unseen` (REQ-FINDING-06):
+    /// findings Filigree has marked `unseen_in_latest` and that are older than
+    /// this are soft-archived (`fixed`) by the retention sweep. Default 30.
+    /// Only consulted when `--prune-unseen` is passed; the sweep itself is
+    /// opt-in per invocation, not on by default.
+    pub prune_unseen_days: u32,
 }
 
 impl Default for FiligreeConfig {
@@ -148,6 +379,8 @@ impl Default for FiligreeConfig {
             actor: "clarion-mcp".to_owned(),
             token_env: "FILIGREE_API_TOKEN".to_owned(),
             timeout_seconds: 5,
+            emit_findings: false,
+            prune_unseen_days: 30,
         }
     }
 }
@@ -157,6 +390,8 @@ pub enum ProviderSelection {
     Disabled,
     Recording,
     OpenRouter { api_key_env: String },
+    CodexCli,
+    ClaudeCli,
 }
 
 pub fn select_provider_with_env<F>(
@@ -193,6 +428,20 @@ where
                 api_key_env: env_var,
             })
         }
+        LlmProviderKind::CodexCli => {
+            let live_env_opt_in = env_lookup("CLARION_LLM_LIVE").as_deref() == Some("1");
+            if !config.llm.allow_live_provider && !live_env_opt_in {
+                return Ok(ProviderSelection::Disabled);
+            }
+            Ok(ProviderSelection::CodexCli)
+        }
+        LlmProviderKind::ClaudeCli => {
+            let live_env_opt_in = env_lookup("CLARION_LLM_LIVE").as_deref() == Some("1");
+            if !config.llm.allow_live_provider && !live_env_opt_in {
+                return Ok(ProviderSelection::Disabled);
+            }
+            Ok(ProviderSelection::ClaudeCli)
+        }
     }
 }
 
@@ -218,6 +467,67 @@ pub enum ConfigError {
 
     #[error("{code}: integrations.filigree.actor must not be blank when Filigree is enabled")]
     InvalidFiligreeActor { code: &'static str },
+
+    #[error(
+        "{code}: serve.http.bind {bind} exposes the unauthenticated non-loopback Clarion HTTP read API; \
+         bind to loopback (127.0.0.1 or ::1) or set serve.http.allow_non_loopback: true only on a trusted network"
+    )]
+    NonLoopbackHttpBind {
+        code: &'static str,
+        bind: SocketAddr,
+    },
+
+    #[error(
+        "{code}: serve.http.bind {bind} is non-loopback and serve.http.allow_non_loopback is true, \
+         but the inbound auth env var ${token_env} is unset; refusing to start an unauthenticated \
+         HTTP read API on a routable interface. Set ${token_env} to a non-empty bearer token, \
+         or bind to loopback."
+    )]
+    NonLoopbackHttpNoAuth {
+        code: &'static str,
+        bind: SocketAddr,
+        token_env: String,
+    },
+
+    #[error(
+        "{code}: serve.http.identity_token_env names ${token_env}, but that env var is unset; \
+         refusing to start an HTTP read API with incomplete Loom component identity configuration."
+    )]
+    MissingHttpIdentitySecret {
+        code: &'static str,
+        token_env: String,
+    },
+
+    #[error(
+        "{code}: clarion.yaml contains both `llm` and `llm_policy` top-level keys; \
+         `llm_policy` is a serde alias for `llm` and serde silently discards one. \
+         Pick one and remove the other."
+    )]
+    AmbiguousLlmKey { code: &'static str },
+}
+
+/// Reject configs that name both `llm` and `llm_policy` at the top level.
+/// They alias the same field; serde-norway silently picks one and discards
+/// the other, which is the classic copy-paste-migration pitfall. Detecting
+/// the collision pre-parse turns a silent override into a typed error.
+fn reject_llm_policy_alias_collision(raw: &str) -> Result<(), ConfigError> {
+    let value: serde_norway::Value = match serde_norway::from_str(raw) {
+        Ok(value) => value,
+        // If the YAML doesn't even parse as a generic Value, let the typed
+        // parse below produce the canonical Yaml error.
+        Err(_) => return Ok(()),
+    };
+    let Some(mapping) = value.as_mapping() else {
+        return Ok(());
+    };
+    let has_llm = mapping.contains_key("llm");
+    let has_llm_policy = mapping.contains_key("llm_policy");
+    if has_llm && has_llm_policy {
+        return Err(ConfigError::AmbiguousLlmKey {
+            code: "CLA-CONFIG-AMBIGUOUS-LLM-KEY",
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -276,6 +586,35 @@ integrations:
     }
 
     #[test]
+    fn filigree_emission_is_opt_in_independent_of_enabled() {
+        // clarion-a26de2f368: outbound finding emission is a one-way egress and
+        // must not piggyback on enabling Filigree for read enrichment. Both
+        // knobs default false so flipping `enabled` for `issues_for` never
+        // silently starts POSTing findings.
+        let defaults = FiligreeConfig::default();
+        assert!(!defaults.enabled);
+        assert!(
+            !defaults.emit_findings,
+            "emit_findings must default false (explicit write opt-in)"
+        );
+
+        // Turning on the read side alone leaves emission off.
+        let read_only = McpConfig::from_yaml_str(
+            r"
+integrations:
+  filigree:
+    enabled: true
+",
+        )
+        .expect("parse config");
+        assert!(read_only.integrations.filigree.enabled);
+        assert!(
+            !read_only.integrations.filigree.emit_findings,
+            "enabling Filigree for reads must not turn on outbound emission"
+        );
+    }
+
+    #[test]
     fn accepts_llm_policy_alias_for_operator_config() {
         let cfg = McpConfig::from_yaml_str(
             r"
@@ -293,6 +632,32 @@ llm_policy:
     }
 
     #[test]
+    fn rejects_both_llm_and_llm_policy_keys_present_together() {
+        // Realistic migration-doc copy-paste case: operator copies the new
+        // `llm_policy:` block but forgets to delete the old `llm:` block.
+        // Serde-norway would silently pick one and discard the other.
+        let err = McpConfig::from_yaml_str(
+            r"
+llm:
+  enabled: false
+  provider: recording
+llm_policy:
+  enabled: true
+  provider: openrouter
+  model_id: openai/gpt-4o-mini
+",
+        )
+        .expect_err("ambiguous llm key must be rejected");
+
+        match err {
+            ConfigError::AmbiguousLlmKey { code } => {
+                assert_eq!(code, "CLA-CONFIG-AMBIGUOUS-LLM-KEY");
+            }
+            other => panic!("expected AmbiguousLlmKey error, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn api_key_alone_does_not_select_live_provider() {
         let cfg = McpConfig {
             llm: LlmConfig {
@@ -301,6 +666,7 @@ llm_policy:
                 ..LlmConfig::default()
             },
             integrations: IntegrationsConfig::default(),
+            serve: ServeConfig::default(),
         };
 
         let selected = select_provider_with_env(&cfg, |name| {
@@ -321,6 +687,7 @@ llm_policy:
                 ..LlmConfig::default()
             },
             integrations: IntegrationsConfig::default(),
+            serve: ServeConfig::default(),
         };
 
         let missing = select_provider_with_env(&cfg, |_| None).expect_err("missing key");
@@ -339,6 +706,265 @@ llm_policy:
             ProviderSelection::OpenRouter {
                 api_key_env: "OPENROUTER_API_KEY".to_owned()
             }
+        );
+    }
+
+    #[test]
+    fn codex_cli_provider_requires_live_opt_in_but_no_api_key() {
+        let cfg = McpConfig::from_yaml_str(
+            r"
+llm_policy:
+  enabled: true
+  provider: codex_cli
+  allow_live_provider: true
+  model_id: codex-cli-default
+  codex_cli:
+    executable: /tmp/fake-codex
+    model: gpt-5.5
+    profile: clarion
+    sandbox: read-only
+    timeout_seconds: 30
+",
+        )
+        .expect("parse Codex CLI provider config");
+
+        assert_eq!(cfg.llm.provider, LlmProviderKind::CodexCli);
+        assert_eq!(cfg.llm.model_id, "codex-cli-default");
+        assert_eq!(cfg.llm.codex_cli.executable, "/tmp/fake-codex");
+        assert_eq!(cfg.llm.codex_cli.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(cfg.llm.codex_cli.profile.as_deref(), Some("clarion"));
+        assert_eq!(cfg.llm.codex_cli.sandbox, CodexSandboxMode::ReadOnly);
+        assert_eq!(cfg.llm.codex_cli.timeout_seconds, 30);
+
+        let selected = select_provider_with_env(&cfg, |_| None).expect("provider selection");
+        assert_eq!(selected, ProviderSelection::CodexCli);
+    }
+
+    #[test]
+    fn codex_cli_provider_stays_disabled_without_live_opt_in() {
+        let cfg = McpConfig {
+            llm: LlmConfig {
+                enabled: true,
+                provider: LlmProviderKind::CodexCli,
+                ..LlmConfig::default()
+            },
+            integrations: IntegrationsConfig::default(),
+            serve: ServeConfig::default(),
+        };
+
+        let selected = select_provider_with_env(&cfg, |_| None).expect("provider selection");
+        assert_eq!(selected, ProviderSelection::Disabled);
+
+        let env_selected = select_provider_with_env(&cfg, |name| {
+            (name == "CLARION_LLM_LIVE").then(|| "1".to_owned())
+        })
+        .expect("provider selection via env opt-in");
+        assert_eq!(env_selected, ProviderSelection::CodexCli);
+    }
+
+    #[test]
+    fn claude_cli_provider_requires_live_opt_in_but_no_api_key() {
+        let cfg = McpConfig::from_yaml_str(
+            r#"
+llm_policy:
+  enabled: true
+  provider: claude_cli
+  allow_live_provider: true
+  model_id: claude-code-default
+  claude_cli:
+    executable: /tmp/fake-claude
+    model: claude-sonnet-4-6
+    permission_mode: plan
+    tools: ["Read", "Glob", "Grep"]
+    timeout_seconds: 45
+    max_turns: 2
+    no_session_persistence: true
+"#,
+        )
+        .expect("parse Claude CLI provider config");
+
+        assert_eq!(cfg.llm.provider, LlmProviderKind::ClaudeCli);
+        assert_eq!(cfg.llm.model_id, "claude-code-default");
+        assert_eq!(cfg.llm.claude_cli.executable, "/tmp/fake-claude");
+        assert_eq!(
+            cfg.llm.claude_cli.model.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(
+            cfg.llm.claude_cli.permission_mode,
+            ClaudePermissionMode::Plan
+        );
+        assert_eq!(cfg.llm.claude_cli.tools, vec!["Read", "Glob", "Grep"]);
+        assert_eq!(cfg.llm.claude_cli.timeout_seconds, 45);
+        assert_eq!(cfg.llm.claude_cli.max_turns, 2);
+        assert!(cfg.llm.claude_cli.no_session_persistence);
+
+        let selected = select_provider_with_env(&cfg, |_| None).expect("provider selection");
+        assert_eq!(selected, ProviderSelection::ClaudeCli);
+    }
+
+    #[test]
+    fn claude_cli_provider_stays_disabled_without_live_opt_in() {
+        let cfg = McpConfig {
+            llm: LlmConfig {
+                enabled: true,
+                provider: LlmProviderKind::ClaudeCli,
+                ..LlmConfig::default()
+            },
+            integrations: IntegrationsConfig::default(),
+            serve: ServeConfig::default(),
+        };
+
+        let selected = select_provider_with_env(&cfg, |_| None).expect("provider selection");
+        assert_eq!(selected, ProviderSelection::Disabled);
+
+        let env_selected = select_provider_with_env(&cfg, |name| {
+            (name == "CLARION_LLM_LIVE").then(|| "1".to_owned())
+        })
+        .expect("provider selection via env opt-in");
+        assert_eq!(env_selected, ProviderSelection::ClaudeCli);
+    }
+
+    #[test]
+    fn http_bind_is_parsed_when_config_loads() {
+        let cfg = McpConfig::from_yaml_str(
+            r#"
+serve:
+  http:
+    enabled: true
+    bind: "127.0.0.1:0"
+"#,
+        )
+        .expect("parse HTTP bind");
+
+        assert_eq!(cfg.serve.http.bind, SocketAddr::from(([127, 0, 0, 1], 0)));
+    }
+
+    #[test]
+    fn http_allow_non_loopback_defaults_false() {
+        assert!(!McpConfig::default().serve.http.allow_non_loopback);
+    }
+
+    #[test]
+    fn http_allow_non_loopback_is_parsed_when_config_loads() {
+        let cfg = McpConfig::from_yaml_str(
+            r#"
+serve:
+  http:
+    enabled: true
+    bind: "127.0.0.1:0"
+    allow_non_loopback: true
+"#,
+        )
+        .expect("parse HTTP allow_non_loopback");
+
+        assert!(cfg.serve.http.allow_non_loopback);
+    }
+
+    #[test]
+    fn http_identity_token_env_is_parsed_when_config_loads() {
+        let cfg = McpConfig::from_yaml_str(
+            r#"
+serve:
+  http:
+    enabled: true
+    bind: "127.0.0.1:0"
+    identity_token_env: CLARION_TEST_IDENTITY
+"#,
+        )
+        .expect("parse HTTP identity_token_env");
+
+        assert_eq!(
+            cfg.serve.http.identity_token_env.as_deref(),
+            Some("CLARION_TEST_IDENTITY")
+        );
+    }
+
+    #[test]
+    fn enabled_non_loopback_http_bind_requires_allow_non_loopback() {
+        let err = McpConfig::from_yaml_str(
+            r#"
+serve:
+  http:
+    enabled: true
+    bind: "0.0.0.0:0"
+"#,
+        )
+        .expect_err("enabled wildcard HTTP bind should require explicit opt-in");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("unauthenticated non-loopback"),
+            "error should explain the unauthenticated non-loopback risk: {message}"
+        );
+        assert!(
+            message.contains("allow_non_loopback"),
+            "error should name the explicit opt-in: {message}"
+        );
+    }
+
+    #[test]
+    fn enabled_lan_http_bind_requires_allow_non_loopback() {
+        let err = McpConfig::from_yaml_str(
+            r#"
+serve:
+  http:
+    enabled: true
+    bind: "192.168.1.10:0"
+"#,
+        )
+        .expect_err("enabled LAN HTTP bind should require explicit opt-in");
+
+        assert!(matches!(err, ConfigError::NonLoopbackHttpBind { .. }));
+    }
+
+    #[test]
+    fn enabled_ipv6_loopback_http_bind_is_allowed_by_default() {
+        let cfg = McpConfig::from_yaml_str(
+            r#"
+serve:
+  http:
+    enabled: true
+    bind: "[::1]:0"
+"#,
+        )
+        .expect("IPv6 loopback HTTP bind should not require non-loopback opt-in");
+
+        assert!(!cfg.serve.http.allow_non_loopback);
+        assert!(cfg.serve.http.is_loopback_bind());
+    }
+
+    #[test]
+    fn enabled_non_loopback_http_bind_allows_explicit_opt_in() {
+        let cfg = McpConfig::from_yaml_str(
+            r#"
+serve:
+  http:
+    enabled: true
+    bind: "0.0.0.0:0"
+    allow_non_loopback: true
+"#,
+        )
+        .expect("explicit opt-in should allow non-loopback HTTP bind");
+
+        assert!(cfg.serve.http.allow_non_loopback);
+    }
+
+    #[test]
+    fn invalid_http_bind_fails_config_load() {
+        let err = McpConfig::from_yaml_str(
+            r#"
+serve:
+  http:
+    enabled: true
+    bind: "not-a-socket"
+"#,
+        )
+        .expect_err("invalid bind should fail");
+
+        assert!(
+            err.to_string().contains("invalid serve.http.bind"),
+            "unexpected error: {err}"
         );
     }
 

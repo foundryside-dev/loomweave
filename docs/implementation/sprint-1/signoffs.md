@@ -134,4 +134,4 @@ ladder completeness; not required to close Sprint 1 or Sprint 2.
 - [`README.md`](./README.md) — sprint orientation and demo script.
 - [`wp1-scaffold.md`](./wp1-scaffold.md), [`wp2-plugin-host.md`](./wp2-plugin-host.md), [`wp3-python-plugin.md`](./wp3-python-plugin.md) — per-WP plans.
 - [`../v0.1-plan.md`](../v0.1-plan.md) — high-level plan for all 11 WPs.
-- [`../../clarion/v0.1/plans/v0.1-scope-commitments.md`](../../clarion/v0.1/plans/v0.1-scope-commitments.md) — scope memo.
+- [`../v0.1-scope-plans/v0.1-scope-commitments.md`](../v0.1-scope-plans/v0.1-scope-commitments.md) — scope memo.

@@ -17,7 +17,7 @@ Clarion's core is responsible for:
 - SQLite-backed storage that serves both batch `clarion analyze` and long-lived `clarion serve` simultaneously (`CON-SQLITE-01`, ADR-011 writer-actor)
 - subprocess supervision for language plugins over Content-Length framed JSON-RPC (`REQ-PLUGIN-01`..`REQ-PLUGIN-06`, ADR-002)
 - bounded-cost LLM orchestration with per-run cache behaviour and cancellation semantics (`NFR-COST-01`..`NFR-COST-03`)
-- local HTTP and MCP serving with auth posture appropriate to a security tool (`NFR-SEC-*`, ADR-012)
+- local HTTP and MCP serving with a bounded trust posture (`NFR-SEC-*`, ADR-012 historically; ADR-014 for the registry-backend HTTP read API)
 
 The product posture is local-first and operationally lightweight (`CON-LOCAL-01`, `NFR-OPS-01`..`NFR-OPS-03`). The implementation language therefore affects packaging, concurrency, storage ergonomics, and deployment complexity — and the acceptable envelope for each is already set by requirements rather than preference.
 

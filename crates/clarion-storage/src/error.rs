@@ -19,6 +19,20 @@ pub enum StorageError {
     #[error("PRAGMA invariant violated: {0}")]
     PragmaInvariant(String),
 
+    #[error(
+        "CLA-INFRA-STORAGE-FOREIGN-DB: refusing to open SQLite file with \
+         application_id={application_id:#010x}; Clarion databases carry \
+         application_id=0x434C524E (\"CLRN\")"
+    )]
+    ForeignDatabase { application_id: u32 },
+
+    #[error(
+        "CLA-INFRA-STORAGE-FUTURE-DB: refusing to open SQLite file with \
+         user_version={found} (greater than current schema version {current}); \
+         the database was written by a newer Clarion build"
+    )]
+    FutureUserVersion { found: u32, current: u32 },
+
     #[error("migration {version} failed: {source}")]
     Migration {
         version: u32,

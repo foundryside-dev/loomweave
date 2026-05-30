@@ -1,9 +1,12 @@
 # OpenRouter LLM Provider
 
-Clarion v0.1 uses OpenRouter as its canonical live LLM provider. The provider
+Clarion uses OpenRouter as its canonical HTTP LLM provider. The provider
 speaks OpenAI-compatible Chat Completions HTTP through the existing
-`LlmProvider` trait, so tests can continue to use `RecordingProvider` and future
-providers can be added without changing MCP tool call sites.
+`LlmProvider` trait, so tests can continue to use `RecordingProvider` and
+coding-agent CLI providers can be added without changing MCP tool call sites.
+
+For local-login alternatives that avoid API keys in Clarion config, see
+[Coding-agent LLM providers](./coding-agent-llm-providers.md).
 
 ## Configure Clarion
 
@@ -19,7 +22,7 @@ llm_policy:
     endpoint_url: https://openrouter.ai/api/v1
     api_key_env: OPENROUTER_API_KEY
     attribution:
-      referer: https://github.com/qacona/clarion
+      referer: https://github.com/tachyon-beep/clarion
       title: Clarion
   model_id: anthropic/claude-sonnet-4.6
   session_token_ceiling: 1000000
@@ -52,7 +55,7 @@ OpenRouter model IDs are concrete strings such as:
 - `meta-llama/llama-3.1-8b-instruct`
 
 Clarion stores this exact string in the summary cache key's `model_tier`
-component. There is no tier-name resolver in v0.1; operators choose the concrete
+component. There is no tier-name resolver in v1.0; operators choose the concrete
 model in `clarion.yaml`. Refresh the chosen ID against OpenRouter's Models API
 before release or production use.
 
@@ -75,7 +78,7 @@ tokens.
 
 To clear a blocked LLM budget, stop and restart `clarion serve`. To change the
 future ceiling, edit `llm_policy.session_token_ceiling` in `clarion.yaml` before
-restarting. Clarion v0.1 intentionally has no MCP tool that resets the in-memory
+restarting. Clarion v1.0 intentionally has no MCP tool that resets the in-memory
 budget ledger.
 
 Dollar budgeting remains an operator concern in OpenRouter billing controls.

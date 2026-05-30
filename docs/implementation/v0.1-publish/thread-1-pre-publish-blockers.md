@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans`. Each workstream is independently dispatchable; sequencing is described in §1.
 
 **Status**: drafted 2026-05-18 — not yet broken into Filigree issues.
-**Predecessor context**: Sprint 2 closed GREEN ([`../sprint-2/signoffs.md`](../sprint-2/signoffs.md)); the 2026-05-18 codebase archaeology ([`../../arch-analysis-2026-05-18-1244/04-final-report.md`](../../arch-analysis-2026-05-18-1244/04-final-report.md)) is the authoritative current-state snapshot.
+**Predecessor context**: Sprint 2 closed GREEN ([`../sprint-2/signoffs.md`](../sprint-2/signoffs.md)); the 2026-05-20 RC1 codebase archaeology ([`../../arch-analysis-2026-05-20-2124/04-final-report.md`](../arch-analysis-2026-05-20-2124/04-final-report.md)) supersedes the removed 2026-05-18 snapshot as the current-state reference.
 **Goal**: take the amended-v0.1 MCP-MVP from "works on the elspeth-slice corpus on the author's box" to "publishable v0.1" — meaning *an outside operator can install it, point it at an arbitrary repo without leaking secrets, and find their way to first value in five minutes*.
 
 **Scope discipline**: this is *only* Thread 1 (pre-publish operational/security blockers). Two adjacent threads exist and are NOT in this program:
@@ -195,7 +195,7 @@ This is the consult-mode-agent surface for "the absence of a summary is policy, 
 #### Task 6 — Rule catalogue entries in `detailed-design.md`
 
 **Files**:
-- Modify: `docs/clarion/v0.1/detailed-design.md` (§5 rule catalogue)
+- Modify: `docs/clarion/1.0/detailed-design.md` (§5 rule catalogue)
 
 **Scope**: append rule rows for `CLA-SEC-SECRET-DETECTED`, `CLA-SEC-UNREDACTED-SECRETS-ALLOWED`, `CLA-INFRA-SECRET-BASELINE-NO-JUSTIFICATION`, `CLA-INFRA-SECRET-BASELINE-MATCH`, `CLA-INFRA-SECRET-OVERRIDE-UNCONFIRMED`. Each row: rule-ID, severity, category, one-sentence description, one-sentence remediation, ADR pointer.
 
@@ -230,7 +230,7 @@ All tasks green; in addition:
 **Files**:
 - Create: `README.md` at repo root.
 
-**Scope**: there is no top-level README currently. The reader-ladder under `docs/suite/briefing.md` → `docs/suite/loom.md` → `docs/clarion/v0.1/README.md` assumes the reader already knows to start there. A first-time visitor (PyPI / crates.io / GitHub front page) has no entry point.
+**Scope**: there is no top-level README currently. The reader-ladder under `docs/suite/briefing.md` → `docs/suite/loom.md` → `docs/clarion/1.0/README.md` assumes the reader already knows to start there. A first-time visitor (PyPI / crates.io / GitHub front page) has no entry point.
 
 The README must answer, in order:
 
@@ -238,7 +238,7 @@ The README must answer, in order:
 2. **What it does today** — bullet list of the 7 MCP tools and what each answers, with one example invocation each.
 3. **Quick start** — `clarion install && clarion analyze && clarion serve`, with the expected stdout shapes. Link to the operator tutorial (Task B.2).
 4. **Status** — explicit "v0.1 — Python only; structural + on-demand LLM summarisation; Filigree finding emission deferred to v0.2." Quote the scope: don't oversell.
-5. **Project layout** — three-sentence map (Rust workspace + Python plugin + docs) with links to `docs/clarion/v0.1/README.md` for the design ladder and `docs/clarion/adr/README.md` for the ADR index.
+5. **Project layout** — three-sentence map (Rust workspace + Python plugin + docs) with links to `docs/clarion/1.0/README.md` for the design ladder and `docs/clarion/adr/README.md` for the ADR index.
 6. **Contributing** — pointer to `CLAUDE.md` and the test commands (ADR-023 floor).
 
 **Length target**: ≤ 200 lines. No installation instructions deeper than `cargo install ...` + `pipx install clarion-plugin-python` (Workstream C delivers the actual commands).
@@ -430,4 +430,4 @@ filigree close clarion-2d178ddda0 --reason="superseded by Publish-prep --force t
 - [System design — §10 Security, pre-ingest redaction paragraph](../../clarion/v0.1/system-design.md)
 - [v0.1-plan.md — WP5 scope](../v0.1-plan.md#wp5--pre-ingest-secret-scanner)
 - [Sprint-2 scope amendment — explicit WP5 deferral rationale, "production deployment against unknown corpora gates on this returning"](../sprint-2/scope-amendment-2026-05.md)
-- [Arch analysis final report — §7 follow-ups #9 (L-1) and §5.3 L-2 (closed)](../../arch-analysis-2026-05-18-1244/04-final-report.md)
+- [Arch analysis final report — current RC1 architecture report](../arch-analysis-2026-05-20-2124/04-final-report.md)

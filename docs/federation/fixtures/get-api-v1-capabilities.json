@@ -1,0 +1,62 @@
+{
+  "_meta": {
+    "contract": "clarion-http-read-api",
+    "endpoint": "GET /api/v1/_capabilities",
+    "api_version": 1,
+    "fixture_version": 2,
+    "stability": "normative",
+    "authority": "Clarion ADR-014 federation registry-backend contract",
+    "verification": "cargo test -p clarion-cli --test serve",
+    "normative": true,
+    "updated": "2026-05-19",
+    "description": "Contract example for Clarion registry-backend capability discovery."
+  },
+  "shape_decl": {
+    "kind": "clarion-http-fixture-shapes",
+    "shapes": {
+      "capabilities_response": {
+        "status": 200,
+        "required_fields": {
+          "registry_backend": {
+            "type": "boolean",
+            "const": true
+          },
+          "file_registry": {
+            "type": "boolean",
+            "const": true
+          },
+          "api_version": {
+            "type": "integer",
+            "const": 1
+          },
+          "instance_id": {
+            "type": "uuid"
+          }
+        },
+        "forbidden_fields": [
+          "version"
+        ],
+        "allow_extra_fields": false
+      }
+    }
+  },
+  "examples": [
+    {
+      "name": "capabilities_200",
+      "request": {
+        "method": "GET",
+        "path": "/api/v1/_capabilities"
+      },
+      "response": {
+        "status": 200,
+        "shape": "capabilities_response",
+        "body": {
+          "registry_backend": true,
+          "file_registry": true,
+          "api_version": 1,
+          "instance_id": "9bd7234e-6d44-4a38-9ae4-76f912a10221"
+        }
+      }
+    }
+  ]
+}

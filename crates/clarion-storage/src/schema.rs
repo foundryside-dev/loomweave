@@ -14,22 +14,52 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "0001_initial_schema",
-    sql: include_str!("../migrations/0001_initial_schema.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "0001_initial_schema",
+        sql: include_str!("../migrations/0001_initial_schema.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "0002_briefing_blocked",
+        sql: include_str!("../migrations/0002_briefing_blocked.sql"),
+    },
+];
+
+/// Highest migration version known to this build. Mirrored into the
+/// `SQLite` `user_version` header (STO-02) so a future-built database is
+/// refused at open instead of silently corrupting state.
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+
+const _CURRENT_SCHEMA_VERSION_MATCHES_LAST_MIGRATION: () = {
+    // Compile-time check: `CURRENT_SCHEMA_VERSION` must equal the highest
+    // version in `MIGRATIONS`. If a new migration is added without bumping
+    // the constant (or vice versa), this assertion fails to compile.
+    assert!(
+        MIGRATIONS[MIGRATIONS.len() - 1].version == CURRENT_SCHEMA_VERSION,
+        "CURRENT_SCHEMA_VERSION must equal the highest MIGRATIONS[].version"
+    );
+};
 
 /// Apply every migration not already recorded in `schema_migrations`.
 ///
 /// The first migration creates the `schema_migrations` table itself, so the
 /// initial lookup tolerates its absence.
 ///
+/// After all pending migrations apply, the `SQLite` header `user_version` is
+/// written to [`CURRENT_SCHEMA_VERSION`]. A `user_version` strictly greater
+/// than [`CURRENT_SCHEMA_VERSION`] at entry is refused via
+/// [`verify_user_version`] (closes STO-02 forward-incompatibility check).
+///
 /// # Errors
 ///
+/// Returns [`StorageError::FutureUserVersion`] if the database was written
+/// by a newer Clarion build.
 /// Returns [`StorageError::Migration`] with the failing version on SQL error
 /// during apply. Returns [`StorageError::Sqlite`] on bookkeeping failures.
 pub fn apply_migrations(conn: &mut Connection) -> Result<()> {
+    verify_user_version(conn)?;
     let applied = read_applied_versions(conn)?;
     for m in MIGRATIONS {
         if applied.contains(&m.version) {
@@ -38,6 +68,49 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<()> {
         }
         apply_one(conn, m)?;
     }
+    apply_user_version(conn)?;
+    Ok(())
+}
+
+/// Refuse to operate on a database whose `user_version` is strictly greater
+/// than [`CURRENT_SCHEMA_VERSION`].
+///
+/// Equal or less is accepted: equal means the schema is current, less means
+/// either a fresh DB (`user_version=0`) or a DB awaiting in-flight migrations
+/// — both are handled by [`apply_migrations`]. The writer-actor calls this
+/// directly (without invoking the migration runner) so a forward-incompatible
+/// file is rejected at `Writer::spawn` time.
+///
+/// # Errors
+///
+/// Returns [`StorageError::FutureUserVersion`] when `user_version >
+/// CURRENT_SCHEMA_VERSION`. Returns [`StorageError::Sqlite`] if the PRAGMA
+/// query fails.
+pub fn verify_user_version(conn: &Connection) -> Result<()> {
+    let raw: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    // SQLite stores user_version as a 32-bit integer; rusqlite returns i64.
+    // Negative values are unreachable in normal use (we only set u32 values);
+    // clamp via `try_from` so an out-of-range value surfaces explicitly
+    // rather than silently truncating.
+    let found = u32::try_from(raw).map_err(|_| {
+        StorageError::PragmaInvariant(format!(
+            "PRAGMA user_version returned out-of-range value {raw}; expected 0..=u32::MAX"
+        ))
+    })?;
+    if found > CURRENT_SCHEMA_VERSION {
+        return Err(StorageError::FutureUserVersion {
+            found,
+            current: CURRENT_SCHEMA_VERSION,
+        });
+    }
+    Ok(())
+}
+
+/// Write `PRAGMA user_version = CURRENT_SCHEMA_VERSION`. Idempotent — writing
+/// the same value is cheap (it touches the `SQLite` header page). Called after
+/// the migration runner has applied every pending migration.
+fn apply_user_version(conn: &Connection) -> Result<()> {
+    conn.execute_batch(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION};"))?;
     Ok(())
 }
 
@@ -127,6 +200,67 @@ fn migration_count_to_u32(n: i64) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entities_has_briefing_blocked(conn: &Connection) -> bool {
+        conn.prepare("SELECT 1 FROM pragma_table_xinfo('entities') WHERE name = 'briefing_blocked'")
+            .and_then(|mut stmt| stmt.exists([]))
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn briefing_blocked_is_added_by_an_upgrade_migration_not_the_initial() {
+        // An existing v1 database (created before briefing_blocked) must gain
+        // the column on upgrade. If the column lives in the already-applied
+        // initial migration, existing DBs at schema_migrations.version=1 skip
+        // it forever and project_status hits `no such column`. Reproduce: apply
+        // only the initial migration, confirm the column is absent, then run
+        // the full migration runner and confirm an upgrade migration adds it.
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_one(&mut conn, &MIGRATIONS[0]).expect("apply initial migration");
+        assert!(
+            !entities_has_briefing_blocked(&conn),
+            "briefing_blocked must not be defined by the initial migration (0001)"
+        );
+
+        apply_migrations(&mut conn).expect("apply pending migrations");
+        assert!(
+            entities_has_briefing_blocked(&conn),
+            "an upgrade migration must add briefing_blocked to an existing v1 DB"
+        );
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(user_version, i64::from(CURRENT_SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn migration_0002_rolls_back_the_column_when_a_later_statement_fails() {
+        // 0002 must apply its ALTER + CREATE INDEX atomically. If the column is
+        // added under autocommit and a later statement fails, the DB is left
+        // with `briefing_blocked` present but no schema_migrations.version=2
+        // row — the next startup reruns the ALTER and dies on duplicate column,
+        // blocking upgrade. Inject that failure: squat the index name so 0002's
+        // CREATE INDEX fails on its second statement, then prove (on a fresh
+        // connection, reading committed state) that the ALTER did not survive.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rollback.db");
+        {
+            let mut conn = Connection::open(&db).unwrap();
+            apply_one(&mut conn, &MIGRATIONS[0]).expect("apply initial migration");
+            // Squat the index name 0002 will try to create.
+            conn.execute_batch("CREATE INDEX ix_entities_briefing_blocked ON entities(id);")
+                .expect("pre-create colliding index");
+            apply_one(&mut conn, &MIGRATIONS[1])
+                .expect_err("0002 must fail when its CREATE INDEX collides");
+            // Drop conn here → any open transaction rolls back on close.
+        }
+        let conn = Connection::open(&db).unwrap();
+        assert!(
+            !entities_has_briefing_blocked(&conn),
+            "0002's ALTER must roll back when a later statement fails; \
+             the column survived, so the migration is not atomic"
+        );
+    }
 
     #[test]
     fn migration_count_conversion_rejects_overflow() {

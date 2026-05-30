@@ -97,6 +97,25 @@ class EntitySource(TypedDict):
     source_range: SourceRange
 
 
+class DefinitionSpan(TypedDict):
+    """Sub-ranges within a function/class entity (clarion-460def6a51).
+
+    ``decl_line`` is the line of the ``def``/``class`` keyword (Python 3.8+
+    ``node.lineno``). ``body_line_start`` is the line of the first body
+    statement (a docstring counts). The two ``decorator_*`` keys are present
+    only when the entity is decorated; ``decorator_line_start`` is the
+    topmost decorator line and matches the entity's expanded
+    ``source_range.start_line``. They let a reader explain *why* a given
+    line resolved to this entity (decorator vs declaration vs body) without
+    re-reading source.
+    """
+
+    decl_line: int
+    body_line_start: NotRequired[int]
+    decorator_line_start: NotRequired[int]
+    decorator_line_end: NotRequired[int]
+
+
 class RawEntity(TypedDict):
     """Wire shape matching the Rust host's RawEntity contract.
 
@@ -116,6 +135,10 @@ class RawEntity(TypedDict):
     source: EntitySource
     parent_id: NotRequired[str]
     parse_status: NotRequired[Literal["ok", "syntax_error"]]
+    # entity_context evidence (clarion-460def6a51). Set on function/class
+    # entities; omitted for modules. Rides the host's RawEntity `extra` flatten
+    # into `properties_json`, so no host or storage schema change is needed.
+    definition: NotRequired[DefinitionSpan]
 
 
 class RawEdge(TypedDict):
@@ -842,6 +865,36 @@ def _walk(  # noqa: PLR0913 - recursive walker needs both accumulators + parent 
         )
 
 
+def _definition_span(
+    node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+) -> tuple[int, int, DefinitionSpan]:
+    """Return ``(start_line, start_col, definition)`` for a definition node.
+
+    ``node.lineno`` is the ``def``/``class`` keyword line (Python 3.8+);
+    decorators sit above it. When the node is decorated the returned
+    ``start_line``/``start_col`` extend the entity span up to the topmost
+    decorator so an ``entity_at`` query on a decorator line resolves to this
+    entity (clarion-460def6a51). The ``definition`` map records the
+    sub-ranges that explain why a line matched.
+    """
+    definition: DefinitionSpan = {"decl_line": node.lineno}
+    if node.body:
+        definition["body_line_start"] = node.body[0].lineno
+    start_line = node.lineno
+    start_col = node.col_offset
+    if node.decorator_list:
+        topmost = min(node.decorator_list, key=lambda d: (d.lineno, d.col_offset))
+        decorator_line_start = topmost.lineno
+        decorator_line_end = max(
+            (d.end_lineno if d.end_lineno is not None else d.lineno) for d in node.decorator_list
+        )
+        definition["decorator_line_start"] = decorator_line_start
+        definition["decorator_line_end"] = decorator_line_end
+        start_line = decorator_line_start
+        start_col = topmost.col_offset
+    return start_line, start_col, definition
+
+
 def _contains_edge(parent_id: str, child_id: str) -> RawEdge:
     """Build a ``contains`` edge per ADR-026 decision 3 (no source range)."""
     return {
@@ -862,6 +915,7 @@ def _build_function_entity(
     qualified_name = f"{dotted_module}.{python_qualname}" if dotted_module else python_qualname
     end_line = node.end_lineno if node.end_lineno is not None else node.lineno
     end_col = node.end_col_offset if node.end_col_offset is not None else node.col_offset
+    start_line, start_col, definition = _definition_span(node)
     child_id = entity_id(_PLUGIN_ID, "function", qualified_name)
     entity: RawEntity = {
         "id": child_id,
@@ -870,13 +924,14 @@ def _build_function_entity(
         "source": {
             "file_path": file_path,
             "source_range": {
-                "start_line": node.lineno,
-                "start_col": node.col_offset,
+                "start_line": start_line,
+                "start_col": start_col,
                 "end_line": end_line,
                 "end_col": end_col,
             },
         },
         "parent_id": parent_entity_id,
+        "definition": definition,
     }
     return entity, child_id
 
@@ -899,6 +954,7 @@ def _build_class_entity(
     qualified_name = f"{dotted_module}.{python_qualname}" if dotted_module else python_qualname
     end_line = node.end_lineno if node.end_lineno is not None else node.lineno
     end_col = node.end_col_offset if node.end_col_offset is not None else node.col_offset
+    start_line, start_col, definition = _definition_span(node)
     child_id = entity_id(_PLUGIN_ID, "class", qualified_name)
     entity: RawEntity = {
         "id": child_id,
@@ -907,12 +963,13 @@ def _build_class_entity(
         "source": {
             "file_path": file_path,
             "source_range": {
-                "start_line": node.lineno,
-                "start_col": node.col_offset,
+                "start_line": start_line,
+                "start_col": start_col,
                 "end_line": end_line,
                 "end_col": end_col,
             },
         },
         "parent_id": parent_entity_id,
+        "definition": definition,
     }
     return entity, child_id

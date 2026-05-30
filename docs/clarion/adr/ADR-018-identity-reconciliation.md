@@ -57,6 +57,16 @@ the recorded `WardlineMeta` / translator output; naively splitting on dots is
 unsafe because dotted class chains and `<locals>` markers are part of Python's
 `__qualname__`, not the module path.
 
+### 2026-05-29 amendment: Wardline emits the dotted qualname pre-composed
+
+The 2026-05-29 Wardline ↔ Loom integration brief (§4.A) resolves the asymmetric-storage clash **in Clarion's favor at the emission boundary**. Under the generic Wardline rebuild's native Filigree emitter ([ADR-015](./ADR-015-wardline-filigree-emission.md) Revision 2), each emitted finding carries `metadata.wardline.qualname` as the **combined dotted `module.qualified_name`** (e.g. `auth.tokens.TokenManager.issue`) — Clarion's L7 form, not Wardline's `(file-path module, bare qualname)` storage pair.
+
+Two consequences:
+
+1. **A clarified entry point.** This is a fifth reconciliation surface alongside the four below: Clarion reads `metadata.wardline.qualname` off a **Filigree finding** (via the federation read path / `issues_for` enrichment), not off a Wardline state file. The composition rule reverses — the 2026-05-18 amendment's "Clarion composes the dotted module name from Wardline's `module`" becomes "**Wardline emits it pre-composed; Clarion matches by direct qualname equality**" (`find_entity` by qualname). The state-file entry points (1–3) and their composition rule remain unchanged for any path that still reads Wardline's on-disk artifacts (e.g. historical SARIF baselines).
+
+2. **The normalization contract is now Wardline's, at the emission boundary.** Because Wardline now performs the dotting Clarion used to do, byte-equality depends on Wardline replicating `module_dotted_name()` **exactly**: `src/` prefix stripped, `.py` removed, `__init__.py` collapsed (and the analogous handling for namespace-package / non-`src` layouts), while preserving `<locals>` markers and dotted class chains in `__qualname__` verbatim — those are part of the qualname, not the module path, and must not be re-dotted or stripped. If Wardline's composition diverges, reconciliation degrades silently to `resolution_confidence: heuristic | none` on exactly the nested-class and closure entities where it is least recoverable. Clarion exposes the canonical rules via `module_dotted_name()` and the `GET /api/v1/entities/resolve?scheme=wardline_qualname` oracle; a divergence shows up there as a non-`exact` resolution. This contract is the open ask-back to Wardline recorded in ADR-015 Revision 2; it is an enrichment-quality concern and does not gate the (Wardline, Filigree) transport path.
+
 ### Translation entry points (v0.1)
 
 1. **`wardline.fingerprint.json`**: for each `FingerprintEntry`, compute `(module, qualified_name) → EntityId` using Wardline's `module_file_map` (from `ScanContext`). Write `WardlineMeta.wardline_qualname = qualified_name` on the resolved Clarion entity.
@@ -169,4 +179,4 @@ Wardline exports its REGISTRY as a declarative descriptor file (`wardline_regist
 - [Clarion v0.1 system design §2 (Direct REGISTRY import), §9 (state-file ingest), §9 (Entity resolve oracle)](../v0.1/system-design.md) — import pattern, ingest paths, HTTP oracle.
 - [Clarion v0.1 detailed design §2 (Identity reconciliation across the suite)](../v0.1/detailed-design.md) (lines 553-571) — three-scheme translation table; ingest-path rules.
 - [Loom doctrine §5 (v0.1 asterisks), §6 (What Loom is NOT)](../../suite/loom.md) — initialization-coupling asterisk; "no identity reconciliation service" categorical.
-- [Panel doctrine synthesis](../v0.1/reviews/panel-2026-04-17/11-doctrine-panel-synthesis.md) — the asterisks framing originated here.
+- [Panel doctrine synthesis](../../implementation/v0.1-reviews/panel-2026-04-17/11-doctrine-panel-synthesis.md) — the asterisks framing originated here.

@@ -7,7 +7,10 @@
 //! - `<path>/clarion.yaml`        (user-edited config stub at project root;
 //!   see detailed-design.md §File layout)
 //!
-//! Refuses if `.clarion/` already exists unless `--force` is passed.
+//! A bare `clarion install` refuses if `.clarion/` already exists unless
+//! `--force` is passed. Under `--skills`/`--hooks`/`--all`, an existing
+//! `.clarion/` is left in place (init is skipped) rather than treated as an
+//! error, so the requested idempotent components can still be applied.
 
 use std::fs;
 use std::path::Path;
@@ -23,31 +26,54 @@ const CONFIG_JSON_STUB: &str = r#"{
 }
 "#;
 
-const CLARION_YAML_STUB: &str = "# clarion.yaml — user-edited config.\n\
-# Do not delete this file: clarion serve reads MCP, LLM, and integration\n\
-# settings from here when present.\n\
-version: 1\n\
-llm_policy:\n\
-  enabled: false\n\
-  provider: openrouter\n\
-  allow_live_provider: false\n\
-  openrouter:\n\
-    endpoint_url: https://openrouter.ai/api/v1\n\
-    api_key_env: OPENROUTER_API_KEY\n\
-    attribution:\n\
-      referer: https://github.com/qacona/clarion\n\
-      title: Clarion\n\
-  model_id: anthropic/claude-sonnet-4.6\n\
-  session_token_ceiling: 1000000\n\
-  max_inferred_edges_per_caller: 8\n\
-  cache_max_age_days: 180\n\
-integrations:\n\
-  filigree:\n\
-    enabled: false\n\
-    base_url: http://127.0.0.1:8766\n\
-    actor: clarion-mcp\n\
-    token_env: FILIGREE_API_TOKEN\n\
-    timeout_seconds: 5\n";
+// NOTE: Do not use `\` line-continuation here — Rust strips both the newline
+// AND all leading whitespace on the continuation line, producing flat (and
+// therefore broken) YAML. Use raw newlines + explicit indentation.
+const CLARION_YAML_STUB: &str = "# clarion.yaml — user-edited config.
+# Do not delete this file: clarion serve reads MCP, LLM, and integration
+# settings from here when present.
+version: 1
+llm_policy:
+  enabled: false
+  provider: openrouter
+  allow_live_provider: false
+  openrouter:
+    endpoint_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    attribution:
+      referer: https://github.com/tachyon-beep/clarion
+      title: Clarion
+  codex_cli:
+    executable: codex
+    model: null
+    profile: null
+    sandbox: read-only
+    timeout_seconds: 300
+  claude_cli:
+    executable: claude
+    model: null
+    permission_mode: plan
+    tools: []
+    timeout_seconds: 300
+    max_turns: 2
+    no_session_persistence: true
+    exclude_dynamic_system_prompt_sections: true
+  model_id: anthropic/claude-sonnet-4.6
+  session_token_ceiling: 1000000
+  max_inferred_edges_per_caller: 8
+  cache_max_age_days: 180
+integrations:
+  filigree:
+    enabled: false
+    base_url: http://127.0.0.1:8766
+    actor: clarion-mcp
+    token_env: FILIGREE_API_TOKEN
+    timeout_seconds: 5
+serve:
+  http:
+    enabled: false
+    bind: 127.0.0.1:9111
+";
 
 const GITIGNORE_CONTENTS: &str = "\
 # Clarion .gitignore — ADR-005 tracked-vs-excluded list.
@@ -74,6 +100,64 @@ logs/
 runs/*/log.jsonl
 ";
 
+/// What `clarion install` should do, resolved from the CLI flags per the agent-
+/// orientation plan: bare install = init only; `--skills`/`--hooks` are
+/// independent and do NOT init; `--all` = init + skills + hooks.
+///
+/// Modeled as an enum rather than three independent bools so the derived and
+/// illegal states the bool form allowed are unrepresentable: `init_clarion` is
+/// no longer a peer field that can contradict an explicit component request,
+/// and the do-nothing `{false, false, false}` state (which PR #21 had to guard
+/// against at the `run()` entry) cannot be produced by [`InstallPlan::from_flags`]
+/// at all (clarion-c6b8dc27f3). The three booleans are derived on demand via
+/// [`init_clarion`](Self::init_clarion) / [`skills`](Self::skills) /
+/// [`hooks`](Self::hooks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallPlan {
+    /// Bare `clarion install`: initialise `.clarion/` only.
+    Bare,
+    /// `--skills` and/or `--hooks` without `--all`: apply the named components
+    /// and do NOT initialise `.clarion/`. `from_flags` only constructs this
+    /// when at least one field is `true`.
+    Components { skills: bool, hooks: bool },
+    /// `--all`: initialise `.clarion/` + skills + hooks.
+    All,
+}
+
+impl InstallPlan {
+    /// Resolve the CLI flags into a plan. `--all` wins; otherwise any of
+    /// `--skills`/`--hooks` selects [`Components`](Self::Components); no flag
+    /// selects [`Bare`](Self::Bare). Never yields a do-nothing plan.
+    #[must_use]
+    pub fn from_flags(skills: bool, hooks: bool, all: bool) -> Self {
+        if all {
+            Self::All
+        } else if skills || hooks {
+            Self::Components { skills, hooks }
+        } else {
+            Self::Bare
+        }
+    }
+
+    /// Whether to initialise `.clarion/` (the index). True for `Bare` and `All`.
+    #[must_use]
+    pub fn init_clarion(self) -> bool {
+        matches!(self, Self::Bare | Self::All)
+    }
+
+    /// Whether to install the `clarion-workflow` skill pack.
+    #[must_use]
+    pub fn skills(self) -> bool {
+        matches!(self, Self::All | Self::Components { skills: true, .. })
+    }
+
+    /// Whether to install the `SessionStart` hook.
+    #[must_use]
+    pub fn hooks(self) -> bool {
+        matches!(self, Self::All | Self::Components { hooks: true, .. })
+    }
+}
+
 /// Run the `install` subcommand.
 ///
 /// # Errors
@@ -81,7 +165,7 @@ runs/*/log.jsonl
 /// Returns an error if `.clarion/` already exists without `--force`, if the
 /// target directory cannot be canonicalised, or if any filesystem or database
 /// operation fails.
-pub fn run(path: &Path, force: bool) -> Result<()> {
+pub fn run(path: &Path, force: bool, plan: InstallPlan) -> Result<()> {
     if !path.exists() {
         bail!(
             "target directory does not exist: {}. Create it first or pass a valid --path.",
@@ -91,47 +175,114 @@ pub fn run(path: &Path, force: bool) -> Result<()> {
     let project_root = path
         .canonicalize()
         .with_context(|| format!("cannot canonicalise --path {}", path.display()))?;
-    let clarion_dir = project_root.join(".clarion");
-    if clarion_dir.exists() {
-        if !force {
-            bail!(
-                ".clarion/ already exists at {}. Delete it or pass --force to overwrite it.",
-                clarion_dir.display()
-            );
-        }
-        if !clarion_dir.is_dir() {
-            bail!(
-                "--force can only overwrite an existing .clarion/ directory; \
-                 found non-directory at {}.",
-                clarion_dir.display()
-            );
-        }
-        fs::remove_dir_all(&clarion_dir)
-            .with_context(|| format!("remove existing {}", clarion_dir.display()))?;
+
+    // `from_flags` cannot produce a do-nothing plan, but a hand-built
+    // `Components { skills: false, hooks: false }` still could, so keep a
+    // defensive guard rather than silently succeeding.
+    if !plan.init_clarion() && !plan.skills() && !plan.hooks() {
+        bail!(
+            "nothing to install: pass --skills, --hooks, or --all, \
+             or run bare `clarion install` to initialise .clarion/."
+        );
     }
 
-    fs::create_dir_all(&clarion_dir).with_context(|| format!("mkdir {}", clarion_dir.display()))?;
+    if plan.init_clarion() {
+        let clarion_dir = project_root.join(".clarion");
+        let exists = clarion_dir.exists();
+        // A bare `clarion install` (no other components requested) refuses to
+        // clobber an existing .clarion/. Under `--all` (other idempotent
+        // components requested) an already-initialised project is not an error:
+        // we keep the existing index and apply the remaining components.
+        let bare_init = !plan.skills() && !plan.hooks();
+        if exists && !force {
+            if bare_init {
+                bail!(
+                    ".clarion/ already exists at {}. Delete it or pass --force to overwrite it.",
+                    clarion_dir.display()
+                );
+            }
+            // A non-bare init (--all / --skills / --hooks) treats an existing
+            // .clarion/ as already-initialised and keeps it. But a non-directory
+            // .clarion is not a usable index — refuse rather than "succeed" with
+            // skills/hooks installed atop a project that has no clarion.db.
+            if !clarion_dir.is_dir() {
+                bail!(
+                    "found a non-directory at {}; expected an initialised .clarion/ \
+                     directory. Remove it (or pass --force) and re-run.",
+                    clarion_dir.display()
+                );
+            }
+            println!(
+                "{} already initialised; skipping .clarion/ init (pass --force to recreate).",
+                clarion_dir.display()
+            );
+        } else {
+            if exists {
+                // --force overwrite path.
+                if !clarion_dir.is_dir() {
+                    bail!(
+                        "--force can only overwrite an existing .clarion/ directory; \
+                         found non-directory at {}.",
+                        clarion_dir.display()
+                    );
+                }
+                fs::remove_dir_all(&clarion_dir)
+                    .with_context(|| format!("remove existing {}", clarion_dir.display()))?;
+            }
 
-    // Cleanup guard: if any post-mkdir step fails, remove .clarion/ before
-    // bubbling the error so the next install attempt isn't blocked by the
-    // "already exists" check (clarion-ed5017139f).
-    if let Err(err) = populate_after_mkdir(&clarion_dir, &project_root) {
-        if let Err(cleanup_err) = fs::remove_dir_all(&clarion_dir) {
-            tracing::warn!(
+            fs::create_dir_all(&clarion_dir)
+                .with_context(|| format!("mkdir {}", clarion_dir.display()))?;
+
+            // Cleanup guard: if any post-mkdir step fails, remove .clarion/ before
+            // bubbling the error so the next install attempt isn't blocked by the
+            // "already exists" check (clarion-ed5017139f).
+            if let Err(err) = populate_after_mkdir(&clarion_dir, &project_root) {
+                if let Err(cleanup_err) = fs::remove_dir_all(&clarion_dir) {
+                    tracing::warn!(
+                        clarion_dir = %clarion_dir.display(),
+                        error = %cleanup_err,
+                        "install failed and cleanup of partial .clarion/ also failed; \
+                         manual rm -rf may be required"
+                    );
+                }
+                return Err(err);
+            }
+
+            tracing::info!(
                 clarion_dir = %clarion_dir.display(),
-                error = %cleanup_err,
-                "install failed and cleanup of partial .clarion/ also failed; \
-                 manual rm -rf may be required"
+                "clarion install complete"
             );
+            println!("Initialised {}", clarion_dir.display());
         }
-        return Err(err);
     }
 
-    tracing::info!(
-        clarion_dir = %clarion_dir.display(),
-        "clarion install complete"
-    );
-    println!("Initialised {}", clarion_dir.display());
+    if plan.skills() {
+        let report = crate::skill_pack::install_skill_pack(&project_root)
+            .context("install clarion-workflow skill pack")?;
+        if report.copied {
+            println!(
+                "Installed clarion-workflow skill into {}/.claude/skills and {}/.agents/skills",
+                project_root.display(),
+                project_root.display()
+            );
+        } else {
+            println!("clarion-workflow skill already up to date");
+        }
+    }
+
+    if plan.hooks() {
+        let changed = crate::hooks_settings::install_session_start_hook(&project_root)
+            .context("merge SessionStart hook into .claude/settings.json")?;
+        if changed {
+            println!(
+                "Added clarion SessionStart hook to {}/.claude/settings.json",
+                project_root.display()
+            );
+        } else {
+            println!("clarion SessionStart hook already present");
+        }
+    }
+
     Ok(())
 }
 
@@ -166,4 +317,84 @@ fn initialise_db(path: &Path) -> Result<()> {
     pragma::apply_write_pragmas(&conn).map_err(|e| anyhow::anyhow!("{e}"))?;
     schema::apply_migrations(&mut conn).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InstallPlan;
+
+    #[test]
+    fn from_flags_truth_table() {
+        // Bare install: no component flags -> init only.
+        let bare = InstallPlan::from_flags(false, false, false);
+        assert_eq!(bare, InstallPlan::Bare);
+        assert!(bare.init_clarion());
+        assert!(!bare.skills());
+        assert!(!bare.hooks());
+
+        // --skills: skills only, no init.
+        let skills = InstallPlan::from_flags(true, false, false);
+        assert_eq!(
+            skills,
+            InstallPlan::Components {
+                skills: true,
+                hooks: false
+            }
+        );
+        assert!(!skills.init_clarion());
+        assert!(skills.skills());
+        assert!(!skills.hooks());
+
+        // --hooks: hooks only, no init.
+        let hooks = InstallPlan::from_flags(false, true, false);
+        assert_eq!(
+            hooks,
+            InstallPlan::Components {
+                skills: false,
+                hooks: true
+            }
+        );
+        assert!(!hooks.init_clarion());
+        assert!(!hooks.skills());
+        assert!(hooks.hooks());
+
+        // --all: everything (component flags ignored).
+        let all = InstallPlan::from_flags(false, false, true);
+        assert_eq!(all, InstallPlan::All);
+        assert!(all.init_clarion());
+        assert!(all.skills());
+        assert!(all.hooks());
+
+        // --skills --hooks: both components, still no init.
+        let both = InstallPlan::from_flags(true, true, false);
+        assert_eq!(
+            both,
+            InstallPlan::Components {
+                skills: true,
+                hooks: true
+            }
+        );
+        assert!(!both.init_clarion());
+        assert!(both.skills());
+        assert!(both.hooks());
+    }
+
+    #[test]
+    fn from_flags_never_yields_a_do_nothing_plan() {
+        // The do-nothing {false,false,false} state that PR #21 guarded against
+        // at run() entry is now unreachable through the only public constructor
+        // (clarion-c6b8dc27f3): every flag combination resolves to a plan that
+        // does at least one thing.
+        for skills in [false, true] {
+            for hooks in [false, true] {
+                for all in [false, true] {
+                    let plan = InstallPlan::from_flags(skills, hooks, all);
+                    assert!(
+                        plan.init_clarion() || plan.skills() || plan.hooks(),
+                        "from_flags({skills},{hooks},{all}) produced a do-nothing plan: {plan:?}"
+                    );
+                }
+            }
+        }
+    }
 }

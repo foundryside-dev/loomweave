@@ -1,12 +1,70 @@
 //! Read-side query helpers used by the MCP navigation surface.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fmt;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use clarion_core::EdgeConfidence;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
+use serde::{Serialize, Serializer};
 
 use crate::{Result, StorageError};
+
+/// A path that is *proven* to be:
+///
+/// 1. anchored under the project root (no `..` / `/` / drive prefix),
+/// 2. composed solely of normal UTF-8 path components, and
+/// 3. emitted in POSIX-style (`/`-joined) form.
+///
+/// The inner string is private and `try_new` is the only public constructor,
+/// so a `CanonicalProjectPath` cannot exist without that proof. Serializes
+/// transparently as its inner string so federation wire formats are
+/// unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalProjectPath(String);
+
+impl CanonicalProjectPath {
+    /// Construct from a `normalized` absolute path under `project_root`.
+    /// `normalized` is expected to already be lexically + filesystem
+    /// canonicalised by the caller (see [`normalize_source_path`]); this
+    /// constructor proves the residual project-relative-POSIX shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::InvalidSourcePath`] when the path escapes
+    /// `project_root`, contains any non-`Normal` component, or is not
+    /// valid UTF-8.
+    pub fn try_new(project_root: &Path, normalized: &Path) -> Result<Self> {
+        Ok(Self(project_relative_path(project_root, normalized)?))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for CanonicalProjectPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for CanonicalProjectPath {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl AsRef<str> for CanonicalProjectPath {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntityRow {
@@ -66,12 +124,100 @@ pub struct ReferenceEdgeMatch {
     pub source_byte_end: Option<i64>,
 }
 
+/// One rolled-up reference edge for a module-altitude query: a `references`
+/// edge into or out of a symbol the module contains, attributed to the
+/// contained `via` symbol it actually touches (clarion-79d0ff6e14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RolledUpReferenceEdge {
+    /// The entity on the far side of the edge — the referencer for `In`
+    /// (who imports a contained symbol), the referenced symbol for `Out`.
+    pub neighbor_id: String,
+    /// The module-contained symbol whose edge this is. For a module's own
+    /// direct reference edge (rare) this equals the module id.
+    pub via_id: String,
+    pub confidence: EdgeConfidence,
+    pub source_file_id: Option<String>,
+    pub source_byte_start: Option<i64>,
+    pub source_byte_end: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleDependencyEdge {
     pub from_module_id: String,
     pub to_module_id: String,
     pub reference_count: u64,
     pub edge_kinds: Vec<String>,
+}
+
+/// One persisted finding joined to its anchoring entity's source location, in
+/// the shape the cross-product emitter (`clarion-mcp` scan-results POST,
+/// WP9-B) needs: the Clarion-internal severity/kind vocabulary plus the
+/// entity's `source_file_path` / `source_line_*` that become Filigree's wire
+/// `path` / `line_start` / `line_end`. `source_file_path` is `None` for
+/// findings anchored to entities with no source location (e.g. a
+/// `core:subsystem:*` anchor); the emitter skips those because Filigree
+/// requires `path`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FindingForEmitRow {
+    pub id: String,
+    pub rule_id: String,
+    pub kind: String,
+    /// Clarion-internal severity: `INFO` | `WARN` | `ERROR` | `CRITICAL` |
+    /// `NONE`. Mapped to Filigree's wire vocabulary by the emitter.
+    pub severity: String,
+    pub confidence: Option<f64>,
+    pub confidence_basis: Option<String>,
+    pub message: String,
+    pub entity_id: String,
+    /// JSON array text as stored in `findings.related_entities`.
+    pub related_entities_json: String,
+    /// JSON array text as stored in `findings.supports`.
+    pub supports_json: String,
+    /// JSON array text as stored in `findings.supported_by`.
+    pub supported_by_json: String,
+    pub source_file_path: Option<String>,
+    pub source_line_start: Option<i64>,
+    pub source_line_end: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedFile {
+    pub entity_id: String,
+    pub content_hash: String,
+    pub canonical_path: CanonicalProjectPath,
+    pub language: String,
+    /// `Some(reason)` when the resolved entity carries a `briefing_blocked`
+    /// property (set by the pre-ingest secret scanner or the unscanned-source
+    /// defense-in-depth path). Federation read surfaces must refuse to expose
+    /// blocked entities to siblings; see `http_read::get_file` for the 404
+    /// translation.
+    pub briefing_blocked: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedFileCatalogEntry {
+    pub entity_id: String,
+    pub content_hash: Option<String>,
+    pub canonical_path: CanonicalProjectPath,
+    pub language: String,
+    pub briefing_blocked: Option<String>,
+    content_hash_path: PathBuf,
+}
+
+impl ResolvedFileCatalogEntry {
+    pub fn into_resolved_file(self) -> Result<ResolvedFile> {
+        let content_hash = match self.content_hash {
+            Some(content_hash) => content_hash,
+            None => file_content_hash(&self.content_hash_path)?,
+        };
+        Ok(ResolvedFile {
+            entity_id: self.entity_id,
+            content_hash,
+            canonical_path: self.canonical_path,
+            language: self.language,
+            briefing_blocked: self.briefing_blocked,
+        })
+    }
 }
 
 const MODULE_ANCESTOR_MAX_DEPTH: i64 = 32;
@@ -150,6 +296,182 @@ pub fn entity_by_id(conn: &Connection, entity_id: &str) -> Result<Option<EntityR
         .map_err(StorageError::from)
 }
 
+pub fn resolve_file(
+    conn: &Connection,
+    project_root: &Path,
+    file: &str,
+    language: &str,
+) -> Result<Option<ResolvedFile>> {
+    let Some(entry) = resolve_file_catalog_entry(conn, project_root, file, language)? else {
+        return Ok(None);
+    };
+    entry.into_resolved_file().map(Some)
+}
+
+pub fn resolve_file_catalog_entry(
+    conn: &Connection,
+    project_root: &Path,
+    file: &str,
+    language: &str,
+) -> Result<Option<ResolvedFileCatalogEntry>> {
+    let lookup_path = normalize_lookup_path(project_root, file)?;
+    let normalized = lookup_path
+        .to_str()
+        .ok_or_else(|| StorageError::InvalidSourcePath(format!("{file:?} is not valid UTF-8")))?;
+    let canonical_path = CanonicalProjectPath::try_new(project_root, &lookup_path)?;
+    if let Some(entity) = source_entity_for_path(conn, normalized, Some("file"))? {
+        let briefing_blocked = entity_briefing_block_reason(&entity.properties_json);
+        return Ok(Some(ResolvedFileCatalogEntry {
+            entity_id: entity.id,
+            content_hash: entity.content_hash,
+            canonical_path,
+            language: resolved_language(
+                language,
+                &entity.plugin_id,
+                &entity.properties_json,
+                &lookup_path,
+            ),
+            briefing_blocked,
+            content_hash_path: lookup_path,
+        }));
+    }
+    Ok(None)
+}
+
+/// Extract the `briefing_blocked` reason from an entity's `properties` JSON
+/// column. Shared with `clarion-mcp` (which makes the same call inline) so
+/// federation read surfaces enforce the block uniformly.
+pub fn entity_briefing_block_reason(properties_json: &str) -> Option<String> {
+    // Fail-closed: malformed properties JSON treated as briefing-blocked to prevent secret exposure.
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(properties_json) else {
+        return Some("malformed_properties_json".to_owned());
+    };
+    value.get("briefing_blocked")?.as_str().map(str::to_owned)
+}
+
+fn source_entity_for_path(
+    conn: &Connection,
+    normalized_path: &str,
+    required_kind: Option<&str>,
+) -> Result<Option<EntityRow>> {
+    let kind_filter = required_kind.map_or(String::new(), |_| "AND kind = ?2".to_owned());
+    let sql = format!(
+        "SELECT {ENTITY_COLUMNS} \
+         FROM entities \
+         WHERE source_file_path = ?1 \
+         {kind_filter} \
+         ORDER BY CASE kind \
+                    WHEN 'file' THEN 0 \
+                    WHEN 'module' THEN 1 \
+                    ELSE 2 \
+                  END ASC, \
+                  id ASC \
+         LIMIT 1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let row = if let Some(kind) = required_kind {
+        stmt.query_row(params![normalized_path, kind], map_entity_row)
+            .optional()?
+    } else {
+        stmt.query_row(params![normalized_path], map_entity_row)
+            .optional()?
+    };
+    Ok(row)
+}
+
+fn project_relative_path(project_root: &Path, normalized_path: &Path) -> Result<String> {
+    let root = project_root.canonicalize()?;
+    let relative = normalized_path.strip_prefix(&root).map_err(|_| {
+        StorageError::InvalidSourcePath(format!(
+            "{} is not under project root {}",
+            normalized_path.display(),
+            root.display()
+        ))
+    })?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => {
+                let Some(part) = part.to_str() else {
+                    return Err(StorageError::InvalidSourcePath(
+                        "source path is not valid UTF-8".to_owned(),
+                    ));
+                };
+                parts.push(part);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(StorageError::InvalidSourcePath(format!(
+                    "{} is not a project-relative source path",
+                    normalized_path.display()
+                )));
+            }
+        }
+    }
+    Ok(parts.join("/"))
+}
+
+fn normalize_lookup_path(project_root: &Path, file: &str) -> Result<PathBuf> {
+    let root = project_root.canonicalize()?;
+    let input = Path::new(file);
+    let candidate = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        root.join(input)
+    };
+    let lexical = normalize_lexically(&candidate);
+    if !lexical.starts_with(&root) {
+        return Err(StorageError::InvalidSourcePath(format!(
+            "{file:?} escapes project root {}",
+            root.display()
+        )));
+    }
+    Ok(lexical)
+}
+
+fn file_content_hash(path: &Path) -> std::io::Result<String> {
+    fs::read(path).map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+}
+
+fn resolved_language(
+    requested: &str,
+    plugin_id: &str,
+    properties_json: &str,
+    path: &Path,
+) -> String {
+    if let Some(language) = stored_language(properties_json) {
+        return language;
+    }
+    if plugin_id != "core" {
+        return plugin_id.to_owned();
+    }
+    if let Some(inferred) = language_for_extension(path) {
+        return inferred;
+    }
+    requested.trim().to_owned()
+}
+
+fn stored_language(properties_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(properties_json)
+        .ok()?
+        .get("language")?
+        .as_str()
+        .map(str::trim)
+        .filter(|language| !language.is_empty())
+        .map(str::to_owned)
+}
+
+fn language_for_extension(path: &Path) -> Option<String> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("py") => Some("python".to_owned()),
+        Some("rs") => Some("rust".to_owned()),
+        Some("js") => Some("javascript".to_owned()),
+        Some("ts") => Some("typescript".to_owned()),
+        Some(extension) => Some(extension.to_owned()),
+        None => None,
+    }
+}
+
 /// Return the subset of `candidates` whose `id` appears in `entities`. Used by
 /// the inferred-edge dispatch path to pre-filter LLM-proposed `to_id` values
 /// before they reach the writer-actor's FK-protected INSERT (clarion-df58379de4).
@@ -209,15 +531,112 @@ pub fn entity_at_line(
         .map_err(StorageError::from)
 }
 
+/// Every entity whose source span contains `line` in `source_file_path`,
+/// innermost first.
+///
+/// Same ordering as [`entity_at_line`] (smallest span first, then a stable
+/// kind/id tie-break) but without the `LIMIT 1`, so the caller sees the full
+/// containing set: the winner is the first row, and any later row sharing the
+/// winner's span length is a genuine ambiguity alternative (overlapping
+/// entities at the same granularity), while strictly larger spans are the
+/// nesting stack. Read-only.
+///
+/// # Errors
+///
+/// Returns [`StorageError::InvalidQuery`] for a non-positive `line`, or a
+/// `SQLite` error if the query fails.
+pub fn entities_containing_line(
+    conn: &Connection,
+    source_file_path: &str,
+    line: i64,
+) -> Result<Vec<EntityRow>> {
+    if line <= 0 {
+        return Err(StorageError::InvalidQuery(
+            "line must be a positive one-based integer".to_owned(),
+        ));
+    }
+    let sql = format!(
+        "SELECT {ENTITY_COLUMNS} \
+         FROM entities \
+         WHERE source_file_path = ?1 \
+           AND source_line_start IS NOT NULL \
+           AND source_line_end IS NOT NULL \
+           AND source_line_start <= ?2 \
+           AND source_line_end >= ?2 \
+         ORDER BY (source_line_end - source_line_start) ASC, \
+                  CASE kind \
+                    WHEN 'function' THEN 0 \
+                    WHEN 'class' THEN 1 \
+                    WHEN 'module' THEN 2 \
+                    ELSE 3 \
+                  END ASC, \
+                  id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![source_file_path, line], map_entity_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The chain of ancestor entities of `entity_id`, immediate parent first up
+/// to the root (module) entity, following each row's `parent_id`.
+///
+/// Used to render the authoritative containing stack for `entity_at`
+/// (module → class → function) independent of span arithmetic. The walk is
+/// bounded by `MAX_ANCESTOR_DEPTH` so a malformed `parent_id` cycle cannot
+/// loop forever. Read-only.
+///
+/// # Errors
+///
+/// Returns a `SQLite` error if a lookup fails. A dangling `parent_id` (parent
+/// row absent) simply ends the chain.
+pub fn ancestor_chain(conn: &Connection, entity_id: &str) -> Result<Vec<EntityRow>> {
+    let mut chain = Vec::new();
+    let mut current = entity_by_id(conn, entity_id)?;
+    let mut depth = 0;
+    while let Some(row) = current {
+        let Some(parent_id) = row.parent_id.clone() else {
+            break;
+        };
+        depth += 1;
+        if depth > MAX_ANCESTOR_DEPTH {
+            break;
+        }
+        let parent = entity_by_id(conn, &parent_id)?;
+        if let Some(parent_row) = &parent {
+            chain.push(parent_row.clone());
+        }
+        current = parent;
+    }
+    Ok(chain)
+}
+
+/// Upper bound on the parent-id ancestor walk in [`ancestor_chain`]. Real
+/// Python nesting is shallow; this only guards against a malformed cycle.
+const MAX_ANCESTOR_DEPTH: usize = 64;
+
 pub fn find_entities(
     conn: &Connection,
     pattern: &str,
     limit: usize,
     offset: usize,
+    kind: Option<&str>,
 ) -> Result<Vec<EntityRow>> {
     if pattern.trim().is_empty() {
         return Err(StorageError::InvalidQuery(
             "entity search pattern must not be blank".to_owned(),
+        ));
+    }
+    // The `kind` filter is an optional exact-match on `entities.kind`. Kinds are
+    // plugin-owned (ADR-003/ADR-022), so we don't validate against a hardcoded
+    // allowlist — an unknown kind simply matches no rows. Reject only a blank
+    // string, which is never a real kind and signals a malformed request.
+    if let Some(kind) = kind
+        && kind.trim().is_empty()
+    {
+        return Err(StorageError::InvalidQuery(
+            "entity search kind filter must not be blank".to_owned(),
         ));
     }
     let limit = limit.clamp(1, 100);
@@ -226,35 +645,50 @@ pub fn find_entities(
     let offset_i64 = i64::try_from(offset)
         .map_err(|_| StorageError::InvalidQuery("entity search offset is too large".to_owned()))?;
     if is_fts_safe(pattern) {
+        let kind_clause = if kind.is_some() {
+            "AND e.kind = ?4 "
+        } else {
+            ""
+        };
         let sql = format!(
             "SELECT e.{columns} \
              FROM entity_fts f \
              JOIN entities e ON e.id = f.entity_id \
-             WHERE entity_fts MATCH ?1 \
+             WHERE entity_fts MATCH ?1 {kind_clause}\
              ORDER BY bm25(entity_fts), e.id \
              LIMIT ?2 OFFSET ?3",
             columns = ENTITY_COLUMNS.replace(", ", ", e.")
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![pattern, limit_i64, offset_i64], map_entity_row)?;
+        let rows = match kind {
+            Some(kind) => stmt.query_map(
+                params![pattern, limit_i64, offset_i64, kind],
+                map_entity_row,
+            )?,
+            None => stmt.query_map(params![pattern, limit_i64, offset_i64], map_entity_row)?,
+        };
         return rows
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(StorageError::from);
     }
 
     let like = format!("%{}%", escape_like(pattern));
+    let kind_clause = if kind.is_some() { "AND kind = ?4 " } else { "" };
     let sql = format!(
         "SELECT {ENTITY_COLUMNS} \
          FROM entities \
-         WHERE id LIKE ?1 ESCAPE '\\' \
+         WHERE (id LIKE ?1 ESCAPE '\\' \
             OR name LIKE ?1 ESCAPE '\\' \
             OR short_name LIKE ?1 ESCAPE '\\' \
-            OR COALESCE(summary, '') LIKE ?1 ESCAPE '\\' \
+            OR COALESCE(summary, '') LIKE ?1 ESCAPE '\\') {kind_clause}\
          ORDER BY id \
          LIMIT ?2 OFFSET ?3"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![like, limit_i64, offset_i64], map_entity_row)?;
+    let rows = match kind {
+        Some(kind) => stmt.query_map(params![like, limit_i64, offset_i64, kind], map_entity_row)?,
+        None => stmt.query_map(params![like, limit_i64, offset_i64], map_entity_row)?,
+    };
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(StorageError::from)
 }
@@ -402,24 +836,118 @@ pub fn reference_edges_for_entity(
     entity_id: &str,
     direction: ReferenceDirection,
 ) -> Result<Vec<ReferenceEdgeMatch>> {
+    directed_edges_for_entity(conn, entity_id, direction, "references")
+}
+
+/// `imports` edges (module → module). Direction `In` answers "who imports this
+/// module" — the reverse-import lookup neighborhood previously could not serve
+/// because it only read `references` edges (clarion-79d0ff6e14).
+pub fn import_edges_for_entity(
+    conn: &Connection,
+    entity_id: &str,
+    direction: ReferenceDirection,
+) -> Result<Vec<ReferenceEdgeMatch>> {
+    directed_edges_for_entity(conn, entity_id, direction, "imports")
+}
+
+fn directed_edges_for_entity(
+    conn: &Connection,
+    entity_id: &str,
+    direction: ReferenceDirection,
+    kind: &str,
+) -> Result<Vec<ReferenceEdgeMatch>> {
     let sql = match direction {
         ReferenceDirection::In => {
             "SELECT from_id, confidence, source_file_id, source_byte_start, source_byte_end \
              FROM edges \
-             WHERE kind = 'references' AND to_id = ?1 \
+             WHERE kind = ?1 AND to_id = ?2 \
              ORDER BY from_id, source_byte_start, source_byte_end"
         }
         ReferenceDirection::Out => {
             "SELECT to_id, confidence, source_file_id, source_byte_start, source_byte_end \
              FROM edges \
-             WHERE kind = 'references' AND from_id = ?1 \
+             WHERE kind = ?1 AND from_id = ?2 \
              ORDER BY to_id, source_byte_start, source_byte_end"
         }
     };
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(params![entity_id], map_reference_edge_match)?;
+    let rows = stmt.query_map(params![kind, entity_id], map_reference_edge_match)?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(StorageError::from)
+}
+
+/// Aggregate the `references` edges of every entity transitively contained in
+/// `module_id` (via `contains`), for module-altitude reference rollup and the
+/// reverse-import lookup ("who imports this module / contract?").
+///
+/// A Python `from pkg.contracts import RunStatus` is recorded as a `references`
+/// edge to the *class*, not the module — so a module's OWN reference edges are
+/// almost always empty and "who references this module?" answered `[]`
+/// (clarion-79d0ff6e14). This rolls the contained symbols' edges up to the
+/// module: direction `In` lists external referencers (who imports a contained
+/// symbol), `Out` lists what contained symbols reference outside the module.
+///
+/// Intra-module edges (both endpoints contained in the same module) are
+/// excluded — they are internal wiring, not a reverse-import answer. Results
+/// are ordered deterministically. The recursive CTE uses `UNION` (not `UNION
+/// ALL`), so a pathological `contains` cycle terminates instead of looping.
+pub fn module_reference_rollup(
+    conn: &Connection,
+    module_id: &str,
+    direction: ReferenceDirection,
+) -> Result<Vec<RolledUpReferenceEdge>> {
+    // Column 0 is always the far-side neighbor, column 1 the contained `via`
+    // symbol, so `map_rolled_up_reference_edge` is direction-agnostic.
+    let sql = match direction {
+        ReferenceDirection::In => {
+            "WITH RECURSIVE contained(id) AS ( \
+                 SELECT ?1 \
+                 UNION \
+                 SELECT child.to_id FROM edges child \
+                 JOIN contained ON contained.id = child.from_id \
+                 WHERE child.kind = 'contains' \
+             ) \
+             SELECT ed.from_id, ed.to_id, ed.confidence, ed.source_file_id, \
+                    ed.source_byte_start, ed.source_byte_end \
+             FROM edges ed \
+             JOIN contained ON contained.id = ed.to_id \
+             WHERE ed.kind = 'references' \
+               AND ed.from_id NOT IN (SELECT id FROM contained) \
+             ORDER BY ed.from_id, ed.to_id, ed.source_byte_start, ed.source_byte_end"
+        }
+        ReferenceDirection::Out => {
+            "WITH RECURSIVE contained(id) AS ( \
+                 SELECT ?1 \
+                 UNION \
+                 SELECT child.to_id FROM edges child \
+                 JOIN contained ON contained.id = child.from_id \
+                 WHERE child.kind = 'contains' \
+             ) \
+             SELECT ed.to_id, ed.from_id, ed.confidence, ed.source_file_id, \
+                    ed.source_byte_start, ed.source_byte_end \
+             FROM edges ed \
+             JOIN contained ON contained.id = ed.from_id \
+             WHERE ed.kind = 'references' \
+               AND ed.to_id NOT IN (SELECT id FROM contained) \
+             ORDER BY ed.to_id, ed.from_id, ed.source_byte_start, ed.source_byte_end"
+        }
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![module_id], map_rolled_up_reference_edge)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+fn map_rolled_up_reference_edge(row: &Row<'_>) -> rusqlite::Result<RolledUpReferenceEdge> {
+    let raw_confidence: String = row.get(2)?;
+    Ok(RolledUpReferenceEdge {
+        neighbor_id: row.get(0)?,
+        via_id: row.get(1)?,
+        confidence: parse_confidence(&raw_confidence)?,
+        source_file_id: row.get(3)?,
+        source_byte_start: row.get(4)?,
+        source_byte_end: row.get(5)?,
+    })
 }
 
 pub fn module_dependency_edges(
@@ -551,6 +1079,83 @@ pub fn subsystem_members(conn: &Connection, subsystem_id: &str) -> Result<Vec<Su
         .map_err(StorageError::from)
 }
 
+/// The subsystem an entity belongs to, plus the module the membership was
+/// resolved through (the entity itself when it is a module).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntitySubsystem {
+    pub subsystem_id: String,
+    pub via_module_id: String,
+}
+
+/// Resolve the subsystem an arbitrary entity belongs to — the reverse of
+/// [`subsystem_members`].
+///
+/// `in_subsystem` edges connect *modules* to subsystems, so for a non-module
+/// entity (function, class, …) this walks up `contains` edges to the nearest
+/// module ancestor and follows that module's `in_subsystem` edge. A module
+/// entity resolves directly (depth 0). Returns the nearest match, or `None` if
+/// the entity has no module ancestor that is assigned to a subsystem.
+pub fn subsystem_of_entity(conn: &Connection, entity_id: &str) -> Result<Option<EntitySubsystem>> {
+    conn.query_row(
+        "WITH RECURSIVE ancestors(id, depth) AS ( \
+             SELECT ?1, 0 \
+             UNION ALL \
+             SELECT parent.from_id, ancestors.depth + 1 \
+             FROM edges parent \
+             JOIN ancestors ON parent.to_id = ancestors.id \
+             WHERE parent.kind = 'contains' AND ancestors.depth < ?2 \
+         ) \
+         SELECT m.id, sub.to_id \
+         FROM ancestors \
+         JOIN entities m ON m.id = ancestors.id AND m.kind = 'module' \
+         JOIN edges sub ON sub.kind = 'in_subsystem' AND sub.from_id = m.id \
+         JOIN entities s ON s.id = sub.to_id AND s.kind = 'subsystem' \
+         ORDER BY ancestors.depth, sub.to_id \
+         LIMIT 1",
+        params![entity_id, MODULE_ANCESTOR_MAX_DEPTH],
+        |row| {
+            Ok(EntitySubsystem {
+                via_module_id: row.get(0)?,
+                subsystem_id: row.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(StorageError::from)
+}
+
+/// Resolve the module that contains `entity_id`: the nearest `module`-kind
+/// ancestor reached by walking `contains` edges upward, or the entity itself
+/// when it is already a module (depth 0).
+///
+/// Used to lift a reverse-import (`who imports this`) result to module altitude
+/// (clarion-79d0ff6e14). A `references` edge is recorded against the importing
+/// *symbol* (`from pkg.contracts import X` binds to the class `X`), but the
+/// reverse-import contract names importing *modules* — so a consumer resolves
+/// each importer to its module here. Returns `None` for a symbol with no module
+/// ancestor within `MODULE_ANCESTOR_MAX_DEPTH`.
+pub fn containing_module_id(conn: &Connection, entity_id: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "WITH RECURSIVE ancestors(id, depth) AS ( \
+             SELECT ?1, 0 \
+             UNION ALL \
+             SELECT parent.from_id, ancestors.depth + 1 \
+             FROM edges parent \
+             JOIN ancestors ON parent.to_id = ancestors.id \
+             WHERE parent.kind = 'contains' AND ancestors.depth < ?2 \
+         ) \
+         SELECT m.id \
+         FROM ancestors \
+         JOIN entities m ON m.id = ancestors.id AND m.kind = 'module' \
+         ORDER BY ancestors.depth \
+         LIMIT 1",
+        params![entity_id, MODULE_ANCESTOR_MAX_DEPTH],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(StorageError::from)
+}
+
 pub fn subsystem_for_member(conn: &Connection, module_id: &str) -> Result<Option<String>> {
     // Reserved for v0.2 neighborhood / issues_for enrichment. v0.1's MCP
     // surface exposes subsystem_members, but keeping this inverse lookup here
@@ -625,6 +1230,58 @@ pub fn contained_entity_ids(
         entity_ids,
         truncated: false,
     })
+}
+
+/// All findings recorded under `run_id`, joined to their anchoring entity's
+/// source location, ordered by finding id for deterministic emission. Used by
+/// the WP9-B cross-product emitter to build a `POST /api/v1/scan-results`
+/// batch. Findings whose anchor entity has no `source_file_path` are returned
+/// with `source_file_path: None`; the emitter skips them (Filigree requires a
+/// `path`).
+///
+/// Findings anchored to a `briefing_blocked` entity are excluded: emission is a
+/// one-way path/line egress to a sibling, and the federation read API
+/// (`GET /api/v1/files`) already refuses briefing-blocked entities and omits
+/// their identity fields. Without this guard the write direction would leak the
+/// very path/line the read direction is engineered to withhold — e.g. a
+/// secret-scanner `CLA-SEC-SECRET-DETECTED` finding on a still-blocked
+/// secret-bearing file. The filter is safe for the ADR-013 audit trail: an
+/// operator override (`--allow-unredacted-secrets`) records the file as
+/// `Overridden`, not `Blocked`, so its anchor entity carries no
+/// `briefing_blocked` reason and the `CLA-SEC-UNREDACTED-SECRETS-ALLOWED` audit
+/// finding still emits.
+pub fn findings_for_emit(conn: &Connection, run_id: &str) -> Result<Vec<FindingForEmitRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.id, f.rule_id, f.kind, f.severity, f.confidence, \
+                f.confidence_basis, f.message, f.entity_id, f.related_entities, \
+                f.supports, f.supported_by, \
+                e.source_file_path, e.source_line_start, e.source_line_end \
+         FROM findings f \
+         JOIN entities e ON e.id = f.entity_id \
+         WHERE f.run_id = ?1 \
+           AND e.briefing_blocked IS NULL \
+         ORDER BY f.id",
+    )?;
+    let rows = stmt.query_map(params![run_id], |row| {
+        Ok(FindingForEmitRow {
+            id: row.get(0)?,
+            rule_id: row.get(1)?,
+            kind: row.get(2)?,
+            severity: row.get(3)?,
+            confidence: row.get(4)?,
+            confidence_basis: row.get(5)?,
+            message: row.get(6)?,
+            entity_id: row.get(7)?,
+            related_entities_json: row.get(8)?,
+            supports_json: row.get(9)?,
+            supported_by_json: row.get(10)?,
+            source_file_path: row.get(11)?,
+            source_line_start: row.get(12)?,
+            source_line_end: row.get(13)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
 }
 
 fn map_entity_row(row: &Row<'_>) -> rusqlite::Result<EntityRow> {

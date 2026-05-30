@@ -1,0 +1,110 @@
+{
+  "_meta": {
+    "contract": "clarion-http-read-api",
+    "endpoint": "POST /api/v1/files:resolve",
+    "api_version": 1,
+    "fixture_version": 1,
+    "stability": "normative",
+    "authority": "Clarion ADR-014 federation registry-backend contract",
+    "verification": "cargo test -p clarion-cli --test serve",
+    "normative": true,
+    "updated": "2026-05-20",
+    "description": "Contract example for per-path batch file identity resolution. The endpoint preserves input order and returns one status/body pair per requested path."
+  },
+  "shape_decl": {
+    "kind": "clarion-http-fixture-shapes",
+    "shapes": {
+      "resolve_batch": {
+        "status": 200,
+        "required_fields": {
+          "results": {
+            "type": "array"
+          }
+        },
+        "forbidden_fields": [
+          "error",
+          "code"
+        ],
+        "allow_extra_fields": false
+      }
+    }
+  },
+  "examples": [
+    {
+      "name": "mixed_paths_200",
+      "request": {
+        "method": "POST",
+        "path": "/api/v1/files:resolve",
+        "body": {
+          "paths": [
+            {
+              "path": "demo.py",
+              "language": "python"
+            },
+            {
+              "path": "missing.py"
+            },
+            {
+              "path": "blocked.py",
+              "language": "python"
+            },
+            {
+              "path": "../escapes.py",
+              "language": "python"
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "shape": "resolve_batch",
+        "body": {
+          "results": [
+            {
+              "path": "demo.py",
+              "response": {
+                "status": "resolved",
+                "body": {
+                  "entity_id": "core:file:demo.py",
+                  "content_hash": "hash-demo-file",
+                  "canonical_path": "demo.py",
+                  "language": "python"
+                }
+              }
+            },
+            {
+              "path": "missing.py",
+              "response": {
+                "status": "not_found",
+                "body": {
+                  "error": "file is not known to Clarion",
+                  "code": "NOT_FOUND"
+                }
+              }
+            },
+            {
+              "path": "blocked.py",
+              "response": {
+                "status": "blocked",
+                "body": {
+                  "error": "entity is briefing-blocked and cannot be exposed",
+                  "code": "BRIEFING_BLOCKED"
+                }
+              }
+            },
+            {
+              "path": "../escapes.py",
+              "response": {
+                "status": "error",
+                "body": {
+                  "error": "path is outside project root",
+                  "code": "PATH_OUTSIDE_PROJECT"
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -13,7 +13,7 @@ Three guidance-schema fields and one finding field are renamed: `entity.properti
 
 The Loom federation axiom (`docs/suite/loom.md` §3–§5) requires solo-useful, pairwise-composable, enrich-only products. None of the three failure modes (semantic / initialization / pipeline coupling) directly applies to vocabulary, but cross-product readability is the *prerequisite* for honest pairwise composition. When a Loom user reads Clarion's design and Filigree's CLI in the same session and `priority` means different things in each, every cross-product debugging pass starts from a misframe. The bug at `clarion-4cd11905e2` is the concrete proof: the issue's filer assumed Filigree's meaning, the audit pass had to reframe before any fix could land.
 
-Three mismatches are documented in the [skeleton audit](../../superpowers/handoffs/2026-05-03-skeleton-audit.md):
+Three mismatches are documented in the [skeleton audit](../../implementation/handoffs/2026-05-03-skeleton-audit.md):
 
 1. **`priority`** — Clarion's guidance composition rank `project | subsystem | package | module | class | function`
    (`detailed-design.md:453`, `system-design.md:346`) collides with Filigree's `priority` label vocabulary
@@ -148,7 +148,7 @@ Add the audit's findings to the glossary as `open` clashes; defer the schema cor
 
 ### Negative
 
-- The rename has a wider blast radius than the schema alone. `requirements.md`, `system-design.md`, and `detailed-design.md` all carry references that must move; this ADR's commit updates them in lockstep. Historical ADRs (e.g., [ADR-007](./ADR-007-summary-cache-key.md) at line 56 still references `critical: true` in its example) are **not** touched — Accepted ADRs are immutable per repo convention. Readers of those historical ADRs should map the old field names to the post-ADR-024 ones using this ADR's rename table. Plan and review documents under `docs/superpowers/plans/` and `docs/clarion/v0.1/reviews/` are also left alone (historical snapshots, not normative).
+- The rename has a wider blast radius than the schema alone. `requirements.md`, `system-design.md`, and `detailed-design.md` all carry references that must move; this ADR's commit updates them in lockstep. Historical ADRs (e.g., [ADR-007](./ADR-007-summary-cache-key.md) at line 56 still references `critical: true` in its example) are **not** touched — Accepted ADRs are immutable per repo convention. Readers of those historical ADRs should map the old field names to the post-ADR-024 ones using this ADR's rename table. Plan and review documents archived under `docs/implementation/` (`agent-plans/`, `v0.1-reviews/`) are also left alone (historical snapshots, not normative).
 - The walking-skeleton fixture's `.clarion/clarion.db` (committed for the e2e test) is rebuilt with the new schema as part of this change. The test script's expectations stay the same; the database file changes. Mitigation: the e2e script doesn't depend on the schema's column names; it asserts on the persisted entity row's `id` and `kind`.
 - An external operator who *did* run a pre-publication build of Clarion against a real codebase between Sprint 1 close and this ADR has a `.clarion/clarion.db` with the old `priority` column. Mitigation: nobody has — this is the explicit pre-condition for the in-place policy. Any future operator who runs the new build sees the corrected schema only.
 - Re-using the `0001` migration version number means the `schema_migrations` ledger row is identical (`version=1`, `name='0001_initial_schema'`) before and after the edit. A consumer who applied the pre-edit `0001` and then upgrades will not see any migration to apply, and their database will diverge silently from the new shape. Mitigation: the same pre-condition — no such consumer exists; the retirement trigger names exactly this case.
@@ -168,11 +168,11 @@ Add the audit's findings to the glossary as `open` clashes; defer the schema cor
 
 ## References
 
-- [Skeleton audit](../../superpowers/handoffs/2026-05-03-skeleton-audit.md) — durable record of the audit pass, reviewer feedback (architecture-critic + leverage-analyst), and the reconciled plan that produced this ADR.
+- [Skeleton audit](../../implementation/handoffs/2026-05-03-skeleton-audit.md) — durable record of the audit pass, reviewer feedback (architecture-critic + leverage-analyst), and the reconciled plan that produced this ADR.
 - [Loom suite glossary](../../suite/glossary.md) — the federation-safe design-review artefact this ADR moves three entries from `open` to `managed` within.
 - [Loom federation axiom](../../suite/loom.md) §3–§5 — the doctrine the glossary defends; the failure-test mode this ADR addresses is reader-side cross-product disambiguation cost.
 - `crates/clarion-storage/migrations/0001_initial_schema.sql:163-191` — the schema sites this ADR edits in place.
 - `crates/clarion-storage/tests/schema_apply.rs:138-169` — the test that documented the bug and is rewritten to test the corrected design.
-- `docs/clarion/v0.1/detailed-design.md:204, 270, 449, 453, 467, 471, 737-748` — the design-doc sites this ADR's renames touch.
-- `docs/clarion/v0.1/system-design.md:346, 675` — the system-level guidance composition references.
+- `docs/clarion/1.0/detailed-design.md:204, 270, 449, 453, 467, 471, 737-748` — the design-doc sites this ADR's renames touch.
+- `docs/clarion/1.0/system-design.md:346, 675` — the system-level guidance composition references.
 - Filigree issue `clarion-4cd11905e2` — the misframed bug whose triage produced this audit.

@@ -122,7 +122,7 @@ v0.1 does not emit observations. Observation generators (LLM-proposed guidance, 
 
 ## References
 
-- [Clarion v0.1 scope commitments — Q1](../v0.1/plans/v0.1-scope-commitments.md) — observation HTTP transport explicitly deferred to v0.2.
+- [Clarion v0.1 scope commitments — Q1](../../implementation/v0.1-scope-plans/v0.1-scope-commitments.md) — observation HTTP transport explicitly deferred to v0.2.
 - [Clarion v0.1 system design §9 (Observation transport)](../v0.1/system-design.md) (lines 916-921) — the passage reversed by this ADR; updated in the same commit.
 - [Clarion v0.1 system design §11 (Capability negotiation)](../v0.1/system-design.md) (lines 1122-1141) — observation HTTP presence moves from v0.1 fallback trigger to v0.2 feature-flag detection.
 - [Clarion v0.1 detailed design §9.1 Filigree prerequisites](../v0.1/detailed-design.md) (lines 1333-1351) — `POST /api/v1/observations` moved from "Required for v0.1 ship" to "Nice-to-have (v0.2+)".

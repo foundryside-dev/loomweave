@@ -62,11 +62,11 @@ A "standalone mode" that works only because an invisible sibling is still import
 - **Clarion** builds its catalog whether Wardline is present or not. Wardline's annotations *enrich* Clarion's entity metadata with trust-tier and policy-semantic information, but Clarion's structural truth is independent of Wardline's policy truth.
 - **Shuttle**, if built, would execute changes whether any sibling is present. Sibling tools enrich its telemetry (which Filigree ticket? which Clarion entity? which Wardline policy?) but are never required for a change to apply or roll back.
 
-### v0.1 asterisks
+### v1.0 asterisks
 
-The v0.1 suite does not pass the expanded failure test cleanly. Two specific couplings are named here so they cannot drift unnoticed:
+The v1.0 suite does not pass the expanded failure test cleanly. Two specific couplings are named here so they cannot drift unnoticed:
 
-- **Wardline→Filigree findings are pipeline-coupled through Clarion in v0.1.** Wardline's SARIF output reaches Filigree only via Clarion's `clarion sarif import` translator. This violates pipeline composability for the (Wardline, Filigree) pair. *Retirement condition*: Wardline gains a native Filigree emitter (see Clarion's ADR-015), at which point Clarion's SARIF translator retires and the pair composes directly. The asterisk ships with v0.1 and retires in v0.2.
+- **Wardline→Filigree findings are pipeline-coupled through Clarion in v1.0.** Wardline's SARIF output reaches Filigree only via Clarion's `clarion sarif import` translator. This violates pipeline composability for the (Wardline, Filigree) pair. *Retirement condition* (mechanism updated 2026-05-29): the generic Wardline rebuild ships a **native Filigree emitter** (Wardline-side, per the 2026-05-29 integration brief and Clarion's ADR-015 Revision 2), at which point the pair composes directly and Clarion drops off the transport path — its `clarion sarif import` translator stays as the general-purpose SARIF path for other tools; only its Wardline-bridge role retires. The asterisk is **kept live** until that emitter ships and (Wardline, Filigree) composition is verified with Clarion absent — agreement to the direction is not retirement. Tracked under `release:1.1`.
 - **Clarion's Python plugin imports `wardline.core.registry.REGISTRY` at startup.** This is initialization coupling scoped to the Wardline-aware plugin specifically, not to Clarion as a product — Clarion's core and any non-Wardline-aware plugins do not depend on Wardline being importable. The coupling is named so it does not slip unexamined into a future general-purpose plugin. If a future plugin introduces similar initialization coupling without a clear "this plugin is specifically about Wardline" justification, it violates this rule.
 
 Asterisks are acceptable only with a written retirement condition and an honest statement of which failure-test mode is being temporarily violated. A "we'll fix it later" without a test-mode citation is not an asterisk; it is the stealth-monolith failure mode wearing different clothes.
@@ -84,7 +84,14 @@ Because the strongest pressure on this charter comes from "wouldn't it be easier
 - **A central store or database.** Each product owns its data locally. No shared SQLite/Postgres/object-store sits under the suite.
 - **A system of record for any cross-product state.** Finding lifecycle lives in Filigree. Entity identity lives in Clarion. Policy baselines live in Wardline. Execution provenance (if Shuttle ships) lives in Shuttle. Loom does not own or mirror these.
 - **An identity reconciliation service.** When cross-scheme translation is needed — e.g. Wardline qualname → Clarion entity ID — the product that *cares* does the translation, because that product is the one whose authority needs it. Clarion translates qualnames because Clarion owns the catalog that makes them meaningful. There is no neutral "Loom identity oracle."
-- **A capability negotiation bus.** Products probe each other directly via their own surfaces (HTTP endpoints, MCP tools, CLI flags). Version skew is handled bilaterally, not through a Loom-level registry.
+- **A capability negotiation bus.** Products probe each other directly via
+  their own surfaces (HTTP endpoints, MCP tools, CLI flags). Version skew is
+  handled bilaterally, not through a Loom-level registry. Clarion's HTTP read
+  API is one such bilateral surface; its operator trust model is documented in
+  [`docs/operator/clarion-http-read-api.md`](../operator/clarion-http-read-api.md):
+  the HTTP surface is unauthenticated, loopback-only by default, and requires an
+  authenticated reverse proxy or equivalent control before any non-loopback
+  bind.
 
 The test for any proposed addition: if the proposal introduces something that would need to be *running* or *present* for the suite to work, it violates federation. Integration protocols, schemas, and narrow contracts are fine. Shared infrastructure that sibling products *depend on* is not.
 
@@ -115,7 +122,7 @@ Federation does not require uniform vocabulary, but it does require that the sam
 
 | Product | Status |
 |---|---|
-| Clarion | Designed; implementation not yet started; first-customer target is elspeth (~425k LOC Python) |
+| Clarion | Walking skeleton tagged `v0.1-sprint-1`; v0.1 build in flight against the published design; first-customer target is elspeth (~425k LOC Python) |
 | Filigree | Built; in active use |
 | Wardline | Built; in active commit-cadence use |
 | Shuttle | Proposed; not in flight; separate design effort when prioritised |

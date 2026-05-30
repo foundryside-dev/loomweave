@@ -161,6 +161,6 @@ Clarion's internal records store `{critical, high, medium, low, info}` directly.
 ## References
 
 - [Clarion v0.1 detailed design §7](../v0.1/detailed-design.md) (lines 1163-1200) — the canonical mapping tables; this ADR formalises what's already there and fixes Issue 7.
-- [Clarion v0.1 integration reconnaissance §2.3, §2.4](../v0.1/reviews/pre-restructure/integration-recon.md) — empirical evidence for severity vocabulary and dedup key on Filigree's side (`db_schema.py` line numbers).
-- [Panel self-sufficiency review — Issue 7](../v0.1/reviews/panel-2026-04-17/04-self-sufficiency.md) (lines 132-134) — rule-ID namespace inconsistency this ADR resolves.
+- [Clarion v0.1 integration reconnaissance §2.3, §2.4](../../implementation/v0.1-reviews/pre-restructure/integration-recon.md) — empirical evidence for severity vocabulary and dedup key on Filigree's side (`db_schema.py` line numbers).
+- [Panel self-sufficiency review — Issue 7](../../implementation/v0.1-reviews/panel-2026-04-17/04-self-sufficiency.md) (lines 132-134) — rule-ID namespace inconsistency this ADR resolves.
 - [Clarion v0.1 requirements — REQ-FINDING-02, NG-21](../v0.1/requirements.md) — rule-ID namespace rule; v0.2 server-side per-entity dedup deferral.

@@ -3,7 +3,7 @@
 #
 # Builds a real demo Clarion database through `clarion analyze`, starts
 # `clarion serve`, and sends Content-Length framed MCP JSON-RPC requests for
-# the eight MCP navigation tools. Filigree is represented by a local HTTP
+# the MCP navigation tools. Filigree is represented by a local HTTP
 # server that implements the B.7 reverse entity-association route.
 
 set -euo pipefail
@@ -359,6 +359,39 @@ requests: list[tuple[str, dict[str, object]]] = [
             "params": {"name": "issues_for", "arguments": {"id": "python:module:demo"}},
         },
     ),
+    (
+        "source-for-entity",
+        {
+            "jsonrpc": "2.0",
+            "id": "source-for-entity",
+            "method": "tools/call",
+            "params": {
+                "name": "source_for_entity",
+                "arguments": {"id": "python:function:demo.hello", "context_lines": 1},
+            },
+        },
+    ),
+    (
+        "call-sites",
+        {
+            "jsonrpc": "2.0",
+            "id": "call-sites",
+            "method": "tools/call",
+            "params": {
+                "name": "call_sites",
+                "arguments": {"id": "python:function:demo.hello", "role": "caller"},
+            },
+        },
+    ),
+    (
+        "context",
+        {
+            "jsonrpc": "2.0",
+            "id": "context",
+            "method": "resources/read",
+            "params": {"uri": "clarion://context"},
+        },
+    ),
 ]
 
 responses: dict[str, dict[str, object]] = {}
@@ -377,9 +410,13 @@ finally:
     assert status == 0, f"clarion serve exited {status}; stderr={stderr}"
 
 assert responses["initialize"]["result"]["protocolVersion"] == "2025-11-25"
+init_result = responses["initialize"]["result"]
+assert "clarion-workflow" in init_result["instructions"], init_result.get("instructions")
+assert isinstance(init_result["capabilities"]["resources"], dict), init_result["capabilities"]
+assert isinstance(init_result["capabilities"]["prompts"], dict), init_result["capabilities"]
 tools = responses["tools"]["result"]["tools"]
-assert len(tools) == 8, tools
-assert [tool["name"] for tool in tools] == [
+tool_names = [tool["name"] for tool in tools]
+assert tool_names == [
     "entity_at",
     "find_entity",
     "callers_of",
@@ -388,7 +425,23 @@ assert [tool["name"] for tool in tools] == [
     "issues_for",
     "neighborhood",
     "subsystem_members",
-]
+    "subsystem_of",
+    "project_status",
+    "summary_preview_cost",
+    "source_for_entity",
+    "call_sites",
+    "orientation_pack",
+    "analyze_start",
+    "analyze_status",
+    "analyze_cancel",
+    "index_diff",
+], tool_names
+# Single-source check (clarion-71f0d6c3dd): the initialize `instructions` tool
+# enumeration is derived from list_tools(), so every advertised tool must appear
+# in it. This catches drift between the tool set and the orientation prose
+# without a second hardcoded list.
+for name in tool_names:
+    assert name in init_result["instructions"], (name, init_result["instructions"])
 assert "leaf scope only" in tools[4]["description"]
 
 entity_hit = assert_tool_ok(responses["entity-hit"])
@@ -397,6 +450,25 @@ assert entity_hit["truncated"] is False
 
 entity_miss = assert_tool_ok(responses["entity-miss"])
 assert entity_miss["result"]["entity"] is None, entity_miss
+
+source_for_entity = assert_tool_ok(responses["source-for-entity"])
+sfe_result = source_for_entity["result"]
+assert sfe_result["source_status"] == "ok", source_for_entity
+assert sfe_result["entity"]["id"] == "python:function:demo.hello", source_for_entity
+# Line-numbered lines, with the entity's own lines flagged in_entity=True.
+sfe_lines = sfe_result["lines"]
+assert sfe_lines, source_for_entity
+assert all("number" in line and "in_entity" in line for line in sfe_lines), source_for_entity
+assert any(line["in_entity"] for line in sfe_lines), source_for_entity
+
+call_sites = assert_tool_ok(responses["call-sites"])
+cs_result = call_sites["result"]
+assert cs_result["role"] == "caller", call_sites
+assert "sites" in cs_result and "unresolved_sites" in cs_result, call_sites
+# Every resolved site carries its edge kind, confidence, and source line text.
+for site in cs_result["sites"]:
+    assert site["edge_kind"] in ("calls", "references"), call_sites
+    assert "confidence" in site and "line_text" in site, call_sites
 
 find_result = assert_tool_ok(responses["find"])
 assert len(find_result["result"]["entities"]) == 2, find_result
@@ -412,8 +484,14 @@ ambiguous_ids = {item["entity"]["id"] for item in ambiguous_callers["result"]["c
 assert "python:function:demo.via_dispatch" in ambiguous_ids, ambiguous_callers
 
 paths = assert_tool_ok(responses["paths"])
-path_ids = [[node["id"] for node in path] for path in paths["result"]["paths"]]
+# Compact shape (clarion-5b3eff9a91): paths are arrays of node-id strings into a
+# deduplicated node table; the queried entity is echoed as root.
+path_ids = paths["result"]["paths"]
 assert ["python:function:demo.hello", "python:function:demo.world"] in path_ids, paths
+assert paths["result"]["root"] == "python:function:demo.hello", paths
+node_ids = {node["id"] for node in paths["result"]["nodes"]}
+assert "python:function:demo.world" in node_ids, paths
+assert all("content_hash" not in node for node in paths["result"]["nodes"]), paths
 assert paths["truncated"] is False, paths
 
 neighborhood = assert_tool_ok(responses["neighborhood"])
@@ -436,9 +514,25 @@ matched_ids = {item["issue_id"] for item in issues["result"]["matched"]}
 drifted_ids = {item["issue_id"] for item in issues["result"]["drifted"]}
 assert "filigree-world" in matched_ids, issues
 assert "filigree-hello-drifted" in drifted_ids, issues
+# issues_for surfaces the resolved Filigree endpoint + a result_kind taxonomy
+# (clarion-318f1254eb): a populated result is "matched" and reports the endpoint
+# it was served from.
+assert issues["result"]["result_kind"] == "matched", issues
+assert issues["result"]["filigree_endpoint"]["enabled"] is True, issues
+assert issues["result"]["filigree_endpoint"]["resolved_url"], issues
 assert issues["stats_delta"]["filigree_requests_total"] >= 2, issues
 assert "python:function:demo.world" in filigree_requests, filigree_requests
 assert "python:function:demo.hello" in filigree_requests, filigree_requests
+
+context = responses["context"]["result"]
+ctx_text = context["contents"][0]["text"]
+ctx = json.loads(ctx_text)
+assert ctx["db_present"] is True, ctx
+assert ctx["entity_count"] >= 1, ctx
+assert "staleness" in ctx, ctx
+# A live, healthy snapshot must report degraded=false; the field is always
+# present so a consumer can tell a broken read from a genuinely empty index.
+assert ctx["degraded"] is False, ctx
 PY
 
-log "PASS: MCP stdio surface returned eight tool definitions and seven tool responses"
+log "PASS: MCP stdio surface returned eighteen tool definitions and nine tool responses"

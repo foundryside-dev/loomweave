@@ -29,6 +29,7 @@ use crate::commands::{
 };
 use crate::error::{Result, StorageError};
 use crate::pragma;
+use crate::schema;
 use crate::unresolved::replace_unresolved_call_sites_for_caller;
 
 /// Default transaction batch size per ADR-011.
@@ -86,6 +87,11 @@ impl Writer {
         let handle = tokio::task::spawn_blocking(move || -> Result<()> {
             let mut conn = Connection::open(&db_path)?;
             pragma::apply_write_pragmas(&conn)?;
+            // STO-02: refuse a database whose `user_version` is strictly greater
+            // than CURRENT_SCHEMA_VERSION. Equal/less are normal — equal is the
+            // already-migrated steady state, less is handled by the migration
+            // runner (which `install` calls before the writer ever spawns).
+            schema::verify_user_version(&conn)?;
             run_actor(
                 rx,
                 &mut conn,
@@ -161,6 +167,9 @@ fn run_actor(
                     ack,
                     begin_run(conn, &mut state, &run_id, &config_json, &started_at),
                 );
+            }
+            WriterCmd::ResumeRun { run_id, ack } => {
+                reply(ack, resume_run(conn, &mut state, &run_id));
             }
             WriterCmd::InsertEntity { entity, ack } => {
                 let res = insert_entity(conn, &mut state, &entity, commits_observed);
@@ -299,6 +308,11 @@ struct ActorState {
     in_tx: bool,
     /// The run currently in progress, if any.
     current_run: Option<String>,
+    /// Retry schedule for acquiring the write transaction (STO-05). Batch
+    /// transactions open with `BEGIN IMMEDIATE` so cross-process write
+    /// contention is resolved at lock-acquire (where `busy_timeout` is honored)
+    /// rather than failing mid-statement on a deferred-lock upgrade.
+    retry_policy: crate::retry::RetryPolicy,
 }
 
 impl ActorState {
@@ -308,8 +322,20 @@ impl ActorState {
             writes_in_batch: 0,
             in_tx: false,
             current_run: None,
+            retry_policy: crate::retry::RetryPolicy::writer_default(),
         }
     }
+}
+
+/// Open the write transaction for the current batch.
+///
+/// Uses `BEGIN IMMEDIATE` with the actor's retry policy (STO-05) rather than a
+/// deferred `BEGIN`: the actor always writes inside the transaction, so taking
+/// the write lock up front lets cross-process contention be resolved at
+/// lock-acquire (where `busy_timeout` and our retry apply) instead of failing
+/// mid-statement on a deferred-lock upgrade that the busy handler cannot serve.
+fn begin_write_tx(conn: &Connection, state: &ActorState) -> Result<()> {
+    crate::retry::begin_immediate(conn, &state.retry_policy)
 }
 
 fn begin_run(
@@ -329,7 +355,38 @@ fn begin_run(
          VALUES (?1, ?2, NULL, ?3, '{}', 'running')",
         params![run_id, started_at, config_json],
     )?;
-    conn.execute_batch("BEGIN")?;
+    begin_write_tx(conn, state)?;
+    state.in_tx = true;
+    state.writes_in_batch = 0;
+    state.current_run = Some(run_id.to_owned());
+    Ok(())
+}
+
+/// Reopen an existing run row instead of inserting a new one (the `--resume`
+/// path, REQ-FINDING-05). `begin_run` does an `INSERT` that fails on the run
+/// PK when handed an existing id; `resume_run` `UPDATE`s the row back to
+/// `running` and clears `completed_at`, then binds it as the active run and
+/// opens the write transaction exactly as `begin_run` does. The subsequent
+/// re-walk upserts entities/edges idempotently (see
+/// `insert_entity_is_idempotent_across_runs`), so a resumed run reproduces the
+/// same durable graph as the original — `--resume` is a re-emit-without-flip
+/// path, not an incremental checkpoint-recovery one.
+fn resume_run(conn: &mut Connection, state: &mut ActorState, run_id: &str) -> Result<()> {
+    if state.current_run.is_some() {
+        return Err(StorageError::WriterProtocol(
+            "ResumeRun received while a run is already in progress".to_owned(),
+        ));
+    }
+    let reopened = conn.execute(
+        "UPDATE runs SET status = 'running', completed_at = NULL WHERE id = ?1",
+        params![run_id],
+    )?;
+    if reopened == 0 {
+        return Err(StorageError::WriterProtocol(format!(
+            "ResumeRun: no run with id {run_id} to resume"
+        )));
+    }
+    begin_write_tx(conn, state)?;
     state.in_tx = true;
     state.writes_in_batch = 0;
     state.current_run = Some(run_id.to_owned());
@@ -349,10 +406,16 @@ fn insert_entity(
     }
     enforce_entity_kind_contract(entity)?;
     if !state.in_tx {
-        conn.execute_batch("BEGIN")?;
+        begin_write_tx(conn, state)?;
         state.in_tx = true;
     }
     validate_entity_source_file_anchor(conn, entity)?;
+    // ON CONFLICT(id) DO UPDATE makes `clarion analyze` idempotent across runs:
+    // a re-walk that produces the same entity updates the existing row instead
+    // of raising UNIQUE. `created_at` and `first_seen_commit` are preserved
+    // (the entity was first seen on its original run); `updated_at` and
+    // `last_seen_commit` are refreshed from the latest run's record. The
+    // AFTER UPDATE trigger on `entities` keeps `entity_fts` in sync.
     conn.execute(
         "INSERT INTO entities ( \
             id, plugin_id, kind, name, short_name, \
@@ -370,7 +433,25 @@ fn insert_entity(
             ?13, ?14, ?15, ?16, \
             ?17, ?18, \
             ?19, ?20 \
-         )",
+         ) \
+         ON CONFLICT(id) DO UPDATE SET \
+            plugin_id         = excluded.plugin_id, \
+            kind              = excluded.kind, \
+            name              = excluded.name, \
+            short_name        = excluded.short_name, \
+            parent_id         = excluded.parent_id, \
+            source_file_id    = excluded.source_file_id, \
+            source_file_path  = excluded.source_file_path, \
+            source_byte_start = excluded.source_byte_start, \
+            source_byte_end   = excluded.source_byte_end, \
+            source_line_start = excluded.source_line_start, \
+            source_line_end   = excluded.source_line_end, \
+            properties        = excluded.properties, \
+            content_hash      = excluded.content_hash, \
+            summary           = excluded.summary, \
+            wardline          = excluded.wardline, \
+            last_seen_commit  = excluded.last_seen_commit, \
+            updated_at        = excluded.updated_at",
         params![
             entity.id,
             entity.plugin_id,
@@ -575,7 +656,7 @@ fn insert_edge(
         return Err(err);
     }
     if !state.in_tx {
-        conn.execute_batch("BEGIN")?;
+        begin_write_tx(conn, state)?;
         state.in_tx = true;
     }
     validate_source_file_anchor(
@@ -622,9 +703,19 @@ fn insert_finding(
         ));
     }
     if !state.in_tx {
-        conn.execute_batch("BEGIN")?;
+        begin_write_tx(conn, state)?;
         state.in_tx = true;
     }
+    // ON CONFLICT(id) DO UPDATE makes the finding path idempotent under
+    // `--resume`: a finding id embeds its run_id (`core:finding:{run_id}:…`),
+    // so cross-run ids never collide and a fresh run only ever INSERTs. A
+    // resume re-walks under the *same* run_id and re-generates the same ids;
+    // without the upsert it would fail on `UNIQUE constraint: findings.id`.
+    // The conflict clause refreshes analysis-derived columns from the re-walk
+    // but PRESERVES the lifecycle columns (`status`, `suppression_reason`,
+    // `filigree_issue_id`) and `created_at` — the same first-seen-preserving
+    // discipline `insert_entity` applies. (These lifecycle columns are never
+    // mutated locally today; preserving them keeps that invariant if they are.)
     conn.execute(
         "INSERT INTO findings ( \
             id, tool, tool_version, run_id, rule_id, kind, severity, confidence, \
@@ -636,7 +727,24 @@ fn insert_finding(
             ?9, ?10, ?11, ?12, ?13, \
             ?14, ?15, ?16, 'open', NULL, \
             NULL, ?17, ?18 \
-         )",
+         ) \
+         ON CONFLICT(id) DO UPDATE SET \
+            tool = excluded.tool, \
+            tool_version = excluded.tool_version, \
+            run_id = excluded.run_id, \
+            rule_id = excluded.rule_id, \
+            kind = excluded.kind, \
+            severity = excluded.severity, \
+            confidence = excluded.confidence, \
+            confidence_basis = excluded.confidence_basis, \
+            entity_id = excluded.entity_id, \
+            related_entities = excluded.related_entities, \
+            message = excluded.message, \
+            evidence = excluded.evidence, \
+            properties = excluded.properties, \
+            supports = excluded.supports, \
+            supported_by = excluded.supported_by, \
+            updated_at = excluded.updated_at",
         params![
             finding.id,
             finding.tool,
@@ -760,7 +868,7 @@ fn replace_unresolved_call_sites_in_run(
         ));
     }
     if !state.in_tx {
-        conn.execute_batch("BEGIN")?;
+        begin_write_tx(conn, state)?;
         state.in_tx = true;
     }
     for site in sites {
@@ -793,7 +901,7 @@ fn bump_writes_and_maybe_commit(
         commits_observed.fetch_add(1, Ordering::Relaxed);
         // Open the next batch eagerly so the next write doesn't pay
         // another `BEGIN` round-trip.
-        conn.execute_batch("BEGIN")?;
+        begin_write_tx(conn, state)?;
         state.in_tx = true;
     }
     Ok(())
@@ -823,7 +931,7 @@ fn flush_run_batch(
         conn.execute_batch("COMMIT")?;
         commits_observed.fetch_add(1, Ordering::Relaxed);
     }
-    conn.execute_batch("BEGIN")?;
+    begin_write_tx(conn, state)?;
     state.in_tx = true;
     Ok(())
 }
@@ -845,7 +953,7 @@ fn query_time_write<T>(
     let result = write(conn);
 
     if reopen_run_transaction {
-        conn.execute_batch("BEGIN")?;
+        begin_write_tx(conn, state)?;
         state.in_tx = true;
     }
 
