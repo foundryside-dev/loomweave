@@ -2547,6 +2547,50 @@ async fn call_sites_caller_shows_calls_and_references_with_line_text() {
 }
 
 #[tokio::test]
+async fn call_sites_redacts_line_text_for_briefing_blocked_owner() {
+    // A call/reference site owned by an entity whose file the pre-ingest
+    // scanner marked briefing_blocked must not have its source bytes read into
+    // line_text — that would bypass the secret-redaction policy other read
+    // paths enforce. demo.entry owns its outgoing sites; mark it blocked.
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "UPDATE entities SET properties = ?1 WHERE id = 'python:function:demo.entry'",
+        params![json!({"briefing_blocked": "secret_present"}).to_string()],
+    )
+    .expect("mark entity blocked");
+    drop(conn);
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "call_sites",
+        json!({"id": "python:function:demo.entry", "confidence": "ambiguous"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp:?}");
+    let sites = resp["result"]["sites"].as_array().expect("sites array");
+    assert!(!sites.is_empty(), "{resp:?}");
+    for site in sites {
+        assert_eq!(
+            site["line_text"], "",
+            "briefing-blocked owner must redact line_text: {site:?}"
+        );
+        assert_eq!(site["briefing_blocked"], true, "{site:?}");
+    }
+    // The blocked file's source bytes must not leak anywhere in the payload.
+    let blob = resp.to_string();
+    assert!(
+        !blob.contains("return mid"),
+        "leaked blocked source: {blob}"
+    );
+    assert!(
+        !blob.contains("return target"),
+        "leaked blocked source: {blob}"
+    );
+}
+
+#[tokio::test]
 async fn call_sites_kind_filter_limits_to_one_edge_kind() {
     let (project, db_path) = open_project();
     let state = state_for(project.path(), &db_path);

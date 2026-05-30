@@ -4872,11 +4872,18 @@ fn build_call_sites(
 
     let (resolved, unbound) = collect_call_sites(conn, &entity, role, kind, confidence)?;
 
-    // Resolve each site's owning file once, mapping the byte anchor to a line.
-    let mut owner_path: HashMap<String, Option<String>> = HashMap::new();
+    // Resolve each site's owning file + briefing-blocked state once, mapping
+    // the byte anchor to a line. A blocked owner's bytes are never read.
+    let mut owner_meta: HashMap<String, (Option<String>, bool)> = HashMap::new();
     let mut file_content: HashMap<String, Option<String>> = HashMap::new();
-    // The queried entity's own path is known without a lookup.
-    owner_path.insert(entity.id.clone(), entity.source_file_path.clone());
+    // The queried entity's own path + block state are known without a lookup.
+    owner_meta.insert(
+        entity.id.clone(),
+        (
+            entity.source_file_path.clone(),
+            briefing_block_reason(&entity).is_some(),
+        ),
+    );
 
     let mut site_values = Vec::new();
     let mut truncated = false;
@@ -4885,12 +4892,16 @@ fn build_call_sites(
             truncated = true;
             break;
         }
-        let path_str = resolve_owner_path(conn, &mut owner_path, &site.owner_id)?;
+        let (path_str, blocked) = resolve_owner(conn, &mut owner_meta, &site.owner_id)?;
         if !path.admits(path_str.as_deref()) {
             continue;
         }
-        let (line, column, line_text) =
-            anchor_line(&mut file_content, path_str.as_deref(), site.byte_start);
+        // Never read a briefing-blocked owner's file; redact line_text.
+        let (line, column, line_text) = if blocked {
+            (Value::Null, Value::Null, String::new())
+        } else {
+            anchor_line(&mut file_content, path_str.as_deref(), site.byte_start)
+        };
         site_values.push(json!({
             "edge_kind": site.edge_kind,
             "other_id": site.other_id,
@@ -4899,6 +4910,7 @@ fn build_call_sites(
             "line": line,
             "column": column,
             "line_text": line_text,
+            "briefing_blocked": blocked,
             "byte_start": site.byte_start,
             "byte_end": site.byte_end
         }));
@@ -4910,21 +4922,27 @@ fn build_call_sites(
             truncated = true;
             break;
         }
-        let path_str = resolve_owner_path(conn, &mut owner_path, &site.owner_id)?;
+        let (path_str, blocked) = resolve_owner(conn, &mut owner_meta, &site.owner_id)?;
         if !path.admits(path_str.as_deref()) {
             continue;
         }
-        let (line, column, line_text) = anchor_line(
-            &mut file_content,
-            path_str.as_deref(),
-            Some(site.byte_start),
-        );
+        // Never read a briefing-blocked owner's file; redact line_text.
+        let (line, column, line_text) = if blocked {
+            (Value::Null, Value::Null, String::new())
+        } else {
+            anchor_line(
+                &mut file_content,
+                path_str.as_deref(),
+                Some(site.byte_start),
+            )
+        };
         unresolved_values.push(json!({
             "callee_expr": site.callee_expr,
             "file": path_str,
             "line": line,
             "column": column,
             "line_text": line_text,
+            "briefing_blocked": blocked,
             "byte_start": site.byte_start,
             "byte_end": site.byte_end
         }));
@@ -4953,18 +4971,27 @@ fn build_call_sites(
     })))
 }
 
-/// Memoized lookup of an owner entity's source file path.
-fn resolve_owner_path(
+/// Memoized lookup of an owner entity's `(source_file_path, briefing_blocked)`.
+/// A briefing-blocked owner's source bytes must never be read — the pre-ingest
+/// scanner withholds them — so `call_sites` redacts `line_text` for such owners
+/// rather than disclosing the file content behind an edge.
+fn resolve_owner(
     conn: &rusqlite::Connection,
-    cache: &mut HashMap<String, Option<String>>,
+    cache: &mut HashMap<String, (Option<String>, bool)>,
     owner_id: &str,
-) -> Result<Option<String>, StorageError> {
-    if let Some(path) = cache.get(owner_id) {
-        return Ok(path.clone());
+) -> Result<(Option<String>, bool), StorageError> {
+    if let Some(meta) = cache.get(owner_id) {
+        return Ok(meta.clone());
     }
-    let path = entity_by_id(conn, owner_id)?.and_then(|e| e.source_file_path);
-    cache.insert(owner_id.to_owned(), path.clone());
-    Ok(path)
+    let meta = match entity_by_id(conn, owner_id)? {
+        Some(entity) => (
+            entity.source_file_path.clone(),
+            briefing_block_reason(&entity).is_some(),
+        ),
+        None => (None, false),
+    };
+    cache.insert(owner_id.to_owned(), meta.clone());
+    Ok(meta)
 }
 
 /// Map a byte anchor to (line, column, `line_text`), reading + caching the file.
@@ -6446,8 +6473,14 @@ mod tests {
         let out = super::source_for_entity_json(&entity, 10);
 
         assert_eq!(out["source_status"], "briefing_blocked");
-        assert_eq!(out["briefing_blocked"], "secret detected by pre-ingest scanner");
-        assert!(out.get("lines").is_none(), "must not return source lines: {out}");
+        assert_eq!(
+            out["briefing_blocked"],
+            "secret detected by pre-ingest scanner"
+        );
+        assert!(
+            out.get("lines").is_none(),
+            "must not return source lines: {out}"
+        );
         assert!(
             !out.to_string().contains("super-secret-value"),
             "leaked briefing-blocked bytes: {out}"
