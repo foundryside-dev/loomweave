@@ -49,7 +49,7 @@ fn install_creates_clarion_dir_with_expected_contents() {
 }
 
 #[test]
-fn install_applies_migration_0001_exactly_once() {
+fn install_applies_each_migration_exactly_once() {
     let dir = tempfile::tempdir().unwrap();
     clarion_bin()
         .args(["install", "--path"])
@@ -63,13 +63,15 @@ fn install_applies_migration_0001_exactly_once() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(count, 1);
-    let version: i64 = conn
-        .query_row("SELECT version FROM schema_migrations", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(count, 2);
+    let versions: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT version FROM schema_migrations ORDER BY version")
+            .unwrap();
+        let rows = stmt.query_map([], |row| row.get(0)).unwrap();
+        rows.map(std::result::Result::unwrap).collect()
+    };
+    assert_eq!(versions, vec![1, 2]);
 }
 
 #[test]
