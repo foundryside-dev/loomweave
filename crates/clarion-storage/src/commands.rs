@@ -16,6 +16,7 @@ pub use clarion_core::EdgeConfidence;
 use crate::cache::{InferredEdgeCacheEntry, SummaryCacheEntry, SummaryCacheKey};
 use crate::error::StorageError;
 use crate::unresolved::UnresolvedCallSiteRecord;
+use crate::wardline_taint::TaintFact;
 
 pub type Ack<T> = oneshot::Sender<Result<T, StorageError>>;
 
@@ -199,6 +200,11 @@ pub enum WriterCmd {
         last_accessed_at: String,
         ack: Ack<bool>,
     },
+    /// Upsert one Wardline taint fact (per-entity replace). Query-time MCP/HTTP
+    /// write; does not require an active analyze run. The fact's `entity_id`
+    /// must be pre-resolved by the caller (exact tier) — the writer does not
+    /// resolve qualnames.
+    UpsertWardlineTaintFact { fact: Box<TaintFact>, ack: Ack<()> },
     /// Replace all unresolved call-site rows for one caller. This is an
     /// analyze-time mapping command that requires an active run transaction so
     /// stale rows from previous content hashes cannot survive re-analysis.
