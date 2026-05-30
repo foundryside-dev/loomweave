@@ -11,7 +11,21 @@
 -- instead of parsing every row's properties JSON. NULL when absent (the common
 -- case), so the partial index stays small.
 
+-- Wrapped in a single transaction (mirroring 0001) so the ALTER, the index,
+-- and the migration record commit together. Without this, an interruption
+-- after the ALTER but before the version row is written leaves the column in
+-- place with no schema_migrations.version=2 row; the next startup reruns the
+-- ALTER and dies on a duplicate-column error, blocking upgrade.
+BEGIN;
+
 ALTER TABLE entities ADD COLUMN briefing_blocked TEXT
     GENERATED ALWAYS AS (json_extract(properties, '$.briefing_blocked')) VIRTUAL;
 CREATE INDEX ix_entities_briefing_blocked ON entities(briefing_blocked)
     WHERE briefing_blocked IS NOT NULL;
+
+-- Record the migration inside the same transaction (defence-in-depth: the
+-- runner's INSERT OR IGNORE in apply_one then no-ops). Matches 0001.
+INSERT INTO schema_migrations (version, name, applied_at)
+VALUES (2, '0002_briefing_blocked', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+
+COMMIT;

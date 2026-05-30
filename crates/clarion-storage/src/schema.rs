@@ -234,6 +234,35 @@ mod tests {
     }
 
     #[test]
+    fn migration_0002_rolls_back_the_column_when_a_later_statement_fails() {
+        // 0002 must apply its ALTER + CREATE INDEX atomically. If the column is
+        // added under autocommit and a later statement fails, the DB is left
+        // with `briefing_blocked` present but no schema_migrations.version=2
+        // row — the next startup reruns the ALTER and dies on duplicate column,
+        // blocking upgrade. Inject that failure: squat the index name so 0002's
+        // CREATE INDEX fails on its second statement, then prove (on a fresh
+        // connection, reading committed state) that the ALTER did not survive.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rollback.db");
+        {
+            let mut conn = Connection::open(&db).unwrap();
+            apply_one(&mut conn, &MIGRATIONS[0]).expect("apply initial migration");
+            // Squat the index name 0002 will try to create.
+            conn.execute_batch("CREATE INDEX ix_entities_briefing_blocked ON entities(id);")
+                .expect("pre-create colliding index");
+            apply_one(&mut conn, &MIGRATIONS[1])
+                .expect_err("0002 must fail when its CREATE INDEX collides");
+            // Drop conn here → any open transaction rolls back on close.
+        }
+        let conn = Connection::open(&db).unwrap();
+        assert!(
+            !entities_has_briefing_blocked(&conn),
+            "0002's ALTER must roll back when a later statement fails; \
+             the column survived, so the migration is not atomic"
+        );
+    }
+
+    #[test]
     fn migration_count_conversion_rejects_overflow() {
         let err = migration_count_to_u32(i64::from(u32::MAX) + 1)
             .expect_err("overflowing migration count should error");
