@@ -1,9 +1,11 @@
 //! `.claude/settings.json` SessionStart-hook merge.
 //!
-//! Merge semantics (never clobber): parse existing JSON, append a `SessionStart`
-//! matcher-group running `clarion hook session-start --path "<project>"` only if
-//! no existing `SessionStart` entry already runs `clarion hook session-start`
-//! (regardless of its `--path`), and preserve every other key.
+//! Merge semantics (never clobber): parse existing JSON and ensure a
+//! `SessionStart` matcher-group runs `clarion hook session-start --path
+//! <project>` (the project path POSIX-single-quote-escaped for the shell). If a
+//! Clarion-owned hook already runs the exact command, it is left untouched; a
+//! stale one (the old path-less form, or one pinned to a different project) is
+//! refreshed in place. Every other key is preserved.
 //!
 //! Verified against the Claude Code settings schema: `hooks.SessionStart` is an
 //! array of matcher-groups, each `{ "matcher"?, "hooks": [ {type,command} ] }`.
@@ -17,14 +19,37 @@ use serde_json::{Map, Value, json};
 /// Substring that identifies Clarion's own `SessionStart` hook command.
 pub const HOOK_COMMAND: &str = "clarion hook session-start";
 
-/// Merge Clarion's `SessionStart` hook into a parsed settings `Value` in place,
-/// inserting the supplied `command` (which must contain [`HOOK_COMMAND`] so the
-/// idempotency predicate recognises it). Returns `true` if a change was made,
-/// `false` if a clarion session-start hook was already present.
+/// POSIX single-quote escaping for a value embedded in a shell command string.
 ///
-/// The idempotency predicate keys on the [`HOOK_COMMAND`] substring, so any
-/// existing clarion session-start hook — regardless of its `--path` argument —
-/// is detected and not duplicated.
+/// Claude Code runs hook commands through a shell, so an embedded project path
+/// must be a single literal argument — never word-split or subject to `$`,
+/// backtick, or `\` expansion. Single quotes suppress all shell processing; the
+/// only character that can't appear inside them is `'` itself, which we close
+/// the quote for, emit an escaped `\'`, and reopen: `a'b` → `'a'\''b'`.
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Merge Clarion's `SessionStart` hook into a parsed settings `Value` in place,
+/// inserting the supplied `command` (which must contain [`HOOK_COMMAND`] so it
+/// is recognised as Clarion-owned). Returns `true` if a change was made.
+///
+/// Clarion-owned entries are keyed on the [`HOOK_COMMAND`] substring. If one
+/// already runs the exact `command`, this is a no-op (`false`). If a Clarion
+/// hook exists but differs (the old path-less form, or one pinned to a
+/// different project), it is refreshed in place to `command` (`true`) rather
+/// than no-oping forever or appending a duplicate. If none exists, the hook is
+/// appended (`true`).
 #[must_use]
 pub fn merge_session_start_hook(settings: &mut Value, command: &str) -> bool {
     // Coercion-after-parse: a successfully-parsed but malformed shape (a wrong
@@ -65,20 +90,38 @@ pub fn merge_session_start_hook(settings: &mut Value, command: &str) -> bool {
         );
     }
 
-    let already_present = groups.iter().any(|group| {
-        group
-            .get("hooks")
-            .and_then(Value::as_array)
-            .is_some_and(|inner| {
-                inner.iter().any(|h| {
-                    h.get("command")
-                        .and_then(Value::as_str)
-                        .is_some_and(|c| c.contains(HOOK_COMMAND))
-                })
-            })
-    });
-    if already_present {
+    // Classify existing Clarion-owned hooks (command contains HOOK_COMMAND).
+    // If one already equals `command`, we're current — no-op. Otherwise, if a
+    // stale Clarion hook exists (the old path-less form, or one pinned to a
+    // different project), refresh it in place rather than no-oping forever or
+    // appending a duplicate. Two passes keep the borrow checker happy and avoid
+    // mutating before we know whether a current entry exists elsewhere.
+    let mut found_current = false;
+    let mut stale_loc: Option<(usize, usize)> = None;
+    for (gi, group) in groups.iter().enumerate() {
+        let Some(inner) = group.get("hooks").and_then(Value::as_array) else {
+            continue;
+        };
+        for (hi, h) in inner.iter().enumerate() {
+            let Some(c) = h.get("command").and_then(Value::as_str) else {
+                continue;
+            };
+            if !c.contains(HOOK_COMMAND) {
+                continue;
+            }
+            if c == command {
+                found_current = true;
+            } else if stale_loc.is_none() {
+                stale_loc = Some((gi, hi));
+            }
+        }
+    }
+    if found_current {
         return false;
+    }
+    if let Some((gi, hi)) = stale_loc {
+        groups[gi]["hooks"][hi]["command"] = Value::String(command.to_string());
+        return true;
     }
 
     groups.push(json!({
@@ -153,13 +196,15 @@ pub fn install_session_start_hook(project_root: &Path) -> Result<bool> {
     // project no matter what working directory Claude Code runs it from.
     // `install::run` canonicalizes before calling, so `project_root` is already
     // absolute; canonicalize defensively in case another caller is not. The
-    // path is shell-quoted because Claude runs hook commands via a shell.
+    // path is POSIX-single-quote-escaped (not merely double-quoted) because
+    // Claude runs hook commands via a shell and the path may contain `$`,
+    // backticks, quotes, or backslashes.
     let canonical = project_root
         .canonicalize()
         .unwrap_or_else(|_| project_root.to_path_buf());
     let command = format!(
-        "clarion hook session-start --path \"{}\"",
-        canonical.display()
+        "clarion hook session-start --path {}",
+        shell_single_quote(&canonical.display().to_string())
     );
 
     let changed = merge_session_start_hook(&mut settings, &command);
@@ -201,6 +246,42 @@ mod tests {
 
     const TEST_COMMAND: &str = "clarion hook session-start --path \"/some/project\"";
 
+    #[cfg(unix)]
+    fn sh_roundtrip(quoted: &str) -> String {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf %s {quoted}"))
+            .output()
+            .expect("run sh");
+        String::from_utf8(out.stdout).expect("utf8")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_quote_round_trips_metacharacters_through_a_real_shell() {
+        // The installed hook command is run by Claude through a shell. A path
+        // with shell metacharacters must survive as a single literal argument,
+        // never expanded or split. Double-quote wrapping (the prior form) lets
+        // $, backtick, and \ act; single-quote escaping does not. Prove the
+        // helper round-trips through `sh` exactly. (clarion review #5)
+        for s in [
+            "/plain/path",
+            "/with space/x",
+            "/we'ird/x",
+            "/$(touch pwned)/x",
+            "/back`tick`/x",
+            "/back\\slash/x",
+            "/dquote\"here/x",
+            "/a'b\"c$d`e/x",
+        ] {
+            assert_eq!(
+                sh_roundtrip(&super::shell_single_quote(s)),
+                s,
+                "shell_single_quote did not round-trip {s:?} through sh"
+            );
+        }
+    }
+
     #[test]
     fn adds_hook_to_empty_settings() {
         let mut settings = json!({});
@@ -222,6 +303,39 @@ mod tests {
         assert!(!merge_session_start_hook(&mut settings, TEST_COMMAND));
         let groups = settings["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(groups.len(), 1, "must not duplicate the hook");
+    }
+
+    #[test]
+    fn refreshes_a_stale_clarion_hook_in_place() {
+        // A previously-installed Clarion hook (e.g. the old path-less form, or
+        // one pinned to a different project) must be refreshed to the desired
+        // command on re-install, not left stale. The idempotency check keys on
+        // the HOOK_COMMAND substring, so a stale entry used to no-op forever.
+        // (clarion review #10)
+        let mut settings = json!({
+            "hooks": {"SessionStart": [
+                {"hooks": [{"type": "command", "command": "clarion hook session-start"}]}
+            ]}
+        });
+        let desired = "clarion hook session-start --path '/proj'";
+        let changed = merge_session_start_hook(&mut settings, desired);
+        assert!(changed, "a stale Clarion hook must be refreshed");
+        let groups = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(
+            groups.len(),
+            1,
+            "must refresh in place, not append a duplicate"
+        );
+        assert_eq!(
+            groups[0]["hooks"][0]["command"].as_str().unwrap(),
+            desired,
+            "stale hook command must be updated to the desired command"
+        );
+        // And a second merge with the now-current command is a no-op.
+        assert!(
+            !merge_session_start_hook(&mut settings, desired),
+            "re-merging the current command must be a no-op"
+        );
     }
 
     #[test]

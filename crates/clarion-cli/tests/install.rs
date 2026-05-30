@@ -75,6 +75,29 @@ fn install_applies_each_migration_exactly_once() {
 }
 
 #[test]
+fn install_all_rejects_non_directory_clarion() {
+    // Bug (PR#21 review #6): when `.clarion` already exists as a regular file
+    // and `--all` (a non-bare init) is run without `--force`, install treated
+    // it as "already initialised" and skipped DB creation, then proceeded to
+    // install skills/hooks atop a project with no usable `.clarion/clarion.db`.
+    // It must instead refuse with a clear non-directory error.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".clarion"), "i am a file, not a dir").unwrap();
+
+    let out = clarion_bin()
+        .args(["install", "--all", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("non-directory"),
+        "error did not mention the non-directory .clarion: {stderr}"
+    );
+}
+
+#[test]
 fn install_refuses_to_overwrite_existing_clarion_dir() {
     let dir = tempfile::tempdir().unwrap();
     clarion_bin()
