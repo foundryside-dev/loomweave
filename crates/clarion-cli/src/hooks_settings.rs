@@ -1,11 +1,11 @@
 //! `.claude/settings.json` SessionStart-hook merge.
 //!
-//! Merge semantics (never clobber): parse existing JSON and ensure a
+//! Merge semantics (never clobber): parse existing JSON and ensure exactly one
 //! `SessionStart` matcher-group runs `clarion hook session-start --path
-//! <project>` (the project path POSIX-single-quote-escaped for the shell). If a
-//! Clarion-owned hook already runs the exact command, it is left untouched; a
-//! stale one (the old path-less form, or one pinned to a different project) is
-//! refreshed in place. Every other key is preserved.
+//! <project>` (the project path POSIX-single-quote-escaped for the shell).
+//! Clarion-owned hooks are canonicalised — the first is refreshed to the
+//! desired command and any extras (a stale duplicate, or one pinned to a
+//! different project) are removed. Every other key is preserved.
 //!
 //! Verified against the Claude Code settings schema: `hooks.SessionStart` is an
 //! array of matcher-groups, each `{ "matcher"?, "hooks": [ {type,command} ] }`.
@@ -44,12 +44,13 @@ fn shell_single_quote(s: &str) -> String {
 /// inserting the supplied `command` (which must contain [`HOOK_COMMAND`] so it
 /// is recognised as Clarion-owned). Returns `true` if a change was made.
 ///
-/// Clarion-owned entries are keyed on the [`HOOK_COMMAND`] substring. If one
-/// already runs the exact `command`, this is a no-op (`false`). If a Clarion
-/// hook exists but differs (the old path-less form, or one pinned to a
-/// different project), it is refreshed in place to `command` (`true`) rather
-/// than no-oping forever or appending a duplicate. If none exists, the hook is
-/// appended (`true`).
+/// Clarion-owned entries are keyed on the [`HOOK_COMMAND`] substring. The merge
+/// canonicalises them to exactly one hook running `command`: the first is
+/// refreshed and any extras (a stale duplicate, or a hook pinned to a different
+/// project — possible in hand-merged settings) are removed, dropping any
+/// Clarion-dedicated group left empty. If none exists, the hook is appended.
+/// Returns `false` only when a single Clarion hook already runs `command` (the
+/// idempotent re-install case); otherwise `true`.
 #[must_use]
 pub fn merge_session_start_hook(settings: &mut Value, command: &str) -> bool {
     // Coercion-after-parse: a successfully-parsed but malformed shape (a wrong
@@ -90,49 +91,72 @@ pub fn merge_session_start_hook(settings: &mut Value, command: &str) -> bool {
         );
     }
 
-    // Classify existing Clarion-owned hooks (command contains HOOK_COMMAND).
-    // If one already equals `command`, we're current — no-op. Otherwise, if a
-    // stale Clarion hook exists (the old path-less form, or one pinned to a
-    // different project), refresh it in place rather than no-oping forever or
-    // appending a duplicate. Two passes keep the borrow checker happy and avoid
-    // mutating before we know whether a current entry exists elsewhere.
-    let mut found_current = false;
-    let mut stale_loc: Option<(usize, usize)> = None;
+    // Locate every Clarion-owned hook (its command contains HOOK_COMMAND),
+    // across all matcher-groups. Pass 1 only reads, so the immutable borrow is
+    // released before any mutation below.
+    let mut locations: Vec<(usize, usize)> = Vec::new();
     for (gi, group) in groups.iter().enumerate() {
         let Some(inner) = group.get("hooks").and_then(Value::as_array) else {
             continue;
         };
         for (hi, h) in inner.iter().enumerate() {
-            let Some(c) = h.get("command").and_then(Value::as_str) else {
-                continue;
-            };
-            if !c.contains(HOOK_COMMAND) {
-                continue;
-            }
-            if c == command {
-                found_current = true;
-            } else if stale_loc.is_none() {
-                stale_loc = Some((gi, hi));
+            if h.get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|c| c.contains(HOOK_COMMAND))
+            {
+                locations.push((gi, hi));
             }
         }
     }
-    if found_current {
-        return false;
-    }
-    if let Some((gi, hi)) = stale_loc {
-        groups[gi]["hooks"][hi]["command"] = Value::String(command.to_string());
+
+    if locations.is_empty() {
+        groups.push(json!({
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": command
+                }
+            ]
+        }));
         return true;
     }
 
-    groups.push(json!({
-        "hooks": [
-            {
-                "type": "command",
-                "command": command
-            }
-        ]
-    }));
-    true
+    // Canonicalise to exactly one Clarion hook running `command`: refresh the
+    // first, then remove any extras (a stale duplicate, or a hook pinned to a
+    // different project — e.g. hand-merged settings). This delivers "don't
+    // no-op on a stale hook, don't leave duplicates, don't silently keep a
+    // wrong-project pin" even when a current and a stale entry coexist or
+    // multiple stale entries exist. Returns `false` only when a single Clarion
+    // hook already runs `command` (the idempotent re-install case).
+    let mut changed = false;
+    let (kg, kh) = locations[0];
+    if groups[kg]["hooks"][kh]["command"].as_str() != Some(command) {
+        groups[kg]["hooks"][kh]["command"] = Value::String(command.to_string());
+        changed = true;
+    }
+
+    // Remove the extras. Descending order keeps inner indices valid as we go.
+    let mut extras: Vec<(usize, usize)> = locations[1..].to_vec();
+    extras.sort_unstable_by(|a, b| b.cmp(a));
+    let mut touched_groups = std::collections::BTreeSet::new();
+    for (gi, hi) in extras {
+        if let Some(inner) = groups[gi]["hooks"].as_array_mut() {
+            inner.remove(hi);
+            touched_groups.insert(gi);
+            changed = true;
+        }
+    }
+    // Drop any Clarion-dedicated group we just emptied (descending to keep
+    // indices valid). A group still holding unrelated hooks is left intact.
+    for gi in touched_groups.into_iter().rev() {
+        if groups[gi]["hooks"]
+            .as_array()
+            .is_some_and(std::vec::Vec::is_empty)
+        {
+            groups.remove(gi);
+        }
+    }
+    changed
 }
 
 /// Read `.claude/settings.json` under `project_root` (creating an empty object
@@ -273,6 +297,7 @@ mod tests {
             "/back\\slash/x",
             "/dquote\"here/x",
             "/a'b\"c$d`e/x",
+            "", // the one structurally distinct (zero-iteration) input
         ] {
             assert_eq!(
                 sh_roundtrip(&super::shell_single_quote(s)),
@@ -280,6 +305,8 @@ mod tests {
                 "shell_single_quote did not round-trip {s:?} through sh"
             );
         }
+        // The empty string must produce a valid empty shell word, not nothing.
+        assert_eq!(super::shell_single_quote(""), "''");
     }
 
     #[test]
@@ -336,6 +363,81 @@ mod tests {
             !merge_session_start_hook(&mut settings, desired),
             "re-merging the current command must be a no-op"
         );
+    }
+
+    /// All `command` strings across every `SessionStart` group that look like a
+    /// Clarion-owned hook (contain [`HOOK_COMMAND`]).
+    fn clarion_commands(settings: &serde_json::Value) -> Vec<String> {
+        settings["hooks"]["SessionStart"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|g| g["hooks"].as_array())
+            .flatten()
+            .filter_map(|h| h["command"].as_str())
+            .filter(|c| c.contains(HOOK_COMMAND))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn refreshes_a_stale_hook_pinned_to_a_different_path() {
+        // The realistic re-install case: the repo moved, so the existing hook
+        // pins the old project path. It must be refreshed to the new path, not
+        // no-oped. (clarion review #4/#10)
+        let mut settings = json!({
+            "hooks": {"SessionStart": [
+                {"hooks": [{"type": "command",
+                    "command": "clarion hook session-start --path '/old/proj'"}]}
+            ]}
+        });
+        let desired = "clarion hook session-start --path '/new/proj'";
+        assert!(merge_session_start_hook(&mut settings, desired));
+        assert_eq!(clarion_commands(&settings), vec![desired.to_string()]);
+    }
+
+    #[test]
+    fn removes_a_stale_hook_when_a_current_one_already_exists() {
+        // A current hook coexisting with a stale one pinned to a different
+        // project (e.g. hand-merged settings). The stale one silently orients
+        // the wrong project every session, so it must be reconciled away —
+        // leaving exactly one Clarion hook running the desired command.
+        // (clarion review #10 — found_current must not short-circuit the sweep)
+        let desired = "clarion hook session-start --path '/proj'";
+        let mut settings = json!({
+            "hooks": {"SessionStart": [
+                {"hooks": [{"type": "command", "command": desired}]},
+                {"hooks": [{"type": "command",
+                    "command": "clarion hook session-start --path '/other'"}]}
+            ]}
+        });
+        assert!(
+            merge_session_start_hook(&mut settings, desired),
+            "a stale entry coexisting with the current one must be reconciled"
+        );
+        assert_eq!(
+            clarion_commands(&settings),
+            vec![desired.to_string()],
+            "exactly one Clarion hook must remain, running the desired command"
+        );
+    }
+
+    #[test]
+    fn dedups_multiple_stale_clarion_hooks() {
+        // Two stale Clarion hooks, no current one. Must converge to a single
+        // hook running the desired command, not leave survivors. (clarion #10)
+        let desired = "clarion hook session-start --path '/proj'";
+        let mut settings = json!({
+            "hooks": {"SessionStart": [
+                {"hooks": [{"type": "command", "command": "clarion hook session-start"}]},
+                {"hooks": [{"type": "command",
+                    "command": "clarion hook session-start --path '/old'"}]}
+            ]}
+        });
+        assert!(merge_session_start_hook(&mut settings, desired));
+        assert_eq!(clarion_commands(&settings), vec![desired.to_string()]);
+        // Convergent: a second merge is now a no-op.
+        assert!(!merge_session_start_hook(&mut settings, desired));
     }
 
     #[test]

@@ -260,6 +260,45 @@ mod tests {
             "0002's ALTER must roll back when a later statement fails; \
              the column survived, so the migration is not atomic"
         );
+        // The version-2 row must roll back *with* the column — proving the two
+        // commit together. If the column rolled back but a version row had been
+        // recorded, the next upgrade would skip 0002 forever.
+        let v2_present: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 2)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !v2_present,
+            "the version-2 row must roll back together with the column"
+        );
+    }
+
+    #[test]
+    fn migration_0002_records_its_own_version_row() {
+        // apply_one writes an INSERT OR IGNORE version row as a fallback, which
+        // would mask a migration that forgot to record itself. Exercise 0002's
+        // SQL directly (bypassing apply_one) so the in-transaction
+        // `INSERT INTO schema_migrations` is load-bearing: this fails if that
+        // line is dropped, reopening the duplicate-column upgrade bug.
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_one(&mut conn, &MIGRATIONS[0]).expect("apply initial migration");
+        conn.execute_batch(MIGRATIONS[1].sql)
+            .expect("apply 0002 SQL directly");
+        let recorded: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations \
+                 WHERE version = 2 AND name = '0002_briefing_blocked')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            recorded,
+            "migration 0002 must record its own schema_migrations row inside its transaction"
+        );
     }
 
     #[test]
