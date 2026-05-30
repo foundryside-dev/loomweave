@@ -94,14 +94,19 @@ jobs:
       - name: deny
         run: cargo deny check
 
-  # macOS build + lint parity. The release matrix (x86_64-apple-darwin on
-  # macos-13, aarch64-apple-darwin on macos-14) was the first place macOS was
+  # macOS build + lint parity. The release matrix was the first place macOS was
   # ever compiled, so a macOS-only `-D warnings` regression stayed invisible
-  # until tag-cut (clarion-12667da9f5). These native runner jobs close that gap.
-  # They mirror only the Linux job's clippy + bin build — the Python guards are
+  # until tag-cut (clarion-12667da9f5). This native runner job closes that gap.
+  # It mirrors only the Linux job's clippy + bin build — the Python guards are
   # platform-independent and already covered by the `rust` job. No `--target`
   # flag: native builds avoid the ring C-build-script failure seen when
   # cross-compiling Linux -> macOS.
+  #
+  # Only aarch64-apple-darwin (macos-14) runs here: the x86_64 (macos-13) leg is
+  # temporarily dropped while those runners are offline/unreliable. Restore it
+  # when macos-13 runner health recovers (clarion-12667da9f5 follow-up). The
+  # unused-symbol class this gate guards is `target_os = "macos"`, i.e.
+  # arch-independent, so aarch64 coverage catches the same regressions.
   rust-macos:
     name: Rust (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
@@ -111,8 +116,6 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             runner: macos-14
-          - target: x86_64-apple-darwin
-            runner: macos-13
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
