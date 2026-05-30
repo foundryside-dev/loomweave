@@ -1,7 +1,10 @@
 # Clarion Federation Contracts
 
-This file pins Clarion's read-side contract for sibling products. The initial
-consumer is Filigree's `ClarionRegistry` from ADR-014.
+This file pins Clarion's federation contracts in both directions: the read-side
+surface Clarion *exposes* to sibling products (the initial consumer is Filigree's
+`ClarionRegistry` from ADR-014), and the conventions and routes Clarion
+*consumes* from Filigree. Every consume-side coupling here is enrich-only and
+fail-soft — Clarion stays solo-useful when Filigree is absent (loom.md §5).
 
 ## HTTP Read API
 
@@ -403,11 +406,94 @@ the endpoint ahead of a shipped Wardline consumer would be speculative
 forward-work (loom.md §5 — Clarion translates qualnames because it owns the
 catalog, but only when a consumer needs it).
 
+## Consumed Filigree convention: ephemeral-port endpoint discovery
+
+The contracts above pin the surface Clarion *exposes*. This section and the ones
+that follow pin what Clarion *consumes*. Endpoint discovery comes first because
+it is the prerequisite for every consumed route below: before Clarion can call
+`issues_for`'s issue-detail read, the scan-results intake, or the clean-stale
+sweep, it must resolve *where* Filigree is actually listening.
+
+`clarion serve` and `clarion analyze` resolve that base URL through
+[`clarion_mcp::filigree_url::resolve_filigree_url`](../../crates/clarion-mcp/src/filigree_url.rs)
+(added with clarion-084e82250c). It is strictly *enrich-only*: discovery only ever
+*upgrades* the statically configured `integrations.filigree.base_url`; it never
+gates Clarion's own semantics. Clarion stays solo-useful with Filigree absent
+(loom.md §5).
+
+**The convention.** Filigree's dashboard, when running in its default *ethereal*
+mode, publishes its live listen port to `<project_root>/.filigree/ephemeral.port`
+— a plain trimmed integer, written atomically, present only while the dashboard
+is up. The port is chosen deterministically but unpredictably
+(`8400 + sha256(project_path) % 1000`, with collision fallback), so it **must be
+read, never computed**. This mirrors the Filigree sources
+`filigree/src/filigree/ephemeral.py::{write,read}_port_file` and
+`scanner_callback.py::resolve_scanner_api_url_with_source`.
+
+**Resolution algorithm.** Given the configured `base_url` and the project root:
+
+| Condition | Resolved URL | `source` label |
+|---|---|---|
+| Integration disabled | none (`null`) | `disabled` |
+| Valid `<root>/.filigree/ephemeral.port` present | configured URL with its **port** overridden by the live port (scheme, host, path preserved) | `.filigree/ephemeral.port` |
+| No / unreadable port file | configured URL unchanged | `config` |
+
+**The negative contract (the load-bearing part).** What Clarion *refuses* to do is
+the loom-§5 safety argument:
+
+- It **reads** the published port; it never **computes** Filigree's port itself
+  (no reimplementation of the `8400 + sha256 % 1000` rule).
+- When no live port file is present, it falls back to Clarion's **own** configured
+  `base_url`, **never** to a Filigree-internal default. Copying Filigree's
+  `DEFAULT_PORT` would be a silent cross-product coupling that breaks the moment
+  Filigree changes its default.
+- Reading is **fail-soft**: a missing, corrupt, out-of-range, or zero-valued port
+  file folds to the configured URL (`source = config`), never an error. A stale
+  configured port that is simply unreachable is handled the same way every
+  consumed route handles a Filigree outage — degrade, never propagate.
+
+**Server-mode gap (named limitation).** Filigree also supports a *server* mode that
+publishes its endpoint through a home-directory global
+(`~/.config/filigree/server.json`) rather than the per-project `ephemeral.port`
+file. Clarion does **not** read `server.json` at release:1.1 — under Filigree
+server mode, discovery finds no `ephemeral.port` and degrades to the configured
+`base_url` (`source = config`), which is correct but does not auto-track a
+server-mode port. Closing this gap (reading the server-mode global) is tracked as
+post-1.1 work; the ethereal path is the only one exercised today.
+
+**Agent-facing surface.** `project_status` reports the resolution verbatim so an
+agent can tell *where* the URL came from without probing ports:
+
+```json
+{
+  "filigree": {
+    "enabled": true,
+    "configured_url": "http://127.0.0.1:8766",
+    "resolved_url": "http://127.0.0.1:8542",
+    "resolution_source": ".filigree/ephemeral.port"
+  }
+}
+```
+
+`resolution_source` is exactly one of the three `source` labels above
+(`disabled` / `.filigree/ephemeral.port` / `config`); `resolved_url` is `null`
+only when the integration is disabled.
+
+**Verification scope.** There is no normative fixture for this convention —
+connection discovery resolves a single scalar (a port), not a wire document, so a
+fixture is not warranted; the shapes above are the contract. The executable check
+is the test module in
+[`filigree_url.rs`](../../crates/clarion-mcp/src/filigree_url.rs): it pins the
+live-port override, the no-file and disabled fall-throughs, and the fail-soft
+folding of corrupt / zero ports to the configured URL. Because the port file is a
+*read* of a Filigree-owned convention, a change on Filigree's side (path or
+format) would be caught by re-reading its `ephemeral.py`, not by Clarion CI.
+
 ## Consumed Filigree route: issue detail (enrichment)
 
-The contracts above pin the surface Clarion *exposes*. This one pins the single
-Filigree route Clarion *consumes* to enrich an entity-association match — the
-read behind `issues_for`'s per-match `issue` block (clarion-51a2868c86). It is
+This pins the single Filigree route Clarion *consumes* (against the endpoint
+resolved above) to enrich an entity-association match — the read behind
+`issues_for`'s per-match `issue` block (clarion-51a2868c86). It is
 strictly *enrich-only*: if the route is absent or unreachable, the match still
 resolves with `issue: null`, and Clarion's semantics are unaffected (loom.md §5).
 
