@@ -261,6 +261,11 @@ pub struct HttpReadConfig {
     /// exists and protected HTTP read routes require
     /// `X-Loom-Component: clarion:<hmac>`.
     pub identity_token_env: Option<String>,
+    /// Enable the Wardline taint-store WRITE API (POST /api/wardline/taint-facts).
+    /// Default false — `serve` is read-only unless explicitly opted in (ADR-036).
+    /// When true, `serve` spawns an optional ADR-011 writer-actor.
+    #[serde(default)]
+    pub wardline_taint_write: bool,
 }
 
 impl Default for HttpReadConfig {
@@ -271,6 +276,7 @@ impl Default for HttpReadConfig {
             allow_non_loopback: false,
             token_env: "CLARION_LOOM_TOKEN".to_owned(),
             identity_token_env: None,
+            wardline_taint_write: false,
         }
     }
 }
@@ -878,6 +884,27 @@ serve:
             cfg.serve.http.identity_token_env.as_deref(),
             Some("CLARION_TEST_IDENTITY")
         );
+    }
+
+    #[test]
+    fn http_wardline_taint_write_defaults_false() {
+        assert!(!McpConfig::default().serve.http.wardline_taint_write);
+    }
+
+    #[test]
+    fn http_wardline_taint_write_is_parsed_when_config_loads() {
+        let cfg = McpConfig::from_yaml_str(
+            r#"
+serve:
+  http:
+    enabled: true
+    bind: "127.0.0.1:0"
+    wardline_taint_write: true
+"#,
+        )
+        .expect("parse HTTP wardline_taint_write");
+
+        assert!(cfg.serve.http.wardline_taint_write);
     }
 
     #[test]

@@ -70,6 +70,7 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
     let http_project_root = project_root.clone();
     let http_server = crate::http_read::spawn(
         http_project_root,
+        db_path.clone(),
         readers.clone(),
         instance_id,
         &config.serve.http,

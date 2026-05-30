@@ -129,6 +129,9 @@ struct AppState {
     /// Resolved Loom component identity HMAC secret. When present, protected
     /// routes require `X-Loom-Component: clarion:<hmac>`.
     identity_secret: Option<Arc<String>>,
+    /// Present only when serve.http.wardline_taint_write is true (ADR-036).
+    /// `None` ⇒ the write API is disabled and returns 403 `WRITE_DISABLED`.
+    taint_writer: Option<tokio::sync::mpsc::Sender<clarion_storage::WriterCmd>>,
 }
 
 impl AppState {
@@ -172,13 +175,19 @@ struct HttpReadReady {
 
 pub fn spawn(
     project_root: PathBuf,
+    db_path: PathBuf,
     readers: ReaderPool,
     instance_id: crate::instance::InstanceId,
     config: &HttpReadConfig,
 ) -> Result<Option<HttpReadServer>> {
-    spawn_with_env(project_root, readers, instance_id, config, |name| {
-        std::env::var(name).ok()
-    })
+    spawn_with_env(
+        project_root,
+        db_path,
+        readers,
+        instance_id,
+        config,
+        |name| std::env::var(name).ok(),
+    )
 }
 
 /// Spawn variant that takes an explicit env lookup so tests can drive the
@@ -186,6 +195,7 @@ pub fn spawn(
 /// mutating process environment.
 pub fn spawn_with_env<F>(
     project_root: PathBuf,
+    db_path: PathBuf,
     readers: ReaderPool,
     instance_id: crate::instance::InstanceId,
     config: &HttpReadConfig,
@@ -197,6 +207,7 @@ where
     if !config.enabled {
         return Ok(None);
     }
+    let wardline_taint_write = config.wardline_taint_write;
     config
         .validate_loopback_trust()
         .context("validate HTTP read API trust model")?;
@@ -235,6 +246,8 @@ where
         .spawn(move || -> Result<()> {
             let result = run_http_read_server(
                 project_root,
+                db_path,
+                wardline_taint_write,
                 readers,
                 instance_id,
                 auth_token_thread,
@@ -285,8 +298,11 @@ where
     }))
 }
 
+#[allow(clippy::too_many_arguments)] // server bootstrap fans many one-shot inputs into one thread
 fn run_http_read_server(
     project_root: PathBuf,
+    db_path: PathBuf,
+    wardline_taint_write: bool,
     readers: ReaderPool,
     instance_id: crate::instance::InstanceId,
     auth_token: Option<Arc<String>>,
@@ -320,19 +336,53 @@ fn run_http_read_server(
             local_addr,
             readers_identity,
         }));
+        // Optional ADR-011 writer-actor for the Wardline taint-store WRITE API.
+        // Spawned INSIDE the HTTP runtime (`Writer::spawn` uses `spawn_blocking`,
+        // which needs a runtime). We keep ONLY `writer.sender()` — the `Writer`
+        // handle is dropped at the end of this block so that the AppState's
+        // sender clone is the last surviving sender. When `serve_future` is
+        // consumed below, that clone (and every per-request/middleware clone)
+        // drops, the actor's `mpsc::Receiver` sees all senders gone, and
+        // `rx.blocking_recv()` returns `None` — so `taint_writer_join.await`
+        // resolves instead of deadlocking. The `taint_writer_join` is held
+        // OUTSIDE the AppState so it survives to be awaited at shutdown.
+        let (taint_writer, taint_writer_join) = if wardline_taint_write {
+            let (writer, join) = clarion_storage::Writer::spawn(
+                db_path.clone(),
+                clarion_storage::DEFAULT_BATCH_SIZE,
+                clarion_storage::DEFAULT_CHANNEL_CAPACITY,
+            )
+            .map_err(|err| anyhow!("spawn taint writer-actor: {err}"))?;
+            (Some(writer.sender()), Some(join))
+        } else {
+            (None, None)
+        };
         let state = AppState {
             project_root,
             readers,
             instance_id,
             auth_token,
             identity_secret,
+            taint_writer,
         };
         let serve_future = axum::serve(listener, router(state))
             .with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
             })
             .into_future();
-        run_serve_future(serve_future).await
+        // Consuming `serve_future` drops the AppState (and its `taint_writer`
+        // sender clone) — the last sender — so the actor's channel closes.
+        let serve_result = run_serve_future(serve_future).await;
+        let writer_result = match taint_writer_join {
+            Some(join) => join
+                .await
+                .context("join taint writer-actor")?
+                .map_err(|err| anyhow!("taint writer-actor failed: {err}")),
+            None => Ok(()),
+        };
+        // Propagate the serve error first (mirrors `finish_supervised_result`).
+        serve_result?;
+        writer_result
     })
 }
 
@@ -1796,6 +1846,7 @@ mod tests {
                 allow_non_loopback: false,
                 token_env: "CLARION_LOOPBACK_NO_TOKEN_TEST_UNSET".to_owned(),
                 identity_token_env: None,
+                wardline_taint_write: false,
             };
             let instance_id =
                 crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-000000000002")
@@ -1808,6 +1859,7 @@ mod tests {
 
             let server = spawn_with_env(
                 tempdir.path().to_path_buf(),
+                db_path.clone(),
                 readers,
                 instance_id,
                 &config,
@@ -1880,6 +1932,7 @@ mod tests {
             instance_id,
             auth_token: None,
             identity_secret: Some(Arc::new(secret.to_owned())),
+            taint_writer: None,
         };
         (state, tempdir)
     }
@@ -2071,9 +2124,15 @@ mod tests {
         // Defensive: clear any stale trigger from a prior test.
         HTTP_THREAD_PANIC_TRIGGER.store(false, std::sync::atomic::Ordering::SeqCst);
 
-        let mut server = spawn(tempdir.path().to_path_buf(), readers, instance_id, &config)
-            .expect("spawn HTTP read API")
-            .expect("config.enabled = true implies Some(server)");
+        let mut server = spawn(
+            tempdir.path().to_path_buf(),
+            db_path.clone(),
+            readers,
+            instance_id,
+            &config,
+        )
+        .expect("spawn HTTP read API")
+        .expect("config.enabled = true implies Some(server)");
 
         // Trip the panic. The watcher polls every 5 ms.
         HTTP_THREAD_PANIC_TRIGGER.store(true, std::sync::atomic::Ordering::SeqCst);
