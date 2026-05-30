@@ -7,6 +7,7 @@ pub mod filigree_url;
 mod index_diff;
 pub mod scan_results;
 pub mod snapshot;
+pub mod wardline_reconcile;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
