@@ -1405,8 +1405,9 @@ async fn respond_taint_facts(
                         let wardline_json =
                             serde_json::value::RawValue::from_string(row.wardline_json.clone())
                                 .map_err(|e| {
-                                    StorageError::InvalidQuery(format!(
-                                        "stored wardline_json is not valid JSON: {e}"
+                                    StorageError::Corruption(format!(
+                                        "stored wardline_json for {} is not valid JSON: {e}",
+                                        row.entity_id
                                     ))
                                 })?;
                         let current_content_hash = match &row.source_file_path {
@@ -1644,6 +1645,15 @@ fn classify_read_error(err: &StorageError) -> ReadError {
             code: ErrorCode::PathOutsideProject,
             message: "path is outside project root",
         },
+        // A stored row that failed an integrity check is Clarion's fault, not
+        // the client's: 500 + logged (via `json_read_error`), never a 4xx that
+        // blames the caller's request. A federation client routing on `code`
+        // must see STORAGE_ERROR, not INVALID_PATH.
+        StorageError::Corruption(_) => ReadError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: ErrorCode::StorageError,
+            message: "stored data failed an integrity check",
+        },
         StorageError::Pool(_) => ReadError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: ErrorCode::StorageError,
@@ -1719,7 +1729,11 @@ fn log_read_server_error(code: ErrorCode, status: StatusCode, err: &StorageError
             code = ?code,
             status = status.as_u16(),
             error_chain = %error_chain,
-            "HTTP /api/v1/files lookup failed"
+            // Route-agnostic: this helper is shared by every read surface
+            // routed through `json_read_error` (files lookup AND the wardline
+            // taint-fact reads). A storage-corruption breadcrumb filed under a
+            // fixed "/api/v1/files" label is one an operator won't find.
+            "HTTP read API storage error"
         );
     });
 }
@@ -2580,6 +2594,136 @@ mod tests {
         drop(writer);
     }
 
+    /// Identity-guard regression lock for the wardline route group. All three
+    /// wardline routes share ONE `require_http_identity_wardline` layer, so the
+    /// mutating POST is a sufficient witness: if a wiring regression dropped the
+    /// `.route_layer(...)`, an absent-header POST would reach the handler and
+    /// return 403/200 — never 401. The trio pins:
+    ///   - valid signature → clears the guard (403 `WRITE_DISABLED` on the
+    ///     write-disabled state is downstream of auth, so it proves the guard
+    ///     passed, independent of the write feature);
+    ///   - wrong signature → 401 `UNAUTHENTICATED`;
+    ///   - absent header → 401 `UNAUTHENTICATED` (the case that catches a dropped
+    ///     `.route_layer`).
+    #[tokio::test]
+    async fn wardline_taint_write_enforces_identity() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let body = br#"{"facts":[{"qualname":"a.b.c","wardline_json":{"v":1}}]}"#;
+
+        // (1) Valid signature clears the guard. Against the write-DISABLED state
+        // (taint_writer: None) the handler then returns 403 WRITE_DISABLED,
+        // which is downstream of auth — so reaching it proves the guard passed.
+        let (state, _td1) = wardline_resolve_test_state(secret, &[]);
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body);
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a valid signature must clear the identity guard (403 is downstream of auth)"
+        );
+
+        // (2) Wrong signature → 401 UNAUTHENTICATED.
+        let (state, _td2) = wardline_resolve_test_state(secret, &[]);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/wardline/taint-facts")
+            .header("X-Loom-Component", "clarion:deadbeefdeadbeef")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_vec()))
+            .expect("build request");
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "a wrong signature must be rejected with 401"
+        );
+        let bytes = to_bytes(response.into_body(), 4096).await.expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(parsed["code"], "UNAUTHENTICATED");
+
+        // (3) Absent X-Loom-Component header → 401. This is the case that
+        // catches a regression dropping the route_layer: with no guard, this
+        // request would reach the handler and 403/200, not 401.
+        let (state, _td3) = wardline_resolve_test_state(secret, &[]);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/wardline/taint-facts")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_vec()))
+            .expect("build request");
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "an absent identity header must 401 — dropping the route_layer fails here"
+        );
+        let bytes = to_bytes(response.into_body(), 4096).await.expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(parsed["code"], "UNAUTHENTICATED");
+    }
+
+    /// Finding 3 (non-atomic batch): pins the invariant that makes partial
+    /// persistence acceptable — a whole-batch re-post is idempotent. Posting a
+    /// MULTI-fact batch twice converges to the same state: stable `written`, no
+    /// row duplication, last-write-wins per entity. (Deterministic mid-batch
+    /// fault injection has no seam in the writer-actor without a test-only hook
+    /// in production code; idempotency is the contract-relevant invariant, and
+    /// is exactly what `contracts.md` instructs clients to rely on after a 5xx.)
+    #[tokio::test]
+    async fn wardline_taint_write_batch_retry_is_idempotent() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let (state, db_path, writer, _tempdir) =
+            wardline_write_test_state(secret, &["python:function:a.b.c", "python:function:d.e.f"]);
+
+        let body = br#"{"facts":[
+            {"qualname":"a.b.c","wardline_json":{"v":1}},
+            {"qualname":"d.e.f","wardline_json":{"v":2}}
+        ]}"#;
+        let post = |body: &'static [u8]| {
+            let state = state.clone();
+            async move {
+                let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body);
+                let response = router(state).oneshot(request).await.expect("oneshot");
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+                    .await
+                    .expect("body");
+                serde_json::from_slice::<serde_json::Value>(&bytes).expect("json")
+            }
+        };
+
+        let first = post(body).await;
+        assert_eq!(first["written"], 2);
+        let second = post(body).await;
+        assert_eq!(
+            second["written"], 2,
+            "a whole-batch re-post writes the same count"
+        );
+
+        // No duplication: exactly one row per entity, last-write-wins.
+        assert_eq!(
+            read_taint_blob(&db_path, "python:function:a.b.c").as_deref(),
+            Some(r#"{"v":1}"#)
+        );
+        assert_eq!(
+            read_taint_blob(&db_path, "python:function:d.e.f").as_deref(),
+            Some(r#"{"v":2}"#)
+        );
+        let count = {
+            let conn = rusqlite::Connection::open(&db_path).expect("verify conn");
+            conn.query_row("SELECT COUNT(*) FROM wardline_taint_facts", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .expect("count")
+        };
+        assert_eq!(count, 2, "re-post must not duplicate rows");
+        drop(writer);
+    }
+
     /// W.2 writer-actor lifecycle: with `wardline_taint_write: true`, `spawn`
     /// runs the FULL `run_http_read_server` path — it spawns the optional
     /// writer-actor inside the HTTP runtime, builds the `AppState` holding the
@@ -2948,6 +3092,47 @@ mod tests {
             "absent fact must omit wardline_json"
         );
         assert!(parsed.get("current_content_hash").is_none());
+    }
+
+    /// Finding 2 (corrupt stored blob): an `exists: true` row whose stored
+    /// `wardline_json` does not re-parse is a STORAGE-integrity failure, not a
+    /// malformed client request. The validated write path (`RawValue` round-trip)
+    /// cannot produce this — only storage corruption or an out-of-band write
+    /// can — so the test injects it directly via the seed builder's verbatim
+    /// blob. The read must return 500 `STORAGE_ERROR` (Clarion's fault, and 5xx
+    /// so `json_read_error` logs it), NOT 400 `INVALID_PATH` (which would blame
+    /// the federation client's request for Clarion's storage damage).
+    #[tokio::test]
+    async fn wardline_taint_get_corrupt_blob_is_500_storage_error_not_400() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-read-secret";
+        let (state, _tempdir) = wardline_read_test_state(
+            secret,
+            &[SeedFn {
+                qualname: "corrupt.fn",
+                bytes: b"def f():\n    return 1\n",
+                blob: "{not valid json",
+            }],
+        );
+        let request = hmac_request(
+            secret,
+            "GET",
+            "/api/wardline/taint-facts?qualname=corrupt.fn",
+            b"",
+        );
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a corrupt stored blob is Clarion's fault → 500, never a client 400"
+        );
+        let bytes = to_bytes(response.into_body(), 4096).await.expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            parsed["code"], "STORAGE_ERROR",
+            "corruption must classify as STORAGE_ERROR, not INVALID_PATH"
+        );
     }
 
     #[tokio::test]

@@ -574,6 +574,15 @@ Successful response (`200 OK`):
 - **Per-entity replace (idempotent).** A write replaces the row keyed on the
   resolved `entity_id` (`ON CONFLICT(entity_id) DO UPDATE`), so re-posting the same
   qualname overwrites rather than duplicating.
+- **Batch writes are NOT atomic; retry the whole batch.** Each fact is persisted
+  in its own transaction, in input order. A mid-batch failure (or the 10 s
+  request timeout aborting a large batch) returns a `5xx` and the facts persisted
+  *before* the failure stay committed — the `written` count is **not** reported in
+  the error envelope, so the client cannot tell how far it got. This is safe
+  because the write is **whole-batch idempotent**: per-entity replace means
+  re-posting the entire batch overwrites the partially-applied prefix and
+  converges to the same state. **On any `5xx`, re-post the whole batch** — do not
+  attempt to diff or resume from a partial point.
 
 Failure modes:
 
@@ -585,7 +594,7 @@ Failure modes:
 | 403 | `PROJECT_MISMATCH` | Non-empty `project` does not match the served project. |
 | 413 | `BATCH_TOO_LARGE` | `facts.len() > 2000`. |
 | 413 | n/a | Request body exceeds the 4 MiB cap (transport-level). |
-| 500/503 | `STORAGE_ERROR` / `INTERNAL` | Writer-actor unavailable or write failed. |
+| 500/503 | `STORAGE_ERROR` / `INTERNAL` | Writer-actor unavailable or write failed. **May have partially persisted** — re-post the whole batch (idempotent). |
 
 ### `GET /api/wardline/taint-facts?project=&qualname=` (read, single) and `POST /api/wardline/taint-facts:batch-get` (read, batch)
 

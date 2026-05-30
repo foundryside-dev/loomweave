@@ -46,6 +46,15 @@ pub enum StorageError {
     #[error("invalid query: {0}")]
     InvalidQuery(String),
 
+    /// A row that exists in storage failed an integrity check on read (e.g. a
+    /// blob that the write path stores byte-verbatim no longer re-parses).
+    /// This is a server-side fault — Clarion's stored state is damaged, NOT a
+    /// malformed client request — so it must map to 5xx and be logged, never to
+    /// a client 4xx. Reachable only via storage corruption or an out-of-band
+    /// write that bypasses the validated write path.
+    #[error("storage integrity failure: {0}")]
+    Corruption(String),
+
     #[error("invalid source path: {0}")]
     InvalidSourcePath(String),
 

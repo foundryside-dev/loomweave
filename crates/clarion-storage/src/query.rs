@@ -449,7 +449,24 @@ pub fn current_file_hash(project_root: &Path, source_file_path: &str) -> Option<
     } else {
         project_root.join(p)
     };
-    file_content_hash(&path).ok()
+    match file_content_hash(&path) {
+        Ok(hash) => Some(hash),
+        // A missing file is the routine stale case (deleted/renamed) — stay
+        // silent. Any other IO kind (PermissionDenied, a permission misconfig,
+        // an IO fault) would otherwise report every fact stale forever with no
+        // breadcrumb. Warn with the path AND the kind so an operator can act,
+        // but still return `None`: the freshness contract is `None` = stale,
+        // never an error.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error_kind = ?err.kind(),
+                "current_file_hash: source file unreadable; reporting stale (absent freshness hash)"
+            );
+            None
+        }
+    }
 }
 
 fn resolved_language(
