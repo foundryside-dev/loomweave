@@ -129,7 +129,7 @@ struct AppState {
     /// Resolved Loom component identity HMAC secret. When present, protected
     /// routes require `X-Loom-Component: clarion:<hmac>`.
     identity_secret: Option<Arc<String>>,
-    /// Present only when serve.http.wardline_taint_write is true (ADR-036).
+    /// Present only when `serve.http.wardline_taint_write` is true (ADR-036).
     /// `None` ⇒ the write API is disabled and returns 403 `WRITE_DISABLED`.
     taint_writer: Option<tokio::sync::mpsc::Sender<clarion_storage::WriterCmd>>,
 }
@@ -464,6 +464,7 @@ fn router(state: AppState) -> Router {
     // 4 MiB target would be nominal only.
     let wardline = Router::new()
         .route("/api/wardline/resolve", post(post_wardline_resolve))
+        .route("/api/wardline/taint-facts", post(post_wardline_taint_facts))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_http_identity_wardline,
@@ -720,10 +721,10 @@ enum ErrorCode {
     Unauthenticated,
     StorageError,
     BatchTooLarge,
-    /// Constructed by the Task 5 write endpoint (`POST /api/wardline/taint`).
-    /// Reachable only via `json_error(StatusCode::FORBIDDEN, …)`; no central
-    /// `StatusCode` mapping is required.
-    #[allow(dead_code)]
+    /// Constructed by the write endpoint (`POST /api/wardline/taint-facts`)
+    /// when the writer-actor is not enabled. Reachable only via
+    /// `json_error(StatusCode::FORBIDDEN, …)`; no central `StatusCode` mapping
+    /// is required.
     WriteDisabled,
     /// The `project` request guard did not match the served project.
     ProjectMismatch,
@@ -840,6 +841,33 @@ struct ResolveResponse {
     /// qualname -> `entity_id`, only for exact matches.
     resolved: std::collections::BTreeMap<String, String>,
     unresolved: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaintFactInput {
+    qualname: String,
+    wardline_json: serde_json::Value,
+    #[serde(default)]
+    scan_id: Option<String>,
+    #[serde(default)]
+    content_hash_at_compute: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteTaintFactsRequest {
+    #[serde(default)]
+    project: String,
+    #[serde(default)]
+    scan_id: Option<String>,
+    facts: Vec<TaintFactInput>,
+}
+
+#[derive(Debug, Serialize)]
+struct WriteTaintFactsResponse {
+    written: usize,
+    unresolved_qualnames: Vec<String>,
 }
 
 async fn get_file(
@@ -1162,6 +1190,140 @@ async fn post_wardline_resolve(
         }
         Err(err) => json_read_error(&err),
     }
+}
+
+/// Wardline taint-fact batch WRITE (ADR-036, W.2). Disabled by default; only
+/// reachable when `serve.http.wardline_taint_write` spawned the optional
+/// writer-actor (`state.taint_writer` is `Some`). Resolution is the SAME
+/// exact-tier oracle the resolve endpoint uses; `wardline_json` is opaque and
+/// stored verbatim. Facts whose qualname does not resolve are reported in
+/// `unresolved_qualnames` and silently skipped (not an error).
+async fn post_wardline_taint_facts(
+    State(state): State<AppState>,
+    body: Result<Json<WriteTaintFactsRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    // Disabled-by-default guard fires BEFORE body parsing: a `None` writer
+    // means the API is off regardless of payload shape.
+    let Some(writer) = state.taint_writer.clone() else {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            ErrorCode::WriteDisabled,
+            "taint-fact write API is disabled (set serve.http.wardline_taint_write: true)",
+        );
+    };
+    let Json(req) = match body {
+        Ok(json) => json,
+        Err(rej) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidPath,
+                &rej.body_text(),
+            );
+        }
+    };
+    if let Some(resp) = state.reject_project_mismatch(&req.project) {
+        return resp;
+    }
+    if req.facts.len() > WARDLINE_TAINT_BATCH_MAX {
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorCode::BatchTooLarge,
+            "too many facts in one request",
+        );
+    }
+
+    // Resolve every qualname EXACT-only on the reader pool, in input order, in
+    // one pooled-connection checkout. Zip results back onto the facts by index
+    // (NOT a qualname->id map) so duplicate qualnames are handled correctly.
+    let qualnames: Vec<String> = req.facts.iter().map(|f| f.qualname.clone()).collect();
+    let resolution = state
+        .readers
+        .with_reader(move |conn| clarion_storage::resolve_wardline_qualnames(conn, &qualnames))
+        .await;
+    let resolved = match resolution {
+        Ok(pairs) => pairs,
+        Err(err) => return json_read_error(&err),
+    };
+
+    let batch_scan_id = req.scan_id.clone();
+    let updated_at = iso8601_now();
+    let mut written = 0_usize;
+    let mut unresolved_qualnames = Vec::new();
+    for (fact, (_, res)) in req.facts.into_iter().zip(resolved) {
+        let Some(entity_id) = res.entity_id else {
+            unresolved_qualnames.push(fact.qualname);
+            continue;
+        };
+        let taint_fact = clarion_storage::TaintFact {
+            entity_id,
+            // Opaque: re-serialize the verbatim JSON value. Do NOT parse out
+            // scan_id/content_hash from inside the blob; do NOT validate it.
+            wardline_json: fact.wardline_json.to_string(),
+            scan_id: fact.scan_id.or_else(|| batch_scan_id.clone()),
+            content_hash_at_compute: fact.content_hash_at_compute.clone(),
+            updated_at: updated_at.clone(),
+        };
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let cmd = clarion_storage::WriterCmd::UpsertWardlineTaintFact {
+            fact: Box::new(taint_fact),
+            ack: ack_tx,
+        };
+        if writer.send(cmd).await.is_err() {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::StorageError,
+                "taint-fact writer is unavailable",
+            );
+        }
+        match ack_rx.await {
+            Ok(Ok(())) => written += 1,
+            Ok(Err(err)) => {
+                log_taint_write_error(&err);
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorCode::Internal,
+                    "taint-fact write failed",
+                );
+            }
+            Err(_) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorCode::Internal,
+                    "taint-fact writer dropped the response channel",
+                );
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(WriteTaintFactsResponse {
+            written,
+            unresolved_qualnames,
+        }),
+    )
+        .into_response()
+}
+
+fn log_taint_write_error(err: &StorageError) {
+    let error_chain = format_error_chain(err);
+    tracing::dispatcher::with_default(&HTTP_ERROR_DISPATCH, || {
+        tracing::error!(
+            error_chain = %error_chain,
+            "HTTP /api/wardline/taint-facts write failed"
+        );
+    });
+}
+
+/// ISO-8601 UTC "now" with millisecond precision (`YYYY-MM-DDTHH:MM:SS.sssZ`),
+/// matching the caller-side timestamps `clarion analyze` stamps onto run rows.
+fn iso8601_now() -> String {
+    use time::macros::format_description;
+    const ISO8601_MILLIS_UTC: &[time::format_description::FormatItem<'_>] =
+        format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
+    time::OffsetDateTime::now_utc()
+        .format(ISO8601_MILLIS_UTC)
+        .expect("fixed ISO-8601 format description should format")
 }
 
 fn resolve_file_query_item(
@@ -1999,6 +2161,258 @@ mod tests {
             .expect("read body");
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
         assert_eq!(parsed["code"], "PROJECT_MISMATCH");
+    }
+
+    /// Build a write-enabled `AppState` over a fresh temp migrated DB with the
+    /// given entity ids seeded, plus a REAL writer-actor. Returns the state, the
+    /// `db_path` (for verification on a fresh connection), the `Writer` handle
+    /// (drop it last so the actor can flush), and the `TempDir` guard. The
+    /// actor runs via `Writer::spawn`'s `spawn_blocking`, so the caller MUST be
+    /// on a tokio runtime (`#[tokio::test]`).
+    fn wardline_write_test_state(
+        secret: &str,
+        seed_ids: &[&str],
+    ) -> (
+        AppState,
+        std::path::PathBuf,
+        clarion_storage::Writer,
+        tempfile::TempDir,
+    ) {
+        use clarion_storage::ReaderPool;
+        use clarion_storage::schema::apply_migrations;
+
+        let tempdir = tempfile::tempdir().expect("temp project root");
+        let db_path = tempdir.path().join("clarion.db");
+        let mut conn = rusqlite::Connection::open(&db_path).expect("open db");
+        apply_migrations(&mut conn).expect("apply migrations");
+        for id in seed_ids {
+            conn.execute(
+                "INSERT INTO entities ( \
+                    id, plugin_id, kind, name, short_name, properties, \
+                    content_hash, created_at, updated_at \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    id,
+                    "python",
+                    "function",
+                    id,
+                    id.rsplit('.').next().unwrap_or(id),
+                    "{}",
+                    "deadbeef",
+                    "2026-05-31T00:00:00.000Z",
+                    "2026-05-31T00:00:00.000Z",
+                ],
+            )
+            .expect("seed entity row");
+        }
+        drop(conn);
+
+        let readers = ReaderPool::open(&db_path, 4).expect("open reader pool");
+        let (writer, _join) = clarion_storage::Writer::spawn(
+            db_path.clone(),
+            clarion_storage::DEFAULT_BATCH_SIZE,
+            clarion_storage::DEFAULT_CHANNEL_CAPACITY,
+        )
+        .expect("spawn taint writer-actor");
+        // The join handle is dropped here: the test reads the DB on a fresh
+        // connection AFTER awaiting per-upsert acks, which confirm durability
+        // (query_time_write auto-commits before the ack fires).
+        let instance_id =
+            crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-000000000005")
+                .expect("parse synthetic instance id");
+        let state = AppState {
+            project_root: tempdir.path().to_path_buf(),
+            readers,
+            instance_id,
+            auth_token: None,
+            identity_secret: Some(Arc::new(secret.to_owned())),
+            taint_writer: Some(writer.sender()),
+        };
+        (state, db_path, writer, tempdir)
+    }
+
+    fn read_taint_blob(db_path: &std::path::Path, entity_id: &str) -> Option<String> {
+        let conn = rusqlite::Connection::open(db_path).expect("open verification conn");
+        conn.query_row(
+            "SELECT wardline_json FROM wardline_taint_facts WHERE entity_id = ?1",
+            rusqlite::params![entity_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_write_disabled_returns_403() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        // `wardline_resolve_test_state` builds a state with `taint_writer: None`.
+        let (state, _tempdir) = wardline_resolve_test_state(secret, &[]);
+        let body = br#"{"facts":[{"qualname":"a.b.c","wardline_json":{"v":1}}]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body);
+
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(parsed["code"], "WRITE_DISABLED");
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_write_persists_resolved_and_reports_unresolved() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let (state, db_path, writer, _tempdir) =
+            wardline_write_test_state(secret, &["python:function:a.b.c"]);
+        let body = br#"{"facts":[
+            {"qualname":"a.b.c","wardline_json":{"schema":"w-1","taint":{"ret":"RAW"}}},
+            {"qualname":"x.y.z","wardline_json":{"v":2}}
+        ]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body);
+
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(parsed["written"], 1);
+        assert_eq!(parsed["unresolved_qualnames"], serde_json::json!(["x.y.z"]));
+
+        // The ack we awaited inside the handler confirms durability; the blob
+        // must round-trip verbatim (re-serialized from the JSON value).
+        let stored = read_taint_blob(&db_path, "python:function:a.b.c").expect("fact stored");
+        let expected = serde_json::json!({"schema":"w-1","taint":{"ret":"RAW"}}).to_string();
+        assert_eq!(stored, expected, "wardline_json stored verbatim");
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_write_replaces_per_entity() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let (state, db_path, writer, _tempdir) =
+            wardline_write_test_state(secret, &["python:function:a.b.c"]);
+
+        let send = |body: &'static [u8]| {
+            let state = state.clone();
+            async move {
+                let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body);
+                let response = router(state).oneshot(request).await.expect("oneshot");
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        };
+        send(br#"{"facts":[{"qualname":"a.b.c","wardline_json":{"v":1}}]}"#).await;
+        send(br#"{"facts":[{"qualname":"a.b.c","wardline_json":{"v":2}}]}"#).await;
+
+        let stored = read_taint_blob(&db_path, "python:function:a.b.c").expect("fact stored");
+        assert_eq!(
+            stored,
+            serde_json::json!({"v":2}).to_string(),
+            "second write overwrites"
+        );
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_write_rejects_project_guard_mismatch() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let (state, _db_path, writer, _tempdir) = wardline_write_test_state(secret, &[]);
+        let body = br#"{"project":"some-other-project","facts":[{"qualname":"a.b.c","wardline_json":{"v":1}}]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body);
+
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(parsed["code"], "PROJECT_MISMATCH");
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_write_rejects_oversize_batch() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let (state, _db_path, writer, _tempdir) = wardline_write_test_state(secret, &[]);
+        let facts: Vec<serde_json::Value> = (0..=WARDLINE_TAINT_BATCH_MAX)
+            .map(
+                |i| serde_json::json!({ "qualname": format!("pkg.mod.f{i}"), "wardline_json": {} }),
+            )
+            .collect();
+        assert!(facts.len() > WARDLINE_TAINT_BATCH_MAX);
+        let body = serde_json::to_vec(&serde_json::json!({ "facts": facts })).expect("json");
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", &body);
+
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(parsed["code"], "BATCH_TOO_LARGE");
+        drop(writer);
+    }
+
+    /// W.2 writer-actor lifecycle: with `wardline_taint_write: true`, `spawn`
+    /// runs the FULL `run_http_read_server` path — it spawns the optional
+    /// writer-actor inside the HTTP runtime, builds the `AppState` holding the
+    /// only surviving sender clone, then on `shutdown()` drops `serve_future`
+    /// (and that clone) so the actor's channel closes and `taint_writer_join`
+    /// resolves. A drop-ordering regression (leaked sender / retained `Writer`)
+    /// would deadlock `shutdown()` forever — the unit tests that build `AppState`
+    /// by hand cannot catch that; this is the only test that exercises the
+    /// spawn→drop→join sequence end to end.
+    #[test]
+    fn spawn_with_taint_writer_shuts_down_cleanly() {
+        use clarion_mcp::config::HttpReadConfig;
+        use clarion_storage::ReaderPool;
+        use std::net::{SocketAddr, TcpListener};
+
+        let probe = TcpListener::bind(("127.0.0.1", 0)).expect("probe bind");
+        let bind: SocketAddr = probe.local_addr().expect("probe local addr");
+        drop(probe);
+
+        let tempdir = tempfile::tempdir().expect("temp project root");
+        let db_path = tempdir.path().join("clarion.db");
+        // `Writer::spawn` creates the file and `verify_user_version` passes at
+        // version 0; a shutdown-only test sends no commands.
+        let readers = ReaderPool::open(&db_path, 4).expect("open reader pool");
+
+        let config = HttpReadConfig {
+            enabled: true,
+            bind,
+            allow_non_loopback: false,
+            wardline_taint_write: true,
+            ..HttpReadConfig::default()
+        };
+        let instance_id =
+            crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-000000000006")
+                .expect("parse synthetic instance id");
+
+        let server = spawn(
+            tempdir.path().to_path_buf(),
+            db_path.clone(),
+            readers,
+            instance_id,
+            &config,
+        )
+        .expect("spawn HTTP read API")
+        .expect("config.enabled = true implies Some(server)");
+
+        // If the writer sender leaked, this `shutdown()` would block on the
+        // join forever; CI's per-test timeout would surface the hang.
+        server
+            .shutdown()
+            .expect("clean shutdown joins the writer-actor without error");
     }
 
     /// The Wardline body-limit relocation is load-bearing: a >16 KiB body must
