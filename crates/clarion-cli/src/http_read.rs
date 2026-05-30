@@ -1216,7 +1216,7 @@ async fn post_wardline_resolve(
             let mut resolved = std::collections::BTreeMap::new();
             let mut unresolved = Vec::new();
             for (qualname, resolution) in pairs {
-                match resolution.entity_id {
+                match resolution.into_entity_id() {
                     Some(id) => {
                         resolved.insert(qualname, id);
                     }
@@ -1294,7 +1294,7 @@ async fn post_wardline_taint_facts(
     let mut written = 0_usize;
     let mut unresolved_qualnames = Vec::new();
     for (fact, (_, res)) in req.facts.into_iter().zip(resolved) {
-        let Some(entity_id) = res.entity_id else {
+        let Some(entity_id) = res.into_entity_id() else {
             unresolved_qualnames.push(fact.qualname);
             continue;
         };
@@ -1384,7 +1384,7 @@ async fn respond_taint_facts(
             // 2. Fetch facts for the resolved entity ids; map back by id.
             let entity_ids: Vec<String> = resolved
                 .iter()
-                .filter_map(|(_, r)| r.entity_id.clone())
+                .filter_map(|(_, r)| r.entity_id().map(str::to_owned))
                 .collect();
             let rows = clarion_storage::get_taint_facts(conn, &entity_ids)?;
             let by_entity: std::collections::HashMap<String, clarion_storage::TaintFactRow> = rows
@@ -1397,8 +1397,11 @@ async fn respond_taint_facts(
                 std::collections::HashMap::new();
             let mut views = Vec::with_capacity(resolved.len());
             for (qualname, resolution) in resolved {
-                let view = match resolution.entity_id.and_then(|id| by_entity.get(&id)) {
-                    Some(row) if row.exists => {
+                let view = match resolution
+                    .into_entity_id()
+                    .and_then(|id| by_entity.get(&id))
+                {
+                    Some(row) => {
                         // Byte-faithful: the stored string is exactly what W.2
                         // wrote from a RawValue, so it re-parses. A parse error
                         // is a storage-integrity failure, not a 404.
@@ -2946,14 +2949,18 @@ mod tests {
     struct SeedFn {
         qualname: &'static str,
         bytes: &'static [u8],
-        blob: &'static str,
+        /// `Some(json)` stores a taint fact; `None` seeds the entity ONLY (the
+        /// resolved-entity-but-no-stored-fact case the read path must report
+        /// as `exists: false`).
+        blob: Option<&'static str>,
     }
 
     /// Build a reads-only `AppState` (`taint_writer: None`) over a fresh temp
     /// migrated DB. Each `SeedFn` gets a real file written under the project
-    /// root, an `entities` row whose `source_file_path` is that file's ABSOLUTE
-    /// path, and a stored `wardline_taint_facts` row carrying its blob verbatim.
-    /// Returns the state and the `TempDir` guard (drop it last).
+    /// root and an `entities` row whose `source_file_path` is that file's
+    /// ABSOLUTE path; a `wardline_taint_facts` row carrying its blob verbatim
+    /// is stored only when `blob` is `Some`. Returns the state and the
+    /// `TempDir` guard (drop it last).
     fn wardline_read_test_state(secret: &str, seeds: &[SeedFn]) -> (AppState, tempfile::TempDir) {
         use clarion_storage::ReaderPool;
         use clarion_storage::schema::apply_migrations;
@@ -2989,13 +2996,15 @@ mod tests {
                 ],
             )
             .expect("seed entity row");
-            conn.execute(
-                "INSERT INTO wardline_taint_facts \
-                    (entity_id, wardline_json, scan_id, content_hash_at_compute, updated_at) \
-                 VALUES (?1, ?2, NULL, NULL, ?3)",
-                rusqlite::params![id, seed.blob, "2026-05-31T00:00:00.000Z"],
-            )
-            .expect("seed taint fact");
+            if let Some(blob) = seed.blob {
+                conn.execute(
+                    "INSERT INTO wardline_taint_facts \
+                        (entity_id, wardline_json, scan_id, content_hash_at_compute, updated_at) \
+                     VALUES (?1, ?2, NULL, NULL, ?3)",
+                    rusqlite::params![id, blob, "2026-05-31T00:00:00.000Z"],
+                )
+                .expect("seed taint fact");
+            }
         }
         // Two seeds may share one file for the dedup test; insert that case
         // explicitly via a shared-file seed below if needed (handled in-test).
@@ -3034,7 +3043,7 @@ mod tests {
             &[SeedFn {
                 qualname: "a.b.c",
                 bytes,
-                blob,
+                blob: Some(blob),
             }],
         );
 
@@ -3112,7 +3121,7 @@ mod tests {
             &[SeedFn {
                 qualname: "corrupt.fn",
                 bytes: b"def f():\n    return 1\n",
-                blob: "{not valid json",
+                blob: Some("{not valid json"),
             }],
         );
         let request = hmac_request(
@@ -3149,7 +3158,7 @@ mod tests {
             &[SeedFn {
                 qualname: "m.span.fn",
                 bytes,
-                blob: r#"{"v":1}"#,
+                blob: Some(r#"{"v":1}"#),
             }],
         );
         let request = hmac_request(
@@ -3189,7 +3198,7 @@ mod tests {
             &[SeedFn {
                 qualname: "pkg.present",
                 bytes,
-                blob: r#"{"present":true}"#,
+                blob: Some(r#"{"present":true}"#),
             }],
         );
         let body = br#"{"qualnames":["pkg.present","pkg.absent"]}"#;
@@ -3208,6 +3217,45 @@ mod tests {
         assert_eq!(arr[1]["qualname"], "pkg.absent");
         assert_eq!(arr[1]["exists"], false);
         assert!(arr[1].get("wardline_json").is_none());
+    }
+
+    /// The qualname RESOLVES to a real entity, but that entity has no stored
+    /// taint fact (`blob: None`). This is a distinct path from an unresolved
+    /// qualname: both converge on the `exists: false` view, but only this one
+    /// exercises `get_taint_facts` returning fewer rows than resolved ids
+    /// (present-rows-only). Without this test the changed consumer arm is
+    /// covered for "unresolved" but not for "resolved-but-no-fact".
+    #[tokio::test]
+    async fn wardline_taint_get_resolved_entity_without_fact_reports_not_exists() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-read-secret";
+        let (state, _tempdir) = wardline_read_test_state(
+            secret,
+            &[SeedFn {
+                qualname: "pkg.no_fact",
+                bytes: b"def f():\n    pass\n",
+                blob: None,
+            }],
+        );
+        let body = br#"{"qualnames":["pkg.no_fact"]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts:batch-get", body);
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes_out = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes_out).expect("json");
+        let arr = parsed.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["qualname"], "pkg.no_fact");
+        assert_eq!(
+            arr[0]["exists"], false,
+            "resolved entity with no stored fact must report exists: false"
+        );
+        assert!(arr[0].get("wardline_json").is_none());
+        // A resolved-but-no-fact view carries no freshness signal either.
+        assert_eq!(arr[0]["current_content_hash"], serde_json::Value::Null);
     }
 
     #[tokio::test]
@@ -3321,7 +3369,7 @@ mod tests {
             &[SeedFn {
                 qualname: "x.y.z",
                 bytes,
-                blob: r#"{"ok":true}"#,
+                blob: Some(r#"{"ok":true}"#),
             }],
         );
         assert!(state.taint_writer.is_none(), "write API is disabled");
@@ -3353,7 +3401,7 @@ mod tests {
             &[SeedFn {
                 qualname: "gone.fn",
                 bytes,
-                blob: r#"{"v":1}"#,
+                blob: Some(r#"{"v":1}"#),
             }],
         );
         // Delete the containing file: a stale signal → current_content_hash
