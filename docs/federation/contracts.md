@@ -851,6 +851,10 @@ is unreachable the `wardline_findings` section degrades to
    reconciliation key is `metadata.wardline.qualname`). Unknown fields are ignored
    so Filigree may grow the row without breaking this consumer.
 
+Clarion reads only the first page of each list response (it does not follow
+`has_more`); for a single source file the expected file/finding volume fits one
+Filigree page. Multi-page following is a documented v1 limitation.
+
 **Reconciliation.** `metadata.wardline.qualname` is matched byte-exact against
 the entity_id's segment-3 `canonical_qualified_name`
 (`python:function:<qualname>`), per
