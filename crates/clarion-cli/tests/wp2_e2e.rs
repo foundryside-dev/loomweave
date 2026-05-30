@@ -20,6 +20,10 @@ use std::path::PathBuf;
 use std::{env, fs};
 
 use assert_cmd::Command;
+// Used only by the Linux-only OOM-kill assertion below; gating the import keeps
+// it from tripping `-D warnings` as unused on non-Linux targets
+// (clarion-12667da9f5).
+#[cfg(target_os = "linux")]
 use clarion_core::plugin::limits::FINDING_OOM_KILLED;
 use rusqlite::Connection;
 use tempfile::TempDir;
