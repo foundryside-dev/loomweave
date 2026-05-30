@@ -93,29 +93,34 @@ for a rejected top-level `__init__.py`, non-`src` roots not stripped, `src` only
 stripped at position 0, `<locals>` closure markers and nested-class chains
 preserved verbatim.
 
-## 4. External dependency — Filigree findings-read route (contract ask)
+## 4. Data source — composed from existing Filigree routes (no new contract)
 
-Flow B needs a Filigree read surface Clarion does not yet call: **fetch Wardline
-findings for a file path.** Proposed contract:
+**Verified against Filigree source (2026-05-30): no new Filigree route is
+needed.** Flow B composes two routes Clarion can already reach:
 
-```text
-GET {filigree_base}/api/loom/findings?scan_source=wardline&path=<rel-path>
-  → { findings: [ { rule_id, message, severity, line_start, line_end,
-                    fingerprint, status, metadata } ... ],
-      result_kind: matched | no_matches | unavailable }
-```
+1. **`POST /api/v1/files:resolve`** — resolve E's file path → Filigree `file_id`.
+   Already a Clarion-consumed contract, pinned in `docs/federation/contracts.md`
+   (the `/api/v1/files` family).
+2. **`GET /api/loom/findings?scan_source=wardline&file_id=<id>`** — already
+   shipped (`api_loom_list_findings`, `filigree/dashboard_routes/files.py`); its
+   query filters include `scan_source`, `status`, and `file_id`. Each row is a
+   `ScanFindingLoom` carrying `rule_id`, `message`, `severity`, `status`,
+   `line_start/line_end`, `fingerprint`, `file_id`, and **`metadata`** (where
+   `metadata.wardline.qualname` lives). Pinned by Filigree's
+   `tests/fixtures/contracts/loom/findings.json`.
 
-Fetching **by `path`** (a first-class top-level column in Filigree's intake)
-rather than by nested `metadata.wardline.qualname` keeps the sibling from having
-to index nested JSON, and leaves the precise qualname match on Clarion's side.
+So the fetch is: `files:resolve(path) → file_id`, then `GET
+/api/loom/findings?scan_source=wardline&file_id=<id>`, then the local qualname
+match in §3. `ScanFindingLoom` rows reference the file by `file_id`, not `path`,
+which is exactly why the resolve step is required (and why file-scoping rather
+than a project-wide findings sweep keeps each query bounded).
 
-This route is **not assumed to exist**. Filigree exposes `list_findings` /
-`get_finding` as MCP tools; the exact HTTP read shape must be confirmed. The
-deliverable below files this as a federation contract request (same pattern as
-the prune-unseen / scan-run-create request in commit `7a93883`), and Flow B
-implementation is gated on it. Until the route lands, Flow B has no live data
-source — which is acceptable: enrich-only means "absent → empty section", not
-"broken".
+This is **Clarion-side build only** — the MCP Filigree client (`filigree.rs`)
+gains a `files:resolve` call and a findings-list call; no Filigree-side work, and
+**no federation contract request** (the route, like the prune route in
+`7a93883`, already exists — checked, not assumed). Enrich-only still holds: if
+either route is unreachable, the `wardline_findings` section degrades to empty +
+`degraded`.
 
 ## 5. Error handling (enrich-only, no fabrication)
 
@@ -175,10 +180,13 @@ when it is built.
 
 ## 9. Risks
 
-- **R1 — sibling-route shape drift.** The Filigree findings-read route is
-  specced ahead of confirmation. Mitigated by filing it as an explicit contract
-  request and gating implementation on its landing; building against a guessed
-  shape is forbidden.
+- **R1 — sibling-route shape drift.** Both consumed routes (`files:resolve`,
+  `GET /api/loom/findings`) exist today (verified), but their wire shape could
+  drift. Mitigated by pinning the consumed shapes in
+  `docs/federation/contracts.md` against Filigree's normative fixtures
+  (`tests/fixtures/contracts/loom/findings.json`) and testing the client against
+  that fixture, not a guess. No new route is requested, so there is no
+  ahead-of-build dependency to land.
 - **R2 — qualname mismatch surfaced as silent miss.** A producer divergence
   (Wardline composing a qualname Clarion can't match) degrades to
   `resolution_confidence: none`. Mitigated by the shared normative fixture and by
@@ -192,10 +200,15 @@ when it is built.
 
 1. This spec, committed.
 2. New `release:1.1` issue — **Flow B: read-time Wardline finding
-   reconciliation** — citing this spec, ADR-018, and contracts.md §reconciliation;
-   gated on the Filigree findings-read route.
-3. Federation contract request for the Filigree findings-read route (a
-   `docs/federation/` request note + a Filigree-side issue).
+   reconciliation** — citing this spec, ADR-018, and contracts.md §reconciliation.
+   **Not** gated on any Filigree-side work (both consumed routes already exist);
+   it is straightforward Clarion-side build, sequenced whenever picked up.
+3. Pin the two consumed routes (`POST /api/v1/files:resolve` reuse for
+   path→file_id, and `GET /api/loom/findings?scan_source=…&file_id=…`) in
+   `docs/federation/contracts.md` as part of the Flow B build. **No** federation
+   contract request is filed — the routes already exist (verified against
+   Filigree source), so a request would be moot (cf. the withdrawn prune ask in
+   `7a93883`).
 4. Re-scoped `clarion-1f6241b329` + `clarion-22acf15fd7` (Flow A unblock +
    cross-reference).
 
