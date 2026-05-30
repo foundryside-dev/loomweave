@@ -43,10 +43,20 @@ pub use super::host_findings::{
 use crate::entity_id::{EntityId, EntityIdError, entity_id};
 use crate::plugin::jail::{JailError, jail_to_string};
 use crate::plugin::limits::{
-    BreakerState, CapExceeded, ContentLengthCeiling, DEFAULT_MAX_NOFILE, DEFAULT_MAX_NPROC,
-    DEFAULT_MAX_RSS_MIB, EntityCountCap, PathEscapeBreaker, apply_prlimit_as,
-    apply_prlimit_nofile_nproc, effective_rss_mib,
+    BreakerState, CapExceeded, ContentLengthCeiling, EntityCountCap, PathEscapeBreaker,
 };
+// The prlimit application path is Linux-only (see the `#[cfg(target_os =
+// "linux")]` pre_exec block in `spawn`); these symbols are unused on other
+// targets and would trip `-D warnings`. Gate the imports to match their usage.
+#[cfg(target_os = "linux")]
+use crate::plugin::limits::{
+    DEFAULT_MAX_NOFILE, DEFAULT_MAX_RSS_MIB, apply_prlimit_as, apply_prlimit_nofile_nproc,
+    effective_rss_mib,
+};
+// `DEFAULT_MAX_NPROC` is also reached from the unit tests below, so it needs
+// the `test` arm in addition to Linux.
+#[cfg(any(target_os = "linux", test))]
+use crate::plugin::limits::DEFAULT_MAX_NPROC;
 use crate::plugin::manifest::{Manifest, ManifestError};
 use crate::plugin::protocol::{
     AnalyzeFileParams, AnalyzeFileResult, AnalyzeFileStats, EdgeConfidence, ExitNotification,
@@ -86,8 +96,13 @@ pub const MAX_ENTITY_EXTRA_BYTES: usize = 64 * 1024;
 /// against all processes/threads for the user, not just descendants of the
 /// plugin, so the Sprint-1 single-plugin ceiling is too low for B.4* call
 /// resolution on ordinary developer workstations.
+// Used only from the Linux pre_exec limit path and from unit tests; gate to
+// match so non-Linux release builds don't see it as dead code under
+// `-D warnings`.
+#[cfg(any(target_os = "linux", test))]
 const PYRIGHT_MAX_NPROC: u64 = 4096;
 
+#[cfg(any(target_os = "linux", test))]
 fn effective_max_nproc(manifest: &Manifest) -> u64 {
     if manifest.capabilities.runtime.pyright.is_some() {
         PYRIGHT_MAX_NPROC
