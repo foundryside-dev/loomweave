@@ -96,31 +96,37 @@ preserved verbatim.
 ## 4. Data source — composed from existing Filigree routes (no new contract)
 
 **Verified against Filigree source (2026-05-30): no new Filigree route is
-needed.** Flow B composes two routes Clarion can already reach:
+needed.** Flow B composes two existing Filigree *loom* read routes. (Note: the
+`POST /api/v1/files:resolve` route in `contracts.md` is a route **Clarion
+exposes** — it returns *Clarion* entity_ids for paths — not a Filigree route
+Clarion consumes; it is the wrong direction for this and is not used here.)
 
-1. **`POST /api/v1/files:resolve`** — resolve E's file path → Filigree `file_id`.
-   Already a Clarion-consumed contract, pinned in `docs/federation/contracts.md`
-   (the `/api/v1/files` family).
-2. **`GET /api/loom/findings?scan_source=wardline&file_id=<id>`** — already
-   shipped (`api_loom_list_findings`, `filigree/dashboard_routes/files.py`); its
-   query filters include `scan_source`, `status`, and `file_id`. Each row is a
-   `ScanFindingLoom` carrying `rule_id`, `message`, `severity`, `status`,
-   `line_start/line_end`, `fingerprint`, `file_id`, and **`metadata`** (where
-   `metadata.wardline.qualname` lives). Pinned by Filigree's
+1. **`GET /api/loom/files?scan_source=wardline&path_prefix=<E.source_file_path>`**
+   — `api_loom_list_files` (`filigree/dashboard_routes/files.py`); filters
+   include `scan_source` and `path_prefix`. Returns `FileRecordLoom` items
+   carrying `file_id` + `path`. Clarion takes the item whose `path` **exactly**
+   equals `E.source_file_path` (`path_prefix` is a prefix, so an exact-match
+   filter is required) → Filigree `file_id`. Pinned by
+   `tests/fixtures/contracts/loom/files.json`.
+2. **`GET /api/loom/findings?scan_source=wardline&file_id=<file_id>`** —
+   `api_loom_list_findings`; filters include `scan_source`, `status`, `file_id`.
+   Each row is a `ScanFindingLoom` carrying `rule_id`, `message`, `severity`,
+   `status`, `line_start/line_end`, `fingerprint`, `file_id`, and **`metadata`**
+   (where `metadata.wardline.qualname` lives). Pinned by
    `tests/fixtures/contracts/loom/findings.json`.
 
-So the fetch is: `files:resolve(path) → file_id`, then `GET
-/api/loom/findings?scan_source=wardline&file_id=<id>`, then the local qualname
-match in §3. `ScanFindingLoom` rows reference the file by `file_id`, not `path`,
-which is exactly why the resolve step is required (and why file-scoping rather
-than a project-wide findings sweep keeps each query bounded).
+So the fetch is: `loom/files?path_prefix=<path>` → exact-path match → `file_id`,
+then `loom/findings?scan_source=wardline&file_id=<id>`, then the local qualname
+match in §3. `ScanFindingLoom` rows reference the file by `file_id` (not `path`),
+which is why the file-list hop is required; file-scoping also keeps each query
+bounded rather than sweeping all project findings.
 
 This is **Clarion-side build only** — the MCP Filigree client (`filigree.rs`)
-gains a `files:resolve` call and a findings-list call; no Filigree-side work, and
-**no federation contract request** (the route, like the prune route in
-`7a93883`, already exists — checked, not assumed). Enrich-only still holds: if
-either route is unreachable, the `wardline_findings` section degrades to empty +
-`degraded`.
+gains a loom-files-list call and a loom-findings-list call; no Filigree-side work,
+and **no federation contract request** (both routes already exist — checked
+against Filigree source, not assumed; cf. the withdrawn prune ask in `7a93883`).
+Enrich-only still holds: if either route is unreachable, the `wardline_findings`
+section degrades to empty + `degraded`.
 
 ## 5. Error handling (enrich-only, no fabrication)
 
@@ -203,12 +209,12 @@ when it is built.
    reconciliation** — citing this spec, ADR-018, and contracts.md §reconciliation.
    **Not** gated on any Filigree-side work (both consumed routes already exist);
    it is straightforward Clarion-side build, sequenced whenever picked up.
-3. Pin the two consumed routes (`POST /api/v1/files:resolve` reuse for
-   path→file_id, and `GET /api/loom/findings?scan_source=…&file_id=…`) in
-   `docs/federation/contracts.md` as part of the Flow B build. **No** federation
-   contract request is filed — the routes already exist (verified against
-   Filigree source), so a request would be moot (cf. the withdrawn prune ask in
-   `7a93883`).
+3. Pin the two consumed loom read routes (`GET /api/loom/files?scan_source=…&
+   path_prefix=…` for path→file_id, and `GET /api/loom/findings?scan_source=…&
+   file_id=…`) in `docs/federation/contracts.md` as part of the Flow B build.
+   **No** federation contract request is filed — the routes already exist
+   (verified against Filigree source), so a request would be moot (cf. the
+   withdrawn prune ask in `7a93883`).
 4. Re-scoped `clarion-1f6241b329` + `clarion-22acf15fd7` (Flow A unblock +
    cross-reference).
 
