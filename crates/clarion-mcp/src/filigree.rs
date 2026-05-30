@@ -145,6 +145,19 @@ pub trait FiligreeLookup: Send + Sync {
     fn issue_detail(&self, _issue_id: &str) -> Result<Option<IssueDetail>, FiligreeClientError> {
         Ok(None)
     }
+
+    /// Wardline findings for a source file, for read-time reconciliation
+    /// (Flow B). Two-hop: resolve `path` -> Filigree `file_id`, then fetch that
+    /// file's `scan_source=wardline` findings. Returns an empty list when no
+    /// Wardline-touched file exists at `path`. Default impl returns empty (no
+    /// Filigree); the HTTP client overrides it. Transport / non-success HTTP is
+    /// surfaced as `Err` so the caller degrades the section to `unavailable`.
+    fn wardline_findings_for_path(
+        &self,
+        _path: &str,
+    ) -> Result<Vec<WardlineFinding>, FiligreeClientError> {
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -264,6 +277,30 @@ impl FiligreeHttpClient {
         }
         parse_clean_stale_response(&body).map_err(FiligreeClientError::InvalidCleanStaleResponse)
     }
+
+    /// GET `url` with the standard actor + bearer headers and parse the body as
+    /// `T`. A non-success status is surfaced as `HttpStatus` so the caller can
+    /// stop hammering a down endpoint.
+    fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+    ) -> Result<T, FiligreeClientError> {
+        let mut request = self.client.get(url).header("accept", "application/json");
+        if !self.actor.trim().is_empty() {
+            request = request.header("x-filigree-actor", self.actor.as_str());
+        }
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().map_err(FiligreeClientError::Request)?;
+        let status = response.status();
+        let body = response.text().map_err(FiligreeClientError::Request)?;
+        if !status.is_success() {
+            return Err(FiligreeClientError::HttpStatus { status: status.as_u16(), body });
+        }
+        serde_json::from_str(&body)
+            .map_err(|e| FiligreeClientError::Contract(FiligreeContractError::from(e)))
+    }
 }
 
 impl FiligreeLookup for FiligreeHttpClient {
@@ -322,6 +359,24 @@ impl FiligreeLookup for FiligreeHttpClient {
             .map(Some)
             .map_err(FiligreeClientError::from)
     }
+
+    fn wardline_findings_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Vec<WardlineFinding>, FiligreeClientError> {
+        // Hop 1: path -> Filigree file_id. path_prefix is a prefix filter, so
+        // take only the row whose path is byte-exact.
+        let files: LoomFilesResponse =
+            self.get_json(&loom_files_url(&self.base_url, "wardline", path))?;
+        let Some(file_id) = files.items.into_iter().find(|f| f.path == path).map(|f| f.file_id)
+        else {
+            return Ok(Vec::new());
+        };
+        // Hop 2: file_id -> wardline findings.
+        let findings: WardlineFindingsResponse =
+            self.get_json(&loom_findings_url(&self.base_url, "wardline", &file_id))?;
+        Ok(findings.items)
+    }
 }
 
 pub fn parse_entity_associations_response(
@@ -347,6 +402,24 @@ pub fn entity_associations_url(base_url: &str, entity_id: &str) -> String {
         "{}/api/entity-associations?entity_id={}",
         base_url.trim_end_matches('/'),
         percent_encode_query_value(entity_id)
+    )
+}
+
+pub fn loom_files_url(base_url: &str, scan_source: &str, path_prefix: &str) -> String {
+    format!(
+        "{}/api/loom/files?scan_source={}&path_prefix={}",
+        base_url.trim_end_matches('/'),
+        percent_encode_query_value(scan_source),
+        percent_encode_query_value(path_prefix)
+    )
+}
+
+pub fn loom_findings_url(base_url: &str, scan_source: &str, file_id: &str) -> String {
+    format!(
+        "{}/api/loom/findings?scan_source={}&file_id={}",
+        base_url.trim_end_matches('/'),
+        percent_encode_query_value(scan_source),
+        percent_encode_query_value(file_id)
     )
 }
 
@@ -707,6 +780,61 @@ mod tests {
         assert_eq!(resp.items.len(), 2);
         assert_eq!(resp.items[0].file_id, "file-9");
         assert_eq!(resp.items[0].path, "src/demo.py");
+    }
+
+    #[test]
+    fn builds_loom_url_builders_with_encoding() {
+        assert_eq!(
+            loom_files_url("http://127.0.0.1:8542/", "wardline", "src/demo.py"),
+            "http://127.0.0.1:8542/api/loom/files?scan_source=wardline&path_prefix=src%2Fdemo.py"
+        );
+        assert_eq!(
+            loom_findings_url("http://127.0.0.1:8542/", "wardline", "file-9"),
+            "http://127.0.0.1:8542/api/loom/findings?scan_source=wardline&file_id=file-9"
+        );
+    }
+
+    #[test]
+    fn wardline_findings_for_path_does_two_hops_and_exact_path_filter() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            // Hop 1: GET /api/loom/files — path_prefix matches two files; the
+            // exact-path filter must pick file-9, not the helpers file.
+            let (mut s1, _) = listener.accept().expect("accept files");
+            let mut buf = [0_u8; 4096];
+            let n = s1.read(&mut buf).expect("read files req");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.contains("GET /api/loom/files?scan_source=wardline&path_prefix=src%2Fdemo.py HTTP/1.1"));
+            let body = r#"{"items":[{"file_id":"file-9","path":"src/demo.py","language":"python","file_type":"source"},{"file_id":"file-10","path":"src/demo.py.bak","language":"python","file_type":"source"}],"has_more":false}"#;
+            write!(s1, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}", body.len(), body).unwrap();
+
+            // Hop 2: GET /api/loom/findings for file-9.
+            let (mut s2, _) = listener.accept().expect("accept findings");
+            let n = s2.read(&mut buf).expect("read findings req");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.contains("GET /api/loom/findings?scan_source=wardline&file_id=file-9 HTTP/1.1"));
+            let body = r#"{"items":[{"finding_id":"f-1","file_id":"file-9","severity":"high","status":"open","scan_source":"wardline","rule_id":"WLN-TAINT-001","message":"sink","suggestion":"","scan_run_id":"r-1","line_start":12,"line_end":12,"fingerprint":"fp","issue_id":null,"seen_count":1,"metadata":{"wardline":{"qualname":"demo.Foo.bar"}},"data_warnings":[]}],"has_more":false}"#;
+            write!(s2, "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let config = FiligreeConfig {
+            enabled: true,
+            base_url: format!("http://{addr}"),
+            actor: "clarion-test".to_owned(),
+            token_env: "TEST_FILIGREE_TOKEN".to_owned(),
+            timeout_seconds: 5,
+            emit_findings: true,
+            prune_unseen_days: 30,
+        };
+        let client = FiligreeHttpClient::from_config(&config, |_| None)
+            .expect("build client")
+            .expect("enabled client");
+        let findings = client
+            .wardline_findings_for_path("src/demo.py")
+            .expect("two-hop fetch");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "WLN-TAINT-001");
+        handle.join().expect("server thread");
     }
 
     fn detail_test_client(addr: std::net::SocketAddr) -> FiligreeHttpClient {
