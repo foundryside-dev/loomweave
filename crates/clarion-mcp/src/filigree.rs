@@ -62,7 +62,9 @@ pub struct WardlineFinding {
     pub metadata: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Envelope returned by `GET /api/loom/findings` — the paged list of
+/// [`WardlineFinding`] rows Clarion reconciles against.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct WardlineFindingsResponse {
     #[serde(default)]
     pub items: Vec<WardlineFinding>,
@@ -76,7 +78,9 @@ pub struct LoomFileRecord {
     pub path: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Envelope returned by `GET /api/loom/files` — the paged list of
+/// [`LoomFileRecord`] rows Clarion uses to map a path to a `file_id`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct LoomFilesResponse {
     #[serde(default)]
     pub items: Vec<LoomFileRecord>,
@@ -94,7 +98,7 @@ pub fn parse_loom_files_response(body: &str) -> Result<LoomFilesResponse, Filigr
 
 #[derive(Debug, Error)]
 pub enum FiligreeContractError {
-    #[error("invalid Filigree entity association response: {0}")]
+    #[error("invalid Filigree response: {0}")]
     InvalidResponse(#[from] serde_json::Error),
 }
 
