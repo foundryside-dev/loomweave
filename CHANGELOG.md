@@ -12,6 +12,12 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-05-30
+
+1.0.0 was tagged but its release failed to publish (the macOS build broke at
+tag-cut), so no 1.0.0 artifacts exist. 1.0.1 is the first published build and
+carries the full post-1.0.0 scope below plus the build fix.
+
 ### Added
 
 - `clarion db backup <output>` — a consistent, WAL-safe online backup of
@@ -92,6 +98,17 @@ only when an incompatible change is made to that surface. See
   write contention at lock-acquire — where `busy_timeout` is honored — rather
   than failing mid-statement on a deferred-lock upgrade the busy handler
   cannot serve. Closes gap-register STO-05 (clarion-bbb3365920).
+
+### Fixed
+
+- **macOS release build under `-D warnings`.** The Linux-only `prlimit`
+  helpers imported/defined in `clarion-core::plugin::host` (and two Linux-only
+  test sites in `clarion-mcp` and `clarion-cli`) were unused on
+  `*-apple-darwin`, so the release build failed with unused-import / dead-code
+  errors. They are now `cfg`-gated to `target_os = "linux"` (plus `test` where
+  unit tests reference them). CI gained a native macOS (aarch64) build + clippy
+  leg so the gap can't recur; the x86_64 (macos-13) leg is temporarily parked
+  while those runners are offline (clarion-12667da9f5, clarion-ec389a8e72).
 
 ## [1.0.0] — 2026-05-19
 
