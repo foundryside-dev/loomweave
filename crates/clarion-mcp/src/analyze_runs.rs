@@ -201,7 +201,10 @@ pub(crate) fn mark_run_cancelled_in_db(db_path: &std::path::Path, run_id: &str, 
     }
 }
 
-#[cfg(test)]
+// The only test here is Linux-only (it relies on `/proc/<pid>/fd`), so gate the
+// whole module — otherwise `use super::*` is an unused import on non-Linux
+// targets under `-D warnings` (clarion-12667da9f5).
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
@@ -211,7 +214,6 @@ mod tests {
     /// client connection. The child's stdout must be isolated. We prove it by
     /// having a stub record where its fd 1 actually points: `/dev/null` when
     /// isolated, a `pipe:`/file path when inherited.
-    #[cfg(target_os = "linux")]
     #[test]
     fn spawn_analyze_isolates_child_stdout_from_parent() {
         use std::io::Write as _;

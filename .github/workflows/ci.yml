@@ -20,6 +20,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          # Full history so the ADR-024 migration-retirement guard can resolve
+          # the published_build.txt ref via `git show <ref>:0001` (the marker
+          # names a commit SHA, which a shallow checkout can't read). Mirrors
+          # the release.yml verify job. clarion-12667da9f5 / clarion-0106a61480.
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
@@ -93,6 +99,46 @@ jobs:
 
       - name: deny
         run: cargo deny check
+
+  # macOS build + lint parity. The release matrix was the first place macOS was
+  # ever compiled, so a macOS-only `-D warnings` regression stayed invisible
+  # until tag-cut (clarion-12667da9f5). This native runner job closes that gap.
+  # It mirrors only the Linux job's clippy + bin build — the Python guards are
+  # platform-independent and already covered by the `rust` job. No `--target`
+  # flag: native builds avoid the ring C-build-script failure seen when
+  # cross-compiling Linux -> macOS.
+  #
+  # Only aarch64-apple-darwin (macos-14) runs here: the x86_64 (macos-13) leg is
+  # temporarily dropped while those runners are offline/unreliable. Restore it
+  # when macos-13 runner health recovers (clarion-12667da9f5 follow-up). The
+  # unused-symbol class this gate guards is `target_os = "macos"`, i.e.
+  # arch-independent, so aarch64 coverage catches the same regressions.
+  rust-macos:
+    name: Rust (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+          components: clippy
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          key: ${{ matrix.target }}
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: build workspace bins
+        run: cargo build --workspace --bins
 
   python-plugin:
     name: Python plugin
