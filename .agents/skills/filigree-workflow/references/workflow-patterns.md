@@ -95,23 +95,33 @@ filigree remove-dep <blocked> <blocker>
 
 ### Standard Flow
 
-```
-create (open) → in_progress → closed
-```
-
-Use `filigree start-work <issue-id> --assignee <name>` to make the
-`open → in_progress` transition atomically.
-
-### With Verification
-
-For types that support it (check `filigree type-info bug`):
+Bugs in the core pack do **not** start in a directly-startable state. They
+open at `triage` and walk soft transitions toward work (run
+`filigree type-info bug` for the authoritative graph):
 
 ```
-open → fixing → verifying → closed
+create (triage) → confirmed → fixing → verifying → closed
 ```
 
-Pass `--target-status fixing` to `start-work` if the workflow has multiple
-`wip`-category targets and the resolver needs disambiguation.
+`triage` has no single-hop transition into a `wip` status, so a fresh bug is
+*ready* but not *startable*. Pass `--advance` to walk the soft transitions to
+the nearest working status automatically:
+
+```bash
+filigree start-work <bug-id> --assignee <name> --advance   # triage → confirmed → fixing
+```
+
+Without `--advance`, `start-work` on a `triage` bug returns
+`INVALID_TRANSITION` naming the next status (`confirmed`), and
+`start-next-work` skips it.
+
+### Disambiguating the wip target
+
+If the workflow has multiple `wip`-category targets reachable from the
+current status and the resolver needs disambiguation, pass
+`--target-status fixing` to `start-work` / `start-next-work`. (`claim` /
+`claim-next` only reserve and never transition, so they do not take
+`--target-status` or `--advance`.)
 
 ### Bug Report Template
 

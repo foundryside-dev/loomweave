@@ -7,10 +7,11 @@ work across multiple agents.
 
 ### The Race Condition Problem
 
-When multiple agents call `filigree update <issue-id> --status=in_progress`
+When multiple agents call `filigree update <issue-id> --status=<wip>`
 simultaneously, both think they own the issue. Filigree 2.0 solves this with
-`start-work`, which atomically claims the issue *and* transitions it to
-`in_progress` in a single DB transaction with optimistic locking on the
+`start-work`, which atomically claims the issue *and* transitions it to its
+type-specific working status (tasks → `in_progress`, features → `building`,
+bugs → `fixing`) in a single DB transaction with optimistic locking on the
 assignee.
 
 ### Start Protocol
@@ -27,9 +28,12 @@ If another agent already claimed the issue, the call fails with
 `code: CONFLICT` (CLI exit 4). No silent overwrite, no half-claimed state —
 either both the claim and the transition land, or neither does.
 
-`start-next-work` accepts the same filters as `claim-next`
-(`--type`, `--priority-min`, `--priority-max`, `--target-status`) so
-specialised agents can scope their work.
+`start-next-work` accepts the work-scoping filters `claim-next` also
+takes (`--type`, `--priority-min`, `--priority-max`) so specialised agents
+can scope their work. Because `start-next-work` *transitions* (not just
+reserves), it additionally accepts `--target-status` to override the wip
+target and `--advance` to walk soft transitions to wip — neither of which
+`claim-next` has, since `claim-next` only reserves and never changes status.
 
 ### Niche: Claim Without Transitioning
 
@@ -62,7 +66,8 @@ When passing work between agents, follow this sequence:
 
 1. **Document state**: Add a comment with current progress, decisions made,
    and remaining work
-2. **Update status**: Leave at `in_progress` if partially done, or close if complete
+2. **Update status**: Leave in its working status (`in_progress` / `building` /
+   `fixing`) if partially done, or close if complete
 3. **Flag blockers**: Create blocker issues and add dependencies if needed
 
 ```bash
