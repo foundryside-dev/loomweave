@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Child;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 /// One supervised analyze subprocess.
@@ -62,7 +63,15 @@ pub(crate) fn spawn_analyze(
         .arg("--run-id")
         .arg(run_id)
         .arg("--progress-file")
-        .arg(progress_path);
+        .arg(progress_path)
+        // Isolate the child's stdio. When analyze_start is driven from the
+        // stdio MCP server, the child would otherwise inherit the server's
+        // stdout — and `clarion analyze` initializes tracing at `info`, so its
+        // non-framed progress bytes would interleave with the MCP JSON-RPC
+        // responses on the same stream and corrupt the client connection.
+        // Progress is reported via --progress-file, not stdout.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 
     #[cfg(unix)]
     {
@@ -188,6 +197,58 @@ pub(crate) fn mark_run_cancelled_in_db(db_path: &std::path::Path, run_id: &str, 
             error = %err,
             run_id,
             "failed to persist cancelled run terminal state (registry still reports cancelled)",
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stdio MCP server speaks JSON-RPC framing on its own stdout. A
+    /// spawned `clarion analyze` that inherited that stdout and emitted `info`
+    /// tracing would interleave non-framed bytes onto the wire and corrupt the
+    /// client connection. The child's stdout must be isolated. We prove it by
+    /// having a stub record where its fd 1 actually points: `/dev/null` when
+    /// isolated, a `pipe:`/file path when inherited.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_analyze_isolates_child_stdout_from_parent() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("stub.sh");
+        let progress = dir.path().join("fd1.txt");
+        // spawn_analyze appends `analyze <root> --run-id <id> --progress-file
+        // <path>`, so the stub's $6 is the progress-file path.
+        let mut file = std::fs::File::create(&script).unwrap();
+        // Capture where the SHELL's fd 1 points via command substitution (so
+        // readlink's own redirected fd 1 doesn't taint the answer), then write
+        // it to "$6". `/dev/null` means the child stdout was isolated.
+        writeln!(
+            file,
+            "#!/bin/sh\nt=$(readlink /proc/$$/fd/1)\nprintf '%s' \"$t\" > \"$6\"\n"
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(file);
+
+        let mut handle = spawn_analyze(
+            &script,
+            dir.path(),
+            "run-x",
+            &progress,
+            "2026-05-30T00:00:00Z".to_owned(),
+        )
+        .expect("spawn stub");
+        handle.child.wait().expect("reap stub");
+
+        let where_fd1 = std::fs::read_to_string(&progress).expect("stub wrote fd1 target");
+        assert_eq!(
+            where_fd1.trim(),
+            "/dev/null",
+            "child stdout was not isolated from the parent: {where_fd1:?}"
         );
     }
 }
