@@ -25,12 +25,17 @@ const MIGRATIONS: &[Migration] = &[
         name: "0002_briefing_blocked",
         sql: include_str!("../migrations/0002_briefing_blocked.sql"),
     },
+    Migration {
+        version: 3,
+        name: "0003_wardline_taint_facts",
+        sql: include_str!("../migrations/0003_wardline_taint_facts.sql"),
+    },
 ];
 
 /// Highest migration version known to this build. Mirrored into the
 /// `SQLite` `user_version` header (STO-02) so a future-built database is
 /// refused at open instead of silently corrupting state.
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 const _CURRENT_SCHEMA_VERSION_MATCHES_LAST_MIGRATION: () = {
     // Compile-time check: `CURRENT_SCHEMA_VERSION` must equal the highest
