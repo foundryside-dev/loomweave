@@ -2,8 +2,11 @@
 //!
 //! `metadata.wardline.qualname` is the pre-composed dotted name, which for a
 //! function/method entity is byte-identical to the `entity_id`'s segment-3
-//! `canonical_qualified_name` (proven by `fixtures/entity_id.json`). Matching is
-//! therefore a local string compare against Clarion's own catalog — no oracle.
+//! `canonical_qualified_name` (the entity-id grammar is fixed by
+//! `fixtures/entity_id.json`; the Wardline-side qualname normalization that
+//! makes the two byte-identical is pinned in `docs/federation/contracts.md`
+//! §"Wardline qualname normalization"). Matching is therefore a local string
+//! compare against Clarion's own catalog — no oracle.
 
 use crate::filigree::WardlineFinding;
 
@@ -56,9 +59,11 @@ fn resolution_confidence(entity_qn: &str, finding_qn: &str) -> ResolutionConfide
     }
 }
 
-/// Filter `findings` to those that resolve to `entity_id`, tagging each with its
-/// confidence. Findings with no `wardline.qualname` are counted in
-/// `omitted_no_qualname`, never dropped silently.
+/// Filter `findings` to those that resolve to `entity_id`, tagging each with
+/// its confidence. Findings with no `wardline.qualname` are counted in
+/// `omitted_no_qualname`. A non-matching qualname is dropped (not counted);
+/// an unparseable/empty `entity_id` returns an empty result without
+/// inspecting any finding.
 pub fn reconcile_for_entity(entity_id: &str, findings: Vec<WardlineFinding>) -> ReconcileResult {
     let Some(target) = entity_qualname(entity_id) else {
         return ReconcileResult::default();
@@ -110,6 +115,7 @@ mod tests {
         );
         assert_eq!(entity_qualname("python:function:hello"), Some("hello"));
         assert_eq!(entity_qualname("python:module:"), None); // empty qualname
+        assert_eq!(entity_qualname("a:b"), None); // only two segments
         assert_eq!(entity_qualname("notanid"), None);
     }
 
