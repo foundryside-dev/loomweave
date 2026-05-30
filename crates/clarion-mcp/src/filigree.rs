@@ -37,6 +37,61 @@ pub struct EntityAssociation {
     pub attached_by: String,
 }
 
+/// One Wardline finding as Clarion surfaces it — the subset of Filigree's
+/// `ScanFindingLoom` (`GET /api/loom/findings`) used for read-time
+/// reconciliation. Unknown fields are ignored so Filigree can grow the row.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct WardlineFinding {
+    pub rule_id: String,
+    pub message: String,
+    #[serde(default)]
+    pub severity: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub line_start: Option<i64>,
+    #[serde(default)]
+    pub line_end: Option<i64>,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    #[serde(default)]
+    pub file_id: Option<String>,
+    /// The finding's `metadata` object; `metadata.wardline.qualname` is the
+    /// reconciliation key. Defaults to JSON null when absent.
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WardlineFindingsResponse {
+    #[serde(default)]
+    pub items: Vec<WardlineFinding>,
+}
+
+/// One row of `GET /api/loom/files` — only the fields needed to map a path to
+/// Filigree's `file_id`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct LoomFileRecord {
+    pub file_id: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoomFilesResponse {
+    #[serde(default)]
+    pub items: Vec<LoomFileRecord>,
+}
+
+pub fn parse_wardline_findings_response(
+    body: &str,
+) -> Result<WardlineFindingsResponse, FiligreeContractError> {
+    serde_json::from_str(body).map_err(FiligreeContractError::from)
+}
+
+pub fn parse_loom_files_response(body: &str) -> Result<LoomFilesResponse, FiligreeContractError> {
+    serde_json::from_str(body).map_err(FiligreeContractError::from)
+}
+
 #[derive(Debug, Error)]
 pub enum FiligreeContractError {
     #[error("invalid Filigree entity association response: {0}")]
@@ -610,6 +665,44 @@ mod tests {
             other => panic!("expected HttpStatus, got {other:?}"),
         }
         handle.join().expect("server thread");
+    }
+
+    #[test]
+    fn parses_loom_findings_list_envelope() {
+        let resp = parse_wardline_findings_response(
+            r#"{"items":[
+                {"finding_id":"f-1","file_id":"file-9","severity":"high","status":"open",
+                 "scan_source":"wardline","rule_id":"WLN-TAINT-001","message":"tainted sink",
+                 "suggestion":"","scan_run_id":"r-1","line_start":12,"line_end":12,
+                 "fingerprint":"fp-abc","issue_id":null,"seen_count":1,
+                 "metadata":{"wardline":{"qualname":"demo.Foo.bar","kind":"DEFECT"}},
+                 "data_warnings":[]}
+            ],"has_more":false}"#,
+        )
+        .expect("parse findings list");
+        assert_eq!(resp.items.len(), 1);
+        let f = &resp.items[0];
+        assert_eq!(f.rule_id, "WLN-TAINT-001");
+        assert_eq!(f.fingerprint.as_deref(), Some("fp-abc"));
+        assert_eq!(f.line_start, Some(12));
+        assert_eq!(
+            f.metadata.get("wardline").and_then(|w| w.get("qualname")).and_then(|q| q.as_str()),
+            Some("demo.Foo.bar")
+        );
+    }
+
+    #[test]
+    fn parses_loom_files_list_envelope() {
+        let resp = parse_loom_files_response(
+            r#"{"items":[
+                {"file_id":"file-9","path":"src/demo.py","language":"python","file_type":"source"},
+                {"file_id":"file-10","path":"src/demo_helpers.py","language":"python","file_type":"source"}
+            ],"has_more":false}"#,
+        )
+        .expect("parse files list");
+        assert_eq!(resp.items.len(), 2);
+        assert_eq!(resp.items[0].file_id, "file-9");
+        assert_eq!(resp.items[0].path, "src/demo.py");
     }
 
     fn detail_test_client(addr: std::net::SocketAddr) -> FiligreeHttpClient {
