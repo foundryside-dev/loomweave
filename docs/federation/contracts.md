@@ -895,13 +895,25 @@ POST {filigree_base}/api/v1/scan-results
   - `scan_source` is always `"clarion"`; it is part of Filigree's dedup key, so
     it is stable across runs.
   - `scan_run_id` carries Clarion's `run_id`. It is omitted entirely when unset;
-    an unknown id is tolerated by Filigree (it warns and proceeds), which is how
-    REQ-FINDING-05's wire shape ships without a pre-create handshake. **Clarion's
-    posture** is to depend on this tolerate-unknown behavior and emit no Phase-0
-    `scan-runs` create call; whether that is Filigree's *intended permanent*
-    contract (vs. an explicit create endpoint) is the open §4 question in
-    [`2026-05-30-prune-unseen-filigree-request.md`](2026-05-30-prune-unseen-filigree-request.md),
-    pending Filigree's confirmation.
+    an unknown id is tolerated by Filigree (it ingests the findings and
+    reconstructs the run in history), which is how REQ-FINDING-05's wire shape
+    ships without a pre-create handshake. **This tolerate-unknown behavior is
+    Filigree's confirmed permanent contract** (decided 2026-05-31, path (a);
+    recorded in Filigree's `docs/federation/contracts.md` §F6 and pinned by
+    `tests/api/test_files_api.py::TestUnknownScanRunIdContract`). There is no
+    `POST /api/.../scan-runs` create endpoint — only read-only
+    `GET /api/scan-runs` history — and Clarion emits no Phase-0 create call.
+    Three intake obligations Clarion honors against this contract:
+    (1) `run_id` is globally unique across producers — Clarion defaults it to a
+    UUIDv4 (`clarion-cli` `analyze.rs`), since Filigree keys on the id alone and
+    a collision either rejects (`VALIDATION`, different `scan_source`) or
+    silently misattributes (same `scan_source`); (2) `scan_source` stays stable
+    across a run (always `"clarion"`, per the bullet above), since history
+    groups on `(scan_run_id, scan_source)`; (3) with `complete_scan_run=true`
+    an unknown run cannot be marked completed, so the response `warnings[]`
+    carries a benign `"Scan run <id> status not updated to 'completed': …"` —
+    Clarion switches on HTTP status + stats counts and never treats a populated
+    `warnings[]` as failure.
   - `mark_unseen` is `true` for a normal full run (old-position findings for the
     same rule/file transition to `unseen_in_latest`); a `--resume RUN_ID` run
     sets it `false` so the re-emit does not flip the prior run's findings to
