@@ -15,6 +15,7 @@ use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use clarion_core::HttpErrorCode as ErrorCode;
 use clarion_mcp::config::HttpReadConfig;
 use clarion_storage::{CanonicalProjectPath, ReaderPool, StorageError, resolve_file_catalog_entry};
 use serde::{Deserialize, Serialize};
@@ -725,25 +726,6 @@ struct ErrorResponse {
     code: ErrorCode,
 }
 
-#[derive(Debug, Copy, Clone, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum ErrorCode {
-    InvalidPath,
-    PathOutsideProject,
-    NotFound,
-    BriefingBlocked,
-    Unauthenticated,
-    StorageError,
-    BatchTooLarge,
-    /// Constructed by the write endpoint (`POST /api/wardline/taint-facts`)
-    /// when the writer-actor is not enabled. Reachable only via
-    /// `json_error(StatusCode::FORBIDDEN, …)`; no central `StatusCode` mapping
-    /// is required.
-    WriteDisabled,
-    /// The `project` request guard did not match the served project.
-    ProjectMismatch,
-    Internal,
-}
 
 /// Maximum number of `BatchFileQuery` entries a single
 /// `POST /api/v1/files/batch` request may carry. Pinned in the federation
