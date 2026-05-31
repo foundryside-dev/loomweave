@@ -122,7 +122,7 @@ Federation does not require uniform vocabulary, but it does require that the sam
 
 | Product | Status |
 |---|---|
-| Clarion | Walking skeleton tagged `v0.1-sprint-1`; v0.1 build in flight against the published design; first-customer target is elspeth (~425k LOC Python) |
+| Clarion | Built; v1.0 shipped against the published design (walking skeleton was tagged `v0.1-sprint-1`); first-customer target is elspeth (~425k LOC Python) |
 | Filigree | Built; in active use |
 | Wardline | Built; in active commit-cadence use |
 | Shuttle | Proposed; not in flight; separate design effort when prioritised |
