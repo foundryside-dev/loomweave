@@ -657,7 +657,11 @@ impl ServerState {
         let normalized = match normalize_source_path(&self.project_root, &file) {
             Ok(path) => path,
             Err(err) => {
-                return Ok(tool_error_envelope(McpErrorCode::InvalidPath, &err.to_string(), false));
+                return Ok(tool_error_envelope(
+                    McpErrorCode::InvalidPath,
+                    &err.to_string(),
+                    false,
+                ));
             }
         };
         let project_root = self.project_root.clone();
@@ -919,9 +923,11 @@ impl ServerState {
                 path_truncation_reason(truncated, compact.path_cap_truncated),
                 stats.to_json(),
             ),
-            Err(err) => {
-                tool_error_envelope(McpErrorCode::StorageError, &err.to_string(), storage_retryable(&err))
-            }
+            Err(err) => tool_error_envelope(
+                McpErrorCode::StorageError,
+                &err.to_string(),
+                storage_retryable(&err),
+            ),
         }
     }
 
@@ -1311,7 +1317,11 @@ impl ServerState {
                 match normalize_source_path(&self.project_root, file) {
                     Ok(path) => (Some(line), Some(path), None),
                     Err(err) => {
-                        return Ok(tool_error_envelope(McpErrorCode::InvalidPath, &err.to_string(), false));
+                        return Ok(tool_error_envelope(
+                            McpErrorCode::InvalidPath,
+                            &err.to_string(),
+                            false,
+                        ));
                     }
                 }
             }
@@ -2874,7 +2884,11 @@ impl ServerState {
             })
             .await
         {
-            return tool_error_envelope(McpErrorCode::StorageError, &err.to_string(), storage_retryable(&err));
+            return tool_error_envelope(
+                McpErrorCode::StorageError,
+                &err.to_string(),
+                storage_retryable(&err),
+            );
         }
 
         summary_success_envelope(
@@ -3892,7 +3906,11 @@ fn call_graph_scope_excludes(confidence: EdgeConfidence) -> Vec<&'static str> {
 fn envelope_from_storage_result(result: Result<Value, StorageError>) -> Value {
     match result {
         Ok(result) => success_envelope(result),
-        Err(err) => tool_error_envelope(McpErrorCode::StorageError, &err.to_string(), storage_retryable(&err)),
+        Err(err) => tool_error_envelope(
+            McpErrorCode::StorageError,
+            &err.to_string(),
+            storage_retryable(&err),
+        ),
     }
 }
 
@@ -3963,7 +3981,11 @@ fn latest_run_row(conn: &rusqlite::Connection) -> Value {
 fn flatten_storage_envelope_result(result: Result<Value, StorageError>) -> Value {
     match result {
         Ok(envelope) => envelope,
-        Err(err) => tool_error_envelope(McpErrorCode::StorageError, &err.to_string(), storage_retryable(&err)),
+        Err(err) => tool_error_envelope(
+            McpErrorCode::StorageError,
+            &err.to_string(),
+            storage_retryable(&err),
+        ),
     }
 }
 

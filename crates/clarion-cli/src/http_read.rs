@@ -726,7 +726,6 @@ struct ErrorResponse {
     code: ErrorCode,
 }
 
-
 /// Maximum number of `BatchFileQuery` entries a single
 /// `POST /api/v1/files/batch` request may carry. Pinned in the federation
 /// contract; Filigree splits oversize lookup sets client-side. Lifted to a

@@ -163,7 +163,10 @@ mod tests {
     fn http_error_code_wire_strings_are_pinned() {
         // The federation contract (contracts.md, ADR-034) freezes these spellings.
         assert_eq!(HttpErrorCode::InvalidPath.as_str(), "INVALID_PATH");
-        assert_eq!(HttpErrorCode::PathOutsideProject.as_str(), "PATH_OUTSIDE_PROJECT");
+        assert_eq!(
+            HttpErrorCode::PathOutsideProject.as_str(),
+            "PATH_OUTSIDE_PROJECT"
+        );
         assert_eq!(HttpErrorCode::NotFound.as_str(), "NOT_FOUND");
         assert_eq!(HttpErrorCode::BriefingBlocked.as_str(), "BRIEFING_BLOCKED");
         assert_eq!(HttpErrorCode::Unauthenticated.as_str(), "UNAUTHENTICATED");
@@ -185,16 +188,34 @@ mod tests {
         assert_eq!(McpErrorCode::NotFound.as_str(), "not-found");
         assert_eq!(McpErrorCode::SpawnFailed.as_str(), "spawn-failed");
         assert_eq!(McpErrorCode::IoError.as_str(), "io-error");
-        assert_eq!(McpErrorCode::AnalyzeAlreadyRunning.as_str(), "analyze-already-running");
+        assert_eq!(
+            McpErrorCode::AnalyzeAlreadyRunning.as_str(),
+            "analyze-already-running"
+        );
         assert_eq!(McpErrorCode::RunNotFound.as_str(), "run-not-found");
         assert_eq!(McpErrorCode::LlmDisabled.as_str(), "llm-disabled");
-        assert_eq!(McpErrorCode::TokenCeilingExceeded.as_str(), "token-ceiling-exceeded");
-        assert_eq!(McpErrorCode::LlmProviderError.as_str(), "llm-provider-error");
+        assert_eq!(
+            McpErrorCode::TokenCeilingExceeded.as_str(),
+            "token-ceiling-exceeded"
+        );
+        assert_eq!(
+            McpErrorCode::LlmProviderError.as_str(),
+            "llm-provider-error"
+        );
         assert_eq!(McpErrorCode::Internal.as_str(), "internal");
         assert_eq!(McpErrorCode::LlmInvalidJson.as_str(), "llm-invalid-json");
         assert_eq!(McpErrorCode::ContentDrift.as_str(), "content-drift");
-        assert_eq!(McpErrorCode::ContentHashMissing.as_str(), "content-hash-missing");
-        assert_eq!(McpErrorCode::InferredDispatchCancelled.as_str(), "inferred-dispatch-cancelled");
-        assert_eq!(McpErrorCode::InferredDispatchTimeout.as_str(), "inferred-dispatch-timeout");
+        assert_eq!(
+            McpErrorCode::ContentHashMissing.as_str(),
+            "content-hash-missing"
+        );
+        assert_eq!(
+            McpErrorCode::InferredDispatchCancelled.as_str(),
+            "inferred-dispatch-cancelled"
+        );
+        assert_eq!(
+            McpErrorCode::InferredDispatchTimeout.as_str(),
+            "inferred-dispatch-timeout"
+        );
     }
 }
