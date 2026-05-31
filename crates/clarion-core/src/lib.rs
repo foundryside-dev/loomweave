@@ -7,10 +7,12 @@
 //! remain accessible via `clarion_core::plugin::transport::*` and siblings.
 
 pub mod entity_id;
+pub mod errors;
 pub mod llm_provider;
 pub mod plugin;
 
 pub use entity_id::{EntityId, EntityIdError, entity_id};
+pub use errors::{HttpErrorCode, McpErrorCode};
 pub use llm_provider::{
     CachingModel, ClaudeCliProvider, ClaudeCliProviderConfig, CodexCliProvider,
     CodexCliProviderConfig, INFERRED_CALLS_PROMPT_VERSION, InferredCallsPromptInput,
