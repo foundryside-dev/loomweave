@@ -199,6 +199,18 @@ clarion install --all   --path /tmp/requests-2.32.4    # .clarion/ init + skills
 hooks are preserved) that runs `clarion hook session-start` — a fail-soft
 command printing live entity/subsystem/finding counts and index freshness.
 
+To verify (and repair) these surfaces later, run `clarion doctor`:
+
+```bash
+clarion doctor --path /tmp/requests-2.32.4          # report only; exits non-zero if anything is off
+clarion doctor --fix --path /tmp/requests-2.32.4    # repair the skill pack, hook, and .mcp.json entry in place
+```
+
+`doctor` also checks the `clarion` entry in `.mcp.json` — which `install` does
+not register automatically — and `--fix` adds it (preserving any sibling MCP
+servers and a customised `command`). The non-zero exit on remaining problems
+makes it usable as a CI / pre-commit gate.
+
 Over MCP, the same orientation is available without install: the `initialize`
 result carries an `instructions` field, the `clarion://context` resource returns
 the live snapshot, and the `clarion-workflow` prompt returns the skill text.

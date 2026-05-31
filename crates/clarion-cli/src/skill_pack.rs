@@ -107,6 +107,45 @@ fn installed_fingerprint(dest: &Path) -> Option<String> {
     Some(hasher.finalize().to_hex().to_string())
 }
 
+/// Read-only health of the installed skill pack, for `clarion doctor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillPackState {
+    /// Every skill root holds the current pack bytes.
+    UpToDate,
+    /// At least one root is missing the pack entirely (never-installed or a
+    /// partial install where only one of the two roots exists).
+    Missing,
+    /// Every root has a pack on disk, but at least one differs from the
+    /// embedded bytes (a stale copy from an older binary, or hand-edited).
+    Drifted,
+}
+
+/// Classify the installed pack across both [`SKILL_ROOTS`] without writing
+/// anything. `Missing` takes precedence over `Drifted` so the report nudges
+/// toward a full (re)install when any root is absent. The repair for both
+/// non-`UpToDate` states is the same idempotent [`install_skill_pack`].
+#[must_use]
+pub fn skill_pack_state(project_root: &Path) -> SkillPackState {
+    let expected = pack_fingerprint();
+    let mut any_absent = false;
+    let mut any_mismatch = false;
+    for root_rel in SKILL_ROOTS {
+        let dest = project_root.join(root_rel).join(PACK_DIR_NAME);
+        match installed_fingerprint(&dest) {
+            None => any_absent = true,
+            Some(fp) if fp != expected => any_mismatch = true,
+            Some(_) => {}
+        }
+    }
+    if any_absent {
+        SkillPackState::Missing
+    } else if any_mismatch {
+        SkillPackState::Drifted
+    } else {
+        SkillPackState::UpToDate
+    }
+}
+
 fn stage_and_swap(root: &Path, dest: &Path, fingerprint: &str) -> Result<()> {
     fs::create_dir_all(root).with_context(|| format!("mkdir {}", root.display()))?;
     // Stage in a sibling temp dir so the final rename is same-filesystem.
@@ -185,7 +224,7 @@ fn write_staged_pack(staging: &Path, fingerprint: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SKILL_PACK, pack_fingerprint};
+    use super::{SKILL_PACK, SkillPackState, pack_fingerprint, skill_pack_state};
 
     #[test]
     fn pack_contains_skill_md_with_frontmatter() {
@@ -236,6 +275,44 @@ mod tests {
         assert!(first.copied);
         let second = install_skill_pack(dir.path()).unwrap();
         assert!(!second.copied, "second install should be a no-op on match");
+    }
+
+    #[test]
+    fn state_is_missing_before_install_and_uptodate_after() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            skill_pack_state(dir.path()),
+            SkillPackState::Missing,
+            "a never-installed project has no pack"
+        );
+        super::install_skill_pack(dir.path()).unwrap();
+        assert_eq!(
+            skill_pack_state(dir.path()),
+            SkillPackState::UpToDate,
+            "a fresh install is up to date in both roots"
+        );
+    }
+
+    #[test]
+    fn state_is_drifted_when_an_installed_copy_is_hand_edited() {
+        let dir = tempfile::tempdir().unwrap();
+        super::install_skill_pack(dir.path()).unwrap();
+        // Corrupt content (not delete) so the file is present but mismatched.
+        std::fs::write(
+            dir.path().join(".claude/skills/clarion-workflow/SKILL.md"),
+            "STALE",
+        )
+        .unwrap();
+        assert_eq!(skill_pack_state(dir.path()), SkillPackState::Drifted);
+    }
+
+    #[test]
+    fn state_is_missing_when_a_root_is_partially_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        super::install_skill_pack(dir.path()).unwrap();
+        // Remove one root entirely: absence outranks drift -> Missing.
+        std::fs::remove_dir_all(dir.path().join(".agents/skills/clarion-workflow")).unwrap();
+        assert_eq!(skill_pack_state(dir.path()), SkillPackState::Missing);
     }
 
     #[test]

@@ -121,6 +121,22 @@ pub enum Command {
         #[command(subcommand)]
         command: DbCommand,
     },
+
+    /// Verify (and optionally repair) the installed agent-orientation surfaces:
+    /// the `clarion-workflow` skill pack, the `SessionStart` hook, and the
+    /// `.mcp.json` MCP registration. Prints a per-surface report plus the index
+    /// snapshot; exits non-zero if any problem remains (usable as a CI /
+    /// pre-commit gate).
+    Doctor {
+        /// Project directory to check (default: current directory).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Repair any problems found, in place (idempotent). Without it, doctor
+        /// only reports.
+        #[arg(long)]
+        fix: bool,
+    },
 }
 
 #[derive(Subcommand)]

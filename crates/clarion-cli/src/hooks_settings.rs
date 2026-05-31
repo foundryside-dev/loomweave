@@ -19,6 +19,79 @@ use serde_json::{Map, Value, json};
 /// Substring that identifies Clarion's own `SessionStart` hook command.
 pub const HOOK_COMMAND: &str = "clarion hook session-start";
 
+/// Read-only health of the installed `SessionStart` hook, for `clarion doctor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookState {
+    /// Exactly one Clarion hook is present and runs the command this project
+    /// would install ([`desired_hook_command`]).
+    Present,
+    /// A Clarion hook exists but is stale — the old path-less form, one pinned
+    /// to a different project, or a duplicate. Repairable in place.
+    Stale,
+    /// No `.claude/settings.json`, or it has no Clarion `SessionStart` hook.
+    Missing,
+    /// `.claude/settings.json` exists but is not parseable JSON. The merge
+    /// refuses to clobber it, so this cannot be auto-repaired.
+    Unparseable,
+}
+
+/// The `SessionStart` hook command this project would install: a bare
+/// `clarion hook session-start` (PATH-resolved) pinned to the absolute project
+/// path (POSIX-single-quote-escaped). Shared by the installer and the
+/// `doctor` state check so the two never disagree on what "current" means.
+#[must_use]
+pub fn desired_hook_command(project_root: &Path) -> String {
+    // `install::run` canonicalizes before calling, so `project_root` is already
+    // absolute; canonicalize defensively in case another caller is not.
+    let canonical = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    format!(
+        "clarion hook session-start --path {}",
+        shell_single_quote(&canonical.display().to_string())
+    )
+}
+
+/// Every `command` string across all `SessionStart` groups that looks like a
+/// Clarion-owned hook (contains [`HOOK_COMMAND`]).
+fn clarion_commands(settings: &Value) -> Vec<String> {
+    settings["hooks"]["SessionStart"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|g| g["hooks"].as_array())
+        .flatten()
+        .filter_map(|h| h["command"].as_str())
+        .filter(|c| c.contains(HOOK_COMMAND))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Classify the installed `SessionStart` hook without writing anything, for
+/// `clarion doctor`. The repair for `Missing`/`Stale` is the idempotent
+/// [`install_session_start_hook`]; `Unparseable` must be fixed by hand.
+#[must_use]
+pub fn session_start_hook_state(project_root: &Path) -> HookState {
+    let settings_path = project_root.join(".claude").join("settings.json");
+    let Ok(raw) = fs::read_to_string(&settings_path) else {
+        return HookState::Missing;
+    };
+    if raw.trim().is_empty() {
+        return HookState::Missing;
+    }
+    let Ok(settings) = serde_json::from_str::<Value>(&raw) else {
+        return HookState::Unparseable;
+    };
+    let cmds = clarion_commands(&settings);
+    if cmds.is_empty() {
+        HookState::Missing
+    } else if cmds.len() == 1 && cmds[0] == desired_hook_command(project_root) {
+        HookState::Present
+    } else {
+        HookState::Stale
+    }
+}
+
 /// POSIX single-quote escaping for a value embedded in a shell command string.
 ///
 /// Claude Code runs hook commands through a shell, so an embedded project path
@@ -217,19 +290,11 @@ pub fn install_session_start_hook(project_root: &Path) -> Result<bool> {
     }
 
     // Embed the resolved project path so the installed hook orients THIS
-    // project no matter what working directory Claude Code runs it from.
-    // `install::run` canonicalizes before calling, so `project_root` is already
-    // absolute; canonicalize defensively in case another caller is not. The
+    // project no matter what working directory Claude Code runs it from. The
     // path is POSIX-single-quote-escaped (not merely double-quoted) because
     // Claude runs hook commands via a shell and the path may contain `$`,
-    // backticks, quotes, or backslashes.
-    let canonical = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
-    let command = format!(
-        "clarion hook session-start --path {}",
-        shell_single_quote(&canonical.display().to_string())
-    );
+    // backticks, quotes, or backslashes — see `desired_hook_command`.
+    let command = desired_hook_command(project_root);
 
     let changed = merge_session_start_hook(&mut settings, &command);
     if !changed {
@@ -266,7 +331,10 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{HOOK_COMMAND, install_session_start_hook, merge_session_start_hook};
+    use super::{
+        HOOK_COMMAND, HookState, clarion_commands, install_session_start_hook,
+        merge_session_start_hook, session_start_hook_state,
+    };
 
     const TEST_COMMAND: &str = "clarion hook session-start --path \"/some/project\"";
 
@@ -365,21 +433,6 @@ mod tests {
         );
     }
 
-    /// All `command` strings across every `SessionStart` group that look like a
-    /// Clarion-owned hook (contain [`HOOK_COMMAND`]).
-    fn clarion_commands(settings: &serde_json::Value) -> Vec<String> {
-        settings["hooks"]["SessionStart"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|g| g["hooks"].as_array())
-            .flatten()
-            .filter_map(|h| h["command"].as_str())
-            .filter(|c| c.contains(HOOK_COMMAND))
-            .map(str::to_owned)
-            .collect()
-    }
-
     #[test]
     fn refreshes_a_stale_hook_pinned_to_a_different_path() {
         // The realistic re-install case: the repo moved, so the existing hook
@@ -471,6 +524,67 @@ mod tests {
             .collect();
         assert!(cmds.iter().any(|c| c.contains("unrelated-greeting")));
         assert!(cmds.iter().any(|c| c.contains(HOOK_COMMAND)));
+    }
+
+    #[test]
+    fn hook_state_missing_then_present_around_install() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            session_start_hook_state(dir.path()),
+            HookState::Missing,
+            "no settings.json -> Missing"
+        );
+        install_session_start_hook(dir.path()).unwrap();
+        assert_eq!(
+            session_start_hook_state(dir.path()),
+            HookState::Present,
+            "a fresh install is Present"
+        );
+    }
+
+    #[test]
+    fn hook_state_stale_when_pinned_to_a_different_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        // A Clarion hook pinned to some other project: present-but-wrong.
+        fs::write(
+            claude.join("settings.json"),
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"clarion hook session-start --path '/some/other/proj'"}]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(session_start_hook_state(dir.path()), HookState::Stale);
+    }
+
+    #[test]
+    fn hook_state_unparseable_on_bad_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        fs::write(claude.join("settings.json"), "{not json").unwrap();
+        assert_eq!(session_start_hook_state(dir.path()), HookState::Unparseable);
+    }
+
+    #[test]
+    fn hook_state_missing_when_only_unrelated_hooks_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        fs::write(
+            claude.join("settings.json"),
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo hi"}]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            session_start_hook_state(dir.path()),
+            HookState::Missing,
+            "an unrelated SessionStart hook is not a Clarion hook"
+        );
+        // And clarion_commands sees nothing Clarion-owned here.
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(claude.join("settings.json")).unwrap())
+                .unwrap();
+        assert!(clarion_commands(&settings).is_empty());
     }
 
     #[test]

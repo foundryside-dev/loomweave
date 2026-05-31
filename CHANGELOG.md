@@ -40,6 +40,16 @@ only when an incompatible change is made to that surface. See
   (`GET /api/loom/files` → `GET /api/loom/findings`) resolves a path to its
   findings. Per the enrich-only axiom, any unreachable hop degrades the section
   to `result_kind: "unavailable"` rather than failing the tool.
+- **`clarion doctor [--fix]`.** A new subcommand that verifies — and with
+  `--fix` repairs in place — the installed agent-orientation surfaces: the
+  `clarion-workflow` skill pack, the `SessionStart` hook in
+  `.claude/settings.json`, and the `clarion` entry in `.mcp.json` (which
+  `clarion install` does not register automatically). It prints a per-surface
+  ✓/✗ report plus the index snapshot and exits non-zero when any problem
+  remains, so it is usable as a CI / pre-commit gate. Repairs reuse the same
+  idempotent installers as `clarion install`, and the `.mcp.json` merge is
+  never-clobber: sibling servers and a deliberately customised `command` are
+  preserved (only the `--path` args are corrected).
 
 ### Changed
 
