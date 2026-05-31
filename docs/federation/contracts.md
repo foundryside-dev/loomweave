@@ -846,19 +846,26 @@ is unreachable the `wardline_findings` section degrades to
    byte-exact (the filter is a prefix query; Clarion performs the exact-match
    itself to get Filigree's `file_id`).
 2. `GET {filigree_base}/api/loom/findings?scan_source=wardline&file_id=<file_id>` →
-   a list envelope of findings. Clarion reads `rule_id`, `message`, `severity`,
-   `status`, `line_start`/`line_end`, `fingerprint`, and `metadata` (the
-   reconciliation key is `metadata.wardline.qualname`). Unknown fields are ignored
-   so Filigree may grow the row without breaking this consumer.
+   a list envelope `{items, has_more}`. Clarion reads `rule_id`, `message`,
+   `severity`, `status`, `line_start`/`line_end`, `fingerprint`, and `metadata`
+   (the reconciliation key is `metadata.wardline.qualname`). Unknown fields are
+   ignored so Filigree may grow the row without breaking this consumer.
 
 Clarion reads only the first page of each list response (it does not follow
 `has_more`); for a single source file the expected file/finding volume fits one
-Filigree page. Multi-page following is a documented v1 limitation. If the
-prefix query for hop-1 returns a page that does not contain the exact-path
-match **and** `has_more` is true, Clarion cannot conclude the file is absent —
-the match may be on a later page. In that case `wardline_findings_for_path`
-returns an error and the `wardline_findings` section degrades to
-`result_kind: "unavailable"` (honest) rather than a false `no_matches`.
+Filigree page. Multi-page following is a documented v1 limitation. **In both
+hops, a truncated first page fails closed rather than returning a partial
+view:**
+
+- Hop-1: if the prefix query returns a page that does not contain the
+  exact-path match **and** `has_more` is true, Clarion cannot conclude the file
+  is absent — the match may be on a later page.
+- Hop-2: if the findings page for the resolved `file_id` reports `has_more`,
+  the first page is an incomplete enumeration of the file's findings.
+
+In either case `wardline_findings_for_path` returns an error and the
+`wardline_findings` section degrades to `result_kind: "unavailable"` (honest)
+rather than a false `no_matches` (hop-1) or a silent undercount (hop-2).
 
 **Reconciliation.** `metadata.wardline.qualname` is matched byte-exact against
 the entity_id's segment-3 `canonical_qualified_name`
