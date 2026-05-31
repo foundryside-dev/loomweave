@@ -220,6 +220,12 @@ fn run_actor(
                 });
                 reply(ack, res);
             }
+            WriterCmd::UpsertWardlineTaintFact { fact, ack } => {
+                let res = query_time_write(conn, &mut state, commits_observed, |conn| {
+                    crate::wardline_taint::upsert_taint_fact(conn, &fact)
+                });
+                reply(ack, res);
+            }
             WriterCmd::ReplaceUnresolvedCallSitesForCaller {
                 caller_entity_id,
                 caller_content_hash,

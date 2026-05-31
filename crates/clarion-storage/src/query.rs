@@ -433,6 +433,42 @@ fn file_content_hash(path: &Path) -> std::io::Result<String> {
     fs::read(path).map(|bytes| blake3::hash(&bytes).to_hex().to_string())
 }
 
+/// Live blake3 (hex) of an entity's containing file, read at call time, by the
+/// contract definition (whole-file, raw bytes). Returns `None` when the file is
+/// missing/unreadable (deleted/renamed) — a stale signal, not an error. The
+/// stored `entities.content_hash` is NOT used: for function entities it is a
+/// span-scoped, LF-normalized hash, and even a stored whole-file hash reflects
+/// the last analyze rather than current disk. `source_file_path` is resolved
+/// against `project_root` when relative (file entities store absolute canonical
+/// paths; some inputs are project-relative).
+#[must_use]
+pub fn current_file_hash(project_root: &Path, source_file_path: &str) -> Option<String> {
+    let p = Path::new(source_file_path);
+    let path = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        project_root.join(p)
+    };
+    match file_content_hash(&path) {
+        Ok(hash) => Some(hash),
+        // A missing file is the routine stale case (deleted/renamed) — stay
+        // silent. Any other IO kind (PermissionDenied, a permission misconfig,
+        // an IO fault) would otherwise report every fact stale forever with no
+        // breadcrumb. Warn with the path AND the kind so an operator can act,
+        // but still return `None`: the freshness contract is `None` = stale,
+        // never an error.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error_kind = ?err.kind(),
+                "current_file_hash: source file unreadable; reporting stale (absent freshness hash)"
+            );
+            None
+        }
+    }
+}
+
 fn resolved_language(
     requested: &str,
     plugin_id: &str,
@@ -1477,4 +1513,63 @@ fn escape_like(pattern: &str) -> String {
         escaped.push(ch);
     }
     escaped
+}
+
+#[cfg(test)]
+mod current_file_hash_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// `current_file_hash` is the WHOLE-FILE blake3 of the raw bytes read live,
+    /// and is distinct from the span-scoped, LF-normalized hash that function
+    /// entities store in `entities.content_hash`. This is the test that closes
+    /// the W.3 freshness blind spot: the contract's `current_content_hash` MUST
+    /// be whole-file, never the stored span hash.
+    #[test]
+    fn whole_file_hash_differs_from_span_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mod.py");
+        // Multi-line file WITH a trailing newline so the LF-normalized span
+        // join cannot accidentally equal the whole-file bytes.
+        let contents = "line0\nline1\nline2\nline3\n";
+        let mut f = std::fs::File::create(&file).unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+        drop(f);
+
+        // Live whole-file hash via the helper (absolute path branch).
+        let live = current_file_hash(dir.path(), file.to_str().unwrap()).unwrap();
+
+        // Reference whole-file hash: blake3 of the raw bytes, exactly.
+        let whole = blake3::hash(&fs::read(&file).unwrap()).to_hex().to_string();
+        assert_eq!(live, whole, "current_file_hash must be whole-file blake3");
+
+        // Span-hash formula (analyze.rs::content_hash_for_entity): read the
+        // file as text, take a STRICT sub-range of lines, LF-join, blake3.
+        let text = fs::read_to_string(&file).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let span = lines[1..3].join("\n"); // "line1\nline2"
+        let span_hash = blake3::hash(span.as_bytes()).to_hex().to_string();
+        assert_ne!(
+            live, span_hash,
+            "whole-file hash must differ from the span/LF-normalized hash"
+        );
+    }
+
+    #[test]
+    fn relative_path_resolves_against_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("pkg/mod.py");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"x = 1\n").unwrap();
+
+        let live = current_file_hash(dir.path(), "pkg/mod.py").unwrap();
+        let whole = blake3::hash(&fs::read(&file).unwrap()).to_hex().to_string();
+        assert_eq!(live, whole);
+    }
+
+    #[test]
+    fn missing_path_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(current_file_hash(dir.path(), "does/not/exist.py"), None);
+    }
 }

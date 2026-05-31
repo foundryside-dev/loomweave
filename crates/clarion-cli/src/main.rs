@@ -4,11 +4,13 @@ mod cli;
 mod clustering;
 mod config;
 mod db;
+mod doctor;
 mod hook;
 mod hooks_settings;
 mod http_read;
 mod install;
 mod instance;
+mod mcp_registration;
 mod run_lifecycle;
 mod secret_scan;
 mod serve;
@@ -87,6 +89,16 @@ fn main() -> Result<()> {
                 force,
             } => db::backup(&path, &output, force),
         },
+        cli::Command::Doctor { path, fix } => {
+            // doctor prints its own report; map an unhealthy result to a
+            // non-zero exit so it can gate CI / pre-commit. The Result<()> arm
+            // is reserved for setup errors (bad --path), which bubble normally.
+            let healthy = doctor::run(&path, fix)?;
+            if !healthy {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
     }
 }
 

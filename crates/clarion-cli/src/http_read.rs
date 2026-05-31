@@ -15,6 +15,7 @@ use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use clarion_core::HttpErrorCode as ErrorCode;
 use clarion_mcp::config::HttpReadConfig;
 use clarion_storage::{CanonicalProjectPath, ReaderPool, StorageError, resolve_file_catalog_entry};
 use serde::{Deserialize, Serialize};
@@ -129,6 +130,36 @@ struct AppState {
     /// Resolved Loom component identity HMAC secret. When present, protected
     /// routes require `X-Loom-Component: clarion:<hmac>`.
     identity_secret: Option<Arc<String>>,
+    /// Present only when `serve.http.wardline_taint_write` is true (ADR-036).
+    /// `None` ⇒ the write API is disabled and returns 403 `WRITE_DISABLED`.
+    taint_writer: Option<tokio::sync::mpsc::Sender<clarion_storage::WriterCmd>>,
+}
+
+impl AppState {
+    /// The `project` request field is a guard, not a selector: one `serve`
+    /// serves exactly one project. An empty field is permitted (Wardline may
+    /// omit it); a non-empty mismatch is rejected. The canonical project
+    /// handle for v1 is the project-root directory name (cheapest, no new
+    /// config). Pinned in contracts.md (W.5).
+    fn reject_project_mismatch(&self, requested: &str) -> Option<Response> {
+        if requested.is_empty() {
+            return None;
+        }
+        let served = self
+            .project_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if requested == served {
+            None
+        } else {
+            Some(json_error(
+                StatusCode::FORBIDDEN,
+                ErrorCode::ProjectMismatch,
+                "project guard mismatch: this server serves a different project",
+            ))
+        }
+    }
 }
 
 /// Ready-signal payload returned from the HTTP thread back to `spawn`.
@@ -145,13 +176,19 @@ struct HttpReadReady {
 
 pub fn spawn(
     project_root: PathBuf,
+    db_path: PathBuf,
     readers: ReaderPool,
     instance_id: crate::instance::InstanceId,
     config: &HttpReadConfig,
 ) -> Result<Option<HttpReadServer>> {
-    spawn_with_env(project_root, readers, instance_id, config, |name| {
-        std::env::var(name).ok()
-    })
+    spawn_with_env(
+        project_root,
+        db_path,
+        readers,
+        instance_id,
+        config,
+        |name| std::env::var(name).ok(),
+    )
 }
 
 /// Spawn variant that takes an explicit env lookup so tests can drive the
@@ -159,6 +196,7 @@ pub fn spawn(
 /// mutating process environment.
 pub fn spawn_with_env<F>(
     project_root: PathBuf,
+    db_path: PathBuf,
     readers: ReaderPool,
     instance_id: crate::instance::InstanceId,
     config: &HttpReadConfig,
@@ -170,6 +208,7 @@ where
     if !config.enabled {
         return Ok(None);
     }
+    let wardline_taint_write = config.wardline_taint_write;
     config
         .validate_loopback_trust()
         .context("validate HTTP read API trust model")?;
@@ -208,6 +247,8 @@ where
         .spawn(move || -> Result<()> {
             let result = run_http_read_server(
                 project_root,
+                db_path,
+                wardline_taint_write,
                 readers,
                 instance_id,
                 auth_token_thread,
@@ -258,8 +299,11 @@ where
     }))
 }
 
+#[allow(clippy::too_many_arguments)] // server bootstrap fans many one-shot inputs into one thread
 fn run_http_read_server(
     project_root: PathBuf,
+    db_path: PathBuf,
+    wardline_taint_write: bool,
     readers: ReaderPool,
     instance_id: crate::instance::InstanceId,
     auth_token: Option<Arc<String>>,
@@ -293,19 +337,60 @@ fn run_http_read_server(
             local_addr,
             readers_identity,
         }));
+        // Optional ADR-011 writer-actor for the Wardline taint-store WRITE API.
+        // Note: when an LLM summary provider is configured, `serve` already
+        // runs a second writer-actor (the MCP summary/inferred-edge writer in
+        // serve.rs). Two writer-actors on one DB is a bounded relaxation of
+        // ADR-011's single-writer expectation (ADR-036 §4): the streams are
+        // independent and every writer opens `BEGIN IMMEDIATE` under
+        // busy_timeout=5000 + capped-backoff retry, so they serialize at the
+        // SQLite write lock rather than corrupting.
+        // Spawned INSIDE the HTTP runtime (`Writer::spawn` uses `spawn_blocking`,
+        // which needs a runtime). We keep ONLY `writer.sender()` — the `Writer`
+        // handle is dropped at the end of this block so that the AppState's
+        // sender clone is the last surviving sender. When `serve_future` is
+        // consumed below, that clone (and every per-request/middleware clone)
+        // drops, the actor's `mpsc::Receiver` sees all senders gone, and
+        // `rx.blocking_recv()` returns `None` — so `taint_writer_join.await`
+        // resolves instead of deadlocking. The `taint_writer_join` is held
+        // OUTSIDE the AppState so it survives to be awaited at shutdown.
+        let (taint_writer, taint_writer_join) = if wardline_taint_write {
+            let (writer, join) = clarion_storage::Writer::spawn(
+                db_path.clone(),
+                clarion_storage::DEFAULT_BATCH_SIZE,
+                clarion_storage::DEFAULT_CHANNEL_CAPACITY,
+            )
+            .map_err(|err| anyhow!("spawn taint writer-actor: {err}"))?;
+            (Some(writer.sender()), Some(join))
+        } else {
+            (None, None)
+        };
         let state = AppState {
             project_root,
             readers,
             instance_id,
             auth_token,
             identity_secret,
+            taint_writer,
         };
         let serve_future = axum::serve(listener, router(state))
             .with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
             })
             .into_future();
-        run_serve_future(serve_future).await
+        // Consuming `serve_future` drops the AppState (and its `taint_writer`
+        // sender clone) — the last sender — so the actor's channel closes.
+        let serve_result = run_serve_future(serve_future).await;
+        let writer_result = match taint_writer_join {
+            Some(join) => join
+                .await
+                .context("join taint writer-actor")?
+                .map_err(|err| anyhow!("taint writer-actor failed: {err}")),
+            None => Ok(()),
+        };
+        // Propagate the serve error first (mirrors `finish_supervised_result`).
+        serve_result?;
+        writer_result
     })
 }
 
@@ -369,7 +454,41 @@ fn router(state: AppState) -> Router {
             require_http_identity,
         ));
     let unprotected = Router::new().route("/api/v1/_capabilities", get(get_capabilities));
-    protected.merge(unprotected).with_state(state).layer(
+    // The 16 KiB read-API body limit is baked onto the merged `/api/v1/*`
+    // group HERE — *before* `.merge(wardline)`. Tower body limits compose as
+    // MIN and layer scope follows merge boundaries: applying this layer to the
+    // already-merged v1 group keeps it off the wardline routes. (Flattening
+    // it onto the final `protected.merge(unprotected).merge(wardline)` would
+    // cap wardline at 16 KiB and defeat the larger limit.) The outer
+    // `ServiceBuilder` no longer carries a body limit; each group owns its own.
+    let v1 = protected
+        .merge(unprotected)
+        .layer(RequestBodyLimitLayer::new(HTTP_BODY_LIMIT_BYTES));
+    // Wardline taint-store sub-router. Batched resolves/writes carry thousands
+    // of qualnames, so this group gets the 4 MiB limit. Later tasks (5/6/7)
+    // add the taint-facts read/write routes here. `DefaultBodyLimit` must also
+    // be raised: axum's `Json` extractor enforces its own 2 MB default that
+    // tower-http's `RequestBodyLimitLayer` does not touch, so without this the
+    // 4 MiB target would be nominal only.
+    let wardline = Router::new()
+        .route("/api/wardline/resolve", post(post_wardline_resolve))
+        .route(
+            "/api/wardline/taint-facts",
+            post(post_wardline_taint_facts).get(get_wardline_taint_fact),
+        )
+        .route(
+            "/api/wardline/taint-facts:batch-get",
+            post(post_wardline_taint_facts_batch_get),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_http_identity_wardline,
+        ))
+        .layer(RequestBodyLimitLayer::new(WARDLINE_BODY_LIMIT_BYTES))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            WARDLINE_BODY_LIMIT_BYTES,
+        ));
+    v1.merge(wardline).with_state(state).layer(
         ServiceBuilder::new()
             .layer(CatchPanicLayer::custom(catch_panic_response))
             .layer(HandleErrorLayer::new(handle_middleware_error))
@@ -379,7 +498,6 @@ fn router(state: AppState) -> Router {
                     .on_failure(()),
             )
             .layer(timeout::TimeoutLayer::new(Duration::from_secs(10)))
-            .layer(RequestBodyLimitLayer::new(HTTP_BODY_LIMIT_BYTES))
             .layer(load_shed::LoadShedLayer::new())
             .layer(ConcurrencyLimitLayer::new(64)),
     )
@@ -393,8 +511,29 @@ async fn require_http_identity(
     request: Request<Body>,
     next: axum::middleware::Next,
 ) -> Response {
+    require_http_identity_with_limit(&state, HTTP_BODY_LIMIT_BYTES, request, next).await
+}
+
+/// Wardline-route identity guard. Identical to [`require_http_identity`] but
+/// reads up to `WARDLINE_BODY_LIMIT_BYTES` when verifying the HMAC signature,
+/// so a multi-MiB taint-store body is not rejected by the signature-read step
+/// before the route's own larger body limit applies.
+async fn require_http_identity_wardline(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    require_http_identity_with_limit(&state, WARDLINE_BODY_LIMIT_BYTES, request, next).await
+}
+
+async fn require_http_identity_with_limit(
+    state: &AppState,
+    body_limit: usize,
+    request: Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
     if let Some(secret) = state.identity_secret.as_ref() {
-        return require_hmac_identity(secret, request, next).await;
+        return require_hmac_identity(secret, body_limit, request, next).await;
     }
     let Some(expected) = state.auth_token.as_ref() else {
         return next.run(request).await;
@@ -419,6 +558,7 @@ async fn require_http_identity(
 
 async fn require_hmac_identity(
     secret: &str,
+    body_limit: usize,
     request: Request<Body>,
     next: axum::middleware::Next,
 ) -> Response {
@@ -438,7 +578,7 @@ async fn require_hmac_identity(
     let Some(presented) = presented else {
         return unauthenticated_response();
     };
-    let Ok(body_bytes) = to_bytes(body, HTTP_BODY_LIMIT_BYTES).await else {
+    let Ok(body_bytes) = to_bytes(body, body_limit).await else {
         // CI-02 fix: a body read failure here is not a path-validation
         // problem. The outer `RequestBodyLimitLayer` already rejects
         // oversized bodies with the framework's 413; reaching this branch
@@ -586,19 +726,6 @@ struct ErrorResponse {
     code: ErrorCode,
 }
 
-#[derive(Debug, Copy, Clone, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum ErrorCode {
-    InvalidPath,
-    PathOutsideProject,
-    NotFound,
-    BriefingBlocked,
-    Unauthenticated,
-    StorageError,
-    BatchTooLarge,
-    Internal,
-}
-
 /// Maximum number of `BatchFileQuery` entries a single
 /// `POST /api/v1/files/batch` request may carry. Pinned in the federation
 /// contract; Filigree splits oversize lookup sets client-side. Lifted to a
@@ -607,6 +734,14 @@ enum ErrorCode {
 const BATCH_MAX_QUERIES: usize = 256;
 const RESOLVE_MAX_PATHS: usize = 1000;
 const HTTP_BODY_LIMIT_BYTES: usize = 16 * 1024;
+
+/// Body limit for the Wardline taint-store routes. Batched writes/resolves
+/// carry thousands of qualnames; the 16 KiB read-API limit is far too small.
+/// Wardline chunks client-side against `WARDLINE_TAINT_BATCH_MAX` (mirrors how
+/// Filigree splits against `BATCH_MAX_QUERIES`). Pinned in contracts.md (W.5).
+const WARDLINE_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+/// Max qualnames/facts in one Wardline request.
+const WARDLINE_TAINT_BATCH_MAX: usize = 2000;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -686,6 +821,78 @@ enum ResolveFileStatus {
     NotFound,
     Blocked,
     Error,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolveRequest {
+    #[serde(default)]
+    project: String,
+    qualnames: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResolveResponse {
+    /// qualname -> `entity_id`, only for exact matches.
+    resolved: std::collections::BTreeMap<String, String>,
+    unresolved: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaintFactInput {
+    qualname: String,
+    /// `RawValue` captures the ORIGINAL bytes of this JSON sub-value exactly —
+    /// `serde_json::Value` would normalize (object keys are a `BTreeMap`, so
+    /// `{"b":2,"a":1}` would re-emit as `{"a":1,"b":2}`). The federation
+    /// contract is "stored and returned verbatim", so we preserve the bytes.
+    wardline_json: Box<serde_json::value::RawValue>,
+    #[serde(default)]
+    scan_id: Option<String>,
+    #[serde(default)]
+    content_hash_at_compute: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteTaintFactsRequest {
+    #[serde(default)]
+    project: String,
+    #[serde(default)]
+    scan_id: Option<String>,
+    facts: Vec<TaintFactInput>,
+}
+
+#[derive(Debug, Serialize)]
+struct WriteTaintFactsResponse {
+    written: usize,
+    unresolved_qualnames: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaintFactQuery {
+    #[serde(default)]
+    project: String,
+    qualname: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TaintFactView {
+    qualname: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wardline_json: Option<Box<serde_json::value::RawValue>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_content_hash: Option<String>,
+    exists: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchGetRequest {
+    #[serde(default)]
+    project: String,
+    qualnames: Vec<String>,
 }
 
 async fn get_file(
@@ -948,6 +1155,370 @@ async fn post_files_resolve(
     }
 }
 
+/// Exact-tier Wardline qualname resolve (ADR-036, W.4). Takes a batch of
+/// PRE-COMPOSED dotted qualnames that Wardline has already shaped to
+/// byte-match Clarion's `canonical_qualified_name`; resolution is the direct
+/// existence lookup in `clarion_storage::resolve_wardline_qualnames`. No
+/// `&file=` disambiguator, no normalization — the generic resolve oracle
+/// remains deferred.
+async fn post_wardline_resolve(
+    State(state): State<AppState>,
+    body: Result<Json<ResolveRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(json) => json,
+        Err(rej) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidPath,
+                &rej.body_text(),
+            );
+        }
+    };
+    if let Some(resp) = state.reject_project_mismatch(&req.project) {
+        return resp;
+    }
+    if req.qualnames.len() > WARDLINE_TAINT_BATCH_MAX {
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorCode::BatchTooLarge,
+            "too many qualnames in one request",
+        );
+    }
+    // Move only `qualnames` into the reader closure; `project` was consumed by
+    // the guard above. `with_reader` runs the lookup on a pooled connection.
+    let qualnames = req.qualnames;
+    let result = state
+        .readers
+        .with_reader(move |conn| clarion_storage::resolve_wardline_qualnames(conn, &qualnames))
+        .await;
+    match result {
+        Ok(pairs) => {
+            let mut resolved = std::collections::BTreeMap::new();
+            let mut unresolved = Vec::new();
+            for (qualname, resolution) in pairs {
+                match resolution.into_entity_id() {
+                    Some(id) => {
+                        resolved.insert(qualname, id);
+                    }
+                    None => unresolved.push(qualname),
+                }
+            }
+            (
+                StatusCode::OK,
+                Json(ResolveResponse {
+                    resolved,
+                    unresolved,
+                }),
+            )
+                .into_response()
+        }
+        Err(err) => json_read_error(&err),
+    }
+}
+
+/// Wardline taint-fact batch WRITE (ADR-036, W.2). Disabled by default; only
+/// reachable when `serve.http.wardline_taint_write` spawned the optional
+/// writer-actor (`state.taint_writer` is `Some`). Resolution is the SAME
+/// exact-tier oracle the resolve endpoint uses; `wardline_json` is opaque and
+/// stored verbatim. Facts whose qualname does not resolve are reported in
+/// `unresolved_qualnames` and silently skipped (not an error).
+async fn post_wardline_taint_facts(
+    State(state): State<AppState>,
+    body: Result<Json<WriteTaintFactsRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    // Disabled-by-default guard fires BEFORE body parsing: a `None` writer
+    // means the API is off regardless of payload shape.
+    let Some(writer) = state.taint_writer.clone() else {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            ErrorCode::WriteDisabled,
+            "taint-fact write API is disabled (set serve.http.wardline_taint_write: true)",
+        );
+    };
+    let Json(req) = match body {
+        Ok(json) => json,
+        Err(rej) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidPath,
+                &rej.body_text(),
+            );
+        }
+    };
+    if let Some(resp) = state.reject_project_mismatch(&req.project) {
+        return resp;
+    }
+    if req.facts.len() > WARDLINE_TAINT_BATCH_MAX {
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorCode::BatchTooLarge,
+            "too many facts in one request",
+        );
+    }
+
+    // Resolve every qualname EXACT-only on the reader pool, in input order, in
+    // one pooled-connection checkout. Zip results back onto the facts by index
+    // (NOT a qualname->id map) so duplicate qualnames are handled correctly.
+    let qualnames: Vec<String> = req.facts.iter().map(|f| f.qualname.clone()).collect();
+    let resolution = state
+        .readers
+        .with_reader(move |conn| clarion_storage::resolve_wardline_qualnames(conn, &qualnames))
+        .await;
+    let resolved = match resolution {
+        Ok(pairs) => pairs,
+        Err(err) => return json_read_error(&err),
+    };
+
+    let batch_scan_id = req.scan_id.clone();
+    let updated_at = iso8601_now();
+    let mut written = 0_usize;
+    let mut unresolved_qualnames = Vec::new();
+    for (fact, (_, res)) in req.facts.into_iter().zip(resolved) {
+        let Some(entity_id) = res.into_entity_id() else {
+            unresolved_qualnames.push(fact.qualname);
+            continue;
+        };
+        let taint_fact = clarion_storage::TaintFact {
+            entity_id,
+            // Opaque + byte-verbatim: `RawValue::get()` returns the original
+            // bytes of the blob exactly as the client sent them (no key
+            // reordering). Do NOT parse out scan_id/content_hash from inside
+            // the blob; do NOT validate it.
+            wardline_json: fact.wardline_json.get().to_owned(),
+            scan_id: fact.scan_id.or_else(|| batch_scan_id.clone()),
+            content_hash_at_compute: fact.content_hash_at_compute.clone(),
+            updated_at: updated_at.clone(),
+        };
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let cmd = clarion_storage::WriterCmd::UpsertWardlineTaintFact {
+            fact: Box::new(taint_fact),
+            ack: ack_tx,
+        };
+        if writer.send(cmd).await.is_err() {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::StorageError,
+                "taint-fact writer is unavailable",
+            );
+        }
+        match ack_rx.await {
+            Ok(Ok(())) => written += 1,
+            Ok(Err(err)) => {
+                log_taint_write_error(&err);
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorCode::Internal,
+                    "taint-fact write failed",
+                );
+            }
+            Err(_) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorCode::Internal,
+                    "taint-fact writer dropped the response channel",
+                );
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(WriteTaintFactsResponse {
+            written,
+            unresolved_qualnames,
+        }),
+    )
+        .into_response()
+}
+
+/// Shared read builder for the GET and `:batch-get` taint-fact endpoints.
+/// Runs ALL DB work and the live file hashing inside ONE pooled-connection
+/// checkout (the `with_reader` closure is the blocking context). For each
+/// qualname:
+///
+/// - resolve exact-tier → entity id (unresolved → `exists: false`);
+/// - `get_taint_facts` for the resolved ids; map back by entity id;
+/// - for rows that exist, parse the stored blob byte-faithfully via
+///   `RawValue::from_string` (W.2 wrote it from a `RawValue`, so it
+///   round-trips) and derive `current_content_hash` live from the row's
+///   `source_file_path` via `clarion_storage::current_file_hash`.
+///
+/// File hashing is DEDUPED per request by `source_file_path`: a chain-walk
+/// batch hits many functions sharing one file, and a 425k-LOC project must
+/// not re-hash the same file N times. A deleted/renamed/unreadable file →
+/// `current_content_hash: None` (a stale signal, not a 500).
+///
+/// Returns `Err(Response)` only when the DB read itself fails; per-qualname
+/// "not found" is conveyed in-band via `exists: false`.
+async fn respond_taint_facts(
+    state: &AppState,
+    qualnames: Vec<String>,
+) -> Result<Vec<TaintFactView>, Response> {
+    let project_root = state.project_root.clone();
+    let result = state
+        .readers
+        .with_reader(move |conn| {
+            // 1. Resolve every qualname (exact tier), in input order.
+            let resolved = clarion_storage::resolve_wardline_qualnames(conn, &qualnames)?;
+
+            // 2. Fetch facts for the resolved entity ids; map back by id.
+            let entity_ids: Vec<String> = resolved
+                .iter()
+                .filter_map(|(_, r)| r.entity_id().map(str::to_owned))
+                .collect();
+            let rows = clarion_storage::get_taint_facts(conn, &entity_ids)?;
+            let by_entity: std::collections::HashMap<String, clarion_storage::TaintFactRow> = rows
+                .into_iter()
+                .map(|row| (row.entity_id.clone(), row))
+                .collect();
+
+            // 3. Build a view per qualname, deduping file hashing by path.
+            let mut file_hash_cache: std::collections::HashMap<String, Option<String>> =
+                std::collections::HashMap::new();
+            let mut views = Vec::with_capacity(resolved.len());
+            for (qualname, resolution) in resolved {
+                let view = match resolution
+                    .into_entity_id()
+                    .and_then(|id| by_entity.get(&id))
+                {
+                    Some(row) => {
+                        // Byte-faithful: the stored string is exactly what W.2
+                        // wrote from a RawValue, so it re-parses. A parse error
+                        // is a storage-integrity failure, not a 404.
+                        let wardline_json =
+                            serde_json::value::RawValue::from_string(row.wardline_json.clone())
+                                .map_err(|e| {
+                                    StorageError::Corruption(format!(
+                                        "stored wardline_json for {} is not valid JSON: {e}",
+                                        row.entity_id
+                                    ))
+                                })?;
+                        let current_content_hash = match &row.source_file_path {
+                            Some(path) => file_hash_cache
+                                .entry(path.clone())
+                                .or_insert_with(|| {
+                                    clarion_storage::current_file_hash(&project_root, path)
+                                })
+                                .clone(),
+                            None => None,
+                        };
+                        TaintFactView {
+                            qualname,
+                            wardline_json: Some(wardline_json),
+                            current_content_hash,
+                            exists: true,
+                        }
+                    }
+                    // Unresolved qualname OR resolved-but-no-stored-fact.
+                    _ => TaintFactView {
+                        qualname,
+                        wardline_json: None,
+                        current_content_hash: None,
+                        exists: false,
+                    },
+                };
+                views.push(view);
+            }
+            Ok(views)
+        })
+        .await;
+    result.map_err(|err| json_read_error(&err))
+}
+
+/// Single taint-fact READ (ADR-036, W.3). Reads only — served regardless of
+/// `state.taint_writer` (the write API may be disabled). Unknown qualname →
+/// `exists: false` with no `wardline_json`.
+async fn get_wardline_taint_fact(
+    State(state): State<AppState>,
+    query: Result<Query<TaintFactQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidPath,
+            "query parameters are invalid",
+        );
+    };
+    if let Some(resp) = state.reject_project_mismatch(&query.project) {
+        return resp;
+    }
+    if query.qualname.trim().is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidPath,
+            "qualname query parameter must not be blank",
+        );
+    }
+    match respond_taint_facts(&state, vec![query.qualname]).await {
+        Ok(mut views) => {
+            // Exactly one input qualname → exactly one view.
+            let view = views.pop().unwrap_or(TaintFactView {
+                qualname: String::new(),
+                wardline_json: None,
+                current_content_hash: None,
+                exists: false,
+            });
+            (StatusCode::OK, Json(view)).into_response()
+        }
+        Err(resp) => resp,
+    }
+}
+
+/// Batch taint-fact READ (ADR-036, W.3). One DB checkout + per-request file
+/// hash dedup serves the chain-walk batch. Reads only — served regardless of
+/// `state.taint_writer`.
+async fn post_wardline_taint_facts_batch_get(
+    State(state): State<AppState>,
+    body: Result<Json<BatchGetRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(json) => json,
+        Err(rej) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidPath,
+                &rej.body_text(),
+            );
+        }
+    };
+    if let Some(resp) = state.reject_project_mismatch(&req.project) {
+        return resp;
+    }
+    if req.qualnames.len() > WARDLINE_TAINT_BATCH_MAX {
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorCode::BatchTooLarge,
+            "too many qualnames in one request",
+        );
+    }
+    match respond_taint_facts(&state, req.qualnames).await {
+        Ok(views) => (StatusCode::OK, Json(views)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+fn log_taint_write_error(err: &StorageError) {
+    let error_chain = format_error_chain(err);
+    tracing::dispatcher::with_default(&HTTP_ERROR_DISPATCH, || {
+        tracing::error!(
+            error_chain = %error_chain,
+            "HTTP /api/wardline/taint-facts write failed"
+        );
+    });
+}
+
+/// ISO-8601 UTC "now" with millisecond precision (`YYYY-MM-DDTHH:MM:SS.sssZ`),
+/// matching the caller-side timestamps `clarion analyze` stamps onto run rows.
+fn iso8601_now() -> String {
+    use time::macros::format_description;
+    const ISO8601_MILLIS_UTC: &[time::format_description::FormatItem<'_>] =
+        format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
+    time::OffsetDateTime::now_utc()
+        .format(ISO8601_MILLIS_UTC)
+        .expect("fixed ISO-8601 format description should format")
+}
+
 fn resolve_file_query_item(
     conn: &rusqlite::Connection,
     project_root: &std::path::Path,
@@ -1058,6 +1629,15 @@ fn classify_read_error(err: &StorageError) -> ReadError {
             code: ErrorCode::PathOutsideProject,
             message: "path is outside project root",
         },
+        // A stored row that failed an integrity check is Clarion's fault, not
+        // the client's: 500 + logged (via `json_read_error`), never a 4xx that
+        // blames the caller's request. A federation client routing on `code`
+        // must see STORAGE_ERROR, not INVALID_PATH.
+        StorageError::Corruption(_) => ReadError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: ErrorCode::StorageError,
+            message: "stored data failed an integrity check",
+        },
         StorageError::Pool(_) => ReadError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: ErrorCode::StorageError,
@@ -1133,7 +1713,11 @@ fn log_read_server_error(code: ErrorCode, status: StatusCode, err: &StorageError
             code = ?code,
             status = status.as_u16(),
             error_chain = %error_chain,
-            "HTTP /api/v1/files lookup failed"
+            // Route-agnostic: this helper is shared by every read surface
+            // routed through `json_read_error` (files lookup AND the wardline
+            // taint-fact reads). A storage-corruption breadcrumb filed under a
+            // fixed "/api/v1/files" label is one an operator won't find.
+            "HTTP read API storage error"
         );
     });
 }
@@ -1536,7 +2120,7 @@ mod tests {
             let app: Router<()> = Router::new()
                 .route("/api/v1/files/batch", post(never_called))
                 .layer(axum::middleware::from_fn(|request, next| async move {
-                    require_hmac_identity("test-secret", request, next).await
+                    require_hmac_identity("test-secret", HTTP_BODY_LIMIT_BYTES, request, next).await
                 }));
 
             let response = app.oneshot(request).await.expect("oneshot response");
@@ -1630,6 +2214,7 @@ mod tests {
                 allow_non_loopback: false,
                 token_env: "CLARION_LOOPBACK_NO_TOKEN_TEST_UNSET".to_owned(),
                 identity_token_env: None,
+                wardline_taint_write: false,
             };
             let instance_id =
                 crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-000000000002")
@@ -1642,6 +2227,7 @@ mod tests {
 
             let server = spawn_with_env(
                 tempdir.path().to_path_buf(),
+                db_path.clone(),
                 readers,
                 instance_id,
                 &config,
@@ -1663,6 +2249,599 @@ mod tests {
         assert!(
             captured.contains("without authentication"),
             "expected loopback-no-token warning to mention 'without authentication'; captured: {captured}"
+        );
+    }
+
+    /// Build an `AppState` over a fresh temp file DB with migrations applied
+    /// and the given entity ids seeded as full `entities` rows. Returns the
+    /// state plus the `TempDir` guard (drop it last). The state carries an
+    /// HMAC `identity_secret` so the protected/wardline routes are exercised
+    /// with real signature verification.
+    fn wardline_resolve_test_state(
+        secret: &str,
+        seed_ids: &[&str],
+    ) -> (AppState, tempfile::TempDir) {
+        use clarion_storage::ReaderPool;
+        use clarion_storage::schema::apply_migrations;
+
+        let tempdir = tempfile::tempdir().expect("temp project root");
+        let db_path = tempdir.path().join("clarion.db");
+        let mut conn = rusqlite::Connection::open(&db_path).expect("open db");
+        apply_migrations(&mut conn).expect("apply migrations");
+        for id in seed_ids {
+            conn.execute(
+                "INSERT INTO entities ( \
+                    id, plugin_id, kind, name, short_name, properties, \
+                    content_hash, created_at, updated_at \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    id,
+                    "python",
+                    "function",
+                    id,
+                    id.rsplit('.').next().unwrap_or(id),
+                    "{}",
+                    "deadbeef",
+                    "2026-05-31T00:00:00.000Z",
+                    "2026-05-31T00:00:00.000Z",
+                ],
+            )
+            .expect("seed entity row");
+        }
+        drop(conn);
+
+        let readers = ReaderPool::open(&db_path, 4).expect("open reader pool");
+        let instance_id =
+            crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-000000000004")
+                .expect("parse synthetic instance id");
+        let state = AppState {
+            project_root: tempdir.path().to_path_buf(),
+            readers,
+            instance_id,
+            auth_token: None,
+            identity_secret: Some(Arc::new(secret.to_owned())),
+            taint_writer: None,
+        };
+        (state, tempdir)
+    }
+
+    fn hmac_request(
+        secret: &str,
+        method: &str,
+        path_and_query: &str,
+        body: &[u8],
+    ) -> axum::http::Request<axum::body::Body> {
+        let signature = component_hmac_hex(secret.as_bytes(), method, path_and_query, body);
+        axum::http::Request::builder()
+            .method(method)
+            .uri(path_and_query)
+            .header("X-Loom-Component", format!("clarion:{signature}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_vec()))
+            .expect("build request")
+    }
+
+    #[tokio::test]
+    async fn wardline_resolve_returns_exact_matches_and_unresolved() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-resolve-secret";
+        let (state, _tempdir) = wardline_resolve_test_state(secret, &["python:function:a.b.c"]);
+        let body = br#"{"qualnames":["a.b.c","x.y.z"]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/resolve", body);
+
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+        assert_eq!(parsed["resolved"]["a.b.c"], "python:function:a.b.c");
+        assert_eq!(
+            parsed["resolved"]
+                .as_object()
+                .expect("resolved object")
+                .len(),
+            1,
+            "only exact matches appear in resolved: {parsed}"
+        );
+        assert_eq!(parsed["unresolved"], serde_json::json!(["x.y.z"]));
+    }
+
+    #[tokio::test]
+    async fn wardline_resolve_rejects_project_guard_mismatch() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-resolve-secret";
+        let (state, _tempdir) = wardline_resolve_test_state(secret, &[]);
+        // A non-empty `project` that does not match the served project-root
+        // directory name must be rejected with 403 PROJECT_MISMATCH.
+        let body = br#"{"project":"some-other-project","qualnames":["a.b.c"]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/resolve", body);
+
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(parsed["code"], "PROJECT_MISMATCH");
+    }
+
+    /// Build a write-enabled `AppState` over a fresh temp migrated DB with the
+    /// given entity ids seeded, plus a REAL writer-actor. Returns the state, the
+    /// `db_path` (for verification on a fresh connection), the `Writer` handle
+    /// (drop it last so the actor can flush), and the `TempDir` guard. The
+    /// actor runs via `Writer::spawn`'s `spawn_blocking`, so the caller MUST be
+    /// on a tokio runtime (`#[tokio::test]`).
+    fn wardline_write_test_state(
+        secret: &str,
+        seed_ids: &[&str],
+    ) -> (
+        AppState,
+        std::path::PathBuf,
+        clarion_storage::Writer,
+        tempfile::TempDir,
+    ) {
+        use clarion_storage::ReaderPool;
+        use clarion_storage::schema::apply_migrations;
+
+        let tempdir = tempfile::tempdir().expect("temp project root");
+        let db_path = tempdir.path().join("clarion.db");
+        let mut conn = rusqlite::Connection::open(&db_path).expect("open db");
+        apply_migrations(&mut conn).expect("apply migrations");
+        for id in seed_ids {
+            conn.execute(
+                "INSERT INTO entities ( \
+                    id, plugin_id, kind, name, short_name, properties, \
+                    content_hash, created_at, updated_at \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    id,
+                    "python",
+                    "function",
+                    id,
+                    id.rsplit('.').next().unwrap_or(id),
+                    "{}",
+                    "deadbeef",
+                    "2026-05-31T00:00:00.000Z",
+                    "2026-05-31T00:00:00.000Z",
+                ],
+            )
+            .expect("seed entity row");
+        }
+        drop(conn);
+
+        let readers = ReaderPool::open(&db_path, 4).expect("open reader pool");
+        let (writer, _join) = clarion_storage::Writer::spawn(
+            db_path.clone(),
+            clarion_storage::DEFAULT_BATCH_SIZE,
+            clarion_storage::DEFAULT_CHANNEL_CAPACITY,
+        )
+        .expect("spawn taint writer-actor");
+        // The join handle is dropped here: the test reads the DB on a fresh
+        // connection AFTER awaiting per-upsert acks, which confirm durability
+        // (query_time_write auto-commits before the ack fires).
+        let instance_id =
+            crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-000000000005")
+                .expect("parse synthetic instance id");
+        let state = AppState {
+            project_root: tempdir.path().to_path_buf(),
+            readers,
+            instance_id,
+            auth_token: None,
+            identity_secret: Some(Arc::new(secret.to_owned())),
+            taint_writer: Some(writer.sender()),
+        };
+        (state, db_path, writer, tempdir)
+    }
+
+    fn read_taint_blob(db_path: &std::path::Path, entity_id: &str) -> Option<String> {
+        let conn = rusqlite::Connection::open(db_path).expect("open verification conn");
+        conn.query_row(
+            "SELECT wardline_json FROM wardline_taint_facts WHERE entity_id = ?1",
+            rusqlite::params![entity_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_write_disabled_returns_403() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        // `wardline_resolve_test_state` builds a state with `taint_writer: None`.
+        let (state, _tempdir) = wardline_resolve_test_state(secret, &[]);
+        let body = br#"{"facts":[{"qualname":"a.b.c","wardline_json":{"v":1}}]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body);
+
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(parsed["code"], "WRITE_DISABLED");
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_write_persists_resolved_and_reports_unresolved() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let (state, db_path, writer, _tempdir) =
+            wardline_write_test_state(secret, &["python:function:a.b.c"]);
+        // The resolved blob's keys are in NON-alphabetical order
+        // (`b` before `a`, `schema` before `ret`). Under the old
+        // `Value::to_string()` path serde's BTreeMap would re-emit them
+        // alphabetized; `RawValue` preserves the original bytes exactly.
+        let resolved_blob = r#"{"b":2,"a":1,"taint":{"ret":"RAW","schema":"w-1"}}"#;
+        let body = format!(
+            r#"{{"facts":[
+            {{"qualname":"a.b.c","wardline_json":{resolved_blob}}},
+            {{"qualname":"x.y.z","wardline_json":{{"v":2}}}}
+        ]}}"#
+        );
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body.as_bytes());
+
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(parsed["written"], 1);
+        assert_eq!(parsed["unresolved_qualnames"], serde_json::json!(["x.y.z"]));
+
+        // The ack we awaited inside the handler confirms durability; the blob
+        // must round-trip BYTE-EXACT — key order preserved, NOT alphabetized.
+        // This assertion fails under the old `Value::to_string()` path.
+        let stored = read_taint_blob(&db_path, "python:function:a.b.c").expect("fact stored");
+        assert_eq!(
+            stored, resolved_blob,
+            "wardline_json stored byte-verbatim (key order preserved)"
+        );
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_write_replaces_per_entity() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let (state, db_path, writer, _tempdir) =
+            wardline_write_test_state(secret, &["python:function:a.b.c"]);
+
+        let send = |body: &'static [u8]| {
+            let state = state.clone();
+            async move {
+                let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body);
+                let response = router(state).oneshot(request).await.expect("oneshot");
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        };
+        send(br#"{"facts":[{"qualname":"a.b.c","wardline_json":{"v":1}}]}"#).await;
+        send(br#"{"facts":[{"qualname":"a.b.c","wardline_json":{"v":2}}]}"#).await;
+
+        let stored = read_taint_blob(&db_path, "python:function:a.b.c").expect("fact stored");
+        assert_eq!(
+            stored,
+            serde_json::json!({"v":2}).to_string(),
+            "second write overwrites"
+        );
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_write_rejects_project_guard_mismatch() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let (state, _db_path, writer, _tempdir) = wardline_write_test_state(secret, &[]);
+        let body = br#"{"project":"some-other-project","facts":[{"qualname":"a.b.c","wardline_json":{"v":1}}]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body);
+
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(parsed["code"], "PROJECT_MISMATCH");
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_write_rejects_oversize_batch() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let (state, _db_path, writer, _tempdir) = wardline_write_test_state(secret, &[]);
+        let facts: Vec<serde_json::Value> = (0..=WARDLINE_TAINT_BATCH_MAX)
+            .map(
+                |i| serde_json::json!({ "qualname": format!("pkg.mod.f{i}"), "wardline_json": {} }),
+            )
+            .collect();
+        assert!(facts.len() > WARDLINE_TAINT_BATCH_MAX);
+        let body = serde_json::to_vec(&serde_json::json!({ "facts": facts })).expect("json");
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", &body);
+
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(parsed["code"], "BATCH_TOO_LARGE");
+        drop(writer);
+    }
+
+    /// Identity-guard regression lock for the wardline route group. All three
+    /// wardline routes share ONE `require_http_identity_wardline` layer, so the
+    /// mutating POST is a sufficient witness: if a wiring regression dropped the
+    /// `.route_layer(...)`, an absent-header POST would reach the handler and
+    /// return 403/200 — never 401. The trio pins:
+    ///   - valid signature → clears the guard (403 `WRITE_DISABLED` on the
+    ///     write-disabled state is downstream of auth, so it proves the guard
+    ///     passed, independent of the write feature);
+    ///   - wrong signature → 401 `UNAUTHENTICATED`;
+    ///   - absent header → 401 `UNAUTHENTICATED` (the case that catches a dropped
+    ///     `.route_layer`).
+    #[tokio::test]
+    async fn wardline_taint_write_enforces_identity() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let body = br#"{"facts":[{"qualname":"a.b.c","wardline_json":{"v":1}}]}"#;
+
+        // (1) Valid signature clears the guard. Against the write-DISABLED state
+        // (taint_writer: None) the handler then returns 403 WRITE_DISABLED,
+        // which is downstream of auth — so reaching it proves the guard passed.
+        let (state, _td1) = wardline_resolve_test_state(secret, &[]);
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body);
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a valid signature must clear the identity guard (403 is downstream of auth)"
+        );
+
+        // (2) Wrong signature → 401 UNAUTHENTICATED.
+        let (state, _td2) = wardline_resolve_test_state(secret, &[]);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/wardline/taint-facts")
+            .header("X-Loom-Component", "clarion:deadbeefdeadbeef")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_vec()))
+            .expect("build request");
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "a wrong signature must be rejected with 401"
+        );
+        let bytes = to_bytes(response.into_body(), 4096).await.expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(parsed["code"], "UNAUTHENTICATED");
+
+        // (3) Absent X-Loom-Component header → 401. This is the case that
+        // catches a regression dropping the route_layer: with no guard, this
+        // request would reach the handler and 403/200, not 401.
+        let (state, _td3) = wardline_resolve_test_state(secret, &[]);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/wardline/taint-facts")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_vec()))
+            .expect("build request");
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "an absent identity header must 401 — dropping the route_layer fails here"
+        );
+        let bytes = to_bytes(response.into_body(), 4096).await.expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(parsed["code"], "UNAUTHENTICATED");
+    }
+
+    /// Finding 3 (non-atomic batch): pins the invariant that makes partial
+    /// persistence acceptable — a whole-batch re-post is idempotent. Posting a
+    /// MULTI-fact batch twice converges to the same state: stable `written`, no
+    /// row duplication, last-write-wins per entity. (Deterministic mid-batch
+    /// fault injection has no seam in the writer-actor without a test-only hook
+    /// in production code; idempotency is the contract-relevant invariant, and
+    /// is exactly what `contracts.md` instructs clients to rely on after a 5xx.)
+    #[tokio::test]
+    async fn wardline_taint_write_batch_retry_is_idempotent() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let (state, db_path, writer, _tempdir) =
+            wardline_write_test_state(secret, &["python:function:a.b.c", "python:function:d.e.f"]);
+
+        let body = br#"{"facts":[
+            {"qualname":"a.b.c","wardline_json":{"v":1}},
+            {"qualname":"d.e.f","wardline_json":{"v":2}}
+        ]}"#;
+        let post = |body: &'static [u8]| {
+            let state = state.clone();
+            async move {
+                let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body);
+                let response = router(state).oneshot(request).await.expect("oneshot");
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+                    .await
+                    .expect("body");
+                serde_json::from_slice::<serde_json::Value>(&bytes).expect("json")
+            }
+        };
+
+        let first = post(body).await;
+        assert_eq!(first["written"], 2);
+        let second = post(body).await;
+        assert_eq!(
+            second["written"], 2,
+            "a whole-batch re-post writes the same count"
+        );
+
+        // No duplication: exactly one row per entity, last-write-wins.
+        assert_eq!(
+            read_taint_blob(&db_path, "python:function:a.b.c").as_deref(),
+            Some(r#"{"v":1}"#)
+        );
+        assert_eq!(
+            read_taint_blob(&db_path, "python:function:d.e.f").as_deref(),
+            Some(r#"{"v":2}"#)
+        );
+        let count = {
+            let conn = rusqlite::Connection::open(&db_path).expect("verify conn");
+            conn.query_row("SELECT COUNT(*) FROM wardline_taint_facts", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .expect("count")
+        };
+        assert_eq!(count, 2, "re-post must not duplicate rows");
+        drop(writer);
+    }
+
+    /// W.2 writer-actor lifecycle: with `wardline_taint_write: true`, `spawn`
+    /// runs the FULL `run_http_read_server` path — it spawns the optional
+    /// writer-actor inside the HTTP runtime, builds the `AppState` holding the
+    /// only surviving sender clone, then on `shutdown()` drops `serve_future`
+    /// (and that clone) so the actor's channel closes and `taint_writer_join`
+    /// resolves. A drop-ordering regression (leaked sender / retained `Writer`)
+    /// would deadlock `shutdown()` forever — the unit tests that build `AppState`
+    /// by hand cannot catch that; this is the only test that exercises the
+    /// spawn→drop→join sequence end to end.
+    #[test]
+    fn spawn_with_taint_writer_shuts_down_cleanly() {
+        use clarion_mcp::config::HttpReadConfig;
+        use clarion_storage::ReaderPool;
+        use std::net::{SocketAddr, TcpListener};
+
+        let probe = TcpListener::bind(("127.0.0.1", 0)).expect("probe bind");
+        let bind: SocketAddr = probe.local_addr().expect("probe local addr");
+        drop(probe);
+
+        let tempdir = tempfile::tempdir().expect("temp project root");
+        let db_path = tempdir.path().join("clarion.db");
+        // `Writer::spawn` creates the file and `verify_user_version` passes at
+        // version 0; a shutdown-only test sends no commands.
+        let readers = ReaderPool::open(&db_path, 4).expect("open reader pool");
+
+        let config = HttpReadConfig {
+            enabled: true,
+            bind,
+            allow_non_loopback: false,
+            wardline_taint_write: true,
+            ..HttpReadConfig::default()
+        };
+        let instance_id =
+            crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-000000000006")
+                .expect("parse synthetic instance id");
+
+        let server = spawn(
+            tempdir.path().to_path_buf(),
+            db_path.clone(),
+            readers,
+            instance_id,
+            &config,
+        )
+        .expect("spawn HTTP read API")
+        .expect("config.enabled = true implies Some(server)");
+
+        // If the writer sender leaked, this `shutdown()` would block on the
+        // join forever; CI's per-test timeout would surface the hang.
+        server
+            .shutdown()
+            .expect("clean shutdown joins the writer-actor without error");
+    }
+
+    /// The Wardline body-limit relocation is load-bearing: a >16 KiB body must
+    /// be accepted on `/api/wardline/resolve` (4 MiB limit) while the SAME body
+    /// is still 413'd on the 16 KiB `/api/v1/files/batch` route. A small body
+    /// passes everywhere and would not catch a broken relocation.
+    #[tokio::test]
+    async fn wardline_resolve_accepts_large_body_but_files_batch_rejects_it() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-resolve-secret";
+
+        // Build a >16 KiB JSON body of qualnames (well under the 2000 batch
+        // cap and under 4 MiB). Each entry is ~30 bytes; 2000 of them clears
+        // 16 KiB comfortably.
+        let qualnames: Vec<String> = (0..2000).map(|i| format!("pkg.mod.func_{i:05}")).collect();
+        let wardline_body =
+            serde_json::to_vec(&serde_json::json!({ "qualnames": qualnames })).expect("json");
+        assert!(
+            wardline_body.len() > HTTP_BODY_LIMIT_BYTES,
+            "test body must exceed the 16 KiB limit to be discriminating: {}",
+            wardline_body.len()
+        );
+
+        let (state, _tempdir) = wardline_resolve_test_state(secret, &[]);
+        let request = hmac_request(secret, "POST", "/api/wardline/resolve", &wardline_body);
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "wardline route must accept a >16 KiB body under its 4 MiB limit"
+        );
+
+        // Same-sized body shaped for the files/batch route — must be rejected
+        // by the 16 KiB limit (413 from the framework's RequestBodyLimitLayer).
+        let batch_body = serde_json::to_vec(&serde_json::json!({ "queries": [] })).expect("json");
+        // Pad with a large dummy so the body exceeds 16 KiB but is otherwise
+        // a structurally-irrelevant oversize; the limit fires before parsing.
+        let mut oversize = batch_body;
+        oversize.resize(HTTP_BODY_LIMIT_BYTES + 1024, b' ');
+        let (state2, _tempdir2) = wardline_resolve_test_state(secret, &[]);
+        let request2 = hmac_request(secret, "POST", "/api/v1/files/batch", &oversize);
+        let response2 = router(state2).oneshot(request2).await.expect("oneshot");
+        // In HMAC mode the v1 route has TWO oversize-body rejecters: the
+        // `RequestBodyLimitLayer(16 KiB)` on the v1 group (→ 413) and the HMAC
+        // middleware's own `to_bytes(_, HTTP_BODY_LIMIT_BYTES)` (→ 500). The
+        // HMAC read fires first, so this half only proves the SAME body the
+        // wardline route accepted is NOT accepted here — it does NOT prove the
+        // v1 `RequestBodyLimitLayer` is wired. The no-auth assertion below
+        // closes that gap.
+        assert_ne!(
+            response2.status(),
+            StatusCode::OK,
+            "files/batch route must reject a >16 KiB body that the wardline route accepts"
+        );
+        assert!(
+            response2.status().is_client_error() || response2.status().is_server_error(),
+            "files/batch >16 KiB body must be an error status, got {}",
+            response2.status()
+        );
+
+        // Regression guard for the v1 `RequestBodyLimitLayer` itself. With NO
+        // identity configured (loopback trust), the auth middleware is a plain
+        // passthrough and never reads the body, so the ONLY thing that can cap
+        // an oversize v1 body is the group's `RequestBodyLimitLayer(16 KiB)`.
+        // If that layer were removed in a future refactor, this assertion would
+        // flip from 413 to 200 (oversize read silently let through) — which the
+        // HMAC-mode half above cannot detect.
+        let (mut state3, _tempdir3) = wardline_resolve_test_state(secret, &[]);
+        state3.identity_secret = None;
+        state3.auth_token = None;
+        let request3 = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/files/batch")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_LENGTH, oversize.len().to_string())
+            .body(axum::body::Body::from(oversize.clone()))
+            .expect("build request");
+        let response3 = router(state3).oneshot(request3).await.expect("oneshot");
+        assert_eq!(
+            response3.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "v1 RequestBodyLimitLayer must 413 a >16 KiB body on the no-auth path"
         );
     }
 
@@ -1705,9 +2884,15 @@ mod tests {
         // Defensive: clear any stale trigger from a prior test.
         HTTP_THREAD_PANIC_TRIGGER.store(false, std::sync::atomic::Ordering::SeqCst);
 
-        let mut server = spawn(tempdir.path().to_path_buf(), readers, instance_id, &config)
-            .expect("spawn HTTP read API")
-            .expect("config.enabled = true implies Some(server)");
+        let mut server = spawn(
+            tempdir.path().to_path_buf(),
+            db_path.clone(),
+            readers,
+            instance_id,
+            &config,
+        )
+        .expect("spawn HTTP read API")
+        .expect("config.enabled = true implies Some(server)");
 
         // Trip the panic. The watcher polls every 5 ms.
         HTTP_THREAD_PANIC_TRIGGER.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1731,6 +2916,492 @@ mod tests {
         assert!(
             message.contains("HTTP read server thread panicked"),
             "supervisor must report the thread panic; got: {message}"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // W.3 taint-fact READ endpoints (GET + :batch-get).
+    // ----------------------------------------------------------------------
+
+    /// A seeded function entity for a read test: its qualname, the absolute
+    /// path of its containing file (written with `bytes`), and the stored taint
+    /// blob (verbatim). `line_start`/`line_end` bound a span inside the file so
+    /// the span-vs-whole-file distinction is observable.
+    struct SeedFn {
+        qualname: &'static str,
+        bytes: &'static [u8],
+        /// `Some(json)` stores a taint fact; `None` seeds the entity ONLY (the
+        /// resolved-entity-but-no-stored-fact case the read path must report
+        /// as `exists: false`).
+        blob: Option<&'static str>,
+    }
+
+    /// Build a reads-only `AppState` (`taint_writer: None`) over a fresh temp
+    /// migrated DB. Each `SeedFn` gets a real file written under the project
+    /// root and an `entities` row whose `source_file_path` is that file's
+    /// ABSOLUTE path; a `wardline_taint_facts` row carrying its blob verbatim
+    /// is stored only when `blob` is `Some`. Returns the state and the
+    /// `TempDir` guard (drop it last).
+    fn wardline_read_test_state(secret: &str, seeds: &[SeedFn]) -> (AppState, tempfile::TempDir) {
+        use clarion_storage::ReaderPool;
+        use clarion_storage::schema::apply_migrations;
+
+        let tempdir = tempfile::tempdir().expect("temp project root");
+        let db_path = tempdir.path().join("clarion.db");
+        let mut conn = rusqlite::Connection::open(&db_path).expect("open db");
+        apply_migrations(&mut conn).expect("apply migrations");
+
+        for (i, seed) in seeds.iter().enumerate() {
+            let file = tempdir.path().join(format!("seed_{i}.py"));
+            std::fs::write(&file, seed.bytes).expect("write seed file");
+            let abs = file.to_str().expect("utf8 path").to_owned();
+            let id = format!("python:function:{}", seed.qualname);
+            conn.execute(
+                "INSERT INTO entities ( \
+                    id, plugin_id, kind, name, short_name, properties, \
+                    content_hash, source_file_path, created_at, updated_at \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    id,
+                    "python",
+                    "function",
+                    id,
+                    seed.qualname.rsplit('.').next().unwrap_or(seed.qualname),
+                    "{}",
+                    // A deliberately-wrong stored hash: the read path must NOT
+                    // use it (it derives the live whole-file hash instead).
+                    "stored-span-hash-not-used",
+                    abs,
+                    "2026-05-31T00:00:00.000Z",
+                    "2026-05-31T00:00:00.000Z",
+                ],
+            )
+            .expect("seed entity row");
+            if let Some(blob) = seed.blob {
+                conn.execute(
+                    "INSERT INTO wardline_taint_facts \
+                        (entity_id, wardline_json, scan_id, content_hash_at_compute, updated_at) \
+                     VALUES (?1, ?2, NULL, NULL, ?3)",
+                    rusqlite::params![id, blob, "2026-05-31T00:00:00.000Z"],
+                )
+                .expect("seed taint fact");
+            }
+        }
+        // Two seeds may share one file for the dedup test; insert that case
+        // explicitly via a shared-file seed below if needed (handled in-test).
+        drop(conn);
+
+        let readers = ReaderPool::open(&db_path, 4).expect("open reader pool");
+        let instance_id =
+            crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-000000000007")
+                .expect("parse synthetic instance id");
+        let state = AppState {
+            project_root: tempdir.path().to_path_buf(),
+            readers,
+            instance_id,
+            auth_token: None,
+            identity_secret: Some(Arc::new(secret.to_owned())),
+            taint_writer: None,
+        };
+        (state, tempdir)
+    }
+
+    /// blake3 (hex) of whole file bytes — the contract's `current_content_hash`.
+    fn whole_file_blake3(bytes: &[u8]) -> String {
+        blake3::hash(bytes).to_hex().to_string()
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_get_returns_fact_with_live_whole_file_hash() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-read-secret";
+        // Key order b,a is deliberate — RawValue must return it verbatim.
+        let blob = r#"{"schema_version":"wardline-taint-1","taint":{"b":2,"a":1}}"#;
+        let bytes = b"def f():\n    return 1\n";
+        let (state, _tempdir) = wardline_read_test_state(
+            secret,
+            &[SeedFn {
+                qualname: "a.b.c",
+                bytes,
+                blob: Some(blob),
+            }],
+        );
+
+        let request = hmac_request(
+            secret,
+            "GET",
+            "/api/wardline/taint-facts?qualname=a.b.c",
+            b"",
+        );
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("json");
+
+        assert_eq!(parsed["qualname"], "a.b.c");
+        assert_eq!(parsed["exists"], true);
+        assert_eq!(
+            parsed["current_content_hash"],
+            whole_file_blake3(bytes),
+            "current_content_hash must be the LIVE whole-file blake3"
+        );
+        // Byte-faithful: the serialized wardline_json sub-object must preserve
+        // the original {"b":2,"a":1} key order, not normalize it.
+        assert!(
+            text.contains(
+                r#""wardline_json":{"schema_version":"wardline-taint-1","taint":{"b":2,"a":1}}"#
+            ),
+            "wardline_json must be byte-faithful (key order preserved): {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_get_unknown_qualname_reports_not_exists() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-read-secret";
+        let (state, _tempdir) = wardline_read_test_state(secret, &[]);
+        let request = hmac_request(
+            secret,
+            "GET",
+            "/api/wardline/taint-facts?qualname=does.not.exist",
+            b"",
+        );
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(parsed["qualname"], "does.not.exist");
+        assert_eq!(parsed["exists"], false);
+        assert!(
+            parsed.get("wardline_json").is_none(),
+            "absent fact must omit wardline_json"
+        );
+        assert!(parsed.get("current_content_hash").is_none());
+    }
+
+    /// Finding 2 (corrupt stored blob): an `exists: true` row whose stored
+    /// `wardline_json` does not re-parse is a STORAGE-integrity failure, not a
+    /// malformed client request. The validated write path (`RawValue` round-trip)
+    /// cannot produce this — only storage corruption or an out-of-band write
+    /// can — so the test injects it directly via the seed builder's verbatim
+    /// blob. The read must return 500 `STORAGE_ERROR` (Clarion's fault, and 5xx
+    /// so `json_read_error` logs it), NOT 400 `INVALID_PATH` (which would blame
+    /// the federation client's request for Clarion's storage damage).
+    #[tokio::test]
+    async fn wardline_taint_get_corrupt_blob_is_500_storage_error_not_400() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-read-secret";
+        let (state, _tempdir) = wardline_read_test_state(
+            secret,
+            &[SeedFn {
+                qualname: "corrupt.fn",
+                bytes: b"def f():\n    return 1\n",
+                blob: Some("{not valid json"),
+            }],
+        );
+        let request = hmac_request(
+            secret,
+            "GET",
+            "/api/wardline/taint-facts?qualname=corrupt.fn",
+            b"",
+        );
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a corrupt stored blob is Clarion's fault → 500, never a client 400"
+        );
+        let bytes = to_bytes(response.into_body(), 4096).await.expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            parsed["code"], "STORAGE_ERROR",
+            "corruption must classify as STORAGE_ERROR, not INVALID_PATH"
+        );
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_get_whole_file_hash_not_span_hash() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-read-secret";
+        // Multi-line file with trailing newline; the function "body" is a
+        // strict sub-range so the span hash differs on BOTH axes (span scope +
+        // LF normalization). The regression guard for the W.3 bug.
+        let bytes = b"line0\nline1\nline2\nline3\n";
+        let (state, _tempdir) = wardline_read_test_state(
+            secret,
+            &[SeedFn {
+                qualname: "m.span.fn",
+                bytes,
+                blob: Some(r#"{"v":1}"#),
+            }],
+        );
+        let request = hmac_request(
+            secret,
+            "GET",
+            "/api/wardline/taint-facts?qualname=m.span.fn",
+            b"",
+        );
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
+
+        let whole = whole_file_blake3(bytes);
+        // Span-hash formula (analyze.rs::content_hash_for_entity).
+        let text = std::str::from_utf8(bytes).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let span = lines[1..3].join("\n");
+        let span_hash = blake3::hash(span.as_bytes()).to_hex().to_string();
+
+        assert_eq!(parsed["current_content_hash"], whole);
+        assert_ne!(
+            parsed["current_content_hash"].as_str().unwrap(),
+            span_hash,
+            "must be whole-file hash, NOT the span/LF-normalized hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_batch_get_mixed_present_and_absent() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-read-secret";
+        let bytes = b"def g():\n    pass\n";
+        let (state, _tempdir) = wardline_read_test_state(
+            secret,
+            &[SeedFn {
+                qualname: "pkg.present",
+                bytes,
+                blob: Some(r#"{"present":true}"#),
+            }],
+        );
+        let body = br#"{"qualnames":["pkg.present","pkg.absent"]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts:batch-get", body);
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes_out = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes_out).expect("json");
+        let arr = parsed.as_array().expect("array");
+        assert_eq!(arr.len(), 2, "one view per input qualname, in order");
+        assert_eq!(arr[0]["qualname"], "pkg.present");
+        assert_eq!(arr[0]["exists"], true);
+        assert_eq!(arr[0]["current_content_hash"], whole_file_blake3(bytes));
+        assert_eq!(arr[1]["qualname"], "pkg.absent");
+        assert_eq!(arr[1]["exists"], false);
+        assert!(arr[1].get("wardline_json").is_none());
+    }
+
+    /// The qualname RESOLVES to a real entity, but that entity has no stored
+    /// taint fact (`blob: None`). This is a distinct path from an unresolved
+    /// qualname: both converge on the `exists: false` view, but only this one
+    /// exercises `get_taint_facts` returning fewer rows than resolved ids
+    /// (present-rows-only). Without this test the changed consumer arm is
+    /// covered for "unresolved" but not for "resolved-but-no-fact".
+    #[tokio::test]
+    async fn wardline_taint_get_resolved_entity_without_fact_reports_not_exists() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-read-secret";
+        let (state, _tempdir) = wardline_read_test_state(
+            secret,
+            &[SeedFn {
+                qualname: "pkg.no_fact",
+                bytes: b"def f():\n    pass\n",
+                blob: None,
+            }],
+        );
+        let body = br#"{"qualnames":["pkg.no_fact"]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts:batch-get", body);
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes_out = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes_out).expect("json");
+        let arr = parsed.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["qualname"], "pkg.no_fact");
+        assert_eq!(
+            arr[0]["exists"], false,
+            "resolved entity with no stored fact must report exists: false"
+        );
+        assert!(arr[0].get("wardline_json").is_none());
+        // A resolved-but-no-fact view carries no freshness signal either.
+        assert_eq!(arr[0]["current_content_hash"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_batch_get_shared_file_yields_same_hash() {
+        use clarion_storage::ReaderPool;
+        use clarion_storage::schema::apply_migrations;
+        use tower::ServiceExt;
+
+        let secret = "wardline-read-secret";
+        // Build state by hand so two entities share ONE file (exercises the
+        // per-request file-hash dedup; both must report the same hash).
+        let tempdir = tempfile::tempdir().expect("temp project root");
+        let db_path = tempdir.path().join("clarion.db");
+        let mut conn = rusqlite::Connection::open(&db_path).expect("open db");
+        apply_migrations(&mut conn).expect("migrations");
+        let shared = tempdir.path().join("shared.py");
+        let bytes: &[u8] = b"def a():\n    pass\n\ndef b():\n    pass\n";
+        std::fs::write(&shared, bytes).expect("write shared file");
+        let abs = shared.to_str().unwrap().to_owned();
+        for q in ["mod.a", "mod.b"] {
+            let id = format!("python:function:{q}");
+            conn.execute(
+                "INSERT INTO entities ( \
+                    id, plugin_id, kind, name, short_name, properties, \
+                    content_hash, source_file_path, created_at, updated_at \
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                rusqlite::params![
+                    id,
+                    "python",
+                    "function",
+                    id,
+                    q,
+                    "{}",
+                    "x",
+                    abs,
+                    "2026-05-31T00:00:00.000Z",
+                    "2026-05-31T00:00:00.000Z",
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO wardline_taint_facts \
+                    (entity_id, wardline_json, scan_id, content_hash_at_compute, updated_at) \
+                 VALUES (?1, ?2, NULL, NULL, ?3)",
+                rusqlite::params![id, r#"{"v":1}"#, "2026-05-31T00:00:00.000Z"],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let readers = ReaderPool::open(&db_path, 4).expect("reader pool");
+        let instance_id =
+            crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-000000000008")
+                .expect("instance id");
+        let state = AppState {
+            project_root: tempdir.path().to_path_buf(),
+            readers,
+            instance_id,
+            auth_token: None,
+            identity_secret: Some(Arc::new(secret.to_owned())),
+            taint_writer: None,
+        };
+
+        let body = br#"{"qualnames":["mod.a","mod.b"]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts:batch-get", body);
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let out = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&out).expect("json");
+        let arr = parsed.as_array().expect("array");
+        assert_eq!(arr.len(), 2);
+        let expected = whole_file_blake3(bytes);
+        assert_eq!(arr[0]["current_content_hash"], expected);
+        assert_eq!(
+            arr[0]["current_content_hash"], arr[1]["current_content_hash"],
+            "two functions in the same file must share one whole-file hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_batch_get_rejects_oversize_batch() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-read-secret";
+        let (state, _tempdir) = wardline_read_test_state(secret, &[]);
+        let qualnames: Vec<String> = (0..=WARDLINE_TAINT_BATCH_MAX)
+            .map(|i| format!("pkg.mod.f{i}"))
+            .collect();
+        assert!(qualnames.len() > WARDLINE_TAINT_BATCH_MAX);
+        let body =
+            serde_json::to_vec(&serde_json::json!({ "qualnames": qualnames })).expect("json");
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts:batch-get", &body);
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(response.into_body(), 4096).await.expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(parsed["code"], "BATCH_TOO_LARGE");
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_read_served_with_writer_disabled() {
+        use tower::ServiceExt;
+
+        // `wardline_read_test_state` builds `taint_writer: None`. The READ
+        // endpoint must still serve (only the WRITE endpoint is gated on it).
+        let secret = "wardline-read-secret";
+        let bytes = b"def h():\n    pass\n";
+        let (state, _tempdir) = wardline_read_test_state(
+            secret,
+            &[SeedFn {
+                qualname: "x.y.z",
+                bytes,
+                blob: Some(r#"{"ok":true}"#),
+            }],
+        );
+        assert!(state.taint_writer.is_none(), "write API is disabled");
+        let request = hmac_request(
+            secret,
+            "GET",
+            "/api/wardline/taint-facts?qualname=x.y.z",
+            b"",
+        );
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "reads must succeed even when the write API is disabled"
+        );
+        let body = to_bytes(response.into_body(), 4096).await.expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(parsed["exists"], true);
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_get_deleted_file_yields_none_hash_not_500() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-read-secret";
+        let bytes = b"def gone():\n    pass\n";
+        let (state, tempdir) = wardline_read_test_state(
+            secret,
+            &[SeedFn {
+                qualname: "gone.fn",
+                bytes,
+                blob: Some(r#"{"v":1}"#),
+            }],
+        );
+        // Delete the containing file: a stale signal → current_content_hash
+        // None, fact still reported (exists:true), and NOT a 500.
+        std::fs::remove_file(tempdir.path().join("seed_0.py")).expect("remove file");
+        let request = hmac_request(
+            secret,
+            "GET",
+            "/api/wardline/taint-facts?qualname=gone.fn",
+            b"",
+        );
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(parsed["exists"], true);
+        assert!(
+            parsed.get("current_content_hash").is_none(),
+            "deleted file → current_content_hash omitted (None), got: {parsed}"
         );
     }
 }

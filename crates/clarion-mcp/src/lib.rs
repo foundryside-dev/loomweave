@@ -7,6 +7,7 @@ pub mod filigree_url;
 mod index_diff;
 pub mod scan_results;
 pub mod snapshot;
+pub mod wardline_reconcile;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -15,7 +16,8 @@ use std::sync::{Arc, Mutex};
 use clarion_core::{
     EdgeConfidence, INFERRED_CALLS_PROMPT_VERSION, InferredCallsPromptInput,
     LEAF_SUMMARY_PROMPT_TEMPLATE_ID, LeafSummaryPromptInput, LlmProvider, LlmProviderError,
-    LlmPurpose, LlmRequest, LlmResponse, build_inferred_calls_prompt, build_leaf_summary_prompt,
+    LlmPurpose, LlmRequest, LlmResponse, McpErrorCode, build_inferred_calls_prompt,
+    build_leaf_summary_prompt,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -154,7 +156,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "issues_for",
-            description: "Return Filigree issues attached to this Clarion entity, optionally including issues attached to contained entities. Filigree is an enrichment source; if unavailable, the tool returns an unavailable envelope instead of failing Clarion. The result carries a result_kind (matched | no_matches | unavailable) so a reachable-but-empty Filigree is distinct from an unreachable one, and a filigree_endpoint block (configured vs resolved URL + resolution_source) so you can see which endpoint — e.g. a live ethereal port — the answer came from. Each matched/drifted entry carries an `issue` object with the issue's title, status, and priority (fetched once per distinct issue, no N+1); `issue` is null when the issue-detail route is unavailable, so the match still resolves without a second hop into Filigree.",
+            description: "Return Filigree issues attached to this Clarion entity, optionally including issues attached to contained entities. Filigree is an enrichment source; if unavailable, the tool returns an unavailable envelope instead of failing Clarion. The result carries a result_kind (matched | no_matches | unavailable) so a reachable-but-empty Filigree is distinct from an unreachable one, and a filigree_endpoint block (configured vs resolved URL + resolution_source) so you can see which endpoint — e.g. a live ethereal port — the answer came from. Each matched/drifted entry carries an `issue` object with the issue's title, status, and priority (fetched once per distinct issue, no N+1); `issue` is null when the issue-detail route is unavailable, so the match still resolves without a second hop into Filigree. Includes a `wardline_findings` section (enrich-only) reconciling Wardline findings to the entity by qualname; `result_kind` is matched|no_matches|unavailable.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -225,7 +227,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "orientation_pack",
-            description: "Assemble one deterministic orientation packet for a code location — the replacement for hand-composing find_entity + entity_at + source reads + neighborhood + issues_for + freshness on every question. Resolve EITHER by `entity` id OR by `file`+`line` (exactly one form). The packet bundles: the primary entity, the entity_context evidence (match_reason / containing stack / decl-body-decorator ranges — so a decorator-line query is explained, not guessed), a compact source-span summary, one-hop neighbors (callers, callees, container, contained, references, imports — for a module, references_in/out are rolled up over contained symbols with references_rolled_up=true), compact resolved execution paths, related Filigree issues, index/Filigree/LLM health, warnings, and suggested next reads. No LLM summary is invoked. Every list is bounded; an `omitted` block reports per-section truncation counts and `degraded` sections name surfaces that were unavailable (e.g. Filigree down) so an empty section is never read as a guaranteed negative.",
+            description: "Assemble one deterministic orientation packet for a code location — the replacement for hand-composing find_entity + entity_at + source reads + neighborhood + issues_for + freshness on every question. Resolve EITHER by `entity` id OR by `file`+`line` (exactly one form). The packet bundles: the primary entity, the entity_context evidence (match_reason / containing stack / decl-body-decorator ranges — so a decorator-line query is explained, not guessed), a compact source-span summary, one-hop neighbors (callers, callees, container, contained, references, imports — for a module, references_in/out are rolled up over contained symbols with references_rolled_up=true), compact resolved execution paths, related Filigree issues, index/Filigree/LLM health, warnings, and suggested next reads. No LLM summary is invoked. Every list is bounded; an `omitted` block reports per-section truncation counts and `degraded` sections name surfaces that were unavailable (e.g. Filigree down) so an empty section is never read as a guaranteed negative. Includes a `wardline_findings` section (enrich-only) reconciling Wardline findings to the entity by qualname; `result_kind` is matched|no_matches|unavailable.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -655,7 +657,11 @@ impl ServerState {
         let normalized = match normalize_source_path(&self.project_root, &file) {
             Ok(path) => path,
             Err(err) => {
-                return Ok(tool_error_envelope("invalid-path", &err.to_string(), false));
+                return Ok(tool_error_envelope(
+                    McpErrorCode::InvalidPath,
+                    &err.to_string(),
+                    false,
+                ));
             }
         };
         let project_root = self.project_root.clone();
@@ -757,7 +763,7 @@ impl ServerState {
             .with_reader(move |conn| {
                 if entity_by_id(conn, &entity_id)?.is_none() {
                     return Ok(tool_error_envelope(
-                        "entity-not-found",
+                        McpErrorCode::EntityNotFound,
                         &format!("entity {entity_id} was not found"),
                         false,
                     ));
@@ -797,7 +803,7 @@ impl ServerState {
             .with_reader(move |conn| {
                 if entity_by_id(conn, &entity_id)?.is_none() {
                     return Ok(tool_error_envelope(
-                        "entity-not-found",
+                        McpErrorCode::EntityNotFound,
                         &format!("entity {entity_id} was not found"),
                         false,
                     ));
@@ -835,14 +841,14 @@ impl ServerState {
             Ok(true) => {}
             Ok(false) => {
                 return tool_error_envelope(
-                    "entity-not-found",
+                    McpErrorCode::EntityNotFound,
                     &format!("entity {entity_id} was not found"),
                     false,
                 );
             }
             Err(err) => {
                 return tool_error_envelope(
-                    "storage-error",
+                    McpErrorCode::StorageError,
                     &err.to_string(),
                     storage_retryable(&err),
                 );
@@ -878,7 +884,7 @@ impl ServerState {
                 Ok(edges) => edges,
                 Err(err) => {
                     return tool_error_envelope(
-                        "storage-error",
+                        McpErrorCode::StorageError,
                         &err.to_string(),
                         storage_retryable(&err),
                     );
@@ -917,9 +923,11 @@ impl ServerState {
                 path_truncation_reason(truncated, compact.path_cap_truncated),
                 stats.to_json(),
             ),
-            Err(err) => {
-                tool_error_envelope("storage-error", &err.to_string(), storage_retryable(&err))
-            }
+            Err(err) => tool_error_envelope(
+                McpErrorCode::StorageError,
+                &err.to_string(),
+                storage_retryable(&err),
+            ),
         }
     }
 
@@ -942,7 +950,7 @@ impl ServerState {
             .with_reader(move |conn| {
                 let Some(entity) = entity_by_id(conn, &entity_id)? else {
                     return Ok(tool_error_envelope(
-                        "entity-not-found",
+                        McpErrorCode::EntityNotFound,
                         &format!("entity {entity_id} was not found"),
                         false,
                     ));
@@ -1004,6 +1012,7 @@ impl ServerState {
         Ok(flatten_storage_envelope_result(result))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn tool_issues_for(
         &self,
         arguments: &serde_json::Map<String, Value>,
@@ -1023,6 +1032,9 @@ impl ServerState {
                 "Filigree integration is disabled",
             ));
         };
+        // Capture the requested entity ID before it is moved into the storage
+        // query for the wardline section lookup below.
+        let requested_id = entity_id.clone();
         let read = match self
             .read_issues_for_entities(entity_id, include_contained)
             .await
@@ -1037,7 +1049,7 @@ impl ServerState {
             }
             Err(err) => {
                 return Ok(tool_error_envelope(
-                    "storage-error",
+                    McpErrorCode::StorageError,
                     &err.to_string(),
                     storage_retryable(&err),
                 ));
@@ -1117,12 +1129,27 @@ impl ServerState {
             }
         }
         accumulator.apply_issue_details(&details);
-        Ok(accumulator.into_envelope(
+        let mut envelope = accumulator.into_envelope(
             read.entity_cap_truncated,
             requests_total,
             detail_requests_total,
             &endpoint,
-        ))
+        );
+        // Flow B: attach Wardline findings reconciled to the requested entity.
+        if let Some(entity) = read.entities.iter().find(|e| e.id == requested_id) {
+            let client = client.clone();
+            let entity_id = entity.id.clone();
+            let path = entity.source_file_path.clone();
+            let section = tokio::task::spawn_blocking(move || {
+                wardline_section_for_entity(&client, &entity_id, path.as_deref())
+            })
+            .await
+            .unwrap_or_else(|err| wardline_unavailable(&format!("wardline task failed: {err}")));
+            if let Some(result) = envelope.get_mut("result").and_then(Value::as_object_mut) {
+                result.insert("wardline_findings".to_owned(), section);
+            }
+        }
+        Ok(envelope)
     }
 
     async fn tool_subsystem_members(
@@ -1135,14 +1162,14 @@ impl ServerState {
             .with_reader(move |conn| {
                 let Some(subsystem) = entity_by_id(conn, &subsystem_id)? else {
                     return Ok(tool_error_envelope(
-                        "entity-not-found",
+                        McpErrorCode::EntityNotFound,
                         &format!("entity {subsystem_id} was not found"),
                         false,
                     ));
                 };
                 if subsystem.kind != "subsystem" {
                     return Ok(tool_error_envelope(
-                        "not-a-subsystem",
+                        McpErrorCode::NotASubsystem,
                         &format!("entity {} is kind {}", subsystem.id, subsystem.kind),
                         false,
                     ));
@@ -1181,7 +1208,7 @@ impl ServerState {
             .with_reader(move |conn| {
                 let Some(entity) = entity_by_id(conn, &entity_id)? else {
                     return Ok(tool_error_envelope(
-                        "entity-not-found",
+                        McpErrorCode::EntityNotFound,
                         &format!("entity {entity_id} was not found"),
                         false,
                     ));
@@ -1251,12 +1278,12 @@ impl ServerState {
         match result {
             Ok(Some(value)) => Ok(success_envelope(value)),
             Ok(None) => Ok(tool_error_envelope(
-                "not-found",
+                McpErrorCode::NotFound,
                 "no entity with the given id",
                 false,
             )),
             Err(err) => Ok(tool_error_envelope(
-                "storage-error",
+                McpErrorCode::StorageError,
                 &err.to_string(),
                 storage_retryable(&err),
             )),
@@ -1290,7 +1317,11 @@ impl ServerState {
                 match normalize_source_path(&self.project_root, file) {
                     Ok(path) => (Some(line), Some(path), None),
                     Err(err) => {
-                        return Ok(tool_error_envelope("invalid-path", &err.to_string(), false));
+                        return Ok(tool_error_envelope(
+                            McpErrorCode::InvalidPath,
+                            &err.to_string(),
+                            false,
+                        ));
                     }
                 }
             }
@@ -1495,7 +1526,7 @@ impl ServerState {
             Ok(core) => core,
             Err(err) => {
                 return Ok(tool_error_envelope(
-                    "storage-error",
+                    McpErrorCode::StorageError,
                     &err.to_string(),
                     storage_retryable(&err),
                 ));
@@ -1506,7 +1537,7 @@ impl ServerState {
         // file/line lookup that spans nothing degrades to a no_match packet.
         if core.primary_id.is_none() && core.lookup_was_id {
             return Ok(tool_error_envelope(
-                "entity-not-found",
+                McpErrorCode::EntityNotFound,
                 "no entity with the given id",
                 false,
             ));
@@ -1515,16 +1546,34 @@ impl ServerState {
         // Related Filigree issues — reuse `issues_for` so its disabled /
         // unreachable degradation paths are shared. Bounded to the primary
         // entity (no contained fan-out) to keep the packet small.
-        let issues = if let Some(primary_id) = &core.primary_id {
+        let (issues, wardline_findings) = if let Some(primary_id) = &core.primary_id {
             let mut issue_args = serde_json::Map::new();
             issue_args.insert("id".to_owned(), json!(primary_id));
             issue_args.insert("include_contained".to_owned(), json!(false));
             match self.tool_issues_for(&issue_args).await {
-                Ok(envelope) => envelope.get("result").cloned().unwrap_or(Value::Null),
-                Err(_) => json!({"available": false, "reason": "issues lookup failed"}),
+                Ok(mut envelope) => {
+                    // Flow B: lift the wardline_findings section out of the nested
+                    // issues result so the pack surfaces it as a top-level section
+                    // (issues_for nests it under `result`). Reuses the reconciliation
+                    // issues_for already did for this same primary entity — no second
+                    // Filigree fetch.
+                    let wardline = envelope
+                        .get_mut("result")
+                        .and_then(Value::as_object_mut)
+                        .and_then(|result| result.remove("wardline_findings"));
+                    let issues = envelope.get("result").cloned().unwrap_or(Value::Null);
+                    (issues, wardline)
+                }
+                Err(_) => (
+                    json!({"available": false, "reason": "issues lookup failed"}),
+                    None,
+                ),
             }
         } else {
-            json!({"available": false, "reason": "no primary entity at this location"})
+            (
+                json!({"available": false, "reason": "no primary entity at this location"}),
+                None,
+            )
         };
 
         let health = json!({
@@ -1598,6 +1647,9 @@ impl ServerState {
             .as_object_mut()
             .expect("orientation packet is an object");
         object.insert("issues".to_owned(), issues);
+        if let Some(wardline) = wardline_findings {
+            object.insert("wardline_findings".to_owned(), wardline);
+        }
         object.insert("health".to_owned(), health);
         object.insert("warnings".to_owned(), json!(warnings));
         object.insert("suggested_next_reads".to_owned(), json!(suggested));
@@ -1622,7 +1674,7 @@ impl ServerState {
                 Ok(path) => path,
                 Err(err) => {
                     return Ok(tool_error_envelope(
-                        "spawn-failed",
+                        McpErrorCode::SpawnFailed,
                         &format!("cannot resolve the clarion executable to launch analyze: {err}"),
                         false,
                     ));
@@ -1634,7 +1686,7 @@ impl ServerState {
         let runs_dir = self.project_root.join(".clarion").join("runs");
         if let Err(err) = std::fs::create_dir_all(&runs_dir) {
             return Ok(tool_error_envelope(
-                "io-error",
+                McpErrorCode::IoError,
                 &format!("create runs directory {}: {err}", runs_dir.display()),
                 false,
             ));
@@ -1659,7 +1711,7 @@ impl ServerState {
             .any(|handle| !handle.cancelled && matches!(handle.child.try_wait(), Ok(None)));
         if already_active {
             return Ok(tool_error_envelope(
-                "analyze-already-running",
+                McpErrorCode::AnalyzeAlreadyRunning,
                 "an analyze run is already active for this project; cancel it or wait for it to finish",
                 true,
             ));
@@ -1675,7 +1727,7 @@ impl ServerState {
             Ok(handle) => handle,
             Err(err) => {
                 return Ok(tool_error_envelope(
-                    "spawn-failed",
+                    McpErrorCode::SpawnFailed,
                     &format!("failed to spawn `clarion analyze`: {err}"),
                     false,
                 ));
@@ -1767,12 +1819,12 @@ impl ServerState {
                         Ok(self.terminal_status_envelope(&run_id, false, None, &now, row))
                     }
                     Ok(None) => Ok(tool_error_envelope(
-                        "run-not-found",
+                        McpErrorCode::RunNotFound,
                         &format!("no analyze run with id {run_id}"),
                         false,
                     )),
                     Err(err) => Ok(tool_error_envelope(
-                        "storage-error",
+                        McpErrorCode::StorageError,
                         &err.to_string(),
                         storage_retryable(err),
                     )),
@@ -1829,12 +1881,12 @@ impl ServerState {
                         Ok(self.terminal_status_envelope(&run_id, false, None, &now, row))
                     }
                     Ok(None) => Ok(tool_error_envelope(
-                        "run-not-found",
+                        McpErrorCode::RunNotFound,
                         &format!("no analyze run with id {run_id}"),
                         false,
                     )),
                     Err(err) => Ok(tool_error_envelope(
-                        "storage-error",
+                        McpErrorCode::StorageError,
                         &err.to_string(),
                         storage_retryable(err),
                     )),
@@ -1880,7 +1932,7 @@ impl ServerState {
             Ok(None) => (None, "{}".to_owned()),
             Err(err) => {
                 return tool_error_envelope(
-                    "storage-error",
+                    McpErrorCode::StorageError,
                     &err.to_string(),
                     storage_retryable(&err),
                 );
@@ -1930,14 +1982,14 @@ impl ServerState {
             Ok(Some(entity)) => entity,
             Ok(None) => {
                 return Ok(tool_error_envelope(
-                    "not-found",
+                    McpErrorCode::NotFound,
                     &format!("no entity with id {entity_id}"),
                     false,
                 ));
             }
             Err(err) => {
                 return Ok(tool_error_envelope(
-                    "storage-error",
+                    McpErrorCode::StorageError,
                     &err.to_string(),
                     storage_retryable(&err),
                 ));
@@ -1962,7 +2014,7 @@ impl ServerState {
             Ok(read) => read,
             Err(err) => {
                 return Ok(tool_error_envelope(
-                    "storage-error",
+                    McpErrorCode::StorageError,
                     &err.to_string(),
                     storage_retryable(&err),
                 ));
@@ -2105,7 +2157,7 @@ impl ServerState {
                 Ok(tuple) => tuple,
                 Err(err) => {
                     return Ok(tool_error_envelope(
-                        "storage-error",
+                        McpErrorCode::StorageError,
                         &err.to_string(),
                         storage_retryable(&err),
                     ));
@@ -2176,7 +2228,7 @@ impl ServerState {
             Ok(facts) => facts,
             Err(err) => {
                 return Ok(tool_error_envelope(
-                    "internal",
+                    McpErrorCode::Internal,
                     &format!("git fact-gathering task failed: {err}"),
                     true,
                 ));
@@ -2267,7 +2319,7 @@ impl ServerState {
             Ok(read) => read,
             Err(err) => {
                 return Ok(tool_error_envelope(
-                    "storage-error",
+                    McpErrorCode::StorageError,
                     &err.to_string(),
                     storage_retryable(&err),
                 ));
@@ -2290,14 +2342,14 @@ impl ServerState {
 
         let Some(summary_llm) = &self.summary_llm else {
             return Ok(tool_error_envelope(
-                "llm-disabled",
+                McpErrorCode::LlmDisabled,
                 "LLM summaries are disabled and no fresh cache row is available",
                 false,
             ));
         };
         if !summary_llm.config.enabled {
             return Ok(tool_error_envelope(
-                "llm-disabled",
+                McpErrorCode::LlmDisabled,
                 "LLM summaries are disabled and no fresh cache row is available",
                 false,
             ));
@@ -2370,21 +2422,21 @@ impl ServerState {
 
         if self.summary_budget_blocked() {
             return Err(InferredDispatchFailure::new(
-                "token-ceiling-exceeded",
+                McpErrorCode::TokenCeilingExceeded,
                 "LLM session token ceiling has been reached",
                 false,
             ));
         }
         let Some(llm) = self.inference_llm_snapshot() else {
             return Err(InferredDispatchFailure::new(
-                "llm-disabled",
+                McpErrorCode::LlmDisabled,
                 "LLM inferred-edge dispatch is disabled and no cache row is available",
                 false,
             ));
         };
         if !llm.config.enabled {
             return Err(InferredDispatchFailure::new(
-                "llm-disabled",
+                McpErrorCode::LlmDisabled,
                 "LLM inferred-edge dispatch is disabled and no cache row is available",
                 false,
             ));
@@ -2438,7 +2490,7 @@ impl ServerState {
     ) -> Result<InferredDispatchStats, InferredDispatchFailure> {
         let Some(llm) = self.inference_llm_snapshot() else {
             return Err(InferredDispatchFailure::new(
-                "llm-disabled",
+                McpErrorCode::LlmDisabled,
                 "LLM inferred-edge dispatch is disabled and no writer is available",
                 false,
             ));
@@ -2489,12 +2541,12 @@ impl ServerState {
                     Ok(stats)
                 }
                 Ok(Err(_)) => Err(InferredDispatchFailure::new(
-                    "inferred-dispatch-cancelled",
+                    McpErrorCode::InferredDispatchCancelled,
                     "inferred dispatch owner ended before broadcasting a result",
                     true,
                 )),
                 Err(_) => Err(InferredDispatchFailure::new(
-                    "inferred-dispatch-timeout",
+                    McpErrorCode::InferredDispatchTimeout,
                     "timed out waiting for in-flight inferred dispatch",
                     true,
                 )),
@@ -2540,7 +2592,7 @@ impl ServerState {
             llm.config.session_token_ceiling,
         ) else {
             return Err(InferredDispatchFailure::new(
-                "token-ceiling-exceeded",
+                McpErrorCode::TokenCeilingExceeded,
                 "LLM session token ceiling has been reached",
                 false,
             ));
@@ -2549,7 +2601,7 @@ impl ServerState {
             .await
             .map_err(|err| {
                 InferredDispatchFailure::new(
-                    "llm-provider-error",
+                    McpErrorCode::LlmProviderError,
                     &err.to_string(),
                     err.retryable(),
                 )
@@ -2559,7 +2611,7 @@ impl ServerState {
             llm.config.session_token_ceiling,
         ) {
             return Err(InferredDispatchFailure::new(
-                "token-ceiling-exceeded",
+                McpErrorCode::TokenCeilingExceeded,
                 "LLM session token ceiling has been reached",
                 false,
             ));
@@ -2570,7 +2622,7 @@ impl ServerState {
             self.max_inferred_edges_per_caller(),
         ) {
             Ok(edges) => edges,
-            Err(err) if err.code == "llm-invalid-json" => {
+            Err(err) if err.code == McpErrorCode::LlmInvalidJson => {
                 let message = err.message.clone();
                 return Err(err.with_stats(
                     inferred_usage_stats(&response, true),
@@ -2702,7 +2754,7 @@ impl ServerState {
                 .await
         {
             return Some(tool_error_envelope(
-                "storage-error",
+                McpErrorCode::StorageError,
                 &err.to_string(),
                 storage_retryable(&err),
             ));
@@ -2751,7 +2803,7 @@ impl ServerState {
             Ok(response) => response,
             Err(err) => {
                 return tool_error_envelope(
-                    "llm-provider-error",
+                    McpErrorCode::LlmProviderError,
                     &err.to_string(),
                     err.retryable(),
                 );
@@ -2796,7 +2848,7 @@ impl ServerState {
                 .await
             {
                 return tool_error_envelope(
-                    "storage-error",
+                    McpErrorCode::StorageError,
                     &err.to_string(),
                     storage_retryable(&err),
                 );
@@ -2832,7 +2884,11 @@ impl ServerState {
             })
             .await
         {
-            return tool_error_envelope("storage-error", &err.to_string(), storage_retryable(&err));
+            return tool_error_envelope(
+                McpErrorCode::StorageError,
+                &err.to_string(),
+                storage_retryable(&err),
+            );
         }
 
         summary_success_envelope(
@@ -3359,7 +3415,7 @@ impl InferredDispatchStats {
 
 #[derive(Debug, Clone)]
 struct InferredDispatchFailure {
-    code: &'static str,
+    code: McpErrorCode,
     message: String,
     retryable: bool,
     stats_delta: Value,
@@ -3367,7 +3423,7 @@ struct InferredDispatchFailure {
 }
 
 impl InferredDispatchFailure {
-    fn new(code: &'static str, message: &str, retryable: bool) -> Self {
+    fn new(code: McpErrorCode, message: &str, retryable: bool) -> Self {
         Self {
             code,
             message: message.to_owned(),
@@ -3383,7 +3439,7 @@ impl InferredDispatchFailure {
         // and re-pay the token cost (clarion-df58379de4). Mark them
         // non-retryable so a client honouring the hint gives up immediately.
         Self {
-            code: "storage-error",
+            code: McpErrorCode::StorageError,
             message: err.to_string(),
             retryable: !err.is_foreign_key_violation(),
             stats_delta: json!({}),
@@ -3398,7 +3454,7 @@ impl InferredDispatchFailure {
     }
 
     fn to_envelope(&self) -> Value {
-        if self.code == "token-ceiling-exceeded" {
+        if self.code == McpErrorCode::TokenCeilingExceeded {
             return token_ceiling_envelope(&self.message);
         }
         tool_error_envelope_with_diagnostics(
@@ -3850,7 +3906,11 @@ fn call_graph_scope_excludes(confidence: EdgeConfidence) -> Vec<&'static str> {
 fn envelope_from_storage_result(result: Result<Value, StorageError>) -> Value {
     match result {
         Ok(result) => success_envelope(result),
-        Err(err) => tool_error_envelope("storage-error", &err.to_string(), storage_retryable(&err)),
+        Err(err) => tool_error_envelope(
+            McpErrorCode::StorageError,
+            &err.to_string(),
+            storage_retryable(&err),
+        ),
     }
 }
 
@@ -3921,7 +3981,11 @@ fn latest_run_row(conn: &rusqlite::Connection) -> Value {
 fn flatten_storage_envelope_result(result: Result<Value, StorageError>) -> Value {
     match result {
         Ok(envelope) => envelope,
-        Err(err) => tool_error_envelope("storage-error", &err.to_string(), storage_retryable(&err)),
+        Err(err) => tool_error_envelope(
+            McpErrorCode::StorageError,
+            &err.to_string(),
+            storage_retryable(&err),
+        ),
     }
 }
 
@@ -3974,12 +4038,12 @@ fn success_envelope_with_stats(result: Value, stats_delta: Value) -> Value {
     envelope
 }
 
-fn tool_error_envelope(code: &str, message: &str, retryable: bool) -> Value {
+fn tool_error_envelope(code: McpErrorCode, message: &str, retryable: bool) -> Value {
     tool_error_envelope_with_diagnostics(code, message, retryable, json!({}), Vec::new())
 }
 
 fn tool_error_envelope_with_diagnostics(
-    code: &str,
+    code: McpErrorCode,
     message: &str,
     retryable: bool,
     stats_delta: Value,
@@ -3991,7 +4055,7 @@ fn tool_error_envelope_with_diagnostics(
     envelope.insert(
         "error".to_owned(),
         json!({
-            "code": code,
+            "code": code.as_str(),
             "message": message,
             "retryable": retryable,
         }),
@@ -4070,7 +4134,7 @@ fn token_ceiling_envelope(message: &str) -> Value {
         "ok": false,
         "result": null,
         "error": {
-            "code": "token-ceiling-exceeded",
+            "code": McpErrorCode::TokenCeilingExceeded.as_str(),
             "message": message,
             "retryable": false
         },
@@ -4088,6 +4152,14 @@ fn token_ceiling_envelope(message: &str) -> Value {
     })
 }
 
+/// `reason` is a degraded-result discriminant for the `issues_for` tool
+/// (`filigree-disabled`, `entity-not-found`, `filigree-unreachable`,
+/// `filigree-client-error`), NOT a member of the `McpErrorCode` error-code
+/// vocabulary. It lives on a `success_envelope` (`available: false`), not an
+/// error envelope. `entity-not-found` here coincidentally matches
+/// `McpErrorCode::EntityNotFound`'s wire spelling but is intentionally a bare
+/// string: most of this closed set are not error codes, and this surface has
+/// its own consumers, so the two axes are kept independent (see ADR-037).
 fn issues_unavailable(filigree_endpoint: &Value, reason: &str, message: &str) -> Value {
     success_envelope(json!({
         "available": false,
@@ -4099,6 +4171,64 @@ fn issues_unavailable(filigree_endpoint: &Value, reason: &str, message: &str) ->
         "drifted": [],
         "not_found": []
     }))
+}
+
+/// The degraded `wardline_findings` section returned when the findings cannot
+/// be fetched (transport/HTTP error) or the blocking task panicked. Single
+/// source of truth for the four-key `unavailable` shape.
+fn wardline_unavailable(reason: &str) -> Value {
+    serde_json::json!({
+        "result_kind": "unavailable",
+        "items": [],
+        "omitted_no_qualname": 0,
+        "reason": reason,
+    })
+}
+
+/// Build the `wardline_findings` enrich section for one entity. Enrich-only:
+/// a fetch error degrades to `result_kind: "unavailable"` rather than failing
+/// the tool.
+fn wardline_section_for_entity(
+    client: &std::sync::Arc<dyn crate::filigree::FiligreeLookup>,
+    entity_id: &str,
+    source_file_path: Option<&str>,
+) -> Value {
+    let Some(path) = source_file_path else {
+        return serde_json::json!({ "result_kind": "no_matches", "items": [], "omitted_no_qualname": 0 });
+    };
+    match client.wardline_findings_for_path(path) {
+        Ok(findings) => {
+            let result = crate::wardline_reconcile::reconcile_for_entity(entity_id, findings);
+            let items: Vec<Value> = result
+                .matched
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "rule_id": m.finding.rule_id,
+                        "message": m.finding.message,
+                        "severity": m.finding.severity,
+                        "status": m.finding.status,
+                        "line_start": m.finding.line_start,
+                        "line_end": m.finding.line_end,
+                        "fingerprint": m.finding.fingerprint,
+                        "resolution_confidence": m.resolution_confidence,
+                        "wardline": m.finding.metadata.get("wardline").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect();
+            let result_kind = if items.is_empty() {
+                "no_matches"
+            } else {
+                "matched"
+            };
+            serde_json::json!({
+                "result_kind": result_kind,
+                "items": items,
+                "omitted_no_qualname": result.omitted_no_qualname,
+            })
+        }
+        Err(err) => wardline_unavailable(&err.to_string()),
+    }
 }
 
 fn association_json(
@@ -4122,12 +4252,12 @@ fn association_json(
 fn summary_read_error(read: SummaryRead) -> Value {
     match read {
         SummaryRead::EntityNotFound(id) => tool_error_envelope(
-            "entity-not-found",
+            McpErrorCode::EntityNotFound,
             &format!("entity {id} was not found"),
             false,
         ),
         SummaryRead::MissingContentHash(id) => tool_error_envelope(
-            "content-hash-missing",
+            McpErrorCode::ContentHashMissing,
             &format!("entity {id} has no content hash for summary cache keying"),
             false,
         ),
@@ -4153,11 +4283,11 @@ impl SourceExcerptError {
     }
 
     fn to_envelope(&self) -> Value {
-        tool_error_envelope("content-drift", &self.message(), false)
+        tool_error_envelope(McpErrorCode::ContentDrift, &self.message(), false)
     }
 
     fn to_inferred_failure(&self) -> InferredDispatchFailure {
-        InferredDispatchFailure::new("content-drift", &self.message(), false)
+        InferredDispatchFailure::new(McpErrorCode::ContentDrift, &self.message(), false)
     }
 }
 
@@ -5239,7 +5369,7 @@ fn inferred_records_from_result(
 ) -> Result<Vec<InferredCallEdgeRecord>, InferredDispatchFailure> {
     let parsed: InferredCallsResponse = serde_json::from_str(result_json).map_err(|err| {
         InferredDispatchFailure::new(
-            "llm-invalid-json",
+            McpErrorCode::LlmInvalidJson,
             &format!("inferred provider returned invalid JSON: {err}"),
             true,
         )
@@ -5620,7 +5750,7 @@ mod tests {
         assert_eq!(tools[5].name, "issues_for");
         assert_eq!(
             tools[5].description,
-            "Return Filigree issues attached to this Clarion entity, optionally including issues attached to contained entities. Filigree is an enrichment source; if unavailable, the tool returns an unavailable envelope instead of failing Clarion. The result carries a result_kind (matched | no_matches | unavailable) so a reachable-but-empty Filigree is distinct from an unreachable one, and a filigree_endpoint block (configured vs resolved URL + resolution_source) so you can see which endpoint — e.g. a live ethereal port — the answer came from. Each matched/drifted entry carries an `issue` object with the issue's title, status, and priority (fetched once per distinct issue, no N+1); `issue` is null when the issue-detail route is unavailable, so the match still resolves without a second hop into Filigree."
+            "Return Filigree issues attached to this Clarion entity, optionally including issues attached to contained entities. Filigree is an enrichment source; if unavailable, the tool returns an unavailable envelope instead of failing Clarion. The result carries a result_kind (matched | no_matches | unavailable) so a reachable-but-empty Filigree is distinct from an unreachable one, and a filigree_endpoint block (configured vs resolved URL + resolution_source) so you can see which endpoint — e.g. a live ethereal port — the answer came from. Each matched/drifted entry carries an `issue` object with the issue's title, status, and priority (fetched once per distinct issue, no N+1); `issue` is null when the issue-detail route is unavailable, so the match still resolves without a second hop into Filigree. Includes a `wardline_findings` section (enrich-only) reconciling Wardline findings to the entity by qualname; `result_kind` is matched|no_matches|unavailable."
         );
         assert_eq!(tools[6].name, "neighborhood");
         assert_eq!(
@@ -5660,7 +5790,7 @@ mod tests {
         assert_eq!(tools[13].name, "orientation_pack");
         assert_eq!(
             tools[13].description,
-            "Assemble one deterministic orientation packet for a code location — the replacement for hand-composing find_entity + entity_at + source reads + neighborhood + issues_for + freshness on every question. Resolve EITHER by `entity` id OR by `file`+`line` (exactly one form). The packet bundles: the primary entity, the entity_context evidence (match_reason / containing stack / decl-body-decorator ranges — so a decorator-line query is explained, not guessed), a compact source-span summary, one-hop neighbors (callers, callees, container, contained, references, imports — for a module, references_in/out are rolled up over contained symbols with references_rolled_up=true), compact resolved execution paths, related Filigree issues, index/Filigree/LLM health, warnings, and suggested next reads. No LLM summary is invoked. Every list is bounded; an `omitted` block reports per-section truncation counts and `degraded` sections name surfaces that were unavailable (e.g. Filigree down) so an empty section is never read as a guaranteed negative."
+            "Assemble one deterministic orientation packet for a code location — the replacement for hand-composing find_entity + entity_at + source reads + neighborhood + issues_for + freshness on every question. Resolve EITHER by `entity` id OR by `file`+`line` (exactly one form). The packet bundles: the primary entity, the entity_context evidence (match_reason / containing stack / decl-body-decorator ranges — so a decorator-line query is explained, not guessed), a compact source-span summary, one-hop neighbors (callers, callees, container, contained, references, imports — for a module, references_in/out are rolled up over contained symbols with references_rolled_up=true), compact resolved execution paths, related Filigree issues, index/Filigree/LLM health, warnings, and suggested next reads. No LLM summary is invoked. Every list is bounded; an `omitted` block reports per-section truncation counts and `degraded` sections name surfaces that were unavailable (e.g. Filigree down) so an empty section is never read as a guaranteed negative. Includes a `wardline_findings` section (enrich-only) reconciling Wardline findings to the entity by qualname; `result_kind` is matched|no_matches|unavailable."
         );
         assert_eq!(tools[14].name, "analyze_start");
         assert_eq!(

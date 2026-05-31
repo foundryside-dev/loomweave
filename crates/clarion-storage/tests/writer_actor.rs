@@ -325,6 +325,45 @@ async fn summary_cache_writer_commands_do_not_require_active_analyze_run() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upsert_wardline_taint_fact_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    // wardline_taint_facts.entity_id has an FK to entities(id) (ADR-036). Seed
+    // the referenced entity directly so the FK is satisfied — this is a
+    // query-time write that must work without an active analyze run.
+    seed_entity_row(&path, "python:function:a.b.c");
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    send::<()>(&tx, |ack| WriterCmd::UpsertWardlineTaintFact {
+        fact: Box::new(clarion_storage::TaintFact {
+            entity_id: "python:function:a.b.c".to_owned(),
+            wardline_json: r#"{"v":1}"#.to_owned(),
+            scan_id: Some("scan-1".to_owned()),
+            content_hash_at_compute: Some("hash".to_owned()),
+            updated_at: now_iso(),
+        }),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let conn = Connection::open(path).unwrap();
+    let json: String = conn
+        .query_row(
+            "SELECT wardline_json FROM wardline_taint_facts WHERE entity_id = ?1",
+            rusqlite::params!["python:function:a.b.c"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(json, r#"{"v":1}"#);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replace_unresolved_call_sites_replaces_current_and_old_hash_rows_for_caller() {
     let dir = tempfile::tempdir().unwrap();
     let path = prepared_db(&dir);

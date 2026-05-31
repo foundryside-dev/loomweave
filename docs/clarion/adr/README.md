@@ -35,6 +35,9 @@ This folder is the canonical home for authored Clarion architecture decision rec
 | [ADR-032](./ADR-032-weighted-components-clustering-fallback.md) | Weighted-components clustering fallback naming | Accepted |
 | [ADR-033](./ADR-033-v1.0-distribution.md) | v1.0 distribution via GitHub Releases (binary matrix + Python sdist; promote to crates.io/PyPI at v2.0) | Accepted |
 | [ADR-034](./ADR-034-federation-http-read-api-hardening.md) | Federation HTTP read API hardening — bearer auth, batch resolution, `BRIEFING_BLOCKED`, instance ID | Accepted |
+| [ADR-035](./ADR-035-operational-tuning-discipline.md) | Operational tuning discipline — declared basis / override surface / retune trigger / coupling per constant; file-LOC + crate-boundary budgets; CI lint gate | Accepted |
+| [ADR-036](./ADR-036-wardline-taint-fact-store.md) | Clarion as Wardline taint-fact store — `wardline_taint_facts` table + `/api/wardline/*` routes; first read+write HTTP surface (optional writer-actor, default off); passes loom.md §3–§5 (ADR, not asterisk) | Accepted |
+| [ADR-037](./ADR-037-shared-error-vocabulary.md) | Shared error vocabulary (`clarion-core::errors`) — two typed enums (`HttpErrorCode`, `McpErrorCode`) as single source of truth; wire spelling unchanged on both surfaces; relates to ADR-034 | Accepted |
 
 ## Backlog still tracked in the detailed design
 

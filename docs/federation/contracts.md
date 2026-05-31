@@ -1,7 +1,17 @@
 # Clarion Federation Contracts
 
-This file pins Clarion's read-side contract for sibling products. The initial
-consumer is Filigree's `ClarionRegistry` from ADR-014.
+This file pins Clarion's federation contracts in both directions: the surface
+Clarion *exposes* to sibling products, and the conventions and routes Clarion
+*consumes* from Filigree. The exposed surface was historically read-only — the
+file-resolution read API consumed by Filigree's `ClarionRegistry` (ADR-014). At
+release:1.1 it also includes one **write** surface: the Wardline taint-fact store
+(ADR-036), a disabled-by-default `/api/wardline/*` sub-router that lets Wardline
+persist per-entity taint facts into Clarion's catalog so briefings can carry them.
+That write surface is enrich-only in the loom.md §5 sense — it is off unless
+explicitly enabled, Clarion never requires Wardline to be present, and Clarion's
+own semantics never depend on a taint fact existing. Every consume-side coupling
+here is likewise enrich-only and fail-soft — Clarion stays solo-useful when
+Filigree is absent (loom.md §5).
 
 ## HTTP Read API
 
@@ -21,8 +31,12 @@ serve:
     token_env: CLARION_LOOM_TOKEN
 ```
 
-The MCP stdio server remains available on stdin/stdout. The HTTP surface is
-read-only and uses Clarion's existing SQLite reader pool.
+The MCP stdio server remains available on stdin/stdout. The `/api/v1/*` read API
+is read-only and uses Clarion's existing SQLite reader pool. The `/api/wardline/*`
+sub-router (see [Wardline taint-fact store](#wardline-taint-fact-store-sp9)) adds
+one write path — `POST /api/wardline/taint-facts` — which is disabled by default
+and, when enabled, routes through Clarion's writer-actor rather than the reader
+pool; its read paths still use the reader pool.
 
 ### Authentication
 
@@ -78,12 +92,20 @@ All non-2xx responses use this closed JSON error envelope:
 }
 ```
 
-The initial `code` enum is closed to `INVALID_PATH`,
+The `code` enum is closed to `INVALID_PATH`,
 `PATH_OUTSIDE_PROJECT`, `NOT_FOUND`, `BRIEFING_BLOCKED`, `UNAUTHENTICATED`,
-`STORAGE_ERROR`, `BATCH_TOO_LARGE`, and `INTERNAL`. Clients must switch
-on `code`; `error` is human-readable diagnostic text. `BATCH_TOO_LARGE`
-is only emitted by `POST /api/v1/files/batch` (see the batch endpoint
-section below).
+`STORAGE_ERROR`, `BATCH_TOO_LARGE`, `WRITE_DISABLED`, `PROJECT_MISMATCH`,
+and `INTERNAL`. Clients must switch on `code`; `error` is human-readable
+diagnostic text. `WRITE_DISABLED` and `PROJECT_MISMATCH` are emitted only by
+the `/api/wardline/*` routes (see
+[Wardline taint-fact store](#wardline-taint-fact-store-sp9)). `BATCH_TOO_LARGE`
+is emitted by `POST /api/v1/files/batch` (as `400`) and by the `/api/wardline/*`
+batch routes (as `413`) — the same `code` carries a **different HTTP status by
+endpoint**, so a client must route on `code`, not on status.
+
+> The `code` enum is defined canonically in Rust as `clarion_core::errors::HttpErrorCode`
+> (single source of truth shared with the MCP tool-error vocabulary; see ADR-037).
+> The wire spelling on this surface is unchanged.
 
 ### `GET /api/v1/files?path=&language=`
 
@@ -396,18 +418,396 @@ top-level `__init__.py`). A conformant emitter reproduces every vector exactly.
 
 **Conformance oracle (deferred).** A live check —
 `GET /api/v1/entities/resolve?scheme=wardline_qualname`, which would return
-`exact | heuristic | none` for a candidate qualname — is named in ADR-018 as the
-eventual conformance surface but is **not implemented at release:1.1**. Until it
-ships, the fixture above is the contract: validate against it offline. Building
-the endpoint ahead of a shipped Wardline consumer would be speculative
-forward-work (loom.md §5 — Clarion translates qualnames because it owns the
-catalog, but only when a consumer needs it).
+`exact | heuristic | none` for a candidate qualname *with normalization* — is
+named in ADR-018 as the eventual conformance surface but is **not implemented at
+release:1.1**. Until it ships, the fixture above is the contract: validate against
+it offline. Building the endpoint ahead of a shipped Wardline consumer would be
+speculative forward-work (loom.md §5 — Clarion translates qualnames because it owns
+the catalog, but only when a consumer needs it). What *did* ship is the narrower,
+exact-tier `POST /api/wardline/resolve` (see
+[Wardline taint-fact store](#wardline-taint-fact-store-sp9)), which takes
+**pre-composed** dotted qualnames and does a direct existence lookup with no
+normalization. The heuristic resolution tier and the normalizing raw-qualname
+conformance oracle both remain deferred to Flow B B.2 (`clarion-ca2d26ffbe`); B.2
+extends the same resolver rather than reimplementing it.
+
+## Wardline taint-fact store (SP9)
+
+This pins the `/api/wardline/*` sub-router Clarion *exposes* to Wardline (ADR-036;
+design spec
+[`2026-05-30-clarion-wardline-taint-store-design.md`](../superpowers/specs/2026-05-30-clarion-wardline-taint-store-design.md)).
+Wardline computes per-entity taint facts and persists them into Clarion's catalog
+so Clarion can fold them into briefings; Clarion treats every fact's payload as an
+**opaque blob** and never asserts whether it is fresh. This is enrich-only and
+disabled-by-default (loom.md §5): the write path is off unless explicitly enabled,
+and Clarion's own semantics never depend on a stored fact.
+
+**Per-project isolation.** One `clarion serve` process serves exactly one project
+(the `.clarion/` store under that project root). The `project` request field is a
+**guard, not a selector** — it does not choose among projects; it only lets a
+client assert which project it believes it is talking to. The handle is the
+project-root directory name. An **empty** `project` is always accepted (no
+assertion); a **non-empty** value that does not match the served project's
+directory name returns `403` with `code: "PROJECT_MISMATCH"`. (Reference:
+`AppState::reject_project_mismatch` in
+[`http_read.rs`](../../crates/clarion-cli/src/http_read.rs).)
+
+### Sub-router framing, auth, and limits
+
+The `/api/wardline/*` routes sit behind the **same identity middleware** as the
+protected `/api/v1/*` routes (HMAC `X-Loom-Component: clarion:<hmac>` preferred per
+ADR-034, legacy `Authorization: Bearer` accepted as fallback, loopback-unauth
+allowed; see [Authentication](#authentication)). The only difference is the body
+limit used while reading the request to verify the HMAC signature: the wardline
+guard reads up to **4 MiB** (`WARDLINE_BODY_LIMIT_BYTES`) rather than the
+`/api/v1/*` 16 KiB, because batched resolves/writes carry thousands of qualnames.
+
+| Property | `/api/v1/*` | `/api/wardline/*` |
+|---|---|---|
+| Body limit | 16 KiB | **4 MiB** |
+| Per-request batch cap | 256 (`files/batch`) / 1000 (`files:resolve`) | **2000** facts/qualnames (`WARDLINE_TAINT_BATCH_MAX`) |
+| Over-cap status | `400 BATCH_TOO_LARGE` | **`413 BATCH_TOO_LARGE`** |
+
+Two distinct `413` sources on these routes — a client seeing `413` **must** check
+for a JSON envelope to tell them apart:
+
+- **Batch cap** — more than `2000` facts/qualnames in one request returns `413`
+  with the JSON envelope `{"error": …, "code": "BATCH_TOO_LARGE"}`. Wardline
+  chunks client-side against `2000`.
+- **Raw body cap** — a request body over `4 MiB` is rejected at the transport layer
+  with a `413` and **no JSON `code`** (same posture as the existing
+  "413 | n/a" rows for `/api/v1/*`).
+
+`GET /api/v1/_capabilities` does **not** advertise the taint store or whether the
+write path is enabled (its response carries only `api_version`, `instance_id`,
+`registry_backend`, `file_registry`). A Wardline client discovers the write API is
+disabled by receiving `403 WRITE_DISABLED` from the write route, not by probing
+capabilities.
+
+### `POST /api/wardline/resolve`
+
+Exact-tier resolution of **pre-composed** dotted qualnames to Clarion entity IDs.
+No `&file=` disambiguator and no normalization: Wardline has already shaped each
+qualname to byte-match Clarion's `canonical_qualified_name`, and Clarion does a
+direct existence lookup of the candidate `python:function:<qualname>` (taint facts
+are function/method-scoped; methods are `python:function:` in Clarion's ontology
+per ADR-022).
+
+Request body (`application/json`, max 4 MiB):
+
+```json
+{
+  "project": "clarion",
+  "qualnames": ["auth.tokens.refresh", "auth.sessions.SessionStore.load"]
+}
+```
+
+`project` is optional (the guard above). Successful response (`200 OK`):
+
+```json
+{
+  "resolved": {"auth.tokens.refresh": "python:function:auth.tokens.refresh"},
+  "unresolved": ["auth.sessions.SessionStore.load"]
+}
+```
+
+- `resolved` is a `{qualname: entity_id}` object, only for exact matches.
+- `unresolved` lists every qualname with no matching `python:function:` entity.
+- Resolution is **exact-only**: there is no heuristic tier and no error for an
+  unresolved name — it simply lands in `unresolved`.
+
+Failure modes:
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `INVALID_PATH` | Body is not a valid `{"qualnames": [...]}` object. |
+| 401 | `UNAUTHENTICATED` | HMAC/bearer auth missing or wrong (when configured). |
+| 403 | `PROJECT_MISMATCH` | Non-empty `project` does not match the served project. |
+| 413 | `BATCH_TOO_LARGE` | `qualnames.len() > 2000`. |
+| 413 | n/a | Request body exceeds the 4 MiB cap (transport-level). |
+| 500/503 | `STORAGE_ERROR` / `INTERNAL` | Storage failure. |
+
+### `POST /api/wardline/taint-facts` (write)
+
+Persists a batch of taint facts. **Disabled by default** — only reachable when
+`serve.http.wardline_taint_write: true` has spawned the optional writer-actor:
+
+```yaml
+serve:
+  http:
+    enabled: true
+    wardline_taint_write: true   # default false; off ⇒ 403 WRITE_DISABLED
+```
+
+When disabled, the route returns `403` with `code: "WRITE_DISABLED"` **before**
+parsing the body. Request body (`application/json`, max 4 MiB):
+
+```json
+{
+  "project": "clarion",
+  "scan_id": "wardline-scan-2026-05-30",
+  "facts": [
+    {
+      "qualname": "auth.tokens.refresh",
+      "wardline_json": {"taint": "tainted", "sources": ["request.body"]},
+      "scan_id": "wardline-scan-2026-05-30",
+      "content_hash_at_compute": "9c1185a5c5e9fc54612808977ee8f548b2258d31"
+    }
+  ]
+}
+```
+
+- `wardline_json` is **opaque** to Clarion (see [Opacity contract](#opacity-contract)).
+- `scan_id` and `content_hash_at_compute` are accepted as **top-level fields**
+  (queryable columns); Clarion does **not** parse them out of the blob. The
+  per-fact `scan_id` falls back to the batch-level `scan_id` when absent. Both are
+  optional.
+
+Successful response (`200 OK`):
+
+```json
+{
+  "written": 1,
+  "unresolved_qualnames": ["auth.sessions.SessionStore.load"]
+}
+```
+
+- **Exact-only writes.** A fact whose qualname does not resolve exact-tier is
+  reported in `unresolved_qualnames` and **never written** — there is no
+  heuristic/none write path. `written` counts only persisted facts.
+- **Per-entity replace (idempotent).** A write replaces the row keyed on the
+  resolved `entity_id` (`ON CONFLICT(entity_id) DO UPDATE`), so re-posting the same
+  qualname overwrites rather than duplicating.
+- **Batch writes are NOT atomic; retry the whole batch.** Each fact is persisted
+  in its own transaction, in input order. A mid-batch failure (or the 10 s
+  request timeout aborting a large batch) returns a `5xx` and the facts persisted
+  *before* the failure stay committed — the `written` count is **not** reported in
+  the error envelope, so the client cannot tell how far it got. This is safe
+  because the write is **whole-batch idempotent**: per-entity replace means
+  re-posting the entire batch overwrites the partially-applied prefix and
+  converges to the same state. **On any `5xx`, re-post the whole batch** — do not
+  attempt to diff or resume from a partial point.
+
+Failure modes:
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `INVALID_PATH` | Body is not a valid `{"facts": [...]}` object. |
+| 401 | `UNAUTHENTICATED` | HMAC/bearer auth missing or wrong (when configured). |
+| 403 | `WRITE_DISABLED` | `serve.http.wardline_taint_write` is not `true`. |
+| 403 | `PROJECT_MISMATCH` | Non-empty `project` does not match the served project. |
+| 413 | `BATCH_TOO_LARGE` | `facts.len() > 2000`. |
+| 413 | n/a | Request body exceeds the 4 MiB cap (transport-level). |
+| 500/503 | `STORAGE_ERROR` / `INTERNAL` | Writer-actor unavailable or write failed. **May have partially persisted** — re-post the whole batch (idempotent). |
+
+### `GET /api/wardline/taint-facts?project=&qualname=` (read, single) and `POST /api/wardline/taint-facts:batch-get` (read, batch)
+
+Both read paths are served **regardless of whether the write API is enabled**.
+They return the **same per-entity view shape**; the only difference is cardinality.
+
+`GET` query parameters: `project` (optional guard), `qualname` (required, must not
+be blank). The single GET returns **one** view object:
+
+```json
+{
+  "qualname": "auth.tokens.refresh",
+  "wardline_json": {"taint": "tainted", "sources": ["request.body"]},
+  "current_content_hash": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9",
+  "exists": true
+}
+```
+
+The batch read body is `{ "project"?, "qualnames": [..] }`; it returns a **bare
+JSON array** of view objects, **one per input qualname, in input order** (not an
+object wrapper):
+
+```json
+[
+  {
+    "qualname": "auth.tokens.refresh",
+    "wardline_json": {"taint": "tainted"},
+    "current_content_hash": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9",
+    "exists": true
+  },
+  {"qualname": "auth.sessions.SessionStore.load", "exists": false}
+]
+```
+
+The view has **exactly four fields**:
+
+- `qualname` — echoed back so the client correlates without re-ordering.
+- `exists` — `true` when a stored fact exists for the resolved entity; `false` when
+  the qualname does not resolve exact-tier **or** resolves but has no stored fact.
+- `wardline_json` — the stored blob, returned **byte-verbatim** (see
+  [Opacity contract](#opacity-contract)). **Field-absent** (not `null`) when
+  `exists` is `false`.
+- `current_content_hash` — the **live** freshness signal (see
+  [Freshness contract](#freshness-contract)). **Field-absent** when `exists` is
+  `false`, and also field-absent when `exists` is `true` but the containing file is
+  deleted/unreadable at request time.
+
+Note what is **not** echoed: the write-time `scan_id` and `content_hash_at_compute`
+columns are **never returned by the read**. Wardline reads its own
+`content_hash_at_compute` from *inside* the opaque `wardline_json` blob, not from a
+Clarion-returned field (see the freshness contract).
+
+Failure modes:
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `INVALID_PATH` | Blank/missing `qualname` (GET) or invalid `{"qualnames": [...]}` body (batch). |
+| 401 | `UNAUTHENTICATED` | HMAC/bearer auth missing or wrong (when configured). |
+| 403 | `PROJECT_MISMATCH` | Non-empty `project` does not match the served project. |
+| 413 | `BATCH_TOO_LARGE` | `qualnames.len() > 2000` (batch). |
+| 413 | n/a | Request body exceeds the 4 MiB cap (batch, transport-level). |
+| 500/503 | `STORAGE_ERROR` / `INTERNAL` | Storage failure. |
+
+### Freshness contract
+
+`current_content_hash` is the load-bearing field of this whole surface, so its
+definition is pinned exactly:
+
+- It is the **blake3** hash of the entity's **containing file** — **whole file, raw
+  bytes, lowercase hex**. It is **not** sha256, **not** LF-normalized, and **not**
+  span-scoped to the entity's line range. (The stored `entities.content_hash` is
+  deliberately *not* reused: for function entities that value is span-scoped and
+  LF-normalized, and even a stored whole-file hash reflects the last analyze, not
+  current disk.)
+- It is computed by a **live filesystem read at request time**, not read from a
+  stored value, so it reflects the file's current on-disk bytes.
+- If the containing file is **deleted or unreadable** at request time,
+  `current_content_hash` is **omitted** (field absent). `exists` still reflects the
+  stored fact (it can be `true` with no `current_content_hash`).
+
+  Reference: `clarion_storage::current_file_hash` in
+  [`query.rs`](../../crates/clarion-storage/src/query.rs).
+
+**Who decides freshness.** Wardline stamps `content_hash_at_compute` *inside* the
+opaque `wardline_json` blob when it computes a fact, then on read compares that
+stamp to Clarion's returned `current_content_hash`: equal ⇒ the fact is fresh;
+mismatch, or `exists: false`, or `current_content_hash` absent ⇒ Wardline
+recomputes. **Wardline owns the fresh/stale decision; Clarion never asserts a
+freshness verdict** — it only reports the live hash and lets Wardline compare.
+
+### Opacity contract
+
+`wardline_json` is stored and returned **byte-verbatim**. Clarion holds it as a
+serde_json `RawValue` on both the write and read paths, so object key order and
+whitespace are preserved exactly — `{"b":2,"a":1}` is *not* re-emitted as
+`{"a":1,"b":2}`. Clarion **never parses or validates** the blob's contents. The
+only fields Clarion reads structurally are the top-level `scan_id` /
+`content_hash_at_compute` accompanying a write (stored as queryable columns) — they
+are taken from the request envelope, **not** parsed out of the blob.
+
+### Verification scope
+
+The contracts above are pinned by the W.1–W.4 tests; there is no new wire fixture
+for these routes (the prose shapes here are the contract).
+
+- The **qualname conformance oracle** is the existing fixture
+  [`fixtures/wardline-qualname-normalization.json`](./fixtures/wardline-qualname-normalization.json)
+  (see [Wardline qualname normalization](#wardline-qualname-normalization-entity-reconciliation));
+  `resolve_wardline_qualnames` is exercised against its vectors by
+  `resolves_fixture_vectors_exact` in
+  [`wardline_taint.rs`](../../crates/clarion-storage/src/wardline_taint.rs).
+- The **whole-file-vs-span freshness** definition is pinned by the
+  `current_file_hash` tests in
+  [`query.rs`](../../crates/clarion-storage/src/query.rs) (asserting whole-file
+  blake3, not the span-scoped LF-normalized hash).
+- The **route behaviour** — exact resolve + unresolved, project-guard mismatch,
+  `WRITE_DISABLED`, per-entity replace, byte-verbatim storage, the live whole-file
+  hash, deleted-file ⇒ absent hash, the bare-array batch read, and the over-cap
+  `413` — is pinned by the `wardline_*` async handler tests in
+  [`http_read.rs`](../../crates/clarion-cli/src/http_read.rs).
+
+## Consumed Filigree convention: ephemeral-port endpoint discovery
+
+The contracts above pin the surface Clarion *exposes*. This section and the ones
+that follow pin what Clarion *consumes*. Endpoint discovery comes first because
+it is the prerequisite for every consumed route below: before Clarion can call
+`issues_for`'s issue-detail read, the scan-results intake, or the clean-stale
+sweep, it must resolve *where* Filigree is actually listening.
+
+`clarion serve` and `clarion analyze` resolve that base URL through
+[`clarion_mcp::filigree_url::resolve_filigree_url`](../../crates/clarion-mcp/src/filigree_url.rs)
+(added with clarion-084e82250c). It is strictly *enrich-only*: discovery only ever
+*upgrades* the statically configured `integrations.filigree.base_url`; it never
+gates Clarion's own semantics. Clarion stays solo-useful with Filigree absent
+(loom.md §5).
+
+**The convention.** Filigree's dashboard, when running in its default *ethereal*
+mode, publishes its live listen port to `<project_root>/.filigree/ephemeral.port`
+— a plain trimmed integer, written atomically, present only while the dashboard
+is up. The port is chosen deterministically but unpredictably
+(`8400 + sha256(project_path) % 1000`, with collision fallback), so it **must be
+read, never computed**. This mirrors the Filigree sources
+`filigree/src/filigree/ephemeral.py::{write,read}_port_file` and
+`scanner_callback.py::resolve_scanner_api_url_with_source`.
+
+**Resolution algorithm.** Given the configured `base_url` and the project root:
+
+| Condition | Resolved URL | `source` label |
+|---|---|---|
+| Integration disabled | none (`null`) | `disabled` |
+| Valid `<root>/.filigree/ephemeral.port` present | configured URL with its **port** overridden by the live port (scheme, host, path preserved) | `.filigree/ephemeral.port` |
+| No / unreadable port file | configured URL unchanged | `config` |
+
+**The negative contract (the load-bearing part).** What Clarion *refuses* to do is
+the loom-§5 safety argument:
+
+- It **reads** the published port; it never **computes** Filigree's port itself
+  (no reimplementation of the `8400 + sha256 % 1000` rule).
+- When no live port file is present, it falls back to Clarion's **own** configured
+  `base_url`, **never** to a Filigree-internal default. Copying Filigree's
+  `DEFAULT_PORT` would be a silent cross-product coupling that breaks the moment
+  Filigree changes its default.
+- Reading is **fail-soft**: a missing, corrupt, out-of-range, or zero-valued port
+  file folds to the configured URL (`source = config`), never an error. A stale
+  configured port that is simply unreachable is handled the same way every
+  consumed route handles a Filigree outage — degrade, never propagate.
+
+**Server-mode gap (named limitation).** Filigree also supports a *server* mode that
+publishes its endpoint through a home-directory global
+(`~/.config/filigree/server.json`) rather than the per-project `ephemeral.port`
+file. Clarion does **not** read `server.json` at release:1.1 — under Filigree
+server mode, discovery finds no `ephemeral.port` and degrades to the configured
+`base_url` (`source = config`), which is correct but does not auto-track a
+server-mode port. Closing this gap (reading the server-mode global) is tracked as
+post-1.1 work; the ethereal path is the only one exercised today.
+
+**Agent-facing surface.** `project_status` reports the resolution verbatim so an
+agent can tell *where* the URL came from without probing ports:
+
+```json
+{
+  "filigree": {
+    "enabled": true,
+    "configured_url": "http://127.0.0.1:8766",
+    "resolved_url": "http://127.0.0.1:8542",
+    "resolution_source": ".filigree/ephemeral.port"
+  }
+}
+```
+
+`resolution_source` is exactly one of the three `source` labels above
+(`disabled` / `.filigree/ephemeral.port` / `config`); `resolved_url` is `null`
+only when the integration is disabled.
+
+**Verification scope.** There is no normative fixture for this convention —
+connection discovery resolves a single scalar (a port), not a wire document, so a
+fixture is not warranted; the shapes above are the contract. The executable check
+is the test module in
+[`filigree_url.rs`](../../crates/clarion-mcp/src/filigree_url.rs): it pins the
+live-port override, the no-file and disabled fall-throughs, and the fail-soft
+folding of corrupt / zero ports to the configured URL. Because the port file is a
+*read* of a Filigree-owned convention, a change on Filigree's side (path or
+format) would be caught by re-reading its `ephemeral.py`, not by Clarion CI.
 
 ## Consumed Filigree route: issue detail (enrichment)
 
-The contracts above pin the surface Clarion *exposes*. This one pins the single
-Filigree route Clarion *consumes* to enrich an entity-association match — the
-read behind `issues_for`'s per-match `issue` block (clarion-51a2868c86). It is
+This pins the single Filigree route Clarion *consumes* (against the endpoint
+resolved above) to enrich an entity-association match — the read behind
+`issues_for`'s per-match `issue` block (clarion-51a2868c86). It is
 strictly *enrich-only*: if the route is absent or unreachable, the match still
 resolves with `issue: null`, and Clarion's semantics are unaffected (loom.md §5).
 
@@ -437,6 +837,70 @@ There is no normative fixture for this route yet; the shape above is the
 contract. The `parse_issue_detail_response` shape test in
 [`filigree.rs`](../../crates/clarion-mcp/src/filigree.rs) is the executable
 check.
+
+## Consumed Filigree routes: Wardline findings (Flow B read-time reconciliation)
+
+Flow B (read-time Wardline finding reconciliation) consumes two existing Filigree
+*loom* read routes — no new route is requested. Both are enrich-only: if either
+is unreachable the `wardline_findings` section degrades to
+`result_kind: "unavailable"` and the tool returns normally (loom.md §5).
+
+1. `GET {filigree_base}/api/loom/files?scan_source=wardline&path_prefix=<rel-path>` →
+   a list envelope `{items, has_more}`. Clarion takes the item whose `path` is
+   byte-exact (the filter is a prefix query; Clarion performs the exact-match
+   itself to get Filigree's `file_id`).
+2. `GET {filigree_base}/api/loom/findings?scan_source=wardline&file_id=<file_id>` →
+   a list envelope `{items, has_more}`. Clarion reads `rule_id`, `message`,
+   `severity`, `status`, `line_start`/`line_end`, `fingerprint`, and `metadata`
+   (the reconciliation key is `metadata.wardline.qualname`). Unknown fields are
+   ignored so Filigree may grow the row without breaking this consumer.
+
+Clarion reads only the first page of each list response (it does not follow
+`has_more`); for a single source file the expected file/finding volume fits one
+Filigree page. Multi-page following is a documented v1 limitation. **In both
+hops, a truncated first page fails closed rather than returning a partial
+view:**
+
+- Hop-1: if the prefix query returns a page that does not contain the
+  exact-path match **and** `has_more` is true, Clarion cannot conclude the file
+  is absent — the match may be on a later page.
+- Hop-2: if the findings page for the resolved `file_id` reports `has_more`,
+  the first page is an incomplete enumeration of the file's findings.
+
+In either case `wardline_findings_for_path` returns an error and the
+`wardline_findings` section degrades to `result_kind: "unavailable"` (honest)
+rather than a false `no_matches` (hop-1) or a silent undercount (hop-2).
+
+**Reconciliation.** `metadata.wardline.qualname` is matched byte-exact against
+the entity_id's segment-3 `canonical_qualified_name`
+(`python:function:<qualname>`), per
+[Wardline qualname normalization](#wardline-qualname-normalization-entity-reconciliation).
+A matching qualname is surfaced with `resolution_confidence: exact`; a
+non-matching qualname is not surfaced (dropped); findings carrying no
+`metadata.wardline.qualname` are counted in `omitted_no_qualname`. `heuristic`
+is reserved but never returned in v1.1 (`wardline_reconcile.rs`).
+
+Flow B does not use `POST /api/v1/files:resolve`; it uses the two `loom` GET
+routes above (`POST /api/v1/files:resolve` is a route Clarion *exposes*, not
+one it consumes — see [`POST /api/v1/files:resolve`](#post-apiv1filesresolve)).
+
+The section is surfaced under `result.wardline_findings` in `issues_for` and as
+a top-level field of the orientation pack.
+
+**Verification scope.** There is no normative wire fixture for these routes —
+the prose above is the contract. Executable checks:
+
+- `loom_files_url` / `loom_findings_url` / `parse_wardline_findings_response`
+  / `wardline_findings_for_path_does_two_hops_and_exact_path_filter` in
+  [`filigree.rs`](../../crates/clarion-mcp/src/filigree.rs) pin the URL shape,
+  response parsing, and exact-path-filter logic.
+- `reconcile_for_entity` tests in
+  [`wardline_reconcile.rs`](../../crates/clarion-mcp/src/wardline_reconcile.rs)
+  pin the exact-tier match and the omitted-no-qualname count.
+- `issues_for_attaches_exact_wardline_findings` and
+  `orientation_pack_includes_wardline_findings` in
+  [`storage_tools.rs`](../../crates/clarion-mcp/tests/storage_tools.rs) pin
+  the end-to-end section attachment and the `result_kind: "unavailable"` degrade.
 
 ## Consumed Filigree route: scan-results intake (finding emission)
 
@@ -499,13 +963,25 @@ POST {filigree_base}/api/v1/scan-results
   - `scan_source` is always `"clarion"`; it is part of Filigree's dedup key, so
     it is stable across runs.
   - `scan_run_id` carries Clarion's `run_id`. It is omitted entirely when unset;
-    an unknown id is tolerated by Filigree (it warns and proceeds), which is how
-    REQ-FINDING-05's wire shape ships without a pre-create handshake. **Clarion's
-    posture** is to depend on this tolerate-unknown behavior and emit no Phase-0
-    `scan-runs` create call; whether that is Filigree's *intended permanent*
-    contract (vs. an explicit create endpoint) is the open §4 question in
-    [`2026-05-30-prune-unseen-filigree-request.md`](2026-05-30-prune-unseen-filigree-request.md),
-    pending Filigree's confirmation.
+    an unknown id is tolerated by Filigree (it ingests the findings and
+    reconstructs the run in history), which is how REQ-FINDING-05's wire shape
+    ships without a pre-create handshake. **This tolerate-unknown behavior is
+    Filigree's confirmed permanent contract** (decided 2026-05-31, path (a);
+    recorded in Filigree's `docs/federation/contracts.md` §F6 and pinned by
+    `tests/api/test_files_api.py::TestUnknownScanRunIdContract`). There is no
+    `POST /api/.../scan-runs` create endpoint — only read-only
+    `GET /api/scan-runs` history — and Clarion emits no Phase-0 create call.
+    Three intake obligations Clarion honors against this contract:
+    (1) `run_id` is globally unique across producers — Clarion defaults it to a
+    UUIDv4 (`clarion-cli` `analyze.rs`), since Filigree keys on the id alone and
+    a collision either rejects (`VALIDATION`, different `scan_source`) or
+    silently misattributes (same `scan_source`); (2) `scan_source` stays stable
+    across a run (always `"clarion"`, per the bullet above), since history
+    groups on `(scan_run_id, scan_source)`; (3) with `complete_scan_run=true`
+    an unknown run cannot be marked completed, so the response `warnings[]`
+    carries a benign `"Scan run <id> status not updated to 'completed': …"` —
+    Clarion switches on HTTP status + stats counts and never treats a populated
+    `warnings[]` as failure.
   - `mark_unseen` is `true` for a normal full run (old-position findings for the
     same rule/file transition to `unseen_in_latest`); a `--resume RUN_ID` run
     sets it `false` so the re-emit does not flip the prior run's findings to

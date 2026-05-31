@@ -82,7 +82,21 @@ Resolve these and implement:
 5. **Auth.** Same posture as `/api/v1/scan-results`: `Authorization: Bearer
    <token>` + `x-filigree-actor: <actor>` headers.
 
-## 4. Secondary ask — scan-run-create contract decision (Clarion REQ-FINDING-05)
+## 4. Secondary ask — scan-run-create contract decision (Clarion REQ-FINDING-05) — RESOLVED 2026-05-31
+
+> **Resolved (2026-05-31): path (a) — tolerate-unknown is Filigree's permanent
+> contract.** Filigree confirmed that accepting findings with a client-supplied
+> `scan_run_id` it has never seen, ingesting them, and reconstructing the run in
+> history is a stable, supported contract — not transitional leniency. There is
+> no `POST /api/.../scan-runs` create endpoint (only read-only
+> `GET /api/scan-runs` history), and none is planned. Clarion adds **no Phase-0
+> handshake**. The decision is pinned in Filigree's `contracts.md` §F6 and
+> defended by `tests/api/test_files_api.py::TestUnknownScanRunIdContract`; the
+> Clarion-side caveats are dropped from `docs/federation/contracts.md`
+> (scan-results intake) and `requirements.md` REQ-FINDING-05, which now record
+> the three intake obligations (globally-unique UUIDv4 `run_id`, stable
+> `scan_source`, benign-completion-warning handling). Tracked by
+> clarion-694aab920a (closed). Original question retained below for context.
 
 Clarion currently POSTs findings with a `scan_run_id` that Filigree has never
 seen; Filigree tolerates the unknown id, emits a warning, and proceeds. Clarion

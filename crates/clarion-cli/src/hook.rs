@@ -88,84 +88,106 @@ fn load_snapshot(project_root: &Path) -> SnapshotOutcome {
 }
 
 fn print_snapshot(project_root: &Path, outcome: &SnapshotOutcome) {
+    for line in snapshot_outcome_lines(project_root, outcome) {
+        println!("{line}");
+    }
+}
+
+/// Load the index snapshot and render it to lines, for reuse by both the
+/// `SessionStart` hook (which prints them) and `clarion doctor` (which appends
+/// them under an `--- index ---` heading). Fail-soft: a missing/unreadable db
+/// yields an advisory line, never an error.
+#[must_use]
+pub fn snapshot_report(project_root: &Path) -> Vec<String> {
+    let outcome = load_snapshot(project_root);
+    snapshot_outcome_lines(project_root, &outcome)
+}
+
+/// Render a [`SnapshotOutcome`] to the exact lines the session-start hook has
+/// always printed (one element per former `println!`), so behaviour is
+/// preserved while the strings become reusable.
+fn snapshot_outcome_lines(project_root: &Path, outcome: &SnapshotOutcome) -> Vec<String> {
+    let mut lines = Vec::new();
     let snapshot = match outcome {
         SnapshotOutcome::Ready(snapshot) => snapshot,
         SnapshotOutcome::DbUnreadable => {
             let db_path = project_root.join(".clarion").join("clarion.db");
-            println!(
+            lines.push(format!(
                 "Clarion: an index exists at {} but could not be opened (it may be \
                  corrupt, locked by another process, or unreadable). Check permissions, \
                  ensure no other clarion process holds it, or remove .clarion/ and re-run \
                  `clarion install` + `clarion analyze`. (Run with RUST_LOG=warn for the \
                  open error.)",
                 db_path.display()
-            );
-            return;
+            ));
+            return lines;
         }
     };
     if !snapshot.db_present() {
-        println!(
+        lines.push(format!(
             "Clarion: no index at {}/.clarion/clarion.db. \
              Run `clarion install --path {}` then `clarion analyze {}`.",
             project_root.display(),
             project_root.display(),
             project_root.display()
-        );
-        return;
+        ));
+        return lines;
     }
     // Subsystems ARE entities (kind = 'subsystem'), so subsystem_count is a
     // subset of entity_count, not a parallel category — say so, or the two read
     // as disjoint (clarion-e4e80eff3f).
-    println!(
+    lines.push(format!(
         "Clarion index: {} entities (incl. {} subsystems), {} findings.",
         snapshot.entity_count(),
         snapshot.subsystem_count(),
         snapshot.finding_count()
-    );
+    ));
     if snapshot.degraded() {
         // A backing query folded to a safe default, so the counts above may
         // understate a populated index. Distinct from the present-but-empty
         // case (which is not degraded). Operator detail is in the warn log.
-        println!(
+        lines.push(
             "Clarion: ⚠ snapshot is degraded — at least one index query failed and \
              the counts above may be incomplete. (Run with RUST_LOG=warn for details.)"
+                .to_string(),
         );
     }
     match snapshot.staleness() {
         Staleness::Fresh => {
-            println!(
+            lines.push(format!(
                 "Index is fresh (last analyzed {}). Ask Clarion before re-exploring \
                  the tree; see the clarion-workflow skill.",
                 snapshot.last_analyzed_at().unwrap_or("unknown")
-            );
+            ));
         }
         Staleness::Stale => {
-            println!(
+            lines.push(format!(
                 "Index may be stale: source files changed since the last run. \
                  Run `clarion analyze {}` to refresh.",
                 project_root.display()
-            );
+            ));
         }
         Staleness::NeverAnalyzed => {
-            println!(
+            lines.push(format!(
                 "No analysis recorded yet. Run `clarion analyze {}` to build the index.",
                 project_root.display()
-            );
+            ));
         }
         Staleness::NoSourcePaths => {
-            println!(
+            lines.push(format!(
                 "Index freshness not checked: no ingested entity has a recorded \
                  source path to compare against (last analyzed {}). The index is \
                  present and queryable.",
                 snapshot.last_analyzed_at().unwrap_or("unknown")
-            );
+            ));
         }
         Staleness::Unknown => {
-            println!(
+            lines.push(format!(
                 "Index freshness unknown (a freshness check failed). If briefings \
                  look empty, run `clarion analyze {}`.",
                 project_root.display()
-            );
+            ));
         }
     }
+    lines
 }

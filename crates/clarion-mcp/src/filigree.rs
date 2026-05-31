@@ -37,9 +37,80 @@ pub struct EntityAssociation {
     pub attached_by: String,
 }
 
+/// One Wardline finding as Clarion surfaces it — the subset of Filigree's
+/// `ScanFindingLoom` (`GET /api/loom/findings`) used for read-time
+/// reconciliation. Unknown fields are ignored so Filigree can grow the row.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct WardlineFinding {
+    pub rule_id: String,
+    pub message: String,
+    #[serde(default)]
+    pub severity: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub line_start: Option<i64>,
+    #[serde(default)]
+    pub line_end: Option<i64>,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    #[serde(default)]
+    pub file_id: Option<String>,
+    /// The finding's `metadata` object; `metadata.wardline.qualname` is the
+    /// reconciliation key. Defaults to JSON null when absent.
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+/// Envelope returned by `GET /api/loom/findings` — the paged list of
+/// [`WardlineFinding`] rows Clarion reconciles against.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct WardlineFindingsResponse {
+    #[serde(default)]
+    pub items: Vec<WardlineFinding>,
+    /// True when more findings pages follow. Clarion does not page the findings
+    /// list (the offset param is unpinned in the federation contract); when this
+    /// is true the first page is an incomplete view, so the caller fails closed
+    /// to `unavailable` rather than silently undercounting the file's findings.
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+/// One row of `GET /api/loom/files` — only the fields needed to map a path to
+/// Filigree's `file_id`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct LoomFileRecord {
+    pub file_id: String,
+    pub path: String,
+}
+
+/// Envelope returned by `GET /api/loom/files` — the paged list of
+/// [`LoomFileRecord`] rows Clarion uses to map a path to a `file_id`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct LoomFilesResponse {
+    #[serde(default)]
+    pub items: Vec<LoomFileRecord>,
+    /// True when more pages follow. When the exact-path match is absent and
+    /// `has_more` is true, the result is indeterminate — the file may be on a
+    /// later page — so callers must degrade to `unavailable` rather than
+    /// concluding `no_matches`.
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+pub fn parse_wardline_findings_response(
+    body: &str,
+) -> Result<WardlineFindingsResponse, FiligreeContractError> {
+    serde_json::from_str(body).map_err(FiligreeContractError::from)
+}
+
+pub fn parse_loom_files_response(body: &str) -> Result<LoomFilesResponse, FiligreeContractError> {
+    serde_json::from_str(body).map_err(FiligreeContractError::from)
+}
+
 #[derive(Debug, Error)]
 pub enum FiligreeContractError {
-    #[error("invalid Filigree entity association response: {0}")]
+    #[error("invalid Filigree response: {0}")]
     InvalidResponse(#[from] serde_json::Error),
 }
 
@@ -85,6 +156,19 @@ pub trait FiligreeLookup: Send + Sync {
     /// so the caller can stop hammering a down endpoint.
     fn issue_detail(&self, _issue_id: &str) -> Result<Option<IssueDetail>, FiligreeClientError> {
         Ok(None)
+    }
+
+    /// Wardline findings for a source file, for read-time reconciliation
+    /// (Flow B). Two-hop: resolve `path` -> Filigree `file_id`, then fetch that
+    /// file's `scan_source=wardline` findings. Returns an empty list when no
+    /// Wardline-touched file exists at `path`. Default impl returns empty (no
+    /// Filigree); the HTTP client overrides it. Transport / non-success HTTP is
+    /// surfaced as `Err` so the caller degrades the section to `unavailable`.
+    fn wardline_findings_for_path(
+        &self,
+        _path: &str,
+    ) -> Result<Vec<WardlineFinding>, FiligreeClientError> {
+        Ok(Vec::new())
     }
 }
 
@@ -205,24 +289,30 @@ impl FiligreeHttpClient {
         }
         parse_clean_stale_response(&body).map_err(FiligreeClientError::InvalidCleanStaleResponse)
     }
-}
 
-impl FiligreeLookup for FiligreeHttpClient {
-    fn associations_for(
-        &self,
-        entity_id: &str,
-    ) -> Result<EntityAssociationsResponse, FiligreeClientError> {
-        let mut request = self
-            .client
-            .get(entity_associations_url(&self.base_url, entity_id))
-            .header("accept", "application/json");
+    /// GET `url` with the standard actor + bearer headers, returning the raw
+    /// (unread) response. Shared by [`get_json`](Self::get_json) and
+    /// [`get_json_or_none`](Self::get_json_or_none); the latter inspects the
+    /// status before reading the body so a `404` can short-circuit.
+    fn send_get(&self, url: &str) -> Result<reqwest::blocking::Response, FiligreeClientError> {
+        let mut request = self.client.get(url).header("accept", "application/json");
         if !self.actor.trim().is_empty() {
             request = request.header("x-filigree-actor", self.actor.as_str());
         }
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
         }
-        let response = request.send().map_err(FiligreeClientError::Request)?;
+        request.send().map_err(FiligreeClientError::Request)
+    }
+
+    /// GET `url` with the standard actor + bearer headers and parse the body as
+    /// `T`. A non-success status is surfaced as `HttpStatus` so the caller can
+    /// stop hammering a down endpoint.
+    fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+    ) -> Result<T, FiligreeClientError> {
+        let response = self.send_get(url)?;
         let status = response.status();
         let body = response.text().map_err(FiligreeClientError::Request)?;
         if !status.is_success() {
@@ -231,24 +321,20 @@ impl FiligreeLookup for FiligreeHttpClient {
                 body,
             });
         }
-        parse_entity_associations_response(&body).map_err(FiligreeClientError::from)
+        serde_json::from_str(&body)
+            .map_err(|e| FiligreeClientError::Contract(FiligreeContractError::from(e)))
     }
 
-    fn issue_detail(&self, issue_id: &str) -> Result<Option<IssueDetail>, FiligreeClientError> {
-        let mut request = self
-            .client
-            .get(issue_detail_url(&self.base_url, issue_id))
-            .header("accept", "application/json");
-        if !self.actor.trim().is_empty() {
-            request = request.header("x-filigree-actor", self.actor.as_str());
-        }
-        if let Some(token) = &self.token {
-            request = request.bearer_auth(token);
-        }
-        let response = request.send().map_err(FiligreeClientError::Request)?;
+    /// Like [`get_json`](Self::get_json) but maps a `404` to `Ok(None)` — the
+    /// enrich-only degrade signal for "the resource (or the route itself) is
+    /// absent", not an error. The body is not read on a `404`. Any other
+    /// non-success status is still surfaced as `HttpStatus`.
+    fn get_json_or_none<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+    ) -> Result<Option<T>, FiligreeClientError> {
+        let response = self.send_get(url)?;
         let status = response.status();
-        // A 404 means the issue (or the whole detail route) is absent — the
-        // enrich-only degrade signal, not an error.
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -259,9 +345,62 @@ impl FiligreeLookup for FiligreeHttpClient {
                 body,
             });
         }
-        parse_issue_detail_response(&body)
+        serde_json::from_str(&body)
             .map(Some)
-            .map_err(FiligreeClientError::from)
+            .map_err(|e| FiligreeClientError::Contract(FiligreeContractError::from(e)))
+    }
+}
+
+impl FiligreeLookup for FiligreeHttpClient {
+    fn associations_for(
+        &self,
+        entity_id: &str,
+    ) -> Result<EntityAssociationsResponse, FiligreeClientError> {
+        self.get_json(&entity_associations_url(&self.base_url, entity_id))
+    }
+
+    fn issue_detail(&self, issue_id: &str) -> Result<Option<IssueDetail>, FiligreeClientError> {
+        // A 404 means the issue (or the whole detail route) is absent — the
+        // enrich-only degrade signal, not an error — so use the `_or_none` form.
+        self.get_json_or_none(&issue_detail_url(&self.base_url, issue_id))
+    }
+
+    fn wardline_findings_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Vec<WardlineFinding>, FiligreeClientError> {
+        // Hop 1: path -> Filigree file_id. path_prefix is a prefix filter, so
+        // take only the row whose path is byte-exact.
+        let files: LoomFilesResponse =
+            self.get_json(&loom_files_url(&self.base_url, "wardline", path))?;
+        let exact = files.items.into_iter().find(|f| f.path == path);
+        let Some(file_id) = exact.map(|f| f.file_id) else {
+            // No exact match on this page. If has_more is true the result is
+            // indeterminate — the file may be on a later page — so degrade to
+            // unavailable rather than falsely concluding no_matches.
+            if files.has_more {
+                return Err(FiligreeClientError::HttpStatus {
+                    status: 0,
+                    body:
+                        "loom/files truncated before exact path match; cannot conclude no findings"
+                            .to_owned(),
+                });
+            }
+            return Ok(Vec::new());
+        };
+        // Hop 2: file_id -> wardline findings. As with hop-1, Clarion reads only
+        // the first page; if it is truncated (`has_more`) the findings view is
+        // incomplete, so fail closed to `unavailable` rather than returning a
+        // silent undercount.
+        let findings: WardlineFindingsResponse =
+            self.get_json(&loom_findings_url(&self.base_url, "wardline", &file_id))?;
+        if findings.has_more {
+            return Err(FiligreeClientError::HttpStatus {
+                status: 0,
+                body: "loom/findings truncated; cannot enumerate all findings for file".to_owned(),
+            });
+        }
+        Ok(findings.items)
     }
 }
 
@@ -288,6 +427,24 @@ pub fn entity_associations_url(base_url: &str, entity_id: &str) -> String {
         "{}/api/entity-associations?entity_id={}",
         base_url.trim_end_matches('/'),
         percent_encode_query_value(entity_id)
+    )
+}
+
+pub fn loom_files_url(base_url: &str, scan_source: &str, path_prefix: &str) -> String {
+    format!(
+        "{}/api/loom/files?scan_source={}&path_prefix={}",
+        base_url.trim_end_matches('/'),
+        percent_encode_query_value(scan_source),
+        percent_encode_query_value(path_prefix)
+    )
+}
+
+pub fn loom_findings_url(base_url: &str, scan_source: &str, file_id: &str) -> String {
+    format!(
+        "{}/api/loom/findings?scan_source={}&file_id={}",
+        base_url.trim_end_matches('/'),
+        percent_encode_query_value(scan_source),
+        percent_encode_query_value(file_id)
     )
 }
 
@@ -610,6 +767,236 @@ mod tests {
             other => panic!("expected HttpStatus, got {other:?}"),
         }
         handle.join().expect("server thread");
+    }
+
+    #[test]
+    fn parses_loom_findings_list_envelope() {
+        let resp = parse_wardline_findings_response(
+            r#"{"items":[
+                {"finding_id":"f-1","file_id":"file-9","severity":"high","status":"open",
+                 "scan_source":"wardline","rule_id":"WLN-TAINT-001","message":"tainted sink",
+                 "suggestion":"","scan_run_id":"r-1","line_start":12,"line_end":12,
+                 "fingerprint":"fp-abc","issue_id":null,"seen_count":1,
+                 "metadata":{"wardline":{"qualname":"demo.Foo.bar","kind":"DEFECT"}},
+                 "data_warnings":[]}
+            ],"has_more":false}"#,
+        )
+        .expect("parse findings list");
+        assert_eq!(resp.items.len(), 1);
+        let f = &resp.items[0];
+        assert_eq!(f.rule_id, "WLN-TAINT-001");
+        assert_eq!(f.fingerprint.as_deref(), Some("fp-abc"));
+        assert_eq!(f.line_start, Some(12));
+        assert_eq!(
+            f.metadata
+                .get("wardline")
+                .and_then(|w| w.get("qualname"))
+                .and_then(|q| q.as_str()),
+            Some("demo.Foo.bar")
+        );
+    }
+
+    #[test]
+    fn parses_loom_files_list_envelope() {
+        let resp = parse_loom_files_response(
+            r#"{"items":[
+                {"file_id":"file-9","path":"src/demo.py","language":"python","file_type":"source"},
+                {"file_id":"file-10","path":"src/demo_helpers.py","language":"python","file_type":"source"}
+            ],"has_more":false}"#,
+        )
+        .expect("parse files list");
+        assert_eq!(resp.items.len(), 2);
+        assert_eq!(resp.items[0].file_id, "file-9");
+        assert_eq!(resp.items[0].path, "src/demo.py");
+    }
+
+    #[test]
+    fn builds_loom_url_builders_with_encoding() {
+        assert_eq!(
+            loom_files_url("http://127.0.0.1:8542/", "wardline", "src/demo.py"),
+            "http://127.0.0.1:8542/api/loom/files?scan_source=wardline&path_prefix=src%2Fdemo.py"
+        );
+        assert_eq!(
+            loom_findings_url("http://127.0.0.1:8542/", "wardline", "file-9"),
+            "http://127.0.0.1:8542/api/loom/findings?scan_source=wardline&file_id=file-9"
+        );
+    }
+
+    #[test]
+    fn wardline_findings_for_path_does_two_hops_and_exact_path_filter() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            // Hop 1: GET /api/loom/files — path_prefix matches two files; the
+            // exact-path filter must pick file-9, not the helpers file.
+            let (mut s1, _) = listener.accept().expect("accept files");
+            let mut buf = [0_u8; 4096];
+            let n = s1.read(&mut buf).expect("read files req");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.contains(
+                "GET /api/loom/files?scan_source=wardline&path_prefix=src%2Fdemo.py HTTP/1.1"
+            ));
+            let body = r#"{"items":[{"file_id":"file-9","path":"src/demo.py","language":"python","file_type":"source"},{"file_id":"file-10","path":"src/demo.py.bak","language":"python","file_type":"source"}],"has_more":false}"#;
+            // connection: close forces reqwest to open a fresh TCP connection for
+            // hop 2, so the listener's second accept() receives it (the blocking
+            // client would otherwise pool/reuse hop-1's socket and hop-2's
+            // accept() would hang).
+            write!(
+                s1,
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+
+            // Hop 2: GET /api/loom/findings for file-9.
+            let (mut s2, _) = listener.accept().expect("accept findings");
+            let n = s2.read(&mut buf).expect("read findings req");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                req.contains("GET /api/loom/findings?scan_source=wardline&file_id=file-9 HTTP/1.1")
+            );
+            let body = r#"{"items":[{"finding_id":"f-1","file_id":"file-9","severity":"high","status":"open","scan_source":"wardline","rule_id":"WLN-TAINT-001","message":"sink","suggestion":"","scan_run_id":"r-1","line_start":12,"line_end":12,"fingerprint":"fp","issue_id":null,"seen_count":1,"metadata":{"wardline":{"qualname":"demo.Foo.bar"}},"data_warnings":[]}],"has_more":false}"#;
+            write!(
+                s2,
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        // Not detail_test_client(addr): the two-hop test does two sequential TCP
+        // accepts, so use a more generous timeout to avoid CI scheduling jitter
+        // between hops.
+        let config = FiligreeConfig {
+            enabled: true,
+            base_url: format!("http://{addr}"),
+            actor: "clarion-test".to_owned(),
+            token_env: "TEST_FILIGREE_TOKEN".to_owned(),
+            timeout_seconds: 5,
+            emit_findings: true,
+            prune_unseen_days: 30,
+        };
+        let client = FiligreeHttpClient::from_config(&config, |_| None)
+            .expect("build client")
+            .expect("enabled client");
+        let findings = client
+            .wardline_findings_for_path("src/demo.py")
+            .expect("two-hop fetch");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "WLN-TAINT-001");
+        handle.join().expect("server thread");
+    }
+
+    /// FIX 3: when hop-1 returns items that don't include the exact path AND
+    /// `has_more` is true, `wardline_findings_for_path` must return `Err` rather
+    /// than `Ok(empty)` — a truncated page is indeterminate, not "no file found".
+    #[test]
+    fn wardline_findings_for_path_errors_when_hop1_truncated_before_exact_match() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            // Hop 1: page does NOT contain src/demo.py but has_more is true —
+            // the exact path may be on a later page.
+            let (mut s1, _) = listener.accept().expect("accept files");
+            let mut buf = [0_u8; 4096];
+            let n = s1.read(&mut buf).expect("read files req");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.contains(
+                "GET /api/loom/files?scan_source=wardline&path_prefix=src%2Fdemo.py HTTP/1.1"
+            ));
+            // Return a page that omits the target path with has_more:true.
+            let body = r#"{"items":[{"file_id":"file-1","path":"src/demo_other.py","language":"python","file_type":"source"}],"has_more":true}"#;
+            write!(
+                s1,
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            // No hop-2 — the function must error before making a second request.
+        });
+        let config = FiligreeConfig {
+            enabled: true,
+            base_url: format!("http://{addr}"),
+            actor: "clarion-test".to_owned(),
+            token_env: "TEST_FILIGREE_TOKEN".to_owned(),
+            timeout_seconds: 5,
+            emit_findings: true,
+            prune_unseen_days: 30,
+        };
+        let client = FiligreeHttpClient::from_config(&config, |_| None)
+            .expect("build client")
+            .expect("enabled client");
+        let result = client.wardline_findings_for_path("src/demo.py");
+        handle.join().expect("server thread");
+        assert!(
+            result.is_err(),
+            "truncated hop-1 without exact match must be Err, not Ok: {result:?}"
+        );
+    }
+
+    /// Hop-2 counterpart to the hop-1 truncation test: when the findings page
+    /// for the resolved `file_id` reports `has_more: true`, the first page is an
+    /// incomplete view, so `wardline_findings_for_path` must return `Err`
+    /// (degrades to `unavailable`) rather than `Ok(partial)` — no silent
+    /// undercount.
+    #[test]
+    fn wardline_findings_for_path_errors_when_hop2_truncated() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            // Hop 1: exact path resolves to file-9 on a complete page.
+            let (mut s1, _) = listener.accept().expect("accept files");
+            let mut buf = [0_u8; 4096];
+            let n = s1.read(&mut buf).expect("read files req");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.contains(
+                "GET /api/loom/files?scan_source=wardline&path_prefix=src%2Fdemo.py HTTP/1.1"
+            ));
+            let body = r#"{"items":[{"file_id":"file-9","path":"src/demo.py","language":"python","file_type":"source"}],"has_more":false}"#;
+            write!(
+                s1,
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+
+            // Hop 2: findings page for file-9 is truncated (has_more:true).
+            let (mut s2, _) = listener.accept().expect("accept findings");
+            let n = s2.read(&mut buf).expect("read findings req");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                req.contains("GET /api/loom/findings?scan_source=wardline&file_id=file-9 HTTP/1.1")
+            );
+            let body = r#"{"items":[{"finding_id":"f-1","file_id":"file-9","severity":"high","status":"open","scan_source":"wardline","rule_id":"WLN-TAINT-001","message":"sink","suggestion":"","scan_run_id":"r-1","line_start":12,"line_end":12,"fingerprint":"fp","issue_id":null,"seen_count":1,"metadata":{"wardline":{"qualname":"demo.Foo.bar"}},"data_warnings":[]}],"has_more":true}"#;
+            write!(
+                s2,
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let config = FiligreeConfig {
+            enabled: true,
+            base_url: format!("http://{addr}"),
+            actor: "clarion-test".to_owned(),
+            token_env: "TEST_FILIGREE_TOKEN".to_owned(),
+            timeout_seconds: 5,
+            emit_findings: true,
+            prune_unseen_days: 30,
+        };
+        let client = FiligreeHttpClient::from_config(&config, |_| None)
+            .expect("build client")
+            .expect("enabled client");
+        let result = client.wardline_findings_for_path("src/demo.py");
+        handle.join().expect("server thread");
+        assert!(
+            result.is_err(),
+            "truncated hop-2 findings page must be Err, not Ok(partial): {result:?}"
+        );
     }
 
     fn detail_test_client(addr: std::net::SocketAddr) -> FiligreeHttpClient {
