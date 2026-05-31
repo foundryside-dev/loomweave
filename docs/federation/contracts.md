@@ -103,6 +103,10 @@ is emitted by `POST /api/v1/files/batch` (as `400`) and by the `/api/wardline/*`
 batch routes (as `413`) — the same `code` carries a **different HTTP status by
 endpoint**, so a client must route on `code`, not on status.
 
+> The `code` enum is defined canonically in Rust as `clarion_core::errors::HttpErrorCode`
+> (single source of truth shared with the MCP tool-error vocabulary; see ADR-037).
+> The wire spelling on this surface is unchanged.
+
 ### `GET /api/v1/files?path=&language=`
 
 Resolves a project-relative or absolute file path to the Clarion file identity
