@@ -12,6 +12,61 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-05-31
+
+### Added
+
+- **Wardline taint-fact store (ADR-036).** Clarion now serves as the persistent
+  read+write store for Wardline's taint facts over HTTP, keyed to Clarion entity
+  qualnames. New migration `0003` adds the `wardline_taint_facts` table; facts
+  are written through the storage writer-actor
+  (`WriterCmd::UpsertWardlineTaintFact`) and resolved/fetched via the new
+  `wardline_taint` storage module. Routes:
+  - `POST /api/wardline/resolve` — exact-tier qualname → entity resolution.
+  - `POST /api/wardline/taint-facts` — exact-only batch write; the Wardline
+    payload is stored byte-verbatim (`serde_json::value::RawValue`) so Clarion
+    never reshapes Wardline's JSON.
+  - `GET /api/wardline/taint-facts` and `…:batch-get` — reads carry a live
+    freshness hash so a consumer can detect drift against the entity's current
+    content.
+
+  The write path is opt-in via `serve.http.wardline_taint_write` config plus an
+  optional writer-actor, and disabled by default.
+- **Flow B — read-time Wardline finding reconciliation (enrich-only).**
+  `issues_for` and `orientation_pack` now attach a `wardline_findings` section
+  reconciled against Wardline findings stored in Filigree. A pure
+  qualname-reconciliation module matches `metadata.wardline.qualname` byte-exact
+  against entity-ID segment-3; a two-hop Filigree read
+  (`GET /api/loom/files` → `GET /api/loom/findings`) resolves a path to its
+  findings. Per the enrich-only axiom, any unreachable hop degrades the section
+  to `result_kind: "unavailable"` rather than failing the tool.
+
+### Changed
+
+- Federation contracts pinned/clarified: the Wardline taint-store routes +
+  freshness contract, the two consumed loom routes for Flow B, Clarion→Filigree
+  ephemeral-port endpoint discovery, and the `scan_run_id` contract (stale
+  Phase-0 handshake references removed).
+- `docs/suite/loom.md`: added a written retirement condition to the §5
+  asterisk-2 (Wardline→Filigree pipeline coupling), and refreshed the §9 status
+  table to the post-1.0 state.
+- ADR-036 accepted (Clarion as Wardline taint-fact store), documenting the
+  in-process two-writer concurrency posture.
+- The Python round-trip self-test now hard-fails (instead of silently skipping)
+  when the installed `clarion-plugin-python` entry point is missing, so a broken
+  editable install cannot pass CI green.
+
+### Fixed
+
+- `wardline_findings_for_path` no longer silently undercounts: a truncated
+  findings page (`has_more`) now fails closed to `unavailable` rather than
+  returning a partial result, mirroring the existing hop-1 truncation handling.
+- Wardline metadata block is now surfaced in finding output, with truncation-safe
+  `no_matches` handling and a corrected tool description.
+- De-duplicated the Filigree HTTP client GET paths: `associations_for` and
+  `issue_detail` now route through a shared `get_json` / `get_json_or_none`,
+  preserving the `404` → enrich-only-degrade semantics.
+
 ## [1.0.1] — 2026-05-30
 
 1.0.0 was tagged but its release failed to publish (the macOS build broke at
@@ -250,5 +305,7 @@ normative.
 - Operator guides under [`docs/operator/`](docs/operator/) — getting-started,
   OpenRouter setup, HTTP read API.
 
-[Unreleased]: https://github.com/tachyon-beep/clarion/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/tachyon-beep/clarion/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/tachyon-beep/clarion/compare/v1.0.1...v1.1.0
+[1.0.1]: https://github.com/tachyon-beep/clarion/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/tachyon-beep/clarion/releases/tag/v1.0.0
