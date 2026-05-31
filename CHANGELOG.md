@@ -55,6 +55,16 @@ only when an incompatible change is made to that surface. See
 - The Python round-trip self-test now hard-fails (instead of silently skipping)
   when the installed `clarion-plugin-python` entry point is missing, so a broken
   editable install cannot pass CI green.
+- **Shared error vocabulary (ADR-037).** New `clarion-core::errors` module is now
+  the single typed source of truth for both wire error-code vocabularies:
+  `HttpErrorCode` (federation HTTP read API, `SCREAMING_SNAKE_CASE`, moved out of
+  `http_read.rs`) and a new `McpErrorCode` (MCP tool envelope, kebab-case) that
+  replaces ~47 bare string literals with compiler-checked variants. The two
+  surfaces keep their established wire spellings — co-located, not merged, since
+  they have disjoint vocabularies and independent consumers — and drift tests pin
+  every wire string at the definition site. Wire output is byte-identical on both
+  surfaces; no consumer change. Closes the MCP/HTTP error-code drift smell
+  (V11-ARCH-01).
 
 ### Fixed
 
