@@ -45,9 +45,11 @@ def _locate_binary() -> Path:
     scripts = Path(sysconfig.get_path("scripts"))
     binary = scripts / "clarion-plugin-python"
     if not binary.exists():
-        pytest.skip(
-            f"clarion-plugin-python not at {binary}; "
-            "install with `pip install -e plugins/python[dev]`",
+        pytest.fail(
+            f"clarion-plugin-python not found at {binary}. It is the installed "
+            "console entry point of clarion-plugin-python; a missing binary means "
+            "`pip install -e plugins/python[dev]` was not run or the install is "
+            "broken. Skipping this round-trip test would mask that regression in CI.",
         )
     return binary
 
