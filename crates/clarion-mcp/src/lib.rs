@@ -4152,6 +4152,14 @@ fn token_ceiling_envelope(message: &str) -> Value {
     })
 }
 
+/// `reason` is a degraded-result discriminant for the `issues_for` tool
+/// (`filigree-disabled`, `entity-not-found`, `filigree-unreachable`,
+/// `filigree-client-error`), NOT a member of the `McpErrorCode` error-code
+/// vocabulary. It lives on a `success_envelope` (`available: false`), not an
+/// error envelope. `entity-not-found` here coincidentally matches
+/// `McpErrorCode::EntityNotFound`'s wire spelling but is intentionally a bare
+/// string: most of this closed set are not error codes, and this surface has
+/// its own consumers, so the two axes are kept independent (see ADR-037).
 fn issues_unavailable(filigree_endpoint: &Value, reason: &str, message: &str) -> Value {
     success_envelope(json!({
         "available": false,
