@@ -1,6 +1,12 @@
 # Clarion .gitignore — ADR-005 tracked-vs-excluded list.
-# Tracked (committed): clarion.db, config.json, .gitignore itself.
-# Excluded (ignored): WAL sidecars, shadow DB, per-run logs, tmp scratch.
+# Tracked (committed): config.json, .gitignore itself.
+# Excluded (ignored): clarion.db + instance_id (runtime artifacts, also pinned
+#   in the repo-root .gitignore), WAL sidecars, shadow DB, per-run logs, tmp.
+
+# Runtime artifacts: the index DB and the per-project instance fingerprint
+# change on every analyze run, so they are NOT tracked (untracked 2026-06-02).
+clarion.db
+instance_id
 
 # SQLite write-ahead files never belong in the repo.
 *-wal

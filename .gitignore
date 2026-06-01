@@ -26,3 +26,11 @@ htmlcov/
 
 # Smoke-test result artifacts (per-run; archived separately at tag-cut)
 tests/e2e/external-operator-smoke-results-*.md
+
+# Generated skill fingerprint (rewritten by `clarion install --skills`).
+.agents/skills/clarion-workflow/.fingerprint
+
+# Clarion runtime artifacts — the index DB and per-project instance fingerprint
+# change on every analyze run, so they are not tracked (see .clarion/.gitignore).
+.clarion/clarion.db
+.clarion/instance_id
