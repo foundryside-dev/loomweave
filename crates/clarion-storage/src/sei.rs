@@ -506,6 +506,129 @@ pub fn has_any_alive_binding(conn: &Connection) -> Result<bool> {
     Ok(n != 0)
 }
 
+// ---------------------------------------------------------------------------
+// Write records + helpers (the writer-actor dispatch targets, T2.2). All run
+// on the sole writer connection; the analyze driver (T2.3) orders orphan /
+// re-point before the corresponding carry so the alive-locator partial unique
+// index never transiently doubles up.
+// ---------------------------------------------------------------------------
+
+/// A durable identity binding to upsert into `sei_bindings`.
+#[derive(Debug, Clone)]
+pub struct SeiBindingRecord {
+    pub sei: String,
+    pub current_locator: Option<String>,
+    pub body_hash: Option<String>,
+    pub signature: Option<String>,
+    pub status: BindingStatus,
+    pub born_run_id: String,
+    pub updated_run_id: String,
+    pub updated_at: String,
+}
+
+/// An append-only lineage event to insert into `sei_lineage` (REQ-L-01).
+#[derive(Debug, Clone)]
+pub struct SeiLineageEntry {
+    pub sei: String,
+    pub event: LineageEvent,
+    pub old_locator: Option<String>,
+    pub new_locator: Option<String>,
+    pub run_id: String,
+    pub recorded_at: String,
+}
+
+/// Mint a new alive binding, or carry an existing one (update its
+/// `current_locator` / `body_hash` / `signature` / `updated_run_id`). Because
+/// the PK is the SEI, a carry that moves a locator REPLACEs the binding's own
+/// row in place — it never creates a second alive row for the same SEI.
+///
+/// # Errors
+/// Returns [`StorageError::Sqlite`] if the statement fails (e.g. a second alive
+/// binding would collide on `ux_sei_alive_locator` — a caller-ordering bug).
+pub fn upsert_sei_binding(conn: &Connection, rec: &SeiBindingRecord) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sei_bindings \
+         (sei, current_locator, body_hash, signature, status, born_run_id, updated_run_id, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+         ON CONFLICT(sei) DO UPDATE SET \
+            current_locator = excluded.current_locator, \
+            body_hash       = excluded.body_hash, \
+            signature       = excluded.signature, \
+            status          = excluded.status, \
+            updated_run_id  = excluded.updated_run_id, \
+            updated_at      = excluded.updated_at",
+        params![
+            rec.sei,
+            rec.current_locator,
+            rec.body_hash,
+            rec.signature,
+            rec.status.as_str(),
+            rec.born_run_id,
+            rec.updated_run_id,
+            rec.updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Flip a binding to `orphaned` (a status change, never a deletion). The
+/// `current_locator` is KEPT for audit; the partial unique index excludes
+/// non-alive rows, so a future entity may reuse that locator freely.
+///
+/// # Errors
+/// Returns [`StorageError::Sqlite`] if the statement fails.
+pub fn orphan_sei_binding(
+    conn: &Connection,
+    sei: &str,
+    run_id: &str,
+    recorded_at: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sei_bindings \
+         SET status = 'orphaned', updated_run_id = ?2, updated_at = ?3 \
+         WHERE sei = ?1",
+        params![sei, run_id, recorded_at],
+    )?;
+    Ok(())
+}
+
+/// Set the plain `entities.signature` column for an existing entity row (the
+/// matcher input; identity itself lives in `sei_bindings`).
+///
+/// # Errors
+/// Returns [`StorageError::Sqlite`] if the statement fails.
+pub fn set_entity_signature(
+    conn: &Connection,
+    entity_id: &str,
+    signature: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE entities SET signature = ?2 WHERE id = ?1",
+        params![entity_id, signature],
+    )?;
+    Ok(())
+}
+
+/// Append one lineage event (INSERT only — REQ-L-01, no UPDATE path in v1).
+///
+/// # Errors
+/// Returns [`StorageError::Sqlite`] if the statement fails.
+pub fn append_sei_lineage(conn: &Connection, entry: &SeiLineageEntry) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sei_lineage (sei, event, old_locator, new_locator, run_id, recorded_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            entry.sei,
+            entry.event.as_str(),
+            entry.old_locator,
+            entry.new_locator,
+            entry.run_id,
+            entry.recorded_at,
+        ],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -884,5 +1007,146 @@ mod tests {
             &binding("clarion:eid:0001", "a.f", "h1", Some("s1")),
         );
         assert!(has_any_alive_binding(&conn).unwrap());
+    }
+
+    // ---- write helpers (T2.2) ----
+
+    fn record(sei: &str, loc: &str, run: &str) -> SeiBindingRecord {
+        SeiBindingRecord {
+            sei: sei.to_owned(),
+            current_locator: Some(loc.to_owned()),
+            body_hash: Some("h1".to_owned()),
+            signature: Some("s1".to_owned()),
+            status: BindingStatus::Alive,
+            born_run_id: run.to_owned(),
+            updated_run_id: run.to_owned(),
+            updated_at: "t0".to_owned(),
+        }
+    }
+
+    #[test]
+    fn upsert_binding_carry_moves_locator_in_place_without_collision() {
+        let conn = migrated_conn();
+        // Mint at the old locator.
+        upsert_sei_binding(&conn, &record("clarion:eid:0001", "auth.login", "r1")).unwrap();
+        // Carry the SAME sei to a new locator (rename) — REPLACE-by-PK moves the
+        // row in place; the alive partial index sees exactly one alive row.
+        let carried = SeiBindingRecord {
+            current_locator: Some("authn.login".to_owned()),
+            updated_run_id: "r2".to_owned(),
+            updated_at: "t1".to_owned(),
+            ..record("clarion:eid:0001", "authn.login", "r1")
+        };
+        upsert_sei_binding(&conn, &carried).unwrap();
+        // Old locator no longer resolves; new one does; born_run_id preserved.
+        assert!(resolve_locator(&conn, "auth.login").unwrap().is_none());
+        assert_eq!(
+            resolve_locator(&conn, "authn.login").unwrap().unwrap().sei,
+            "clarion:eid:0001"
+        );
+        let born: String = conn
+            .query_row(
+                "SELECT born_run_id FROM sei_bindings WHERE sei = 'clarion:eid:0001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(born, "r1");
+    }
+
+    #[test]
+    fn orphan_flips_status_and_frees_the_locator() {
+        let conn = migrated_conn();
+        upsert_sei_binding(&conn, &record("clarion:eid:0001", "gone.f", "r1")).unwrap();
+        orphan_sei_binding(&conn, "clarion:eid:0001", "r2", "t1").unwrap();
+        // resolve(locator) no longer finds it alive.
+        assert!(resolve_locator(&conn, "gone.f").unwrap().is_none());
+        // resolve_sei reports not-alive.
+        assert!(matches!(
+            resolve_sei(&conn, "clarion:eid:0001").unwrap(),
+            SeiLookupResult::NotAlive { .. }
+        ));
+        // A NEW binding may now take the freed locator (partial index excludes
+        // the orphaned row).
+        upsert_sei_binding(&conn, &record("clarion:eid:0002", "gone.f", "r2")).unwrap();
+        assert_eq!(
+            resolve_locator(&conn, "gone.f").unwrap().unwrap().sei,
+            "clarion:eid:0002"
+        );
+    }
+
+    #[test]
+    fn lineage_appends_in_order_and_resolve_sei_returns_it_when_orphaned() {
+        let conn = migrated_conn();
+        upsert_sei_binding(&conn, &record("clarion:eid:0001", "a.f", "r1")).unwrap();
+        append_sei_lineage(
+            &conn,
+            &SeiLineageEntry {
+                sei: "clarion:eid:0001".to_owned(),
+                event: LineageEvent::Born,
+                old_locator: None,
+                new_locator: Some("a.f".to_owned()),
+                run_id: "r1".to_owned(),
+                recorded_at: "t0".to_owned(),
+            },
+        )
+        .unwrap();
+        append_sei_lineage(
+            &conn,
+            &SeiLineageEntry {
+                sei: "clarion:eid:0001".to_owned(),
+                event: LineageEvent::Orphaned,
+                old_locator: Some("a.f".to_owned()),
+                new_locator: None,
+                run_id: "r2".to_owned(),
+                recorded_at: "t1".to_owned(),
+            },
+        )
+        .unwrap();
+        orphan_sei_binding(&conn, "clarion:eid:0001", "r2", "t1").unwrap();
+
+        let events: Vec<String> = sei_lineage(&conn, "clarion:eid:0001")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .collect();
+        assert_eq!(events, vec!["born".to_owned(), "orphaned".to_owned()]);
+
+        match resolve_sei(&conn, "clarion:eid:0001").unwrap() {
+            SeiLookupResult::NotAlive { lineage } => assert_eq!(lineage.len(), 2),
+            SeiLookupResult::Alive(rec) => panic!("expected NotAlive, got Alive({rec:?})"),
+        }
+    }
+
+    #[test]
+    fn set_entity_signature_updates_only_the_target_row() {
+        let conn = migrated_conn();
+        // Minimal entity rows (entities requires a handful of NOT NULL columns).
+        for id in ["python:function:m.f", "python:function:m.g"] {
+            conn.execute(
+                "INSERT INTO entities \
+                 (id, plugin_id, kind, name, short_name, properties, created_at, updated_at) \
+                 VALUES (?1, 'python', 'function', ?1, ?1, '{}', 't0', 't0')",
+                params![id],
+            )
+            .unwrap();
+        }
+        set_entity_signature(&conn, "python:function:m.f", Some(r#"{"v":1}"#)).unwrap();
+        let sig_f: Option<String> = conn
+            .query_row(
+                "SELECT signature FROM entities WHERE id = 'python:function:m.f'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let sig_g: Option<String> = conn
+            .query_row(
+                "SELECT signature FROM entities WHERE id = 'python:function:m.g'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sig_f.as_deref(), Some(r#"{"v":1}"#));
+        assert_eq!(sig_g, None);
     }
 }

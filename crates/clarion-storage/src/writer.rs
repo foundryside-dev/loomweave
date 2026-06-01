@@ -240,6 +240,39 @@ fn run_actor(
                 });
                 reply(ack, res);
             }
+            WriterCmd::UpsertSeiBinding { record, ack } => {
+                let res = query_time_write(conn, &mut state, commits_observed, |conn| {
+                    crate::sei::upsert_sei_binding(conn, &record)
+                });
+                reply(ack, res);
+            }
+            WriterCmd::OrphanSeiBinding {
+                sei,
+                run_id,
+                recorded_at,
+                ack,
+            } => {
+                let res = query_time_write(conn, &mut state, commits_observed, |conn| {
+                    crate::sei::orphan_sei_binding(conn, &sei, &run_id, &recorded_at)
+                });
+                reply(ack, res);
+            }
+            WriterCmd::SetEntitySignature {
+                entity_id,
+                signature,
+                ack,
+            } => {
+                let res = query_time_write(conn, &mut state, commits_observed, |conn| {
+                    crate::sei::set_entity_signature(conn, &entity_id, signature.as_deref())
+                });
+                reply(ack, res);
+            }
+            WriterCmd::AppendSeiLineage { entry, ack } => {
+                let res = query_time_write(conn, &mut state, commits_observed, |conn| {
+                    crate::sei::append_sei_lineage(conn, &entry)
+                });
+                reply(ack, res);
+            }
             WriterCmd::ReplaceUnresolvedCallSitesForCaller {
                 caller_entity_id,
                 caller_content_hash,

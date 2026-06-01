@@ -16,6 +16,7 @@ pub use clarion_core::EdgeConfidence;
 use crate::cache::{InferredEdgeCacheEntry, SummaryCacheEntry, SummaryCacheKey};
 use crate::error::StorageError;
 use crate::prior_index::PriorIndexEntry;
+use crate::sei::{SeiBindingRecord, SeiLineageEntry};
 use crate::unresolved::UnresolvedCallSiteRecord;
 use crate::wardline_taint::TaintFact;
 
@@ -216,6 +217,37 @@ pub enum WriterCmd {
     UpsertPriorIndex {
         entries: Vec<PriorIndexEntry>,
         recorded_at: String,
+        ack: Ack<()>,
+    },
+    /// Upsert one SEI binding (mint or carry) — Wave 1 / WS1 (ADR-038). A carry
+    /// REPLACEs the binding's own row by SEI PK, moving `current_locator` in
+    /// place; it never creates a second alive row. Query-time write: the SEI
+    /// mint pass runs after `CommitRun` (entities durable) and before the
+    /// prior-index flush (so it reads the prior alive snapshot intact). The
+    /// driver orders orphan/re-point before the corresponding carry so
+    /// `ux_sei_alive_locator` never transiently doubles up.
+    UpsertSeiBinding {
+        record: Box<SeiBindingRecord>,
+        ack: Ack<()>,
+    },
+    /// Flip a binding to `orphaned` (status change, not a deletion;
+    /// `current_locator` retained for audit). Query-time write.
+    OrphanSeiBinding {
+        sei: String,
+        run_id: String,
+        recorded_at: String,
+        ack: Ack<()>,
+    },
+    /// Set the plain `entities.signature` matcher input for an existing entity
+    /// row (identity itself lives in `sei_bindings`). Query-time write.
+    SetEntitySignature {
+        entity_id: String,
+        signature: Option<String>,
+        ack: Ack<()>,
+    },
+    /// Append one SEI lineage event (INSERT only — REQ-L-01). Query-time write.
+    AppendSeiLineage {
+        entry: Box<SeiLineageEntry>,
         ack: Ack<()>,
     },
     /// Replace all unresolved call-site rows for one caller. This is an
