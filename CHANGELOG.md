@@ -12,6 +12,38 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+### Added
+
+- **Stable Entity Identity (SEI) — Wave 1 / WS1 (ADR-038).** Clarion is now the
+  suite's identity authority: it mints a durable, opaque **SEI**
+  (`clarion:eid:<blake3(locator ++ 0x00 ++ mint_run_id)[:32]>`) for every entity
+  and demotes the `{plugin}:{kind}:{qualname}` id to a mutable **locator**, so
+  cross-tool bindings survive rename and move.
+  - Migration `0005` adds `sei_bindings` (durable identity store, keyed by SEI,
+    decoupled from the cumulative `entities` table) + `sei_lineage` (append-only
+    event log) + a plain `entities.signature TEXT`. Schema version 4 → 5.
+  - A deterministic, **fail-closed** re-binding matcher (`sei.rs`) carries an SEI
+    on an unchanged locator, a git-detected rename with an identical body
+    (`locator_changed`), or an identical body+signature at a new locator
+    (`moved`); it mints a new SEI and orphans the old binding whenever sameness
+    cannot be proven. A back-to-back unchanged re-run carries (never re-mints)
+    every SEI. The git-rename signal is consumed behind a typed `GitRenameSource`
+    seam (REQ-C-05); v1 ships `ShellGitRenameSource`.
+  - The analyze pipeline runs an SEI mint pass after each successful run;
+    `--no-sei` skips it. The Python plugin emits a versioned `signature` object
+    per function/class (`plugin.toml [signature]`).
+  - HTTP read API: `POST /api/v1/identity/resolve` (+ `:batch`),
+    `GET /api/v1/identity/sei/{sei}`, `GET /api/v1/identity/lineage/{sei}`.
+    `resolve` fail-closed-rejects an SEI-shaped input by the reserved
+    `clarion:eid:` prefix (REQ-F-02). `_capabilities` advertises
+    `sei: { supported: true, version: 1 }`.
+  - The MCP tool surface carries the `sei` alongside every entity id (no MCP
+    locator exception — REQ-C-04), via a read-time `sei_bindings` join.
+  - The shared **SEI conformance oracle** (SEI standard §8) is authored and
+    passes; the cross-tool hard-cutover backfill is documented in
+    [`docs/federation/sei-migration-playbook.md`](docs/federation/sei-migration-playbook.md)
+    and surfaced for owner-gated scheduling.
+
 ## [1.1.0] — 2026-05-31
 
 ### Added
