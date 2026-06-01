@@ -1,0 +1,85 @@
+{
+  "_meta": {
+    "contract": "loom-sei-conformance-oracle",
+    "standard": "Loom Stable Entity Identity (SEI) conformance standard §8",
+    "authority": "Clarion ADR-038 (token/signature/persistence/reserved-namespace); SEI standard (suite-wide)",
+    "fixture_version": 1,
+    "stability": "normative",
+    "token_format_agnostic": true,
+    "verification": "cargo test -p clarion-storage --test sei_conformance_oracle",
+    "updated": "2026-06-02",
+    "description": "The six shared SEI conformance scenarios every Loom tool runs against a reference Clarion. Asserts BEHAVIOUR and OPACITY, never the SEI's internal form. A subsystem is SEI-conformant only when it passes all six (no grandfathering)."
+  },
+  "invariants": [
+    "SEI is opaque: a consumer never parses it. It carries the reserved `clarion:eid:` prefix and is NOT a locator.",
+    "Fail-closed: when sameness cannot be PROVEN, mint a new SEI and orphan the old one — never silently re-point.",
+    "Lineage is append-only: born / locator_changed / moved / orphaned / superseded.",
+    "Identity is carried (never re-minted) for an unchanged locator; SEI values are not part of the byte-identical-run guarantee, but carry/mint decisions are deterministic given the same bindings + source."
+  ],
+  "scenarios": [
+    {
+      "id": "identity_round_trip_and_opacity",
+      "given": "A function entity is analyzed for the first time.",
+      "when": "Mint an SEI; resolve(locator) → sei; resolve_sei(sei) → locator.",
+      "expect": {
+        "resolve_locator": { "sei": "<opaque>", "current_locator": "<locator>", "content_hash": "<hash>", "alive": true },
+        "resolve_sei": { "current_locator": "<locator>", "alive": true },
+        "opacity": "the returned `sei` begins with `clarion:eid:` and is treated as an opaque string by the consumer (never parsed); it is not equal to the locator"
+      }
+    },
+    {
+      "id": "rename",
+      "given": "An entity with an alive SEI; its file/module is renamed so the locator prefix changes; the body is byte-identical; a git-rename signal maps old_locator → new_locator.",
+      "when": "Re-index.",
+      "expect": {
+        "carry": true,
+        "sei": "unchanged (same token as before)",
+        "current_locator": "the new locator",
+        "lineage_appends": "locator_changed",
+        "resolve_locator(old)": { "alive": false },
+        "resolve_locator(new)": { "alive": true, "sei": "<the carried SEI>" }
+      }
+    },
+    {
+      "id": "move",
+      "given": "An entity with an alive SEI is moved to a new module; body hash AND signature are identical at the new locator; exactly one vanished candidate matches; no git signal required.",
+      "when": "Re-index.",
+      "expect": {
+        "carry": true,
+        "sei": "unchanged",
+        "lineage_appends": "moved"
+      }
+    },
+    {
+      "id": "ambiguous",
+      "given": "An entity is renamed WITH a body edit (the body hash changes), even if a git-rename signal is present.",
+      "when": "Re-index.",
+      "expect": {
+        "carry": false,
+        "new_entity": "minted a fresh SEI (born)",
+        "old_binding": "orphaned (resolve_sei → alive:false with an `orphaned` lineage event)",
+        "rationale": "the matcher cannot PROVE sameness → fail closed; a governance attestation on the old SEI is never silently carried across an unproven match"
+      }
+    },
+    {
+      "id": "delete",
+      "given": "An entity present in a prior run is absent from the current run and was not rematched by a rename/move.",
+      "when": "Re-index.",
+      "expect": {
+        "old_binding": "orphaned",
+        "resolve_locator(old)": { "alive": false },
+        "resolve_sei(old_sei)": { "alive": false, "lineage": "includes an `orphaned` event" }
+      }
+    },
+    {
+      "id": "capability_absent",
+      "given": "A Clarion instance that has not populated SEI (pre-SEI DB, or `_capabilities.sei.supported` false / absent).",
+      "when": "A consumer probes `_capabilities` and/or resolves.",
+      "expect": {
+        "consumer": "detects the absent capability and DEGRADES gracefully — keeps working on locators, no crash, honest 'identity unavailable'",
+        "resolve_locator(any)": { "alive": false },
+        "resolve_sei(unknown)": { "alive": false, "lineage": [] }
+      }
+    }
+  ]
+}

@@ -448,12 +448,23 @@ Successful response:
   "file_registry": true,
   "linkages": {
     "http": true
+  },
+  "sei": {
+    "supported": true,
+    "version": 1
   }
 }
 ```
 
 Filigree should treat `registry_backend: true` as the flag that the
 `/api/v1/files` resolution surface is present.
+
+`sei.supported: true` advertises the Stable Entity Identity resolution routes
+(see [§SEI identity resolution](#sei-identity-resolution)); `sei.version` is the
+SEI wire/format version (`1`). A consumer **must** gate its use of SEIs on this
+flag and **degrade gracefully** when it is absent or `supported: false` — that
+is a pre-SEI or non-conformant Clarion, and the consumer keeps working on
+locators (per ADR-038 / the Loom SEI standard §4).
 
 `linkages.http: true` advertises the call-graph linkage routes
 (`GET /api/v1/entities/:id/callers|callees` and their `:batch-get` variants —
@@ -474,6 +485,79 @@ The contract fixture at
 [`fixtures/get-api-v1-capabilities.json`](./fixtures/get-api-v1-capabilities.json)
 is normative for this section. Its shape declaration pins `api_version` and
 asserts that `instance_id` is a UUID; the example uses a seeded stable ID.
+
+## SEI identity resolution
+
+Stable Entity Identity (SEI) resolution over HTTP (Wave 1 / WS1, ADR-038; the
+suite-wide standard is the Loom SEI conformance spec). The **SEI** is a durable,
+opaque surrogate identity that survives rename and move; the
+`{plugin}:{kind}:{qualname}` entity id is demoted to a mutable **locator**
+(address). Cross-tool bindings (Filigree associations, Wardline taint facts,
+`legis` attestations) **must** key on the SEI, never the locator.
+
+These routes are HMAC-gated exactly like `/api/v1/files`. Identity is read from
+Clarion's `sei_bindings` store (the source of truth). SEIs are **opaque on the
+wire** — consumers MUST NOT parse them.
+
+### `POST /api/v1/identity/resolve`
+
+Resolve a locator to its alive SEI. Request: `{ "locator": "python:function:auth.tokens.refresh" }`.
+
+Successful response (`200 OK`):
+
+```json
+{ "sei": "clarion:eid:<hex>", "current_locator": "python:function:auth.tokens.refresh", "content_hash": "<blake3>", "alive": true }
+```
+
+When the locator resolves to nothing alive: `{ "alive": false }` (still `200`).
+
+**Fail-closed input validation (REQ-F-02).** `resolve` **rejects** any input that
+is not a locator — including an already-migrated, **SEI-shaped** string — with
+`400` and `code: "INVALID_PATH"` (`"not a valid locator…"`), **never** a silent
+mis-resolution. The rejection keys on the reserved **`clarion:eid:` prefix**, not
+a colon count (an SEI carries the same two colons a locator does). This contract
+is what makes the idempotent, resumable cross-tool backfill safe — see
+[`sei-migration-playbook.md`](./sei-migration-playbook.md).
+
+### `POST /api/v1/identity/resolve:batch`
+
+Resolve up to **256** locators in one request. Request:
+`{ "locators": ["python:function:a.b", …] }`. Response:
+
+```json
+{
+  "resolved": { "python:function:a.b": { "sei": "clarion:eid:<hex>", "current_locator": "python:function:a.b", "content_hash": "<blake3>", "alive": true } },
+  "invalid": ["clarion:eid:…", "malformed"],
+  "not_found": ["python:function:gone"]
+}
+```
+
+`invalid[]` collects SEI-shaped or malformed inputs (the REQ-F-02 rejection,
+batched — never mis-resolved); `not_found[]` collects well-formed locators with
+no alive binding. Oversize requests get `400` / `code: "BATCH_TOO_LARGE"`.
+
+### `GET /api/v1/identity/sei/:sei`
+
+Resolve an SEI. Alive: `{ "sei": "…", "current_locator": "…", "content_hash": "…", "alive": true }`.
+Orphaned/superseded/unknown: `{ "sei": "…", "alive": false, "lineage": [ … ] }`,
+where each lineage event is `{ event, old_locator, new_locator, run_id, recorded_at }`
+and `event ∈ {born, locator_changed, moved, orphaned, superseded}`.
+
+### `GET /api/v1/identity/lineage/:sei`
+
+The ordered append-only lineage event list for an SEI:
+`{ "sei": "…", "lineage": [ { event, old_locator, new_locator, run_id, recorded_at }, … ] }`.
+
+### Conformance
+
+Clarion's SEI behaviour is proven by the shared **SEI conformance oracle** (the
+Loom SEI standard §8): identity round-trip + opacity, rename (`locator_changed`),
+move (`moved`), ambiguous (fail-closed mint + orphan), delete (orphan +
+`alive: false`), and capability-absent (graceful degrade). The normative scenario
+definitions live at
+[`fixtures/sei-conformance-oracle.json`](./fixtures/sei-conformance-oracle.json)
+and Clarion's pass is enforced by
+`cargo test -p clarion-storage --test sei_conformance_oracle`.
 
 ## Path normalization
 
