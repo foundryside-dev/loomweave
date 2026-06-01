@@ -13,6 +13,7 @@ mod instance;
 mod mcp_registration;
 mod run_lifecycle;
 mod secret_scan;
+mod sei_git;
 mod serve;
 mod skill_pack;
 mod stats;
@@ -52,6 +53,7 @@ fn main() -> Result<()> {
             resume,
             prune_unseen,
             progress_file,
+            no_sei,
         } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -75,6 +77,7 @@ fn main() -> Result<()> {
                     resume_run_id: resume,
                     prune_unseen,
                     progress_file,
+                    no_sei,
                 },
             ))
         }

@@ -1910,6 +1910,141 @@ fn analyze_rewrites_prior_index_to_current_run_entity_set() {
     assert!(!recorded_at.is_empty(), "recorded_at must be populated");
     assert_eq!(
         signature, None,
-        "signature stays NULL in Wave 0 (WS1 fills it)"
+        "the phase3 fixture declares no signature, so module rows stay NULL"
+    );
+}
+
+/// Map of `current_locator -> sei` for every ALIVE binding (Wave 1 / WS1).
+fn alive_sei_bindings(project_root: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+    let conn = Connection::open(project_root.join(".clarion/clarion.db")).unwrap();
+    conn.prepare(
+        "SELECT current_locator, sei FROM sei_bindings \
+         WHERE status = 'alive' AND current_locator IS NOT NULL",
+    )
+    .unwrap()
+    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap()
+}
+
+fn all_entity_ids(project_root: &std::path::Path) -> std::collections::BTreeSet<String> {
+    let conn = Connection::open(project_root.join(".clarion/clarion.db")).unwrap();
+    conn.prepare("SELECT id FROM entities")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_mints_alive_sei_binding_for_every_entity() {
+    // DoD: every alive entity has an alive `sei_bindings` row after analysis,
+    // and every SEI carries the reserved `clarion:eid:` prefix (ADR-038).
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_phase3_plugin(plugin_dir.path());
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+
+    std::fs::write(project_dir.path().join("sei_alpha.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("sei_beta.p3"), b"module\n").unwrap();
+    clarion_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    let entities = all_entity_ids(project_dir.path());
+    let bindings = alive_sei_bindings(project_dir.path());
+    // On a from-scratch run every entity is current, so the alive binding set
+    // must equal the entity set exactly.
+    assert_eq!(
+        bindings.keys().cloned().collect::<std::collections::BTreeSet<_>>(),
+        entities,
+        "every entity must have exactly one alive SEI binding after analysis"
+    );
+    assert!(!bindings.is_empty(), "expected at least one minted SEI");
+    for (locator, sei) in &bindings {
+        assert!(
+            sei.starts_with("clarion:eid:"),
+            "SEI for {locator} must carry the reserved prefix: {sei}"
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_carries_sei_on_unchanged_rerun() {
+    // DoD + ADR-038 determinity boundary: a back-to-back unchanged re-run must
+    // CARRY (never re-mint) every SEI. Run 2 uses a different run_id, so a
+    // re-mint would change every token — identical tokens prove the carry.
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_phase3_plugin(plugin_dir.path());
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let analyze = || {
+        clarion_bin()
+            .args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .assert()
+            .success();
+    };
+
+    std::fs::write(project_dir.path().join("sei_gamma.p3"), b"module\n").unwrap();
+    analyze();
+    let after_run1 = alive_sei_bindings(project_dir.path());
+    assert!(!after_run1.is_empty());
+
+    analyze();
+    let after_run2 = alive_sei_bindings(project_dir.path());
+
+    assert_eq!(
+        after_run1, after_run2,
+        "an unchanged re-run must carry every SEI (identical token per locator), not re-mint"
+    );
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_no_sei_flag_skips_minting() {
+    // The --no-sei escape hatch leaves sei_bindings empty.
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_phase3_plugin(plugin_dir.path());
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+
+    std::fs::write(project_dir.path().join("sei_delta.p3"), b"module\n").unwrap();
+    clarion_bin()
+        .args(["analyze", "--no-sei"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    assert!(
+        alive_sei_bindings(project_dir.path()).is_empty(),
+        "--no-sei must skip the mint pass entirely"
     );
 }

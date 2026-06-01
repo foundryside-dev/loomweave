@@ -96,6 +96,13 @@ pub enum Command {
         /// Internal: set by the MCP `analyze_start` tool. Hidden from `--help`.
         #[arg(long, hide = true)]
         progress_file: Option<PathBuf>,
+
+        /// Skip the SEI mint pass (ADR-038 / Wave 1). A diagnostic escape hatch
+        /// for runs against a pre-migration database or when stable identity is
+        /// not needed; the durable entity graph is unaffected (SEI is
+        /// enrich-only). Without this flag every analyze run mints/carries SEIs.
+        #[arg(long)]
+        no_sei: bool,
     },
 
     /// Run the MCP stdio server.

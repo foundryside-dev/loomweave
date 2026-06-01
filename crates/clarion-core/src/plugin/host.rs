@@ -135,6 +135,14 @@ pub struct RawEntity {
     /// would silently drop the field on a typo.
     #[serde(default)]
     pub parent_id: Option<String>,
+    /// Plugin-declared, versioned SEI signature (ADR-038 REQ-C-01). An opaque
+    /// JSON object the core stores verbatim and compares by string equality
+    /// (never parses) — the matcher's move-case input. `None` for kinds where
+    /// the plugin declares no signature (modules, packages). Typed top-level
+    /// (like `parent_id`) rather than routed through `extra`, because it is a
+    /// load-bearing identity input a string-key typo must not silently drop.
+    #[serde(default)]
+    pub signature: Option<serde_json::Value>,
     /// Extra fields — accepted without interpretation.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,

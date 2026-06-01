@@ -9,7 +9,7 @@
 //! - On unrecoverable error (cap, escape, spawn, transport) → `FailRun`.
 //! - Zero successful plugins discovered → `SkippedNoPlugins` (existing path).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,10 +27,12 @@ use clarion_core::{
     discover,
 };
 use clarion_storage::{
-    DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, PriorIndexEntry, UnresolvedCallSiteRecord,
-    Writer,
+    DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, GitRename, NewEntityDescriptor, PriorIndexEntry,
+    SeiBindingRecord, SeiDecision, SeiLineageEntry, UnresolvedCallSiteRecord, Writer,
+    alive_bindings_snapshot,
     commands::{EdgeRecord, EntityRecord, FindingRecord, RunStatus, WriterCmd},
-    module_dependency_edges,
+    mint_sei, module_dependency_edges, orphaned_bindings, rebind_or_mint,
+    sei::{BindingStatus, GitRenameSource, LineageEvent},
 };
 
 use clarion_mcp::config::McpConfig;
@@ -155,6 +157,10 @@ pub(crate) struct AnalyzeOptions {
     pub(crate) prune_unseen: bool,
     /// When set, structured progress is written here as the run proceeds.
     pub(crate) progress_file: Option<PathBuf>,
+    /// `--no-sei`: skip the Wave 1 SEI mint pass (ADR-038). A diagnostic escape
+    /// hatch for runs against a pre-migration DB or when identity is irrelevant;
+    /// the durable graph is unaffected (SEI is enrich-only).
+    pub(crate) no_sei: bool,
 }
 
 /// Run the analyze command against `project_path` with resolved CLI options.
@@ -383,6 +389,11 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // here. Entities with no `content_hash` (no body to hash) are omitted: the
     // snapshot's `body_hash` is NOT NULL and such entities are not move-matchable.
     let mut prior_index_entries: Vec<PriorIndexEntry> = Vec::new();
+    // Wave 1 / WS1: accumulate this run's entity descriptors (locator + body
+    // hash + signature) for the SEI mint pass, which runs after CommitRun and
+    // before the prior-index flush. Gathered here for the same reason as the
+    // prior index — `entities` is cumulative and cannot recover the run's set.
+    let mut sei_descriptors: Vec<NewEntityDescriptor> = Vec::new();
     let briefing_blocks = secret_scan_outcome.briefing_blocks_shared();
     let scanned_files = secret_scan_outcome.scanned_files_shared();
     'plugins: for plugin in plugins {
@@ -480,6 +491,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 unresolved_call_sites,
                 stats,
                 findings,
+                signatures,
             }) => {
                 unresolved_call_sites_total += stats.unresolved_call_sites_total;
                 reference_sites_total += stats.reference_sites_total;
@@ -512,10 +524,11 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 secret_scan_outcome.remember_finding_anchors(&entities);
                 let mut insert_err: Option<anyhow::Error> = None;
                 for (id_str, record) in entities {
-                    // Capture the prior-index row BEFORE `record` is moved into
-                    // the command. Only entities carrying a `content_hash` enter
-                    // the snapshot (body_hash is NOT NULL); `signature` is the
-                    // WS1 matcher input and stays None in Wave 0.
+                    // Capture the prior-index row and the SEI descriptor BEFORE
+                    // `record` is moved into the command. `signature` (WS1) is the
+                    // plugin-declared matcher input, now carried into both the
+                    // prior-index snapshot and the SEI descriptor list.
+                    let signature = signatures.get(&id_str).cloned();
                     let prior_entry =
                         record
                             .content_hash
@@ -523,8 +536,16 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                             .map(|body_hash| PriorIndexEntry {
                                 locator: record.id.clone(),
                                 body_hash,
-                                signature: None,
+                                signature: signature.clone(),
                             });
+                    // Every accepted entity gets a descriptor (even ones with no
+                    // body hash — they still carry/mint an SEI on the
+                    // locator-unchanged path; only the move case needs a body).
+                    let descriptor = NewEntityDescriptor {
+                        locator: record.id.clone(),
+                        body_hash: record.content_hash.clone(),
+                        signature,
+                    };
                     let res = writer
                         .send_wait(|ack| WriterCmd::InsertEntity {
                             entity: Box::new(record),
@@ -537,11 +558,13 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                         insert_err = Some(e);
                         break;
                     }
-                    // Recorded only after a successful insert so the snapshot
-                    // never claims an entity the durable graph lacks.
+                    // Recorded only after a successful insert so neither the
+                    // snapshot nor the SEI pass claims an entity the durable
+                    // graph lacks.
                     if let Some(prior_entry) = prior_entry {
                         prior_index_entries.push(prior_entry);
                     }
+                    sei_descriptors.push(descriptor);
                 }
                 if insert_err.is_none() {
                     for pending in unresolved_call_sites {
@@ -754,6 +777,41 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))
                 .context("CommitRun(Completed)")?;
+            // Wave 1 / WS1: SEI mint pass (ADR-038). Runs AFTER CommitRun (the
+            // entity graph is durable, so reads see the complete run) and BEFORE
+            // the prior-index flush (it reads the prior alive bindings; both are
+            // independent tables but the SEI pass is the identity authority and
+            // goes first). Enrich-only and best-effort: a failure logs and is
+            // swallowed — identity is additive and never un-commits a graph the
+            // run already persisted (the §5 enrich-only invariant). `--no-sei`
+            // skips it entirely.
+            if options.no_sei {
+                tracing::info!(run_id = %run_id, "SEI mint pass skipped (--no-sei)");
+            } else {
+                match run_sei_mint_pass(
+                    &writer,
+                    &db_path,
+                    &project_root,
+                    &run_id,
+                    sei_descriptors,
+                )
+                .await
+                {
+                    Ok(stats) => tracing::info!(
+                        run_id = %run_id,
+                        minted = stats.minted,
+                        carried = stats.carried,
+                        orphaned = stats.orphaned,
+                        "SEI mint pass complete"
+                    ),
+                    Err(e) => tracing::warn!(
+                        run_id = %run_id,
+                        error = %e,
+                        "SEI mint pass failed; identity bindings skipped for this run \
+                         (run already committed successfully)"
+                    ),
+                }
+            }
             // Wave 0 / WS3: rewrite the prior-index snapshot to exactly this
             // run's entities (stale rows from the prior run removed). Runs AFTER
             // CommitRun — the run is already durably `completed`, so this is a
@@ -858,6 +916,212 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
          ({total_entity_count} entities, {total_edge_count} edges)"
     );
     Ok(())
+}
+
+/// Outcome counts of one SEI mint pass (for logging / observability).
+#[derive(Debug, Default, Clone, Copy)]
+struct SeiPassStats {
+    minted: u64,
+    carried: u64,
+    orphaned: u64,
+}
+
+/// One entity's planned identity write, computed before any DB write so the
+/// orphan-first ordering (T2.2 Step 5) can be applied.
+struct PlannedSeiWrite {
+    descriptor: NewEntityDescriptor,
+    decision: SeiDecision,
+}
+
+/// Wave 1 / WS1 SEI mint pass (ADR-038 §3, SEI spec §3). For every entity in the
+/// completed run, carry-or-mint an SEI against the prior alive bindings + the
+/// git-rename signal, record lineage, and orphan vanished-unmatched bindings.
+///
+/// Determinism boundary (ADR-038): SEI *values* are not part of the
+/// byte-identical-run guarantee — two from-scratch runs mint different SEIs. The
+/// guarantee is that the carry/mint *decisions* are deterministic given the same
+/// `sei_bindings` + source. A back-to-back unchanged re-run therefore CARRIES
+/// (never re-mints) every SEI (the locator-unchanged path).
+#[allow(clippy::too_many_lines)]
+async fn run_sei_mint_pass(
+    writer: &Writer,
+    db_path: &Path,
+    project_root: &Path,
+    run_id: &str,
+    mut descriptors: Vec<NewEntityDescriptor>,
+) -> anyhow::Result<SeiPassStats> {
+    // Read the prior alive bindings (this run has written no SEI yet, so this is
+    // exactly the previous run's identity state).
+    let alive = {
+        let conn =
+            Connection::open(db_path).context("open read connection for SEI mint pass")?;
+        alive_bindings_snapshot(&conn).map_err(|e| anyhow::anyhow!("{e}"))?
+    };
+
+    // Deterministic processing order so cross-entity dedup (below) is stable.
+    descriptors.sort_by(|a, b| a.locator.cmp(&b.locator));
+    let current_locators: HashSet<String> =
+        descriptors.iter().map(|d| d.locator.clone()).collect();
+
+    // The git-rename signal (best-effort, typed seam REQ-C-05). Skipped entirely
+    // on non-repo corpora to avoid a spurious subprocess.
+    let git_renames: Vec<GitRename> = if crate::sei_git::is_git_repo(project_root) {
+        crate::sei_git::ShellGitRenameSource::new(
+            project_root.to_path_buf(),
+            descriptors.iter().map(|d| d.locator.clone()).collect(),
+        )
+        .renames_since("")
+    } else {
+        Vec::new()
+    };
+
+    // sei -> prior (vanished) locator, for the rematched set + lineage old_locator.
+    let sei_to_old_locator: HashMap<String, String> = alive
+        .iter()
+        .map(|(loc, b)| (b.sei.clone(), loc.clone()))
+        .collect();
+
+    // Decide every entity; dedup carries of the same SEI (fail-closed re-mint —
+    // two entities cannot both prove they are the one prior binding).
+    let mut claimed: HashSet<String> = HashSet::new();
+    let mut rematched: HashSet<String> = HashSet::new();
+    let mut planned: Vec<PlannedSeiWrite> = Vec::with_capacity(descriptors.len());
+    for descriptor in descriptors {
+        let mut decision =
+            rebind_or_mint(&descriptor, &alive, &current_locators, &git_renames, run_id);
+        if let SeiDecision::Carry { sei, .. } = &decision
+            && !claimed.insert(sei.clone())
+        {
+            decision = SeiDecision::Mint {
+                sei: mint_sei(&descriptor.locator, run_id),
+            };
+        }
+        if let SeiDecision::Carry {
+            sei,
+            event: Some(_),
+        } = &decision
+            && let Some(old_loc) = sei_to_old_locator.get(sei)
+        {
+            rematched.insert(old_loc.clone());
+        }
+        planned.push(PlannedSeiWrite {
+            descriptor,
+            decision,
+        });
+    }
+
+    let orphans = orphaned_bindings(&alive, &current_locators, &rematched);
+    let recorded_at = iso8601_now();
+    let mut stats = SeiPassStats::default();
+
+    // WRITE ORDER (T2.2 Step 5): orphan/re-point vanished bindings FIRST so a
+    // carry/mint that claims a freed locator never transiently doubles up the
+    // alive-locator partial unique index.
+    for sei in &orphans {
+        let old_locator = sei_to_old_locator.get(sei).cloned();
+        writer
+            .send_wait(|ack| WriterCmd::OrphanSeiBinding {
+                sei: sei.clone(),
+                run_id: run_id.to_owned(),
+                recorded_at: recorded_at.clone(),
+                ack,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("OrphanSeiBinding")?;
+        writer
+            .send_wait(|ack| WriterCmd::AppendSeiLineage {
+                entry: Box::new(SeiLineageEntry {
+                    sei: sei.clone(),
+                    event: LineageEvent::Orphaned,
+                    old_locator: old_locator.clone(),
+                    new_locator: None,
+                    run_id: run_id.to_owned(),
+                    recorded_at: recorded_at.clone(),
+                }),
+                ack,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("AppendSeiLineage(orphaned)")?;
+        stats.orphaned += 1;
+    }
+
+    for PlannedSeiWrite {
+        descriptor,
+        decision,
+    } in planned
+    {
+        // Persist the signature (next run's matcher input; identity is separate).
+        writer
+            .send_wait(|ack| WriterCmd::SetEntitySignature {
+                entity_id: descriptor.locator.clone(),
+                signature: descriptor.signature.clone(),
+                ack,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("SetEntitySignature")?;
+
+        let is_mint = matches!(decision, SeiDecision::Mint { .. });
+        let (sei, lineage_event) = match decision {
+            SeiDecision::Carry { sei, event } => (sei, event),
+            SeiDecision::Mint { sei } => (sei, Some(LineageEvent::Born)),
+        };
+
+        writer
+            .send_wait(|ack| WriterCmd::UpsertSeiBinding {
+                record: Box::new(SeiBindingRecord {
+                    sei: sei.clone(),
+                    current_locator: Some(descriptor.locator.clone()),
+                    body_hash: descriptor.body_hash.clone(),
+                    signature: descriptor.signature.clone(),
+                    status: BindingStatus::Alive,
+                    // Ignored on carry: ON CONFLICT(sei) preserves the original
+                    // born_run_id; only an INSERT (mint) uses this value.
+                    born_run_id: run_id.to_owned(),
+                    updated_run_id: run_id.to_owned(),
+                    updated_at: recorded_at.clone(),
+                }),
+                ack,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("UpsertSeiBinding")?;
+
+        if let Some(event) = lineage_event {
+            let (old_locator, new_locator) = match event {
+                LineageEvent::LocatorChanged | LineageEvent::Moved => (
+                    sei_to_old_locator.get(&sei).cloned(),
+                    Some(descriptor.locator.clone()),
+                ),
+                _ => (None, Some(descriptor.locator.clone())),
+            };
+            writer
+                .send_wait(|ack| WriterCmd::AppendSeiLineage {
+                    entry: Box::new(SeiLineageEntry {
+                        sei: sei.clone(),
+                        event,
+                        old_locator,
+                        new_locator,
+                        run_id: run_id.to_owned(),
+                        recorded_at: recorded_at.clone(),
+                    }),
+                    ack,
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .context("AppendSeiLineage")?;
+        }
+
+        if is_mint {
+            stats.minted += 1;
+        } else {
+            stats.carried += 1;
+        }
+    }
+
+    Ok(stats)
 }
 
 // ── Phase 3 subsystem materialisation ─────────────────────────────────────────
@@ -1669,6 +1933,10 @@ struct BatchResult {
     stats: BatchStats,
     /// Findings accumulated by the host during the session.
     findings: Vec<clarion_core::HostFinding>,
+    /// `locator -> canonical SEI signature JSON` for entities the plugin
+    /// declared a signature for (WS1 / ADR-038). The SEI mint pass reads it as
+    /// the move-case matcher input and persists it to `entities.signature`.
+    signatures: BTreeMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -1716,6 +1984,9 @@ type Collected = (
     Vec<(String, EdgeRecord)>,
     Vec<PendingUnresolvedCallSites>,
     BatchStats,
+    // locator -> canonical SEI signature JSON (WS1). Only entities the plugin
+    // declared a signature for appear; absent ⇒ null signature.
+    BTreeMap<String, String>,
 );
 
 /// Spawn the plugin, handshake, run `analyze_file` for each file, collect results.
@@ -1762,6 +2033,7 @@ fn run_plugin_blocking(
         let mut collected_edges: Vec<(String, EdgeRecord)> = Vec::new();
         let mut collected_unresolved_call_sites: Vec<PendingUnresolvedCallSites> = Vec::new();
         let mut collected_stats = BatchStats::default();
+        let mut collected_signatures: BTreeMap<String, String> = BTreeMap::new();
         for file in files {
             progress.file_started(plugin_id, &file.to_string_lossy());
             let AnalyzeFileOutcome {
@@ -1808,6 +2080,12 @@ fn run_plugin_blocking(
             collected_entities.push((file_entity_id, file_record));
             for entity in &entities {
                 let id_str = entity.id.to_string();
+                // Capture the plugin-declared SEI signature (ADR-038 REQ-C-01),
+                // canonicalised for stable string-equality comparison. The core
+                // never interprets the JSON — it only re-serialises the value.
+                if let Some(sig) = &entity.raw.signature {
+                    collected_signatures.insert(id_str.clone(), canonical_signature(sig));
+                }
                 let record = map_entity_to_record(entity, plugin_id, source_file_id.clone());
                 file_entities.push((id_str.clone(), record.clone()));
                 collected_entities.push((id_str, record));
@@ -1838,6 +2116,7 @@ fn run_plugin_blocking(
             collected_edges,
             collected_unresolved_call_sites,
             collected_stats,
+            collected_signatures,
         ))
     })();
 
@@ -1866,12 +2145,13 @@ fn run_plugin_blocking(
     reap_and_classify_exit(&mut child, plugin_id, &mut findings);
 
     match work_result {
-        Ok((entities, edges, unresolved_call_sites, stats)) => Ok(BatchResult {
+        Ok((entities, edges, unresolved_call_sites, stats, signatures)) => Ok(BatchResult {
             entities,
             edges,
             unresolved_call_sites,
             stats,
             findings,
+            signatures,
         }),
         Err(reason) => Err(PluginRunError::with_findings(reason, findings)),
     }
@@ -2273,6 +2553,15 @@ fn content_hash_for_entity(
     }
     let normalized = lines[start..end].join("\n");
     Some(blake3::hash(normalized.as_bytes()).to_hex().to_string())
+}
+
+/// Canonicalise a plugin-declared SEI signature for stable string-equality
+/// comparison (ADR-038 REQ-C-01). The core re-serialises the value (keys sorted
+/// by `serde_json`'s default `BTreeMap`-backed object), never interpreting its
+/// semantics. Both the current run and the prior binding pass through this same
+/// path, so the comparison is self-consistent run-to-run.
+fn canonical_signature(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned())
 }
 
 /// Map an `AcceptedEdge` to an `EdgeRecord` for the writer-actor (B.3).
@@ -2785,6 +3074,7 @@ mod tests {
             unresolved_call_sites: Vec::new(),
             stats: BatchStats::default(),
             findings: Vec::new(),
+            signatures: BTreeMap::new(),
         };
         let out = handle_plugin_task_join_result(Ok(Ok(br)), "python");
         assert!(out.is_ok());
@@ -2890,6 +3180,7 @@ mod tests {
                     extra: source_range.as_object().unwrap().clone(),
                 },
                 parent_id: Some("python:module:demo".to_owned()),
+                signature: Some(serde_json::json!({"v": 1, "params": ["x: int"], "return_ann": "bool"})),
                 extra: serde_json::Map::new(),
             },
         };
