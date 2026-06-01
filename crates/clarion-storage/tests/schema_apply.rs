@@ -775,7 +775,7 @@ fn migrations_are_idempotent() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut conn = open_fresh(&tempdir);
     schema::apply_migrations(&mut conn).expect("second apply should be a no-op");
-    assert_eq!(schema::applied_count(&conn).unwrap(), 4);
+    assert_eq!(schema::applied_count(&conn).unwrap(), 5);
     let tables_after = table_names(&conn);
     assert!(tables_after.contains(&"entities".to_owned()));
 }
@@ -789,7 +789,7 @@ fn schema_migrations_records_each_applied_migration() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(count, 4);
+    assert_eq!(count, 5);
     let names: Vec<String> = {
         let mut stmt = conn
             .prepare("SELECT name FROM schema_migrations ORDER BY version")
@@ -804,8 +804,105 @@ fn schema_migrations_records_each_applied_migration() {
             "0002_briefing_blocked",
             "0003_wardline_taint_facts",
             "0004_sei_prior_index",
+            "0005_sei",
         ]
     );
+}
+
+// ----------------------------------------------------------------------------
+// Migration 0005 — SEI identity store (Wave 1 / WS1, ADR-038). The identity
+// store lives in `sei_bindings` (NOT a column on the cumulative `entities`
+// table); `entities` gains only a plain `signature TEXT`. These tests pin the
+// shape the matcher + resolution surface depend on.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn migration_0005_creates_sei_tables_and_signature_column() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+
+    let tables = table_names(&conn);
+    for expected in &["sei_bindings", "sei_lineage"] {
+        assert!(
+            tables.iter().any(|t| t == expected),
+            "missing table {expected} in {tables:?}"
+        );
+    }
+
+    // entities gains a plain `signature` column; there is NO `sei` column
+    // (identity lives in sei_bindings — entities is cumulative/never-pruned).
+    let entity_cols = table_columns(&conn, "entities");
+    assert!(
+        entity_cols.iter().any(|c| c == "signature"),
+        "entities.signature missing in {entity_cols:?}"
+    );
+    assert!(
+        !entity_cols.iter().any(|c| c == "sei"),
+        "entities must NOT have a `sei` column (ADR-038): {entity_cols:?}"
+    );
+
+    // sei_bindings is keyed by the opaque SEI.
+    assert_eq!(primary_key_columns(&conn, "sei_bindings"), vec!["sei"]);
+}
+
+#[test]
+fn migration_0005_partial_unique_index_allows_one_alive_binding_per_locator() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+
+    let insert = |sei: &str, locator: &str, status: &str| {
+        conn.execute(
+            "INSERT INTO sei_bindings \
+             (sei, current_locator, body_hash, signature, status, born_run_id, updated_run_id, updated_at) \
+             VALUES (?1, ?2, 'h', NULL, ?3, 'r0', 'r0', 't0')",
+            params![sei, locator, status],
+        )
+    };
+
+    // One alive binding for a locator is fine.
+    insert("clarion:eid:aaaa", "python:function:m.f", "alive").expect("first alive");
+    // A SECOND alive binding for the same locator violates the partial unique index.
+    insert("clarion:eid:bbbb", "python:function:m.f", "alive")
+        .expect_err("second alive binding on the same locator must be rejected");
+    // An orphaned binding may share the former locator (audit history retained).
+    insert("clarion:eid:cccc", "python:function:m.f", "orphaned").expect("orphaned may share locator");
+    // Two alive bindings with NULL locator do not collide (partial index excludes NULLs).
+    insert("clarion:eid:dddd", "", "alive").expect("setup distinct locator");
+    conn.execute(
+        "INSERT INTO sei_bindings \
+         (sei, current_locator, body_hash, signature, status, born_run_id, updated_run_id, updated_at) \
+         VALUES ('clarion:eid:eeee', NULL, 'h', NULL, 'alive', 'r0', 'r0', 't0')",
+        [],
+    )
+    .expect("null locator alive #1");
+    conn.execute(
+        "INSERT INTO sei_bindings \
+         (sei, current_locator, body_hash, signature, status, born_run_id, updated_run_id, updated_at) \
+         VALUES ('clarion:eid:ffff', NULL, 'h', NULL, 'alive', 'r0', 'r0', 't0')",
+        [],
+    )
+    .expect("null locator alive #2 must not collide");
+}
+
+#[test]
+fn migration_0005_check_constraints_reject_bad_vocab() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+
+    conn.execute(
+        "INSERT INTO sei_bindings \
+         (sei, current_locator, body_hash, signature, status, born_run_id, updated_run_id, updated_at) \
+         VALUES ('clarion:eid:aaaa', 'l', 'h', NULL, 'bogus', 'r0', 'r0', 't0')",
+        [],
+    )
+    .expect_err("sei_bindings.status must reject out-of-vocabulary values");
+
+    conn.execute(
+        "INSERT INTO sei_lineage (sei, event, old_locator, new_locator, run_id, recorded_at) \
+         VALUES ('clarion:eid:aaaa', 'bogus_event', NULL, NULL, 'r0', 't0')",
+        [],
+    )
+    .expect_err("sei_lineage.event must reject out-of-vocabulary values");
 }
 
 // ----------------------------------------------------------------------------

@@ -35,12 +35,17 @@ const MIGRATIONS: &[Migration] = &[
         name: "0004_sei_prior_index",
         sql: include_str!("../migrations/0004_sei_prior_index.sql"),
     },
+    Migration {
+        version: 5,
+        name: "0005_sei",
+        sql: include_str!("../migrations/0005_sei.sql"),
+    },
 ];
 
 /// Highest migration version known to this build. Mirrored into the
 /// `SQLite` `user_version` header (STO-02) so a future-built database is
 /// refused at open instead of silently corrupting state.
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 const _CURRENT_SCHEMA_VERSION_MATCHES_LAST_MIGRATION: () = {
     // Compile-time check: `CURRENT_SCHEMA_VERSION` must equal the highest
