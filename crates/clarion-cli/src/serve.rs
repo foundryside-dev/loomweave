@@ -288,6 +288,7 @@ fn build_llm_provider(
                 endpoint_url: config.llm.openrouter.endpoint_url.clone(),
                 referer: config.llm.openrouter.attribution.referer.clone(),
                 title: config.llm.openrouter.attribution.title.clone(),
+                timeout_seconds: config.llm.openrouter.timeout_seconds,
             })
             .context("build OpenRouter LLM provider")?;
             Ok(Some(Arc::new(provider)))

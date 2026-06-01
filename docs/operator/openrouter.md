@@ -21,6 +21,7 @@ llm_policy:
   openrouter:
     endpoint_url: https://openrouter.ai/api/v1
     api_key_env: OPENROUTER_API_KEY
+    timeout_seconds: 300        # per-request HTTP timeout; must be > 0 (default 300)
     attribution:
       referer: https://github.com/tachyon-beep/clarion
       title: Clarion

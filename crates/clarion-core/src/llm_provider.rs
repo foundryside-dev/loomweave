@@ -81,14 +81,18 @@ pub enum LlmProviderError {
 
     #[error("invalid live LLM provider response: {message}")]
     InvalidResponse { message: String, retryable: bool },
+
+    #[error("invalid LLM provider configuration: {message}")]
+    InvalidConfig { message: String },
 }
 
 impl LlmProviderError {
     pub fn retryable(&self) -> bool {
         match self {
-            Self::MissingRecording { .. } | Self::LiveProviderNotAllowed | Self::MissingApiKey => {
-                false
-            }
+            Self::MissingRecording { .. }
+            | Self::LiveProviderNotAllowed
+            | Self::MissingApiKey
+            | Self::InvalidConfig { .. } => false,
             Self::Http { retryable, .. }
             | Self::Provider { retryable, .. }
             | Self::Cli { retryable, .. }
@@ -201,6 +205,7 @@ pub struct OpenRouterProviderConfig {
     pub endpoint_url: String,
     pub referer: String,
     pub title: String,
+    pub timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +215,7 @@ pub struct OpenRouterProvider {
     endpoint_url: String,
     referer: String,
     title: String,
+    timeout_seconds: u64,
 }
 
 impl OpenRouterProvider {
@@ -220,12 +226,18 @@ impl OpenRouterProvider {
         let Some(api_key) = config.api_key.filter(|key| !key.trim().is_empty()) else {
             return Err(LlmProviderError::MissingApiKey);
         };
+        if config.timeout_seconds == 0 {
+            return Err(LlmProviderError::InvalidConfig {
+                message: "OpenRouter timeout_seconds must be greater than zero".to_owned(),
+            });
+        }
         Ok(Self {
             model_id: config.model_id,
             api_key,
             endpoint_url: config.endpoint_url,
             referer: config.referer,
             title: config.title,
+            timeout_seconds: config.timeout_seconds,
         })
     }
 
@@ -259,7 +271,7 @@ impl LlmProvider for OpenRouterProvider {
             ]
         });
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(self.timeout_seconds))
             .build()
             .map_err(|err| LlmProviderError::Http {
                 message: err.to_string(),
@@ -1497,6 +1509,7 @@ mod tests {
             endpoint_url: "https://openrouter.ai/api/v1".to_owned(),
             referer: "https://github.com/tachyon-beep/clarion".to_owned(),
             title: "Clarion".to_owned(),
+            timeout_seconds: 30,
         })
         .expect_err("api key alone must not enable live calls");
         assert!(matches!(denied, LlmProviderError::LiveProviderNotAllowed));
@@ -1508,6 +1521,7 @@ mod tests {
             endpoint_url: "https://openrouter.ai/api/v1".to_owned(),
             referer: "https://github.com/tachyon-beep/clarion".to_owned(),
             title: "Clarion".to_owned(),
+            timeout_seconds: 30,
         })
         .expect_err("live opt-in without key should fail");
         assert!(matches!(missing_key, LlmProviderError::MissingApiKey));
@@ -1519,6 +1533,7 @@ mod tests {
             endpoint_url: "https://openrouter.ai/api/v1".to_owned(),
             referer: "https://github.com/tachyon-beep/clarion".to_owned(),
             title: "Clarion".to_owned(),
+            timeout_seconds: 30,
         })
         .expect("live opt-in and key should construct provider");
 
@@ -1534,6 +1549,20 @@ mod tests {
         assert_eq!(
             provider.caching_model(),
             CachingModel::OpenAiChatCompletions
+        );
+
+        let zero_timeout = OpenRouterProvider::from_config(OpenRouterProviderConfig {
+            api_key: Some("secret".to_owned()),
+            allow_live_provider: true,
+            model_id: "anthropic/claude-sonnet-4.6".to_owned(),
+            endpoint_url: "https://openrouter.ai/api/v1".to_owned(),
+            referer: "https://github.com/tachyon-beep/clarion".to_owned(),
+            title: "Clarion".to_owned(),
+            timeout_seconds: 0,
+        });
+        assert!(
+            matches!(zero_timeout, Err(LlmProviderError::InvalidConfig { .. })),
+            "zero timeout_seconds must be rejected"
         );
     }
 
@@ -1593,6 +1622,7 @@ mod tests {
             endpoint_url: format!("http://{addr}/api/v1"),
             referer: "https://github.com/tachyon-beep/clarion".to_owned(),
             title: "Clarion".to_owned(),
+            timeout_seconds: 30,
         })
         .expect("test provider");
 
@@ -1714,6 +1744,7 @@ mod tests {
             endpoint_url: format!("http://{addr}/api/v1"),
             referer: "https://github.com/tachyon-beep/clarion".to_owned(),
             title: "Clarion".to_owned(),
+            timeout_seconds: 30,
         })
         .expect("test provider");
 
@@ -1745,6 +1776,7 @@ mod tests {
             endpoint_url: format!("http://{addr}/api/v1"),
             referer: "https://github.com/tachyon-beep/clarion".to_owned(),
             title: "Clarion".to_owned(),
+            timeout_seconds: 30,
         })
         .expect("test provider");
 
@@ -2458,6 +2490,7 @@ printf '%s\n' '{{"type":"result","subtype":"success","structured_output":{{"purp
             endpoint_url: format!("http://{addr}/api/v1"),
             referer: "https://github.com/tachyon-beep/clarion".to_owned(),
             title: "Clarion".to_owned(),
+            timeout_seconds: 30,
         })
         .expect("test provider");
         let result = provider.invoke(sample_request());

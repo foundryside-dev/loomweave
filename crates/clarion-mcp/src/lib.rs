@@ -2914,7 +2914,10 @@ impl ServerState {
             .send(build(ack_tx))
             .await
             .map_err(|_| StorageError::WriterGone)?;
-        ack_rx.await.map_err(|_| StorageError::WriterNoResponse)?
+        tokio::time::timeout(std::time::Duration::from_secs(30), ack_rx)
+            .await
+            .map_err(|_| StorageError::WriterNoResponse)?
+            .map_err(|_| StorageError::WriterNoResponse)?
     }
 
     fn summary_budget_blocked(&self) -> bool {

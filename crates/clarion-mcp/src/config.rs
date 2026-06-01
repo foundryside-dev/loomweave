@@ -107,6 +107,7 @@ pub struct OpenRouterConfig {
     pub endpoint_url: String,
     pub api_key_env: String,
     pub attribution: OpenRouterAttributionConfig,
+    pub timeout_seconds: u64,
 }
 
 impl Default for OpenRouterConfig {
@@ -115,6 +116,7 @@ impl Default for OpenRouterConfig {
             endpoint_url: "https://openrouter.ai/api/v1".to_owned(),
             api_key_env: "OPENROUTER_API_KEY".to_owned(),
             attribution: OpenRouterAttributionConfig::default(),
+            timeout_seconds: 300,
         }
     }
 }
@@ -582,6 +584,7 @@ integrations:
             "https://example.invalid/clarion"
         );
         assert_eq!(cfg.llm.openrouter.attribution.title, "Clarion Test");
+        assert_eq!(cfg.llm.openrouter.timeout_seconds, 300); // default — not set in YAML
         assert_eq!(cfg.llm.max_inferred_edges_per_caller, 3);
         assert_eq!(cfg.llm.cache_max_age_days, 7);
         assert!(cfg.integrations.filigree.enabled);
