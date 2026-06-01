@@ -11,12 +11,12 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Initialise .clarion/ and/or install agent-orientation assets.
+    /// Initialise .clarion/ and install agent-orientation assets.
     ///
-    /// Bare `clarion install` initialises .clarion/ only (refuses if it
-    /// already exists). `--skills` and `--hooks` install the orientation
-    /// assets and do NOT initialise .clarion/. `--all` does init + skills +
-    /// hooks.
+    /// Bare `clarion install` does everything: .clarion/ init + skills + hooks.
+    /// If .clarion/ already exists, init is skipped and skills/hooks are applied
+    /// idempotently. `--skills` and `--hooks` install only the named components
+    /// without touching .clarion/. `--all` is equivalent to a bare install.
     Install {
         /// Overwrite an existing .clarion/ directory.
         #[arg(long)]

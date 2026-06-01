@@ -119,7 +119,7 @@ fn install_force_rejects_non_directory_clarion() {
 }
 
 #[test]
-fn install_refuses_to_overwrite_existing_clarion_dir() {
+fn install_skips_clarion_init_when_dir_already_exists() {
     let dir = tempfile::tempdir().unwrap();
     clarion_bin()
         .args(["install", "--path"])
@@ -127,20 +127,17 @@ fn install_refuses_to_overwrite_existing_clarion_dir() {
         .assert()
         .success();
 
-    // Second install must fail with a clear message.
+    // Second bare install must succeed: skip .clarion/ init but still apply
+    // skills/hooks idempotently and report "already initialised".
     let out = clarion_bin()
         .args(["install", "--path"])
         .arg(dir.path())
         .assert()
-        .failure();
-    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(
-        stderr.contains("already exists"),
-        "error did not mention existing dir: {stderr}"
-    );
-    assert!(
-        stderr.contains("--force"),
-        "error did not mention --force escape hatch: {stderr}"
+        stdout.contains("already initialised"),
+        "expected 'already initialised' message on second install: {stdout}"
     );
 }
 

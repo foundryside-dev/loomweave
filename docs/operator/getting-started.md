@@ -133,12 +133,20 @@ clarion install
 clarion analyze
 ```
 
+A bare `clarion install` does everything: it initialises `.clarion/` and
+installs the agent-orientation assets (the `clarion-workflow` skill and the
+SessionStart hook — see [§3](#agent-orientation-installed-by-default)). If
+`.clarion/` already exists, init is skipped and the skill/hook are applied
+idempotently; pass `--force` to wipe and reinitialise the index.
+
 Expected output (abridged):
 
 ```
 applying migration version=1 name="0001_initial_schema"
 clarion install complete clarion_dir=/tmp/requests-2.32.4/.clarion
 Initialised /tmp/requests-2.32.4/.clarion
+Installed clarion-workflow skill into ...
+Added clarion SessionStart hook to .../.claude/settings.json
 ...
 analyze complete: run <uuid> ok (entities=NNN, edges=MMM)
 ```
@@ -184,14 +192,16 @@ documented options:
 
 Pick whichever you have; the questions in step 4 are client-agnostic.
 
-### Agent orientation (optional but recommended)
+### Agent orientation (installed by default)
 
-Give consult-mode agents a head start:
+A bare `clarion install` already bundles these for consult-mode agents. The
+component flags exist for explicit partial installs (e.g. adding the skill to a
+project whose `.clarion/` you do not want re-touched):
 
 ```bash
-clarion install --skills --path /tmp/requests-2.32.4   # bundle the clarion-workflow skill
-clarion install --hooks --path /tmp/requests-2.32.4    # add a SessionStart snapshot hook
-clarion install --all   --path /tmp/requests-2.32.4    # .clarion/ init + skills + hooks
+clarion install --skills --path /tmp/requests-2.32.4   # skill only, do NOT touch .clarion/
+clarion install --hooks --path /tmp/requests-2.32.4    # hook only, do NOT touch .clarion/
+clarion install --all   --path /tmp/requests-2.32.4    # same as a bare install: init + skills + hooks
 ```
 
 `--skills` writes `.claude/skills/clarion-workflow/` and `.agents/skills/clarion-workflow/`.

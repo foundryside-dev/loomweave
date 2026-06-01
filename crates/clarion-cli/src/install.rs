@@ -7,10 +7,11 @@
 //! - `<path>/clarion.yaml`        (user-edited config stub at project root;
 //!   see detailed-design.md §File layout)
 //!
-//! A bare `clarion install` refuses if `.clarion/` already exists unless
-//! `--force` is passed. Under `--skills`/`--hooks`/`--all`, an existing
-//! `.clarion/` is left in place (init is skipped) rather than treated as an
-//! error, so the requested idempotent components can still be applied.
+//! A bare `clarion install` (no flags) does everything: init + skills + hooks.
+//! If `.clarion/` already exists, init is skipped and the idempotent components
+//! (skills, hooks) are still applied. Pass `--force` to wipe and reinitialise
+//! `.clarion/`. `--skills` / `--hooks` / `--all` are still accepted for
+//! explicit partial installs.
 
 use std::fs;
 use std::path::Path;
@@ -100,9 +101,7 @@ logs/
 runs/*/log.jsonl
 ";
 
-/// What `clarion install` should do, resolved from the CLI flags per the agent-
-/// orientation plan: bare install = init only; `--skills`/`--hooks` are
-/// independent and do NOT init; `--all` = init + skills + hooks.
+/// What `clarion install` should do, resolved from the CLI flags.
 ///
 /// Modeled as an enum rather than three independent bools so the derived and
 /// illegal states the bool form allowed are unrepresentable: `init_clarion` is
@@ -114,20 +113,19 @@ runs/*/log.jsonl
 /// [`hooks`](Self::hooks).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallPlan {
-    /// Bare `clarion install`: initialise `.clarion/` only.
-    Bare,
     /// `--skills` and/or `--hooks` without `--all`: apply the named components
     /// and do NOT initialise `.clarion/`. `from_flags` only constructs this
     /// when at least one field is `true`.
     Components { skills: bool, hooks: bool },
-    /// `--all`: initialise `.clarion/` + skills + hooks.
+    /// No flags or `--all`: initialise `.clarion/` + skills + hooks.
     All,
 }
 
 impl InstallPlan {
     /// Resolve the CLI flags into a plan. `--all` wins; otherwise any of
     /// `--skills`/`--hooks` selects [`Components`](Self::Components); no flag
-    /// selects [`Bare`](Self::Bare). Never yields a do-nothing plan.
+    /// selects [`All`](Self::All) so that a naked `clarion install` does
+    /// everything. Never yields a do-nothing plan.
     #[must_use]
     pub fn from_flags(skills: bool, hooks: bool, all: bool) -> Self {
         if all {
@@ -135,14 +133,14 @@ impl InstallPlan {
         } else if skills || hooks {
             Self::Components { skills, hooks }
         } else {
-            Self::Bare
+            Self::All
         }
     }
 
-    /// Whether to initialise `.clarion/` (the index). True for `Bare` and `All`.
+    /// Whether to initialise `.clarion/` (the index). True for `All`.
     #[must_use]
     pub fn init_clarion(self) -> bool {
-        matches!(self, Self::Bare | Self::All)
+        matches!(self, Self::All)
     }
 
     /// Whether to install the `clarion-workflow` skill pack.
@@ -181,33 +179,21 @@ pub fn run(path: &Path, force: bool, plan: InstallPlan) -> Result<()> {
     // defensive guard rather than silently succeeding.
     if !plan.init_clarion() && !plan.skills() && !plan.hooks() {
         bail!(
-            "nothing to install: pass --skills, --hooks, or --all, \
-             or run bare `clarion install` to initialise .clarion/."
+            "nothing to install: pass --skills, --hooks, --all, \
+             or run bare `clarion install` to do everything."
         );
     }
 
     if plan.init_clarion() {
         let clarion_dir = project_root.join(".clarion");
         let exists = clarion_dir.exists();
-        // A bare `clarion install` (no other components requested) refuses to
-        // clobber an existing .clarion/. Under `--all` (other idempotent
-        // components requested) an already-initialised project is not an error:
-        // we keep the existing index and apply the remaining components.
-        let bare_init = !plan.skills() && !plan.hooks();
+        // `All` (including naked install) treats an existing .clarion/ as
+        // already-initialised and skips re-init, still applying the idempotent
+        // components. A non-directory .clarion is not a usable index, so refuse
+        // rather than "succeed" with skills/hooks atop a project with no clarion.db.
+        // `--skills`/`--hooks` alone are `Components` (init_clarion() == false)
+        // and skip this entire block.
         if exists && !force {
-            if bare_init {
-                bail!(
-                    ".clarion/ already exists at {}. Delete it or pass --force to overwrite it.",
-                    clarion_dir.display()
-                );
-            }
-            // Only `--all` reaches here: a bare install bailed above, and
-            // `--skills`/`--hooks` alone are `Components` (init_clarion() ==
-            // false) that skip this whole block. `--all` treats an existing
-            // .clarion/ as already-initialised and keeps it — but a
-            // non-directory .clarion is not a usable index, so refuse rather
-            // than "succeed" with skills/hooks atop a project that has no
-            // clarion.db.
             if !clarion_dir.is_dir() {
                 bail!(
                     "found a non-directory at {}; expected an initialised .clarion/ \
@@ -328,12 +314,12 @@ mod tests {
 
     #[test]
     fn from_flags_truth_table() {
-        // Bare install: no component flags -> init only.
-        let bare = InstallPlan::from_flags(false, false, false);
-        assert_eq!(bare, InstallPlan::Bare);
-        assert!(bare.init_clarion());
-        assert!(!bare.skills());
-        assert!(!bare.hooks());
+        // Naked install: no flags -> everything (same as --all).
+        let naked = InstallPlan::from_flags(false, false, false);
+        assert_eq!(naked, InstallPlan::All);
+        assert!(naked.init_clarion());
+        assert!(naked.skills());
+        assert!(naked.hooks());
 
         // --skills: skills only, no init.
         let skills = InstallPlan::from_flags(true, false, false);
