@@ -52,7 +52,7 @@ fn wp1_walking_skeleton_end_to_end() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(migration_version, 3, "schema not on the latest migration");
+    assert_eq!(migration_version, 4, "schema not on the latest migration");
 
     let runs_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))

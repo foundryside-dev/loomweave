@@ -27,7 +27,8 @@ use clarion_core::{
     discover,
 };
 use clarion_storage::{
-    DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, UnresolvedCallSiteRecord, Writer,
+    DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, PriorIndexEntry, UnresolvedCallSiteRecord,
+    Writer,
     commands::{EdgeRecord, EntityRecord, FindingRecord, RunStatus, WriterCmd},
     module_dependency_edges,
 };
@@ -376,6 +377,12 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let mut run_outcome: RunOutcome = RunOutcome::Completed;
     let mut breaker = CrashLoopBreaker::default();
     let mut crash_reasons: Vec<String> = Vec::new();
+    // Wave 0 / WS3: accumulate this run's prior-index snapshot as entities are
+    // inserted. `entities` is cumulative (never pruned, no run-scoping), so the
+    // current run's set cannot be recovered by querying it — it must be gathered
+    // here. Entities with no `content_hash` (no body to hash) are omitted: the
+    // snapshot's `body_hash` is NOT NULL and such entities are not move-matchable.
+    let mut prior_index_entries: Vec<PriorIndexEntry> = Vec::new();
     let briefing_blocks = secret_scan_outcome.briefing_blocks_shared();
     let scanned_files = secret_scan_outcome.scanned_files_shared();
     'plugins: for plugin in plugins {
@@ -505,6 +512,19 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 secret_scan_outcome.remember_finding_anchors(&entities);
                 let mut insert_err: Option<anyhow::Error> = None;
                 for (id_str, record) in entities {
+                    // Capture the prior-index row BEFORE `record` is moved into
+                    // the command. Only entities carrying a `content_hash` enter
+                    // the snapshot (body_hash is NOT NULL); `signature` is the
+                    // WS1 matcher input and stays None in Wave 0.
+                    let prior_entry =
+                        record
+                            .content_hash
+                            .clone()
+                            .map(|body_hash| PriorIndexEntry {
+                                locator: record.id.clone(),
+                                body_hash,
+                                signature: None,
+                            });
                     let res = writer
                         .send_wait(|ack| WriterCmd::InsertEntity {
                             entity: Box::new(record),
@@ -516,6 +536,11 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     if let Err(e) = res {
                         insert_err = Some(e);
                         break;
+                    }
+                    // Recorded only after a successful insert so the snapshot
+                    // never claims an entity the durable graph lacks.
+                    if let Some(prior_entry) = prior_entry {
+                        prior_index_entries.push(prior_entry);
                     }
                 }
                 if insert_err.is_none() {
@@ -729,6 +754,34 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))
                 .context("CommitRun(Completed)")?;
+            // Wave 0 / WS3: rewrite the prior-index snapshot to exactly this
+            // run's entities (stale rows from the prior run removed). Runs AFTER
+            // CommitRun — the run is already durably `completed`, so this is a
+            // best-effort, enrich-only retention write: a failure here logs and
+            // is swallowed, never failing an analysis whose graph is committed
+            // (mirrors the Filigree-emission "outage never changes the outcome"
+            // posture). Nothing consumes the snapshot in Wave 0; the WS1 matcher
+            // and incremental skip degrade to a full pass when it is absent.
+            // ONLY the Completed arm flushes: SoftFailed/HardFailed runs are
+            // recorded as `failed`, so the snapshot deliberately stays at the
+            // last fully-successful run (a WS1 consumer must treat snapshot vs
+            // durable graph as possibly divergent after a soft-fail, not assume
+            // equality).
+            if let Err(e) = writer
+                .send_wait(|ack| WriterCmd::UpsertPriorIndex {
+                    entries: prior_index_entries,
+                    recorded_at: iso8601_now(),
+                    ack,
+                })
+                .await
+            {
+                tracing::warn!(
+                    run_id = %run_id,
+                    error = %e,
+                    "prior-index snapshot flush failed; retention skipped for this run \
+                     (run already committed successfully)"
+                );
+            }
         }
         RunOutcome::SoftFailed { reason } => {
             // Commit entities inserted by healthy plugins AND mark the run

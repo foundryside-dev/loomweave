@@ -534,6 +534,42 @@ pub fn existing_entity_ids(conn: &Connection, candidates: &[String]) -> Result<H
     Ok(found)
 }
 
+/// Federation-surface visibility of a single entity: whether it exists at all
+/// and, if so, whether it carries a `briefing_blocked` marker. Read via the
+/// generated `briefing_blocked` column in one point lookup (cheaper than
+/// loading the whole row). Federation read surfaces use this to translate a
+/// missing entity to 404 and a blocked entity to a refusal, mirroring the
+/// file-content surface's `briefing_blocked` 403.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntityVisibility {
+    /// No entity row with this id.
+    NotFound,
+    /// The entity exists but is briefing-blocked (carries the reason).
+    Blocked(String),
+    /// The entity exists and may be exposed.
+    Visible,
+}
+
+/// Look up an entity's [`EntityVisibility`] by id.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Sqlite`] if the query fails.
+pub fn entity_visibility(conn: &Connection, id: &str) -> Result<EntityVisibility> {
+    let row: Option<Option<String>> = conn
+        .query_row(
+            "SELECT briefing_blocked FROM entities WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(match row {
+        None => EntityVisibility::NotFound,
+        Some(None) => EntityVisibility::Visible,
+        Some(Some(reason)) => EntityVisibility::Blocked(reason),
+    })
+}
+
 pub fn entity_at_line(
     conn: &Connection,
     source_file_path: &str,

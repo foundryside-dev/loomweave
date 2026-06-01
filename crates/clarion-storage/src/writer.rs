@@ -145,6 +145,10 @@ impl Writer {
     }
 }
 
+// Exhaustive single-`match` command-dispatch loop: each `WriterCmd` variant gets
+// one short arm, so length scales with the command set, not with logic depth.
+// Splitting it would only scatter the dispatch a reader wants in one place.
+#[allow(clippy::too_many_lines)]
 fn run_actor(
     mut rx: mpsc::Receiver<WriterCmd>,
     conn: &mut Connection,
@@ -223,6 +227,16 @@ fn run_actor(
             WriterCmd::UpsertWardlineTaintFact { fact, ack } => {
                 let res = query_time_write(conn, &mut state, commits_observed, |conn| {
                     crate::wardline_taint::upsert_taint_fact(conn, &fact)
+                });
+                reply(ack, res);
+            }
+            WriterCmd::UpsertPriorIndex {
+                entries,
+                recorded_at,
+                ack,
+            } => {
+                let res = query_time_write(conn, &mut state, commits_observed, |conn| {
+                    crate::prior_index::replace_prior_index(conn, &entries, &recorded_at)
                 });
                 reply(ack, res);
             }

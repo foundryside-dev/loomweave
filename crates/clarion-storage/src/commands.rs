@@ -15,6 +15,7 @@ pub use clarion_core::EdgeConfidence;
 
 use crate::cache::{InferredEdgeCacheEntry, SummaryCacheEntry, SummaryCacheKey};
 use crate::error::StorageError;
+use crate::prior_index::PriorIndexEntry;
 use crate::unresolved::UnresolvedCallSiteRecord;
 use crate::wardline_taint::TaintFact;
 
@@ -205,6 +206,18 @@ pub enum WriterCmd {
     /// must be pre-resolved by the caller (exact tier) — the writer does not
     /// resolve qualnames.
     UpsertWardlineTaintFact { fact: Box<TaintFact>, ack: Ack<()> },
+    /// Rewrite the prior-index snapshot to exactly the current run's entities
+    /// (Wave 0 / WS3). FULL-SNAPSHOT REPLACE — clears `sei_prior_index` and
+    /// inserts every entry in one transaction, so stale rows from the prior run
+    /// are removed (despite the `Upsert` name, this is a whole-table replace).
+    /// Query-time write: it runs after `CommitRun` (no active run transaction),
+    /// best-effort, and never gates the run's own outcome. `recorded_at` is the
+    /// run-completion timestamp stamped onto every row.
+    UpsertPriorIndex {
+        entries: Vec<PriorIndexEntry>,
+        recorded_at: String,
+        ack: Ack<()>,
+    },
     /// Replace all unresolved call-site rows for one caller. This is an
     /// analyze-time mapping command that requires an active run transaction so
     /// stale rows from previous content hashes cannot survive re-analysis.

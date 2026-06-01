@@ -2076,6 +2076,12 @@ fn assert_value_matches_decl(
                 "{fixture_name}:{example_name} field {field} is not a project-relative path"
             );
         }
+        "object" => {
+            assert!(
+                value.is_object(),
+                "{fixture_name}:{example_name} field {field} is not an object"
+            );
+        }
         other => panic!("{fixture_name}:{example_name} unknown field type {other} for {field}"),
     }
 }

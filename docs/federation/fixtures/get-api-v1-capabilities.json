@@ -3,13 +3,13 @@
     "contract": "clarion-http-read-api",
     "endpoint": "GET /api/v1/_capabilities",
     "api_version": 1,
-    "fixture_version": 2,
+    "fixture_version": 3,
     "stability": "normative",
-    "authority": "Clarion ADR-014 federation registry-backend contract",
+    "authority": "Clarion ADR-014 federation registry-backend contract; Wave 0 / WS2 linkages",
     "verification": "cargo test -p clarion-cli --test serve",
     "normative": true,
-    "updated": "2026-05-19",
-    "description": "Contract example for Clarion registry-backend capability discovery."
+    "updated": "2026-06-02",
+    "description": "Contract example for Clarion registry-backend capability discovery (now advertising the WS2 call-graph linkage routes)."
   },
   "shape_decl": {
     "kind": "clarion-http-fixture-shapes",
@@ -31,6 +31,12 @@
           },
           "instance_id": {
             "type": "uuid"
+          },
+          "linkages": {
+            "type": "object",
+            "const": {
+              "http": true
+            }
           }
         },
         "forbidden_fields": [
@@ -54,7 +60,10 @@
           "registry_backend": true,
           "file_registry": true,
           "api_version": 1,
-          "instance_id": "9bd7234e-6d44-4a38-9ae4-76f912a10221"
+          "instance_id": "9bd7234e-6d44-4a38-9ae4-76f912a10221",
+          "linkages": {
+            "http": true
+          }
         }
       }
     }

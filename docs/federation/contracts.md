@@ -309,6 +309,130 @@ The contract fixture at
 [`fixtures/post-api-v1-files-batch.json`](./fixtures/post-api-v1-files-batch.json)
 is normative for this section.
 
+## Call-graph linkages
+
+Structural call-graph adjacency over HTTP (Wave 0 / WS2). These routes wrap
+Clarion's stored `calls` edges so a sibling (notably the dossier assembler) can
+fetch a function's callers and callees without an MCP session. They are thin
+read wrappers — no inference is run at request time (see the confidence note).
+
+All four routes are **protected** (same HMAC/bearer identity layer as the
+`/api/v1/files` family — see [§Authentication](#authentication)) and advertised
+by `linkages.http: true` in `/api/v1/_capabilities`.
+
+### `GET /api/v1/entities/:entity_id/callers` and `…/callees`
+
+`callers` returns the entities that call `entity_id`; `callees` returns the
+entities `entity_id` calls. `:entity_id` is a full Clarion entity id
+(`{plugin}:{kind}:{qualname}`, e.g. `python:function:auth.tokens.refresh`) in
+the path segment; percent-encode any reserved characters. In practice the
+call-graph subject is a function/method (dotted qualnames carry no `/`).
+
+Query parameters:
+
+| Name | Required | Default | Meaning |
+|---|---:|---|---|
+| `confidence` | no | `all` | Tier ceiling: `resolved`, `ambiguous`, `inferred`, or `all`. `resolved` returns resolved edges only; `ambiguous` adds ambiguous; `inferred`/`all` add inferred. |
+| `limit` | no | 50 | Page size, clamped to a maximum of **200**. |
+| `offset` | no | 0 | Number of leading entries to skip (entries are ordered by `entity_id`). |
+
+Successful response (`200 OK`), `callers` shown (`callees` is identical with a
+`callees` array):
+
+```json
+{
+  "entity_id": "python:function:auth.tokens.refresh",
+  "callers": [
+    { "entity_id": "python:function:auth.api.login", "confidence": "resolved", "call_site_count": 1 },
+    { "entity_id": "python:function:auth.api.retry", "confidence": "ambiguous", "call_site_count": 2 }
+  ],
+  "total": 2,
+  "truncated": false
+}
+```
+
+Semantics:
+
+- Each array element is one **neighbour** entity. `call_site_count` is the
+  number of call relationships to/from that neighbour **across all returned
+  tiers**; `confidence` is the **strongest** tier present for that neighbour
+  (`resolved` > `ambiguous` > `inferred`). A neighbour reachable by a resolved
+  call is reported `resolved` even if weaker corroborating sites also exist.
+- `total` is the count of distinct neighbours before pagination; `truncated` is
+  `true` when more neighbours exist beyond the returned page
+  (`offset + returned < total`).
+- For `callees`, an ambiguous call edge is expanded to one neighbour per
+  candidate callee (this mirrors the underlying query), so a callee
+  `call_site_count` can reflect candidate breadth rather than distinct syntactic
+  call sites.
+- **Inferred tier is read-only here.** The HTTP surface returns only inferred
+  edges already persisted by a prior MCP/analyze pass; unlike the MCP
+  `callers_of` tool it does **not** materialise inferred edges on demand (the
+  read API has no writer for that). `resolved` and `ambiguous` are complete
+  (materialised at scan time); treat `inferred`/`all` results as best-effort.
+
+Failure envelopes:
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `INVALID_PATH` | `confidence` is not one of the four accepted values, or query params are malformed. |
+| 401 | `UNAUTHENTICATED` | HMAC/bearer auth missing or wrong (when configured). |
+| 403 | `BRIEFING_BLOCKED` | The **queried** entity carries a `briefing_blocked` marker — refused exactly like `GET /api/v1/files`, so a sibling cannot read structure around a withheld entity. |
+| 404 | `NOT_FOUND` | No entity row exists for `:entity_id`. |
+
+**Briefing-block policy.** Only the *queried* entity is checked for
+`briefing_blocked` (→ 403). **Neighbour** entities in the result are **not**
+filtered: the payload is structural topology (ids + counts + tier), not file
+content, and this matches Clarion's MCP call-graph surface (`callers_of` /
+`neighborhood`), which likewise does not filter briefing-blocked neighbours. The
+content-bearing surface (`GET /api/v1/files`) is where the block is load-bearing.
+
+### `POST /api/v1/entities/callers:batch-get` and `…/callees:batch-get`
+
+Resolve linkages for up to **50** entities in one request.
+
+Request body (`application/json`, max 16 KiB):
+
+```json
+{
+  "entity_ids": ["python:function:a", "python:function:b"],
+  "confidence": "resolved",
+  "limit": 50
+}
+```
+
+`confidence` (default `all`) and `limit` (default 50, max 200) apply to every
+entity; there is no `offset` on the batch surface.
+
+Successful response (`200 OK`):
+
+```json
+{
+  "results": {
+    "python:function:a": [
+      { "entity_id": "python:function:caller", "confidence": "resolved", "call_site_count": 1 }
+    ]
+  }
+}
+```
+
+`results` is keyed by requested entity id and contains an entry **only for
+entities that are known and not briefing-blocked**. Not-found and
+briefing-blocked ids are omitted — a caller detects them by diffing requested
+ids against returned keys (fail-closed: a withheld entity simply does not
+appear, it is never partially exposed). Each entity's entries are capped at
+`limit`.
+
+Envelope-level failures:
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `INVALID_PATH` | Body is not a valid `{"entity_ids": [...]}` object, or `confidence` is invalid. |
+| 400 | `BATCH_TOO_LARGE` | `entity_ids.len() > 50`. |
+| 401 | `UNAUTHENTICATED` | HMAC/bearer auth missing or wrong (when configured). |
+| 413 | n/a | Request body exceeds the 16 KiB cap. |
+| 500/503 | `STORAGE_ERROR` / `INTERNAL` | Whole-batch storage failure. |
+
 ### `GET /api/v1/_capabilities`
 
 Reports whether this Clarion instance can serve the registry-backend read
@@ -321,12 +445,21 @@ Successful response:
   "api_version": 1,
   "instance_id": "9bd7234e-6d44-4a38-9ae4-76f912a10221",
   "registry_backend": true,
-  "file_registry": true
+  "file_registry": true,
+  "linkages": {
+    "http": true
+  }
 }
 ```
 
 Filigree should treat `registry_backend: true` as the flag that the
 `/api/v1/files` resolution surface is present.
+
+`linkages.http: true` advertises the call-graph linkage routes
+(`GET /api/v1/entities/:id/callers|callees` and their `:batch-get` variants —
+see [§Call-graph linkages](#call-graph-linkages)). A consumer (e.g. the
+dossier assembler) should gate its use of those routes on this flag rather
+than probing the routes directly.
 
 `api_version` is the HTTP read API wire-contract version, not Clarion product
 semver. It increments only for incompatible changes to the wire contract

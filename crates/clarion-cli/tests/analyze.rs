@@ -1819,3 +1819,97 @@ fn analyze_prune_unseen_noops_when_filigree_disabled() {
         Some("filigree_disabled"),
     );
 }
+
+/// Wave 0 / WS3 (plan T1.4): after a successful `clarion analyze`, the
+/// `sei_prior_index` snapshot must equal EXACTLY that run's entity set — stale
+/// rows from the prior run removed. Two back-to-back runs on the same project
+/// where the second drops a file prove the full-snapshot replace: the dropped
+/// entity's row must not survive. `entities` is cumulative, so a snapshot built
+/// by querying it would wrongly retain the vanished entity; this guards the
+/// accumulate-and-replace path that avoids that.
+#[cfg(unix)]
+#[test]
+fn analyze_rewrites_prior_index_to_current_run_entity_set() {
+    use std::collections::BTreeSet;
+
+    fn prior_index_locators(project_root: &std::path::Path) -> BTreeSet<String> {
+        let conn = Connection::open(project_root.join(".clarion/clarion.db")).unwrap();
+        conn.prepare("SELECT locator FROM sei_prior_index")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_phase3_plugin(plugin_dir.path());
+
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+
+    // Stems deliberately absent from the plugin's TARGETS map, so each file
+    // yields one module entity and no import edges (clustering skips cleanly).
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let analyze = |dir: &std::path::Path| {
+        clarion_bin()
+            .args(["analyze"])
+            .arg(dir)
+            .env("PATH", &plugin_path)
+            .assert()
+            .success();
+    };
+
+    // Run 1: two source files. Each yields a core-minted `core:file:*` entity
+    // (whole-file hash) plus the plugin's `module` entity — all four carry a
+    // body hash, so all four enter the snapshot.
+    std::fs::write(project_dir.path().join("pidx_alpha.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("pidx_beta.p3"), b"module\n").unwrap();
+    analyze(project_dir.path());
+    assert_eq!(
+        prior_index_locators(project_dir.path()),
+        BTreeSet::from([
+            "core:file:pidx_alpha.p3".to_owned(),
+            "core:file:pidx_beta.p3".to_owned(),
+            "phase3fixture:module:pidx_alpha".to_owned(),
+            "phase3fixture:module:pidx_beta".to_owned(),
+        ]),
+        "prior index after run 1 must equal run 1's entity set"
+    );
+
+    // Run 2: beta removed → the snapshot must drop BOTH stale beta rows (the
+    // core file entity and the plugin module) even though those rows still live
+    // in the cumulative `entities` table.
+    std::fs::remove_file(project_dir.path().join("pidx_beta.p3")).unwrap();
+    analyze(project_dir.path());
+    assert_eq!(
+        prior_index_locators(project_dir.path()),
+        BTreeSet::from([
+            "core:file:pidx_alpha.p3".to_owned(),
+            "phase3fixture:module:pidx_alpha".to_owned(),
+        ]),
+        "prior index after run 2 must equal run 2's entity set (stale beta rows removed)"
+    );
+
+    // Column contract: body_hash populated (NOT NULL), recorded_at stamped, and
+    // signature still NULL in Wave 0 (the WS1 matcher fills it later).
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    let (body_hash, recorded_at, signature): (String, String, Option<String>) = conn
+        .query_row(
+            "SELECT body_hash, recorded_at, signature FROM sei_prior_index WHERE locator = ?1",
+            ["phase3fixture:module:pidx_alpha"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("prior-index row for the surviving module");
+    assert!(!body_hash.is_empty(), "body_hash must be populated");
+    assert!(!recorded_at.is_empty(), "recorded_at must be populated");
+    assert_eq!(
+        signature, None,
+        "signature stays NULL in Wave 0 (WS1 fills it)"
+    );
+}

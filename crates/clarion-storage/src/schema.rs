@@ -30,12 +30,17 @@ const MIGRATIONS: &[Migration] = &[
         name: "0003_wardline_taint_facts",
         sql: include_str!("../migrations/0003_wardline_taint_facts.sql"),
     },
+    Migration {
+        version: 4,
+        name: "0004_sei_prior_index",
+        sql: include_str!("../migrations/0004_sei_prior_index.sql"),
+    },
 ];
 
 /// Highest migration version known to this build. Mirrored into the
 /// `SQLite` `user_version` header (STO-02) so a future-built database is
 /// refused at open instead of silently corrupting state.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 const _CURRENT_SCHEMA_VERSION_MATCHES_LAST_MIGRATION: () = {
     // Compile-time check: `CURRENT_SCHEMA_VERSION` must equal the highest
@@ -303,6 +308,59 @@ mod tests {
         assert!(
             recorded,
             "migration 0002 must record its own schema_migrations row inside its transaction"
+        );
+    }
+
+    fn table_exists(conn: &Connection, table: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            params![table],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .unwrap()
+        .is_some()
+    }
+
+    #[test]
+    fn sei_prior_index_is_added_by_an_upgrade_migration_not_the_initial() {
+        // The prior-index side table (0004) must arrive on an existing DB via an
+        // upgrade migration, not the initial schema — same discipline as 0002's
+        // briefing_blocked. Apply only 0001, confirm the table is absent, then
+        // run the full runner and confirm it appears with user_version bumped.
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_one(&mut conn, &MIGRATIONS[0]).expect("apply initial migration");
+        assert!(
+            !table_exists(&conn, "sei_prior_index"),
+            "sei_prior_index must not be defined by the initial migration (0001)"
+        );
+
+        apply_migrations(&mut conn).expect("apply pending migrations");
+        assert!(
+            table_exists(&conn, "sei_prior_index"),
+            "an upgrade migration must add sei_prior_index to an existing v1 DB"
+        );
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(user_version, i64::from(CURRENT_SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn sei_prior_index_has_no_sei_column() {
+        // Wave-0 invariant: the prior-index table is SHAPE-INDEPENDENT — it must
+        // ship before SEI lock and therefore must NOT carry any `sei` column.
+        // Identity lives in a later table; this guards against a refactor that
+        // smuggles identity into the side table.
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut conn).expect("apply migrations");
+        let has_sei: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_xinfo('sei_prior_index') WHERE name = 'sei'")
+            .and_then(|mut stmt| stmt.exists([]))
+            .unwrap();
+        assert!(
+            !has_sei,
+            "sei_prior_index must be shape-independent (no `sei` column) so it ships pre-lock"
         );
     }
 
