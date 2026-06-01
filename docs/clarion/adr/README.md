@@ -38,6 +38,7 @@ This folder is the canonical home for authored Clarion architecture decision rec
 | [ADR-035](./ADR-035-operational-tuning-discipline.md) | Operational tuning discipline — declared basis / override surface / retune trigger / coupling per constant; file-LOC + crate-boundary budgets; CI lint gate | Accepted |
 | [ADR-036](./ADR-036-wardline-taint-fact-store.md) | Clarion as Wardline taint-fact store — `wardline_taint_facts` table + `/api/wardline/*` routes; first read+write HTTP surface (optional writer-actor, default off); passes loom.md §3–§5 (ADR, not asterisk) | Accepted |
 | [ADR-037](./ADR-037-shared-error-vocabulary.md) | Shared error vocabulary (`clarion-core::errors`) — two typed enums (`HttpErrorCode`, `McpErrorCode`) as single source of truth; wire spelling unchanged on both surfaces; relates to ADR-034 | Accepted |
+| [ADR-038](./ADR-038-sei-token-and-signature.md) | SEI token scheme (`clarion:eid:<blake3(locator++mint_run_id)>`), signature schema (plugin-declared versioned JSON), and identity persistence (`sei_bindings` table, not an `entities` column); reserves the `clarion:eid:` locator namespace; resolves SEI-standard REQ-C-01/REQ-C-02; demotes ADR-003 id to *locator* | Accepted |
 
 ## Backlog still tracked in the detailed design
 
