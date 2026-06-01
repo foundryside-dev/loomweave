@@ -385,6 +385,41 @@ fn serve_http_files_blank_path_returns_invalid_path_envelope() {
 }
 
 #[test]
+fn serve_http_identity_resolve_rejects_sei_shaped_input_and_resolves_unknown() {
+    // REQ-F-02 (ADR-038 §4) over the wire: an SEI-shaped locator is rejected
+    // with 400 INVALID_PATH (never silently mis-resolved); a well-formed but
+    // unknown locator resolves to { alive: false }.
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+    let mut child = spawn_serve(dir.path());
+
+    let sei_body =
+        serde_json::json!({ "locator": "clarion:eid:0123456789abcdef0123456789abcdef" })
+            .to_string();
+    let rejected = wait_for_http_post_json(&bind, "/api/v1/identity/resolve", &sei_body, &[]);
+
+    let unknown_body = serde_json::json!({ "locator": "python:function:nope.absent" }).to_string();
+    let unknown = wait_for_http_post_json(&bind, "/api/v1/identity/resolve", &unknown_body, &[]);
+
+    stop_serve(&mut child);
+
+    let rejected = rejected.expect("identity/resolve rejection response");
+    assert_eq!(rejected.status_code, 400, "{rejected:?}");
+    assert_eq!(rejected.body["code"], "INVALID_PATH");
+
+    let unknown = unknown.expect("identity/resolve unknown response");
+    assert_eq!(unknown.status_code, 200, "{unknown:?}");
+    assert_eq!(unknown.body["alive"], false);
+}
+
+#[test]
 fn serve_http_files_rejects_unknown_query_fields() {
     let dir = tempfile::tempdir().expect("temp project");
     clarion_bin()
