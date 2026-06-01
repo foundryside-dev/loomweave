@@ -865,7 +865,8 @@ fn migration_0005_partial_unique_index_allows_one_alive_binding_per_locator() {
     insert("clarion:eid:bbbb", "python:function:m.f", "alive")
         .expect_err("second alive binding on the same locator must be rejected");
     // An orphaned binding may share the former locator (audit history retained).
-    insert("clarion:eid:cccc", "python:function:m.f", "orphaned").expect("orphaned may share locator");
+    insert("clarion:eid:cccc", "python:function:m.f", "orphaned")
+        .expect("orphaned may share locator");
     // Two alive bindings with NULL locator do not collide (partial index excludes NULLs).
     insert("clarion:eid:dddd", "", "alive").expect("setup distinct locator");
     conn.execute(

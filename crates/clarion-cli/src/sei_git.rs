@@ -125,8 +125,7 @@ fn file_renames_to_locator_renames(
 ) -> Vec<GitRename> {
     let mut out = Vec::new();
     for (old_path, new_path) in file_renames {
-        let (Some(old_mod), Some(new_mod)) =
-            (path_to_module(old_path), path_to_module(new_path))
+        let (Some(old_mod), Some(new_mod)) = (path_to_module(old_path), path_to_module(new_path))
         else {
             continue;
         };

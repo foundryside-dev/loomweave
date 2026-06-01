@@ -892,13 +892,7 @@ mod tests {
             binding("clarion:eid:0001", "a.f", "h1", None),
         )]);
         let cur = locset(&["b.f"]);
-        let decision = rebind_or_mint(
-            &entity("b.f", Some("h1"), None),
-            &alive,
-            &cur,
-            &[],
-            "run-2",
-        );
+        let decision = rebind_or_mint(&entity("b.f", Some("h1"), None), &alive, &cur, &[], "run-2");
         assert!(matches!(decision, SeiDecision::Mint { .. }));
     }
 
@@ -977,10 +971,7 @@ mod tests {
     #[test]
     fn alive_snapshot_excludes_orphaned_and_keys_by_locator() {
         let conn = migrated_conn();
-        insert_binding(
-            &conn,
-            &binding("clarion:eid:0001", "a.f", "h1", Some("s1")),
-        );
+        insert_binding(&conn, &binding("clarion:eid:0001", "a.f", "h1", Some("s1")));
         insert_binding(
             &conn,
             &SeiBinding {
@@ -992,7 +983,10 @@ mod tests {
         assert_eq!(snap.len(), 1);
         assert_eq!(snap["a.f"].sei, "clarion:eid:0001");
         assert_eq!(
-            alive_binding_for_locator(&conn, "a.f").unwrap().unwrap().sei,
+            alive_binding_for_locator(&conn, "a.f")
+                .unwrap()
+                .unwrap()
+                .sei,
             "clarion:eid:0001"
         );
         assert!(alive_binding_for_locator(&conn, "a.g").unwrap().is_none());
@@ -1002,10 +996,7 @@ mod tests {
     fn has_any_alive_binding_reflects_state() {
         let conn = migrated_conn();
         assert!(!has_any_alive_binding(&conn).unwrap());
-        insert_binding(
-            &conn,
-            &binding("clarion:eid:0001", "a.f", "h1", Some("s1")),
-        );
+        insert_binding(&conn, &binding("clarion:eid:0001", "a.f", "h1", Some("s1")));
         assert!(has_any_alive_binding(&conn).unwrap());
     }
 

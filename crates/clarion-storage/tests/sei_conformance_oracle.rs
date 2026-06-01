@@ -69,8 +69,7 @@ fn apply_run(
     }
 
     let alive = alive_bindings_snapshot(conn).unwrap();
-    let current_locators: HashSet<String> =
-        descriptors.iter().map(|d| d.locator.clone()).collect();
+    let current_locators: HashSet<String> = descriptors.iter().map(|d| d.locator.clone()).collect();
     let sei_to_old: HashMap<String, String> = alive
         .iter()
         .map(|(loc, b)| (b.sei.clone(), loc.clone()))
@@ -180,9 +179,14 @@ fn oracle_identity_round_trip_and_opacity() {
     let sei = seis["python:function:m.f"].clone();
 
     // resolve(locator) → sei
-    let by_locator = resolve_locator(&conn, "python:function:m.f").unwrap().unwrap();
+    let by_locator = resolve_locator(&conn, "python:function:m.f")
+        .unwrap()
+        .unwrap();
     assert_eq!(by_locator.sei, sei);
-    assert_eq!(by_locator.current_locator.as_deref(), Some("python:function:m.f"));
+    assert_eq!(
+        by_locator.current_locator.as_deref(),
+        Some("python:function:m.f")
+    );
     assert_eq!(by_locator.content_hash.as_deref(), Some("h1"));
 
     // resolve_sei(sei) → locator (round-trip closes)
@@ -195,7 +199,10 @@ fn oracle_identity_round_trip_and_opacity() {
 
     // Opacity: the consumer treats the SEI as an opaque string. It carries the
     // reserved prefix and is NOT a locator (a colon-count check would be wrong).
-    assert!(is_reserved_sei(&sei), "SEI must be opaque + reserved-prefixed");
+    assert!(
+        is_reserved_sei(&sei),
+        "SEI must be opaque + reserved-prefixed"
+    );
     assert_ne!(sei, "python:function:m.f");
 }
 
@@ -215,7 +222,11 @@ fn oracle_rename_carries_sei_with_locator_changed() {
     let r2 = apply_run(
         &conn,
         "run-2",
-        &[entity("python:function:authn.login", Some("h1"), Some("s1"))],
+        &[entity(
+            "python:function:authn.login",
+            Some("h1"),
+            Some("s1"),
+        )],
         &[GitRename {
             old_locator: "python:function:auth.login".to_owned(),
             new_locator: "python:function:authn.login".to_owned(),
@@ -226,9 +237,16 @@ fn oracle_rename_carries_sei_with_locator_changed() {
         "rename must CARRY the SEI (same token)"
     );
     // Old locator no longer resolves; new one does.
-    assert!(resolve_locator(&conn, "python:function:auth.login").unwrap().is_none());
+    assert!(
+        resolve_locator(&conn, "python:function:auth.login")
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(
-        resolve_locator(&conn, "python:function:authn.login").unwrap().unwrap().sei,
+        resolve_locator(&conn, "python:function:authn.login")
+            .unwrap()
+            .unwrap()
+            .sei,
         original
     );
     // locator_changed lineage event recorded.
@@ -237,7 +255,10 @@ fn oracle_rename_carries_sei_with_locator_changed() {
         .into_iter()
         .map(|r| r.event)
         .collect();
-    assert_eq!(events, vec!["born".to_owned(), "locator_changed".to_owned()]);
+    assert_eq!(
+        events,
+        vec!["born".to_owned(), "locator_changed".to_owned()]
+    );
 }
 
 // ── §8.3 — move (body + signature stable, new module) → carry, moved ─────────
@@ -253,7 +274,12 @@ fn oracle_move_carries_sei_with_moved_event() {
     let original = r1["a.mod.f"].clone();
 
     // No git signal — identical body + signature at a new module carries (moved).
-    let r2 = apply_run(&conn, "run-2", &[entity("b.mod.f", Some("h1"), Some("s1"))], &[]);
+    let r2 = apply_run(
+        &conn,
+        "run-2",
+        &[entity("b.mod.f", Some("h1"), Some("s1"))],
+        &[],
+    );
     assert_eq!(r2["b.mod.f"], original, "move must CARRY the SEI");
     let events: Vec<String> = sei_lineage(&conn, &original)
         .unwrap()
@@ -280,14 +306,21 @@ fn oracle_ambiguous_fails_closed() {
     let r2 = apply_run(
         &conn,
         "run-2",
-        &[entity("python:function:authn.login", Some("h2-edited"), Some("s1"))],
+        &[entity(
+            "python:function:authn.login",
+            Some("h2-edited"),
+            Some("s1"),
+        )],
         &[GitRename {
             old_locator: "python:function:auth.login".to_owned(),
             new_locator: "python:function:authn.login".to_owned(),
         }],
     );
     let minted = r2["python:function:authn.login"].clone();
-    assert_ne!(minted, original, "ambiguous match must NOT carry (fail closed)");
+    assert_ne!(
+        minted, original,
+        "ambiguous match must NOT carry (fail closed)"
+    );
     // Old SEI is orphaned (never silently re-pointed).
     match resolve_sei(&conn, &original).unwrap() {
         SeiLookupResult::NotAlive { lineage } => {
@@ -297,7 +330,10 @@ fn oracle_ambiguous_fails_closed() {
     }
     // The new SEI is alive at the new locator.
     assert_eq!(
-        resolve_locator(&conn, "python:function:authn.login").unwrap().unwrap().sei,
+        resolve_locator(&conn, "python:function:authn.login")
+            .unwrap()
+            .unwrap()
+            .sei,
         minted
     );
 }
@@ -318,7 +354,12 @@ fn oracle_delete_orphans_and_reports_not_alive() {
     let gone_sei = r1["gone.g"].clone();
 
     // Run 2: gone.g removed (not in the current set), keep.f remains.
-    apply_run(&conn, "run-2", &[entity("keep.f", Some("h1"), Some("s1"))], &[]);
+    apply_run(
+        &conn,
+        "run-2",
+        &[entity("keep.f", Some("h1"), Some("s1"))],
+        &[],
+    );
 
     assert!(resolve_locator(&conn, "gone.g").unwrap().is_none());
     match resolve_sei(&conn, &gone_sei).unwrap() {
@@ -346,13 +387,22 @@ fn oracle_capability_absent_degrades_gracefully() {
         "no bindings ⇒ capability effectively absent for this index"
     );
     // resolve over an empty store returns a clean negative, not an error.
-    assert!(resolve_locator(&conn, "python:function:m.f").unwrap().is_none());
+    assert!(
+        resolve_locator(&conn, "python:function:m.f")
+            .unwrap()
+            .is_none()
+    );
     match resolve_sei(&conn, "clarion:eid:deadbeefdeadbeefdeadbeefdeadbeef").unwrap() {
         SeiLookupResult::NotAlive { lineage } => assert!(lineage.is_empty()),
         SeiLookupResult::Alive(_) => panic!("unknown SEI must resolve not-alive, not alive"),
     }
 
     // After a run, the capability is populated — the consumer's degrade check flips.
-    apply_run(&conn, "run-1", &[entity("python:function:m.f", Some("h1"), Some("s1"))], &[]);
+    apply_run(
+        &conn,
+        "run-1",
+        &[entity("python:function:m.f", Some("h1"), Some("s1"))],
+        &[],
+    );
     assert!(has_any_alive_binding(&conn).unwrap());
 }

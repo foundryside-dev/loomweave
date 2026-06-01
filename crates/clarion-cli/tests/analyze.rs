@@ -1915,14 +1915,18 @@ fn analyze_rewrites_prior_index_to_current_run_entity_set() {
 }
 
 /// Map of `current_locator -> sei` for every ALIVE binding (Wave 1 / WS1).
-fn alive_sei_bindings(project_root: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+fn alive_sei_bindings(
+    project_root: &std::path::Path,
+) -> std::collections::BTreeMap<String, String> {
     let conn = Connection::open(project_root.join(".clarion/clarion.db")).unwrap();
     conn.prepare(
         "SELECT current_locator, sei FROM sei_bindings \
          WHERE status = 'alive' AND current_locator IS NOT NULL",
     )
     .unwrap()
-    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+    .query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })
     .unwrap()
     .collect::<Result<_, _>>()
     .unwrap()
@@ -1968,7 +1972,10 @@ fn analyze_mints_alive_sei_binding_for_every_entity() {
     // On a from-scratch run every entity is current, so the alive binding set
     // must equal the entity set exactly.
     assert_eq!(
-        bindings.keys().cloned().collect::<std::collections::BTreeSet<_>>(),
+        bindings
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
         entities,
         "every entity must have exactly one alive SEI binding after analysis"
     );

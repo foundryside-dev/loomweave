@@ -19,9 +19,9 @@ use clarion_core::EdgeConfidence;
 use clarion_core::HttpErrorCode as ErrorCode;
 use clarion_mcp::config::HttpReadConfig;
 use clarion_storage::{
-    CallEdgeMatch, CanonicalProjectPath, EntityVisibility, ReaderPool, SeiLookupResult, StorageError,
-    call_edges_from, call_edges_targeting, entity_visibility, is_reserved_sei, resolve_file_catalog_entry,
-    resolve_locator, resolve_sei, sei_lineage,
+    CallEdgeMatch, CanonicalProjectPath, EntityVisibility, ReaderPool, SeiLookupResult,
+    StorageError, call_edges_from, call_edges_targeting, entity_visibility, is_reserved_sei,
+    resolve_file_catalog_entry, resolve_locator, resolve_sei, sei_lineage,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1552,9 +1552,7 @@ fn validate_locator(locator: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn lineage_rows_to_body(
-    rows: Vec<clarion_storage::SeiLineageRow>,
-) -> Vec<SeiLineageEventBody> {
+fn lineage_rows_to_body(rows: Vec<clarion_storage::SeiLineageRow>) -> Vec<SeiLineageEventBody> {
     rows.into_iter()
         .map(|r| SeiLineageEventBody {
             event: r.event,
@@ -1596,11 +1594,7 @@ async fn post_identity_resolve(
             })),
         )
             .into_response(),
-        Ok(None) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "alive": false })),
-        )
-            .into_response(),
+        Ok(None) => (StatusCode::OK, Json(serde_json::json!({ "alive": false }))).into_response(),
         Err(err) => json_read_error(&err),
     }
 }
@@ -1670,10 +1664,7 @@ async fn post_identity_resolve_batch(
     }
 }
 
-async fn get_identity_sei(
-    State(state): State<AppState>,
-    Path(sei): Path<String>,
-) -> Response {
+async fn get_identity_sei(State(state): State<AppState>, Path(sei): Path<String>) -> Response {
     let lookup_sei = sei.clone();
     let result = state
         .readers
@@ -1703,10 +1694,7 @@ async fn get_identity_sei(
     }
 }
 
-async fn get_identity_lineage(
-    State(state): State<AppState>,
-    Path(sei): Path<String>,
-) -> Response {
+async fn get_identity_lineage(State(state): State<AppState>, Path(sei): Path<String>) -> Response {
     let lookup_sei = sei.clone();
     let result = state
         .readers

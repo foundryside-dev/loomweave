@@ -788,14 +788,8 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             if options.no_sei {
                 tracing::info!(run_id = %run_id, "SEI mint pass skipped (--no-sei)");
             } else {
-                match run_sei_mint_pass(
-                    &writer,
-                    &db_path,
-                    &project_root,
-                    &run_id,
-                    sei_descriptors,
-                )
-                .await
+                match run_sei_mint_pass(&writer, &db_path, &project_root, &run_id, sei_descriptors)
+                    .await
                 {
                     Ok(stats) => tracing::info!(
                         run_id = %run_id,
@@ -953,15 +947,13 @@ async fn run_sei_mint_pass(
     // Read the prior alive bindings (this run has written no SEI yet, so this is
     // exactly the previous run's identity state).
     let alive = {
-        let conn =
-            Connection::open(db_path).context("open read connection for SEI mint pass")?;
+        let conn = Connection::open(db_path).context("open read connection for SEI mint pass")?;
         alive_bindings_snapshot(&conn).map_err(|e| anyhow::anyhow!("{e}"))?
     };
 
     // Deterministic processing order so cross-entity dedup (below) is stable.
     descriptors.sort_by(|a, b| a.locator.cmp(&b.locator));
-    let current_locators: HashSet<String> =
-        descriptors.iter().map(|d| d.locator.clone()).collect();
+    let current_locators: HashSet<String> = descriptors.iter().map(|d| d.locator.clone()).collect();
 
     // The git-rename signal (best-effort, typed seam REQ-C-05). Skipped entirely
     // on non-repo corpora to avoid a spurious subprocess.
@@ -3180,7 +3172,9 @@ mod tests {
                     extra: source_range.as_object().unwrap().clone(),
                 },
                 parent_id: Some("python:module:demo".to_owned()),
-                signature: Some(serde_json::json!({"v": 1, "params": ["x: int"], "return_ann": "bool"})),
+                signature: Some(
+                    serde_json::json!({"v": 1, "params": ["x: int"], "return_ann": "bool"}),
+                ),
                 extra: serde_json::Map::new(),
             },
         };

@@ -400,9 +400,8 @@ fn serve_http_identity_resolve_rejects_sei_shaped_input_and_resolves_unknown() {
     write_http_config(dir.path(), &bind);
     let mut child = spawn_serve(dir.path());
 
-    let sei_body =
-        serde_json::json!({ "locator": "clarion:eid:0123456789abcdef0123456789abcdef" })
-            .to_string();
+    let sei_body = serde_json::json!({ "locator": "clarion:eid:0123456789abcdef0123456789abcdef" })
+        .to_string();
     let rejected = wait_for_http_post_json(&bind, "/api/v1/identity/resolve", &sei_body, &[]);
 
     let unknown_body = serde_json::json!({ "locator": "python:function:nope.absent" }).to_string();
