@@ -134,6 +134,39 @@ pub struct Manifest {
     /// [`parse_manifest`].
     #[serde(default)]
     pub integrations: BTreeMap<String, BTreeMap<String, String>>,
+
+    /// `[signature]` — optional SEI signature declaration (ADR-038 REQ-C-01).
+    /// Documentation + a version stamp the plugin echoes into each entity's
+    /// `signature` field; the core never parses the per-entity signature JSON,
+    /// it only stores it verbatim and compares by string equality. Absent for
+    /// plugins that emit no signatures (they degrade to the no-signature move
+    /// case). A `schema_version` bump voids cached signature comparisons.
+    #[serde(default)]
+    pub signature: Option<SignatureManifest>,
+}
+
+/// `[signature]` manifest block (ADR-038 REQ-C-01).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignatureManifest {
+    /// Bumped when any per-kind signature shape changes incompatibly; a bump
+    /// voids cached signature equality on the consumer side.
+    pub schema_version: u32,
+    /// Per-entity-kind declared signature shape. Informational for the core.
+    #[serde(default)]
+    pub schemas: BTreeMap<String, SignatureKindSchema>,
+}
+
+/// A per-kind signature shape declaration (e.g. `function = { v = 1, fields =
+/// ["params", "return_ann"] }`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignatureKindSchema {
+    /// Per-kind schema version (mirrored into the emitted signature's `v`).
+    pub v: u32,
+    /// The field names the plugin emits for this kind (documentation).
+    #[serde(default)]
+    pub fields: Vec<String>,
 }
 
 /// Maximum number of `[integrations.*]` entries accepted per manifest.

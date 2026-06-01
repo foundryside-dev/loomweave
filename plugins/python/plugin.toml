@@ -54,3 +54,19 @@ ontology_version = "0.6.0"
 # rather than silent drift.
 min_version = "1.0.0"
 max_version = "2.0.0"
+
+# SEI signature declaration (ADR-038 REQ-C-01 / Wave 1). The plugin emits a
+# versioned `signature` object per function/class entity, stored verbatim by the
+# core and compared by string equality as the matcher's move-case input. Modules
+# and packages declare no signature (the move case abstains for them — fail
+# closed). A `schema_version` bump voids cached signature equality.
+[signature]
+schema_version = 1
+
+[signature.schemas.function]
+v = 1
+fields = ["params", "return_ann"]
+
+[signature.schemas.class]
+v = 1
+fields = ["bases"]

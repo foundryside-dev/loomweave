@@ -261,6 +261,47 @@ def test_extractor_with_noop_resolver_emits_no_calls() -> None:
     assert [edge for edge in edges if edge["kind"] == "calls"] == []
 
 
+def test_function_entity_carries_sei_signature() -> None:
+    # ADR-038 REQ-C-01: functions emit a versioned signature with params +
+    # return annotation; modules carry none (the move case abstains).
+    entities, _ = extract(
+        "def f(x: int, y: str = 'a', *args, z: bool, **kw) -> bool:\n    return z\n",
+        "demo.py",
+    )
+    func = next(e for e in entities if e["kind"] == "function")
+    assert func["signature"] == {
+        "v": 1,
+        "params": ["x: int", "y: str", "*args", "z: bool", "**kw"],
+        "return_ann": "bool",
+    }
+    module = next(e for e in entities if e["kind"] == "module")
+    assert "signature" not in module
+
+
+def test_function_signature_omits_missing_annotations() -> None:
+    entities, _ = extract("def g(a, b):\n    return a\n", "demo.py")
+    func = next(e for e in entities if e["kind"] == "function")
+    assert func["signature"] == {"v": 1, "params": ["a", "b"], "return_ann": None}
+
+
+def test_class_entity_carries_base_signature() -> None:
+    entities, _ = extract(
+        "class C(Base, mixins.M):\n    pass\n",
+        "demo.py",
+    )
+    cls = next(e for e in entities if e["kind"] == "class")
+    assert cls["signature"] == {"v": 1, "bases": ["Base", "mixins.M"]}
+
+
+def test_function_signature_is_stable_across_extractions() -> None:
+    # The matcher compares signatures by string equality, so the emitted shape
+    # must be deterministic for identical source.
+    source = "def h(p: dict[str, int]) -> None:\n    pass\n"
+    first = next(e for e in extract(source, "a.py")[0] if e["kind"] == "function")
+    second = next(e for e in extract(source, "a.py")[0] if e["kind"] == "function")
+    assert first["signature"] == second["signature"]
+
+
 def test_import_statement_emits_module_import_edge() -> None:
     _entities, edges = extract("import pkg.service\n", "consumer.py")
 

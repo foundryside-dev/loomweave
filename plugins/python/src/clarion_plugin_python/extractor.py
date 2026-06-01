@@ -116,6 +116,35 @@ class DefinitionSpan(TypedDict):
     decorator_line_end: NotRequired[int]
 
 
+# SEI signature schema version (ADR-038 REQ-C-01). Mirrors plugin.toml's
+# `[signature] schema_version`; bumped when a per-kind shape changes
+# incompatibly. The value is stamped into every emitted signature's ``v`` field
+# so a consumer can detect a version change as a changed signature.
+SIGNATURE_SCHEMA_VERSION = 1
+
+
+class FunctionSignature(TypedDict):
+    """SEI signature for a ``function`` entity (ADR-038 REQ-C-01).
+
+    ``params`` is the ordered parameter list rendered as ``name`` or
+    ``name: annotation`` strings (positional-only, positional, ``*args``,
+    keyword-only, ``**kwargs`` in source order). ``return_ann`` is the unparsed
+    return annotation or ``None``.
+    """
+
+    v: int
+    params: list[str]
+    return_ann: str | None
+
+
+class ClassSignature(TypedDict):
+    """SEI signature for a ``class`` entity (ADR-038 REQ-C-01): the unparsed
+    base-class expressions in declaration order."""
+
+    v: int
+    bases: list[str]
+
+
 class RawEntity(TypedDict):
     """Wire shape matching the Rust host's RawEntity contract.
 
@@ -139,6 +168,12 @@ class RawEntity(TypedDict):
     # entities; omitted for modules. Rides the host's RawEntity `extra` flatten
     # into `properties_json`, so no host or storage schema change is needed.
     definition: NotRequired[DefinitionSpan]
+    # SEI signature (ADR-038 REQ-C-01 / Wave 1). A plugin-declared, versioned
+    # JSON object the core stores verbatim and compares by string equality as
+    # the matcher's move-case input. Set on function/class entities; omitted for
+    # modules (the move case abstains — fail closed). Typed top-level field on
+    # the host's RawEntity, not routed through `extra`.
+    signature: NotRequired[FunctionSignature | ClassSignature]
 
 
 class RawEdge(TypedDict):
@@ -904,6 +939,46 @@ def _contains_edge(parent_id: str, child_id: str) -> RawEdge:
     }
 
 
+def _annotation_str(node: ast.expr | None) -> str | None:
+    """Unparse an annotation/expression node to its canonical source text, or
+    ``None`` when absent. ``ast.unparse`` is deterministic for a given AST."""
+    if node is None:
+        return None
+    return ast.unparse(node)
+
+
+def _format_param(arg: ast.arg, prefix: str = "") -> str:
+    """Render one parameter as ``name`` or ``name: annotation`` (``prefix`` is
+    ``*`` / ``**`` for var-positional / var-keyword params)."""
+    annotation = _annotation_str(arg.annotation)
+    name = f"{prefix}{arg.arg}"
+    return f"{name}: {annotation}" if annotation is not None else name
+
+
+def _function_signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> FunctionSignature:
+    """SEI signature for a function (ADR-038 REQ-C-01). Near-redundant for the
+    v1 deterministic move case (a byte-identical body already implies an
+    identical ``def`` line), carried for spec conformance + the fuzzy future."""
+    args = node.args
+    params: list[str] = [_format_param(arg) for arg in (*args.posonlyargs, *args.args)]
+    if args.vararg is not None:
+        params.append(_format_param(args.vararg, "*"))
+    params.extend(_format_param(arg) for arg in args.kwonlyargs)
+    if args.kwarg is not None:
+        params.append(_format_param(args.kwarg, "**"))
+    return {
+        "v": SIGNATURE_SCHEMA_VERSION,
+        "params": params,
+        "return_ann": _annotation_str(node.returns),
+    }
+
+
+def _class_signature(node: ast.ClassDef) -> ClassSignature:
+    """SEI signature for a class (ADR-038 REQ-C-01): unparsed base expressions."""
+    bases = [text for text in (_annotation_str(base) for base in node.bases) if text is not None]
+    return {"v": SIGNATURE_SCHEMA_VERSION, "bases": bases}
+
+
 def _build_function_entity(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
     parents: list[ast.AST],
@@ -932,6 +1007,7 @@ def _build_function_entity(
         },
         "parent_id": parent_entity_id,
         "definition": definition,
+        "signature": _function_signature(node),
     }
     return entity, child_id
 
@@ -971,5 +1047,6 @@ def _build_class_entity(
         },
         "parent_id": parent_entity_id,
         "definition": definition,
+        "signature": _class_signature(node),
     }
     return entity, child_id
