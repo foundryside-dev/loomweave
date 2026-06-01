@@ -13,6 +13,7 @@ pub mod query;
 pub mod reader;
 pub mod retry;
 pub mod schema;
+pub mod sei;
 pub mod unresolved;
 pub mod wardline_taint;
 pub mod writer;
@@ -47,6 +48,12 @@ pub use query::{
 };
 pub use reader::ReaderPool;
 pub use retry::{RetryPolicy, begin_immediate};
+pub use sei::{
+    BindingStatus, GitRename, GitRenameSource, LineageEvent, NewEntityDescriptor, SEI_PREFIX,
+    SeiBinding, SeiDecision, SeiLineageRow, SeiLookupResult, SeiRecord, alive_binding_for_locator,
+    alive_bindings_snapshot, has_any_alive_binding, is_reserved_sei, mint_sei, orphaned_bindings,
+    rebind_or_mint, resolve_locator, resolve_sei, sei_for_locator, sei_lineage,
+};
 pub use unresolved::{UnresolvedCallSiteRecord, replace_unresolved_call_sites_for_caller};
 pub use wardline_taint::{
     Resolution, TaintFact, TaintFactRow, get_taint_facts, resolve_wardline_qualname,
