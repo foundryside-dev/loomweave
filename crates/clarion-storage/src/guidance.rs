@@ -148,6 +148,11 @@ pub fn guidance_sheet_is_stale(sheet: &GuidanceSheet, stale_before: &str) -> boo
 const SELECT_COLUMNS: &str = "id, name, short_name, scope_level, properties, \
      scope_rank, created_at, updated_at";
 
+/// The reserved id prefix every guidance sheet's id must carry: `plugin_id`
+/// `core`, reserved kind `guidance` (ADR-003 + ADR-022). The third segment (the
+/// canonical name) follows.
+const GUIDANCE_ID_PREFIX: &str = "core:guidance:";
+
 /// Insert or replace a guidance sheet. On a fresh id this inserts; on an
 /// existing id it updates `name`, `short_name`, `properties`, and bumps
 /// `updated_at` (preserving `created_at`). The generated columns recompute from
@@ -157,10 +162,29 @@ const SELECT_COLUMNS: &str = "id, name, short_name, scope_level, properties, \
 /// clobbering an existing id (that is `edit`'s job); `edit` does a
 /// read-modify-write that preserves `authored_at` / `provenance` / `pinned`.
 ///
+/// **Id guard (graph-integrity invariant):** the id MUST carry the
+/// `core:guidance:` prefix. This protects ALL write paths
+/// (create / edit / import) from a hand-edited or malicious payload whose id
+/// names a *code* entity (e.g. `python:function:foo`): without the guard the
+/// `ON CONFLICT(id) DO UPDATE` would overwrite that code entity's
+/// `name`/`properties` (leaving its `kind`/`plugin_id`), silently corrupting the
+/// entity graph. The `ON CONFLICT` clause is additionally scoped
+/// `WHERE kind = 'guidance'` as defense-in-depth, but the prefix check is the
+/// primary gate.
+///
 /// # Errors
 ///
-/// Returns [`StorageError::Sqlite`] on any `SQLite` failure (lock, constraint).
+/// Returns [`StorageError::InvalidQuery`] if `sheet.id` does not start with
+/// `core:guidance:` (nothing is written). Returns [`StorageError::Sqlite`] on
+/// any `SQLite` failure (lock, constraint).
 pub fn upsert_guidance_sheet(conn: &Connection, sheet: &GuidanceSheetInput<'_>) -> Result<()> {
+    if !sheet.id.starts_with(GUIDANCE_ID_PREFIX) {
+        return Err(StorageError::InvalidQuery(format!(
+            "guidance sheet id '{}' is not a guidance id (must start with `{GUIDANCE_ID_PREFIX}`); \
+             refusing to write — this would corrupt the entity it names",
+            sheet.id
+        )));
+    }
     let properties = serde_json::to_string(sheet.properties)
         .map_err(|e| StorageError::InvalidQuery(format!("serialize guidance properties: {e}")))?;
     conn.execute(
@@ -173,7 +197,8 @@ pub fn upsert_guidance_sheet(conn: &Connection, sheet: &GuidanceSheetInput<'_>) 
             name = excluded.name, \
             short_name = excluded.short_name, \
             properties = excluded.properties, \
-            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+         WHERE kind = 'guidance'",
         params![sheet.id, sheet.name, sheet.short_name, properties],
     )?;
     Ok(())
@@ -434,9 +459,15 @@ pub fn guidance_sheet_matches_entity(
 /// match would otherwise hit on a large corpus. Guidance sheets never carry
 /// cache rows, so the `kind = 'guidance'` exclusion is automatic.
 ///
-/// A sheet with no (evaluable) `match_rules` matches nothing and this is a clean
-/// 0-row no-op — that is correct: explicit `guides`-edge composition is handled
-/// elsewhere (analyze.rs deletion path) and is deliberately out of scope here.
+/// A sheet applies to an entity if EITHER a `match_rules` rule fires OR the sheet
+/// has an explicit `guides` edge to it — the same OR composition the MCP
+/// `guidance_for` read path uses. This function honours both: it collects the
+/// sheet's `guides`-edge targets (`SELECT to_id FROM edges WHERE kind = 'guides'
+/// AND from_id = ?sheet_id`) and invalidates them alongside the rule matches.
+/// An entity reached by both a rule and a guides edge is invalidated exactly
+/// once (the `cached_ids`-driven loop de-dups automatically). A sheet with no
+/// `match_rules` and no `guides` edges matches nothing and this is a clean 0-row
+/// no-op.
 ///
 /// `project_root` is required to evaluate `path:` rules (the stored
 /// `source_file_path` is absolute; the matcher strips this prefix to a
@@ -462,9 +493,22 @@ pub fn invalidate_summaries_for_sheet(
         rows.collect::<rusqlite::Result<_>>()?
     };
 
+    // The sheet's explicit `guides`-edge targets. `guidance_for` composes these
+    // OR-wise with `match_rules`, so invalidation must too. Driving the delete off
+    // `cached_ids` (below) with an OR'd predicate keeps the count exact and
+    // de-dups an entity reached by both a rule and a guides edge automatically.
+    let guides_targets: HashSet<String> = {
+        let mut stmt =
+            conn.prepare("SELECT to_id FROM edges WHERE kind = 'guides' AND from_id = ?1")?;
+        let rows = stmt.query_map(params![sheet.id], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+
     let mut removed = 0usize;
     for entity_id in &cached_ids {
-        if guidance_sheet_matches_entity(conn, sheet, entity_id, &canonical_root)? {
+        if guides_targets.contains(entity_id)
+            || guidance_sheet_matches_entity(conn, sheet, entity_id, &canonical_root)?
+        {
             removed += crate::cache::delete_summary_cache_for_entity(conn, entity_id)?;
         }
     }

@@ -997,6 +997,189 @@ fn import_fails_loudly_on_malformed_file() {
 }
 
 #[test]
+fn import_rejects_code_entity_id_and_leaves_entity_intact() {
+    // FINDING 1(c): an import file whose JSON `id` is a CODE entity id must fail
+    // loudly (naming the file) and must NOT mutate the existing code entity.
+    let dst = tempfile::tempdir().unwrap();
+    seed_db(dst.path()); // seeds python:function:auth.tokens.refresh
+
+    let target = "python:function:auth.tokens.refresh";
+    let before = sheet_props_raw(dst.path(), target).expect("code entity present");
+
+    let import_dir = tempfile::tempdir().unwrap();
+    let evil = serde_json::json!({
+        "id": target,
+        "name": "pwned",
+        "properties": { "content": "overwrite", "scope_level": "module", "match_rules": [] },
+    });
+    std::fs::write(
+        import_dir.path().join("evil.json"),
+        serde_json::to_string_pretty(&evil).unwrap(),
+    )
+    .unwrap();
+
+    let assert = clarion_bin()
+        .args(["guidance", "import"])
+        .args(["--path"])
+        .arg(dst.path())
+        .arg(import_dir.path())
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("evil.json"),
+        "import error must name the offending file: {stderr}"
+    );
+
+    let after = sheet_props_raw(dst.path(), target).expect("code entity still present");
+    assert_eq!(
+        after, before,
+        "the code entity must be byte-identical after a rejected import"
+    );
+}
+
+/// Fetch the raw (name, kind, `plugin_id`, properties) tuple for ANY entity (not
+/// just guidance), or None.
+fn sheet_props_raw(root: &std::path::Path, id: &str) -> Option<(String, String, String, String)> {
+    let db_path = root.join(".clarion").join("clarion.db");
+    let conn = Connection::open(&db_path).expect("reopen db");
+    conn.query_row(
+        "SELECT name, kind, plugin_id, properties FROM entities WHERE id = ?1",
+        rusqlite::params![id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )
+    .optional()
+    .expect("query entity")
+}
+
+#[test]
+fn import_invalidates_union_of_old_and_new_matches() {
+    // FINDING 2: when import UPDATES an existing sheet whose match_rules changed,
+    // the OLD-matched entities' cached summaries must also be invalidated (not
+    // just the NEW-matched ones). kind:class → kind:function is the reliable
+    // discriminator (no on-disk file needed for kind rules).
+    let dst = tempfile::tempdir().unwrap();
+    seed_db(dst.path()); // seeds a `function` entity: auth.tokens.refresh
+
+    // Seed a `class` entity too, so an OLD `kind:class` rule has a target.
+    {
+        let db_path = dst.path().join(".clarion").join("clarion.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
+             created_at, updated_at) VALUES \
+             (?1, 'python', 'class', 'pkg.mod.C', 'C', '{}', \
+              strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            rusqlite::params!["python:class:pkg.mod.C"],
+        )
+        .unwrap();
+    }
+
+    // Pre-existing sheet matching the CLASS entity (OLD rule: kind:class).
+    seed_sheet(
+        dst.path(),
+        "shifting",
+        &serde_json::json!({
+            "content": "old", "scope_level": "module",
+            "match_rules": [{ "type": "kind", "value": "class" }],
+            "authored_at": "2026-01-01T00:00:00.000Z",
+        }),
+    );
+
+    // Cache rows for BOTH the old-matched (class) and new-matched (function).
+    seed_summary_cache(dst.path(), "python:class:pkg.mod.C");
+    seed_summary_cache(dst.path(), "python:function:auth.tokens.refresh");
+
+    // Import a NEW version of the SAME sheet id, with match_rules flipped to
+    // kind:function (so the OLD class match no longer applies).
+    let import_dir = tempfile::tempdir().unwrap();
+    let updated = serde_json::json!({
+        "id": "core:guidance:shifting",
+        "name": "shifting",
+        "properties": {
+            "content": "new", "scope_level": "module",
+            "match_rules": [{ "type": "kind", "value": "function" }],
+            "authored_at": "2026-01-01T00:00:00.000Z",
+        },
+    });
+    std::fs::write(
+        import_dir.path().join("core__guidance__shifting.json"),
+        serde_json::to_string_pretty(&updated).unwrap(),
+    )
+    .unwrap();
+
+    import_from(dst.path(), import_dir.path());
+
+    // BOTH cache rows must be gone: the NEW match (function) AND — the regression
+    // this fixes — the OLD match (class) that no longer applies.
+    assert_eq!(
+        summary_cache_count(dst.path(), "python:function:auth.tokens.refresh"),
+        0,
+        "new-matched entity invalidated"
+    );
+    assert_eq!(
+        summary_cache_count(dst.path(), "python:class:pkg.mod.C"),
+        0,
+        "OLD-matched entity must also be invalidated on a match_rules change"
+    );
+}
+
+#[test]
+fn delete_invalidates_guides_edge_target() {
+    // FINDING 3 (through the real delete path): a sheet that applies SOLELY via a
+    // `guides` edge must invalidate the guided entity's cache on delete. This is
+    // the FK-cascade trap: delete must invalidate BEFORE removing the sheet row,
+    // or the CASCADE removes the guides edge first and invalidation sees nothing.
+    let dir = tempfile::tempdir().unwrap();
+    seed_db(dir.path()); // seeds python:function:auth.tokens.refresh
+
+    // Author a sheet with NO match_rules (so only the guides edge can match).
+    clarion_bin()
+        .args(["guidance", "create"])
+        .args(["--path"])
+        .arg(dir.path())
+        .args(["--scope-level", "module"])
+        .args(["--name", "guides-sheet"])
+        .args(["--content", "guides-edge guidance"])
+        .assert()
+        .success();
+
+    // Manually wire a `guides` edge (no authoring path creates one today) and a
+    // cache row on the target.
+    {
+        let db_path = dir.path().join(".clarion").join("clarion.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO edges (kind, from_id, to_id, confidence) VALUES \
+             ('guides', ?1, ?2, 'resolved')",
+            rusqlite::params![
+                "core:guidance:guides-sheet",
+                "python:function:auth.tokens.refresh"
+            ],
+        )
+        .unwrap();
+    }
+    seed_summary_cache(dir.path(), "python:function:auth.tokens.refresh");
+
+    let assert = clarion_bin()
+        .args(["guidance", "delete", "core:guidance:guides-sheet"])
+        .args(["--path"])
+        .arg(dir.path())
+        .assert()
+        .success();
+    assert!(
+        String::from_utf8_lossy(&assert.get_output().stdout).contains("Invalidated 1 cached"),
+        "delete should report invalidating the guides-edge target"
+    );
+
+    assert_eq!(
+        summary_cache_count(dir.path(), "python:function:auth.tokens.refresh"),
+        0,
+        "guides-edge target's cache must be invalidated on delete (before FK cascade)"
+    );
+}
+
+#[test]
 fn import_ignores_non_json_files() {
     // A README committed alongside the sheets must not crash import.
     let src = tempfile::tempdir().unwrap();

@@ -499,18 +499,22 @@ fn delete(project_root: &Path, id: &str) -> Result<()> {
         .into_anyhow()?
         .ok_or_else(|| anyhow!("guidance sheet {id} not found"))?;
 
-    if !delete_guidance_sheet(&conn, id).into_anyhow()? {
-        bail!("guidance sheet {id} not found")
-    }
-
     // ADR-007 churn-eager invalidation: removing the sheet removes guidance from
     // the entities it covered, so their cached summaries are stale and must be
     // dropped (the next query re-summarizes without the now-deleted guidance).
-    // Deleting the guidance row never touches the matched code entities' own
-    // rows, so post-deletion invalidation against the pre-deletion snapshot is
-    // correct. The helper canonicalizes `project_root` itself (for `path:`
-    // rules), so we pass the raw root, as `create`/`edit` do.
+    //
+    // ORDER MATTERS: invalidate BEFORE deleting the sheet row. The sheet's
+    // `guides` edges are `from_id REFERENCES entities(id) ON DELETE CASCADE`, and
+    // `open_db` enables `foreign_keys`, so deleting the sheet first would CASCADE
+    // those edges away before `invalidate_summaries_for_sheet` reads them — and a
+    // guides-only sheet would invalidate nothing. Invalidating first is safe:
+    // rule/edge matching is unaffected by the sheet's presence (it never touches
+    // the matched entities' own rows), and over-invalidation is harmless.
     let invalidated = invalidate_summaries_for_sheet(&conn, &sheet, project_root).into_anyhow()?;
+
+    if !delete_guidance_sheet(&conn, id).into_anyhow()? {
+        bail!("guidance sheet {id} not found")
+    }
 
     println!("Deleted guidance sheet {id}");
     report_invalidation(invalidated);
@@ -585,13 +589,25 @@ fn import(project_root: &Path, from_dir: &Path) -> Result<()> {
             std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
         let portable = PortableSheet::from_canonical_json(&file.display().to_string(), &bytes)
             .into_anyhow()?;
+
+        // Snapshot the pre-import sheet (if any) BEFORE the upsert, so that when an
+        // import UPDATES an existing sheet whose `match_rules` changed, we can
+        // invalidate the OLD matches too — not just the post-import matches. A
+        // fresh import (no prior sheet) has no old set.
+        let before = get_guidance_sheet(&conn, &portable.id).into_anyhow()?;
+
         import_portable_sheet(&conn, &portable)
             .into_anyhow()
             .with_context(|| format!("import {}", file.display()))?;
         // ADR-007 churn-eager invalidation: an imported sheet adds/changes
-        // guidance for the entities its match_rules cover, so their cached
-        // summaries must be dropped — same posture as `create`/`edit`.
-        invalidated += invalidate_matched_summaries(project_root, &conn, &portable.id)?;
+        // guidance for the entities it covers, so their cached summaries must be
+        // dropped — same union-of-before+after posture as `edit`.
+        invalidated += match before {
+            Some(before) => {
+                invalidate_matched_summaries_union(project_root, &conn, &before, &portable.id)?
+            }
+            None => invalidate_matched_summaries(project_root, &conn, &portable.id)?,
+        };
         imported += 1;
     }
 

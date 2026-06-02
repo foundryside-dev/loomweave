@@ -394,6 +394,75 @@ fn invalidate_summaries_drops_matched_and_keeps_unmatched() {
 }
 
 #[test]
+fn upsert_rejects_non_guidance_id_and_leaves_code_entity_intact() {
+    // FINDING 1: a sheet id that is NOT `core:guidance:` (e.g. a hand-edited /
+    // malicious import naming a code entity) must be rejected by
+    // `upsert_guidance_sheet`, and must NOT overwrite the existing code entity.
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+
+    // A pre-existing code entity with distinctive name/properties.
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
+         created_at, updated_at) VALUES \
+         (?1, 'python', 'function', 'pkg.mod.foo', 'foo', '{\"k\":\"v\"}', \
+          strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        params!["python:function:foo"],
+    )
+    .unwrap();
+
+    let before: (String, String, String, String) = conn
+        .query_row(
+            "SELECT name, kind, plugin_id, properties FROM entities WHERE id = ?1",
+            params!["python:function:foo"],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+
+    // Attempt to upsert a "guidance" sheet whose id collides with the code entity.
+    let props = base_props("module", "2026-06-01T00:00:00.000Z");
+    let err = upsert_guidance_sheet(
+        &conn,
+        &GuidanceSheetInput {
+            id: "python:function:foo",
+            name: "evil",
+            short_name: "evil",
+            properties: &props,
+        },
+    );
+    assert!(err.is_err(), "non-guidance id must be rejected");
+
+    let after: (String, String, String, String) = conn
+        .query_row(
+            "SELECT name, kind, plugin_id, properties FROM entities WHERE id = ?1",
+            params!["python:function:foo"],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "code entity must be byte-identical after a rejected upsert"
+    );
+}
+
+#[test]
+fn upsert_accepts_valid_guidance_id() {
+    // FINDING 1: the canonical `core:guidance:` id still upserts fine.
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    write_sheet(
+        &conn,
+        "valid.sheet",
+        &base_props("module", "2026-06-01T00:00:00.000Z"),
+    );
+    assert!(
+        get_guidance_sheet(&conn, "core:guidance:valid.sheet")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
 fn invalidate_summaries_for_no_rule_sheet_is_noop() {
     use clarion_storage::invalidate_summaries_for_sheet;
 
@@ -414,4 +483,84 @@ fn invalidate_summaries_for_no_rule_sheet_is_noop() {
     let removed = invalidate_summaries_for_sheet(&conn, &sheet, tempdir.path()).unwrap();
     assert_eq!(removed, 0, "a no-rule sheet invalidates nothing");
     assert_eq!(cache_row_count(&conn, "python:function:pkg.mod.f"), 1);
+}
+
+#[test]
+fn invalidate_summaries_includes_guides_edge_targets() {
+    // FINDING 3: a sheet that applies SOLELY via a `guides` edge (NO match_rules)
+    // must still invalidate the guided entity's cached summary. The `guidance_for`
+    // read path composes match_rules OR guides edges, so invalidation must too.
+    use clarion_storage::invalidate_summaries_for_sheet;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+
+    // A code entity that will be the `guides`-edge target (it must exist first,
+    // for the edge's FK).
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
+         created_at, updated_at) VALUES \
+         (?1, 'python', 'function', 'pkg.mod.g', 'g', '{}', \
+          strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        params!["python:function:pkg.mod.g"],
+    )
+    .unwrap();
+    seed_cache_row(&conn, "python:function:pkg.mod.g");
+
+    // A sheet with NO match_rules — so any invalidation can ONLY come from the
+    // guides edge, not a rule.
+    let sheet = sheet_with_rules(&conn, "guides-only", &json!([]));
+    conn.execute(
+        "INSERT INTO edges (kind, from_id, to_id, confidence) VALUES \
+         ('guides', ?1, ?2, 'resolved')",
+        params!["core:guidance:guides-only", "python:function:pkg.mod.g"],
+    )
+    .unwrap();
+
+    let removed = invalidate_summaries_for_sheet(&conn, &sheet, tempdir.path()).unwrap();
+    assert_eq!(
+        removed, 1,
+        "the guides-edge target's cache row is invalidated"
+    );
+    assert_eq!(
+        cache_row_count(&conn, "python:function:pkg.mod.g"),
+        0,
+        "guided entity's summary row must be gone"
+    );
+}
+
+#[test]
+fn invalidate_summaries_dedups_rule_and_guides_match() {
+    // FINDING 3: an entity matched by BOTH a match_rule AND a guides edge is
+    // invalidated exactly once (count is 1, not 2).
+    use clarion_storage::invalidate_summaries_for_sheet;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
+         created_at, updated_at) VALUES \
+         (?1, 'python', 'function', 'pkg.mod.h', 'h', '{}', \
+          strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        params!["python:function:pkg.mod.h"],
+    )
+    .unwrap();
+    seed_cache_row(&conn, "python:function:pkg.mod.h");
+
+    // A sheet whose `kind:function` rule matches the entity AND a guides edge to
+    // the same entity → it must count once.
+    let sheet = sheet_with_rules(&conn, "both", &json!([{"type":"kind","value":"function"}]));
+    conn.execute(
+        "INSERT INTO edges (kind, from_id, to_id, confidence) VALUES \
+         ('guides', ?1, ?2, 'resolved')",
+        params!["core:guidance:both", "python:function:pkg.mod.h"],
+    )
+    .unwrap();
+
+    let removed = invalidate_summaries_for_sheet(&conn, &sheet, tempdir.path()).unwrap();
+    assert_eq!(
+        removed, 1,
+        "matched by both rule and guides edge → invalidated once"
+    );
 }
