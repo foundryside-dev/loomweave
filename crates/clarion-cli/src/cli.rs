@@ -251,6 +251,11 @@ pub enum GuidanceCommand {
     },
 
     /// List guidance sheets, ordered by `scope_rank` (project → function).
+    ///
+    /// `--expired` and `--stale` are independent filters that compose by
+    /// intersection (AND): a sheet is shown only if it passes every active
+    /// filter (including `--for-entity`). Without any of them, behaves as the
+    /// plain list.
     List {
         /// Project directory containing .clarion/clarion.db (default: current).
         #[arg(long, default_value = ".")]
@@ -258,6 +263,19 @@ pub enum GuidanceCommand {
         /// Only list sheets whose `match_rules` apply to this entity id.
         #[arg(long, value_name = "ENTITY_ID")]
         for_entity: Option<String>,
+        /// Only show sheets whose `expires` instant is in the past (mirrors the
+        /// read path's expiry exclusion). Sheets with no `expires` are excluded.
+        #[arg(long)]
+        expired: bool,
+        /// Only show sheets not "touched" (the later of `reviewed_at` /
+        /// `authored_at`) within `--days`. This is the review-cadence/age signal
+        /// (system-design §7.741), NOT the churn-based staleness finding.
+        #[arg(long)]
+        stale: bool,
+        /// Staleness window in days for `--stale` (default: 90). Ignored without
+        /// `--stale`.
+        #[arg(long, value_name = "N", default_value_t = 90)]
+        days: u32,
     },
 
     /// Delete a guidance sheet.

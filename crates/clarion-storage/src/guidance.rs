@@ -87,6 +87,61 @@ impl GuidanceSheet {
     fn authored_at(&self) -> Option<&str> {
         self.properties.get("authored_at").and_then(Value::as_str)
     }
+
+    /// `$.reviewed_at` from properties. Optional and not currently populated by
+    /// any write path, but honoured if present (an operator or a future
+    /// "mark reviewed" verb may set it).
+    fn reviewed_at(&self) -> Option<&str> {
+        self.properties.get("reviewed_at").and_then(Value::as_str)
+    }
+
+    /// The instant this sheet was last "touched" for review-cadence purposes:
+    /// the later of `reviewed_at` and `authored_at` (lexical max — both are the
+    /// same fixed-width `YYYY-MM-DDTHH:MM:SS.mmmZ` shape, so byte order is
+    /// instant order). Returns `None` when neither is present.
+    fn touched_at(&self) -> Option<&str> {
+        match (self.reviewed_at(), self.authored_at()) {
+            (Some(r), Some(a)) => Some(r.max(a)),
+            (Some(r), None) => Some(r),
+            (None, Some(a)) => Some(a),
+            (None, None) => None,
+        }
+    }
+}
+
+/// True if `sheet`'s `expires` instant is in the past relative to `now`.
+///
+/// This is the **review-cadence/expiry** predicate that mirrors the MCP read
+/// path's expiry exclusion (`clarion-mcp` `catalogue::inspection`) and the
+/// `CLA-FACT-GUIDANCE-EXPIRED` finding exactly: a lexical `expires < now`
+/// compare. `now` MUST be in the same fixed-width `YYYY-MM-DDTHH:MM:SS.mmmZ`
+/// shape the write path stamps timestamps with, so the byte compare is a valid
+/// instant compare. A sheet with **no `expires`** is never expired.
+#[must_use]
+pub fn guidance_sheet_is_expired(sheet: &GuidanceSheet, now: &str) -> bool {
+    sheet
+        .properties
+        .get("expires")
+        .and_then(Value::as_str)
+        .is_some_and(|expires| expires < now)
+}
+
+/// True if `sheet` has not been "touched" since `stale_before` — the
+/// **age/review-cadence** staleness of system-design.md §7 line 741
+/// ("sheets not touched in N days"). "Touched" is the later of `reviewed_at`
+/// and `authored_at`; the sheet is stale when that instant is strictly older
+/// than `stale_before` (the caller's `now − N days` cutoff, in the same
+/// fixed-width ISO-8601 shape so the compare is lexical). A sheet with neither
+/// timestamp has no measurable age and is treated as **not stale**.
+///
+/// NOTE: this is age-based staleness, distinct from the churn-based signal the
+/// `CLA-FACT-GUIDANCE-CHURN-STALE` finding surfaces (which aggregates git churn
+/// over matched entities). Do not conflate the two.
+#[must_use]
+pub fn guidance_sheet_is_stale(sheet: &GuidanceSheet, stale_before: &str) -> bool {
+    sheet
+        .touched_at()
+        .is_some_and(|touched| touched < stale_before)
 }
 
 const SELECT_COLUMNS: &str = "id, name, short_name, scope_level, properties, \
@@ -398,5 +453,122 @@ pub fn rule_match(rule: &Value, facts: &MatchFacts) -> RuleVerdict {
         },
         "wardline_group" => RuleVerdict::Unevaluable,
         _ => RuleVerdict::NoMatch,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a bare `GuidanceSheet` carrying only the given properties object,
+    /// for testing the pure date predicates (no DB needed).
+    fn sheet_with(properties: Value) -> GuidanceSheet {
+        GuidanceSheet {
+            id: "core:guidance:test".to_owned(),
+            name: "test".to_owned(),
+            short_name: "test".to_owned(),
+            scope_level: Some("module".to_owned()),
+            scope_rank: Some(4),
+            properties,
+            created_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00.000Z".to_owned(),
+        }
+    }
+
+    // ── guidance_sheet_is_expired ────────────────────────────────────────────
+
+    #[test]
+    fn expired_past_expires_is_expired() {
+        let sheet = sheet_with(json!({ "expires": "2026-01-01T00:00:00.000Z" }));
+        assert!(guidance_sheet_is_expired(
+            &sheet,
+            "2026-06-03T12:00:00.000Z"
+        ));
+    }
+
+    #[test]
+    fn expired_future_expires_is_not_expired() {
+        let sheet = sheet_with(json!({ "expires": "2999-01-01T00:00:00.000Z" }));
+        assert!(!guidance_sheet_is_expired(
+            &sheet,
+            "2026-06-03T12:00:00.000Z"
+        ));
+    }
+
+    #[test]
+    fn expired_absent_expires_is_not_expired() {
+        let sheet = sheet_with(json!({ "authored_at": "2026-01-01T00:00:00.000Z" }));
+        assert!(!guidance_sheet_is_expired(
+            &sheet,
+            "2026-06-03T12:00:00.000Z"
+        ));
+    }
+
+    #[test]
+    fn expired_equal_expires_is_not_expired() {
+        // `expires < now` is strict: a sheet expiring exactly at `now` is not
+        // yet expired (mirrors the read path's `<` compare).
+        let sheet = sheet_with(json!({ "expires": "2026-06-03T12:00:00.000Z" }));
+        assert!(!guidance_sheet_is_expired(
+            &sheet,
+            "2026-06-03T12:00:00.000Z"
+        ));
+    }
+
+    // ── guidance_sheet_is_stale ──────────────────────────────────────────────
+
+    #[test]
+    fn stale_old_authored_is_stale() {
+        // authored long ago, no reviewed_at → touched = authored < cutoff.
+        let sheet = sheet_with(json!({ "authored_at": "2026-01-01T00:00:00.000Z" }));
+        let cutoff = "2026-03-05T12:00:00.000Z"; // now − 90 days, roughly
+        assert!(guidance_sheet_is_stale(&sheet, cutoff));
+    }
+
+    #[test]
+    fn stale_fresh_authored_is_not_stale() {
+        let sheet = sheet_with(json!({ "authored_at": "2026-06-01T00:00:00.000Z" }));
+        let cutoff = "2026-03-05T12:00:00.000Z";
+        assert!(!guidance_sheet_is_stale(&sheet, cutoff));
+    }
+
+    #[test]
+    fn stale_recent_reviewed_at_overrides_old_authored_at() {
+        // Old authored_at but a recent reviewed_at → touched = max = reviewed_at,
+        // which is after the cutoff, so the sheet is NOT stale. This is the named
+        // TDD target: reviewed_at (when later) is what counts.
+        let sheet = sheet_with(json!({
+            "authored_at": "2025-01-01T00:00:00.000Z",
+            "reviewed_at": "2026-06-01T00:00:00.000Z",
+        }));
+        let cutoff = "2026-03-05T12:00:00.000Z";
+        assert!(!guidance_sheet_is_stale(&sheet, cutoff));
+    }
+
+    #[test]
+    fn stale_old_reviewed_at_still_stale() {
+        // Both old → touched = max is still before the cutoff → stale.
+        let sheet = sheet_with(json!({
+            "authored_at": "2025-01-01T00:00:00.000Z",
+            "reviewed_at": "2025-02-01T00:00:00.000Z",
+        }));
+        let cutoff = "2026-03-05T12:00:00.000Z";
+        assert!(guidance_sheet_is_stale(&sheet, cutoff));
+    }
+
+    #[test]
+    fn stale_no_timestamps_is_not_stale() {
+        // Neither authored_at nor reviewed_at → unmeasurable age → not stale.
+        let sheet = sheet_with(json!({ "content": "x" }));
+        let cutoff = "2026-03-05T12:00:00.000Z";
+        assert!(!guidance_sheet_is_stale(&sheet, cutoff));
+    }
+
+    #[test]
+    fn stale_equal_to_cutoff_is_not_stale() {
+        // `touched < stale_before` is strict.
+        let sheet = sheet_with(json!({ "authored_at": "2026-03-05T12:00:00.000Z" }));
+        let cutoff = "2026-03-05T12:00:00.000Z";
+        assert!(!guidance_sheet_is_stale(&sheet, cutoff));
     }
 }

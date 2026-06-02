@@ -36,8 +36,9 @@ pub use error::{Result, StorageError};
 pub use glob::glob_match;
 pub use guidance::{
     GuidanceSheet, GuidanceSheetInput, MatchFacts, RuleVerdict, delete_guidance_sheet,
-    get_guidance_sheet, guidance_sheet_matches_entity, invalidate_summaries_for_sheet,
-    list_guidance_sheets, rule_match, upsert_guidance_sheet,
+    get_guidance_sheet, guidance_sheet_is_expired, guidance_sheet_is_stale,
+    guidance_sheet_matches_entity, invalidate_summaries_for_sheet, list_guidance_sheets,
+    rule_match, upsert_guidance_sheet,
 };
 pub use prior_index::{
     PriorIndexEntry, clear_prior_index, load_prior_index, previously_analyzed_files,

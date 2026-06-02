@@ -61,6 +61,172 @@ fn properties(root: &std::path::Path, id: &str) -> Value {
     serde_json::from_str(&raw).expect("properties parse")
 }
 
+/// Insert a guidance sheet directly with a fully-controlled `properties` object
+/// (so `expires` / `authored_at` / `reviewed_at` can be pinned to fixed instants
+/// for the `--expired` / `--stale` filter tests). Bypasses the CLI `create` path
+/// deliberately — these tests exercise `list`, not authoring.
+fn seed_sheet(root: &std::path::Path, slug: &str, properties: &Value) {
+    let db_path = root.join(".clarion").join("clarion.db");
+    let conn = Connection::open(&db_path).expect("open db for seed_sheet");
+    let id = format!("core:guidance:{slug}");
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
+         created_at, updated_at) VALUES \
+         (?1, 'core', 'guidance', ?2, ?2, ?3, \
+          strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        rusqlite::params![id, slug, serde_json::to_string(&properties).unwrap()],
+    )
+    .expect("seed guidance sheet");
+}
+
+/// Run `guidance list` with the given extra args and return stdout.
+fn list_stdout(root: &std::path::Path, extra: &[&str]) -> String {
+    let assert = clarion_bin()
+        .args(["guidance", "list"])
+        .args(["--path"])
+        .arg(root)
+        .args(extra)
+        .assert()
+        .success();
+    String::from_utf8_lossy(&assert.get_output().stdout).into_owned()
+}
+
+#[test]
+fn list_expired_shows_only_past_expiry_sheets() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_db(dir.path());
+
+    // Past expiry → expired; future expiry → not; no expiry → not.
+    seed_sheet(
+        dir.path(),
+        "past",
+        &serde_json::json!({
+            "content": "x", "scope_level": "module", "match_rules": [],
+            "authored_at": "2026-01-01T00:00:00.000Z",
+            "expires": "2026-01-02T00:00:00.000Z",
+        }),
+    );
+    seed_sheet(
+        dir.path(),
+        "future",
+        &serde_json::json!({
+            "content": "x", "scope_level": "module", "match_rules": [],
+            "authored_at": "2026-01-01T00:00:00.000Z",
+            "expires": "2999-01-01T00:00:00.000Z",
+        }),
+    );
+    seed_sheet(
+        dir.path(),
+        "noexpiry",
+        &serde_json::json!({
+            "content": "x", "scope_level": "module", "match_rules": [],
+            "authored_at": "2026-01-01T00:00:00.000Z",
+        }),
+    );
+
+    let out = list_stdout(dir.path(), &["--expired"]);
+    assert!(
+        out.contains("core:guidance:past"),
+        "expired list missing past-expiry sheet: {out}"
+    );
+    assert!(
+        !out.contains("core:guidance:future"),
+        "expired list should not include future-expiry sheet: {out}"
+    );
+    assert!(
+        !out.contains("core:guidance:noexpiry"),
+        "expired list should not include no-expiry sheet: {out}"
+    );
+}
+
+#[test]
+fn list_stale_shows_only_sheets_untouched_within_window() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_db(dir.path());
+
+    // Authored long ago → stale at 90 days.
+    seed_sheet(
+        dir.path(),
+        "old",
+        &serde_json::json!({
+            "content": "x", "scope_level": "module", "match_rules": [],
+            "authored_at": "2025-01-01T00:00:00.000Z",
+        }),
+    );
+    // Old authored_at but recently reviewed → max(reviewed,authored) is fresh →
+    // NOT stale. The reviewed_at-wins TDD target, exercised through the binary.
+    seed_sheet(
+        dir.path(),
+        "reviewed",
+        &serde_json::json!({
+            "content": "x", "scope_level": "module", "match_rules": [],
+            "authored_at": "2025-01-01T00:00:00.000Z",
+            "reviewed_at": "2999-01-01T00:00:00.000Z",
+        }),
+    );
+
+    let out = list_stdout(dir.path(), &["--stale", "--days", "90"]);
+    assert!(
+        out.contains("core:guidance:old"),
+        "stale list missing old sheet: {out}"
+    );
+    assert!(
+        !out.contains("core:guidance:reviewed"),
+        "stale list should exclude recently-reviewed sheet: {out}"
+    );
+}
+
+#[test]
+fn list_expired_and_stale_intersect() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_db(dir.path());
+
+    // Expired AND stale (old authored_at, past expiry) → shown.
+    seed_sheet(
+        dir.path(),
+        "both",
+        &serde_json::json!({
+            "content": "x", "scope_level": "module", "match_rules": [],
+            "authored_at": "2025-01-01T00:00:00.000Z",
+            "expires": "2025-06-01T00:00:00.000Z",
+        }),
+    );
+    // Expired but fresh (recent authored_at) → excluded by --stale.
+    seed_sheet(
+        dir.path(),
+        "expired-fresh",
+        &serde_json::json!({
+            "content": "x", "scope_level": "module", "match_rules": [],
+            "authored_at": "2999-01-01T00:00:00.000Z",
+            "expires": "2025-06-01T00:00:00.000Z",
+        }),
+    );
+    // Stale but not expired (future expiry) → excluded by --expired.
+    seed_sheet(
+        dir.path(),
+        "stale-unexpired",
+        &serde_json::json!({
+            "content": "x", "scope_level": "module", "match_rules": [],
+            "authored_at": "2025-01-01T00:00:00.000Z",
+            "expires": "2999-01-01T00:00:00.000Z",
+        }),
+    );
+
+    let out = list_stdout(dir.path(), &["--expired", "--stale", "--days", "90"]);
+    assert!(
+        out.contains("core:guidance:both"),
+        "intersection list missing expired+stale sheet: {out}"
+    );
+    assert!(
+        !out.contains("core:guidance:expired-fresh"),
+        "intersection should exclude fresh sheet: {out}"
+    );
+    assert!(
+        !out.contains("core:guidance:stale-unexpired"),
+        "intersection should exclude unexpired sheet: {out}"
+    );
+}
+
 #[test]
 fn create_show_list_delete_lifecycle() {
     let dir = tempfile::tempdir().unwrap();

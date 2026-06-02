@@ -32,8 +32,8 @@ use serde_json::{Value, json};
 
 use clarion_storage::{
     GuidanceSheet, GuidanceSheetInput, delete_guidance_sheet, get_guidance_sheet,
-    guidance_sheet_matches_entity, invalidate_summaries_for_sheet, list_guidance_sheets,
-    upsert_guidance_sheet,
+    guidance_sheet_is_expired, guidance_sheet_is_stale, guidance_sheet_matches_entity,
+    invalidate_summaries_for_sheet, list_guidance_sheets, upsert_guidance_sheet,
 };
 
 use crate::cli::GuidanceCommand;
@@ -94,7 +94,21 @@ pub fn run(command: GuidanceCommand) -> Result<()> {
         ),
         GuidanceCommand::Edit { path, id } => edit(&path, &id),
         GuidanceCommand::Show { path, id } => show(&path, &id),
-        GuidanceCommand::List { path, for_entity } => list(&path, for_entity.as_deref()),
+        GuidanceCommand::List {
+            path,
+            for_entity,
+            expired,
+            stale,
+            days,
+        } => list(
+            &path,
+            ListFilters {
+                for_entity: for_entity.as_deref(),
+                expired,
+                stale,
+                days,
+            },
+        ),
         GuidanceCommand::Delete { path, id } => delete(&path, &id),
     }
 }
@@ -378,7 +392,21 @@ fn show(project_root: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn list(project_root: &Path, for_entity: Option<&str>) -> Result<()> {
+/// Filters for `clarion guidance list`. All active filters compose by
+/// **intersection** (AND): a sheet is shown only if it passes every one. The
+/// two date filters (`expired`, `stale`) are independent — combining them shows
+/// sheets that are expired AND stale, which is the intuitive "show me the worst
+/// of the worst" operator-triage reading and falls out of the simplest code.
+#[derive(Clone, Copy)]
+struct ListFilters<'a> {
+    for_entity: Option<&'a str>,
+    expired: bool,
+    stale: bool,
+    /// Staleness window in days (used only when `stale` is set).
+    days: u32,
+}
+
+fn list(project_root: &Path, filters: ListFilters<'_>) -> Result<()> {
     let conn = open_db(project_root)?;
     let sheets = list_guidance_sheets(&conn).into_anyhow()?;
 
@@ -386,11 +414,32 @@ fn list(project_root: &Path, for_entity: Option<&str>) -> Result<()> {
         .canonicalize()
         .unwrap_or_else(|_| project_root.to_path_buf());
 
+    // Compute the comparison instants once, from the connection's own clock, in
+    // the exact `YYYY-MM-DDTHH:MM:SS.mmmZ` shape stored timestamps use — so the
+    // storage predicates' lexical compares are valid instant compares. `now`
+    // drives `--expired`; `stale_before` (now − N days) drives `--stale`. NB:
+    // `--stale` here is the *age/review-cadence* signal (system-design §7.741),
+    // distinct from the churn-based `CLA-FACT-GUIDANCE-CHURN-STALE` finding.
+    let now = now_iso8601(&conn)?;
+    let stale_before = if filters.stale {
+        Some(now_minus_days(&conn, filters.days)?)
+    } else {
+        None
+    };
+
     let mut shown = 0usize;
     for sheet in &sheets {
-        if let Some(entity_id) = for_entity
+        if let Some(entity_id) = filters.for_entity
             && !guidance_sheet_matches_entity(&conn, sheet, entity_id, &canonical_root)
                 .into_anyhow()?
+        {
+            continue;
+        }
+        if filters.expired && !guidance_sheet_is_expired(sheet, &now) {
+            continue;
+        }
+        if let Some(cutoff) = stale_before.as_deref()
+            && !guidance_sheet_is_stale(sheet, cutoff)
         {
             continue;
         }
@@ -398,12 +447,44 @@ fn list(project_root: &Path, for_entity: Option<&str>) -> Result<()> {
         shown += 1;
     }
     if shown == 0 {
-        match for_entity {
-            Some(entity_id) => println!("(no guidance sheets match {entity_id})"),
-            None => println!("(no guidance sheets)"),
-        }
+        println!("{}", empty_list_message(&filters));
     }
     Ok(())
+}
+
+/// The "nothing matched" line, naming the active filters so an operator knows
+/// why the list is empty.
+fn empty_list_message(filters: &ListFilters<'_>) -> String {
+    let mut qualifiers: Vec<String> = Vec::new();
+    if let Some(entity_id) = filters.for_entity {
+        qualifiers.push(format!("match {entity_id}"));
+    }
+    if filters.expired {
+        qualifiers.push("are expired".to_owned());
+    }
+    if filters.stale {
+        qualifiers.push(format!("are stale (> {} days)", filters.days));
+    }
+    if qualifiers.is_empty() {
+        "(no guidance sheets)".to_owned()
+    } else {
+        format!("(no guidance sheets {})", qualifiers.join(" and "))
+    }
+}
+
+/// Mint the `now − days` staleness cutoff via the connection's own clock, in the
+/// same fixed-width ISO-8601 shape as [`now_iso8601`] so the storage staleness
+/// predicate's lexical compare is a valid instant compare. `days` is a `u32`, so
+/// the inline modifier string can never carry injection.
+fn now_minus_days(conn: &Connection, days: u32) -> Result<String> {
+    let ts: String = conn
+        .query_row(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now',?1)",
+            [format!("-{days} days")],
+            |row| row.get(0),
+        )
+        .context("mint staleness cutoff timestamp")?;
+    Ok(ts)
 }
 
 fn delete(project_root: &Path, id: &str) -> Result<()> {
