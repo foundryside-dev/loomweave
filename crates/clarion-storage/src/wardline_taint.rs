@@ -657,6 +657,44 @@ mod tests {
     }
 
     #[test]
+    fn by_sei_breaks_equal_updated_at_tie_by_rowid() {
+        // Determinism guard: when two locators carry the same SEI with an
+        // IDENTICAL updated_at, the later-inserted row (higher rowid) wins, so
+        // the result is deterministic rather than arbitrary across runs.
+        let conn = migrated_conn();
+        insert_entity(&conn, "python:function:first", None);
+        insert_entity(&conn, "python:function:second", None);
+        let sei = "clarion:eid:tie";
+        let same_ts = "2026-03-01T00:00:00.000Z";
+        upsert_taint_fact(
+            &conn,
+            &mk_fact(
+                "python:function:first",
+                r#"{"order":1}"#,
+                same_ts,
+                Some(sei),
+            ),
+        )
+        .unwrap();
+        upsert_taint_fact(
+            &conn,
+            &mk_fact(
+                "python:function:second",
+                r#"{"order":2}"#,
+                same_ts,
+                Some(sei),
+            ),
+        )
+        .unwrap();
+        let rows = get_taint_facts_by_sei(&conn, &[sei.to_owned()]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].entity_id, "python:function:second",
+            "the later-inserted row (higher rowid) wins an updated_at tie"
+        );
+    }
+
+    #[test]
     fn by_sei_dedups_duplicate_input_seis() {
         let conn = migrated_conn();
         insert_entity(&conn, "python:function:a.b.c", None);

@@ -2203,7 +2203,8 @@ async fn respond_taint_facts_by_sei(
 /// Read taint facts by SEI (T3.4). The rename-survival surface: a fact written
 /// under a former locator is retrievable by its stable SEI after a rename.
 /// Reads only — served regardless of `state.taint_writer`. Opaque inputs: no
-/// locator-shape validation, blank SEIs are dropped.
+/// locator-shape validation; a blank SEI simply matches no row (echoed back as
+/// `exists: false`, like any unknown SEI).
 async fn post_wardline_taint_facts_batch_get_by_sei(
     State(state): State<AppState>,
     body: Result<Json<BatchGetBySeiRequest>, axum::extract::rejection::JsonRejection>,
@@ -4676,12 +4677,44 @@ mod tests {
             "/api/wardline/taint-facts?qualname=new.pkg.fn",
             b"",
         );
-        let resp = router(state).oneshot(by_new).await.expect("oneshot");
+        let resp = router(state.clone())
+            .oneshot(by_new)
+            .await
+            .expect("oneshot");
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             json_body(resp).await["exists"],
             false,
             "no fact under the new locator until re-scan"
+        );
+
+        // 5. The post-rename re-scan writes a NEW fact under the NEW locator,
+        //    carrying the same (now-current) SEI. read-by-SEI must converge on
+        //    the newer fact — genuinely exercising most-recent-across-locators
+        //    at the HTTP layer, not just storage.
+        let rescan_body =
+            br#"{"facts":[{"qualname":"new.pkg.fn","wardline_json":{"taint":"SANITIZED"}}]}"#;
+        let rescan = hmac_request(secret, "POST", "/api/wardline/taint-facts", rescan_body);
+        let resp = router(state.clone())
+            .oneshot(rescan)
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let by_sei_again = hmac_request(
+            secret,
+            "POST",
+            "/api/wardline/taint-facts/by-sei",
+            serde_json::json!({ "seis": [sei] }).to_string().as_bytes(),
+        );
+        let resp = router(state).oneshot(by_sei_again).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let parsed = json_body(resp).await;
+        let arr = parsed.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(
+            arr[0]["wardline_json"]["taint"], "SANITIZED",
+            "by-SEI converges on the freshest fact after re-scan under the new locator"
         );
     }
 
