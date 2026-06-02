@@ -395,6 +395,14 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // incremental` and a first run (empty prior index) both degrade to a full
     // analysis. Skip is speed-only: entities are cumulative, edges are `INSERT
     // OR IGNORE`, so a skipped file's durable rows are untouched.
+    //
+    // Caveat (benign): a skipped file's core `file` entity keeps last run's
+    // `briefing_blocked` / `language` properties, which a full re-analysis would
+    // refresh. This can only go stale TOWARD blocked (a withheld briefing that
+    // could now be served — the conservative direction); a file that should
+    // NEWLY block is either secret-bearing (carved out of skip below) or scanned
+    // by `pre_ingest` before the partition, so it cannot silently under-block.
+    // `--no-incremental` clears any such staleness.
     let incremental = !options.no_incremental;
     let (prior_file_hashes, mut prior_locs_by_file, prior_index_snapshot) = if incremental {
         match Connection::open(&db_path) {

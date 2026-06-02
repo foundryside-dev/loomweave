@@ -562,9 +562,10 @@ and Clarion's pass is enforced by
 ## Dossier participation surface
 
 Wave 2 / WS4. Clarion does **not** assemble the cross-tool entity dossier — the
-*assembler* (Wardline, per its
-[entity-dossier design](../../../wardline/docs/superpowers/specs/2026-06-01-wardline-loom-entity-dossier-design.md))
-composes it. This section pins the exact Clarion HTTP slices the assembler reads,
+*assembler* (Wardline; see its entity-dossier design at
+`wardline/docs/superpowers/specs/2026-06-01-wardline-loom-entity-dossier-design.md`
+in the sibling repo, not vendored here) composes it. This section pins the exact
+Clarion HTTP slices the assembler reads,
 so the contract is explicit and the assembler can build a complete,
 freshness-stamped, SEI-keyed view of an entity **that stays correct after a
 rename**. The participation contract is specified in full at
