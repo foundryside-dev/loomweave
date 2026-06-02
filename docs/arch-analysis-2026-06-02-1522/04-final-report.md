@@ -69,14 +69,22 @@ A CLI with two architectural modes. `install`/`analyze`/`hook`/`doctor` are one-
 |---|---|---|---|---|
 | D1 | §2: async/tokio host, mpsc backpressure, streaming, `file_list` RPC | fully synchronous host; batch `analyze_file`; no `file_list` | 🔴 | doc (write ADR/errata) |
 | D2 | §2 Python: tree-sitter + LibCST, `TYPE_CHECKING` exclusion, `alias_of`, `unresolved` entities | CPython `ast` only; none of those exist | 🔴 | doc |
-| D3 | §5: AnthropicProvider, 4-segment cache_control, async cost trait, `cost_report`, budget findings | 4 providers (no Anthropic), flat payload, sync `estimate_tokens`, no budget engine | 🔴 | doc + roadmap decision |
+| D3 | §5: AnthropicProvider, 4-segment cache_control, async cost trait, `cost_report`, budget engine | 4 providers (no Anthropic), flat payload, sync `estimate_tokens`, no budget engine | 🔴 | **doc** (deferral confirmed) |
+| D3a | `CON-ANTHROPIC-01`: v0.1 LLM provider is **Anthropic-only** with 4 `cache_control` breakpoints | code dropped Anthropic → OpenRouter + claude/codex CLI; flat payload | 🟡 | **superseded constraint → needs ADR** |
 | D4 | §6: 4 phase-7 `CLA-FACT-*` findings; phases 0/2/4–7 | unimplemented; 3 SEI/incremental phases undocumented (1 other CLA-FACT *does* ship) | 🔴 | doc + roadmap decision |
+| D4a | `REQ-ANALYZE-06`: **no silent fallbacks** — every recoverable failure emits a finding visible in stats.json + store + Filigree | plugin `HostFinding`s are **log-only** ("Tier B persistence is future work", `analyze.rs:626`) | 🔴 | **possible release gap — verify** |
 | D5 | §8: "v1.0 ships 8-tool subset"; shortcuts "deferred to v1.1" | 35 tools ship | 🔴 | doc |
 | D6 | §9: `GET /api/v1/entities/resolve` shipped | does not exist (deferred per `contracts.md`); 16 routes live; §9 not cross-linked to `contracts.md` | 🟡 | doc |
 | D7 | `detailed-design.md:611-760`: 6 tables + FTS5 | 13 tables + FTS5 + view across 6 migrations; `entities.signature` undocumented | 🟡 | doc |
 | D8 | `CLAUDE.md` Layout: 4 crates / v1.0.0 | 6 crates / v1.1.0 (`clarion-mcp`, `clarion-scanner` omitted) | 🟡 | doc |
 
-All eight are **doc-side bugs** in this repo's precedence model (code wins). D3/D4 additionally pose a *roadmap* question: are the unbuilt features deferred or abandoned? The doc should say which.
+Two kinds of drift, and they resolve differently (checked against `requirements.md`, which CLAUDE.md ranks **above** `system-design.md`):
+
+- **"Ahead" drift (D1, D2, D5, D6, D7, D8)** — code is *ahead of / different from* the doc. The doc is simply stale → **code wins, fix the doc.** No requirements concern.
+- **"Behind" drift (D3, D4)** — code *lacks* what the doc describes. Here "code wins" is the wrong default; the discriminator is whether a baselined requirement backs the missing feature:
+  - **D3 resolves to deferral, confirmed.** `§5 Addresses: … NFR-COST-01, NFR-COST-03, …` and both of those requirements in `requirements.md` are explicitly **"Deferred to v1.1 per ADR-030"** (the batched-pipeline LLM-spend / preflight engine). So the missing budget engine is a *documented deferral* — the bug is only that `system-design.md §5` describes it present-tense without the deferral notice `requirements.md` already carries. Mirror the notice; cite ADR-030.
+  - **D3a is a genuinely superseded constraint.** `CON-ANTHROPIC-01` mandates an Anthropic-only provider with 4 `cache_control` breakpoints; the code deliberately went OpenRouter + CLI. That decision needs an ADR if one doesn't exist — the constraint can't just be silently contradicted.
+  - **D4a may be a real release gap — the architect must verify.** `§6 Addresses: REQ-ANALYZE-06`, a baselined requirement that **no failure is silently swallowed** and every finding is visible in `stats.json`, the store, *and* Filigree. Plugin `HostFinding`s being **log-only** (`analyze.rs:626`) is in direct tension with it. If failure findings (not just the structural phase-7 ones) are not persisted, REQ-ANALYZE-06 is **unmet** — a release gap, not doc cleanup. The four unbuilt phase-7 `CLA-FACT-*` structural findings have no baselined REQ I could locate, so cutting/deferring *those* is safe.
 
 ---
 

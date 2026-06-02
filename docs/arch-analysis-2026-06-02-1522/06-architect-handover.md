@@ -16,7 +16,7 @@
 The code is **structurally sound and maturing** (three prior defects closed; SEI/incremental/taint added with the same failure-containment discipline the rest of the system shows). It is **not** carrying hidden correctness landmines. The two things that need an architect's decision are:
 
 - **Documentation integrity.** `system-design.md` is the stated acceptance surface, and it now contradicts the code in five sections. This is a governance problem more than an engineering one: the canonical record lies to the next contributor. **Decide who owns the reconciliation and when** (recommendation: before this branch merges to `main`, because the branch is what introduced most of the drift).
-- **Deferred-vs-abandoned.** Two large design surfaces — the §5 analyze-time policy/budget engine and the §6 phase-7 structural findings — are documented as if shipping but are unbuilt. The architect must rule each **deferred** (keep in doc with a dated deferral + tracking issue) or **abandoned** (cut from `system-design.md`, supersede with an ADR). Right now they are limbo, which is the worst state.
+- **One verifiable release gap, not a vague roadmap call.** I checked the unbuilt surfaces against `requirements.md` (which outranks `system-design.md`). The §5 budget engine is **already a documented v1.1 deferral** (NFR-COST-01/03 → ADR-030) — settled, just mirror the notice into §5. The four §6 phase-7 findings have **no baselined REQ** — safe to cut. What is *not* settled is **D4a**: `REQ-ANALYZE-06` is baselined ("no silent fallbacks; findings visible in store + Filigree") and the code makes plugin `HostFinding`s **log-only** (`analyze.rs:626`). **Verify whether failure findings are persisted before any release claim** — if not, that is an unmet baselined requirement. Separately, **D3a**: the Anthropic→OpenRouter provider pivot silently contradicts `CON-ANTHROPIC-01` and needs an ADR to supersede it.
 
 ## 3. Drift reconciliation plan (the #1 recommended action)
 
@@ -26,8 +26,10 @@ All drift is **doc-side** (code wins, per CLAUDE.md precedence). For each, the r
 |---|---|---|---|
 | D1 | §2 sync vs async host | Rewrite §2 supervision to describe the synchronous host; write a short ADR recording the sync decision and *why* (testability via in-process mock). | No — code is correct |
 | D2 | §2 Python parser | Replace "tree-sitter + LibCST / TYPE_CHECKING / alias_of / unresolved entities" with the `ast`-only reality. | No |
-| D3 | §5 policy/budget engine | **Decide deferred/abandoned.** If deferred: mark §5 future-work + tracking issue. If abandoned: cut + ADR. Either way fix the provider list (4, no Anthropic). | **Yes** |
-| D4 | §6 phase-7 findings | **Decide deferred/abandoned** for the 4 unbuilt `CLA-FACT-*`; document the 3 shipped SEI/incremental phases; note `CLA-FACT-CLUSTERING-WEAK-MODULARITY` ships. | **Yes** |
+| D3 | §5 policy/budget engine | **Deferral confirmed** — `NFR-COST-01`/`NFR-COST-03` (which §5 Addresses) are already "Deferred to v1.1 per ADR-030" in `requirements.md`. Just mirror that deferral notice into §5 + fix the provider list (4, no Anthropic). | No — req settles it |
+| D3a | `CON-ANTHROPIC-01` superseded | Code went OpenRouter + CLI, dropping the Anthropic-only constraint + 4-segment caching. **Write an ADR** recording the provider pivot (and its cost-caching tradeoff) to supersede the constraint. | **Yes** |
+| D4 | §6 phase-7 findings | The 4 unbuilt `CLA-FACT-*` have no baselined REQ found → **safe to cut/defer**. Document the 3 shipped SEI/incremental phases; note `CLA-FACT-CLUSTERING-WEAK-MODULARITY` ships. | No (cut is safe) |
+| D4a | `REQ-ANALYZE-06` tension | **Verify before any release claim.** REQ-ANALYZE-06 (baselined: no silent fallbacks; findings visible in store + Filigree) vs. log-only `HostFinding`s (`analyze.rs:626`). If failure findings aren't persisted, this is an **unmet baselined requirement = release gap**, not doc cleanup. | **Yes — gap check** |
 | D5 | §8 "8-tool subset" | Replace with the 35-tool catalogue (categories in `02` §6). | No |
 | D6 | §9 `entities/resolve` | Mark deferred; **cross-link §9 to `docs/federation/contracts.md` as the authoritative wire surface.** | No |
 | D7 | detailed-design schema | Regenerate the schema table from the 6 migration files (13 tables + FTS5 + view; add `entities.signature`). | No |
@@ -58,7 +60,8 @@ A focused doc pass closes D1, D2, D5, D6, D7, D8 in roughly a day. D3/D4 need a 
 
 ## 6. Recommended work queue (maps to filigree)
 
-1. **Doc reconciliation D1–D8** (`05` Q5) — file an issue; do before merge to `main`. *No existing ticket — create one.*
+0. **Verify D4a (REQ-ANALYZE-06 gap)** — confirm plugin/failure `HostFinding`s are persisted to the store + emitted to Filigree, not just logged (`analyze.rs:626`). If not persisted, this is an unmet baselined requirement; gate the release on it. *No ticket — create one (P1 if confirmed a gap).*
+1. **Doc reconciliation D1–D8 + D3a ADR** (`05` Q5) — file an issue; do before merge to `main`. Includes mirroring the ADR-030 v1.1 deferral notice into §5 and writing an ADR for the Anthropic→OpenRouter pivot (D3a). *No existing ticket — create one.*
 2. **Split `mcp/lib.rs`** — `clarion-42cbd8a25a` (start it).
 3. **Split `analyze.rs run_with_options`** — `clarion-cb9676de57` (start it).
 4. **Retire Wardline asterisk #2** — `clarion-1f6241b329` (prereq met per `loom.md §5`).

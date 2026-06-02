@@ -48,3 +48,14 @@ Multi-subsystem (≥3) ⇒ MUST spawn `analysis-validator` after the catalog and
 - 2026-06-02 — Holistic scan: 6 crates, ~47K Rust src LOC, Python plugin ~3.2K. Workspace v1.1.0.
 - 2026-06-02 — Advisor checkpoint: reframed to delta/drift analysis anchored to system-design §1–§11; read prior art (05-22 final report, 05-20 handover).
 - 2026-06-02 — Strategy fixed: PARALLEL, 8 focused explorers (drift-hunting + quality), then validate.
+- 2026-06-02 — 8 `codebase-explorer` agents completed; partials in `temp/catalog-*.md`. Headline finding: doc drift across system-design §2/§5/§6/§8/§9 + detailed-design + CLAUDE.md.
+- 2026-06-02 — Wrote `01-discovery`, `02-catalog`, `03-diagrams`.
+- 2026-06-02 — **Validation gate 1** (`analysis-validator` on `02`): NEEDS-REVISION → corrected inline (ADR-013 GCP strawman dropped; provider count 4; detailed-design "6 tables+FTS5"; CLAUDE.md "4 crates"; wardline ×4; phase-7 reframed). 5/9 drift claims clean-verified; no BLOCK. Report: `temp/validation-catalog.md`.
+- 2026-06-02 — Wrote `04-final-report`, `05-quality-assessment`, `06-architect-handover`.
+- 2026-06-02 — **Validation gate 2** (`analysis-validator` on `04/05/06`): APPROVED-WITH-WARNINGS. All 6 cited filigree IDs verified real; no reintroduced errors; no invented claims. Fixed 2 blemishes (http_read.rs LOC erratum 4,387→4,765 grew mid-analysis; unsafe-block count 1→2). Report: `temp/validation-final-report.md`.
+- 2026-06-02 — **Requirements check (advisor-driven):** split "behind" drift (D3/D4) against `requirements.md` (outranks system-design). D3 §5 budget engine = **confirmed v1.1 deferral** (NFR-COST-01/03 → ADR-030); D3a Anthropic→OpenRouter pivot = **superseded CON-ANTHROPIC-01, needs ADR**; D4a `REQ-ANALYZE-06` (no silent fallbacks) vs log-only `HostFinding`s = **possible release gap, verify**. Folded into 04 §4, 05 Q5/Q12/priority-0, 06 §2/§3/queue.
+- 2026-06-02 — **COMPLETE.** All 6 Architect-Ready deliverables produced + validated.
+
+## Outcome
+
+Architect-Ready analysis delivered. Dominant finding: **documentation-integrity debt** — `system-design.md` drifted from shipped code in 5 sections with no reconciling ADR (all doc-side bugs under CLAUDE.md precedence). Code is structurally sound and maturing (3 prior defects closed; SEI/ADR-038 + Wardline-taint/ADR-036 + WS5 35-tool surface added). Top recommendation (`06` §3): a ~1-day doc-reconciliation pass before merge to `main`, plus a deferred-vs-abandoned ruling on the §5 policy engine and §6 phase-7 findings. Four of the next five debts already have filigree tickets needing scheduling, not analysis.

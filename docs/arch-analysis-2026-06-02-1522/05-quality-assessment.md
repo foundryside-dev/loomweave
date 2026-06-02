@@ -24,7 +24,9 @@ The encouraging signal: three prior-flagged 🔴/🟡 defects were genuinely clo
 | Inter-crate cycles | 0 | clean DAG |
 | MCP tools | 35 | doc says 8 |
 | SQLite tables | 13 + FTS5 + view | doc says 6+FTS5 |
-| Unsafe blocks | 1 (documented) | `pre_exec` setrlimit, SAFETY-commented |
+| Unsafe blocks | 2 | 1 non-test (`host.rs:602` `pre_exec` setrlimit, SAFETY-commented); 1 test-only (`plugin-fixture/main.rs:155`) |
+
+> **Erratum (captured during analysis):** all LOC figures here are HEAD-at-capture. `http_read.rs` grew from **4,387 → 4,765** *during* the synthesis window (two Wardline-T3.4 commits, `caa2665`/`204790e`). The 4,387 figure used throughout 01–06 was exact when read; it is now ~4,765. No conclusion changes — http_read remains the #2 monolith either way.
 
 ## 3. Findings by severity
 
@@ -38,7 +40,7 @@ The encouraging signal: three prior-flagged 🔴/🟡 defects were genuinely clo
 
 **Q4 — `clarion-core/src/plugin/host.rs` is 2,958 LOC in one `impl`** (+678 inline-test LOC). Validation pipeline, edge pipeline, stats validation, briefing-block, subprocess ctor, stderr drain, `connect()` all one unit. *Fix:* split along lifecycle / pipeline / IO axes — filigree **`clarion-2b8811da39`** (proposed).
 
-**Q5 — Documentation drift D1–D8 (see `04` §4).** `system-design.md` §2/§5/§6/§8/§9, `detailed-design.md` schema, and `CLAUDE.md` Layout each contradict shipped code; no ADR/errata reconciles them. *Fix:* a documentation-reconciliation pass (details in `06` §3). For D3/D4 the doc must also state deferred-vs-abandoned. This is the highest-ROI work in the report: small effort, removes an active trap from the canonical record.
+**Q5 — Documentation drift D1–D8 (see `04` §4).** `system-design.md` §2/§5/§6/§8/§9, `detailed-design.md` schema, and `CLAUDE.md` Layout each contradict shipped code; no ADR/errata reconciles them. **"Ahead" drift** (D1/D2/D5/D6/D7/D8) is pure doc cleanup (code wins). **"Behind" drift** was checked against `requirements.md`: D3 (§5 budget engine) is a **confirmed v1.1 deferral** (NFR-COST-01/03 → ADR-030) — mirror the notice into §5; D3a (Anthropic→OpenRouter pivot) **needs an ADR** to supersede `CON-ANTHROPIC-01`. *Fix:* a documentation-reconciliation pass (details in `06` §3). Highest-ROI work in the report: small effort, removes an active trap from the canonical record. (The one item that is *not* doc cleanup — D4a / Q12 — is broken out below and gates the release.)
 
 ### 🟡 Medium
 
@@ -54,7 +56,7 @@ The encouraging signal: three prior-flagged 🔴/🟡 defects were genuinely clo
 
 **Q11 — Wardline taint writer-actor runs in the HTTP runtime** (ADR-036) with no dedicated health-check surface; if it wedges, the HTTP API has no signal. *Fix:* expose its liveness via `_capabilities` or `doctor`.
 
-**Q12 — Phase-7 structural findings are log-only / partly unbuilt.** Plugin `HostFinding`s are logged not persisted ("Tier B persistence is future work", `analyze.rs:626`); four of five §6 `CLA-FACT-*` findings are unimplemented. Operators can't see structural findings via `findings_for`. *Fix:* decide scope (persist Tier B? build the four findings?) and align §6.
+**Q12 — Log-only `HostFinding`s may breach a baselined requirement (possible release gap, verify).** Plugin `HostFinding`s are logged not persisted ("Tier B persistence is future work", `analyze.rs:626`). This is in direct tension with **`REQ-ANALYZE-06`** (baselined: *no silent fallbacks — every recoverable failure emits a finding visible in `stats.json`, the store, and Filigree*). If failure findings are not persisted, REQ-ANALYZE-06 is **unmet** — a release gap, not cleanup (see `04` D4a / `06` §3). Separately, four of five §6 `CLA-FACT-*` *structural* findings are unimplemented but have **no baselined REQ** (safe to cut/defer). *Fix:* (1) verify+persist failure findings (gate release on it); (2) decide scope for the structural findings and align §6.
 
 ### 🟢 Low
 
@@ -70,7 +72,8 @@ The encouraging signal: three prior-flagged 🔴/🟡 defects were genuinely clo
 
 | Priority | Item | Effort | Payoff |
 |---|---|---|---|
-| 1 | **Q5** doc reconciliation (D1–D8) | Low (doc edits) | High — removes active trap from canonical record |
+| 0 | **Q12/D4a** verify failure findings are persisted (REQ-ANALYZE-06) | Low (verify) | **Gates release** — possible unmet baselined requirement |
+| 1 | **Q5** doc reconciliation (D1–D8 + D3a ADR) | Low (doc edits) | High — removes active trap from canonical record |
 | 2 | **Q1** mcp/lib.rs split (`clarion-42cbd8a25a`) | Med (mechanical) | High — biggest change-risk surface |
 | 3 | **Q3** analyze.rs split (`clarion-cb9676de57`) | Med | High |
 | 4 | **Q6** Wardline asterisk retire (`clarion-1f6241b329`) | Med | Med — closes a federation coupling whose prereq is met |
