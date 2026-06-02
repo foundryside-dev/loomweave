@@ -540,6 +540,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // synthetic project entity minted just before persistence.
     let mut failure_findings: Vec<FindingRecord> = Vec::new();
     let project_anchor = project_anchor_id(&project_root);
+    let file_timeout = plugin_file_timeout();
     let briefing_blocks = secret_scan_outcome.briefing_blocks_shared();
     let scanned_files = secret_scan_outcome.scanned_files_shared();
     'plugins: for plugin in plugins {
@@ -639,6 +640,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     &briefing_blocks_clone,
                     &scanned_files_clone,
                     &progress_clone,
+                    file_timeout,
                 )
             })
             .await,
@@ -649,7 +651,13 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             Err(plugin_error) => {
                 log_plugin_findings(&plugin_id, &plugin_error.findings);
                 // REQ-ANALYZE-06: persist the host findings collected before the
-                // crash plus a CLA-INFRA-PLUGIN-CRASH finding for the crash itself.
+                // crash. A per-file timeout already rides in as a CLA-PY-TIMEOUT
+                // finding (and is the root cause), so suppress the generic
+                // CLA-INFRA-PLUGIN-CRASH in that case to avoid double-reporting.
+                let timed_out = plugin_error
+                    .findings
+                    .iter()
+                    .any(|hf| hf.subcode == PLUGIN_TIMEOUT_RULE_ID);
                 for hf in &plugin_error.findings {
                     failure_findings.push(host_finding_to_record(
                         hf,
@@ -659,13 +667,15 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                         &started_at,
                     ));
                 }
-                failure_findings.push(crash_finding_record(
-                    &plugin_id,
-                    &plugin_error.reason,
-                    &project_anchor,
-                    &run_id,
-                    &started_at,
-                ));
+                if !timed_out {
+                    failure_findings.push(crash_finding_record(
+                        &plugin_id,
+                        &plugin_error.reason,
+                        &project_anchor,
+                        &run_id,
+                        &started_at,
+                    ));
+                }
                 tracing::warn!(
                     plugin_id = %plugin_id,
                     reason = %plugin_error.reason,
@@ -1900,12 +1910,36 @@ async fn ensure_project_anchor(
     Ok(id)
 }
 
-/// Map a host-layer subcode to an ADR-017 severity. Crash / kill / OOM are
-/// `ERROR` (the plugin or a file was lost); drop-and-continue diagnostics
+/// Core-emitted per-file analysis-timeout subcode (REQ-ANALYZE-06). Host-side:
+/// the plugin is killed when a single `analyze_file` exceeds the deadline.
+const PLUGIN_TIMEOUT_RULE_ID: &str = "CLA-PY-TIMEOUT";
+
+/// Per-file `analyze_file` deadline. ADR-035 tuning: basis — a single file's
+/// extraction (incl. pyright queries) completes in well under a second on
+/// healthy plugins, so minutes of no progress means a hung plugin, not slow
+/// work; override — env `CLARION_PLUGIN_FILE_TIMEOUT_MS`; retune — raise if a
+/// legitimate analyzer (very large generated file) trips it in practice.
+const DEFAULT_PLUGIN_FILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const PLUGIN_WATCHDOG_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Resolve the per-file analysis timeout, honouring the env override.
+fn plugin_file_timeout() -> std::time::Duration {
+    std::env::var("CLARION_PLUGIN_FILE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(
+            DEFAULT_PLUGIN_FILE_TIMEOUT,
+            std::time::Duration::from_millis,
+        )
+}
+
+/// Map a host-layer subcode to an ADR-017 severity. Crash / kill / OOM / timeout
+/// are `ERROR` (the plugin or a file was lost); drop-and-continue diagnostics
 /// (malformed/undeclared/oversize) are `WARN`.
 fn infra_severity(subcode: &str) -> &'static str {
     match subcode {
         INFRA_CRASH_RULE_ID
+        | PLUGIN_TIMEOUT_RULE_ID
         | FINDING_DISABLED_CRASH_LOOP
         | "CLA-INFRA-PLUGIN-OOM-KILLED"
         | "CLA-INFRA-PLUGIN-DISABLED-PATH-ESCAPE" => "ERROR",
@@ -2483,6 +2517,87 @@ type Collected = (
     BTreeMap<String, String>,
 );
 
+/// Per-file analysis-timeout watchdog (REQ-ANALYZE-06, `CLA-PY-TIMEOUT`).
+///
+/// `analyze_file` blocks on a synchronous read of the plugin's stdout, which has
+/// no read deadline. The watchdog runs on its own thread holding a shared handle
+/// to the child process (the reader lives in the *host*, a separate value, so
+/// killing the child unblocks the read without touching the host). The main
+/// thread `arm`s before each `analyze_file` and `disarm`s after; if the deadline
+/// passes while armed, the watchdog kills the child and records the timeout.
+struct PluginWatchdog {
+    /// Active deadline, or `None` when disarmed. Guarded so `disarm` and the
+    /// watchdog's fire-check observe a consistent value (no kill-after-disarm).
+    deadline: std::sync::Mutex<Option<std::time::Instant>>,
+    timed_out: std::sync::atomic::AtomicBool,
+    stop: std::sync::atomic::AtomicBool,
+}
+
+impl PluginWatchdog {
+    fn new() -> Self {
+        Self {
+            deadline: std::sync::Mutex::new(None),
+            timed_out: std::sync::atomic::AtomicBool::new(false),
+            stop: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn arm(&self, timeout: std::time::Duration) {
+        *self.deadline.lock().expect("watchdog deadline poisoned") =
+            Some(std::time::Instant::now() + timeout);
+    }
+
+    fn disarm(&self) {
+        *self.deadline.lock().expect("watchdog deadline poisoned") = None;
+    }
+
+    fn did_time_out(&self) -> bool {
+        self.timed_out.load(Ordering::SeqCst)
+    }
+
+    fn request_stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Spawn the watchdog thread. It polls the shared deadline; on expiry it flips
+/// `timed_out`, clears the deadline (kill at most once), and kills the child.
+/// Returns the join handle so the caller can stop + join before reaping.
+fn spawn_plugin_watchdog(
+    watchdog: Arc<PluginWatchdog>,
+    child: Arc<std::sync::Mutex<std::process::Child>>,
+    plugin_id: String,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !watchdog.stop.load(Ordering::SeqCst) {
+            std::thread::sleep(PLUGIN_WATCHDOG_POLL_INTERVAL);
+            let expired = {
+                let mut guard = watchdog
+                    .deadline
+                    .lock()
+                    .expect("watchdog deadline poisoned");
+                match *guard {
+                    Some(deadline) if std::time::Instant::now() >= deadline => {
+                        *guard = None; // disarm so we kill at most once
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if expired {
+                watchdog.timed_out.store(true, Ordering::SeqCst);
+                tracing::warn!(
+                    plugin_id = %plugin_id,
+                    "plugin exceeded per-file analysis timeout; killing child",
+                );
+                if let Ok(mut c) = child.lock() {
+                    let _ = c.kill();
+                }
+            }
+        }
+    })
+}
+
 /// Spawn the plugin, handshake, run `analyze_file` for each file, collect results.
 ///
 /// All I/O is synchronous — this is designed to run inside `spawn_blocking`.
@@ -2493,7 +2608,7 @@ type Collected = (
 /// via `child.kill()` + `child.wait()`. `std::process::Child::Drop` does NOT
 /// kill or reap on Unix, so discarding `child` without `wait()` would leak a
 /// zombie into the kernel process table per spawn.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn run_plugin_blocking(
     manifest: clarion_core::Manifest,
     project_root: &Path,
@@ -2503,11 +2618,12 @@ fn run_plugin_blocking(
     briefing_blocks: &Arc<BTreeMap<PathBuf, clarion_core::BriefingBlockReason>>,
     scanned_source_files: &Arc<BTreeSet<PathBuf>>,
     progress: &ProgressReporter,
+    file_timeout: std::time::Duration,
 ) -> Result<BatchResult, PluginRunError> {
     use clarion_core::PluginHost;
 
     let manifest_language = manifest.plugin.language.clone();
-    let (mut host, mut child) =
+    let (mut host, child) =
         PluginHost::spawn(manifest, project_root, executable).map_err(|e| match e {
             HostError::Spawn(msg) => {
                 PluginRunError::new(format!("failed to spawn plugin {plugin_id}: {msg}"))
@@ -2522,6 +2638,16 @@ fn run_plugin_blocking(
     host.set_briefing_blocks(Arc::clone(briefing_blocks));
     host.set_scanned_source_files(Arc::clone(scanned_source_files));
 
+    // Per-file analysis-timeout watchdog (REQ-ANALYZE-06). Shares the child
+    // handle so it can kill a hung plugin and unblock the synchronous read.
+    let child = Arc::new(std::sync::Mutex::new(child));
+    let watchdog = Arc::new(PluginWatchdog::new());
+    let watchdog_handle = spawn_plugin_watchdog(
+        Arc::clone(&watchdog),
+        Arc::clone(&child),
+        plugin_id.to_owned(),
+    );
+
     let work_result: Result<Collected, String> = (|| {
         let mut collected_entities: Vec<(String, EntityRecord)> = Vec::new();
         let mut collected_edges: Vec<(String, EdgeRecord)> = Vec::new();
@@ -2530,13 +2656,14 @@ fn run_plugin_blocking(
         let mut collected_signatures: BTreeMap<String, String> = BTreeMap::new();
         for file in files {
             progress.file_started(plugin_id, &file.to_string_lossy());
+            watchdog.arm(file_timeout);
+            let analyze_outcome = host.analyze_file(file);
+            watchdog.disarm();
             let AnalyzeFileOutcome {
                 entities,
                 edges,
                 stats,
-            } = host
-                .analyze_file(file)
-                .map_err(|e| classify_host_error(plugin_id, e))?;
+            } = analyze_outcome.map_err(|e| classify_host_error(plugin_id, e))?;
             progress.file_completed();
             collected_stats.unresolved_call_sites_total += stats.unresolved_call_sites_total;
             collected_stats.reference_sites_total += stats.reference_sites_total;
@@ -2614,6 +2741,28 @@ fn run_plugin_blocking(
         ))
     })();
 
+    // Stop and join the watchdog before reaping so it no longer holds the child
+    // handle (lets us reclaim the owned `Child` for the reap path).
+    watchdog.request_stop();
+    let _ = watchdog_handle.join();
+    let timed_out = watchdog.did_time_out();
+    let mut child = Arc::try_unwrap(child)
+        .unwrap_or_else(|_| unreachable!("watchdog joined; no other Arc holders remain"))
+        .into_inner()
+        .expect("child mutex poisoned");
+
+    // A timeout forces the failure branch: the watchdog already killed the child,
+    // so any in-flight read failed (or, in a near-deadline race, a stale Ok no
+    // longer reflects a live plugin). Replace the reason with a clear timeout.
+    let work_result = if timed_out {
+        Err(format!(
+            "plugin {plugin_id} exceeded the per-file analysis timeout ({} ms) and was killed",
+            file_timeout.as_millis()
+        ))
+    } else {
+        work_result
+    };
+
     // Try a graceful shutdown on the happy path; on error, skip straight to
     // kill — the plugin's behaviour is already untrusted. `analyze_file`
     // already issues `shutdown`/`exit` before returning PathEscapeBreaker or
@@ -2634,6 +2783,26 @@ fn run_plugin_blocking(
 
     let mut findings = host.take_findings();
     drop(host);
+
+    // REQ-ANALYZE-06: a per-file timeout is a recoverable failure that must be
+    // visible. Add a CLA-PY-TIMEOUT host finding; it rides out through
+    // PluginRunError.findings and is persisted by the run's crash path.
+    if timed_out {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("plugin_id".to_owned(), plugin_id.to_owned());
+        metadata.insert(
+            "timeout_ms".to_owned(),
+            file_timeout.as_millis().to_string(),
+        );
+        findings.push(HostFinding {
+            subcode: PLUGIN_TIMEOUT_RULE_ID,
+            message: format!(
+                "plugin {plugin_id} exceeded the per-file analysis timeout ({} ms) and was killed",
+                file_timeout.as_millis()
+            ),
+            metadata,
+        });
+    }
 
     // Reap unconditionally. `Child::Drop` does not wait on Unix.
     reap_and_classify_exit(&mut child, plugin_id, &mut findings);
@@ -3692,6 +3861,21 @@ mod tests {
         assert_eq!(rec.kind, "defect");
         assert_eq!(rec.tool, "clarion");
         assert!(rec.evidence_json.contains("python"));
+    }
+
+    #[test]
+    fn plugin_watchdog_arm_disarm_and_severity() {
+        let wd = PluginWatchdog::new();
+        assert!(!wd.did_time_out(), "fresh watchdog has not fired");
+        wd.arm(std::time::Duration::from_secs(60));
+        assert!(wd.deadline.lock().unwrap().is_some(), "arm sets a deadline");
+        wd.disarm();
+        assert!(
+            wd.deadline.lock().unwrap().is_none(),
+            "disarm clears the deadline"
+        );
+        // A timeout is an ERROR-severity loss of work.
+        assert_eq!(infra_severity(PLUGIN_TIMEOUT_RULE_ID), "ERROR");
     }
 
     #[test]

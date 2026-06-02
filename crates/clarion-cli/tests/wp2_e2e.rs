@@ -574,10 +574,17 @@ ontology_version = "0.1.0"
     );
 
     // 7. Fixture plugin must NOT have produced an entity — the break
-    //    statement at analyze.rs ~247 must have fired before it ran.
+    //    statement at analyze.rs ~247 must have fired before it ran. The
+    //    synthetic `core:project:*` finding anchor (REQ-ANALYZE-06, minted to
+    //    hold the persisted crash findings) is excluded — it is not a
+    //    plugin-produced entity.
     let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
     let entity_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE NOT (plugin_id = 'core' AND kind = 'project')",
+            [],
+            |row| row.get(0),
+        )
         .expect("query entities count");
     assert_eq!(
         entity_count, 0,

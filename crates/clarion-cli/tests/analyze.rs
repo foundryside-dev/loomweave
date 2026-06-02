@@ -2691,3 +2691,163 @@ fn analyze_persists_crash_finding_anchored_to_project() {
         .unwrap();
     assert_eq!(anchor_exists, 1, "project anchor entity is present");
 }
+
+/// A plugin that hangs inside `analyze_file` (sleeps far longer than the
+/// configured per-file timeout). Initializes cleanly, then blocks forever on the
+/// first analyze request.
+#[cfg(unix)]
+const HANGING_PLUGIN_SCRIPT: &str = r#"#!/usr/bin/python3
+import json
+import sys
+import time
+
+
+def read_frame():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if line in (b"", b"\r\n"):
+            break
+        name, value = line.decode("ascii").strip().split(":", 1)
+        headers[name.lower()] = value.strip()
+    length = int(headers["content-length"])
+    return json.loads(sys.stdin.buffer.read(length))
+
+
+def write_frame(message):
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n")
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+
+while True:
+    msg = read_frame()
+    method = msg.get("method")
+    if method == "initialized":
+        continue
+    if method == "exit":
+        raise SystemExit(0)
+    ident = msg["id"]
+    if method == "initialize":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "name": "clarion-plugin-hang",
+                "version": "0.1.0",
+                "ontology_version": "0.6.0",
+                "capabilities": {},
+            },
+        })
+    elif method == "analyze_file":
+        # Hang: never respond. The host watchdog must kill us.
+        time.sleep(3600)
+    elif method == "shutdown":
+        write_frame({"jsonrpc": "2.0", "id": ident, "result": {}})
+    else:
+        raise SystemExit(1)
+"#;
+
+#[cfg(unix)]
+const HANGING_PLUGIN_MANIFEST: &str = r#"
+[plugin]
+name = "clarion-plugin-hang"
+plugin_id = "hangfixture"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "clarion-plugin-hang"
+language = "hangfixture"
+extensions = ["hng"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 256
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+entity_kinds = ["module"]
+edge_kinds = []
+rule_id_prefix = "CLA-HANG-"
+ontology_version = "0.6.0"
+"#;
+
+#[cfg(unix)]
+fn write_hanging_plugin(plugin_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let plugin_script = plugin_dir.join("clarion-plugin-hang");
+    std::fs::write(&plugin_script, HANGING_PLUGIN_SCRIPT).expect("write hang plugin script");
+    let mut perms = std::fs::metadata(&plugin_script)
+        .expect("stat hang plugin")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&plugin_script, perms).expect("chmod hang plugin");
+
+    std::fs::write(plugin_dir.join("plugin.toml"), HANGING_PLUGIN_MANIFEST)
+        .expect("write hang plugin manifest");
+}
+
+/// REQ-ANALYZE-06 verification (in part): a plugin that hangs on a file is killed
+/// by the per-file analysis-timeout watchdog and produces a persisted
+/// `CLA-PY-TIMEOUT` finding (and not a redundant `CLA-INFRA-PLUGIN-CRASH`). The
+/// timeout is set low via `CLARION_PLUGIN_FILE_TIMEOUT_MS` on the spawned process.
+#[cfg(unix)]
+#[test]
+fn analyze_persists_timeout_finding_for_hanging_plugin() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_hanging_plugin(plugin_dir.path());
+
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    std::fs::write(project_dir.path().join("slow.hng"), b"x\n").unwrap();
+
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    clarion_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("CLARION_PLUGIN_FILE_TIMEOUT_MS", "500")
+        .assert()
+        .failure();
+
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    let (timeout_count, anchor): (i64, String) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(MIN(entity_id), '') FROM findings \
+             WHERE rule_id = 'CLA-PY-TIMEOUT'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("query timeout findings");
+    assert!(timeout_count >= 1, "a CLA-PY-TIMEOUT finding is persisted");
+    let project_name = project_dir
+        .path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap();
+    assert_eq!(
+        anchor,
+        format!("core:project:{project_name}"),
+        "timeout finding anchors to the synthetic project entity"
+    );
+
+    // The generic crash finding is suppressed when a timeout is the root cause.
+    let crash_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'CLA-INFRA-PLUGIN-CRASH'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        crash_count, 0,
+        "no redundant CLA-INFRA-PLUGIN-CRASH when the cause is a timeout"
+    );
+}
