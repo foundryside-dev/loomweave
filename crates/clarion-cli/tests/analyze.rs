@@ -2537,3 +2537,157 @@ fn analyze_persists_syntax_error_finding_for_unparseable_file() {
         .unwrap();
     assert_eq!(anchor_exists, 1, "finding anchor entity is present");
 }
+
+/// A plugin that crashes mid-`analyze_file`. Initializes cleanly, then exits
+/// non-zero on the first analyze request — exercising the host's crash path.
+#[cfg(unix)]
+const CRASHING_PLUGIN_SCRIPT: &str = r#"#!/usr/bin/python3
+import json
+import sys
+
+
+def read_frame():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if line in (b"", b"\r\n"):
+            break
+        name, value = line.decode("ascii").strip().split(":", 1)
+        headers[name.lower()] = value.strip()
+    length = int(headers["content-length"])
+    return json.loads(sys.stdin.buffer.read(length))
+
+
+def write_frame(message):
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n")
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+
+while True:
+    msg = read_frame()
+    method = msg.get("method")
+    if method == "initialized":
+        continue
+    if method == "exit":
+        raise SystemExit(0)
+    ident = msg["id"]
+    if method == "initialize":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "name": "clarion-plugin-crash",
+                "version": "0.1.0",
+                "ontology_version": "0.6.0",
+                "capabilities": {},
+            },
+        })
+    elif method == "analyze_file":
+        # Crash mid-run: exit non-zero so the host's supervisor sees a crash.
+        raise SystemExit(7)
+    elif method == "shutdown":
+        write_frame({"jsonrpc": "2.0", "id": ident, "result": {}})
+    else:
+        raise SystemExit(1)
+"#;
+
+#[cfg(unix)]
+const CRASHING_PLUGIN_MANIFEST: &str = r#"
+[plugin]
+name = "clarion-plugin-crash"
+plugin_id = "crashfixture"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "clarion-plugin-crash"
+language = "crashfixture"
+extensions = ["crx"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 256
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+entity_kinds = ["module"]
+edge_kinds = []
+rule_id_prefix = "CLA-CRASH-"
+ontology_version = "0.6.0"
+"#;
+
+#[cfg(unix)]
+fn write_crashing_plugin(plugin_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let plugin_script = plugin_dir.join("clarion-plugin-crash");
+    std::fs::write(&plugin_script, CRASHING_PLUGIN_SCRIPT).expect("write crash plugin script");
+    let mut perms = std::fs::metadata(&plugin_script)
+        .expect("stat crash plugin")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&plugin_script, perms).expect("chmod crash plugin");
+
+    std::fs::write(plugin_dir.join("plugin.toml"), CRASHING_PLUGIN_MANIFEST)
+        .expect("write crash plugin manifest");
+}
+
+/// REQ-ANALYZE-06 verification (in part): a plugin that crashes mid-run produces
+/// a `CLA-INFRA-PLUGIN-CRASH` finding **persisted to the store**, anchored to the
+/// synthetic `core:project:{name}` entity — not merely logged.
+#[cfg(unix)]
+#[test]
+fn analyze_persists_crash_finding_anchored_to_project() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_crashing_plugin(plugin_dir.path());
+
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    std::fs::write(project_dir.path().join("a.crx"), b"x\n").unwrap();
+
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    // A crashed plugin yields a non-zero exit (SoftFailed → CommitRun(Failed));
+    // the persisted finding is what we assert on.
+    clarion_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .failure();
+
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    let (count, anchor): (i64, String) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(MIN(entity_id), '') FROM findings \
+             WHERE rule_id = 'CLA-INFRA-PLUGIN-CRASH'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("query crash findings");
+    assert!(count >= 1, "a CLA-INFRA-PLUGIN-CRASH finding is persisted");
+    let project_name = project_dir
+        .path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap();
+    assert_eq!(
+        anchor,
+        format!("core:project:{project_name}"),
+        "crash finding anchors to the synthetic project entity"
+    );
+    // The synthetic anchor entity exists (FK integrity).
+    let anchor_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE id = ?1 AND kind = 'project'",
+            [&anchor],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(anchor_exists, 1, "project anchor entity is present");
+}

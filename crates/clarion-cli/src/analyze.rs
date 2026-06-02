@@ -533,11 +533,13 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // before the prior-index flush. Gathered here for the same reason as the
     // prior index — `entities` is cumulative and cannot recover the run's set.
     let mut sei_descriptors: Vec<NewEntityDescriptor> = Vec::new();
-    // REQ-ANALYZE-06: failure findings (parse errors today; crash/timeout/LLM/
-    // budget to follow) accumulated through the run and persisted before
-    // CommitRun, so a recoverable failure is visible in the store rather than
-    // only in logs.
+    // REQ-ANALYZE-06: failure findings accumulated through the run and persisted
+    // before CommitRun, so a recoverable failure is visible in the store rather
+    // than only in logs. Parse errors anchor to their (degraded) module entity;
+    // plugin-level findings (crash, ontology/protocol violations) anchor to the
+    // synthetic project entity minted just before persistence.
     let mut failure_findings: Vec<FindingRecord> = Vec::new();
+    let project_anchor = project_anchor_id(&project_root);
     let briefing_blocks = secret_scan_outcome.briefing_blocks_shared();
     let scanned_files = secret_scan_outcome.scanned_files_shared();
     'plugins: for plugin in plugins {
@@ -646,6 +648,24 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         match spawn_result {
             Err(plugin_error) => {
                 log_plugin_findings(&plugin_id, &plugin_error.findings);
+                // REQ-ANALYZE-06: persist the host findings collected before the
+                // crash plus a CLA-INFRA-PLUGIN-CRASH finding for the crash itself.
+                for hf in &plugin_error.findings {
+                    failure_findings.push(host_finding_to_record(
+                        hf,
+                        &plugin_id,
+                        &project_anchor,
+                        &run_id,
+                        &started_at,
+                    ));
+                }
+                failure_findings.push(crash_finding_record(
+                    &plugin_id,
+                    &plugin_error.reason,
+                    &project_anchor,
+                    &run_id,
+                    &started_at,
+                ));
                 tracing::warn!(
                     plugin_id = %plugin_id,
                     reason = %plugin_error.reason,
@@ -683,11 +703,19 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 pyright_index_parse_latency.record_many(stats.pyright_index_parse_latency_ms);
                 extractor_parse_latency.record_many(stats.extractor_parse_latency_ms);
 
-                // Log findings individually (Tier B persistence is future
-                // work). Logging only the count leaves operators guessing
-                // whether the plugin tripped an ontology check, emitted
-                // malformed JSON, or hit a path-jail violation.
+                // Log findings individually (operator-facing stderr) and persist
+                // them (REQ-ANALYZE-06) so an ontology check, malformed-JSON drop,
+                // or path-jail violation is visible in the store, not just logs.
                 log_plugin_findings(&plugin_id, &findings);
+                for hf in &findings {
+                    failure_findings.push(host_finding_to_record(
+                        hf,
+                        &plugin_id,
+                        &project_anchor,
+                        &run_id,
+                        &started_at,
+                    ));
+                }
 
                 // Persist entities + edges via writer-actor (async side).
                 //
@@ -822,9 +850,27 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         };
     }
 
-    // REQ-ANALYZE-06: persist accumulated failure findings (parse errors today).
-    // Runs after entity inserts so each finding's `entity_id` anchor resolves,
-    // and only when the run is being committed (a HardFailed run is rolled back).
+    // REQ-ANALYZE-06: persist accumulated failure findings (parse errors,
+    // host/protocol diagnostics, plugin crashes). Runs after entity inserts so
+    // each finding's `entity_id` anchor resolves, and only when the run is being
+    // committed (a HardFailed run is rolled back).
+    if !matches!(run_outcome, RunOutcome::HardFailed { .. }) {
+        // Mint the synthetic project anchor first, but only if a finding actually
+        // anchors to it (parse-error findings anchor to their module entity and
+        // need no project entity).
+        let needs_project_anchor = failure_findings
+            .iter()
+            .any(|f| f.entity_id == project_anchor);
+        if needs_project_anchor
+            && let Err(e) = ensure_project_anchor(&writer, &project_root, &started_at).await
+        {
+            tracing::error!(run_id = %run_id, error = %e, "project finding-anchor insert failed");
+            run_outcome = RunOutcome::HardFailed {
+                reason: format!("project finding-anchor insert failed: {e:#}"),
+            };
+        }
+    }
+
     if !matches!(run_outcome, RunOutcome::HardFailed { .. }) {
         let finding_count = failure_findings.len();
         for finding in failure_findings {
@@ -1788,6 +1834,157 @@ fn syntax_error_finding(record: &EntityRecord, run_id: &str, now: &str) -> Optio
         created_at: now.to_owned(),
         updated_at: now.to_owned(),
     })
+}
+
+/// Core-emitted crash subcode (REQ-ANALYZE-06). Distinct from the crash-loop
+/// breaker subcode (`FINDING_DISABLED_CRASH_LOOP`): this fires per plugin crash,
+/// the breaker subcode fires once when the breaker trips.
+const INFRA_CRASH_RULE_ID: &str = "CLA-INFRA-PLUGIN-CRASH";
+
+/// Anchor entity id for project/plugin-level findings that are not file-scoped
+/// (plugin crash, OOM, protocol/ontology violations). `findings.entity_id` is
+/// NOT NULL + FK, and no project entity otherwise exists, so the run mints one
+/// synthetic `core:project:{name}` anchor (idempotent upsert) before persisting.
+fn project_anchor_id(project_root: &Path) -> String {
+    let name = project_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("root");
+    format!("core:project:{name}")
+}
+
+/// Idempotently mint the synthetic project anchor entity. Mirrors the secret-scan
+/// file anchor (`core:file:{path}`): `finding_anchor=true`, `plugin_id="core"`.
+async fn ensure_project_anchor(
+    writer: &Writer,
+    project_root: &Path,
+    started_at: &str,
+) -> Result<String> {
+    let id = project_anchor_id(project_root);
+    let name = project_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("root")
+        .to_owned();
+    let properties = serde_json::json!({ "finding_anchor": true }).to_string();
+    let record = EntityRecord {
+        id: id.clone(),
+        plugin_id: "core".to_owned(),
+        kind: "project".to_owned(),
+        name: name.clone(),
+        short_name: name,
+        parent_id: None,
+        source_file_id: None,
+        source_file_path: Some(project_root.display().to_string()),
+        source_byte_start: None,
+        source_byte_end: None,
+        source_line_start: None,
+        source_line_end: None,
+        properties_json: properties,
+        content_hash: None,
+        summary_json: None,
+        wardline_json: None,
+        first_seen_commit: None,
+        last_seen_commit: None,
+        created_at: started_at.to_owned(),
+        updated_at: started_at.to_owned(),
+    };
+    writer
+        .send_wait(|ack| WriterCmd::InsertEntity {
+            entity: Box::new(record),
+            ack,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("InsertEntity for project finding anchor {id}"))?;
+    Ok(id)
+}
+
+/// Map a host-layer subcode to an ADR-017 severity. Crash / kill / OOM are
+/// `ERROR` (the plugin or a file was lost); drop-and-continue diagnostics
+/// (malformed/undeclared/oversize) are `WARN`.
+fn infra_severity(subcode: &str) -> &'static str {
+    match subcode {
+        INFRA_CRASH_RULE_ID
+        | FINDING_DISABLED_CRASH_LOOP
+        | "CLA-INFRA-PLUGIN-OOM-KILLED"
+        | "CLA-INFRA-PLUGIN-DISABLED-PATH-ESCAPE" => "ERROR",
+        _ => "WARN",
+    }
+}
+
+/// Convert a collected [`HostFinding`] into a persistable [`FindingRecord`]
+/// anchored to `anchor_id` (REQ-ANALYZE-06). The id is deterministic
+/// (run + plugin + subcode + message digest) so `InsertFinding`'s upsert is
+/// idempotent across `--resume` re-walks and dedups identical diagnostics.
+fn host_finding_to_record(
+    hf: &HostFinding,
+    plugin_id: &str,
+    anchor_id: &str,
+    run_id: &str,
+    now: &str,
+) -> FindingRecord {
+    let discriminator =
+        blake3::hash(format!("{plugin_id}\u{0}{}\u{0}{}", hf.subcode, hf.message).as_bytes())
+            .to_hex();
+    let evidence = serde_json::json!({
+        "plugin_id": plugin_id,
+        "metadata": hf.metadata,
+    })
+    .to_string();
+    FindingRecord {
+        id: format!("core:finding:{run_id}:infra:{discriminator}"),
+        tool: "clarion".to_owned(),
+        tool_version: env!("CARGO_PKG_VERSION").to_owned(),
+        run_id: run_id.to_owned(),
+        rule_id: hf.subcode.to_owned(),
+        kind: "defect".to_owned(),
+        severity: infra_severity(hf.subcode).to_owned(),
+        confidence: Some(1.0),
+        confidence_basis: Some("host enforcement".to_owned()),
+        entity_id: anchor_id.to_owned(),
+        related_entities_json: "[]".to_owned(),
+        message: hf.message.clone(),
+        evidence_json: evidence,
+        properties_json: "{}".to_owned(),
+        supports_json: "[]".to_owned(),
+        supported_by_json: "[]".to_owned(),
+        created_at: now.to_owned(),
+        updated_at: now.to_owned(),
+    }
+}
+
+/// Build the `CLA-INFRA-PLUGIN-CRASH` finding for a plugin that crashed mid-run
+/// (REQ-ANALYZE-06). Anchored to the project entity; the crash reason is the
+/// evidence.
+fn crash_finding_record(
+    plugin_id: &str,
+    reason: &str,
+    anchor_id: &str,
+    run_id: &str,
+    now: &str,
+) -> FindingRecord {
+    let discriminator = blake3::hash(format!("{plugin_id}\u{0}{reason}").as_bytes()).to_hex();
+    FindingRecord {
+        id: format!("core:finding:{run_id}:crash:{discriminator}"),
+        tool: "clarion".to_owned(),
+        tool_version: env!("CARGO_PKG_VERSION").to_owned(),
+        run_id: run_id.to_owned(),
+        rule_id: INFRA_CRASH_RULE_ID.to_owned(),
+        kind: "defect".to_owned(),
+        severity: "ERROR".to_owned(),
+        confidence: Some(1.0),
+        confidence_basis: Some("host supervision".to_owned()),
+        entity_id: anchor_id.to_owned(),
+        related_entities_json: "[]".to_owned(),
+        message: format!("plugin {plugin_id} crashed mid-run: {reason}"),
+        evidence_json: serde_json::json!({ "plugin_id": plugin_id, "reason": reason }).to_string(),
+        properties_json: "{}".to_owned(),
+        supports_json: "[]".to_owned(),
+        supported_by_json: "[]".to_owned(),
+        created_at: now.to_owned(),
+        updated_at: now.to_owned(),
+    }
 }
 
 /// Load the MCP-side config (Filigree integration) from the same `clarion.yaml`
@@ -3464,6 +3661,46 @@ mod tests {
         assert!(syntax_error_finding(&plain, "run-1", "t").is_none());
         let malformed = entity_with_properties("python:module:pkg.bad", "not json");
         assert!(syntax_error_finding(&malformed, "run-1", "t").is_none());
+    }
+
+    #[test]
+    fn project_anchor_id_uses_dir_name() {
+        assert_eq!(
+            project_anchor_id(std::path::Path::new("/tmp/demo")),
+            "core:project:demo"
+        );
+    }
+
+    #[test]
+    fn infra_severity_escalates_crash_and_kill() {
+        assert_eq!(infra_severity(INFRA_CRASH_RULE_ID), "ERROR");
+        assert_eq!(infra_severity("CLA-INFRA-PLUGIN-OOM-KILLED"), "ERROR");
+        assert_eq!(infra_severity("CLA-INFRA-PLUGIN-MALFORMED-ENTITY"), "WARN");
+    }
+
+    #[test]
+    fn host_finding_to_record_anchors_and_carries_subcode() {
+        let hf = HostFinding {
+            subcode: "CLA-INFRA-PLUGIN-MALFORMED-ENTITY",
+            message: "entity failed to deserialise".to_owned(),
+            metadata: std::collections::BTreeMap::new(),
+        };
+        let rec = host_finding_to_record(&hf, "python", "core:project:demo", "run-1", "t");
+        assert_eq!(rec.rule_id, "CLA-INFRA-PLUGIN-MALFORMED-ENTITY");
+        assert_eq!(rec.entity_id, "core:project:demo");
+        assert_eq!(rec.severity, "WARN");
+        assert_eq!(rec.kind, "defect");
+        assert_eq!(rec.tool, "clarion");
+        assert!(rec.evidence_json.contains("python"));
+    }
+
+    #[test]
+    fn crash_finding_record_is_error_and_anchored_to_project() {
+        let rec = crash_finding_record("python", "boom", "core:project:demo", "run-1", "t");
+        assert_eq!(rec.rule_id, INFRA_CRASH_RULE_ID);
+        assert_eq!(rec.severity, "ERROR");
+        assert_eq!(rec.entity_id, "core:project:demo");
+        assert!(rec.message.contains("boom"));
     }
 
     fn from_import_edge(from_id: &str, to_id: &str, imported_name: &str) -> (String, EdgeRecord) {
