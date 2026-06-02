@@ -257,6 +257,11 @@ fn create(project_root: &Path, args: CreateArgs<'_>) -> Result<()> {
     // or the guidance stays inert until each entity's code changes. Re-fetch the
     // just-written sheet (cleaner than hand-rolling a `GuidanceSheet`) and
     // invalidate the entities it matches.
+    //
+    // Non-atomic: the sheet write is already committed above; an error here can
+    // leave a committed sheet alongside a stale cache row. Self-healing — a
+    // re-run, or the next cache-key rotation when the entity's code changes,
+    // clears it. Over-invalidation is safe; under-invalidation is the only bug.
     let invalidated = invalidate_matched_summaries(project_root, &conn, &id)?;
 
     println!("Created guidance sheet {id}");
@@ -335,6 +340,10 @@ fn edit(project_root: &Path, id: &str) -> Result<()> {
     // rule-editing path stays correct without a second visit here. The earlier
     // `sheet` snapshot carries the pre-edit rules; `id` re-fetches the post-edit
     // sheet.
+    //
+    // Non-atomic: the edited sheet is already committed above; an error here can
+    // leave it alongside a stale cache row. Self-healing on re-run / next
+    // cache-key rotation (same posture as `create`).
     let invalidated = invalidate_matched_summaries_union(project_root, &conn, &sheet, id)?;
 
     println!("Updated guidance sheet {id}");
@@ -343,10 +352,12 @@ fn edit(project_root: &Path, id: &str) -> Result<()> {
 }
 
 /// Invalidate the union of entities matched by `before` (a pre-edit snapshot)
-/// and by the sheet currently stored under `id`. Each matched entity's cache is
-/// deleted at most once (the storage helper's per-entity `DELETE` is idempotent,
-/// so a second pass over an already-cleared entity contributes 0), so the
-/// returned count is the true number of rows removed across the union.
+/// and by the sheet currently stored under `id`. The returned count is the true
+/// number of rows removed across the union, with no double-count: pass 1
+/// (`before`) deletes its matched rows, which removes those entities from pass 2's
+/// driving `SELECT DISTINCT entity_id FROM summary_cache`, so pass 2 never
+/// re-tests an already-cleared entity — only after-only entities remain for it
+/// to delete.
 fn invalidate_matched_summaries_union(
     project_root: &Path,
     conn: &Connection,
@@ -413,12 +424,9 @@ fn delete(project_root: &Path, id: &str) -> Result<()> {
     // dropped (the next query re-summarizes without the now-deleted guidance).
     // Deleting the guidance row never touches the matched code entities' own
     // rows, so post-deletion invalidation against the pre-deletion snapshot is
-    // correct.
-    let canonical_root = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
-    let invalidated =
-        invalidate_summaries_for_sheet(&conn, &sheet, &canonical_root).into_anyhow()?;
+    // correct. The helper canonicalizes `project_root` itself (for `path:`
+    // rules), so we pass the raw root, as `create`/`edit` do.
+    let invalidated = invalidate_summaries_for_sheet(&conn, &sheet, project_root).into_anyhow()?;
 
     println!("Deleted guidance sheet {id}");
     report_invalidation(invalidated);
