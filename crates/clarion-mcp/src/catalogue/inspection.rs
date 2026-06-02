@@ -15,7 +15,10 @@ use clarion_storage::{entity_by_id, get_taint_facts, sei_for_locator, subsystem_
 use crate::ParamError;
 use crate::ServerState;
 use crate::catalogue::{Page, missing_signal, paginate};
-use crate::{entity_json, flatten_storage_envelope_result, required_str, success_envelope, tool_error_envelope};
+use crate::{
+    entity_json, flatten_storage_envelope_result, required_str, success_envelope,
+    tool_error_envelope,
+};
 
 /// Bound on guidance sheets scanned per `guidance_for` call. Guidance is
 /// authored, low-cardinality institutional knowledge; this only guards a
@@ -324,7 +327,8 @@ fn guides_edge_sources(
     entity_id: &str,
 ) -> clarion_storage::Result<HashSet<String>> {
     let mut set = HashSet::new();
-    let mut stmt = conn.prepare("SELECT from_id FROM edges WHERE kind = 'guides' AND to_id = ?1")?;
+    let mut stmt =
+        conn.prepare("SELECT from_id FROM edges WHERE kind = 'guides' AND to_id = ?1")?;
     let mut rows = stmt.query(rusqlite::params![entity_id])?;
     while let Some(row) = rows.next()? {
         set.insert(row.get::<_, String>(0)?);
@@ -408,7 +412,10 @@ fn rule_match(rule: &Value, facts: &EntityFacts) -> RuleVerdict {
         return RuleVerdict::NoMatch;
     };
     match rule_type {
-        "path" => match (rule.get("pattern").and_then(Value::as_str), facts.rel_path.as_deref()) {
+        "path" => match (
+            rule.get("pattern").and_then(Value::as_str),
+            facts.rel_path.as_deref(),
+        ) {
             (Some(pattern), Some(path)) if super::glob_match(pattern, path) => {
                 RuleVerdict::Matched("path")
             }
@@ -422,7 +429,10 @@ fn rule_match(rule: &Value, facts: &EntityFacts) -> RuleVerdict {
             Some(value) if value == facts.kind => RuleVerdict::Matched("kind"),
             _ => RuleVerdict::NoMatch,
         },
-        "subsystem" => match (rule.get("id").and_then(Value::as_str), facts.subsystem_id.as_deref()) {
+        "subsystem" => match (
+            rule.get("id").and_then(Value::as_str),
+            facts.subsystem_id.as_deref(),
+        ) {
             (Some(id), Some(sub)) if id == sub => RuleVerdict::Matched("subsystem"),
             _ => RuleVerdict::NoMatch,
         },
@@ -443,9 +453,7 @@ struct FindingFilter {
 }
 
 impl FindingFilter {
-    fn parse(
-        arguments: &serde_json::Map<String, Value>,
-    ) -> std::result::Result<Self, ParamError> {
+    fn parse(arguments: &serde_json::Map<String, Value>) -> std::result::Result<Self, ParamError> {
         let Some(filter) = arguments.get("filter") else {
             return Ok(Self {
                 kind: None,
@@ -472,7 +480,10 @@ impl FindingFilter {
 
     fn matches(&self, finding: &FindingRow) -> bool {
         self.kind.as_ref().is_none_or(|k| *k == finding.kind)
-            && self.severity.as_ref().is_none_or(|s| *s == finding.severity)
+            && self
+                .severity
+                .as_ref()
+                .is_none_or(|s| *s == finding.severity)
             && self.status.as_ref().is_none_or(|s| *s == finding.status)
     }
 

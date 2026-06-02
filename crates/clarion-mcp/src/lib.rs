@@ -438,9 +438,15 @@ fn scope_page_schema(with_since: bool) -> Value {
         "limit".to_owned(),
         json!({"type": "integer", "minimum": 1, "maximum": 200}),
     );
-    properties.insert("offset".to_owned(), json!({"type": "integer", "minimum": 0}));
+    properties.insert(
+        "offset".to_owned(),
+        json!({"type": "integer", "minimum": 0}),
+    );
     if with_since {
-        properties.insert("since".to_owned(), json!({"type": "string", "minLength": 1}));
+        properties.insert(
+            "since".to_owned(),
+            json!({"type": "string", "minLength": 1}),
+        );
     }
     json!({
         "type": "object",
@@ -474,7 +480,10 @@ fn scope_facet_schema(facets: &[(&str, bool)]) -> Value {
         "limit".to_owned(),
         json!({"type": "integer", "minimum": 1, "maximum": 200}),
     );
-    properties.insert("offset".to_owned(), json!({"type": "integer", "minimum": 0}));
+    properties.insert(
+        "offset".to_owned(),
+        json!({"type": "integer", "minimum": 0}),
+    );
     json!({
         "type": "object",
         "properties": Value::Object(properties),

@@ -97,18 +97,18 @@ impl ServerState {
             .readers
             .with_reader(move |conn| {
                 let filter = scope.resolve(conn)?;
-                let (candidates, scan_truncated) = match entities_by_kind(conn, &kind, FACET_SCAN_CAP)
-                {
-                    Ok(found) => found,
-                    Err(clarion_storage::StorageError::InvalidQuery(message)) => {
-                        return Ok(crate::tool_error_envelope(
-                            McpErrorCode::InvalidPath,
-                            &message,
-                            false,
-                        ));
-                    }
-                    Err(err) => return Err(err),
-                };
+                let (candidates, scan_truncated) =
+                    match entities_by_kind(conn, &kind, FACET_SCAN_CAP) {
+                        Ok(found) => found,
+                        Err(clarion_storage::StorageError::InvalidQuery(message)) => {
+                            return Ok(crate::tool_error_envelope(
+                                McpErrorCode::InvalidPath,
+                                &message,
+                                false,
+                            ));
+                        }
+                        Err(err) => return Err(err),
+                    };
                 let mut response = finalize_entity_page(
                     conn,
                     &project_root,
@@ -160,7 +160,9 @@ impl ServerState {
 
                 let matched: Vec<(EntityRow, Value)> = candidates
                     .into_iter()
-                    .filter(|e| filter.contains(&e.id, e.source_file_path.as_deref(), &project_root))
+                    .filter(|e| {
+                        filter.contains(&e.id, e.source_file_path.as_deref(), &project_root)
+                    })
                     .filter_map(|e| {
                         let blob = blobs.get(&e.id).cloned().unwrap_or(Value::Null);
                         if facet_matches(&blob, "tier", tier.as_ref())

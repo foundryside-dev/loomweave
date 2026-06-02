@@ -109,7 +109,10 @@ pub(crate) fn finalize_entity_page(
         .collect();
     let returned_count = returned.len();
     let truncated = page.offset.saturating_add(returned_count) < total;
-    let entities: Vec<Value> = returned.iter().map(|e| crate::entity_json(conn, e)).collect();
+    let entities: Vec<Value> = returned
+        .iter()
+        .map(|e| crate::entity_json(conn, e))
+        .collect();
     json!({
         "entities": entities,
         "page": {
@@ -256,7 +259,10 @@ pub(crate) enum ScopeFilter {
     Project,
     /// Only entities whose id is in this set (an entity scope: the anchor plus
     /// its descendants). `truncated` is true when the descendant cap was hit.
-    Ids { ids: HashSet<String>, truncated: bool },
+    Ids {
+        ids: HashSet<String>,
+        truncated: bool,
+    },
     /// Only entities whose source path matches this glob (relative to the
     /// project root, falling back to the absolute path).
     Path { pattern: String },
@@ -286,7 +292,13 @@ impl ScopeFilter {
 
     /// Whether descendant resolution truncated (entity scope only).
     pub(crate) fn scope_truncated(&self) -> bool {
-        matches!(self, ScopeFilter::Ids { truncated: true, .. })
+        matches!(
+            self,
+            ScopeFilter::Ids {
+                truncated: true,
+                ..
+            }
+        )
     }
 
     /// Materialise the set of in-scope entity ids for graph tools that work on
@@ -302,7 +314,8 @@ impl ScopeFilter {
             ScopeFilter::Project => Ok((None, false)),
             ScopeFilter::Ids { ids, truncated } => Ok((Some(ids.clone()), *truncated)),
             ScopeFilter::Path { pattern } => {
-                let limit = i64::try_from(SCOPE_DESCENDANT_CAP.saturating_add(1)).unwrap_or(i64::MAX);
+                let limit =
+                    i64::try_from(SCOPE_DESCENDANT_CAP.saturating_add(1)).unwrap_or(i64::MAX);
                 let mut stmt = conn.prepare(
                     "SELECT id, source_file_path FROM entities \
                      WHERE source_file_path IS NOT NULL ORDER BY id LIMIT ?1",
@@ -388,13 +401,25 @@ mod tests {
     #[test]
     fn paginate_reports_total_and_truncation() {
         let rows: Vec<i32> = (0..10).collect();
-        let (slice, meta) = paginate(&rows, Page { limit: 3, offset: 0 });
+        let (slice, meta) = paginate(
+            &rows,
+            Page {
+                limit: 3,
+                offset: 0,
+            },
+        );
         assert_eq!(slice, vec![0, 1, 2]);
         assert_eq!(meta["total"], 10);
         assert_eq!(meta["truncated"], true);
         assert_eq!(meta["returned"], 3);
 
-        let (slice, meta) = paginate(&rows, Page { limit: 5, offset: 8 });
+        let (slice, meta) = paginate(
+            &rows,
+            Page {
+                limit: 5,
+                offset: 8,
+            },
+        );
         assert_eq!(slice, vec![8, 9]);
         assert_eq!(meta["truncated"], false);
         assert_eq!(meta["returned"], 2);

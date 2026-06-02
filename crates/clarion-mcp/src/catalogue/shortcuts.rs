@@ -189,11 +189,7 @@ impl ServerState {
                     .map(|(id, (fan_in, fan_out))| (id, fan_in, fan_out))
                     .collect();
                 // Rank by total coupling desc, ties by id for determinism.
-                ranked.sort_by(|a, b| {
-                    (b.1 + b.2)
-                        .cmp(&(a.1 + a.2))
-                        .then_with(|| a.0.cmp(&b.0))
-                });
+                ranked.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)).then_with(|| a.0.cmp(&b.0)));
 
                 let total = ranked.len();
                 let returned: Vec<(String, i64, i64)> = ranked
@@ -448,8 +444,14 @@ impl ServerState {
                 let churn_by_id: std::collections::HashMap<String, i64> =
                     rows.iter().map(|(e, c)| (e.id.clone(), *c)).collect();
                 let entities: Vec<_> = rows.into_iter().map(|(e, _)| e).collect();
-                let mut response =
-                    finalize_entity_page(conn, &project_root, entities, &filter, page, scan_truncated);
+                let mut response = finalize_entity_page(
+                    conn,
+                    &project_root,
+                    entities,
+                    &filter,
+                    page,
+                    scan_truncated,
+                );
                 if let Some(list) = response["entities"].as_array() {
                     let grafted: Vec<Value> = list
                         .iter()

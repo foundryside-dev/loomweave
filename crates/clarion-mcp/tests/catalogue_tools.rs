@@ -21,10 +21,17 @@ fn open_project() -> (tempfile::TempDir, std::path::PathBuf, Connection) {
 
 fn state_for(project_root: &std::path::Path, db_path: &std::path::Path) -> ServerState {
     let pool = ReaderPool::open(db_path, 2).expect("reader pool");
-    ServerState::new(project_root.to_path_buf(), pool).with_clock(|| "2026-06-02T00:00:00.000Z".to_owned())
+    ServerState::new(project_root.to_path_buf(), pool)
+        .with_clock(|| "2026-06-02T00:00:00.000Z".to_owned())
 }
 
-fn insert_entity(conn: &Connection, id: &str, kind: &str, source_path: &str, range: Option<(i64, i64)>) {
+fn insert_entity(
+    conn: &Connection,
+    id: &str,
+    kind: &str,
+    source_path: &str,
+    range: Option<(i64, i64)>,
+) {
     conn.execute(
         "INSERT INTO entities (id, plugin_id, kind, name, short_name, source_file_path, \
             source_line_start, source_line_end, properties, content_hash, created_at, updated_at) \
@@ -43,7 +50,14 @@ fn insert_guidance(conn: &Connection, id: &str, properties_json: &str) {
     .expect("insert guidance");
 }
 
-fn insert_finding(conn: &Connection, id: &str, entity_id: &str, kind: &str, severity: &str, status: &str) {
+fn insert_finding(
+    conn: &Connection,
+    id: &str,
+    entity_id: &str,
+    kind: &str,
+    severity: &str,
+    status: &str,
+) {
     // A run row is required by the findings.run_id FK.
     conn.execute(
         "INSERT OR IGNORE INTO runs (id, started_at, config, stats, status) \
@@ -124,8 +138,18 @@ fn tools_list_includes_ws5_inspection_tools() {
 #[tokio::test]
 async fn wardline_for_returns_verbatim_blob_when_present() {
     let (project, db, conn) = open_project();
-    insert_entity(&conn, "python:function:m.f", "function", "m.py", Some((1, 2)));
-    insert_taint_fact(&conn, "python:function:m.f", r#"{"taint":"tainted","sources":["request.body"]}"#);
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
+    insert_taint_fact(
+        &conn,
+        "python:function:m.f",
+        r#"{"taint":"tainted","sources":["request.body"]}"#,
+    );
     drop(conn);
     let state = state_for(project.path(), &db);
 
@@ -138,7 +162,13 @@ async fn wardline_for_returns_verbatim_blob_when_present() {
 #[tokio::test]
 async fn wardline_for_is_honest_empty_when_no_fact() {
     let (project, db, conn) = open_project();
-    insert_entity(&conn, "python:function:m.f", "function", "m.py", Some((1, 2)));
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
     drop(conn);
     let state = state_for(project.path(), &db);
 
@@ -153,7 +183,12 @@ async fn wardline_for_is_honest_empty_when_no_fact() {
 async fn wardline_for_unknown_entity_errors() {
     let (project, db, _conn) = open_project();
     let state = state_for(project.path(), &db);
-    let env = call_tool(&state, "wardline_for", json!({"id": "python:function:nope"})).await;
+    let env = call_tool(
+        &state,
+        "wardline_for",
+        json!({"id": "python:function:nope"}),
+    )
+    .await;
     assert_eq!(env["ok"], false, "{env}");
     assert_eq!(env["error"]["code"], "entity-not-found");
 }
@@ -163,7 +198,13 @@ async fn wardline_for_unknown_entity_errors() {
 #[tokio::test]
 async fn entity_sei_is_null_without_binding_and_populated_with_one() {
     let (project, db, conn) = open_project();
-    insert_entity(&conn, "python:function:m.f", "function", "m.py", Some((1, 2)));
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
     drop(conn);
     let state = state_for(project.path(), &db);
 
@@ -176,7 +217,10 @@ async fn entity_sei_is_null_without_binding_and_populated_with_one() {
     insert_alive_sei(&conn, "clarion:eid:deadbeef", "python:function:m.f");
     drop(conn);
     let env = call_tool(&state, "wardline_for", json!({"id": "python:function:m.f"})).await;
-    assert_eq!(env["result"]["entity"]["sei"], "clarion:eid:deadbeef", "{env}");
+    assert_eq!(
+        env["result"]["entity"]["sei"], "clarion:eid:deadbeef",
+        "{env}"
+    );
 }
 
 // ---- findings_for -------------------------------------------------------
@@ -184,9 +228,29 @@ async fn entity_sei_is_null_without_binding_and_populated_with_one() {
 #[tokio::test]
 async fn findings_for_returns_anchored_findings_and_filters() {
     let (project, db, conn) = open_project();
-    insert_entity(&conn, "python:function:m.f", "function", "m.py", Some((1, 2)));
-    insert_finding(&conn, "f-open", "python:function:m.f", "defect", "WARN", "open");
-    insert_finding(&conn, "f-supp", "python:function:m.f", "defect", "ERROR", "suppressed");
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
+    insert_finding(
+        &conn,
+        "f-open",
+        "python:function:m.f",
+        "defect",
+        "WARN",
+        "open",
+    );
+    insert_finding(
+        &conn,
+        "f-supp",
+        "python:function:m.f",
+        "defect",
+        "ERROR",
+        "suppressed",
+    );
     drop(conn);
     let state = state_for(project.path(), &db);
 
@@ -207,9 +271,22 @@ async fn findings_for_returns_anchored_findings_and_filters() {
 #[tokio::test]
 async fn findings_for_paginates_with_total_and_truncated() {
     let (project, db, conn) = open_project();
-    insert_entity(&conn, "python:function:m.f", "function", "m.py", Some((1, 2)));
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
     for i in 0..5 {
-        insert_finding(&conn, &format!("f-{i}"), "python:function:m.f", "defect", "WARN", "open");
+        insert_finding(
+            &conn,
+            &format!("f-{i}"),
+            "python:function:m.f",
+            "defect",
+            "WARN",
+            "open",
+        );
     }
     drop(conn);
     let state = state_for(project.path(), &db);
@@ -229,7 +306,13 @@ async fn findings_for_paginates_with_total_and_truncated() {
 #[tokio::test]
 async fn findings_for_empty_entity_is_not_an_error() {
     let (project, db, conn) = open_project();
-    insert_entity(&conn, "python:function:m.f", "function", "m.py", Some((1, 2)));
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
     drop(conn);
     let state = state_for(project.path(), &db);
     let env = call_tool(&state, "findings_for", json!({"id": "python:function:m.f"})).await;
@@ -292,7 +375,13 @@ async fn guidance_for_composes_path_matched_sheets_ranked() {
 #[tokio::test]
 async fn guidance_for_excludes_expired_sheets() {
     let (project, db, conn) = open_project();
-    insert_entity(&conn, "python:function:m.f", "function", "m.py", Some((1, 2)));
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
     insert_guidance(
         &conn,
         "core:guidance:stale",
@@ -303,13 +392,23 @@ async fn guidance_for_excludes_expired_sheets() {
     // clock is 2026-06-02, after the expiry
     let state = state_for(project.path(), &db);
     let env = call_tool(&state, "guidance_for", json!({"id": "python:function:m.f"})).await;
-    assert_eq!(env["result"]["guidance"].as_array().unwrap().len(), 0, "{env}");
+    assert_eq!(
+        env["result"]["guidance"].as_array().unwrap().len(),
+        0,
+        "{env}"
+    );
 }
 
 #[tokio::test]
 async fn guidance_for_honest_empty_when_no_sheet_matches() {
     let (project, db, conn) = open_project();
-    insert_entity(&conn, "python:function:m.f", "function", "m.py", Some((1, 2)));
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
     drop(conn);
     let state = state_for(project.path(), &db);
     let env = call_tool(&state, "guidance_for", json!({"id": "python:function:m.f"})).await;
@@ -320,7 +419,13 @@ async fn guidance_for_honest_empty_when_no_sheet_matches() {
 #[tokio::test]
 async fn guidance_for_reports_unevaluable_wardline_group_rule() {
     let (project, db, conn) = open_project();
-    insert_entity(&conn, "python:function:m.f", "function", "m.py", Some((1, 2)));
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
     insert_guidance(
         &conn,
         "core:guidance:wl",
@@ -331,7 +436,11 @@ async fn guidance_for_reports_unevaluable_wardline_group_rule() {
     let state = state_for(project.path(), &db);
     let env = call_tool(&state, "guidance_for", json!({"id": "python:function:m.f"})).await;
     // The wardline_group rule cannot match here -> sheet not applied, note surfaced.
-    assert_eq!(env["result"]["guidance"].as_array().unwrap().len(), 0, "{env}");
+    assert_eq!(
+        env["result"]["guidance"].as_array().unwrap().len(),
+        0,
+        "{env}"
+    );
     assert_eq!(env["result"]["notes"][0]["signal"], "wardline_group");
 }
 
@@ -351,7 +460,10 @@ async fn find_by_kind_returns_matching_entities_with_sei_field() {
     assert_eq!(env["result"]["page"]["total"], 2);
     let ents = env["result"]["entities"].as_array().unwrap();
     assert_eq!(ents.len(), 2);
-    assert!(ents[0].get("sei").is_some(), "entity rows must carry sei: {env}");
+    assert!(
+        ents[0].get("sei").is_some(),
+        "entity rows must carry sei: {env}"
+    );
 }
 
 #[tokio::test]
@@ -369,11 +481,22 @@ async fn find_by_kind_unknown_kind_is_empty_not_error() {
 async fn find_by_kind_paginates_with_total_and_truncated() {
     let (project, db, conn) = open_project();
     for i in 0..5 {
-        insert_entity(&conn, &format!("python:function:f{i}"), "function", "m.py", Some((1, 2)));
+        insert_entity(
+            &conn,
+            &format!("python:function:f{i}"),
+            "function",
+            "m.py",
+            Some((1, 2)),
+        );
     }
     drop(conn);
     let state = state_for(project.path(), &db);
-    let env = call_tool(&state, "find_by_kind", json!({"kind": "function", "limit": 2})).await;
+    let env = call_tool(
+        &state,
+        "find_by_kind",
+        json!({"kind": "function", "limit": 2}),
+    )
+    .await;
     assert_eq!(env["result"]["page"]["total"], 5, "{env}");
     assert_eq!(env["result"]["page"]["returned"], 2);
     assert_eq!(env["result"]["page"]["truncated"], true);
@@ -409,8 +532,20 @@ async fn find_by_kind_path_glob_scope_filters_by_source_path() {
     let (project, db, conn) = open_project();
     let auth = project.path().join("src/auth/tokens.py");
     let billing = project.path().join("src/billing/ledger.py");
-    insert_entity(&conn, "python:function:auth.f", "function", auth.to_str().unwrap(), Some((1, 2)));
-    insert_entity(&conn, "python:function:billing.f", "function", billing.to_str().unwrap(), Some((1, 2)));
+    insert_entity(
+        &conn,
+        "python:function:auth.f",
+        "function",
+        auth.to_str().unwrap(),
+        Some((1, 2)),
+    );
+    insert_entity(
+        &conn,
+        "python:function:billing.f",
+        "function",
+        billing.to_str().unwrap(),
+        Some((1, 2)),
+    );
     drop(conn);
     let state = state_for(project.path(), &db);
     let env = call_tool(
@@ -427,8 +562,20 @@ async fn find_by_kind_path_glob_scope_filters_by_source_path() {
 async fn find_by_kind_entity_scope_filters_to_descendants() {
     let (project, db, conn) = open_project();
     insert_entity(&conn, "python:module:m", "module", "m.py", Some((1, 20)));
-    insert_entity(&conn, "python:function:m.inner", "function", "m.py", Some((2, 3)));
-    insert_entity(&conn, "python:function:other", "function", "o.py", Some((1, 2)));
+    insert_entity(
+        &conn,
+        "python:function:m.inner",
+        "function",
+        "m.py",
+        Some((2, 3)),
+    );
+    insert_entity(
+        &conn,
+        "python:function:other",
+        "function",
+        "o.py",
+        Some((1, 2)),
+    );
     insert_contains_edge(&conn, "python:module:m", "python:function:m.inner");
     drop(conn);
     let state = state_for(project.path(), &db);
@@ -439,7 +586,10 @@ async fn find_by_kind_entity_scope_filters_to_descendants() {
     )
     .await;
     assert_eq!(env["result"]["page"]["total"], 1, "{env}");
-    assert_eq!(env["result"]["entities"][0]["id"], "python:function:m.inner");
+    assert_eq!(
+        env["result"]["entities"][0]["id"],
+        "python:function:m.inner"
+    );
 }
 
 #[tokio::test]
@@ -448,7 +598,11 @@ async fn find_by_wardline_filters_by_tier_best_effort() {
     insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
     insert_entity(&conn, "python:function:b", "function", "b.py", Some((1, 2)));
     insert_taint_fact(&conn, "python:function:a", r#"{"tier":"exact","group":2}"#);
-    insert_taint_fact(&conn, "python:function:b", r#"{"tier":"heuristic","group":1}"#);
+    insert_taint_fact(
+        &conn,
+        "python:function:b",
+        r#"{"tier":"heuristic","group":1}"#,
+    );
     drop(conn);
     let state = state_for(project.path(), &db);
 
@@ -493,9 +647,27 @@ async fn find_circular_imports_detects_a_cycle() {
     insert_entity(&conn, "python:module:a", "module", "a.py", Some((1, 5)));
     insert_entity(&conn, "python:module:b", "module", "b.py", Some((1, 5)));
     insert_entity(&conn, "python:module:c", "module", "c.py", Some((1, 5)));
-    insert_edge(&conn, "imports", "python:module:a", "python:module:b", "resolved");
-    insert_edge(&conn, "imports", "python:module:b", "python:module:a", "resolved");
-    insert_edge(&conn, "imports", "python:module:b", "python:module:c", "resolved");
+    insert_edge(
+        &conn,
+        "imports",
+        "python:module:a",
+        "python:module:b",
+        "resolved",
+    );
+    insert_edge(
+        &conn,
+        "imports",
+        "python:module:b",
+        "python:module:a",
+        "resolved",
+    );
+    insert_edge(
+        &conn,
+        "imports",
+        "python:module:b",
+        "python:module:c",
+        "resolved",
+    );
     drop(conn);
     let state = state_for(project.path(), &db);
 
@@ -505,7 +677,11 @@ async fn find_circular_imports_detects_a_cycle() {
     assert_eq!(env["result"]["cycles"][0]["length"], 2);
     assert_eq!(env["result"]["confidence"], "resolved");
     // members carry sei
-    assert!(env["result"]["cycles"][0]["members"][0].get("sei").is_some());
+    assert!(
+        env["result"]["cycles"][0]["members"][0]
+            .get("sei")
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -513,7 +689,13 @@ async fn find_circular_imports_empty_on_a_dag() {
     let (project, db, conn) = open_project();
     insert_entity(&conn, "python:module:a", "module", "a.py", Some((1, 5)));
     insert_entity(&conn, "python:module:b", "module", "b.py", Some((1, 5)));
-    insert_edge(&conn, "imports", "python:module:a", "python:module:b", "resolved");
+    insert_edge(
+        &conn,
+        "imports",
+        "python:module:a",
+        "python:module:b",
+        "resolved",
+    );
     drop(conn);
     let state = state_for(project.path(), &db);
     let env = call_tool(&state, "find_circular_imports", json!({})).await;
@@ -525,8 +707,20 @@ async fn find_circular_imports_default_confidence_excludes_inferred() {
     let (project, db, conn) = open_project();
     insert_entity(&conn, "python:module:a", "module", "a.py", Some((1, 5)));
     insert_entity(&conn, "python:module:b", "module", "b.py", Some((1, 5)));
-    insert_edge(&conn, "imports", "python:module:a", "python:module:b", "resolved");
-    insert_edge(&conn, "imports", "python:module:b", "python:module:a", "inferred");
+    insert_edge(
+        &conn,
+        "imports",
+        "python:module:a",
+        "python:module:b",
+        "resolved",
+    );
+    insert_edge(
+        &conn,
+        "imports",
+        "python:module:b",
+        "python:module:a",
+        "inferred",
+    );
     drop(conn);
     let state = state_for(project.path(), &db);
 
@@ -535,7 +729,12 @@ async fn find_circular_imports_default_confidence_excludes_inferred() {
     assert_eq!(env["result"]["page"]["total"], 0, "{env}");
 
     // requesting inferred includes it -> cycle appears.
-    let env = call_tool(&state, "find_circular_imports", json!({"confidence": "inferred"})).await;
+    let env = call_tool(
+        &state,
+        "find_circular_imports",
+        json!({"confidence": "inferred"}),
+    )
+    .await;
     assert_eq!(env["result"]["page"]["total"], 1, "{env}");
     assert_eq!(env["result"]["confidence"], "inferred");
 }
@@ -544,13 +743,43 @@ async fn find_circular_imports_default_confidence_excludes_inferred() {
 async fn find_coupling_hotspots_ranks_by_fan_in_plus_out() {
     let (project, db, conn) = open_project();
     for id in ["hub", "a", "b", "c"] {
-        insert_entity(&conn, &format!("python:function:{id}"), "function", "m.py", Some((1, 2)));
+        insert_entity(
+            &conn,
+            &format!("python:function:{id}"),
+            "function",
+            "m.py",
+            Some((1, 2)),
+        );
     }
     // hub is called by a, b, c and calls a -> fan_in 3, fan_out 1, coupling 4.
-    insert_edge(&conn, "calls", "python:function:a", "python:function:hub", "resolved");
-    insert_edge(&conn, "calls", "python:function:b", "python:function:hub", "resolved");
-    insert_edge(&conn, "calls", "python:function:c", "python:function:hub", "resolved");
-    insert_edge(&conn, "calls", "python:function:hub", "python:function:a", "resolved");
+    insert_edge(
+        &conn,
+        "calls",
+        "python:function:a",
+        "python:function:hub",
+        "resolved",
+    );
+    insert_edge(
+        &conn,
+        "calls",
+        "python:function:b",
+        "python:function:hub",
+        "resolved",
+    );
+    insert_edge(
+        &conn,
+        "calls",
+        "python:function:c",
+        "python:function:hub",
+        "resolved",
+    );
+    insert_edge(
+        &conn,
+        "calls",
+        "python:function:hub",
+        "python:function:a",
+        "resolved",
+    );
     drop(conn);
     let state = state_for(project.path(), &db);
 
@@ -569,16 +798,42 @@ async fn find_coupling_hotspots_respects_limit_and_scope() {
     let (project, db, conn) = open_project();
     let auth = project.path().join("src/auth/a.py");
     let other = project.path().join("src/other/b.py");
-    insert_entity(&conn, "python:function:auth.a", "function", auth.to_str().unwrap(), Some((1, 2)));
-    insert_entity(&conn, "python:function:other.b", "function", other.to_str().unwrap(), Some((1, 2)));
-    insert_edge(&conn, "calls", "python:function:auth.a", "python:function:other.b", "resolved");
+    insert_entity(
+        &conn,
+        "python:function:auth.a",
+        "function",
+        auth.to_str().unwrap(),
+        Some((1, 2)),
+    );
+    insert_entity(
+        &conn,
+        "python:function:other.b",
+        "function",
+        other.to_str().unwrap(),
+        Some((1, 2)),
+    );
+    insert_edge(
+        &conn,
+        "calls",
+        "python:function:auth.a",
+        "python:function:other.b",
+        "resolved",
+    );
     drop(conn);
     let state = state_for(project.path(), &db);
 
     // Scope to src/auth/** -> only auth.a is in scope (fan_out 1).
-    let env = call_tool(&state, "find_coupling_hotspots", json!({"scope": "src/auth/**"})).await;
+    let env = call_tool(
+        &state,
+        "find_coupling_hotspots",
+        json!({"scope": "src/auth/**"}),
+    )
+    .await;
     assert_eq!(env["result"]["page"]["total"], 1, "{env}");
-    assert_eq!(env["result"]["hotspots"][0]["entity"]["id"], "python:function:auth.a");
+    assert_eq!(
+        env["result"]["hotspots"][0]["entity"]["id"],
+        "python:function:auth.a"
+    );
 }
 
 // ---- categorisation / churn shortcuts (honest-empty) --------------------
@@ -611,24 +866,56 @@ async fn find_tests_lights_up_when_test_tag_is_present() {
     // The query is real: if a plugin ever emits the `test` tag, the tool returns
     // results (this proves it is not a hardcoded empty).
     let (project, db, conn) = open_project();
-    insert_entity(&conn, "python:function:test_login", "function", "t.py", Some((1, 2)));
+    insert_entity(
+        &conn,
+        "python:function:test_login",
+        "function",
+        "t.py",
+        Some((1, 2)),
+    );
     insert_tag(&conn, "python:function:test_login", "test");
     drop(conn);
     let state = state_for(project.path(), &db);
     let env = call_tool(&state, "find_tests", json!({})).await;
     assert_eq!(env["result"]["page"]["total"], 1, "{env}");
-    assert_eq!(env["result"]["entities"][0]["id"], "python:function:test_login");
+    assert_eq!(
+        env["result"]["entities"][0]["id"],
+        "python:function:test_login"
+    );
 }
 
 #[tokio::test]
 async fn what_tests_this_is_honest_empty_without_test_tags() {
     let (project, db, conn) = open_project();
-    insert_entity(&conn, "python:function:target", "function", "m.py", Some((1, 2)));
-    insert_entity(&conn, "python:function:caller", "function", "m.py", Some((3, 4)));
-    insert_edge(&conn, "calls", "python:function:caller", "python:function:target", "resolved");
+    insert_entity(
+        &conn,
+        "python:function:target",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
+    insert_entity(
+        &conn,
+        "python:function:caller",
+        "function",
+        "m.py",
+        Some((3, 4)),
+    );
+    insert_edge(
+        &conn,
+        "calls",
+        "python:function:caller",
+        "python:function:target",
+        "resolved",
+    );
     drop(conn);
     let state = state_for(project.path(), &db);
-    let env = call_tool(&state, "what_tests_this", json!({"id": "python:function:target"})).await;
+    let env = call_tool(
+        &state,
+        "what_tests_this",
+        json!({"id": "python:function:target"}),
+    )
+    .await;
     assert_eq!(env["ok"], true, "{env}");
     assert_eq!(env["result"]["page"]["total"], 0);
     assert_eq!(env["result"]["signal"]["available"], false);
@@ -637,15 +924,41 @@ async fn what_tests_this_is_honest_empty_without_test_tags() {
 #[tokio::test]
 async fn what_tests_this_returns_test_tagged_callers() {
     let (project, db, conn) = open_project();
-    insert_entity(&conn, "python:function:target", "function", "m.py", Some((1, 2)));
-    insert_entity(&conn, "python:function:test_target", "function", "t.py", Some((1, 2)));
-    insert_edge(&conn, "calls", "python:function:test_target", "python:function:target", "resolved");
+    insert_entity(
+        &conn,
+        "python:function:target",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
+    insert_entity(
+        &conn,
+        "python:function:test_target",
+        "function",
+        "t.py",
+        Some((1, 2)),
+    );
+    insert_edge(
+        &conn,
+        "calls",
+        "python:function:test_target",
+        "python:function:target",
+        "resolved",
+    );
     insert_tag(&conn, "python:function:test_target", "test");
     drop(conn);
     let state = state_for(project.path(), &db);
-    let env = call_tool(&state, "what_tests_this", json!({"id": "python:function:target"})).await;
+    let env = call_tool(
+        &state,
+        "what_tests_this",
+        json!({"id": "python:function:target"}),
+    )
+    .await;
     assert_eq!(env["result"]["page"]["total"], 1, "{env}");
-    assert_eq!(env["result"]["tests"][0]["id"], "python:function:test_target");
+    assert_eq!(
+        env["result"]["tests"][0]["id"],
+        "python:function:test_target"
+    );
 }
 
 #[tokio::test]
@@ -654,7 +967,12 @@ async fn recently_changed_is_honest_noop() {
     insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
     drop(conn);
     let state = state_for(project.path(), &db);
-    let env = call_tool(&state, "recently_changed", json!({"since": "2026-01-01T00:00:00Z"})).await;
+    let env = call_tool(
+        &state,
+        "recently_changed",
+        json!({"since": "2026-01-01T00:00:00Z"}),
+    )
+    .await;
     assert_eq!(env["ok"], true, "{env}");
     assert_eq!(env["result"]["page"]["total"], 0);
     assert_eq!(env["result"]["signal"]["signal"], "git_change_time");
