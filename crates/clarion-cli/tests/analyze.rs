@@ -1227,6 +1227,330 @@ fn analyze_emits_guidance_orphan_and_invalidates_summary_cache_on_deletion() {
     );
 }
 
+/// T4a (WS6): a guidance sheet whose `match_rules` carries `{"type":"entity","id":X}`
+/// pointing at a deleted entity also produces `CLA-FACT-GUIDANCE-ORPHAN`. When the
+/// SAME deleted target is reachable via BOTH a `guides` edge and a `match_rule`, only
+/// one finding is emitted for that (sheet, target) pair (idempotent run-scoped id).
+#[cfg(unix)]
+#[test]
+fn analyze_emits_guidance_orphan_for_match_rule_entity_and_dedupes() {
+    let (project_dir, plugin_dir, config_path) =
+        phase3_project_for_rerun(&["auth_a", "auth_b", "billing_a", "billing_b"]);
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let db_path = project_dir.path().join(".clarion/clarion.db");
+    let target = "phase3fixture:module:billing_a";
+
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        // g_match: orphans `target` via a match_rule {type:entity, id:target} only.
+        let props = serde_json::json!({
+            "match_rules": [{ "type": "entity", "id": target }],
+            "authored_at": "2026-01-01T00:00:00.000Z",
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO entities \
+             (id, plugin_id, kind, name, short_name, properties, created_at, updated_at) \
+             VALUES ('core:guidance:g_match', 'core', 'guidance', 'g_match', 'g_match', ?1, \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [&props],
+        )
+        .unwrap();
+        // g_both: orphans `target` via a `guides` edge AND a match_rule → one finding.
+        conn.execute(
+            "INSERT INTO entities \
+             (id, plugin_id, kind, name, short_name, properties, created_at, updated_at) \
+             VALUES ('core:guidance:g_both', 'core', 'guidance', 'g_both', 'g_both', ?1, \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [&props],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edges (kind, from_id, to_id, confidence) \
+             VALUES ('guides', 'core:guidance:g_both', ?1, 'resolved')",
+            [target],
+        )
+        .unwrap();
+    }
+
+    std::fs::remove_file(project_dir.path().join("billing_a.p3")).expect("delete a source file");
+    run_phase3_analyze(
+        project_dir.path(),
+        std::path::Path::new(&config_path),
+        &plugin_path,
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    // g_match emits exactly one orphan finding for target.
+    let match_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM findings \
+             WHERE rule_id = 'CLA-FACT-GUIDANCE-ORPHAN' AND entity_id = 'core:guidance:g_match'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(match_count, 1, "match_rule entity orphan should emit");
+
+    // g_both: guides-edge + match_rule to the same target ⇒ exactly one finding.
+    let both_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM findings \
+             WHERE rule_id = 'CLA-FACT-GUIDANCE-ORPHAN' AND entity_id = 'core:guidance:g_both'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        both_count, 1,
+        "guides-edge + match_rule to same target must dedupe to one finding"
+    );
+}
+
+/// T4a (WS6): `CLA-FACT-GUIDANCE-EXPIRED` fires for a sheet whose `expires` is in
+/// the past, and does NOT fire for a future `expires` or a sheet with no `expires`.
+/// Runs on every analyze (independent of deletions), so this re-runs with no source
+/// change. Severity INFO, confidence 1.0.
+#[cfg(unix)]
+#[test]
+fn analyze_emits_guidance_expired_for_past_expiry_only() {
+    let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["auth_a", "auth_b"]);
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let db_path = project_dir.path().join(".clarion/clarion.db");
+
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        let insert = |conn: &Connection, slug: &str, expires: Option<&str>| {
+            let mut props = serde_json::json!({ "authored_at": "2026-01-01T00:00:00.000Z" });
+            if let Some(e) = expires {
+                props["expires"] = serde_json::Value::String(e.to_owned());
+            }
+            conn.execute(
+                "INSERT INTO entities \
+                 (id, plugin_id, kind, name, short_name, properties, created_at, updated_at) \
+                 VALUES (?1, 'core', 'guidance', ?2, ?2, ?3, \
+                         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                rusqlite::params![format!("core:guidance:{slug}"), slug, props.to_string()],
+            )
+            .unwrap();
+        };
+        insert(&conn, "g_past", Some("2020-01-01T00:00:00.000Z"));
+        insert(&conn, "g_future", Some("2999-01-01T00:00:00.000Z"));
+        insert(&conn, "g_none", None);
+    }
+
+    run_phase3_analyze(
+        project_dir.path(),
+        std::path::Path::new(&config_path),
+        &plugin_path,
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let anchors: Vec<String> = conn
+        .prepare("SELECT entity_id FROM findings WHERE rule_id = 'CLA-FACT-GUIDANCE-EXPIRED'")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(anchors, vec!["core:guidance:g_past".to_owned()]);
+
+    let (severity, confidence): (String, f64) = conn
+        .query_row(
+            "SELECT severity, confidence FROM findings \
+             WHERE rule_id = 'CLA-FACT-GUIDANCE-EXPIRED'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(severity, "INFO");
+    assert!((confidence - 1.0).abs() < f64::EPSILON);
+}
+
+/// T4a (WS6): EXPIRED fires even under `--no-sei` — the guidance-staleness pass is
+/// independent of the SEI mint pass (deletion detection is SEI-gated; staleness is
+/// not). Guards the load-bearing placement decision.
+#[cfg(unix)]
+#[test]
+fn analyze_emits_guidance_expired_under_no_sei() {
+    let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["auth_a", "auth_b"]);
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let db_path = project_dir.path().join(".clarion/clarion.db");
+
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO entities \
+             (id, plugin_id, kind, name, short_name, properties, created_at, updated_at) \
+             VALUES ('core:guidance:g_past', 'core', 'guidance', 'g_past', 'g_past', ?1, \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [&serde_json::json!({
+                "authored_at": "2026-01-01T00:00:00.000Z",
+                "expires": "2020-01-01T00:00:00.000Z",
+            })
+            .to_string()],
+        )
+        .unwrap();
+    }
+
+    clarion_bin()
+        .args(["analyze", "--config"])
+        .arg(std::path::Path::new(&config_path))
+        .arg("--no-sei")
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    let conn = Connection::open(&db_path).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'CLA-FACT-GUIDANCE-EXPIRED'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "EXPIRED must fire under --no-sei");
+}
+
+/// T4a (WS6): `CLA-FACT-GUIDANCE-CHURN-STALE` asymmetric threshold. A pinned sheet
+/// matching entities whose aggregate `git_churn_count` is in [20, 49] fires; an
+/// identical non-pinned sheet at the same churn does not. Below 20 neither fires;
+/// at/above 50 both fire. With churn unpopulated (production), nothing fires.
+#[cfg(unix)]
+#[test]
+fn analyze_emits_guidance_churn_stale_with_asymmetric_pinned_threshold() {
+    let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["auth_a", "auth_b"]);
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let db_path = project_dir.path().join(".clarion/clarion.db");
+
+    // Seed git_churn_count on the matched module via properties JSON (the analyze
+    // pipeline does not populate it). A `kind:module` match_rule selects both
+    // auth modules; we control the aggregate by choosing the per-module value.
+    let seed_run = |churn_each: i64, pinned: bool, slug: &str| {
+        let conn = Connection::open(&db_path).unwrap();
+        // Set churn on auth_a + auth_b (both kind=module) via properties merge.
+        for stem in ["auth_a", "auth_b"] {
+            conn.execute(
+                "UPDATE entities SET properties = json_set(properties, '$.git_churn_count', ?2) \
+                 WHERE id = ?1",
+                rusqlite::params![format!("phase3fixture:module:{stem}"), churn_each],
+            )
+            .unwrap();
+        }
+        let props = serde_json::json!({
+            "match_rules": [{ "type": "kind", "value": "module" }],
+            "authored_at": "2026-01-01T00:00:00.000Z",
+            "pinned": pinned,
+        })
+        .to_string();
+        conn.execute(
+            "INSERT OR REPLACE INTO entities \
+             (id, plugin_id, kind, name, short_name, properties, created_at, updated_at) \
+             VALUES (?1, 'core', 'guidance', ?2, ?2, ?3, \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            rusqlite::params![format!("core:guidance:{slug}"), slug, props],
+        )
+        .unwrap();
+        drop(conn);
+        run_phase3_analyze(
+            project_dir.path(),
+            std::path::Path::new(&config_path),
+            &plugin_path,
+        );
+        let conn = Connection::open(&db_path).unwrap();
+        let fired: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM findings \
+                 WHERE rule_id = 'CLA-FACT-GUIDANCE-CHURN-STALE' AND entity_id = ?1",
+                rusqlite::params![format!("core:guidance:{slug}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        fired > 0
+    };
+
+    // Aggregate 30 (15 each): pinned fires (>=20), non-pinned does not (<50).
+    assert!(seed_run(15, true, "g_pinned_30"), "pinned@30 should fire");
+    assert!(
+        !seed_run(15, false, "g_plain_30"),
+        "non-pinned@30 should NOT fire"
+    );
+    // Aggregate 10 (5 each): neither fires (<20).
+    assert!(
+        !seed_run(5, true, "g_pinned_10"),
+        "pinned@10 should NOT fire"
+    );
+    // Aggregate 60 (30 each): both fire (>=50).
+    assert!(seed_run(30, true, "g_pinned_60"), "pinned@60 should fire");
+    assert!(
+        seed_run(30, false, "g_plain_60"),
+        "non-pinned@60 should fire"
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let (severity, confidence): (String, f64) = conn
+        .query_row(
+            "SELECT severity, confidence FROM findings \
+             WHERE rule_id = 'CLA-FACT-GUIDANCE-CHURN-STALE' LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(severity, "WARN");
+    assert!((confidence - 0.7).abs() < 1e-9);
+}
+
+/// T4a (WS6): honest-empty churn. With `git_churn_count` unpopulated (the
+/// production reality — analyze never writes it), CHURN-STALE does not fire even
+/// for a sheet that matches many entities.
+#[cfg(unix)]
+#[test]
+fn analyze_guidance_churn_stale_is_honest_empty_without_churn() {
+    let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["auth_a", "auth_b"]);
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let db_path = project_dir.path().join(".clarion/clarion.db");
+
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        let props = serde_json::json!({
+            "match_rules": [{ "type": "kind", "value": "module" }],
+            "authored_at": "2026-01-01T00:00:00.000Z",
+            "pinned": true,
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO entities \
+             (id, plugin_id, kind, name, short_name, properties, created_at, updated_at) \
+             VALUES ('core:guidance:g_inert', 'core', 'guidance', 'g_inert', 'g_inert', ?1, \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [&props],
+        )
+        .unwrap();
+    }
+
+    run_phase3_analyze(
+        project_dir.path(),
+        std::path::Path::new(&config_path),
+        &plugin_path,
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'CLA-FACT-GUIDANCE-CHURN-STALE'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "no churn populated ⇒ CHURN-STALE inert");
+}
+
 #[cfg(unix)]
 fn seed_wardline_tier(conn: &Connection, entity_id: &str, tier: &str) {
     conn.execute(

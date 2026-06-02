@@ -228,7 +228,7 @@ pub fn guidance_sheet_matches_entity(
 /// Scan strategy: drive off `SELECT DISTINCT entity_id FROM summary_cache` (the
 /// only entities that *can* be invalidated), not the whole entity table — this
 /// keeps the work O(cached-entities) ≤ O(N-entities) and, by reusing
-/// [`delete_summary_cache_for_entity`]'s single-entity `DELETE`, dodges the
+/// [`crate::cache::delete_summary_cache_for_entity`]'s single-entity `DELETE`, dodges the
 /// `SQLite` 999-bound-parameter ceiling a broad `IN (…)` over a wide `path:`
 /// match would otherwise hit on a large corpus. Guidance sheets never carry
 /// cache rows, so the `kind = 'guidance'` exclusion is automatic.

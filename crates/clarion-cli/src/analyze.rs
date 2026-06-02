@@ -58,6 +58,25 @@ const ENTITY_DELETED_RULE_ID: &str = "CLA-FACT-ENTITY-DELETED";
 /// an entity that no longer exists.
 const GUIDANCE_ORPHAN_RULE_ID: &str = "CLA-FACT-GUIDANCE-ORPHAN";
 
+/// REQ-GUIDANCE-05 (WS6 T4a): a guidance sheet whose `expires` instant is in the
+/// past. The read path already excludes expired sheets from composition; this
+/// finding surfaces the state operatively (the sheet is not deleted).
+const GUIDANCE_EXPIRED_RULE_ID: &str = "CLA-FACT-GUIDANCE-EXPIRED";
+
+/// REQ-GUIDANCE-05 (WS6 T4a): a guidance sheet whose matched entities carry a high
+/// aggregate `git_churn_count` — the code under the sheet has churned enough that
+/// the guidance is likely stale. Heuristic (confidence 0.7); inert until the
+/// churn-history pipeline (clarion-997c93ec4e) populates `git_churn_count`.
+const GUIDANCE_CHURN_STALE_RULE_ID: &str = "CLA-FACT-GUIDANCE-CHURN-STALE";
+
+/// Aggregate `git_churn_count` (summed over a sheet's matched entities) at or above
+/// which a non-pinned sheet is flagged `CLA-FACT-GUIDANCE-CHURN-STALE`.
+const CHURN_STALE_THRESHOLD: i64 = 50;
+
+/// The lower (stricter) churn threshold for `pinned: true` sheets — pinned guidance
+/// is asserted institutional knowledge, so it goes stale on less churn.
+const CHURN_STALE_THRESHOLD_PINNED: i64 = 20;
+
 /// REQ-ANALYZE-05: a subsystem whose tier-bearing members declare ≥2 distinct
 /// Wardline tiers (a trust-boundary smell — the cluster straddles tiers).
 const TIER_MIXING_RULE_ID: &str = "CLA-FACT-TIER-SUBSYSTEM-MIXING";
@@ -79,6 +98,8 @@ const TIER_UNANIMOUS_RULE_ID: &str = "CLA-FACT-SUBSYSTEM-TIER-UNANIMOUS";
 const POST_RUN_FINDING_RULES: &[&str] = &[
     ENTITY_DELETED_RULE_ID,
     GUIDANCE_ORPHAN_RULE_ID,
+    GUIDANCE_EXPIRED_RULE_ID,
+    GUIDANCE_CHURN_STALE_RULE_ID,
     TIER_MIXING_RULE_ID,
     TIER_UNANIMOUS_RULE_ID,
 ];
@@ -1180,6 +1201,33 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     "tier-subsystem findings skipped (run already committed successfully)"
                 ),
             }
+            // REQ-GUIDANCE-05 (WS6 T4a): guidance-staleness findings (EXPIRED +
+            // CHURN-STALE). Runs on EVERY analyze, deliberately OUTSIDE the SEI
+            // `if no_sei { … } else { … }` block above and independent of any
+            // deletion: these surface a sheet's own state, not an identity event,
+            // so `--no-sei` must NOT suppress them. Best-effort + enrich-only like
+            // the tier pass: a failure logs and never un-commits the graph.
+            match emit_guidance_staleness_findings(
+                &writer,
+                &db_path,
+                &project_root,
+                &run_id,
+                &iso8601_now(),
+            )
+            .await
+            {
+                Ok(emitted) if emitted > 0 => tracing::info!(
+                    run_id = %run_id,
+                    guidance_staleness_findings = emitted,
+                    "guidance-staleness findings emitted"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    run_id = %run_id,
+                    error = %e,
+                    "guidance-staleness findings skipped (run already committed successfully)"
+                ),
+            }
             // Phase 8c (clarion-ef8f64d5fd): the deletion + tier findings above
             // are persisted via `PersistPostRunFinding` *after* the Phase-8
             // emission already ran, so without this they reach the store but
@@ -1570,9 +1618,11 @@ async fn run_sei_mint_pass(
 ///
 /// For each deleted entity: emit one `CLA-FACT-ENTITY-DELETED` (anchored to the
 /// entity's own row — `entities` is never pruned, so the FK resolves) and
-/// invalidate its cached summaries. Then, for every guidance sheet whose explicit
-/// `guides` edge targets a deleted entity, emit one `CLA-FACT-GUIDANCE-ORPHAN`
-/// (anchored to the guidance sheet, the deleted target carried as a related id).
+/// invalidate its cached summaries. Then, for every guidance sheet stranded on a
+/// deleted entity — via an explicit `guides` edge OR a `match_rules`
+/// `{"type":"entity","id":X}` entry (detailed-design.md §5) — emit one
+/// `CLA-FACT-GUIDANCE-ORPHAN` (anchored to the sheet, deleted target as a related
+/// id). A sheet that strands the same target via both paths emits one finding.
 ///
 /// Returns `Ok(0)` for an empty deleted set without opening a connection.
 async fn emit_deletion_findings(
@@ -1611,17 +1661,19 @@ async fn emit_deletion_findings(
             .with_context(|| format!("InvalidateSummaryCacheForEntity {entity_id}"))?;
     }
 
-    // Guidance sheets that explicitly `guides` a now-deleted entity are orphaned.
-    // Read the (sheet, target) pairs once, filter to deleted targets, sort for
-    // determinism. The `guides` edge survives the target's vanishing because
-    // `entities` is never pruned (the ON DELETE CASCADE never fires).
-    let orphaned_guidance = {
+    // Guidance sheets stranded on a now-deleted entity are orphaned via EITHER an
+    // explicit `guides` edge OR a `match_rules` `{"type":"entity","id":X}` entry
+    // pointing at a deleted target (detailed-design.md §5). Collect both into one
+    // de-duped, sorted `(sheet, target)` set so a sheet that orphans the same
+    // target via both paths emits exactly ONE finding. Both survive the target's
+    // vanishing because `entities` is never pruned.
+    let orphaned_guidance: std::collections::BTreeSet<(String, String)> = {
         let conn =
             Connection::open(db_path).context("open read connection for guidance-orphan scan")?;
-        let mut stmt = conn
+
+        let mut pairs: std::collections::BTreeSet<(String, String)> = conn
             .prepare("SELECT from_id, to_id FROM edges WHERE kind = 'guides'")
-            .context("prepare guides-edge scan")?;
-        let mut pairs: Vec<(String, String)> = stmt
+            .context("prepare guides-edge scan")?
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
@@ -1631,7 +1683,31 @@ async fn emit_deletion_findings(
             .into_iter()
             .filter(|(_, to_id)| deleted_set.contains(to_id.as_str()))
             .collect();
-        pairs.sort();
+
+        // Scan every guidance sheet's `match_rules` for `{type:entity, id:X}`
+        // entries whose X is in the deleted set. Reuse the shared rule shape
+        // (`clarion_storage::rule_match` reads `{"type":"entity","id":…}`), not a
+        // hand-rolled key.
+        for sheet in clarion_storage::list_guidance_sheets(&conn)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("list guidance sheets for match-rule orphan scan")?
+        {
+            let Some(rules) = sheet
+                .properties
+                .get("match_rules")
+                .and_then(serde_json::Value::as_array)
+            else {
+                continue;
+            };
+            for rule in rules {
+                if rule.get("type").and_then(serde_json::Value::as_str) == Some("entity")
+                    && let Some(target) = rule.get("id").and_then(serde_json::Value::as_str)
+                    && deleted_set.contains(target)
+                {
+                    pairs.insert((sheet.id.clone(), target.to_owned()));
+                }
+            }
+        }
         pairs
     };
 
@@ -1695,7 +1771,7 @@ fn guidance_orphan_finding(
         kind: "fact".to_owned(),
         severity: "WARN".to_owned(),
         confidence: Some(1.0),
-        confidence_basis: Some("guidance `guides`-edge target deleted".to_owned()),
+        confidence_basis: Some("guidance sheet target deleted".to_owned()),
         entity_id: guidance_id.to_owned(),
         related_entities_json: serde_json::json!([deleted_entity_id]).to_string(),
         message: format!(
@@ -1704,6 +1780,217 @@ fn guidance_orphan_finding(
         evidence_json: serde_json::json!({
             "guidance_id": guidance_id,
             "deleted_entity_id": deleted_entity_id,
+        })
+        .to_string(),
+        properties_json: "{}".to_owned(),
+        supports_json: "[]".to_owned(),
+        supported_by_json: "[]".to_owned(),
+        created_at: now.to_owned(),
+        updated_at: now.to_owned(),
+    }
+}
+
+/// REQ-GUIDANCE-05 (WS6 T4a): persist guidance-staleness findings over the
+/// committed graph and return the count. Two independent signals per sheet:
+///
+/// - **`CLA-FACT-GUIDANCE-EXPIRED`** — the sheet's `expires` instant is lexically
+///   `< now` (both are the fixed-width `YYYY-MM-DDTHH:MM:SS.sssZ` form
+///   [`iso8601_now`] emits, so a byte compare is a valid instant compare). Absent
+///   or malformed `expires` ⇒ skip.
+/// - **`CLA-FACT-GUIDANCE-CHURN-STALE`** — the aggregate `git_churn_count` over the
+///   sheet's matched entities meets the staleness threshold (asymmetric: 20 for
+///   `pinned` sheets, 50 otherwise).
+///
+/// Runs post-`CommitRun`, unconditionally (NOT gated on the SEI pass or on
+/// deletions) — see the call site. Deterministic: sheets in
+/// [`clarion_storage::list_guidance_sheets`] order; matched ids sorted.
+///
+/// Churn proxy note: the design wants "churn since `authored_at`/`reviewed_at`",
+/// but there is no churn-history to compute a true delta and `git_churn_count` is
+/// not populated by analyze in v1.0 (so this is honest-empty in production). We
+/// implement the computable proxy — the aggregate current `git_churn_count` over
+/// matched entities vs the threshold. A true since-authored delta awaits the
+/// churn-history pipeline (clarion-997c93ec4e); `authored_at`/`reviewed_at` are
+/// deliberately unused here because no real delta is computable.
+async fn emit_guidance_staleness_findings(
+    writer: &Writer,
+    db_path: &Path,
+    project_root: &Path,
+    run_id: &str,
+    now: &str,
+) -> anyhow::Result<u64> {
+    // Build the (sheet, [matched churn pairs]) plan in one read pass, then emit.
+    // Drive the churn scan off the populated churn set only — `WHERE
+    // git_churn_count IS NOT NULL` — so the work is O(sheets × churned), and so
+    // production (no churn populated) yields an empty candidate set and CHURN-STALE
+    // never fires, with no special-casing.
+    enum Pending {
+        Expired(String),
+        ChurnStale {
+            sheet_id: String,
+            agg: i64,
+            matched: Vec<String>,
+        },
+    }
+
+    let plan: Vec<Pending> = {
+        let conn = Connection::open(db_path)
+            .context("open read connection for guidance-staleness findings")?;
+        let canonical_root = project_root
+            .canonicalize()
+            .unwrap_or_else(|_| project_root.to_path_buf());
+
+        let sheets = clarion_storage::list_guidance_sheets(&conn)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("list guidance sheets for staleness scan")?;
+
+        // Entities carrying a populated churn count (the only ones that can move an
+        // aggregate). Empty in production today (see fn doc).
+        let churned: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT id, git_churn_count FROM entities \
+                 WHERE git_churn_count IS NOT NULL ORDER BY id",
+            )
+            .context("prepare churned-entity scan")?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .context("query churned entities")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect churned entities")?;
+
+        let mut plan = Vec::new();
+        for sheet in &sheets {
+            // EXPIRED: lexical (instant) compare against `now`.
+            if let Some(expires) = sheet
+                .properties
+                .get("expires")
+                .and_then(serde_json::Value::as_str)
+                && expires < now
+            {
+                plan.push(Pending::Expired(sheet.id.clone()));
+            }
+
+            // CHURN-STALE: aggregate churn over matched entities vs asymmetric
+            // threshold. Reuse the shared matcher; only churned entities can matter.
+            let pinned = sheet
+                .properties
+                .get("pinned")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let threshold = if pinned {
+                CHURN_STALE_THRESHOLD_PINNED
+            } else {
+                CHURN_STALE_THRESHOLD
+            };
+
+            let mut agg: i64 = 0;
+            let mut matched: Vec<String> = Vec::new();
+            for (entity_id, churn) in &churned {
+                if clarion_storage::guidance_sheet_matches_entity(
+                    &conn,
+                    sheet,
+                    entity_id,
+                    &canonical_root,
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .with_context(|| format!("match {entity_id} against {}", sheet.id))?
+                {
+                    agg = agg.saturating_add(*churn);
+                    matched.push(entity_id.clone());
+                }
+            }
+            if agg >= threshold {
+                matched.sort();
+                plan.push(Pending::ChurnStale {
+                    sheet_id: sheet.id.clone(),
+                    agg,
+                    matched,
+                });
+            }
+        }
+        plan
+    };
+
+    let mut count: u64 = 0;
+    for pending in &plan {
+        let finding = match pending {
+            Pending::Expired(sheet_id) => guidance_expired_finding(sheet_id, run_id, now),
+            Pending::ChurnStale {
+                sheet_id,
+                agg,
+                matched,
+            } => guidance_churn_stale_finding(sheet_id, *agg, matched, run_id, now),
+        };
+        let finding_id = finding.id.clone();
+        writer
+            .send_wait(|ack| WriterCmd::PersistPostRunFinding {
+                finding: Box::new(finding),
+                ack,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("PersistPostRunFinding {finding_id}"))?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Build a `CLA-FACT-GUIDANCE-EXPIRED` finding anchored to the expired sheet.
+/// Run-scoped, deterministic id; INFO, confidence 1.0.
+fn guidance_expired_finding(guidance_id: &str, run_id: &str, now: &str) -> FindingRecord {
+    FindingRecord {
+        id: format!("core:finding:{run_id}:guidance-expired:{guidance_id}"),
+        tool: "clarion".to_owned(),
+        tool_version: env!("CARGO_PKG_VERSION").to_owned(),
+        run_id: run_id.to_owned(),
+        rule_id: GUIDANCE_EXPIRED_RULE_ID.to_owned(),
+        kind: "fact".to_owned(),
+        severity: "INFO".to_owned(),
+        confidence: Some(1.0),
+        confidence_basis: Some("guidance sheet past its `expires`".to_owned()),
+        entity_id: guidance_id.to_owned(),
+        related_entities_json: "[]".to_owned(),
+        message: format!("Guidance sheet {guidance_id} is past its `expires` instant"),
+        evidence_json: serde_json::json!({ "guidance_id": guidance_id }).to_string(),
+        properties_json: "{}".to_owned(),
+        supports_json: "[]".to_owned(),
+        supported_by_json: "[]".to_owned(),
+        created_at: now.to_owned(),
+        updated_at: now.to_owned(),
+    }
+}
+
+/// Build a `CLA-FACT-GUIDANCE-CHURN-STALE` finding anchored to the sheet, carrying
+/// the matched entities (sorted) as related ids and the aggregate churn +
+/// threshold as evidence. Run-scoped, deterministic id; WARN, confidence 0.7
+/// (heuristic).
+fn guidance_churn_stale_finding(
+    guidance_id: &str,
+    aggregate_churn: i64,
+    matched: &[String],
+    run_id: &str,
+    now: &str,
+) -> FindingRecord {
+    FindingRecord {
+        id: format!("core:finding:{run_id}:guidance-churn-stale:{guidance_id}"),
+        tool: "clarion".to_owned(),
+        tool_version: env!("CARGO_PKG_VERSION").to_owned(),
+        run_id: run_id.to_owned(),
+        rule_id: GUIDANCE_CHURN_STALE_RULE_ID.to_owned(),
+        kind: "fact".to_owned(),
+        severity: "WARN".to_owned(),
+        confidence: Some(0.7),
+        confidence_basis: Some("heuristic".to_owned()),
+        entity_id: guidance_id.to_owned(),
+        related_entities_json: serde_json::to_string(matched).unwrap_or_else(|_| "[]".to_owned()),
+        message: format!(
+            "Guidance sheet {guidance_id} covers high-churn code (aggregate git_churn_count = {aggregate_churn})"
+        ),
+        evidence_json: serde_json::json!({
+            "guidance_id": guidance_id,
+            "aggregate_git_churn_count": aggregate_churn,
+            "matched_entities": matched,
         })
         .to_string(),
         properties_json: "{}".to_owned(),
