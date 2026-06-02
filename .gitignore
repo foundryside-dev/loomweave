@@ -34,3 +34,6 @@ tests/e2e/external-operator-smoke-results-*.md
 # change on every analyze run, so they are not tracked (see .clarion/.gitignore).
 .clarion/clarion.db
 .clarion/instance_id
+
+# Documentation site build output (mkdocs `site_dir`, web/mkdocs.yml).
+/site-build/

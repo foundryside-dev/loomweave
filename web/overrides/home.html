@@ -1,0 +1,132 @@
+{% extends "main.html" %}
+
+{#
+  Clarion product landing page.
+  Applied only to docs/index.md via front-matter `template: home.html`.
+  The hero, feature cards, agent-exchange snippet, and Loom-suite grid live
+  here; the markdown body of index.md (install + the real consult example) is
+  rendered via {{ page.content }} so Material's syntax highlighting and
+  content.code.copy buttons keep working on the real fenced code blocks.
+#}
+
+{% block content %}
+<div class="cl-landing">
+
+  <section class="cl-hero">
+    <span class="cl-hero__eyebrow">Code archaeology for coding agents</span>
+    <h1 class="cl-hero__title">Clarion</h1>
+    <p class="cl-hero__tagline">
+      Clarion ingests a codebase, extracts its entities and relationships into a
+      graph, and serves entity-level facts to consult-mode agents over MCP &mdash;
+      so an agent asks a graph-aware tool instead of re-grepping the tree on every
+      question.
+    </p>
+    <div class="cl-hero__cta">
+      <a class="cl-btn cl-btn--primary" href="{{ 'getting-started/' | url }}">
+        Get Started
+      </a>
+      <a class="cl-btn cl-btn--secondary" href="{{ config.repo_url }}"
+         rel="noopener" target="_blank">
+        View on GitHub
+      </a>
+    </div>
+  </section>
+
+  <section class="cl-features" aria-label="What Clarion does">
+    <div class="cl-feature-card">
+      <h3>Structural extraction</h3>
+      <p>
+        <code>clarion analyze</code> walks the corpus, extracts functions,
+        classes, and modules, and persists the <code>contains</code>,
+        <code>calls</code>, and <code>references</code> graph to a local SQLite
+        store.
+      </p>
+    </div>
+    <div class="cl-feature-card">
+      <h3>Consult tools over MCP</h3>
+      <p>
+        <code>clarion serve</code> exposes a catalogue of MCP tools &mdash;
+        <code>entity_at</code>, <code>callers_of</code>,
+        <code>neighborhood</code>, <code>execution_paths_from</code> and more
+        &mdash; that answer graph questions in one hop.
+      </p>
+    </div>
+    <div class="cl-feature-card">
+      <h3>Lazy LLM summaries</h3>
+      <p>
+        <code>summary(id)</code> dispatches the LLM one entity at a time and
+        caches the result. <code>analyze</code> needs no credentials at all;
+        summarisation is opt-in and pay-as-you-go.
+      </p>
+    </div>
+    <div class="cl-feature-card">
+      <h3>Local-first &amp; enrich-only</h3>
+      <p>
+        All state lives in a project-local <code>.clarion/</code> directory. As a
+        Loom citizen, Clarion only ever <em>adds</em> facts to a sibling's view
+        &mdash; never required for one to make sense.
+      </p>
+    </div>
+  </section>
+
+  {# A consult-loop illustration. Decorative (raw HTML, not Material-highlighted)
+     so it stays a clean "what your agent sees" picture; the real, copyable
+     examples live in the markdown body below. #}
+  <section class="cl-snippet" aria-label="An agent asking Clarion">
+    <div class="cl-snippet__bar" aria-hidden="true">
+      <span class="cl-snippet__dot"></span>
+      <span class="cl-snippet__dot"></span>
+      <span class="cl-snippet__dot"></span>
+      <span class="cl-snippet__title">consult-mode agent → clarion (MCP)</span>
+    </div>
+<pre><span class="cl-comment"># Agent: "Who calls the token refresher, and what does it touch?"</span>
+<span class="cl-prompt">→</span> entity_at(<span class="cl-key">file</span>="auth/tokens.py", <span class="cl-key">line</span>=42)
+<span class="cl-prompt">←</span> python:function:auth.tokens.refresh
+
+<span class="cl-prompt">→</span> neighborhood(<span class="cl-key">id</span>="python:function:auth.tokens.refresh")
+<span class="cl-prompt">←</span> callers:  [api.session.login, api.session.renew]
+   callees:  [auth.tokens._mint, http.client.post]
+   imports:  in=3  out=2     references: 4
+   subsystem: auth</pre>
+  </section>
+
+  {# The index.md markdown body: install + the real, copyable consult example. #}
+  <section class="cl-body" aria-label="Install and quick example">
+    {{ page.content }}
+  </section>
+
+  <section class="cl-suite" aria-labelledby="cl-suite-heading">
+    <h2 id="cl-suite-heading">The Loom suite</h2>
+    <p class="cl-suite__intro">
+      Clarion is one of four Loom citizens &mdash; agent-first tooling built on
+      &ldquo;humans on the loop, not in the loop.&rdquo; Each is solo-useful and
+      composes with the others on its own: enterprise-class rigour for
+      one-to-two-developer teams, without the enterprise weight.
+    </p>
+    <div class="cl-suite__grid">
+      <a class="cl-suite-card cl-suite-card--current" href="https://clarion.foundryside.dev"
+         rel="noopener">
+        <h3>Clarion</h3>
+        <p>Code intelligence &mdash; entity-level facts about your codebase.</p>
+        <span class="cl-suite-card__badge">You are here</span>
+      </a>
+      <a class="cl-suite-card" href="https://wardline.foundryside.dev"
+         rel="noopener" target="_blank">
+        <h3>Wardline</h3>
+        <p>Semantic-tainting static analysis for Python.</p>
+      </a>
+      <a class="cl-suite-card" href="https://filigree.foundryside.dev"
+         rel="noopener" target="_blank">
+        <h3>Filigree</h3>
+        <p>Issue tracking built for agent-driven teams.</p>
+      </a>
+      <a class="cl-suite-card" href="https://legis.foundryside.dev"
+         rel="noopener" target="_blank">
+        <h3>Legis</h3>
+        <p>Opt-in governance for the development lifecycle.</p>
+      </a>
+    </div>
+  </section>
+
+</div>
+{% endblock %}

@@ -1,0 +1,414 @@
+/* ==========================================================================
+   Clarion — Loom design system + Clarion accent, layered on Material.
+
+   Convergence strategy (shared with Wardline, Filigree, Legis):
+   - Material owns the light/dark toggle. We do NOT add a custom toggle and we
+     do NOT use light-dark()/[data-theme]; semantic tokens are mapped under
+     Material's own scheme selectors ([data-md-color-scheme="default"|"slate"])
+     and we override Material's --md-primary/--md-accent there.
+   - The `--loom-*` primitives, the spacing scale, the fluid type, the radius,
+     and the `.cl-*` landing structure are the SHARED Loom layer — byte-for-byte
+     portable across the suite. Only the accent ramp differs per product.
+   - Wardline's accent is teal (~195). Clarion's accent is amber/brass (~58–78):
+     a clarion is a brass trumpet — a clear call, illumination, light shed on
+     the codebase. The deep shades are tuned to clear WCAG AA on white.
+   ========================================================================== */
+
+:root {
+  /* ---- Loom primitive ramp (OKLCH, perceptually uniform) — SHARED ---- */
+  /* Slate/ink — shared Loom neutral hue (~255) */
+  --loom-ink-50:  oklch(0.97 0.010 255);
+  --loom-ink-100: oklch(0.93 0.018 255);
+  --loom-ink-200: oklch(0.86 0.028 255);
+  --loom-ink-700: oklch(0.40 0.060 255);
+  --loom-ink-900: oklch(0.22 0.040 255);
+
+  /* Clarion accent — amber/brass. Hue rotates 78→56 as it deepens so the dark
+     end reads as brass, not yellow, and the link shade clears AA on white. */
+  --cl-amber-200: oklch(0.88 0.070 78);
+  --cl-amber-300: oklch(0.78 0.100 72);  /* dark-scheme links: #dfad6d, 8.7:1 */
+  --cl-amber-400: oklch(0.72 0.120 68);
+  --cl-amber-500: oklch(0.62 0.130 64);
+  --cl-amber-600: oklch(0.55 0.130 70);  /* #a16100 — button hover (light) */
+  --cl-amber-700: oklch(0.50 0.120 58);  /* light-scheme links: #944e00, 6.2:1 */
+  --cl-amber-800: oklch(0.44 0.100 56);
+
+  /* ---- Spacing scale (4px base) — SHARED ---- */
+  --cl-space-1: 0.25rem;
+  --cl-space-2: 0.5rem;
+  --cl-space-3: 0.75rem;
+  --cl-space-4: 1rem;
+  --cl-space-5: 1.5rem;
+  --cl-space-6: 2rem;
+  --cl-space-8: 3rem;
+  --cl-space-10: 4rem;
+
+  /* ---- Fluid type — SHARED ---- */
+  --cl-text-hero: clamp(2.25rem, 1.6rem + 3vw, 3.5rem);
+  --cl-text-lead: clamp(1.1rem, 1rem + 0.6vw, 1.375rem);
+
+  --cl-radius: 10px;
+  --cl-content-width: 52rem;
+}
+
+/* ---- Material variable overrides: LIGHT scheme ---- */
+[data-md-color-scheme="default"] {
+  /* Amber-700 on white = strong contrast; used for links/header/accents */
+  --md-primary-fg-color:        var(--cl-amber-700);
+  --md-primary-fg-color--light: var(--cl-amber-500);
+  --md-primary-fg-color--dark:  var(--cl-amber-800);
+  --md-accent-fg-color:         var(--cl-amber-600);
+
+  /* Semantic tokens for landing markup */
+  --cl-bg:          oklch(0.99 0.003 255);
+  --cl-bg-subtle:   oklch(0.975 0.006 255);
+  --cl-bg-card:     oklch(1 0 0);
+  --cl-text:        var(--loom-ink-900);
+  --cl-text-muted:  oklch(0.46 0.020 255);
+  --cl-border:      var(--loom-ink-200);
+  --cl-accent:      var(--cl-amber-700);
+  --cl-accent-soft: oklch(0.95 0.045 80);
+  --cl-on-accent:   oklch(0.99 0.010 80);
+  --cl-snippet-bg:  oklch(0.20 0.030 255);
+  --cl-snippet-fg:  oklch(0.92 0.012 255);
+}
+
+/* ---- Material variable overrides: DARK (slate) scheme ---- */
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color:        var(--cl-amber-300);
+  --md-primary-fg-color--light: var(--cl-amber-200);
+  --md-primary-fg-color--dark:  var(--cl-amber-400);
+  --md-accent-fg-color:         var(--cl-amber-200);
+
+  --cl-bg:          oklch(0.21 0.022 255);
+  --cl-bg-subtle:   oklch(0.25 0.022 255);
+  --cl-bg-card:     oklch(0.27 0.024 255);
+  --cl-text:        oklch(0.94 0.012 255);
+  --cl-text-muted:  oklch(0.80 0.018 255);
+  --cl-border:      oklch(0.36 0.024 255);
+  --cl-accent:      var(--cl-amber-300);
+  --cl-accent-soft: oklch(0.32 0.055 70);
+  --cl-on-accent:   oklch(0.18 0.030 60);
+  --cl-snippet-bg:  oklch(0.16 0.022 255);
+  --cl-snippet-fg:  oklch(0.92 0.012 255);
+}
+
+/* ==========================================================================
+   Landing page
+   ========================================================================== */
+
+.cl-landing {
+  max-width: 64rem;
+  margin: 0 auto;
+  padding: 0 var(--cl-space-4) var(--cl-space-10);
+}
+
+/* ---- Hero ---- */
+.cl-hero {
+  text-align: center;
+  padding: var(--cl-space-10) var(--cl-space-3) var(--cl-space-8);
+}
+
+.cl-hero__eyebrow {
+  display: inline-block;
+  margin: 0 0 var(--cl-space-4);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--cl-accent);
+}
+
+.cl-hero__title {
+  font-size: var(--cl-text-hero);
+  line-height: 1.05;
+  margin: 0 0 var(--cl-space-4);
+  letter-spacing: -0.02em;
+  color: var(--cl-text);
+  /* One-shot reveal — no library, no-ops on older browsers */
+  opacity: 1;
+  translate: 0 0;
+  transition: opacity 400ms ease, translate 400ms ease;
+}
+
+@starting-style {
+  .cl-hero__title {
+    opacity: 0;
+    translate: 0 0.5rem;
+  }
+}
+
+.cl-hero__tagline {
+  font-size: var(--cl-text-lead);
+  line-height: 1.5;
+  color: var(--cl-text-muted);
+  max-width: 42rem;
+  margin: 0 auto var(--cl-space-6);
+}
+
+.cl-hero__cta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--cl-space-3);
+  justify-content: center;
+}
+
+.cl-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 2.75rem;
+  padding: var(--cl-space-3) var(--cl-space-5);
+  border-radius: var(--cl-radius);
+  font-weight: 600;
+  font-size: 1rem;
+  text-decoration: none;
+  border: 1px solid transparent;
+  transition: background-color 150ms ease, color 150ms ease, border-color 150ms ease;
+}
+
+.cl-btn--primary {
+  background: var(--cl-accent);
+  color: var(--cl-on-accent);
+}
+.cl-btn--primary:hover,
+.cl-btn--primary:focus-visible {
+  background: var(--cl-amber-600);
+  color: var(--cl-on-accent);
+}
+[data-md-color-scheme="slate"] .cl-btn--primary:hover,
+[data-md-color-scheme="slate"] .cl-btn--primary:focus-visible {
+  background: var(--cl-amber-200);
+}
+
+.cl-btn--secondary {
+  background: transparent;
+  color: var(--cl-text);
+  border-color: var(--cl-border);
+}
+.cl-btn--secondary:hover,
+.cl-btn--secondary:focus-visible {
+  border-color: var(--cl-accent);
+  color: var(--cl-accent);
+}
+
+.cl-btn:focus-visible {
+  outline: 3px solid var(--cl-text);
+  outline-offset: 2px;
+}
+
+/* ---- Feature cards ---- */
+.cl-features {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: var(--cl-space-4);
+  margin: var(--cl-space-6) 0 var(--cl-space-8);
+}
+
+.cl-feature-card {
+  padding: var(--cl-space-5);
+  border: 1px solid var(--cl-border);
+  border-radius: var(--cl-radius);
+  background: var(--cl-bg-subtle);
+}
+
+.cl-feature-card h3 {
+  margin: 0 0 var(--cl-space-2);
+  font-size: 1.1rem;
+  color: var(--cl-text);
+}
+
+.cl-feature-card p {
+  margin: 0;
+  color: var(--cl-text-muted);
+  line-height: 1.55;
+}
+
+.cl-feature-card code {
+  background: var(--cl-accent-soft);
+  color: var(--cl-accent);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+  font-size: 0.85em;
+}
+
+/* ---- Agent-exchange snippet (shared Loom improvement: a terminal-styled
+        illustration of the consult loop, portable to every product) ---- */
+.cl-snippet {
+  margin: var(--cl-space-8) auto var(--cl-space-6);
+  max-width: 48rem;
+  border: 1px solid var(--cl-border);
+  border-radius: var(--cl-radius);
+  overflow: hidden;
+  background: var(--cl-snippet-bg);
+  box-shadow: 0 1px 2px oklch(0 0 0 / 0.06), 0 8px 24px oklch(0 0 0 / 0.10);
+}
+
+.cl-snippet__bar {
+  display: flex;
+  align-items: center;
+  gap: var(--cl-space-2);
+  padding: var(--cl-space-3) var(--cl-space-4);
+  border-bottom: 1px solid oklch(1 0 0 / 0.08);
+}
+
+.cl-snippet__dot {
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 50%;
+  background: oklch(1 0 0 / 0.18);
+}
+
+.cl-snippet__title {
+  margin-left: var(--cl-space-2);
+  font-size: 0.78rem;
+  letter-spacing: 0.02em;
+  color: oklch(1 0 0 / 0.55);
+}
+
+.cl-snippet pre {
+  margin: 0;
+  padding: var(--cl-space-5);
+  overflow-x: auto;
+  font-family: var(--md-code-font-family, monospace);
+  font-size: 0.84rem;
+  line-height: 1.6;
+  color: var(--cl-snippet-fg);
+  background: transparent;
+}
+
+.cl-snippet .cl-prompt { color: var(--cl-amber-300); font-weight: 600; }
+.cl-snippet .cl-comment { color: oklch(0.70 0.020 255); }
+.cl-snippet .cl-key { color: var(--cl-amber-200); }
+
+/* ---- Embedded markdown body (install + quick example) ---- */
+.cl-body {
+  margin: var(--cl-space-8) 0;
+}
+
+.cl-body::before {
+  content: "";
+  display: block;
+  border-top: 1px solid var(--cl-border);
+  margin-bottom: var(--cl-space-6);
+}
+
+/* ---- Loom suite ---- */
+.cl-suite {
+  margin-top: var(--cl-space-10);
+  padding-top: var(--cl-space-6);
+  border-top: 1px solid var(--cl-border);
+}
+
+.cl-suite h2 {
+  margin: 0 0 var(--cl-space-2);
+}
+
+.cl-suite__intro {
+  color: var(--cl-text-muted);
+  max-width: 44rem;
+  line-height: 1.55;
+  margin: 0 0 var(--cl-space-5);
+}
+
+.cl-suite__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: var(--cl-space-4);
+}
+
+.cl-suite-card {
+  display: block;
+  padding: var(--cl-space-5);
+  border: 1px solid var(--cl-border);
+  border-radius: var(--cl-radius);
+  background: var(--cl-bg-card);
+  text-decoration: none;
+  color: var(--cl-text);
+  transition: border-color 150ms ease, transform 150ms ease;
+}
+
+.cl-suite-card:hover,
+.cl-suite-card:focus-visible {
+  border-color: var(--cl-accent);
+  transform: translateY(-2px);
+}
+
+.cl-suite-card:focus-visible {
+  outline: 3px solid var(--cl-accent);
+  outline-offset: 2px;
+}
+
+.cl-suite-card h3 {
+  margin: 0 0 var(--cl-space-2);
+  font-size: 1.1rem;
+  color: var(--cl-accent);
+}
+
+.cl-suite-card p {
+  margin: 0;
+  color: var(--cl-text-muted);
+  line-height: 1.5;
+}
+
+.cl-suite-card--current {
+  border-color: var(--cl-accent);
+  background: var(--cl-accent-soft);
+}
+
+.cl-suite-card--current h3 {
+  color: var(--cl-text);
+}
+
+.cl-suite-card__badge {
+  display: inline-block;
+  margin-top: var(--cl-space-3);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--cl-on-accent);
+  background: var(--cl-accent);
+  padding: 0.15em 0.6em;
+  border-radius: 999px;
+}
+
+/* ==========================================================================
+   Footer Loom suite links (copyright partial override) — site-wide
+   ========================================================================== */
+.cl-footer-suite {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--cl-space-3);
+  margin-bottom: var(--cl-space-2);
+  font-size: 0.8rem;
+}
+
+.cl-footer-suite__label {
+  font-weight: 700;
+  opacity: 0.8;
+}
+
+.cl-footer-suite a {
+  color: inherit;
+  text-decoration: none;
+  opacity: 0.85;
+}
+
+.cl-footer-suite a:hover,
+.cl-footer-suite a:focus-visible {
+  text-decoration: underline;
+  opacity: 1;
+}
+
+/* ==========================================================================
+   Reduced motion
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  .cl-btn,
+  .cl-suite-card,
+  .cl-hero__title {
+    transition: none;
+  }
+}

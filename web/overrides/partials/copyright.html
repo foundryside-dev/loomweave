@@ -1,0 +1,25 @@
+{#-
+  Clarion override of Material's copyright partial.
+  Adds the Loom suite links to the footer site-wide so suite presence is
+  reachable from every docs page, then preserves Material's default content.
+-#}
+<div class="md-copyright">
+  <nav class="cl-footer-suite" aria-label="Loom suite">
+    <span class="cl-footer-suite__label">Loom suite</span>
+    <a href="https://clarion.foundryside.dev" rel="noopener">Clarion</a>
+    <a href="https://wardline.foundryside.dev" rel="noopener" target="_blank">Wardline</a>
+    <a href="https://filigree.foundryside.dev" rel="noopener" target="_blank">Filigree</a>
+    <a href="https://legis.foundryside.dev" rel="noopener" target="_blank">Legis</a>
+  </nav>
+  {% if config.copyright %}
+    <div class="md-copyright__highlight">
+      {{ config.copyright }}
+    </div>
+  {% endif %}
+  {% if not config.extra.generator == false %}
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  {% endif %}
+</div>
