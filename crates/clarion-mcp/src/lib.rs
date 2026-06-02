@@ -33,10 +33,10 @@ use clarion_storage::{
     WriterCmd, ancestor_chain, call_edges_from, call_edges_targeting,
     candidate_entities_for_unresolved_sites, child_entity_ids, contained_entity_ids,
     containing_module_id, entities_containing_line, entity_by_id, existing_entity_ids,
-    find_entities, import_edges_for_entity, inferred_edge_cache_key_id, inferred_edge_cache_lookup,
-    module_reference_rollup, normalize_source_path, reference_edges_for_entity, subsystem_members,
-    subsystem_of_entity, summary_cache_lookup, unresolved_call_sites_for_caller,
-    unresolved_callers_for_target,
+    find_entities, has_any_alive_binding, import_edges_for_entity, inferred_edge_cache_key_id,
+    inferred_edge_cache_lookup, module_reference_rollup, normalize_source_path,
+    reference_edges_for_entity, sei_for_locator, subsystem_members, subsystem_of_entity,
+    summary_cache_lookup, unresolved_call_sites_for_caller, unresolved_callers_for_target,
 };
 
 use crate::config::LlmConfig;
@@ -678,8 +678,9 @@ impl ServerState {
                 };
                 let snapshot = crate::snapshot::project_snapshot(conn, &project_root);
                 Ok(json!({
-                    "entity": matched.as_ref().map(entity_json),
+                    "entity": matched.as_ref().map(|e| entity_json(conn, e)),
                     "entity_context": entity_context_json(
+                        conn,
                         Some(line),
                         matched.as_ref(),
                         &candidates,
@@ -736,7 +737,7 @@ impl ServerState {
                     None
                 };
                 Ok(json!({
-                    "entities": rows.iter().map(entity_json).collect::<Vec<_>>(),
+                    "entities": rows.iter().map(|e| entity_json(conn, e)).collect::<Vec<_>>(),
                     "next_cursor": next_cursor
                 }))
             })
@@ -969,11 +970,11 @@ impl ServerState {
                     .and_then(|parent_id| entity_by_id(conn, parent_id).transpose())
                     .transpose()?
                     .as_ref()
-                    .map(entity_json);
+                    .map(|e| entity_json(conn, e));
                 let contained_entities = child_entity_ids(conn, &entity_id)?
                     .iter()
                     .filter_map(|child_id| entity_by_id(conn, child_id).transpose())
-                    .map(|row| row.map(|entity| entity_json(&entity)))
+                    .map(|row| row.map(|entity| entity_json(conn, &entity)))
                     .collect::<Result<Vec<_>, StorageError>>()?;
                 let (references_in, references_rolled_up) = reference_neighbors_for(
                     conn,
@@ -991,7 +992,7 @@ impl ServerState {
                 let imports_out = import_neighbors(conn, &entity_id, ReferenceDirection::Out)?;
                 let scope_excludes = call_graph_scope_excludes(confidence);
                 Ok(success_envelope(json!({
-                    "entity": entity_json(&entity),
+                    "entity": entity_json(conn, &entity),
                     "callers": inbound_callers,
                     "callees": outbound_calls,
                     "container": container_entity,
@@ -1055,7 +1056,8 @@ impl ServerState {
                 ));
             }
         };
-        let mut accumulator = IssuesForAccumulator::new(&read.entities);
+        let mut accumulator =
+            IssuesForAccumulator::new(&read.entities, read.entity_json_by_id.clone());
         let mut requests_total = 0_usize;
         for (idx, entity) in read.entities.iter().enumerate() {
             let entity_id = entity.id.clone();
@@ -1362,6 +1364,9 @@ impl ServerState {
                 });
                 let staleness_stale =
                     matches!(snapshot.staleness(), crate::snapshot::Staleness::Stale);
+                // Whether this index has any alive SEI bindings (REQ-C-04 /
+                // ADR-038). Degrades to `false` on a pre-SEI database.
+                let sei_populated = has_any_alive_binding(conn).unwrap_or(false);
 
                 let Some(entity) = matched else {
                     return Ok(OrientationCore {
@@ -1371,13 +1376,14 @@ impl ServerState {
                         packet: json!({
                             "primary_entity": Value::Null,
                             "entity_context":
-                                entity_context_json(query_line, None, &[], &[], &snapshot),
+                                entity_context_json(conn, query_line, None, &[], &[], &snapshot),
                             "source": Value::Null,
                             "neighbors": Value::Null,
                             "execution_paths": Value::Null,
                         }),
                         freshness,
                         staleness_stale,
+                        sei_populated,
                         neighbors_omitted: serde_json::Map::new(),
                         paths_truncation_reason: None,
                     });
@@ -1385,6 +1391,7 @@ impl ServerState {
 
                 let ancestors = ancestor_chain(conn, &entity.id)?;
                 let entity_context = entity_context_json(
+                    conn,
                     query_line,
                     Some(&entity),
                     &candidates,
@@ -1419,11 +1426,11 @@ impl ServerState {
                     .and_then(|parent_id| entity_by_id(conn, parent_id).transpose())
                     .transpose()?
                     .as_ref()
-                    .map(entity_json);
+                    .map(|e| entity_json(conn, e));
                 let contained_all = child_entity_ids(conn, &entity.id)?
                     .iter()
                     .filter_map(|child_id| entity_by_id(conn, child_id).transpose())
-                    .map(|row| row.map(|entity| entity_json(&entity)))
+                    .map(|row| row.map(|entity| entity_json(conn, &entity)))
                     .collect::<Result<Vec<_>, StorageError>>()?;
                 let (refs_in, references_rolled_up) = reference_neighbors_for(
                     conn,
@@ -1508,7 +1515,7 @@ impl ServerState {
                     primary_kind: Some(entity.kind.clone()),
                     lookup_was_id: query_line.is_none(),
                     packet: json!({
-                        "primary_entity": entity_json(&entity),
+                        "primary_entity": entity_json(conn, &entity),
                         "entity_context": entity_context,
                         "source": source,
                         "neighbors": neighbors,
@@ -1516,6 +1523,7 @@ impl ServerState {
                     }),
                     freshness,
                     staleness_stale,
+                    sei_populated,
                     neighbors_omitted,
                     paths_truncation_reason: paths_truncation_reason.map(str::to_owned),
                 })
@@ -1578,6 +1586,14 @@ impl ServerState {
 
         let health = json!({
             "index": core.freshness,
+            // Whether this build understands SEIs (always true) and whether the
+            // served index has SEI bindings populated (REQ-C-04 / ADR-038), so a
+            // consult agent knows if entity `sei` fields in this pack are
+            // non-null.
+            "sei": {
+                "supported": true,
+                "populated": core.sei_populated,
+            },
             "filigree": self.filigree_diagnostics_json(),
             "llm": self.llm_diagnostics_json(),
         });
@@ -1974,31 +1990,30 @@ impl ServerState {
             .unwrap_or(10)
             .min(200);
         let id_for_reader = entity_id.clone();
-        let entity = self
+        // Build the payload (including the entity's SEI read-time join) inside
+        // the reader closure so a connection is in scope for `entity_json`.
+        let payload = self
             .readers
-            .with_reader(move |conn| entity_by_id(conn, &id_for_reader))
+            .with_reader(move |conn| {
+                let Some(entity) = entity_by_id(conn, &id_for_reader)? else {
+                    return Ok(None);
+                };
+                Ok(Some(source_for_entity_json(conn, &entity, context_lines)))
+            })
             .await;
-        let entity = match entity {
-            Ok(Some(entity)) => entity,
-            Ok(None) => {
-                return Ok(tool_error_envelope(
-                    McpErrorCode::NotFound,
-                    &format!("no entity with id {entity_id}"),
-                    false,
-                ));
-            }
-            Err(err) => {
-                return Ok(tool_error_envelope(
-                    McpErrorCode::StorageError,
-                    &err.to_string(),
-                    storage_retryable(&err),
-                ));
-            }
-        };
-        Ok(success_envelope(source_for_entity_json(
-            &entity,
-            context_lines,
-        )))
+        match payload {
+            Ok(Some(payload)) => Ok(success_envelope(payload)),
+            Ok(None) => Ok(tool_error_envelope(
+                McpErrorCode::NotFound,
+                &format!("no entity with id {entity_id}"),
+                false,
+            )),
+            Err(err) => Ok(tool_error_envelope(
+                McpErrorCode::StorageError,
+                &err.to_string(),
+                storage_retryable(&err),
+            )),
+        }
     }
 
     async fn tool_summary_preview_cost(
@@ -2141,6 +2156,9 @@ impl ServerState {
                 // to the DB, so a consult agent can detect that the index changed
                 // under it across calls (clarion-22c18fdb34).
                 let data_version = scalar_count_fail_soft(conn, "PRAGMA data_version");
+                // Whether this index has any alive SEI bindings (REQ-C-04 /
+                // ADR-038). Degrades to `false` on a pre-SEI database.
+                let sei_populated = has_any_alive_binding(conn).unwrap_or(false);
                 Ok((
                     snapshot,
                     edge_count,
@@ -2148,21 +2166,29 @@ impl ServerState {
                     plugins,
                     latest_run,
                     data_version,
+                    sei_populated,
                 ))
             })
             .await;
 
-        let (snapshot, edge_count, briefing_blocked, plugins, latest_run, data_version) =
-            match storage {
-                Ok(tuple) => tuple,
-                Err(err) => {
-                    return Ok(tool_error_envelope(
-                        McpErrorCode::StorageError,
-                        &err.to_string(),
-                        storage_retryable(&err),
-                    ));
-                }
-            };
+        let (
+            snapshot,
+            edge_count,
+            briefing_blocked,
+            plugins,
+            latest_run,
+            data_version,
+            sei_populated,
+        ) = match storage {
+            Ok(tuple) => tuple,
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::StorageError,
+                    &err.to_string(),
+                    storage_retryable(&err),
+                ));
+            }
+        };
 
         // The on-disk size, paired with data_version, exposes a swapped or
         // truncated DB the server may still be serving from a stale handle.
@@ -2204,6 +2230,14 @@ impl ServerState {
             // integration; report null rather than fabricate one.
             "git_sha": Value::Null,
             "plugins": plugins,
+            // Whether this build understands SEIs (always true here) and whether
+            // the served index actually has SEI bindings populated (REQ-C-04 /
+            // ADR-038). A consult agent reads this to know if entity responses
+            // will carry a non-null `sei`.
+            "sei": {
+                "supported": true,
+                "populated": sei_populated,
+            },
             "llm": self.llm_diagnostics_json(),
             "filigree": self.filigree_diagnostics_json(),
         });
@@ -2298,8 +2332,16 @@ impl ServerState {
                         entities.push(entity);
                     }
                 }
+                // Resolve each entity's `sei` while a reader connection is in
+                // scope; `tool_issues_for` consumes this map outside any reader
+                // closure (REQ-C-04 / ADR-038).
+                let entity_json_by_id: HashMap<String, Value> = entities
+                    .iter()
+                    .map(|entity| (entity.id.clone(), entity_json(conn, entity)))
+                    .collect();
                 Ok(Some(IssuesForRead {
                     entities,
+                    entity_json_by_id,
                     entity_cap_truncated,
                 }))
             })
@@ -2704,10 +2746,13 @@ impl ServerState {
                     return Ok(SummaryRead::EntityNotFound(entity_id));
                 };
                 if entity.kind == "subsystem" {
-                    return Ok(SummaryRead::ScopeDeferred(Box::new(entity)));
+                    return Ok(SummaryRead::ScopeDeferred(entity_json(conn, &entity)));
                 }
                 if let Some(reason) = briefing_block_reason(&entity) {
-                    return Ok(SummaryRead::BriefingBlocked(Box::new(entity), reason));
+                    return Ok(SummaryRead::BriefingBlocked(
+                        entity_json(conn, &entity),
+                        reason,
+                    ));
                 }
                 let Some(content_hash) = entity.content_hash.clone() else {
                     return Ok(SummaryRead::MissingContentHash(entity.id));
@@ -2728,8 +2773,10 @@ impl ServerState {
                     call_edges_from(conn, &entity.id, EdgeConfidence::Ambiguous)?.len(),
                 )
                 .unwrap_or(i64::MAX);
+                let entity_payload = entity_json(conn, &entity);
                 Ok(SummaryRead::Ready(Box::new(SummaryReady {
                     entity,
+                    entity_json: entity_payload,
                     key,
                     cached,
                     caller_count,
@@ -2760,7 +2807,7 @@ impl ServerState {
             ));
         }
         Some(summary_success_envelope(
-            &ready.entity,
+            &ready.entity_json,
             cached,
             true,
             stale_semantic(cached, ready.caller_count, ready.fan_out),
@@ -2854,7 +2901,7 @@ impl ServerState {
                 );
             }
             return summary_success_envelope(
-                &ready.entity,
+                &ready.entity_json,
                 &entry,
                 false,
                 false,
@@ -2892,7 +2939,7 @@ impl ServerState {
         }
 
         summary_success_envelope(
-            &ready.entity,
+            &ready.entity_json,
             &entry,
             false,
             false,
@@ -3072,12 +3119,19 @@ enum SummaryRead {
     Ready(Box<SummaryReady>),
     EntityNotFound(String),
     MissingContentHash(String),
-    ScopeDeferred(Box<EntityRow>),
-    BriefingBlocked(Box<EntityRow>, String),
+    // The pre-serialized entity payload (carrying its `sei`) is built in the
+    // reader closure; the summary envelope is otherwise assembled after async
+    // writer/LLM calls where no reader connection is in scope (REQ-C-04 /
+    // ADR-038).
+    ScopeDeferred(Value),
+    BriefingBlocked(Value, String),
 }
 
 struct SummaryReady {
     entity: EntityRow,
+    /// Pre-serialized entity payload (including the SEI read-time join), built
+    /// in the reader closure for the same reason as the variants above.
+    entity_json: Value,
     key: SummaryCacheKey,
     cached: Option<SummaryCacheEntry>,
     caller_count: i64,
@@ -3086,11 +3140,18 @@ struct SummaryReady {
 
 struct IssuesForRead {
     entities: Vec<EntityRow>,
+    /// Pre-serialized entity payloads keyed by locator, built inside the reader
+    /// closure so the SEI read-time join (REQ-C-04 / ADR-038) happens while a
+    /// connection is in scope. `tool_issues_for` runs outside any reader closure
+    /// (it interleaves Filigree HTTP calls), so the `sei` field cannot be
+    /// resolved during accumulation — it is resolved here, ahead of the loop.
+    entity_json_by_id: HashMap<String, Value>,
     entity_cap_truncated: bool,
 }
 
 struct IssuesForAccumulator {
     entities_by_id: HashMap<String, EntityRow>,
+    entity_json_by_id: HashMap<String, Value>,
     seen_issue_ids: BTreeSet<String>,
     matched: Vec<Value>,
     drifted: Vec<Value>,
@@ -3101,12 +3162,13 @@ struct IssuesForAccumulator {
 }
 
 impl IssuesForAccumulator {
-    fn new(entities: &[EntityRow]) -> Self {
+    fn new(entities: &[EntityRow], entity_json_by_id: HashMap<String, Value>) -> Self {
         Self {
             entities_by_id: entities
                 .iter()
                 .map(|entity| (entity.id.clone(), entity.clone()))
                 .collect(),
+            entity_json_by_id,
             seen_issue_ids: BTreeSet::new(),
             matched: Vec::new(),
             drifted: Vec::new(),
@@ -3132,6 +3194,13 @@ impl IssuesForAccumulator {
     }
 
     fn add_association(&mut self, association: &EntityAssociation) {
+        // The nested entity payload (including its `sei`) was pre-built in the
+        // reader closure; `entities_by_id` is retained only for content-hash
+        // drift classification.
+        let entity_json = self
+            .entity_json_by_id
+            .get(&association.clarion_entity_id)
+            .cloned();
         match self.entities_by_id.get(&association.clarion_entity_id) {
             None => self
                 .not_found
@@ -3140,7 +3209,7 @@ impl IssuesForAccumulator {
                 Some(current_hash) if current_hash == association.content_hash_at_attach => {
                     self.matched.push(association_json(
                         association,
-                        Some(entity),
+                        entity_json.as_ref(),
                         Some(current_hash),
                         "matched",
                     ));
@@ -3148,7 +3217,7 @@ impl IssuesForAccumulator {
                 Some(current_hash) => {
                     self.drifted.push(association_json(
                         association,
-                        Some(entity),
+                        entity_json.as_ref(),
                         Some(current_hash),
                         "drifted",
                     ));
@@ -3158,8 +3227,12 @@ impl IssuesForAccumulator {
                         "code": "CLA-ENTITY-CONTENT-HASH-MISSING",
                         "entity_id": entity.id
                     }));
-                    self.matched
-                        .push(association_json(association, Some(entity), None, "unknown"));
+                    self.matched.push(association_json(
+                        association,
+                        entity_json.as_ref(),
+                        None,
+                        "unknown",
+                    ));
                 }
             },
         }
@@ -4236,14 +4309,14 @@ fn wardline_section_for_entity(
 
 fn association_json(
     association: &EntityAssociation,
-    entity: Option<&EntityRow>,
+    entity: Option<&Value>,
     current_content_hash: Option<&str>,
     drift_status: &str,
 ) -> Value {
     json!({
         "issue_id": association.issue_id,
         "entity_id": association.clarion_entity_id,
-        "entity": entity.map(entity_json),
+        "entity": entity,
         "content_hash_at_attach": association.content_hash_at_attach,
         "current_content_hash": current_content_hash,
         "attached_at": association.attached_at,
@@ -4264,8 +4337,10 @@ fn summary_read_error(read: SummaryRead) -> Value {
             &format!("entity {id} has no content hash for summary cache keying"),
             false,
         ),
-        SummaryRead::ScopeDeferred(entity) => summary_scope_deferred(&entity),
-        SummaryRead::BriefingBlocked(entity, reason) => summary_briefing_blocked(&entity, &reason),
+        SummaryRead::ScopeDeferred(entity_json) => summary_scope_deferred(&entity_json),
+        SummaryRead::BriefingBlocked(entity_json, reason) => {
+            summary_briefing_blocked(&entity_json, &reason)
+        }
         SummaryRead::Ready(_) => unreachable!("ready summary read is not an error"),
     }
 }
@@ -4322,7 +4397,7 @@ fn structural_summary_json(entity: &EntityRow, source_excerpt: &str) -> String {
 }
 
 fn summary_success_envelope(
-    entity: &EntityRow,
+    entity_json: &Value,
     entry: &SummaryCacheEntry,
     cache_hit: bool,
     stale_semantic: bool,
@@ -4347,7 +4422,7 @@ fn summary_success_envelope(
     success_envelope_with_stats(
         json!({
             "available": true,
-            "entity": entity_json(entity),
+            "entity": entity_json,
             "summary": summary,
             "cache": {
                 "hit": cache_hit,
@@ -4364,25 +4439,29 @@ fn summary_success_envelope(
     )
 }
 
-fn summary_scope_deferred(entity: &EntityRow) -> Value {
+fn summary_scope_deferred(entity_json: &Value) -> Value {
     success_envelope(json!({
         "available": false,
         "reason": "summary-scope-deferred",
         "message": "subsystem summaries are deferred to v0.2",
-        "entity": entity_json(entity)
+        "entity": entity_json
     }))
 }
 
-fn summary_briefing_blocked(entity: &EntityRow, reason: &str) -> Value {
+fn summary_briefing_blocked(entity_json: &Value, reason: &str) -> Value {
     let remediation = if reason == "unscanned_source" {
         "Entity source file was not covered by the pre-ingest secret scan. Re-run with scanner coverage for that path or fix the plugin source path before requesting a summary."
     } else {
         "File flagged by pre-ingest secret scan. Fix the secret or whitelist via .clarion/secrets-baseline.yaml. See ADR-013."
     };
+    let entity_id = entity_json
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     success_envelope(json!({
         "available": false,
-        "entity_id": entity.id,
-        "entity": entity_json(entity),
+        "entity_id": entity_id,
+        "entity": entity_json,
         "summary": null,
         "briefing_blocked": reason,
         "remediation": remediation
@@ -4415,7 +4494,13 @@ fn tool_json_rpc_response(id: &Value, envelope: &Value) -> Value {
     )
 }
 
-fn entity_json(entity: &EntityRow) -> Value {
+/// Serialize an entity's stable identity fields, without the SEI.
+///
+/// This is the conn-free core used both by [`entity_json`] (which adds the SEI
+/// for client-facing tool responses) and by internal payloads — notably the LLM
+/// inference prompt — that must *not* gain a `sei` field (it is neither a tool
+/// return surface nor allowed to change shape; see REQ-C-04 scope).
+fn entity_identity_json(entity: &EntityRow) -> Value {
     json!({
         "id": entity.id,
         "kind": entity.kind,
@@ -4426,6 +4511,25 @@ fn entity_json(entity: &EntityRow) -> Value {
         "source_line_end": entity.source_line_end,
         "content_hash": entity.content_hash
     })
+}
+
+/// Serialize an entity for an MCP tool response.
+///
+/// Per REQ-C-04 / ADR-038, every tool surface that returns an entity `id` must
+/// also carry its SEI: the `id` (locator) is the *mutable* address that changes
+/// on rename/move, while the `sei` is the durable cross-tool binding key. The
+/// SEI is read via a read-time join (`sei_for_locator`) and graceful-degrades
+/// to JSON `null` on a pre-SEI database or an orphaned/unbound locator — the
+/// lookup must never fail the tool call.
+fn entity_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
+    let mut value = entity_identity_json(entity);
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "sei".to_owned(),
+            json!(sei_for_locator(conn, &entity.id).ok().flatten()),
+        );
+    }
+    value
 }
 
 fn entity_properties_json(entity: &EntityRow) -> Value {
@@ -4506,9 +4610,13 @@ fn span_len(entity: &EntityRow) -> Option<i64> {
 
 /// Compact entity descriptor for the containing stack — enough to orient
 /// without the full `entity_json` payload.
-fn stack_entity_json(entity: &EntityRow) -> Value {
+fn stack_entity_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
+    // REQ-C-04: a containing-stack ancestor is sometimes the ONLY place an
+    // entity appears in the response, so it carries its `sei` (the durable
+    // binding key) — not just the mutable `id`/locator. Graceful-degrade null.
     json!({
         "id": entity.id,
+        "sei": sei_for_locator(conn, &entity.id).ok().flatten(),
         "kind": entity.kind,
         "short_name": entity.short_name,
         "name": entity.name,
@@ -4523,6 +4631,7 @@ fn stack_entity_json(entity: &EntityRow) -> Value {
 /// and index freshness. Returns a `no_match` shell when no entity spans the
 /// line (e.g. an unindexed file).
 fn entity_context_json(
+    conn: &rusqlite::Connection,
     line: Option<i64>,
     matched: Option<&EntityRow>,
     candidates: &[EntityRow],
@@ -4548,8 +4657,12 @@ fn entity_context_json(
     };
 
     // Containing stack outermost (module) → matched entity, inclusive.
-    let mut containing_stack: Vec<Value> = ancestors.iter().rev().map(stack_entity_json).collect();
-    containing_stack.push(stack_entity_json(matched));
+    let mut containing_stack: Vec<Value> = ancestors
+        .iter()
+        .rev()
+        .map(|e| stack_entity_json(conn, e))
+        .collect();
+    containing_stack.push(stack_entity_json(conn, matched));
 
     let def = DefinitionSpan::from_entity(matched);
     let ranges = json!({
@@ -4574,7 +4687,7 @@ fn entity_context_json(
             .take(ENTITY_CONTEXT_MAX_ALTERNATIVES)
             .map(|cand| {
                 json!({
-                    "entity": entity_json(cand),
+                    "entity": entity_json(conn, cand),
                     "match_reason": match_reason_for(line, cand),
                 })
             })
@@ -4621,6 +4734,9 @@ struct OrientationCore {
     packet: Value,
     freshness: Value,
     staleness_stale: bool,
+    /// Whether the served index has any alive SEI bindings (REQ-C-04 /
+    /// ADR-038). Resolved in the reader closure and surfaced under `health.sei`.
+    sei_populated: bool,
     neighbors_omitted: serde_json::Map<String, Value>,
     paths_truncation_reason: Option<String>,
 }
@@ -5082,7 +5198,7 @@ fn build_call_sites(
     }
 
     Ok(Some(json!({
-        "entity": entity_json(&entity),
+        "entity": entity_json(conn, &entity),
         "role": match role { CallSiteRole::Caller => "caller", CallSiteRole::Callee => "callee" },
         "filters": {
             "kind": match kind {
@@ -5157,8 +5273,12 @@ fn anchor_line(
 /// snippet when the source cannot be trusted: `missing` (file gone),
 /// `no_source_path` / `no_range` (no anchor to read), `binary` (non-UTF-8), or
 /// `drifted` (the file no longer hashes to the indexed `content_hash`).
-fn source_for_entity_json(entity: &EntityRow, context_lines: usize) -> Value {
-    let identity = entity_json(entity);
+fn source_for_entity_json(
+    conn: &rusqlite::Connection,
+    entity: &EntityRow,
+    context_lines: usize,
+) -> Value {
+    let identity = entity_json(conn, entity);
 
     // Refuse to read or return bytes for an entity whose file the pre-ingest
     // scanner marked `briefing_blocked`. Without this guard, an agent holding
@@ -5361,8 +5481,15 @@ fn unresolved_sites_json(sites: &[UnresolvedCallSiteRow]) -> String {
 }
 
 fn entities_json(entities: &[EntityRow]) -> String {
-    serde_json::to_string(&entities.iter().map(entity_json).collect::<Vec<_>>())
-        .expect("candidate entity JSON serializes")
+    // Candidate entities for the LLM inference prompt — an internal payload,
+    // not a tool return surface, so it carries identity fields only (no `sei`).
+    serde_json::to_string(
+        &entities
+            .iter()
+            .map(entity_identity_json)
+            .collect::<Vec<_>>(),
+    )
+    .expect("candidate entity JSON serializes")
 }
 
 fn inferred_records_from_result(
@@ -5479,7 +5606,7 @@ fn caller_json(
 ) -> Result<Option<Value>, StorageError> {
     Ok(entity_by_id(conn, &edge.from_id)?.map(|entity| {
         json!({
-            "entity": entity_json(&entity),
+            "entity": entity_json(conn, &entity),
             "edge_confidence": edge.confidence.as_str(),
             "source_byte_start": edge.source_byte_start,
             "source_byte_end": edge.source_byte_end,
@@ -5495,7 +5622,7 @@ fn callee_json(
 ) -> Result<Option<Value>, StorageError> {
     Ok(entity_by_id(conn, &edge.to_id)?.map(|entity| {
         json!({
-            "entity": entity_json(&entity),
+            "entity": entity_json(conn, &entity),
             "edge_confidence": edge.confidence.as_str(),
             "source_byte_start": edge.source_byte_start,
             "source_byte_end": edge.source_byte_end,
@@ -5536,7 +5663,7 @@ fn compact_execution_paths(
     let nodes = node_ids
         .iter()
         .filter_map(|id| entity_by_id(conn, id).transpose())
-        .map(|row| row.map(|entity| compact_node_json(&entity)))
+        .map(|row| row.map(|entity| compact_node_json(conn, &entity)))
         .collect::<Result<Vec<_>, StorageError>>()?;
     Ok(CompactPaths {
         nodes,
@@ -5562,9 +5689,13 @@ fn path_truncation_reason(edge_truncated: bool, path_cap_truncated: bool) -> Opt
 /// A path node trimmed for token economy: identity + location only. The full id
 /// already encodes the qualified name; `content_hash` and the redundant `name`
 /// are dropped (clarion-5b3eff9a91).
-fn compact_node_json(entity: &EntityRow) -> Value {
+fn compact_node_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
+    // REQ-C-04: a path node is the only representation of that entity in the
+    // response, so it carries its `sei` (the durable binding key) alongside the
+    // mutable `id`/locator. Graceful-degrade to null on a pre-SEI DB.
     json!({
         "id": entity.id,
+        "sei": sei_for_locator(conn, &entity.id).ok().flatten(),
         "kind": entity.kind,
         "short_name": entity.short_name,
         "source_file_path": entity.source_file_path,
@@ -5629,7 +5760,7 @@ fn rolled_up_neighbors_json(
         if let Some(entity) = entity_by_id(conn, &edge.neighbor_id)? {
             let via = entity_by_id(conn, &edge.via_id)?;
             let mut object = serde_json::Map::new();
-            object.insert("entity".to_owned(), entity_json(&entity));
+            object.insert("entity".to_owned(), entity_json(conn, &entity));
             object.insert(
                 "edge_confidence".to_owned(),
                 json!(edge.confidence.as_str()),
@@ -5644,7 +5775,8 @@ fn rolled_up_neighbors_json(
             // (entity) AND the imported symbol (via).
             object.insert(
                 "via".to_owned(),
-                via.as_ref().map_or(Value::Null, entity_json),
+                via.as_ref()
+                    .map_or(Value::Null, |entity| entity_json(conn, entity)),
             );
             // Reverse-import altitude (clarion-79d0ff6e14): the edge is recorded
             // against the importing *symbol*, but "who imports this module /
@@ -5660,7 +5792,9 @@ fn rolled_up_neighbors_json(
                 };
                 object.insert(
                     "importer_module".to_owned(),
-                    importer_module.as_ref().map_or(Value::Null, entity_json),
+                    importer_module
+                        .as_ref()
+                        .map_or(Value::Null, |entity| entity_json(conn, entity)),
                 );
             }
             neighbors.push(Value::Object(object));
@@ -5677,7 +5811,7 @@ fn edge_neighbors_json(
     for edge in edges {
         if let Some(entity) = entity_by_id(conn, &edge.neighbor_id)? {
             neighbors.push(json!({
-                "entity": entity_json(&entity),
+                "entity": entity_json(conn, &entity),
                 "edge_confidence": edge.confidence.as_str(),
                 "source_byte_start": edge.source_byte_start,
                 "source_byte_end": edge.source_byte_end
@@ -6603,7 +6737,16 @@ mod tests {
         entity.properties_json =
             r#"{"briefing_blocked":"secret detected by pre-ingest scanner"}"#.to_owned();
 
-        let out = super::source_for_entity_json(&entity, 10);
+        // A migrated connection satisfies the SEI read-time join
+        // (`entity_json`); with no bindings seeded, `sei` degrades to null,
+        // which is irrelevant to this briefing-block assertion. WAL (ADR-011)
+        // requires a file-backed DB, so use the tempdir rather than :memory:.
+        let db_path = dir.path().join("clarion.db");
+        let mut conn = Connection::open(&db_path).expect("open sqlite");
+        pragma::apply_write_pragmas(&conn).expect("write pragmas");
+        schema::apply_migrations(&mut conn).expect("apply migrations");
+
+        let out = super::source_for_entity_json(&conn, &entity, 10);
 
         assert_eq!(out["source_status"], "briefing_blocked");
         assert_eq!(
