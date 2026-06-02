@@ -150,9 +150,18 @@ signal is absent", not "there is nothing here". Likewise `high_churn` and
 `index_diff` for repo-level freshness).
 
 > Not in this catalogue: `search_semantic` and `find_dead_code` (need embedding
-> / whole-graph-reachability infrastructure — a separate wave), guidance
-> *authoring* (`propose_guidance`/`promote_guidance` — `guidance_for` is read
-> only), and `emit_observation` (no observation-write transport ships yet).
+> / whole-graph-reachability infrastructure — a separate wave), agent-mediated
+> guidance authoring (`propose_guidance`/`promote_guidance` — deferred, no
+> observation-write transport: clarion-3d272da8a7), and `emit_observation` (no
+> observation-write transport ships yet).
+
+**Guidance authoring is operator-driven (CLI), not an MCP tool.** Sheets are
+authored out-of-band via `clarion guidance create/edit/show/list/delete` (plus
+`export`/`import` for team sharing) — see the operator guide. `guidance_for`
+(above) is the read surface: it composes the authored sheets that apply to an
+entity at query time, scope-ranked project → function. So new guidance reaches
+you through `guidance_for`, not (yet) through `summary` — summaries do not
+compose guidance today (clarion-b8b296352e).
 
 ## Workflow: orient, then navigate
 

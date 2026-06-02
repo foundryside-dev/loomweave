@@ -295,7 +295,10 @@ pub enum GuidanceCommand {
         /// Project directory containing .clarion/clarion.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
-        /// Directory to write the exported sheet files into.
+        /// Directory to write the exported sheet files into. Export does NOT
+        /// prune: a sheet deleted locally keeps its file here, and a teammate's
+        /// additive `import` would resurrect it. To mirror, clear the directory
+        /// before exporting.
         #[arg(long)]
         to: PathBuf,
     },
