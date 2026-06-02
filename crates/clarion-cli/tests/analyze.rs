@@ -2055,3 +2055,83 @@ fn analyze_no_sei_flag_skips_minting() {
         "--no-sei must skip the mint pass entirely"
     );
 }
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_orphans_deleted_entity_bindings_through_the_real_pipeline() {
+    // Drives the PRODUCTION `run_sei_mint_pass` orphan-first path + lineage
+    // end-to-end (not the oracle's re-implementation): an entity present in run
+    // 1 but absent in run 2 must have its binding flipped to `orphaned` with an
+    // `orphaned` lineage event, while the surviving entity stays `alive`.
+    // (Phase3 fixture entities are module-only with null signatures, so a
+    // vanished locator with no git signal correctly fails closed to orphan.)
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_phase3_plugin(plugin_dir.path());
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let analyze = || {
+        clarion_bin()
+            .args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .assert()
+            .success();
+    };
+
+    std::fs::write(project_dir.path().join("sei_keep.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("sei_drop.p3"), b"module\n").unwrap();
+    analyze();
+    let run1 = alive_sei_bindings(project_dir.path());
+    let drop_locator = "phase3fixture:module:sei_drop";
+    let keep_locator = "phase3fixture:module:sei_keep";
+    let dropped_sei = run1
+        .get(drop_locator)
+        .expect("dropped module must have an alive binding after run 1")
+        .clone();
+
+    // Run 2: remove sei_drop.p3 → its module entity vanishes.
+    std::fs::remove_file(project_dir.path().join("sei_drop.p3")).unwrap();
+    analyze();
+
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    // The dropped entity's binding is now orphaned (by SEI — its row persists).
+    let dropped_status: String = conn
+        .query_row(
+            "SELECT status FROM sei_bindings WHERE sei = ?1",
+            [&dropped_sei],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        dropped_status, "orphaned",
+        "a deleted entity's binding must flip to orphaned on the real pipeline"
+    );
+    // An `orphaned` lineage event was appended for it.
+    let orphaned_events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sei_lineage WHERE sei = ?1 AND event = 'orphaned'",
+            [&dropped_sei],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        orphaned_events >= 1,
+        "delete must record an orphaned lineage event"
+    );
+    // The dropped locator no longer has an alive binding; the survivor does.
+    let after = alive_sei_bindings(project_dir.path());
+    assert!(
+        !after.contains_key(drop_locator),
+        "dropped locator must not be alive"
+    );
+    assert!(
+        after.contains_key(keep_locator),
+        "kept locator must stay alive"
+    );
+}
