@@ -327,6 +327,7 @@ dependencies = [
  "dotenvy",
  "fs2",
  "ignore",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

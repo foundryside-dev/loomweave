@@ -32,7 +32,7 @@ use clarion_storage::{
     alive_bindings_snapshot,
     commands::{EdgeRecord, EntityRecord, FindingRecord, RunStatus, WriterCmd},
     mint_sei, module_dependency_edges, orphaned_bindings, rebind_or_mint,
-    sei::{BindingStatus, GitRenameSource, LineageEvent},
+    sei::{BindingStatus, LineageEvent},
 };
 
 use clarion_mcp::config::McpConfig;
@@ -188,6 +188,11 @@ pub(crate) struct AnalyzeOptions {
     /// cumulative, edges are `INSERT OR IGNORE`), so this is an escape hatch for a
     /// clean re-index, not a correctness switch.
     pub(crate) no_incremental: bool,
+    /// `--legis-url`: `legis`'s read-API base URL, enabling the WS9 git-rename
+    /// provider seam (REQ-C-05). Enrich-only and capability-aware: the operative
+    /// working-tree window stays on the shell source, so an unset/unreachable
+    /// `legis` leaves behaviour byte-identical to pre-WS9. `None` ⇒ shell only.
+    pub(crate) legis_url: Option<String>,
 }
 
 /// Run the analyze command against `project_path` with resolved CLI options.
@@ -910,6 +915,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     &run_id,
                     sei_descriptors,
                     &retained_locators,
+                    options.legis_url.as_deref(),
                 )
                 .await
                 {
@@ -1083,6 +1089,7 @@ async fn run_sei_mint_pass(
     run_id: &str,
     descriptors: Vec<NewEntityDescriptor>,
     retained_locators: &HashSet<String>,
+    legis_url: Option<&str>,
 ) -> anyhow::Result<SeiPassStats> {
     // Read the prior alive bindings (this run has written no SEI yet, so this is
     // exactly the previous run's identity state).
@@ -1103,10 +1110,16 @@ async fn run_sei_mint_pass(
     current_locators.extend(retained_locators.iter().cloned());
 
     // The git-rename signal (best-effort, typed seam REQ-C-05). Skipped entirely
-    // on non-repo corpora to avoid a spurious subprocess.
+    // on non-repo corpora to avoid a spurious subprocess. The operative window is
+    // working-tree-vs-HEAD (empty base); `select_git_rename_source` keeps the
+    // shell source for that window and consults a configured `legis` only for a
+    // committed rev-range (WS9 / SEI §6), so an unset/unreachable `legis` issues
+    // no HTTP and leaves this path byte-identical to pre-WS9 behaviour.
     let git_renames: Vec<GitRename> = if crate::sei_git::is_git_repo(project_root) {
-        crate::sei_git::ShellGitRenameSource::new(
-            project_root.to_path_buf(),
+        crate::sei_git::select_git_rename_source(
+            project_root,
+            legis_url.map(str::to_owned),
+            "",
             descriptors.iter().map(|d| d.locator.clone()).collect(),
         )
         .renames_since("")

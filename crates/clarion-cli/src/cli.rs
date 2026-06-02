@@ -110,6 +110,14 @@ pub enum Command {
         /// clean re-index. Without this flag unchanged files are skipped.
         #[arg(long)]
         no_incremental: bool,
+
+        /// `legis`'s read-API base URL (e.g. `http://127.0.0.1:8615`), enabling
+        /// the WS9 git-rename provider seam (REQ-C-05). Enrich-only and
+        /// capability-aware: the operative working-tree rename window stays on
+        /// Clarion's own git probe, so an unset or unreachable `legis` leaves
+        /// behaviour byte-identical. Omit to use Clarion's shell git source only.
+        #[arg(long)]
+        legis_url: Option<String>,
     },
 
     /// Run the MCP stdio server.
