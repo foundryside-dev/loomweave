@@ -1443,8 +1443,19 @@ POST {filigree_base}/api/v1/scan-results
   - `mark_unseen` is `true` for a normal full run (old-position findings for the
     same rule/file transition to `unseen_in_latest`); a `--resume RUN_ID` run
     sets it `false` so the re-emit does not flip the prior run's findings to
-    `unseen_in_latest`. `complete_scan_run` is `true` on the final (here: only)
-    batch. **`--resume` is implemented** (REQ-FINDING-05): it reopens the prior
+    `unseen_in_latest`. `complete_scan_run` is `true` on the final batch.
+    **Two-pass emission (`clarion-ef8f64d5fd`):** a single analyze run may POST
+    *two* scan-results batches under one `scan_run_id` — the pre-`CommitRun`
+    Phase-8 batch (`complete_scan_run=true`) carrying the during-run findings,
+    then an additive post-`CommitRun` Phase-8c batch (`complete_scan_run=false`)
+    carrying the findings persisted after Phase 8 (the deletion + tier facts).
+    The second batch is additive: `mark_unseen` matches the first, and because it
+    re-sends only post-commit rule IDs (distinct from the first batch's, which
+    `mark_unseen` keys on per rule/file) it never flips the first batch's findings
+    to `unseen_in_latest`. The Phase-8c batch is omitted when there are no
+    post-commit findings, and is logged-only (not recorded in `stats.json`, which
+    `CommitRun` has already written). **`--resume` is implemented**
+    (REQ-FINDING-05): it reopens the prior
     run's `runs` row instead of inserting a fresh one and re-walks idempotently
     (entities and run-scoped findings UPSERT). It re-walks the tree from scratch
     (not incremental recovery) and assumes an unchanged corpus. Because a resume
@@ -1462,8 +1473,18 @@ POST {filigree_base}/api/v1/scan-results
     `metadata.clarion.internal_severity`.
   - `line_start` / `line_end` are omitted when the anchor entity has no line
     range. A finding whose anchor entity has **no `path`** is skipped (and
-    counted in `stats.json`); Filigree rejects path-less findings with
-    `400 VALIDATION`.
+    counted in `stats.json` as `skipped_no_path`); Filigree rejects path-less
+    findings with `400 VALIDATION`.
+  - **synthetic anchor (`clarion-ef8f64d5fd`):** the post-`CommitRun` Phase-8c
+    batch (above) carries tier facts anchored to a synthetic subsystem entity,
+    which has no `source_file_path`. Rather than dropping them, that pass anchors
+    them to the **project-root** `path` (the same stand-in the `core:project:*`
+    `CLA-INFRA-*` findings use) and sets `metadata.clarion.synthetic_anchor=true`;
+    such findings carry no `line_start`/`line_end`. A consumer must treat the
+    `path` of a `synthetic_anchor` finding as a placeholder for a non-file entity
+    (the real subject is `metadata.clarion.entity_id`), never as a source
+    location. The during-run Phase-8 batch supplies no fallback, so a path-less
+    during-run finding (e.g. the weak-modularity subsystem fact) is still skipped.
   - **briefing-blocked exclusion:** findings anchored to a `briefing_blocked`
     entity are **never emitted** (clarion-8b32ba0d02). This matches the
     fail-closed read posture — `GET /api/v1/files` refuses the same entities —

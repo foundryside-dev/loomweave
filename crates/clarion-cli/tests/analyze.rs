@@ -910,6 +910,190 @@ fn run_phase3_analyze(
         .success();
 }
 
+/// A one-shot mock Filigree `/api/v1/scan-results` sink. Captures every POST body
+/// via an idle-timeout accept loop, so it tolerates a run emitting one batch or
+/// two (Phase 8 + Phase 8c) without a hard-coded connection count, and stops
+/// early as soon as a captured body contains `needle`. Returns the bound base
+/// URL and the join handle yielding the captured request strings.
+#[cfg(unix)]
+fn spawn_capturing_filigree_mock(
+    needle: &'static str,
+) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock filigree");
+    let addr = listener.local_addr().expect("local addr");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking mock listener");
+    let handle = std::thread::spawn(move || {
+        let body = r#"{"files_created":0,"files_updated":0,"findings_created":0,"findings_updated":0,"new_finding_ids":[],"observations_created":0,"observations_failed":0,"warnings":[]}"#;
+        let mut requests: Vec<String> = Vec::new();
+        let start = Instant::now();
+        let mut last = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).ok();
+                    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                    let mut buf = [0_u8; 16384];
+                    let read = stream.read(&mut buf).unwrap_or(0);
+                    let captured = String::from_utf8_lossy(&buf[..read]).into_owned();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let hit = captured.contains(needle);
+                    requests.push(captured);
+                    // Fast path: stop as soon as the awaited batch lands.
+                    if hit {
+                        break;
+                    }
+                    last = Instant::now();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Otherwise return once the client has been idle past the
+                    // window (a batch landed and no more is coming), or after a
+                    // hard cap so a never-connecting client can't hang the test.
+                    if (!requests.is_empty() && last.elapsed() > Duration::from_secs(3))
+                        || start.elapsed() > Duration::from_secs(30)
+                    {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(_) => break,
+            }
+        }
+        requests
+    });
+    (format!("http://{addr}"), handle)
+}
+
+/// clarion-ef8f64d5fd: the post-`CommitRun` deletion finding
+/// (`CLA-FACT-ENTITY-DELETED`) must reach Filigree in the SAME run, not only the
+/// store. Phase-8 emission runs *before* `CommitRun`, while the SEI mint pass
+/// persists deletion findings *after* it, so without a second emission pass the
+/// finding is stranded store-only even with `emit_findings=true`. End-to-end:
+/// run 1 establishes the prior index (no Filigree); run 2 (file removed, emit
+/// enabled) must POST a body containing the deletion finding to a mock Filigree.
+/// The deletion finding anchors to the deleted entity's own never-pruned,
+/// path-bearing row, so it survives the `findings_for_emit` JOIN and the
+/// `wire_finding` path filter.
+#[cfg(unix)]
+#[test]
+fn analyze_emits_post_commit_deletion_finding_to_filigree() {
+    // Run 1: establish the prior index with a plain (no-Filigree) config so the
+    // mock only sees run 2's POSTs.
+    let (project_dir, plugin_dir, config_path) =
+        phase3_project_for_rerun(&["auth_a", "auth_b", "billing_a", "billing_b"]);
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+
+    let (base_url, server) = spawn_capturing_filigree_mock("CLA-FACT-ENTITY-DELETED");
+
+    // Run 2: rewrite the config to enable emission against the mock, delete a
+    // source file, and re-run.
+    std::fs::write(&config_path, phase3_config_with_filigree(2, &base_url))
+        .expect("rewrite config with filigree emission enabled");
+    std::fs::remove_file(project_dir.path().join("billing_a.p3")).expect("delete a source file");
+    run_phase3_analyze(
+        project_dir.path(),
+        std::path::Path::new(&config_path),
+        &plugin_path,
+    );
+
+    let requests = server.join().expect("mock server thread");
+    let combined = requests.join("\n---POST BOUNDARY---\n");
+    assert!(
+        combined.contains("CLA-FACT-ENTITY-DELETED"),
+        "the post-commit deletion finding must reach Filigree in the same run; \
+         captured {} POST(s): {combined}",
+        requests.len(),
+    );
+}
+
+/// clarion-ef8f64d5fd (tier half): post-`CommitRun` tier findings reach Filigree
+/// in the same run too. They anchor to a synthetic subsystem entity with no
+/// `source_file_path`, so the Phase-8c pass posts them against the project-root
+/// fallback path (mirroring the `core:project:*` anchor) and flags them
+/// `synthetic_anchor`. Run 1 builds the subsystems; tiers are seeded between runs
+/// (analyze never writes them — the enrich-only axiom); run 2 (emit enabled)
+/// computes the tier finding post-commit and Phase 8c POSTs it.
+#[cfg(unix)]
+#[test]
+fn analyze_emits_post_commit_tier_finding_to_filigree_at_project_anchor() {
+    let (project_dir, plugin_dir, config_path) =
+        phase3_project_for_rerun(&["auth_a", "auth_b", "billing_a", "billing_b"]);
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+
+    {
+        let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+        // Two subsystems → two tier findings, both anchored to the project root.
+        // auth disagrees (MIXING); billing agrees (UNANIMOUS). They share
+        // (rule-family, path, null line) but carry subsystem-distinct messages —
+        // Filigree's intake is content-keyed (includes the message), so both
+        // persist distinctly rather than collapsing onto the shared path.
+        seed_wardline_tier(&conn, "phase3fixture:module:auth_a", "public");
+        seed_wardline_tier(&conn, "phase3fixture:module:auth_b", "internal");
+        seed_wardline_tier(&conn, "phase3fixture:module:billing_a", "trusted");
+        seed_wardline_tier(&conn, "phase3fixture:module:billing_b", "trusted");
+    }
+
+    let (base_url, server) = spawn_capturing_filigree_mock("CLA-FACT-SUBSYSTEM-TIER-UNANIMOUS");
+
+    std::fs::write(&config_path, phase3_config_with_filigree(2, &base_url))
+        .expect("rewrite config with filigree emission enabled");
+    run_phase3_analyze(
+        project_dir.path(),
+        std::path::Path::new(&config_path),
+        &plugin_path,
+    );
+
+    let requests = server.join().expect("mock server thread");
+    let posted = requests
+        .iter()
+        .find(|r| r.contains("CLA-FACT-SUBSYSTEM-TIER-UNANIMOUS"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the post-commit tier finding must reach Filigree; captured {} POST(s): {}",
+                requests.len(),
+                requests.join("\n---\n")
+            )
+        });
+    // Both subsystems' tier findings ride the one Phase-8c batch...
+    assert!(
+        posted.contains("CLA-FACT-TIER-SUBSYSTEM-MIXING")
+            && posted.contains("CLA-FACT-SUBSYSTEM-TIER-UNANIMOUS"),
+        "both tier findings reach Filigree in one batch: {posted}"
+    );
+    // ...anchored to the project root and flagged synthetic (non-file) so a
+    // consumer never reads the shared path as a real location...
+    assert!(
+        posted.contains("\"synthetic_anchor\":true"),
+        "tier findings are flagged as synthetic anchors: {posted}"
+    );
+    assert!(
+        posted.contains(&project_dir.path().display().to_string()),
+        "tier findings are anchored to the project root path: {posted}"
+    );
+    // ...and carry subsystem-distinct messages (≥2 distinct `Subsystem <id>`
+    // anchors), which is what keeps them distinct under Filigree's content key.
+    let subsystem_mentions: std::collections::BTreeSet<&str> = posted
+        .match_indices("core:subsystem:")
+        .map(|(i, _)| &posted[i..(i + "core:subsystem:".len() + 8).min(posted.len())])
+        .collect();
+    assert!(
+        subsystem_mentions.len() >= 2,
+        "two distinct subsystem anchors keep the findings content-distinct: {subsystem_mentions:?} in {posted}"
+    );
+}
+
 /// REQ-ANALYZE-04 verification (verbatim): run analyze, delete a file, re-run;
 /// assert a `CLA-FACT-ENTITY-DELETED` finding per previously-extracted entity in
 /// the deleted file — and no false positives for entities still present.

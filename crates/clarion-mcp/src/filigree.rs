@@ -720,6 +720,7 @@ mod tests {
                 scan_run_id: Some("run-1".to_owned()),
                 mark_unseen: true,
                 complete_scan_run: true,
+                default_path: None,
             },
         );
 
@@ -757,6 +758,7 @@ mod tests {
                 scan_run_id: None,
                 mark_unseen: true,
                 complete_scan_run: true,
+                default_path: None,
             },
         );
         let err = client

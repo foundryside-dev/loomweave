@@ -39,8 +39,8 @@ use clarion_mcp::config::McpConfig;
 use clarion_mcp::filigree::FiligreeHttpClient;
 use clarion_mcp::filigree_url::resolve_filigree_url;
 use clarion_mcp::scan_results::{
-    CLARION_SCAN_SOURCE, CleanStaleRequest, CleanStaleResponse, EmitOptions, ScanResultsResponse,
-    clean_stale_url, prepare_batch, scan_results_url,
+    CLARION_SCAN_SOURCE, CleanStaleRequest, CleanStaleResponse, EmitOptions, PreparedBatch,
+    ScanResultsResponse, clean_stale_url, prepare_batch, scan_results_url,
 };
 
 use crate::clustering::{ClusterConfig, ModuleEdge, ModuleGraph, cluster_hash, cluster_modules};
@@ -65,6 +65,23 @@ const TIER_MIXING_RULE_ID: &str = "CLA-FACT-TIER-SUBSYSTEM-MIXING";
 /// REQ-ANALYZE-05: a subsystem whose tier-bearing members (≥2) all agree on one
 /// Wardline tier — a positive signal for tier-consistency reporting.
 const TIER_UNANIMOUS_RULE_ID: &str = "CLA-FACT-SUBSYSTEM-TIER-UNANIMOUS";
+
+/// The finding rules persisted via `PersistPostRunFinding` *after* `CommitRun`
+/// (the SEI mint pass's deletion findings + the tier-subsystem pass), and so
+/// after Phase-8 emission has already run. A second, additive emission pass
+/// (Phase 8c, `clarion-ef8f64d5fd`) re-reads exactly these so they reach Filigree
+/// in the same run rather than being stranded store-only. `CLA-FACT-ENTITY-DELETED`
+/// anchors to the deleted entity's own path-bearing row; the subsystem-anchored
+/// tier rules (and, once authoring lands, the guidance-anchored orphan rule) are
+/// path-less, so the Phase-8c pass anchors them to the project root (the
+/// `EmitOptions::default_path` fallback) and flags them `synthetic_anchor` rather
+/// than dropping them as `skipped_no_path`.
+const POST_RUN_FINDING_RULES: &[&str] = &[
+    ENTITY_DELETED_RULE_ID,
+    GUIDANCE_ORPHAN_RULE_ID,
+    TIER_MIXING_RULE_ID,
+    TIER_UNANIMOUS_RULE_ID,
+];
 
 /// REQ-ANALYZE-06 "no silent fallbacks": a Python file that fails `ast.parse`
 /// is surfaced by the plugin as a degraded `module` entity carrying
@@ -985,6 +1002,11 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             // unseen (REQ-FINDING-05); a fresh run marks them unseen so a
             // dropped finding transitions to `unseen_in_latest` on the peer.
             !resume,
+            // Final/only completing batch for the during-run findings; the
+            // Phase-8c follow-up (if any) is additive (`complete_scan_run=false`).
+            true,
+            // No rule filter: emit every finding the run wrote up to this point.
+            None,
             options.config_path.as_deref(),
         )
         .await
@@ -1157,6 +1179,47 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     error = %e,
                     "tier-subsystem findings skipped (run already committed successfully)"
                 ),
+            }
+            // Phase 8c (clarion-ef8f64d5fd): the deletion + tier findings above
+            // are persisted via `PersistPostRunFinding` *after* the Phase-8
+            // emission already ran, so without this they reach the store but
+            // never the same-run Filigree emission. A second, additive pass
+            // re-reads only the post-commit rules (the during-run findings were
+            // already emitted at Phase 8) and posts them: `CLA-FACT-ENTITY-DELETED`
+            // against the deleted entity's own path, and the path-less
+            // subsystem-anchored tier facts against the project root (the
+            // `default_path` fallback supplied inside `emit_findings_to_filigree`
+            // for the filtered pass), flagged `synthetic_anchor`. `mark_unseen`
+            // mirrors Phase 8 so a finding's prior-run position transitions to
+            // `unseen_in_latest`; `complete_scan_run=false` because this batch
+            // *appends* to the run Phase 8 already completed. Best-effort +
+            // enrich-only and logged-only (not folded into `stats.json`:
+            // `CommitRun` is already durable, exactly like the SEI and tier passes
+            // above). When there are no post-commit findings the batch is empty
+            // and no POST is made.
+            let postrun_emission = emit_findings_to_filigree(
+                &writer,
+                &db_path,
+                &project_root,
+                &run_id,
+                !resume,
+                false,
+                Some(POST_RUN_FINDING_RULES),
+                options.config_path.as_deref(),
+            )
+            .await;
+            match postrun_emission.get("status").and_then(|s| s.as_str()) {
+                Some("emitted") => tracing::info!(
+                    run_id = %run_id,
+                    emission = %postrun_emission,
+                    "post-commit findings emitted to Filigree"
+                ),
+                Some("unreachable") => tracing::warn!(
+                    run_id = %run_id,
+                    emission = %postrun_emission,
+                    "post-commit finding emission could not reach Filigree (enrich-only)"
+                ),
+                _ => {}
             }
         }
         RunOutcome::SoftFailed { reason } => {
@@ -2454,12 +2517,23 @@ fn load_mcp_config(project_root: &Path, config_path: Option<&Path>) -> McpConfig
 ///
 /// Findings written during the run (including the phase-3 weak-modularity fact)
 /// are flushed before reading so the emission batch is complete.
+///
+/// `rule_filter` restricts the batch to a fixed set of rule IDs. The Phase-8
+/// (pre-`CommitRun`) call passes `None` and emits everything the run wrote so
+/// far. The Phase-8c (post-`CommitRun`) call passes [`POST_RUN_FINDING_RULES`]
+/// so the second pass re-sends only the findings persisted after Phase 8, never
+/// the during-run findings already emitted; in that filtered mode an empty
+/// emittable batch skips the POST entirely (no wasted call when a run deletes
+/// nothing). `complete_scan_run` rides into the wire request: `true` for the
+/// final/only batch, `false` for an additive follow-up batch.
 async fn emit_findings_to_filigree(
     writer: &Writer,
     db_path: &Path,
     project_root: &Path,
     run_id: &str,
     mark_unseen: bool,
+    complete_scan_run: bool,
+    rule_filter: Option<&[&str]>,
     config_path: Option<&Path>,
 ) -> serde_json::Value {
     let mcp_config = load_mcp_config(project_root, config_path);
@@ -2468,10 +2542,17 @@ async fn emit_findings_to_filigree(
         return serde_json::Value::Null;
     }
 
-    // Make findings durable so a fresh read connection observes them.
-    if let Err(err) = writer
-        .send_wait(|ack| WriterCmd::FlushRunBatch { ack })
-        .await
+    // Make findings durable so a fresh read connection observes them. Only the
+    // Phase-8 (pre-`CommitRun`) call has an open run batch to flush; the Phase-8c
+    // (post-`CommitRun`, `rule_filter.is_some()`) call runs after the run is
+    // already committed and its post-commit findings were each written via
+    // `PersistPostRunFinding` (a query-time write that auto-commits), so there is
+    // no batch to flush — and `FlushRunBatch` would in fact error
+    // (`WriterProtocol: without a preceding BeginRun`) and wrongly skip emission.
+    if rule_filter.is_none()
+        && let Err(err) = writer
+            .send_wait(|ack| WriterCmd::FlushRunBatch { ack })
+            .await
     {
         tracing::warn!(run_id, error = %err, "flush before finding emission failed; skipping emission");
         return serde_json::json!({"status": "skipped", "reason": "flush_failed"});
@@ -2490,16 +2571,74 @@ async fn emit_findings_to_filigree(
             return serde_json::json!({"status": "skipped", "reason": "read_open_failed"});
         }
     };
+    let rows: Vec<_> = match rule_filter {
+        Some(allow) => rows
+            .into_iter()
+            .filter(|r| allow.contains(&r.rule_id.as_str()))
+            .collect(),
+        None => rows,
+    };
     let total_findings = rows.len();
+
+    // In the Phase-8c (post-`CommitRun`, filtered) pass, anchor path-less
+    // synthetic-entity findings — the subsystem-anchored tier facts — to the
+    // project root (mirroring the `core:project:*` finding anchor) so they POST
+    // rather than being dropped as `skipped_no_path`. The wire layer flags these
+    // `metadata.clarion.synthetic_anchor=true`. The Phase-8 pass passes `None`,
+    // so during-run path-less findings (e.g. the weak-modularity subsystem fact)
+    // keep their existing store-only treatment.
+    let default_path = rule_filter.map(|_| project_root.display().to_string());
 
     let batch = prepare_batch(
         &rows,
         &EmitOptions {
             scan_run_id: Some(run_id.to_owned()),
             mark_unseen,
-            complete_scan_run: true,
+            complete_scan_run,
+            default_path,
         },
     );
+    let emitted = batch.emitted;
+    let skipped_no_path = batch.skipped_no_path;
+
+    // In filtered (Phase-8c) mode, suppress the POST when nothing emittable
+    // remains: a run that deleted nothing has no post-commit findings, and a run
+    // whose only post-commit findings are path-less (tier/guidance) has nothing
+    // the wire contract accepts. The unfiltered Phase-8 call always posts (even
+    // an empty batch) so its `complete_scan_run` signal still rides through.
+    if rule_filter.is_some() && emitted == 0 {
+        return serde_json::json!({
+            "status": "skipped",
+            "reason": "no_postrun_findings_with_path",
+            "findings_total": total_findings,
+            "skipped_no_path": skipped_no_path,
+        });
+    }
+
+    post_findings_batch(
+        filigree_cfg,
+        project_root,
+        run_id,
+        batch,
+        total_findings,
+        mark_unseen,
+    )
+    .await
+}
+
+/// POST a prepared scan-results batch to the live Filigree endpoint and render
+/// the `filigree_emission` stats blob. Split out of [`emit_findings_to_filigree`]
+/// so the Phase-8 read/filter logic and this network lifecycle stay independently
+/// readable. Best-effort: a build/transport failure becomes an
+/// `CLA-INFRA-FILIGREE-UNREACHABLE` stats blob via [`unreachable_stats`].
+async fn post_findings_batch(
+    filigree_cfg: &clarion_mcp::config::FiligreeConfig,
+    project_root: &Path,
+    run_id: &str,
+    batch: PreparedBatch,
+    total_findings: usize,
+    mark_unseen: bool,
+) -> serde_json::Value {
     let emitted = batch.emitted;
     let skipped_no_path = batch.skipped_no_path;
 

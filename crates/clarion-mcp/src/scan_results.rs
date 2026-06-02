@@ -52,6 +52,15 @@ pub struct EmitOptions {
     pub mark_unseen: bool,
     /// `complete_scan_run`: `true` on the final (here: only) batch.
     pub complete_scan_run: bool,
+    /// Fallback `path` for findings whose anchor entity has no `source_file_path`
+    /// (synthetic, non-file entities — subsystems, project, guidance). Filigree
+    /// rejects path-less findings, so when this is set such a finding emits
+    /// against this stand-in path (the project root, mirroring the
+    /// `core:project:*` finding anchor) and carries
+    /// `metadata.clarion.synthetic_anchor=true` so a consumer knows the path is a
+    /// placeholder for a non-file entity, not the finding's real location. When
+    /// `None`, path-less findings are skipped (`skipped_no_path`) as before.
+    pub default_path: Option<String>,
 }
 
 /// The Filigree-native scan-results request body. Serializes to the exact wire
@@ -87,7 +96,7 @@ pub fn prepare_batch(rows: &[FindingForEmitRow], opts: &EmitOptions) -> Prepared
     let mut findings = Vec::with_capacity(rows.len());
     let mut skipped_no_path = 0;
     for row in rows {
-        match wire_finding(row) {
+        match wire_finding(row, opts.default_path.as_deref()) {
             Some(finding) => findings.push(finding),
             None => skipped_no_path += 1,
         }
@@ -110,12 +119,27 @@ pub fn prepare_batch(rows: &[FindingForEmitRow], opts: &EmitOptions) -> Prepared
 /// Render one persisted finding as a Filigree-native wire finding, or `None`
 /// when it has no usable `path` (Filigree rejects path-less findings with a
 /// `400 VALIDATION`).
-fn wire_finding(row: &FindingForEmitRow) -> Option<Value> {
-    let path = row
+///
+/// `default_path` is the [`EmitOptions::default_path`] fallback: when the anchor
+/// entity has no `source_file_path` (a synthetic, non-file entity) but a fallback
+/// is supplied, the finding emits against it and is flagged
+/// `metadata.clarion.synthetic_anchor=true`. A synthetic anchor never carries
+/// line numbers (the placeholder path has no meaningful position).
+fn wire_finding(row: &FindingForEmitRow, default_path: Option<&str>) -> Option<Value> {
+    let row_path = row
         .source_file_path
         .as_deref()
         .map(str::trim)
-        .filter(|path| !path.is_empty())?;
+        .filter(|path| !path.is_empty());
+    let (path, synthetic_anchor) = match row_path {
+        Some(path) => (path, false),
+        None => (
+            default_path
+                .map(str::trim)
+                .filter(|path| !path.is_empty())?,
+            true,
+        ),
+    };
     let mut finding = Map::new();
     finding.insert("path".to_owned(), json!(path));
     finding.insert("rule_id".to_owned(), json!(row.rule_id));
@@ -124,19 +148,23 @@ fn wire_finding(row: &FindingForEmitRow) -> Option<Value> {
         "severity".to_owned(),
         json!(severity_to_wire(&row.severity)),
     );
-    if let Some(line_start) = row.source_line_start {
-        finding.insert("line_start".to_owned(), json!(line_start));
+    // A synthetic-anchor finding (subsystem/project/guidance) has no real
+    // file position, so the placeholder path carries no line numbers.
+    if !synthetic_anchor {
+        if let Some(line_start) = row.source_line_start {
+            finding.insert("line_start".to_owned(), json!(line_start));
+        }
+        if let Some(line_end) = row.source_line_end {
+            finding.insert("line_end".to_owned(), json!(line_end));
+        }
     }
-    if let Some(line_end) = row.source_line_end {
-        finding.insert("line_end".to_owned(), json!(line_end));
-    }
-    finding.insert("metadata".to_owned(), wire_metadata(row));
+    finding.insert("metadata".to_owned(), wire_metadata(row, synthetic_anchor));
     Some(Value::Object(finding))
 }
 
 /// Nest Clarion's richer fields under `metadata` (top level) and
 /// `metadata.clarion` (Clarion-owned slot), per ADR-004 + detailed-design §7.
-fn wire_metadata(row: &FindingForEmitRow) -> Value {
+fn wire_metadata(row: &FindingForEmitRow, synthetic_anchor: bool) -> Value {
     let mut meta = Map::new();
     meta.insert("kind".to_owned(), json!(row.kind));
     if let Some(confidence) = row.confidence {
@@ -164,6 +192,11 @@ fn wire_metadata(row: &FindingForEmitRow) -> Value {
     // internal vocabulary is preserved here for read-back.
     clarion.insert("internal_severity".to_owned(), json!(row.severity));
     clarion.insert("internal_status".to_owned(), json!("open"));
+    // Flag the placeholder anchor so a consumer never mistakes the stand-in
+    // `path` (the project root) for the finding's real file location.
+    if synthetic_anchor {
+        clarion.insert("synthetic_anchor".to_owned(), json!(true));
+    }
     meta.insert("clarion".to_owned(), Value::Object(clarion));
     Value::Object(meta)
 }
@@ -293,7 +326,7 @@ mod tests {
 
     #[test]
     fn wire_finding_carries_mapped_severity_and_nested_clarion_metadata() {
-        let finding = wire_finding(&defect_row()).expect("path present");
+        let finding = wire_finding(&defect_row(), None).expect("path present");
 
         assert_eq!(finding["path"], json!("src/auth/tokens.py"));
         assert_eq!(finding["rule_id"], json!("CLA-PY-STRUCTURE-001"));
@@ -332,7 +365,7 @@ mod tests {
         row.confidence = None;
         row.confidence_basis = None;
 
-        let finding = wire_finding(&row).expect("path present");
+        let finding = wire_finding(&row, None).expect("path present");
         assert_eq!(finding["severity"], json!("info"));
         let meta = &finding["metadata"];
         assert_eq!(meta["kind"], json!("fact"));
@@ -351,18 +384,56 @@ mod tests {
     fn path_less_finding_is_skipped_not_emitted() {
         let mut row = defect_row();
         row.source_file_path = None;
-        assert!(wire_finding(&row).is_none());
+        assert!(wire_finding(&row, None).is_none());
 
         let mut blank = defect_row();
         blank.source_file_path = Some("   ".to_owned());
-        assert!(wire_finding(&blank).is_none(), "blank path is skipped too");
+        assert!(
+            wire_finding(&blank, None).is_none(),
+            "blank path is skipped too"
+        );
+    }
+
+    #[test]
+    fn path_less_finding_uses_default_path_and_flags_synthetic_anchor() {
+        // A subsystem-anchored finding (no source_file_path) emits against the
+        // supplied fallback path and is flagged as a synthetic anchor, with no
+        // line numbers (the placeholder path has no real position).
+        let mut row = defect_row();
+        row.entity_id = "core:subsystem:abcd".to_owned();
+        row.source_file_path = None;
+        let finding = wire_finding(&row, Some("/repo/root")).expect("emits via default path");
+        assert_eq!(finding["path"], json!("/repo/root"));
+        assert_eq!(
+            finding["metadata"]["clarion"]["synthetic_anchor"],
+            json!(true)
+        );
+        assert!(
+            finding.get("line_start").is_none() && finding.get("line_end").is_none(),
+            "synthetic anchor carries no line position: {finding}"
+        );
+
+        // A path-bearing finding ignores the fallback and is not flagged.
+        let finding = wire_finding(&defect_row(), Some("/repo/root")).expect("path present");
+        assert_eq!(finding["path"], json!("src/auth/tokens.py"));
+        assert!(
+            finding["metadata"]["clarion"]
+                .get("synthetic_anchor")
+                .is_none(),
+            "real-path finding is not a synthetic anchor: {finding}"
+        );
+
+        // A blank fallback is no better than none: still skipped.
+        let mut row = defect_row();
+        row.source_file_path = None;
+        assert!(wire_finding(&row, Some("  ")).is_none());
     }
 
     #[test]
     fn malformed_related_entities_falls_back_to_empty_array() {
         let mut row = defect_row();
         row.related_entities_json = "not json".to_owned();
-        let finding = wire_finding(&row).expect("path present");
+        let finding = wire_finding(&row, None).expect("path present");
         assert_eq!(
             finding["metadata"]["clarion"]["related_entities"],
             json!([])
@@ -383,6 +454,7 @@ mod tests {
                 scan_run_id: Some("run-1".to_owned()),
                 mark_unseen: true,
                 complete_scan_run: true,
+                default_path: None,
             },
         );
 
@@ -404,6 +476,7 @@ mod tests {
                 scan_run_id: Some("run-1".to_owned()),
                 mark_unseen: true,
                 complete_scan_run: true,
+                default_path: None,
             },
         );
         let value = serde_json::to_value(&batch.request).expect("serialize request");
@@ -427,6 +500,7 @@ mod tests {
                 scan_run_id: None,
                 mark_unseen: true,
                 complete_scan_run: true,
+                default_path: None,
             },
         );
         let value = serde_json::to_value(&batch.request).expect("serialize request");
