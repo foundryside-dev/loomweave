@@ -6,7 +6,7 @@
 //! the shape the MCP read path consumes.
 
 use assert_cmd::Command;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 
 fn clarion_bin() -> Command {
@@ -731,5 +731,341 @@ fn edit_invalidates_cached_summary_for_matched_entity() {
         summary_cache_count(dir.path(), "python:function:auth.tokens.refresh"),
         0,
         "editing a matching sheet must invalidate the matched entity's cache"
+    );
+}
+
+// ── Export / import (WS6 / T5, REQ-GUIDANCE-06) ───────────────────────────────
+
+/// Run `guidance export --to <to_dir>`.
+fn export_to(root: &std::path::Path, to_dir: &std::path::Path) {
+    clarion_bin()
+        .args(["guidance", "export"])
+        .args(["--path"])
+        .arg(root)
+        .args(["--to"])
+        .arg(to_dir)
+        .assert()
+        .success();
+}
+
+/// Run `guidance import <from_dir>`.
+fn import_from(root: &std::path::Path, from_dir: &std::path::Path) {
+    clarion_bin()
+        .args(["guidance", "import"])
+        .args(["--path"])
+        .arg(root)
+        .arg(from_dir)
+        .assert()
+        .success();
+}
+
+/// Fetch a guidance sheet's (name, properties) tuple, or None if absent.
+fn sheet_fields(root: &std::path::Path, id: &str) -> Option<(String, Value)> {
+    let db_path = root.join(".clarion").join("clarion.db");
+    let conn = Connection::open(&db_path).expect("reopen db");
+    conn.query_row(
+        "SELECT name, properties FROM entities WHERE id = ?1 AND kind = 'guidance'",
+        rusqlite::params![id],
+        |row| {
+            let name: String = row.get(0)?;
+            let raw: String = row.get(1)?;
+            Ok((name, raw))
+        },
+    )
+    .optional()
+    .expect("query sheet")
+    .map(|(name, raw)| (name, serde_json::from_str(&raw).expect("props parse")))
+}
+
+#[test]
+fn export_import_round_trips_all_fields() {
+    // Headline test: seed varied sheets → export → import into a FRESH empty DB →
+    // every sheet equals the original field-for-field (id, name, every property
+    // incl. match_rules / pinned / expires / authored_at / content).
+    let src = tempfile::tempdir().unwrap();
+    seed_db(src.path());
+
+    let sheets = [
+        (
+            "alpha",
+            serde_json::json!({
+                "content": "Refresh tokens carefully.",
+                "scope_level": "module",
+                "match_rules": [
+                    { "type": "path", "pattern": "src/auth/**" },
+                    { "type": "kind", "value": "function" },
+                ],
+                "pinned": true,
+                "provenance": "manual",
+                "authored_at": "2026-01-01T00:00:00.000Z",
+                "expires": "2027-12-31T00:00:00.000Z",
+            }),
+        ),
+        (
+            "beta.nested.name",
+            serde_json::json!({
+                "content": "Project-wide invariant.",
+                "scope_level": "project",
+                "match_rules": [],
+                "pinned": false,
+                "provenance": "manual",
+                "authored_at": "2025-06-01T12:34:56.789Z",
+            }),
+        ),
+        (
+            "gamma",
+            serde_json::json!({
+                "content": "multi\nline\ncontent with \"quotes\" and, commas",
+                "scope_level": "subsystem",
+                "match_rules": [
+                    { "type": "subsystem", "id": "core:subsystem:abcd" },
+                ],
+                "pinned": false,
+                "provenance": "manual",
+                "authored_at": "2026-03-15T08:00:00.000Z",
+                "reviewed_at": "2026-04-01T09:00:00.000Z",
+            }),
+        ),
+    ];
+    for (slug, props) in &sheets {
+        seed_sheet(src.path(), slug, props);
+    }
+
+    let export_dir = tempfile::tempdir().unwrap();
+    export_to(src.path(), export_dir.path());
+
+    // One file per sheet, colons sanitized.
+    assert!(
+        export_dir
+            .path()
+            .join("core__guidance__alpha.json")
+            .exists(),
+        "expected per-sheet file with sanitized name"
+    );
+
+    // Import into a fresh, empty DB.
+    let dst = tempfile::tempdir().unwrap();
+    seed_db(dst.path()); // schema only; no guidance sheets yet.
+    import_from(dst.path(), export_dir.path());
+
+    for (slug, props) in &sheets {
+        let id = format!("core:guidance:{slug}");
+        let (orig_name, orig_props) =
+            sheet_fields(src.path(), &id).expect("original sheet present");
+        let (imp_name, imp_props) = sheet_fields(dst.path(), &id).expect("imported sheet present");
+        assert_eq!(imp_name, orig_name, "name round-trips for {id}");
+        // Field-for-field: properties equal the original (excludes created_at /
+        // updated_at, which are NOT stored in properties).
+        assert_eq!(imp_props, *props, "properties round-trip for {id}");
+        assert_eq!(imp_props, orig_props, "imported == original for {id}");
+    }
+}
+
+#[test]
+fn export_is_byte_deterministic() {
+    // Export the same DB to two dirs → byte-identical files.
+    let src = tempfile::tempdir().unwrap();
+    seed_db(src.path());
+    seed_sheet(
+        src.path(),
+        "det",
+        // Properties authored with keys in non-sorted order on purpose.
+        &serde_json::json!({
+            "zeta": "z", "content": "x", "alpha": "a",
+            "scope_level": "module", "match_rules": [],
+            "authored_at": "2026-01-01T00:00:00.000Z",
+        }),
+    );
+
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    export_to(src.path(), a.path());
+    export_to(src.path(), b.path());
+
+    let fname = "core__guidance__det.json";
+    let bytes_a = std::fs::read(a.path().join(fname)).unwrap();
+    let bytes_b = std::fs::read(b.path().join(fname)).unwrap();
+    assert_eq!(bytes_a, bytes_b, "two exports must be byte-identical");
+
+    // Sanity: keys are actually sorted (alpha before zeta) and there is a
+    // trailing newline.
+    let text = String::from_utf8(bytes_a).unwrap();
+    assert!(text.ends_with('\n'), "trailing newline: {text:?}");
+    assert!(
+        text.find("alpha").unwrap() < text.find("zeta").unwrap(),
+        "keys sorted for diff-friendliness: {text}"
+    );
+}
+
+#[test]
+fn import_is_idempotent() {
+    let src = tempfile::tempdir().unwrap();
+    seed_db(src.path());
+    seed_sheet(
+        src.path(),
+        "idem",
+        &serde_json::json!({
+            "content": "stable", "scope_level": "module", "match_rules": [],
+            "authored_at": "2026-01-01T00:00:00.000Z",
+        }),
+    );
+    let export_dir = tempfile::tempdir().unwrap();
+    export_to(src.path(), export_dir.path());
+
+    let dst = tempfile::tempdir().unwrap();
+    seed_db(dst.path());
+    import_from(dst.path(), export_dir.path());
+    let first = sheet_fields(dst.path(), "core:guidance:idem").expect("present after import 1");
+
+    // Second import of the same dir changes nothing in content.
+    import_from(dst.path(), export_dir.path());
+    let second = sheet_fields(dst.path(), "core:guidance:idem").expect("present after import 2");
+
+    assert_eq!(first, second, "re-import is a content no-op");
+
+    // Exactly one sheet, not duplicated.
+    let db_path = dst.path().join(".clarion").join("clarion.db");
+    let conn = Connection::open(&db_path).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE kind = 'guidance'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "re-import must not duplicate sheets");
+}
+
+#[test]
+fn import_is_additive_not_a_mirror() {
+    // A local sheet absent from the import dir must survive the import.
+    let src = tempfile::tempdir().unwrap();
+    seed_db(src.path());
+    seed_sheet(
+        src.path(),
+        "incoming",
+        &serde_json::json!({
+            "content": "from-team", "scope_level": "module", "match_rules": [],
+            "authored_at": "2026-01-01T00:00:00.000Z",
+        }),
+    );
+    let export_dir = tempfile::tempdir().unwrap();
+    export_to(src.path(), export_dir.path());
+
+    let dst = tempfile::tempdir().unwrap();
+    seed_db(dst.path());
+    seed_sheet(
+        dst.path(),
+        "local-only",
+        &serde_json::json!({
+            "content": "mine", "scope_level": "module", "match_rules": [],
+            "authored_at": "2026-01-01T00:00:00.000Z",
+        }),
+    );
+    import_from(dst.path(), export_dir.path());
+
+    assert!(
+        sheet_fields(dst.path(), "core:guidance:incoming").is_some(),
+        "imported sheet present"
+    );
+    assert!(
+        sheet_fields(dst.path(), "core:guidance:local-only").is_some(),
+        "local-only sheet must NOT be deleted by an additive import"
+    );
+}
+
+#[test]
+fn import_fails_loudly_on_malformed_file() {
+    let dst = tempfile::tempdir().unwrap();
+    seed_db(dst.path());
+    let import_dir = tempfile::tempdir().unwrap();
+    // A junk .json file in the import set.
+    std::fs::write(import_dir.path().join("broken.json"), "{ not valid json").unwrap();
+
+    let assert = clarion_bin()
+        .args(["guidance", "import"])
+        .args(["--path"])
+        .arg(dst.path())
+        .arg(import_dir.path())
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("broken.json"),
+        "import error must name the offending file: {stderr}"
+    );
+}
+
+#[test]
+fn import_ignores_non_json_files() {
+    // A README committed alongside the sheets must not crash import.
+    let src = tempfile::tempdir().unwrap();
+    seed_db(src.path());
+    seed_sheet(
+        src.path(),
+        "ok",
+        &serde_json::json!({
+            "content": "x", "scope_level": "module", "match_rules": [],
+            "authored_at": "2026-01-01T00:00:00.000Z",
+        }),
+    );
+    let export_dir = tempfile::tempdir().unwrap();
+    export_to(src.path(), export_dir.path());
+    std::fs::write(export_dir.path().join("README.md"), "# team guidance\n").unwrap();
+
+    let dst = tempfile::tempdir().unwrap();
+    seed_db(dst.path());
+    import_from(dst.path(), export_dir.path());
+    assert!(
+        sheet_fields(dst.path(), "core:guidance:ok").is_some(),
+        "the json sheet imports despite a non-json sibling"
+    );
+}
+
+#[test]
+fn import_is_partial_but_safe_when_a_later_file_is_malformed() {
+    // Import is not atomic across the file set (each upsert is its own txn, files
+    // processed in sorted name order). A malformed file aborts loudly, but any
+    // sheet already committed before it survives — and re-import is idempotent, so
+    // partial progress is safe to retry. This locks that property: a good "aaa"
+    // sheet sorts before the bad "zzz" file, so it is committed before the abort.
+    let dst = tempfile::tempdir().unwrap();
+    seed_db(dst.path());
+
+    let import_dir = tempfile::tempdir().unwrap();
+    let good = serde_json::json!({
+        "id": "core:guidance:aaa-good",
+        "name": "aaa-good",
+        "properties": {
+            "content": "valid", "scope_level": "module", "match_rules": [],
+            "authored_at": "2026-01-01T00:00:00.000Z",
+        },
+    });
+    std::fs::write(
+        import_dir.path().join("aaa-good.json"),
+        serde_json::to_string_pretty(&good).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(import_dir.path().join("zzz-bad.json"), "{ not valid json").unwrap();
+
+    // The whole import fails loudly naming the bad file...
+    let assert = clarion_bin()
+        .args(["guidance", "import"])
+        .args(["--path"])
+        .arg(dst.path())
+        .arg(import_dir.path())
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("zzz-bad.json"),
+        "names the bad file: {stderr}"
+    );
+
+    // ...but the earlier good sheet was already committed (non-atomic, idempotent
+    // on retry).
+    assert!(
+        sheet_fields(dst.path(), "core:guidance:aaa-good").is_some(),
+        "a sheet committed before the malformed file survives the abort"
     );
 }

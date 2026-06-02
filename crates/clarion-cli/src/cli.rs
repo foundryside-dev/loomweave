@@ -286,6 +286,32 @@ pub enum GuidanceCommand {
         /// The guidance sheet id.
         id: String,
     },
+
+    /// Export every guidance sheet to a directory as one deterministic,
+    /// diff-friendly JSON file per sheet, for committing to a shared repo
+    /// (REQ-GUIDANCE-06). Output is byte-stable across runs on identical DB
+    /// state. The target directory is created if absent.
+    Export {
+        /// Project directory containing .clarion/clarion.db (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Directory to write the exported sheet files into.
+        #[arg(long)]
+        to: PathBuf,
+    },
+
+    /// Import guidance sheets from a directory of exported JSON files
+    /// (REQ-GUIDANCE-06). Additive: each sheet is upserted by id, preserving ids
+    /// exactly; existing local sheets not present in the directory are left
+    /// untouched (never a destructive mirror). A malformed `*.json` aborts the
+    /// import naming the offending file (a dropped sheet is silent data loss).
+    Import {
+        /// Project directory containing .clarion/clarion.db (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Directory of exported sheet files to import.
+        dir: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]

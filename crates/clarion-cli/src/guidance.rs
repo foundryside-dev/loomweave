@@ -31,9 +31,10 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 
 use clarion_storage::{
-    GuidanceSheet, GuidanceSheetInput, delete_guidance_sheet, get_guidance_sheet,
+    GuidanceSheet, GuidanceSheetInput, PortableSheet, delete_guidance_sheet, get_guidance_sheet,
     guidance_sheet_is_expired, guidance_sheet_is_stale, guidance_sheet_matches_entity,
-    invalidate_summaries_for_sheet, list_guidance_sheets, upsert_guidance_sheet,
+    import_portable_sheet, invalidate_summaries_for_sheet, list_guidance_sheets,
+    upsert_guidance_sheet,
 };
 
 use crate::cli::GuidanceCommand;
@@ -110,6 +111,8 @@ pub fn run(command: GuidanceCommand) -> Result<()> {
             },
         ),
         GuidanceCommand::Delete { path, id } => delete(&path, &id),
+        GuidanceCommand::Export { path, to } => export(&path, &to),
+        GuidanceCommand::Import { path, dir } => import(&path, &dir),
     }
 }
 
@@ -510,6 +513,92 @@ fn delete(project_root: &Path, id: &str) -> Result<()> {
     let invalidated = invalidate_summaries_for_sheet(&conn, &sheet, project_root).into_anyhow()?;
 
     println!("Deleted guidance sheet {id}");
+    report_invalidation(invalidated);
+    Ok(())
+}
+
+// ── Export / import (TDD target: round-trip) ──────────────────────────────────
+
+/// Export every guidance sheet to `to_dir`, one deterministic JSON file per
+/// sheet. The output is engineered to be committed to a shared git repo:
+/// byte-identical across runs (sorted keys, no embedded export timestamp/path)
+/// and diff-friendly (one file per sheet, one field per line). Sheets are
+/// iterated in stable id order so any incidental logging is run-stable; the
+/// per-file bytes — the thing that gets committed — carry no ordering.
+fn export(project_root: &Path, to_dir: &Path) -> Result<()> {
+    let conn = open_db(project_root)?;
+    let mut sheets = list_guidance_sheets(&conn).into_anyhow()?;
+    // `list_guidance_sheets` orders by scope_rank/authored_at/id (the read-path
+    // composition sort). Re-sort by id alone for a stable, content-independent
+    // export order — id is unique, so this is a total order with no tie-break on
+    // a mutable field.
+    sheets.sort_by(|a, b| a.id.cmp(&b.id));
+
+    std::fs::create_dir_all(to_dir)
+        .with_context(|| format!("create export directory {}", to_dir.display()))?;
+
+    for sheet in &sheets {
+        let portable = PortableSheet::from_sheet(sheet);
+        let json = portable.to_canonical_json().into_anyhow()?;
+        let file = to_dir.join(portable.file_name());
+        std::fs::write(&file, json.as_bytes())
+            .with_context(|| format!("write {}", file.display()))?;
+    }
+
+    println!(
+        "Exported {} guidance sheet(s) to {}",
+        sheets.len(),
+        to_dir.display()
+    );
+    Ok(())
+}
+
+/// Import guidance sheets from `from_dir`. Reads every `*.json` file, parses each
+/// into a [`PortableSheet`], and upserts it (additive — existing local sheets not
+/// in the directory are untouched; this is a merge, never a destructive mirror).
+/// Ids are preserved exactly. A malformed `*.json` aborts the whole import with
+/// an error naming the file — a silently-dropped sheet is data loss, so we fail
+/// loud rather than skip. Non-`.json` files (a README, a `.gitignore`) are
+/// ignored: the sheet contract is `*.json`, so filtering to it is not "skipping a
+/// sheet". Re-importing the same directory is idempotent on content.
+fn import(project_root: &Path, from_dir: &Path) -> Result<()> {
+    let conn = open_db(project_root)?;
+
+    // Collect + sort the file list so import order (and thus any per-sheet log
+    // line / cache-invalidation sequencing) is deterministic across runs.
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let entries = std::fs::read_dir(from_dir)
+        .with_context(|| format!("read import directory {}", from_dir.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read entry in {}", from_dir.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            files.push(path);
+        }
+    }
+    files.sort();
+
+    let mut imported = 0usize;
+    let mut invalidated = 0usize;
+    for file in &files {
+        let bytes =
+            std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+        let portable = PortableSheet::from_canonical_json(&file.display().to_string(), &bytes)
+            .into_anyhow()?;
+        import_portable_sheet(&conn, &portable)
+            .into_anyhow()
+            .with_context(|| format!("import {}", file.display()))?;
+        // ADR-007 churn-eager invalidation: an imported sheet adds/changes
+        // guidance for the entities its match_rules cover, so their cached
+        // summaries must be dropped — same posture as `create`/`edit`.
+        invalidated += invalidate_matched_summaries(project_root, &conn, &portable.id)?;
+        imported += 1;
+    }
+
+    println!(
+        "Imported {imported} guidance sheet(s) from {}",
+        from_dir.display()
+    );
     report_invalidation(invalidated);
     Ok(())
 }

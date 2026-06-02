@@ -26,6 +26,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::glob::glob_match;
@@ -178,6 +179,29 @@ pub fn upsert_guidance_sheet(conn: &Connection, sheet: &GuidanceSheetInput<'_>) 
     Ok(())
 }
 
+/// Upsert a [`PortableSheet`] (the import primitive, WS6 / T5).
+///
+/// Additive by design: it `upsert`s the one sheet, re-deriving `short_name` from
+/// `name`, and leaves every other sheet in the DB untouched. Import is therefore
+/// a **merge**, never a mirror — it never deletes a local sheet absent from the
+/// imported set (a mirror would be silent destruction of local knowledge). Re-
+/// importing identical bytes is a no-op on content (only `updated_at` moves).
+///
+/// # Errors
+///
+/// Returns [`StorageError::Sqlite`] on any `SQLite` failure.
+pub fn import_portable_sheet(conn: &Connection, sheet: &PortableSheet) -> Result<()> {
+    upsert_guidance_sheet(
+        conn,
+        &GuidanceSheetInput {
+            id: &sheet.id,
+            name: &sheet.name,
+            short_name: sheet.short_name(),
+            properties: &sheet.properties,
+        },
+    )
+}
+
 /// Fetch one guidance sheet by id. Returns `None` if the id is absent or the
 /// row exists but is not `kind = 'guidance'`.
 ///
@@ -226,6 +250,128 @@ pub fn delete_guidance_sheet(conn: &Connection, id: &str) -> Result<bool> {
         params![id],
     )?;
     Ok(affected > 0)
+}
+
+// ── Portable (export/import) form (WS6 / T5, REQ-GUIDANCE-06) ──────────────────
+
+/// The git-shareable, diff-friendly form of one guidance sheet.
+///
+/// A team commits these files to a repo to share institutional knowledge, so the
+/// serialization is engineered for **determinism** (identical DB state → byte-
+/// identical bytes) and **diff-friendliness** (a one-field change is a one-line
+/// diff). It carries only the sheet's **portable** content:
+///   - `id`   — the full entity id (`core:guidance:<name>`); preserved exactly.
+///   - `name` — `entities.name` (segment 3 of the id).
+///   - `properties` — the verbatim `entities.properties` object (`content`,
+///     `scope_level`, `match_rules`, `pinned`, `provenance`, `authored_at`, …).
+///
+/// Deliberately **omitted**: `created_at` / `updated_at`. Those are per-DB write
+/// bookkeeping — they differ across machines and re-import, so exporting them
+/// would inject spurious, non-deterministic diffs. `short_name` is also omitted:
+/// it is re-derived on import from `name` exactly as the authoring path does, so
+/// it can never drift from `create`'s convention.
+///
+/// Determinism rests on `serde_json::Map` being a `BTreeMap` in this build (no
+/// `preserve_order` feature), so [`Self::to_canonical_json`] emits map keys in
+/// sorted order recursively; arrays (e.g. `match_rules`) keep author order, which
+/// is the intended semantic. See [`Self::to_canonical_json`] for the byte contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortableSheet {
+    /// Full entity id (`core:guidance:<name>`).
+    pub id: String,
+    /// `entities.name` — the canonical qualified name.
+    pub name: String,
+    /// The verbatim `entities.properties` object.
+    pub properties: Value,
+}
+
+impl PortableSheet {
+    /// Project a stored [`GuidanceSheet`] down to its portable form, dropping the
+    /// per-DB `created_at` / `updated_at` bookkeeping and the re-derivable
+    /// `short_name`.
+    #[must_use]
+    pub fn from_sheet(sheet: &GuidanceSheet) -> Self {
+        Self {
+            id: sheet.id.clone(),
+            name: sheet.name.clone(),
+            properties: sheet.properties.clone(),
+        }
+    }
+
+    /// The `short_name` to store on import: the display tail of `name`, derived
+    /// exactly as the CLI `create` path does (`name.rsplit('.').next()`), so an
+    /// imported sheet is byte-indistinguishable from a locally-authored one.
+    #[must_use]
+    pub fn short_name(&self) -> &str {
+        self.name.rsplit('.').next().unwrap_or(&self.name)
+    }
+
+    /// Serialize to canonical, diff-friendly JSON **with a trailing newline**.
+    ///
+    /// "Canonical" = pretty-printed (one field per line, so a single changed
+    /// field is a single changed line) with **sorted** object keys at every
+    /// depth. Key order is sorted because `serde_json::Map` is a `BTreeMap` in
+    /// this build; `to_string_pretty` walks it in `BTreeMap` (sorted) order. The
+    /// struct's own three keys (`id`, `name`, `properties`) are likewise emitted
+    /// sorted — `id` < `name` < `properties` alphabetically, a stable order. The
+    /// trailing `\n` is POSIX-text hygiene and keeps git from flagging a
+    /// "no newline at end of file".
+    ///
+    /// This is the **only** place output bytes are formed; nothing on the export
+    /// path uses `HashMap` iteration order or embeds an export timestamp / path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::InvalidQuery`] if serialization fails (it cannot,
+    /// for a `Value`-backed struct, but the fallible signature avoids a panic).
+    pub fn to_canonical_json(&self) -> Result<String> {
+        let mut out = serde_json::to_string_pretty(self)
+            .map_err(|e| StorageError::InvalidQuery(format!("serialize guidance sheet: {e}")))?;
+        out.push('\n');
+        Ok(out)
+    }
+
+    /// Parse a [`PortableSheet`] from the canonical JSON bytes (`source` names the
+    /// file, for a loud error). Rejects an empty `id` or `name` — a sheet without
+    /// either cannot be upserted and signals a corrupt/hand-mangled file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::InvalidQuery`] naming `source` on malformed JSON or
+    /// a missing/empty `id` / `name`. Import callers surface this as a hard
+    /// failure (a dropped sheet is silent data loss).
+    pub fn from_canonical_json(source: &str, bytes: &str) -> Result<Self> {
+        let sheet: Self = serde_json::from_str(bytes).map_err(|e| {
+            StorageError::InvalidQuery(format!("parse guidance sheet {source}: {e}"))
+        })?;
+        if sheet.id.trim().is_empty() {
+            return Err(StorageError::InvalidQuery(format!(
+                "guidance sheet {source}: missing or empty `id`"
+            )));
+        }
+        if sheet.name.trim().is_empty() {
+            return Err(StorageError::InvalidQuery(format!(
+                "guidance sheet {source}: missing or empty `name`"
+            )));
+        }
+        Ok(sheet)
+    }
+
+    /// The deterministic, filesystem-safe filename for this sheet.
+    ///
+    /// The entity id contains colons (`core:guidance:foo.bar`), which are not
+    /// portable across filesystems (illegal on Windows/NTFS, awkward in shells).
+    /// We map each `:` to `__` (double underscore) and append `.json`, giving
+    /// e.g. `core__guidance__foo.bar.json`. The mapping is **deterministic** and
+    /// **collision-free**: `:` is a reserved id separator (ADR-003 entity ids are
+    /// exactly three colon-joined segments and the segments never contain a bare
+    /// colon by construction), so distinct ids never collide after substitution.
+    /// We do not need to reverse the filename — the authoritative id lives inside
+    /// the file — so the encoding only has to be injective, not invertible.
+    #[must_use]
+    pub fn file_name(&self) -> String {
+        format!("{}.json", self.id.replace(':', "__"))
+    }
 }
 
 /// True if `sheet` applies to the entity `entity_id`, evaluating its
@@ -570,5 +716,133 @@ mod tests {
         let sheet = sheet_with(json!({ "authored_at": "2026-03-05T12:00:00.000Z" }));
         let cutoff = "2026-03-05T12:00:00.000Z";
         assert!(!guidance_sheet_is_stale(&sheet, cutoff));
+    }
+
+    // ── PortableSheet (export/import) ─────────────────────────────────────────
+
+    fn portable_with(id: &str, name: &str, properties: Value) -> PortableSheet {
+        PortableSheet {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            properties,
+        }
+    }
+
+    #[test]
+    fn canonical_json_has_trailing_newline() {
+        let p = portable_with("core:guidance:x", "x", json!({ "content": "y" }));
+        let json = p.to_canonical_json().unwrap();
+        assert!(json.ends_with('\n'), "must end with a newline: {json:?}");
+        assert!(!json.ends_with("\n\n"), "exactly one newline: {json:?}");
+    }
+
+    #[test]
+    fn canonical_json_sorts_keys_for_diff_stability() {
+        // Author the properties with keys in NON-sorted order; the serialized
+        // bytes must come out sorted (so a re-serialize from any key order is
+        // byte-stable). `serde_json::Map` is a BTreeMap in this build, so this
+        // holds recursively.
+        let p = portable_with(
+            "core:guidance:s",
+            "s",
+            json!({ "zeta": 1, "alpha": 2, "nested": { "yray": 1, "beta": 2 } }),
+        );
+        let json = p.to_canonical_json().unwrap();
+        let alpha = json.find("alpha").unwrap();
+        let zeta = json.find("zeta").unwrap();
+        assert!(alpha < zeta, "top-level keys sorted: {json}");
+        let beta = json.find("beta").unwrap();
+        let yray = json.find("yray").unwrap();
+        assert!(beta < yray, "nested keys sorted: {json}");
+    }
+
+    #[test]
+    fn canonical_json_is_deterministic_across_runs() {
+        // Two PortableSheets built from differently-ordered property maps but the
+        // same logical content must serialize byte-identically.
+        let a = portable_with(
+            "core:guidance:d",
+            "d",
+            json!({ "b": 1, "a": 2, "c": [3, 2, 1] }),
+        );
+        let b = portable_with(
+            "core:guidance:d",
+            "d",
+            json!({ "c": [3, 2, 1], "a": 2, "b": 1 }),
+        );
+        assert_eq!(
+            a.to_canonical_json().unwrap(),
+            b.to_canonical_json().unwrap()
+        );
+    }
+
+    #[test]
+    fn canonical_json_preserves_array_order() {
+        // match_rules order is semantic (first-match precedence) — arrays must NOT
+        // be reordered, only object keys.
+        let p = portable_with(
+            "core:guidance:r",
+            "r",
+            json!({ "match_rules": [{ "type": "path" }, { "type": "kind" }] }),
+        );
+        let json = p.to_canonical_json().unwrap();
+        assert!(
+            json.find("path").unwrap() < json.find("kind").unwrap(),
+            "array element order preserved: {json}"
+        );
+    }
+
+    #[test]
+    fn portable_json_round_trips() {
+        let p = portable_with(
+            "core:guidance:rt",
+            "auth.tokens",
+            json!({
+                "content": "guard the refresh path",
+                "scope_level": "module",
+                "match_rules": [{ "type": "path", "pattern": "src/auth/**" }],
+                "pinned": true,
+                "provenance": "manual",
+                "authored_at": "2026-01-01T00:00:00.000Z",
+                "expires": "2027-01-01T00:00:00.000Z",
+            }),
+        );
+        let json = p.to_canonical_json().unwrap();
+        let back = PortableSheet::from_canonical_json("rt.json", &json).unwrap();
+        assert_eq!(back.id, p.id);
+        assert_eq!(back.name, p.name);
+        assert_eq!(back.properties, p.properties);
+    }
+
+    #[test]
+    fn file_name_sanitizes_colons() {
+        let p = portable_with("core:guidance:foo.bar", "foo.bar", json!({}));
+        assert_eq!(p.file_name(), "core__guidance__foo.bar.json");
+    }
+
+    #[test]
+    fn short_name_is_display_tail() {
+        let p = portable_with("core:guidance:a.b.c", "a.b.c", json!({}));
+        assert_eq!(p.short_name(), "c");
+        let flat = portable_with("core:guidance:flat", "flat", json!({}));
+        assert_eq!(flat.short_name(), "flat");
+    }
+
+    #[test]
+    fn from_canonical_json_rejects_malformed() {
+        assert!(PortableSheet::from_canonical_json("bad.json", "{ not json").is_err());
+        // valid JSON but not a sheet (missing id/name) → error naming the file.
+        let err = PortableSheet::from_canonical_json("nmeta.json", "{\"properties\": {}}")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nmeta.json"), "error names the file: {err}");
+    }
+
+    #[test]
+    fn from_canonical_json_rejects_empty_id() {
+        let err = PortableSheet::from_canonical_json("empty.json", "{\"id\":\"\",\"name\":\"n\"}")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty.json"), "{err}");
     }
 }
