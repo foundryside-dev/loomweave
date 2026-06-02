@@ -435,6 +435,25 @@ assert tool_names == [
     "analyze_status",
     "analyze_cancel",
     "index_diff",
+    "guidance_for",
+    "findings_for",
+    "wardline_for",
+    "find_by_tag",
+    "find_by_kind",
+    "find_by_wardline",
+    "find_circular_imports",
+    "find_coupling_hotspots",
+    "find_entry_points",
+    "find_http_routes",
+    "find_data_models",
+    "find_tests",
+    "find_deprecations",
+    "find_todos",
+    "what_tests_this",
+    "high_churn",
+    "recently_changed",
+    "find_dead_code",
+    "search_semantic",
 ], tool_names
 # Single-source check (clarion-71f0d6c3dd): the initialize `instructions` tool
 # enumeration is derived from list_tools(), so every advertised tool must appear
@@ -535,4 +554,4 @@ assert "staleness" in ctx, ctx
 assert ctx["degraded"] is False, ctx
 PY
 
-log "PASS: MCP stdio surface returned eighteen tool definitions and nine tool responses"
+log "PASS: MCP stdio surface returned the full tool catalogue and all expected tool responses"
