@@ -3,10 +3,10 @@
 **Date:** 2026-06-02
 **Use:** Drop the fenced prompt below into an agent to plan and execute **Wave 3 — WS9 `legis`
 governance consumption**, the post-core-paradise wave that closes **governed paradise**.
-**Status caveat:** The program map (`…-first-class-program-design.md` §4) files WS9 as **"Later"**,
-not a numbered wave — it is labelled "Wave 3" here because it is the one *sequential, gated,
-post-paradise* workstream. It is **thin on Clarion's side**: Clarion is already the identity
-authority, so this wave mostly exposes what Wave 1 built and swaps one provider.
+**Position:** Wave 3 = WS9, the suite track's gated terminus (governed paradise). It is **thin on
+Clarion's side**: Clarion is already the identity authority, so this wave mostly exposes what Wave 1
+built and swaps one provider. (The standalone-first-class workstreams take the later wave numbers
+4–8; this WS9 prompt keeps Wave 3 because it was dispatched under that number.)
 **Gate:** ⛔ Gated on (a) Wave 2 complete (core paradise) **and** (b) **`legis` actually exists**
 (it is design-ready, not implemented). Until `legis` ships, this prompt is forward-staged — the
 gate check blocks.

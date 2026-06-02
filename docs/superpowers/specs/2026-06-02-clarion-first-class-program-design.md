@@ -35,9 +35,9 @@ Two orderings are in tension, and this program reconciles them rather than picki
   the critical path — not cancelled*.
 
 **Reconciliation:** the unit of work is the **workstream**, tagged with both its roadmap-half and its
-dependency gate (§2). Execution order (§4) follows the priority brief — critical path first,
-autonomous code-intelligence work in parallel as capacity allows. Both views are first-class; neither
-is lost. The roadmap remains the definition of "done"; the brief defines the sequence.
+dependency gate (§2). All nine get **committed, numbered waves** (§4) — the suite critical path is
+sequenced first (priority brief), and the standalone-first-class half is *concurrent and committed*,
+not "as capacity allows." Neither half is floated; the roadmap remains the definition of "done."
 
 ---
 
@@ -174,8 +174,8 @@ now?" means its design can be locked without waiting on an external event.
                           WS9 legis governance                                          │
                           (gate: legis exists — external)                               │
                                                                                         │
-   WS5 MCP catalogue · WS6 guidance · WS7 multi-language · WS8 op-quality               │
-        (ungated; parallel band — independent of WS1–WS4) ◄──────────────────────────── ┘
+   WS5 · WS5b · WS6 · WS7 · WS8  (standalone first-class — Waves 4–8)                    │
+        (ungated; concurrent committed waves, independent of WS1–WS4) ◄──────────────────┘
 ```
 
 Edges: WS3 → WS1 (matcher needs prior state); WS1 → WS4 and WS2 → WS4 (dossier gated on both);
@@ -192,23 +192,47 @@ Critical observations:
 
 ---
 
-## 4. Wave sequencing (what to spec→plan next)
+## 4. Wave sequencing — every workstream has a committed delivery slot
 
-Per the priority brief: critical path first; autonomous code-intelligence in parallel.
+**Nine workstreams, nine committed waves. There is no "parallel band, as capacity allows" —
+that phrasing was floated scope and is retired.** A wave **number is a committed dispatch slot**;
+once a wave is dispatched/executed, its number is fixed and is never re-used or renumbered.
 
-| Wave | Workstreams | Rationale | Output of the wave |
-|---|---|---|---|
-| **Wave 0 (now)** | WS2, WS3 *(side table now; incremental-skip behaviour lands with WS1 per D3)*, + the two ADR-038 decisions (done) | P0, autonomous, un-gated. WS3's prior-index is the matcher prerequisite; WS2 closes the dossier's structural half. | HTTP linkages live; prior-index retained; **SEI can lock** |
-| **Wave 1 (on lock)** | WS1 (incl. cutover + oracle) | Unblocks the SEI-client halves Filigree + Wardline have already built; the hard cutover re-keys every binding | Identity is refactor-stable suite-wide |
-| **Wave 2 (internal)** | WS4 | Closes once WS1 + WS2 are in — no sibling wait | `dossier(entity)` achievable → **core paradise** |
-| **Parallel band** | WS5, WS5b, WS6, WS7, WS8 | Ungated; the standalone-first-class half. Run against Waves 0–2 as capacity allows; **sequenced behind, not cancelled** (priority brief). WS5b extends WS5 (semantic search + reachability — split out but scheduled, not deferred). | Clarion is first-class *standalone*, not only as a suite citizen |
-| **Later** | WS9 | Gated on `legis`; thin on Clarion's side | Governed paradise (does not gate core) |
+Waves **0–3 are already spent** (dispatched): Wave 0 (WS2+WS3) is executing, and Wave 3 (WS9) has
+executed. The remaining standalone-first-class workstreams take the **next free numbers, 4–8** —
+forward, never by renumbering history. These are **ungated**, so they run concurrently with the
+suite work, but each is a committed deliverable with a defined predecessor — not "if we get to it."
+The roadmap is explicit that this half is **co-equal, not optional** (a perfect SEI authority with a
+thin MCP surface is *not* first-class), which is why it gets committed waves, not a holding pen.
 
-**Spec→plan cadence.** Each workstream entering a wave gets its own spec→plan cycle. Waves 0–2 (WS1–WS4)
-are already specified at design+task level (ADR-038 + integrated delivery plan) — they need execution,
-not more design. **WS5 (MCP catalogue) and WS5b (advanced queries) are now designed+planned**; the
-remaining un-designed parallel-band work is **WS6 (guidance), WS7 (multi-language), WS8 (op-quality)** —
-WS6 is the next highest-value brainstorm→spec target.
+| Wave | Workstream | Gate | Status | Output |
+|---|---|---|---|---|
+| **0** | WS2 + WS3 *(side table; incremental-skip lands with WS1 per D3)* + ADR-038 (done) | none | **executing** | HTTP linkages live; prior-index retained; **SEI can lock** |
+| **1** | WS1 (incl. cutover + oracle) | Wave 0 + SEI lock | prompt ready | identity refactor-stable suite-wide |
+| **2** | WS4 | WS1 + WS2 (internal) | prompt ready | `dossier(entity)` achievable → **core paradise** |
+| **3** | WS9 — `legis` governance consumption | Wave 2 + `legis` exists | **executed** (forward-staged on legis) | **governed paradise** (opt-in) |
+| **4** | WS5 — MCP catalogue | none (concurrent) | designed + **prompt** | full stateless consult surface |
+| **5** | **WS5b — semantic search + reachability** | soft: WS5 | planned + **prompt** | `search_semantic` + `find_dead_code` delivered |
+| **6** | WS6 — guidance maturity | none (concurrent) | **planned** → prompt owed | guidance authoring + staleness |
+| **7** | WS7 — multi-language plugin | none (concurrent) | **planned** → prompt owed | published protocol + 2nd-language plugin |
+| **8** | WS8 — operational quality | none (concurrent) | design spec owed | doctor/cost/staleness robustness |
+
+> **Numbering note.** WS9 sits at Wave 3 (not last) because it was *dispatched* there; the numbers
+> are commitment/dispatch order, not dependency order. Spent numbers are immutable — the standalone
+> work continues from Wave 4 rather than re-slotting WS9.
+
+**So: WS5b is Wave 5.** It is delivered right after WS5 (Wave 4), concurrently with the suite
+track — a committed slot, not "someday." Its plan exists
+(`../plans/2026-06-02-clarion-ws5b-advanced-queries-plan.md`); its one open item is D-WS5b-1
+(embedding provider), which gates only its Part A.
+
+**Readiness (the honest next-action per wave, not a deferral):**
+- Waves 0–3: dispatched (executing/executed) or prompt-ready (Waves 1–2).
+- Waves 4–5: designed/planned **+ execution prompt written** — ready to dispatch.
+- Waves 6–7: **planned** (`…-ws6-guidance-maturity-plan.md`, `…-ws7-multi-language-plan.md`) →
+  **execution prompt owed**. Open owner-decisions: D5 (Wave 6 lifecycle depth), D2 (Wave 7 2nd language).
+- Wave 8 (WS8): **design spec is the named prerequisite and next authoring task** — the last
+  un-planned workstream.
 
 ---
 
