@@ -765,6 +765,91 @@ pub fn find_entities(
         .map_err(StorageError::from)
 }
 
+/// Collect an entity-row iterator, stopping at `scan_cap`. Returns the rows plus
+/// `scan_truncated` (true when the cap was hit and more rows existed). Used by
+/// the WS5 faceted-search helpers, which apply scope + pagination in the read
+/// layer over the materialised candidate set.
+fn collect_capped(
+    rows: impl Iterator<Item = rusqlite::Result<EntityRow>>,
+    scan_cap: usize,
+) -> Result<(Vec<EntityRow>, bool)> {
+    let mut out = Vec::new();
+    let mut truncated = false;
+    for row in rows {
+        if out.len() >= scan_cap {
+            truncated = true;
+            break;
+        }
+        out.push(row.map_err(StorageError::from)?);
+    }
+    Ok((out, truncated))
+}
+
+/// Faceted catalog query: entities of a plugin-declared `kind`, ordered by id,
+/// materialised up to `scan_cap`. Returns `(rows, scan_truncated)`. Kinds are
+/// plugin-owned (ADR-003/ADR-022); an unknown kind matches no rows. A blank kind
+/// is rejected.
+pub fn entities_by_kind(
+    conn: &Connection,
+    kind: &str,
+    scan_cap: usize,
+) -> Result<(Vec<EntityRow>, bool)> {
+    if kind.trim().is_empty() {
+        return Err(StorageError::InvalidQuery(
+            "kind filter must not be blank".to_owned(),
+        ));
+    }
+    let limit = i64::try_from(scan_cap.saturating_add(1)).unwrap_or(i64::MAX);
+    let sql = format!("SELECT {ENTITY_COLUMNS} FROM entities WHERE kind = ?1 ORDER BY id LIMIT ?2");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![kind, limit], map_entity_row)?;
+    collect_capped(rows, scan_cap)
+}
+
+/// Faceted catalog query: entities carrying `tag` (any plugin's
+/// `entity_tags.tag`), ordered by id, materialised up to `scan_cap`. Returns
+/// `(rows, scan_truncated)`. A blank tag is rejected; an unknown tag matches no
+/// rows (the honest-empty case the read layer surfaces).
+pub fn entities_by_tag(
+    conn: &Connection,
+    tag: &str,
+    scan_cap: usize,
+) -> Result<(Vec<EntityRow>, bool)> {
+    if tag.trim().is_empty() {
+        return Err(StorageError::InvalidQuery(
+            "tag must not be blank".to_owned(),
+        ));
+    }
+    let limit = i64::try_from(scan_cap.saturating_add(1)).unwrap_or(i64::MAX);
+    let sql = format!(
+        "SELECT {ENTITY_COLUMNS} FROM entities \
+         WHERE id IN (SELECT entity_id FROM entity_tags WHERE tag = ?1) \
+         ORDER BY id LIMIT ?2"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![tag, limit], map_entity_row)?;
+    collect_capped(rows, scan_cap)
+}
+
+/// Faceted catalog query: entities that carry a Wardline taint fact, ordered by
+/// id, materialised up to `scan_cap`. Returns `(rows, scan_truncated)`. The
+/// `wardline_json` blob is opaque to storage; tier/group filtering is the read
+/// layer's concern (it fetches blobs via [`crate::get_taint_facts`]).
+pub fn entities_with_wardline_facts(
+    conn: &Connection,
+    scan_cap: usize,
+) -> Result<(Vec<EntityRow>, bool)> {
+    let limit = i64::try_from(scan_cap.saturating_add(1)).unwrap_or(i64::MAX);
+    let sql = format!(
+        "SELECT {ENTITY_COLUMNS} FROM entities \
+         WHERE id IN (SELECT entity_id FROM wardline_taint_facts) \
+         ORDER BY id LIMIT ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![limit], map_entity_row)?;
+    collect_capped(rows, scan_cap)
+}
+
 pub fn call_edges_targeting(
     conn: &Connection,
     target_id: &str,

@@ -325,7 +325,56 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             description: "Return the Wardline metadata recorded for one entity (declared tier, groups, boundary contracts) returned VERBATIM — the `wardline_json` blob is opaque to Clarion. result_kind is `present` when a taint fact exists, else `no_facts` with a missing-signal note: facts are populated via Filigree Flow-B (POST /api/wardline/taint-facts), so a locally-empty result is honest, not an error. The entity carries its `sei`. No LLM call.",
             input_schema: id_schema(),
         },
+        ToolDefinition {
+            name: "find_by_tag",
+            description: "Return entities carrying a plugin-emitted categorisation `tag`, within an optional `scope` (an entity id → its descendants, OR a path glob like \"src/auth/**\"; omitted → whole project). Bounded (limit/offset, page.total/truncated; scope_truncated/scan_truncated flag cap hits). Entities carry their `sei`. Honest-empty with a missing-signal note when no entity carries the tag — the Python plugin emits no categorisation tags today. No LLM call.",
+            input_schema: scope_facet_schema(&[("tag", true)]),
+        },
+        ToolDefinition {
+            name: "find_by_kind",
+            description: "Return entities of a plugin-declared `kind` (e.g. \"function\", \"class\", \"module\"), within an optional `scope` (entity id → descendants, OR path glob; omitted → whole project). Bounded (limit/offset, page.total/truncated). Entities carry their `sei`. An unknown kind matches no rows. No LLM call.",
+            input_schema: scope_facet_schema(&[("kind", true)]),
+        },
+        ToolDefinition {
+            name: "find_by_wardline",
+            description: "Return entities carrying a Wardline taint fact, optionally filtered by `tier` and/or `group`, within an optional `scope` (entity id → descendants, OR path glob; omitted → whole project). The Wardline blob is opaque to Clarion: tier/group filtering is best-effort against a top-level field on the blob and honest-empty when absent. Each entity carries its `wardline` blob verbatim plus its `sei`. Bounded (limit/offset, page.total/truncated). Facts are populated via Filigree Flow-B. No LLM call.",
+            input_schema: scope_facet_schema(&[("tier", false), ("group", false)]),
+        },
     ]
+}
+
+/// Input schema for a faceted-search tool: the named facet fields (each
+/// `required` or not) plus the shared `scope`/`limit`/`offset` bounds.
+fn scope_facet_schema(facets: &[(&str, bool)]) -> Value {
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    for (name, is_required) in facets {
+        // `group` accepts a string or number; everything else is a string.
+        let schema = if *name == "group" {
+            json!({"type": ["string", "integer"]})
+        } else {
+            json!({"type": "string", "minLength": 1})
+        };
+        properties.insert((*name).to_owned(), schema);
+        if *is_required {
+            required.push(Value::String((*name).to_owned()));
+        }
+    }
+    properties.insert(
+        "scope".to_owned(),
+        json!({"type": "string", "minLength": 1}),
+    );
+    properties.insert(
+        "limit".to_owned(),
+        json!({"type": "integer", "minimum": 1, "maximum": 200}),
+    );
+    properties.insert("offset".to_owned(), json!({"type": "integer", "minimum": 0}));
+    json!({
+        "type": "object",
+        "properties": Value::Object(properties),
+        "required": required,
+        "additionalProperties": false
+    })
 }
 
 fn confidence_schema() -> Value {
@@ -639,6 +688,18 @@ impl ServerState {
                 Err(response) => return response.to_json_rpc(id),
             },
             "wardline_for" => match self.tool_wardline_for(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "find_by_tag" => match self.tool_find_by_tag(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "find_by_kind" => match self.tool_find_by_kind(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "find_by_wardline" => match self.tool_find_by_wardline(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
@@ -5913,7 +5974,7 @@ mod tests {
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 21);
+        assert_eq!(tools.len(), 24);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
@@ -6003,6 +6064,9 @@ mod tests {
         assert_eq!(tools[18].name, "guidance_for");
         assert_eq!(tools[19].name, "findings_for");
         assert_eq!(tools[20].name, "wardline_for");
+        assert_eq!(tools[21].name, "find_by_tag");
+        assert_eq!(tools[22].name, "find_by_kind");
+        assert_eq!(tools[23].name, "find_by_wardline");
     }
 
     #[test]
@@ -6305,7 +6369,7 @@ mod tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], "tools-1");
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 21);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 24);
         assert_eq!(response["result"]["tools"][0]["name"], "entity_at");
         assert_eq!(response["result"]["tools"][7]["name"], "subsystem_members");
     }
@@ -6406,7 +6470,7 @@ mod tests {
 
         assert_eq!(decoded["jsonrpc"], "2.0");
         assert_eq!(decoded["id"], 10);
-        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 21);
+        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 24);
     }
 
     #[test]
@@ -6481,7 +6545,7 @@ mod tests {
         assert_eq!(first_json["id"], 11);
         assert_eq!(first_json["result"]["serverInfo"]["name"], "clarion");
         assert_eq!(second_json["id"], 12);
-        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 21);
+        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 24);
     }
 
     #[test]

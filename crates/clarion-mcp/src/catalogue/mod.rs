@@ -22,9 +22,14 @@
 //! in the submodules; `lib.rs` wires them into `list_tools()` and the
 //! `tools/call` dispatch.
 
+mod faceted;
 mod inspection;
 
+use std::collections::HashSet;
+
 use serde_json::{Value, json};
+
+use clarion_storage::contained_entity_ids;
 
 use crate::ParamError;
 
@@ -135,6 +140,115 @@ fn segment_match(pat: &[u8], name: &[u8]) -> bool {
     }
 }
 
+/// Bound on entity ids materialised when resolving an entity-descendant scope.
+const SCOPE_DESCENDANT_CAP: usize = 50_000;
+
+/// A parsed `scope` argument. `scope?` accepts an entity id (its descendants)
+/// **or** a path glob (`"src/auth/**"`); omitted → the whole project.
+///
+/// Disambiguation: a value that looks like a three-segment entity id
+/// (`plugin:kind:qualname`) with no `/` or `*` is an entity scope; anything else
+/// is a path glob.
+#[derive(Debug, Clone)]
+pub(crate) enum RawScope {
+    Project,
+    Entity(String),
+    PathGlob(String),
+}
+
+impl RawScope {
+    /// Parse the optional `scope` argument.
+    pub(crate) fn parse(
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Self, ParamError> {
+        match arguments.get("scope") {
+            None | Some(Value::Null) => Ok(Self::Project),
+            Some(Value::String(raw)) if raw.is_empty() => Err(ParamError::new(
+                "scope must be a non-empty string when present",
+            )),
+            Some(Value::String(raw)) => Ok(Self::classify(raw)),
+            Some(_) => Err(ParamError::new("scope must be a string or null")),
+        }
+    }
+
+    fn classify(raw: &str) -> Self {
+        let looks_like_entity_id = !raw.contains('/')
+            && !raw.contains('*')
+            && raw.split(':').count() >= 3
+            && raw.split(':').take(2).all(|seg| !seg.is_empty());
+        if looks_like_entity_id {
+            Self::Entity(raw.to_owned())
+        } else {
+            Self::PathGlob(raw.to_owned())
+        }
+    }
+
+    /// Resolve this scope against storage into a membership test. Entity scopes
+    /// materialise the anchor plus its descendants (bounded by
+    /// [`SCOPE_DESCENDANT_CAP`]; `scope_truncated` is reported when the cap is
+    /// hit). The anchor entity must exist (else `EntityNotFound`-style `Err`).
+    pub(crate) fn resolve(
+        &self,
+        conn: &rusqlite::Connection,
+    ) -> clarion_storage::Result<ScopeFilter> {
+        match self {
+            RawScope::Project => Ok(ScopeFilter::Project),
+            RawScope::PathGlob(pattern) => Ok(ScopeFilter::Path {
+                pattern: pattern.clone(),
+            }),
+            RawScope::Entity(id) => {
+                let contained = contained_entity_ids(conn, id, SCOPE_DESCENDANT_CAP)?;
+                let mut ids: HashSet<String> = contained.entity_ids.into_iter().collect();
+                ids.insert(id.clone());
+                Ok(ScopeFilter::Ids {
+                    ids,
+                    truncated: contained.truncated,
+                })
+            }
+        }
+    }
+}
+
+/// A resolved scope membership test over entity rows.
+pub(crate) enum ScopeFilter {
+    /// Whole project — every entity is in scope.
+    Project,
+    /// Only entities whose id is in this set (an entity scope: the anchor plus
+    /// its descendants). `truncated` is true when the descendant cap was hit.
+    Ids { ids: HashSet<String>, truncated: bool },
+    /// Only entities whose source path matches this glob (relative to the
+    /// project root, falling back to the absolute path).
+    Path { pattern: String },
+}
+
+impl ScopeFilter {
+    /// Whether an entity (by id and optional source path) is in scope.
+    pub(crate) fn contains(
+        &self,
+        id: &str,
+        source_file_path: Option<&str>,
+        project_root: &std::path::Path,
+    ) -> bool {
+        match self {
+            ScopeFilter::Project => true,
+            ScopeFilter::Ids { ids, .. } => ids.contains(id),
+            ScopeFilter::Path { pattern } => source_file_path.is_some_and(|path| {
+                let rel = std::path::Path::new(path)
+                    .strip_prefix(project_root)
+                    .ok()
+                    .and_then(|rel| rel.to_str())
+                    .unwrap_or(path);
+                glob_match(pattern, rel)
+            }),
+        }
+    }
+
+    /// Whether descendant resolution truncated (entity scope only).
+    pub(crate) fn scope_truncated(&self) -> bool {
+        matches!(self, ScopeFilter::Ids { truncated: true, .. })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +278,26 @@ mod tests {
     fn glob_question_matches_single_char() {
         assert!(glob_match("src/v?.py", "src/v1.py"));
         assert!(!glob_match("src/v?.py", "src/v10.py"));
+    }
+
+    #[test]
+    fn raw_scope_classifies_entity_ids_vs_path_globs() {
+        assert!(matches!(
+            RawScope::classify("python:function:auth.tokens.refresh"),
+            RawScope::Entity(_)
+        ));
+        assert!(matches!(
+            RawScope::classify("core:subsystem:abc123"),
+            RawScope::Entity(_)
+        ));
+        assert!(matches!(
+            RawScope::classify("src/auth/**"),
+            RawScope::PathGlob(_)
+        ));
+        assert!(matches!(
+            RawScope::classify("src/auth/tokens.py"),
+            RawScope::PathGlob(_)
+        ));
     }
 
     #[test]

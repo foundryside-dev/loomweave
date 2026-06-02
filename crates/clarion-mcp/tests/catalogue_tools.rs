@@ -79,6 +79,22 @@ fn insert_alive_sei(conn: &Connection, sei: &str, locator: &str) {
     .expect("insert sei binding");
 }
 
+fn insert_tag(conn: &Connection, entity_id: &str, tag: &str) {
+    conn.execute(
+        "INSERT INTO entity_tags (entity_id, plugin_id, tag) VALUES (?1, 'python', ?2)",
+        params![entity_id, tag],
+    )
+    .expect("insert tag");
+}
+
+fn insert_contains_edge(conn: &Connection, parent: &str, child: &str) {
+    conn.execute(
+        "INSERT INTO edges (kind, from_id, to_id, confidence) VALUES ('contains', ?1, ?2, 'resolved')",
+        params![parent, child],
+    )
+    .expect("insert contains edge");
+}
+
 async fn call_tool(state: &ServerState, name: &str, arguments: Value) -> Value {
     let response = state
         .handle_json_rpc(&json!({
@@ -317,4 +333,146 @@ async fn guidance_for_reports_unevaluable_wardline_group_rule() {
     // The wardline_group rule cannot match here -> sheet not applied, note surfaced.
     assert_eq!(env["result"]["guidance"].as_array().unwrap().len(), 0, "{env}");
     assert_eq!(env["result"]["notes"][0]["signal"], "wardline_group");
+}
+
+// ---- faceted search -----------------------------------------------------
+
+#[tokio::test]
+async fn find_by_kind_returns_matching_entities_with_sei_field() {
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    insert_entity(&conn, "python:function:b", "function", "b.py", Some((1, 2)));
+    insert_entity(&conn, "python:class:C", "class", "c.py", Some((1, 2)));
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_by_kind", json!({"kind": "function"})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 2);
+    let ents = env["result"]["entities"].as_array().unwrap();
+    assert_eq!(ents.len(), 2);
+    assert!(ents[0].get("sei").is_some(), "entity rows must carry sei: {env}");
+}
+
+#[tokio::test]
+async fn find_by_kind_unknown_kind_is_empty_not_error() {
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    drop(conn);
+    let state = state_for(project.path(), &db);
+    let env = call_tool(&state, "find_by_kind", json!({"kind": "nonesuch"})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 0);
+}
+
+#[tokio::test]
+async fn find_by_kind_paginates_with_total_and_truncated() {
+    let (project, db, conn) = open_project();
+    for i in 0..5 {
+        insert_entity(&conn, &format!("python:function:f{i}"), "function", "m.py", Some((1, 2)));
+    }
+    drop(conn);
+    let state = state_for(project.path(), &db);
+    let env = call_tool(&state, "find_by_kind", json!({"kind": "function", "limit": 2})).await;
+    assert_eq!(env["result"]["page"]["total"], 5, "{env}");
+    assert_eq!(env["result"]["page"]["returned"], 2);
+    assert_eq!(env["result"]["page"]["truncated"], true);
+}
+
+#[tokio::test]
+async fn find_by_tag_is_honest_empty_when_no_tag_emitted() {
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    drop(conn);
+    let state = state_for(project.path(), &db);
+    let env = call_tool(&state, "find_by_tag", json!({"tag": "entry-point"})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 0);
+    assert_eq!(env["result"]["signal"]["available"], false);
+}
+
+#[tokio::test]
+async fn find_by_tag_returns_tagged_entities() {
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    insert_entity(&conn, "python:function:b", "function", "b.py", Some((1, 2)));
+    insert_tag(&conn, "python:function:a", "integral_writer");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+    let env = call_tool(&state, "find_by_tag", json!({"tag": "integral_writer"})).await;
+    assert_eq!(env["result"]["page"]["total"], 1, "{env}");
+    assert_eq!(env["result"]["entities"][0]["id"], "python:function:a");
+}
+
+#[tokio::test]
+async fn find_by_kind_path_glob_scope_filters_by_source_path() {
+    let (project, db, conn) = open_project();
+    let auth = project.path().join("src/auth/tokens.py");
+    let billing = project.path().join("src/billing/ledger.py");
+    insert_entity(&conn, "python:function:auth.f", "function", auth.to_str().unwrap(), Some((1, 2)));
+    insert_entity(&conn, "python:function:billing.f", "function", billing.to_str().unwrap(), Some((1, 2)));
+    drop(conn);
+    let state = state_for(project.path(), &db);
+    let env = call_tool(
+        &state,
+        "find_by_kind",
+        json!({"kind": "function", "scope": "src/auth/**"}),
+    )
+    .await;
+    assert_eq!(env["result"]["page"]["total"], 1, "{env}");
+    assert_eq!(env["result"]["entities"][0]["id"], "python:function:auth.f");
+}
+
+#[tokio::test]
+async fn find_by_kind_entity_scope_filters_to_descendants() {
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:module:m", "module", "m.py", Some((1, 20)));
+    insert_entity(&conn, "python:function:m.inner", "function", "m.py", Some((2, 3)));
+    insert_entity(&conn, "python:function:other", "function", "o.py", Some((1, 2)));
+    insert_contains_edge(&conn, "python:module:m", "python:function:m.inner");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+    let env = call_tool(
+        &state,
+        "find_by_kind",
+        json!({"kind": "function", "scope": "python:module:m"}),
+    )
+    .await;
+    assert_eq!(env["result"]["page"]["total"], 1, "{env}");
+    assert_eq!(env["result"]["entities"][0]["id"], "python:function:m.inner");
+}
+
+#[tokio::test]
+async fn find_by_wardline_filters_by_tier_best_effort() {
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    insert_entity(&conn, "python:function:b", "function", "b.py", Some((1, 2)));
+    insert_taint_fact(&conn, "python:function:a", r#"{"tier":"exact","group":2}"#);
+    insert_taint_fact(&conn, "python:function:b", r#"{"tier":"heuristic","group":1}"#);
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_by_wardline", json!({})).await;
+    assert_eq!(env["result"]["page"]["total"], 2, "{env}");
+
+    let env = call_tool(&state, "find_by_wardline", json!({"tier": "exact"})).await;
+    assert_eq!(env["result"]["page"]["total"], 1, "{env}");
+    assert_eq!(env["result"]["entities"][0]["id"], "python:function:a");
+    assert_eq!(env["result"]["entities"][0]["wardline"]["tier"], "exact");
+
+    let env = call_tool(&state, "find_by_wardline", json!({"group": 1})).await;
+    assert_eq!(env["result"]["page"]["total"], 1, "{env}");
+    assert_eq!(env["result"]["entities"][0]["id"], "python:function:b");
+}
+
+#[tokio::test]
+async fn find_by_wardline_honest_empty_when_no_facts() {
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    drop(conn);
+    let state = state_for(project.path(), &db);
+    let env = call_tool(&state, "find_by_wardline", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 0);
+    assert_eq!(env["result"]["signal"]["available"], false);
 }
