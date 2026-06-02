@@ -140,50 +140,11 @@ pub(crate) fn missing_signal(signal: &str, reason: &str) -> Value {
     })
 }
 
-/// Glob-match `path` against a `**`/`*`/`?` `pattern`, treating `/` as the
-/// path separator. `**` matches zero or more whole segments; `*` matches any
-/// run of non-`/` characters within a single segment; `?` matches one such
-/// character. Used by `scope` path-globs and by guidance `path` match-rules.
-pub(crate) fn glob_match(pattern: &str, path: &str) -> bool {
-    let pat: Vec<&str> = pattern.split('/').collect();
-    let seg: Vec<&str> = path.split('/').collect();
-    glob_segments(&pat, &seg)
-}
-
-fn glob_segments(pat: &[&str], seg: &[&str]) -> bool {
-    match pat.first() {
-        None => seg.is_empty(),
-        Some(&"**") => {
-            // `**` consumes zero or more whole segments; try each split point.
-            (0..=seg.len()).any(|i| glob_segments(&pat[1..], &seg[i..]))
-        }
-        Some(head) => match seg.first() {
-            Some(name) if segment_match(head.as_bytes(), name.as_bytes()) => {
-                glob_segments(&pat[1..], &seg[1..])
-            }
-            _ => false,
-        },
-    }
-}
-
-/// Within-segment wildcard match: `*` matches any run, `?` matches one char.
-fn segment_match(pat: &[u8], name: &[u8]) -> bool {
-    match pat.first() {
-        None => name.is_empty(),
-        Some(b'*') => {
-            // `*` matches zero or more chars within the segment.
-            (0..=name.len()).any(|i| segment_match(&pat[1..], &name[i..]))
-        }
-        Some(b'?') => match name.first() {
-            Some(_) => segment_match(&pat[1..], &name[1..]),
-            None => false,
-        },
-        Some(&head) => match name.first() {
-            Some(&c) if c == head => segment_match(&pat[1..], &name[1..]),
-            _ => false,
-        },
-    }
-}
+/// Glob-match `path` against a `**`/`*`/`?` `pattern`. Re-exported from
+/// `clarion-storage` so the read (`scope` / guidance `match_rules`) and write
+/// (CLI guidance `--for-entity`) surfaces share one matcher — see
+/// `clarion_storage::glob`.
+pub(crate) use clarion_storage::glob_match;
 
 /// Bound on entity ids materialised when resolving an entity-descendant scope.
 const SCOPE_DESCENDANT_CAP: usize = 50_000;

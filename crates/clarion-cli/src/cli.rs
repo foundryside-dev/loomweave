@@ -144,6 +144,13 @@ pub enum Command {
         command: DbCommand,
     },
 
+    /// Author guidance sheets — institutional knowledge attached to entities
+    /// that the MCP read path composes into briefings (REQ-GUIDANCE-03).
+    Guidance {
+        #[command(subcommand)]
+        command: GuidanceCommand,
+    },
+
     /// Verify (and optionally repair) the installed agent-orientation surfaces:
     /// the `clarion-workflow` skill pack, the `SessionStart` hook, and the
     /// `.mcp.json` MCP registration. Prints a per-surface report plus the index
@@ -178,6 +185,84 @@ pub enum DbCommand {
         /// Overwrite the output file if it already exists.
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum GuidanceCommand {
+    /// Create a new guidance sheet (`kind: guidance`, provenance: manual).
+    ///
+    /// `--match` syntax is `<type>:<value>` (split on the first colon):
+    /// `path:<glob>`, `tag:<tag>`, `kind:<entity-kind>`, `subsystem:<id>`,
+    /// `entity:<entity-id>`. Content comes from `--content`, else stdin (when
+    /// piped) or `$EDITOR`/`$VISUAL`.
+    Create {
+        /// Project directory containing .clarion/clarion.db (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// A match rule (`<type>:<value>`); repeatable.
+        #[arg(long = "match", value_name = "RULE")]
+        r#match: Vec<String>,
+
+        /// Scope level: project | subsystem | package | module | class | function.
+        #[arg(long, value_name = "LEVEL")]
+        scope_level: String,
+
+        /// Guidance text (markdown). Omit to author via stdin or $EDITOR.
+        #[arg(long)]
+        content: Option<String>,
+
+        /// Slug for the entity id's third segment (`core:guidance:<name>`).
+        /// Defaults to a slug derived from the first match rule.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Mark the sheet pinned (preserved under token-budget pressure).
+        #[arg(long)]
+        pinned: bool,
+
+        /// Optional ISO-8601 expiry timestamp.
+        #[arg(long, value_name = "ISO8601")]
+        expires: Option<String>,
+    },
+
+    /// Edit a sheet's content in `$EDITOR`/`$VISUAL` (other properties, including
+    /// `authored_at` and provenance, are preserved).
+    Edit {
+        /// Project directory containing .clarion/clarion.db (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// The guidance sheet id (`core:guidance:<slug>`).
+        id: String,
+    },
+
+    /// Print a guidance sheet (human-readable).
+    Show {
+        /// Project directory containing .clarion/clarion.db (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// The guidance sheet id.
+        id: String,
+    },
+
+    /// List guidance sheets, ordered by `scope_rank` (project → function).
+    List {
+        /// Project directory containing .clarion/clarion.db (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Only list sheets whose `match_rules` apply to this entity id.
+        #[arg(long, value_name = "ENTITY_ID")]
+        for_entity: Option<String>,
+    },
+
+    /// Delete a guidance sheet.
+    Delete {
+        /// Project directory containing .clarion/clarion.db (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// The guidance sheet id.
+        id: String,
     },
 }
 

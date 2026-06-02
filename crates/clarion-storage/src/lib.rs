@@ -8,6 +8,8 @@ pub mod cache;
 pub mod commands;
 pub mod embeddings;
 pub mod error;
+pub mod glob;
+pub mod guidance;
 pub mod pragma;
 pub mod prior_index;
 pub mod query;
@@ -31,6 +33,11 @@ pub use commands::{
 };
 pub use embeddings::{EmbeddingKey, EmbeddingStore, StoredEmbedding, embeddings_db_path};
 pub use error::{Result, StorageError};
+pub use glob::glob_match;
+pub use guidance::{
+    GuidanceSheet, GuidanceSheetInput, delete_guidance_sheet, get_guidance_sheet,
+    guidance_sheet_matches_entity, list_guidance_sheets, upsert_guidance_sheet,
+};
 pub use prior_index::{
     PriorIndexEntry, clear_prior_index, load_prior_index, previously_analyzed_files,
     prior_locators_by_file, replace_prior_index, upsert_prior_index_entry,

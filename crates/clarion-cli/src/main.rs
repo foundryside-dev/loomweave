@@ -5,6 +5,7 @@ mod clustering;
 mod config;
 mod db;
 mod doctor;
+mod guidance;
 mod hook;
 mod hooks_settings;
 mod http_read;
@@ -96,6 +97,7 @@ fn main() -> Result<()> {
                 force,
             } => db::backup(&path, &output, force),
         },
+        cli::Command::Guidance { command } => guidance::run(command),
         cli::Command::Doctor { path, fix } => {
             // doctor prints its own report; map an unhealthy result to a
             // non-zero exit so it can gate CI / pre-commit. The Result<()> arm
