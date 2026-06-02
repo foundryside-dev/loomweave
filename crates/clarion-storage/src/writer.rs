@@ -165,11 +165,19 @@ fn run_actor(
                 run_id,
                 config_json,
                 started_at,
+                head_commit,
                 ack,
             } => {
                 reply(
                     ack,
-                    begin_run(conn, &mut state, &run_id, &config_json, &started_at),
+                    begin_run(
+                        conn,
+                        &mut state,
+                        &run_id,
+                        &config_json,
+                        &started_at,
+                        head_commit.as_deref(),
+                    ),
                 );
             }
             WriterCmd::ResumeRun { run_id, ack } => {
@@ -397,6 +405,7 @@ fn begin_run(
     run_id: &str,
     config_json: &str,
     started_at: &str,
+    head_commit: Option<&str>,
 ) -> Result<()> {
     if state.current_run.is_some() {
         return Err(StorageError::WriterProtocol(
@@ -404,9 +413,9 @@ fn begin_run(
         ));
     }
     conn.execute(
-        "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
-         VALUES (?1, ?2, NULL, ?3, '{}', 'running')",
-        params![run_id, started_at, config_json],
+        "INSERT INTO runs (id, started_at, completed_at, config, stats, status, analyzed_at_commit) \
+         VALUES (?1, ?2, NULL, ?3, '{}', 'running', ?4)",
+        params![run_id, started_at, config_json, head_commit],
     )?;
     begin_write_tx(conn, state)?;
     state.in_tx = true;

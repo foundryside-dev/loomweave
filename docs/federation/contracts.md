@@ -664,7 +664,7 @@ plus transport is the custody substrate `legis` verifies against. A signed
 lineage is North-Star, not a v1 requirement. This is the custody axiom: integrity
 is re-established at the governance boundary, never assumed from the store.
 
-### Git-rename provider seam (REQ-C-05) — wired, with a surfaced window gap
+### Git-rename provider seam (REQ-C-05) — wired and operative (both windows)
 
 The SEI matcher consumes a typed, locator-level git-rename signal behind the
 `GitRenameSource` trait (SEI spec §6). `legis` owns the git interface, so it is
@@ -677,26 +677,33 @@ Selection is enrich-only and **capability-aware** (`select_git_rename_source`):
 when configured (`--legis-url`) **and** reachable. Unset/unreachable `legis`
 issues no HTTP and leaves behaviour byte-identical to pre-WS9.
 
-**Surfaced gap (not papered over).** The two suppliers observe **different rename
-windows**: Clarion's `analyze` depends on the **working-tree-vs-HEAD**
-(uncommitted) window — the "rename a file, re-analyze before commit" flow — while
-`legis`'s endpoint serves only **committed** renames over a rev-range (`git log
--M`). In the working-tree flow `legis` returns empty. So the selector keeps the
-shell source for that window; `legis` activates only for a committed rev-range,
-which Clarion's pipeline does not yet drive (it always passes the empty/working-
-tree base today). The seam is therefore **built, tested, and ready** but not yet
-operative in the default pipeline. Closing the loop requires **either**:
+**Two windows, unioned (gap closed via option 2).** The two suppliers observe
+**different rename windows**: Clarion's working-tree-vs-HEAD window (uncommitted
+renames — the "rename a file, re-analyze before commit" flow, shell `git diff -M
+HEAD`) and `legis`'s committed window over a rev-range (`git log -M`, which cannot
+see the working tree). A naive *swap* of one for the other would drop uncommitted
+renames, so `analyze` now **unions** both each run (`gather_git_renames`):
 
-1. `legis` adds a working-tree rename surface (a `git diff -M HEAD` equivalent), **or**
-2. Clarion gains prior-run commit tracking and drives a committed rev-range re-index.
+- The **working-tree window** always runs via the shell source (THE WS9 crux: it
+  is never handed to `legis`), so the pre-commit re-analyze flow is unchanged.
+- The **committed window** `<prior_commit>..HEAD` runs additionally when `legis`
+  is configured (`--legis-url`) and a prior commit differs from HEAD. `analyze`
+  records the HEAD it analyzed on the run row (`runs.analyzed_at_commit`, migration
+  `0007`) and reads the *prior* run's commit (`prior_analyzed_commit`, excluding
+  the current run) to form the range. So `legis` is now **operatively consulted**
+  for renames committed between runs — the gap formerly disclosed here is closed
+  by option 2 (Clarion drives a committed rev-range). Option 1 (a `legis`
+  working-tree surface) remains unnecessary.
 
-Until then, enabling `legis` is safe but inert for the default flow — and never a
-regression: the matcher is fail-closed (a rename is a *hint*, confirmed by
-byte-identical body hash), so neither window choice can cause a false carry, only
-a missed one. Proven by
+Enrich-only and never a regression: with `legis` unset, or no prior commit, only
+the working-tree window runs — byte-identical to pre-WS9, no HTTP. The matcher is
+fail-closed (a rename is a *hint*, confirmed by byte-identical body hash), so the
+union can only *miss* a carry, never cause a false one. Proven by
 `selector_keeps_working_tree_rename_even_when_a_reachable_legis_sees_nothing`
-(`crates/clarion-cli/src/sei_git.rs`): a reachable `legis` that (correctly) reports
-no committed rename never swallows a shell-detectable working-tree rename.
+(working-tree rename survives a reachable-but-empty `legis`) and
+`gather_unions_committed_legis_and_working_tree_shell_renames` (committed `legis`
+rename and uncommitted shell rename both appear) in
+`crates/clarion-cli/src/sei_git.rs`.
 
 ### Trust vocabulary — carried verbatim, never adjudicated
 

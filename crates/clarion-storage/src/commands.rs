@@ -142,10 +142,16 @@ pub enum WriterCmd {
     /// Open a new run. The writer inserts a row into `runs` with status
     /// `running`, begins an implicit transaction on the entities write
     /// path, and binds `run_id` into its state.
+    ///
+    /// `head_commit` is the git `HEAD` SHA the run analyzes against (WS9 /
+    /// SEI §6): persisted on the run row so the *next* run can drive a committed
+    /// rename window `<prior_commit>..HEAD`. `None` when the corpus is not a git
+    /// repo or `git rev-parse HEAD` fails — the committed window is then skipped.
     BeginRun {
         run_id: String,
         config_json: String,
         started_at: String,
+        head_commit: Option<String>,
         ack: Ack<()>,
     },
     /// Reopen an existing run row for the `--resume` path (REQ-FINDING-05).

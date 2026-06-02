@@ -245,6 +245,31 @@ pub fn alive_bindings_snapshot(conn: &Connection) -> Result<HashMap<String, SeiB
     Ok(out)
 }
 
+/// The git `HEAD` commit recorded by the most recent *completed* run other than
+/// `current_run_id` (WS9 / SEI §6, REQ-C-05). Drives the committed rename window
+/// `<prior_commit>..HEAD` on the next run so the `legis` git-rename provider can
+/// be selected. `None` when no prior completed run recorded a commit (first run,
+/// non-git corpus, or pre-migration rows).
+///
+/// `current_run_id` is excluded explicitly: the SEI mint pass runs *after*
+/// `CommitRun` marks the current run `completed`, so an unfiltered "most recent
+/// completed run" would return the current run and collapse the window to
+/// `<HEAD>..HEAD` — a silent no-op.
+///
+/// # Errors
+/// Returns [`StorageError::Sqlite`] if the query fails.
+pub fn prior_analyzed_commit(conn: &Connection, current_run_id: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT analyzed_at_commit FROM runs \
+         WHERE id != ?1 AND analyzed_at_commit IS NOT NULL AND status = 'completed' \
+         ORDER BY started_at DESC LIMIT 1",
+        [current_run_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(StorageError::from)
+}
+
 // ---------------------------------------------------------------------------
 // The deterministic, fail-closed matcher (ADR-038 §3 / SEI spec §3).
 // ---------------------------------------------------------------------------
@@ -638,6 +663,85 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         apply_migrations(&mut conn).unwrap();
         conn
+    }
+
+    fn insert_run(conn: &Connection, id: &str, started_at: &str, commit: Option<&str>, status: &str) {
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status, analyzed_at_commit) \
+             VALUES (?1, ?2, ?2, '{}', '{}', ?3, ?4)",
+            params![id, started_at, status, commit],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migration_adds_nullable_analyzed_at_commit() {
+        // The column exists after migration and round-trips a value (and a NULL).
+        let conn = migrated_conn();
+        insert_run(&conn, "r1", "t1", Some("deadbeef"), "completed");
+        insert_run(&conn, "r2", "t2", None, "completed");
+        let got: Option<String> = conn
+            .query_row(
+                "SELECT analyzed_at_commit FROM runs WHERE id = 'r1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(got.as_deref(), Some("deadbeef"));
+        let none: Option<String> = conn
+            .query_row(
+                "SELECT analyzed_at_commit FROM runs WHERE id = 'r2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(none, None);
+    }
+
+    #[test]
+    fn prior_analyzed_commit_returns_most_recent_other_completed_run() {
+        let conn = migrated_conn();
+        insert_run(&conn, "old", "2026-01-01", Some("sha_old"), "completed");
+        insert_run(&conn, "new", "2026-02-01", Some("sha_new"), "completed");
+        // Querying as a *third* run returns the most recent completed commit.
+        assert_eq!(
+            prior_analyzed_commit(&conn, "current").unwrap().as_deref(),
+            Some("sha_new")
+        );
+    }
+
+    /// THE SELF-REFERENCE GUARD (WS9): the SEI mint pass runs *after* `CommitRun`
+    /// marks the current run `completed`, so the current run is already a
+    /// completed row when this is called. It must be excluded by id — else the
+    /// committed window collapses to `<HEAD>..HEAD` (a silent no-op).
+    #[test]
+    fn prior_analyzed_commit_excludes_the_current_run() {
+        let conn = migrated_conn();
+        // Only the current run exists, already marked completed with its HEAD.
+        insert_run(&conn, "current", "2026-02-01", Some("current_head"), "completed");
+        assert_eq!(prior_analyzed_commit(&conn, "current").unwrap(), None);
+
+        // Add a genuine prior run: now it — not current_head — is returned.
+        insert_run(&conn, "prior", "2026-01-01", Some("prior_head"), "completed");
+        assert_eq!(
+            prior_analyzed_commit(&conn, "current").unwrap().as_deref(),
+            Some("prior_head")
+        );
+    }
+
+    #[test]
+    fn prior_analyzed_commit_ignores_null_and_non_completed_runs() {
+        let conn = migrated_conn();
+        // Most recent by time, but no commit recorded → skipped.
+        insert_run(&conn, "nullc", "2026-03-01", None, "completed");
+        // More recent, but failed → skipped.
+        insert_run(&conn, "failed", "2026-04-01", Some("sha_failed"), "failed");
+        // Older, completed, with a commit → the answer.
+        insert_run(&conn, "good", "2026-02-01", Some("sha_good"), "completed");
+        assert_eq!(
+            prior_analyzed_commit(&conn, "current").unwrap().as_deref(),
+            Some("sha_good")
+        );
     }
 
     fn binding(sei: &str, locator: &str, body: &str, sig: Option<&str>) -> SeiBinding {

@@ -54,6 +54,7 @@ pub use sei::{
     SeiBinding, SeiBindingRecord, SeiDecision, SeiLineageEntry, SeiLineageRow, SeiLookupResult,
     SeiRecord, alive_binding_for_locator, alive_bindings_snapshot, append_sei_lineage,
     has_any_alive_binding, is_reserved_sei, mint_sei, orphan_sei_binding, orphaned_bindings,
+    prior_analyzed_commit,
     rebind_or_mint, resolve_locator, resolve_sei, sei_for_locator, sei_lineage,
     set_entity_signature, upsert_sei_binding,
 };

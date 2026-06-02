@@ -28,8 +28,15 @@
 //! Clarion-without (the enrich-only invariant, loom.md §5). The matcher is
 //! fail-closed anyway — a rename is only a hint, confirmed by byte-identical body
 //! hash — so neither window choice can cause a *false* carry, only a missed one.
-//! The gap (legis lacks a working-tree rename surface; Clarion does not yet drive
-//! a committed rev-range re-index) is surfaced in `docs/federation/contracts.md`.
+//!
+//! Both windows are now driven each run by [`gather_git_renames`], which unions
+//! the working-tree window (always, shell) with the committed window
+//! `<prior_commit>..HEAD` (`legis`-gated). `analyze` records the HEAD it analyzed
+//! on the run row (`runs.analyzed_at_commit`) and reads the prior run's commit to
+//! drive the committed window — so a `legis` configured against a repo with
+//! commits between runs is *operatively* consulted, closing the WS9 window gap
+//! formerly disclosed in `docs/federation/contracts.md`. Without `legis`, or with
+//! no prior commit, only the working-tree window runs (byte-identical to pre-WS9).
 //!
 //! ## Scope (v1, honest framing)
 //! - Path→module translation is Python-shaped (strip the extension, drop a
@@ -336,6 +343,88 @@ pub(crate) fn is_git_repo(path: &Path) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// The current `HEAD` commit SHA, or `None` on any failure (not a repo, git
+/// missing, detached/unborn HEAD, non-zero exit). Persisted on the run row so a
+/// later run can drive the committed rename window `<prior_commit>..HEAD` (WS9 /
+/// SEI §6). Fail-soft like [`is_git_repo`]: an absent SHA simply skips the
+/// committed window, never errors the run.
+pub(crate) fn git_head_sha(repo_root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    if sha.is_empty() { None } else { Some(sha) }
+}
+
+/// The git-rename windows to query, in order (WS9 / SEI §6). Pure — no I/O.
+///
+/// Always includes the **working-tree window** (`""`), which the selector routes
+/// to the shell source (`git diff -M HEAD`) and which catches *uncommitted*
+/// renames — the pre-commit re-analyze flow `analyze` depends on. THE WS9 CRUX:
+/// this window must never be handed to `legis`, whose committed-only endpoint
+/// cannot see it (see [`select_git_rename_source`]).
+///
+/// Adds the **committed window** (`prior`) only when `legis` is configured AND a
+/// prior commit exists AND it differs from `head` (an empty `prior..HEAD` range
+/// is a wasted probe). Gating on `legis_set` keeps the no-`legis` path
+/// byte-identical to pre-WS9 (enrich-only): without `legis` the only window is
+/// the working tree, exactly as before.
+fn rename_windows(legis_set: bool, prior: Option<&str>, head: Option<&str>) -> Vec<String> {
+    let mut windows = vec![String::new()];
+    if legis_set
+        && let Some(base) = prior
+        && !base.is_empty()
+        && Some(base) != head
+    {
+        windows.push(base.to_owned());
+    }
+    windows
+}
+
+/// Gather locator renames across both windows and union them (WS9 / SEI §6).
+///
+/// The two windows are complementary: the working tree (uncommitted renames, via
+/// the shell source) and the committed range `prior..HEAD` (committed renames,
+/// via `legis` when reachable, else a shell `git diff -M prior` fallback). The
+/// matcher is fail-closed — a rename is only a hint, confirmed by a
+/// byte-identical body hash — so an over-broad union can only *miss* a carry,
+/// never cause a false one; dedup is for tidiness, not correctness.
+///
+/// Returns empty on a non-git corpus (no spurious subprocess). When `legis` is
+/// unset this issues exactly the one pre-WS9 working-tree call.
+pub(crate) fn gather_git_renames(
+    project_root: &Path,
+    legis_url: Option<&str>,
+    prior_commit: Option<&str>,
+    head_commit: Option<&str>,
+    current_locators: &[String],
+) -> Vec<GitRename> {
+    if !is_git_repo(project_root) {
+        return Vec::new();
+    }
+    let mut out: Vec<GitRename> = Vec::new();
+    for base in rename_windows(legis_url.is_some(), prior_commit, head_commit) {
+        let source = select_git_rename_source(
+            project_root,
+            legis_url.map(str::to_owned),
+            &base,
+            current_locators.to_vec(),
+        );
+        for rename in source.renames_since(&base) {
+            if !out.contains(&rename) {
+                out.push(rename);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,5 +719,139 @@ mod tests {
             }),
             "the shell-detected working-tree rename must survive even with legis configured; got {got:?}"
         );
+    }
+
+    // ── WS9 windowing: rename_windows (pure) + gather union ────────────────────
+
+    #[test]
+    fn rename_windows_is_working_tree_only_without_legis() {
+        // Enrich-only: with `legis` unset, the only window is the working tree,
+        // byte-identical to pre-WS9 — even when a prior commit exists.
+        assert_eq!(
+            rename_windows(false, Some("base"), Some("head")),
+            vec![String::new()]
+        );
+    }
+
+    #[test]
+    fn rename_windows_adds_committed_window_when_legis_and_distinct_prior() {
+        assert_eq!(
+            rename_windows(true, Some("base"), Some("head")),
+            vec![String::new(), "base".to_owned()]
+        );
+    }
+
+    #[test]
+    fn rename_windows_skips_committed_window_on_degenerate_base() {
+        // No prior, empty prior, or prior == head (empty `base..HEAD` range) all
+        // collapse to the working-tree window — no wasted committed query/probe.
+        assert_eq!(rename_windows(true, None, Some("head")), vec![String::new()]);
+        assert_eq!(
+            rename_windows(true, Some(""), Some("head")),
+            vec![String::new()]
+        );
+        assert_eq!(
+            rename_windows(true, Some("head"), Some("head")),
+            vec![String::new()]
+        );
+    }
+
+    /// THE WS9 UNION — committed (legis) ∪ working-tree (shell), both survive.
+    ///
+    /// A committed rename (`auth.py→authn.py`, served by the legis mock for the
+    /// `<prior>..HEAD` window) AND an *uncommitted* rename (`extra.py→extras.py`,
+    /// seen only by the shell working-tree window) must BOTH appear. A swap would
+    /// route the working-tree window to legis and drop the uncommitted one.
+    #[test]
+    fn gather_unions_committed_legis_and_working_tree_shell_renames() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        run_git(repo, &["init", "-q"]);
+        run_git(repo, &["config", "user.email", "t@t"]);
+        run_git(repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("auth.py"), "def login():\n    return 1\n").unwrap();
+        std::fs::write(repo.join("extra.py"), "def helper():\n    return 2\n").unwrap();
+        run_git(repo, &["add", "."]);
+        run_git(repo, &["commit", "-qm", "init"]);
+        let prior = git_head_sha(repo).expect("prior sha");
+        // Committed rename in `prior..HEAD`.
+        run_git(repo, &["mv", "auth.py", "authn.py"]);
+        run_git(repo, &["commit", "-qm", "rename auth"]);
+        let head = git_head_sha(repo).expect("head sha");
+        // Uncommitted rename — invisible to the committed window, only the shell
+        // working-tree window can see it.
+        run_git(repo, &["mv", "extra.py", "extras.py"]);
+
+        // legis mock answers the committed window with the committed rename.
+        let body =
+            r#"[{"commit_sha":"c","old_path":"auth.py","new_path":"authn.py","similarity":100}]"#;
+        // /health probe + /git/renames read for the committed window = 2 conns.
+        let (addr, handle) = spawn_legis_mock(2, body);
+
+        let got = gather_git_renames(
+            repo,
+            Some(&format!("http://{addr}")),
+            Some(&prior),
+            Some(&head),
+            &[
+                "python:module:authn".to_owned(),
+                "python:module:extras".to_owned(),
+            ],
+        );
+        drop(handle);
+
+        assert!(
+            got.contains(&GitRename {
+                old_locator: "python:module:auth".to_owned(),
+                new_locator: "python:module:authn".to_owned(),
+            }),
+            "committed rename from legis must be present; got {got:?}"
+        );
+        assert!(
+            got.contains(&GitRename {
+                old_locator: "python:module:extra".to_owned(),
+                new_locator: "python:module:extras".to_owned(),
+            }),
+            "uncommitted working-tree rename from shell must survive the union; got {got:?}"
+        );
+    }
+
+    #[test]
+    fn gather_without_legis_issues_only_working_tree_window() {
+        // No legis_url: only the working-tree window runs (the committed rename is
+        // NOT picked up, proving the committed window is legis-gated and the
+        // no-legis path is byte-identical to pre-WS9).
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        run_git(repo, &["init", "-q"]);
+        run_git(repo, &["config", "user.email", "t@t"]);
+        run_git(repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("auth.py"), "def login():\n    return 1\n").unwrap();
+        run_git(repo, &["add", "."]);
+        run_git(repo, &["commit", "-qm", "init"]);
+        let prior = git_head_sha(repo).expect("prior sha");
+        run_git(repo, &["mv", "auth.py", "authn.py"]);
+        run_git(repo, &["commit", "-qm", "rename auth"]);
+        let head = git_head_sha(repo).expect("head sha");
+
+        let got = gather_git_renames(
+            repo,
+            None,
+            Some(&prior),
+            Some(&head),
+            &["python:module:authn".to_owned()],
+        );
+        assert!(
+            got.is_empty(),
+            "committed rename must be invisible without legis (working-tree window only); got {got:?}"
+        );
+    }
+
+    #[test]
+    fn git_head_sha_returns_none_outside_a_repo() {
+        let tmp = std::env::temp_dir();
+        // temp_dir itself is not a git repo (no .git); rev-parse HEAD fails.
+        let dir = tempfile::tempdir_in(tmp).unwrap();
+        assert!(git_head_sha(dir.path()).is_none());
     }
 }

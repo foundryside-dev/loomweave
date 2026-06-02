@@ -29,7 +29,7 @@ use clarion_core::{
 use clarion_storage::{
     DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, GitRename, NewEntityDescriptor, PriorIndexEntry,
     SeiBindingRecord, SeiDecision, SeiLineageEntry, UnresolvedCallSiteRecord, Writer,
-    alive_bindings_snapshot,
+    alive_bindings_snapshot, prior_analyzed_commit,
     commands::{EdgeRecord, EntityRecord, FindingRecord, RunStatus, WriterCmd},
     mint_sei, module_dependency_edges, orphaned_bindings, rebind_or_mint,
     sei::{BindingStatus, LineageEvent},
@@ -227,6 +227,22 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // note on `AnalyzeLockGuard`. Drop on function exit releases the lock.
     let _analyze_lock = crate::analyze_lock::acquire_analyze_lock(&clarion_dir)?;
 
+    // Apply any pending schema migrations before opening the writer. `install`
+    // is the usual migrator, but a binary upgrade that adds a migration the run
+    // path writes (WS9: `runs.analyzed_at_commit`) must not hard-fail `analyze`
+    // on a DB that `install` has not re-touched. Idempotent (only pending
+    // migrations run) and safe under the analyze lock acquired above; the writer
+    // still verifies `user_version` on spawn to reject a forward-incompatible file.
+    {
+        let mut conn =
+            Connection::open(&db_path).context("open database to apply pending migrations")?;
+        clarion_storage::pragma::apply_write_pragmas(&conn)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        clarion_storage::schema::apply_migrations(&mut conn)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("apply pending migrations")?;
+    }
+
     let analyze_config = AnalyzeConfig::load(&project_root, options.config_path.as_deref())?;
     let analyze_config_json = analyze_config.to_json_string()?;
 
@@ -247,6 +263,21 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         .or_else(|| options.run_id.clone())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let started_at = iso8601_now();
+
+    // WS9 / SEI §6 git-rename windowing. Capture the HEAD this run analyzes
+    // against (persisted on the run row), and read the *prior* run's recorded
+    // commit to drive the committed window `<prior_commit>..HEAD`. The prior read
+    // happens here — before `open_run` writes/reopens this run's row — and
+    // excludes `run_id`, so it can never resolve to the current run (which
+    // `CommitRun` marks `completed` before the SEI mint pass runs). Both are
+    // best-effort: a non-git corpus or a read failure degrades to the
+    // working-tree-only window, exactly as pre-WS9.
+    let head_commit = crate::sei_git::git_head_sha(&project_root);
+    let prior_commit = match Connection::open(&db_path) {
+        Ok(conn) => prior_analyzed_commit(&conn, &run_id).unwrap_or(None),
+        Err(_) => None,
+    };
+
     // Structured progress sink (MCP `analyze_start` sets `progress_file`); a
     // no-op when absent so the normal CLI path is unchanged.
     let progress = Arc::new(ProgressReporter::new(
@@ -295,6 +326,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 &run_id,
                 &analyze_config_json,
                 &started_at,
+                head_commit.as_deref(),
             )
             .await?;
             let completed_at = iso8601_now();
@@ -323,8 +355,15 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         }
 
         tracing::warn!(run_id = %run_id, "no plugins discovered");
-        crate::run_lifecycle::open_run(&writer, resume, &run_id, &analyze_config_json, &started_at)
-            .await?;
+        crate::run_lifecycle::open_run(
+            &writer,
+            resume,
+            &run_id,
+            &analyze_config_json,
+            &started_at,
+            head_commit.as_deref(),
+        )
+        .await?;
         let completed_at = iso8601_now();
         writer
             .send_wait(|ack| WriterCmd::CommitRun {
@@ -385,8 +424,15 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     );
     let mut secret_scan_outcome =
         crate::secret_scan::pre_ingest(&project_root, &secret_scan_files, &options.secret_scan)?;
-    crate::run_lifecycle::open_run(&writer, resume, &run_id, &analyze_config_json, &started_at)
-        .await?;
+    crate::run_lifecycle::open_run(
+        &writer,
+        resume,
+        &run_id,
+        &analyze_config_json,
+        &started_at,
+        head_commit.as_deref(),
+    )
+    .await?;
 
     // ── Wave 2 / T3.1: incremental-analysis skip state ────────────────────────
     //
@@ -916,6 +962,8 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     sei_descriptors,
                     &retained_locators,
                     options.legis_url.as_deref(),
+                    prior_commit.as_deref(),
+                    head_commit.as_deref(),
                 )
                 .await
                 {
@@ -1081,7 +1129,7 @@ fn dedup_descriptors_by_locator(descriptors: Vec<NewEntityDescriptor>) -> Vec<Ne
 /// guarantee is that the carry/mint *decisions* are deterministic given the same
 /// `sei_bindings` + source. A back-to-back unchanged re-run therefore CARRIES
 /// (never re-mints) every SEI (the locator-unchanged path).
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn run_sei_mint_pass(
     writer: &Writer,
     db_path: &Path,
@@ -1090,6 +1138,8 @@ async fn run_sei_mint_pass(
     descriptors: Vec<NewEntityDescriptor>,
     retained_locators: &HashSet<String>,
     legis_url: Option<&str>,
+    prior_commit: Option<&str>,
+    head_commit: Option<&str>,
 ) -> anyhow::Result<SeiPassStats> {
     // Read the prior alive bindings (this run has written no SEI yet, so this is
     // exactly the previous run's identity state).
@@ -1109,23 +1159,25 @@ async fn run_sei_mint_pass(
         descriptors.iter().map(|d| d.locator.clone()).collect();
     current_locators.extend(retained_locators.iter().cloned());
 
-    // The git-rename signal (best-effort, typed seam REQ-C-05). Skipped entirely
-    // on non-repo corpora to avoid a spurious subprocess. The operative window is
-    // working-tree-vs-HEAD (empty base); `select_git_rename_source` keeps the
-    // shell source for that window and consults a configured `legis` only for a
-    // committed rev-range (WS9 / SEI §6), so an unset/unreachable `legis` issues
-    // no HTTP and leaves this path byte-identical to pre-WS9 behaviour.
-    let git_renames: Vec<GitRename> = if crate::sei_git::is_git_repo(project_root) {
-        crate::sei_git::select_git_rename_source(
-            project_root,
-            legis_url.map(str::to_owned),
-            "",
-            descriptors.iter().map(|d| d.locator.clone()).collect(),
-        )
-        .renames_since("")
-    } else {
-        Vec::new()
-    };
+    // The git-rename signal (best-effort, typed seam REQ-C-05), unioned across
+    // two complementary windows (WS9 / SEI §6): the working tree (uncommitted
+    // renames, shell `git diff -M HEAD`) and — when `legis` is configured and a
+    // prior commit differs from HEAD — the committed range `<prior>..HEAD`
+    // (committed renames, served by `legis` via `git log -M`, else a shell
+    // fallback). The working-tree window is never handed to `legis` (its
+    // committed-only endpoint cannot see it); without `legis` this is exactly the
+    // one pre-WS9 working-tree call. Skipped entirely on non-repo corpora. The
+    // matcher is fail-closed (a rename is a hint, confirmed by body hash), so an
+    // over-broad union only ever misses a carry, never causes a false one.
+    let descriptor_locators: Vec<String> =
+        descriptors.iter().map(|d| d.locator.clone()).collect();
+    let git_renames: Vec<GitRename> = crate::sei_git::gather_git_renames(
+        project_root,
+        legis_url,
+        prior_commit,
+        head_commit,
+        &descriptor_locators,
+    );
 
     // sei -> prior (vanished) locator, for the rematched set + lineage old_locator.
     let sei_to_old_locator: HashMap<String, String> = alive

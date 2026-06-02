@@ -150,6 +150,7 @@ async fn begin_demo_run(tx: &tokio::sync::mpsc::Sender<WriterCmd>, run_id: &str)
         run_id: run_id.into(),
         config_json: "{}".into(),
         started_at: now_iso(),
+        head_commit: None,
         ack,
     })
     .await
@@ -563,6 +564,7 @@ async fn round_trip_insert_persists_entity() {
         run_id: "run-1".into(),
         config_json: "{}".into(),
         started_at: now_iso(),
+        head_commit: None,
         ack,
     })
     .await
@@ -634,6 +636,7 @@ async fn insert_entity_is_idempotent_across_runs() {
         run_id: "run-1".into(),
         config_json: "{}".into(),
         started_at: now_iso(),
+        head_commit: None,
         ack,
     })
     .await
@@ -664,6 +667,7 @@ async fn insert_entity_is_idempotent_across_runs() {
         run_id: "run-2".into(),
         config_json: "{}".into(),
         started_at: now_iso(),
+        head_commit: None,
         ack,
     })
     .await
@@ -764,6 +768,7 @@ async fn resume_run_reopens_existing_row_without_pk_conflict() {
         run_id: "run-1".into(),
         config_json: "{}".into(),
         started_at: now_iso(),
+        head_commit: None,
         ack,
     })
     .await
@@ -876,6 +881,7 @@ async fn non_core_plugin_cannot_insert_reserved_entity_kind() {
         run_id: "run-reserved-kind".into(),
         config_json: "{}".into(),
         started_at: now_iso(),
+        head_commit: None,
         ack,
     })
     .await
@@ -1268,6 +1274,7 @@ async fn batch_size_fifty_commits_every_fifty_inserts() {
         run_id: "run-1".into(),
         config_json: "{}".into(),
         started_at: now_iso(),
+        head_commit: None,
         ack,
     })
     .await
@@ -1386,6 +1393,7 @@ async fn fail_run_rolls_back_pending_inserts() {
         run_id: "run-fail".into(),
         config_json: "{}".into(),
         started_at: now_iso(),
+        head_commit: None,
         ack,
     })
     .await
@@ -1448,6 +1456,7 @@ async fn fail_run_after_prior_batch_commit_rolls_back_only_pending_inserts() {
         run_id: "run-fail-after-batch".into(),
         config_json: "{}".into(),
         started_at: now_iso(),
+        head_commit: None,
         ack,
     })
     .await
@@ -1660,6 +1669,7 @@ async fn double_begin_run_is_protocol_violation() {
         run_id: "run-a".into(),
         config_json: "{}".into(),
         started_at: now_iso(),
+        head_commit: None,
         ack,
     })
     .await
@@ -1669,6 +1679,7 @@ async fn double_begin_run_is_protocol_violation() {
         run_id: "run-b".into(),
         config_json: "{}".into(),
         started_at: now_iso(),
+        head_commit: None,
         ack,
     })
     .await;
@@ -1696,6 +1707,7 @@ async fn round_trip_insert_persists_contains_edge() {
         run_id: "run-1".into(),
         config_json: "{}".into(),
         started_at: now_iso(),
+        head_commit: None,
         ack,
     })
     .await
@@ -1766,6 +1778,7 @@ async fn contains_edge_with_byte_offsets_rejected_by_per_kind_contract() {
         run_id: "run-c".into(),
         config_json: "{}".into(),
         started_at: now_iso(),
+        head_commit: None,
         ack,
     })
     .await
@@ -1820,6 +1833,7 @@ async fn calls_edge_without_byte_offsets_rejected_by_per_kind_contract() {
         run_id: "run-k".into(),
         config_json: "{}".into(),
         started_at: now_iso(),
+        head_commit: None,
         ack,
     })
     .await
@@ -1888,6 +1902,7 @@ async fn unknown_edge_kind_rejected_strictly() {
         run_id: "run-u".into(),
         config_json: "{}".into(),
         started_at: now_iso(),
+        head_commit: None,
         ack,
     })
     .await
@@ -1952,6 +1967,7 @@ async fn duplicate_contains_edge_is_deduped_and_counter_increments() {
         run_id: "run-d".into(),
         config_json: "{}".into(),
         started_at: now_iso(),
+        head_commit: None,
         ack,
     })
     .await
@@ -2026,6 +2042,7 @@ async fn parent_id_without_matching_contains_edge_rejects_run() {
         run_id: "run-m".into(),
         config_json: "{}".into(),
         started_at: now_iso(),
+        head_commit: None,
         ack,
     })
     .await
@@ -2095,6 +2112,7 @@ async fn orphan_contains_edge_with_no_matching_parent_id_rejects_run() {
         run_id: "run-o".into(),
         config_json: "{}".into(),
         started_at: now_iso(),
+        head_commit: None,
         ack,
     })
     .await
@@ -2152,6 +2170,7 @@ async fn flush_run_batch_rejects_parent_contains_mismatch_before_commit() {
         run_id: "run-flush-mismatch".into(),
         config_json: "{}".into(),
         started_at: now_iso(),
+        head_commit: None,
         ack,
     })
     .await
@@ -2226,6 +2245,7 @@ async fn writes_in_batch_counts_entities_and_edges_uniformly() {
         run_id: "run-b".into(),
         config_json: "{}".into(),
         started_at: now_iso(),
+        head_commit: None,
         ack,
     })
     .await
@@ -2708,6 +2728,7 @@ async fn channel_close_with_open_run_self_heals_to_failed() {
         run_id: "run-abandoned".into(),
         config_json: "{}".into(),
         started_at: now_iso(),
+        head_commit: None,
         ack,
     })
     .await

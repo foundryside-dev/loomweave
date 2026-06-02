@@ -6,12 +6,14 @@ pub(crate) async fn begin_run(
     run_id: &str,
     analyze_config_json: &str,
     started_at: &str,
+    head_commit: Option<&str>,
 ) -> Result<()> {
     writer
         .send_wait(|ack| WriterCmd::BeginRun {
             run_id: run_id.to_owned(),
             config_json: analyze_config_json.to_owned(),
             started_at: started_at.to_owned(),
+            head_commit: head_commit.map(str::to_owned),
             ack,
         })
         .await
@@ -43,10 +45,13 @@ pub(crate) async fn open_run(
     run_id: &str,
     analyze_config_json: &str,
     started_at: &str,
+    head_commit: Option<&str>,
 ) -> Result<()> {
     if resume {
+        // Resume reuses the existing run row (and its original
+        // `analyzed_at_commit`); the prior-run base must not shift mid-resume.
         resume_run(writer, run_id).await
     } else {
-        begin_run(writer, run_id, analyze_config_json, started_at).await
+        begin_run(writer, run_id, analyze_config_json, started_at, head_commit).await
     }
 }

@@ -562,6 +562,63 @@ fn analyze_without_plugins_writes_skipped_run_row() {
     assert_eq!(entity_count, 0);
 }
 
+/// `analyze` self-migrates a stale DB rather than hard-failing (WS9). `install`
+/// is the usual migrator, but a binary upgrade that adds a migration the run path
+/// writes (`runs.analyzed_at_commit`) must still work if the operator runs
+/// `analyze` before re-`install`. Simulate a pre-0007 (v6) DB by dropping the new
+/// column and rewinding the migration ledger, then assert `analyze` succeeds and
+/// the schema is brought current.
+#[test]
+fn analyze_migrates_a_stale_db_instead_of_failing() {
+    let dir = tempfile::tempdir().unwrap();
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+
+    let db = dir.path().join(".clarion/clarion.db");
+    // Rewind to the pre-0007 (v6) shape: no `analyzed_at_commit`, no v7 ledger
+    // row, user_version back to 6 — exactly an upgraded-binary-vs-old-DB state.
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE runs DROP COLUMN analyzed_at_commit;\n\
+             DELETE FROM schema_migrations WHERE version = 7;\n\
+             PRAGMA user_version = 6;",
+        )
+        .unwrap();
+        let uv: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(uv, 6, "precondition: DB rewound to v6");
+    }
+
+    clarion_bin()
+        .args(["analyze"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+
+    // The run path ran (a row exists with the column populated by begin_run) and
+    // the schema is current again.
+    let conn = Connection::open(&db).unwrap();
+    let uv: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(uv, 7, "analyze must apply the pending migration");
+    let has_column: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name = 'analyzed_at_commit'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(has_column, 1, "analyzed_at_commit must exist after analyze");
+}
+
 #[test]
 fn analyze_default_config_records_clustering_defaults() {
     let dir = tempfile::tempdir().unwrap();

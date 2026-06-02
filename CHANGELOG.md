@@ -14,6 +14,23 @@ only when an incompatible change is made to that surface. See
 
 ### Added
 
+- **Git-rename provider seam now operative — WS9 / SEI §6 (REQ-C-05).** `analyze`
+  drives the committed rename window so the `legis` `GitRenameSource` is actually
+  consulted, closing the window gap previously surfaced in
+  [`docs/federation/contracts.md`](docs/federation/contracts.md). Each run records
+  the git `HEAD` it analyzed on the run row (migration `0007`, new nullable
+  `runs.analyzed_at_commit`; schema version 6 → 7) and reads the *prior* run's
+  commit to query renames over `<prior_commit>..HEAD`. The SEI mint pass now
+  **unions** two complementary windows (`gather_git_renames`): the working tree
+  (uncommitted renames, shell `git diff -M HEAD`, always) and the committed range
+  (committed renames via `legis` when `--legis-url` is set and reachable, else a
+  shell fallback). Enrich-only and never a regression — without `legis`, or with
+  no prior commit, only the working-tree window runs (byte-identical to pre-WS9,
+  no HTTP). The prior-commit read excludes the current run (which `CommitRun`
+  marks `completed` before the mint pass), so the committed window never collapses
+  to `<HEAD>..HEAD`. `analyze` also applies any pending migrations on startup
+  (under the analyze lock) so a binary upgrade does not hard-fail on a DB that
+  `install` has not re-touched.
 - **Stable Entity Identity (SEI) — Wave 1 / WS1 (ADR-038).** Clarion is now the
   suite's identity authority: it mints a durable, opaque **SEI**
   (`clarion:eid:<blake3(locator ++ 0x00 ++ mint_run_id)[:32]>`) for every entity
