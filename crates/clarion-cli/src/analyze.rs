@@ -58,6 +58,14 @@ const ENTITY_DELETED_RULE_ID: &str = "CLA-FACT-ENTITY-DELETED";
 /// an entity that no longer exists.
 const GUIDANCE_ORPHAN_RULE_ID: &str = "CLA-FACT-GUIDANCE-ORPHAN";
 
+/// REQ-ANALYZE-05: a subsystem whose tier-bearing members declare ≥2 distinct
+/// Wardline tiers (a trust-boundary smell — the cluster straddles tiers).
+const TIER_MIXING_RULE_ID: &str = "CLA-FACT-TIER-SUBSYSTEM-MIXING";
+
+/// REQ-ANALYZE-05: a subsystem whose tier-bearing members (≥2) all agree on one
+/// Wardline tier — a positive signal for tier-consistency reporting.
+const TIER_UNANIMOUS_RULE_ID: &str = "CLA-FACT-SUBSYSTEM-TIER-UNANIMOUS";
+
 /// REQ-ANALYZE-06 "no silent fallbacks": a Python file that fails `ast.parse`
 /// is surfaced by the plugin as a degraded `module` entity carrying
 /// `parse_status="syntax_error"` (extractor.py). The core mints a persisted
@@ -1132,6 +1140,24 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                      (run already committed successfully)"
                 );
             }
+            // REQ-ANALYZE-05 Phase-7 structural findings (tier × subsystem). Runs
+            // AFTER CommitRun (the in_subsystem edges are durable) and is
+            // best-effort + enrich-only like the SEI pass: a failure logs and is
+            // swallowed, never un-committing the graph. Honest-empty when no
+            // Wardline tier facts exist (analyze never writes them).
+            match emit_tier_subsystem_findings(&writer, &db_path, &run_id, &iso8601_now()).await {
+                Ok(emitted) if emitted > 0 => tracing::info!(
+                    run_id = %run_id,
+                    tier_subsystem_findings = emitted,
+                    "tier-subsystem findings emitted"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    run_id = %run_id,
+                    error = %e,
+                    "tier-subsystem findings skipped (run already committed successfully)"
+                ),
+            }
         }
         RunOutcome::SoftFailed { reason } => {
             // Commit entities inserted by healthy plugins AND mark the run
@@ -1615,6 +1641,188 @@ fn guidance_orphan_finding(
         evidence_json: serde_json::json!({
             "guidance_id": guidance_id,
             "deleted_entity_id": deleted_entity_id,
+        })
+        .to_string(),
+        properties_json: "{}".to_owned(),
+        supports_json: "[]".to_owned(),
+        supported_by_json: "[]".to_owned(),
+        created_at: now.to_owned(),
+        updated_at: now.to_owned(),
+    }
+}
+
+/// Extract a subsystem-member's Wardline tier from its opaque `wardline_json`
+/// blob: the best-effort top-level `tier` field, stringified. Kept byte-identical
+/// to the MCP `find_by_wardline` read path (`facet_matches`) so the analyze-side
+/// consensus and the query-side filter never disagree. A blob with no scalar
+/// `tier` field contributes no tier (the entity is excluded from consensus).
+fn extract_wardline_tier(wardline_json: &str) -> Option<String> {
+    let blob: serde_json::Value = serde_json::from_str(wardline_json).ok()?;
+    match blob.get("tier") {
+        Some(serde_json::Value::String(value)) => Some(value.clone()),
+        Some(serde_json::Value::Number(value)) => Some(value.to_string()),
+        Some(serde_json::Value::Bool(value)) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+/// REQ-ANALYZE-05 Phase-7 structural findings combining Phase-3 clustering with
+/// Wardline tier declarations — signals no single sibling holds alone.
+///
+/// Wardline tiers land on functions (`python:function:<qualname>`), not modules,
+/// so each tier-bearing entity is resolved up its `contains` chain to the
+/// subsystem it belongs to (`subsystem_of_entity`). Per subsystem, over its
+/// tier-bearing members: ≥2 distinct tiers ⇒ `CLA-FACT-TIER-SUBSYSTEM-MIXING`;
+/// exactly one tier across ≥2 members ⇒ `CLA-FACT-SUBSYSTEM-TIER-UNANIMOUS`. A
+/// single tier-bearing member yields neither (no consensus from one voice).
+///
+/// Conditional on a prior Wardline ingest: `analyze` never writes tier facts (the
+/// enrich-only axiom), so a project that has not ingested Wardline produces no
+/// tier findings — correct, not a gap. Runs post-`CommitRun` (the `in_subsystem`
+/// edges are durable by then); persists via `PersistPostRunFinding`. Returns the
+/// finding count. Deterministic: subsystems and members are sorted before emit.
+async fn emit_tier_subsystem_findings(
+    writer: &Writer,
+    db_path: &Path,
+    run_id: &str,
+    now: &str,
+) -> anyhow::Result<u64> {
+    use std::collections::BTreeMap;
+
+    // (subsystem_id -> sorted members [(entity_id, tier)]). Read-only over the
+    // committed graph. The tier-bearing set is bounded by Wardline-tagged
+    // entities; read it whole (no cap) — a partial set would compute the WRONG
+    // consensus, which REQ-ANALYZE-06's no-silent-fallback discipline forbids.
+    let by_subsystem: BTreeMap<String, Vec<(String, String)>> = {
+        let conn = Connection::open(db_path)
+            .context("open read connection for tier-subsystem findings")?;
+        let mut stmt = conn
+            .prepare("SELECT entity_id, wardline_json FROM wardline_taint_facts ORDER BY entity_id")
+            .context("prepare wardline-taint scan")?;
+        let tagged: Vec<(String, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .context("query wardline taint facts")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect wardline taint facts")?;
+
+        let mut map: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        for (entity_id, wardline_json) in tagged {
+            let Some(tier) = extract_wardline_tier(&wardline_json) else {
+                continue;
+            };
+            if let Some(subsystem) = clarion_storage::subsystem_of_entity(&conn, &entity_id)
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .with_context(|| format!("resolve subsystem for {entity_id}"))?
+            {
+                map.entry(subsystem.subsystem_id)
+                    .or_default()
+                    .push((entity_id, tier));
+            }
+        }
+        // Members arrive in entity_id order (the scan is ORDERed); keep it.
+        map
+    };
+
+    let mut count: u64 = 0;
+    for (subsystem_id, members) in &by_subsystem {
+        if members.len() < 2 {
+            continue;
+        }
+        let distinct: std::collections::BTreeSet<&str> =
+            members.iter().map(|(_, tier)| tier.as_str()).collect();
+        let finding = if distinct.len() >= 2 {
+            tier_mixing_finding(subsystem_id, members, run_id, now)
+        } else {
+            // Exactly one distinct tier across ≥2 members.
+            let tier = distinct.iter().next().expect("one tier present");
+            tier_unanimous_finding(subsystem_id, tier, members, run_id, now)
+        };
+        let finding_id = finding.id.clone();
+        writer
+            .send_wait(|ack| WriterCmd::PersistPostRunFinding {
+                finding: Box::new(finding),
+                ack,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("PersistPostRunFinding {finding_id}"))?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Build a `CLA-FACT-TIER-SUBSYSTEM-MIXING` finding anchored to the subsystem,
+/// carrying its tier-bearing members as related ids and the tier distribution as
+/// evidence. Members are pre-sorted by the caller; the id is run-scoped.
+fn tier_mixing_finding(
+    subsystem_id: &str,
+    members: &[(String, String)],
+    run_id: &str,
+    now: &str,
+) -> FindingRecord {
+    let member_ids: Vec<&str> = members.iter().map(|(id, _)| id.as_str()).collect();
+    let mut tier_counts: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
+    for (_, tier) in members {
+        *tier_counts.entry(tier.as_str()).or_default() += 1;
+    }
+    FindingRecord {
+        id: format!("core:finding:{run_id}:tier-mixing:{subsystem_id}"),
+        tool: "clarion".to_owned(),
+        tool_version: env!("CARGO_PKG_VERSION").to_owned(),
+        run_id: run_id.to_owned(),
+        rule_id: TIER_MIXING_RULE_ID.to_owned(),
+        kind: "fact".to_owned(),
+        severity: "WARN".to_owned(),
+        confidence: Some(1.0),
+        confidence_basis: Some("subsystem members declare disagreeing Wardline tiers".to_owned()),
+        entity_id: subsystem_id.to_owned(),
+        related_entities_json: serde_json::to_string(&member_ids)
+            .unwrap_or_else(|_| "[]".to_owned()),
+        message: format!(
+            "Subsystem {subsystem_id} mixes {} Wardline tiers",
+            tier_counts.len()
+        ),
+        evidence_json: serde_json::json!({ "tier_distribution": tier_counts }).to_string(),
+        properties_json: "{}".to_owned(),
+        supports_json: "[]".to_owned(),
+        supported_by_json: "[]".to_owned(),
+        created_at: now.to_owned(),
+        updated_at: now.to_owned(),
+    }
+}
+
+/// Build a `CLA-FACT-SUBSYSTEM-TIER-UNANIMOUS` finding (positive signal) anchored
+/// to the subsystem whose ≥2 tier-bearing members all share `tier`.
+fn tier_unanimous_finding(
+    subsystem_id: &str,
+    tier: &str,
+    members: &[(String, String)],
+    run_id: &str,
+    now: &str,
+) -> FindingRecord {
+    let member_ids: Vec<&str> = members.iter().map(|(id, _)| id.as_str()).collect();
+    FindingRecord {
+        id: format!("core:finding:{run_id}:tier-unanimous:{subsystem_id}"),
+        tool: "clarion".to_owned(),
+        tool_version: env!("CARGO_PKG_VERSION").to_owned(),
+        run_id: run_id.to_owned(),
+        rule_id: TIER_UNANIMOUS_RULE_ID.to_owned(),
+        kind: "fact".to_owned(),
+        severity: "INFO".to_owned(),
+        confidence: Some(1.0),
+        confidence_basis: Some(
+            "all tier-bearing subsystem members share one Wardline tier".to_owned(),
+        ),
+        entity_id: subsystem_id.to_owned(),
+        related_entities_json: serde_json::to_string(&member_ids)
+            .unwrap_or_else(|_| "[]".to_owned()),
+        message: format!("Subsystem {subsystem_id} is unanimous in Wardline tier {tier}"),
+        evidence_json: serde_json::json!({
+            "tier": tier,
+            "member_count": members.len(),
         })
         .to_string(),
         properties_json: "{}".to_owned(),
@@ -4042,6 +4250,60 @@ mod tests {
             finding.id,
             "core:finding:run-1:entity-deleted:python:function:pkg.gone"
         );
+    }
+
+    #[test]
+    fn extract_wardline_tier_matches_facet_scalar_semantics() {
+        // String / number / bool tier fields all stringify (parity with the MCP
+        // `facet_matches` read path); a missing or non-scalar tier yields None.
+        assert_eq!(
+            extract_wardline_tier(r#"{"tier":"public"}"#).as_deref(),
+            Some("public")
+        );
+        assert_eq!(extract_wardline_tier(r#"{"tier":2}"#).as_deref(), Some("2"));
+        assert_eq!(
+            extract_wardline_tier(r#"{"tier":true}"#).as_deref(),
+            Some("true")
+        );
+        assert_eq!(extract_wardline_tier(r#"{"group":"x"}"#), None);
+        assert_eq!(extract_wardline_tier(r#"{"tier":["a"]}"#), None);
+        assert_eq!(extract_wardline_tier("not json"), None);
+    }
+
+    #[test]
+    fn tier_mixing_finding_records_distribution_and_anchors_to_subsystem() {
+        let members = vec![
+            ("python:function:a".to_owned(), "public".to_owned()),
+            ("python:function:b".to_owned(), "internal".to_owned()),
+        ];
+        let finding = tier_mixing_finding("core:subsystem:abc", &members, "run-1", "t");
+        assert_eq!(finding.rule_id, TIER_MIXING_RULE_ID);
+        assert_eq!(finding.kind, "fact");
+        assert_eq!(finding.severity, "WARN");
+        assert_eq!(finding.entity_id, "core:subsystem:abc");
+        assert_eq!(
+            finding.id,
+            "core:finding:run-1:tier-mixing:core:subsystem:abc"
+        );
+        let evidence: serde_json::Value = serde_json::from_str(&finding.evidence_json).unwrap();
+        assert_eq!(evidence["tier_distribution"]["public"], 1);
+        assert_eq!(evidence["tier_distribution"]["internal"], 1);
+    }
+
+    #[test]
+    fn tier_unanimous_finding_is_info_and_records_member_count() {
+        let members = vec![
+            ("python:function:a".to_owned(), "trusted".to_owned()),
+            ("python:function:b".to_owned(), "trusted".to_owned()),
+        ];
+        let finding =
+            tier_unanimous_finding("core:subsystem:abc", "trusted", &members, "run-1", "t");
+        assert_eq!(finding.rule_id, TIER_UNANIMOUS_RULE_ID);
+        assert_eq!(finding.severity, "INFO");
+        assert_eq!(finding.entity_id, "core:subsystem:abc");
+        let evidence: serde_json::Value = serde_json::from_str(&finding.evidence_json).unwrap();
+        assert_eq!(evidence["tier"], "trusted");
+        assert_eq!(evidence["member_count"], 2);
     }
 
     #[test]

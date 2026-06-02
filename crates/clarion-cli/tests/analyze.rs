@@ -1044,6 +1044,151 @@ fn analyze_emits_guidance_orphan_and_invalidates_summary_cache_on_deletion() {
 }
 
 #[cfg(unix)]
+fn seed_wardline_tier(conn: &Connection, entity_id: &str, tier: &str) {
+    conn.execute(
+        "INSERT INTO wardline_taint_facts (entity_id, wardline_json, updated_at) \
+         VALUES (?1, ?2, '2026-01-01T00:00:00Z')",
+        rusqlite::params![entity_id, format!("{{\"tier\":\"{tier}\"}}")],
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+fn findings_by_rule(conn: &Connection, rule_id: &str) -> Vec<(String, String, String)> {
+    // (entity_id anchor, related_entities, evidence)
+    conn.prepare(
+        "SELECT entity_id, related_entities, evidence FROM findings \
+         WHERE rule_id = ?1 ORDER BY entity_id",
+    )
+    .unwrap()
+    .query_map([rule_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap()
+}
+
+/// REQ-ANALYZE-05 verification (verbatim): a fixture with mixed Wardline tiers in
+/// a subsystem produces `CLA-FACT-TIER-SUBSYSTEM-MIXING`; a uniform-tier subsystem
+/// produces `CLA-FACT-SUBSYSTEM-TIER-UNANIMOUS`. Tier facts are seeded between
+/// runs (analyze never writes them — the enrich-only axiom), so run 1 builds the
+/// subsystems and run 2 emits the findings against the seeded tiers.
+#[cfg(unix)]
+#[test]
+fn analyze_emits_tier_mixing_and_unanimous_findings() {
+    let (project_dir, plugin_dir, config_path) =
+        phase3_project_for_rerun(&["auth_a", "auth_b", "billing_a", "billing_b"]);
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let db_path = project_dir.path().join(".clarion/clarion.db");
+
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        // auth subsystem: two disagreeing tiers -> MIXING.
+        seed_wardline_tier(&conn, "phase3fixture:module:auth_a", "public");
+        seed_wardline_tier(&conn, "phase3fixture:module:auth_b", "internal");
+        // billing subsystem: two agreeing tiers -> UNANIMOUS.
+        seed_wardline_tier(&conn, "phase3fixture:module:billing_a", "trusted");
+        seed_wardline_tier(&conn, "phase3fixture:module:billing_b", "trusted");
+    }
+
+    run_phase3_analyze(
+        project_dir.path(),
+        std::path::Path::new(&config_path),
+        &plugin_path,
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let mixing = findings_by_rule(&conn, "CLA-FACT-TIER-SUBSYSTEM-MIXING");
+    assert_eq!(mixing.len(), 1, "exactly the auth subsystem mixes tiers");
+    let related: serde_json::Value = serde_json::from_str(&mixing[0].1).unwrap();
+    assert_eq!(
+        related,
+        serde_json::json!(["phase3fixture:module:auth_a", "phase3fixture:module:auth_b"])
+    );
+    let evidence: serde_json::Value = serde_json::from_str(&mixing[0].2).unwrap();
+    assert_eq!(evidence["tier_distribution"]["public"], 1);
+    assert_eq!(evidence["tier_distribution"]["internal"], 1);
+
+    let unanimous = findings_by_rule(&conn, "CLA-FACT-SUBSYSTEM-TIER-UNANIMOUS");
+    assert_eq!(
+        unanimous.len(),
+        1,
+        "exactly the billing subsystem is unanimous"
+    );
+    let related: serde_json::Value = serde_json::from_str(&unanimous[0].1).unwrap();
+    assert_eq!(
+        related,
+        serde_json::json!([
+            "phase3fixture:module:billing_a",
+            "phase3fixture:module:billing_b"
+        ])
+    );
+    let evidence: serde_json::Value = serde_json::from_str(&unanimous[0].2).unwrap();
+    assert_eq!(evidence["tier"], "trusted");
+    assert_eq!(evidence["member_count"], 2);
+}
+
+/// REQ-ANALYZE-05: tiers land on functions, not modules, so the production path
+/// resolves a tier-bearing function up its `contains` chain to the subsystem.
+/// This seeds a tier on a `python:function:*` entity contained in a
+/// subsystem-member module (depth-1 walk) and asserts it contributes to the
+/// subsystem's consensus alongside a module-level member.
+#[cfg(unix)]
+#[test]
+fn analyze_resolves_function_tier_through_contains_chain_to_subsystem() {
+    let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["auth_a", "auth_b"]);
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let db_path = project_dir.path().join(".clarion/clarion.db");
+    let func = "phase3fixture:function:auth_a.handler";
+
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        // A function contained in the auth_a module (which is in the auth
+        // subsystem). The auth_a module itself carries NO tier — the only way the
+        // auth_a side contributes is via this contained function (depth-1 walk).
+        conn.execute(
+            "INSERT INTO entities \
+             (id, plugin_id, kind, name, short_name, parent_id, properties, created_at, updated_at) \
+             VALUES (?1, 'phase3fixture', 'function', 'handler', 'handler', \
+                     'phase3fixture:module:auth_a', '{}', \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [func],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edges (kind, from_id, to_id, confidence) \
+             VALUES ('contains', 'phase3fixture:module:auth_a', ?1, 'resolved')",
+            [func],
+        )
+        .unwrap();
+        seed_wardline_tier(&conn, func, "secret");
+        seed_wardline_tier(&conn, "phase3fixture:module:auth_b", "secret");
+    }
+
+    run_phase3_analyze(
+        project_dir.path(),
+        std::path::Path::new(&config_path),
+        &plugin_path,
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let unanimous = findings_by_rule(&conn, "CLA-FACT-SUBSYSTEM-TIER-UNANIMOUS");
+    assert_eq!(
+        unanimous.len(),
+        1,
+        "the auth subsystem is unanimous via the function tier"
+    );
+    let related: serde_json::Value = serde_json::from_str(&unanimous[0].1).unwrap();
+    // The contained FUNCTION (not its module) is the auth_a-side member, proving
+    // the function -> module -> subsystem resolution fired.
+    assert_eq!(
+        related,
+        serde_json::json!([func, "phase3fixture:module:auth_b"])
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn analyze_phase3_weak_modularity_threshold_zero_disables_fact() {
     let project_dir = run_phase3_fixture(
