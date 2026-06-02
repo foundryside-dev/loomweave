@@ -7,10 +7,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use clarion_core::{
-    ClaudeCliProvider, ClaudeCliProviderConfig, CodexCliProvider, CodexCliProviderConfig,
+    ApiEmbeddingProvider, ApiEmbeddingProviderConfig, ClaudeCliProvider, ClaudeCliProviderConfig,
+    CodexCliProvider, CodexCliProviderConfig, EmbeddingProvider, EmbeddingProviderError,
     LlmProvider, OpenRouterProvider, OpenRouterProviderConfig, Recording, RecordingProvider,
 };
-use clarion_mcp::config::{LlmConfig, McpConfig, ProviderSelection, select_provider_with_env};
+use clarion_mcp::config::{
+    LlmConfig, McpConfig, ProviderSelection, SemanticSearchConfig, select_provider_with_env,
+};
 use clarion_mcp::filigree::FiligreeHttpClient;
 use clarion_storage::{DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, ReaderPool, Writer};
 
@@ -39,6 +42,8 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
     let provider_selection = select_provider_with_env(&config, |name| std::env::var(name).ok())?;
     let llm_diagnostics = llm_diagnostics(&provider_selection, &config.llm);
     let llm_provider = build_llm_provider(&config, provider_selection, &project_root)?;
+    let embedding_provider =
+        build_embedding_provider(&config.semantic_search, |name| std::env::var(name).ok())?;
 
     // Resolve where Filigree actually listens — prefer the live ethereal port
     // published in `.filigree/ephemeral.port` over the static configured port
@@ -91,6 +96,7 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
         readers,
         config.llm.clone(),
         llm_provider,
+        semantic_search_state(&config.semantic_search, embedding_provider),
         filigree_client,
         diagnostics,
     )?;
@@ -121,12 +127,15 @@ struct StdioServe {
     join: thread::JoinHandle<()>,
 }
 
+type SemanticSearchState = (SemanticSearchConfig, Arc<dyn EmbeddingProvider>);
+
 fn spawn_mcp_stdio(
     project_root: PathBuf,
     db_path: PathBuf,
     readers: ReaderPool,
     llm_config: LlmConfig,
     llm_provider: Option<Arc<dyn LlmProvider>>,
+    semantic_search: Option<SemanticSearchState>,
     filigree_client: Option<FiligreeHttpClient>,
     diagnostics: clarion_mcp::DiagnosticsContext,
 ) -> Result<StdioServe> {
@@ -140,6 +149,7 @@ fn spawn_mcp_stdio(
                 readers,
                 llm_config,
                 llm_provider,
+                semantic_search,
                 filigree_client,
                 diagnostics,
             );
@@ -155,6 +165,7 @@ fn run_mcp_stdio(
     readers: ReaderPool,
     llm_config: LlmConfig,
     llm_provider: Option<Arc<dyn LlmProvider>>,
+    semantic_search: Option<SemanticSearchState>,
     filigree_client: Option<FiligreeHttpClient>,
     diagnostics: clarion_mcp::DiagnosticsContext,
 ) -> Result<()> {
@@ -180,6 +191,9 @@ fn run_mcp_stdio(
         state = state.with_summary_llm(writer.sender(), llm_config, provider);
         llm_writer = Some(writer);
         llm_writer_join = Some(handle);
+    }
+    if let Some((semantic_config, embedding_provider)) = semantic_search {
+        state = state.with_semantic_search(semantic_config, embedding_provider);
     }
     if let Some(client) = filigree_client {
         state = state.with_filigree_client(Arc::new(client));
@@ -249,6 +263,52 @@ fn supervise_stdio_with_http(
         None => Ok(()),
     };
     finish_supervised_result(serve_result, shutdown_result)
+}
+
+/// Construct the embedding provider for `search_semantic` from config. Returns
+/// `None` (honest degrade — the tool reports "not enabled") when semantic search
+/// is disabled, or when it is enabled but live access is not opted in / no API
+/// key is present. A genuine misconfiguration (e.g. zero dimensions) fails fast.
+fn build_embedding_provider(
+    config: &SemanticSearchConfig,
+    read_env: impl Fn(&str) -> Option<String>,
+) -> Result<Option<Arc<dyn EmbeddingProvider>>> {
+    if !config.enabled {
+        return Ok(None);
+    }
+    let api_key = read_env(&config.api_key_env);
+    match ApiEmbeddingProvider::from_config(ApiEmbeddingProviderConfig {
+        api_key,
+        allow_live_provider: config.allow_live_provider,
+        model_id: config.model_id.clone(),
+        endpoint_url: config.endpoint_url.clone(),
+        dimensions: config.dimensions,
+        timeout_seconds: config.timeout_seconds,
+    }) {
+        Ok(provider) => Ok(Some(Arc::new(provider))),
+        // Opt-in / key absent → degrade honestly rather than fail serve startup.
+        Err(
+            err @ (EmbeddingProviderError::LiveProviderNotAllowed
+            | EmbeddingProviderError::MissingApiKey),
+        ) => {
+            tracing::warn!(
+                error = %err,
+                "semantic_search.enabled=true but the embedding provider could not be \
+                 constructed; search_semantic will report not_enabled"
+            );
+            Ok(None)
+        }
+        Err(err) => Err(anyhow!("build embedding provider: {err}")),
+    }
+}
+
+/// Pair the (cloned) config with a constructed provider so `run_mcp_stdio` can
+/// call `with_semantic_search`. `None` provider → semantic search stays off.
+fn semantic_search_state(
+    config: &SemanticSearchConfig,
+    provider: Option<Arc<dyn EmbeddingProvider>>,
+) -> Option<SemanticSearchState> {
+    provider.map(|provider| (config.clone(), provider))
 }
 
 fn finish_supervised_result(serve_result: Result<()>, shutdown_result: Result<()>) -> Result<()> {

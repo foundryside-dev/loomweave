@@ -91,6 +91,10 @@ const GITIGNORE_CONTENTS: &str = "\
 *.shadow.db
 *.db.new
 
+# Semantic-search embeddings sidecar (ADR-040): large + rebuildable, never
+# committed (keeps clarion.db unbloated). WAL files are covered by *.db-wal/-shm.
+embeddings.db
+
 # Scratch / temp space.
 tmp/
 

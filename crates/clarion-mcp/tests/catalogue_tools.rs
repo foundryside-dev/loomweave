@@ -3,8 +3,12 @@
 //! honest-empty behaviour, and the bounded/pagination contract over the public
 //! JSON-RPC surface.
 
+use std::sync::Arc;
+
+use clarion_core::{EmbeddingRecording, RecordingEmbeddingProvider};
+use clarion_mcp::config::SemanticSearchConfig;
 use clarion_mcp::{ServerState, list_tools};
-use clarion_storage::{ReaderPool, pragma, schema};
+use clarion_storage::{EmbeddingKey, EmbeddingStore, ReaderPool, pragma, schema};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 
@@ -1027,5 +1031,291 @@ async fn guidance_sheet_carries_its_own_sei_not_the_queried_entitys() {
     assert_eq!(
         env["result"]["guidance"][0]["sei"], "clarion:eid:sheetsei",
         "{env}"
+    );
+}
+
+// ---- find_dead_code -----------------------------------------------------
+
+fn insert_calls_edge(conn: &Connection, from: &str, to: &str, confidence: &str) {
+    conn.execute(
+        "INSERT INTO edges (kind, from_id, to_id, confidence) VALUES ('calls', ?1, ?2, ?3)",
+        params![from, to, confidence],
+    )
+    .expect("insert calls edge");
+}
+
+#[test]
+fn tools_list_includes_find_dead_code() {
+    let names: Vec<&str> = list_tools().iter().map(|t| t.name).collect();
+    assert!(names.contains(&"find_dead_code"), "missing find_dead_code");
+}
+
+// Safety case (and the catastrophe guard): with no reachability roots emitted,
+// the tool must NOT flag every entity as dead — it returns an honest
+// signal-unavailable with zero candidates.
+#[tokio::test]
+async fn find_dead_code_signal_unavailable_when_no_roots() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:orphan",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["signal"]["available"], false, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 0, "{env}");
+    assert!(
+        env["result"]["dead_code"].as_array().unwrap().is_empty(),
+        "{env}"
+    );
+}
+
+// Conservative reachability: a genuinely dead leaf is flagged; an
+// ambiguous-edge target is spared (all tiers count as reachable); a
+// reflection/dynamic-dispatch barrier-tagged entity is spared.
+#[tokio::test]
+async fn find_dead_code_flags_unreachable_and_spares_live() {
+    let (project, db, conn) = open_project();
+    // Root (entry point) — seeded live.
+    insert_entity(
+        &conn,
+        "python:function:main",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    insert_tag(&conn, "python:function:main", "entry-point");
+    // Reachable from the root over a resolved call edge.
+    insert_entity(
+        &conn,
+        "python:function:helper",
+        "function",
+        "app.py",
+        Some((6, 10)),
+    );
+    insert_calls_edge(
+        &conn,
+        "python:function:main",
+        "python:function:helper",
+        "resolved",
+    );
+    // Reachable only via an AMBIGUOUS edge — must NOT be flagged (fail toward live).
+    insert_entity(
+        &conn,
+        "python:function:maybe",
+        "function",
+        "app.py",
+        Some((11, 15)),
+    );
+    insert_calls_edge(
+        &conn,
+        "python:function:helper",
+        "python:function:maybe",
+        "ambiguous",
+    );
+    // Reflectively reached: no static edge, but barrier-tagged → live.
+    insert_entity(
+        &conn,
+        "python:function:reflected",
+        "function",
+        "app.py",
+        Some((16, 20)),
+    );
+    insert_tag(&conn, "python:function:reflected", "dynamic-dispatch");
+    // Genuinely dead leaf.
+    insert_entity(
+        &conn,
+        "python:function:unused",
+        "function",
+        "app.py",
+        Some((21, 25)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(dead, vec!["python:function:unused".to_owned()], "{env}");
+    assert_eq!(env["result"]["page"]["total"], 1, "{env}");
+
+    let candidate = &env["result"]["dead_code"][0];
+    assert_eq!(
+        candidate["rule_id"], "CLA-FACT-DEAD-CODE-CANDIDATE",
+        "{env}"
+    );
+    assert_eq!(candidate["kind"], "fact", "{env}");
+    assert_eq!(candidate["confidence_basis"], "heuristic", "{env}");
+    assert!(
+        candidate["confidence"].as_f64().unwrap() < 1.0,
+        "heuristic confidence must be < 1: {env}"
+    );
+    assert!(
+        candidate["entity"]["sei"].is_null() || candidate["entity"]["sei"].is_string(),
+        "candidate carries an sei field: {env}"
+    );
+}
+
+// Framework-magic entities (decorated handlers, plugin hooks) are excluded from
+// candidacy even when statically unreached.
+#[tokio::test]
+async fn find_dead_code_excludes_framework_magic() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:main",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    insert_tag(&conn, "python:function:main", "entry-point");
+    // Unreached, but a framework handler — excluded from candidacy.
+    insert_entity(
+        &conn,
+        "python:function:on_event",
+        "function",
+        "app.py",
+        Some((6, 10)),
+    );
+    insert_tag(&conn, "python:function:on_event", "framework-handler");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 0, "{env}");
+}
+
+// ---- search_semantic ----------------------------------------------------
+
+#[test]
+fn tools_list_includes_search_semantic() {
+    let names: Vec<&str> = list_tools().iter().map(|t| t.name).collect();
+    assert!(
+        names.contains(&"search_semantic"),
+        "missing search_semantic"
+    );
+}
+
+// Off by default: honest "not enabled", never a fabricated result.
+#[tokio::test]
+async fn search_semantic_disabled_returns_not_enabled() {
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:f", "function", "f.py", Some((1, 2)));
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "search_semantic", json!({"query": "auth"})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["result_kind"], "not_enabled", "{env}");
+    assert_eq!(env["result"]["signal"]["available"], false, "{env}");
+    assert!(
+        env["result"]["results"].as_array().unwrap().is_empty(),
+        "{env}"
+    );
+}
+
+// Enabled: ranks entities by cosine similarity to the query embedding, using
+// only sidecar vectors whose content_hash matches the entity's current hash.
+#[tokio::test]
+async fn search_semantic_ranks_by_cosine_similarity() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:login",
+        "function",
+        "auth.py",
+        Some((1, 2)),
+    );
+    insert_entity(
+        &conn,
+        "python:function:add",
+        "function",
+        "math.py",
+        Some((3, 4)),
+    );
+    // A stale embedding (content_hash mismatch) must be ignored.
+    insert_entity(
+        &conn,
+        "python:function:stale",
+        "function",
+        "old.py",
+        Some((5, 6)),
+    );
+    drop(conn);
+
+    let now = "2026-01-01T00:00:00.000Z";
+    let store = EmbeddingStore::open_in_clarion_dir(project.path()).expect("open sidecar");
+    let mk = |id: &str, hash: &str| EmbeddingKey {
+        entity_id: id.to_owned(),
+        content_hash: hash.to_owned(),
+        model_id: "rec-model".to_owned(),
+    };
+    // insert_entity sets content_hash = "hash".
+    store
+        .upsert(
+            &mk("python:function:login", "hash"),
+            &[1.0, 0.0],
+            0.0,
+            1,
+            now,
+        )
+        .expect("u login");
+    store
+        .upsert(&mk("python:function:add", "hash"), &[0.0, 1.0], 0.0, 1, now)
+        .expect("u add");
+    store
+        .upsert(
+            &mk("python:function:stale", "STALE"),
+            &[1.0, 0.0],
+            0.0,
+            1,
+            now,
+        )
+        .expect("u stale");
+    drop(store);
+
+    let provider = Arc::new(RecordingEmbeddingProvider::from_recordings(
+        "rec-model",
+        2,
+        vec![EmbeddingRecording {
+            text: "authenticate user".to_owned(),
+            vector: vec![0.9, 0.1],
+        }],
+    ));
+    let config = SemanticSearchConfig {
+        enabled: true,
+        model_id: "rec-model".to_owned(),
+        dimensions: 2,
+        ..SemanticSearchConfig::default()
+    };
+    let state = state_for(project.path(), &db).with_semantic_search(config, provider);
+
+    let env = call_tool(
+        &state,
+        "search_semantic",
+        json!({"query": "authenticate user"}),
+    )
+    .await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["result_kind"], "ranked", "{env}");
+    let results = env["result"]["results"].as_array().unwrap();
+    // stale (content_hash mismatch) is excluded; login + add remain.
+    assert_eq!(results.len(), 2, "{env}");
+    assert_eq!(results[0]["entity"]["id"], "python:function:login", "{env}");
+    assert!(
+        results[0]["score"].as_f64().unwrap() > results[1]["score"].as_f64().unwrap(),
+        "login should outrank add: {env}"
     );
 }

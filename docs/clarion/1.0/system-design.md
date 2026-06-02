@@ -172,8 +172,8 @@ sequenceDiagram
     Plugin-->>Core: [files...]
     loop per file
         Core->>Plugin: analyze_file(path)
-        Plugin-->>Core: stream of file_analyzed notifications:<br/>{ entity } | { edge } | { finding }
-        Core->>Core: writer actor commits to store
+        Plugin-->>Core: { entities[], edges[], stats }
+        Core->>Core: validates, then writer actor commits to store
     end
 
     Note over Core,Plugin: Consult phase — serve
@@ -182,7 +182,7 @@ sequenceDiagram
     Core->>Core: invokes LLM with prompt-cache breakpoints
 ```
 
-`analyze_file` uses streaming notifications (not request/response per entity) so the core can commit entities to the store as they arrive — backpressure via a bounded `tokio::sync::mpsc` (default 100 messages) prevents a runaway plugin from OOMing the core.
+`analyze_file` is a single JSON-RPC **request/response** per file: the core sends one `analyze_file(path)` request and reads one matching `AnalyzeFileResult { entities[], edges[], stats }` (`plugin/host.rs::analyze_file`, `plugin/protocol.rs::AnalyzeFileResult`). The plugin's whole-file result returns in one Content-Length-framed body; the **8 MiB frame ceiling** (not a message-count channel) bounds host memory and trips a finding on a runaway plugin. The core validates each entity/edge through the host pipeline and then commits surviving rows via the writer actor.
 
 ### Plugin manifest
 
@@ -210,14 +210,14 @@ hash-pinning are deferred (NG-16).
 
 The Python plugin is the v0.1 validating plugin and the reference implementation of the manifest contract.
 
-**Parser dispatch**. Tree-sitter for structural extraction (entities, edges, direct imports, call-graph best-effort). LibCST for decorator argument extraction and fine-grained source-range recovery where tree-sitter is coarse. LibCST parse failures fall back to tree-sitter with a `CLA-PY-PARTIAL-PARSE` finding.
+**Parser dispatch**. The plugin parses with the standard-library `ast` module — there is **no tree-sitter and no LibCST dependency**. Structural extraction (`function` / `class` / `module` entities, qualnames, `imports` and decorator edges) walks the `ast` tree directly. Call-graph and reference resolution is delegated to a managed **pyright** subprocess session (`PyrightSession`, recycled every 25 files), which serves as both the call resolver and the reference resolver. There is no `CLA-PY-PARTIAL-PARSE` fallback path.
 
 **Import resolution** (REQ-PLUGIN-05). Resolution uses an explicit policy:
 - `sys.path` discovered via virtualenv introspection (`python -m site` against the supplied `python_executable` from `plugins.toml`) or, if none supplied, the ambient Python
 - `src.` prefix stripped by default; configurable via `clarion.yaml:analysis.python.canonical_root`
-- `__init__.py` re-exports produce `alias_of` edges; definition site wins for the canonical ID
-- Unresolvable imports produce `python:unresolved:{module.path}` placeholder entities, reconciled when resolution later succeeds
-- `TYPE_CHECKING` blocks are excluded from runtime-import edges (prevents spurious circular-import findings in typed codebases)
+- `__init__.py` re-exports resolve to the definition site (which wins for the canonical ID). The plugin does **not** emit a separate `alias_of` edge in v1.0 — the kind is reserved in the manifest but unused.
+- Calls and references that pyright cannot resolve are recorded as **unresolved call / reference sites** (counted in run stats; unresolved *call* sites persist to `entity_unresolved_call_sites` for query-time inferred dispatch) rather than dropped. The plugin does **not** mint `python:unresolved:*` placeholder entities.
+- `imports` edges are emitted from `import` / `from … import` statements via the `ast` walk; `TYPE_CHECKING`-guarded imports are **not** excluded in v1.0 (the type-only-import filter is not implemented).
 
 **Decorator detection** (REQ-PLUGIN-06). Direct-name match is insufficient — real Python code uses decorator factories (`@app.route("/health")`), stacked decorators (order matters), class decorators, and aliases (`validates = validates_shape`). Detection handles:
 - Factory invocations: record the decorator name + call arguments as edge properties
@@ -516,6 +516,8 @@ Named profiles compress the per-level configuration into one switch:
 
 ### Budget enforcement
 
+> **Deferred to v1.1** (`NFR-COST-01` / `NFR-COST-03`, per [ADR-030](../adr/ADR-030-on-demand-summary-scope.md) + [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md)). The dry-run preflight estimate and batched-run budget watcher described below belong to the batched pipeline (Phases 4–6), which v1.0 does not run — v1.0 reaches LLM cost only lazily through the on-demand MCP `summary` tool, bounded by a **session-local token ceiling** (`BudgetLedger`). The full preflight + on-exceed machinery lands when the batched pipeline does.
+
 Every `clarion analyze` does a **dry-run estimate first** (default `dry_run_first: true`) — counts entities per level, applies per-tier pricing, prints the estimate, confirms with the user. At run time, a budget watcher tracks running totals; `on_exceed: stop` halts dispatch and writes `runs/<run_id>/partial.json`; `on_exceed: warn` logs and continues.
 
 Estimate accuracy: target ±50% (NFR-COST-03). The known error sources are subsystem synthesis cost (varies with cluster sizes) and prompt-cache hit rates (which depend on guidance composition). ±50% is tight enough to be useful, loose enough to be achievable without full per-call simulation.
@@ -531,13 +533,11 @@ trait LlmProvider {
 }
 ```
 
-**Honest portability framing**: the trait anticipates multiple providers, but **v0.1's plugin-level prompt protocol assumes Anthropic prompt-caching semantics** (four `cache_control` breakpoints at specific segment boundaries). Adding a second provider that works with the same caching model: straightforward. Adding one that loses the four-segment structure: pay more per call. Adding one while preserving equivalent caching performance: structural refactor (v0.3+).
-
-v0.1 ships `AnthropicProvider` only. `CON-ANTHROPIC-01` formalises this as a constraint, not an accident. The trait exists to keep testability high (`RecordingProvider` for replay) — not to promise cheap provider swaps.
+**Provider posture (per [ADR-039](../adr/ADR-039-llm-provider-pivot-openrouter-cli.md), which supersedes `CON-ANTHROPIC-01`)**: the shipped `LlmProvider` implementations are `OpenRouterProvider` (the primary live transport — an OpenAI-compatible chat-completions HTTP surface; Anthropic models reachable as routed model strings, e.g. `anthropic/claude-sonnet-4.6`), `CodexCliProvider` and `ClaudeCliProvider` (subprocess bridges to the Codex / Claude CLIs), and `RecordingProvider` (record-and-replay for deterministic tests, REQ-ANALYZE-07). There is **no native Anthropic SDK provider**. All four declare `CachingModel::OpenAiChatCompletions` — OpenAI-style automatic prefix caching, not Anthropic's caller-placed four-`cache_control`-breakpoint scheme. Provider selection is configuration, not a hard-coded vendor.
 
 ### Prompt caching strategy
 
-Anthropic prompt caching supports up to 4 cache-control breakpoints. Clarion exploits this layering:
+Prompts are assembled in four ordered segments, most-stable first, so a provider's **automatic prefix cache** (`CachingModel::OpenAiChatCompletions`, per [ADR-039](../adr/ADR-039-llm-provider-pivot-openrouter-cli.md)) reuses the shared prefix across calls. This is provider-side prefix caching, not caller-placed `cache_control` breakpoints; the segment layering below is the prompt-assembly structure that keeps the cacheable prefix stable:
 
 | Segment | Content | Cache horizon |
 |---|---|---|
@@ -770,29 +770,31 @@ The scope lens shapes neighbour queries without changing their signatures:
 
 ### Tool catalogue by category
 
-> **v1.0 ships an 8-tool subset of this catalogue** per the [Sprint 2 scope amendment §3 (Box B.6)](../../implementation/sprint-2/scope-amendment-2026-05.md): `entity_at(file, line)`, `find_entity(pattern)`, `callers_of(id, confidence)`, `execution_paths_from(id, max_depth, confidence)`, `summary(id)`, `issues_for(id, include_contained)`, `neighborhood(id, confidence)`, plus `subsystem_members(id)` (added in Sprint 3 with WP4 Phase-3 clustering). The full categorical catalogue below — including the cursor-based Navigation model, write-effect Inspection tools, Search, Findings ops, Guidance (deferred with WP7), Session/scope — is the v1.1 target surface and is not present in v1.0. See [REQ-MCP-02](requirements.md#req-mcp-02--navigation-and-inspection-tool-catalogue) for the row-level deferral notice.
+> **The MCP server registers 35 tools** (`clarion-mcp/src/lib.rs::list_tools`). The categories below name the actual shipped tools, not the original aspirational cursor-based catalogue. The earlier 8-tool subset has been superseded as WP4/WP5 navigation, catalog filters, and analyze-control tools landed; the tools are **stateless and id-based** (no `goto`/`back`/`zoom` cursor session), so an agent passes an `EntityId` (obtained from `find_entity` / `entity_at`) into each call. Tools that produce LLM summaries remain on-demand per [ADR-030](../adr/ADR-030-on-demand-summary-scope.md).
 
-**Navigation**: `goto(id)`, `goto_path(path, line?)`, `back()`, `zoom_out()`, `zoom_in(child_id)`, `breadcrumbs()`
+**Location & lookup**: `entity_at(file, line)`, `find_entity(pattern)`, `source_for_entity(id)`, `orientation_pack(...)`, `project_status()`
 
-**Inspection**: `summary(id?, detail?)`, `source(id?, range?)`, `metadata(id?)`, `guidance_for(id?)`, `findings_for(id?, filter?)`, `wardline_for(id?)`
+**Graph navigation**: `callers_of(id, confidence)`, `call_sites(id)`, `execution_paths_from(id, max_depth, confidence)`, `neighborhood(id, confidence)`, `what_tests_this(id)`
 
-**Neighbours**: `neighbors(id?, edge_kind?, direction?)`, `callers(id?)`, `callees(id?)`, `children(id?, kind_filter?)`, `imports_from(id?)`, `imported_by(id?)`, `in_subsystem(id?)`, `subsystem_members(id?)`
+**Subsystems**: `subsystem_members(id)`, `subsystem_of(id)`
 
-**Search**: `search_structural(query)`, `search_semantic(query, limit?)`, `find_by_tag(tag, scope?)`, `find_by_wardline(tier?, group?)`, `find_by_kind(kind, scope?)`
+**Summaries & guidance**: `summary(id)`, `summary_preview_cost(id)`, `guidance_for(id)`
 
-**Findings & observability**: `list_findings(filter)`, `emit_observation(id, text)`, `promote_observation(obs_id, issue_template?)`, `cost_report(since?)`
+**Findings & cross-product**: `findings_for(id)`, `issues_for(id, include_contained)`, `wardline_for(id)`
 
-**Guidance**: `show_guidance(id?)`, `list_guidance(filter?)`, `propose_guidance(id, content, rules?)`, `promote_guidance(obs_id)`
+**Analyze control**: `analyze_start(...)`, `analyze_status(...)`, `analyze_cancel(...)`, `index_diff(...)`
 
-**Scope / session**: `set_scope_lens(lens)`, `session_info()`
+**Catalog filters & exploration shortcuts**: `find_by_tag(tag)`, `find_by_kind(kind)`, `find_by_wardline(tier?, group?)`, `find_circular_imports()`, `find_coupling_hotspots()`, `find_entry_points()`, `find_http_routes()`, `find_data_models()`, `find_tests()`, `find_deprecations()`, `find_todos()`, `high_churn(limit?)`, `recently_changed(since?)`
 
 ### Exploration-elimination shortcuts (Principle 2)
 
-> **Deferred to v1.1** per the [Sprint 2 scope amendment](../../implementation/sprint-2/scope-amendment-2026-05.md) (Box B.6 narrowed the v1.0 MCP surface; WP4 Phase-7 cross-cutting analysis deferred). Shortcuts depend on batched pre-computation during analyze; v1.0 ships on-demand `summary` only ([ADR-030](../adr/ADR-030-on-demand-summary-scope.md)).
+Every common explore-agent question is a pre-computed shortcut. **Most ship today** (see the catalogue above):
 
-Every common explore-agent question is a pre-computed shortcut:
+`find_entry_points(scope?)`, `find_http_routes(scope?)`, `find_data_models(scope?)`, `find_tests(scope?)`, `find_deprecations(scope?)`, `find_todos(scope?)`, `find_circular_imports(scope?)`, `find_coupling_hotspots(scope?)`, `find_dead_code(scope?)`, `recently_changed(since?, scope?)`, `high_churn(limit?, scope?)`, `what_tests_this(id)`
 
-`find_entry_points(scope?)`, `find_http_routes(scope?)`, `find_cli_commands(scope?)`, `find_data_models(scope?)`, `find_config_loaders(scope?)`, `find_tests(scope?)`, `find_fixtures(scope?)`, `find_deprecations(scope?)`, `find_todos(scope?)`, `find_dead_code(scope?)`, `find_circular_imports(scope?)`, `find_coupling_hotspots(scope?)`, `recently_changed(since?, scope?)`, `high_churn(limit?, scope?)`, `what_tests_this(id)`
+> **`find_dead_code(scope?)`** is registered (WS5b): a conservative reachability query that flags entities unreachable from the root set (entry points ∪ exported API ∪ tests ∪ HTTP routes ∪ CLI commands ∪ data models) over call+import edges. It fails toward "live" — counts all edge confidence tiers, honours reflection/dynamic-dispatch barrier tags, excludes framework-magic kinds, and emits heuristic `CLA-FACT-DEAD-CODE-CANDIDATE` results (confidence < 1). The root categorisation tags it consumes are **not emitted by any active plugin today**, so it returns an honest signal-unavailable result (never a flood of false positives) until the root-tag emission pipeline lands (tracked follow-up). Emitting those tags during analyze is the trigger that makes it light up.
+>
+> **Three shortcuts remain deferred to a later release**: `find_cli_commands`, `find_config_loaders`, `find_fixtures` are not yet registered in `list_tools`.
 
 All `scope?` parameters accept either an `EntityId` (confine results to descendants of that entity, typically a subsystem or package) or a path glob (`"src/auth/**"`). Omitted → whole project.
 
@@ -985,7 +987,7 @@ Translator behaviour:
 
 #### Endpoints
 
-> **v1.0 ships the [ADR-014](../adr/ADR-014-filigree-registry-backend.md) file-registry subset only**: `GET /api/v1/files`, `POST /api/v1/files:resolve`, `POST /api/v1/files/batch`, `GET /api/v1/_capabilities` (plus the [ADR-034](../adr/ADR-034-federation-http-read-api-hardening.md) authentication surface). The `/entities*` / `/findings` / `/wardline/declared` / `/state` / `/health` / `/metrics` catalogue below is the v1.1 target — deferred per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B for entities/findings/wardline; WP10 for `/state`, `/health`, `/metrics`). The entity-resolve oracle ships only for the `file_path` scheme via `POST /api/v1/files:resolve`; the multi-scheme oracle below is also v1.1. See [REQ-HTTP-01](requirements.md#req-http-01--read-endpoints-for-entities-findings-wardline-state) and [REQ-HTTP-02](requirements.md#req-http-02--entity-resolution-oracle) for the row-level deferral notices.
+> **The pinned, authoritative wire surface is [`docs/federation/contracts.md`](../../federation/contracts.md)** (with normative fixtures under `docs/federation/fixtures/`). The illustrative catalogue below is the broader v1.1 *target*; consult contracts.md for what is actually contracted today. The shipped routes (`crates/clarion-cli/src/http_read.rs::router`) are: the [ADR-014](../adr/ADR-014-filigree-registry-backend.md) file-registry subset (`GET /api/v1/files`, `POST /api/v1/files:resolve`, `POST /api/v1/files/batch`), entity caller/callee reads (`GET /api/v1/entities/{id}/callers|callees` + their `:batch-get` POST forms), the [ADR-038](../adr/ADR-038-sei-token-and-signature.md) SEI identity-resolution endpoints (`POST /api/v1/identity/resolve`, `…:batch`, `GET /api/v1/identity/sei/{sei}`, `…/lineage/{sei}`), the [ADR-036](../adr/ADR-036-wardline-taint-fact-store.md) Wardline taint-store routes (`/api/wardline/*`), and `GET /api/v1/_capabilities` (unauthenticated probe) — all under the [ADR-034](../adr/ADR-034-federation-http-read-api-hardening.md) authentication surface. **Still deferred**: the broad `/entities?…` query + `/entities/{id}/{summary,guidance,findings,neighbors}`, `/findings`, `/wardline/declared`, `/state`, `/health`, `/metrics`, and the **multi-scheme `GET /api/v1/entities/resolve` oracle** below. Identity translation today is split across `POST /api/v1/files:resolve` (file scheme) and `POST /api/v1/identity/resolve` (SEI). See [REQ-HTTP-01](requirements.md#req-http-01--read-endpoints-for-entities-findings-wardline-state) and [REQ-HTTP-02](requirements.md#req-http-02--entity-resolution-oracle) for the row-level deferral notices.
 
 ```
 GET  /api/v1/entities?file=<path>&kind=<kind>&tag=<tag>
@@ -1004,7 +1006,9 @@ GET  /api/v1/metrics     # Prometheus-compatible
 
 #### Entity resolve oracle
 
-`GET /api/v1/entities/resolve?scheme=<scheme>&value=<value>` — the identity-translation layer exposed as a public API. Schemes accepted in v0.1: `wardline_qualname`, `wardline_exception_location`, `file_path`, `sarif_logical_location`. Response includes `resolution_confidence` (`exact | heuristic | none`) and alternative candidates for non-exact matches.
+> **Deferred (v1.1 target).** The unified multi-scheme `GET /api/v1/entities/resolve` endpoint is not built. What ships is split: `POST /api/v1/files:resolve` (the `file_path` scheme, ADR-014) and `POST /api/v1/identity/resolve` (SEI resolution, ADR-038). The unified oracle below describes the eventual single surface.
+
+`GET /api/v1/entities/resolve?scheme=<scheme>&value=<value>` — the identity-translation layer exposed as a public API. Target schemes: `wardline_qualname`, `wardline_exception_location`, `file_path`, `sarif_logical_location`. Response includes `resolution_confidence` (`exact | heuristic | none`) and alternative candidates for non-exact matches.
 
 Why this exists: every sibling tool consuming Clarion should ask in *their* native identity scheme, not embed Clarion's ID format. The alternative is every sibling re-implementing Clarion's ID generation, which couples them all to Clarion's ID scheme changes. `resolve` lets them stay decoupled (enrichment, not load-bearing).
 

@@ -27,6 +27,37 @@ use crate::{
 
 /// Scan bound on edges materialised for a graph query.
 const EDGE_SCAN_CAP: usize = 500_000;
+/// Scan bound on entities materialised for the dead-code candidate set.
+const ENTITY_SCAN_CAP: usize = 500_000;
+
+/// Categorisation tags whose union is the reachability root set for
+/// `find_dead_code` — entities "called from outside" the codebase. None are
+/// emitted by the active plugins today (the tag-emission pipeline is tracked
+/// follow-up work), so the empty-root guard fires in practice.
+const DEAD_CODE_ROOT_TAGS: &[&str] = &[
+    "entry-point",
+    "http-route",
+    "test",
+    "data-model",
+    "cli-command",
+    "exported-api",
+];
+
+/// Tags that force an entity to be treated as live regardless of static
+/// reachability — dynamic-dispatch / reflection barriers. Better to under-report
+/// dead code than to call a reflectively-reached function dead (fail toward
+/// "live").
+const DEAD_CODE_BARRIER_TAGS: &[&str] = &["dynamic-dispatch", "reflection"];
+
+/// Tags excluding an entity from dead-code candidacy even when unreached —
+/// framework-magic entry kinds (decorated handlers, plugin hooks) whose callers
+/// are invisible to static analysis.
+const DEAD_CODE_EXCLUDED_TAGS: &[&str] = &["framework-handler", "plugin-hook"];
+
+/// Rule id for an emitted dead-code candidate (ADR-017 `CLA-FACT-*` namespace).
+const DEAD_CODE_RULE_ID: &str = "CLA-FACT-DEAD-CODE-CANDIDATE";
+/// Heuristic confidence for a dead-code candidate — never presented as certain.
+const DEAD_CODE_CONFIDENCE: f64 = 0.6;
 const HOTSPOTS_PAGE_DEFAULT: usize = 20;
 const HOTSPOTS_PAGE_MAX: usize = 200;
 const CYCLES_PAGE_DEFAULT: usize = 50;
@@ -233,6 +264,123 @@ impl ServerState {
                         "truncated": truncated,
                     },
                     "scope_truncated": scope_truncated,
+                })))
+            })
+            .await;
+        Ok(flatten_storage_envelope_result(result))
+    }
+
+    /// `find_dead_code(scope?, limit?, offset?)` — entities not reachable from
+    /// the root set (entry points ∪ exported API ∪ tests ∪ HTTP routes ∪ CLI
+    /// commands ∪ data models) over the call+import graph.
+    ///
+    /// **Conservative by construction (fail toward "live").** Reachability
+    /// counts *all* edge confidence tiers (resolved ∪ ambiguous ∪ inferred):
+    /// including more edges keeps more entities live, so the tool under-reports
+    /// rather than over-reports dead code. Hence no `confidence` argument — a
+    /// ceiling would only make *more* code look dead, the harmful direction.
+    /// Dynamic-dispatch / reflection barrier tags force their entities live, and
+    /// framework-magic kinds are excluded from candidacy.
+    ///
+    /// **Empty-root guard.** When no root categorisation is emitted the root set
+    /// is empty; the naive computation would then flag the *entire* codebase as
+    /// dead. Instead the tool returns an honest signal-unavailable result with
+    /// zero candidates — never a false positive. Results are heuristic
+    /// (`CLA-FACT-DEAD-CODE-CANDIDATE`, confidence < 1), bounded, SEI-carrying.
+    pub(crate) async fn tool_find_dead_code(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let scope = RawScope::parse(arguments)?;
+        let page = Page::parse(arguments, SHORTCUT_PAGE_DEFAULT, SHORTCUT_PAGE_MAX)?;
+        let project_root = self.project_root.clone();
+        let result = self
+            .readers
+            .with_reader(move |conn| {
+                let filter = scope.resolve(conn)?;
+                let (in_scope, scope_truncated) = filter.in_scope_ids(conn, &project_root)?;
+
+                // Roots = "called from outside" categorisations. Absent today.
+                let roots = ids_with_any_tag(conn, DEAD_CODE_ROOT_TAGS)?;
+                if roots.is_empty() {
+                    return Ok(success_envelope(json!({
+                        "dead_code": [],
+                        "page": {
+                            "total": 0, "offset": page.offset, "limit": page.limit,
+                            "returned": 0, "truncated": false,
+                        },
+                        "scope_truncated": scope_truncated,
+                        "scan_truncated": false,
+                        "signal": missing_signal(
+                            "entity_tags",
+                            "reachability roots are not emitted by the active plugins \
+                             (entry-point / http-route / test / data-model / cli-command / \
+                             exported-api categorisation tags are absent), so dead code cannot be \
+                             determined — this is NOT a guarantee there is no dead code",
+                        ),
+                    })));
+                }
+
+                // Forward BFS over call+import edges across ALL confidence tiers
+                // (fail toward live). Reachability is whole-graph: an in-scope
+                // entity reached via an out-of-scope caller must not be flagged.
+                let (adjacency, scan_truncated) = call_import_adjacency(conn)?;
+                let barriers = ids_with_any_tag(conn, DEAD_CODE_BARRIER_TAGS)?;
+                let mut live: HashSet<String> = roots;
+                live.extend(barriers);
+                let reachable = forward_reachable(&adjacency, live);
+
+                let excluded = ids_with_any_tag(conn, DEAD_CODE_EXCLUDED_TAGS)?;
+                let (all_ids, entity_scan_truncated) = all_entity_ids(conn)?;
+
+                let mut candidates: Vec<String> = all_ids
+                    .into_iter()
+                    .filter(|id| !reachable.contains(id))
+                    .filter(|id| !excluded.contains(id))
+                    .filter(|id| in_scope.as_ref().is_none_or(|ids| ids.contains(id)))
+                    .collect();
+                candidates.sort();
+
+                let total = candidates.len();
+                let returned: Vec<String> = candidates
+                    .into_iter()
+                    .skip(page.offset)
+                    .take(page.limit)
+                    .collect();
+                let returned_count = returned.len();
+                let truncated = page.offset.saturating_add(returned_count) < total;
+
+                let dead_code: Vec<Value> = returned
+                    .iter()
+                    .map(|id| {
+                        let entity = match entity_by_id(conn, id) {
+                            Ok(Some(entity)) => entity_json(conn, &entity),
+                            _ => json!({ "id": id, "sei": Value::Null }),
+                        };
+                        json!({
+                            "entity": entity,
+                            "rule_id": DEAD_CODE_RULE_ID,
+                            "kind": "fact",
+                            "confidence": DEAD_CODE_CONFIDENCE,
+                            "confidence_basis": "heuristic",
+                            "reason": "unreachable from the reachability root set over call+import \
+                                       edges across all confidence tiers; static reachability \
+                                       cannot prove dynamic or reflective reach",
+                        })
+                    })
+                    .collect();
+
+                Ok(success_envelope(json!({
+                    "dead_code": dead_code,
+                    "page": {
+                        "total": total,
+                        "offset": page.offset,
+                        "limit": page.limit,
+                        "returned": returned_count,
+                        "truncated": truncated,
+                    },
+                    "scope_truncated": scope_truncated,
+                    "scan_truncated": scan_truncated || entity_scan_truncated,
                 })))
             })
             .await;
@@ -544,6 +692,92 @@ fn test_tagged_subset(
         }
     }
     Ok(out)
+}
+
+/// Entity ids carrying any of `tags` (one `IN` query, distinct ids).
+fn ids_with_any_tag(
+    conn: &rusqlite::Connection,
+    tags: &[&str],
+) -> clarion_storage::Result<HashSet<String>> {
+    if tags.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let placeholders = std::iter::repeat_n("?", tags.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("SELECT DISTINCT entity_id FROM entity_tags WHERE tag IN ({placeholders})");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(tags.iter()))?;
+    let mut out = HashSet::new();
+    while let Some(row) = rows.next()? {
+        out.insert(row.get::<_, String>(0)?);
+    }
+    Ok(out)
+}
+
+/// All entity ids, bounded by [`ENTITY_SCAN_CAP`]. Returns `(ids, truncated)`.
+fn all_entity_ids(conn: &rusqlite::Connection) -> clarion_storage::Result<(Vec<String>, bool)> {
+    let cap = i64::try_from(ENTITY_SCAN_CAP.saturating_add(1)).unwrap_or(i64::MAX);
+    let mut stmt = conn.prepare("SELECT id FROM entities ORDER BY id LIMIT ?1")?;
+    let mut rows = stmt.query(rusqlite::params![cap])?;
+    let mut out = Vec::new();
+    let mut truncated = false;
+    while let Some(row) = rows.next()? {
+        if out.len() >= ENTITY_SCAN_CAP {
+            truncated = true;
+            break;
+        }
+        out.push(row.get::<_, String>(0)?);
+    }
+    Ok((out, truncated))
+}
+
+/// The call+import adjacency over *all* confidence tiers (the conservative,
+/// fail-toward-live choice for reachability). Bounded by [`EDGE_SCAN_CAP`];
+/// returns `(adjacency, scan_truncated)`.
+fn call_import_adjacency(
+    conn: &rusqlite::Connection,
+) -> clarion_storage::Result<(HashMap<String, Vec<String>>, bool)> {
+    let cap = i64::try_from(EDGE_SCAN_CAP.saturating_add(1)).unwrap_or(i64::MAX);
+    let mut stmt = conn
+        .prepare("SELECT from_id, to_id FROM edges WHERE kind IN ('calls', 'imports') LIMIT ?1")?;
+    let mut rows = stmt.query(rusqlite::params![cap])?;
+    let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
+    let mut edge_count = 0usize;
+    let mut truncated = false;
+    while let Some(row) = rows.next()? {
+        if edge_count >= EDGE_SCAN_CAP {
+            truncated = true;
+            break;
+        }
+        edge_count += 1;
+        let from: String = row.get(0)?;
+        let to: String = row.get(1)?;
+        adjacency.entry(from).or_default().push(to);
+    }
+    Ok((adjacency, truncated))
+}
+
+/// Forward-reachable closure of `seed` over `adjacency` (iterative BFS/DFS).
+fn forward_reachable(
+    adjacency: &HashMap<String, Vec<String>>,
+    seed: HashSet<String>,
+) -> HashSet<String> {
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = seed.into_iter().collect();
+    while let Some(node) = stack.pop() {
+        if !visited.insert(node.clone()) {
+            continue;
+        }
+        if let Some(neighbours) = adjacency.get(&node) {
+            for next in neighbours {
+                if !visited.contains(next) {
+                    stack.push(next.clone());
+                }
+            }
+        }
+    }
+    visited
 }
 
 /// Tarjan strongly-connected components over the adjacency map; returns the

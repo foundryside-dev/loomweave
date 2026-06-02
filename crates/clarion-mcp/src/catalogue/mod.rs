@@ -24,6 +24,7 @@
 
 mod faceted;
 mod inspection;
+mod semantic;
 mod shortcuts;
 
 use std::collections::HashSet;

@@ -126,6 +126,7 @@ rules:  # abridged example; exact emitted catalogue lives in §5 and the authore
   - { id: CLA-PY-STRUCTURE-002, description: "Module-level side effect at import time", severity: INFO }
   - { id: CLA-FACT-TODO, description: "TODO marker in comment", severity: INFO, kind: fact }
   - { id: CLA-FACT-ENTRYPOINT, description: "CLI/HTTP entry point detected", severity: INFO, kind: fact }
+  - { id: CLA-FACT-DEAD-CODE-CANDIDATE, description: "Entity unreachable from the reachability root set over call+import edges (heuristic; confidence_basis: heuristic, confidence < 1). Conservative — counts all edge tiers, honours reflection/dynamic-dispatch barriers, excludes framework-magic kinds; honest signal-unavailable when no roots are emitted. Emitted by find_dead_code.", severity: NONE, kind: fact }
   # Additional plugin-declared rules are omitted here for readability; see §5 for
   # the concrete emitted findings and ADR-017 / ADR-022 for naming rules.
 
@@ -610,6 +611,11 @@ Alternatives considered and rejected for v0.1:
 
 ### Schema (outline)
 
+This outline reflects migrations `0001`–`0007` under `crates/clarion-storage/migrations/`.
+The physical schema is **13 tables + 1 FTS5 virtual table (`entity_fts`) + 1 view
+(`guidance_sheets`)**. The runner's own bookkeeping table, `schema_migrations`, is
+deliberately not shown here (it is migration-runner internal, not part of the data model).
+
 ```sql
 -- Entities
 CREATE TABLE entities (
@@ -620,6 +626,7 @@ CREATE TABLE entities (
     short_name TEXT NOT NULL,
     parent_id TEXT REFERENCES entities(id),
     source_file_id TEXT REFERENCES entities(id),
+    source_file_path TEXT,
     source_byte_start INTEGER,
     source_byte_end INTEGER,
     source_line_start INTEGER,
@@ -628,6 +635,7 @@ CREATE TABLE entities (
     content_hash TEXT,
     summary TEXT,
     wardline TEXT,
+    signature TEXT,           -- plugin-declared SEI matcher input (ADR-038, migration 0005)
     first_seen_commit TEXT,   -- underlying git SHA (no `-dirty` suffix); set at run boundary
     last_seen_commit TEXT,    -- underlying git SHA; updated every run that observes the entity
     created_at TEXT NOT NULL,
@@ -708,9 +716,10 @@ CREATE INDEX ix_findings_tool_rule ON findings(tool, rule_id);
 CREATE INDEX ix_findings_run ON findings(run_id);
 CREATE INDEX ix_findings_status ON findings(status);
 
--- Summary cache
+-- Summary cache. entity_id FK ON DELETE CASCADE (ADR-024, V11-STO-03) so a
+-- removed entity clears its cached summaries.
 CREATE TABLE summary_cache (
-    entity_id TEXT NOT NULL,
+    entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
     content_hash TEXT NOT NULL,
     prompt_template_id TEXT NOT NULL,
     model_tier TEXT NOT NULL,
@@ -720,7 +729,39 @@ CREATE TABLE summary_cache (
     tokens_input INTEGER NOT NULL,
     tokens_output INTEGER NOT NULL,
     created_at TEXT NOT NULL,
+    last_accessed_at TEXT NOT NULL,
+    caller_count INTEGER NOT NULL,
+    fan_out INTEGER NOT NULL,
+    stale_semantic INTEGER NOT NULL DEFAULT 0 CHECK (stale_semantic IN (0, 1)),
     PRIMARY KEY (entity_id, content_hash, prompt_template_id, model_tier, guidance_fingerprint)
+);
+
+-- Inferred edge cache (query-time inferred-dispatch results, keyed by caller body).
+CREATE TABLE inferred_edge_cache (
+    caller_entity_id     TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    caller_content_hash  TEXT NOT NULL,
+    model_id             TEXT NOT NULL,
+    prompt_version       TEXT NOT NULL,
+    result_json          TEXT NOT NULL,
+    cost_usd             REAL NOT NULL DEFAULT 0.0,
+    token_count          INTEGER NOT NULL DEFAULT 0,
+    created_at           TEXT NOT NULL,
+    last_accessed_at     TEXT NOT NULL,
+    PRIMARY KEY (caller_entity_id, caller_content_hash, model_id, prompt_version)
+);
+
+-- Unresolved call sites for query-time inferred dispatch.
+CREATE TABLE entity_unresolved_call_sites (
+    caller_entity_id     TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    caller_content_hash  TEXT NOT NULL,
+    site_key             TEXT NOT NULL,
+    site_ordinal         INTEGER NOT NULL,
+    source_file_id       TEXT REFERENCES entities(id),
+    source_byte_start    INTEGER NOT NULL,
+    source_byte_end      INTEGER NOT NULL,
+    callee_expr          TEXT NOT NULL,
+    created_at           TEXT NOT NULL,
+    PRIMARY KEY (caller_entity_id, caller_content_hash, site_key)
 );
 
 -- Runs (provenance)
@@ -732,7 +773,8 @@ CREATE TABLE runs (
     -- Closed core-owned vocabulary per ADR-031; terminal values from the
     -- writer-actor `RunStatus` enum; 'running' is the BeginRun in-flight literal.
     status TEXT NOT NULL
-           CHECK (status IN ('running', 'skipped_no_plugins', 'completed', 'failed'))
+           CHECK (status IN ('running', 'skipped_no_plugins', 'completed', 'failed')),
+    analyzed_at_commit TEXT   -- git HEAD analyzed against (WS9 / SEI §6, migration 0007); NULL off-git
 );
 
 -- FTS5 for text search
@@ -792,6 +834,14 @@ ALTER TABLE entities ADD COLUMN git_churn_count INTEGER
     GENERATED ALWAYS AS (json_extract(properties, '$.git_churn_count')) VIRTUAL;
 CREATE INDEX ix_entities_churn ON entities(git_churn_count) WHERE git_churn_count IS NOT NULL;
 
+-- briefing_blocked (ADR-024, migration 0002): secret-scan-set property that
+-- withholds an entity from briefings / federation exposure. Generated column +
+-- partial index so the federation read-API hot path filters in SQL.
+ALTER TABLE entities ADD COLUMN briefing_blocked TEXT
+    GENERATED ALWAYS AS (json_extract(properties, '$.briefing_blocked')) VIRTUAL;
+CREATE INDEX ix_entities_briefing_blocked ON entities(briefing_blocked)
+    WHERE briefing_blocked IS NOT NULL;
+
 -- View for guidance resolver
 CREATE VIEW guidance_sheets AS
 SELECT id, name,
@@ -803,6 +853,59 @@ SELECT id, name,
        json_extract(properties, '$.expires') AS expires,
        tags
 FROM entities WHERE kind = 'guidance';
+
+-- Wardline taint-fact store (SP9, ADR-036, migration 0003). Wardline-owned,
+-- per-entity; `wardline_json` is opaque to Clarion (stored/returned verbatim).
+-- `sei` (migration 0006) is the rename-stable lookup key (NULL on pre-SEI rows).
+CREATE TABLE wardline_taint_facts (
+    entity_id               TEXT PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
+    wardline_json           TEXT NOT NULL,
+    scan_id                 TEXT,
+    content_hash_at_compute TEXT,
+    updated_at              TEXT NOT NULL,
+    sei                     TEXT   -- rename-stable lookup key (ADR-038); NULL pre-SEI
+);
+CREATE INDEX ix_wardline_taint_sei ON wardline_taint_facts(sei) WHERE sei IS NOT NULL;
+
+-- Last-run entity snapshot for incremental analysis + SEI move detection
+-- (migration 0004). Rebuilt (full replace) after each successful run; never
+-- holds identity (the SEI itself lives in sei_bindings).
+CREATE TABLE sei_prior_index (
+    locator      TEXT PRIMARY KEY,  -- the entity's full id string (plugin:kind:qualname)
+    body_hash    TEXT NOT NULL,     -- entities.content_hash at prior-run time
+    signature    TEXT,              -- entities.signature at prior-run time (WS1)
+    recorded_at  TEXT NOT NULL      -- ISO-8601 UTC; prior-run completion timestamp
+);
+
+-- SEI identity store (ADR-038, migration 0005). Keyed by the opaque SEI;
+-- decoupled from the cumulative `entities` table so a rename-carry never
+-- collides with the stale entity row. Orphaning is a status flip, not a delete.
+CREATE TABLE sei_bindings (
+    sei             TEXT PRIMARY KEY,  -- clarion:eid:<hex> (opaque; consumers MUST NOT parse)
+    current_locator TEXT,              -- current address: the alive binding's entity id
+    body_hash       TEXT,              -- entities.content_hash at last (re)bind
+    signature       TEXT,              -- entities.signature at last (re)bind
+    status          TEXT NOT NULL CHECK (status IN ('alive', 'orphaned', 'superseded')),
+    born_run_id     TEXT NOT NULL,     -- run that first minted this SEI
+    updated_run_id  TEXT NOT NULL,     -- run that last carried/updated this binding
+    updated_at      TEXT NOT NULL
+);
+-- At most one alive binding per locator (orphaned/superseded may share history).
+CREATE UNIQUE INDEX ux_sei_alive_locator ON sei_bindings(current_locator)
+    WHERE status = 'alive' AND current_locator IS NOT NULL;
+
+-- Append-only identity-event log (REQ-L-01; INSERT only, no UPDATE path).
+CREATE TABLE sei_lineage (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    sei          TEXT NOT NULL,
+    event        TEXT NOT NULL CHECK (event IN
+                     ('born', 'locator_changed', 'moved', 'orphaned', 'superseded')),
+    old_locator  TEXT,            -- set for locator_changed, moved, orphaned
+    new_locator  TEXT,            -- set for born, locator_changed, moved
+    run_id       TEXT NOT NULL,
+    recorded_at  TEXT NOT NULL    -- ISO-8601 UTC
+);
+CREATE INDEX ix_sei_lineage_sei ON sei_lineage(sei);
 ```
 
 ### Concurrency

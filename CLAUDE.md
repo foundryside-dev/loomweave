@@ -4,14 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-**v1.0.0 — first publishable release.** Targets the `v1.0.0` tag (cut once release blockers are green; pre-release working tags `v0.1-sprint-1` and `v0.1-sprint-2` remain in the repo as historical anchors). Workspace + Python plugin are at 1.0.0; ADR-014 federation HTTP read API ships with bearer auth, batch resolution, briefing-blocked propagation, and stable per-project `instance_id`. See [`CHANGELOG.md`](CHANGELOG.md) for the full 1.0 scope and [`docs/implementation/`](docs/implementation/) for sprint-closure artifacts.
+**v1.1.0 — current pre-release working version.** The `v1.0.0` tag (first publishable release) is cut; pre-release working tags `v0.1-sprint-1` and `v0.1-sprint-2` remain in the repo as historical anchors. Workspace + Python plugin are at 1.1.0; ADR-014 federation HTTP read API ships with bearer auth, batch resolution, briefing-blocked propagation, and stable per-project `instance_id`. See [`CHANGELOG.md`](CHANGELOG.md) for the full 1.0 scope and [`docs/implementation/`](docs/implementation/) for sprint-closure artifacts.
 
 ### Layout (post-1.0)
 
-- **Rust workspace** at repo root (`Cargo.toml`, `crates/`):
+- **Rust workspace** at repo root (`Cargo.toml`, `crates/`) — six crates:
   - `crates/clarion-core/` — entity-ID assembler, plugin host (`plugin/host.rs`), JSON-RPC transport, manifest parser, jail + limits, discovery, breaker.
   - `crates/clarion-storage/` — writer-actor + reader-pool over SQLite (per ADR-011).
   - `crates/clarion-cli/` — the `clarion` binary; `install` and `analyze` subcommands.
+  - `crates/clarion-mcp/` — the MCP protocol surface (the `clarion serve` tool catalogue, Filigree HTTP client, scan-results emission, snapshot reader).
+  - `crates/clarion-scanner/` — core-owned pre-ingest secret scanner; stores only positions, rule IDs, and a detect-secrets-compatible SHA-1 digest (literal secret values never leave the scan).
   - `crates/clarion-plugin-fixture/` — test-only fixture plugin used by `wp2_e2e` integration tests.
 - **Python plugin** at `plugins/python/` (editable install: `pip install -e plugins/python[dev]`). Speaks the L4 JSON-RPC protocol; emits function entities with L7 qualnames; runs the L8 Wardline probe.
 - **Shared cross-language fixture** at `fixtures/entity_id.json` — the L2 byte-for-byte parity proof (consumed by Rust + Python tests both).

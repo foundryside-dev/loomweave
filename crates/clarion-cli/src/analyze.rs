@@ -29,9 +29,9 @@ use clarion_core::{
 use clarion_storage::{
     DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, GitRename, NewEntityDescriptor, PriorIndexEntry,
     SeiBindingRecord, SeiDecision, SeiLineageEntry, UnresolvedCallSiteRecord, Writer,
-    alive_bindings_snapshot, prior_analyzed_commit,
+    alive_bindings_snapshot,
     commands::{EdgeRecord, EntityRecord, FindingRecord, RunStatus, WriterCmd},
-    mint_sei, module_dependency_edges, orphaned_bindings, rebind_or_mint,
+    mint_sei, module_dependency_edges, orphaned_bindings, prior_analyzed_commit, rebind_or_mint,
     sei::{BindingStatus, LineageEvent},
 };
 
@@ -236,8 +236,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     {
         let mut conn =
             Connection::open(&db_path).context("open database to apply pending migrations")?;
-        clarion_storage::pragma::apply_write_pragmas(&conn)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        clarion_storage::pragma::apply_write_pragmas(&conn).map_err(|e| anyhow::anyhow!("{e}"))?;
         clarion_storage::schema::apply_migrations(&mut conn)
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("apply pending migrations")?;
@@ -1169,8 +1168,7 @@ async fn run_sei_mint_pass(
     // one pre-WS9 working-tree call. Skipped entirely on non-repo corpora. The
     // matcher is fail-closed (a rename is a hint, confirmed by body hash), so an
     // over-broad union only ever misses a carry, never causes a false one.
-    let descriptor_locators: Vec<String> =
-        descriptors.iter().map(|d| d.locator.clone()).collect();
+    let descriptor_locators: Vec<String> = descriptors.iter().map(|d| d.locator.clone()).collect();
     let git_renames: Vec<GitRename> = crate::sei_git::gather_git_renames(
         project_root,
         legis_url,

@@ -9,6 +9,7 @@ use thiserror::Error;
 pub struct McpConfig {
     #[serde(alias = "llm_policy")]
     pub llm: LlmConfig,
+    pub semantic_search: SemanticSearchConfig,
     pub integrations: IntegrationsConfig,
     pub serve: ServeConfig,
 }
@@ -84,6 +85,44 @@ impl Default for LlmConfig {
             max_inferred_edges_per_caller: 8,
             cache_max_age_days: 180,
             anthropic_api_key_env: None,
+        }
+    }
+}
+
+/// Semantic-search (embeddings) policy for `search_semantic` (`WS5b` / ADR-040).
+/// **Opt-in, off by default** — mirrors [`LlmConfig`]; Loom is local-first, so
+/// nothing here makes a hosted embedding service required. When `enabled` is
+/// false the `search_semantic` tool degrades honestly to "not enabled".
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct SemanticSearchConfig {
+    pub enabled: bool,
+    /// Explicit opt-in to the live API provider (in addition to `enabled`).
+    pub allow_live_provider: bool,
+    /// Embedding model id; embeddings are cache-keyed by this.
+    pub model_id: String,
+    /// Vector dimensionality (must match the model).
+    pub dimensions: usize,
+    /// `OpenAI`-compatible base URL (`/embeddings` is appended).
+    pub endpoint_url: String,
+    /// Env var holding the API key for the live provider.
+    pub api_key_env: String,
+    pub timeout_seconds: u64,
+    /// Per-session embedding token ceiling for cost governance.
+    pub session_token_ceiling: u64,
+}
+
+impl Default for SemanticSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_live_provider: false,
+            model_id: "text-embedding-3-small".to_owned(),
+            dimensions: 1536,
+            endpoint_url: "https://api.openai.com/v1".to_owned(),
+            api_key_env: "OPENAI_API_KEY".to_owned(),
+            timeout_seconds: 60,
+            session_token_ceiling: 5_000_000,
         }
     }
 }
@@ -674,6 +713,7 @@ llm_policy:
                 provider: LlmProviderKind::OpenRouter,
                 ..LlmConfig::default()
             },
+            semantic_search: SemanticSearchConfig::default(),
             integrations: IntegrationsConfig::default(),
             serve: ServeConfig::default(),
         };
@@ -695,6 +735,7 @@ llm_policy:
                 allow_live_provider: true,
                 ..LlmConfig::default()
             },
+            semantic_search: SemanticSearchConfig::default(),
             integrations: IntegrationsConfig::default(),
             serve: ServeConfig::default(),
         };
@@ -757,6 +798,7 @@ llm_policy:
                 provider: LlmProviderKind::CodexCli,
                 ..LlmConfig::default()
             },
+            semantic_search: SemanticSearchConfig::default(),
             integrations: IntegrationsConfig::default(),
             serve: ServeConfig::default(),
         };
@@ -820,6 +862,7 @@ llm_policy:
                 provider: LlmProviderKind::ClaudeCli,
                 ..LlmConfig::default()
             },
+            semantic_search: SemanticSearchConfig::default(),
             integrations: IntegrationsConfig::default(),
             serve: ServeConfig::default(),
         };

@@ -745,7 +745,10 @@ mod tests {
     fn rename_windows_skips_committed_window_on_degenerate_base() {
         // No prior, empty prior, or prior == head (empty `base..HEAD` range) all
         // collapse to the working-tree window — no wasted committed query/probe.
-        assert_eq!(rename_windows(true, None, Some("head")), vec![String::new()]);
+        assert_eq!(
+            rename_windows(true, None, Some("head")),
+            vec![String::new()]
+        );
         assert_eq!(
             rename_windows(true, Some(""), Some("head")),
             vec![String::new()]

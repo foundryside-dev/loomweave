@@ -1078,6 +1078,8 @@ Clarion consumes Wardline's `wardline.core.registry.REGISTRY` and `REGISTRY_VERS
 
 ### CON-ANTHROPIC-01 — Anthropic-only LLM provider in v0.1
 
+> **Superseded by [ADR-039](../adr/ADR-039-llm-provider-pivot-openrouter-cli.md)**. The implementation pivoted to OpenRouter (live HTTP) + Codex/Claude CLI bridges + a recording provider, all declaring `CachingModel::OpenAiChatCompletions` rather than Anthropic's four-`cache_control`-breakpoint scheme. The "Anthropic-only" constraint and its four-segment-caching premise below are retained for historical traceability; ADR-039 is the current decision.
+
 Clarion v0.1's LLM provider is Anthropic only. The `LlmProvider` trait exists for testability (`RecordingProvider`) and future extensibility, but the plugin-level prompt protocol assumes Anthropic prompt-caching semantics (four `cache_control` breakpoints at specific segment boundaries). Adding a provider without that caching structure sacrifices cost performance.
 
 **Rationale**: Anthropic's prompt caching is the mechanism that makes elspeth-scale cost tractable; alternative providers either lose caching advantage (pay more) or require prompt-protocol refactoring (v0.3+).

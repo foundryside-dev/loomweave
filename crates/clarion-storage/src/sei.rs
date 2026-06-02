@@ -665,7 +665,13 @@ mod tests {
         conn
     }
 
-    fn insert_run(conn: &Connection, id: &str, started_at: &str, commit: Option<&str>, status: &str) {
+    fn insert_run(
+        conn: &Connection,
+        id: &str,
+        started_at: &str,
+        commit: Option<&str>,
+        status: &str,
+    ) {
         conn.execute(
             "INSERT INTO runs (id, started_at, completed_at, config, stats, status, analyzed_at_commit) \
              VALUES (?1, ?2, ?2, '{}', '{}', ?3, ?4)",
@@ -718,11 +724,23 @@ mod tests {
     fn prior_analyzed_commit_excludes_the_current_run() {
         let conn = migrated_conn();
         // Only the current run exists, already marked completed with its HEAD.
-        insert_run(&conn, "current", "2026-02-01", Some("current_head"), "completed");
+        insert_run(
+            &conn,
+            "current",
+            "2026-02-01",
+            Some("current_head"),
+            "completed",
+        );
         assert_eq!(prior_analyzed_commit(&conn, "current").unwrap(), None);
 
         // Add a genuine prior run: now it — not current_head — is returned.
-        insert_run(&conn, "prior", "2026-01-01", Some("prior_head"), "completed");
+        insert_run(
+            &conn,
+            "prior",
+            "2026-01-01",
+            Some("prior_head"),
+            "completed",
+        );
         assert_eq!(
             prior_analyzed_commit(&conn, "current").unwrap().as_deref(),
             Some("prior_head")

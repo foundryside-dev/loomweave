@@ -39,6 +39,8 @@ This folder is the canonical home for authored Clarion architecture decision rec
 | [ADR-036](./ADR-036-wardline-taint-fact-store.md) | Clarion as Wardline taint-fact store — `wardline_taint_facts` table + `/api/wardline/*` routes; first read+write HTTP surface (optional writer-actor, default off); passes loom.md §3–§5 (ADR, not asterisk) | Accepted |
 | [ADR-037](./ADR-037-shared-error-vocabulary.md) | Shared error vocabulary (`clarion-core::errors`) — two typed enums (`HttpErrorCode`, `McpErrorCode`) as single source of truth; wire spelling unchanged on both surfaces; relates to ADR-034 | Accepted |
 | [ADR-038](./ADR-038-sei-token-and-signature.md) | SEI token scheme (`clarion:eid:<blake3(locator++mint_run_id)>`), signature schema (plugin-declared versioned JSON), and identity persistence (`sei_bindings` table, not an `entities` column); reserves the `clarion:eid:` locator namespace; resolves SEI-standard REQ-C-01/REQ-C-02; demotes ADR-003 id to *locator* | Accepted |
+| [ADR-039](./ADR-039-llm-provider-pivot-openrouter-cli.md) | LLM provider pivot — OpenRouter (live HTTP) + Codex/Claude CLI bridges + recording provider; `CachingModel::OpenAiChatCompletions` (not Anthropic four-`cache_control`-breakpoint); supersedes CON-ANTHROPIC-01 | Accepted |
+| [ADR-040](./ADR-040-semantic-search-embeddings.md) | Semantic search (`search_semantic`) — opt-in `EmbeddingProvider` trait (recording + API-endpoint impls), git-ignored `.clarion/embeddings.db` sidecar keyed `(entity_id, content_hash, model_id)` (extends ADR-005's gitignore list), bounded exact cosine scan, policy-engine cost governance | Accepted |
 
 ## Backlog still tracked in the detailed design
 

@@ -6,11 +6,16 @@
 //! root. Implementation types (`Frame`, `TransportError`, `RequestEnvelope`, etc.)
 //! remain accessible via `clarion_core::plugin::transport::*` and siblings.
 
+pub mod embedding_provider;
 pub mod entity_id;
 pub mod errors;
 pub mod llm_provider;
 pub mod plugin;
 
+pub use embedding_provider::{
+    ApiEmbeddingProvider, ApiEmbeddingProviderConfig, EmbeddingProvider, EmbeddingProviderError,
+    EmbeddingRecording, RecordingEmbeddingProvider,
+};
 pub use entity_id::{EntityId, EntityIdError, entity_id};
 pub use errors::{HttpErrorCode, McpErrorCode};
 pub use llm_provider::{

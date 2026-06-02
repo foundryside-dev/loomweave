@@ -16,7 +16,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use clarion_core::{
-    EdgeConfidence, LlmProvider, LlmProviderError, LlmRequest, LlmResponse, McpErrorCode,
+    EdgeConfidence, EmbeddingProvider, LlmProvider, LlmProviderError, LlmRequest, LlmResponse,
+    McpErrorCode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -35,7 +36,7 @@ use clarion_storage::{
     unresolved_callers_for_target,
 };
 
-use crate::config::LlmConfig;
+use crate::config::{LlmConfig, SemanticSearchConfig};
 use crate::filigree::{EntityAssociation, EntityAssociationsResponse, FiligreeLookup, IssueDetail};
 
 /// MCP protocol revision supported by the B.6 stdio server.
@@ -417,6 +418,26 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             description: "Return entities changed since a timestamp (`since?`), within an optional `scope`. Clarion does not index a per-entity git change timestamp in v1.0, so this is an HONEST NO-OP: it returns an empty set with a missing-signal note pointing at `index_diff` for repo-level freshness (HEAD vs last analyze). Never fabricates a change set. No LLM call.",
             input_schema: scope_page_schema(true),
         },
+        ToolDefinition {
+            name: "find_dead_code",
+            description: "Return entities NOT reachable from the root set (entry points ∪ exported API ∪ tests ∪ HTTP routes ∪ CLI commands ∪ data models) over the call+import graph, within an optional `scope`. On-demand graph query (no analyze-time precompute). CONSERVATIVE (fails toward `live`): reachability counts ALL edge confidence tiers (resolved ∪ ambiguous ∪ inferred), dynamic-dispatch/reflection barrier tags force their entities live, and framework-magic kinds are excluded from candidacy — so it under-reports rather than over-reports. No `confidence` argument (a ceiling would only make more code look dead). HONEST SIGNAL-UNAVAILABLE: the active plugins emit no root categorisation today, so the root set is empty and the tool returns zero candidates with a missing-signal note (NOT a flood of false positives, and NOT a guarantee there is no dead code). Heuristic results (CLA-FACT-DEAD-CODE-CANDIDATE, confidence < 1) — never certain. Bounded; SEI-carrying. No LLM call.",
+            input_schema: scope_page_schema(false),
+        },
+        ToolDefinition {
+            name: "search_semantic",
+            description: "Rank entities by semantic (embedding cosine) similarity to a `query` string, within an optional `scope`. OPT-IN: semantic search is OFF by default; when disabled or no embedding provider is configured the tool returns result_kind=`not_enabled` with a missing-signal note (never a faked or empty-as-complete result). When enabled it embeds the query and runs a bounded exact cosine scan over the git-ignored `.clarion/embeddings.db` sidecar (built at analyze time), considering only embeddings whose content_hash matches the entity's current hash (stale vectors never surface). Bounded (limit default 20, max 100; page.total/truncated). Each result carries its `sei` and a `score`.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "minLength": 1},
+                    "scope": {"type": "string", "minLength": 1},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    "offset": {"type": "integer", "minimum": 0}
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -581,6 +602,7 @@ pub struct ServerState {
     execution_edge_cap: usize,
     execution_path_cap: usize,
     summary_llm: Option<SummaryLlmState>,
+    semantic_search: Option<SemanticSearchState>,
     clock: Arc<dyn Fn() -> String + Send + Sync>,
     budget: Arc<Mutex<BudgetLedger>>,
     inferred_inflight: InferredInflight,
@@ -602,6 +624,7 @@ impl ServerState {
             execution_edge_cap: 500,
             execution_path_cap: 200,
             summary_llm: None,
+            semantic_search: None,
             clock: Arc::new(default_now_string),
             budget: Arc::new(Mutex::new(BudgetLedger::default())),
             inferred_inflight: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -657,6 +680,21 @@ impl ServerState {
             config,
             provider,
         });
+        self
+    }
+
+    /// Attach the embeddings provider + policy for `search_semantic` (`WS5b`).
+    /// Absent (or `config.enabled == false`) → the tool degrades honestly to
+    /// "not enabled". The provider is constructed by the caller (`serve`) only
+    /// when opted in with a key present, so the trait — not the choice — is
+    /// load-bearing.
+    #[must_use]
+    pub fn with_semantic_search(
+        mut self,
+        config: SemanticSearchConfig,
+        provider: Arc<dyn EmbeddingProvider>,
+    ) -> Self {
+        self.semantic_search = Some(SemanticSearchState { config, provider });
         self
     }
 
@@ -862,6 +900,14 @@ impl ServerState {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
+            "find_dead_code" => match self.tool_find_dead_code(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "search_semantic" => match self.tool_search_semantic(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
             _ => unreachable!("known tools checked above"),
         };
 
@@ -937,6 +983,11 @@ struct SummaryLlmState {
     writer: mpsc::Sender<WriterCmd>,
     config: LlmConfig,
     provider: Arc<dyn LlmProvider>,
+}
+
+struct SemanticSearchState {
+    config: SemanticSearchConfig,
+    provider: Arc<dyn EmbeddingProvider>,
 }
 
 #[derive(Default)]
@@ -3731,7 +3782,7 @@ mod tests {
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 35);
+        assert_eq!(tools.len(), 37);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
@@ -3835,6 +3886,8 @@ mod tests {
         assert_eq!(tools[32].name, "what_tests_this");
         assert_eq!(tools[33].name, "high_churn");
         assert_eq!(tools[34].name, "recently_changed");
+        assert_eq!(tools[35].name, "find_dead_code");
+        assert_eq!(tools[36].name, "search_semantic");
     }
 
     #[test]
@@ -4137,7 +4190,7 @@ mod tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], "tools-1");
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 35);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 37);
         assert_eq!(response["result"]["tools"][0]["name"], "entity_at");
         assert_eq!(response["result"]["tools"][7]["name"], "subsystem_members");
     }
@@ -4238,7 +4291,7 @@ mod tests {
 
         assert_eq!(decoded["jsonrpc"], "2.0");
         assert_eq!(decoded["id"], 10);
-        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 35);
+        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 37);
     }
 
     #[test]
@@ -4313,7 +4366,7 @@ mod tests {
         assert_eq!(first_json["id"], 11);
         assert_eq!(first_json["result"]["serverInfo"]["name"], "clarion");
         assert_eq!(second_json["id"], 12);
-        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 35);
+        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 37);
     }
 
     #[test]
