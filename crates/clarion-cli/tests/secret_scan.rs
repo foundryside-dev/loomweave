@@ -220,6 +220,12 @@ fn resume_does_not_duplicate_secret_findings() {
     // rather than inserting a duplicate (a random-UUID id would duplicate on
     // every resume). Regression for the gap that the phase3 weak-modularity
     // finding alone did not cover.
+    //
+    // Also load-bearing for Wave 2 / T3.1: this passes only because a file with
+    // an active secret finding is NEVER incrementally skipped (the resume run
+    // would otherwise skip the unchanged leaky file, re-anchoring its finding to
+    // the core file entity instead of the plugin entity → a duplicate id). If the
+    // secret carve-out in `analyze.rs` is removed, this test fails.
     let project = tempfile::tempdir().unwrap();
     let plugin = tempfile::tempdir().unwrap();
     write_secret_fixture_plugin(plugin.path());
