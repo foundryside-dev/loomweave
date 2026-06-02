@@ -117,10 +117,14 @@ impl ServerState {
                     if matched_by.is_empty() {
                         continue;
                     }
+                    // The sheet row IS an entity (kind=guidance); its `sei` is
+                    // the sheet's own locator-independent identity, not the
+                    // queried entity's.
+                    let sei = sei_for_locator(conn, &sheet.id)?;
                     composed.push(ComposedSheet {
                         sheet,
                         matched_by,
-                        sei: sei_for_locator(conn, &facts.entity_id_for_sheet_lookup)?,
+                        sei,
                     });
                 }
 
@@ -278,7 +282,6 @@ impl ServerState {
 
 /// Entity facts a guidance `match_rules` evaluation needs.
 struct EntityFacts {
-    entity_id_for_sheet_lookup: String,
     kind: String,
     rel_path: Option<String>,
     tags: HashSet<String>,
@@ -311,7 +314,6 @@ impl EntityFacts {
         let subsystem_id = subsystem_of_entity(conn, &entity.id)?.map(|found| found.subsystem_id);
 
         Ok(Self {
-            entity_id_for_sheet_lookup: entity.id.clone(),
             kind: entity.kind.clone(),
             rel_path,
             tags,

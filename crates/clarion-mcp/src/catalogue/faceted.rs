@@ -146,8 +146,15 @@ impl ServerState {
                 let (candidates, scan_truncated) =
                     entities_with_wardline_facts(conn, FACET_SCAN_CAP)?;
 
-                // Fetch the (opaque) blobs for best-effort tier/group filtering.
-                let ids: Vec<String> = candidates.iter().map(|e| e.id.clone()).collect();
+                // Scope-filter first, then fetch the (opaque) blobs only for the
+                // survivors — a narrow scope avoids reading every candidate blob.
+                let in_scope: Vec<EntityRow> = candidates
+                    .into_iter()
+                    .filter(|e| {
+                        filter.contains(&e.id, e.source_file_path.as_deref(), &project_root)
+                    })
+                    .collect();
+                let ids: Vec<String> = in_scope.iter().map(|e| e.id.clone()).collect();
                 let facts = get_taint_facts(conn, &ids)?;
                 let blobs: std::collections::HashMap<String, Value> = facts
                     .into_iter()
@@ -158,11 +165,8 @@ impl ServerState {
                     })
                     .collect();
 
-                let matched: Vec<(EntityRow, Value)> = candidates
+                let matched: Vec<(EntityRow, Value)> = in_scope
                     .into_iter()
-                    .filter(|e| {
-                        filter.contains(&e.id, e.source_file_path.as_deref(), &project_root)
-                    })
                     .filter_map(|e| {
                         let blob = blobs.get(&e.id).cloned().unwrap_or(Value::Null);
                         if facet_matches(&blob, "tier", tier.as_ref())

@@ -160,10 +160,16 @@ impl ServerState {
                 let in_clause = confidence_in_clause(confidence);
 
                 let mut coupling: HashMap<String, (i64, i64)> = HashMap::new();
+                // Coupling is over DEPENDENCY edges only — calls / imports /
+                // references. Structural edges (contains, in_subsystem, guides,
+                // emits_finding) all carry confidence='resolved', so including
+                // them would make the ranking dominated by containment /
+                // membership fan-out, not actionable coupling (spec §3.3).
+                let kinds = "kind IN ('calls', 'imports', 'references')";
                 // out-degree (distinct callees / targets)
                 let out_sql = format!(
                     "SELECT from_id, COUNT(DISTINCT to_id) FROM edges \
-                     WHERE confidence IN ({in_clause}) GROUP BY from_id"
+                     WHERE {kinds} AND confidence IN ({in_clause}) GROUP BY from_id"
                 );
                 let mut stmt = conn.prepare(&out_sql)?;
                 let mut rows = stmt.query([])?;
@@ -174,7 +180,7 @@ impl ServerState {
                 // in-degree (distinct callers / sources)
                 let in_sql = format!(
                     "SELECT to_id, COUNT(DISTINCT from_id) FROM edges \
-                     WHERE confidence IN ({in_clause}) GROUP BY to_id"
+                     WHERE {kinds} AND confidence IN ({in_clause}) GROUP BY to_id"
                 );
                 let mut stmt = conn.prepare(&in_sql)?;
                 let mut rows = stmt.query([])?;
@@ -370,16 +376,12 @@ impl ServerState {
                 let caller_ids: HashSet<String> =
                     callers.into_iter().map(|edge| edge.from_id).collect();
 
+                // One query for the test-tagged subset, then materialise only
+                // those rows (avoids a per-caller tag probe + lookup).
+                let test_ids = test_tagged_subset(conn, &caller_ids)?;
                 let mut test_callers: Vec<Value> = Vec::new();
-                for caller_id in &caller_ids {
-                    let is_test: bool = conn.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM entity_tags WHERE entity_id = ?1 AND tag = 'test')",
-                        rusqlite::params![caller_id],
-                        |row| row.get(0),
-                    )?;
-                    if is_test
-                        && let Some(caller) = entity_by_id(conn, caller_id)?
-                    {
+                for caller_id in &test_ids {
+                    if let Some(caller) = entity_by_id(conn, caller_id)? {
                         test_callers.push(entity_json(conn, &caller));
                     }
                 }
@@ -518,6 +520,30 @@ impl ServerState {
             ),
         })))
     }
+}
+
+/// Of the given entity ids, those carrying the `test` categorisation tag.
+/// One chunked `IN` query rather than a probe per id.
+fn test_tagged_subset(
+    conn: &rusqlite::Connection,
+    ids: &HashSet<String>,
+) -> clarion_storage::Result<HashSet<String>> {
+    let mut out = HashSet::new();
+    let all: Vec<&String> = ids.iter().collect();
+    for chunk in all.chunks(500) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT entity_id FROM entity_tags WHERE tag = 'test' AND entity_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(chunk.iter()))?;
+        while let Some(row) = rows.next()? {
+            out.insert(row.get::<_, String>(0)?);
+        }
+    }
+    Ok(out)
 }
 
 /// Tarjan strongly-connected components over the adjacency map; returns the

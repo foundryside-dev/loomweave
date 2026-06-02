@@ -977,3 +977,55 @@ async fn recently_changed_is_honest_noop() {
     assert_eq!(env["result"]["page"]["total"], 0);
     assert_eq!(env["result"]["signal"]["signal"], "git_change_time");
 }
+
+#[tokio::test]
+async fn find_coupling_hotspots_ignores_structural_edges() {
+    // Regression (code review): coupling must rank on dependency edges
+    // (calls/imports/references), not structural ones (contains/in_subsystem),
+    // which would otherwise make containers dominate purely by membership.
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:module:m", "module", "m.py", Some((1, 20)));
+    for i in 0..5 {
+        let f = format!("python:function:m.f{i}");
+        insert_entity(&conn, &f, "function", "m.py", Some((i + 1, i + 2)));
+        insert_edge(&conn, "contains", "python:module:m", &f, "resolved");
+    }
+    drop(conn);
+    let state = state_for(project.path(), &db);
+    let env = call_tool(&state, "find_coupling_hotspots", json!({})).await;
+    // Only structural `contains` edges exist -> no dependency coupling at all.
+    assert_eq!(env["result"]["page"]["total"], 0, "{env}");
+}
+
+#[tokio::test]
+async fn guidance_sheet_carries_its_own_sei_not_the_queried_entitys() {
+    // Regression (code review): each composed sheet's `sei` is the sheet's own
+    // identity, not the queried entity's.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
+    insert_guidance(
+        &conn,
+        "core:guidance:g",
+        r#"{"scope_level":"project","scope_rank":1,"content":"G","authored_at":"2026-01-01",
+            "match_rules":[{"type":"kind","value":"function"}]}"#,
+    );
+    insert_alive_sei(&conn, "clarion:eid:entitysei", "python:function:m.f");
+    insert_alive_sei(&conn, "clarion:eid:sheetsei", "core:guidance:g");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+    let env = call_tool(&state, "guidance_for", json!({"id": "python:function:m.f"})).await;
+    assert_eq!(
+        env["result"]["entity"]["sei"], "clarion:eid:entitysei",
+        "{env}"
+    );
+    assert_eq!(
+        env["result"]["guidance"][0]["sei"], "clarion:eid:sheetsei",
+        "{env}"
+    );
+}

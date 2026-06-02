@@ -461,8 +461,10 @@ fn scope_facet_schema(facets: &[(&str, bool)]) -> Value {
     let mut properties = serde_json::Map::new();
     let mut required = Vec::new();
     for (name, is_required) in facets {
-        // `group` accepts a string or number; everything else is a string.
-        let schema = if *name == "group" {
+        // Wardline `tier`/`group` filter against the opaque blob and accept a
+        // string or number (matching the handler's `optional_facet`); other
+        // facets (e.g. `tag`) are strings.
+        let schema = if *name == "tier" || *name == "group" {
             json!({"type": ["string", "integer"]})
         } else {
             json!({"type": "string", "minLength": 1})
