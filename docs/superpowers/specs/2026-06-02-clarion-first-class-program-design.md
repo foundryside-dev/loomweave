@@ -215,7 +215,7 @@ thin MCP surface is *not* first-class), which is why it gets committed waves, no
 | **5** | **WS5b — semantic search + reachability** | soft: WS5 | planned + **prompt** | `search_semantic` + `find_dead_code` delivered |
 | **6** | WS6 — guidance maturity | none (concurrent) | **planned** → prompt owed | guidance authoring + staleness |
 | **7** | WS7 — multi-language plugin | none (concurrent) | **planned** → prompt owed | published protocol + 2nd-language plugin |
-| **8** | WS8 — operational quality | none (concurrent) | design spec owed | doctor/cost/staleness robustness |
+| **8** | WS8 — operational quality | none (concurrent) | **planned** → prompt owed | doctor/cost/staleness robustness |
 
 > **Numbering note.** WS9 sits at Wave 3 (not last) because it was *dispatched* there; the numbers
 > are commitment/dispatch order, not dependency order. Spent numbers are immutable — the standalone
@@ -229,10 +229,12 @@ track — a committed slot, not "someday." Its plan exists
 **Readiness (the honest next-action per wave, not a deferral):**
 - Waves 0–3: dispatched (executing/executed) or prompt-ready (Waves 1–2).
 - Waves 4–5: designed/planned **+ execution prompt written** — ready to dispatch.
-- Waves 6–7: **planned** (`…-ws6-guidance-maturity-plan.md`, `…-ws7-multi-language-plan.md`) →
-  **execution prompt owed**. Open owner-decisions: D5 (Wave 6 lifecycle depth), D2 (Wave 7 2nd language).
-- Wave 8 (WS8): **design spec is the named prerequisite and next authoring task** — the last
-  un-planned workstream.
+- Waves 6–8: **planned** (`…-ws6-guidance-maturity-plan.md`, `…-ws7-multi-language-plan.md`,
+  `…-ws8-operational-quality-plan.md`) → **execution prompt owed**. Open owner-decisions: D5 (Wave 6
+  depth), D2 (Wave 7 2nd language), plus the Wave 8 cost-estimator ground-truth fork (§2 of that plan).
+
+**All nine workstreams are now planned.** Every wave has a design/plan and a committed slot; nothing
+is floated. Remaining authoring: execution prompts for Waves 6–8 (Waves 0–5 already have them).
 
 ---
 

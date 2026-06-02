@@ -24,7 +24,7 @@ dependency order.)
 | **5** | WS5b — semantic search + reachability | soft: WS5 | [`wave-5`](./2026-06-02-wave-5-execution.md) — _scheduled, not deferred_ |
 | **6** | WS6 — guidance maturity | none (concurrent) | planned (`…-ws6-guidance-maturity-plan.md`) → **prompt owed** |
 | **7** | WS7 — multi-language plugin | none (concurrent) | planned (`…-ws7-multi-language-plan.md`) → **prompt owed** |
-| **8** | WS8 — operational quality | none (concurrent) | **design spec owed** |
+| **8** | WS8 — operational quality | none (concurrent) | planned (`…-ws8-operational-quality-plan.md`) → **prompt owed** |
 
 ## Order
 
@@ -35,5 +35,5 @@ dependency order.)
 5. **Waves 4–8 (standalone first-class)** — ungated, concurrent with the suite waves, committed
    order: WS5 → WS5b → WS6 → WS7 → WS8. **WS5b is Wave 5** — a committed slot, not "someday."
 
-**Prompts written:** Waves 0–5. **Planned (execution prompt owed):** Waves 6–7 (WS6, WS7).
-**Design spec owed:** Wave 8 (WS8 operational quality) — the last un-planned workstream.
+**All nine workstreams are planned.** **Prompts written:** Waves 0–5. **Planned, execution prompt
+owed:** Waves 6–8 (WS6, WS7, WS8). Nothing is floated — every wave has a committed slot.
