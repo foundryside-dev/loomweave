@@ -10,7 +10,9 @@ use std::collections::HashSet;
 use serde_json::{Value, json};
 
 use clarion_core::McpErrorCode;
-use clarion_storage::{entity_by_id, get_taint_facts, sei_for_locator, subsystem_of_entity};
+use clarion_storage::{
+    MatchFacts, RuleVerdict, entity_by_id, get_taint_facts, rule_match, sei_for_locator,
+};
 
 use crate::ParamError;
 use crate::ServerState;
@@ -63,7 +65,7 @@ impl ServerState {
                     ));
                 };
 
-                let facts = EntityFacts::load(conn, &entity, &project_root)?;
+                let facts = MatchFacts::from_entity_row(conn, &entity, &project_root)?;
                 let guides_targets = guides_edge_sources(conn, &entity.id)?;
 
                 let mut wardline_group_skipped = false;
@@ -280,49 +282,6 @@ impl ServerState {
     }
 }
 
-/// Entity facts a guidance `match_rules` evaluation needs.
-struct EntityFacts {
-    kind: String,
-    rel_path: Option<String>,
-    tags: HashSet<String>,
-    subsystem_id: Option<String>,
-    entity_id: String,
-}
-
-impl EntityFacts {
-    fn load(
-        conn: &rusqlite::Connection,
-        entity: &clarion_storage::EntityRow,
-        project_root: &std::path::Path,
-    ) -> clarion_storage::Result<Self> {
-        let rel_path = entity.source_file_path.as_ref().map(|path| {
-            std::path::Path::new(path)
-                .strip_prefix(project_root)
-                .ok()
-                .and_then(|rel| rel.to_str())
-                .unwrap_or(path)
-                .to_owned()
-        });
-
-        let mut tags = HashSet::new();
-        let mut stmt = conn.prepare("SELECT tag FROM entity_tags WHERE entity_id = ?1")?;
-        let mut rows = stmt.query(rusqlite::params![entity.id])?;
-        while let Some(row) = rows.next()? {
-            tags.insert(row.get::<_, String>(0)?);
-        }
-
-        let subsystem_id = subsystem_of_entity(conn, &entity.id)?.map(|found| found.subsystem_id);
-
-        Ok(Self {
-            kind: entity.kind.clone(),
-            rel_path,
-            tags,
-            subsystem_id,
-            entity_id: entity.id.clone(),
-        })
-    }
-}
-
 /// guidance sheet ids that explicitly `guides` the given entity.
 fn guides_edge_sources(
     conn: &rusqlite::Connection,
@@ -397,53 +356,6 @@ impl ComposedSheet {
             "expires": self.sheet.expires,
             "matched_by": self.matched_by,
         })
-    }
-}
-
-/// The verdict of evaluating one guidance match-rule against an entity.
-enum RuleVerdict {
-    Matched(&'static str),
-    NoMatch,
-    /// The rule cannot be evaluated at this surface (e.g. `wardline_group`,
-    /// which would require parsing the opaque Wardline blob).
-    Unevaluable,
-}
-
-fn rule_match(rule: &Value, facts: &EntityFacts) -> RuleVerdict {
-    let Some(rule_type) = rule.get("type").and_then(Value::as_str) else {
-        return RuleVerdict::NoMatch;
-    };
-    match rule_type {
-        "path" => match (
-            rule.get("pattern").and_then(Value::as_str),
-            facts.rel_path.as_deref(),
-        ) {
-            (Some(pattern), Some(path)) if super::glob_match(pattern, path) => {
-                RuleVerdict::Matched("path")
-            }
-            _ => RuleVerdict::NoMatch,
-        },
-        "tag" => match rule.get("value").and_then(Value::as_str) {
-            Some(value) if facts.tags.contains(value) => RuleVerdict::Matched("tag"),
-            _ => RuleVerdict::NoMatch,
-        },
-        "kind" => match rule.get("value").and_then(Value::as_str) {
-            Some(value) if value == facts.kind => RuleVerdict::Matched("kind"),
-            _ => RuleVerdict::NoMatch,
-        },
-        "subsystem" => match (
-            rule.get("id").and_then(Value::as_str),
-            facts.subsystem_id.as_deref(),
-        ) {
-            (Some(id), Some(sub)) if id == sub => RuleVerdict::Matched("subsystem"),
-            _ => RuleVerdict::NoMatch,
-        },
-        "entity" => match rule.get("id").and_then(Value::as_str) {
-            Some(id) if id == facts.entity_id => RuleVerdict::Matched("entity"),
-            _ => RuleVerdict::NoMatch,
-        },
-        "wardline_group" => RuleVerdict::Unevaluable,
-        _ => RuleVerdict::NoMatch,
     }
 }
 

@@ -222,8 +222,12 @@ pub enum GuidanceCommand {
         #[arg(long)]
         pinned: bool,
 
-        /// Optional ISO-8601 expiry timestamp.
-        #[arg(long, value_name = "ISO8601")]
+        /// Optional expiry. Accepts an ISO-8601 instant (e.g.
+        /// `2026-12-31T23:59:59Z`), an offset form (converted to UTC), or a bare
+        /// date (e.g. `2026-12-31`, taken as start-of-day UTC). Stored
+        /// normalized to UTC so the read path's lexical expiry compare is
+        /// correct; unparseable input is rejected.
+        #[arg(long, value_name = "WHEN")]
         expires: Option<String>,
     },
 

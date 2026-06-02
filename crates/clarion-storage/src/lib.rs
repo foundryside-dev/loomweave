@@ -35,8 +35,9 @@ pub use embeddings::{EmbeddingKey, EmbeddingStore, StoredEmbedding, embeddings_d
 pub use error::{Result, StorageError};
 pub use glob::glob_match;
 pub use guidance::{
-    GuidanceSheet, GuidanceSheetInput, delete_guidance_sheet, get_guidance_sheet,
-    guidance_sheet_matches_entity, list_guidance_sheets, upsert_guidance_sheet,
+    GuidanceSheet, GuidanceSheetInput, MatchFacts, RuleVerdict, delete_guidance_sheet,
+    get_guidance_sheet, guidance_sheet_matches_entity, list_guidance_sheets, rule_match,
+    upsert_guidance_sheet,
 };
 pub use prior_index::{
     PriorIndexEntry, clear_prior_index, load_prior_index, previously_analyzed_files,

@@ -259,6 +259,57 @@ fn create_rejects_bad_scope_level_and_bad_match() {
 }
 
 #[test]
+fn create_normalizes_and_validates_expires() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_db(dir.path());
+
+    // A bare date is accepted and normalized to start-of-day UTC in the same
+    // 24-char `…Z` shape the read path's lexical expiry compare expects.
+    clarion_bin()
+        .args(["guidance", "create"])
+        .args(["--path"])
+        .arg(dir.path())
+        .args(["--scope-level", "module"])
+        .args(["--name", "expiring"])
+        .args(["--match", "kind:function"])
+        .args(["--content", "x"])
+        .args(["--expires", "2999-12-31"])
+        .assert()
+        .success();
+
+    let props = properties(dir.path(), "core:guidance:expiring");
+    let stored = props["expires"].as_str().expect("expires stored");
+    assert_eq!(
+        stored, "2999-12-31T00:00:00.000Z",
+        "bare date normalized to start-of-day UTC"
+    );
+
+    // Proxy the read path: a future expiry must NOT be lexically < now, i.e. the
+    // sheet is not treated as already expired.
+    let db_path = dir.path().join(".clarion").join("clarion.db");
+    let conn = Connection::open(&db_path).unwrap();
+    let now: String = conn
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(stored > now.as_str(), "future expiry must sort after now");
+
+    // Garbage `--expires` is rejected up front (no sheet written).
+    clarion_bin()
+        .args(["guidance", "create"])
+        .args(["--path"])
+        .arg(dir.path())
+        .args(["--scope-level", "module"])
+        .args(["--name", "bad-expiry"])
+        .args(["--match", "kind:function"])
+        .args(["--content", "x"])
+        .args(["--expires", "tomorrow"])
+        .assert()
+        .failure();
+}
+
+#[test]
 fn edit_preserves_authored_at_and_provenance_changes_only_content() {
     let dir = tempfile::tempdir().unwrap();
     seed_db(dir.path());

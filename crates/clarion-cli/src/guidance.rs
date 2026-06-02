@@ -82,12 +82,14 @@ pub fn run(command: GuidanceCommand) -> Result<()> {
             expires,
         } => create(
             &path,
-            &r#match,
-            &scope_level,
-            content,
-            name.as_deref(),
-            pinned,
-            expires.as_deref(),
+            CreateArgs {
+                raw_match: &r#match,
+                scope_level: &scope_level,
+                content,
+                name: name.as_deref(),
+                pinned,
+                expires: expires.as_deref(),
+            },
         ),
         GuidanceCommand::Edit { path, id } => edit(&path, &id),
         GuidanceCommand::Show { path, id } => show(&path, &id),
@@ -174,21 +176,23 @@ fn slugify(input: &str) -> String {
 
 // ── Subcommand handlers ───────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
-fn create(
-    project_root: &Path,
-    raw_match: &[String],
-    scope_level: &str,
+/// Inputs for `create`, grouped so the handler takes one struct instead of a
+/// long positional argument list.
+struct CreateArgs<'a> {
+    raw_match: &'a [String],
+    scope_level: &'a str,
     content: Option<String>,
-    name: Option<&str>,
+    name: Option<&'a str>,
     pinned: bool,
-    expires: Option<&str>,
-) -> Result<()> {
-    validate_scope_level(scope_level)?;
-    let match_rules = parse_match_rules(raw_match)?;
+    expires: Option<&'a str>,
+}
+
+fn create(project_root: &Path, args: CreateArgs<'_>) -> Result<()> {
+    validate_scope_level(args.scope_level)?;
+    let match_rules = parse_match_rules(args.raw_match)?;
 
     // Content: explicit flag, else stdin / $EDITOR.
-    let content = match content {
+    let content = match args.content {
         Some(text) => text,
         None => read_content_interactively("")?,
     };
@@ -196,22 +200,36 @@ fn create(
         bail!("guidance content is empty; pass --content or provide text in the editor");
     }
 
-    let slug_source = name.unwrap_or_else(|| raw_match.first().map_or("guidance", String::as_str));
+    let slug_source = args
+        .name
+        .unwrap_or_else(|| args.raw_match.first().map_or("guidance", String::as_str));
     let slug = slugify(slug_source);
     let id = format!("core:guidance:{slug}");
     let short_name = slug.rsplit('.').next().unwrap_or(&slug).to_owned();
 
     let conn = open_db(project_root)?;
+    // Non-atomic guard: a concurrent `create` for the same id between this read
+    // and the upsert below could race. Acceptable for a single-operator CLI;
+    // the worst case is the later writer's upsert overwriting the earlier sheet.
     if get_guidance_sheet(&conn, &id).into_anyhow()?.is_some() {
         bail!("guidance sheet {id} already exists; use `clarion guidance edit {id}`");
     }
 
+    // Normalise `--expires` *before* the write so the stored instant is
+    // byte-format-identical to the read path's `now` (the expiry compare is
+    // lexical, so a raw date-only or offset string would mis-order). Reject
+    // unparseable input up front, mirroring `validate_scope_level`.
+    let expires = args
+        .expires
+        .map(|raw| normalize_expires(&conn, raw))
+        .transpose()?;
+
     let now = now_iso8601(&conn)?;
     let mut properties = json!({
         "content": content,
-        "scope_level": scope_level,
+        "scope_level": args.scope_level,
         "match_rules": match_rules,
-        "pinned": pinned,
+        "pinned": args.pinned,
         "provenance": PROVENANCE_MANUAL,
         "authored_at": now,
     });
@@ -499,6 +517,36 @@ fn now_iso8601(conn: &Connection) -> Result<String> {
     Ok(ts)
 }
 
+/// Normalise an `--expires` value to a UTC instant in the exact
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ` shape the read path compares against. The expiry
+/// check (`crates/clarion-mcp/src/catalogue/inspection.rs`) is a *lexical*
+/// `expires < now` compare, so the stored string must be byte-format-identical
+/// to `now`: same UTC zone (`Z`), same 3-digit subsecond, same length. We run
+/// the input through the connection's own `strftime`, which:
+///   - accepts a full instant (`2026-12-31T23:59:59.999Z`), a date+time, an
+///     offset form (`…+02:00`, converted to UTC), or a bare date;
+///   - normalises a **date-only** value to **start-of-day UTC**
+///     (`2026-06-03` → `2026-06-03T00:00:00.000Z`); and
+///   - returns `NULL` for anything it cannot parse, which we reject.
+///
+/// # Errors
+///
+/// Returns an error if `raw` is not a parseable date/time.
+fn normalize_expires(conn: &Connection, raw: &str) -> Result<String> {
+    let normalized: Option<String> = conn
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', ?1)", [raw], |row| {
+            row.get(0)
+        })
+        .context("normalize --expires timestamp")?;
+    normalized.ok_or_else(|| {
+        anyhow!(
+            "--expires '{raw}' is not a valid date/time; use an ISO-8601 instant \
+             (e.g. 2026-12-31T23:59:59Z) or a date (e.g. 2026-12-31, taken as \
+             start-of-day UTC)"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,5 +664,54 @@ mod tests {
         assert!(ts.ends_with('Z'));
         assert_eq!(&ts[4..5], "-");
         assert_eq!(&ts[10..11], "T");
+    }
+
+    #[test]
+    fn normalize_expires_produces_now_compatible_format() {
+        let conn = Connection::open_in_memory().unwrap();
+        // A full instant round-trips byte-identically.
+        assert_eq!(
+            normalize_expires(&conn, "2026-12-31T23:59:59.999Z").unwrap(),
+            "2026-12-31T23:59:59.999Z"
+        );
+        // A bare date normalizes to start-of-day UTC, NOT a bare prefix that
+        // would sort below same-day instants and expire immediately.
+        assert_eq!(
+            normalize_expires(&conn, "2026-12-31").unwrap(),
+            "2026-12-31T00:00:00.000Z"
+        );
+        // An offset form is converted to UTC `Z`.
+        assert_eq!(
+            normalize_expires(&conn, "2026-06-03T12:00:00+02:00").unwrap(),
+            "2026-06-03T10:00:00.000Z"
+        );
+        // Every normalized value matches the `now` shape (24 chars, ends in Z).
+        for raw in ["2026-12-31", "2026-12-31T23:59:59Z", "2026-06-03 12:00:00"] {
+            let out = normalize_expires(&conn, raw).unwrap();
+            assert_eq!(out.len(), 24, "{raw} -> {out}");
+            assert!(out.ends_with('Z'), "{raw} -> {out}");
+        }
+    }
+
+    #[test]
+    fn normalize_expires_rejects_garbage() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(normalize_expires(&conn, "tomorrow").is_err());
+        assert!(normalize_expires(&conn, "not-a-date").is_err());
+        assert!(normalize_expires(&conn, "").is_err());
+    }
+
+    #[test]
+    fn normalize_expires_future_is_not_lexically_expired() {
+        // Proxy the read path's `expires < now` lexical compare: a future
+        // normalized expiry must sort *after* the current instant, so the read
+        // path will NOT treat the sheet as expired.
+        let conn = Connection::open_in_memory().unwrap();
+        let now = now_iso8601(&conn).unwrap();
+        let future = normalize_expires(&conn, "2999-01-01T00:00:00Z").unwrap();
+        assert!(
+            future > now,
+            "future expiry {future} must sort after now {now}"
+        );
     }
 }

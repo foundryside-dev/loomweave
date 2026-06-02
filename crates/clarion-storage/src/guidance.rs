@@ -29,7 +29,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 use crate::glob::glob_match;
-use crate::query::{entity_by_id, subsystem_of_entity};
+use crate::query::{EntityRow, entity_by_id, subsystem_of_entity};
 use crate::{Result, StorageError};
 
 /// The fully-resolved write payload for one guidance sheet. The caller (the CLI)
@@ -175,10 +175,14 @@ pub fn delete_guidance_sheet(conn: &Connection, id: &str) -> Result<bool> {
 
 /// True if `sheet` applies to the entity `entity_id`, evaluating its
 /// `match_rules` (path / tag / kind / subsystem / entity) against the entity's
-/// facts. This mirrors the read path's `rule_match` so CLI `list --for-entity`
-/// agrees with `guidance_for`. `wardline_group` rules are not evaluable here and
-/// never match (the Wardline blob is opaque to Clarion). Explicit `guides`-edge
-/// matches are NOT considered here — only `match_rules`.
+/// facts. Uses the shared [`rule_match`] dispatch, so CLI `list --for-entity`
+/// stays consistent with the MCP `guidance_for` read path on rule semantics.
+///
+/// This considers **`match_rules` only** — it deliberately ignores explicit
+/// `guides`-edge composition (which `guidance_for` *also* honours), so a `true`
+/// here means "a match rule fired", not "`guidance_for` would compose this sheet".
+/// `wardline_group` rules are not evaluable here and never match (the Wardline
+/// blob is opaque to Clarion).
 ///
 /// `project_root` is needed to compute the entity's project-relative path for
 /// `path` rules (the stored `source_file_path` is absolute).
@@ -202,15 +206,21 @@ pub fn guidance_sheet_matches_entity(
     if rules.is_empty() {
         return Ok(false);
     }
-    let Some(facts) = EntityMatchFacts::load(conn, entity_id, project_root)? else {
+    let Some(facts) = MatchFacts::from_entity_id(conn, entity_id, project_root)? else {
         return Ok(false);
     };
-    Ok(rules.iter().any(|rule| facts.matches(rule)))
+    Ok(rules
+        .iter()
+        .any(|rule| matches!(rule_match(rule, &facts), RuleVerdict::Matched(_))))
 }
 
-/// The minimum entity facts a `match_rules` evaluation needs. Mirrors the
-/// read-path `EntityFacts` in `clarion-mcp` (kept in sync deliberately).
-struct EntityMatchFacts {
+/// The minimum entity facts a guidance `match_rules` evaluation needs. This is
+/// the single source of truth shared by the CLI write path
+/// ([`guidance_sheet_matches_entity`]) and the MCP `guidance_for` read path —
+/// the read path builds one from an already-loaded `EntityRow`
+/// ([`MatchFacts::from_entity_row`]) to avoid a second lookup; the CLI resolves
+/// by id ([`MatchFacts::from_entity_id`]).
+pub struct MatchFacts {
     kind: String,
     rel_path: Option<String>,
     tags: HashSet<String>,
@@ -218,11 +228,19 @@ struct EntityMatchFacts {
     entity_id: String,
 }
 
-impl EntityMatchFacts {
-    fn load(conn: &Connection, entity_id: &str, project_root: &Path) -> Result<Option<Self>> {
-        let Some(entity) = entity_by_id(conn, entity_id)? else {
-            return Ok(None);
-        };
+impl MatchFacts {
+    /// Build facts from an already-loaded [`EntityRow`] (the read path has the
+    /// row in hand for the response, so it should not re-query).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Sqlite`] on any `SQLite` failure loading tags or
+    /// the entity's subsystem.
+    pub fn from_entity_row(
+        conn: &Connection,
+        entity: &EntityRow,
+        project_root: &Path,
+    ) -> Result<Self> {
         let rel_path = entity.source_file_path.as_ref().map(|path| {
             Path::new(path)
                 .strip_prefix(project_root)
@@ -241,42 +259,88 @@ impl EntityMatchFacts {
 
         let subsystem_id = subsystem_of_entity(conn, &entity.id)?.map(|found| found.subsystem_id);
 
-        Ok(Some(Self {
-            kind: entity.kind,
+        Ok(Self {
+            kind: entity.kind.clone(),
             rel_path,
             tags,
             subsystem_id,
-            entity_id: entity.id,
-        }))
+            entity_id: entity.id.clone(),
+        })
     }
 
-    fn matches(&self, rule: &Value) -> bool {
-        let Some(rule_type) = rule.get("type").and_then(Value::as_str) else {
-            return false;
+    /// Resolve an entity by id, then build its facts. Returns `None` when the id
+    /// is unknown.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Sqlite`] on any `SQLite` failure.
+    pub fn from_entity_id(
+        conn: &Connection,
+        entity_id: &str,
+        project_root: &Path,
+    ) -> Result<Option<Self>> {
+        let Some(entity) = entity_by_id(conn, entity_id)? else {
+            return Ok(None);
         };
-        match rule_type {
-            "path" => matches!(
-                (rule.get("pattern").and_then(Value::as_str), self.rel_path.as_deref()),
-                (Some(pattern), Some(path)) if glob_match(pattern, path)
-            ),
-            "tag" => rule
-                .get("value")
-                .and_then(Value::as_str)
-                .is_some_and(|v| self.tags.contains(v)),
-            "kind" => rule
-                .get("value")
-                .and_then(Value::as_str)
-                .is_some_and(|v| v == self.kind),
-            "subsystem" => matches!(
-                (rule.get("id").and_then(Value::as_str), self.subsystem_id.as_deref()),
-                (Some(id), Some(sub)) if id == sub
-            ),
-            "entity" => rule
-                .get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| id == self.entity_id),
-            // `wardline_group` and any unknown type are not evaluable here.
-            _ => false,
-        }
+        Ok(Some(Self::from_entity_row(conn, &entity, project_root)?))
+    }
+}
+
+/// The verdict of evaluating one guidance `match_rule` against an entity's
+/// [`MatchFacts`]. The `Matched(&'static str)` label is load-bearing: the MCP
+/// `guidance_for` read path surfaces it as the sheet's `matched_by` reason, and
+/// `Unevaluable` drives its `wardline_group` skip signal. Do not rename the
+/// labels.
+pub enum RuleVerdict {
+    /// The rule matched; the static label is the rule-type name (`"path"`,
+    /// `"tag"`, `"kind"`, `"subsystem"`, `"entity"`).
+    Matched(&'static str),
+    /// The rule did not match (or was malformed).
+    NoMatch,
+    /// The rule cannot be evaluated against static facts (`wardline_group`,
+    /// which would require parsing the opaque Wardline blob).
+    Unevaluable,
+}
+
+/// Evaluate one guidance `match_rule` (a `{"type": …, …}` object) against an
+/// entity's [`MatchFacts`]. The single shared dispatch behind both
+/// `guidance_sheet_matches_entity` (CLI) and `tool_guidance_for` (MCP), so the
+/// two surfaces cannot drift on rule semantics.
+#[must_use]
+pub fn rule_match(rule: &Value, facts: &MatchFacts) -> RuleVerdict {
+    let Some(rule_type) = rule.get("type").and_then(Value::as_str) else {
+        return RuleVerdict::NoMatch;
+    };
+    match rule_type {
+        "path" => match (
+            rule.get("pattern").and_then(Value::as_str),
+            facts.rel_path.as_deref(),
+        ) {
+            (Some(pattern), Some(path)) if glob_match(pattern, path) => {
+                RuleVerdict::Matched("path")
+            }
+            _ => RuleVerdict::NoMatch,
+        },
+        "tag" => match rule.get("value").and_then(Value::as_str) {
+            Some(value) if facts.tags.contains(value) => RuleVerdict::Matched("tag"),
+            _ => RuleVerdict::NoMatch,
+        },
+        "kind" => match rule.get("value").and_then(Value::as_str) {
+            Some(value) if value == facts.kind => RuleVerdict::Matched("kind"),
+            _ => RuleVerdict::NoMatch,
+        },
+        "subsystem" => match (
+            rule.get("id").and_then(Value::as_str),
+            facts.subsystem_id.as_deref(),
+        ) {
+            (Some(id), Some(sub)) if id == sub => RuleVerdict::Matched("subsystem"),
+            _ => RuleVerdict::NoMatch,
+        },
+        "entity" => match rule.get("id").and_then(Value::as_str) {
+            Some(id) if id == facts.entity_id => RuleVerdict::Matched("entity"),
+            _ => RuleVerdict::NoMatch,
+        },
+        "wardline_group" => RuleVerdict::Unevaluable,
+        _ => RuleVerdict::NoMatch,
     }
 }
