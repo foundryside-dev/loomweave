@@ -503,6 +503,16 @@ fn router(state: AppState) -> Router {
             "/api/wardline/taint-facts:batch-get",
             post(post_wardline_taint_facts_batch_get),
         )
+        // SEI read is a `by-sei` SUB-RESOURCE, not a `taint-facts:batch-get-by-sei`
+        // custom method: matchit 0.7 parses the existing `taint-facts:batch-get`
+        // as `[static taint-facts][param]`, whose param greedily eats every
+        // suffix — so a second colon custom-method on the same resource both
+        // (a) fails to register (Conflict) and (b) would be shadowed by the
+        // first. A distinct slash-segment sidesteps that cleanly.
+        .route(
+            "/api/wardline/taint-facts/by-sei",
+            post(post_wardline_taint_facts_batch_get_by_sei),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_http_identity_wardline,
@@ -747,6 +757,12 @@ struct CapabilitiesResponse {
     /// Stable Entity Identity (Wave 1 / WS1, ADR-038). Consumers degrade against
     /// a pre-SEI Clarion by reading `sei.supported`.
     sei: SeiCapability,
+    /// Wardline taint-store sub-capabilities (T3.4). `read_by_sei` advertises
+    /// the `POST /api/wardline/taint-facts/by-sei` route discretely: an older
+    /// SEI-capable Clarion has `sei.supported: true` but lacks this route, so
+    /// consumers MUST gate the rename-stable taint read on this flag rather
+    /// than on `sei.supported`.
+    taint_store: TaintStoreCapability,
 }
 
 #[derive(Debug, Serialize)]
@@ -758,6 +774,12 @@ struct LinkagesCapability {
 struct SeiCapability {
     supported: bool,
     version: u8,
+}
+
+#[derive(Debug, Serialize)]
+struct TaintStoreCapability {
+    /// `POST /api/wardline/taint-facts/by-sei` is served.
+    read_by_sei: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -898,6 +920,13 @@ struct TaintFactInput {
     scan_id: Option<String>,
     #[serde(default)]
     content_hash_at_compute: Option<String>,
+    /// Optional caller-supplied Stable Entity Identity (T3.4, migration 0006).
+    /// Opaque — stored verbatim, never parsed. When omitted, the write path
+    /// resolves the alive SEI for the resolved locator server-side. A
+    /// caller-supplied value wins (Wardline already holds the SEI from its
+    /// `SeiResolver`).
+    #[serde(default)]
+    sei: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -940,6 +969,30 @@ struct BatchGetRequest {
     #[serde(default)]
     project: String,
     qualnames: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchGetBySeiRequest {
+    #[serde(default)]
+    project: String,
+    /// Opaque SEIs (`clarion:eid:<hex>`). Treated verbatim — NO locator-shape
+    /// validation (SEI-shaped strings are the valid input here, the inverse of
+    /// the `resolve` REQ-F-02 rejection).
+    seis: Vec<String>,
+}
+
+/// One taint fact keyed by SEI (T3.4 read-by-SEI surface). Same fields as
+/// [`TaintFactView`] but keyed on the opaque `sei` instead of the qualname:
+/// `exists: false` when no SEI-tagged fact is stored for the SEI.
+#[derive(Debug, Serialize)]
+struct TaintFactBySeiView {
+    sei: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wardline_json: Option<Box<serde_json::value::RawValue>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_content_hash: Option<String>,
+    exists: bool,
 }
 
 async fn get_file(
@@ -1817,14 +1870,25 @@ async fn post_wardline_taint_facts(
 
     // Resolve every qualname EXACT-only on the reader pool, in input order, in
     // one pooled-connection checkout. Zip results back onto the facts by index
-    // (NOT a qualname->id map) so duplicate qualnames are handled correctly.
+    // (NOT a qualname->id map) so duplicate qualnames are handled correctly. In
+    // the SAME checkout, batch-resolve the alive SEI for every resolved locator
+    // (one chunked `IN`, not an N+1 of point lookups) so each fact can be
+    // stamped with its rename-stable SEI key (T3.4).
     let qualnames: Vec<String> = req.facts.iter().map(|f| f.qualname.clone()).collect();
     let resolution = state
         .readers
-        .with_reader(move |conn| clarion_storage::resolve_wardline_qualnames(conn, &qualnames))
+        .with_reader(move |conn| {
+            let resolved = clarion_storage::resolve_wardline_qualnames(conn, &qualnames)?;
+            let locators: Vec<String> = resolved
+                .iter()
+                .filter_map(|(_, r)| r.entity_id().map(str::to_owned))
+                .collect();
+            let seis = clarion_storage::seis_for_locators(conn, &locators)?;
+            Ok::<_, clarion_storage::StorageError>((resolved, seis))
+        })
         .await;
-    let resolved = match resolution {
-        Ok(pairs) => pairs,
+    let (resolved, seis_by_locator) = match resolution {
+        Ok(pair) => pair,
         Err(err) => return json_read_error(&err),
     };
 
@@ -1837,6 +1901,13 @@ async fn post_wardline_taint_facts(
             unresolved_qualnames.push(fact.qualname);
             continue;
         };
+        // SEI key: a caller-supplied value wins (opaque, verbatim); otherwise
+        // the alive binding resolved for this locator. `None` on a pre-SEI DB /
+        // unbound locator — the fact is still written, locator-keyed only.
+        let sei = fact
+            .sei
+            .clone()
+            .or_else(|| seis_by_locator.get(&entity_id).cloned());
         let taint_fact = clarion_storage::TaintFact {
             entity_id,
             // Opaque + byte-verbatim: `RawValue::get()` returns the original
@@ -1847,6 +1918,7 @@ async fn post_wardline_taint_facts(
             scan_id: fact.scan_id.or_else(|| batch_scan_id.clone()),
             content_hash_at_compute: fact.content_hash_at_compute.clone(),
             updated_at: updated_at.clone(),
+            sei,
         };
         let (ack_tx, ack_rx) = oneshot::channel();
         let cmd = clarion_storage::WriterCmd::UpsertWardlineTaintFact {
@@ -2056,6 +2128,112 @@ async fn post_wardline_taint_facts_batch_get(
     }
 }
 
+/// Shared read builder for the read-by-SEI taint-fact endpoint (T3.4).
+/// Mirrors [`respond_taint_facts`] but keys on the opaque SEI: for each SEI,
+/// fetch the most-recent SEI-tagged fact (regardless of the locator it was
+/// written under), parse the stored blob byte-faithfully, and derive the live
+/// whole-file `current_content_hash` from the fact's `source_file_path`. File
+/// hashing is DEDUPED per request by path. All DB work + hashing run in ONE
+/// pooled-connection checkout. A SEI with no stored fact → `exists: false`.
+async fn respond_taint_facts_by_sei(
+    state: &AppState,
+    seis: Vec<String>,
+) -> Result<Vec<TaintFactBySeiView>, Response> {
+    let project_root = state.project_root.clone();
+    let result = state
+        .readers
+        .with_reader(move |conn| {
+            // Most-recent fact per SEI (rename-stable lookup).
+            let rows = clarion_storage::get_taint_facts_by_sei(conn, &seis)?;
+            let by_sei: std::collections::HashMap<String, clarion_storage::TaintFactRow> = rows
+                .into_iter()
+                .filter_map(|row| row.sei.clone().map(|sei| (sei, row)))
+                .collect();
+
+            let mut file_hash_cache: std::collections::HashMap<String, Option<String>> =
+                std::collections::HashMap::new();
+            let mut views = Vec::with_capacity(seis.len());
+            // Emit one view per input SEI, in input order. A duplicate input
+            // SEI yields a duplicate view (input shape is the client's).
+            for sei in seis {
+                let view = match by_sei.get(&sei) {
+                    Some(row) => {
+                        // Byte-faithful re-parse: the stored string is exactly
+                        // what the write path persisted from a RawValue. A parse
+                        // error is a storage-integrity failure, not a 404.
+                        let wardline_json =
+                            serde_json::value::RawValue::from_string(row.wardline_json.clone())
+                                .map_err(|e| {
+                                    StorageError::Corruption(format!(
+                                        "stored wardline_json for {} is not valid JSON: {e}",
+                                        row.entity_id
+                                    ))
+                                })?;
+                        let current_content_hash = match &row.source_file_path {
+                            Some(path) => file_hash_cache
+                                .entry(path.clone())
+                                .or_insert_with(|| {
+                                    clarion_storage::current_file_hash(&project_root, path)
+                                })
+                                .clone(),
+                            None => None,
+                        };
+                        TaintFactBySeiView {
+                            sei,
+                            wardline_json: Some(wardline_json),
+                            current_content_hash,
+                            exists: true,
+                        }
+                    }
+                    None => TaintFactBySeiView {
+                        sei,
+                        wardline_json: None,
+                        current_content_hash: None,
+                        exists: false,
+                    },
+                };
+                views.push(view);
+            }
+            Ok(views)
+        })
+        .await;
+    result.map_err(|err| json_read_error(&err))
+}
+
+/// Read taint facts by SEI (T3.4). The rename-survival surface: a fact written
+/// under a former locator is retrievable by its stable SEI after a rename.
+/// Reads only — served regardless of `state.taint_writer`. Opaque inputs: no
+/// locator-shape validation, blank SEIs are dropped.
+async fn post_wardline_taint_facts_batch_get_by_sei(
+    State(state): State<AppState>,
+    body: Result<Json<BatchGetBySeiRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(json) => json,
+        Err(rej) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidPath,
+                &rej.body_text(),
+            );
+        }
+    };
+    if let Some(resp) = state.reject_project_mismatch(&req.project) {
+        return resp;
+    }
+    if req.seis.len() > WARDLINE_TAINT_BATCH_MAX {
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorCode::BatchTooLarge,
+            "too many seis in one request",
+        );
+    }
+    match respond_taint_facts_by_sei(&state, req.seis).await {
+        Ok(views) => (StatusCode::OK, Json(views)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
 fn log_taint_write_error(err: &StorageError) {
     let error_chain = format_error_chain(err);
     tracing::dispatcher::with_default(&HTTP_ERROR_DISPATCH, || {
@@ -2163,6 +2341,7 @@ async fn get_capabilities(State(state): State<AppState>) -> Json<CapabilitiesRes
             supported: true,
             version: 1,
         },
+        taint_store: TaintStoreCapability { read_by_sei: true },
     })
 }
 
@@ -4383,5 +4562,171 @@ mod tests {
         let response = router(state).oneshot(request).await.expect("oneshot");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(json_body(response).await["linkages"]["http"], true);
+    }
+
+    #[tokio::test]
+    async fn capabilities_reports_taint_store_read_by_sei_true() {
+        use tower::ServiceExt;
+        // Discrete from `sei.supported`: an older SEI-capable Clarion would set
+        // `sei.supported: true` yet lack this route, so consumers gate the
+        // rename-stable taint read on this flag specifically.
+        let (state, _tempdir) = linkage_test_state("linkage-secret", &[], &[]);
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/v1/_capabilities")
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(response).await["taint_store"]["read_by_sei"],
+            true
+        );
+    }
+
+    /// T3.4 end-to-end oracle: a taint fact written before a rename is still
+    /// retrievable by its stable SEI after the rename, while a read by the new
+    /// locator correctly returns nothing until a re-scan writes under it.
+    #[tokio::test]
+    async fn wardline_taint_fact_survives_rename_via_sei() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let old = "python:function:old.pkg.fn";
+        let new = "python:function:new.pkg.fn";
+        let sei = "clarion:eid:rename-stable";
+        // Both pre- and post-rename entity rows exist (entities is cumulative).
+        let (state, db_path, _writer, _tempdir) = wardline_write_test_state(secret, &[old, new]);
+
+        // Alive SEI binding at the OLD locator, as it stands at write time.
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open db");
+            conn.execute(
+                "INSERT INTO sei_bindings \
+                    (sei, current_locator, body_hash, signature, status, \
+                     born_run_id, updated_run_id, updated_at) \
+                 VALUES (?1, ?2, NULL, NULL, 'alive', 'run-0', 'run-0', 't')",
+                rusqlite::params![sei, old],
+            )
+            .expect("insert binding");
+        }
+
+        // 1. Write a fact for the OLD qualname. The request omits `sei`; the
+        //    server resolves and stamps it from the alive binding.
+        let write_body =
+            br#"{"facts":[{"qualname":"old.pkg.fn","wardline_json":{"taint":"EXTERNAL"}}]}"#;
+        let write = hmac_request(secret, "POST", "/api/wardline/taint-facts", write_body);
+        let resp = router(state.clone()).oneshot(write).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The fact stored under the OLD locator carries the resolved SEI.
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open db");
+            let stored: Option<String> = conn
+                .query_row(
+                    "SELECT sei FROM wardline_taint_facts WHERE entity_id = ?1",
+                    rusqlite::params![old],
+                    |r| r.get(0),
+                )
+                .expect("query stored sei");
+            assert_eq!(
+                stored.as_deref(),
+                Some(sei),
+                "write must auto-populate the SEI from the alive binding"
+            );
+        }
+
+        // 2. Simulate the rename: the binding's current_locator flips OLD→NEW.
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open db");
+            conn.execute(
+                "UPDATE sei_bindings SET current_locator = ?1 WHERE sei = ?2",
+                rusqlite::params![new, sei],
+            )
+            .expect("flip binding locator");
+        }
+
+        // 3. read-by-SEI still returns the fact (stored under the dead locator).
+        let by_sei_body = serde_json::json!({ "seis": [sei] }).to_string();
+        let by_sei = hmac_request(
+            secret,
+            "POST",
+            "/api/wardline/taint-facts/by-sei",
+            by_sei_body.as_bytes(),
+        );
+        let resp = router(state.clone())
+            .oneshot(by_sei)
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let parsed = json_body(resp).await;
+        let arr = parsed.as_array().expect("array");
+        assert_eq!(arr.len(), 1, "one view per input SEI");
+        assert_eq!(arr[0]["sei"], sei);
+        assert_eq!(
+            arr[0]["exists"], true,
+            "the fact survives the rename via its stable SEI"
+        );
+        assert_eq!(arr[0]["wardline_json"]["taint"], "EXTERNAL");
+
+        // 4. read-by-NEW-locator returns nothing until a re-scan writes there.
+        let by_new = hmac_request(
+            secret,
+            "GET",
+            "/api/wardline/taint-facts?qualname=new.pkg.fn",
+            b"",
+        );
+        let resp = router(state).oneshot(by_new).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(resp).await["exists"],
+            false,
+            "no fact under the new locator until re-scan"
+        );
+    }
+
+    /// An unknown SEI yields an honest `exists: false` view, in input order,
+    /// never a fabricated row or an error.
+    #[tokio::test]
+    async fn wardline_taint_by_sei_unknown_reports_not_exists() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let (state, _db_path, _writer, _tempdir) =
+            wardline_write_test_state(secret, &["python:function:a.b.c"]);
+        let body = serde_json::json!({ "seis": ["clarion:eid:nope"] }).to_string();
+        let request = hmac_request(
+            secret,
+            "POST",
+            "/api/wardline/taint-facts/by-sei",
+            body.as_bytes(),
+        );
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let parsed = json_body(response).await;
+        let arr = parsed.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["sei"], "clarion:eid:nope");
+        assert_eq!(arr[0]["exists"], false);
+        assert!(arr[0].get("wardline_json").is_none());
+    }
+
+    /// The read-by-SEI route is HMAC-gated like the rest of the wardline group.
+    #[tokio::test]
+    async fn wardline_taint_by_sei_requires_identity() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let (state, _db_path, _writer, _tempdir) =
+            wardline_write_test_state(secret, &["python:function:a.b.c"]);
+        // No HMAC signature — a bare request must be rejected.
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/wardline/taint-facts/by-sei")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"seis":["clarion:eid:x"]}"#))
+            .expect("build request");
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

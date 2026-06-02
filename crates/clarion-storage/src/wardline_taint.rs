@@ -4,7 +4,7 @@
 //! Clarion's `canonical_qualified_name`, so resolution is a direct existence
 //! lookup of `python:function:<qualname>`. Heuristic tier is Flow B B.2.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::{Connection, params};
 
@@ -95,6 +95,14 @@ pub struct TaintFact {
     pub scan_id: Option<String>,
     pub content_hash_at_compute: Option<String>,
     pub updated_at: String,
+    /// The fact's Stable Entity Identity at write time (T3.4, migration 0006).
+    /// A SECOND, rename-stable lookup key alongside the locator `entity_id`:
+    /// the write path resolves the alive `sei_bindings` row for `entity_id`
+    /// (or accepts a caller-supplied SEI), so a fact stays retrievable by SEI
+    /// after the entity is renamed. `None` on a pre-SEI database / unbound
+    /// locator (graceful degrade — the fact is still locator-keyed). Opaque:
+    /// stored and matched verbatim, never parsed.
+    pub sei: Option<String>,
 }
 
 /// Upsert one taint fact (per-entity replace). Idempotent on `entity_id`.
@@ -102,19 +110,21 @@ pub struct TaintFact {
 pub fn upsert_taint_fact(conn: &Connection, fact: &TaintFact) -> Result<()> {
     conn.execute(
         "INSERT INTO wardline_taint_facts \
-            (entity_id, wardline_json, scan_id, content_hash_at_compute, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5) \
+            (entity_id, wardline_json, scan_id, content_hash_at_compute, updated_at, sei) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
          ON CONFLICT(entity_id) DO UPDATE SET \
             wardline_json = excluded.wardline_json, \
             scan_id = excluded.scan_id, \
             content_hash_at_compute = excluded.content_hash_at_compute, \
-            updated_at = excluded.updated_at",
+            updated_at = excluded.updated_at, \
+            sei = excluded.sei",
         params![
             fact.entity_id,
             fact.wardline_json,
             fact.scan_id,
             fact.content_hash_at_compute,
             fact.updated_at,
+            fact.sei,
         ],
     )?;
     Ok(())
@@ -134,6 +144,10 @@ pub struct TaintFactRow {
     /// `current_content_hash` from it (see `query::current_file_hash`). `None`
     /// only if the entity row has no `source_file_path`.
     pub source_file_path: Option<String>,
+    /// The SEI stored on the fact at write time (migration 0006). `None` for a
+    /// pre-SEI fact. The read-by-SEI surface keys on this; the locator read
+    /// surface ignores it.
+    pub sei: Option<String>,
 }
 
 /// Fetch taint facts for a set of already-resolved entity ids. Returns ONLY
@@ -154,7 +168,7 @@ pub fn get_taint_facts(conn: &Connection, entity_ids: &[String]) -> Result<Vec<T
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "SELECT f.entity_id, f.wardline_json, e.source_file_path \
+            "SELECT f.entity_id, f.wardline_json, e.source_file_path, f.sei \
                FROM wardline_taint_facts f \
                JOIN entities e ON e.id = f.entity_id \
               WHERE f.entity_id IN ({placeholders})"
@@ -165,6 +179,7 @@ pub fn get_taint_facts(conn: &Connection, entity_ids: &[String]) -> Result<Vec<T
                 entity_id: row.get::<_, String>(0)?,
                 wardline_json: row.get::<_, String>(1)?,
                 source_file_path: row.get::<_, Option<String>>(2)?,
+                sei: row.get::<_, Option<String>>(3)?,
             })
         })?;
         for row in fetched {
@@ -172,6 +187,106 @@ pub fn get_taint_facts(conn: &Connection, entity_ids: &[String]) -> Result<Vec<T
         }
     }
     Ok(rows)
+}
+
+/// Fetch the **most-recent** taint fact per SEI (T3.4, migration 0006).
+///
+/// The read-by-SEI surface: given a set of opaque SEIs, return each one's
+/// latest fact regardless of which locator it was written under — so a fact
+/// written before a rename is still retrievable after it. Strictly keyed on
+/// the stored `sei` column; a `NULL`-SEI (pre-migration) fact is not reachable
+/// here (it is still reachable by locator via [`get_taint_facts`]).
+///
+/// A single SEI can match more than one row only when a caller writes explicit
+/// SEIs that collide (server-populated SEIs cannot — `ux_sei_alive_locator`
+/// enforces one alive locator per SEI); ordering by `updated_at DESC, rowid
+/// DESC` makes the winner deterministic. The reduce is done in Rust (rows-per-
+/// SEI is tiny) rather than a `GROUP BY` over bare columns. Returns at most one
+/// row per input SEI; SEIs with no stored fact are simply absent. The caller
+/// derives the live whole-file freshness hash from `source_file_path`; this
+/// function does NOT read the filesystem.
+pub fn get_taint_facts_by_sei(conn: &Connection, seis: &[String]) -> Result<Vec<TaintFactRow>> {
+    if seis.is_empty() {
+        return Ok(Vec::new());
+    }
+    // sei -> most-recent row. Rows arrive most-recent-first (ORDER BY below),
+    // so `or_insert` keeps the winner.
+    let mut chosen: HashMap<String, TaintFactRow> = HashMap::new();
+    for chunk in seis.chunks(500) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        // ORDER BY (updated_at, rowid) DESC: the first row seen per SEI is the
+        // most-recent write, deterministically (rowid breaks an updated_at tie).
+        let sql = format!(
+            "SELECT f.entity_id, f.wardline_json, e.source_file_path, f.sei \
+               FROM wardline_taint_facts f \
+               JOIN entities e ON e.id = f.entity_id \
+              WHERE f.sei IN ({placeholders}) \
+              ORDER BY f.updated_at DESC, f.rowid DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let fetched = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            Ok(TaintFactRow {
+                entity_id: row.get::<_, String>(0)?,
+                wardline_json: row.get::<_, String>(1)?,
+                source_file_path: row.get::<_, Option<String>>(2)?,
+                sei: row.get::<_, Option<String>>(3)?,
+            })
+        })?;
+        for row in fetched {
+            let row = row.map_err(StorageError::from)?;
+            if let Some(sei) = row.sei.clone() {
+                chosen.entry(sei).or_insert(row);
+            }
+        }
+    }
+    // Emit at most one row per input SEI, in input order, first occurrence wins.
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut out = Vec::new();
+    for sei in seis {
+        if seen.insert(sei.as_str())
+            && let Some(row) = chosen.remove(sei)
+        {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve the alive SEI for each of a set of locators in one batched query
+/// (chunked `IN`). Returns a `locator -> sei` map containing only locators
+/// that have an alive `sei_bindings` row. Used by the taint-fact write path to
+/// stamp the SEI on each fact without an N+1 of per-locator point lookups.
+///
+/// A pre-SEI database / unbound locator is simply absent from the map (the
+/// fact is then written with `sei = NULL` — graceful degrade).
+pub fn seis_for_locators(
+    conn: &Connection,
+    locators: &[String],
+) -> Result<HashMap<String, String>> {
+    if locators.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut out = HashMap::new();
+    for chunk in locators.chunks(500) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT current_locator, sei FROM sei_bindings \
+              WHERE status = 'alive' AND current_locator IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let fetched = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in fetched {
+            let (locator, sei) = row.map_err(StorageError::from)?;
+            out.insert(locator, sei);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -295,6 +410,7 @@ mod tests {
                 scan_id: Some("scan-1".to_owned()),
                 content_hash_at_compute: Some("deadbeef".to_owned()),
                 updated_at: "2026-05-31T00:00:00.000Z".to_owned(),
+                sei: None,
             },
         )
         .unwrap();
@@ -316,6 +432,7 @@ mod tests {
             scan_id: None,
             content_hash_at_compute: None,
             updated_at: "t".to_owned(),
+            sei: None,
         };
         // Multi-key blobs whose contents differ only by key ORDER: a naive
         // overwrite that compared parsed JSON (or kept the first write) would
@@ -354,6 +471,7 @@ mod tests {
                 scan_id: None,
                 content_hash_at_compute: None,
                 updated_at: "t".to_owned(),
+                sei: None,
             },
         )
         .unwrap();
@@ -392,6 +510,7 @@ mod tests {
                 scan_id: None,
                 content_hash_at_compute: None,
                 updated_at: "t".to_owned(),
+                sei: None,
             },
         )
         .unwrap();
@@ -414,5 +533,176 @@ mod tests {
                 .is_empty(),
             "deleting the entity must cascade-delete its taint fact"
         );
+    }
+
+    /// Insert an `sei_bindings` row directly (tests for the SEI-keyed read /
+    /// the batched locator→SEI lookup). `status` is 'alive' or 'orphaned'.
+    fn insert_binding(conn: &Connection, sei: &str, locator: &str, status: &str) {
+        conn.execute(
+            "INSERT INTO sei_bindings \
+                (sei, current_locator, body_hash, signature, status, \
+                 born_run_id, updated_run_id, updated_at) \
+             VALUES (?1, ?2, NULL, NULL, ?3, 'run-0', 'run-0', 't')",
+            params![sei, locator, status],
+        )
+        .unwrap();
+    }
+
+    fn mk_fact(entity_id: &str, json: &str, updated_at: &str, sei: Option<&str>) -> TaintFact {
+        TaintFact {
+            entity_id: entity_id.to_owned(),
+            wardline_json: json.to_owned(),
+            scan_id: None,
+            content_hash_at_compute: None,
+            updated_at: updated_at.to_owned(),
+            sei: sei.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn upsert_persists_sei_and_fetch_returns_it() {
+        let conn = migrated_conn();
+        insert_entity(&conn, "python:function:a.b.c", None);
+        upsert_taint_fact(
+            &conn,
+            &mk_fact(
+                "python:function:a.b.c",
+                r#"{"v":1}"#,
+                "t",
+                Some("clarion:eid:abc123"),
+            ),
+        )
+        .unwrap();
+        let rows = get_taint_facts(&conn, &["python:function:a.b.c".to_owned()]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sei.as_deref(), Some("clarion:eid:abc123"));
+    }
+
+    #[test]
+    fn by_sei_returns_most_recent_across_two_locators() {
+        // T3.4 storage oracle. A fact is written under locator L1, then the
+        // entity is renamed to L2 and re-scanned: a second fact is written
+        // under L2 carrying the SAME SEI. read-by-SEI must return the L2 fact
+        // (most recent), regardless of which locator each was written under.
+        let conn = migrated_conn();
+        insert_entity(&conn, "python:function:old.name", None);
+        insert_entity(&conn, "python:function:new.name", None);
+        let sei = "clarion:eid:stable";
+        upsert_taint_fact(
+            &conn,
+            &mk_fact(
+                "python:function:old.name",
+                r#"{"gen":1}"#,
+                "2026-01-01T00:00:00.000Z",
+                Some(sei),
+            ),
+        )
+        .unwrap();
+        upsert_taint_fact(
+            &conn,
+            &mk_fact(
+                "python:function:new.name",
+                r#"{"gen":2}"#,
+                "2026-02-01T00:00:00.000Z",
+                Some(sei),
+            ),
+        )
+        .unwrap();
+        let rows = get_taint_facts_by_sei(&conn, &[sei.to_owned()]).unwrap();
+        assert_eq!(rows.len(), 1, "exactly one row per SEI");
+        assert_eq!(rows[0].entity_id, "python:function:new.name");
+        assert_eq!(rows[0].wardline_json, r#"{"gen":2}"#);
+    }
+
+    #[test]
+    fn by_sei_returns_pre_rename_fact_when_only_old_locator_written() {
+        // Before the post-rename re-scan, only the fact under the OLD locator
+        // exists. read-by-SEI must still return it (it is stranded under the
+        // dead locator otherwise — the whole point of T3.4).
+        let conn = migrated_conn();
+        insert_entity(&conn, "python:function:old.name", None);
+        let sei = "clarion:eid:stable";
+        upsert_taint_fact(
+            &conn,
+            &mk_fact("python:function:old.name", r#"{"gen":1}"#, "t", Some(sei)),
+        )
+        .unwrap();
+        let rows = get_taint_facts_by_sei(&conn, &[sei.to_owned()]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "python:function:old.name");
+    }
+
+    #[test]
+    fn by_sei_omits_null_sei_facts_and_unknown_seis() {
+        let conn = migrated_conn();
+        insert_entity(&conn, "python:function:untagged", None);
+        // A pre-migration fact (sei = NULL) is NOT reachable by SEI.
+        upsert_taint_fact(
+            &conn,
+            &mk_fact("python:function:untagged", r#"{"v":1}"#, "t", None),
+        )
+        .unwrap();
+        assert!(
+            get_taint_facts_by_sei(&conn, &["clarion:eid:nope".to_owned()])
+                .unwrap()
+                .is_empty(),
+            "an unknown SEI matches nothing"
+        );
+    }
+
+    #[test]
+    fn by_sei_empty_input_returns_empty() {
+        let conn = migrated_conn();
+        assert!(get_taint_facts_by_sei(&conn, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn by_sei_dedups_duplicate_input_seis() {
+        let conn = migrated_conn();
+        insert_entity(&conn, "python:function:a.b.c", None);
+        let sei = "clarion:eid:dup";
+        upsert_taint_fact(
+            &conn,
+            &mk_fact("python:function:a.b.c", r#"{"v":1}"#, "t", Some(sei)),
+        )
+        .unwrap();
+        let rows = get_taint_facts_by_sei(&conn, &[sei.to_owned(), sei.to_owned()]).unwrap();
+        assert_eq!(rows.len(), 1, "a repeated input SEI yields one row");
+    }
+
+    #[test]
+    fn seis_for_locators_returns_only_alive_bindings() {
+        let conn = migrated_conn();
+        insert_binding(&conn, "clarion:eid:alive", "python:function:live", "alive");
+        insert_binding(
+            &conn,
+            "clarion:eid:dead",
+            "python:function:gone",
+            "orphaned",
+        );
+        let map = seis_for_locators(
+            &conn,
+            &[
+                "python:function:live".to_owned(),
+                "python:function:gone".to_owned(),
+                "python:function:never".to_owned(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            map.get("python:function:live").map(String::as_str),
+            Some("clarion:eid:alive")
+        );
+        assert!(
+            !map.contains_key("python:function:gone"),
+            "an orphaned binding is not a live SEI"
+        );
+        assert!(!map.contains_key("python:function:never"));
+    }
+
+    #[test]
+    fn seis_for_locators_empty_input_returns_empty() {
+        let conn = migrated_conn();
+        assert!(seis_for_locators(&conn, &[]).unwrap().is_empty());
     }
 }

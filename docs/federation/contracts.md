@@ -452,6 +452,9 @@ Successful response:
   "sei": {
     "supported": true,
     "version": 1
+  },
+  "taint_store": {
+    "read_by_sei": true
   }
 }
 ```
@@ -471,6 +474,13 @@ locators (per ADR-038 / the Loom SEI standard §4).
 see [§Call-graph linkages](#call-graph-linkages)). A consumer (e.g. the
 dossier assembler) should gate its use of those routes on this flag rather
 than probing the routes directly.
+
+`taint_store.read_by_sei: true` advertises the rename-stable taint read route
+([`POST /api/wardline/taint-facts/by-sei`](#post-apiwardlinetaint-factsby-sei-read-batch-by-sei),
+T3.4). It is **discrete from `sei.supported`** deliberately: an older SEI-capable
+Clarion sets `sei.supported: true` but predates this route, so a consumer must
+gate the by-SEI taint read on **this** flag and fall back to the locator-keyed
+read when it is absent.
 
 `api_version` is the HTTP read API wire-contract version, not Clarion product
 semver. It increments only for incompatible changes to the wire contract
@@ -593,6 +603,14 @@ only the **join key** — the SEI from `resolve` — which both Filigree associa
 and Wardline taint facts key on. Routing Filigree data through Clarion would
 violate the enrich-only axiom (`loom.md` §5: Clarion serves slices, it does not
 assemble or aggregate sibling data). This is a deliberate decision, not a gap.
+
+**Wardline's taint axis stays rename-correct via the SEI, not the locator.** A
+taint fact Wardline stored before a rename is retrievable afterward through
+[`POST /api/wardline/taint-facts/by-sei`](#post-apiwardlinetaint-factsby-sei-read-batch-by-sei)
+(T3.4) — the concrete mechanism behind this section's "stays correct after a
+rename" promise for the taint slice. The fact is keyed on the same stable SEI the
+rest of the dossier joins on, so a rename surfaces on the identity axis while the
+taint fact remains reachable. Gate on `taint_store.read_by_sei`.
 
 **`scc_peers` is not directly HTTP-reachable.** The dossier envelope lists
 `scc_peers[]`; Clarion exposes subsystem *clustering*
@@ -918,6 +936,14 @@ parsing the body. Request body (`application/json`, max 4 MiB):
   (queryable columns); Clarion does **not** parse them out of the blob. The
   per-fact `scan_id` falls back to the batch-level `scan_id` when absent. Both are
   optional.
+- `sei` (optional, per fact) is the fact's **Stable Entity Identity** — a second,
+  rename-stable lookup key (see
+  [`POST /api/wardline/taint-facts/by-sei`](#post-apiwardlinetaint-factsby-sei-read-batch-by-sei)).
+  When **omitted**, Clarion resolves it server-side from the alive `sei_bindings`
+  row for the fact's resolved locator (batched, one query for the whole request);
+  when **present**, the caller-supplied value wins and is stored **verbatim**
+  (opaque — Clarion never parses `clarion:eid:<hex>`). A fact written on a pre-SEI
+  database / unbound locator stores `sei = null` and is reachable by locator only.
 
 Successful response (`200 OK`):
 
@@ -1016,6 +1042,75 @@ Failure modes:
 | 403 | `PROJECT_MISMATCH` | Non-empty `project` does not match the served project. |
 | 413 | `BATCH_TOO_LARGE` | `qualnames.len() > 2000` (batch). |
 | 413 | n/a | Request body exceeds the 4 MiB cap (batch, transport-level). |
+| 500/503 | `STORAGE_ERROR` / `INTERNAL` | Storage failure. |
+
+### `POST /api/wardline/taint-facts/by-sei` (read, batch by SEI)
+
+The **rename-stable** read surface (T3.4). A taint fact written under one locator
+stays retrievable after the entity is renamed, because the write path stamps the
+fact's [SEI](#sei-identity-resolution) on it (migration `0006`, additive nullable
+`sei` column — no primary-key change) and this route looks up by that SEI rather
+than the locator. Served **regardless of whether the write API is enabled**, and
+HMAC-gated like the rest of the `/api/wardline/*` group.
+
+Gate on the discrete capability flag
+[`taint_store.read_by_sei`](#get-apiv1_capabilities), **not** on `sei.supported`:
+an older SEI-capable Clarion advertises `sei.supported: true` yet predates this
+route.
+
+Request body (`application/json`, max 4 MiB): `{ "project"?, "seis": [..] }`.
+The `seis` are **opaque** — taken verbatim with no locator-shape validation (SEI-
+shaped strings are the valid input here, the inverse of the `resolve` REQ-F-02
+rejection). Blank entries match nothing. Returns a **bare JSON array** of view
+objects, **one per input SEI, in input order**:
+
+```json
+[
+  {
+    "sei": "clarion:eid:9f2c…",
+    "wardline_json": {"taint": "tainted"},
+    "current_content_hash": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9",
+    "exists": true
+  },
+  {"sei": "clarion:eid:deadbeef", "exists": false}
+]
+```
+
+The view has the same field discipline as the qualname read, keyed on `sei`
+instead of `qualname`:
+
+- `sei` — echoed back so the client correlates without re-ordering.
+- `exists` — `true` when a SEI-tagged fact is stored for the SEI; `false` when no
+  fact carries it (unknown SEI, or a pre-migration `sei = null` fact — reachable by
+  locator only).
+- `wardline_json` — the stored blob, **byte-verbatim**; **field-absent** when
+  `exists` is `false`.
+- `current_content_hash` — the **live** freshness signal, derived from the
+  containing file of the **fact's own** (possibly former) locator; field-absent
+  when `exists` is `false` or the file is deleted/unreadable.
+
+**Most-recent wins.** When a fact exists under both a former and the current
+locator for one SEI (e.g. after a post-rename re-scan rewrites it), the latest by
+`updated_at` is returned (ties broken deterministically). So a consumer reading by
+SEI converges on the freshest fact as Wardline re-scans, while still seeing the
+pre-rescan fact in the window before it.
+
+**Pre-migration window (named, not hidden).** A fact written *before* migration
+`0006` carries `sei = null`. If its entity is renamed *before* its next re-scan,
+it is stranded under both the dead locator (resolution now points elsewhere) and
+this route (no SEI tag) until Wardline recomputes — the freshness gate surfaces it
+as stale, Wardline rewrites it, and the `sei` is populated. This is self-healing
+by design; Clarion does **not** backfill historical rows.
+
+Failure modes:
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `INVALID_PATH` | Invalid `{"seis": [...]}` body. |
+| 401 | `UNAUTHENTICATED` | HMAC/bearer auth missing or wrong (when configured). |
+| 403 | `PROJECT_MISMATCH` | Non-empty `project` does not match the served project. |
+| 413 | `BATCH_TOO_LARGE` | `seis.len() > 2000`. |
+| 413 | n/a | Request body exceeds the 4 MiB cap (transport-level). |
 | 500/503 | `STORAGE_ERROR` / `INTERNAL` | Storage failure. |
 
 ### Freshness contract

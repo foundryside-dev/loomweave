@@ -68,3 +68,35 @@ qualname conformance per Round 1 + the shared corpus; Wardline owns the fresh/st
 decision (Clarion supplies `current_content_hash`, you decide).
 
 Route-backs welcome on any shape — the capability is the contract.
+
+---
+
+## Addendum (T3.4): rename-stable read-by-SEI
+
+Additive extension, shipped after the original SP9 surface. It closes T3.4 — *a
+taint fact survives a rename* — without a primary-key change or a backfill, so it
+is safe to ship ahead of the suite-wide SEI cutover (Option A of the two we
+weighed; the alternative hard re-key to `sei` PRIMARY KEY was rejected as it would
+force write-ordering + a one-shot backfill into the coordinated cutover).
+
+- **Storage:** migration `0006` adds a nullable `sei TEXT` column (+ partial
+  index) to `wardline_taint_facts`. Facts stay locator-keyed; `sei` is a *second*,
+  rename-stable lookup key.
+- **Write:** `POST /api/wardline/taint-facts` accepts an optional opaque `sei` per
+  fact. Omitted ⇒ Clarion resolves it from the alive `sei_bindings` row for the
+  resolved locator (batched). Supplied ⇒ stored verbatim. Pre-SEI/unbound ⇒ `null`
+  (locator-keyed only). You already hold the SEI from `SeiResolver`, so sending it
+  is the fast path.
+- **Read:** `POST /api/wardline/taint-facts/by-sei` (body `{ project?, seis: [] }`)
+  returns the most-recent fact per SEI regardless of the locator it was written
+  under, with the same live whole-file `current_content_hash`. HMAC-gated; SEIs
+  opaque (no locator-shape validation).
+- **Detection:** gate on the discrete `taint_store.read_by_sei` capability flag,
+  **not** `sei.supported` (an older SEI-capable Clarion lacks this route). Fall
+  back to the locator-keyed read when absent.
+- **Named window:** a fact written *before* migration `0006` (`sei = null`) whose
+  entity is renamed *before* its next re-scan is reachable by neither key until you
+  recompute — the freshness gate surfaces it as stale and the rewrite populates the
+  `sei`. Self-healing; Clarion does not backfill historical rows.
+
+Full shapes pinned in [`contracts.md`](./contracts.md#post-apiwardlinetaint-factsby-sei-read-batch-by-sei).

@@ -342,6 +342,7 @@ async fn upsert_wardline_taint_fact_persists() {
             scan_id: Some("scan-1".to_owned()),
             content_hash_at_compute: Some("hash".to_owned()),
             updated_at: now_iso(),
+            sei: None,
         }),
         ack,
     })
