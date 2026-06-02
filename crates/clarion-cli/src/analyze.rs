@@ -49,6 +49,15 @@ use crate::stats::P95Accumulator;
 
 const WEAK_MODULARITY_RULE_ID: &str = "CLA-FACT-CLUSTERING-WEAK-MODULARITY";
 
+/// REQ-ANALYZE-04: one finding per entity that vanished from source since the
+/// prior run (deletion detection, Phase 7).
+const ENTITY_DELETED_RULE_ID: &str = "CLA-FACT-ENTITY-DELETED";
+
+/// REQ-ANALYZE-04: a guidance sheet whose explicit `guides` edge now points at a
+/// deleted entity — the guidance is stranded and should not enrich briefings for
+/// an entity that no longer exists.
+const GUIDANCE_ORPHAN_RULE_ID: &str = "CLA-FACT-GUIDANCE-ORPHAN";
+
 /// REQ-ANALYZE-06 "no silent fallbacks": a Python file that fails `ast.parse`
 /// is surfaced by the plugin as a degraded `module` entity carrying
 /// `parse_status="syntax_error"` (extractor.py). The core mints a persisted
@@ -1084,6 +1093,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                         minted = stats.minted,
                         carried = stats.carried,
                         orphaned = stats.orphaned,
+                        deletion_findings = stats.deletion_findings,
                         "SEI mint pass complete"
                     ),
                     Err(e) => tracing::warn!(
@@ -1208,6 +1218,9 @@ struct SeiPassStats {
     minted: u64,
     carried: u64,
     orphaned: u64,
+    /// Count of REQ-ANALYZE-04 deletion findings (`CLA-FACT-ENTITY-DELETED` +
+    /// `CLA-FACT-GUIDANCE-ORPHAN`) persisted from this run's orphaned set.
+    deletion_findings: u64,
 }
 
 /// One entity's planned identity write, computed before any DB write so the
@@ -1330,11 +1343,22 @@ async fn run_sei_mint_pass(
     let recorded_at = iso8601_now();
     let mut stats = SeiPassStats::default();
 
+    // REQ-ANALYZE-04: the orphaned set is exactly "prior-run entity ids minus
+    // current-run set, excluding renames" — `orphaned_bindings` already excludes
+    // `rematched` (carried-across-a-rename) bindings, so a renamed entity is NOT
+    // reported as deleted. A locator IS an entity id (ADR-038 demotes the ADR-003
+    // id to the SEI locator; `descriptor.locator == entities.id`), so the orphan's
+    // `old_locator` is the deleted entity's id for the Phase-7 deletion findings.
+    let mut deleted_entity_ids: Vec<String> = Vec::new();
+
     // WRITE ORDER (T2.2 Step 5): orphan/re-point vanished bindings FIRST so a
     // carry/mint that claims a freed locator never transiently doubles up the
     // alive-locator partial unique index.
     for sei in &orphans {
         let old_locator = sei_to_old_locator.get(sei).cloned();
+        if let Some(locator) = &old_locator {
+            deleted_entity_ids.push(locator.clone());
+        }
         writer
             .send_wait(|ack| WriterCmd::OrphanSeiBinding {
                 sei: sei.clone(),
@@ -1437,7 +1461,168 @@ async fn run_sei_mint_pass(
         }
     }
 
+    // REQ-ANALYZE-04 deletion findings (Phase 7). Deterministic order
+    // (REQ-ANALYZE-07): `orphaned_bindings` returns a set, so sort + dedup before
+    // emitting so back-to-back runs persist an identical id set. Runs after the
+    // orphan bindings are written so a guidance-orphan scan sees the settled
+    // identity state. Best-effort like the rest of the pass: a failure here logs
+    // via the caller and never un-commits the already-durable graph.
+    deleted_entity_ids.sort();
+    deleted_entity_ids.dedup();
+    stats.deletion_findings =
+        emit_deletion_findings(writer, db_path, run_id, &deleted_entity_ids, &recorded_at).await?;
+
     Ok(stats)
+}
+
+/// Persist REQ-ANALYZE-04 Phase-7 deletion findings for `deleted_entity_ids`
+/// (already sorted + deduped by the caller for determinism), returning the total
+/// finding count.
+///
+/// For each deleted entity: emit one `CLA-FACT-ENTITY-DELETED` (anchored to the
+/// entity's own row — `entities` is never pruned, so the FK resolves) and
+/// invalidate its cached summaries. Then, for every guidance sheet whose explicit
+/// `guides` edge targets a deleted entity, emit one `CLA-FACT-GUIDANCE-ORPHAN`
+/// (anchored to the guidance sheet, the deleted target carried as a related id).
+///
+/// Returns `Ok(0)` for an empty deleted set without opening a connection.
+async fn emit_deletion_findings(
+    writer: &Writer,
+    db_path: &Path,
+    run_id: &str,
+    deleted_entity_ids: &[String],
+    now: &str,
+) -> anyhow::Result<u64> {
+    if deleted_entity_ids.is_empty() {
+        return Ok(0);
+    }
+    let deleted_set: HashSet<&str> = deleted_entity_ids.iter().map(String::as_str).collect();
+    let mut count: u64 = 0;
+
+    for entity_id in deleted_entity_ids {
+        let finding = entity_deleted_finding(entity_id, run_id, now);
+        let finding_id = finding.id.clone();
+        writer
+            .send_wait(|ack| WriterCmd::PersistPostRunFinding {
+                finding: Box::new(finding),
+                ack,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("InsertFinding {finding_id}"))?;
+        count += 1;
+
+        writer
+            .send_wait(|ack| WriterCmd::InvalidateSummaryCacheForEntity {
+                entity_id: entity_id.clone(),
+                ack,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("InvalidateSummaryCacheForEntity {entity_id}"))?;
+    }
+
+    // Guidance sheets that explicitly `guides` a now-deleted entity are orphaned.
+    // Read the (sheet, target) pairs once, filter to deleted targets, sort for
+    // determinism. The `guides` edge survives the target's vanishing because
+    // `entities` is never pruned (the ON DELETE CASCADE never fires).
+    let orphaned_guidance = {
+        let conn =
+            Connection::open(db_path).context("open read connection for guidance-orphan scan")?;
+        let mut stmt = conn
+            .prepare("SELECT from_id, to_id FROM edges WHERE kind = 'guides'")
+            .context("prepare guides-edge scan")?;
+        let mut pairs: Vec<(String, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .context("query guides edges")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect guides edges")?
+            .into_iter()
+            .filter(|(_, to_id)| deleted_set.contains(to_id.as_str()))
+            .collect();
+        pairs.sort();
+        pairs
+    };
+
+    for (guidance_id, deleted_target) in &orphaned_guidance {
+        let finding = guidance_orphan_finding(guidance_id, deleted_target, run_id, now);
+        let finding_id = finding.id.clone();
+        writer
+            .send_wait(|ack| WriterCmd::PersistPostRunFinding {
+                finding: Box::new(finding),
+                ack,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("InsertFinding {finding_id}"))?;
+        count += 1;
+    }
+
+    Ok(count)
+}
+
+/// Build a `CLA-FACT-ENTITY-DELETED` finding anchored to the deleted entity's own
+/// (never-pruned) row. The id is deterministic and run-scoped so a `--resume`
+/// re-walk regenerates the same id and `InsertFinding`'s upsert is idempotent.
+fn entity_deleted_finding(entity_id: &str, run_id: &str, now: &str) -> FindingRecord {
+    FindingRecord {
+        id: format!("core:finding:{run_id}:entity-deleted:{entity_id}"),
+        tool: "clarion".to_owned(),
+        tool_version: env!("CARGO_PKG_VERSION").to_owned(),
+        run_id: run_id.to_owned(),
+        rule_id: ENTITY_DELETED_RULE_ID.to_owned(),
+        kind: "fact".to_owned(),
+        severity: "INFO".to_owned(),
+        confidence: Some(1.0),
+        confidence_basis: Some("entity absent from current run's locator set".to_owned()),
+        entity_id: entity_id.to_owned(),
+        related_entities_json: "[]".to_owned(),
+        message: format!("Entity {entity_id} was deleted since the prior analyze run"),
+        evidence_json: serde_json::json!({ "deleted_entity_id": entity_id }).to_string(),
+        properties_json: "{}".to_owned(),
+        supports_json: "[]".to_owned(),
+        supported_by_json: "[]".to_owned(),
+        created_at: now.to_owned(),
+        updated_at: now.to_owned(),
+    }
+}
+
+/// Build a `CLA-FACT-GUIDANCE-ORPHAN` finding anchored to the guidance sheet
+/// whose `guides` edge targets `deleted_entity_id`. Run-scoped, deterministic id.
+fn guidance_orphan_finding(
+    guidance_id: &str,
+    deleted_entity_id: &str,
+    run_id: &str,
+    now: &str,
+) -> FindingRecord {
+    FindingRecord {
+        id: format!("core:finding:{run_id}:guidance-orphan:{guidance_id}:{deleted_entity_id}"),
+        tool: "clarion".to_owned(),
+        tool_version: env!("CARGO_PKG_VERSION").to_owned(),
+        run_id: run_id.to_owned(),
+        rule_id: GUIDANCE_ORPHAN_RULE_ID.to_owned(),
+        kind: "fact".to_owned(),
+        severity: "WARN".to_owned(),
+        confidence: Some(1.0),
+        confidence_basis: Some("guidance `guides`-edge target deleted".to_owned()),
+        entity_id: guidance_id.to_owned(),
+        related_entities_json: serde_json::json!([deleted_entity_id]).to_string(),
+        message: format!(
+            "Guidance sheet {guidance_id} points at deleted entity {deleted_entity_id}"
+        ),
+        evidence_json: serde_json::json!({
+            "guidance_id": guidance_id,
+            "deleted_entity_id": deleted_entity_id,
+        })
+        .to_string(),
+        properties_json: "{}".to_owned(),
+        supports_json: "[]".to_owned(),
+        supported_by_json: "[]".to_owned(),
+        created_at: now.to_owned(),
+        updated_at: now.to_owned(),
+    }
 }
 
 // ── Phase 3 subsystem materialisation ─────────────────────────────────────────
@@ -3838,6 +4023,47 @@ mod tests {
         assert!(syntax_error_finding(&plain, "run-1", "t").is_none());
         let malformed = entity_with_properties("python:module:pkg.bad", "not json");
         assert!(syntax_error_finding(&malformed, "run-1", "t").is_none());
+    }
+
+    #[test]
+    fn entity_deleted_finding_is_fact_anchored_to_the_deleted_entity() {
+        let finding = entity_deleted_finding(
+            "python:function:pkg.gone",
+            "run-1",
+            "2026-06-02T00:00:00.000Z",
+        );
+        assert_eq!(finding.rule_id, ENTITY_DELETED_RULE_ID);
+        assert_eq!(finding.kind, "fact");
+        assert_eq!(finding.severity, "INFO");
+        // Anchors to the deleted entity's own (never-pruned) row.
+        assert_eq!(finding.entity_id, "python:function:pkg.gone");
+        // Deterministic, run-scoped id keeps InsertFinding idempotent on resume.
+        assert_eq!(
+            finding.id,
+            "core:finding:run-1:entity-deleted:python:function:pkg.gone"
+        );
+    }
+
+    #[test]
+    fn guidance_orphan_finding_anchors_to_sheet_and_carries_deleted_target() {
+        let finding = guidance_orphan_finding(
+            "core:guidance:g1",
+            "python:function:pkg.gone",
+            "run-1",
+            "2026-06-02T00:00:00.000Z",
+        );
+        assert_eq!(finding.rule_id, GUIDANCE_ORPHAN_RULE_ID);
+        assert_eq!(finding.kind, "fact");
+        assert_eq!(finding.severity, "WARN");
+        // Anchors to the guidance sheet; the deleted target is a related entity.
+        assert_eq!(finding.entity_id, "core:guidance:g1");
+        let related: serde_json::Value =
+            serde_json::from_str(&finding.related_entities_json).unwrap();
+        assert_eq!(related, serde_json::json!(["python:function:pkg.gone"]));
+        assert_eq!(
+            finding.id,
+            "core:finding:run-1:guidance-orphan:core:guidance:g1:python:function:pkg.gone"
+        );
     }
 
     #[test]

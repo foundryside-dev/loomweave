@@ -20,8 +20,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::cache::{
-    InferredEdgeCacheEntry, inferred_edge_cache_key_id, touch_summary_cache,
-    upsert_inferred_edge_cache, upsert_summary_cache,
+    InferredEdgeCacheEntry, delete_summary_cache_for_entity, inferred_edge_cache_key_id,
+    touch_summary_cache, upsert_inferred_edge_cache, upsert_summary_cache,
 };
 use crate::commands::{
     Ack, EdgeConfidence, EdgeRecord, EntityRecord, FindingRecord, InferredCallEdgeRecord,
@@ -202,6 +202,12 @@ fn run_actor(
                 let res = insert_finding(conn, &mut state, &finding, commits_observed);
                 reply(ack, res);
             }
+            WriterCmd::PersistPostRunFinding { finding, ack } => {
+                let res = query_time_write(conn, &mut state, commits_observed, |conn| {
+                    write_finding_row(conn, &finding)
+                });
+                reply(ack, res);
+            }
             WriterCmd::FlushRunBatch { ack } => {
                 let res = flush_run_batch(conn, &mut state, commits_observed);
                 reply(ack, res);
@@ -229,6 +235,12 @@ fn run_actor(
             } => {
                 let res = query_time_write(conn, &mut state, commits_observed, |conn| {
                     touch_summary_cache(conn, &key, &last_accessed_at)
+                });
+                reply(ack, res);
+            }
+            WriterCmd::InvalidateSummaryCacheForEntity { entity_id, ack } => {
+                let res = query_time_write(conn, &mut state, commits_observed, |conn| {
+                    delete_summary_cache_for_entity(conn, &entity_id)
                 });
                 reply(ack, res);
             }
@@ -768,6 +780,16 @@ fn insert_finding(
         begin_write_tx(conn, state)?;
         state.in_tx = true;
     }
+    write_finding_row(conn, finding)?;
+    bump_writes_and_maybe_commit(conn, state, commits_observed)?;
+    Ok(())
+}
+
+/// The raw `findings` upsert, with no run-state or transaction management — both
+/// the run-scoped [`insert_finding`] (inside the open run tx) and the post-run
+/// path (REQ-ANALYZE-04 deletion findings, emitted after `CommitRun` via
+/// `query_time_write`) share this so the SQL has a single home.
+fn write_finding_row(conn: &Connection, finding: &FindingRecord) -> Result<()> {
     // ON CONFLICT(id) DO UPDATE makes the finding path idempotent under
     // `--resume`: a finding id embeds its run_id (`core:finding:{run_id}:…`),
     // so cross-run ids never collide and a fresh run only ever INSERTs. A
@@ -828,7 +850,6 @@ fn insert_finding(
             finding.updated_at,
         ],
     )?;
-    bump_writes_and_maybe_commit(conn, state, commits_observed)?;
     Ok(())
 }
 

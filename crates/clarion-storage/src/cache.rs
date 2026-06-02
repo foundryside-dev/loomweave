@@ -109,6 +109,22 @@ pub fn summary_cache_lookup(
     .map_err(StorageError::from)
 }
 
+/// Delete every cached summary row for `entity_id`, returning the count removed.
+///
+/// REQ-ANALYZE-04 (deletion detection): `entities` is a cumulative, never-pruned
+/// table, so the `summary_cache.entity_id ON DELETE CASCADE` never fires for an
+/// entity that has vanished from source — its cached summaries would otherwise
+/// be served indefinitely for an entity that no longer exists. Phase 7 calls
+/// this for each deleted entity so a removed function's summary cannot resurface
+/// in a briefing. Idempotent: a no-row entity returns `Ok(0)`.
+pub fn delete_summary_cache_for_entity(conn: &Connection, entity_id: &str) -> Result<usize> {
+    let removed = conn.execute(
+        "DELETE FROM summary_cache WHERE entity_id = ?1",
+        params![entity_id],
+    )?;
+    Ok(removed)
+}
+
 pub fn touch_summary_cache(
     conn: &Connection,
     key: &SummaryCacheKey,
@@ -248,4 +264,76 @@ fn map_inferred_edge_cache_entry(row: &Row<'_>) -> rusqlite::Result<InferredEdge
 
 fn bool_as_i64(value: bool) -> i64 {
     i64::from(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::apply_migrations;
+
+    fn entry_for(entity_id: &str, content_hash: &str) -> SummaryCacheEntry {
+        SummaryCacheEntry {
+            key: SummaryCacheKey {
+                entity_id: entity_id.to_owned(),
+                content_hash: content_hash.to_owned(),
+                prompt_template_id: "tmpl".to_owned(),
+                model_tier: "tier".to_owned(),
+                guidance_fingerprint: "fp".to_owned(),
+            },
+            summary_json: "{}".to_owned(),
+            cost_usd: 0.0,
+            tokens_input: 0,
+            tokens_output: 0,
+            caller_count: 0,
+            fan_out: 0,
+            stale_semantic: false,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            last_accessed_at: "2026-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn insert_entity(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO entities \
+             (id, plugin_id, kind, name, short_name, properties, created_at, updated_at) \
+             VALUES (?1, 'core', 'module', ?1, ?1, '{}', '2026-01-01T00:00:00Z', \
+                     '2026-01-01T00:00:00Z')",
+            params![id],
+        )
+        .unwrap();
+    }
+
+    fn count_for(conn: &Connection, entity_id: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM summary_cache WHERE entity_id = ?1",
+            params![entity_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn delete_summary_cache_for_entity_removes_only_that_entity() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut conn).unwrap();
+        insert_entity(&conn, "doomed");
+        insert_entity(&conn, "survivor");
+        // Two cached rows for the doomed entity (distinct content hashes), one for
+        // a survivor.
+        upsert_summary_cache(&conn, &entry_for("doomed", "h1")).unwrap();
+        upsert_summary_cache(&conn, &entry_for("doomed", "h2")).unwrap();
+        upsert_summary_cache(&conn, &entry_for("survivor", "h1")).unwrap();
+
+        let removed = delete_summary_cache_for_entity(&conn, "doomed").unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(count_for(&conn, "doomed"), 0);
+        assert_eq!(count_for(&conn, "survivor"), 1);
+    }
+
+    #[test]
+    fn delete_summary_cache_for_entity_is_idempotent_for_absent_entity() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut conn).unwrap();
+        assert_eq!(delete_summary_cache_for_entity(&conn, "never").unwrap(), 0);
+    }
 }

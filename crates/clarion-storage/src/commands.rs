@@ -208,6 +208,22 @@ pub enum WriterCmd {
         last_accessed_at: String,
         ack: Ack<bool>,
     },
+    /// Persist a finding AFTER `CommitRun`, outside the run transaction
+    /// (REQ-ANALYZE-04 Phase-7 deletion findings are computed by the SEI pass,
+    /// which runs post-commit). Unlike [`WriterCmd::InsertFinding`] this does not
+    /// require an active run; it routes through the query-time write path. The
+    /// finding's `run_id` still references the just-completed run. Idempotent
+    /// upsert by id.
+    PersistPostRunFinding {
+        finding: Box<FindingRecord>,
+        ack: Ack<()>,
+    },
+    /// Invalidate (delete) every cached summary row for a deleted entity,
+    /// returning the count removed. REQ-ANALYZE-04: Phase 7 calls this for each
+    /// entity that vanished from source so a removed entity's summary cannot
+    /// resurface in a briefing (the `ON DELETE CASCADE` never fires because
+    /// `entities` is never pruned). Post-`CommitRun`, enrich-only.
+    InvalidateSummaryCacheForEntity { entity_id: String, ack: Ack<usize> },
     /// Upsert one Wardline taint fact (per-entity replace). Query-time MCP/HTTP
     /// write; does not require an active analyze run. The fact's `entity_id`
     /// must be pre-resolved by the caller (exact tier) — the writer does not

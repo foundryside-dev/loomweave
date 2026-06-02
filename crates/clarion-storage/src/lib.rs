@@ -21,9 +21,9 @@ pub mod writer;
 
 pub use cache::{
     InferredEdgeCacheEntry, InferredEdgeCacheKey, SummaryCacheEntry, SummaryCacheKey,
-    inferred_edge_cache_key_id, inferred_edge_cache_lookup, summary_cache_lookup,
-    touch_inferred_edge_cache, touch_summary_cache, upsert_inferred_edge_cache,
-    upsert_summary_cache,
+    delete_summary_cache_for_entity, inferred_edge_cache_key_id, inferred_edge_cache_lookup,
+    summary_cache_lookup, touch_inferred_edge_cache, touch_summary_cache,
+    upsert_inferred_edge_cache, upsert_summary_cache,
 };
 pub use commands::{
     EdgeRecord, EntityRecord, FindingRecord, InferredCallEdgeRecord, InferredEdgeWriteStats,

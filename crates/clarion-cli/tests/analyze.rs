@@ -867,6 +867,182 @@ fn analyze_phase3_emits_weak_modularity_fact_when_below_threshold() {
     );
 }
 
+/// Set up a phase3 project + plugin and run analyze once. Returns BOTH tempdirs
+/// (project, plugin) so the caller can keep the plugin on `PATH` and re-run
+/// `analyze` after mutating the source tree — `run_phase3_fixture` drops the
+/// plugin dir, which a deletion-detection re-run needs alive.
+#[cfg(unix)]
+fn phase3_project_for_rerun(stems: &[&str]) -> (tempfile::TempDir, tempfile::TempDir, String) {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_phase3_plugin(plugin_dir.path());
+
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    for stem in stems {
+        std::fs::write(project_dir.path().join(format!("{stem}.p3")), b"module\n")
+            .expect("write phase3 fixture file");
+    }
+    let config_path = project_dir.path().join("phase3-clarion.yaml");
+    std::fs::write(&config_path, phase3_config(2)).expect("write phase3 config");
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+
+    run_phase3_analyze(project_dir.path(), &config_path, &plugin_path);
+    (project_dir, plugin_dir, config_path.display().to_string())
+}
+
+#[cfg(unix)]
+fn run_phase3_analyze(
+    project_root: &std::path::Path,
+    config_path: &std::path::Path,
+    plugin_path: &std::ffi::OsStr,
+) {
+    clarion_bin()
+        .args(["analyze", "--config"])
+        .arg(config_path)
+        .arg(project_root)
+        .env("PATH", plugin_path)
+        .assert()
+        .success();
+}
+
+/// REQ-ANALYZE-04 verification (verbatim): run analyze, delete a file, re-run;
+/// assert a `CLA-FACT-ENTITY-DELETED` finding per previously-extracted entity in
+/// the deleted file — and no false positives for entities still present.
+#[cfg(unix)]
+#[test]
+fn analyze_emits_entity_deleted_finding_when_file_removed() {
+    let (project_dir, plugin_dir, config_path) =
+        phase3_project_for_rerun(&["auth_a", "auth_b", "billing_a", "billing_b"]);
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+
+    std::fs::remove_file(project_dir.path().join("billing_a.p3")).expect("delete a source file");
+    run_phase3_analyze(
+        project_dir.path(),
+        std::path::Path::new(&config_path),
+        &plugin_path,
+    );
+
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    // The plugin's `module` entity carries the canonical finding shape.
+    let (kind, severity, status): (String, String, String) = conn
+        .query_row(
+            "SELECT kind, severity, status FROM findings \
+             WHERE rule_id = 'CLA-FACT-ENTITY-DELETED' \
+               AND entity_id = 'phase3fixture:module:billing_a'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("entity-deleted finding for the deleted module");
+    assert_eq!(kind, "fact");
+    assert_eq!(severity, "INFO");
+    assert_eq!(status, "open");
+
+    // Deleting one source file orphans exactly its two previously-extracted
+    // entities — the core-minted `core:file:*` and the plugin `module` — and
+    // nothing belonging to the surviving files.
+    let deleted: std::collections::BTreeSet<String> = conn
+        .prepare("SELECT entity_id FROM findings WHERE rule_id = 'CLA-FACT-ENTITY-DELETED'")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        deleted,
+        std::collections::BTreeSet::from([
+            "core:file:billing_a.p3".to_owned(),
+            "phase3fixture:module:billing_a".to_owned(),
+        ]),
+        "only the deleted file's entities should be flagged"
+    );
+}
+
+/// REQ-ANALYZE-04: a guidance sheet whose `guides` edge targets a deleted entity
+/// produces `CLA-FACT-GUIDANCE-ORPHAN`, and the deleted entity's cached summaries
+/// are invalidated. Both halves are injected between runs (the fixture plugin
+/// emits neither guidance sheets nor summaries), then a file is deleted + re-run.
+#[cfg(unix)]
+#[test]
+fn analyze_emits_guidance_orphan_and_invalidates_summary_cache_on_deletion() {
+    let (project_dir, plugin_dir, config_path) =
+        phase3_project_for_rerun(&["auth_a", "auth_b", "billing_a", "billing_b"]);
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let db_path = project_dir.path().join(".clarion/clarion.db");
+    let target = "phase3fixture:module:billing_a";
+
+    // Inject a guidance sheet that `guides` the soon-to-be-deleted entity, plus a
+    // cached summary for it. Entities/edges are never pruned, so these survive the
+    // re-run; the deletion path must orphan the guidance and clear the summary.
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO entities \
+             (id, plugin_id, kind, name, short_name, properties, created_at, updated_at) \
+             VALUES ('core:guidance:g1', 'core', 'guidance', 'g1', 'g1', '{}', \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edges (kind, from_id, to_id, confidence) \
+             VALUES ('guides', 'core:guidance:g1', ?1, 'resolved')",
+            [target],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO summary_cache \
+             (entity_id, content_hash, prompt_template_id, model_tier, guidance_fingerprint, \
+              summary_json, cost_usd, tokens_input, tokens_output, created_at, last_accessed_at, \
+              caller_count, fan_out) \
+             VALUES (?1, 'h', 'tmpl', 'tier', 'fp', '{}', 0.0, 0, 0, \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 0, 0)",
+            [target],
+        )
+        .unwrap();
+    }
+
+    std::fs::remove_file(project_dir.path().join("billing_a.p3")).expect("delete a source file");
+    run_phase3_analyze(
+        project_dir.path(),
+        std::path::Path::new(&config_path),
+        &plugin_path,
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let (rule_id, severity, anchor, related): (String, String, String, String) = conn
+        .query_row(
+            "SELECT rule_id, severity, entity_id, related_entities \
+             FROM findings WHERE rule_id = 'CLA-FACT-GUIDANCE-ORPHAN'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("query guidance-orphan finding");
+    assert_eq!(rule_id, "CLA-FACT-GUIDANCE-ORPHAN");
+    assert_eq!(severity, "WARN");
+    assert_eq!(anchor, "core:guidance:g1");
+    let related: serde_json::Value = serde_json::from_str(&related).unwrap();
+    assert_eq!(related, serde_json::json!([target]));
+
+    let cached: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM summary_cache WHERE entity_id = ?1",
+            [target],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        cached, 0,
+        "deleted entity's summary cache must be invalidated"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn analyze_phase3_weak_modularity_threshold_zero_disables_fact() {
