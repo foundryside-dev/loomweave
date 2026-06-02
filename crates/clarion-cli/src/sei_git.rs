@@ -46,7 +46,15 @@ use clarion_storage::{GitRename, GitRenameSource};
 
 /// How long to wait on a `legis` HTTP probe/read before giving up and degrading
 /// to an empty signal. Short on purpose: `legis` is enrich-only, so a slow or
-/// dead peer must never stall an `analyze` run.
+/// dead peer must never stall an `analyze` run. This is a reqwest **total**
+/// request deadline (connection establishment included), so a black-hole host is
+/// bounded, not infinite. On the committed-base path the bound is *sequential* —
+/// [`legis_reachable`]'s `/health` probe then [`LegisGitRenameSource::fetch_renames`]'s
+/// read — so a dead peer degrades to empty after at most `2 × LEGIS_HTTP_TIMEOUT`.
+/// (The default working-tree path never reaches `legis` at all; see
+/// [`select_git_rename_source`].) The connection-refused degrade is covered by
+/// `legis_source_unreachable_degrades_to_empty`; the timeout-firing case is left
+/// to this by-construction bound rather than a deliberately-slow test.
 const LEGIS_HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// v1 `GitRenameSource`: shells git, translates file renames to locator renames
