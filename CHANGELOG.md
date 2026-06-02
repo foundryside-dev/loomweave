@@ -43,6 +43,26 @@ only when an incompatible change is made to that surface. See
     passes; the cross-tool hard-cutover backfill is documented in
     [`docs/federation/sei-migration-playbook.md`](docs/federation/sei-migration-playbook.md)
     and surfaced for owner-gated scheduling.
+- **Incremental analysis — Wave 2 / T3.1.** `clarion analyze` now skips files
+  whose whole-file hash matches the prior run, reusing their entities (the entity
+  graph is cumulative and edges are insert-or-ignore, so the skip is speed-only).
+  `skipped_files` is reported in `stats.json` and a `skipped_unchanged` progress
+  event is emitted; `--no-incremental` forces a full re-index. The skip is guarded
+  against the SEI matcher: the current-locator set is the union of re-analysed and
+  skipped-file entities, so an unchanged file's identities are never falsely
+  orphaned, and skipped entries are re-fed into the prior-index rebuild so the
+  snapshot does not decay. Files carrying a secret finding are never skipped (their
+  finding anchor must stay stable).
+- **Dossier participation surface — Wave 2 / WS4.** The exact Clarion HTTP slices
+  the cross-tool dossier *assembler* (Wardline) reads are pinned in
+  [`docs/federation/contracts.md`](docs/federation/contracts.md) and specified in
+  [`docs/superpowers/specs/2026-06-02-clarion-dossier-participation.md`](docs/superpowers/specs/2026-06-02-clarion-dossier-participation.md):
+  identity (`resolve` → SEI + content-axis freshness; `resolve_sei`/`lineage` →
+  identity-axis freshness), structural linkages (callers/callees), and file
+  context. Clarion contributes slices and the SEI join key; it does **not** proxy
+  Filigree associations (read directly from Filigree's own ADR-029 endpoint) or
+  assemble the envelope. Proven end-to-end against a renamed-function fixture
+  (`serve_http_dossier_participation_surface_serves_a_renamed_function`).
 
 ## [1.1.0] — 2026-05-31
 

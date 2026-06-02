@@ -418,6 +418,188 @@ fn serve_http_identity_resolve_rejects_sei_shaped_input_and_resolves_unknown() {
     assert_eq!(unknown.body["alive"], false);
 }
 
+/// Seed a coherent POST-RENAME snapshot for the WS4 dossier-participation e2e: a
+/// function renamed `mod.process` → `mod.process_v2` whose SEI was CARRIED across
+/// the rename (a `locator_changed` lineage event), still carrying its
+/// caller/callee linkages, in a file with a content hash. This is the state the
+/// Wave 1 matcher produces (proven by the SEI conformance oracle + the
+/// production orphan test); the test below proves the Wardline dossier assembler
+/// can read every slice it needs over Clarion's HTTP surface alone. Returns the
+/// carried SEI.
+fn seed_renamed_function_dossier(project_root: &Path) -> String {
+    let source_path = project_root.join("mod.py");
+    fs::write(&source_path, "def process_v2():\n    return 1\n").expect("write source");
+    let canonical_path = source_path
+        .canonicalize()
+        .expect("canonical source path")
+        .display()
+        .to_string();
+    let sei = "clarion:eid:0123456789abcdef0123456789abcdef".to_owned();
+    let new_locator = "python:function:mod.process_v2";
+    let old_locator = "python:function:mod.process";
+    let ts = "2026-06-02T00:00:00.000Z";
+    let db_path = project_root.join(".clarion/clarion.db");
+    let conn = Connection::open(&db_path).expect("open sqlite");
+
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, source_file_path,
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at)
+         VALUES ('core:file:mod.py','core','file','mod.py','mod.py',?1,1,2,'{}','hash-mod-file',?2,?2)",
+        params![canonical_path, ts],
+    )
+    .expect("insert file entity");
+    for (id, name) in [
+        (new_locator, "process_v2"),
+        ("python:function:mod.caller", "caller"),
+        ("python:function:mod.callee", "callee"),
+    ] {
+        conn.execute(
+            "INSERT INTO entities (id, plugin_id, kind, name, short_name, source_file_path,
+                source_line_start, source_line_end, properties, content_hash, created_at, updated_at)
+             VALUES (?1,'python','function',?2,?2,?3,1,2,'{}','hash-fn',?4,?4)",
+            params![id, name, canonical_path, ts],
+        )
+        .expect("insert function entity");
+    }
+    // Linkages: caller → process_v2 → callee.
+    conn.execute(
+        "INSERT INTO edges (kind, from_id, to_id, confidence) VALUES
+            ('calls','python:function:mod.caller',?1,'resolved'),
+            ('calls',?1,'python:function:mod.callee','resolved')",
+        params![new_locator],
+    )
+    .expect("insert call edges");
+    // Identity: minted at the OLD locator (run-1), CARRIED to the new locator
+    // (run-2, locator_changed). Alive — never orphaned.
+    conn.execute(
+        "INSERT INTO sei_bindings
+            (sei, current_locator, body_hash, signature, status, born_run_id, updated_run_id, updated_at)
+         VALUES (?1, ?2, 'hash-fn', NULL, 'alive', 'run-1', 'run-2', ?3)",
+        params![sei, new_locator, ts],
+    )
+    .expect("insert sei binding");
+    conn.execute(
+        "INSERT INTO sei_lineage (sei, event, old_locator, new_locator, run_id, recorded_at) VALUES
+            (?1,'born',NULL,?2,'run-1',?4),
+            (?1,'locator_changed',?2,?3,'run-2',?4)",
+        params![sei, old_locator, new_locator, ts],
+    )
+    .expect("insert sei lineage");
+    sei
+}
+
+#[test]
+fn serve_http_dossier_participation_surface_serves_a_renamed_function() {
+    // WS4 core-paradise e2e (Wave 2 DoD): the Wardline dossier assembler can build
+    // a complete, freshness-stamped, SEI-keyed view of a RENAMED function using
+    // ONLY Clarion's HTTP surface — SEI carried, facts not orphaned, freshness
+    // stamped. Exercises every slice the participation spec pins.
+    let dir = tempfile::tempdir().expect("temp project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let sei = seed_renamed_function_dossier(dir.path());
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+    let mut child = spawn_serve(dir.path());
+
+    let new_locator = "python:function:mod.process_v2";
+    let old_locator = "python:function:mod.process";
+
+    // Content axis + identity join: resolve(new) → carried SEI + content_hash.
+    let resolve_new = wait_for_http_post_json(
+        &bind,
+        "/api/v1/identity/resolve",
+        &serde_json::json!({ "locator": new_locator }).to_string(),
+        &[],
+    );
+    // The renamed-away OLD address no longer resolves — but identity persists.
+    let resolve_old = wait_for_http_post_json(
+        &bind,
+        "/api/v1/identity/resolve",
+        &serde_json::json!({ "locator": old_locator }).to_string(),
+        &[],
+    );
+    // Identity axis: resolve_sei(sei) alive at the new locator + lineage rename.
+    let sei_lookup = wait_for_http_json(&bind, &format!("/api/v1/identity/sei/{sei}"));
+    let lineage = wait_for_http_json(&bind, &format!("/api/v1/identity/lineage/{sei}"));
+    // Linkages over HTTP, keyed on the new locator.
+    let inbound = wait_for_http_json(&bind, &format!("/api/v1/entities/{new_locator}/callers"));
+    let outbound = wait_for_http_json(&bind, &format!("/api/v1/entities/{new_locator}/callees"));
+    // File context.
+    let file = wait_for_http_json(&bind, "/api/v1/files?path=mod.py&language=python");
+    stop_serve(&mut child);
+
+    let resolve_new = resolve_new.expect("resolve(new) response");
+    assert_eq!(resolve_new.status_code, 200, "{resolve_new:?}");
+    assert_eq!(resolve_new.body["alive"], true);
+    assert_eq!(
+        resolve_new.body["sei"], sei,
+        "resolve(new) must carry the SEI"
+    );
+    assert_eq!(
+        resolve_new.body["content_hash"], "hash-fn",
+        "resolve(new) must stamp the content axis"
+    );
+
+    let resolve_old = resolve_old.expect("resolve(old) response");
+    assert_eq!(resolve_old.status_code, 200, "{resolve_old:?}");
+    assert_eq!(
+        resolve_old.body["alive"], false,
+        "the renamed-away locator must no longer resolve"
+    );
+
+    let sei_lookup = sei_lookup.expect("resolve_sei response");
+    assert_eq!(
+        sei_lookup["alive"], true,
+        "the carried identity must be alive (not orphaned) after the rename"
+    );
+    assert_eq!(sei_lookup["current_locator"], new_locator);
+
+    let lineage = lineage.expect("lineage response");
+    let events = lineage["lineage"].as_array().expect("lineage array");
+    assert!(
+        events.iter().any(|e| e["event"] == "locator_changed"
+            && e["old_locator"] == old_locator
+            && e["new_locator"] == new_locator),
+        "lineage must record the rename carry: {lineage}"
+    );
+
+    let inbound = inbound.expect("callers response");
+    let inbound_ids: Vec<&str> = inbound["callers"]
+        .as_array()
+        .expect("callers array")
+        .iter()
+        .map(|c| c["entity_id"].as_str().unwrap())
+        .collect();
+    assert!(
+        inbound_ids.contains(&"python:function:mod.caller"),
+        "callers must resolve at the new locator: {inbound}"
+    );
+
+    let outbound = outbound.expect("callees response");
+    let outbound_ids: Vec<&str> = outbound["callees"]
+        .as_array()
+        .expect("callees array")
+        .iter()
+        .map(|c| c["entity_id"].as_str().unwrap())
+        .collect();
+    assert!(
+        outbound_ids.contains(&"python:function:mod.callee"),
+        "callees must resolve at the new locator: {outbound}"
+    );
+
+    let file = file.expect("file context response");
+    assert_eq!(file["entity_id"], "core:file:mod.py");
+    assert_eq!(
+        file["content_hash"], "hash-mod-file",
+        "file context must be reachable + content-stamped"
+    );
+}
+
 #[test]
 fn serve_http_files_rejects_unknown_query_fields() {
     let dir = tempfile::tempdir().expect("temp project");

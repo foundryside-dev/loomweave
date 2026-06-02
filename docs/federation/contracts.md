@@ -559,6 +559,54 @@ definitions live at
 and Clarion's pass is enforced by
 `cargo test -p clarion-storage --test sei_conformance_oracle`.
 
+## Dossier participation surface
+
+Wave 2 / WS4. Clarion does **not** assemble the cross-tool entity dossier — the
+*assembler* (Wardline, per its
+[entity-dossier design](../../../wardline/docs/superpowers/specs/2026-06-01-wardline-loom-entity-dossier-design.md))
+composes it. This section pins the exact Clarion HTTP slices the assembler reads,
+so the contract is explicit and the assembler can build a complete,
+freshness-stamped, SEI-keyed view of an entity **that stays correct after a
+rename**. The participation contract is specified in full at
+[`docs/superpowers/specs/2026-06-02-clarion-dossier-participation.md`](../superpowers/specs/2026-06-02-clarion-dossier-participation.md).
+Every slice is an existing pinned endpoint — WS4 adds **no new endpoint**:
+
+| Dossier slice | Clarion endpoint | Pinned at |
+|---|---|---|
+| Identity + **content-axis** freshness | `POST /api/v1/identity/resolve` → `{ sei, content_hash, alive }` | [§SEI identity resolution](#post-apiv1identityresolve) |
+| **Identity-axis** freshness (alive/orphaned + rename lineage) | `GET /api/v1/identity/sei/:sei`, `GET /api/v1/identity/lineage/:sei` | [§SEI identity resolution](#get-apiv1identityseisei) |
+| Structural linkages | `GET /api/v1/entities/:id/callers`, `…/callees` (+ `:batch-get`) | [§Call-graph linkages](#get-apiv1entitiesentity_idcallers-and-callees) |
+| File context | `GET /api/v1/files?path=&language=` (+ `:resolve`, `/batch`) | [§HTTP Read API](#get-apiv1filespathlanguage) |
+
+**Two-axis freshness is explicit; neither axis is inferred from the other.** The
+*content axis* is `resolve`'s `content_hash` (the assembler hash-compares its
+stored fact against it → FRESH/STALE). The *identity axis* is `resolve_sei`'s
+`alive` flag plus lineage (a renamed entity's locator changes, but its SEI stays
+alive — never silently orphaned). A rename therefore surfaces on the identity
+axis while content freshness is judged independently.
+
+**Filigree associations are NOT a Clarion surface.** The dossier's `work` section
+reads Filigree's own `GET /api/entity-associations?entity_id=…` (ADR-029)
+**directly**; Clarion is not a proxy or aggregator for it. Clarion contributes
+only the **join key** — the SEI from `resolve` — which both Filigree associations
+and Wardline taint facts key on. Routing Filigree data through Clarion would
+violate the enrich-only axiom (`loom.md` §5: Clarion serves slices, it does not
+assemble or aggregate sibling data). This is a deliberate decision, not a gap.
+
+**`scc_peers` is not directly HTTP-reachable.** The dossier envelope lists
+`scc_peers[]`; Clarion exposes subsystem *clustering*
+(`subsystem_members`/`subsystem_of`, MCP-only), which is **not** the same as
+strongly-connected-component peers — serving it under that name would be a
+semantic mismatch. The dossier degrades gracefully on partial linkages
+(callers/callees carry the load-bearing "fix locus / responsible boundary"
+synthesis). Exposing a subsystem-peers HTTP route is a thin additive follow-up,
+to be taken only if the assembler confirms it wants subsystem peers there — named
+here, not silently dropped.
+
+The composition is proven end-to-end against a renamed-function fixture by
+`serve_http_dossier_participation_surface_serves_a_renamed_function`
+(`crates/clarion-cli/tests/serve.rs`).
+
 ## Path normalization
 
 Both `GET /api/v1/files` and `POST /api/v1/files/batch` accept the same
