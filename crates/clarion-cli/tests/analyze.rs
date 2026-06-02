@@ -2690,6 +2690,20 @@ fn analyze_persists_crash_finding_anchored_to_project() {
         )
         .unwrap();
     assert_eq!(anchor_exists, 1, "project anchor entity is present");
+
+    // REQ-ANALYZE-06: failure findings are also visible in runs.stats.
+    let stats_raw: String = conn
+        .query_row(
+            "SELECT stats FROM runs ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query run stats");
+    let stats: serde_json::Value = serde_json::from_str(&stats_raw).expect("stats JSON");
+    assert!(
+        stats["failure_findings"].as_u64().unwrap_or(0) >= 1,
+        "stats.json reports the persisted failure-finding count; got: {stats_raw}"
+    );
 }
 
 /// A plugin that hangs inside `analyze_file` (sleeps far longer than the

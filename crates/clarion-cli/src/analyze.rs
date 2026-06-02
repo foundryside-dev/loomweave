@@ -881,8 +881,10 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         }
     }
 
+    // Captured for stats.json (REQ-ANALYZE-06 "visible in stats.json") so the
+    // count is reported regardless of whether Filigree emission runs.
+    let failure_finding_count = failure_findings.len();
     if !matches!(run_outcome, RunOutcome::HardFailed { .. }) {
-        let finding_count = failure_findings.len();
         for finding in failure_findings {
             let finding_id = finding.id.clone();
             if let Err(e) = writer
@@ -901,8 +903,12 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 break;
             }
         }
-        if finding_count > 0 {
-            tracing::info!(run_id = %run_id, finding_count, "persisted failure findings");
+        if failure_finding_count > 0 {
+            tracing::info!(
+                run_id = %run_id,
+                finding_count = failure_finding_count,
+                "persisted failure findings"
+            );
         }
     }
 
@@ -1028,6 +1034,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "pyright_index_parse_latency_p95_ms": pyright_index_parse_latency_p95_ms,
                 "extractor_parse_latency_p95_ms": extractor_parse_latency_p95_ms,
                 "clustering": phase3_output.clustering_stats.clone(),
+                "failure_findings": failure_finding_count,
             });
             secret_scan_outcome.augment_stats(&mut stats_json);
             if !filigree_emission.is_null() {
@@ -1138,6 +1145,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "pyright_index_parse_latency_p95_ms": pyright_index_parse_latency_p95_ms,
                 "extractor_parse_latency_p95_ms": extractor_parse_latency_p95_ms,
                 "clustering": phase3_output.clustering_stats.clone(),
+                "failure_findings": failure_finding_count,
                 "failure_reason": reason,
             });
             secret_scan_outcome.augment_stats(&mut stats_json);
