@@ -49,6 +49,16 @@ use crate::stats::P95Accumulator;
 
 const WEAK_MODULARITY_RULE_ID: &str = "CLA-FACT-CLUSTERING-WEAK-MODULARITY";
 
+/// REQ-ANALYZE-06 "no silent fallbacks": a Python file that fails `ast.parse`
+/// is surfaced by the plugin as a degraded `module` entity carrying
+/// `parse_status="syntax_error"` (extractor.py). The core mints a persisted
+/// finding from that property so the failure is visible in the store, not just
+/// in the plugin's stderr. The subcode is python-namespaced per the requirement;
+/// the architecturally-pure form (plugin emits the finding over a findings wire
+/// channel, owning its own namespace per loom.md Principle 3) is forward work —
+/// `AnalyzeFileResult` carries no findings field today.
+const SYNTAX_ERROR_RULE_ID: &str = "CLA-PY-SYNTAX-ERROR";
+
 /// Writes structured run progress to a JSON file for the MCP `analyze_status`
 /// tool (clarion-7e0c21558a). A no-op unless `analyze_start` passed a
 /// `--progress-file` path, so the normal CLI path pays nothing. Each write
@@ -523,6 +533,11 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // before the prior-index flush. Gathered here for the same reason as the
     // prior index — `entities` is cumulative and cannot recover the run's set.
     let mut sei_descriptors: Vec<NewEntityDescriptor> = Vec::new();
+    // REQ-ANALYZE-06: failure findings (parse errors today; crash/timeout/LLM/
+    // budget to follow) accumulated through the run and persisted before
+    // CommitRun, so a recoverable failure is visible in the store rather than
+    // only in logs.
+    let mut failure_findings: Vec<FindingRecord> = Vec::new();
     let briefing_blocks = secret_scan_outcome.briefing_blocks_shared();
     let scanned_files = secret_scan_outcome.scanned_files_shared();
     'plugins: for plugin in plugins {
@@ -710,6 +725,13 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                         body_hash: record.content_hash.clone(),
                         signature,
                     };
+                    // REQ-ANALYZE-06: capture a parse-failure finding from the
+                    // degraded entity BEFORE `record` is moved into the command.
+                    // Anchors to this same entity (inserted just below), so the
+                    // finding's FK resolves.
+                    if let Some(finding) = syntax_error_finding(&record, &run_id, &started_at) {
+                        failure_findings.push(finding);
+                    }
                     let res = writer
                         .send_wait(|ack| WriterCmd::InsertEntity {
                             entity: Box::new(record),
@@ -798,6 +820,34 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         run_outcome = RunOutcome::HardFailed {
             reason: format!("secret finding persistence failed: {e:#}"),
         };
+    }
+
+    // REQ-ANALYZE-06: persist accumulated failure findings (parse errors today).
+    // Runs after entity inserts so each finding's `entity_id` anchor resolves,
+    // and only when the run is being committed (a HardFailed run is rolled back).
+    if !matches!(run_outcome, RunOutcome::HardFailed { .. }) {
+        let finding_count = failure_findings.len();
+        for finding in failure_findings {
+            let finding_id = finding.id.clone();
+            if let Err(e) = writer
+                .send_wait(|ack| WriterCmd::InsertFinding {
+                    finding: Box::new(finding),
+                    ack,
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .with_context(|| format!("InsertFinding {finding_id}"))
+            {
+                tracing::error!(run_id = %run_id, error = %e, "failure-finding persistence failed");
+                run_outcome = RunOutcome::HardFailed {
+                    reason: format!("failure-finding persistence failed: {e:#}"),
+                };
+                break;
+            }
+        }
+        if finding_count > 0 {
+            tracing::info!(run_id = %run_id, finding_count, "persisted failure findings");
+        }
     }
 
     // ── Commit or fail the run ────────────────────────────────────────────────
@@ -1693,6 +1743,51 @@ async fn insert_weak_modularity_finding(
         .map_err(|e| anyhow::anyhow!("{e}"))
         .with_context(|| format!("InsertFinding {finding_id}"))?;
     Ok(true)
+}
+
+/// Build a `CLA-PY-SYNTAX-ERROR` finding for an accepted entity the plugin
+/// flagged `parse_status="syntax_error"`, or `None` for cleanly-parsed entities.
+///
+/// The finding anchors to the degraded entity itself (the plugin still emits one
+/// `module` entity for a syntax-failed file), so no synthetic anchor is needed.
+/// The id is deterministic and run-scoped so a `--resume` re-walk regenerates the
+/// same id and `InsertFinding`'s upsert is idempotent (REQ-FINDING-05).
+fn syntax_error_finding(record: &EntityRecord, run_id: &str, now: &str) -> Option<FindingRecord> {
+    let props: serde_json::Value = serde_json::from_str(&record.properties_json).ok()?;
+    if props
+        .get("parse_status")
+        .and_then(serde_json::Value::as_str)
+        != Some("syntax_error")
+    {
+        return None;
+    }
+    Some(FindingRecord {
+        id: format!("core:finding:{run_id}:syntax-error:{}", record.id),
+        tool: "clarion".to_owned(),
+        tool_version: env!("CARGO_PKG_VERSION").to_owned(),
+        run_id: run_id.to_owned(),
+        rule_id: SYNTAX_ERROR_RULE_ID.to_owned(),
+        kind: "defect".to_owned(),
+        severity: "WARN".to_owned(),
+        confidence: Some(1.0),
+        confidence_basis: Some("plugin parse_status".to_owned()),
+        entity_id: record.id.clone(),
+        related_entities_json: "[]".to_owned(),
+        message: format!(
+            "{}: syntax error prevented full extraction; file ingested as a degraded module entity",
+            record.name
+        ),
+        evidence_json: serde_json::json!({
+            "parse_status": "syntax_error",
+            "source_file_path": record.source_file_path,
+        })
+        .to_string(),
+        properties_json: "{}".to_owned(),
+        supports_json: "[]".to_owned(),
+        supported_by_json: "[]".to_owned(),
+        created_at: now.to_owned(),
+        updated_at: now.to_owned(),
+    })
 }
 
 /// Load the MCP-side config (Filigree integration) from the same `clarion.yaml`
@@ -3314,6 +3409,61 @@ mod tests {
                 updated_at: "2026-05-17T00:00:00.000Z".to_owned(),
             },
         )
+    }
+
+    fn entity_with_properties(id: &str, properties_json: &str) -> EntityRecord {
+        EntityRecord {
+            id: id.to_owned(),
+            plugin_id: "python".to_owned(),
+            kind: "module".to_owned(),
+            name: id.trim_start_matches("python:module:").to_owned(),
+            short_name: id.rsplit('.').next().unwrap_or(id).to_owned(),
+            parent_id: None,
+            source_file_id: None,
+            source_file_path: Some("pkg/broken.py".to_owned()),
+            source_byte_start: None,
+            source_byte_end: None,
+            source_line_start: None,
+            source_line_end: None,
+            properties_json: properties_json.to_owned(),
+            content_hash: None,
+            summary_json: None,
+            wardline_json: None,
+            first_seen_commit: None,
+            last_seen_commit: None,
+            created_at: "2026-06-02T00:00:00.000Z".to_owned(),
+            updated_at: "2026-06-02T00:00:00.000Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn syntax_error_finding_minted_for_degraded_entity() {
+        let record = entity_with_properties(
+            "python:module:pkg.broken",
+            r#"{"parse_status":"syntax_error"}"#,
+        );
+        let finding = syntax_error_finding(&record, "run-1", "2026-06-02T00:00:00.000Z")
+            .expect("syntax_error entity must mint a finding");
+        assert_eq!(finding.rule_id, SYNTAX_ERROR_RULE_ID);
+        assert_eq!(finding.entity_id, "python:module:pkg.broken");
+        assert_eq!(finding.kind, "defect");
+        assert_eq!(finding.severity, "WARN");
+        assert_eq!(finding.tool, "clarion");
+        // Deterministic, run-scoped id keeps InsertFinding idempotent on resume.
+        assert_eq!(
+            finding.id,
+            "core:finding:run-1:syntax-error:python:module:pkg.broken"
+        );
+    }
+
+    #[test]
+    fn syntax_error_finding_absent_for_clean_or_unflagged_entities() {
+        let ok = entity_with_properties("python:module:pkg.ok", r#"{"parse_status":"ok"}"#);
+        assert!(syntax_error_finding(&ok, "run-1", "t").is_none());
+        let plain = entity_with_properties("python:module:pkg.plain", "{}");
+        assert!(syntax_error_finding(&plain, "run-1", "t").is_none());
+        let malformed = entity_with_properties("python:module:pkg.bad", "not json");
+        assert!(syntax_error_finding(&malformed, "run-1", "t").is_none());
     }
 
     fn from_import_edge(from_id: &str, to_id: &str, imported_name: &str) -> (String, EdgeRecord) {

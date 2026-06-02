@@ -2367,3 +2367,173 @@ fn analyze_no_incremental_forces_full_reanalysis() {
         "a forced full re-run still carries SEIs"
     );
 }
+
+// ── REQ-ANALYZE-06: parse-failure findings are persisted, not just logged ────
+
+/// Mirrors the real Python plugin: every file yields one `module` entity, and a
+/// file whose stem starts with `broken` carries the top-level
+/// `parse_status="syntax_error"` flag the plugin sets on `ast.parse` failure.
+/// The flag rides into `properties_json` via the host's `extra` handling, where
+/// the core's `syntax_error_finding` reads it.
+#[cfg(unix)]
+const SYNTAX_ERROR_PLUGIN_SCRIPT: &str = r#"#!/usr/bin/python3
+import json
+import pathlib
+import sys
+
+
+def read_frame():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if line in (b"", b"\r\n"):
+            break
+        name, value = line.decode("ascii").strip().split(":", 1)
+        headers[name.lower()] = value.strip()
+    length = int(headers["content-length"])
+    return json.loads(sys.stdin.buffer.read(length))
+
+
+def write_frame(message):
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n")
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+
+while True:
+    msg = read_frame()
+    method = msg.get("method")
+    if method == "initialized":
+        continue
+    if method == "exit":
+        raise SystemExit(0)
+    ident = msg["id"]
+    if method == "initialize":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "name": "clarion-plugin-syn",
+                "version": "0.1.0",
+                "ontology_version": "0.6.0",
+                "capabilities": {},
+            },
+        })
+    elif method == "analyze_file":
+        path = msg["params"]["file_path"]
+        stem = pathlib.Path(path).stem
+        entity = {
+            "id": f"synfixture:module:{stem}",
+            "kind": "module",
+            "qualified_name": stem,
+            "source": {"file_path": path},
+            "parse_status": "syntax_error" if stem.startswith("broken") else "ok",
+        }
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {"entities": [entity], "edges": [], "stats": {}},
+        })
+    elif method == "shutdown":
+        write_frame({"jsonrpc": "2.0", "id": ident, "result": {}})
+    else:
+        raise SystemExit(1)
+"#;
+
+#[cfg(unix)]
+const SYNTAX_ERROR_PLUGIN_MANIFEST: &str = r#"
+[plugin]
+name = "clarion-plugin-syn"
+plugin_id = "synfixture"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "clarion-plugin-syn"
+language = "synfixture"
+extensions = ["syn"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 256
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+entity_kinds = ["module"]
+edge_kinds = []
+rule_id_prefix = "CLA-SYN-"
+ontology_version = "0.6.0"
+"#;
+
+#[cfg(unix)]
+fn write_syntax_error_plugin(plugin_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let plugin_script = plugin_dir.join("clarion-plugin-syn");
+    std::fs::write(&plugin_script, SYNTAX_ERROR_PLUGIN_SCRIPT).expect("write syn plugin script");
+    let mut perms = std::fs::metadata(&plugin_script)
+        .expect("stat syn plugin")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&plugin_script, perms).expect("chmod syn plugin");
+
+    std::fs::write(plugin_dir.join("plugin.toml"), SYNTAX_ERROR_PLUGIN_MANIFEST)
+        .expect("write syn plugin manifest");
+}
+
+/// REQ-ANALYZE-06 verification (in part): a file that fails to parse produces a
+/// `CLA-PY-SYNTAX-ERROR` finding **persisted to the store**, anchored to the
+/// degraded module entity — not merely logged. A cleanly-parsed file produces
+/// no such finding.
+#[cfg(unix)]
+#[test]
+fn analyze_persists_syntax_error_finding_for_unparseable_file() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_syntax_error_plugin(plugin_dir.path());
+
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    std::fs::write(project_dir.path().join("broken_mod.syn"), b"def (\n").unwrap();
+    std::fs::write(project_dir.path().join("clean_mod.syn"), b"ok\n").unwrap();
+
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    clarion_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    let (count, anchor): (i64, String) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(MIN(entity_id), '') FROM findings \
+             WHERE rule_id = 'CLA-PY-SYNTAX-ERROR'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("query syntax-error findings");
+    assert_eq!(
+        count, 1,
+        "exactly one CLA-PY-SYNTAX-ERROR finding persisted"
+    );
+    assert_eq!(
+        anchor, "synfixture:module:broken_mod",
+        "finding anchors to the degraded module entity"
+    );
+
+    // The anchor row exists (FK integrity) and the clean file produced no finding.
+    let anchor_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE id = 'synfixture:module:broken_mod'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(anchor_exists, 1, "finding anchor entity is present");
+}

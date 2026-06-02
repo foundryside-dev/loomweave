@@ -173,10 +173,12 @@ Clarion emits structural findings that combine signals no single sibling tool ca
 
 #### REQ-ANALYZE-06 — No silent fallbacks on failure
 
-Every recoverable failure in the pipeline emits a structured finding (`CLA-PY-PARSE-ERROR`, `CLA-INFRA-PLUGIN-CRASH`, `CLA-INFRA-LLM-ERROR`, `CLA-INFRA-BUDGET-WARNING`, etc.). No failure is silently swallowed; every finding is visible in `runs/<run_id>/stats.json`, the store, and Filigree.
+Every recoverable failure in the pipeline emits a structured finding (`CLA-PY-SYNTAX-ERROR`, `CLA-PY-TIMEOUT`, `CLA-INFRA-PLUGIN-CRASH`, `CLA-INFRA-LLM-ERROR`, `CLA-INFRA-BUDGET-WARNING`, etc.). No failure is silently swallowed; every finding is visible in `runs/<run_id>/stats.json`, the store, and Filigree.
+
+> **Subcode reconciliation (v1.1, [ADR-039]-era cleanup)**: the Python plugin surfaces a syntax-failed file as a degraded module entity carrying `parse_status="syntax_error"` (extractor.py), so the persisted finding's canonical subcode is **`CLA-PY-SYNTAX-ERROR`** — this requirement's earlier `CLA-PY-PARSE-ERROR` spelling is retired in its favour. `CLA-PY-TIMEOUT` is emitted by a per-file analysis-timeout in the host (a slow plugin is killed and the finding persisted), not by the plugin itself.
 
 **Rationale**: Silent fallbacks make debugging impossible and gradually erode trust — operators stop believing the catalog because "Clarion sometimes skips files for reasons I can't see." Explicit findings make the degradation visible and actionable.
-**Verification**: Fixture with a deliberately malformed file produces `CLA-PY-PARSE-ERROR`; plugin timeout on a slow fixture produces `CLA-PY-TIMEOUT`; both reach Filigree via the normal emission path.
+**Verification**: Fixture with a deliberately malformed file produces `CLA-PY-SYNTAX-ERROR`; plugin timeout on a slow fixture produces `CLA-PY-TIMEOUT`; both are persisted to the store (and reach Filigree when emission is enabled).
 **See**: System Design §6 (Analysis Pipeline, Failure & Degradation).
 
 #### REQ-ANALYZE-07 — Determinism of outputs
