@@ -927,6 +927,22 @@ struct PlannedSeiWrite {
     decision: SeiDecision,
 }
 
+/// Collapse SEI descriptors to one per locator, LAST write wins — matching the
+/// entity layer's `INSERT ... ON CONFLICT(id) DO UPDATE`, which tolerates a
+/// plugin emitting the same id twice in a run (the architecture permits it).
+/// Without this, two descriptors at one locator would plan two `alive` bindings
+/// there and violate the `ux_sei_alive_locator` partial unique index. The
+/// `BTreeMap` also yields the deterministic, locator-sorted processing order the
+/// cross-entity carry dedup in [`run_sei_mint_pass`] relies on.
+fn dedup_descriptors_by_locator(descriptors: Vec<NewEntityDescriptor>) -> Vec<NewEntityDescriptor> {
+    descriptors
+        .into_iter()
+        .map(|d| (d.locator.clone(), d))
+        .collect::<BTreeMap<String, NewEntityDescriptor>>()
+        .into_values()
+        .collect()
+}
+
 /// Wave 1 / WS1 SEI mint pass (ADR-038 §3, SEI spec §3). For every entity in the
 /// completed run, carry-or-mint an SEI against the prior alive bindings + the
 /// git-rename signal, record lineage, and orphan vanished-unmatched bindings.
@@ -942,7 +958,7 @@ async fn run_sei_mint_pass(
     db_path: &Path,
     project_root: &Path,
     run_id: &str,
-    mut descriptors: Vec<NewEntityDescriptor>,
+    descriptors: Vec<NewEntityDescriptor>,
 ) -> anyhow::Result<SeiPassStats> {
     // Read the prior alive bindings (this run has written no SEI yet, so this is
     // exactly the previous run's identity state).
@@ -951,8 +967,7 @@ async fn run_sei_mint_pass(
         alive_bindings_snapshot(&conn).map_err(|e| anyhow::anyhow!("{e}"))?
     };
 
-    // Deterministic processing order so cross-entity dedup (below) is stable.
-    descriptors.sort_by(|a, b| a.locator.cmp(&b.locator));
+    let descriptors = dedup_descriptors_by_locator(descriptors);
     let current_locators: HashSet<String> = descriptors.iter().map(|d| d.locator.clone()).collect();
 
     // The git-rename signal (best-effort, typed seam REQ-C-05). Skipped entirely
@@ -2797,6 +2812,47 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use std::fs;
+
+    #[test]
+    fn dedup_descriptors_keeps_one_per_locator_last_wins() {
+        // A plugin may legally emit the same id twice in a run (the entity layer
+        // tolerates it via ON CONFLICT(id) DO UPDATE, last-wins). The SEI
+        // descriptor list must collapse to one per locator, last-wins, so the
+        // mint pass never plans two `alive` bindings on one locator (H1).
+        let descriptors = vec![
+            NewEntityDescriptor {
+                locator: "python:function:m.f".to_owned(),
+                body_hash: Some("first".to_owned()),
+                signature: Some("s0".to_owned()),
+            },
+            NewEntityDescriptor {
+                locator: "python:function:m.g".to_owned(),
+                body_hash: Some("g".to_owned()),
+                signature: None,
+            },
+            NewEntityDescriptor {
+                locator: "python:function:m.f".to_owned(),
+                body_hash: Some("last".to_owned()),
+                signature: Some("s1".to_owned()),
+            },
+        ];
+        let deduped = dedup_descriptors_by_locator(descriptors);
+        // Exactly one entry per locator, sorted by locator.
+        assert_eq!(
+            deduped
+                .iter()
+                .map(|d| d.locator.as_str())
+                .collect::<Vec<_>>(),
+            vec!["python:function:m.f", "python:function:m.g"]
+        );
+        // Last write wins for the duplicated locator (matches the entity row).
+        let f = deduped
+            .iter()
+            .find(|d| d.locator == "python:function:m.f")
+            .unwrap();
+        assert_eq!(f.body_hash.as_deref(), Some("last"));
+        assert_eq!(f.signature.as_deref(), Some("s1"));
+    }
 
     #[test]
     fn progress_reporter_is_noop_without_a_path() {
