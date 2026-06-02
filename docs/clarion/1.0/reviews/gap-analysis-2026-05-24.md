@@ -216,8 +216,8 @@ Sorted by leverage. Status legend: ✅ done · ⏳ pending. Each item names a ta
 | REQ-ANALYZE-01 | Partial | `analyze.rs:54,485` | Phases 4–8 absent; no phase log | P2 | deferred:scope-amendment |
 | REQ-ANALYZE-02 | Partial | `analyze.rs:308`; writer serial | No LLM parallelism | — | deferred:scope-amendment |
 | REQ-ANALYZE-03 | **Missing** | `cli.rs:30` no flag | No `--resume`; no checkpoint reader | P1 | new |
-| REQ-ANALYZE-04 | Deferred | 0 `CLA-FACT-ENTITY-DELETED` emitters | Phase-7 entity-set diff | — | deferred:scope-amendment |
-| REQ-ANALYZE-05 | Deferred | 0 `CLA-FACT-TIER-SUBSYSTEM-MIXING` emitters | Phase-7 `CLA-*` rules | — | deferred:scope-amendment |
+| REQ-ANALYZE-04 | Built (v1.1) | deletion findings in the SEI mint pass (`analyze.rs` `emit_deletion_findings`); `--no-sei` disables | — (was: Phase-7 entity-set diff) | — | built:v1.1 |
+| REQ-ANALYZE-05 | Built (v1.1) | `analyze.rs` `emit_tier_subsystem_findings` (tier × subsystem, function→subsystem resolution); conditional on Wardline ingest | — (was: Phase-7 `CLA-*` rules) | — | built:v1.1 |
 | REQ-ANALYZE-06 | Partial | `breaker.rs:16`, `host_findings.rs`, `limits.rs` | Named rules `CLA-PY-PARSE-ERROR`/`-TIMEOUT`/`CLA-INFRA-LLM-ERROR`/`-BUDGET-WARNING` absent | P2 | new |
 | REQ-ANALYZE-07 | Partial | `tests/analyze.rs:730` | No `clarion db export --textual`; whole-catalog byte-id not verified | P3 | new |
 | REQ-ARTEFACT-01 | Deferred | no `catalog.json` emit | Doc drift: requirement lacks blockquote | — | deferred:scope-amendment |
