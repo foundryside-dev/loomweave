@@ -608,6 +608,96 @@ The composition is proven end-to-end against a renamed-function fixture by
 `serve_http_dossier_participation_surface_serves_a_renamed_function`
 (`crates/clarion-cli/tests/serve.rs`).
 
+## Governed paradise: `legis` governance consumption (WS9)
+
+Wave 3 / WS9 closes **governed paradise**: `legis` adds IRAP-grade governance
+(attestations, sign-offs, custody, audit lineage) keyed to Clarion's stable
+identity, as an **opt-in** layer a solo project never sees. Clarion is *already*
+the identity authority (Wave 1) — WS9 exposes existing surfaces and swaps one
+provider; it adds **no** new identity surface and **no** trust adjudication.
+Governed paradise does **not** gate core paradise (Wave 2); core paradise stands
+on its own.
+
+### Audit-spine consumption (read-only, existing surface)
+
+`legis` reads Clarion's **existing** Wave-1 identity surface as its audit spine —
+no new endpoint, **no Clarion-side integrity machinery**:
+
+| `legis` need | Clarion endpoint | Maps to |
+|---|---|---|
+| Attestation join key (SEI for a code entity) | `POST /api/v1/identity/resolve` → `{ sei, content_hash, alive }` | [§SEI identity resolution](#post-apiv1identityresolve) |
+| Orphan → governance gap (attestation in limbo) | `GET /api/v1/identity/sei/:sei` → `{ alive: false, lineage }` | [§SEI identity resolution](#get-apiv1identityseisei) |
+| Identity history for human reviewers | `GET /api/v1/identity/lineage/:sei` → ordered append-only events | [§SEI identity resolution](#get-apiv1identitylineagesei) |
+
+`legis`'s formal §5 obligations (attestations keyed on SEI, opaque treatment,
+lineage as audit spine, honest-degrade `identity_stable: false` when the `sei`
+capability is absent, governance-gap on `alive: false`, two-axis status) are
+discharged **entirely** against these three routes. `legis` polls (pull-only);
+no push surface is required for v1 (it is informational future work per `legis`'s
+own conformance notes).
+
+**Integrity is `legis`'s boundary, not Clarion's (REQ-L-01).** The SEI standard
+leaves lineage tamper-evidence to a named decision; `legis` accepts **Option 3** —
+each consumer establishes its own integrity layer over polled snapshots (`legis`
+stores a snapshot hash of the lineage at each governance decision and detects
+divergence on re-read). Clarion therefore ships **no** lineage hash-chain or
+signature in v1; the append-only `sei_lineage` log (INSERT-only, no UPDATE path)
+plus transport is the custody substrate `legis` verifies against. A signed
+lineage is North-Star, not a v1 requirement. This is the custody axiom: integrity
+is re-established at the governance boundary, never assumed from the store.
+
+### Git-rename provider seam (REQ-C-05) — wired, with a surfaced window gap
+
+The SEI matcher consumes a typed, locator-level git-rename signal behind the
+`GitRenameSource` trait (SEI spec §6). `legis` owns the git interface, so it is
+the intended external supplier: `LegisGitRenameSource`
+(`crates/clarion-cli/src/sei_git.rs`) reads `legis`'s
+`GET /git/renames?rev_range=…` and feeds the **same** file→locator translation as
+the v1 `ShellGitRenameSource`, behind the same trait — no matcher change.
+Selection is enrich-only and **capability-aware** (`select_git_rename_source`):
+`ShellGitRenameSource` is the default and the fallback; `legis` is consulted only
+when configured (`--legis-url`) **and** reachable. Unset/unreachable `legis`
+issues no HTTP and leaves behaviour byte-identical to pre-WS9.
+
+**Surfaced gap (not papered over).** The two suppliers observe **different rename
+windows**: Clarion's `analyze` depends on the **working-tree-vs-HEAD**
+(uncommitted) window — the "rename a file, re-analyze before commit" flow — while
+`legis`'s endpoint serves only **committed** renames over a rev-range (`git log
+-M`). In the working-tree flow `legis` returns empty. So the selector keeps the
+shell source for that window; `legis` activates only for a committed rev-range,
+which Clarion's pipeline does not yet drive (it always passes the empty/working-
+tree base today). The seam is therefore **built, tested, and ready** but not yet
+operative in the default pipeline. Closing the loop requires **either**:
+
+1. `legis` adds a working-tree rename surface (a `git diff -M HEAD` equivalent), **or**
+2. Clarion gains prior-run commit tracking and drives a committed rev-range re-index.
+
+Until then, enabling `legis` is safe but inert for the default flow — and never a
+regression: the matcher is fail-closed (a rename is a *hint*, confirmed by
+byte-identical body hash), so neither window choice can cause a false carry, only
+a missed one. Proven by
+`selector_keeps_working_tree_rename_even_when_a_reachable_legis_sees_nothing`
+(`crates/clarion-cli/src/sei_git.rs`): a reachable `legis` that (correctly) reports
+no committed rename never swallows a shell-detectable working-tree rename.
+
+### Trust vocabulary — carried verbatim, never adjudicated
+
+Clarion does **not** adjudicate trust. One judge: **Wardline analyses, `legis`
+governs.** Clarion adds **no** policy / attestation engine — attestations live in
+`legis`, keyed on Clarion's SEI. The trust vocabulary (`declared_tier`,
+`wardline_groups`/`declared_groups`, boundary contracts) is carried **exactly as
+Wardline emits it**; Clarion participates in, never leads, any suite
+trust-vocabulary convergence.
+
+What Clarion carries from Wardline **today** is the taint-fact store and
+qualname-reconciled findings (see [§Wardline taint-fact store](#wardline-taint-fact-store-sp9)
+and [§Wardline qualname normalization](#wardline-qualname-normalization-entity-reconciliation)) —
+verbatim, no re-judgement. The `WardlineMeta` entity-property carriage of
+`declared_tier`/`declared_groups` from `wardline.yaml` (detailed-design §2) is a
+**designed-but-unbuilt v1.0 path**, not WS9 scope; WS9 owns nothing new and adds
+no adjudication. That carriage gap is pre-existing and tracked separately, not
+introduced or closed here.
+
 ## Path normalization
 
 Both `GET /api/v1/files` and `POST /api/v1/files/batch` accept the same

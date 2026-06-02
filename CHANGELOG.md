@@ -63,6 +63,32 @@ only when an incompatible change is made to that surface. See
   Filigree associations (read directly from Filigree's own ADR-029 endpoint) or
   assemble the envelope. Proven end-to-end against a renamed-function fixture
   (`serve_http_dossier_participation_surface_serves_a_renamed_function`).
+- **`legis` governance consumption — Wave 3 / WS9 (governed paradise).** `legis`
+  consumes Clarion's stable identity as an **opt-in** governance layer a solo
+  project never sees; core paradise (Wave 2) does not depend on it.
+  - **Git-rename provider seam (REQ-C-05).** A second `GitRenameSource`,
+    `LegisGitRenameSource`, reads `legis`'s `GET /git/renames` over HTTP and feeds
+    the same file→locator translation as `ShellGitRenameSource` — `legis` supplies
+    the git signal with no matcher change (SEI spec §6). Selection
+    (`select_git_rename_source`, `--legis-url`) is enrich-only and
+    capability-aware: the shell source remains the default and fallback; an
+    unset/unreachable `legis` issues no HTTP and is byte-identical to before. The
+    two suppliers observe different rename windows (Clarion's `analyze` depends on
+    the working-tree window; `legis` serves only committed rev-ranges), so the
+    seam is built/tested/ready but inert in the default pipeline until `legis`
+    adds a working-tree surface or Clarion drives a committed re-index — a gap
+    surfaced (not papered) in [`docs/federation/contracts.md`](docs/federation/contracts.md).
+    The matcher is fail-closed regardless, so neither window can cause a false
+    carry. Proven by
+    `selector_keeps_working_tree_rename_even_when_a_reachable_legis_sees_nothing`.
+  - **Audit-spine consumption.** `legis` reads Clarion's existing
+    `resolve`/`resolve_sei`/`lineage` routes as its governance audit spine; the
+    consumption contract is pinned in `docs/federation/contracts.md`. Per REQ-L-01
+    (Option 3) `legis` owns integrity at its own boundary (snapshot-hash over
+    polled lineage) — Clarion ships **no** lineage hash-chain or signature.
+  - **No trust adjudication.** Clarion carries the trust vocabulary verbatim and
+    adds no policy/attestation engine — Wardline analyses, `legis` governs,
+    attestations key on Clarion's SEI.
 
 ## [1.1.0] — 2026-05-31
 
