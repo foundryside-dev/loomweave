@@ -1,6 +1,7 @@
 //! MCP protocol surface for Clarion.
 
 mod analyze_runs;
+mod catalogue;
 pub mod config;
 pub mod filigree;
 pub mod filigree_url;
@@ -281,6 +282,48 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 },
                 "additionalProperties": false
             }),
+        },
+        ToolDefinition {
+            name: "guidance_for",
+            description: "Return the guidance sheets applicable to one entity, composed at query time and ranked by scope_rank (project → subsystem → package → module → class → function), ties broken by authored_at then id. Read-only: this surfaces composed institutional knowledge; authoring (propose/promote) is a separate lifecycle. A sheet applies via an explicit `guides` edge OR a `match_rules` entry resolved against the entity (path glob / tag / kind / subsystem / entity). `wardline_group` rules are not evaluated here (the Wardline blob is opaque) and are reported in `notes`, never guessed. Expired sheets are excluded. Each sheet carries its `sei`. Bounded (limit/offset, page.total/truncated). Honest-empty when no sheet applies. No LLM call.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "minLength": 1},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                    "offset": {"type": "integer", "minimum": 0}
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "findings_for",
+            description: "Return findings anchored to one entity, optionally filtered by `filter.kind` (defect/fact/classification/metric/suggestion), `filter.severity` (INFO/WARN/ERROR/CRITICAL/NONE), and `filter.status` (open/acknowledged/suppressed/promoted_to_issue). The queried entity carries its `sei`; each finding's `related_entities` are raw locator ids (references, not the primary return). Bounded (limit/offset, page.total/truncated). An entity with no findings returns an empty list, not an error. No LLM call.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "minLength": 1},
+                    "filter": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string"},
+                            "severity": {"type": "string"},
+                            "status": {"type": "string"}
+                        },
+                        "additionalProperties": false
+                    },
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                    "offset": {"type": "integer", "minimum": 0}
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "wardline_for",
+            description: "Return the Wardline metadata recorded for one entity (declared tier, groups, boundary contracts) returned VERBATIM — the `wardline_json` blob is opaque to Clarion. result_kind is `present` when a taint fact exists, else `no_facts` with a missing-signal note: facts are populated via Filigree Flow-B (POST /api/wardline/taint-facts), so a locally-empty result is honest, not an error. The entity carries its `sei`. No LLM call.",
+            input_schema: id_schema(),
         },
     ]
 }
@@ -584,6 +627,18 @@ impl ServerState {
                 Err(response) => return response.to_json_rpc(id),
             },
             "index_diff" => match self.tool_index_diff(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "guidance_for" => match self.tool_guidance_for(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "findings_for" => match self.tool_findings_for(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "wardline_for" => match self.tool_wardline_for(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
@@ -5858,7 +5913,7 @@ mod tests {
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 18);
+        assert_eq!(tools.len(), 21);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
@@ -5945,6 +6000,9 @@ mod tests {
             "Cancel a running analyze. SIGKILLs the run's whole process group — terminating the language plugin and its pyright-langserver child — then marks the run terminal (status `cancelled`) so it is never left dangling as `running`. Idempotent: cancelling an already-terminal run reports its current state. Partial work already written is kept (cancel discards in-flight work, not the index)."
         );
         assert_eq!(tools[17].name, "index_diff");
+        assert_eq!(tools[18].name, "guidance_for");
+        assert_eq!(tools[19].name, "findings_for");
+        assert_eq!(tools[20].name, "wardline_for");
     }
 
     #[test]
@@ -6247,7 +6305,7 @@ mod tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], "tools-1");
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 18);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 21);
         assert_eq!(response["result"]["tools"][0]["name"], "entity_at");
         assert_eq!(response["result"]["tools"][7]["name"], "subsystem_members");
     }
@@ -6348,7 +6406,7 @@ mod tests {
 
         assert_eq!(decoded["jsonrpc"], "2.0");
         assert_eq!(decoded["id"], 10);
-        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 18);
+        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 21);
     }
 
     #[test]
@@ -6423,7 +6481,7 @@ mod tests {
         assert_eq!(first_json["id"], 11);
         assert_eq!(first_json["result"]["serverInfo"]["name"], "clarion");
         assert_eq!(second_json["id"], 12);
-        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 18);
+        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 21);
     }
 
     #[test]
