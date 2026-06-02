@@ -160,12 +160,12 @@ impl ServerState {
                 let in_clause = confidence_in_clause(confidence);
 
                 let mut coupling: HashMap<String, (i64, i64)> = HashMap::new();
-                // Coupling is over DEPENDENCY edges only — calls / imports /
-                // references. Structural edges (contains, in_subsystem, guides,
+                // Coupling is over the import/call edge graph (spec §3.3).
+                // Structural edges (contains, in_subsystem, guides,
                 // emits_finding) all carry confidence='resolved', so including
                 // them would make the ranking dominated by containment /
-                // membership fan-out, not actionable coupling (spec §3.3).
-                let kinds = "kind IN ('calls', 'imports', 'references')";
+                // membership fan-out, not actionable coupling.
+                let kinds = "kind IN ('calls', 'imports')";
                 // out-degree (distinct callees / targets)
                 let out_sql = format!(
                     "SELECT from_id, COUNT(DISTINCT to_id) FROM edges \

@@ -37,6 +37,23 @@ Every entity has an ID: `{plugin}:{kind}:{qualified_name}`
 **You almost never type IDs.** Get one from `find_entity` / `entity_at`, then
 **copy it verbatim** into the next tool. Don't hand-construct or guess IDs.
 
+### `id` vs `sei` — which one to bind on
+
+Every entity in a tool response now carries an `sei` field alongside its `id`.
+They are not interchangeable:
+
+- **`id`** is the entity's *locator* — a mutable address. It changes when the
+  code is renamed or moved, and it's the right thing to feed into the next
+  Clarion tool call (above).
+- **`sei`** is the entity's *durable, stable identity*. It survives renames and
+  moves. **When you record a cross-tool binding** — e.g. attaching a Filigree
+  issue to a Clarion entity — **bind on the `sei`, not the `id`.** A binding
+  keyed on the mutable `id` silently breaks the first time the entity moves.
+
+`sei` is `null` when the index predates SEI support or the entity has no binding
+yet; `project_status` and `orientation_pack` report `sei.populated` so you can
+tell which case you're in.
+
 ## Tools
 
 | Tool | Use when | Args |
@@ -80,6 +97,63 @@ node-id strings ranked longest-first. Resolve a path id against `nodes`, not by
 re-reading each path element. `truncated`/`truncation_reason` report `edge-cap`
 (traversal stopped early) or `path-cap` (ranked output trimmed for size).
 
+## Catalogue tools — inspection · faceted search · shortcuts
+
+Beyond navigation, Clarion serves a **stateless catalogue** of read tools. All
+of them: take explicit ids/scopes (no cursor/session — there is no `goto`/`back`
+state to manage); **paginate** (`limit`/`offset`, with a `page` block reporting
+`total`/`returned`/`truncated` — no silent caps); carry `sei` on every entity
+they return; and are **honest-empty** — where a signal isn't present they return
+an empty result with a `signal` note (`available:false`, the reason), never a
+fabricated answer.
+
+`scope?` (where accepted) takes **either** an entity id (→ that entity's
+descendants) **or** a path glob (`"src/auth/**"`); omit it for the whole project.
+
+**Inspection (read):**
+
+| Tool | Use when | Args |
+|------|----------|------|
+| `guidance_for` | guidance sheets applicable to an entity, scope-ranked | `{"id": "<id>"}` |
+| `findings_for` | findings anchored to an entity (filter kind/severity/status) | `{"id": "<id>", "filter": {"status": "open"}}` |
+| `wardline_for` | the entity's Wardline metadata (verbatim, opaque) | `{"id": "<id>"}` |
+
+**Faceted search:**
+
+| Tool | Use when | Args |
+|------|----------|------|
+| `find_by_tag` | entities carrying a categorisation tag | `{"tag": "<tag>", "scope": "src/**"}` |
+| `find_by_kind` | entities of a kind (`function`/`class`/`module`/…) | `{"kind": "function"}` |
+| `find_by_wardline` | entities by Wardline tier/group (best-effort) | `{"tier": "exact"}` |
+
+**Exploration-elimination shortcuts** (on-demand graph/index queries — no
+analyze-time precompute):
+
+| Tool | Use when |
+|------|----------|
+| `find_circular_imports` | import cycles (SCCs over `imports` edges) |
+| `find_coupling_hotspots` | entities ranked by fan-in + fan-out |
+| `find_entry_points` / `find_http_routes` / `find_data_models` / `find_tests` | entities by categorisation tag |
+| `find_deprecations` / `find_todos` | deprecated / TODO-tagged entities |
+| `what_tests_this` | test-tagged callers of an entity |
+| `high_churn` | entities ranked by git churn |
+| `recently_changed` | entities changed since a timestamp |
+
+`find_circular_imports` and `find_coupling_hotspots` are edge-derived, so they
+take a `confidence` tier (default `resolved`, a ceiling) and echo it. The
+categorisation shortcuts read plugin-emitted tags; the **Python plugin emits no
+categorisation tags today**, so `find_entry_points`/`find_http_routes`/
+`find_data_models`/`find_tests`/`find_deprecations`/`find_todos`/`what_tests_this`
+return honest-empty with a missing-signal note — an empty result means "the
+signal is absent", not "there is nothing here". Likewise `high_churn` and
+`recently_changed` are honest-empty until churn/change signals are populated (use
+`index_diff` for repo-level freshness).
+
+> Not in this catalogue: `search_semantic` and `find_dead_code` (need embedding
+> / whole-graph-reachability infrastructure — a separate wave), guidance
+> *authoring* (`propose_guidance`/`promote_guidance` — `guidance_for` is read
+> only), and `emit_observation` (no observation-write transport ships yet).
+
 ## Workflow: orient, then navigate
 
 1. **Anchor.** `find_entity` by name (or `entity_at` for a file:line) to get the
@@ -111,3 +185,7 @@ re-reading each path element. `truncated`/`truncation_reason` report `edge-cap`
 `clarion serve --path <dir>` where `<dir>` contains `.clarion/clarion.db`
 (built by `clarion analyze <dir>`). In an MCP client the tools appear as
 `mcp__clarion__find_entity`, etc.
+
+Besides the tools, the server exposes a `clarion://context` **resource** — live
+entity/subsystem/finding counts and index freshness as JSON, a lightweight read
+when you only want the numbers (`project_status` is the fuller tool-based view).
