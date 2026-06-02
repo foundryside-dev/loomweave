@@ -3,10 +3,10 @@
 //! `sei_prior_index` (migration 0004) is a side table holding the previous
 //! successful run's `locator -> body_hash (+ signature)` snapshot. It is
 //! SHAPE-INDEPENDENT — there is no `sei` column — so it ships before the
-//! suite-wide SEI identity standard locks. Two later consumers read it: the
-//! incremental-analysis fast path (skip unchanged files) and the SEI matcher
-//! (detect vanished locators / compare bodies for move + rename). Neither is
-//! wired in Wave 0; this module only builds and rewrites the snapshot.
+//! suite-wide SEI identity standard locks. Two consumers read it: the SEI
+//! matcher (Wave 1 — detect vanished locators / compare bodies for move +
+//! rename) and the incremental-analysis fast path (Wave 2 / T3.1 — skip
+//! unchanged files via [`previously_analyzed_files`] / [`prior_locators_by_file`]).
 //!
 //! The snapshot is rewritten as a FULL REPLACE after each successful run (see
 //! [`replace_prior_index`] and `WriterCmd::UpsertPriorIndex`). `entities` is a
@@ -86,6 +86,69 @@ pub fn load_prior_index(conn: &Connection) -> Result<HashMap<String, PriorIndexE
     for row in rows {
         let entry = row.map_err(StorageError::from)?;
         out.insert(entry.locator.clone(), entry);
+    }
+    Ok(out)
+}
+
+/// Recover the prior run's **whole-file** content hash per source file, for the
+/// incremental-analysis fast path (Wave 2 / T3.1). Joins the prior index to
+/// `entities` and keeps the synthetic **core `file`** entity (`plugin_id='core'`,
+/// `kind='file'`), which the analyze pipeline creates per source file with its
+/// `content_hash` set to the blake3 of the whole file (`core_file_entity`). That
+/// entity is plugin-language-agnostic — every analysed file gets one — and its
+/// `source_file_path` is the canonical absolute path, so it keys cleanly against
+/// the tree-walk file list. The returned map is `{ source_file_path -> whole_file_hash }`.
+///
+/// Plugin-generality note: a file is skippable only if its core `file` entity
+/// survives in the prior index. Absent it (e.g. the file failed to hash last
+/// run), the file is always re-analysed — the safe (fail-toward-work) direction.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Sqlite`] if the query fails.
+pub fn previously_analyzed_files(conn: &Connection) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.source_file_path, p.body_hash \
+         FROM sei_prior_index p \
+         JOIN entities e ON e.id = p.locator \
+         WHERE e.plugin_id = 'core' AND e.kind = 'file' \
+           AND e.source_file_path IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (path, hash) = row.map_err(StorageError::from)?;
+        out.insert(path, hash);
+    }
+    Ok(out)
+}
+
+/// Group every prior-index locator by the source file its entity belongs to, for
+/// the incremental skip's orphan-guard union (Wave 2 / T3.1). When a file is
+/// skipped, ALL its prior entities — not just the module — must be (a) added to
+/// the matcher's current-locator set so they are not falsely orphaned and (b)
+/// re-fed into the rebuilt prior index so the snapshot does not decay. The
+/// returned map is `{ source_file_path -> [locator, …] }`.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Sqlite`] if the query fails.
+pub fn prior_locators_by_file(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.source_file_path, p.locator \
+         FROM sei_prior_index p \
+         JOIN entities e ON e.id = p.locator \
+         WHERE e.source_file_path IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for row in rows {
+        let (path, locator) = row.map_err(StorageError::from)?;
+        out.entry(path).or_default().push(locator);
     }
     Ok(out)
 }
@@ -247,5 +310,125 @@ mod tests {
         replace_prior_index(&conn, &[entry("python:function:a", "h")], "t0").unwrap();
         replace_prior_index(&conn, &[], "t1").unwrap();
         assert!(load_prior_index(&conn).unwrap().is_empty());
+    }
+
+    /// Insert a minimal `entities` row so the prior-index ↔ entities joins
+    /// (`previously_analyzed_files`, `prior_locators_by_file`) have something to
+    /// resolve against. Only the columns those queries read are meaningful.
+    fn insert_entity(conn: &Connection, id: &str, plugin: &str, kind: &str, file: &str) {
+        conn.execute(
+            "INSERT INTO entities \
+             (id, plugin_id, kind, name, short_name, source_file_path, properties, \
+              content_hash, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?4, ?5, '{}', 'h', 't', 't')",
+            params![id, plugin, kind, id, file],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn previously_analyzed_files_recovers_core_file_whole_file_hashes() {
+        // The core `file` entity carries the whole-file hash; a plugin function
+        // entity in the same file must NOT appear (its hash is a span hash).
+        let conn = migrated_conn();
+        insert_entity(
+            &conn,
+            "core:file:pkg/mod.py",
+            "core",
+            "file",
+            "/abs/pkg/mod.py",
+        );
+        insert_entity(
+            &conn,
+            "python:function:pkg.mod.f",
+            "python",
+            "function",
+            "/abs/pkg/mod.py",
+        );
+        upsert_prior_index_entry(&conn, &entry("core:file:pkg/mod.py", "FILEHASH"), "t0").unwrap();
+        upsert_prior_index_entry(&conn, &entry("python:function:pkg.mod.f", "SPANHASH"), "t0")
+            .unwrap();
+
+        let files = previously_analyzed_files(&conn).unwrap();
+        assert_eq!(
+            files.len(),
+            1,
+            "only the core file entity carries a file hash"
+        );
+        assert_eq!(files.get("/abs/pkg/mod.py"), Some(&"FILEHASH".to_owned()));
+    }
+
+    #[test]
+    fn previously_analyzed_files_omits_files_with_no_core_file_entity_in_prior_index() {
+        // A file whose core `file` entity is absent from the prior index is not
+        // skippable — it must be re-analysed (fail toward work).
+        let conn = migrated_conn();
+        insert_entity(
+            &conn,
+            "python:function:pkg.mod.f",
+            "python",
+            "function",
+            "/abs/pkg/mod.py",
+        );
+        upsert_prior_index_entry(&conn, &entry("python:function:pkg.mod.f", "SPANHASH"), "t0")
+            .unwrap();
+        assert!(previously_analyzed_files(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn prior_locators_by_file_groups_every_entity_of_a_file() {
+        // The orphan-guard union needs ALL of a skipped file's locators (core
+        // file + plugin entities) — so a skipped file's functions are not falsely
+        // orphaned.
+        let conn = migrated_conn();
+        insert_entity(
+            &conn,
+            "core:file:pkg/mod.py",
+            "core",
+            "file",
+            "/abs/pkg/mod.py",
+        );
+        insert_entity(
+            &conn,
+            "python:function:pkg.mod.f",
+            "python",
+            "function",
+            "/abs/pkg/mod.py",
+        );
+        insert_entity(
+            &conn,
+            "python:function:pkg.mod.g",
+            "python",
+            "function",
+            "/abs/pkg/mod.py",
+        );
+        insert_entity(
+            &conn,
+            "core:file:pkg/other.py",
+            "core",
+            "file",
+            "/abs/pkg/other.py",
+        );
+        for loc in [
+            "core:file:pkg/mod.py",
+            "python:function:pkg.mod.f",
+            "python:function:pkg.mod.g",
+            "core:file:pkg/other.py",
+        ] {
+            upsert_prior_index_entry(&conn, &entry(loc, "h"), "t0").unwrap();
+        }
+
+        let by_file = prior_locators_by_file(&conn).unwrap();
+        let mut mod_locs = by_file["/abs/pkg/mod.py"].clone();
+        mod_locs.sort();
+        assert_eq!(
+            mod_locs,
+            [
+                "core:file:pkg/mod.py",
+                "python:function:pkg.mod.f",
+                "python:function:pkg.mod.g",
+            ]
+        );
+        assert_eq!(by_file["/abs/pkg/other.py"], ["core:file:pkg/other.py"]);
     }
 }

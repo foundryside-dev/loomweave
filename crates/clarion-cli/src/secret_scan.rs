@@ -445,7 +445,7 @@ fn abort_unconfirmed_override() -> ! {
     std::process::exit(78);
 }
 
-pub(super) fn canonical_or_original(path: &Path) -> PathBuf {
+pub(crate) fn canonical_or_original(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|err| {
         tracing::warn!(
             path = %path.display(),

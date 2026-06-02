@@ -30,8 +30,8 @@ pub use commands::{
 };
 pub use error::{Result, StorageError};
 pub use prior_index::{
-    PriorIndexEntry, clear_prior_index, load_prior_index, replace_prior_index,
-    upsert_prior_index_entry,
+    PriorIndexEntry, clear_prior_index, load_prior_index, previously_analyzed_files,
+    prior_locators_by_file, replace_prior_index, upsert_prior_index_entry,
 };
 pub use query::{
     CallEdgeMatch, CanonicalProjectPath, ContainedEntities, EntityRow, EntitySubsystem,

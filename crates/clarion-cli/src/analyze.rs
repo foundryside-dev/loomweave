@@ -122,6 +122,28 @@ impl ProgressReporter {
         }
     }
 
+    /// Snapshot for a file the Wave 2 / T3.1 incremental fast path skipped
+    /// (unchanged since the prior run): emit an `analyzing` snapshot tagged
+    /// `skipped_unchanged`, then count the file as processed — it is done, just
+    /// not re-parsed, so the progress denominator still resolves.
+    fn file_skipped_unchanged(&self, plugin_id: &str, file: &str) {
+        if let Some(inner) = &self.inner {
+            let snapshot = serde_json::json!({
+                "run_id": inner.run_id,
+                "pid": inner.pid,
+                "phase": "analyzing",
+                "event": "skipped_unchanged",
+                "current_plugin": plugin_id,
+                "current_file": file,
+                "processed_files": inner.processed_files.load(Ordering::Relaxed),
+                "total_files": inner.total_files.load(Ordering::Relaxed),
+                "heartbeat_at": iso8601_now(),
+            });
+            self.write_atomic(&snapshot);
+            inner.processed_files.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn write_atomic(&self, snapshot: &serde_json::Value) {
         let Some(inner) = &self.inner else {
             return;
@@ -161,6 +183,11 @@ pub(crate) struct AnalyzeOptions {
     /// hatch for runs against a pre-migration DB or when identity is irrelevant;
     /// the durable graph is unaffected (SEI is enrich-only).
     pub(crate) no_sei: bool,
+    /// `--no-incremental`: force a full re-analysis, disabling the Wave 2 / T3.1
+    /// skip of unchanged files. Incremental skip is speed-only (entities are
+    /// cumulative, edges are `INSERT OR IGNORE`), so this is an escape hatch for a
+    /// clean re-index, not a correctness switch.
+    pub(crate) no_incremental: bool,
 }
 
 /// Run the analyze command against `project_path` with resolved CLI options.
@@ -356,6 +383,50 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     crate::run_lifecycle::open_run(&writer, resume, &run_id, &analyze_config_json, &started_at)
         .await?;
 
+    // ── Wave 2 / T3.1: incremental-analysis skip state ────────────────────────
+    //
+    // Recover the prior run's per-file whole-file hashes (to detect unchanged
+    // files), the locators each file contributed (so a skipped file's still-
+    // present entities are never falsely orphaned by the SEI matcher), and the
+    // full prior-index snapshot (to re-feed skipped entries into the rebuilt
+    // index — otherwise the snapshot would blank them out and the skip would
+    // decay after one run). Read from a fresh connection BEFORE this run writes
+    // anything, so it reflects exactly the previous successful run. `--no-
+    // incremental` and a first run (empty prior index) both degrade to a full
+    // analysis. Skip is speed-only: entities are cumulative, edges are `INSERT
+    // OR IGNORE`, so a skipped file's durable rows are untouched.
+    let incremental = !options.no_incremental;
+    let (prior_file_hashes, mut prior_locs_by_file, prior_index_snapshot) = if incremental {
+        match Connection::open(&db_path) {
+            Ok(conn) => {
+                let files = clarion_storage::previously_analyzed_files(&conn).unwrap_or_default();
+                let locs = clarion_storage::prior_locators_by_file(&conn).unwrap_or_default();
+                let snapshot = clarion_storage::load_prior_index(&conn).unwrap_or_default();
+                (files, locs, snapshot)
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "incremental skip disabled: cannot open read connection");
+                (HashMap::new(), HashMap::new(), HashMap::new())
+            }
+        }
+    } else {
+        (HashMap::new(), HashMap::new(), HashMap::new())
+    };
+    // Locators of skipped-unchanged entities — fed into the SEI matcher's
+    // current-locator union AND re-appended to the prior-index rebuild below.
+    let mut retained_locators: HashSet<String> = HashSet::new();
+    let mut skipped_files_total: u64 = 0;
+    // Files with an active secret finding must NEVER be skipped: the finding
+    // anchors to the plugin entity emitted only when the file is analysed, so
+    // skipping it would re-anchor to the core `file` entity and duplicate the
+    // finding (REQ-FINDING-05 determinism). The set is small (files containing
+    // secrets) and canonicalised with the same helper the anchor logic uses.
+    let secret_finding_files: HashSet<PathBuf> = secret_scan_outcome
+        .finding_files()
+        .iter()
+        .map(|f| crate::secret_scan::canonical_or_original(f))
+        .collect();
+
     // ── Per-plugin processing ─────────────────────────────────────────────────
     //
     // A per-plugin crash (spawn / handshake / analyze_file Err) does NOT tank
@@ -422,9 +493,44 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             continue;
         }
 
+        // Wave 2 / T3.1: partition into files to re-analyse (changed, new,
+        // unhashable → fail toward work, or carrying a secret finding whose
+        // anchor must stay stable) and files to skip (whole-file hash identical to
+        // the prior run). Each skipped file's prior entities stay in the DB; we
+        // record their locators for the matcher union and re-append their
+        // prior-index rows so the rebuilt snapshot keeps them.
+        let (plugin_files, skipped_files): (Vec<PathBuf>, Vec<PathBuf>) =
+            plugin_files.into_iter().partition(|path| {
+                secret_finding_files.contains(&crate::secret_scan::canonical_or_original(path))
+                    || file_needs_reanalysis(path, &prior_file_hashes)
+            });
+        for path in &skipped_files {
+            skipped_files_total += 1;
+            progress.file_skipped_unchanged(&plugin_id, &path.to_string_lossy());
+            if let Some(key) = canonical_path_key(path)
+                && let Some(locators) = prior_locs_by_file.remove(&key)
+            {
+                for locator in locators {
+                    if let Some(entry) = prior_index_snapshot.get(&locator) {
+                        prior_index_entries.push(entry.clone());
+                    }
+                    retained_locators.insert(locator);
+                }
+            }
+        }
+        if plugin_files.is_empty() {
+            tracing::info!(
+                plugin_id = %plugin_id,
+                skipped = skipped_files.len(),
+                "all plugin files unchanged; skipping plugin dispatch (incremental)"
+            );
+            continue;
+        }
+
         tracing::info!(
             plugin_id = %plugin_id,
             file_count = plugin_files.len(),
+            skipped = skipped_files.len(),
             "processing plugin"
         );
 
@@ -752,6 +858,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "references_skipped_external_total": references_skipped_external_total,
                 "references_skipped_cap_total": references_skipped_cap_total,
                 "imports_skipped_external_total": imports_skipped_external_total,
+                "skipped_files": skipped_files_total,
                 "unresolved_reference_sites_total": unresolved_reference_sites_total,
                 "pyright_query_latency_p95_ms": pyright_query_latency_p95_ms,
                 "pyright_index_parse_latency_p95_ms": pyright_index_parse_latency_p95_ms,
@@ -788,8 +895,15 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             if options.no_sei {
                 tracing::info!(run_id = %run_id, "SEI mint pass skipped (--no-sei)");
             } else {
-                match run_sei_mint_pass(&writer, &db_path, &project_root, &run_id, sei_descriptors)
-                    .await
+                match run_sei_mint_pass(
+                    &writer,
+                    &db_path,
+                    &project_root,
+                    &run_id,
+                    sei_descriptors,
+                    &retained_locators,
+                )
+                .await
                 {
                     Ok(stats) => tracing::info!(
                         run_id = %run_id,
@@ -851,6 +965,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "references_skipped_external_total": references_skipped_external_total,
                 "references_skipped_cap_total": references_skipped_cap_total,
                 "imports_skipped_external_total": imports_skipped_external_total,
+                "skipped_files": skipped_files_total,
                 "unresolved_reference_sites_total": unresolved_reference_sites_total,
                 "pyright_query_latency_p95_ms": pyright_query_latency_p95_ms,
                 "pyright_index_parse_latency_p95_ms": pyright_index_parse_latency_p95_ms,
@@ -959,6 +1074,7 @@ async fn run_sei_mint_pass(
     project_root: &Path,
     run_id: &str,
     descriptors: Vec<NewEntityDescriptor>,
+    retained_locators: &HashSet<String>,
 ) -> anyhow::Result<SeiPassStats> {
     // Read the prior alive bindings (this run has written no SEI yet, so this is
     // exactly the previous run's identity state).
@@ -968,7 +1084,15 @@ async fn run_sei_mint_pass(
     };
 
     let descriptors = dedup_descriptors_by_locator(descriptors);
-    let current_locators: HashSet<String> = descriptors.iter().map(|d| d.locator.clone()).collect();
+    // LOAD-BEARING (Wave 2 / T3.1): the current-run locator set is the union of
+    // the re-analysed entities AND the skipped-unchanged files' entities (which
+    // are still present, just not re-parsed). Both `rebind_or_mint` (vanish
+    // detection — never steal a still-present SEI) and `orphaned_bindings` (never
+    // orphan a still-present entity) consume this set. Omitting the skipped
+    // locators would falsely orphan every entity in every unchanged file.
+    let mut current_locators: HashSet<String> =
+        descriptors.iter().map(|d| d.locator.clone()).collect();
+    current_locators.extend(retained_locators.iter().cloned());
 
     // The git-rename signal (best-effort, typed seam REQ-C-05). Skipped entirely
     // on non-repo corpora to avoid a spurious subprocess.
@@ -2405,9 +2529,8 @@ fn core_file_entity_record(
         .and_then(|name| name.to_str())
         .unwrap_or(&qualified_name)
         .to_owned();
-    let content_hash = fs::read(&source_file_path)
-        .with_context(|| format!("read source file {source_file_path}"))
-        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())?;
+    let content_hash = whole_file_hash(Path::new(&source_file_path))
+        .with_context(|| format!("read source file {source_file_path}"))?;
     let mut properties = serde_json::Map::new();
     properties.insert(
         "language".to_owned(),
@@ -2540,13 +2663,54 @@ fn source_line_range(entity: &AcceptedEntity) -> Option<SourceLineRange> {
     })
 }
 
+/// The blake3 hex of a file's whole contents — the single canonical whole-file
+/// hash used everywhere the "did this file change?" question is asked: the core
+/// `file` entity's `content_hash` (`core_file_entity`), a plugin `module`
+/// entity's `content_hash` (`content_hash_for_entity`), and the Wave 2
+/// incremental-skip check. They MUST agree byte-for-byte or the skip silently
+/// never matches; one helper guarantees that. `None` when the file cannot be
+/// read — callers fail toward re-analysis.
+fn whole_file_hash(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    Some(blake3::hash(&bytes).to_hex().to_string())
+}
+
+/// The canonical UTF-8 path string for a source file, formed exactly as
+/// `core_file_entity` forms `source_file_path` (canonicalise → UTF-8), so the
+/// incremental-skip lookup keys cleanly against `previously_analyzed_files` /
+/// `prior_locators_by_file`. `None` when the path cannot be canonicalised or is
+/// not UTF-8 — callers fail toward re-analysis.
+fn canonical_path_key(path: &Path) -> Option<String> {
+    path.canonicalize()
+        .ok()?
+        .into_os_string()
+        .into_string()
+        .ok()
+}
+
+/// Whether `path` must be re-analysed (Wave 2 / T3.1). Re-analyses — the safe,
+/// fail-toward-work direction — on any uncertainty: the path cannot be
+/// canonicalised, the prior run recorded no whole-file hash for it (a new file),
+/// or the file is unhashable now. Skips only on a confident byte-identical match.
+fn file_needs_reanalysis(path: &Path, prior_file_hashes: &HashMap<String, String>) -> bool {
+    let Some(key) = canonical_path_key(path) else {
+        return true;
+    };
+    let Some(prior) = prior_file_hashes.get(&key) else {
+        return true;
+    };
+    match whole_file_hash(path) {
+        Some(current) => &current != prior,
+        None => true,
+    }
+}
+
 fn content_hash_for_entity(
     entity: &AcceptedEntity,
     source_line_range: Option<SourceLineRange>,
 ) -> Option<String> {
     if entity.kind == "module" {
-        let bytes = fs::read(&entity.source_file_path).ok()?;
-        return Some(blake3::hash(&bytes).to_hex().to_string());
+        return whole_file_hash(Path::new(&entity.source_file_path));
     }
 
     let range = source_line_range?;

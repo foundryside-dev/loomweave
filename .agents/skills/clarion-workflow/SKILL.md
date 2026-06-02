@@ -1,0 +1,113 @@
+---
+name: clarion-workflow
+description: >
+  Use when orienting in an unfamiliar or large codebase and you want to avoid
+  re-reading or grepping the whole source tree: answering "what calls X",
+  "where is X defined", "what does X depend on", "what subsystem is X in", or
+  "find the function/class/module that does Y". Applies whenever a Clarion
+  code-archaeology MCP server (clarion serve / mcp__clarion__* tools) is
+  available for the project.
+---
+
+# Clarion Workflow
+
+## Overview
+
+Clarion pre-extracts a codebase into a queryable map — entities (functions,
+classes, modules, files), the call/reference/import edges between them, and
+subsystem clusters — and serves it over MCP. **Ask Clarion instead of
+re-exploring the tree.** One `find_entity` + one `callers_of` answers "what
+calls this?" without reading a single file.
+
+## When to use
+
+- You're dropped into a codebase and need to locate a symbol or trace its callers/callees.
+- You'd otherwise `grep`/read many files to answer a structural question.
+- You need a function's neighborhood, execution paths, or which subsystem it belongs to.
+
+**Not for:** editing code, reading exact implementation bodies (use `summary` or
+read the file once you have its path), or codebases with no `.clarion/` index.
+
+## Entity IDs — the model
+
+Every entity has an ID: `{plugin}:{kind}:{qualified_name}`
+(e.g. `python:function:pkg.mod.func`, `python:class:pkg.mod.Cls`,
+`python:module:pkg.mod`). Subsystems are `core:subsystem:{hash}`.
+
+**You almost never type IDs.** Get one from `find_entity` / `entity_at`, then
+**copy it verbatim** into the next tool. Don't hand-construct or guess IDs.
+
+## Tools
+
+| Tool | Use when | Args |
+|------|----------|------|
+| `find_entity` | locate an entity by name/text | `{"pattern": "<name>"}` |
+| `entity_at` | what's at a file:line | `{"file": "rel/path.py", "line": 42}` |
+| `callers_of` | what calls this entity | `{"id": "<id>"}` |
+| `neighborhood` | one-hop callers+callees+container+contained+references+imports | `{"id": "<id>"}` |
+| `execution_paths_from` | bounded call paths out of an entity | `{"id": "<id>", "max_depth": 5}` |
+| `subsystem_members` | modules in a subsystem | `{"id": "core:subsystem:<hash>"}` |
+| `subsystem_of` | the subsystem an entity belongs to (reverse of `subsystem_members`) | `{"id": "<id>"}` |
+| `summary` | on-demand prose summary of one entity | `{"id": "<id>"}` |
+| `summary_preview_cost` | preview a `summary` call's cache status / cost before spending | `{"id": "<id>"}` |
+| `issues_for` | Filigree issues attached to an entity | `{"id": "<id>"}` |
+| `source_for_entity` | an entity's exact indexed source span + bounded context | `{"id": "<id>", "context_lines": 10}` |
+| `call_sites` | the source line(s) behind a calls/references edge | `{"id": "<id>", "role": "caller"}` |
+| `orientation_pack` | one deterministic orientation packet for an entity or file:line (entity + context + neighbors + paths + issues + freshness) | `{"file": "rel/path.py", "line": 42}` |
+| `index_diff` | index freshness / drift vs. the current working tree | `{}` |
+| `analyze_start` | launch a background re-index, return its `run_id` | `{}` |
+| `analyze_status` | poll a started analyze (queued/running/terminal + progress) | `{"run_id": "<id>"}` |
+| `analyze_cancel` | stop a running analyze (group-kills plugin + Pyright) | `{"run_id": "<id>"}` |
+| `project_status` | index freshness, counts, LLM + Filigree status | `{}` |
+
+`callers_of` / `neighborhood` / `execution_paths_from` take a `confidence`
+tier — one of `"resolved"` (default; only high-confidence edges),
+`"ambiguous"`, or `"inferred"`. There is no `"all"` value. When you suspect an
+edge is missing (e.g. dynamic dispatch), re-query at `"ambiguous"` and
+`"inferred"` and union the results — a default `resolved` count can understate
+the true caller set.
+
+These three tools also return a `scope_excludes` array listing static blind
+spots the query did **not** search (e.g. `"attribute-receiver-calls"` like
+`ctx.svc.run()`). A non-empty
+`scope_excludes` means an empty/short result is **not** a guaranteed true
+negative — re-query at `"inferred"` (which searches those categories and returns
+`scope_excludes: []`) before concluding "nothing calls this."
+
+`execution_paths_from` returns a compact shape: `root`, a deduplicated `nodes`
+table (id + short_name + location, each node once), and `paths` as arrays of
+node-id strings ranked longest-first. Resolve a path id against `nodes`, not by
+re-reading each path element. `truncated`/`truncation_reason` report `edge-cap`
+(traversal stopped early) or `path-cap` (ranked output trimmed for size).
+
+## Workflow: orient, then navigate
+
+1. **Anchor.** `find_entity` by name (or `entity_at` for a file:line) to get the
+   entity and its `id`. For a code location you're about to dig into, prefer
+   `orientation_pack` — it returns the entity, its context, one-hop neighbors,
+   execution paths, attached issues, and index freshness in one deterministic
+   call, instead of hand-composing those queries.
+2. **Navigate.** Feed that `id` into `callers_of`, `neighborhood`,
+   `execution_paths_from`, or `summary`. Chain results' IDs to keep walking.
+
+## Gotchas (read before hunting for a subsystem)
+
+- **To find a package's subsystem, search the package NAME with `kind`.**
+  Subsystems are *named after* their dominant package (e.g. `mypkg`), so
+  `find_entity {"pattern":"subsystem"}` returns nothing. Search the package name
+  and pass `{"kind":"subsystem"}` to return only subsystem entities, then call
+  `subsystem_members`. (`find_entity` accepts an optional `kind` filter —
+  `"subsystem"`, `"function"`, `"class"`, `"module"`, …; omit it for no filter.)
+- **To go from an entity to its subsystem, use `subsystem_of`.**
+  `neighborhood` does **not** return the entity's subsystem. Call
+  `subsystem_of {"id": "<entity-id>"}` — it accepts any entity (a function/class
+  resolves through its containing module) and returns the subsystem plus the
+  module it resolved through. `subsystem_members` is the forward direction.
+- **`find_entity` is paginated** (~20/page, `next_cursor`); narrow the pattern
+  rather than paging if you can.
+
+## Launch
+
+`clarion serve --path <dir>` where `<dir>` contains `.clarion/clarion.db`
+(built by `clarion analyze <dir>`). In an MCP client the tools appear as
+`mcp__clarion__find_entity`, etc.

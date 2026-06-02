@@ -103,6 +103,13 @@ pub enum Command {
         /// enrich-only). Without this flag every analyze run mints/carries SEIs.
         #[arg(long)]
         no_sei: bool,
+
+        /// Force a full re-analysis, disabling the incremental skip of files
+        /// unchanged since the last run (Wave 2 / T3.1). The skip is speed-only
+        /// (entities are cumulative, edges are insert-or-ignore); use this for a
+        /// clean re-index. Without this flag unchanged files are skipped.
+        #[arg(long)]
+        no_incremental: bool,
     },
 
     /// Run the MCP stdio server.

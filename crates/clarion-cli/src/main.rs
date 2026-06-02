@@ -54,6 +54,7 @@ fn main() -> Result<()> {
             prune_unseen,
             progress_file,
             no_sei,
+            no_incremental,
         } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -78,6 +79,7 @@ fn main() -> Result<()> {
                     prune_unseen,
                     progress_file,
                     no_sei,
+                    no_incremental,
                 },
             ))
         }

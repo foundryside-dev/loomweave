@@ -2135,3 +2135,178 @@ fn analyze_orphans_deleted_entity_bindings_through_the_real_pipeline() {
         "kept locator must stay alive"
     );
 }
+
+// ── Wave 2 / T3.1: incremental analysis (skip unchanged files) + orphan guard ──
+
+/// Install Clarion + the phase3 fixture plugin into a fresh project. Returns the
+/// project dir, the plugin dir (kept alive so the script stays on disk), and the
+/// `PATH` value that exposes the plugin to `clarion analyze`.
+#[cfg(unix)]
+fn phase3_env() -> (tempfile::TempDir, tempfile::TempDir, std::ffi::OsString) {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_phase3_plugin(plugin_dir.path());
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    (project_dir, plugin_dir, plugin_path)
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_skip_does_not_orphan_unchanged_file_entities() {
+    // THE correctness crux of Wave 2 (T3.1 Step 4). With incremental skip on, a
+    // re-run that changes ONE file must skip the OTHER — and a skipped file's
+    // still-present entities must keep their SEI and NOT be orphaned. This is
+    // load-bearing: without the matcher's current-locator union including skipped
+    // entities, every entity in every unchanged file would be falsely orphaned.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    let analyze = || {
+        clarion_bin()
+            .args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .assert()
+            .success();
+    };
+
+    std::fs::write(project_dir.path().join("inc_stable.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("inc_churn.p3"), b"module\n").unwrap();
+    analyze();
+    let run1 = alive_sei_bindings(project_dir.path());
+    // The unchanged file contributes two entities: its core `file` entity and the
+    // fixture module. Both must survive run 2 with identical SEIs.
+    let stable_module = "phase3fixture:module:inc_stable";
+    let stable_sei = run1
+        .get(stable_module)
+        .expect("stable module has an alive binding after run 1")
+        .clone();
+    let stable_file_locator = run1
+        .keys()
+        .find(|k| k.starts_with("core:file:") && k.contains("inc_stable"))
+        .expect("stable file entity has an alive binding after run 1")
+        .clone();
+    let stable_file_sei = run1[&stable_file_locator].clone();
+
+    // Run 2: change ONLY inc_churn.p3 (its whole-file hash changes → re-analyzed);
+    // inc_stable.p3 is byte-identical → skipped.
+    std::fs::write(
+        project_dir.path().join("inc_churn.p3"),
+        b"module\n# changed\n",
+    )
+    .unwrap();
+    analyze();
+
+    let stats = latest_run_stats(project_dir.path());
+    assert_eq!(
+        stats["skipped_files"].as_u64(),
+        Some(1),
+        "exactly the unchanged file must be skipped: {stats}"
+    );
+
+    let run2 = alive_sei_bindings(project_dir.path());
+    assert_eq!(
+        run2.get(stable_module),
+        Some(&stable_sei),
+        "the skipped file's module must keep its SEI alive (not orphaned, not re-minted)"
+    );
+    assert_eq!(
+        run2.get(&stable_file_locator),
+        Some(&stable_file_sei),
+        "the skipped file's core file entity must keep its SEI alive"
+    );
+    // And the binding's status is literally alive (belt-and-braces: alive_sei_bindings
+    // already filters status='alive', but assert no orphaned lineage was recorded).
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    let orphaned_for_stable: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sei_lineage WHERE sei = ?1 AND event = 'orphaned'",
+            [&stable_sei],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        orphaned_for_stable, 0,
+        "no orphaned lineage event may be recorded for a skipped-unchanged entity"
+    );
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_repeated_unchanged_runs_keep_skipping() {
+    // Guards the prior-index WRITE side: a skipped file's entries must be re-fed
+    // into the rebuilt prior index, or the snapshot blanks them out and the skip
+    // decays (run 2 skips all, run 3 skips nothing). Three identical runs must
+    // each skip BOTH files after the first.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    let analyze = || {
+        clarion_bin()
+            .args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .assert()
+            .success();
+    };
+
+    std::fs::write(project_dir.path().join("decay_a.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("decay_b.p3"), b"module\n").unwrap();
+
+    analyze(); // run 1: from-scratch, nothing to skip.
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(0),
+        "first run has no prior index, so it skips nothing"
+    );
+
+    analyze(); // run 2: both unchanged → both skipped.
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(2),
+        "second run must skip both unchanged files"
+    );
+
+    analyze(); // run 3: the snapshot must NOT have decayed.
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(2),
+        "third run must still skip both — the prior index must not decay after a skip"
+    );
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_no_incremental_forces_full_reanalysis() {
+    // The --no-incremental escape hatch disables the skip entirely: an unchanged
+    // re-run re-analyses every file (skipped_files = 0).
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    std::fs::write(project_dir.path().join("full_a.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("full_b.p3"), b"module\n").unwrap();
+
+    clarion_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+    clarion_bin()
+        .args(["analyze", "--no-incremental"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(0),
+        "--no-incremental must re-analyse everything"
+    );
+    // Identity is still stable across the forced full re-run (carried, not re-minted).
+    assert!(
+        !alive_sei_bindings(project_dir.path()).is_empty(),
+        "a forced full re-run still carries SEIs"
+    );
+}
