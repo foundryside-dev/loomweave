@@ -32,7 +32,8 @@ use serde_json::{Value, json};
 
 use clarion_storage::{
     GuidanceSheet, GuidanceSheetInput, delete_guidance_sheet, get_guidance_sheet,
-    guidance_sheet_matches_entity, list_guidance_sheets, upsert_guidance_sheet,
+    guidance_sheet_matches_entity, invalidate_summaries_for_sheet, list_guidance_sheets,
+    upsert_guidance_sheet,
 };
 
 use crate::cli::GuidanceCommand;
@@ -250,11 +251,37 @@ fn create(project_root: &Path, args: CreateArgs<'_>) -> Result<()> {
     )
     .into_anyhow()
     .context("write guidance sheet")?;
-    // TODO(T-cache): invalidate dependent summaries when a new sheet changes
-    // which entities have applicable guidance.
+
+    // ADR-007 churn-eager invalidation: a new sheet adds guidance to the
+    // entities its match_rules cover, so their cached summaries must be dropped
+    // or the guidance stays inert until each entity's code changes. Re-fetch the
+    // just-written sheet (cleaner than hand-rolling a `GuidanceSheet`) and
+    // invalidate the entities it matches.
+    let invalidated = invalidate_matched_summaries(project_root, &conn, &id)?;
 
     println!("Created guidance sheet {id}");
+    report_invalidation(invalidated);
     Ok(())
+}
+
+/// Invalidate cached summaries for every entity the sheet `id` matches, using
+/// the canonicalized project root the storage matcher needs for `path:` rules.
+/// Re-fetches the sheet by id so callers don't hand-build a `GuidanceSheet`.
+/// A missing sheet (e.g. raced away) is a clean 0.
+fn invalidate_matched_summaries(project_root: &Path, conn: &Connection, id: &str) -> Result<usize> {
+    let Some(sheet) = get_guidance_sheet(conn, id).into_anyhow()? else {
+        return Ok(0);
+    };
+    invalidate_summaries_for_sheet(conn, &sheet, project_root).into_anyhow()
+}
+
+/// Print a short operator note when summaries were invalidated. Silent on 0 so
+/// the common no-match case stays quiet.
+fn report_invalidation(count: usize) {
+    if count > 0 {
+        let plural = if count == 1 { "summary" } else { "summaries" };
+        println!("Invalidated {count} cached {plural}");
+    }
 }
 
 fn edit(project_root: &Path, id: &str) -> Result<()> {
@@ -299,10 +326,36 @@ fn edit(project_root: &Path, id: &str) -> Result<()> {
     )
     .into_anyhow()
     .context("write edited guidance sheet")?;
-    // TODO(T-cache): invalidate dependent summaries on content change.
+
+    // ADR-007 churn-eager invalidation: the edit changed `content`, so the
+    // composed guidance for every matched entity changed and their cached
+    // summaries are stale. Invalidate the union of entities matched before and
+    // after the edit. `edit` only mutates `content` (match_rules are preserved),
+    // so before == after today — but compute the union defensively so a future
+    // rule-editing path stays correct without a second visit here. The earlier
+    // `sheet` snapshot carries the pre-edit rules; `id` re-fetches the post-edit
+    // sheet.
+    let invalidated = invalidate_matched_summaries_union(project_root, &conn, &sheet, id)?;
 
     println!("Updated guidance sheet {id}");
+    report_invalidation(invalidated);
     Ok(())
+}
+
+/// Invalidate the union of entities matched by `before` (a pre-edit snapshot)
+/// and by the sheet currently stored under `id`. Each matched entity's cache is
+/// deleted at most once (the storage helper's per-entity `DELETE` is idempotent,
+/// so a second pass over an already-cleared entity contributes 0), so the
+/// returned count is the true number of rows removed across the union.
+fn invalidate_matched_summaries_union(
+    project_root: &Path,
+    conn: &Connection,
+    before: &GuidanceSheet,
+    id: &str,
+) -> Result<usize> {
+    let mut removed = invalidate_summaries_for_sheet(conn, before, project_root).into_anyhow()?;
+    removed += invalidate_matched_summaries(project_root, conn, id)?;
+    Ok(removed)
 }
 
 fn show(project_root: &Path, id: &str) -> Result<()> {
@@ -344,14 +397,32 @@ fn list(project_root: &Path, for_entity: Option<&str>) -> Result<()> {
 
 fn delete(project_root: &Path, id: &str) -> Result<()> {
     let conn = open_db(project_root)?;
-    if delete_guidance_sheet(&conn, id).into_anyhow()? {
-        // TODO(T-cache): invalidate dependent summaries for entities this sheet
-        // matched.
-        println!("Deleted guidance sheet {id}");
-        Ok(())
-    } else {
+
+    // Snapshot the sheet (and thus its match_rules) BEFORE deletion so we can
+    // still compute which entities it covered. Not-found is a clean error.
+    let sheet = get_guidance_sheet(&conn, id)
+        .into_anyhow()?
+        .ok_or_else(|| anyhow!("guidance sheet {id} not found"))?;
+
+    if !delete_guidance_sheet(&conn, id).into_anyhow()? {
         bail!("guidance sheet {id} not found")
     }
+
+    // ADR-007 churn-eager invalidation: removing the sheet removes guidance from
+    // the entities it covered, so their cached summaries are stale and must be
+    // dropped (the next query re-summarizes without the now-deleted guidance).
+    // Deleting the guidance row never touches the matched code entities' own
+    // rows, so post-deletion invalidation against the pre-deletion snapshot is
+    // correct.
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let invalidated =
+        invalidate_summaries_for_sheet(&conn, &sheet, &canonical_root).into_anyhow()?;
+
+    println!("Deleted guidance sheet {id}");
+    report_invalidation(invalidated);
+    Ok(())
 }
 
 // ── Presentation ──────────────────────────────────────────────────────────────

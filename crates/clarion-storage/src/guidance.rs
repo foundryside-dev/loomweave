@@ -214,6 +214,62 @@ pub fn guidance_sheet_matches_entity(
         .any(|rule| matches!(rule_match(rule, &facts), RuleVerdict::Matched(_))))
 }
 
+/// Invalidate (delete) cached summaries for every entity `sheet` matches,
+/// returning the number of `summary_cache` rows removed (WS6 / T-cache,
+/// ADR-007).
+///
+/// This is the eager-invalidation half of ADR-007's guidance contract: a
+/// guidance-sheet edit changes the composed guidance, so the cached summaries of
+/// every affected entity must be dropped or the new guidance never reaches a
+/// future prompt (it would otherwise stay inert until the entity's *code*
+/// changed and its `content_hash` cache key rotated). The CLI authoring path
+/// (`clarion guidance create|edit|delete`) calls this on every mutation.
+///
+/// Scan strategy: drive off `SELECT DISTINCT entity_id FROM summary_cache` (the
+/// only entities that *can* be invalidated), not the whole entity table — this
+/// keeps the work O(cached-entities) ≤ O(N-entities) and, by reusing
+/// [`delete_summary_cache_for_entity`]'s single-entity `DELETE`, dodges the
+/// `SQLite` 999-bound-parameter ceiling a broad `IN (…)` over a wide `path:`
+/// match would otherwise hit on a large corpus. Guidance sheets never carry
+/// cache rows, so the `kind = 'guidance'` exclusion is automatic.
+///
+/// A sheet with no (evaluable) `match_rules` matches nothing and this is a clean
+/// 0-row no-op — that is correct: explicit `guides`-edge composition is handled
+/// elsewhere (analyze.rs deletion path) and is deliberately out of scope here.
+///
+/// `project_root` is required to evaluate `path:` rules (the stored
+/// `source_file_path` is absolute; the matcher strips this prefix to a
+/// project-relative path). It is canonicalized to align with symlink-resolved
+/// stored paths, mirroring the CLI `list` path.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Sqlite`] on any `SQLite` failure enumerating cached
+/// entities, resolving entity facts, or deleting rows.
+pub fn invalidate_summaries_for_sheet(
+    conn: &Connection,
+    sheet: &GuidanceSheet,
+    project_root: &Path,
+) -> Result<usize> {
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+
+    let cached_ids: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT DISTINCT entity_id FROM summary_cache")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+
+    let mut removed = 0usize;
+    for entity_id in &cached_ids {
+        if guidance_sheet_matches_entity(conn, sheet, entity_id, &canonical_root)? {
+            removed += crate::cache::delete_summary_cache_for_entity(conn, entity_id)?;
+        }
+    }
+    Ok(removed)
+}
+
 /// The minimum entity facts a guidance `match_rules` evaluation needs. This is
 /// the single source of truth shared by the CLI write path
 /// ([`guidance_sheet_matches_entity`]) and the MCP `guidance_for` read path —

@@ -386,3 +386,184 @@ fn edit_without_editor_set_fails_cleanly() {
         .assert()
         .failure();
 }
+
+/// Seed one `summary_cache` row for the given entity (the column shape
+/// `analyze` and the cache writer use).
+fn seed_summary_cache(root: &std::path::Path, entity_id: &str) {
+    let db_path = root.join(".clarion").join("clarion.db");
+    let conn = Connection::open(&db_path).expect("open db");
+    conn.execute(
+        "INSERT INTO summary_cache \
+         (entity_id, content_hash, prompt_template_id, model_tier, guidance_fingerprint, \
+          summary_json, cost_usd, tokens_input, tokens_output, created_at, last_accessed_at, \
+          caller_count, fan_out) \
+         VALUES (?1, 'h', 'tmpl', 'tier', 'fp', '{}', 0.0, 0, 0, \
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 0, 0)",
+        rusqlite::params![entity_id],
+    )
+    .expect("seed summary_cache row");
+}
+
+fn summary_cache_count(root: &std::path::Path, entity_id: &str) -> i64 {
+    let db_path = root.join(".clarion").join("clarion.db");
+    let conn = Connection::open(&db_path).expect("open db");
+    conn.query_row(
+        "SELECT COUNT(*) FROM summary_cache WHERE entity_id = ?1",
+        rusqlite::params![entity_id],
+        |row| row.get(0),
+    )
+    .expect("count cache rows")
+}
+
+#[test]
+fn create_invalidates_cached_summary_for_matched_entity() {
+    // ADR-007 / T-cache: authoring a sheet that matches a seeded entity drops
+    // that entity's cached summary, so the new guidance can reach future prompts.
+    let dir = tempfile::tempdir().unwrap();
+    seed_db(dir.path());
+    seed_summary_cache(dir.path(), "python:function:auth.tokens.refresh");
+    assert_eq!(
+        summary_cache_count(dir.path(), "python:function:auth.tokens.refresh"),
+        1
+    );
+
+    let assert = clarion_bin()
+        .args(["guidance", "create"])
+        .args(["--path"])
+        .arg(dir.path())
+        .args(["--scope-level", "module"])
+        .args(["--name", "auth-sheet"])
+        .args(["--match", "path:src/auth/**"])
+        .args(["--content", "auth guidance"])
+        .assert()
+        .success();
+    assert!(
+        String::from_utf8_lossy(&assert.get_output().stdout).contains("Invalidated 1 cached"),
+        "create should report the invalidation"
+    );
+
+    assert_eq!(
+        summary_cache_count(dir.path(), "python:function:auth.tokens.refresh"),
+        0,
+        "matched entity's cached summary must be invalidated on authoring"
+    );
+}
+
+#[test]
+fn create_non_matching_sheet_leaves_cache_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_db(dir.path());
+    seed_summary_cache(dir.path(), "python:function:auth.tokens.refresh");
+
+    clarion_bin()
+        .args(["guidance", "create"])
+        .args(["--path"])
+        .arg(dir.path())
+        .args(["--scope-level", "module"])
+        .args(["--name", "billing-sheet"])
+        .args(["--match", "path:src/billing/**"])
+        .args(["--content", "billing guidance"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        summary_cache_count(dir.path(), "python:function:auth.tokens.refresh"),
+        1,
+        "a sheet that matches nothing must not touch any cache row"
+    );
+}
+
+#[test]
+fn delete_invalidates_cached_summary_for_matched_entity() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_db(dir.path());
+
+    clarion_bin()
+        .args(["guidance", "create"])
+        .args(["--path"])
+        .arg(dir.path())
+        .args(["--scope-level", "module"])
+        .args(["--name", "auth-sheet"])
+        .args(["--match", "kind:function"])
+        .args(["--content", "auth guidance"])
+        .assert()
+        .success();
+
+    // Simulate a summary cached *after* the sheet was created (e.g. the next
+    // briefing query); deleting the sheet must drop it so the now-removed
+    // guidance can't linger in a cached summary.
+    seed_summary_cache(dir.path(), "python:function:auth.tokens.refresh");
+    assert_eq!(
+        summary_cache_count(dir.path(), "python:function:auth.tokens.refresh"),
+        1
+    );
+
+    let assert = clarion_bin()
+        .args(["guidance", "delete", "core:guidance:auth-sheet"])
+        .args(["--path"])
+        .arg(dir.path())
+        .assert()
+        .success();
+    assert!(
+        String::from_utf8_lossy(&assert.get_output().stdout).contains("Invalidated 1 cached"),
+        "delete should report the invalidation"
+    );
+
+    assert_eq!(
+        summary_cache_count(dir.path(), "python:function:auth.tokens.refresh"),
+        0,
+        "deleting a matching sheet must invalidate the matched entity's cache"
+    );
+}
+
+#[test]
+fn edit_invalidates_cached_summary_for_matched_entity() {
+    // An edit changes `content`, so the composed guidance for every matched
+    // entity changed; the cached summary must be dropped.
+    let dir = tempfile::tempdir().unwrap();
+    seed_db(dir.path());
+    let id = "core:guidance:edit-cache";
+
+    clarion_bin()
+        .args(["guidance", "create"])
+        .args(["--path"])
+        .arg(dir.path())
+        .args(["--scope-level", "module"])
+        .args(["--name", "edit-cache"])
+        .args(["--match", "kind:function"])
+        .args(["--content", "original"])
+        .assert()
+        .success();
+
+    // Cache a summary *after* creation; the edit below must invalidate it.
+    seed_summary_cache(dir.path(), "python:function:auth.tokens.refresh");
+
+    let editor = dir.path().join("fake-editor.sh");
+    std::fs::write(&editor, "#!/bin/sh\nprintf 'revised guidance' > \"$1\"\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&editor).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&editor, perms).unwrap();
+    }
+
+    let assert = clarion_bin()
+        .args(["guidance", "edit", id])
+        .args(["--path"])
+        .arg(dir.path())
+        .env("EDITOR", &editor)
+        .env_remove("VISUAL")
+        .assert()
+        .success();
+    assert!(
+        String::from_utf8_lossy(&assert.get_output().stdout).contains("Invalidated 1 cached"),
+        "edit should report the invalidation"
+    );
+
+    assert_eq!(
+        summary_cache_count(dir.path(), "python:function:auth.tokens.refresh"),
+        0,
+        "editing a matching sheet must invalidate the matched entity's cache"
+    );
+}

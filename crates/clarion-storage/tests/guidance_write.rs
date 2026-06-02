@@ -325,3 +325,93 @@ fn sheet_with_rules(
         .unwrap()
         .unwrap()
 }
+
+fn seed_cache_row(conn: &Connection, entity_id: &str) {
+    conn.execute(
+        "INSERT INTO summary_cache \
+         (entity_id, content_hash, prompt_template_id, model_tier, guidance_fingerprint, \
+          summary_json, cost_usd, tokens_input, tokens_output, created_at, last_accessed_at, \
+          caller_count, fan_out) \
+         VALUES (?1, 'h', 'tmpl', 'tier', 'fp', '{}', 0.0, 0, 0, \
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 0, 0)",
+        params![entity_id],
+    )
+    .unwrap();
+}
+
+fn cache_row_count(conn: &Connection, entity_id: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM summary_cache WHERE entity_id = ?1",
+        params![entity_id],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn invalidate_summaries_drops_matched_and_keeps_unmatched() {
+    use clarion_storage::invalidate_summaries_for_sheet;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    let project_root = tempdir.path();
+
+    // A `function` entity (the sheet's `kind:function` rule will match) and a
+    // `class` entity (it will not). Both have a cached summary.
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
+         created_at, updated_at) VALUES \
+         (?1, 'python', 'function', 'pkg.mod.f', 'f', '{}', \
+          strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        params!["python:function:pkg.mod.f"],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
+         created_at, updated_at) VALUES \
+         (?1, 'python', 'class', 'pkg.mod.C', 'C', '{}', \
+          strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        params!["python:class:pkg.mod.C"],
+    )
+    .unwrap();
+    seed_cache_row(&conn, "python:function:pkg.mod.f");
+    seed_cache_row(&conn, "python:class:pkg.mod.C");
+
+    let sheet = sheet_with_rules(&conn, "k", &json!([{"type":"kind","value":"function"}]));
+    let removed = invalidate_summaries_for_sheet(&conn, &sheet, project_root).unwrap();
+
+    assert_eq!(removed, 1, "exactly one matched entity's cache invalidated");
+    assert_eq!(
+        cache_row_count(&conn, "python:function:pkg.mod.f"),
+        0,
+        "matched entity's cache row gone"
+    );
+    assert_eq!(
+        cache_row_count(&conn, "python:class:pkg.mod.C"),
+        1,
+        "non-matching entity's cache row survives"
+    );
+}
+
+#[test]
+fn invalidate_summaries_for_no_rule_sheet_is_noop() {
+    use clarion_storage::invalidate_summaries_for_sheet;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
+         created_at, updated_at) VALUES \
+         (?1, 'python', 'function', 'pkg.mod.f', 'f', '{}', \
+          strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        params!["python:function:pkg.mod.f"],
+    )
+    .unwrap();
+    seed_cache_row(&conn, "python:function:pkg.mod.f");
+
+    let sheet = sheet_with_rules(&conn, "empty", &json!([]));
+    let removed = invalidate_summaries_for_sheet(&conn, &sheet, tempdir.path()).unwrap();
+    assert_eq!(removed, 0, "a no-rule sheet invalidates nothing");
+    assert_eq!(cache_row_count(&conn, "python:function:pkg.mod.f"), 1);
+}
