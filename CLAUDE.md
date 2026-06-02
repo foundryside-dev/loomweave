@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-**v1.1.0 — current pre-release working version.** The `v1.0.0` tag (first publishable release) is cut; pre-release working tags `v0.1-sprint-1` and `v0.1-sprint-2` remain in the repo as historical anchors. Workspace + Python plugin are at 1.1.0; ADR-014 federation HTTP read API ships with bearer auth, batch resolution, briefing-blocked propagation, and stable per-project `instance_id`. See [`CHANGELOG.md`](CHANGELOG.md) for the full 1.0 scope and [`docs/implementation/`](docs/implementation/) for sprint-closure artifacts.
+**v1.2.0 — current pre-release working version.** The `v1.0.0` (first publishable release), `v1.0.1`, and `v1.1.0` tags are cut; pre-release working tags `v0.1-sprint-1` and `v0.1-sprint-2` remain in the repo as historical anchors. Workspace + Python plugin are at 1.2.0; ADR-014 federation HTTP read API ships with bearer auth, batch resolution, briefing-blocked propagation, and stable per-project `instance_id`. See [`CHANGELOG.md`](CHANGELOG.md) for the full scope and [`docs/implementation/`](docs/implementation/) for sprint-closure artifacts.
 
 ### Layout (post-1.0)
 

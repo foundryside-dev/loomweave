@@ -312,7 +312,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clarion-cli"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "clarion-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "nix",
  "reqwest",
@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "clarion-mcp"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "blake3",
  "clarion-core",
@@ -383,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "clarion-plugin-fixture"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "clarion-core",
  "nix",
@@ -392,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "clarion-scanner"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "regex",
  "serde",
@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "clarion-storage"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "blake3",
  "clarion-core",
