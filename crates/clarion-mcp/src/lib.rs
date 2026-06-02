@@ -368,7 +368,85 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "additionalProperties": false
             }),
         },
+        ToolDefinition {
+            name: "find_entry_points",
+            description: "Return entities tagged as entry points, within an optional `scope` (entity id → descendants, OR path glob). Reads the `entry-point` categorisation tag. HONEST-EMPTY: the active plugins emit no entry-point categorisation today, so an empty result means the signal is absent (a missing-signal note says so), NOT that there are no entry points. Bounded; SEI-carrying. No LLM call.",
+            input_schema: scope_page_schema(false),
+        },
+        ToolDefinition {
+            name: "find_http_routes",
+            description: "Return entities tagged as HTTP routes, within an optional `scope`. Reads the `http-route` categorisation tag. HONEST-EMPTY when route categorisation is not emitted (missing-signal note). Bounded; SEI-carrying. No LLM call.",
+            input_schema: scope_page_schema(false),
+        },
+        ToolDefinition {
+            name: "find_data_models",
+            description: "Return entities tagged as data models, within an optional `scope`. Reads the `data-model` categorisation tag. HONEST-EMPTY when data-model categorisation is not emitted (missing-signal note). Bounded; SEI-carrying. No LLM call.",
+            input_schema: scope_page_schema(false),
+        },
+        ToolDefinition {
+            name: "find_tests",
+            description: "Return entities tagged as tests, within an optional `scope`. Reads the `test` categorisation tag. HONEST-EMPTY when test categorisation is not emitted (missing-signal note). Bounded; SEI-carrying. No LLM call.",
+            input_schema: scope_page_schema(false),
+        },
+        ToolDefinition {
+            name: "find_deprecations",
+            description: "Return entities tagged deprecated, within an optional `scope`. Reads the `deprecated` categorisation tag. HONEST-EMPTY when deprecation categorisation is not emitted (missing-signal note). Bounded; SEI-carrying. No LLM call.",
+            input_schema: scope_page_schema(false),
+        },
+        ToolDefinition {
+            name: "find_todos",
+            description: "Return entities carrying a TODO/FIXME marker, within an optional `scope`. Reads the `todo` categorisation tag. HONEST-EMPTY when TODO extraction is not emitted (missing-signal note). Bounded; SEI-carrying. No LLM call.",
+            input_schema: scope_page_schema(false),
+        },
+        ToolDefinition {
+            name: "what_tests_this",
+            description: "Return the test entities that exercise an entity — its callers carrying the `test` categorisation tag. HONEST-EMPTY when test categorisation is not emitted, so an empty result is NOT a guarantee the entity is untested (a missing-signal note says so). Bounded; tests carry their `sei`. No LLM call.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "minLength": 1},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                    "offset": {"type": "integer", "minimum": 0}
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "high_churn",
+            description: "Return entities ranked by git churn (`git_churn_count`) descending, within an optional `scope`. The analyze pipeline does not populate churn in v1.0, so this is HONEST-EMPTY in practice (missing-signal note); the query is real and lights up if churn is ever populated. Bounded; SEI-carrying. No LLM call.",
+            input_schema: scope_page_schema(false),
+        },
+        ToolDefinition {
+            name: "recently_changed",
+            description: "Return entities changed since a timestamp (`since?`), within an optional `scope`. Clarion does not index a per-entity git change timestamp in v1.0, so this is an HONEST NO-OP: it returns an empty set with a missing-signal note pointing at `index_diff` for repo-level freshness (HEAD vs last analyze). Never fabricates a change set. No LLM call.",
+            input_schema: scope_page_schema(true),
+        },
     ]
+}
+
+/// Input schema for the scope-aware shortcut tools: optional `scope` (entity id
+/// or path glob) plus `limit`/`offset` bounds, and — when `with_since` —
+/// an optional ISO-8601 `since`.
+fn scope_page_schema(with_since: bool) -> Value {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "scope".to_owned(),
+        json!({"type": "string", "minLength": 1}),
+    );
+    properties.insert(
+        "limit".to_owned(),
+        json!({"type": "integer", "minimum": 1, "maximum": 200}),
+    );
+    properties.insert("offset".to_owned(), json!({"type": "integer", "minimum": 0}));
+    if with_since {
+        properties.insert("since".to_owned(), json!({"type": "string", "minLength": 1}));
+    }
+    json!({
+        "type": "object",
+        "properties": Value::Object(properties),
+        "additionalProperties": false
+    })
 }
 
 /// Input schema for a faceted-search tool: the named facet fields (each
@@ -739,6 +817,42 @@ impl ServerState {
                 Err(response) => return response.to_json_rpc(id),
             },
             "find_coupling_hotspots" => match self.tool_find_coupling_hotspots(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "find_entry_points" => match self.tool_find_entry_points(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "find_http_routes" => match self.tool_find_http_routes(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "find_data_models" => match self.tool_find_data_models(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "find_tests" => match self.tool_find_tests(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "find_deprecations" => match self.tool_find_deprecations(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "find_todos" => match self.tool_find_todos(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "what_tests_this" => match self.tool_what_tests_this(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "high_churn" => match self.tool_high_churn(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "recently_changed" => match self.tool_recently_changed(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
@@ -6013,7 +6127,7 @@ mod tests {
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 26);
+        assert_eq!(tools.len(), 35);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
@@ -6108,6 +6222,15 @@ mod tests {
         assert_eq!(tools[23].name, "find_by_wardline");
         assert_eq!(tools[24].name, "find_circular_imports");
         assert_eq!(tools[25].name, "find_coupling_hotspots");
+        assert_eq!(tools[26].name, "find_entry_points");
+        assert_eq!(tools[27].name, "find_http_routes");
+        assert_eq!(tools[28].name, "find_data_models");
+        assert_eq!(tools[29].name, "find_tests");
+        assert_eq!(tools[30].name, "find_deprecations");
+        assert_eq!(tools[31].name, "find_todos");
+        assert_eq!(tools[32].name, "what_tests_this");
+        assert_eq!(tools[33].name, "high_churn");
+        assert_eq!(tools[34].name, "recently_changed");
     }
 
     #[test]
@@ -6410,7 +6533,7 @@ mod tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], "tools-1");
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 26);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 35);
         assert_eq!(response["result"]["tools"][0]["name"], "entity_at");
         assert_eq!(response["result"]["tools"][7]["name"], "subsystem_members");
     }
@@ -6511,7 +6634,7 @@ mod tests {
 
         assert_eq!(decoded["jsonrpc"], "2.0");
         assert_eq!(decoded["id"], 10);
-        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 26);
+        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 35);
     }
 
     #[test]
@@ -6586,7 +6709,7 @@ mod tests {
         assert_eq!(first_json["id"], 11);
         assert_eq!(first_json["result"]["serverInfo"]["name"], "clarion");
         assert_eq!(second_json["id"], 12);
-        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 26);
+        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 35);
     }
 
     #[test]

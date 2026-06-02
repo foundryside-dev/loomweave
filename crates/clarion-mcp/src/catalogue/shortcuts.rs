@@ -14,13 +14,16 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 
-use clarion_core::EdgeConfidence;
-use clarion_storage::entity_by_id;
+use clarion_core::{EdgeConfidence, McpErrorCode};
+use clarion_storage::{call_edges_targeting, entities_by_churn, entity_by_id};
 
 use crate::ParamError;
 use crate::ServerState;
-use crate::catalogue::{Page, RawScope};
-use crate::{entity_json, flatten_storage_envelope_result, optional_confidence, success_envelope};
+use crate::catalogue::{Page, RawScope, finalize_entity_page, missing_signal};
+use crate::{
+    entity_json, flatten_storage_envelope_result, optional_confidence, required_str,
+    success_envelope, tool_error_envelope,
+};
 
 /// Scan bound on edges materialised for a graph query.
 const EDGE_SCAN_CAP: usize = 500_000;
@@ -232,6 +235,286 @@ impl ServerState {
             })
             .await;
         Ok(flatten_storage_envelope_result(result))
+    }
+}
+
+const SHORTCUT_PAGE_DEFAULT: usize = 50;
+const SHORTCUT_PAGE_MAX: usize = 200;
+const CHURN_SCAN_CAP: usize = 50_000;
+
+impl ServerState {
+    /// `find_entry_points(scope?)` — entities tagged as entry points. Reads the
+    /// `entry-point` categorisation tag; honest-empty when no plugin emits it.
+    pub(crate) async fn tool_find_entry_points(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        self.categorisation_shortcut(
+            arguments,
+            "entry-point",
+            "no entity is tagged as an entry point; entry-point categorisation is not emitted by \
+             the active plugins (honest-empty, not a guaranteed absence of entry points)",
+        )
+        .await
+    }
+
+    /// `find_http_routes(scope?)` — entities tagged as HTTP routes (honest-empty
+    /// when the `http-route` tag is not emitted).
+    pub(crate) async fn tool_find_http_routes(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        self.categorisation_shortcut(
+            arguments,
+            "http-route",
+            "no entity is tagged as an HTTP route; route categorisation is not emitted by the \
+             active plugins",
+        )
+        .await
+    }
+
+    /// `find_data_models(scope?)` — entities tagged as data models (honest-empty
+    /// when the `data-model` tag is not emitted).
+    pub(crate) async fn tool_find_data_models(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        self.categorisation_shortcut(
+            arguments,
+            "data-model",
+            "no entity is tagged as a data model; data-model categorisation is not emitted by the \
+             active plugins",
+        )
+        .await
+    }
+
+    /// `find_tests(scope?)` — entities tagged as tests (honest-empty when the
+    /// `test` tag is not emitted).
+    pub(crate) async fn tool_find_tests(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        self.categorisation_shortcut(
+            arguments,
+            "test",
+            "no entity is tagged as a test; test categorisation is not emitted by the active \
+             plugins",
+        )
+        .await
+    }
+
+    /// `find_deprecations(scope?)` — entities tagged deprecated (honest-empty
+    /// when the `deprecated` tag is not emitted).
+    pub(crate) async fn tool_find_deprecations(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        self.categorisation_shortcut(
+            arguments,
+            "deprecated",
+            "no entity is tagged as deprecated; deprecation categorisation is not emitted by the \
+             active plugins",
+        )
+        .await
+    }
+
+    /// `find_todos(scope?)` — entities tagged with a TODO marker (honest-empty
+    /// when the `todo` tag is not emitted).
+    pub(crate) async fn tool_find_todos(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        self.categorisation_shortcut(
+            arguments,
+            "todo",
+            "no entity is tagged with a TODO/FIXME marker; TODO extraction is not emitted by the \
+             active plugins",
+        )
+        .await
+    }
+
+    /// Shared body for the categorisation shortcuts: parse scope/page, then run
+    /// the canonical tag through [`ServerState::tag_facet`].
+    async fn categorisation_shortcut(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+        tag: &'static str,
+        missing_reason: &'static str,
+    ) -> std::result::Result<Value, ParamError> {
+        let scope = RawScope::parse(arguments)?;
+        let page = Page::parse(arguments, SHORTCUT_PAGE_DEFAULT, SHORTCUT_PAGE_MAX)?;
+        Ok(self
+            .tag_facet(tag.to_owned(), missing_reason, scope, page)
+            .await)
+    }
+
+    /// `what_tests_this(id)` — the test entities that exercise an entity: its
+    /// callers that carry the `test` categorisation tag. Honest-empty when test
+    /// categorisation is not emitted (so an empty result is never read as "this
+    /// is untested"). Stateless, bounded, SEI-carrying.
+    pub(crate) async fn tool_what_tests_this(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let entity_id = required_str(arguments, "id")?.to_owned();
+        let page = Page::parse(arguments, SHORTCUT_PAGE_DEFAULT, SHORTCUT_PAGE_MAX)?;
+        let result = self
+            .readers
+            .with_reader(move |conn| {
+                let Some(entity) = entity_by_id(conn, &entity_id)? else {
+                    return Ok(tool_error_envelope(
+                        McpErrorCode::EntityNotFound,
+                        &format!("entity {entity_id} was not found"),
+                        false,
+                    ));
+                };
+
+                // Callers tagged `test`. Resolved-tier callers only.
+                let callers = call_edges_targeting(conn, &entity.id, EdgeConfidence::Resolved)?;
+                let caller_ids: HashSet<String> =
+                    callers.into_iter().map(|edge| edge.from_id).collect();
+
+                let mut test_callers: Vec<Value> = Vec::new();
+                for caller_id in &caller_ids {
+                    let is_test: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM entity_tags WHERE entity_id = ?1 AND tag = 'test')",
+                        rusqlite::params![caller_id],
+                        |row| row.get(0),
+                    )?;
+                    if is_test
+                        && let Some(caller) = entity_by_id(conn, caller_id)?
+                    {
+                        test_callers.push(entity_json(conn, &caller));
+                    }
+                }
+                test_callers.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+
+                let total = test_callers.len();
+                let returned: Vec<Value> = test_callers
+                    .into_iter()
+                    .skip(page.offset)
+                    .take(page.limit)
+                    .collect();
+                let returned_count = returned.len();
+                let truncated = page.offset.saturating_add(returned_count) < total;
+
+                let mut response = json!({
+                    "entity": entity_json(conn, &entity),
+                    "tests": returned,
+                    "page": {
+                        "total": total,
+                        "offset": page.offset,
+                        "limit": page.limit,
+                        "returned": returned_count,
+                        "truncated": truncated,
+                    },
+                });
+                if total == 0
+                    && let Some(object) = response.as_object_mut()
+                {
+                    object.insert(
+                        "signal".to_owned(),
+                        missing_signal(
+                            "entity_tags",
+                            "no test-tagged caller found; test categorisation is not emitted by \
+                             the active plugins, so this is not a guarantee the entity is untested",
+                        ),
+                    );
+                }
+                Ok(success_envelope(response))
+            })
+            .await;
+        Ok(flatten_storage_envelope_result(result))
+    }
+
+    /// `high_churn(limit?, scope?)` — entities ranked by `git_churn_count`
+    /// descending. The analyze pipeline does not populate churn in v1.0, so this
+    /// is honest-empty in practice (the missing signal is surfaced); the query is
+    /// real, so it lights up if churn is ever populated. Bounded, SEI-carrying.
+    pub(crate) async fn tool_high_churn(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let scope = RawScope::parse(arguments)?;
+        let page = Page::parse(arguments, SHORTCUT_PAGE_DEFAULT, SHORTCUT_PAGE_MAX)?;
+        let project_root = self.project_root.clone();
+        let result = self
+            .readers
+            .with_reader(move |conn| {
+                let filter = scope.resolve(conn)?;
+                let (rows, scan_truncated) = entities_by_churn(conn, CHURN_SCAN_CAP)?;
+                // Keep churn alongside; finalize over the entity rows, then graft
+                // the churn count onto each returned entity.
+                let churn_by_id: std::collections::HashMap<String, i64> =
+                    rows.iter().map(|(e, c)| (e.id.clone(), *c)).collect();
+                let entities: Vec<_> = rows.into_iter().map(|(e, _)| e).collect();
+                let mut response =
+                    finalize_entity_page(conn, &project_root, entities, &filter, page, scan_truncated);
+                if let Some(list) = response["entities"].as_array() {
+                    let grafted: Vec<Value> = list
+                        .iter()
+                        .map(|entity| {
+                            let mut entity = entity.clone();
+                            if let Some(object) = entity.as_object_mut()
+                                && let Some(id) = object.get("id").and_then(Value::as_str)
+                                && let Some(churn) = churn_by_id.get(id)
+                            {
+                                object.insert("git_churn_count".to_owned(), json!(churn));
+                            }
+                            entity
+                        })
+                        .collect();
+                    if let Some(object) = response.as_object_mut() {
+                        object.insert("entities".to_owned(), Value::Array(grafted));
+                    }
+                }
+                if response["page"]["total"] == json!(0)
+                    && let Some(object) = response.as_object_mut()
+                {
+                    object.insert(
+                        "signal".to_owned(),
+                        missing_signal(
+                            "git_churn_count",
+                            "no entity carries git churn; the analyze pipeline does not populate \
+                             git_churn_count in v1.0",
+                        ),
+                    );
+                }
+                Ok(success_envelope(response))
+            })
+            .await;
+        Ok(flatten_storage_envelope_result(result))
+    }
+
+    /// `recently_changed(since?, scope?)` — entities changed since a timestamp.
+    /// Clarion does not index a per-entity git change timestamp in v1.0, so this
+    /// is an honest no-op: it returns an empty set with a missing-signal note
+    /// pointing at `index_diff` for repo-level freshness. The args are accepted
+    /// for forward-compatibility. Never fabricates a change set.
+    // Honest no-op: no storage read, but kept `async` for the uniform tool
+    // dispatch interface (every `tool_*` is awaited in `handle_tool_call`).
+    #[allow(clippy::unused_async)]
+    pub(crate) async fn tool_recently_changed(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        // Validate args so a malformed call still errors honestly.
+        let _ = RawScope::parse(arguments)?;
+        let since = match arguments.get("since") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) => Some(value.clone()),
+            Some(_) => return Err(ParamError::new("since must be an ISO-8601 string or null")),
+        };
+        Ok(success_envelope(json!({
+            "entities": [],
+            "since": since,
+            "page": { "total": 0, "offset": 0, "limit": 0, "returned": 0, "truncated": false },
+            "signal": missing_signal(
+                "git_change_time",
+                "Clarion does not index a per-entity git change timestamp in v1.0; use index_diff \
+                 for repo-level freshness (HEAD vs last analyze)"
+            ),
+        })))
     }
 }
 

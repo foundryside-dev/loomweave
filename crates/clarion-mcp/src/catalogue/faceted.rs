@@ -16,7 +16,7 @@ use clarion_storage::{
 
 use crate::ParamError;
 use crate::ServerState;
-use crate::catalogue::{Page, RawScope, ScopeFilter, missing_signal};
+use crate::catalogue::{Page, RawScope, finalize_entity_page, missing_signal};
 use crate::{entity_json, flatten_storage_envelope_result, required_str, success_envelope};
 
 /// Candidate-set scan bound, shared with the entity-descendant scope cap so a
@@ -36,13 +36,36 @@ impl ServerState {
         let tag = required_str(arguments, "tag")?.to_owned();
         let scope = RawScope::parse(arguments)?;
         let page = Page::parse(arguments, FACET_PAGE_DEFAULT, FACET_PAGE_MAX)?;
+        Ok(self
+            .tag_facet(
+                tag,
+                "no entity carries this categorisation tag; tags are populated by plugins \
+                 (the Python plugin emits none today)",
+                scope,
+                page,
+            )
+            .await)
+    }
+
+    /// Shared core for tag-keyed facets: filter `entities_by_tag(tag)` by scope,
+    /// paginate, render SEI-bearing rows, and surface a missing-signal note when
+    /// the result is empty. Reused by `find_by_tag` and the categorisation
+    /// shortcuts (`find_entry_points`, `find_tests`, …), each of which reads an
+    /// existing tag and is honest-empty when no plugin emits it.
+    pub(crate) async fn tag_facet(
+        &self,
+        tag: String,
+        missing_reason: &'static str,
+        scope: RawScope,
+        page: Page,
+    ) -> Value {
         let project_root = self.project_root.clone();
         let result = self
             .readers
             .with_reader(move |conn| {
                 let filter = scope.resolve(conn)?;
                 let (candidates, scan_truncated) = entities_by_tag(conn, &tag, FACET_SCAN_CAP)?;
-                let mut response = finalize_entity_facet(
+                let mut response = finalize_entity_page(
                     conn,
                     &project_root,
                     candidates,
@@ -52,19 +75,12 @@ impl ServerState {
                 );
                 attach_facet(&mut response, json!({ "tag": tag }));
                 if response["page"]["total"] == json!(0) {
-                    attach_signal(
-                        &mut response,
-                        missing_signal(
-                            "entity_tags",
-                            "no entity carries this categorisation tag; tags are populated by \
-                             plugins (the Python plugin emits none today)",
-                        ),
-                    );
+                    attach_signal(&mut response, missing_signal("entity_tags", missing_reason));
                 }
                 Ok(success_envelope(response))
             })
             .await;
-        Ok(flatten_storage_envelope_result(result))
+        flatten_storage_envelope_result(result)
     }
 
     /// `find_by_kind(kind, scope?)` — entities of a plugin-declared kind, scoped
@@ -93,7 +109,7 @@ impl ServerState {
                     }
                     Err(err) => return Err(err),
                 };
-                let mut response = finalize_entity_facet(
+                let mut response = finalize_entity_page(
                     conn,
                     &project_root,
                     candidates,
@@ -205,43 +221,6 @@ impl ServerState {
             .await;
         Ok(flatten_storage_envelope_result(result))
     }
-}
-
-/// Filter `candidates` by `scope`, paginate, and render SEI-bearing entity rows
-/// with bounded-response metadata. Consumes the candidate vec (no clone).
-fn finalize_entity_facet(
-    conn: &rusqlite::Connection,
-    project_root: &std::path::Path,
-    candidates: Vec<EntityRow>,
-    scope: &ScopeFilter,
-    page: Page,
-    scan_truncated: bool,
-) -> Value {
-    let in_scope: Vec<EntityRow> = candidates
-        .into_iter()
-        .filter(|e| scope.contains(&e.id, e.source_file_path.as_deref(), project_root))
-        .collect();
-    let total = in_scope.len();
-    let returned: Vec<EntityRow> = in_scope
-        .into_iter()
-        .skip(page.offset)
-        .take(page.limit)
-        .collect();
-    let returned_count = returned.len();
-    let truncated = page.offset.saturating_add(returned_count) < total;
-    let entities: Vec<Value> = returned.iter().map(|e| entity_json(conn, e)).collect();
-    json!({
-        "entities": entities,
-        "page": {
-            "total": total,
-            "offset": page.offset,
-            "limit": page.limit,
-            "returned": returned_count,
-            "truncated": truncated,
-        },
-        "scope_truncated": scope.scope_truncated(),
-        "scan_truncated": scan_truncated,
-    })
 }
 
 /// Merge a `facet` echo block into a response object.

@@ -850,6 +850,37 @@ pub fn entities_with_wardline_facts(
     collect_capped(rows, scan_cap)
 }
 
+/// Faceted catalog query: entities carrying a non-null `git_churn_count`,
+/// ordered by churn descending then id, materialised up to `scan_cap`. Returns
+/// `(rows, scan_truncated)` and the churn count alongside each row. The pipeline
+/// does not populate `git_churn_count` in v1.0, so this is honest-empty in
+/// practice — the read layer surfaces the missing signal.
+pub fn entities_by_churn(
+    conn: &Connection,
+    scan_cap: usize,
+) -> Result<(Vec<(EntityRow, i64)>, bool)> {
+    let limit = i64::try_from(scan_cap.saturating_add(1)).unwrap_or(i64::MAX);
+    let sql = format!(
+        "SELECT {ENTITY_COLUMNS}, git_churn_count FROM entities \
+         WHERE git_churn_count IS NOT NULL \
+         ORDER BY git_churn_count DESC, id LIMIT ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params![limit])?;
+    let mut out = Vec::new();
+    let mut truncated = false;
+    while let Some(row) = rows.next()? {
+        if out.len() >= scan_cap {
+            truncated = true;
+            break;
+        }
+        let entity = map_entity_row(row)?;
+        let churn: i64 = row.get(15)?;
+        out.push((entity, churn));
+    }
+    Ok((out, truncated))
+}
+
 pub fn call_edges_targeting(
     conn: &Connection,
     target_id: &str,

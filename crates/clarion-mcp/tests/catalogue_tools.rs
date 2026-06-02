@@ -580,3 +580,82 @@ async fn find_coupling_hotspots_respects_limit_and_scope() {
     assert_eq!(env["result"]["page"]["total"], 1, "{env}");
     assert_eq!(env["result"]["hotspots"][0]["entity"]["id"], "python:function:auth.a");
 }
+
+// ---- categorisation / churn shortcuts (honest-empty) --------------------
+
+#[tokio::test]
+async fn categorisation_shortcuts_are_honest_empty() {
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    for tool in [
+        "find_entry_points",
+        "find_http_routes",
+        "find_data_models",
+        "find_tests",
+        "find_deprecations",
+        "find_todos",
+        "high_churn",
+    ] {
+        let env = call_tool(&state, tool, json!({})).await;
+        assert_eq!(env["ok"], true, "{tool}: {env}");
+        assert_eq!(env["result"]["page"]["total"], 0, "{tool}: {env}");
+        assert_eq!(env["result"]["signal"]["available"], false, "{tool}: {env}");
+    }
+}
+
+#[tokio::test]
+async fn find_tests_lights_up_when_test_tag_is_present() {
+    // The query is real: if a plugin ever emits the `test` tag, the tool returns
+    // results (this proves it is not a hardcoded empty).
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:test_login", "function", "t.py", Some((1, 2)));
+    insert_tag(&conn, "python:function:test_login", "test");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+    let env = call_tool(&state, "find_tests", json!({})).await;
+    assert_eq!(env["result"]["page"]["total"], 1, "{env}");
+    assert_eq!(env["result"]["entities"][0]["id"], "python:function:test_login");
+}
+
+#[tokio::test]
+async fn what_tests_this_is_honest_empty_without_test_tags() {
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:target", "function", "m.py", Some((1, 2)));
+    insert_entity(&conn, "python:function:caller", "function", "m.py", Some((3, 4)));
+    insert_edge(&conn, "calls", "python:function:caller", "python:function:target", "resolved");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+    let env = call_tool(&state, "what_tests_this", json!({"id": "python:function:target"})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 0);
+    assert_eq!(env["result"]["signal"]["available"], false);
+}
+
+#[tokio::test]
+async fn what_tests_this_returns_test_tagged_callers() {
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:target", "function", "m.py", Some((1, 2)));
+    insert_entity(&conn, "python:function:test_target", "function", "t.py", Some((1, 2)));
+    insert_edge(&conn, "calls", "python:function:test_target", "python:function:target", "resolved");
+    insert_tag(&conn, "python:function:test_target", "test");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+    let env = call_tool(&state, "what_tests_this", json!({"id": "python:function:target"})).await;
+    assert_eq!(env["result"]["page"]["total"], 1, "{env}");
+    assert_eq!(env["result"]["tests"][0]["id"], "python:function:test_target");
+}
+
+#[tokio::test]
+async fn recently_changed_is_honest_noop() {
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    drop(conn);
+    let state = state_for(project.path(), &db);
+    let env = call_tool(&state, "recently_changed", json!({"since": "2026-01-01T00:00:00Z"})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 0);
+    assert_eq!(env["result"]["signal"]["signal"], "git_change_time");
+}

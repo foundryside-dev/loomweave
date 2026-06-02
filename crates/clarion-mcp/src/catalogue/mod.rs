@@ -84,6 +84,46 @@ pub(crate) fn paginate<T: Clone>(rows: &[T], page: Page) -> (Vec<T>, Value) {
     (slice, meta)
 }
 
+/// Filter materialised `candidates` by `scope`, paginate, and render
+/// SEI-bearing entity rows (via [`crate::entity_json`]) with bounded-response
+/// metadata (`page.total`/`returned`/`truncated`, plus `scope_truncated` and
+/// `scan_truncated`). Consumes the candidate vec (no clone). Shared by the
+/// faceted tools and the churn shortcuts.
+pub(crate) fn finalize_entity_page(
+    conn: &rusqlite::Connection,
+    project_root: &std::path::Path,
+    candidates: Vec<clarion_storage::EntityRow>,
+    scope: &ScopeFilter,
+    page: Page,
+    scan_truncated: bool,
+) -> Value {
+    let in_scope: Vec<clarion_storage::EntityRow> = candidates
+        .into_iter()
+        .filter(|e| scope.contains(&e.id, e.source_file_path.as_deref(), project_root))
+        .collect();
+    let total = in_scope.len();
+    let returned: Vec<clarion_storage::EntityRow> = in_scope
+        .into_iter()
+        .skip(page.offset)
+        .take(page.limit)
+        .collect();
+    let returned_count = returned.len();
+    let truncated = page.offset.saturating_add(returned_count) < total;
+    let entities: Vec<Value> = returned.iter().map(|e| crate::entity_json(conn, e)).collect();
+    json!({
+        "entities": entities,
+        "page": {
+            "total": total,
+            "offset": page.offset,
+            "limit": page.limit,
+            "returned": returned_count,
+            "truncated": truncated,
+        },
+        "scope_truncated": scope.scope_truncated(),
+        "scan_truncated": scan_truncated,
+    })
+}
+
 /// An honest-empty signal note. WS5 shortcuts read *existing* signals
 /// (categorisation tags, git churn); where the active plugins emit no such
 /// signal the tool returns empty and attaches this block so an agent reads the
