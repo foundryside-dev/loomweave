@@ -24,6 +24,7 @@
 
 mod faceted;
 mod inspection;
+mod shortcuts;
 
 use std::collections::HashSet;
 
@@ -246,6 +247,50 @@ impl ScopeFilter {
     /// Whether descendant resolution truncated (entity scope only).
     pub(crate) fn scope_truncated(&self) -> bool {
         matches!(self, ScopeFilter::Ids { truncated: true, .. })
+    }
+
+    /// Materialise the set of in-scope entity ids for graph tools that work on
+    /// edge endpoints (which have ids, not rows). `None` means "whole project"
+    /// (no filter). For a path scope this scans entity source paths up to
+    /// [`SCOPE_DESCENDANT_CAP`]; the bool is `truncated` (cap hit).
+    pub(crate) fn in_scope_ids(
+        &self,
+        conn: &rusqlite::Connection,
+        project_root: &std::path::Path,
+    ) -> clarion_storage::Result<(Option<HashSet<String>>, bool)> {
+        match self {
+            ScopeFilter::Project => Ok((None, false)),
+            ScopeFilter::Ids { ids, truncated } => Ok((Some(ids.clone()), *truncated)),
+            ScopeFilter::Path { pattern } => {
+                let limit = i64::try_from(SCOPE_DESCENDANT_CAP.saturating_add(1)).unwrap_or(i64::MAX);
+                let mut stmt = conn.prepare(
+                    "SELECT id, source_file_path FROM entities \
+                     WHERE source_file_path IS NOT NULL ORDER BY id LIMIT ?1",
+                )?;
+                let mut rows = stmt.query(rusqlite::params![limit])?;
+                let mut set = HashSet::new();
+                let mut scanned = 0usize;
+                let mut truncated = false;
+                while let Some(row) = rows.next()? {
+                    if scanned >= SCOPE_DESCENDANT_CAP {
+                        truncated = true;
+                        break;
+                    }
+                    scanned += 1;
+                    let id: String = row.get(0)?;
+                    let path: String = row.get(1)?;
+                    let rel = std::path::Path::new(&path)
+                        .strip_prefix(project_root)
+                        .ok()
+                        .and_then(|rel| rel.to_str())
+                        .unwrap_or(&path);
+                    if glob_match(pattern, rel) {
+                        set.insert(id);
+                    }
+                }
+                Ok((Some(set), truncated))
+            }
+        }
     }
 }
 

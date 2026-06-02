@@ -476,3 +476,107 @@ async fn find_by_wardline_honest_empty_when_no_facts() {
     assert_eq!(env["result"]["page"]["total"], 0);
     assert_eq!(env["result"]["signal"]["available"], false);
 }
+
+// ---- graph shortcuts ----------------------------------------------------
+
+fn insert_edge(conn: &Connection, kind: &str, from: &str, to: &str, confidence: &str) {
+    conn.execute(
+        "INSERT INTO edges (kind, from_id, to_id, confidence) VALUES (?1, ?2, ?3, ?4)",
+        params![kind, from, to, confidence],
+    )
+    .expect("insert edge");
+}
+
+#[tokio::test]
+async fn find_circular_imports_detects_a_cycle() {
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:module:a", "module", "a.py", Some((1, 5)));
+    insert_entity(&conn, "python:module:b", "module", "b.py", Some((1, 5)));
+    insert_entity(&conn, "python:module:c", "module", "c.py", Some((1, 5)));
+    insert_edge(&conn, "imports", "python:module:a", "python:module:b", "resolved");
+    insert_edge(&conn, "imports", "python:module:b", "python:module:a", "resolved");
+    insert_edge(&conn, "imports", "python:module:b", "python:module:c", "resolved");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_circular_imports", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 1, "{env}");
+    assert_eq!(env["result"]["cycles"][0]["length"], 2);
+    assert_eq!(env["result"]["confidence"], "resolved");
+    // members carry sei
+    assert!(env["result"]["cycles"][0]["members"][0].get("sei").is_some());
+}
+
+#[tokio::test]
+async fn find_circular_imports_empty_on_a_dag() {
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:module:a", "module", "a.py", Some((1, 5)));
+    insert_entity(&conn, "python:module:b", "module", "b.py", Some((1, 5)));
+    insert_edge(&conn, "imports", "python:module:a", "python:module:b", "resolved");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+    let env = call_tool(&state, "find_circular_imports", json!({})).await;
+    assert_eq!(env["result"]["page"]["total"], 0, "{env}");
+}
+
+#[tokio::test]
+async fn find_circular_imports_default_confidence_excludes_inferred() {
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:module:a", "module", "a.py", Some((1, 5)));
+    insert_entity(&conn, "python:module:b", "module", "b.py", Some((1, 5)));
+    insert_edge(&conn, "imports", "python:module:a", "python:module:b", "resolved");
+    insert_edge(&conn, "imports", "python:module:b", "python:module:a", "inferred");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    // resolved-only: the inferred back-edge is excluded, so no cycle.
+    let env = call_tool(&state, "find_circular_imports", json!({})).await;
+    assert_eq!(env["result"]["page"]["total"], 0, "{env}");
+
+    // requesting inferred includes it -> cycle appears.
+    let env = call_tool(&state, "find_circular_imports", json!({"confidence": "inferred"})).await;
+    assert_eq!(env["result"]["page"]["total"], 1, "{env}");
+    assert_eq!(env["result"]["confidence"], "inferred");
+}
+
+#[tokio::test]
+async fn find_coupling_hotspots_ranks_by_fan_in_plus_out() {
+    let (project, db, conn) = open_project();
+    for id in ["hub", "a", "b", "c"] {
+        insert_entity(&conn, &format!("python:function:{id}"), "function", "m.py", Some((1, 2)));
+    }
+    // hub is called by a, b, c and calls a -> fan_in 3, fan_out 1, coupling 4.
+    insert_edge(&conn, "calls", "python:function:a", "python:function:hub", "resolved");
+    insert_edge(&conn, "calls", "python:function:b", "python:function:hub", "resolved");
+    insert_edge(&conn, "calls", "python:function:c", "python:function:hub", "resolved");
+    insert_edge(&conn, "calls", "python:function:hub", "python:function:a", "resolved");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_coupling_hotspots", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let top = &env["result"]["hotspots"][0];
+    assert_eq!(top["entity"]["id"], "python:function:hub", "{env}");
+    assert_eq!(top["fan_in"], 3);
+    assert_eq!(top["fan_out"], 1);
+    assert_eq!(top["coupling"], 4);
+    assert!(top["entity"].get("sei").is_some());
+}
+
+#[tokio::test]
+async fn find_coupling_hotspots_respects_limit_and_scope() {
+    let (project, db, conn) = open_project();
+    let auth = project.path().join("src/auth/a.py");
+    let other = project.path().join("src/other/b.py");
+    insert_entity(&conn, "python:function:auth.a", "function", auth.to_str().unwrap(), Some((1, 2)));
+    insert_entity(&conn, "python:function:other.b", "function", other.to_str().unwrap(), Some((1, 2)));
+    insert_edge(&conn, "calls", "python:function:auth.a", "python:function:other.b", "resolved");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    // Scope to src/auth/** -> only auth.a is in scope (fan_out 1).
+    let env = call_tool(&state, "find_coupling_hotspots", json!({"scope": "src/auth/**"})).await;
+    assert_eq!(env["result"]["page"]["total"], 1, "{env}");
+    assert_eq!(env["result"]["hotspots"][0]["entity"]["id"], "python:function:auth.a");
+}

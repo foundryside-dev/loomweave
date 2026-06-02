@@ -340,6 +340,34 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             description: "Return entities carrying a Wardline taint fact, optionally filtered by `tier` and/or `group`, within an optional `scope` (entity id → descendants, OR path glob; omitted → whole project). The Wardline blob is opaque to Clarion: tier/group filtering is best-effort against a top-level field on the blob and honest-empty when absent. Each entity carries its `wardline` blob verbatim plus its `sei`. Bounded (limit/offset, page.total/truncated). Facts are populated via Filigree Flow-B. No LLM call.",
             input_schema: scope_facet_schema(&[("tier", false), ("group", false)]),
         },
+        ToolDefinition {
+            name: "find_circular_imports",
+            description: "Return import cycles in the module import graph (`imports` edges) — each a strongly-connected component of size > 1 (or a self-import), members sorted. On-demand graph query (no analyze-time precompute). Edge-derived: default `confidence` is resolved (the tier is a ceiling — resolved → resolved only, inferred → all) and is echoed in the result. Optional `scope` (entity id → descendants, OR path glob) restricts to cycles whose members are all in scope. Bounded (limit/offset, page.total/truncated). Each member carries its `sei`. No LLM call.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope": {"type": "string", "minLength": 1},
+                    "confidence": confidence_schema(),
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                    "offset": {"type": "integer", "minimum": 0}
+                },
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "find_coupling_hotspots",
+            description: "Return entities ranked by coupling (distinct fan-in + fan-out over the edge graph), most-coupled first. On-demand graph query (no analyze-time precompute). Edge-derived: default `confidence` is resolved (a ceiling) and is echoed. Optional `scope` (entity id → descendants, OR path glob; omitted → whole project). Bounded (limit default 20, max 200; page.total/truncated). Each entity carries its `sei`. No LLM call.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope": {"type": "string", "minLength": 1},
+                    "confidence": confidence_schema(),
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                    "offset": {"type": "integer", "minimum": 0}
+                },
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -587,6 +615,9 @@ impl ServerState {
         })
     }
 
+    // A flat dispatch table over every tool; length tracks the tool count by
+    // design (mirrors the `#[allow]` on `list_tools`).
+    #[allow(clippy::too_many_lines)]
     async fn handle_tool_call(&self, id: &Value, params: Option<&Value>) -> Value {
         let Some(params) = params.and_then(Value::as_object) else {
             return error_response(id, -32602, "invalid tools/call params");
@@ -700,6 +731,14 @@ impl ServerState {
                 Err(response) => return response.to_json_rpc(id),
             },
             "find_by_wardline" => match self.tool_find_by_wardline(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "find_circular_imports" => match self.tool_find_circular_imports(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "find_coupling_hotspots" => match self.tool_find_coupling_hotspots(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
@@ -5974,7 +6013,7 @@ mod tests {
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 24);
+        assert_eq!(tools.len(), 26);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
@@ -6067,6 +6106,8 @@ mod tests {
         assert_eq!(tools[21].name, "find_by_tag");
         assert_eq!(tools[22].name, "find_by_kind");
         assert_eq!(tools[23].name, "find_by_wardline");
+        assert_eq!(tools[24].name, "find_circular_imports");
+        assert_eq!(tools[25].name, "find_coupling_hotspots");
     }
 
     #[test]
@@ -6369,7 +6410,7 @@ mod tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], "tools-1");
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 24);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 26);
         assert_eq!(response["result"]["tools"][0]["name"], "entity_at");
         assert_eq!(response["result"]["tools"][7]["name"], "subsystem_members");
     }
@@ -6470,7 +6511,7 @@ mod tests {
 
         assert_eq!(decoded["jsonrpc"], "2.0");
         assert_eq!(decoded["id"], 10);
-        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 24);
+        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 26);
     }
 
     #[test]
@@ -6545,7 +6586,7 @@ mod tests {
         assert_eq!(first_json["id"], 11);
         assert_eq!(first_json["result"]["serverInfo"]["name"], "clarion");
         assert_eq!(second_json["id"], 12);
-        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 24);
+        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 26);
     }
 
     #[test]
