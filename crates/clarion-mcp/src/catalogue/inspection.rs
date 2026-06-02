@@ -18,8 +18,8 @@ use crate::ParamError;
 use crate::ServerState;
 use crate::catalogue::{Page, missing_signal, paginate};
 use crate::{
-    entity_json, flatten_storage_envelope_result, required_str, success_envelope,
-    tool_error_envelope,
+    entity_json, flatten_storage_envelope_result, parse_to_unix_seconds, required_str,
+    success_envelope, tool_error_envelope,
 };
 
 /// Bound on guidance sheets scanned per `guidance_for` call. Guidance is
@@ -94,8 +94,16 @@ impl ServerState {
                     scanned += 1;
                     let sheet = GuidanceRow::from_row(row)?;
 
-                    // Expiry: lexical ISO-8601 compare against the server clock.
-                    if sheet.expires.as_deref().is_some_and(|exp| exp < now.as_str()) {
+                    // Expiry: parse both `expires` and the server clock to Unix
+                    // seconds (accepting `unix:<secs>` and RFC3339) and compare
+                    // numerically. Skip only when both parse and the sheet's
+                    // expiry precedes `now`. Fail open: a missing or unparseable
+                    // `expires` (or an unparseable clock) never hides a sheet.
+                    if let Some(exp) = sheet.expires.as_deref()
+                        && let Some(exp_secs) = parse_to_unix_seconds(exp)
+                        && let Some(now_secs) = parse_to_unix_seconds(&now)
+                        && exp_secs < now_secs
+                    {
                         continue;
                     }
 

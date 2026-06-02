@@ -2776,7 +2776,7 @@ fn read_progress_snapshot(path: &std::path::Path) -> Option<Value> {
 /// Parse a timestamp to Unix seconds, accepting both the MCP clock's
 /// `unix:<seconds>` form and the RFC3339 form analyze writes into the progress
 /// file's `heartbeat_at`. `None` if neither parses.
-fn parse_to_unix_seconds(value: &str) -> Option<i64> {
+pub(crate) fn parse_to_unix_seconds(value: &str) -> Option<i64> {
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
     if let Some(rest) = value.strip_prefix("unix:") {

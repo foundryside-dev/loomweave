@@ -404,6 +404,55 @@ async fn guidance_for_excludes_expired_sheets() {
 }
 
 #[tokio::test]
+async fn guidance_for_honors_unix_clock_for_expiry() {
+    // Regression for clarion-3153e74f0b: production `serve` uses the default
+    // `unix:<seconds>` clock (never `.with_clock(...)`). A raw lexical compare
+    // against an ISO `expires` (which starts with '2' < 'u') wrongly classified
+    // EVERY sheet with any `expires` as expired. This exercises the production
+    // clock path: a far-future sheet must survive; a far-past one must be dropped.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
+    insert_guidance(
+        &conn,
+        "core:guidance:future",
+        r#"{"scope_level":"project","scope_rank":1,"content":"F","authored_at":"2026-01-01",
+            "expires":"2999-12-31T00:00:00.000Z","match_rules":[{"type":"kind","value":"function"}]}"#,
+    );
+    insert_guidance(
+        &conn,
+        "core:guidance:past",
+        r#"{"scope_level":"project","scope_rank":1,"content":"P","authored_at":"2026-01-01",
+            "expires":"2000-01-01T00:00:00.000Z","match_rules":[{"type":"kind","value":"function"}]}"#,
+    );
+    drop(conn);
+    // Production-style clock: `unix:<seconds>` (here a fixed mid-2025 instant),
+    // matching `default_now_string`'s form — between the past (2000) and
+    // future (2999) expiries.
+    let pool = ReaderPool::open(&db, 2).expect("reader pool");
+    let state = ServerState::new(project.path().to_path_buf(), pool)
+        .with_clock(|| "unix:1748822400".to_owned());
+
+    let env = call_tool(&state, "guidance_for", json!({"id": "python:function:m.f"})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let sheets = env["result"]["guidance"].as_array().unwrap();
+    let ids: Vec<&str> = sheets.iter().map(|s| s["id"].as_str().unwrap()).collect();
+    assert!(
+        ids.contains(&"core:guidance:future"),
+        "far-future sheet must survive under the unix: clock, got {ids:?} in {env}"
+    );
+    assert!(
+        !ids.contains(&"core:guidance:past"),
+        "far-past sheet must be excluded, got {ids:?} in {env}"
+    );
+}
+
+#[tokio::test]
 async fn guidance_for_honest_empty_when_no_sheet_matches() {
     let (project, db, conn) = open_project();
     insert_entity(
