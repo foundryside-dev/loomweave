@@ -971,12 +971,7 @@ async fn invoke_llm_provider(
     provider: Arc<dyn LlmProvider>,
     request: LlmRequest,
 ) -> Result<LlmResponse, LlmProviderError> {
-    tokio::task::spawn_blocking(move || provider.invoke(request))
-        .await
-        .map_err(|err| LlmProviderError::InvalidResponse {
-            message: format!("LLM provider task failed: {err}"),
-            retryable: true,
-        })?
+    provider.invoke(request).await
 }
 
 struct SummaryLlmState {
@@ -3766,7 +3761,7 @@ fn error_response(id: &Value, code: i64, message: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use clarion_core::{CachingModel, LlmProvider, LlmProviderError, LlmRequest, LlmResponse};
@@ -4560,12 +4555,12 @@ mod tests {
         let key = inferred_test_key();
         let read = inferred_test_read(key.clone());
         let (writer, _rx) = mpsc::channel(1);
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = tokio::sync::mpsc::channel(1);
         let llm = InferenceLlmState {
             writer,
             config: LlmConfig::default(),
             provider: Arc::new(BlockingProvider {
-                release: Mutex::new(release_rx),
+                release: tokio::sync::Mutex::new(release_rx),
             }),
         };
 
@@ -4581,7 +4576,7 @@ mod tests {
         handle.abort();
         let _ = handle.await;
         let removed = wait_until_inferred_inflight_removed(&state, &key).await;
-        let _ = release_tx.send(());
+        let _ = release_tx.send(()).await;
 
         assert!(
             removed,
@@ -4707,20 +4702,18 @@ mod tests {
     }
 
     struct BlockingProvider {
-        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        release: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<()>>,
     }
 
+    #[async_trait::async_trait]
     impl LlmProvider for BlockingProvider {
         fn name(&self) -> &'static str {
             "blocking"
         }
 
-        fn invoke(&self, _request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
-            let _ = self
-                .release
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .recv();
+        async fn invoke(&self, _request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
+            let mut rx = self.release.lock().await;
+            let _ = rx.recv().await;
             Ok(LlmResponse {
                 model_id: "test-model".to_owned(),
                 output_json: r#"{"edges":[]}"#.to_owned(),

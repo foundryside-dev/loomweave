@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import ast
+import ctypes
+import ctypes.util
 import json
 import math
 import os
 import select
 import shutil
+import signal
 import subprocess
 import sys
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any, Self
+from typing import IO, TYPE_CHECKING, Any, Literal, Self
 from urllib.parse import unquote, urlparse
 
 from clarion_plugin_python import __version__
@@ -134,6 +137,7 @@ class _FunctionIndex:
     functions: tuple[_FunctionInfo, ...]
     entities: tuple[_EntityInfo, ...]
     tree: ast.Module
+    parse_status: Literal["ok", "syntax_error"] = "ok"
 
 
 @dataclass
@@ -224,6 +228,12 @@ class PyrightSession:
     ) -> CallResolutionResult:
         path = Path(file_path).resolve()
         index = self._function_index_for_path(path)
+        if index.parse_status == "syntax_error":
+            return CallResolutionResult(
+                unresolved_call_sites_total=len(function_ids),
+                pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
+                findings=self._pop_findings(),
+            )
         requested = [
             index.by_id[function_id] for function_id in function_ids if function_id in index.by_id
         ]
@@ -283,6 +293,13 @@ class PyrightSession:
         path = Path(file_path).resolve()
         index = self._function_index_for_path(path)
         reference_sites_total = len(sites)
+        if index.parse_status == "syntax_error":
+            return ReferenceResolutionResult(
+                reference_sites_total=reference_sites_total,
+                unresolved_reference_sites_total=reference_sites_total,
+                pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
+                findings=self._pop_findings(),
+            )
         if not sites:
             return ReferenceResolutionResult(
                 pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
@@ -599,6 +616,8 @@ class PyrightSession:
         if not self._is_internal_project_path(target_path):
             return None, True
         target_index = self._function_index_for_path(target_path)
+        if target_index.parse_status == "syntax_error":
+            return None, False
         key = _range_start_key(raw_range)
         if key is not None and key in target_index.entity_by_name_position:
             return target_index.entity_by_name_position[key], False
@@ -654,6 +673,29 @@ class PyrightSession:
             )
             return False
 
+        preexec_fn = None
+        if sys.platform == "linux":
+            libc_name = ctypes.util.find_library("c")
+            libc = None
+            if libc_name is not None:
+                try:  # noqa: SIM105
+                    libc = ctypes.CDLL(libc_name, use_errno=True)
+                except Exception:  # noqa: BLE001, S110
+                    pass
+
+            if libc is not None:
+
+                def set_pdeathsig() -> None:
+                    try:
+                        # PR_SET_PDEATHSIG is 1
+                        libc.prctl(1, signal.SIGTERM, 0, 0, 0)
+                        if os.getppid() == 1:
+                            os._exit(0)
+                    except Exception:  # noqa: BLE001, S110
+                        pass
+
+                preexec_fn = set_pdeathsig
+
         try:
             process = subprocess.Popen(  # noqa: S603 - executable path comes from manifest/PATH.
                 [executable, "--stdio"],
@@ -662,6 +704,7 @@ class PyrightSession:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                preexec_fn=preexec_fn,  # noqa: PLW1509
             )
         except OSError as exc:
             self._run_state.disabled = True
@@ -841,11 +884,11 @@ class PyrightSession:
             line = _read_line(fd, deadline)
             if line in (b"\r\n", b"\n"):
                 break
-            if b":" not in line:
-                message = f"malformed LSP header: {line!r}"
-                raise LspTransportClosedError(message)
-            name, value = line.decode("ascii").strip().split(":", 1)
-            headers[name.lower()] = value.strip()
+            decoded_line = line.decode("ascii", errors="ignore").strip()
+            name, sep, value = decoded_line.partition(":")
+            if not sep:
+                continue
+            headers[name.strip().lower()] = value.strip()
         if "content-length" not in headers:
             message = f"missing LSP Content-Length header: {headers!r}"
             raise LspTransportClosedError(message)
@@ -868,6 +911,8 @@ class PyrightSession:
         if not self._is_internal_project_path(target_path):
             return None
         index = self._function_index_for_path(target_path)
+        if index.parse_status == "syntax_error":
+            return None
         key = _range_start_key(raw_selection)
         if key is not None and key in index.by_name_position:
             return index.by_name_position[key].entity_id
@@ -915,7 +960,12 @@ def _build_function_index(project_root: Path, path: Path, source: str) -> _Funct
     relative = path.relative_to(project_root) if path.is_relative_to(project_root) else path
     dotted_module = module_dotted_name(relative.as_posix())
     parse_started = time.perf_counter()
-    tree = ast.parse(source)
+    parse_status: Literal["ok", "syntax_error"] = "ok"
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        tree = ast.Module(body=[], type_ignores=[])
+        parse_status = "syntax_error"
     parse_latency_ms = max(1, math.ceil((time.perf_counter() - parse_started) * 1000))
     functions: list[_FunctionInfo] = []
     entities: list[_EntityInfo] = []
@@ -943,6 +993,7 @@ def _build_function_index(project_root: Path, path: Path, source: str) -> _Funct
         functions=tuple(functions),
         entities=tuple(entities),
         tree=tree,
+        parse_status=parse_status,
     )
 
 

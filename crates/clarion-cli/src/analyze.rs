@@ -633,7 +633,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         let (plugin_files, skipped_files): (Vec<PathBuf>, Vec<PathBuf>) =
             plugin_files.into_iter().partition(|path| {
                 secret_finding_files.contains(&crate::secret_scan::canonical_or_original(path))
-                    || file_needs_reanalysis(path, &prior_file_hashes)
+                    || file_needs_reanalysis(&project_root, path, &prior_file_hashes)
             });
         for path in &skipped_files {
             skipped_files_total += 1;
@@ -3534,7 +3534,8 @@ fn run_plugin_blocking(
                 if let Some(sig) = &entity.raw.signature {
                     collected_signatures.insert(id_str.clone(), canonical_signature(sig));
                 }
-                let record = map_entity_to_record(entity, plugin_id, source_file_id.clone());
+                let record =
+                    map_entity_to_record(project_root, entity, plugin_id, source_file_id.clone());
                 file_entities.push((id_str.clone(), record.clone()));
                 collected_entities.push((id_str, record));
             }
@@ -3888,7 +3889,7 @@ fn core_file_entity_record(
         .and_then(|name| name.to_str())
         .unwrap_or(&qualified_name)
         .to_owned();
-    let content_hash = whole_file_hash(Path::new(&source_file_path))
+    let content_hash = whole_file_hash(&canonical_root, Path::new(&source_file_path))
         .with_context(|| format!("read source file {source_file_path}"))?;
     let mut properties = serde_json::Map::new();
     properties.insert(
@@ -3962,6 +3963,7 @@ fn project_relative_posix(path: &Path) -> Result<String> {
 
 /// Map an `AcceptedEntity` to an `EntityRecord` for the writer-actor.
 fn map_entity_to_record(
+    project_root: &Path,
     entity: &AcceptedEntity,
     plugin_id: &str,
     source_file_id: Option<String>,
@@ -3993,7 +3995,7 @@ fn map_entity_to_record(
         source_line_start: source_line_range.map(|range| range.start_line),
         source_line_end: source_line_range.map(|range| range.end_line),
         properties_json,
-        content_hash: content_hash_for_entity(entity, source_line_range),
+        content_hash: content_hash_for_entity(project_root, entity, source_line_range),
         summary_json: None,
         wardline_json: None,
         first_seen_commit: None,
@@ -4029,8 +4031,11 @@ fn source_line_range(entity: &AcceptedEntity) -> Option<SourceLineRange> {
 /// incremental-skip check. They MUST agree byte-for-byte or the skip silently
 /// never matches; one helper guarantees that. `None` when the file cannot be
 /// read — callers fail toward re-analysis.
-fn whole_file_hash(path: &Path) -> Option<String> {
-    let bytes = fs::read(path).ok()?;
+fn whole_file_hash(project_root: &Path, path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut file = clarion_core::plugin::jail::safe_open(project_root, path).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
     Some(blake3::hash(&bytes).to_hex().to_string())
 }
 
@@ -4051,29 +4056,40 @@ fn canonical_path_key(path: &Path) -> Option<String> {
 /// fail-toward-work direction — on any uncertainty: the path cannot be
 /// canonicalised, the prior run recorded no whole-file hash for it (a new file),
 /// or the file is unhashable now. Skips only on a confident byte-identical match.
-fn file_needs_reanalysis(path: &Path, prior_file_hashes: &HashMap<String, String>) -> bool {
+fn file_needs_reanalysis(
+    project_root: &Path,
+    path: &Path,
+    prior_file_hashes: &HashMap<String, String>,
+) -> bool {
     let Some(key) = canonical_path_key(path) else {
         return true;
     };
     let Some(prior) = prior_file_hashes.get(&key) else {
         return true;
     };
-    match whole_file_hash(path) {
+    match whole_file_hash(project_root, path) {
         Some(current) => &current != prior,
         None => true,
     }
 }
 
 fn content_hash_for_entity(
+    project_root: &Path,
     entity: &AcceptedEntity,
     source_line_range: Option<SourceLineRange>,
 ) -> Option<String> {
+    use std::io::Read;
+
     if entity.kind == "module" {
-        return whole_file_hash(Path::new(&entity.source_file_path));
+        return whole_file_hash(project_root, Path::new(&entity.source_file_path));
     }
 
     let range = source_line_range?;
-    let source = fs::read_to_string(&entity.source_file_path).ok()?;
+    let mut file =
+        clarion_core::plugin::jail::safe_open(project_root, Path::new(&entity.source_file_path))
+            .ok()?;
+    let mut source = String::new();
+    file.read_to_string(&mut source).ok()?;
     let lines: Vec<&str> = source.lines().collect();
     let start = usize::try_from(range.start_line - 1).ok()?;
     let mut end = usize::try_from(range.end_line).ok()?;
@@ -4963,7 +4979,12 @@ mod tests {
             },
         };
 
-        let record = map_entity_to_record(&entity, "python", Some("python:module:demo".to_owned()));
+        let record = map_entity_to_record(
+            tempdir.path(),
+            &entity,
+            "python",
+            Some("python:module:demo".to_owned()),
+        );
 
         assert_eq!(
             record.source_file_path.as_deref(),

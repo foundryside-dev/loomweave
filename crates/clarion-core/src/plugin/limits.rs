@@ -298,7 +298,7 @@ pub const DEFAULT_MAX_NPROC: u64 = 32;
 /// # Errors
 ///
 /// Returns `std::io::Error` on `setrlimit` failure.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn apply_prlimit_as(max_rss_mib: u64) -> std::io::Result<()> {
     use nix::sys::resource::{Resource, setrlimit};
 
@@ -317,7 +317,7 @@ pub fn apply_prlimit_as(max_rss_mib: u64) -> std::io::Result<()> {
 /// # Errors
 ///
 /// Returns `std::io::Error` on the first `setrlimit` failure.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn apply_prlimit_nofile_nproc(max_nofile: u64, max_nproc: u64) -> std::io::Result<()> {
     use nix::sys::resource::{Resource, setrlimit};
 
@@ -325,33 +325,33 @@ pub fn apply_prlimit_nofile_nproc(max_nofile: u64, max_nproc: u64) -> std::io::R
     setrlimit(Resource::RLIMIT_NPROC, max_nproc, max_nproc).map_err(std::io::Error::from)
 }
 
-/// Non-Linux stub for [`apply_prlimit_nofile_nproc`].
-#[cfg(not(target_os = "linux"))]
+/// Non-Linux/macOS stub for [`apply_prlimit_nofile_nproc`].
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn apply_prlimit_nofile_nproc(_max_nofile: u64, _max_nproc: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-/// No-op stub for non-Linux targets (UQ-WP2-06: Linux-only for Sprint 1).
+/// No-op stub for non-Linux/macOS targets (UQ-WP2-06: Linux-only for Sprint 1).
 ///
 /// Logs a one-time warning and returns `Ok(())`. The caller proceeds without a
 /// memory ceiling on the plugin process.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn apply_prlimit_as(_max_rss_mib: u64) -> std::io::Result<()> {
     warn_once_non_linux();
     Ok(())
 }
 
-/// Emit a one-time warning on non-Linux platforms.
+/// Emit a one-time warning on non-Linux/macOS platforms.
 ///
 /// Uses `std::sync::Once` rather than `tracing` — clarion-core has no tracing
 /// dep and we do not add one for this single warning (per task spec).
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn warn_once_non_linux() {
     use std::sync::Once;
     static WARN: Once = Once::new();
     WARN.call_once(|| {
         eprintln!(
-            "clarion: RLIMIT_AS enforcement is Linux-only; \
+            "clarion: RLIMIT_AS enforcement is Linux/macOS only; \
              plugin memory ceiling will not be applied on this platform"
         );
     });
@@ -562,8 +562,8 @@ mod tests {
         assert!(result.is_ok(), "apply_prlimit_as must succeed: {result:?}");
     }
 
-    /// On non-Linux: the stub path compiles and returns Ok (type-level check).
-    #[cfg(not(target_os = "linux"))]
+    /// On non-Linux/macOS: the stub path compiles and returns Ok (type-level check).
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn apply_prlimit_non_linux_stub_returns_ok() {
         let result = apply_prlimit_as(DEFAULT_MAX_RSS_MIB);

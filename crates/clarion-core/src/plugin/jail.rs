@@ -83,6 +83,52 @@ pub fn jail(root: &Path, candidate: &Path) -> Result<PathBuf, JailError> {
     Ok(canonical_candidate)
 }
 
+/// Open a candidate file safely, mitigating TOCTOU symlink swap hazards by
+/// verifying that the opened file's metadata matches the jail-checked canonical path.
+pub fn safe_open(root: &Path, candidate: &Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::File::open(candidate)?;
+    let canonical_root = std::fs::canonicalize(root)?;
+    let canonical_candidate = std::fs::canonicalize(candidate)?;
+
+    if !canonical_candidate.starts_with(&canonical_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "Path escape: {} resolves outside jail root",
+                canonical_candidate.display()
+            ),
+        ));
+    }
+
+    // TOCTOU mitigation: verify the open file handle matches the canonical path
+    let meta_file = file.metadata()?;
+    let meta_canonical = std::fs::metadata(&canonical_candidate)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta_file.dev() != meta_canonical.dev() || meta_file.ino() != meta_canonical.ino() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "TOCTOU validation failure: device or inode mismatch",
+            ));
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Best-effort fallback for non-Unix targets
+        if meta_file.len() != meta_canonical.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "TOCTOU validation failure: file length mismatch",
+            ));
+        }
+    }
+
+    Ok(file)
+}
+
 /// Assert that `candidate` is inside `root` and return the canonical path as
 /// a UTF-8 `String`.
 ///

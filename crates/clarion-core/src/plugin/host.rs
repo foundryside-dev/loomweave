@@ -438,6 +438,8 @@ where
     /// discarded on overflow so the plugin cannot back-pressure the host
     /// via stderr writes.
     stderr_tail: Option<Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>>,
+    /// Background thread draining stderr from the plugin subprocess.
+    stderr_thread: Option<std::thread::JoinHandle<()>>,
     /// Canonical source paths whose entities must not be sent for LLM briefing.
     briefing_blocks: Arc<BTreeMap<PathBuf, BriefingBlockReason>>,
     /// Canonical source paths that were covered by the core pre-ingest scanner.
@@ -589,7 +591,7 @@ impl
         // only the child's limits are affected. No Rust allocation, no Drop
         // and no non-async-signal-safe call occurs inside the closure;
         // `u64` captures are trivially Copy.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             use std::os::unix::process::CommandExt;
             let rss_mib = effective_rss_mib(
@@ -634,7 +636,7 @@ impl
                 std::collections::VecDeque::with_capacity(STDERR_TAIL_BYTES),
             ));
         let stderr_tail_for_thread = std::sync::Arc::clone(&stderr_tail);
-        std::thread::Builder::new()
+        let stderr_thread = std::thread::Builder::new()
             .name(format!(
                 "clarion-plugin-stderr-drain:{}",
                 manifest.plugin.plugin_id
@@ -649,6 +651,7 @@ impl
             std::io::BufWriter::new(stdin),
         );
         host.stderr_tail = Some(stderr_tail);
+        host.stderr_thread = Some(stderr_thread);
 
         // Reap on handshake failure. `std::process::Child::Drop` does NOT
         // waitpid on Unix, so returning Err while `child` goes out of scope
@@ -706,6 +709,7 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
             terminated: false,
             ontology_version: None,
             stderr_tail: None,
+            stderr_thread: None,
             briefing_blocks: Arc::new(BTreeMap::new()),
             scanned_source_files: Arc::new(BTreeSet::new()),
         }

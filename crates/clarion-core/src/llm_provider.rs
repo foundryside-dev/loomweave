@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -102,9 +103,10 @@ impl LlmProviderError {
     }
 }
 
+#[async_trait]
 pub trait LlmProvider: Send + Sync {
     fn name(&self) -> &'static str;
-    fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError>;
+    async fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError>;
     fn estimate_tokens(&self, request: &LlmRequest) -> u64;
     fn tier_to_model(&self, tier: &str) -> Option<&str>;
     fn caching_model(&self) -> CachingModel;
@@ -164,12 +166,13 @@ impl RecordingProvider {
     }
 }
 
+#[async_trait]
 impl LlmProvider for RecordingProvider {
     fn name(&self) -> &'static str {
         "recording"
     }
 
-    fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
+    async fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
         self.invocations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -249,12 +252,13 @@ impl OpenRouterProvider {
     }
 }
 
+#[async_trait]
 impl LlmProvider for OpenRouterProvider {
     fn name(&self) -> &'static str {
         "openrouter"
     }
 
-    fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
+    async fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
         let payload = serde_json::json!({
             "model": request.model_id,
             "max_tokens": request.max_output_tokens,
@@ -270,7 +274,7 @@ impl LlmProvider for OpenRouterProvider {
                 }
             ]
         });
-        let client = reqwest::blocking::Client::builder()
+        let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_seconds))
             .build()
             .map_err(|err| LlmProviderError::Http {
@@ -285,16 +289,20 @@ impl LlmProvider for OpenRouterProvider {
             .header("content-type", "application/json")
             .json(&payload)
             .send()
+            .await
             .map_err(|err| LlmProviderError::Http {
                 message: err.to_string(),
                 retryable: true,
             })?;
         let status = response.status();
         let retry_after_seconds = retry_after_seconds(response.headers());
-        let body = response.text().map_err(|err| LlmProviderError::Http {
-            message: err.to_string(),
-            retryable: true,
-        })?;
+        let body = response
+            .text()
+            .await
+            .map_err(|err| LlmProviderError::Http {
+                message: err.to_string(),
+                retryable: true,
+            })?;
         if !status.is_success() {
             return Err(provider_error_from_body(
                 status.as_u16(),
@@ -546,15 +554,24 @@ impl CodexCliProvider {
     }
 }
 
+#[async_trait]
 impl LlmProvider for CodexCliProvider {
     fn name(&self) -> &'static str {
         "codex_cli"
     }
 
-    fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
-        let output_file = codex_temp_file("clarion-codex-output", ".json")?;
-        let schema_file = codex_temp_file("clarion-codex-schema", ".json")?;
-        self.invoke_with_temp_files(request, output_file.path(), schema_file.path())
+    async fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let output_file = codex_temp_file("clarion-codex-output", ".json")?;
+            let schema_file = codex_temp_file("clarion-codex-schema", ".json")?;
+            this.invoke_with_temp_files(request, output_file.path(), schema_file.path())
+        })
+        .await
+        .map_err(|err| LlmProviderError::Cli {
+            message: format!("Codex CLI task failed to join: {err}"),
+            retryable: true,
+        })?
     }
 
     fn estimate_tokens(&self, request: &LlmRequest) -> u64 {
@@ -658,99 +675,109 @@ impl ClaudeCliProvider {
     }
 }
 
+#[async_trait]
 impl LlmProvider for ClaudeCliProvider {
     fn name(&self) -> &'static str {
         "claude_cli"
     }
 
-    fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
-        let schema = codex_output_schema_for_purpose(&request.purpose);
-        let schema_json =
-            serde_json::to_string(&schema).map_err(|err| LlmProviderError::InvalidResponse {
-                message: format!("serialize Claude output schema: {err}"),
+    async fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let schema = codex_output_schema_for_purpose(&request.purpose);
+            let schema_json = serde_json::to_string(&schema).map_err(|err| {
+                LlmProviderError::InvalidResponse {
+                    message: format!("serialize Claude output schema: {err}"),
+                    retryable: false,
+                }
+            })?;
+            let provider_prompt = build_coding_agent_provider_prompt(&request);
+            let mut command = Command::new(&this.executable);
+            command
+                .arg("-p")
+                .arg(CLAUDE_CLI_PRINT_PROMPT)
+                .arg("--output-format")
+                .arg("json")
+                .arg("--json-schema")
+                .arg(schema_json)
+                .arg("--permission-mode")
+                .arg(&this.permission_mode)
+                .arg("--max-turns")
+                .arg(this.max_turns.to_string())
+                .arg("--mcp-config")
+                .arg(r#"{"mcpServers":{}}"#)
+                .arg("--strict-mcp-config")
+                .arg("--disable-slash-commands");
+            if this.no_session_persistence {
+                command.arg("--no-session-persistence");
+            }
+            if this.exclude_dynamic_system_prompt_sections {
+                command.arg("--exclude-dynamic-system-prompt-sections");
+            }
+            if let Some(model) = &this.model {
+                command.arg("--model").arg(model);
+            }
+            command.arg("--tools").arg(this.tools.join(","));
+            command
+                .current_dir(&this.project_root)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            let mut child = command.spawn().map_err(|err| LlmProviderError::Cli {
+                message: format!("spawn Claude CLI {}: {err}", this.executable),
                 retryable: false,
             })?;
-        let provider_prompt = build_coding_agent_provider_prompt(&request);
-        let mut command = Command::new(&self.executable);
-        command
-            .arg("-p")
-            .arg(CLAUDE_CLI_PRINT_PROMPT)
-            .arg("--output-format")
-            .arg("json")
-            .arg("--json-schema")
-            .arg(schema_json)
-            .arg("--permission-mode")
-            .arg(&self.permission_mode)
-            .arg("--max-turns")
-            .arg(self.max_turns.to_string())
-            .arg("--mcp-config")
-            .arg(r#"{"mcpServers":{}}"#)
-            .arg("--strict-mcp-config")
-            .arg("--disable-slash-commands");
-        if self.no_session_persistence {
-            command.arg("--no-session-persistence");
-        }
-        if self.exclude_dynamic_system_prompt_sections {
-            command.arg("--exclude-dynamic-system-prompt-sections");
-        }
-        if let Some(model) = &self.model {
-            command.arg("--model").arg(model);
-        }
-        command.arg("--tools").arg(self.tools.join(","));
-        command
-            .current_dir(&self.project_root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            let stdout_reader = take_reader(&mut child.stdout, "stdout")?;
+            let stderr_reader = take_reader(&mut child.stderr, "stderr")?;
+            if let Err(err) = write_child_stdin(&mut child, &provider_prompt) {
+                let _ = child.kill();
+                return Err(err);
+            }
 
-        let mut child = command.spawn().map_err(|err| LlmProviderError::Cli {
-            message: format!("spawn Claude CLI {}: {err}", self.executable),
-            retryable: false,
-        })?;
-        let stdout_reader = take_reader(&mut child.stdout, "stdout")?;
-        let stderr_reader = take_reader(&mut child.stderr, "stderr")?;
-        if let Err(err) = write_child_stdin(&mut child, &provider_prompt) {
-            let _ = child.kill();
-            return Err(err);
-        }
+            let status = wait_for_child(&mut child, this.timeout, this.timeout_seconds)?;
+            let stdout = join_reader(stdout_reader, "stdout")?;
+            let stderr = join_reader(stderr_reader, "stderr")?;
+            if !status.success() {
+                return Err(LlmProviderError::Cli {
+                    message: format!(
+                        "claude -p exited with {status}: {}",
+                        truncate_for_error(&String::from_utf8_lossy(&stderr))
+                    ),
+                    retryable: cli_status_retryable(status),
+                });
+            }
 
-        let status = wait_for_child(&mut child, self.timeout, self.timeout_seconds)?;
-        let stdout = join_reader(stdout_reader, "stdout")?;
-        let stderr = join_reader(stderr_reader, "stderr")?;
-        if !status.success() {
-            return Err(LlmProviderError::Cli {
-                message: format!(
-                    "claude -p exited with {status}: {}",
-                    truncate_for_error(&String::from_utf8_lossy(&stderr))
-                ),
-                retryable: cli_status_retryable(status),
-            });
-        }
+            let parsed = parse_claude_cli_json_output(&stdout)?;
+            let input_tokens = parsed
+                .usage
+                .input_tokens
+                .unwrap_or_else(|| estimate_text_tokens(&provider_prompt));
+            let output_tokens = parsed
+                .usage
+                .output_tokens
+                .unwrap_or_else(|| estimate_text_tokens(&parsed.output_json));
+            let total_tokens = parsed
+                .usage
+                .total_tokens
+                .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+            let cached_input_tokens = parsed.usage.cached_input_tokens.unwrap_or(0);
 
-        let parsed = parse_claude_cli_json_output(&stdout)?;
-        let input_tokens = parsed
-            .usage
-            .input_tokens
-            .unwrap_or_else(|| estimate_text_tokens(&provider_prompt));
-        let output_tokens = parsed
-            .usage
-            .output_tokens
-            .unwrap_or_else(|| estimate_text_tokens(&parsed.output_json));
-        let total_tokens = parsed
-            .usage
-            .total_tokens
-            .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
-        let cached_input_tokens = parsed.usage.cached_input_tokens.unwrap_or(0);
-
-        Ok(LlmResponse {
-            model_id: request.model_id,
-            output_json: parsed.output_json,
-            input_tokens,
-            cached_input_tokens,
-            output_tokens,
-            total_tokens,
-            cost_usd: parsed.cost_usd.unwrap_or(0.0),
+            Ok(LlmResponse {
+                model_id: request.model_id,
+                output_json: parsed.output_json,
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                total_tokens,
+                cost_usd: parsed.cost_usd.unwrap_or(0.0),
+            })
         })
+        .await
+        .map_err(|err| LlmProviderError::Cli {
+            message: format!("Claude CLI task failed to join: {err}"),
+            retryable: true,
+        })?
     }
 
     fn estimate_tokens(&self, request: &LlmRequest) -> u64 {
@@ -1419,8 +1446,8 @@ pub fn build_inferred_calls_prompt(input: &InferredCallsPromptInput) -> PromptTe
 mod tests {
     use super::*;
 
-    #[test]
-    fn recording_provider_replays_exact_request_shape() {
+    #[tokio::test]
+    async fn recording_provider_replays_exact_request_shape() {
         let request = LlmRequest {
             purpose: LlmPurpose::Summary,
             model_id: "anthropic/claude-sonnet-4.6".to_owned(),
@@ -1442,7 +1469,7 @@ mod tests {
             response: response.clone(),
         }]);
 
-        assert_eq!(provider.invoke(request.clone()).unwrap(), response);
+        assert_eq!(provider.invoke(request.clone()).await.unwrap(), response);
         assert_eq!(provider.invocations(), vec![request.clone()]);
 
         let missing = provider
@@ -1450,6 +1477,7 @@ mod tests {
                 prompt: "changed".to_owned(),
                 ..request
             })
+            .await
             .expect_err("request-shape drift should miss the recording");
         assert!(matches!(missing, LlmProviderError::MissingRecording { .. }));
     }
@@ -1566,8 +1594,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn openrouter_provider_invokes_chat_completions_and_extracts_usage_tokens() {
+    #[tokio::test]
+    async fn openrouter_provider_invokes_chat_completions_and_extracts_usage_tokens() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -1634,6 +1662,7 @@ mod tests {
                 prompt: "Summarize this function".to_owned(),
                 max_output_tokens: 512,
             })
+            .await
             .expect("invoke mocked OpenRouter");
 
         assert_eq!(response.output_json, r#"{"purpose":"demo"}"#);
@@ -1644,11 +1673,12 @@ mod tests {
         handle.join().expect("server thread");
     }
 
-    #[test]
-    fn openrouter_provider_unwraps_error_envelope_with_retryability() {
+    #[tokio::test]
+    async fn openrouter_provider_unwraps_error_envelope_with_retryability() {
         let auth_error = invoke_openrouter_once(
             "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"error\":{\"code\":401,\"message\":\"Invalid credentials\",\"metadata\":{}}}",
         )
+        .await
         .expect_err("401 should return provider error");
         assert!(matches!(
             auth_error,
@@ -1663,6 +1693,7 @@ mod tests {
         let retryable = invoke_openrouter_once(
             "HTTP/1.1 503 Service Unavailable\r\nretry-after: 60\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"error\":{\"code\":503,\"message\":\"No provider available\",\"metadata\":{}}}",
         )
+        .await
         .expect_err("503 should return provider error");
         assert!(matches!(
             retryable,
@@ -1675,11 +1706,12 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn openrouter_provider_unwraps_choice_level_error() {
+    #[tokio::test]
+    async fn openrouter_provider_unwraps_choice_level_error() {
         let err = invoke_openrouter_once(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"id\":\"gen-01\",\"object\":\"chat.completion\",\"created\":1779000000,\"model\":\"anthropic/claude-sonnet-4.6\",\"choices\":[{\"finish_reason\":\"error\",\"native_finish_reason\":\"error\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"error\":{\"code\":502,\"message\":\"Provider disconnected\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":0,\"total_tokens\":1}}",
         )
+        .await
         .expect_err("choice error should return provider error");
 
         assert!(matches!(
@@ -1693,8 +1725,8 @@ mod tests {
         assert!(err.to_string().contains("Provider disconnected"));
     }
 
-    #[test]
-    fn openrouter_provider_uses_inferred_calls_schema_for_inferred_requests() {
+    #[tokio::test]
+    async fn openrouter_provider_uses_inferred_calls_schema_for_inferred_requests() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -1756,6 +1788,7 @@ mod tests {
                 prompt: "Resolve calls".to_owned(),
                 max_output_tokens: 512,
             })
+            .await
             .expect("invoke mocked OpenRouter");
 
         assert_eq!(response.output_json, r#"{"edges":[]}"#);
@@ -1764,8 +1797,8 @@ mod tests {
         handle.join().expect("server thread");
     }
 
-    #[test]
-    fn openrouter_provider_connection_error_is_retryable() {
+    #[tokio::test]
+    async fn openrouter_provider_connection_error_is_retryable() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind unused port");
         let addr = listener.local_addr().expect("unused port addr");
         drop(listener);
@@ -1782,6 +1815,7 @@ mod tests {
 
         let err = provider
             .invoke(sample_request())
+            .await
             .expect_err("connection refused should be retryable");
         assert!(matches!(
             err,
@@ -1792,9 +1826,9 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    fn codex_cli_provider_invokes_exec_with_schema_stdin_and_usage() {
+    async fn codex_cli_provider_invokes_exec_with_schema_stdin_and_usage() {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
@@ -1911,6 +1945,7 @@ printf '%s' '{{"purpose":"via codex","behavior":"ran fake CLI","relationships":"
                 prompt: "Summarize this function".to_owned(),
                 max_output_tokens: 512,
             })
+            .await
             .expect("invoke fake Codex CLI");
 
         assert_eq!(provider.name(), "codex_cli");
@@ -1935,8 +1970,8 @@ printf '%s' '{{"purpose":"via codex","behavior":"ran fake CLI","relationships":"
         assert!(log.contains("profile=clarion"));
     }
 
-    #[test]
-    fn codex_cli_provider_fallback_usage_counts_wrapped_prompt() {
+    #[tokio::test]
+    async fn codex_cli_provider_fallback_usage_counts_wrapped_prompt() {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
@@ -1992,14 +2027,17 @@ printf '%s' '{"purpose":"via codex","behavior":"ran fake CLI","relationships":""
         let expected_input_tokens =
             estimate_text_tokens(&build_coding_agent_provider_prompt(&request));
 
-        let response = provider.invoke(request).expect("invoke fake Codex CLI");
+        let response = provider
+            .invoke(request)
+            .await
+            .expect("invoke fake Codex CLI");
 
         assert_eq!(response.input_tokens, expected_input_tokens);
     }
 
-    #[test]
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    fn claude_cli_provider_invokes_print_mode_with_schema_and_usage() {
+    async fn claude_cli_provider_invokes_print_mode_with_schema_and_usage() {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
@@ -2138,6 +2176,7 @@ printf '%s\n' '{{"type":"result","subtype":"success","structured_output":{{"purp
                 prompt: "Summarize this function".to_owned(),
                 max_output_tokens: 512,
             })
+            .await
             .expect("invoke fake Claude CLI");
 
         assert_eq!(provider.name(), "claude_cli");
@@ -2174,8 +2213,8 @@ printf '%s\n' '{{"type":"result","subtype":"success","structured_output":{{"purp
         assert!(log.contains("exclude_dynamic=1"));
     }
 
-    #[test]
-    fn claude_cli_provider_fallback_usage_counts_wrapped_prompt() {
+    #[tokio::test]
+    async fn claude_cli_provider_fallback_usage_counts_wrapped_prompt() {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
@@ -2229,13 +2268,16 @@ printf '%s\n' '{"type":"result","subtype":"success","structured_output":{"purpos
         let expected_input_tokens =
             estimate_text_tokens(&build_coding_agent_provider_prompt(&request));
 
-        let response = provider.invoke(request).expect("invoke fake Claude CLI");
+        let response = provider
+            .invoke(request)
+            .await
+            .expect("invoke fake Claude CLI");
 
         assert_eq!(response.input_tokens, expected_input_tokens);
     }
 
-    #[test]
-    fn claude_cli_provider_passes_empty_tools_arg_when_no_tools_are_configured() {
+    #[tokio::test]
+    async fn claude_cli_provider_passes_empty_tools_arg_when_no_tools_are_configured() {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
@@ -2302,6 +2344,7 @@ printf '%s\n' '{{"type":"result","subtype":"success","structured_output":{{"purp
                 prompt: "Summarize this function".to_owned(),
                 max_output_tokens: 512,
             })
+            .await
             .expect("invoke fake Claude CLI");
 
         let log = fs::read_to_string(log_path).expect("read fake claude log");
@@ -2469,7 +2512,9 @@ printf '%s\n' '{{"type":"result","subtype":"success","structured_output":{{"purp
         }
     }
 
-    fn invoke_openrouter_once(raw_response: &'static str) -> Result<LlmResponse, LlmProviderError> {
+    async fn invoke_openrouter_once(
+        raw_response: &'static str,
+    ) -> Result<LlmResponse, LlmProviderError> {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -2493,7 +2538,7 @@ printf '%s\n' '{{"type":"result","subtype":"success","structured_output":{{"purp
             timeout_seconds: 30,
         })
         .expect("test provider");
-        let result = provider.invoke(sample_request());
+        let result = provider.invoke(sample_request()).await;
         handle.join().expect("server thread");
         result
     }

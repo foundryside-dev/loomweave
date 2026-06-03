@@ -596,12 +596,13 @@ impl AnySummaryProvider {
     }
 }
 
+#[async_trait::async_trait]
 impl LlmProvider for AnySummaryProvider {
     fn name(&self) -> &'static str {
         "recording"
     }
 
-    fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
+    async fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
         self.invocations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -633,12 +634,13 @@ impl LlmProvider for AnySummaryProvider {
     }
 }
 
+#[async_trait::async_trait]
 impl LlmProvider for AnyInferredProvider {
     fn name(&self) -> &'static str {
         "recording"
     }
 
-    fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
+    async fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
         self.invocations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

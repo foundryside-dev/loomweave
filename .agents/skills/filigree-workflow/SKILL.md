@@ -271,11 +271,11 @@ are for "hmm, this might be worth looking at" — the uncertain middle ground.
 
 Observations expire after 14 days. Triage them before they rot:
 
-1. **At session end:** run `list_observations` and quickly scan what's accumulated
+1. **At session end:** run `observation_list` and quickly scan what's accumulated
 2. **For each observation, decide:**
    - **Dismiss** — not actionable, already fixed, or not worth tracking. Use
-     `dismiss_observation` with a brief reason for the audit trail.
-   - **Promote** — deserves to be tracked as an issue. Use `promote_observation`
+     `observation_dismiss` with a brief reason for the audit trail.
+   - **Promote** — deserves to be tracked as an issue. Use `observation_promote`
      which atomically creates an issue and labels it `from-observation`. Choose
      the right issue type:
      - `type='bug'` — something is broken or produces wrong results
@@ -285,7 +285,7 @@ Observations expire after 14 days. Triage them before they rot:
    - **Leave it** — still uncertain. Let it age. If it survives a few sessions
      without being promoted, it's probably a dismiss.
 
-3. **Batch cleanup:** use the MCP tool `batch_dismiss_observations` when several observations
+3. **Batch cleanup:** use the MCP tool `observation_batch_dismiss` when several observations
    have gone stale together.
 
 ### Promote vs Dismiss
@@ -319,6 +319,6 @@ filigree search "from-observation"         # Search with context
 | "This task is bigger than expected" | Create sub-tasks, add deps |
 | "I'm done" | Comment, close with reason, check `ready` |
 | "Something changed while I worked" | `filigree changes --since <timestamp>` |
-| "I noticed something odd in a file I'm passing through" | `observe` with file_path and line — keep working |
+| "I noticed something odd in a file I'm passing through" | `observation_create` with file_path and line — keep working |
 | "I noticed a gap in the work I'm currently doing" | Fix it, expand the task, or file a proper issue — **do not** observe it |
-| "These observations are piling up" | `list_observations`, then dismiss or promote each |
+| "These observations are piling up" | `observation_list`, then dismiss or promote each |

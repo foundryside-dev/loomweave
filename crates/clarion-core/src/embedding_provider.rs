@@ -14,6 +14,7 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -64,6 +65,7 @@ impl EmbeddingProviderError {
 /// A provider that turns text into dense float vectors. One `embed` call
 /// processes a batch; the returned vectors are positionally aligned with the
 /// input `texts` and each has length [`EmbeddingProvider::dimensions`].
+#[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     fn name(&self) -> &'static str;
     /// The model identifier embeddings are keyed by (cache invalidation).
@@ -71,7 +73,7 @@ pub trait EmbeddingProvider: Send + Sync {
     /// The dimensionality every returned vector must have.
     fn dimensions(&self) -> usize;
     /// Embed a batch of texts, positionally aligned with the input.
-    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingProviderError>;
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingProviderError>;
     /// Heuristic input-token estimate for cost governance (chars / 4).
     fn estimate_tokens(&self, texts: &[String]) -> u64 {
         texts
@@ -128,6 +130,7 @@ impl RecordingEmbeddingProvider {
     }
 }
 
+#[async_trait]
 impl EmbeddingProvider for RecordingEmbeddingProvider {
     fn name(&self) -> &'static str {
         "recording"
@@ -141,7 +144,7 @@ impl EmbeddingProvider for RecordingEmbeddingProvider {
         self.dimensions
     }
 
-    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingProviderError> {
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingProviderError> {
         let mut out = Vec::with_capacity(texts.len());
         for text in texts {
             self.invocations
@@ -238,6 +241,7 @@ impl ApiEmbeddingProvider {
     }
 }
 
+#[async_trait]
 impl EmbeddingProvider for ApiEmbeddingProvider {
     fn name(&self) -> &'static str {
         "api"
@@ -251,12 +255,12 @@ impl EmbeddingProvider for ApiEmbeddingProvider {
         self.dimensions
     }
 
-    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingProviderError> {
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingProviderError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
         let payload = serde_json::json!({ "model": self.model_id, "input": texts });
-        let client = reqwest::blocking::Client::builder()
+        let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_seconds))
             .build()
             .map_err(|err| EmbeddingProviderError::Http {
@@ -269,6 +273,7 @@ impl EmbeddingProvider for ApiEmbeddingProvider {
             .header("content-type", "application/json")
             .json(&payload)
             .send()
+            .await
             .map_err(|err| EmbeddingProviderError::Http {
                 message: err.to_string(),
                 retryable: true,
@@ -276,6 +281,7 @@ impl EmbeddingProvider for ApiEmbeddingProvider {
         let status = response.status();
         let body = response
             .text()
+            .await
             .map_err(|err| EmbeddingProviderError::Http {
                 message: err.to_string(),
                 retryable: true,
@@ -360,8 +366,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn recording_provider_returns_recorded_vectors_in_order() {
+    #[tokio::test]
+    async fn recording_provider_returns_recorded_vectors_in_order() {
         let provider = RecordingEmbeddingProvider::from_recordings(
             "test-model",
             2,
@@ -369,6 +375,7 @@ mod tests {
         );
         let out = provider
             .embed(&["beta".to_owned(), "alpha".to_owned()])
+            .await
             .expect("embed");
         assert_eq!(out, vec![vec![0.0, 1.0], vec![1.0, 0.0]]);
         assert_eq!(provider.invocations(), vec!["beta", "alpha"]);
@@ -376,11 +383,11 @@ mod tests {
         assert_eq!(provider.model_id(), "test-model");
     }
 
-    #[test]
-    fn recording_provider_errors_on_missing_text() {
+    #[tokio::test]
+    async fn recording_provider_errors_on_missing_text() {
         let provider =
             RecordingEmbeddingProvider::from_recordings("m", 1, vec![rec("known", vec![1.0])]);
-        let err = provider.embed(&["unknown".to_owned()]).unwrap_err();
+        let err = provider.embed(&["unknown".to_owned()]).await.unwrap_err();
         assert!(matches!(
             err,
             EmbeddingProviderError::MissingRecording { .. }
@@ -388,11 +395,11 @@ mod tests {
         assert!(!err.retryable());
     }
 
-    #[test]
-    fn recording_provider_rejects_wrong_dimension() {
+    #[tokio::test]
+    async fn recording_provider_rejects_wrong_dimension() {
         let provider =
             RecordingEmbeddingProvider::from_recordings("m", 3, vec![rec("x", vec![1.0, 2.0])]);
-        let err = provider.embed(&["x".to_owned()]).unwrap_err();
+        let err = provider.embed(&["x".to_owned()]).await.unwrap_err();
         assert!(matches!(
             err,
             EmbeddingProviderError::InvalidResponse { .. }
