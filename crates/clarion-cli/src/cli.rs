@@ -166,6 +166,12 @@ pub enum Command {
         #[arg(long)]
         fix: bool,
     },
+
+    /// Import external findings in SARIF format and post them to Filigree.
+    Sarif {
+        #[command(subcommand)]
+        command: SarifCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -322,6 +328,24 @@ pub enum HookCommand {
     /// Print a project snapshot and re-sync the skill pack on drift.
     SessionStart {
         /// Project directory containing .clarion/clarion.db.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SarifCommand {
+    /// Translate SARIF findings and post them to Filigree.
+    Import {
+        /// The SARIF file path to import.
+        file: PathBuf,
+
+        /// Scan source name to tag the findings (e.g. wardline, semgrep, codeql).
+        /// If omitted, defaults to the driver name from the SARIF file.
+        #[arg(long)]
+        scan_source: Option<String>,
+
+        /// Project directory containing .clarion/clarion.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },

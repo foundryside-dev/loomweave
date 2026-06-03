@@ -132,7 +132,11 @@ async fn call_tool(state: &ServerState, name: &str, arguments: Value) -> Value {
 #[test]
 fn tools_list_includes_ws5_inspection_tools() {
     let names: Vec<&str> = list_tools().iter().map(|t| t.name).collect();
-    for expected in ["guidance_for", "findings_for", "wardline_for"] {
+    for expected in [
+        "entity_guidance_list",
+        "entity_finding_list",
+        "entity_wardline_get",
+    ] {
         assert!(names.contains(&expected), "missing tool {expected}");
     }
 }
@@ -1096,7 +1100,10 @@ fn insert_calls_edge(conn: &Connection, from: &str, to: &str, confidence: &str) 
 #[test]
 fn tools_list_includes_find_dead_code() {
     let names: Vec<&str> = list_tools().iter().map(|t| t.name).collect();
-    assert!(names.contains(&"find_dead_code"), "missing find_dead_code");
+    assert!(
+        names.contains(&"entity_dead_list"),
+        "missing entity_dead_list"
+    );
 }
 
 // Safety case (and the catastrophe guard): with no reachability roots emitted,
@@ -1252,8 +1259,8 @@ async fn find_dead_code_excludes_framework_magic() {
 fn tools_list_includes_search_semantic() {
     let names: Vec<&str> = list_tools().iter().map(|t| t.name).collect();
     assert!(
-        names.contains(&"search_semantic"),
-        "missing search_semantic"
+        names.contains(&"entity_semantic_search_list"),
+        "missing entity_semantic_search_list"
     );
 }
 

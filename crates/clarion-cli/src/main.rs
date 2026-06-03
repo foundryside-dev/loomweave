@@ -13,6 +13,7 @@ mod install;
 mod instance;
 mod mcp_registration;
 mod run_lifecycle;
+mod sarif;
 mod secret_scan;
 mod sei_git;
 mod serve;
@@ -108,6 +109,13 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        cli::Command::Sarif { command } => match command {
+            cli::SarifCommand::Import {
+                file,
+                scan_source,
+                path,
+            } => sarif::run_import(&file, scan_source, &path),
+        },
     }
 }
 

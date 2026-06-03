@@ -2776,7 +2776,7 @@ fn crash_finding_record(
 /// `clarion serve` reads. A missing or unparseable file falls back to the
 /// default (Filigree disabled), so a config problem never fails the run — it
 /// just means no emission.
-fn load_mcp_config(project_root: &Path, config_path: Option<&Path>) -> McpConfig {
+pub(crate) fn load_mcp_config(project_root: &Path, config_path: Option<&Path>) -> McpConfig {
     let path = config_path.map_or_else(|| project_root.join("clarion.yaml"), Path::to_path_buf);
     if !path.exists() {
         return McpConfig::default();

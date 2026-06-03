@@ -820,8 +820,8 @@ fn tools_list_includes_subsystem_members() {
     let tools = list_tools();
     let tool = tools
         .iter()
-        .find(|tool| tool.name == "subsystem_members")
-        .expect("subsystem_members tool definition");
+        .find(|tool| tool.name == "subsystem_member_list")
+        .expect("subsystem_member_list tool definition");
 
     assert_eq!(
         tool.description,
@@ -2255,7 +2255,7 @@ async fn orientation_pack_for_entity_bundles_all_sections_deterministically() {
     assert!(result["health"]["index"].is_object());
     assert!(result["omitted"].is_object());
     let suggested = result["suggested_next_reads"].as_array().unwrap();
-    assert_eq!(suggested[0]["tool"], "source_for_entity");
+    assert_eq!(suggested[0]["tool"], "entity_source_get");
 
     // Filigree is disabled in this fixture → a clear degradation warning, not a
     // silent empty section.
@@ -3966,8 +3966,8 @@ fn tools_list_includes_project_status() {
     let tools = list_tools();
     let tool = tools
         .iter()
-        .find(|tool| tool.name == "project_status")
-        .expect("project_status tool definition");
+        .find(|tool| tool.name == "project_status_get")
+        .expect("project_status_get tool definition");
     assert_eq!(
         tool.input_schema,
         json!({"type": "object", "properties": {}, "additionalProperties": false})

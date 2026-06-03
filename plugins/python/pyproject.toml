@@ -86,6 +86,14 @@ strict = true
 warn_unused_configs = true
 files = ["src", "tests"]
 
+[[tool.mypy.overrides]]
+module = "yaml"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "clarion_plugin_python.wardline_probe"
+warn_unused_ignores = false
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--strict-markers --cov=clarion_plugin_python --cov-report=term-missing"
