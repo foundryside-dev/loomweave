@@ -181,21 +181,6 @@ impl ServerState {
         let storage = self
             .readers
             .with_reader(move |conn| {
-                match clarion_storage::mark_stale_running_runs_failed(conn) {
-                    Ok(repaired) if repaired > 0 => {
-                        tracing::warn!(
-                            repaired,
-                            "project_status marked stale running analyze runs failed"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "project_status stale-run reconciliation failed; continuing"
-                        );
-                    }
-                }
                 let snapshot = crate::snapshot::project_snapshot(conn, &project_root);
                 let edge_count = scalar_count_fail_soft(conn, "SELECT COUNT(*) FROM edges");
                 // Entities withheld from briefings/federation exposure (secret

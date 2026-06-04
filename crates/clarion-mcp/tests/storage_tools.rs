@@ -16,13 +16,15 @@ use clarion_mcp::{
     config::{FiligreeConfig, LlmConfig, LlmProviderKind},
     filigree::{
         EntityAssociation, EntityAssociationsResponse, FiligreeClientError, FiligreeLookup,
-        IssueDetail, WardlineFinding,
+        IssueDetail, ObservationCreateRequest, ObservationCreateResponse, ObservationRecord,
+        WardlineFinding,
     },
     filigree_url::{SOURCE_CONFIG, SOURCE_EPHEMERAL_PORT, resolve_filigree_url},
     list_tools,
 };
 use clarion_storage::{
-    ReaderPool, SummaryCacheEntry, SummaryCacheKey, Writer, pragma, schema, upsert_summary_cache,
+    GuidanceSheetInput, ReaderPool, SummaryCacheEntry, SummaryCacheKey, Writer, pragma, schema,
+    upsert_guidance_sheet, upsert_summary_cache,
 };
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -56,6 +58,7 @@ fn seed_graph(conn: &Connection, project_root: &std::path::Path) {
     )
     .expect("write demo source");
 
+    insert_file_entity(conn, "core:file:demo.py", &source_path);
     insert_entity(
         conn,
         "python:module:demo",
@@ -160,6 +163,29 @@ fn seed_graph(conn: &Connection, project_root: &std::path::Path) {
         "resolved",
         None,
     );
+}
+
+fn insert_file_entity(conn: &Connection, id: &str, source_path: &std::path::Path) {
+    let content_hash = blake3::hash(&std::fs::read(source_path).expect("read file source"))
+        .to_hex()
+        .to_string();
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path, properties, content_hash,
+            created_at, updated_at
+         ) VALUES (
+            ?1, 'core', 'file', ?2, ?2, ?3, '{}', ?4,
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        params![
+            id,
+            source_path.file_name().unwrap().to_string_lossy().as_ref(),
+            source_path.display().to_string(),
+            content_hash,
+        ],
+    )
+    .expect("insert file entity");
 }
 
 fn insert_entity(
@@ -288,7 +314,7 @@ fn insert_unresolved_call_site(conn: &Connection, caller_id: &str, site_key: &st
         "INSERT INTO entity_unresolved_call_sites (
             caller_entity_id, caller_content_hash, site_key, site_ordinal,
             source_file_id, source_byte_start, source_byte_end, callee_expr, created_at
-         ) VALUES (?1, ?2, ?3, 0, 'python:module:demo', 30, 37, ?4, '2026-05-17T00:00:00.000Z')",
+         ) VALUES (?1, ?2, ?3, 0, 'core:file:demo.py', 30, 37, ?4, '2026-05-17T00:00:00.000Z')",
         params![caller_id, caller_content_hash, site_key, expr],
     )
     .expect("insert unresolved call site");
@@ -384,6 +410,7 @@ fn expected_summary_request(project_root: &std::path::Path, entity_id: &str) -> 
         entity_id: entity_id.to_owned(),
         kind: "function".to_owned(),
         name: entity_id.to_owned(),
+        guidance: String::new(),
         source_excerpt,
     });
     LlmRequest {
@@ -425,7 +452,7 @@ fn expected_inferred_request(
         "caller_content_hash": caller_content_hash,
         "site_key": site_key,
         "site_ordinal": 0,
-        "source_file_id": "python:module:demo",
+        "source_file_id": "core:file:demo.py",
         "source_byte_start": 30,
         "source_byte_end": 37,
         "callee_expr": callee_expr
@@ -599,12 +626,13 @@ impl AnySummaryProvider {
     }
 }
 
+#[async_trait::async_trait]
 impl LlmProvider for AnySummaryProvider {
     fn name(&self) -> &'static str {
         "recording"
     }
 
-    fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
+    async fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
         self.invocations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -636,12 +664,13 @@ impl LlmProvider for AnySummaryProvider {
     }
 }
 
+#[async_trait::async_trait]
 impl LlmProvider for AnyInferredProvider {
     fn name(&self) -> &'static str {
         "recording"
     }
 
-    fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
+    async fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
         self.invocations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -685,6 +714,9 @@ struct FakeFiligreeClient {
     wardline_findings: Mutex<Vec<WardlineFinding>>,
     /// When true, `wardline_findings_for_path` returns an `HttpStatus` 503 error.
     wardline_error: Mutex<bool>,
+    created_observations: Mutex<Vec<ObservationCreateRequest>>,
+    observations: Mutex<std::collections::HashMap<String, ObservationRecord>>,
+    dismissed_observations: Mutex<Vec<String>>,
 }
 
 impl FakeFiligreeClient {
@@ -727,6 +759,20 @@ impl FakeFiligreeClient {
 
     fn detail_calls(&self) -> Vec<String> {
         self.detail_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn created_observations(&self) -> Vec<ObservationCreateRequest> {
+        self.created_observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn dismissed_observations(&self) -> Vec<String> {
+        self.dismissed_observations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -786,6 +832,58 @@ impl FiligreeLookup for FakeFiligreeClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone())
     }
+
+    fn create_observation(
+        &self,
+        request: ObservationCreateRequest,
+    ) -> Result<ObservationCreateResponse, FiligreeClientError> {
+        let mut created = self
+            .created_observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        created.push(request.clone());
+        let observation_id = format!("clarion-obs-{}", created.len());
+        self.observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                observation_id.clone(),
+                ObservationRecord {
+                    observation_id: observation_id.clone(),
+                    summary: request.summary.clone(),
+                    detail: request.detail.clone(),
+                    file_path: request.file_path.clone().unwrap_or_default(),
+                    line: request.line,
+                    priority: request.priority,
+                    actor: request.actor.clone(),
+                },
+            );
+        Ok(ObservationCreateResponse { observation_id })
+    }
+
+    fn observation_by_id(
+        &self,
+        observation_id: &str,
+    ) -> Result<Option<ObservationRecord>, FiligreeClientError> {
+        Ok(self
+            .observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(observation_id)
+            .cloned())
+    }
+
+    fn dismiss_observation(
+        &self,
+        observation_id: &str,
+        _reason: &str,
+    ) -> Result<(), FiligreeClientError> {
+        self.dismissed_observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(observation_id.to_owned());
+        Ok(())
+    }
 }
 
 fn association(issue_id: &str, entity_id: &str, content_hash: &str) -> EntityAssociation {
@@ -821,8 +919,8 @@ fn tools_list_includes_subsystem_members() {
     let tools = list_tools();
     let tool = tools
         .iter()
-        .find(|tool| tool.name == "subsystem_members")
-        .expect("subsystem_members tool definition");
+        .find(|tool| tool.name == "subsystem_member_list")
+        .expect("subsystem_member_list tool definition");
 
     assert_eq!(
         tool.description,
@@ -851,7 +949,7 @@ async fn subsystem_members_returns_member_modules() {
 
     let envelope = call_tool(&state, "subsystem_members", json!({"id": subsystem_id})).await;
 
-    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["ok"], true, "{envelope}");
     assert_eq!(
         envelope["result"]["subsystem"]["id"],
         "core:subsystem:abc123def456"
@@ -1391,6 +1489,357 @@ async fn summary_cold_miss_records_provider_response_then_hits_cache() {
     drop(state);
     drop(writer);
     handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_cache_key_and_prompt_include_matching_guidance() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    upsert_summary_cache(
+        &conn,
+        &SummaryCacheEntry {
+            key: SummaryCacheKey {
+                entity_id: "python:function:demo.entry".to_owned(),
+                content_hash: expected_content_hash(project.path(), "python:function:demo.entry"),
+                prompt_template_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+                model_tier: "anthropic/claude-sonnet-4.6".to_owned(),
+                guidance_fingerprint: "guidance-empty".to_owned(),
+            },
+            summary_json: r#"{"purpose":"unguided"}"#.to_owned(),
+            cost_usd: 0.001,
+            tokens_input: 100,
+            tokens_output: 20,
+            caller_count: 0,
+            fan_out: 2,
+            stale_semantic: false,
+            created_at: "2026-05-17T00:00:00.000Z".to_owned(),
+            last_accessed_at: "2026-05-17T00:00:00.000Z".to_owned(),
+        },
+    )
+    .unwrap();
+    let guidance_properties = json!({
+        "content": "Prefer operational risk notes when summarising functions.",
+        "scope_level": "function",
+        "match_rules": [{"type": "entity", "id": "python:function:demo.entry"}],
+        "provenance": {"author": "test"},
+        "authored_at": "2026-05-17T00:00:00.000Z"
+    });
+    upsert_guidance_sheet(
+        &conn,
+        &GuidanceSheetInput {
+            id: "core:guidance:test-summary",
+            name: "test-summary",
+            short_name: "test-summary",
+            properties: &guidance_properties,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnySummaryProvider::new_output(
+        r#"{"purpose":"guided"}"#,
+        120,
+        0.0,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let cold = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(cold["ok"], true, "{cold}");
+    assert_eq!(cold["result"]["cache"]["hit"], false);
+    assert_eq!(cold["result"]["summary"]["purpose"], "guided");
+    let invocation = provider
+        .invocations()
+        .into_iter()
+        .next()
+        .expect("summary provider invocation");
+    assert!(
+        invocation
+            .prompt
+            .contains("Prefer operational risk notes when summarising functions."),
+        "summary prompt should include matching guidance: {}",
+        invocation.prompt
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let fingerprints: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT guidance_fingerprint FROM summary_cache \
+                 WHERE entity_id = 'python:function:demo.entry' \
+                 ORDER BY guidance_fingerprint",
+            )
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    assert!(fingerprints.iter().any(|fp| fp == "guidance-empty"));
+    assert!(
+        fingerprints
+            .iter()
+            .any(|fp| fp.starts_with("guidance:") && fp != "guidance-empty"),
+        "guided summary should use a non-empty guidance fingerprint: {fingerprints:?}"
+    );
+    drop(conn);
+
+    let warm = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(warm["ok"], true, "{warm}");
+    assert_eq!(warm["result"]["cache"]["hit"], true);
+    assert_eq!(warm["result"]["summary"]["purpose"], "guided");
+    assert_eq!(provider.invocations().len(), 1);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_keeps_future_guidance_under_unix_clock() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    let guidance_properties = json!({
+        "content": "Future-dated guidance must still reach summary prompts.",
+        "scope_level": "function",
+        "expires": "2999-12-31T00:00:00.000Z",
+        "match_rules": [{"type": "entity", "id": "python:function:demo.entry"}],
+        "provenance": {"author": "test"},
+        "authored_at": "2026-05-17T00:00:00.000Z"
+    });
+    upsert_guidance_sheet(
+        &conn,
+        &GuidanceSheetInput {
+            id: "core:guidance:test-summary-future",
+            name: "test-summary-future",
+            short_name: "test-summary-future",
+            properties: &guidance_properties,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnySummaryProvider::new_output(
+        r#"{"purpose":"guided"}"#,
+        120,
+        0.0,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    )
+    .with_clock(|| "unix:1748822400".to_owned());
+
+    let cold = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(cold["ok"], true, "{cold}");
+    let invocation = provider
+        .invocations()
+        .into_iter()
+        .next()
+        .expect("summary provider invocation");
+    assert!(
+        invocation
+            .prompt
+            .contains("Future-dated guidance must still reach summary prompts."),
+        "summary prompt should include future guidance under unix clock: {}",
+        invocation.prompt
+    );
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn summary_preview_cost_counts_future_guidance_under_unix_clock() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    let guidance_properties = json!({
+        "content": "Future-dated guidance must still reach preview estimates.",
+        "scope_level": "function",
+        "expires": "2999-12-31T00:00:00.000Z",
+        "match_rules": [{"type": "entity", "id": "python:function:demo.entry"}],
+        "provenance": {"author": "test"},
+        "authored_at": "2026-05-17T00:00:00.000Z"
+    });
+    upsert_guidance_sheet(
+        &conn,
+        &GuidanceSheetInput {
+            id: "core:guidance:test-summary-preview-future",
+            name: "test-summary-preview-future",
+            short_name: "test-summary-preview-future",
+            properties: &guidance_properties,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnySummaryProvider::new_output(
+        r#"{"purpose":"unused"}"#,
+        120,
+        0.0,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    )
+    .with_clock(|| "unix:1748822400".to_owned());
+
+    let envelope = call_tool(
+        &state,
+        "summary_preview_cost",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    let prompt = build_leaf_summary_prompt(&LeafSummaryPromptInput {
+        entity_id: "python:function:demo.entry".to_owned(),
+        kind: "function".to_owned(),
+        name: "python:function:demo.entry".to_owned(),
+        guidance: "Guidance sheet core:guidance:test-summary-preview-future:\n\
+                   Future-dated guidance must still reach preview estimates."
+            .to_owned(),
+        source_excerpt: expected_source_excerpt(project.path(), "python:function:demo.entry"),
+    });
+    let expected_tokens = i64::try_from(prompt.body.chars().count())
+        .unwrap_or(i64::MAX)
+        .saturating_add(3)
+        / 4;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(envelope["result"]["cache_status"], "miss");
+    assert_eq!(
+        envelope["result"]["estimated_input_tokens"], expected_tokens,
+        "preview estimate should include future guidance under unix clock: {envelope}"
+    );
+    assert!(
+        provider.invocations().is_empty(),
+        "preview must not call the LLM provider"
+    );
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn propose_guidance_creates_observation_and_promote_makes_sheet_visible() {
+    let (project, db_path) = open_project();
+    let client = Arc::new(FakeFiligreeClient::default());
+    let state = state_for_filigree(project.path(), &db_path, client.clone())
+        .with_clock(|| "unix:1748822400".to_owned());
+
+    let proposed = call_tool(
+        &state,
+        "propose_guidance",
+        json!({
+            "entity_id": "python:function:demo.entry",
+            "content": "Prefer operational risk notes when summarising entrypoints.",
+            "scope_level": "function",
+            "name": "demo-entry-risk",
+            "pinned": true
+        }),
+    )
+    .await;
+
+    assert_eq!(proposed["ok"], true);
+    assert_eq!(proposed["result"]["observation_id"], "clarion-obs-1");
+    let created = client.created_observations();
+    assert_eq!(created.len(), 1);
+    assert!(created[0].summary.contains("python:function:demo.entry"));
+
+    let inert = call_tool(
+        &state,
+        "guidance_for",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(inert["ok"], true);
+    assert_eq!(
+        inert["result"]["guidance"]
+            .as_array()
+            .expect("guidance array")
+            .len(),
+        0,
+        "a proposal must not be composed before promotion"
+    );
+
+    let promoted = call_tool(
+        &state,
+        "promote_guidance",
+        json!({"observation_id": "clarion-obs-1"}),
+    )
+    .await;
+    assert_eq!(promoted["ok"], true);
+    assert_eq!(
+        promoted["result"]["sheet_id"],
+        "core:guidance:demo-entry-risk"
+    );
+    assert_eq!(
+        client.dismissed_observations(),
+        vec!["clarion-obs-1".to_owned()]
+    );
+
+    let visible = call_tool(
+        &state,
+        "guidance_for",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(visible["ok"], true);
+    let sheets = visible["result"]["guidance"]
+        .as_array()
+        .expect("guidance array");
+    assert_eq!(sheets.len(), 1);
+    assert_eq!(sheets[0]["id"], "core:guidance:demo-entry-risk");
+    assert_eq!(
+        sheets[0]["content"],
+        "Prefer operational risk notes when summarising entrypoints."
+    );
+    assert_eq!(sheets[0]["provenance"], "filigree_promotion");
+    assert_eq!(sheets[0]["matched_by"], json!(["entity"]));
+
+    let conn = Connection::open(&db_path).unwrap();
+    let authored_at: String = conn
+        .query_row(
+            "SELECT json_extract(properties, '$.authored_at') \
+             FROM entities WHERE id = 'core:guidance:demo-entry-risk'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(authored_at, "2025-06-02T00:00:00.000Z");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2257,7 +2706,7 @@ async fn orientation_pack_for_entity_bundles_all_sections_deterministically() {
     assert!(result["health"]["index"].is_object());
     assert!(result["omitted"].is_object());
     let suggested = result["suggested_next_reads"].as_array().unwrap();
-    assert_eq!(suggested[0]["tool"], "source_for_entity");
+    assert_eq!(suggested[0]["tool"], "entity_source_get");
 
     // Filigree is disabled in this fixture → a clear degradation warning, not a
     // silent empty section.
@@ -2949,7 +3398,7 @@ async fn callers_of_inferred_dispatches_and_materializes_recording_result() {
     )
     .await;
 
-    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["ok"], true, "{envelope}");
     assert_eq!(
         envelope["result"]["callers"][0]["entity"]["id"],
         "python:function:demo.entry"
@@ -2977,6 +3426,60 @@ async fn callers_of_inferred_dispatches_and_materializes_recording_result() {
     .await;
     assert_eq!(warm["ok"], true);
     assert_eq!(provider.invocations().len(), 1);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn callers_of_inferred_ignores_stale_unresolved_call_sites() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    add_dynamic_source(project.path());
+    let source_path = project.path().join("demo.py");
+    insert_entity(
+        &conn,
+        "python:function:demo.dynamic",
+        "function",
+        &source_path,
+        Some((9, 10)),
+        Some("python:module:demo"),
+    );
+    insert_unresolved_call_site(&conn, "python:function:demo.entry", "site-stale", "dynamic");
+    conn.execute(
+        "UPDATE entities SET content_hash = 'hash-after-body-change' \
+         WHERE id = 'python:function:demo.entry'",
+        [],
+    )
+    .expect("simulate a changed caller body without authoritative unresolved rows");
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnyInferredProvider::new(
+        r#"{"edges":[{"site_key":"site-stale","target_id":"python:function:demo.dynamic","confidence":0.91,"rationale":"stale"}]}"#,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.dynamic", "confidence": "inferred"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(envelope["result"]["callers"].as_array().unwrap().len(), 0);
+    assert!(
+        provider.invocations().is_empty(),
+        "stale unresolved rows must not trigger inferred dispatch"
+    );
 
     drop(state);
     drop(writer);
@@ -3972,8 +4475,8 @@ fn tools_list_includes_project_status() {
     let tools = list_tools();
     let tool = tools
         .iter()
-        .find(|tool| tool.name == "project_status")
-        .expect("project_status tool definition");
+        .find(|tool| tool.name == "project_status_get")
+        .expect("project_status_get tool definition");
     assert_eq!(
         tool.input_schema,
         json!({"type": "object", "properties": {}, "additionalProperties": false})

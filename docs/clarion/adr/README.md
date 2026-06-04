@@ -10,10 +10,10 @@ This folder is the canonical home for authored Clarion architecture decision rec
 | [ADR-002](./ADR-002-plugin-transport-json-rpc.md) | Plugin transport: Content-Length framed JSON-RPC subprocess | Accepted |
 | [ADR-003](./ADR-003-entity-id-scheme.md) | Entity ID scheme: symbolic canonical names | Accepted |
 | [ADR-004](./ADR-004-finding-exchange-format.md) | Finding-exchange format: Filigree-native intake | Accepted |
-| [ADR-005](./ADR-005-clarion-dir-tracking.md) | `.clarion/` git-committable by default; DB included, run logs excluded | Accepted |
+| [ADR-005](./ADR-005-clarion-dir-tracking.md) | `.clarion/` git-committable by default; DB included, run logs excluded | Accepted; amended by ADR-041 |
 | [ADR-006](./ADR-006-clustering-algorithm.md) | Clustering algorithm — Leiden on imports+calls subgraph; fallback amended by ADR-032 | Accepted; amended |
 | [ADR-007](./ADR-007-summary-cache-key.md) | Summary cache key — 5-part composite with TTL backstop and churn-eager invalidation | Accepted |
-| [ADR-011](./ADR-011-writer-actor-concurrency.md) | Writer-actor concurrency with per-N-files transactions; `--shadow-db` opt-in | Accepted |
+| [ADR-011](./ADR-011-writer-actor-concurrency.md) | Writer-actor concurrency with per-N-files transactions; `--shadow-db` opt-in | Accepted; amended by ADR-041 |
 | [ADR-012](./ADR-012-http-auth-default.md) | HTTP read-API authentication — UDS default with token fallback | Superseded for ADR-014 registry-backend API |
 | [ADR-013](./ADR-013-pre-ingest-secret-scanner.md) | Pre-ingest secret scanner with LLM-dispatch block | Accepted |
 | [ADR-014](./ADR-014-filigree-registry-backend.md) | Filigree `registry_backend` flag and pluggable `RegistryProtocol` | Accepted; partially extended by ADR-034 |
@@ -34,7 +34,7 @@ This folder is the canonical home for authored Clarion architecture decision rec
 | [ADR-031](./ADR-031-schema-validation-policy.md) | Schema-validation policy — CHECK on closed core-owned vocabularies (`findings.{kind,severity,status}`, `runs.status`); writer-actor + manifest are the only enforcement layer for plugin-extensible vocabularies (`entities.kind`, `edges.kind`) | Accepted |
 | [ADR-032](./ADR-032-weighted-components-clustering-fallback.md) | Weighted-components clustering fallback naming | Accepted |
 | [ADR-033](./ADR-033-v1.0-distribution.md) | v1.0 distribution via GitHub Releases (binary matrix + Python sdist; promote to crates.io/PyPI at v2.0) | Accepted |
-| [ADR-034](./ADR-034-federation-http-read-api-hardening.md) | Federation HTTP read API hardening — bearer auth, batch resolution, `BRIEFING_BLOCKED`, instance ID | Accepted |
+| [ADR-034](./ADR-034-federation-http-read-api-hardening.md) | Federation HTTP read API hardening — bearer auth, batch resolution, `BRIEFING_BLOCKED`, instance ID | Accepted; amended by ADR-042 |
 | [ADR-035](./ADR-035-operational-tuning-discipline.md) | Operational tuning discipline — declared basis / override surface / retune trigger / coupling per constant; file-LOC + crate-boundary budgets; CI lint gate | Accepted |
 | [ADR-036](./ADR-036-wardline-taint-fact-store.md) | Clarion as Wardline taint-fact store — `wardline_taint_facts` table + `/api/wardline/*` routes; first read+write HTTP surface (optional writer-actor, default off); passes loom.md §3–§5 (ADR, not asterisk) | Accepted |
 | [ADR-037](./ADR-037-shared-error-vocabulary.md) | Shared error vocabulary (`clarion-core::errors`) — two typed enums (`HttpErrorCode`, `McpErrorCode`) as single source of truth; wire spelling unchanged on both surfaces; relates to ADR-034 | Accepted |
@@ -47,7 +47,7 @@ This folder is the canonical home for authored Clarion architecture decision rec
 
 ## Backlog still tracked in the detailed design
 
-The following decisions are still backlog items rather than authored ADR files. Their current summaries live in [../v0.1/detailed-design.md](../v0.1/detailed-design.md) §11 and [../v0.1/system-design.md](../v0.1/system-design.md) §12.
+The following decisions are still backlog items rather than authored ADR files. Their current summaries live in [../1.0/detailed-design.md](../1.0/detailed-design.md) §11 and [../1.0/system-design.md](../1.0/system-design.md) §12.
 
 | ADR | Title | Current state |
 |---|---|---|
