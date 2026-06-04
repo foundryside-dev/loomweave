@@ -170,43 +170,43 @@ fn local_weighted_components(graph: &ModuleGraph, min_cluster_size: usize) -> Ve
     }
 
     let threshold = average_positive_weight(graph).max(1.0);
-    let modules = graph.modules.iter().cloned().collect::<BTreeSet<_>>();
+    let modules = graph.modules.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let mut neighbors = modules
         .iter()
-        .map(|module_id| (module_id.clone(), BTreeSet::new()))
+        .map(|&module_id| (module_id, BTreeSet::new()))
         .collect::<BTreeMap<_, _>>();
 
     for edge in &graph.edges {
         if reference_weight(edge.reference_count) >= threshold
-            && modules.contains(&edge.from)
-            && modules.contains(&edge.to)
+            && modules.contains(edge.from.as_str())
+            && modules.contains(edge.to.as_str())
         {
             neighbors
-                .entry(edge.from.clone())
+                .entry(edge.from.as_str())
                 .or_default()
-                .insert(edge.to.clone());
+                .insert(edge.to.as_str());
             neighbors
-                .entry(edge.to.clone())
+                .entry(edge.to.as_str())
                 .or_default()
-                .insert(edge.from.clone());
+                .insert(edge.from.as_str());
         }
     }
 
     let mut seen = BTreeSet::new();
     let mut communities = Vec::new();
     for module_id in modules {
-        if !seen.insert(module_id.clone()) {
+        if !seen.insert(module_id) {
             continue;
         }
 
         let mut stack = vec![module_id];
         let mut community = Vec::new();
         while let Some(current) = stack.pop() {
-            community.push(current.clone());
+            community.push(current.to_owned());
             if let Some(next) = neighbors.get(&current) {
-                for neighbor in next.iter().rev() {
-                    if seen.insert(neighbor.clone()) {
-                        stack.push(neighbor.clone());
+                for &neighbor in next.iter().rev() {
+                    if seen.insert(neighbor) {
+                        stack.push(neighbor);
                     }
                 }
             }
