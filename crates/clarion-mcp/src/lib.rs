@@ -19,6 +19,7 @@ use clarion_core::{
     EdgeConfidence, EmbeddingProvider, LlmProvider, LlmProviderError, LlmRequest, LlmResponse,
     McpErrorCode,
 };
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -37,7 +38,13 @@ use clarion_storage::{
 };
 
 use crate::config::{LlmConfig, SemanticSearchConfig};
-use crate::filigree::{EntityAssociation, EntityAssociationsResponse, FiligreeLookup, IssueDetail};
+use crate::filigree::{
+    EntityAssociation, EntityAssociationsResponse, FiligreeLookup, IssueDetail,
+    ObservationCreateRequest,
+};
+use clarion_storage::{
+    GuidanceProposal, GuidanceSheetInput, invalidate_summaries_for_sheet, upsert_guidance_sheet,
+};
 
 /// MCP protocol revision supported by the B.6 stdio server.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -106,6 +113,8 @@ pub const RENAME_MAP: &[(&str, &str)] = &[
     ("analyze_cancel", "analyze_cancel"),
     ("index_diff", "index_diff_get"),
     ("guidance_for", "entity_guidance_list"),
+    ("propose_guidance", "propose_guidance"),
+    ("promote_guidance", "promote_guidance"),
     ("findings_for", "entity_finding_list"),
     ("wardline_for", "entity_wardline_get"),
     ("find_by_tag", "entity_tag_list"),
@@ -339,6 +348,40 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "offset": {"type": "integer", "minimum": 0}
                 },
                 "required": ["id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "propose_guidance",
+            description: "Propose a guidance sheet for operator review by creating a Filigree observation. This is deliberately inert: it does not write a Clarion guidance entity and cannot enter summaries until `promote_guidance` or `clarion guidance promote` consumes the observation.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "entity_id": {"type": "string", "minLength": 1},
+                    "content": {"type": "string", "minLength": 1},
+                    "scope_level": {
+                        "type": "string",
+                        "enum": ["project", "subsystem", "package", "module", "class", "function"],
+                        "default": "function"
+                    },
+                    "match_rules": {"type": "array", "items": {"type": "object"}},
+                    "name": {"type": "string", "minLength": 1},
+                    "pinned": {"type": "boolean", "default": false},
+                    "expires": {"type": "string", "minLength": 1}
+                },
+                "required": ["entity_id", "content"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "promote_guidance",
+            description: "Promote a reviewed Filigree observation produced by `propose_guidance` into a local Clarion guidance sheet. This operator action is the anti-poisoning boundary: only promoted observations become prompt-composed guidance.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "observation_id": {"type": "string", "minLength": 1}
+                },
+                "required": ["observation_id"],
                 "additionalProperties": false
             }),
         },
@@ -888,6 +931,14 @@ impl ServerState {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
+            "propose_guidance" => match self.tool_propose_guidance(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "promote_guidance" => match self.tool_promote_guidance(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
             "entity_finding_list" => match self.tool_findings_for(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
@@ -1020,6 +1071,248 @@ impl ServerState {
             }
         }
     }
+
+    async fn tool_propose_guidance(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let entity_id = required_str(arguments, "entity_id")?.to_owned();
+        let content = required_str(arguments, "content")?.to_owned();
+        let scope_level = arguments
+            .get("scope_level")
+            .and_then(Value::as_str)
+            .unwrap_or("function")
+            .to_owned();
+        let pinned = optional_bool(arguments, "pinned")?.unwrap_or(false);
+        let name = arguments
+            .get("name")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let expires = arguments
+            .get("expires")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let match_rules = arguments
+            .get("match_rules")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| vec![json!({"type": "entity", "id": entity_id})]);
+
+        let project_root = self.project_root.clone();
+        let entity_lookup_id = entity_id.clone();
+        let entity = match self
+            .readers
+            .with_reader(move |conn| entity_by_id(conn, &entity_lookup_id))
+            .await
+        {
+            Ok(Some(entity)) => entity,
+            Ok(None) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::EntityNotFound,
+                    &format!("entity {entity_id} was not found"),
+                    false,
+                ));
+            }
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::StorageError,
+                    &format!("read entity for guidance proposal: {err}"),
+                    storage_retryable(&err),
+                ));
+            }
+        };
+
+        let proposal = GuidanceProposal {
+            entity_id: entity_id.clone(),
+            content,
+            scope_level,
+            match_rules,
+            name,
+            pinned,
+            expires,
+        };
+        let detail = match proposal.to_observation_detail() {
+            Ok(detail) => detail,
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::StorageError,
+                    &format!("build guidance proposal: {err}"),
+                    false,
+                ));
+            }
+        };
+
+        let Some(client) = self.filigree_client.clone() else {
+            return Ok(tool_error_envelope(
+                McpErrorCode::IoError,
+                "Filigree integration is not configured; cannot create guidance proposal observation",
+                true,
+            ));
+        };
+        let file_path = entity.source_file_path.as_deref().map(|path| {
+            std::path::Path::new(path)
+                .strip_prefix(&project_root)
+                .ok()
+                .and_then(|rel| rel.to_str())
+                .unwrap_or(path)
+                .to_owned()
+        });
+        let request = ObservationCreateRequest {
+            summary: format!("Clarion guidance proposal for {entity_id}"),
+            detail,
+            file_path,
+            line: entity.source_line_start,
+            priority: 2,
+            actor: "clarion".to_owned(),
+        };
+
+        let response =
+            match tokio::task::spawn_blocking(move || client.create_observation(request)).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(err)) => {
+                    return Ok(tool_error_envelope(
+                        McpErrorCode::IoError,
+                        &format!("create Filigree guidance proposal observation: {err}"),
+                        true,
+                    ));
+                }
+                Err(err) => {
+                    return Ok(tool_error_envelope(
+                        McpErrorCode::Internal,
+                        &format!("create Filigree guidance proposal task failed: {err}"),
+                        true,
+                    ));
+                }
+            };
+
+        Ok(success_envelope(json!({
+            "observation_id": response.observation_id,
+            "promoted": false,
+        })))
+    }
+
+    async fn tool_promote_guidance(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let observation_id = required_str(arguments, "observation_id")?.to_owned();
+        let Some(client) = self.filigree_client.clone() else {
+            return Ok(tool_error_envelope(
+                McpErrorCode::IoError,
+                "Filigree integration is not configured; cannot read guidance proposal observation",
+                true,
+            ));
+        };
+        let lookup_client = client.clone();
+        let lookup_id = observation_id.clone();
+        let observation =
+            match tokio::task::spawn_blocking(move || lookup_client.observation_by_id(&lookup_id))
+                .await
+            {
+                Ok(Ok(Some(observation))) => observation,
+                Ok(Ok(None)) => {
+                    return Ok(tool_error_envelope(
+                        McpErrorCode::NotFound,
+                        &format!("observation {observation_id} was not found"),
+                        false,
+                    ));
+                }
+                Ok(Err(err)) => {
+                    return Ok(tool_error_envelope(
+                        McpErrorCode::IoError,
+                        &format!("read Filigree observation {observation_id}: {err}"),
+                        true,
+                    ));
+                }
+                Err(err) => {
+                    return Ok(tool_error_envelope(
+                        McpErrorCode::Internal,
+                        &format!("read Filigree observation task failed: {err}"),
+                        true,
+                    ));
+                }
+            };
+
+        let proposal = match GuidanceProposal::from_observation_detail(&observation.detail) {
+            Ok(proposal) => proposal,
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::StorageError,
+                    &format!("observation {observation_id} is not a guidance proposal: {err}"),
+                    false,
+                ));
+            }
+        };
+        let authored_at = (self.clock)();
+        let promoted = match proposal.to_promoted_sheet(&authored_at) {
+            Ok(promoted) => promoted,
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::StorageError,
+                    &format!("build promoted guidance sheet: {err}"),
+                    false,
+                ));
+            }
+        };
+
+        let db_path = self.project_root.join(".clarion").join("clarion.db");
+        let project_root = self.project_root.clone();
+        let sheet_id = promoted.id.clone();
+        let write_result =
+            tokio::task::spawn_blocking(move || -> std::result::Result<usize, String> {
+                let conn =
+                    open_guidance_write_connection(&db_path).map_err(|err| err.to_string())?;
+                upsert_guidance_sheet(
+                    &conn,
+                    &GuidanceSheetInput {
+                        id: &promoted.id,
+                        name: &promoted.name,
+                        short_name: &promoted.short_name,
+                        properties: &promoted.properties,
+                    },
+                )
+                .map_err(|err| err.to_string())?;
+                let Some(sheet) = clarion_storage::get_guidance_sheet(&conn, &promoted.id)
+                    .map_err(|err| err.to_string())?
+                else {
+                    return Ok(0);
+                };
+                invalidate_summaries_for_sheet(&conn, &sheet, &project_root)
+                    .map_err(|err| err.to_string())
+            })
+            .await;
+        let invalidated = match write_result {
+            Ok(Ok(invalidated)) => invalidated,
+            Ok(Err(err)) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::StorageError,
+                    &format!("write promoted guidance sheet {sheet_id}: {err}"),
+                    true,
+                ));
+            }
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::Internal,
+                    &format!("write promoted guidance sheet task failed: {err}"),
+                    true,
+                ));
+            }
+        };
+
+        let dismiss_id = observation_id.clone();
+        let dismissed = tokio::task::spawn_blocking(move || {
+            client.dismiss_observation(&dismiss_id, "promoted to Clarion guidance sheet")
+        })
+        .await
+        .is_ok_and(|result| result.is_ok());
+
+        Ok(success_envelope(json!({
+            "observation_id": observation_id,
+            "sheet_id": sheet_id,
+            "invalidated_summaries": invalidated,
+            "observation_dismissed": dismissed,
+        })))
+    }
 }
 
 async fn invoke_llm_provider(
@@ -1027,6 +1320,16 @@ async fn invoke_llm_provider(
     request: LlmRequest,
 ) -> Result<LlmResponse, LlmProviderError> {
     provider.invoke(request).await
+}
+
+fn open_guidance_write_connection(path: &std::path::Path) -> rusqlite::Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(conn)
 }
 
 struct SummaryLlmState {
@@ -3835,7 +4138,7 @@ mod tests {
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 37);
+        assert_eq!(tools.len(), 39);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
@@ -3923,24 +4226,26 @@ mod tests {
         );
         assert_eq!(tools[17].name, "index_diff_get");
         assert_eq!(tools[18].name, "entity_guidance_list");
-        assert_eq!(tools[19].name, "entity_finding_list");
-        assert_eq!(tools[20].name, "entity_wardline_get");
-        assert_eq!(tools[21].name, "entity_tag_list");
-        assert_eq!(tools[22].name, "entity_kind_list");
-        assert_eq!(tools[23].name, "entity_wardline_list");
-        assert_eq!(tools[24].name, "module_circular_import_list");
-        assert_eq!(tools[25].name, "entity_coupling_hotspot_list");
-        assert_eq!(tools[26].name, "entity_entry_point_list");
-        assert_eq!(tools[27].name, "entity_http_route_list");
-        assert_eq!(tools[28].name, "entity_data_model_list");
-        assert_eq!(tools[29].name, "entity_test_list");
-        assert_eq!(tools[30].name, "entity_deprecation_list");
-        assert_eq!(tools[31].name, "entity_todo_list");
-        assert_eq!(tools[32].name, "entity_test_caller_list");
-        assert_eq!(tools[33].name, "entity_high_churn_list");
-        assert_eq!(tools[34].name, "entity_recent_change_list");
-        assert_eq!(tools[35].name, "entity_dead_list");
-        assert_eq!(tools[36].name, "entity_semantic_search_list");
+        assert_eq!(tools[19].name, "propose_guidance");
+        assert_eq!(tools[20].name, "promote_guidance");
+        assert_eq!(tools[21].name, "entity_finding_list");
+        assert_eq!(tools[22].name, "entity_wardline_get");
+        assert_eq!(tools[23].name, "entity_tag_list");
+        assert_eq!(tools[24].name, "entity_kind_list");
+        assert_eq!(tools[25].name, "entity_wardline_list");
+        assert_eq!(tools[26].name, "module_circular_import_list");
+        assert_eq!(tools[27].name, "entity_coupling_hotspot_list");
+        assert_eq!(tools[28].name, "entity_entry_point_list");
+        assert_eq!(tools[29].name, "entity_http_route_list");
+        assert_eq!(tools[30].name, "entity_data_model_list");
+        assert_eq!(tools[31].name, "entity_test_list");
+        assert_eq!(tools[32].name, "entity_deprecation_list");
+        assert_eq!(tools[33].name, "entity_todo_list");
+        assert_eq!(tools[34].name, "entity_test_caller_list");
+        assert_eq!(tools[35].name, "entity_high_churn_list");
+        assert_eq!(tools[36].name, "entity_recent_change_list");
+        assert_eq!(tools[37].name, "entity_dead_list");
+        assert_eq!(tools[38].name, "entity_semantic_search_list");
     }
 
     #[test]
@@ -4243,7 +4548,14 @@ mod tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], "tools-1");
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 37);
+        let tools = response["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 39);
+        let tool_names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+        assert!(tool_names.contains(&"propose_guidance"));
+        assert!(tool_names.contains(&"promote_guidance"));
         assert_eq!(response["result"]["tools"][0]["name"], "entity_at");
         assert_eq!(
             response["result"]["tools"][7]["name"],
@@ -4347,7 +4659,14 @@ mod tests {
 
         assert_eq!(decoded["jsonrpc"], "2.0");
         assert_eq!(decoded["id"], 10);
-        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 37);
+        let tools = decoded["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 39);
+        let tool_names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+        assert!(tool_names.contains(&"propose_guidance"));
+        assert!(tool_names.contains(&"promote_guidance"));
     }
 
     #[test]
@@ -4422,7 +4741,14 @@ mod tests {
         assert_eq!(first_json["id"], 11);
         assert_eq!(first_json["result"]["serverInfo"]["name"], "clarion");
         assert_eq!(second_json["id"], 12);
-        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 37);
+        let tools = second_json["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 39);
+        let tool_names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+        assert!(tool_names.contains(&"propose_guidance"));
+        assert!(tool_names.contains(&"promote_guidance"));
     }
 
     #[test]

@@ -75,6 +75,10 @@ const GUIDANCE_EXPIRED_RULE_ID: &str = "CLA-FACT-GUIDANCE-EXPIRED";
 /// churn-history pipeline (clarion-997c93ec4e) populates `git_churn_count`.
 const GUIDANCE_CHURN_STALE_RULE_ID: &str = "CLA-FACT-GUIDANCE-CHURN-STALE";
 
+/// REQ-GUIDANCE-05 (WS6 T4): a Wardline-derived guidance sheet was preserved as
+/// an operator override while `wardline.yaml` changed underneath it.
+const GUIDANCE_STALE_RULE_ID: &str = "CLA-FACT-GUIDANCE-STALE";
+
 /// Aggregate `git_churn_count` (summed over a sheet's matched entities) at or above
 /// which a non-pinned sheet is flagged `CLA-FACT-GUIDANCE-CHURN-STALE`.
 const CHURN_STALE_THRESHOLD: i64 = 50;
@@ -106,6 +110,7 @@ const POST_RUN_FINDING_RULES: &[&str] = &[
     GUIDANCE_ORPHAN_RULE_ID,
     GUIDANCE_EXPIRED_RULE_ID,
     GUIDANCE_CHURN_STALE_RULE_ID,
+    GUIDANCE_STALE_RULE_ID,
     TIER_MIXING_RULE_ID,
     TIER_UNANIMOUS_RULE_ID,
 ];
@@ -1305,6 +1310,25 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     "tier-subsystem findings skipped (run already committed successfully)"
                 ),
             }
+            // REQ-GUIDANCE-04: when `wardline.yaml` is present, keep the
+            // generated guidance sheets in sync before evaluating guidance
+            // staleness. Operator edits are preserved as
+            // `wardline_derived_overridden`, so the following staleness pass can
+            // surface manifest drift instead of overwriting human review.
+            match crate::wardline_guidance::sync_wardline_guidance(&db_path, &project_root) {
+                Ok(stats) if stats.generated > 0 || stats.overridden > 0 => tracing::info!(
+                    run_id = %run_id,
+                    wardline_guidance_generated = stats.generated,
+                    wardline_guidance_overridden = stats.overridden,
+                    "Wardline-derived guidance synced"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    run_id = %run_id,
+                    error = %e,
+                    "Wardline-derived guidance skipped (run already committed successfully)"
+                ),
+            }
             // REQ-GUIDANCE-05 (WS6 T4a): guidance-staleness findings (EXPIRED +
             // CHURN-STALE). Runs on EVERY analyze, deliberately OUTSIDE the SEI
             // `if no_sei { … } else { … }` block above and independent of any
@@ -1898,7 +1922,7 @@ fn guidance_orphan_finding(
 }
 
 /// REQ-GUIDANCE-05 (WS6 T4a): persist guidance-staleness findings over the
-/// committed graph and return the count. Two independent signals per sheet:
+/// committed graph and return the count. Independent signals per sheet:
 ///
 /// - **`CLA-FACT-GUIDANCE-EXPIRED`** — the sheet's `expires` instant is lexically
 ///   `< now` (both are the fixed-width `YYYY-MM-DDTHH:MM:SS.sssZ` form
@@ -1907,6 +1931,8 @@ fn guidance_orphan_finding(
 /// - **`CLA-FACT-GUIDANCE-CHURN-STALE`** — the aggregate `git_churn_count` over the
 ///   sheet's matched entities meets the staleness threshold (asymmetric: 20 for
 ///   `pinned` sheets, 50 otherwise).
+/// - **`CLA-FACT-GUIDANCE-STALE`** — a Wardline-derived override still carries
+///   the old `wardline.yaml` manifest hash after the manifest changed.
 ///
 /// Runs post-`CommitRun`, unconditionally (NOT gated on the SEI pass or on
 /// deletions) — see the call site. Deterministic: sheets in
@@ -1919,6 +1945,119 @@ fn guidance_orphan_finding(
 /// matched entities vs the threshold. A true since-authored delta awaits the
 /// churn-history pipeline (clarion-997c93ec4e); `authored_at`/`reviewed_at` are
 /// deliberately unused here because no real delta is computable.
+enum PendingGuidanceStaleness {
+    Expired(String),
+    WardlineStale {
+        sheet_id: String,
+        stored_manifest_hash: String,
+        current_manifest_hash: String,
+    },
+    ChurnStale {
+        sheet_id: String,
+        agg: i64,
+        matched: Vec<String>,
+    },
+}
+
+fn plan_guidance_staleness_findings(
+    db_path: &Path,
+    project_root: &Path,
+    now: &str,
+) -> anyhow::Result<Vec<PendingGuidanceStaleness>> {
+    let current_wardline_hash = crate::wardline_guidance::current_manifest_hash(project_root)?;
+    let conn = Connection::open(db_path)
+        .context("open read connection for guidance-staleness findings")?;
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+
+    let sheets = clarion_storage::list_guidance_sheets(&conn)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("list guidance sheets for staleness scan")?;
+
+    // Entities carrying a populated churn count (the only ones that can move an
+    // aggregate). Empty in production today (see fn doc).
+    let churned: Vec<(String, i64)> = conn
+        .prepare(
+            "SELECT id, git_churn_count FROM entities \
+                 WHERE git_churn_count IS NOT NULL ORDER BY id",
+        )
+        .context("prepare churned-entity scan")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .context("query churned entities")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collect churned entities")?;
+
+    let mut plan = Vec::new();
+    for sheet in &sheets {
+        // EXPIRED: lexical (instant) compare against `now`.
+        if let Some(expires) = sheet
+            .properties
+            .get("expires")
+            .and_then(serde_json::Value::as_str)
+            && expires < now
+        {
+            plan.push(PendingGuidanceStaleness::Expired(sheet.id.clone()));
+        }
+
+        if let Some(current_hash) = current_wardline_hash.as_deref()
+            && crate::wardline_guidance::is_wardline_derived(&sheet.properties)
+            && let Some(stored_hash) = sheet
+                .properties
+                .get("wardline_manifest_hash")
+                .and_then(serde_json::Value::as_str)
+            && stored_hash != current_hash
+        {
+            plan.push(PendingGuidanceStaleness::WardlineStale {
+                sheet_id: sheet.id.clone(),
+                stored_manifest_hash: stored_hash.to_owned(),
+                current_manifest_hash: current_hash.to_owned(),
+            });
+        }
+
+        // CHURN-STALE: aggregate churn over matched entities vs asymmetric
+        // threshold. Reuse the shared matcher; only churned entities can matter.
+        let pinned = sheet
+            .properties
+            .get("pinned")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let threshold = if pinned {
+            CHURN_STALE_THRESHOLD_PINNED
+        } else {
+            CHURN_STALE_THRESHOLD
+        };
+
+        let mut agg: i64 = 0;
+        let mut matched: Vec<String> = Vec::new();
+        for (entity_id, churn) in &churned {
+            if clarion_storage::guidance_sheet_matches_entity(
+                &conn,
+                sheet,
+                entity_id,
+                &canonical_root,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("match {entity_id} against {}", sheet.id))?
+            {
+                agg = agg.saturating_add(*churn);
+                matched.push(entity_id.clone());
+            }
+        }
+        if agg >= threshold {
+            matched.sort();
+            plan.push(PendingGuidanceStaleness::ChurnStale {
+                sheet_id: sheet.id.clone(),
+                agg,
+                matched,
+            });
+        }
+    }
+    Ok(plan)
+}
+
 async fn emit_guidance_staleness_findings(
     writer: &Writer,
     db_path: &Path,
@@ -1931,99 +2070,25 @@ async fn emit_guidance_staleness_findings(
     // git_churn_count IS NOT NULL` — so the work is O(sheets × churned), and so
     // production (no churn populated) yields an empty candidate set and CHURN-STALE
     // never fires, with no special-casing.
-    enum Pending {
-        Expired(String),
-        ChurnStale {
-            sheet_id: String,
-            agg: i64,
-            matched: Vec<String>,
-        },
-    }
-
-    let plan: Vec<Pending> = {
-        let conn = Connection::open(db_path)
-            .context("open read connection for guidance-staleness findings")?;
-        let canonical_root = project_root
-            .canonicalize()
-            .unwrap_or_else(|_| project_root.to_path_buf());
-
-        let sheets = clarion_storage::list_guidance_sheets(&conn)
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .context("list guidance sheets for staleness scan")?;
-
-        // Entities carrying a populated churn count (the only ones that can move an
-        // aggregate). Empty in production today (see fn doc).
-        let churned: Vec<(String, i64)> = conn
-            .prepare(
-                "SELECT id, git_churn_count FROM entities \
-                 WHERE git_churn_count IS NOT NULL ORDER BY id",
-            )
-            .context("prepare churned-entity scan")?
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .context("query churned entities")?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("collect churned entities")?;
-
-        let mut plan = Vec::new();
-        for sheet in &sheets {
-            // EXPIRED: lexical (instant) compare against `now`.
-            if let Some(expires) = sheet
-                .properties
-                .get("expires")
-                .and_then(serde_json::Value::as_str)
-                && expires < now
-            {
-                plan.push(Pending::Expired(sheet.id.clone()));
-            }
-
-            // CHURN-STALE: aggregate churn over matched entities vs asymmetric
-            // threshold. Reuse the shared matcher; only churned entities can matter.
-            let pinned = sheet
-                .properties
-                .get("pinned")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            let threshold = if pinned {
-                CHURN_STALE_THRESHOLD_PINNED
-            } else {
-                CHURN_STALE_THRESHOLD
-            };
-
-            let mut agg: i64 = 0;
-            let mut matched: Vec<String> = Vec::new();
-            for (entity_id, churn) in &churned {
-                if clarion_storage::guidance_sheet_matches_entity(
-                    &conn,
-                    sheet,
-                    entity_id,
-                    &canonical_root,
-                )
-                .map_err(|e| anyhow::anyhow!("{e}"))
-                .with_context(|| format!("match {entity_id} against {}", sheet.id))?
-                {
-                    agg = agg.saturating_add(*churn);
-                    matched.push(entity_id.clone());
-                }
-            }
-            if agg >= threshold {
-                matched.sort();
-                plan.push(Pending::ChurnStale {
-                    sheet_id: sheet.id.clone(),
-                    agg,
-                    matched,
-                });
-            }
-        }
-        plan
-    };
-
+    let plan = plan_guidance_staleness_findings(db_path, project_root, now)?;
     let mut count: u64 = 0;
     for pending in &plan {
         let finding = match pending {
-            Pending::Expired(sheet_id) => guidance_expired_finding(sheet_id, run_id, now),
-            Pending::ChurnStale {
+            PendingGuidanceStaleness::Expired(sheet_id) => {
+                guidance_expired_finding(sheet_id, run_id, now)
+            }
+            PendingGuidanceStaleness::WardlineStale {
+                sheet_id,
+                stored_manifest_hash,
+                current_manifest_hash,
+            } => guidance_stale_finding(
+                sheet_id,
+                stored_manifest_hash,
+                current_manifest_hash,
+                run_id,
+                now,
+            ),
+            PendingGuidanceStaleness::ChurnStale {
                 sheet_id,
                 agg,
                 matched,
@@ -2060,6 +2125,42 @@ fn guidance_expired_finding(guidance_id: &str, run_id: &str, now: &str) -> Findi
         related_entities_json: "[]".to_owned(),
         message: format!("Guidance sheet {guidance_id} is past its `expires` instant"),
         evidence_json: serde_json::json!({ "guidance_id": guidance_id }).to_string(),
+        properties_json: "{}".to_owned(),
+        supports_json: "[]".to_owned(),
+        supported_by_json: "[]".to_owned(),
+        created_at: now.to_owned(),
+        updated_at: now.to_owned(),
+    }
+}
+
+fn guidance_stale_finding(
+    guidance_id: &str,
+    stored_manifest_hash: &str,
+    current_manifest_hash: &str,
+    run_id: &str,
+    now: &str,
+) -> FindingRecord {
+    FindingRecord {
+        id: format!("core:finding:{run_id}:guidance-stale:{guidance_id}"),
+        tool: "clarion".to_owned(),
+        tool_version: env!("CARGO_PKG_VERSION").to_owned(),
+        run_id: run_id.to_owned(),
+        rule_id: GUIDANCE_STALE_RULE_ID.to_owned(),
+        kind: "fact".to_owned(),
+        severity: "WARN".to_owned(),
+        confidence: Some(1.0),
+        confidence_basis: Some("Wardline manifest hash drift".to_owned()),
+        entity_id: guidance_id.to_owned(),
+        related_entities_json: "[]".to_owned(),
+        message: format!(
+            "Wardline-derived guidance sheet {guidance_id} is stale relative to wardline.yaml"
+        ),
+        evidence_json: serde_json::json!({
+            "guidance_id": guidance_id,
+            "stored_manifest_hash": stored_manifest_hash,
+            "current_manifest_hash": current_manifest_hash,
+        })
+        .to_string(),
         properties_json: "{}".to_owned(),
         supports_json: "[]".to_owned(),
         supported_by_json: "[]".to_owned(),

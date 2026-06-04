@@ -16,7 +16,8 @@ use clarion_mcp::{
     config::{FiligreeConfig, LlmConfig, LlmProviderKind},
     filigree::{
         EntityAssociation, EntityAssociationsResponse, FiligreeClientError, FiligreeLookup,
-        IssueDetail, WardlineFinding,
+        IssueDetail, ObservationCreateRequest, ObservationCreateResponse, ObservationRecord,
+        WardlineFinding,
     },
     filigree_url::{SOURCE_CONFIG, SOURCE_EPHEMERAL_PORT, resolve_filigree_url},
     list_tools,
@@ -710,6 +711,9 @@ struct FakeFiligreeClient {
     wardline_findings: Mutex<Vec<WardlineFinding>>,
     /// When true, `wardline_findings_for_path` returns an `HttpStatus` 503 error.
     wardline_error: Mutex<bool>,
+    created_observations: Mutex<Vec<ObservationCreateRequest>>,
+    observations: Mutex<std::collections::HashMap<String, ObservationRecord>>,
+    dismissed_observations: Mutex<Vec<String>>,
 }
 
 impl FakeFiligreeClient {
@@ -752,6 +756,20 @@ impl FakeFiligreeClient {
 
     fn detail_calls(&self) -> Vec<String> {
         self.detail_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn created_observations(&self) -> Vec<ObservationCreateRequest> {
+        self.created_observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn dismissed_observations(&self) -> Vec<String> {
+        self.dismissed_observations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -810,6 +828,58 @@ impl FiligreeLookup for FakeFiligreeClient {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone())
+    }
+
+    fn create_observation(
+        &self,
+        request: ObservationCreateRequest,
+    ) -> Result<ObservationCreateResponse, FiligreeClientError> {
+        let mut created = self
+            .created_observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        created.push(request.clone());
+        let observation_id = format!("clarion-obs-{}", created.len());
+        self.observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                observation_id.clone(),
+                ObservationRecord {
+                    observation_id: observation_id.clone(),
+                    summary: request.summary.clone(),
+                    detail: request.detail.clone(),
+                    file_path: request.file_path.clone().unwrap_or_default(),
+                    line: request.line,
+                    priority: request.priority,
+                    actor: request.actor.clone(),
+                },
+            );
+        Ok(ObservationCreateResponse { observation_id })
+    }
+
+    fn observation_by_id(
+        &self,
+        observation_id: &str,
+    ) -> Result<Option<ObservationRecord>, FiligreeClientError> {
+        Ok(self
+            .observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(observation_id)
+            .cloned())
+    }
+
+    fn dismiss_observation(
+        &self,
+        observation_id: &str,
+        _reason: &str,
+    ) -> Result<(), FiligreeClientError> {
+        self.dismissed_observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(observation_id.to_owned());
+        Ok(())
     }
 }
 
@@ -1536,6 +1606,83 @@ async fn summary_cache_key_and_prompt_include_matching_guidance() {
     drop(state);
     drop(writer);
     handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn propose_guidance_creates_observation_and_promote_makes_sheet_visible() {
+    let (project, db_path) = open_project();
+    let client = Arc::new(FakeFiligreeClient::default());
+    let state = state_for_filigree(project.path(), &db_path, client.clone());
+
+    let proposed = call_tool(
+        &state,
+        "propose_guidance",
+        json!({
+            "entity_id": "python:function:demo.entry",
+            "content": "Prefer operational risk notes when summarising entrypoints.",
+            "scope_level": "function",
+            "name": "demo-entry-risk",
+            "pinned": true
+        }),
+    )
+    .await;
+
+    assert_eq!(proposed["ok"], true);
+    assert_eq!(proposed["result"]["observation_id"], "clarion-obs-1");
+    let created = client.created_observations();
+    assert_eq!(created.len(), 1);
+    assert!(created[0].summary.contains("python:function:demo.entry"));
+
+    let inert = call_tool(
+        &state,
+        "guidance_for",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(inert["ok"], true);
+    assert_eq!(
+        inert["result"]["guidance"]
+            .as_array()
+            .expect("guidance array")
+            .len(),
+        0,
+        "a proposal must not be composed before promotion"
+    );
+
+    let promoted = call_tool(
+        &state,
+        "promote_guidance",
+        json!({"observation_id": "clarion-obs-1"}),
+    )
+    .await;
+    assert_eq!(promoted["ok"], true);
+    assert_eq!(
+        promoted["result"]["sheet_id"],
+        "core:guidance:demo-entry-risk"
+    );
+    assert_eq!(
+        client.dismissed_observations(),
+        vec!["clarion-obs-1".to_owned()]
+    );
+
+    let visible = call_tool(
+        &state,
+        "guidance_for",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(visible["ok"], true);
+    let sheets = visible["result"]["guidance"]
+        .as_array()
+        .expect("guidance array");
+    assert_eq!(sheets.len(), 1);
+    assert_eq!(sheets[0]["id"], "core:guidance:demo-entry-risk");
+    assert_eq!(
+        sheets[0]["content"],
+        "Prefer operational risk notes when summarising entrypoints."
+    );
+    assert_eq!(sheets[0]["provenance"], "filigree_promotion");
+    assert_eq!(sheets[0]["matched_by"], json!(["entity"]));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

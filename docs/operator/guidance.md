@@ -8,11 +8,11 @@ sheet is a first-class entity of `kind: guidance` (`id` form
 which entities it covers, a scope level, and optional pinning / expiry
 (`REQ-GUIDANCE-01`, ADR-024).
 
-Guidance is authored by operators via the `clarion guidance` CLI (this guide).
-Authored sheets reach consult agents through the `guidance_for` MCP read tool,
-which composes the applicable sheets for an entity at query time. Guidance does
-**not** flow into auto-generated `summary` output today — see
-[Not yet available](#not-yet-available).
+Guidance is authored by operators via the `clarion guidance` CLI (this guide)
+or proposed by agents through MCP and promoted by an operator. Authored and
+promoted sheets reach consult agents through the `guidance_for` MCP read tool
+and are also composed into auto-generated `summary` prompts with a real
+`guidance_fingerprint` cache key.
 
 All subcommands operate on `.clarion/clarion.db`, so **run `clarion analyze`
 first** — the CLI errors if the database is absent.
@@ -65,6 +65,25 @@ to sheets whose `match_rules` apply to that entity id. See
 Removes the sheet. Its matched entities' cached summaries are invalidated (see
 [Cache behaviour](#cache-behaviour)).
 
+### `promote <observation-id>`
+
+```bash
+clarion guidance promote clarion-obs-abc123
+```
+
+Promotes a reviewed Filigree observation produced by MCP `propose_guidance`
+into a local guidance sheet (`provenance: filigree_promotion`). Arbitrary
+observations are rejected: the observation detail must contain Clarion's
+guidance-proposal payload. This is the anti-poisoning boundary (`NFR-SEC-02`):
+an agent proposal is inert until an operator promotes it.
+
+MCP also exposes the same lifecycle:
+
+- `propose_guidance(entity_id, content, scope_level?, match_rules?, name?,
+  pinned?, expires?)` creates a Filigree observation, not a sheet.
+- `promote_guidance(observation_id)` consumes a reviewed observation and writes
+  the local sheet.
+
 ## `--match` rules
 
 Each `--match` value is `<type>:<value>`, split on the **first** colon only
@@ -102,6 +121,31 @@ lexical expiry compare is correct. Unparseable input is rejected at create time.
 The read path excludes expired sheets from composition; analyze also surfaces
 them as a finding (below).
 
+## Wardline-derived guidance (`REQ-GUIDANCE-04`)
+
+When `wardline.yaml` is present, `clarion analyze` generates deterministic,
+pinned guidance sheets from the Wardline bundle:
+
+- `core:guidance:wardline-tier-<name>`
+- `core:guidance:wardline-boundary-<name>`
+- `core:guidance:wardline-annotation-group-<name>`
+
+The parser accepts real Wardline output (`tiers: [...]`, `module_tiers: [...]`,
+`wardline.fingerprint.json`, `wardline.exceptions.json`, and
+`**/wardline.overlay.yaml`) plus the earlier guidance-map shape with `paths`,
+optional `content`, optional `scope_level`, and optional explicit
+`match_rules`. The bundle hash folds in the root manifest, fingerprint baseline,
+exceptions register, and overlay boundary files, so drift in any governance
+artifact can make preserved overrides reviewable. Generated sheets carry
+`provenance: wardline_derived`, `pinned: true`, `wardline_manifest_hash`,
+artifact hash/count metadata, and a generated-signature guard.
+
+If an operator edits a generated sheet, the next analyze preserves the edit and
+marks the sheet `provenance: wardline_derived_overridden`. If the Wardline
+bundle changes while an override remains in place, analyze emits
+`CLA-FACT-GUIDANCE-STALE` so the override can be reviewed instead of silently
+overwritten.
+
 ## Staleness
 
 Two independent staleness signals exist, and they are **not** the same thing:
@@ -126,12 +170,13 @@ the guidance sheet). See `detailed-design.md` §5 for the canonical catalogue.
 |---|---|---|
 | `CLA-FACT-GUIDANCE-ORPHAN` | WARN | The sheet's `guides` edge **or** a `match_rules` `entity:<id>` rule points at an entity deleted between runs. The sheet's guidance is stranded. |
 | `CLA-FACT-GUIDANCE-EXPIRED` | INFO | The sheet's `expires` instant is in the past. The read path already excludes it from composition; this surfaces the state operatively (the sheet is not deleted). |
+| `CLA-FACT-GUIDANCE-STALE` | WARN | A Wardline-derived override carries an older `wardline_manifest_hash` than the current Wardline bundle. |
 | `CLA-FACT-GUIDANCE-CHURN-STALE` | WARN (confidence 0.7) | The aggregate `git_churn_count` over the sheet's matched entities meets the staleness threshold (50; 20 for `pinned: true` sheets). |
 
 > **`CLA-FACT-GUIDANCE-CHURN-STALE` is currently inert.** It is emitted only
 > when churn data is available, and the analyze pipeline does not yet populate
 > `git_churn_count` (tracked: clarion-997c93ec4e). In production today it never
-> fires. The other two findings are live.
+> fires. The other guidance findings are live.
 
 ## Team sharing: export / import (`REQ-GUIDANCE-06`)
 
@@ -157,28 +202,18 @@ would be data loss).
 
 ## Cache behaviour
 
-Authoring — `create`, `edit`, `delete`, and `import` — invalidates the cached
-summaries of the entities the affected sheet's `match_rules` cover (ADR-007
-churn-eager invalidation). Without this, new or changed guidance would stay
-inert until each matched entity's code next changed. Over-invalidation is safe;
-the CLI prints how many summaries it dropped.
+Authoring — `create`, `edit`, `delete`, `promote`, `import`, and Wardline
+regeneration — invalidates the cached summaries of the entities the affected
+sheet's `match_rules` cover (ADR-007 churn-eager invalidation). Without this,
+new or changed guidance would stay inert until each matched entity's code next
+changed. Over-invalidation is safe; the CLI prints how many summaries it
+dropped.
 
 ## Not yet available
 
 These pieces of the guidance system are **deferred** and do not ship today.
-Authored guidance still reaches consult agents — via the `guidance_for` MCP read
-tool's query-time composition — but the following are not yet wired:
+Authored guidance reaches consult agents through both `guidance_for` and
+auto-generated summaries, but the following are not yet wired:
 
-- **Agent-mediated authoring (`propose_guidance` / `promote_guidance`)** —
-  deferred (no observation-write transport). The `NFR-SEC-02` anti-poisoning
-  promotion lifecycle is not yet available; for now guidance is authored by
-  operators via the CLI. Ticket: clarion-3d272da8a7.
-- **Wardline-derived guidance generation (`REQ-GUIDANCE-04`)** — deferred.
-  Ticket: clarion-115c93de0e.
 - **In-browser staleness-review UI (`NG-13`)** — deferred. Ticket:
   clarion-0d7e22c6cb.
-- **Guidance composition into `summary` generation** — not yet wired. Summaries
-  do not yet compose guidance, and the real `guidance_fingerprint` is still the
-  `EMPTY_GUIDANCE_FINGERPRINT` placeholder. Authored guidance therefore reaches
-  agents through `guidance_for`, **not** through auto-generated summaries.
-  Ticket: clarion-b8b296352e.

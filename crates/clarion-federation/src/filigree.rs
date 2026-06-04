@@ -1,7 +1,11 @@
-//! Filigree HTTP contract helpers for Clarion MCP.
+//! Filigree HTTP/MCP contract helpers for Clarion MCP.
 
+use std::io::{BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use clarion_core::plugin::{ContentLengthCeiling, Frame, read_frame, write_frame};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -26,6 +30,43 @@ pub struct IssueDetail {
     pub title: String,
     pub status: String,
     pub priority: i64,
+}
+
+/// Request Clarion sends to Filigree's observation scratchpad when an agent
+/// proposes guidance. This is an observation, not a Clarion sheet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ObservationCreateRequest {
+    pub summary: String,
+    pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<i64>,
+    pub priority: i64,
+    pub actor: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ObservationCreateResponse {
+    pub observation_id: String,
+}
+
+/// Pending Filigree observation row, as read from `GET /api/loom/observations`
+/// or from a test double. Unknown live fields are ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ObservationRecord {
+    pub observation_id: String,
+    pub summary: String,
+    #[serde(default)]
+    pub detail: String,
+    #[serde(default)]
+    pub file_path: String,
+    #[serde(default)]
+    pub line: Option<i64>,
+    #[serde(default)]
+    pub priority: i64,
+    #[serde(default)]
+    pub actor: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -98,6 +139,18 @@ pub struct LoomFilesResponse {
     pub has_more: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct LoomObservationsResponse {
+    #[serde(default)]
+    pub items: Vec<ObservationRecord>,
+    #[serde(default)]
+    pub limit: Option<u64>,
+    #[serde(default)]
+    pub offset: Option<u64>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
 pub fn parse_wardline_findings_response(
     body: &str,
 ) -> Result<WardlineFindingsResponse, FiligreeContractError> {
@@ -137,6 +190,15 @@ pub enum FiligreeClientError {
     #[error("invalid Filigree clean-stale response: {0}")]
     InvalidCleanStaleResponse(#[source] serde_json::Error),
 
+    #[error("request Filigree observations: {0}")]
+    ObservationRequest(#[source] reqwest::Error),
+
+    #[error("invalid Filigree observation response: {0}")]
+    InvalidObservationResponse(#[source] serde_json::Error),
+
+    #[error("run Filigree MCP tool {tool}: {message}")]
+    McpTool { tool: String, message: String },
+
     #[error(transparent)]
     Contract(#[from] FiligreeContractError),
 }
@@ -170,6 +232,38 @@ pub trait FiligreeLookup: Send + Sync {
     ) -> Result<Vec<WardlineFinding>, FiligreeClientError> {
         Ok(Vec::new())
     }
+
+    /// Create a pending Filigree observation. Default degrades to unavailable so
+    /// tests/fake clients opt in explicitly and read-only deployments cannot
+    /// accidentally pretend a proposal was recorded.
+    fn create_observation(
+        &self,
+        _request: ObservationCreateRequest,
+    ) -> Result<ObservationCreateResponse, FiligreeClientError> {
+        Err(FiligreeClientError::McpTool {
+            tool: "observation_create".to_owned(),
+            message: "Filigree observation creation is unavailable".to_owned(),
+        })
+    }
+
+    /// Fetch one pending observation by id. Default says "not found".
+    fn observation_by_id(
+        &self,
+        _observation_id: &str,
+    ) -> Result<Option<ObservationRecord>, FiligreeClientError> {
+        Ok(None)
+    }
+
+    /// Mark a pending observation as consumed after Clarion writes the local
+    /// guidance sheet. Default no-ops so promotion remains local-first if the
+    /// scratchpad cleanup route is unavailable.
+    fn dismiss_observation(
+        &self,
+        _observation_id: &str,
+        _reason: &str,
+    ) -> Result<(), FiligreeClientError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -178,12 +272,24 @@ pub struct FiligreeHttpClient {
     actor: String,
     token: Option<String>,
     client: reqwest::blocking::Client,
+    project_root: Option<PathBuf>,
 }
 
 impl FiligreeHttpClient {
     pub fn from_config<F>(
         config: &FiligreeConfig,
         env_lookup: F,
+    ) -> Result<Option<Self>, FiligreeClientError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        Self::from_config_with_project_root(config, env_lookup, None)
+    }
+
+    pub fn from_config_with_project_root<F>(
+        config: &FiligreeConfig,
+        env_lookup: F,
+        project_root: Option<&Path>,
     ) -> Result<Option<Self>, FiligreeClientError>
     where
         F: Fn(&str) -> Option<String>,
@@ -201,6 +307,7 @@ impl FiligreeHttpClient {
             actor: config.actor.clone(),
             token,
             client,
+            project_root: project_root.map(Path::to_path_buf),
         }))
     }
 
@@ -349,6 +456,117 @@ impl FiligreeHttpClient {
             .map(Some)
             .map_err(|e| FiligreeClientError::Contract(FiligreeContractError::from(e)))
     }
+
+    fn run_mcp_tool(
+        &self,
+        tool: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<serde_json::Value, FiligreeClientError> {
+        let (program, args) = resolve_filigree_mcp_command(self.project_root.as_deref());
+        let mut child = Command::new(&program)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .current_dir(
+                self.project_root
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new(".")),
+            )
+            .spawn()
+            .map_err(|err| FiligreeClientError::McpTool {
+                tool: tool.to_owned(),
+                message: format!("spawn {program}: {err}"),
+            })?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| FiligreeClientError::McpTool {
+                tool: tool.to_owned(),
+                message: "child stdin unavailable".to_owned(),
+            })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| FiligreeClientError::McpTool {
+                tool: tool.to_owned(),
+                message: "child stdout unavailable".to_owned(),
+            })?;
+        let mut stdout = BufReader::new(stdout);
+
+        write_mcp_json(
+            &mut stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "clarion-init",
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "clarion",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }
+            }),
+            tool,
+        )?;
+        let _ = read_mcp_json(&mut stdout, "clarion-init", tool)?;
+
+        write_mcp_json(
+            &mut stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {}
+            }),
+            tool,
+        )?;
+
+        write_mcp_json(
+            &mut stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "clarion-call",
+                "method": "tools/call",
+                "params": {
+                    "name": tool,
+                    "arguments": arguments,
+                }
+            }),
+            tool,
+        )?;
+        drop(stdin);
+
+        let response = read_mcp_json(&mut stdout, "clarion-call", tool)?;
+        let _ = child.wait();
+        if let Some(error) = response.get("error") {
+            return Err(FiligreeClientError::McpTool {
+                tool: tool.to_owned(),
+                message: error.to_string(),
+            });
+        }
+        let text = response
+            .get("result")
+            .and_then(|result| result.get("content"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|content| content.first())
+            .and_then(|item| item.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| FiligreeClientError::McpTool {
+                tool: tool.to_owned(),
+                message: format!("missing result.content[0].text in response {response}"),
+            })?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(text).map_err(FiligreeClientError::InvalidObservationResponse)?;
+        if parsed.get("error").is_some() {
+            return Err(FiligreeClientError::McpTool {
+                tool: tool.to_owned(),
+                message: parsed.to_string(),
+            });
+        }
+        Ok(parsed)
+    }
 }
 
 impl FiligreeLookup for FiligreeHttpClient {
@@ -402,6 +620,65 @@ impl FiligreeLookup for FiligreeHttpClient {
         }
         Ok(findings.items)
     }
+
+    fn create_observation(
+        &self,
+        request: ObservationCreateRequest,
+    ) -> Result<ObservationCreateResponse, FiligreeClientError> {
+        let mut arguments = serde_json::json!({
+            "summary": request.summary,
+            "detail": request.detail,
+            "priority": request.priority,
+            "actor": request.actor,
+        });
+        if let Some(obj) = arguments.as_object_mut() {
+            if let Some(file_path) = request.file_path {
+                obj.insert("file_path".to_owned(), serde_json::json!(file_path));
+            }
+            if let Some(line) = request.line {
+                obj.insert("line".to_owned(), serde_json::json!(line));
+            }
+        }
+        let value = self.run_mcp_tool("observation_create", &arguments)?;
+        serde_json::from_value(value).map_err(FiligreeClientError::InvalidObservationResponse)
+    }
+
+    fn observation_by_id(
+        &self,
+        observation_id: &str,
+    ) -> Result<Option<ObservationRecord>, FiligreeClientError> {
+        let mut offset = 0_u64;
+        let limit = 100_u64;
+        loop {
+            let page: LoomObservationsResponse =
+                self.get_json(&loom_observations_url(&self.base_url, limit, offset))?;
+            if let Some(found) = page
+                .items
+                .into_iter()
+                .find(|item| item.observation_id == observation_id)
+            {
+                return Ok(Some(found));
+            }
+            if !page.has_more {
+                return Ok(None);
+            }
+            offset = offset.saturating_add(limit);
+        }
+    }
+
+    fn dismiss_observation(
+        &self,
+        observation_id: &str,
+        reason: &str,
+    ) -> Result<(), FiligreeClientError> {
+        let arguments = serde_json::json!({
+            "observation_id": observation_id,
+            "reason": reason,
+            "actor": self.actor.clone(),
+        });
+        let _ = self.run_mcp_tool("observation_dismiss", &arguments)?;
+        Ok(())
+    }
 }
 
 pub fn parse_entity_associations_response(
@@ -446,6 +723,100 @@ pub fn loom_findings_url(base_url: &str, scan_source: &str, file_id: &str) -> St
         percent_encode_query_value(scan_source),
         percent_encode_query_value(file_id)
     )
+}
+
+pub fn loom_observations_url(base_url: &str, limit: u64, offset: u64) -> String {
+    format!(
+        "{}/api/loom/observations?limit={}&offset={}",
+        base_url.trim_end_matches('/'),
+        limit,
+        offset
+    )
+}
+
+fn write_mcp_json(
+    writer: &mut impl Write,
+    value: &serde_json::Value,
+    tool: &str,
+) -> Result<(), FiligreeClientError> {
+    let body = serde_json::to_vec(value).map_err(|err| FiligreeClientError::McpTool {
+        tool: tool.to_owned(),
+        message: format!("serialize MCP request: {err}"),
+    })?;
+    write_frame(writer, &Frame { body }).map_err(|err| FiligreeClientError::McpTool {
+        tool: tool.to_owned(),
+        message: format!("write MCP frame: {err}"),
+    })
+}
+
+fn read_mcp_json(
+    reader: &mut impl std::io::BufRead,
+    expected_id: &str,
+    tool: &str,
+) -> Result<serde_json::Value, FiligreeClientError> {
+    loop {
+        let frame = read_frame(reader, ContentLengthCeiling::DEFAULT).map_err(|err| {
+            FiligreeClientError::McpTool {
+                tool: tool.to_owned(),
+                message: format!("read MCP frame: {err}"),
+            }
+        })?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&frame.body).map_err(|err| FiligreeClientError::McpTool {
+                tool: tool.to_owned(),
+                message: format!("parse MCP response: {err}"),
+            })?;
+        if value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| id == expected_id)
+        {
+            return Ok(value);
+        }
+    }
+}
+
+fn resolve_filigree_mcp_command(project_root: Option<&Path>) -> (String, Vec<String>) {
+    if let Ok(raw) = std::env::var("CLARION_FILIGREE_MCP_COMMAND") {
+        let mut parts: Vec<String> = raw
+            .split_whitespace()
+            .map(|part| replace_project_placeholder(part, project_root))
+            .collect();
+        if let Some(program) = parts.first().cloned() {
+            parts.remove(0);
+            return (program, parts);
+        }
+    }
+
+    let mut status_cmd = Command::new("filigree");
+    status_cmd.args(["mcp-status", "--json"]);
+    if let Some(root) = project_root {
+        status_cmd.current_dir(root);
+    }
+    if let Ok(output) = status_cmd.output()
+        && output.status.success()
+        && let Ok(status) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        && let Some(python) = status
+            .get("runtime")
+            .and_then(|runtime| runtime.get("python_executable"))
+            .and_then(serde_json::Value::as_str)
+    {
+        let mut args = vec!["-m".to_owned(), "filigree.mcp_server".to_owned()];
+        if let Some(root) = project_root {
+            args.push("--project".to_owned());
+            args.push(root.display().to_string());
+        }
+        return (python.to_owned(), args);
+    }
+
+    ("filigree".to_owned(), vec!["mcp".to_owned()])
+}
+
+fn replace_project_placeholder(raw: &str, project_root: Option<&Path>) -> String {
+    match project_root {
+        Some(root) => raw.replace("{project}", &root.display().to_string()),
+        None => raw.to_owned(),
+    }
 }
 
 fn percent_encode_query_value(raw: &str) -> String {

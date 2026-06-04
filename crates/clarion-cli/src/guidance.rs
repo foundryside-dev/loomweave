@@ -6,9 +6,6 @@
 //! (`clarion_storage::guidance`); this module owns only argument parsing, the
 //! `$EDITOR` round-trip, and presentation.
 //!
-//! `promote` (consume a Filigree observation into a sheet) is intentionally NOT
-//! here — it depends on the observation lifecycle owned by a later WS6 task.
-//!
 //! ## `--match` syntax
 //!
 //! Each `--match` value is `<type>:<value>` (split on the **first** colon only,
@@ -30,11 +27,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 
+use clarion_federation::filigree::{FiligreeHttpClient, FiligreeLookup};
 use clarion_storage::{
-    GuidanceSheet, GuidanceSheetInput, PortableSheet, delete_guidance_sheet, get_guidance_sheet,
-    guidance_sheet_is_expired, guidance_sheet_is_stale, guidance_sheet_matches_entity,
-    import_portable_sheet, insert_guidance_sheet, invalidate_summaries_for_sheet,
-    list_guidance_sheets, upsert_guidance_sheet,
+    GuidanceProposal, GuidanceSheet, GuidanceSheetInput, PortableSheet, delete_guidance_sheet,
+    get_guidance_sheet, guidance_sheet_is_expired, guidance_sheet_is_stale,
+    guidance_sheet_matches_entity, import_portable_sheet, insert_guidance_sheet,
+    invalidate_summaries_for_sheet, list_guidance_sheets, upsert_guidance_sheet,
 };
 
 use crate::cli::GuidanceCommand;
@@ -111,6 +109,11 @@ pub fn run(command: GuidanceCommand) -> Result<()> {
             },
         ),
         GuidanceCommand::Delete { path, id } => delete(&path, &id),
+        GuidanceCommand::Promote {
+            path,
+            config,
+            observation_id,
+        } => promote(&path, config.as_deref(), &observation_id),
         GuidanceCommand::Export { path, to } => export(&path, &to),
         GuidanceCommand::Import { path, dir } => import(&path, &dir),
     }
@@ -512,6 +515,69 @@ fn delete(project_root: &Path, id: &str) -> Result<()> {
 
     println!("Deleted guidance sheet {id}");
     report_invalidation(invalidated);
+    Ok(())
+}
+
+fn promote(project_root: &Path, config_path: Option<&Path>, observation_id: &str) -> Result<()> {
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let mcp_config = crate::analyze::load_mcp_config(&canonical_root, config_path);
+    let client = FiligreeHttpClient::from_config_with_project_root(
+        &mcp_config.integrations.filigree,
+        |name| std::env::var(name).ok(),
+        Some(&canonical_root),
+    )
+    .context("build Filigree client")?
+    .ok_or_else(|| anyhow!("Filigree integration is disabled in clarion.yaml"))?;
+
+    let observation = client
+        .observation_by_id(observation_id)
+        .with_context(|| format!("read Filigree observation {observation_id}"))?
+        .ok_or_else(|| anyhow!("Filigree observation {observation_id} not found"))?;
+    let proposal = GuidanceProposal::from_observation_detail(&observation.detail)
+        .map_err(|e| anyhow!("{e}"))
+        .with_context(|| {
+            format!("Filigree observation {observation_id} is not a Clarion guidance proposal")
+        })?;
+
+    let conn = open_db(&canonical_root)?;
+    let now = now_iso8601(&conn)?;
+    let promoted = proposal
+        .to_promoted_sheet(&now)
+        .map_err(|e| anyhow!("{e}"))
+        .context("build promoted guidance sheet")?;
+
+    let before = get_guidance_sheet(&conn, &promoted.id).into_anyhow()?;
+    upsert_guidance_sheet(
+        &conn,
+        &GuidanceSheetInput {
+            id: &promoted.id,
+            name: &promoted.name,
+            short_name: &promoted.short_name,
+            properties: &promoted.properties,
+        },
+    )
+    .into_anyhow()
+    .with_context(|| format!("write promoted guidance sheet {}", promoted.id))?;
+
+    let invalidated = match before {
+        Some(before) => {
+            invalidate_matched_summaries_union(&canonical_root, &conn, &before, &promoted.id)?
+        }
+        None => invalidate_matched_summaries(&canonical_root, &conn, &promoted.id)?,
+    };
+
+    let dismissed = client
+        .dismiss_observation(observation_id, "promoted to Clarion guidance sheet")
+        .is_ok();
+    println!("Promoted observation {observation_id} to {}", promoted.id);
+    report_invalidation(invalidated);
+    if !dismissed {
+        println!(
+            "Filigree observation {observation_id} was promoted locally but could not be dismissed"
+        );
+    }
     Ok(())
 }
 

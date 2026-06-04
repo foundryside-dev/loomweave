@@ -8,6 +8,8 @@
 use assert_cmd::Command;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener};
 
 fn clarion_bin() -> Command {
     Command::cargo_bin("clarion").expect("clarion binary")
@@ -89,6 +91,44 @@ fn list_stdout(root: &std::path::Path, extra: &[&str]) -> String {
         .assert()
         .success();
     String::from_utf8_lossy(&assert.get_output().stdout).into_owned()
+}
+
+fn spawn_observations_server(detail: String) -> (SocketAddr, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind observations server");
+    let addr = listener.local_addr().expect("server addr");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept observations request");
+        let mut buf = [0_u8; 4096];
+        let read = stream.read(&mut buf).expect("read observations request");
+        let request = String::from_utf8_lossy(&buf[..read]);
+        assert!(
+            request.contains("GET /api/loom/observations?limit=100&offset=0 HTTP/1.1"),
+            "unexpected request: {request}"
+        );
+        let body = serde_json::json!({
+            "items": [{
+                "observation_id": "clarion-obs-guidance",
+                "summary": "Clarion guidance proposal for python:function:auth.tokens.refresh",
+                "detail": detail,
+                "file_path": "src/auth/tokens.py",
+                "line": 1,
+                "priority": 2,
+                "actor": "clarion"
+            }],
+            "limit": 100,
+            "offset": 0,
+            "has_more": false
+        })
+        .to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write observations response");
+    });
+    (addr, handle)
 }
 
 #[test]
@@ -317,6 +357,59 @@ fn create_show_list_delete_lifecycle() {
         .arg(dir.path())
         .assert()
         .failure();
+}
+
+#[test]
+fn promote_observation_creates_guidance_sheet() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_db(dir.path());
+    let proposal = clarion_storage::GuidanceProposal {
+        entity_id: "python:function:auth.tokens.refresh".to_owned(),
+        content: "Escalate auth-token risk in summaries.".to_owned(),
+        scope_level: "function".to_owned(),
+        match_rules: vec![serde_json::json!({
+            "type": "entity",
+            "id": "python:function:auth.tokens.refresh"
+        })],
+        name: Some("auth-token-risk".to_owned()),
+        pinned: true,
+        expires: None,
+    };
+    let detail = proposal.to_observation_detail().unwrap();
+    let (addr, handle) = spawn_observations_server(detail);
+    std::fs::write(
+        dir.path().join("clarion.yaml"),
+        format!(
+            "integrations:\n  filigree:\n    enabled: true\n    base_url: http://{addr}\n    actor: clarion-test\n"
+        ),
+    )
+    .unwrap();
+
+    let promoted = clarion_bin()
+        .args(["guidance", "promote", "clarion-obs-guidance"])
+        .args(["--path"])
+        .arg(dir.path())
+        // Dismissal is best-effort and uses the Filigree MCP subprocess; point it
+        // at a fast no-op so this test only owns the observation-read contract.
+        .env("CLARION_FILIGREE_MCP_COMMAND", "/bin/true")
+        .assert()
+        .success();
+    let out = String::from_utf8_lossy(&promoted.get_output().stdout);
+    assert!(
+        out.contains("Promoted observation clarion-obs-guidance to core:guidance:auth-token-risk"),
+        "unexpected promote output: {out}"
+    );
+    handle.join().expect("observations server");
+
+    let props = properties(dir.path(), "core:guidance:auth-token-risk");
+    assert_eq!(props["content"], "Escalate auth-token risk in summaries.");
+    assert_eq!(props["scope_level"], "function");
+    assert_eq!(props["provenance"], "filigree_promotion");
+    assert_eq!(props["pinned"], true);
+    assert_eq!(
+        props["match_rules"][0],
+        serde_json::json!({"type":"entity","id":"python:function:auth.tokens.refresh"})
+    );
 }
 
 #[test]

@@ -19,6 +19,7 @@ mod sei_git;
 mod serve;
 mod skill_pack;
 mod stats;
+mod wardline_guidance;
 
 use anyhow::Result;
 use clap::Parser;

@@ -153,6 +153,185 @@ const SELECT_COLUMNS: &str = "id, name, short_name, scope_level, properties, \
 /// canonical name) follows.
 const GUIDANCE_ID_PREFIX: &str = "core:guidance:";
 
+/// Marker wrapping a Clarion guidance proposal inside a Filigree observation's
+/// free-form detail field. The marker lets promotion parse only observations
+/// that deliberately carry the guidance payload, rather than treating arbitrary
+/// scratchpad prose as trusted sheet data.
+pub const GUIDANCE_PROPOSAL_MARKER: &str = "BEGIN_CLARION_GUIDANCE_PROPOSAL_V1";
+const GUIDANCE_PROPOSAL_END_MARKER: &str = "END_CLARION_GUIDANCE_PROPOSAL_V1";
+
+const PROVENANCE_FILIGREE_PROMOTION: &str = "filigree_promotion";
+const GUIDANCE_SCOPE_LEVELS: &[&str] = &[
+    "project",
+    "subsystem",
+    "package",
+    "module",
+    "class",
+    "function",
+];
+
+/// The reviewed payload an MCP `propose_guidance` call stores in a Filigree
+/// observation. A proposal is inert: until [`GuidanceProposal::to_promoted_sheet`]
+/// is called by an operator-controlled promotion path and the resulting sheet is
+/// written, it is not a `kind='guidance'` entity and cannot enter prompts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GuidanceProposal {
+    pub entity_id: String,
+    pub content: String,
+    pub scope_level: String,
+    pub match_rules: Vec<Value>,
+    pub name: Option<String>,
+    pub pinned: bool,
+    pub expires: Option<String>,
+}
+
+/// Fully-owned guidance sheet data produced from a promoted observation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromotedGuidanceSheet {
+    pub id: String,
+    pub name: String,
+    pub short_name: String,
+    pub properties: Value,
+}
+
+impl GuidanceProposal {
+    /// Build the default proposal shape for an entity-targeted suggestion.
+    #[must_use]
+    pub fn for_entity(entity_id: &str, content: &str) -> Self {
+        Self {
+            entity_id: entity_id.to_owned(),
+            content: content.to_owned(),
+            scope_level: "function".to_owned(),
+            match_rules: vec![json!({ "type": "entity", "id": entity_id })],
+            name: None,
+            pinned: false,
+            expires: None,
+        }
+    }
+
+    /// Serialize the proposal into the observation detail envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::InvalidQuery`] when JSON serialization fails.
+    pub fn to_observation_detail(&self) -> Result<String> {
+        self.validate()?;
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| StorageError::InvalidQuery(format!("serialize guidance proposal: {e}")))?;
+        Ok(format!(
+            "Clarion guidance proposal. Promote with `clarion guidance promote` after review.\n\n\
+             {GUIDANCE_PROPOSAL_MARKER}\n{json}\n{GUIDANCE_PROPOSAL_END_MARKER}\n"
+        ))
+    }
+
+    /// Parse a guidance proposal from a Filigree observation detail string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::InvalidQuery`] when the marker is missing, JSON is
+    /// malformed, or the decoded proposal violates sheet invariants.
+    pub fn from_observation_detail(detail: &str) -> Result<Self> {
+        let start = detail.find(GUIDANCE_PROPOSAL_MARKER).ok_or_else(|| {
+            StorageError::InvalidQuery(
+                "observation does not contain a Clarion guidance proposal".to_owned(),
+            )
+        })? + GUIDANCE_PROPOSAL_MARKER.len();
+        let rest = &detail[start..];
+        let end = rest.find(GUIDANCE_PROPOSAL_END_MARKER).ok_or_else(|| {
+            StorageError::InvalidQuery(
+                "Clarion guidance proposal is missing its end marker".to_owned(),
+            )
+        })?;
+        let raw_json = rest[..end].trim();
+        let proposal: Self = serde_json::from_str(raw_json).map_err(|e| {
+            StorageError::InvalidQuery(format!("parse Clarion guidance proposal: {e}"))
+        })?;
+        proposal.validate()?;
+        Ok(proposal)
+    }
+
+    /// Convert this reviewed proposal into a guidance sheet payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::InvalidQuery`] if the proposal is malformed.
+    pub fn to_promoted_sheet(&self, authored_at: &str) -> Result<PromotedGuidanceSheet> {
+        self.validate()?;
+        let slug_source = self.name.as_deref().unwrap_or(&self.entity_id);
+        let name = slugify_guidance_name(slug_source);
+        let short_name = name.rsplit('.').next().unwrap_or(&name).to_owned();
+        let id = format!("{GUIDANCE_ID_PREFIX}{name}");
+        let mut properties = json!({
+            "content": self.content,
+            "scope_level": self.scope_level,
+            "match_rules": self.match_rules,
+            "pinned": self.pinned,
+            "provenance": PROVENANCE_FILIGREE_PROMOTION,
+            "authored_at": authored_at,
+            "proposed_for_entity": self.entity_id,
+        });
+        if let Some(expires) = &self.expires
+            && let Some(obj) = properties.as_object_mut()
+        {
+            obj.insert("expires".to_owned(), json!(expires));
+        }
+        Ok(PromotedGuidanceSheet {
+            id,
+            name,
+            short_name,
+            properties,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.entity_id.trim().is_empty() {
+            return Err(StorageError::InvalidQuery(
+                "guidance proposal missing entity_id".to_owned(),
+            ));
+        }
+        if self.content.trim().is_empty() {
+            return Err(StorageError::InvalidQuery(
+                "guidance proposal content is empty".to_owned(),
+            ));
+        }
+        if !GUIDANCE_SCOPE_LEVELS.contains(&self.scope_level.as_str()) {
+            return Err(StorageError::InvalidQuery(format!(
+                "guidance proposal scope_level '{}' is invalid",
+                self.scope_level
+            )));
+        }
+        if self.match_rules.is_empty() {
+            return Err(StorageError::InvalidQuery(
+                "guidance proposal needs at least one match rule".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Derive a canonical guidance-name slug. Kept here so CLI, MCP, and Wardline-
+/// derived generation all mint ids with the same grammar.
+#[must_use]
+pub fn slugify_guidance_name(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut last_dash = false;
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+            out.push(ch);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_owned();
+    if trimmed.is_empty() {
+        "guidance".to_owned()
+    } else {
+        trimmed
+    }
+}
+
 fn validate_guidance_id(id: &str) -> Result<()> {
     if !id.starts_with(GUIDANCE_ID_PREFIX) {
         return Err(StorageError::InvalidQuery(format!(
@@ -698,6 +877,53 @@ mod tests {
             created_at: "2026-01-01T00:00:00.000Z".to_owned(),
             updated_at: "2026-01-01T00:00:00.000Z".to_owned(),
         }
+    }
+
+    #[test]
+    fn guidance_proposal_detail_round_trips_to_promoted_sheet() {
+        let proposal = GuidanceProposal {
+            entity_id: "python:function:demo.entry".to_owned(),
+            content: "Prefer operational risk notes.".to_owned(),
+            scope_level: "function".to_owned(),
+            match_rules: vec![json!({"type": "entity", "id": "python:function:demo.entry"})],
+            name: Some("demo-entry-risk".to_owned()),
+            pinned: true,
+            expires: Some("2026-12-31T00:00:00.000Z".to_owned()),
+        };
+
+        let detail = proposal
+            .to_observation_detail()
+            .expect("serialize proposal detail");
+        assert!(detail.contains(GUIDANCE_PROPOSAL_MARKER));
+
+        let parsed = GuidanceProposal::from_observation_detail(&detail)
+            .expect("parse proposal from observation detail");
+        assert_eq!(parsed, proposal);
+
+        let sheet = parsed
+            .to_promoted_sheet("2026-06-04T00:00:00.000Z")
+            .expect("build promoted sheet");
+        assert_eq!(sheet.id, "core:guidance:demo-entry-risk");
+        assert_eq!(sheet.name, "demo-entry-risk");
+        assert_eq!(sheet.short_name, "demo-entry-risk");
+        assert_eq!(
+            sheet.properties.get("provenance").and_then(Value::as_str),
+            Some("filigree_promotion")
+        );
+        assert_eq!(
+            sheet.properties.get("authored_at").and_then(Value::as_str),
+            Some("2026-06-04T00:00:00.000Z")
+        );
+        assert_eq!(
+            sheet
+                .properties
+                .get("match_rules")
+                .and_then(Value::as_array)
+                .and_then(|rules| rules.first())
+                .and_then(|rule| rule.get("id"))
+                .and_then(Value::as_str),
+            Some("python:function:demo.entry")
+        );
     }
 
     // ── guidance_sheet_is_expired ────────────────────────────────────────────

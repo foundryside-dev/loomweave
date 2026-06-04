@@ -150,18 +150,15 @@ signal is absent", not "there is nothing here". Likewise `high_churn` and
 `index_diff` for repo-level freshness).
 
 > Not in this catalogue: `search_semantic` and `find_dead_code` (need embedding
-> / whole-graph-reachability infrastructure — a separate wave), agent-mediated
-> guidance authoring (`propose_guidance`/`promote_guidance` — deferred, no
-> observation-write transport: clarion-3d272da8a7), and `emit_observation` (no
-> observation-write transport ships yet).
+> / whole-graph-reachability infrastructure — a separate wave) and
+> `emit_observation` as a general-purpose write surface.
 
-**Guidance authoring is operator-driven (CLI), not an MCP tool.** Sheets are
-authored out-of-band via `clarion guidance create/edit/show/list/delete` (plus
-`export`/`import` for team sharing) — see the operator guide. `guidance_for`
-(above) is the read surface: it composes the authored sheets that apply to an
-entity at query time, scope-ranked project → function. So new guidance reaches
-you through `guidance_for`, not (yet) through `summary` — summaries do not
-compose guidance today (clarion-b8b296352e).
+**Guidance authoring has an operator boundary.** Operators can manage sheets via
+`clarion guidance create/edit/show/list/delete/promote` (plus `export`/`import`
+for team sharing). Agents may call `propose_guidance` to create a Filigree
+observation, but that proposal is inert until an operator promotes it through
+`promote_guidance` or the CLI. Promoted sheets reach you through `guidance_for`
+and are composed into `summary` prompts with a real guidance fingerprint.
 
 ## Workflow: orient, then navigate
 

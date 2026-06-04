@@ -437,6 +437,8 @@ assert tool_names == [
     "analyze_cancel",
     "index_diff_get",
     "entity_guidance_list",
+    "propose_guidance",
+    "promote_guidance",
     "entity_finding_list",
     "entity_wardline_get",
     "entity_tag_list",

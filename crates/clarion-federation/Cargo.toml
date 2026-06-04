@@ -10,6 +10,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+clarion-core = { path = "../clarion-core", version = "1.2.0" }
 clarion-storage = { path = "../clarion-storage", version = "1.2.0" }
 reqwest.workspace = true
 serde.workspace = true

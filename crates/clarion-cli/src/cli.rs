@@ -293,6 +293,20 @@ pub enum GuidanceCommand {
         id: String,
     },
 
+    /// Promote a reviewed Filigree guidance-proposal observation into a local
+    /// guidance sheet. The observation must have been produced by MCP
+    /// `propose_guidance`; arbitrary observations are rejected.
+    Promote {
+        /// Project directory containing .clarion/clarion.db (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Path to clarion.yaml (default: project-root/clarion.yaml if present).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// The Filigree observation id to promote.
+        observation_id: String,
+    },
+
     /// Export every guidance sheet to a directory as one deterministic,
     /// diff-friendly JSON file per sheet, for committing to a shared repo
     /// (REQ-GUIDANCE-06). Output is byte-stable across runs on identical DB
