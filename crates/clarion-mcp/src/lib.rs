@@ -1694,6 +1694,11 @@ struct IssuesForAccumulator {
 
 impl IssuesForAccumulator {
     fn new(entities: &[EntityRow], entity_json_by_id: HashMap<String, Value>) -> Self {
+        // Map every key Filigree might echo back in `clarion_entity_id` to the
+        // current locator (`entity.id`). A SEI-bearing entity is queried by SEI
+        // only (see `tool_issues_for`), so the SEI→locator alias is the live
+        // path for those rows; the locator self-mapping covers no-SEI entities
+        // and any straggler locator-keyed rows during the SEI migration window.
         let mut association_aliases = HashMap::new();
         for entity in entities {
             association_aliases.insert(entity.id.clone(), entity.id.clone());
