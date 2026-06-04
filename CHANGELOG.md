@@ -65,6 +65,38 @@ only when an incompatible change is made to that surface. See
   `problem`. A bare `clarion doctor` on a no-bindings (Clarion-solo or
   Clarion+Filigree-only) project now exits 0 with the warning surfaced.
 
+### Security
+
+- **Closed a config-driven command-execution path from untrusted repository
+  contents (`clarion-4b5a8aff54`).** `clarion analyze` (the SEI git-rename
+  signal) and `clarion serve` (the `index_diff_get` freshness/drift report)
+  shelled `git` inside the analyzed repository with repo-local configuration and
+  Git attributes enabled, so a malicious repository could execute arbitrary
+  commands as the local user during an ordinary analyze/serve — via
+  `core.fsmonitor`, an external diff/textconv driver, or a `filter.<name>.clean`
+  selected by a `filter` attribute. All corpus-facing `git` calls now route
+  through a single hardened helper (`clarion_core::hardened_git_command`) that
+  ignores operator/global/system config, strips config/exec-injecting environment
+  variables, overrides the program-naming repo-local keys via highest-precedence
+  `-c` flags (including `core.fsmonitor=false` and `core.attributesFile=`), and
+  neutralizes the attribute sources it can — the in-tree `.gitattributes` via
+  `--attr-source=<empty-tree>` and the system file via `GIT_ATTR_NOSYSTEM`. The
+  one source no config flag can disable, `$GIT_DIR/info/attributes`, only triggers
+  a filter when Git hashes working-tree content, so the call sites no longer do
+  that on an untrusted corpus: the rename signal uses `git diff --cached`
+  (index-vs-HEAD; still catches staged `git mv` renames) and the freshness probe
+  replaces `git status` with `git diff --cached` plus the existing stat-based
+  per-file drift check. **Behavior change:** `index_diff`'s `dirty_files` now
+  lists staged changes only — unstaged working-tree modifications and untracked
+  files are no longer enumerated there (unstaged edits to indexed files still
+  surface in `modified_since_analyze`). Signals remain best-effort and
+  enrich-only. The `--attr-source` belt-and-suspenders is applied only when a
+  one-time probe confirms Git >= 2.40; older Git omits it and stays both safe (the
+  `--cached` call sites carry the actual protection) and fully functional, so no
+  minimum-Git floor is introduced. Reported externally and re-verified with
+  working PoCs across all attribute sources; relates to the untrusted-corpus
+  posture of ADR-021.
+
 ## [1.2.0] — 2026-06-03
 
 ### Added

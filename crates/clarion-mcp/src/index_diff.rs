@@ -16,9 +16,9 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::process::Command;
 use std::time::SystemTime;
 
+use clarion_core::hardened_git_command;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -48,9 +48,11 @@ struct DirtyEntry {
 /// Run `git` read-only against `project_root` and collect HEAD + dirty-tree
 /// facts. Blocking; call from a `spawn_blocking` context.
 pub(crate) fn gather_git_facts(project_root: &Path) -> GitFacts {
-    let inside = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
+    // Hardened against the untrusted corpus (clarion-4b5a8aff54): no
+    // repo-controlled program runs while gathering git facts. `git status` below
+    // is the most reliable fsmonitor/clean-filter trigger of all, so the
+    // hardening is load-bearing here.
+    let inside = hardened_git_command(project_root)
         .args(["rev-parse", "--is-inside-work-tree"])
         .output();
     let (available, is_repo, reason) = match inside {
@@ -74,9 +76,7 @@ pub(crate) fn gather_git_facts(project_root: &Path) -> GitFacts {
     }
 
     let run = |args: &[&str]| -> Option<String> {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(project_root)
+        let out = hardened_git_command(project_root)
             .args(args)
             .output()
             .ok()?;
@@ -89,17 +89,23 @@ pub(crate) fn gather_git_facts(project_root: &Path) -> GitFacts {
     let head_commit = run(&["rev-parse", "HEAD"]);
     // `%cI` is strict ISO-8601 (RFC3339) with the committer's UTC offset.
     let head_committed_at = run(&["log", "-1", "--format=%cI", "HEAD"]);
-    // Read status raw: porcelain's leading X-column space is significant, so it
-    // must NOT be trimmed off the front (the `run` closure trims the whole
-    // blob, which would shift every column left and corrupt the path).
-    let dirty = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
-        .args(["status", "--porcelain=v1"])
+    // Dirty signal via `git diff --cached` (STAGED changes, index vs HEAD), NOT
+    // `git status` (clarion-4b5a8aff54): `git status` must hash working-tree
+    // content to report unstaged modifications, which executes a repo-controlled
+    // `filter.<name>.clean` selected by `$GIT_DIR/info/attributes` — a source no
+    // config flag can disable on an untrusted corpus. `--cached` compares only
+    // stored objects (index + HEAD), so it never hashes the working tree. The
+    // cost is honest and bounded: unstaged working-tree modifications and
+    // untracked files are NOT enumerated here. Unstaged modifications to *indexed*
+    // files are still caught by the stat-based `compute_file_drift`
+    // (`modified_since_analyze`); only never-staged/never-indexed changes go
+    // unreported, which the report notes already disclaim.
+    let dirty = hardened_git_command(project_root)
+        .args(["diff", "--cached", "--name-status", "-M", "HEAD"])
         .output()
         .ok()
         .filter(|out| out.status.success())
-        .map(|out| parse_porcelain(&String::from_utf8_lossy(&out.stdout)))
+        .map(|out| parse_name_status(&String::from_utf8_lossy(&out.stdout)))
         .unwrap_or_default();
 
     GitFacts {
@@ -112,20 +118,29 @@ pub(crate) fn gather_git_facts(project_root: &Path) -> GitFacts {
     }
 }
 
-/// Parse `git status --porcelain=v1` output into per-path entries. Renames
-/// (`R  old -> new`) collapse to the new path; git's C-style quoting of paths
-/// with special bytes is decoded (see [`unquote_c_path`]).
-fn parse_porcelain(out: &str) -> Vec<DirtyEntry> {
+/// Parse `git diff --cached --name-status -M HEAD` output into per-path entries.
+/// Each line is `<STATUS>\t<path>` (e.g. `M\tsrc/lib.rs`, `A\tnew.py`) or, for
+/// renames/copies, `<STATUS>\t<old>\t<new>` — which collapse to the new path. The
+/// status is reduced to its leading letter (`R096` → `R`). git's C-style quoting
+/// of paths with special bytes is decoded (see [`unquote_c_path`]).
+fn parse_name_status(out: &str) -> Vec<DirtyEntry> {
     out.lines()
         .filter_map(|line| {
-            if line.len() <= 3 {
+            let mut cols = line.split('\t');
+            let raw = cols.next()?;
+            let code = raw.chars().next()?;
+            // Rename/copy lines carry two paths (old, new); report the new path.
+            let path = if matches!(code, 'R' | 'C') {
+                let _old = cols.next()?;
+                cols.next()?
+            } else {
+                cols.next()?
+            };
+            if path.is_empty() {
                 return None;
             }
-            let status = line[..2].trim().to_owned();
-            let rest = line[3..].trim();
-            let path = rest.rsplit(" -> ").next().unwrap_or(rest);
             Some(DirtyEntry {
-                status,
+                status: code.to_string(),
                 rel_path: unquote_c_path(path),
             })
         })
@@ -401,7 +416,9 @@ pub(crate) fn build_report(
         .filter_map(|f| normalize_source_path(project_root, &f.source_file_path).ok())
         .collect();
 
-    // Dirty working-tree files, flagged when they touch an indexed path.
+    // Staged-vs-HEAD changes (clarion-4b5a8aff54: no worktree hashing), flagged
+    // when they touch an indexed path. Unstaged/untracked changes are not in this
+    // set; unstaged edits to indexed files surface via `file_drift` below.
     let mut dirty = Vec::new();
     let mut dirty_indexed_count = 0usize;
     for entry in &git.dirty {
@@ -447,6 +464,11 @@ pub(crate) fn build_report(
             .to_owned(),
         "added (never-indexed) source files are not enumerated here beyond the \
          git dirty set; a new commit still flips head_newer_than_analyze"
+            .to_owned(),
+        "dirty_files lists STAGED changes (index vs HEAD); unstaged working-tree \
+         modifications and untracked files are not enumerated (untrusted-corpus \
+         hardening). Unstaged edits to indexed files still surface in \
+         modified_since_analyze."
             .to_owned(),
     ];
     if file_drift.stat_failures > 0 {
@@ -512,29 +534,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_porcelain_handles_modified_and_rename() {
-        let out = " M src/lib.rs\nR  old.rs -> new.rs\n?? untracked.py\n";
-        let entries = parse_porcelain(out);
+    fn parse_name_status_handles_modified_added_and_rename() {
+        // `git diff --cached --name-status -M HEAD` format: tab-separated, with a
+        // second path column for renames/copies.
+        let out = "M\tsrc/lib.rs\nA\tnew.py\nR096\told.rs\tnew.rs\n";
+        let entries = parse_name_status(out);
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].status, "M");
         assert_eq!(entries[0].rel_path, "src/lib.rs");
-        assert_eq!(entries[1].status, "R");
-        assert_eq!(entries[1].rel_path, "new.rs");
-        assert_eq!(entries[2].status, "??");
-        assert_eq!(entries[2].rel_path, "untracked.py");
+        assert_eq!(entries[1].status, "A");
+        assert_eq!(entries[1].rel_path, "new.py");
+        assert_eq!(entries[2].status, "R");
+        assert_eq!(entries[2].rel_path, "new.rs");
     }
 
     #[test]
-    fn parse_porcelain_skips_blank_and_short_lines() {
-        assert!(parse_porcelain("\n \nM\n").is_empty());
+    fn parse_name_status_skips_blank_and_malformed_lines() {
+        // Blank lines and a status with no path column yield nothing.
+        assert!(parse_name_status("\n\nM\n").is_empty());
     }
 
     #[test]
-    fn parse_porcelain_decodes_c_quoted_non_ascii_path() {
+    fn parse_name_status_decodes_c_quoted_non_ascii_path() {
         // git quotes `café.py` (and emits its UTF-8 bytes as octal escapes)
         // under the default core.quotePath=true.
-        let out = " M \"caf\\303\\251.py\"\n";
-        let entries = parse_porcelain(out);
+        let out = "M\t\"caf\\303\\251.py\"\n";
+        let entries = parse_name_status(out);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].status, "M");
         assert_eq!(
@@ -745,5 +770,97 @@ mod tests {
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0]["path"], abs);
         assert_eq!(missing[0]["indexed_entities"], 4);
+    }
+
+    /// REGRESSION (clarion-4b5a8aff54): `gather_git_facts` gathers facts against
+    /// an untrusted served corpus. It must not execute any repo-controlled helper
+    /// — not `core.fsmonitor`, and not a `filter.<name>.clean` selected by ANY
+    /// attribute source (in-tree `.gitattributes`, `$GIT_DIR/info/attributes`
+    /// which no config flag disables, or `core.attributesFile`). It avoids
+    /// `git status` (which would hash the worktree) in favour of `git diff
+    /// --cached`, so staged changes are still reported.
+    #[cfg(unix)]
+    #[test]
+    fn gather_git_facts_does_not_execute_repo_controlled_helpers() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        // Raw `git` is fine here: it builds the trusted fixture repo. The
+        // assertion below exercises the hardened production path.
+        let run_git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.email", "t@t"]);
+        run_git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("auth.py"), "def login():\n    return 1\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-qm", "init"]);
+        // Dirty the tree so `git status` must re-hash working-tree content.
+        run_git(&["mv", "auth.py", "authn.py"]);
+        std::fs::write(repo.join("authn.py"), "def login():\n    return 2\n").unwrap();
+
+        let make_payload = |name: &str, marker: &Path| {
+            let p = repo.join(name);
+            std::fs::write(
+                &p,
+                format!("#!/bin/sh\necho fired > {}\ncat\n", marker.display()),
+            )
+            .unwrap();
+            let mut perms = std::fs::metadata(&p).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&p, perms).unwrap();
+            p
+        };
+        let fsmonitor_marker = repo.join("FSMONITOR_FIRED");
+        let filter_marker = repo.join("FILTER_FIRED");
+        let fsmonitor_payload = make_payload("fsmonitor.sh", &fsmonitor_marker);
+        let filter_payload = make_payload("filter.sh", &filter_marker);
+
+        run_git(&[
+            "config",
+            "core.fsmonitor",
+            &fsmonitor_payload.display().to_string(),
+        ]);
+        // `filter=evil` assigned from all three attribute sources at once.
+        std::fs::write(repo.join(".gitattributes"), "* filter=evil\n").unwrap();
+        std::fs::write(repo.join(".git/info/attributes"), "* filter=evil\n").unwrap();
+        std::fs::write(repo.join("extra-attrs"), "* filter=evil\n").unwrap();
+        run_git(&[
+            "config",
+            "core.attributesFile",
+            &repo.join("extra-attrs").display().to_string(),
+        ]);
+        run_git(&[
+            "config",
+            "filter.evil.clean",
+            &filter_payload.display().to_string(),
+        ]);
+
+        let facts = gather_git_facts(&repo);
+
+        assert!(
+            !fsmonitor_marker.exists(),
+            "repo-local core.fsmonitor executed during gather_git_facts"
+        );
+        assert!(
+            !filter_marker.exists(),
+            "repo-local filter.*.clean executed during gather_git_facts"
+        );
+        assert!(facts.is_repo, "repo must still be recognized");
+        assert!(
+            facts.dirty.iter().any(|e| e.rel_path == "authn.py"),
+            "dirty reporting must still work; got {:?}",
+            facts.dirty.iter().map(|e| &e.rel_path).collect::<Vec<_>>()
+        );
     }
 }

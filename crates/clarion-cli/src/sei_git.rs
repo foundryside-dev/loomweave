@@ -5,9 +5,12 @@
 //! implement the same trait, with a shared file→locator translation:
 //!
 //! - [`ShellGitRenameSource`] — the v1 concrete supplier: shells
-//!   `git diff --name-status -M` for *file* renames and translates each into the
-//!   locator renames it implies, by substituting the renamed file's module prefix
-//!   across the current run's locator set.
+//!   `git diff --cached --name-status -M` for *file* renames and translates each
+//!   into the locator renames it implies, by substituting the renamed file's
+//!   module prefix across the current run's locator set. The `--cached` (index)
+//!   window — rather than a working-tree diff — is what keeps the probe from
+//!   executing repo-controlled filters on an untrusted corpus (clarion-4b5a8aff54);
+//!   see [`hardened_git_command`] and `ShellGitRenameSource::run_git_diff`.
 //! - [`LegisGitRenameSource`] — the WS9 supplier: reads `legis`'s
 //!   `GET /git/renames?rev_range=…` over HTTP and feeds the *same* translation,
 //!   so `legis` becomes the first external supplier with no change to the matcher
@@ -15,13 +18,16 @@
 //!
 //! ## Window mismatch (the WS9 load-bearing fact)
 //! The two suppliers observe **different rename windows**:
-//! - `ShellGitRenameSource` diffs the **working tree against `HEAD`** (`git diff -M
-//!   HEAD`, empty base) → *uncommitted* renames: the "rename a file, then
-//!   re-analyze before commit" flow `analyze` depends on today.
+//! - `ShellGitRenameSource` diffs the **staged index against `HEAD`** (`git diff
+//!   --cached -M HEAD`, empty base) → *staged-but-uncommitted* renames: the
+//!   "`git mv` a file, then re-analyze before commit" flow `analyze` depends on
+//!   today. (`--cached` rather than a worktree diff is the untrusted-corpus
+//!   hardening, clarion-4b5a8aff54; a rename only becomes a `-M` rename once
+//!   staged, so the signal is preserved.)
 //! - `legis`'s endpoint serves only **committed** renames over a rev-range
-//!   (`git log -M`). In the working-tree flow it returns empty.
+//!   (`git log -M`). In the staged-index flow it returns empty.
 //!
-//! So [`select_git_rename_source`] is **capability-aware**: for the working-tree
+//! So [`select_git_rename_source`] is **capability-aware**: for the staged-index
 //! window (empty base) the shell source is the authority regardless of `legis`;
 //! `legis` is selected only for a committed rev-range when configured AND
 //! reachable. This guarantees Clarion-with-`legis` is never *worse* than
@@ -30,13 +36,13 @@
 //! hash — so neither window choice can cause a *false* carry, only a missed one.
 //!
 //! Both windows are now driven each run by [`gather_git_renames`], which unions
-//! the working-tree window (always, shell) with the committed window
+//! the staged-index window (always, shell) with the committed window
 //! `<prior_commit>..HEAD` (`legis`-gated). `analyze` records the HEAD it analyzed
 //! on the run row (`runs.analyzed_at_commit`) and reads the prior run's commit to
 //! drive the committed window — so a `legis` configured against a repo with
 //! commits between runs is *operatively* consulted, closing the WS9 window gap
 //! formerly disclosed in `docs/federation/contracts.md`. Without `legis`, or with
-//! no prior commit, only the working-tree window runs (byte-identical to pre-WS9).
+//! no prior commit, only the staged-index window runs (enrich-only as pre-WS9).
 //!
 //! ## Scope (v1, honest framing)
 //! - Path→module translation is Python-shaped (strip the extension, drop a
@@ -46,9 +52,9 @@
 //!   (best-effort): the move case (identical body + signature) carries the load.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
+use clarion_core::hardened_git_command;
 use clarion_storage::{GitRename, GitRenameSource};
 
 /// How long to wait on a `legis` HTTP probe/read before giving up and degrading
@@ -58,7 +64,7 @@ use clarion_storage::{GitRename, GitRenameSource};
 /// bounded, not infinite. On the committed-base path the bound is *sequential* —
 /// [`legis_reachable`]'s `/health` probe then [`LegisGitRenameSource::fetch_renames`]'s
 /// read — so a dead peer degrades to empty after at most `2 × LEGIS_HTTP_TIMEOUT`.
-/// (The default working-tree path never reaches `legis` at all; see
+/// (The default staged-index path never reaches `legis` at all; see
 /// [`select_git_rename_source`].) The connection-refused degrade is covered by
 /// `legis_source_unreachable_degrades_to_empty`; the timeout-firing case is left
 /// to this by-construction bound rather than a deliberately-slow test.
@@ -82,13 +88,26 @@ impl ShellGitRenameSource {
         }
     }
 
-    /// Run `git diff --name-status -M <base>` in the repo and return its stdout,
-    /// or `None` on any failure (not a repo, git missing, non-zero exit).
+    /// Run `git diff --cached --name-status -M <base>` in the repo and return its
+    /// stdout, or `None` on any failure (not a repo, git missing, non-zero exit).
     fn run_git_diff(&self, base: &str) -> Option<String> {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&self.repo_root)
-            .args(["diff", "--name-status", "-M"])
+        // Hardened against the untrusted corpus (clarion-4b5a8aff54). `--cached`
+        // diffs the *index* against <base> and never hashes working-tree content,
+        // which is what closes the one filter-exec source the hardened command
+        // cannot (`$GIT_DIR/info/attributes`); see `hardened_git_command`. It also
+        // preserves the signal: `git mv` stages a rename, so a pre-commit
+        // re-analyze still sees it (a plain `mv` without `git add` is not a `-M`
+        // rename in any window). `--no-ext-diff`/`--no-textconv` are
+        // belt-and-suspenders over the helper's config overrides.
+        let output = hardened_git_command(&self.repo_root)
+            .args([
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--name-status",
+                "-M",
+            ])
             .arg(base)
             .output()
             .ok()?;
@@ -101,7 +120,8 @@ impl ShellGitRenameSource {
 
 impl GitRenameSource for ShellGitRenameSource {
     fn renames_since(&self, base_commit: &str) -> Vec<GitRename> {
-        // An empty base means "compare the working tree to HEAD".
+        // An empty base means "compare the staged index to HEAD" (the `--cached`
+        // window; see `run_git_diff` for why it is index- not worktree-based).
         let base = if base_commit.is_empty() {
             "HEAD"
         } else {
@@ -220,7 +240,7 @@ impl LegisGitRenameSource {
 
 impl GitRenameSource for LegisGitRenameSource {
     fn renames_since(&self, base_commit: &str) -> Vec<GitRename> {
-        // The working-tree window (empty base) is precisely what `legis`'s
+        // The staged-index window (empty base) is precisely what `legis`'s
         // committed-rev-range endpoint cannot answer. Return empty rather than
         // issue a request that can only come back empty — and so that
         // `select_git_rename_source` callers that reach here for the wrong window
@@ -309,10 +329,10 @@ fn legis_reachable(base_url: &str) -> bool {
 /// Capability-aware, enrich-only selection of the git-rename supplier (REQ-C-05,
 /// loom.md §5). `legis` is chosen ONLY when it is configured, the window is a
 /// committed rev-range (`!base.is_empty()`), AND it is reachable; in every other
-/// case — `legis` absent/unset/unreachable, or the working-tree window the shell
+/// case — `legis` absent/unset/unreachable, or the staged-index window the shell
 /// source alone can answer — the shell source is the authority. The
 /// `base.is_empty()` check short-circuits *before* any network probe, so the
-/// default working-tree path issues no HTTP and is byte-identical to pre-WS9
+/// default staged-index path issues no HTTP and is byte-identical to pre-WS9
 /// behaviour. See this module's "Window mismatch" note.
 pub(crate) fn select_git_rename_source(
     project_root: &Path,
@@ -335,9 +355,7 @@ pub(crate) fn select_git_rename_source(
 /// True if `path` is inside a git work tree (used to skip the git probe
 /// entirely on non-repo corpora, avoiding a spurious subprocess per run).
 pub(crate) fn is_git_repo(path: &Path) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(path)
+    hardened_git_command(path)
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()
         .is_ok_and(|o| o.status.success())
@@ -349,9 +367,7 @@ pub(crate) fn is_git_repo(path: &Path) -> bool {
 /// SEI §6). Fail-soft like [`is_git_repo`]: an absent SHA simply skips the
 /// committed window, never errors the run.
 pub(crate) fn git_head_sha(repo_root: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+    let output = hardened_git_command(repo_root)
         .args(["rev-parse", "HEAD"])
         .output()
         .ok()?;
@@ -364,9 +380,10 @@ pub(crate) fn git_head_sha(repo_root: &Path) -> Option<String> {
 
 /// The git-rename windows to query, in order (WS9 / SEI §6). Pure — no I/O.
 ///
-/// Always includes the **working-tree window** (`""`), which the selector routes
-/// to the shell source (`git diff -M HEAD`) and which catches *uncommitted*
-/// renames — the pre-commit re-analyze flow `analyze` depends on. THE WS9 CRUX:
+/// Always includes the **staged-index window** (`""`), which the selector routes
+/// to the shell source (`git diff --cached -M HEAD`) and which catches
+/// *staged-but-uncommitted* renames — the pre-commit re-analyze flow `analyze`
+/// depends on. THE WS9 CRUX:
 /// this window must never be handed to `legis`, whose committed-only endpoint
 /// cannot see it (see [`select_git_rename_source`]).
 ///
@@ -389,15 +406,16 @@ fn rename_windows(legis_set: bool, prior: Option<&str>, head: Option<&str>) -> V
 
 /// Gather locator renames across both windows and union them (WS9 / SEI §6).
 ///
-/// The two windows are complementary: the working tree (uncommitted renames, via
-/// the shell source) and the committed range `prior..HEAD` (committed renames,
-/// via `legis` when reachable, else a shell `git diff -M prior` fallback). The
+/// The two windows are complementary: the staged index (staged-but-uncommitted
+/// renames, via the shell source) and the committed range `prior..HEAD`
+/// (committed renames, via `legis` when reachable, else a shell
+/// `git diff --cached -M prior` fallback). The
 /// matcher is fail-closed — a rename is only a hint, confirmed by a
 /// byte-identical body hash — so an over-broad union can only *miss* a carry,
 /// never cause a false one; dedup is for tidiness, not correctness.
 ///
 /// Returns empty on a non-git corpus (no spurious subprocess). When `legis` is
-/// unset this issues exactly the one pre-WS9 working-tree call.
+/// unset this issues exactly the one pre-WS9 staged-index call.
 pub(crate) fn gather_git_renames(
     project_root: &Path,
     legis_url: Option<&str>,
@@ -428,6 +446,9 @@ pub(crate) fn gather_git_renames(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Raw `git` is fine in tests: these build a trusted fixture repo, not probe
+    // an untrusted corpus.
+    use std::process::Command;
 
     #[test]
     fn parses_rename_lines_and_ignores_others() {
@@ -594,7 +615,7 @@ mod tests {
 
     #[test]
     fn legis_source_empty_base_returns_empty_without_network() {
-        // The working-tree window: legis cannot serve it. The source must return
+        // The staged-index window: legis cannot serve it. The source must return
         // empty WITHOUT a request — proven by pointing at an unroutable address
         // that would hang/timeout if a request were issued.
         let src = LegisGitRenameSource::new(
@@ -678,7 +699,7 @@ mod tests {
     ///
     /// A working-tree (uncommitted) rename is exactly what `legis`'s committed
     /// endpoint CANNOT see — a reachable `legis` returns `[]` here. If the
-    /// selector handed the working-tree window to `legis`, the shell-detectable
+    /// selector handed the staged-index window to `legis`, the shell-detectable
     /// rename would be LOST and the entity's SEI would orphan instead of carry.
     /// The capability guard (`!base.is_empty()`) keeps the shell source for this
     /// window, so Clarion-with-`legis` is never worse than Clarion-without.
@@ -692,7 +713,7 @@ mod tests {
         std::fs::write(repo.join("auth.py"), "def login():\n    return 1\n").unwrap();
         run_git(repo, &["add", "."]);
         run_git(repo, &["commit", "-qm", "init"]);
-        // Uncommitted rename: visible to `git diff -M HEAD`, invisible to a
+        // Staged rename (`git mv`): visible to `git diff --cached -M HEAD`, invisible to a
         // committed-range query — just as a real pre-commit re-analyze would be.
         run_git(repo, &["mv", "auth.py", "authn.py"]);
 
@@ -701,7 +722,7 @@ mod tests {
         let src = select_git_rename_source(
             repo,
             Some(format!("http://{addr}")),
-            "", // the operative working-tree window
+            "", // the operative staged-index window
             vec![
                 "python:function:authn.login".to_owned(),
                 "python:module:authn".to_owned(),
@@ -744,7 +765,7 @@ mod tests {
     #[test]
     fn rename_windows_skips_committed_window_on_degenerate_base() {
         // No prior, empty prior, or prior == head (empty `base..HEAD` range) all
-        // collapse to the working-tree window — no wasted committed query/probe.
+        // collapse to the staged-index window — no wasted committed query/probe.
         assert_eq!(
             rename_windows(true, None, Some("head")),
             vec![String::new()]
@@ -763,8 +784,8 @@ mod tests {
     ///
     /// A committed rename (`auth.py→authn.py`, served by the legis mock for the
     /// `<prior>..HEAD` window) AND an *uncommitted* rename (`extra.py→extras.py`,
-    /// seen only by the shell working-tree window) must BOTH appear. A swap would
-    /// route the working-tree window to legis and drop the uncommitted one.
+    /// seen only by the shell staged-index window) must BOTH appear. A swap would
+    /// route the staged-index window to legis and drop the uncommitted one.
     #[test]
     fn gather_unions_committed_legis_and_working_tree_shell_renames() {
         let dir = tempfile::tempdir().unwrap();
@@ -782,7 +803,7 @@ mod tests {
         run_git(repo, &["commit", "-qm", "rename auth"]);
         let head = git_head_sha(repo).expect("head sha");
         // Uncommitted rename — invisible to the committed window, only the shell
-        // working-tree window can see it.
+        // staged-index window can see it.
         run_git(repo, &["mv", "extra.py", "extras.py"]);
 
         // legis mock answers the committed window with the committed rename.
@@ -821,7 +842,7 @@ mod tests {
 
     #[test]
     fn gather_without_legis_issues_only_working_tree_window() {
-        // No legis_url: only the working-tree window runs (the committed rename is
+        // No legis_url: only the staged-index window runs (the committed rename is
         // NOT picked up, proving the committed window is legis-gated and the
         // no-legis path is byte-identical to pre-WS9).
         let dir = tempfile::tempdir().unwrap();
@@ -846,7 +867,7 @@ mod tests {
         );
         assert!(
             got.is_empty(),
-            "committed rename must be invisible without legis (working-tree window only); got {got:?}"
+            "committed rename must be invisible without legis (staged-index window only); got {got:?}"
         );
     }
 
@@ -856,5 +877,121 @@ mod tests {
         // temp_dir itself is not a git repo (no .git); rev-parse HEAD fails.
         let dir = tempfile::tempdir_in(tmp).unwrap();
         assert!(git_head_sha(dir.path()).is_none());
+    }
+
+    /// Build a repo with a renamed-and-modified tracked file plus an
+    /// attacker-controlled, repo-local Git feature that points at an executable
+    /// dropper in the worktree. Returns `(tempdir, marker_path)`. The marker is
+    /// written by the dropper iff Git executes it. `set_repo_local` installs the
+    /// hostile config (and `.gitattributes` for the filter vector).
+    #[cfg(unix)]
+    fn hostile_rename_repo(
+        set_repo_local: impl FnOnce(&Path, &Path),
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        run_git(repo, &["init", "-q"]);
+        run_git(repo, &["config", "user.email", "t@t"]);
+        run_git(repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("auth.py"), "def login():\n    return 1\n").unwrap();
+        run_git(repo, &["add", "."]);
+        run_git(repo, &["commit", "-qm", "init"]);
+        // `git mv` stages a rename AND mutates the file's stat, forcing Git to
+        // re-hash working-tree content on the next diff — the condition a clean
+        // filter needs to fire. This is the working-tree rename window itself.
+        run_git(repo, &["mv", "auth.py", "authn.py"]);
+        std::fs::write(repo.join("authn.py"), "def login():\n    return 2\n").unwrap();
+
+        let marker = repo.join("PAYLOAD_FIRED");
+        let payload = repo.join("payload.sh");
+        // `cat` so the script is a valid clean filter (passes content through).
+        std::fs::write(
+            &payload,
+            format!("#!/bin/sh\necho fired > {}\ncat\n", marker.display()),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&payload).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&payload, perms).unwrap();
+
+        set_repo_local(repo, &payload);
+        (dir, marker)
+    }
+
+    /// REGRESSION (clarion-4b5a8aff54): a repo-local `core.fsmonitor` program
+    /// must not execute when the rename source shells `git diff` against an
+    /// untrusted corpus, and the rename must still be detected.
+    #[cfg(unix)]
+    #[test]
+    fn shell_rename_source_does_not_execute_repo_fsmonitor() {
+        let (dir, marker) = hostile_rename_repo(|repo, payload| {
+            run_git(
+                repo,
+                &["config", "core.fsmonitor", &payload.display().to_string()],
+            );
+        });
+        let got = ShellGitRenameSource::new(
+            dir.path().to_path_buf(),
+            vec!["python:module:authn".to_owned()],
+        )
+        .renames_since("");
+        assert!(
+            !marker.exists(),
+            "repo-local core.fsmonitor executed during the git rename probe"
+        );
+        assert!(
+            got.contains(&GitRename {
+                old_locator: "python:module:auth".to_owned(),
+                new_locator: "python:module:authn".to_owned(),
+            }),
+            "hardened git diff must still detect the rename; got {got:?}"
+        );
+    }
+
+    /// REGRESSION (clarion-4b5a8aff54): a repo-local `filter.<name>.clean` must
+    /// not execute regardless of WHICH attribute source selects it. This arms all
+    /// four sources at once — in-tree `.gitattributes`, `$GIT_DIR/info/attributes`
+    /// (which NO config flag can disable), and `core.attributesFile` — plus
+    /// `core.fsmonitor`. The diff is safe because it never hashes working-tree
+    /// content (`--cached`), so no source can select an executing filter.
+    #[cfg(unix)]
+    #[test]
+    fn shell_rename_source_does_not_execute_repo_clean_filter_from_any_attr_source() {
+        let (dir, marker) = hostile_rename_repo(|repo, payload| {
+            let cmd = payload.display().to_string();
+            // Three independent attribute sources, each assigning `filter=evil`.
+            std::fs::write(repo.join(".gitattributes"), "* filter=evil\n").unwrap();
+            std::fs::write(repo.join(".git/info/attributes"), "* filter=evil\n").unwrap();
+            std::fs::write(repo.join("extra-attrs"), "* filter=evil\n").unwrap();
+            run_git(
+                repo,
+                &[
+                    "config",
+                    "core.attributesFile",
+                    &repo.join("extra-attrs").display().to_string(),
+                ],
+            );
+            run_git(repo, &["config", "filter.evil.clean", &cmd]);
+            // And the fsmonitor program, for good measure.
+            run_git(repo, &["config", "core.fsmonitor", &cmd]);
+        });
+        let got = ShellGitRenameSource::new(
+            dir.path().to_path_buf(),
+            vec!["python:module:authn".to_owned()],
+        )
+        .renames_since("");
+        assert!(
+            !marker.exists(),
+            "a repo-controlled filter/fsmonitor executed during the git rename probe"
+        );
+        assert!(
+            got.contains(&GitRename {
+                old_locator: "python:module:auth".to_owned(),
+                new_locator: "python:module:authn".to_owned(),
+            }),
+            "hardened git diff must still detect the staged rename; got {got:?}"
+        );
     }
 }
