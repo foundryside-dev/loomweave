@@ -3,6 +3,15 @@
 This module deliberately reads descriptor files without importing Wardline.
 Wardline remains authoritative for the vocabulary; Clarion records only the
 source-observed decorator facts it can derive from that descriptor.
+
+Two contract details below (``PROJECT_DESCRIPTOR_PATH`` and the descriptor
+``version`` semantics) are Clarion-side assumptions pending Wardline's
+"Pre-Rust core hardening" Task B, which has not yet published the canonical
+project-local descriptor location or the ``schema: wardline.vocabulary/v1``
+format-version field. The parser ignores unknown top-level keys, so a future
+``schema`` field is tolerated without change; acting on it (format-version
+compatibility decisions) is deferred until Task B pins the contract. Confirm
+both assumptions against the Wardline descriptor ADR when it lands.
 """
 
 from __future__ import annotations
@@ -14,6 +23,8 @@ from typing import Any, Literal, cast
 
 import yaml
 
+# PO-confirm against Wardline Task B (descriptor ADR) — canonical project-local
+# location and descriptor-version semantics are not yet pinned by Wardline.
 EXPECTED_DESCRIPTOR_VERSION = "wardline-generic-2"
 PROJECT_DESCRIPTOR_PATH = Path(".wardline/vocabulary.yaml")
 
