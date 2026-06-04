@@ -43,10 +43,14 @@ pub fn pack_fingerprint() -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// The two skill roots Clarion installs into, relative to the project root.
-/// `.claude/skills/` is read by Claude Code; `.agents/skills/` is the
-/// tool-agnostic convention so non-Claude agent harnesses find it too.
-const SKILL_ROOTS: &[&str] = &[".claude/skills", ".agents/skills"];
+/// The Claude Code skill root, relative to the project root.
+const CLAUDE_SKILL_ROOT: &str = ".claude/skills";
+
+/// The Codex / tool-agnostic skill root, relative to the project root.
+const CODEX_SKILL_ROOT: &str = ".agents/skills";
+
+/// The two skill roots Clarion can install into, relative to the project root.
+const SKILL_ROOTS: &[&str] = &[CLAUDE_SKILL_ROOT, CODEX_SKILL_ROOT];
 
 const FINGERPRINT_FILE: &str = ".fingerprint";
 
@@ -76,9 +80,23 @@ pub struct SkillInstallReport {
 ///
 /// Returns an error if any directory create, temp write, or rename fails.
 pub fn install_skill_pack(project_root: &Path) -> Result<SkillInstallReport> {
+    install_skill_pack_into(project_root, SKILL_ROOTS)
+}
+
+/// Install the embedded skill pack into Claude Code's `.claude/skills/` root.
+pub fn install_claude_skill_pack(project_root: &Path) -> Result<SkillInstallReport> {
+    install_skill_pack_into(project_root, &[CLAUDE_SKILL_ROOT])
+}
+
+/// Install the embedded skill pack into Codex's `.agents/skills/` root.
+pub fn install_codex_skill_pack(project_root: &Path) -> Result<SkillInstallReport> {
+    install_skill_pack_into(project_root, &[CODEX_SKILL_ROOT])
+}
+
+fn install_skill_pack_into(project_root: &Path, roots: &[&str]) -> Result<SkillInstallReport> {
     let fingerprint = pack_fingerprint();
     let mut copied = false;
-    for root_rel in SKILL_ROOTS {
+    for root_rel in roots {
         let root = project_root.join(root_rel);
         let dest = root.join(PACK_DIR_NAME);
         if installed_fingerprint(&dest).as_deref() == Some(fingerprint.as_str()) {

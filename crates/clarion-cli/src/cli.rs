@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "clarion", version, about = "Clarion code-archaeology tool")]
@@ -13,10 +13,11 @@ pub struct Cli {
 pub enum Command {
     /// Initialise .clarion/ and install agent-orientation assets.
     ///
-    /// Bare `clarion install` does everything: .clarion/ init + skills + hooks.
-    /// If .clarion/ already exists, init is skipped and skills/hooks are applied
-    /// idempotently. `--skills` and `--hooks` install only the named components
-    /// without touching .clarion/. `--all` is equivalent to a bare install.
+    /// Bare `clarion install` does everything: .clarion/ init, Claude Code MCP,
+    /// Codex MCP, Claude/Codex skills, and hooks. If .clarion/ already exists,
+    /// init is skipped and the other components are applied idempotently.
+    /// Component flags install only the named components without touching
+    /// .clarion/. `--all` is equivalent to a bare install.
     Install {
         /// Overwrite an existing .clarion/ directory.
         #[arg(long)]
@@ -26,16 +27,32 @@ pub enum Command {
         #[arg(long, default_value = ".")]
         path: PathBuf,
 
-        /// Install the bundled clarion-workflow skill pack into
-        /// .claude/skills/ and .agents/skills/.
+        /// Install MCP config for Claude Code only.
+        #[arg(long)]
+        claude_code: bool,
+
+        /// Install MCP config for Codex only.
+        #[arg(long)]
+        codex: bool,
+
+        /// Path to Codex config.toml. Hidden; tests use this to avoid writing
+        /// the real user-level ~/.codex/config.toml.
+        #[arg(long, hide = true)]
+        codex_config: Option<PathBuf>,
+
+        /// Install the bundled clarion-workflow skill pack into .claude/skills/.
         #[arg(long)]
         skills: bool,
+
+        /// Install the bundled clarion-workflow skill pack into .agents/skills/.
+        #[arg(long)]
+        codex_skills: bool,
 
         /// Merge a `SessionStart` hook into .claude/settings.json.
         #[arg(long)]
         hooks: bool,
 
-        /// Do everything: .clarion/ init + --skills + --hooks.
+        /// Do everything: .clarion/ init + MCP config + skills + hooks.
         #[arg(long)]
         all: bool,
     },
@@ -165,6 +182,10 @@ pub enum Command {
         /// only reports.
         #[arg(long)]
         fix: bool,
+
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = DoctorOutputFormat::Text)]
+        format: DoctorOutputFormat,
     },
 
     /// Import external findings in SARIF format and post them to Filigree.
@@ -172,6 +193,12 @@ pub enum Command {
         #[command(subcommand)]
         command: SarifCommand,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DoctorOutputFormat {
+    Text,
+    Json,
 }
 
 #[derive(Subcommand)]

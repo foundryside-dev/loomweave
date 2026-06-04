@@ -1,15 +1,23 @@
-//! `clarion install --skills/--hooks/--all` integration tests.
+//! `clarion install --skills/--codex-skills/--hooks/--all` integration tests.
 
 use std::fs;
 
 use assert_cmd::Command;
 
 fn clarion_bin() -> Command {
-    Command::cargo_bin("clarion").expect("clarion binary")
+    let mut cmd = Command::cargo_bin("clarion").expect("clarion binary");
+    cmd.env(
+        "CLARION_CODEX_CONFIG",
+        std::env::temp_dir().join(format!(
+            "clarion-test-codex-config-{}.toml",
+            std::process::id()
+        )),
+    );
+    cmd
 }
 
 #[test]
-fn install_skills_writes_pack_without_initialising_clarion_dir() {
+fn install_skills_writes_claude_pack_without_initialising_clarion_dir() {
     let dir = tempfile::tempdir().unwrap();
     clarion_bin()
         .args(["install", "--skills", "--path"])
@@ -24,15 +32,42 @@ fn install_skills_writes_pack_without_initialising_clarion_dir() {
         "skill not installed under .claude"
     );
     assert!(
-        dir.path()
+        !dir.path()
             .join(".agents/skills/clarion-workflow/SKILL.md")
             .exists(),
-        "skill not installed under .agents"
+        "--skills should not install Codex skills under .agents"
     );
     // --skills MUST NOT init .clarion/.
     assert!(
         !dir.path().join(".clarion").exists(),
         "--skills should not create .clarion/"
+    );
+}
+
+#[test]
+fn install_codex_skills_writes_agents_pack_without_initialising_clarion_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    clarion_bin()
+        .args(["install", "--codex-skills", "--path"])
+        .arg(dir.path())
+        .assert()
+        .success();
+
+    assert!(
+        !dir.path()
+            .join(".claude/skills/clarion-workflow/SKILL.md")
+            .exists(),
+        "--codex-skills should not install Claude skills under .claude"
+    );
+    assert!(
+        dir.path()
+            .join(".agents/skills/clarion-workflow/SKILL.md")
+            .exists(),
+        "Codex skill not installed under .agents"
+    );
+    assert!(
+        !dir.path().join(".clarion").exists(),
+        "--codex-skills should not create .clarion/"
     );
 }
 
@@ -103,10 +138,21 @@ fn install_all_does_init_skills_and_hooks() {
         dir.path()
             .join(".claude/skills/clarion-workflow/SKILL.md")
             .exists(),
-        "no skill"
+        "no Claude skill"
+    );
+    assert!(
+        dir.path()
+            .join(".agents/skills/clarion-workflow/SKILL.md")
+            .exists(),
+        "no Codex skill"
     );
     let raw = fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
     assert!(raw.contains("clarion hook session-start"), "no hook: {raw}");
+    let mcp_raw = fs::read_to_string(dir.path().join(".mcp.json")).unwrap();
+    assert!(
+        mcp_raw.contains("\"clarion\""),
+        "no Claude Code MCP entry: {mcp_raw}"
+    );
 }
 
 #[test]

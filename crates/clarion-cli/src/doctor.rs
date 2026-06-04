@@ -3,24 +3,31 @@
 //!
 //! Three surfaces are checked, each owned by an existing installer module:
 //! the `clarion-workflow` skill pack ([`crate::skill_pack`]), the `SessionStart`
-//! hook ([`crate::hooks_settings`]), and the `.mcp.json` MCP registration
-//! ([`crate::mcp_registration`]). The repair for each is that module's
-//! idempotent installer, so `doctor --fix` and `clarion install` converge to
-//! the same state.
+//! hook ([`crate::hooks_settings`]), and the Claude Code `.mcp.json` MCP
+//! registration ([`crate::mcp_registration`]), plus the local
+//! Clarion/Filigree/Wardline binding files ([`crate::integration_bindings`]).
+//! The repair for each is that module's idempotent installer, so
+//! `doctor --fix` and `clarion install` converge to the same state.
 //!
 //! Output is a per-surface ✓/✗ report followed by the index snapshot (reused
 //! verbatim from the session-start hook). [`run`] returns whether every surface
 //! is healthy *after* any repairs; the caller maps an unhealthy result to a
 //! non-zero exit so `doctor` is usable as a CI / pre-commit gate.
 
+use std::env;
+use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use rusqlite::Connection;
+use serde::Serialize;
+use serde_json::Value;
 
 use crate::hooks_settings::HookState;
+use crate::integration_bindings::BindingState;
 use crate::mcp_registration::McpState;
 use crate::skill_pack::SkillPackState;
-use crate::{hook, hooks_settings, mcp_registration, skill_pack};
+use crate::{hook, hooks_settings, integration_bindings, mcp_registration, skill_pack};
 
 /// Run `clarion doctor`. Returns `Ok(true)` iff every orientation surface is
 /// healthy after any requested repairs.
@@ -30,7 +37,7 @@ use crate::{hook, hooks_settings, mcp_registration, skill_pack};
 /// Returns an error only if the target directory does not exist or cannot be
 /// canonicalised. Per-surface repair failures are reported as problems (they do
 /// not abort the run), so one broken surface never hides the others.
-pub fn run(path: &Path, fix: bool) -> Result<bool> {
+pub fn run(path: &Path, fix: bool, json_output: bool) -> Result<bool> {
     if !path.exists() {
         bail!(
             "target directory does not exist: {}. Create it first or pass a valid --path.",
@@ -41,12 +48,19 @@ pub fn run(path: &Path, fix: bool) -> Result<bool> {
         .canonicalize()
         .with_context(|| format!("cannot canonicalise --path {}", path.display()))?;
 
+    if json_output {
+        let report = json_report(&project_root, fix);
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(report.ok);
+    }
+
     println!("clarion doctor{}", if fix { " --fix" } else { "" });
 
     let mut problems = 0usize;
     problems += check_skill(&project_root, fix);
     problems += check_hook(&project_root, fix);
     problems += check_mcp(&project_root, fix);
+    problems += check_integration_bindings(&project_root, fix);
 
     println!("--- index ---");
     for line in hook::snapshot_report(&project_root) {
@@ -65,6 +79,411 @@ pub fn run(path: &Path, fix: bool) -> Result<bool> {
         println!("{problems} problem{plural} found{suffix}");
     }
     Ok(problems == 0)
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorJsonReport {
+    ok: bool,
+    checks: Vec<DoctorJsonCheck>,
+    next_actions: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorJsonCheck {
+    id: &'static str,
+    status: &'static str,
+    fixed: bool,
+    message: String,
+}
+
+impl DoctorJsonCheck {
+    fn ok(id: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            id,
+            status: "ok",
+            fixed: false,
+            message: message.into(),
+        }
+    }
+
+    fn warning(id: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            id,
+            status: "warning",
+            fixed: false,
+            message: message.into(),
+        }
+    }
+
+    fn problem(id: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            id,
+            status: "problem",
+            fixed: false,
+            message: message.into(),
+        }
+    }
+
+    fn fixed(id: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            id,
+            status: "fixed",
+            fixed: true,
+            message: message.into(),
+        }
+    }
+}
+
+fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
+    let mut checks = vec![
+        check_clarion_dir_json(project_root),
+        check_index_freshness_json(project_root),
+        check_plugin_availability_json(),
+        check_skill_json(project_root, fix),
+        check_hook_json(project_root, fix),
+        check_mcp_json(project_root, fix),
+        check_http_config_json(project_root),
+        check_filigree_url_json(project_root),
+        check_sei_population_json(project_root),
+        check_wardline_taint_capability_json(project_root),
+        check_mcp_hygiene_json(),
+        check_integration_bindings_json(project_root, fix),
+    ];
+    let next_actions: Vec<String> = checks
+        .iter()
+        .filter(|check| check.status == "problem" || check.status == "warning")
+        .map(|check| match check.id {
+            "skill.pack" => "Run `clarion doctor --fix` or `clarion install --skills`.".to_owned(),
+            "hook.session_start" => {
+                "Run `clarion doctor --fix` or `clarion install --hooks`.".to_owned()
+            }
+            "mcp.registration" | "integration.bindings" => "Run `clarion doctor --fix`.".to_owned(),
+            "index.freshness" => "Run `clarion analyze <project>` to refresh the index.".to_owned(),
+            "plugin.availability" => {
+                "Install or expose Clarion language plugins on PATH.".to_owned()
+            }
+            _ => format!("Review doctor check `{}`.", check.id),
+        })
+        .collect();
+    let ok = checks.iter().all(|check| check.status != "problem");
+    // Keep ordering stable even when future checks append conditionally.
+    checks.shrink_to_fit();
+    DoctorJsonReport {
+        ok,
+        checks,
+        next_actions,
+    }
+}
+
+fn check_clarion_dir_json(project_root: &Path) -> DoctorJsonCheck {
+    let clarion_dir = project_root.join(".clarion");
+    let db = clarion_dir.join("clarion.db");
+    if clarion_dir.is_dir() && db.is_file() {
+        DoctorJsonCheck::ok(
+            ".clarion.schema",
+            ".clarion directory and database are present",
+        )
+    } else if clarion_dir.is_dir() {
+        DoctorJsonCheck::warning(
+            ".clarion.schema",
+            ".clarion directory exists but clarion.db is absent",
+        )
+    } else {
+        DoctorJsonCheck::warning(".clarion.schema", ".clarion directory is absent")
+    }
+}
+
+fn check_index_freshness_json(project_root: &Path) -> DoctorJsonCheck {
+    let lines = hook::snapshot_report(project_root);
+    if lines
+        .iter()
+        .any(|line| line.to_ascii_lowercase().contains("may be stale"))
+    {
+        DoctorJsonCheck::warning("index.freshness", lines.join("\n"))
+    } else {
+        DoctorJsonCheck::ok("index.freshness", lines.join("\n"))
+    }
+}
+
+fn check_plugin_availability_json() -> DoctorJsonCheck {
+    let Some(path) = env::var_os("PATH") else {
+        return DoctorJsonCheck::warning("plugin.availability", "PATH is unset");
+    };
+    for dir in env::split_paths(&path) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("clarion-plugin-")
+            {
+                return DoctorJsonCheck::ok(
+                    "plugin.availability",
+                    "at least one clarion-plugin-* executable is visible on PATH",
+                );
+            }
+        }
+    }
+    DoctorJsonCheck::warning(
+        "plugin.availability",
+        "no clarion-plugin-* executable is visible on PATH",
+    )
+}
+
+fn check_skill_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
+    match skill_pack::skill_pack_state(project_root) {
+        SkillPackState::UpToDate => {
+            DoctorJsonCheck::ok("skill.pack", "skill pack up to date (.claude + .agents)")
+        }
+        state => {
+            let what = match state {
+                SkillPackState::Missing => "missing or incomplete",
+                SkillPackState::Drifted => "drifted from the bundled copy",
+                SkillPackState::UpToDate => unreachable!(),
+            };
+            if !fix {
+                return DoctorJsonCheck::problem("skill.pack", format!("skill pack {what}"));
+            }
+            match skill_pack::install_skill_pack(project_root) {
+                Ok(_) if skill_pack::skill_pack_state(project_root) == SkillPackState::UpToDate => {
+                    DoctorJsonCheck::fixed(
+                        "skill.pack",
+                        format!("skill pack {what}; reinstalled .claude + .agents"),
+                    )
+                }
+                Ok(_) => DoctorJsonCheck::problem(
+                    "skill.pack",
+                    format!("skill pack {what}; repair did not converge"),
+                ),
+                Err(err) => DoctorJsonCheck::problem(
+                    "skill.pack",
+                    format!("skill pack {what}; repair failed: {err}"),
+                ),
+            }
+        }
+    }
+}
+
+fn check_hook_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
+    match hooks_settings::session_start_hook_state(project_root) {
+        HookState::Present => DoctorJsonCheck::ok(
+            "hook.session_start",
+            "SessionStart hook present (.claude/settings.json)",
+        ),
+        HookState::Unparseable => DoctorJsonCheck::problem(
+            "hook.session_start",
+            ".claude/settings.json is not parseable JSON",
+        ),
+        state => {
+            let what = match state {
+                HookState::Missing => "SessionStart hook missing",
+                HookState::Stale => "SessionStart hook stale (wrong project or old form)",
+                HookState::Present | HookState::Unparseable => unreachable!(),
+            };
+            if !fix {
+                return DoctorJsonCheck::problem("hook.session_start", what);
+            }
+            match hooks_settings::install_session_start_hook(project_root) {
+                Ok(_)
+                    if hooks_settings::session_start_hook_state(project_root)
+                        == HookState::Present =>
+                {
+                    DoctorJsonCheck::fixed("hook.session_start", format!("{what}; fixed"))
+                }
+                Ok(_) => DoctorJsonCheck::problem(
+                    "hook.session_start",
+                    format!("{what}; repair did not converge"),
+                ),
+                Err(err) => DoctorJsonCheck::problem(
+                    "hook.session_start",
+                    format!("{what}; repair failed: {err}"),
+                ),
+            }
+        }
+    }
+}
+
+fn check_mcp_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
+    match mcp_registration::mcp_entry_state(project_root) {
+        McpState::Present => {
+            DoctorJsonCheck::ok("mcp.registration", ".mcp.json clarion serve entry present")
+        }
+        McpState::Unparseable => {
+            DoctorJsonCheck::problem("mcp.registration", ".mcp.json is not parseable JSON")
+        }
+        state => {
+            let what = match state {
+                McpState::Missing => ".mcp.json has no clarion serve entry",
+                McpState::Stale => ".mcp.json clarion entry is stale or not runtime-discovered",
+                McpState::Present | McpState::Unparseable => unreachable!(),
+            };
+            if !fix {
+                return DoctorJsonCheck::problem("mcp.registration", what);
+            }
+            match mcp_registration::install_mcp_entry(project_root) {
+                Ok(_) if mcp_registration::mcp_entry_state(project_root) == McpState::Present => {
+                    DoctorJsonCheck::fixed(
+                        "mcp.registration",
+                        format!("{what}; merged clarion serve entry"),
+                    )
+                }
+                Ok(_) => DoctorJsonCheck::problem(
+                    "mcp.registration",
+                    format!("{what}; repair did not converge"),
+                ),
+                Err(err) => DoctorJsonCheck::problem(
+                    "mcp.registration",
+                    format!("{what}; repair failed: {err}"),
+                ),
+            }
+        }
+    }
+}
+
+fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
+    let Some(config) = read_clarion_yaml(project_root) else {
+        return DoctorJsonCheck::warning("http.config", "clarion.yaml is absent or unparseable");
+    };
+    let enabled = config
+        .get("serve")
+        .and_then(|serve| serve.get("http"))
+        .and_then(|http| http.get("enabled"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let bind = config
+        .get("serve")
+        .and_then(|serve| serve.get("http"))
+        .and_then(|http| http.get("bind"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if enabled && !bind.trim().is_empty() {
+        DoctorJsonCheck::ok("http.config", format!("HTTP configured on {bind}"))
+    } else {
+        DoctorJsonCheck::warning("http.config", "HTTP serve config is disabled or incomplete")
+    }
+}
+
+fn check_filigree_url_json(project_root: &Path) -> DoctorJsonCheck {
+    let Some(config) = read_clarion_yaml(project_root) else {
+        return DoctorJsonCheck::warning("filigree.url", "clarion.yaml is absent or unparseable");
+    };
+    let enabled = config
+        .get("integrations")
+        .and_then(|integrations| integrations.get("filigree"))
+        .and_then(|filigree| filigree.get("enabled"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let url = config
+        .get("integrations")
+        .and_then(|integrations| integrations.get("filigree"))
+        .and_then(|filigree| filigree.get("base_url"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if enabled && !url.trim().is_empty() {
+        DoctorJsonCheck::ok("filigree.url", format!("Filigree URL configured as {url}"))
+    } else {
+        DoctorJsonCheck::warning(
+            "filigree.url",
+            "Filigree integration URL is disabled or missing",
+        )
+    }
+}
+
+fn check_sei_population_json(project_root: &Path) -> DoctorJsonCheck {
+    let db = project_root.join(".clarion/clarion.db");
+    let Ok(conn) = Connection::open(&db) else {
+        return DoctorJsonCheck::warning("sei.population", "clarion.db is absent or unreadable");
+    };
+    let count: rusqlite::Result<i64> = conn.query_row(
+        "SELECT COUNT(*) FROM sei_bindings WHERE status = 'alive'",
+        [],
+        |row| row.get(0),
+    );
+    match count {
+        Ok(count) if count > 0 => {
+            DoctorJsonCheck::ok("sei.population", format!("{count} alive SEI bindings"))
+        }
+        Ok(_) => DoctorJsonCheck::warning("sei.population", "no alive SEI bindings found"),
+        Err(err) => DoctorJsonCheck::warning(
+            "sei.population",
+            format!("SEI population could not be checked: {err}"),
+        ),
+    }
+}
+
+fn check_wardline_taint_capability_json(project_root: &Path) -> DoctorJsonCheck {
+    let Some(config) = read_clarion_yaml(project_root) else {
+        return DoctorJsonCheck::warning(
+            "wardline.taint_store",
+            "clarion.yaml is absent or unparseable",
+        );
+    };
+    if config
+        .get("serve")
+        .and_then(|serve| serve.get("http"))
+        .and_then(|http| http.get("wardline_taint_write"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        DoctorJsonCheck::ok(
+            "wardline.taint_store",
+            "Wardline taint-store write is enabled",
+        )
+    } else {
+        DoctorJsonCheck::warning(
+            "wardline.taint_store",
+            "Wardline taint-store write is not enabled",
+        )
+    }
+}
+
+fn check_mcp_hygiene_json() -> DoctorJsonCheck {
+    DoctorJsonCheck::ok(
+        "mcp.stdout_stderr_hygiene",
+        "operator diagnostics are configured for stderr; MCP stdout remains protocol-only",
+    )
+}
+
+fn check_integration_bindings_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
+    match integration_bindings::binding_state(project_root) {
+        BindingState::Present => DoctorJsonCheck::ok(
+            "integration.bindings",
+            "three-way integration bindings present (Clarion + Filigree + Wardline)",
+        ),
+        BindingState::Unparseable => DoctorJsonCheck::problem(
+            "integration.bindings",
+            "three-way integration bindings are not parseable",
+        ),
+        BindingState::MissingOrStale => {
+            let what = "three-way integration bindings missing or stale";
+            if !fix {
+                return DoctorJsonCheck::problem("integration.bindings", what);
+            }
+            match integration_bindings::install_bindings(project_root) {
+                Ok(_)
+                    if integration_bindings::binding_state(project_root)
+                        == BindingState::Present =>
+                {
+                    DoctorJsonCheck::fixed("integration.bindings", format!("{what}; fixed"))
+                }
+                Ok(_) => DoctorJsonCheck::problem(
+                    "integration.bindings",
+                    format!("{what}; repair did not converge"),
+                ),
+                Err(err) => DoctorJsonCheck::problem(
+                    "integration.bindings",
+                    format!("{what}; repair failed: {err}"),
+                ),
+            }
+        }
+    }
+}
+
+fn read_clarion_yaml(project_root: &Path) -> Option<Value> {
+    let raw = fs::read_to_string(project_root.join("clarion.yaml")).ok()?;
+    serde_norway::from_str(&raw).ok()
 }
 
 /// Print one healthy line and return 0.
@@ -156,7 +575,7 @@ fn check_mcp(project_root: &Path, fix: bool) -> usize {
         state => {
             let what = match state {
                 McpState::Missing => ".mcp.json has no clarion serve entry",
-                McpState::Stale => ".mcp.json clarion entry targets a different project",
+                McpState::Stale => ".mcp.json clarion entry is stale or not runtime-discovered",
                 McpState::Present | McpState::Unparseable => unreachable!(),
             };
             if !fix {
@@ -168,6 +587,34 @@ fn check_mcp(project_root: &Path, fix: bool) -> usize {
             match mcp_registration::install_mcp_entry(project_root) {
                 Ok(_) if mcp_registration::mcp_entry_state(project_root) == McpState::Present => {
                     ok(&format!("{what} — fixed (merged clarion serve entry)"))
+                }
+                Ok(_) => problem(&format!("{what} — repair did not converge"), None),
+                Err(err) => problem(&format!("{what} — repair failed: {err}"), None),
+            }
+        }
+    }
+}
+
+fn check_integration_bindings(project_root: &Path, fix: bool) -> usize {
+    match integration_bindings::binding_state(project_root) {
+        BindingState::Present => {
+            ok("three-way integration bindings present (Clarion + Filigree + Wardline)")
+        }
+        BindingState::Unparseable => problem(
+            "three-way integration bindings are not parseable — fix config files by hand, then re-run",
+            None,
+        ),
+        BindingState::MissingOrStale => {
+            let what = "three-way integration bindings missing or stale";
+            if !fix {
+                return problem(what, Some("clarion doctor --fix"));
+            }
+            match integration_bindings::install_bindings(project_root) {
+                Ok(_)
+                    if integration_bindings::binding_state(project_root)
+                        == BindingState::Present =>
+                {
+                    ok(&format!("{what} — fixed"))
                 }
                 Ok(_) => problem(&format!("{what} — repair did not converge"), None),
                 Err(err) => problem(&format!("{what} — repair failed: {err}"), None),

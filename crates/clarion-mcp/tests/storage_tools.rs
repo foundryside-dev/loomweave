@@ -712,6 +712,8 @@ struct FakeFiligreeClient {
     detail_calls: Mutex<Vec<String>>,
     /// Wardline findings returned by `wardline_findings_for_path`.
     wardline_findings: Mutex<Vec<WardlineFinding>>,
+    /// Paths requested through `wardline_findings_for_path`.
+    wardline_path_calls: Mutex<Vec<String>>,
     /// When true, `wardline_findings_for_path` returns an `HttpStatus` 503 error.
     wardline_error: Mutex<bool>,
     created_observations: Mutex<Vec<ObservationCreateRequest>>,
@@ -771,6 +773,13 @@ impl FakeFiligreeClient {
             .clone()
     }
 
+    fn wardline_path_calls(&self) -> Vec<String> {
+        self.wardline_path_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     fn dismissed_observations(&self) -> Vec<String> {
         self.dismissed_observations
             .lock()
@@ -814,8 +823,12 @@ impl FiligreeLookup for FakeFiligreeClient {
 
     fn wardline_findings_for_path(
         &self,
-        _path: &str,
+        path: &str,
     ) -> Result<Vec<WardlineFinding>, FiligreeClientError> {
+        self.wardline_path_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(path.to_owned());
         if *self
             .wardline_error
             .lock()
@@ -1265,6 +1278,113 @@ async fn issues_for_includes_contained_entities_and_flags_drift() {
         client
             .calls()
             .contains(&"python:function:demo.mid".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn issues_for_queries_sei_before_locator_and_aliases_match_to_current_entity() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "INSERT INTO sei_bindings (
+            sei, current_locator, body_hash, signature, status,
+            born_run_id, updated_run_id, updated_at
+         ) VALUES (
+            'clarion:eid:demo-entry', 'python:function:demo.entry',
+            'hash-entry', NULL, 'alive', 'run-1', 'run-1',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        [],
+    )
+    .expect("insert alive SEI binding");
+    drop(conn);
+    let client = Arc::new(FakeFiligreeClient::default().with_response(
+        "clarion:eid:demo-entry",
+        vec![association(
+            "filigree-sei",
+            "clarion:eid:demo-entry",
+            &expected_content_hash(project.path(), "python:function:demo.entry"),
+        )],
+    ));
+    let state = state_for_filigree(project.path(), &db_path, client.clone());
+
+    let envelope = call_tool(
+        &state,
+        "issues_for",
+        json!({"id": "python:function:demo.entry", "include_contained": false}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["result"]["result_kind"], "matched", "{envelope}");
+    let matched = &envelope["result"]["matched"][0];
+    assert_eq!(matched["issue_id"], "filigree-sei");
+    assert_eq!(matched["entity_id"], "python:function:demo.entry");
+    assert_eq!(matched["association_entity_id"], "clarion:eid:demo-entry");
+    assert_eq!(matched["entity"]["sei"], "clarion:eid:demo-entry");
+    assert_eq!(
+        client.calls(),
+        vec![
+            "clarion:eid:demo-entry".to_owned(),
+            "python:function:demo.entry".to_owned()
+        ],
+        "SEI should be queried before locator fallback"
+    );
+}
+
+#[tokio::test]
+async fn issues_for_dedupes_same_issue_returned_by_sei_and_locator() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "INSERT INTO sei_bindings (
+            sei, current_locator, body_hash, signature, status,
+            born_run_id, updated_run_id, updated_at
+         ) VALUES (
+            'clarion:eid:demo-entry', 'python:function:demo.entry',
+            'hash-entry', NULL, 'alive', 'run-1', 'run-1',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        [],
+    )
+    .expect("insert alive SEI binding");
+    drop(conn);
+    let hash = expected_content_hash(project.path(), "python:function:demo.entry");
+    let client = Arc::new(
+        FakeFiligreeClient::default()
+            .with_response(
+                "clarion:eid:demo-entry",
+                vec![association(
+                    "filigree-same",
+                    "clarion:eid:demo-entry",
+                    &hash,
+                )],
+            )
+            .with_response(
+                "python:function:demo.entry",
+                vec![association(
+                    "filigree-same",
+                    "python:function:demo.entry",
+                    &hash,
+                )],
+            ),
+    );
+    let state = state_for_filigree(project.path(), &db_path, client);
+
+    let envelope = call_tool(
+        &state,
+        "issues_for",
+        json!({"id": "python:function:demo.entry", "include_contained": false}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    let matched = envelope["result"]["matched"].as_array().unwrap();
+    assert_eq!(matched.len(), 1, "same issue must be deduped: {envelope}");
+    assert_eq!(matched[0]["issue_id"], "filigree-same");
+    assert_eq!(
+        matched[0]["association_entity_id"],
+        "clarion:eid:demo-entry"
     );
 }
 
@@ -4854,6 +4974,55 @@ async fn issues_for_attaches_exact_wardline_findings() {
     assert_eq!(
         section["omitted_no_qualname"], 1,
         "one finding had no qualname"
+    );
+}
+
+#[tokio::test]
+async fn issues_for_normalizes_absolute_source_path_before_wardline_lookup() {
+    let (project, db_path) = open_project();
+    fs::create_dir_all(project.path().join("src")).expect("create src dir");
+    let source_path = project.path().join("src/demo.py");
+    fs::write(&source_path, "def hello():\n    pass\n").expect("write source file");
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, parent_id, source_file_path,
+            source_line_start, source_line_end, properties, content_hash,
+            created_at, updated_at
+         ) VALUES (
+            'python:function:demo.hello', 'python', 'function',
+            'python:function:demo.hello', 'demo.hello', NULL,
+            ?1, 1, 3, '{}', 'fake-hash-wf-test',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        [source_path.to_string_lossy().as_ref()],
+    )
+    .expect("insert demo.hello entity with absolute source path");
+    drop(conn);
+
+    let client = Arc::new(
+        FakeFiligreeClient::default()
+            .with_wardline_findings(vec![wf("demo.hello", "WLN-TAINT-001")]),
+    );
+    let state = state_for_filigree(project.path(), &db_path, client.clone());
+
+    let envelope = call_tool(
+        &state,
+        "issues_for",
+        json!({"id": "python:function:demo.hello", "include_contained": false}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(
+        client.wardline_path_calls(),
+        vec!["src/demo.py".to_owned()],
+        "Filigree path_prefix must be project-relative"
+    );
+    assert_eq!(
+        envelope["result"]["wardline_findings"]["result_kind"],
+        "matched"
     );
 }
 

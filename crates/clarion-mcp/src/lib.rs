@@ -12,7 +12,7 @@ mod tools;
 pub mod wardline_reconcile;
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use clarion_core::{
@@ -1682,6 +1682,7 @@ struct IssuesForRead {
 struct IssuesForAccumulator {
     entities_by_id: HashMap<String, EntityRow>,
     entity_json_by_id: HashMap<String, Value>,
+    association_aliases: HashMap<String, String>,
     seen_issue_ids: BTreeSet<String>,
     matched: Vec<Value>,
     drifted: Vec<Value>,
@@ -1693,12 +1694,25 @@ struct IssuesForAccumulator {
 
 impl IssuesForAccumulator {
     fn new(entities: &[EntityRow], entity_json_by_id: HashMap<String, Value>) -> Self {
+        let mut association_aliases = HashMap::new();
+        for entity in entities {
+            association_aliases.insert(entity.id.clone(), entity.id.clone());
+            if let Some(sei) = entity_json_by_id
+                .get(&entity.id)
+                .and_then(|json| json.get("sei"))
+                .and_then(Value::as_str)
+                .filter(|sei| !sei.trim().is_empty())
+            {
+                association_aliases.insert(sei.to_owned(), entity.id.clone());
+            }
+        }
         Self {
             entities_by_id: entities
                 .iter()
                 .map(|entity| (entity.id.clone(), entity.clone()))
                 .collect(),
             entity_json_by_id,
+            association_aliases,
             seen_issue_ids: BTreeSet::new(),
             matched: Vec::new(),
             drifted: Vec::new(),
@@ -1727,14 +1741,16 @@ impl IssuesForAccumulator {
         // The nested entity payload (including its `sei`) was pre-built in the
         // reader closure; `entities_by_id` is retained only for content-hash
         // drift classification.
-        let entity_json = self
-            .entity_json_by_id
+        let canonical_entity_id = self
+            .association_aliases
             .get(&association.clarion_entity_id)
-            .cloned();
-        match self.entities_by_id.get(&association.clarion_entity_id) {
-            None => self
-                .not_found
-                .push(association_json(association, None, None, "not_found")),
+            .map_or(association.clarion_entity_id.as_str(), String::as_str);
+        let entity_json = self.entity_json_by_id.get(canonical_entity_id).cloned();
+        match self.entities_by_id.get(canonical_entity_id) {
+            None => {
+                self.not_found
+                    .push(association_json(association, None, None, "not_found", None));
+            }
             Some(entity) => match entity.content_hash.as_deref() {
                 Some(current_hash) if current_hash == association.content_hash_at_attach => {
                     self.matched.push(association_json(
@@ -1742,6 +1758,7 @@ impl IssuesForAccumulator {
                         entity_json.as_ref(),
                         Some(current_hash),
                         "matched",
+                        Some(&entity.id),
                     ));
                 }
                 Some(current_hash) => {
@@ -1750,6 +1767,7 @@ impl IssuesForAccumulator {
                         entity_json.as_ref(),
                         Some(current_hash),
                         "drifted",
+                        Some(&entity.id),
                     ));
                 }
                 None => {
@@ -1762,6 +1780,7 @@ impl IssuesForAccumulator {
                         entity_json.as_ref(),
                         None,
                         "unknown",
+                        Some(&entity.id),
                     ));
                 }
             },
@@ -2914,13 +2933,22 @@ fn wardline_unavailable(reason: &str) -> Value {
 /// the tool.
 fn wardline_section_for_entity(
     client: &std::sync::Arc<dyn crate::filigree::FiligreeLookup>,
+    project_root: &Path,
     entity_id: &str,
     source_file_path: Option<&str>,
 ) -> Value {
     let Some(path) = source_file_path else {
         return serde_json::json!({ "result_kind": "no_matches", "items": [], "omitted_no_qualname": 0 });
     };
-    match client.wardline_findings_for_path(path) {
+    let path = match project_relative_lookup_path(project_root, path) {
+        Ok(path) => path,
+        Err(err) => {
+            return wardline_unavailable(&format!(
+                "cannot normalize source_file_path for Filigree lookup: {err}"
+            ));
+        }
+    };
+    match client.wardline_findings_for_path(&path) {
         Ok(findings) => {
             let result = crate::wardline_reconcile::reconcile_for_entity(entity_id, findings);
             let items: Vec<Value> = result
@@ -2955,22 +2983,92 @@ fn wardline_section_for_entity(
     }
 }
 
+fn project_relative_lookup_path(
+    project_root: &Path,
+    source_file_path: &str,
+) -> Result<String, String> {
+    let root = project_root
+        .canonicalize()
+        .map_err(|err| format!("canonicalize project root: {err}"))?;
+    let input = Path::new(source_file_path);
+    let absolute = if input.is_absolute() {
+        normalize_path_lexically(input)
+    } else {
+        normalize_path_lexically(&root.join(input))
+    };
+    if !absolute.starts_with(&root) {
+        return Err(format!(
+            "{source_file_path:?} escapes project root {}",
+            root.display()
+        ));
+    }
+    let relative = absolute
+        .strip_prefix(&root)
+        .map_err(|err| format!("strip project root: {err}"))?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => {
+                let Some(part) = part.to_str() else {
+                    return Err(format!("{source_file_path:?} is not valid UTF-8"));
+                };
+                parts.push(part.to_owned());
+            }
+            Component::CurDir => {}
+            _ => {
+                return Err(format!(
+                    "{source_file_path:?} is not a clean project-relative path"
+                ));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(format!("{source_file_path:?} does not name a file path"));
+    }
+    Ok(parts.join("/"))
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
 fn association_json(
     association: &EntityAssociation,
     entity: Option<&Value>,
     current_content_hash: Option<&str>,
     drift_status: &str,
+    canonical_entity_id: Option<&str>,
 ) -> Value {
-    json!({
+    let entity_id = canonical_entity_id.unwrap_or(&association.clarion_entity_id);
+    let mut value = json!({
         "issue_id": association.issue_id,
-        "entity_id": association.clarion_entity_id,
+        "entity_id": entity_id,
         "entity": entity,
         "content_hash_at_attach": association.content_hash_at_attach,
         "current_content_hash": current_content_hash,
         "attached_at": association.attached_at,
         "attached_by": association.attached_by,
         "drift_status": drift_status
-    })
+    });
+    if entity_id != association.clarion_entity_id
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert(
+            "association_entity_id".to_owned(),
+            json!(association.clarion_entity_id),
+        );
+    }
+    value
 }
 
 fn summary_read_error(read: SummaryRead) -> Value {

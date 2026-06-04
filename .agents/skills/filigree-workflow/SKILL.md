@@ -196,8 +196,9 @@ When parsing `--json` output or MCP responses, expect these unified envelopes:
   one of: `VALIDATION`, `NOT_FOUND`, `CONFLICT`, `INVALID_TRANSITION`,
   `PERMISSION`, `NOT_INITIALIZED`, `IO`, `INVALID_API_URL`,
   `FILE_REGISTRY_DISPLACED`, `REGISTRY_UNAVAILABLE`,
-  `CLARION_REGISTRY_VERSION_MISMATCH`, `BRIEFING_BLOCKED`, `STOP_FAILED`,
-  `SCHEMA_MISMATCH`, `INTERNAL`. Branch on `code` for retry policy
+  `CLARION_REGISTRY_VERSION_MISMATCH`, `CLARION_OUT_OF_SYNC`,
+  `BRIEFING_BLOCKED`, `STOP_FAILED`, `SCHEMA_MISMATCH`, `INTERNAL`.
+  Branch on `code` for retry policy
   (`CONFLICT` → exit 4, retryable; everything at exit 1 needs operator
   intervention).
 

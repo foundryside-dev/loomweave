@@ -29,7 +29,15 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 fn clarion_bin() -> Command {
-    Command::cargo_bin("clarion").expect("clarion binary")
+    let mut cmd = Command::cargo_bin("clarion").expect("clarion binary");
+    cmd.env(
+        "CLARION_CODEX_CONFIG",
+        std::env::temp_dir().join(format!(
+            "clarion-test-codex-config-{}.toml",
+            std::process::id()
+        )),
+    );
+    cmd
 }
 
 /// Locate the `clarion-plugin-fixture` binary.
@@ -285,8 +293,8 @@ fn wp2_rlimit_as_oom_kill_is_reported_as_host_finding() {
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     assert!(
-        stdout.contains(FINDING_OOM_KILLED),
-        "OOM finding missing from analyze output.\nstdout: {stdout}\nstderr: {stderr}"
+        stderr.contains(FINDING_OOM_KILLED),
+        "OOM finding missing from analyze diagnostics.\nstdout: {stdout}\nstderr: {stderr}"
     );
 
     let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
@@ -554,23 +562,22 @@ ontology_version = "0.1.0"
         .env("PATH", &new_path)
         .assert()
         .failure();
-    // `tracing_subscriber::fmt::init()` writes events to STDOUT (not
-    // stderr). `anyhow::Error` propagated by `main()` via `?` is what hits
-    // stderr. So we check stdout for the tracing log line and stderr for
-    // the process-level error.
+    // Tracing is intentionally written to stderr so MCP stdio stdout stays
+    // protocol-clean. Check stderr for both the tracing log line and the
+    // process-level error.
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
 
-    // 6. The breaker-tripped tracing line must appear in stdout. This
+    // 6. The breaker-tripped tracing line must appear in stderr. This
     //    proves analyze.rs:240 reached CrashLoopState::Tripped — the
     //    wiring that breaker_06's mock-only test does not cover.
     assert!(
-        stdout.contains("crash-loop breaker tripped"),
-        "breaker-tripped log line missing from stdout.\nstdout: {stdout}\nstderr: {stderr}"
+        stderr.contains("crash-loop breaker tripped"),
+        "breaker-tripped log line missing from stderr.\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
-        stdout.contains("CLA-INFRA-PLUGIN-DISABLED-CRASH-LOOP"),
-        "FINDING_DISABLED_CRASH_LOOP subcode missing from stdout.\nstdout: {stdout}\nstderr: {stderr}"
+        stderr.contains("CLA-INFRA-PLUGIN-DISABLED-CRASH-LOOP"),
+        "FINDING_DISABLED_CRASH_LOOP subcode missing from stderr.\nstdout: {stdout}\nstderr: {stderr}"
     );
 
     // 7. Fixture plugin must NOT have produced an entity — the break

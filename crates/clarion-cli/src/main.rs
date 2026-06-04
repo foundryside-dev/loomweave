@@ -10,6 +10,7 @@ mod hooks_settings;
 mod http_read;
 mod install;
 mod instance;
+mod integration_bindings;
 mod mcp_registration;
 mod run_lifecycle;
 mod sarif;
@@ -38,14 +39,37 @@ fn main() -> Result<()> {
         cli::Command::Install {
             force,
             path,
+            claude_code,
+            codex,
+            codex_config,
             skills,
+            codex_skills,
             hooks,
             all,
-        } => install::run(
-            &path,
-            force,
-            install::InstallPlan::from_flags(skills, hooks, all),
-        ),
+        } => {
+            let mut components = Vec::new();
+            if claude_code {
+                components.push(install::InstallComponent::ClaudeCode);
+            }
+            if codex {
+                components.push(install::InstallComponent::Codex);
+            }
+            if skills {
+                components.push(install::InstallComponent::Skills);
+            }
+            if codex_skills {
+                components.push(install::InstallComponent::CodexSkills);
+            }
+            if hooks {
+                components.push(install::InstallComponent::Hooks);
+            }
+            install::run(
+                &path,
+                force,
+                install::InstallPlan::from_components(all, &components),
+                codex_config.as_deref(),
+            )
+        }
         cli::Command::Analyze {
             path,
             config,
@@ -99,11 +123,11 @@ fn main() -> Result<()> {
             } => db::backup(&path, &output, force),
         },
         cli::Command::Guidance { command } => guidance::run(command),
-        cli::Command::Doctor { path, fix } => {
+        cli::Command::Doctor { path, fix, format } => {
             // doctor prints its own report; map an unhealthy result to a
             // non-zero exit so it can gate CI / pre-commit. The Result<()> arm
             // is reserved for setup errors (bad --path), which bubble normally.
-            let healthy = doctor::run(&path, fix)?;
+            let healthy = doctor::run(&path, fix, matches!(format, cli::DoctorOutputFormat::Json))?;
             if !healthy {
                 std::process::exit(1);
             }
@@ -124,6 +148,7 @@ fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_writer(std::io::stderr)
         .with_target(false)
         .init();
 }

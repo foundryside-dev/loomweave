@@ -44,7 +44,15 @@ impl HttpRawResponse {
 }
 
 fn clarion_bin() -> Command {
-    Command::cargo_bin("clarion").expect("clarion binary")
+    let mut cmd = Command::cargo_bin("clarion").expect("clarion binary");
+    cmd.env(
+        "CLARION_CODEX_CONFIG",
+        std::env::temp_dir().join(format!(
+            "clarion-test-codex-config-{}.toml",
+            std::process::id()
+        )),
+    );
+    cmd
 }
 
 #[test]
@@ -65,6 +73,7 @@ fn serve_stdio_initialize_round_trip() {
         .env("PATH", "")
         .assert()
         .success();
+    write_stdio_config(dir.path());
 
     let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("clarion"))
         .args(["serve", "--path"])
@@ -124,6 +133,7 @@ fn serve_stdio_accepts_mcp_json_line_initialize_without_stdin_eof() {
         .env("PATH", "")
         .assert()
         .success();
+    write_stdio_config(dir.path());
 
     let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("clarion"))
         .args(["serve", "--path"])
@@ -2570,6 +2580,14 @@ fn seed_storage_failure_file_entity(project_root: &Path) {
 fn free_loopback_bind() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind free loopback port");
     listener.local_addr().expect("local addr").to_string()
+}
+
+fn write_stdio_config(project_root: &Path) {
+    fs::write(
+        project_root.join("clarion.yaml"),
+        "version: 1\nserve:\n  http:\n    enabled: false\n",
+    )
+    .expect("write MCP stdio-only serve config");
 }
 
 fn write_http_config(project_root: &Path, bind: &str) {

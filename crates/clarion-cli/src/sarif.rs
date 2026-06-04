@@ -112,9 +112,16 @@ pub fn run_import(file: &Path, scan_source_opt: Option<String>, project_path: &P
                         .get("properties")
                         .cloned()
                         .unwrap_or_else(|| Value::Object(Map::new()));
+                    let partial_fingerprints = res.get("partialFingerprints").cloned();
+                    let fingerprint = partial_fingerprints
+                        .as_ref()
+                        .and_then(select_partial_fingerprint);
 
                     let mut metadata = Map::new();
                     metadata.insert("kind".to_owned(), json!("defect"));
+                    if let Some(partial_fingerprints) = partial_fingerprints {
+                        metadata.insert("partial_fingerprints".to_owned(), partial_fingerprints);
+                    }
                     if scan_source == "wardline" {
                         metadata.insert("wardline_properties".to_owned(), properties);
                     } else {
@@ -126,6 +133,9 @@ pub fn run_import(file: &Path, scan_source_opt: Option<String>, project_path: &P
                     wire_find.insert("rule_id".to_owned(), json!(rule_id));
                     wire_find.insert("message".to_owned(), json!(message));
                     wire_find.insert("severity".to_owned(), json!(severity));
+                    if let Some(fingerprint) = fingerprint {
+                        wire_find.insert("fingerprint".to_owned(), json!(fingerprint));
+                    }
                     if let Some(ls) = line_start {
                         wire_find.insert("line_start".to_owned(), json!(ls));
                     }
@@ -183,6 +193,22 @@ pub fn run_import(file: &Path, scan_source_opt: Option<String>, project_path: &P
     );
 
     Ok(())
+}
+
+fn select_partial_fingerprint(partial_fingerprints: &Value) -> Option<String> {
+    let object = partial_fingerprints.as_object()?;
+    object
+        .get("wardlineFingerprint/v1")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            object
+                .iter()
+                .filter_map(|(_, value)| value.as_str())
+                .find(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        })
 }
 
 fn normalize_sarif_uri(uri: &str, project_root: &Path) -> String {

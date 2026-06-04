@@ -75,6 +75,12 @@ clarion analyze
 clarion serve
 ```
 
+`clarion install` is the one-step agent setup path: it initialises `.clarion/`,
+installs the `clarion-workflow` skill for Claude Code and Codex, writes Claude
+Code MCP config, upserts Codex MCP config, and installs the SessionStart hook.
+Use component flags such as `--claude-code`, `--codex`, `--skills`,
+`--codex-skills`, and `--hooks` for partial installs.
+
 `clarion analyze` works without any LLM credentials and is the fastest way to
 verify the install. `summary(id)` calls require `OPENROUTER_API_KEY` to be set
 (see [docs/operator/openrouter.md](docs/operator/openrouter.md)).

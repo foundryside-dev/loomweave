@@ -1,44 +1,42 @@
-# clarion.yaml — user-edited config.
-# Do not delete this file: clarion serve reads MCP, LLM, and integration
-# settings from here when present.
-version: 1
+integrations:
+  filigree:
+    actor: clarion-mcp
+    base_url: http://127.0.0.1:8542
+    enabled: true
+    timeout_seconds: 5
+    token_env: FILIGREE_API_TOKEN
 llm_policy:
-  enabled: false
-  provider: openrouter
   allow_live_provider: false
-  openrouter:
-    endpoint_url: https://openrouter.ai/api/v1
-    api_key_env: OPENROUTER_API_KEY
-    attribution:
-      referer: https://github.com/tachyon-beep/clarion
-      title: Clarion
+  cache_max_age_days: 180
+  claude_cli:
+    exclude_dynamic_system_prompt_sections: true
+    executable: claude
+    max_turns: 2
+    model: null
+    no_session_persistence: true
+    permission_mode: plan
+    timeout_seconds: 300
+    tools: []
   codex_cli:
     executable: codex
     model: null
     profile: null
     sandbox: read-only
     timeout_seconds: 300
-  claude_cli:
-    executable: claude
-    model: null
-    permission_mode: plan
-    tools: []
-    timeout_seconds: 300
-    max_turns: 2
-    no_session_persistence: true
-    exclude_dynamic_system_prompt_sections: true
-  model_id: anthropic/claude-sonnet-4.6
-  session_token_ceiling: 1000000
+  enabled: false
   max_inferred_edges_per_caller: 8
-  cache_max_age_days: 180
-integrations:
-  filigree:
-    enabled: false
-    base_url: http://127.0.0.1:8766
-    actor: clarion-mcp
-    token_env: FILIGREE_API_TOKEN
-    timeout_seconds: 5
+  model_id: anthropic/claude-sonnet-4.6
+  openrouter:
+    api_key_env: OPENROUTER_API_KEY
+    attribution:
+      referer: https://github.com/tachyon-beep/clarion
+      title: Clarion
+    endpoint_url: https://openrouter.ai/api/v1
+  provider: openrouter
+  session_token_ceiling: 1000000
 serve:
   http:
-    enabled: false
     bind: 127.0.0.1:9111
+    enabled: true
+    wardline_taint_write: true
+version: 1

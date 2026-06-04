@@ -7,11 +7,11 @@
 //! - `<path>/clarion.yaml`        (user-edited config stub at project root;
 //!   see detailed-design.md §File layout)
 //!
-//! A bare `clarion install` (no flags) does everything: init + skills + hooks.
-//! If `.clarion/` already exists, init is skipped and the idempotent components
-//! (skills, hooks) are still applied. Pass `--force` to wipe and reinitialise
-//! `.clarion/`. `--skills` / `--hooks` / `--all` are still accepted for
-//! explicit partial installs.
+//! A bare `clarion install` (no flags) does everything: init + MCP config +
+//! skills + hooks + local Loom integration bindings. If `.clarion/` already
+//! exists, init is skipped and the idempotent components are still applied.
+//! Pass `--force` to wipe and reinitialise `.clarion/`. Component flags and
+//! `--all` are still accepted for explicit partial installs.
 
 use std::fs;
 use std::path::Path;
@@ -107,39 +107,60 @@ logs/
 runs/*/log.jsonl
 ";
 
+/// A single component selected by a partial `clarion install`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallComponent {
+    ClaudeCode,
+    Codex,
+    Skills,
+    CodexSkills,
+    Hooks,
+}
+
 /// What `clarion install` should do, resolved from the CLI flags.
 ///
 /// Modeled as an enum rather than three independent bools so the derived and
 /// illegal states the bool form allowed are unrepresentable: `init_clarion` is
 /// no longer a peer field that can contradict an explicit component request,
 /// and the do-nothing `{false, false, false}` state (which PR #21 had to guard
-/// against at the `run()` entry) cannot be produced by [`InstallPlan::from_flags`]
-/// at all (clarion-c6b8dc27f3). The three booleans are derived on demand via
+/// against at the `run()` entry) cannot be produced by
+/// [`InstallPlan::from_components`]
+/// at all (clarion-c6b8dc27f3). Component booleans are derived on demand via
 /// [`init_clarion`](Self::init_clarion) / [`skills`](Self::skills) /
 /// [`hooks`](Self::hooks).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallPlan {
-    /// `--skills` and/or `--hooks` without `--all`: apply the named components
-    /// and do NOT initialise `.clarion/`. `from_flags` only constructs this
-    /// when at least one field is `true`.
-    Components { skills: bool, hooks: bool },
-    /// No flags or `--all`: initialise `.clarion/` + skills + hooks.
+    /// Component flags without `--all`: apply the named components and do NOT
+    /// initialise `.clarion/`. `from_components` only constructs this when at
+    /// least one component is present.
+    Components {
+        claude_code: bool,
+        codex: bool,
+        skills: bool,
+        codex_skills: bool,
+        hooks: bool,
+    },
+    /// No flags or `--all`: initialise `.clarion/` + every integration.
     All,
 }
 
 impl InstallPlan {
     /// Resolve the CLI flags into a plan. `--all` wins; otherwise any of
-    /// `--skills`/`--hooks` selects [`Components`](Self::Components); no flag
+    /// the component flags selects [`Components`](Self::Components); no flag
     /// selects [`All`](Self::All) so that a naked `clarion install` does
     /// everything. Never yields a do-nothing plan.
     #[must_use]
-    pub fn from_flags(skills: bool, hooks: bool, all: bool) -> Self {
-        if all {
+    pub fn from_components(all: bool, components: &[InstallComponent]) -> Self {
+        if all || components.is_empty() {
             Self::All
-        } else if skills || hooks {
-            Self::Components { skills, hooks }
         } else {
-            Self::All
+            Self::Components {
+                claude_code: components.contains(&InstallComponent::ClaudeCode),
+                codex: components.contains(&InstallComponent::Codex),
+                skills: components.contains(&InstallComponent::Skills),
+                codex_skills: components.contains(&InstallComponent::CodexSkills),
+                hooks: components.contains(&InstallComponent::Hooks),
+            }
         }
     }
 
@@ -149,10 +170,42 @@ impl InstallPlan {
         matches!(self, Self::All)
     }
 
-    /// Whether to install the `clarion-workflow` skill pack.
+    /// Whether to install the Claude Code MCP config.
+    #[must_use]
+    pub fn claude_code(self) -> bool {
+        matches!(
+            self,
+            Self::All
+                | Self::Components {
+                    claude_code: true,
+                    ..
+                }
+        )
+    }
+
+    /// Whether to install the Codex MCP config.
+    #[must_use]
+    pub fn codex(self) -> bool {
+        matches!(self, Self::All | Self::Components { codex: true, .. })
+    }
+
+    /// Whether to install the `clarion-workflow` skill pack for Claude Code.
     #[must_use]
     pub fn skills(self) -> bool {
         matches!(self, Self::All | Self::Components { skills: true, .. })
+    }
+
+    /// Whether to install the `clarion-workflow` skill pack for Codex.
+    #[must_use]
+    pub fn codex_skills(self) -> bool {
+        matches!(
+            self,
+            Self::All
+                | Self::Components {
+                    codex_skills: true,
+                    ..
+                }
+        )
     }
 
     /// Whether to install the `SessionStart` hook.
@@ -169,7 +222,12 @@ impl InstallPlan {
 /// Returns an error if `.clarion/` already exists without `--force`, if the
 /// target directory cannot be canonicalised, or if any filesystem or database
 /// operation fails.
-pub fn run(path: &Path, force: bool, plan: InstallPlan) -> Result<()> {
+pub fn run(
+    path: &Path,
+    force: bool,
+    plan: InstallPlan,
+    codex_config_path: Option<&Path>,
+) -> Result<()> {
     if !path.exists() {
         bail!(
             "target directory does not exist: {}. Create it first or pass a valid --path.",
@@ -180,104 +238,204 @@ pub fn run(path: &Path, force: bool, plan: InstallPlan) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("cannot canonicalise --path {}", path.display()))?;
 
-    // `from_flags` cannot produce a do-nothing plan, but a hand-built
+    // `from_components` cannot produce a do-nothing plan, but a hand-built
     // `Components { skills: false, hooks: false }` still could, so keep a
     // defensive guard rather than silently succeeding.
-    if !plan.init_clarion() && !plan.skills() && !plan.hooks() {
-        bail!(
-            "nothing to install: pass --skills, --hooks, --all, \
-             or run bare `clarion install` to do everything."
-        );
-    }
+    validate_plan(plan)?;
 
     if plan.init_clarion() {
-        let clarion_dir = project_root.join(".clarion");
-        let exists = clarion_dir.exists();
-        // `All` (including naked install) treats an existing .clarion/ as
-        // already-initialised and skips re-init, still applying the idempotent
-        // components. A non-directory .clarion is not a usable index, so refuse
-        // rather than "succeed" with skills/hooks atop a project with no clarion.db.
-        // `--skills`/`--hooks` alone are `Components` (init_clarion() == false)
-        // and skip this entire block.
-        if exists && !force {
-            if !clarion_dir.is_dir() {
-                bail!(
-                    "found a non-directory at {}; expected an initialised .clarion/ \
-                     directory. Remove it (or pass --force) and re-run.",
-                    clarion_dir.display()
-                );
-            }
-            println!(
-                "{} already initialised; skipping .clarion/ init (pass --force to recreate).",
-                clarion_dir.display()
-            );
-        } else {
-            if exists {
-                // --force overwrite path.
-                if !clarion_dir.is_dir() {
-                    bail!(
-                        "--force can only overwrite an existing .clarion/ directory; \
-                         found non-directory at {}.",
-                        clarion_dir.display()
-                    );
-                }
-                fs::remove_dir_all(&clarion_dir)
-                    .with_context(|| format!("remove existing {}", clarion_dir.display()))?;
-            }
+        initialise_project(&project_root, force)?;
+    }
 
-            fs::create_dir_all(&clarion_dir)
-                .with_context(|| format!("mkdir {}", clarion_dir.display()))?;
+    if plan.claude_code() {
+        install_claude_code(&project_root)?;
+    }
 
-            // Cleanup guard: if any post-mkdir step fails, remove .clarion/ before
-            // bubbling the error so the next install attempt isn't blocked by the
-            // "already exists" check (clarion-ed5017139f).
-            if let Err(err) = populate_after_mkdir(&clarion_dir, &project_root) {
-                if let Err(cleanup_err) = fs::remove_dir_all(&clarion_dir) {
-                    tracing::warn!(
-                        clarion_dir = %clarion_dir.display(),
-                        error = %cleanup_err,
-                        "install failed and cleanup of partial .clarion/ also failed; \
-                         manual rm -rf may be required"
-                    );
-                }
-                return Err(err);
-            }
-
-            tracing::info!(
-                clarion_dir = %clarion_dir.display(),
-                "clarion install complete"
-            );
-            println!("Initialised {}", clarion_dir.display());
-        }
+    if plan.codex() {
+        install_codex(codex_config_path)?;
     }
 
     if plan.skills() {
-        let report = crate::skill_pack::install_skill_pack(&project_root)
-            .context("install clarion-workflow skill pack")?;
-        if report.copied {
-            println!(
-                "Installed clarion-workflow skill into {}/.claude/skills and {}/.agents/skills",
-                project_root.display(),
-                project_root.display()
-            );
-        } else {
-            println!("clarion-workflow skill already up to date");
-        }
+        install_claude_skills(&project_root)?;
+    }
+
+    if plan.codex_skills() {
+        install_codex_skills(&project_root)?;
     }
 
     if plan.hooks() {
-        let changed = crate::hooks_settings::install_session_start_hook(&project_root)
-            .context("merge SessionStart hook into .claude/settings.json")?;
-        if changed {
-            println!(
-                "Added clarion SessionStart hook to {}/.claude/settings.json",
-                project_root.display()
-            );
-        } else {
-            println!("clarion SessionStart hook already present");
-        }
+        install_hooks(&project_root)?;
     }
 
+    if matches!(plan, InstallPlan::All) {
+        install_integration_bindings(&project_root)?;
+    }
+
+    Ok(())
+}
+
+fn validate_plan(plan: InstallPlan) -> Result<()> {
+    // `from_components` cannot produce a do-nothing plan, but a hand-built
+    // `Components { skills: false, hooks: false }` still could, so keep a
+    // defensive guard rather than silently succeeding.
+    if !plan.init_clarion()
+        && !plan.claude_code()
+        && !plan.codex()
+        && !plan.skills()
+        && !plan.codex_skills()
+        && !plan.hooks()
+    {
+        bail!(
+            "nothing to install: pass --claude-code, --codex, --skills, \
+             --codex-skills, --hooks, --all, \
+             or run bare `clarion install` to do everything."
+        );
+    }
+    Ok(())
+}
+
+fn initialise_project(project_root: &Path, force: bool) -> Result<()> {
+    let clarion_dir = project_root.join(".clarion");
+    let exists = clarion_dir.exists();
+    // `All` (including naked install) treats an existing .clarion/ as
+    // already-initialised and skips re-init, still applying the idempotent
+    // components. A non-directory .clarion is not a usable index, so refuse
+    // rather than "succeed" with skills/hooks atop a project with no clarion.db.
+    // Component-only installs skip this block.
+    if exists && !force {
+        if !clarion_dir.is_dir() {
+            bail!(
+                "found a non-directory at {}; expected an initialised .clarion/ \
+                 directory. Remove it (or pass --force) and re-run.",
+                clarion_dir.display()
+            );
+        }
+        println!(
+            "{} already initialised; skipping .clarion/ init (pass --force to recreate).",
+            clarion_dir.display()
+        );
+        return Ok(());
+    }
+
+    if exists {
+        // --force overwrite path.
+        if !clarion_dir.is_dir() {
+            bail!(
+                "--force can only overwrite an existing .clarion/ directory; \
+                 found non-directory at {}.",
+                clarion_dir.display()
+            );
+        }
+        fs::remove_dir_all(&clarion_dir)
+            .with_context(|| format!("remove existing {}", clarion_dir.display()))?;
+    }
+
+    fs::create_dir_all(&clarion_dir).with_context(|| format!("mkdir {}", clarion_dir.display()))?;
+
+    // Cleanup guard: if any post-mkdir step fails, remove .clarion/ before
+    // bubbling the error so the next install attempt isn't blocked by the
+    // "already exists" check (clarion-ed5017139f).
+    if let Err(err) = populate_after_mkdir(&clarion_dir, project_root) {
+        if let Err(cleanup_err) = fs::remove_dir_all(&clarion_dir) {
+            tracing::warn!(
+                clarion_dir = %clarion_dir.display(),
+                error = %cleanup_err,
+                "install failed and cleanup of partial .clarion/ also failed; \
+                 manual rm -rf may be required"
+            );
+        }
+        return Err(err);
+    }
+
+    tracing::info!(
+        clarion_dir = %clarion_dir.display(),
+        "clarion install complete"
+    );
+    println!("Initialised {}", clarion_dir.display());
+    Ok(())
+}
+
+fn install_claude_code(project_root: &Path) -> Result<()> {
+    let changed = crate::mcp_registration::install_mcp_entry(project_root)
+        .context("install Claude Code MCP config")?;
+    if changed {
+        println!(
+            "Installed Claude Code MCP config at {}/.mcp.json",
+            project_root.display()
+        );
+    } else {
+        println!("Claude Code MCP config already up to date");
+    }
+    Ok(())
+}
+
+fn install_codex(codex_config_path: Option<&Path>) -> Result<()> {
+    let config_path = match codex_config_path {
+        Some(path) => path.to_path_buf(),
+        None => {
+            crate::mcp_registration::codex_config_path().context("locate Codex MCP config path")?
+        }
+    };
+    let changed = crate::mcp_registration::install_codex_mcp_entry(&config_path)
+        .context("install Codex MCP config")?;
+    if changed {
+        println!("Installed Codex MCP config at {}", config_path.display());
+    } else {
+        println!("Codex MCP config already up to date");
+    }
+    Ok(())
+}
+
+fn install_claude_skills(project_root: &Path) -> Result<()> {
+    let report = crate::skill_pack::install_claude_skill_pack(project_root)
+        .context("install clarion-workflow skill pack for Claude Code")?;
+    if report.copied {
+        println!(
+            "Installed clarion-workflow skill into {}/.claude/skills",
+            project_root.display()
+        );
+    } else {
+        println!("clarion-workflow Claude Code skill already up to date");
+    }
+    Ok(())
+}
+
+fn install_codex_skills(project_root: &Path) -> Result<()> {
+    let report = crate::skill_pack::install_codex_skill_pack(project_root)
+        .context("install clarion-workflow skill pack for Codex")?;
+    if report.copied {
+        println!(
+            "Installed clarion-workflow skill into {}/.agents/skills",
+            project_root.display()
+        );
+    } else {
+        println!("clarion-workflow Codex skill already up to date");
+    }
+    Ok(())
+}
+
+fn install_hooks(project_root: &Path) -> Result<()> {
+    let changed = crate::hooks_settings::install_session_start_hook(project_root)
+        .context("merge SessionStart hook into .claude/settings.json")?;
+    if changed {
+        println!(
+            "Added clarion SessionStart hook to {}/.claude/settings.json",
+            project_root.display()
+        );
+    } else {
+        println!("clarion SessionStart hook already present");
+    }
+    Ok(())
+}
+
+fn install_integration_bindings(project_root: &Path) -> Result<()> {
+    let changed = crate::integration_bindings::install_bindings(project_root)
+        .context("install local Clarion/Filigree/Wardline integration bindings")?;
+    if changed {
+        println!("Installed local Clarion/Filigree/Wardline integration bindings");
+    } else {
+        println!("Local Clarion/Filigree/Wardline integration bindings already up to date");
+    }
     Ok(())
 }
 
@@ -316,79 +474,130 @@ fn initialise_db(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::InstallPlan;
+    use super::{InstallComponent, InstallPlan};
 
     #[test]
-    fn from_flags_truth_table() {
+    fn from_components_truth_table() {
         // Naked install: no flags -> everything (same as --all).
-        let naked = InstallPlan::from_flags(false, false, false);
+        let naked = InstallPlan::from_components(false, &[]);
         assert_eq!(naked, InstallPlan::All);
         assert!(naked.init_clarion());
+        assert!(naked.claude_code());
+        assert!(naked.codex());
         assert!(naked.skills());
+        assert!(naked.codex_skills());
         assert!(naked.hooks());
 
         // --skills: skills only, no init.
-        let skills = InstallPlan::from_flags(true, false, false);
+        let skills = InstallPlan::from_components(false, &[InstallComponent::Skills]);
         assert_eq!(
             skills,
             InstallPlan::Components {
+                claude_code: false,
+                codex: false,
                 skills: true,
+                codex_skills: false,
                 hooks: false
             }
         );
         assert!(!skills.init_clarion());
+        assert!(!skills.claude_code());
+        assert!(!skills.codex());
         assert!(skills.skills());
+        assert!(!skills.codex_skills());
         assert!(!skills.hooks());
 
         // --hooks: hooks only, no init.
-        let hooks = InstallPlan::from_flags(false, true, false);
+        let hooks = InstallPlan::from_components(false, &[InstallComponent::Hooks]);
         assert_eq!(
             hooks,
             InstallPlan::Components {
+                claude_code: false,
+                codex: false,
                 skills: false,
+                codex_skills: false,
                 hooks: true
             }
         );
         assert!(!hooks.init_clarion());
+        assert!(!hooks.claude_code());
+        assert!(!hooks.codex());
         assert!(!hooks.skills());
+        assert!(!hooks.codex_skills());
         assert!(hooks.hooks());
 
         // --all: everything (component flags ignored).
-        let all = InstallPlan::from_flags(false, false, true);
+        let all = InstallPlan::from_components(true, &[]);
         assert_eq!(all, InstallPlan::All);
         assert!(all.init_clarion());
+        assert!(all.claude_code());
+        assert!(all.codex());
         assert!(all.skills());
+        assert!(all.codex_skills());
         assert!(all.hooks());
 
-        // --skills --hooks: both components, still no init.
-        let both = InstallPlan::from_flags(true, true, false);
+        // Multiple component flags: selected components only, still no init.
+        let both = InstallPlan::from_components(
+            false,
+            &[
+                InstallComponent::ClaudeCode,
+                InstallComponent::Codex,
+                InstallComponent::Skills,
+                InstallComponent::CodexSkills,
+                InstallComponent::Hooks,
+            ],
+        );
         assert_eq!(
             both,
             InstallPlan::Components {
+                claude_code: true,
+                codex: true,
                 skills: true,
+                codex_skills: true,
                 hooks: true
             }
         );
         assert!(!both.init_clarion());
+        assert!(both.claude_code());
+        assert!(both.codex());
         assert!(both.skills());
+        assert!(both.codex_skills());
         assert!(both.hooks());
     }
 
     #[test]
-    fn from_flags_never_yields_a_do_nothing_plan() {
+    fn from_components_never_yields_a_do_nothing_plan() {
         // The do-nothing {false,false,false} state that PR #21 guarded against
         // at run() entry is now unreachable through the only public constructor
         // (clarion-c6b8dc27f3): every flag combination resolves to a plan that
         // does at least one thing.
-        for skills in [false, true] {
-            for hooks in [false, true] {
-                for all in [false, true] {
-                    let plan = InstallPlan::from_flags(skills, hooks, all);
-                    assert!(
-                        plan.init_clarion() || plan.skills() || plan.hooks(),
-                        "from_flags({skills},{hooks},{all}) produced a do-nothing plan: {plan:?}"
-                    );
-                }
+        let cases: &[&[InstallComponent]] = &[
+            &[],
+            &[InstallComponent::ClaudeCode],
+            &[InstallComponent::Codex],
+            &[InstallComponent::Skills],
+            &[InstallComponent::CodexSkills],
+            &[InstallComponent::Hooks],
+            &[
+                InstallComponent::ClaudeCode,
+                InstallComponent::Codex,
+                InstallComponent::Skills,
+                InstallComponent::CodexSkills,
+                InstallComponent::Hooks,
+            ],
+        ];
+        for all in [false, true] {
+            for components in cases {
+                let plan = InstallPlan::from_components(all, components);
+                assert!(
+                    plan.init_clarion()
+                        || plan.claude_code()
+                        || plan.codex()
+                        || plan.skills()
+                        || plan.codex_skills()
+                        || plan.hooks(),
+                    "from_components({all}, {components:?}) produced a do-nothing plan: {plan:?}"
+                );
             }
         }
     }

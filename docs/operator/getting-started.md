@@ -128,10 +128,10 @@ clarion install
 clarion analyze
 ```
 
-A bare `clarion install` does everything: it initialises `.clarion/` and
-installs the agent-orientation assets (the `clarion-workflow` skill and the
-SessionStart hook — see [§3](#agent-orientation-installed-by-default)). If
-`.clarion/` already exists, init is skipped and the skill/hook are applied
+A bare `clarion install` does everything: it initialises `.clarion/`, installs
+the agent-orientation assets, writes Claude Code MCP config, and upserts the
+Codex MCP config (see [§3](#agent-orientation-installed-by-default)). If
+`.clarion/` already exists, init is skipped and the other components are applied
 idempotently; pass `--force` to wipe and reinitialise the index.
 
 Expected output (abridged):
@@ -141,6 +141,8 @@ applying migration version=1 name="0001_initial_schema"
 clarion install complete clarion_dir=/tmp/requests-2.32.4/.clarion
 Initialised /tmp/requests-2.32.4/.clarion
 Installed clarion-workflow skill into ...
+Installed Claude Code MCP config at .../.mcp.json
+Installed Codex MCP config at ~/.codex/config.toml
 Added clarion SessionStart hook to .../.claude/settings.json
 ...
 analyze complete: run <uuid> ok (entities=NNN, edges=MMM)
@@ -194,12 +196,19 @@ component flags exist for explicit partial installs (e.g. adding the skill to a
 project whose `.clarion/` you do not want re-touched):
 
 ```bash
-clarion install --skills --path /tmp/requests-2.32.4   # skill only, do NOT touch .clarion/
-clarion install --hooks --path /tmp/requests-2.32.4    # hook only, do NOT touch .clarion/
-clarion install --all   --path /tmp/requests-2.32.4    # same as a bare install: init + skills + hooks
+clarion install --claude-code --path /tmp/requests-2.32.4  # Claude Code MCP only
+clarion install --codex --path /tmp/requests-2.32.4        # Codex MCP only
+clarion install --skills --path /tmp/requests-2.32.4       # Claude skill only
+clarion install --codex-skills --path /tmp/requests-2.32.4 # Codex skill only
+clarion install --hooks --path /tmp/requests-2.32.4        # hook only
+clarion install --all --path /tmp/requests-2.32.4          # same as bare install
 ```
 
-`--skills` writes `.claude/skills/clarion-workflow/` and `.agents/skills/clarion-workflow/`.
+`--skills` writes `.claude/skills/clarion-workflow/`; `--codex-skills` writes
+`.agents/skills/clarion-workflow/`. `--claude-code` writes `.mcp.json` with a
+stdio `clarion serve` entry. `--codex` upserts `[mcp_servers.clarion]` in
+`~/.codex/config.toml`. Both MCP configs rely on the client working directory
+for project discovery instead of pinning `--path`.
 `--hooks` merges a SessionStart entry into `.claude/settings.json` (existing
 hooks are preserved) that runs `clarion hook session-start` — a fail-soft
 command printing live entity/subsystem/finding counts and index freshness.

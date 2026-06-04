@@ -11,7 +11,15 @@ use std::path::Path;
 use assert_cmd::Command;
 
 fn clarion_bin() -> Command {
-    Command::cargo_bin("clarion").expect("clarion binary")
+    let mut cmd = Command::cargo_bin("clarion").expect("clarion binary");
+    cmd.env(
+        "CLARION_CODEX_CONFIG",
+        std::env::temp_dir().join(format!(
+            "clarion-test-codex-config-{}.toml",
+            std::process::id()
+        )),
+    );
+    cmd
 }
 
 fn install(args: &[&str], dir: &Path) {
@@ -21,6 +29,10 @@ fn install(args: &[&str], dir: &Path) {
         .arg(dir)
         .assert()
         .success();
+}
+
+fn read_yaml(path: &Path) -> serde_json::Value {
+    serde_norway::from_str(&fs::read_to_string(path).unwrap()).unwrap()
 }
 
 /// Run `doctor` (optionally with `--fix`) and return `(exit_code, stdout)`.
@@ -37,20 +49,40 @@ fn doctor(dir: &Path, fix: bool) -> (i32, String) {
     )
 }
 
-/// A freshly `install --all`ed project has the skill + hook, but `install`
-/// never registers `.mcp.json`, so `doctor` must flag the missing MCP entry and
-/// exit non-zero.
+fn doctor_json(dir: &Path, fix: bool) -> (i32, serde_json::Value) {
+    let mut cmd = clarion_bin();
+    cmd.arg("doctor");
+    if fix {
+        cmd.arg("--fix");
+    }
+    let output = cmd
+        .args(["--format", "json"])
+        .arg("--path")
+        .arg(dir)
+        .output()
+        .expect("run doctor json");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    (
+        output.status.code().expect("exit code"),
+        serde_json::from_str(&stdout).unwrap_or_else(|err| {
+            panic!("doctor --format json must emit parseable JSON: {err}\nstdout:\n{stdout}")
+        }),
+    )
+}
+
+/// A freshly `install --all`ed project has every orientation surface, including
+/// Claude Code MCP, so `doctor` must report it healthy.
 #[test]
-fn doctor_flags_missing_mcp_entry_after_plain_install() {
+fn doctor_reports_plain_install_healthy() {
     let dir = tempfile::tempdir().unwrap();
     install(&["install", "--all"], dir.path());
 
     let (code, out) = doctor(dir.path(), false);
-    assert_eq!(code, 1, "missing mcp entry must fail; stdout:\n{out}");
+    assert_eq!(code, 0, "plain install should be healthy; stdout:\n{out}");
     assert!(out.contains("skill pack up to date"), "stdout:\n{out}");
     assert!(out.contains("SessionStart hook present"), "stdout:\n{out}");
     assert!(
-        out.contains(".mcp.json has no clarion serve entry"),
+        out.contains(".mcp.json clarion serve entry present"),
         "stdout:\n{out}"
     );
 }
@@ -60,7 +92,10 @@ fn doctor_flags_missing_mcp_entry_after_plain_install() {
 #[test]
 fn doctor_fix_registers_mcp_then_reports_healthy() {
     let dir = tempfile::tempdir().unwrap();
-    install(&["install", "--all"], dir.path());
+    install(
+        &["install", "--skills", "--codex-skills", "--hooks"],
+        dir.path(),
+    );
 
     let (code, out) = doctor(dir.path(), true);
     assert_eq!(code, 0, "--fix should repair and exit 0; stdout:\n{out}");
@@ -69,14 +104,18 @@ fn doctor_fix_registers_mcp_then_reports_healthy() {
         "stdout:\n{out}"
     );
 
-    // The entry is now on disk, pinned to this project with the bare command.
+    // The entry is now on disk and uses runtime project autodiscovery.
     let v: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dir.path().join(".mcp.json")).unwrap()).unwrap();
-    assert_eq!(v["mcpServers"]["clarion"]["command"], "clarion");
-    let canon = dir.path().canonicalize().unwrap().display().to_string();
+    assert!(
+        v["mcpServers"]["clarion"]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("clarion")
+    );
     assert_eq!(
         v["mcpServers"]["clarion"]["args"],
-        serde_json::json!(["serve", "--path", canon])
+        serde_json::json!(["serve"])
     );
 
     // A plain re-run is now clean.
@@ -89,7 +128,10 @@ fn doctor_fix_registers_mcp_then_reports_healthy() {
 #[test]
 fn doctor_fix_preserves_sibling_mcp_server() {
     let dir = tempfile::tempdir().unwrap();
-    install(&["install", "--all"], dir.path());
+    install(
+        &["install", "--skills", "--codex-skills", "--hooks"],
+        dir.path(),
+    );
     fs::write(
         dir.path().join(".mcp.json"),
         r#"{"mcpServers":{"filigree":{"type":"stdio","command":"/opt/filigree-mcp","args":[]}}}"#,
@@ -105,16 +147,164 @@ fn doctor_fix_preserves_sibling_mcp_server() {
         v["mcpServers"]["filigree"]["command"], "/opt/filigree-mcp",
         "sibling server must be preserved"
     );
-    assert_eq!(v["mcpServers"]["clarion"]["command"], "clarion");
+    assert!(
+        v["mcpServers"]["clarion"]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("clarion")
+    );
 }
 
-/// With only the skill installed (no hook, no mcp), `doctor` reports two
-/// problems and exits 1; the index snapshot block is still printed.
+#[test]
+fn doctor_fix_repairs_missing_three_way_integration_bindings() {
+    let dir = tempfile::tempdir().unwrap();
+    let filigree_dir = dir.path().join(".filigree");
+    fs::create_dir_all(&filigree_dir).unwrap();
+    fs::write(filigree_dir.join("ephemeral.port"), "8749\n").unwrap();
+
+    install(
+        &[
+            "install",
+            "--skills",
+            "--codex-skills",
+            "--hooks",
+            "--claude-code",
+        ],
+        dir.path(),
+    );
+
+    let (code, out) = doctor(dir.path(), false);
+    assert_eq!(
+        code, 1,
+        "missing integration bindings should be unhealthy:\n{out}"
+    );
+    assert!(
+        out.contains("three-way integration bindings missing or stale"),
+        "stdout:\n{out}"
+    );
+
+    let (code, out) = doctor(dir.path(), true);
+    assert_eq!(code, 0, "--fix should repair and exit 0; stdout:\n{out}");
+    assert!(
+        out.contains("three-way integration bindings missing or stale — fixed"),
+        "stdout:\n{out}"
+    );
+
+    let clarion_yaml = read_yaml(&dir.path().join("clarion.yaml"));
+    assert_eq!(
+        clarion_yaml["integrations"]["filigree"]["base_url"],
+        "http://127.0.0.1:8749"
+    );
+    assert_eq!(
+        clarion_yaml["serve"]["http"]["wardline_taint_write"],
+        serde_json::json!(true)
+    );
+
+    let wardline_yaml = read_yaml(&dir.path().join("wardline.yaml"));
+    assert_eq!(
+        wardline_yaml["filigree"]["url"],
+        "http://127.0.0.1:8749/api/loom/scan-results"
+    );
+
+    let mcp: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join(".mcp.json")).unwrap()).unwrap();
+    assert_eq!(
+        mcp["mcpServers"]["wardline"]["args"],
+        serde_json::json!([
+            "mcp",
+            "--root",
+            ".",
+            "--clarion-url",
+            "http://127.0.0.1:9111",
+            "--filigree-url",
+            "http://127.0.0.1:8749/api/loom/scan-results"
+        ])
+    );
+
+    let (code, out) = doctor(dir.path(), false);
+    assert_eq!(code, 0, "repaired project should be healthy:\n{out}");
+}
+
+#[test]
+fn doctor_json_reports_stable_check_shape_for_healthy_install() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], dir.path());
+
+    let (code, json) = doctor_json(dir.path(), false);
+    assert_eq!(code, 0, "healthy install should exit 0: {json}");
+    assert_eq!(json["ok"], true);
+    assert!(json["checks"].as_array().unwrap().iter().any(|check| {
+        check["id"] == "mcp.registration"
+            && check["status"] == "ok"
+            && check["fixed"] == serde_json::json!(false)
+    }));
+    assert!(json["checks"].as_array().unwrap().iter().any(|check| {
+        check["id"] == "integration.bindings"
+            && check["status"] == "ok"
+            && check["fixed"] == serde_json::json!(false)
+    }));
+    assert!(
+        json["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| { check["id"] == "index.freshness" && check["status"].is_string() })
+    );
+    assert!(
+        json["next_actions"].is_array(),
+        "next_actions must always be an array: {json}"
+    );
+}
+
+#[test]
+fn doctor_fix_json_reports_fixed_config_bindings() {
+    let dir = tempfile::tempdir().unwrap();
+    let filigree_dir = dir.path().join(".filigree");
+    fs::create_dir_all(&filigree_dir).unwrap();
+    fs::write(filigree_dir.join("ephemeral.port"), "8749\n").unwrap();
+    install(
+        &[
+            "install",
+            "--skills",
+            "--codex-skills",
+            "--hooks",
+            "--claude-code",
+        ],
+        dir.path(),
+    );
+
+    let (code, json) = doctor_json(dir.path(), true);
+    assert_eq!(code, 0, "--fix json should repair and exit 0: {json}");
+    assert_eq!(json["ok"], true);
+    let check = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == "integration.bindings")
+        .expect("integration.bindings check");
+    assert_eq!(check["status"], "fixed");
+    assert_eq!(check["fixed"], serde_json::json!(true));
+
+    let (code, json) = doctor_json(dir.path(), false);
+    assert_eq!(code, 0, "repaired project should be healthy: {json}");
+    let check = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == "integration.bindings")
+        .expect("integration.bindings check");
+    assert_eq!(check["status"], "ok");
+    assert_eq!(check["fixed"], serde_json::json!(false));
+}
+
+/// With only the skill installed (no hook, no mcp, no integration bindings),
+/// `doctor` reports the missing surfaces and exits 1; the index snapshot block
+/// is still printed.
 #[test]
 fn doctor_reports_missing_hook_and_mcp_and_prints_index_block() {
     let dir = tempfile::tempdir().unwrap();
-    // --skills installs ONLY the skill pack (no .clarion/, no hook, no mcp).
-    install(&["install", "--skills"], dir.path());
+    // Skill flags install ONLY the skill packs (no .clarion/, no hook, no mcp).
+    install(&["install", "--skills", "--codex-skills"], dir.path());
 
     let (code, out) = doctor(dir.path(), false);
     assert_eq!(code, 1, "stdout:\n{out}");
@@ -123,6 +313,10 @@ fn doctor_reports_missing_hook_and_mcp_and_prints_index_block() {
         out.contains(".mcp.json has no clarion serve entry"),
         "stdout:\n{out}"
     );
+    assert!(
+        out.contains("three-way integration bindings missing or stale"),
+        "stdout:\n{out}"
+    );
     assert!(out.contains("--- index ---"), "stdout:\n{out}");
-    assert!(out.contains("2 problems found"), "stdout:\n{out}");
+    assert!(out.contains("3 problems found"), "stdout:\n{out}");
 }

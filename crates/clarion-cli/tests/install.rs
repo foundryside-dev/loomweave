@@ -6,7 +6,19 @@ use assert_cmd::Command;
 use rusqlite::Connection;
 
 fn clarion_bin() -> Command {
-    Command::cargo_bin("clarion").expect("clarion binary")
+    let mut cmd = Command::cargo_bin("clarion").expect("clarion binary");
+    cmd.env(
+        "CLARION_CODEX_CONFIG",
+        std::env::temp_dir().join(format!(
+            "clarion-test-codex-config-{}.toml",
+            std::process::id()
+        )),
+    );
+    cmd
+}
+
+fn read_yaml(path: &std::path::Path) -> serde_json::Value {
+    serde_norway::from_str(&fs::read_to_string(path).unwrap()).unwrap()
 }
 
 #[test]
@@ -46,6 +58,61 @@ fn install_creates_clarion_dir_with_expected_contents() {
             ".gitignore missing rule {rule}: {gitignore}"
         );
     }
+}
+
+#[test]
+fn install_all_wires_three_way_integration_bindings() {
+    let dir = tempfile::tempdir().unwrap();
+    let filigree_dir = dir.path().join(".filigree");
+    fs::create_dir_all(&filigree_dir).unwrap();
+    fs::write(filigree_dir.join("ephemeral.port"), "8749\n").unwrap();
+
+    clarion_bin()
+        .args(["install", "--all", "--path"])
+        .arg(dir.path())
+        .assert()
+        .success();
+
+    let clarion_yaml = read_yaml(&dir.path().join("clarion.yaml"));
+    assert_eq!(
+        clarion_yaml["integrations"]["filigree"]["enabled"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        clarion_yaml["integrations"]["filigree"]["base_url"],
+        "http://127.0.0.1:8749"
+    );
+    assert_eq!(
+        clarion_yaml["serve"]["http"]["enabled"],
+        serde_json::json!(true)
+    );
+    assert_eq!(clarion_yaml["serve"]["http"]["bind"], "127.0.0.1:9111");
+    assert_eq!(
+        clarion_yaml["serve"]["http"]["wardline_taint_write"],
+        serde_json::json!(true)
+    );
+
+    let wardline_yaml = read_yaml(&dir.path().join("wardline.yaml"));
+    assert_eq!(wardline_yaml["clarion"]["url"], "http://127.0.0.1:9111");
+    assert_eq!(
+        wardline_yaml["filigree"]["url"],
+        "http://127.0.0.1:8749/api/loom/scan-results"
+    );
+
+    let mcp: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join(".mcp.json")).unwrap()).unwrap();
+    assert_eq!(
+        mcp["mcpServers"]["wardline"]["args"],
+        serde_json::json!([
+            "mcp",
+            "--root",
+            ".",
+            "--clarion-url",
+            "http://127.0.0.1:9111",
+            "--filigree-url",
+            "http://127.0.0.1:8749/api/loom/scan-results"
+        ])
+    );
 }
 
 #[test]
@@ -174,9 +241,11 @@ fn install_force_replaces_existing_clarion_dir_without_overwriting_yaml() {
         "--force should remove stale .clarion/ contents"
     );
     assert!(clarion.join("clarion.db").exists(), "clarion.db missing");
+    let yaml = read_yaml(&dir.path().join("clarion.yaml"));
+    assert_eq!(yaml["custom"], serde_json::json!(true));
     assert_eq!(
-        fs::read_to_string(dir.path().join("clarion.yaml")).unwrap(),
-        "version: 1\ncustom: true\n"
+        yaml["serve"]["http"]["wardline_taint_write"],
+        serde_json::json!(true)
     );
 }
 
@@ -218,7 +287,7 @@ fn install_cleans_up_clarion_dir_when_post_mkdir_step_fails() {
 }
 
 #[test]
-fn install_leaves_existing_clarion_yaml_untouched() {
+fn install_preserves_existing_clarion_yaml_keys_while_wiring_bindings() {
     let dir = tempfile::tempdir().unwrap();
     let yaml_path = dir.path().join("clarion.yaml");
     let user_content = "# user-edited clarion.yaml\nversion: 1\ncustom_key: preserved\n";
@@ -230,10 +299,71 @@ fn install_leaves_existing_clarion_yaml_untouched() {
         .assert()
         .success();
 
-    let after = fs::read_to_string(&yaml_path).unwrap();
+    let after = read_yaml(&yaml_path);
+    assert_eq!(after["custom_key"], "preserved");
     assert_eq!(
-        after, user_content,
-        "clarion.yaml was overwritten; user content lost"
+        after["integrations"]["filigree"]["enabled"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        after["serve"]["http"]["wardline_taint_write"],
+        serde_json::json!(true)
+    );
+}
+
+#[test]
+fn install_claude_code_writes_mcp_json_without_initialising_clarion_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    clarion_bin()
+        .args(["install", "--claude-code", "--path"])
+        .arg(dir.path())
+        .assert()
+        .success();
+
+    assert!(
+        !dir.path().join(".clarion").exists(),
+        "--claude-code should not create .clarion/"
+    );
+    let raw = fs::read_to_string(dir.path().join(".mcp.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let entry = &parsed["mcpServers"]["clarion"];
+    assert_eq!(entry["type"], "stdio");
+    assert!(
+        entry["command"].as_str().unwrap().ends_with("clarion"),
+        "command should point at a clarion executable: {entry:?}"
+    );
+    assert_eq!(
+        entry["args"],
+        serde_json::json!(["serve"]),
+        "Claude Code MCP should rely on runtime project autodiscovery"
+    );
+}
+
+#[test]
+fn install_codex_writes_requested_config_without_initialising_clarion_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex_config = dir.path().join("codex-config.toml");
+
+    clarion_bin()
+        .args(["install", "--codex", "--codex-config"])
+        .arg(&codex_config)
+        .args(["--path"])
+        .arg(dir.path())
+        .assert()
+        .success();
+
+    assert!(
+        !dir.path().join(".clarion").exists(),
+        "--codex should not create .clarion/"
+    );
+    let raw = fs::read_to_string(&codex_config).unwrap();
+    assert!(
+        raw.contains("[mcp_servers.clarion]"),
+        "Codex MCP entry missing: {raw}"
+    );
+    assert!(
+        raw.contains("args = [\"serve\"]"),
+        "Codex MCP should rely on runtime project autodiscovery: {raw}"
     );
 }
 
@@ -260,6 +390,10 @@ fn dotenv_in_cwd_is_loaded_before_tracing_setup() {
         .current_dir(dir.path())
         .env_clear()
         .env("PATH", path)
+        .env(
+            "CLARION_CODEX_CONFIG",
+            dir.path().join("isolated-codex-config.toml"),
+        )
         .args(["install", "--path"])
         .arg(dir.path())
         .output()
@@ -271,11 +405,12 @@ fn dotenv_in_cwd_is_loaded_before_tracing_setup() {
         out.status.success(),
         "install failed; stdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    // tracing_subscriber::fmt defaults to stdout, so the DEBUG line lands there.
+    // Tracing is intentionally written to stderr so MCP stdio stdout stays
+    // protocol-clean; this still proves .env was loaded before tracing setup.
     assert!(
-        stdout.contains("DEBUG"),
-        ".env-supplied RUST_LOG=debug should produce DEBUG-level lines on stdout; \
-         stdout was:\n{stdout}"
+        stderr.contains("DEBUG"),
+        ".env-supplied RUST_LOG=debug should produce DEBUG-level lines on stderr; \
+         stderr was:\n{stderr}"
     );
 }
 
@@ -295,6 +430,10 @@ fn explicit_env_var_wins_over_dotenv() {
         .env_clear()
         .env("PATH", path)
         .env("RUST_LOG", "info")
+        .env(
+            "CLARION_CODEX_CONFIG",
+            dir.path().join("isolated-codex-config.toml"),
+        )
         .args(["install", "--path"])
         .arg(dir.path())
         .output()
@@ -307,8 +446,8 @@ fn explicit_env_var_wins_over_dotenv() {
         "install failed; stdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        !stdout.contains("DEBUG"),
+        !stderr.contains("DEBUG"),
         "explicit RUST_LOG=info should beat .env's RUST_LOG=debug; \
-         stdout was:\n{stdout}"
+         stderr was:\n{stderr}"
     );
 }

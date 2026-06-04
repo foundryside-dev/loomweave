@@ -1,19 +1,20 @@
-//! `.mcp.json` Clarion server-entry detection and never-clobber merge.
+//! Clarion MCP server-entry detection and never-clobber merge.
 //!
-//! `clarion install` does not register the MCP server today (it is a manual,
-//! documented step), so `clarion doctor` is the surface that detects a missing
-//! or mis-pointed `clarion` entry and — under `--fix` — repairs it.
+//! `clarion install --claude-code` writes the project-local `.mcp.json` entry
+//! for Claude Code. `clarion install --codex` writes the user-level Codex
+//! `config.toml` entry. `clarion doctor` detects a missing or mis-pointed
+//! Claude Code entry and — under `--fix` — repairs it.
 //!
 //! Merge semantics mirror [`crate::hooks_settings`]: parse the existing JSON,
 //! touch only the `mcpServers.clarion` key, and preserve every other server
 //! (e.g. a sibling `filigree` entry) and top-level key. A fresh entry uses the
-//! bare `clarion` command (PATH-resolved, same convention as the `SessionStart`
-//! hook); an existing entry keeps its `command` verbatim and only has its
-//! `args` corrected to point at this project — never clobbering a deliberately
-//! customised binary path.
+//! current `clarion` executable; an existing entry refreshes stale `clarion`
+//! executable paths and corrects `args` to the runtime-autodiscovery form while
+//! preserving deliberately customised non-Clarion wrapper commands.
 
+use std::ffi::OsStr;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
@@ -24,11 +25,12 @@ pub const SERVER_KEY: &str = "clarion";
 /// Read-only health of the `.mcp.json` Clarion registration, for `doctor`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpState {
-    /// A `clarion` stdio server is registered and runs `serve --path <this
-    /// project>`.
+    /// A `clarion` stdio server is registered and runs `serve` using the MCP
+    /// client's current working directory for project discovery.
     Present,
-    /// A `clarion` entry exists but does not target this project (wrong or
-    /// missing `--path`, or not a `serve` invocation). Repairable in place.
+    /// A `clarion` entry exists but is not the runtime-autodiscovery form
+    /// (wrong args, stale executable path, or not a `serve` invocation).
+    /// Repairable in place.
     Stale,
     /// No `.mcp.json`, or it has no `clarion` server entry.
     Missing,
@@ -37,27 +39,53 @@ pub enum McpState {
     Unparseable,
 }
 
-/// The `args` a `clarion` entry must carry to orient this project.
-fn desired_args(project_root: &Path) -> Value {
-    let canonical = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
-    json!(["serve", "--path", canonical.display().to_string()])
+/// The `args` a stdio `clarion` MCP entry must carry.
+///
+/// Claude Code project configs and Codex global configs should use runtime
+/// project autodiscovery from the client working directory. Pinning `--path`
+/// into an MCP config makes the server useful only for one checkout and is the
+/// same cross-project routing bug Filigree already removed.
+fn desired_args() -> Value {
+    json!(["serve"])
 }
 
-/// True if `entry.args` runs `serve` with `--path <this project>`.
-fn entry_targets_project(entry: &Value, project_root: &Path) -> bool {
-    let canonical = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
-    let want = canonical.display().to_string();
+fn desired_arg_strings() -> Vec<&'static str> {
+    vec!["serve"]
+}
+
+/// Return the command path to write into fresh MCP configs.
+fn clarion_command() -> String {
+    match std::env::current_exe() {
+        Ok(path) if executable_name_is_clarion(path.file_name()) => path.display().to_string(),
+        _ => "clarion".to_owned(),
+    }
+}
+
+fn executable_name_is_clarion(name: Option<&OsStr>) -> bool {
+    let Some(name) = name.and_then(OsStr::to_str) else {
+        return false;
+    };
+    name == "clarion" || name == "clarion.exe"
+}
+
+fn command_string_is_clarion(command: &str) -> bool {
+    executable_name_is_clarion(Path::new(command).file_name())
+}
+
+/// True if `entry.args` runs `serve` and does not pin a project path.
+fn entry_uses_runtime_project(entry: &Value) -> bool {
     let Some(args) = entry.get("args").and_then(Value::as_array) else {
         return false;
     };
     let strs: Vec<&str> = args.iter().filter_map(Value::as_str).collect();
-    let has_serve = strs.contains(&"serve");
-    let path_ok = strs.windows(2).any(|w| w[0] == "--path" && w[1] == want);
-    has_serve && path_ok
+    strs == desired_arg_strings() && entry_command_is_current_or_custom(entry)
+}
+
+fn entry_command_is_current_or_custom(entry: &Value) -> bool {
+    let Some(command) = entry.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    !command_string_is_clarion(command) || command == clarion_command()
 }
 
 /// Classify the `.mcp.json` Clarion entry without writing anything.
@@ -83,7 +111,7 @@ pub fn mcp_entry_state(project_root: &Path) -> McpState {
     let Some(entry) = root.get("mcpServers").and_then(|m| m.get(SERVER_KEY)) else {
         return McpState::Missing;
     };
-    if entry_targets_project(entry, project_root) {
+    if entry_uses_runtime_project(entry) {
         McpState::Present
     } else {
         McpState::Stale
@@ -94,9 +122,10 @@ pub fn mcp_entry_state(project_root: &Path) -> McpState {
 /// Clarion's `serve` entry, and write it back pretty-printed. Returns `true`
 /// if the file changed.
 ///
-/// Never-clobber: an existing `clarion` object entry keeps its `command`,
-/// `type`, and `env`; only `args` are corrected. A fresh entry is written with
-/// the bare `clarion` command. All other servers and top-level keys are
+/// Never-clobber: an existing object entry keeps `type` and `env`; `args`
+/// are corrected, stale `clarion` executable paths are refreshed, and
+/// non-Clarion wrapper commands are preserved. A fresh entry is written with
+/// the current `clarion` command. All other servers and top-level keys are
 /// preserved.
 ///
 /// # Errors
@@ -137,7 +166,8 @@ pub fn install_mcp_entry(project_root: &Path) -> Result<bool> {
         );
     }
 
-    let want_args = desired_args(project_root);
+    let want_args = desired_args();
+    let want_command = clarion_command();
     let obj = root.as_object_mut().expect("root is object");
     let servers = obj
         .entry("mcpServers")
@@ -145,15 +175,27 @@ pub fn install_mcp_entry(project_root: &Path) -> Result<bool> {
     let servers = servers.as_object_mut().expect("mcpServers is object");
 
     let changed = match servers.get_mut(SERVER_KEY) {
-        // Existing object entry: preserve command/type/env, correct args only.
+        // Existing object entry: preserve type/env and deliberate wrappers,
+        // correct args, and refresh stale clarion executable paths.
         Some(entry) if entry.is_object() => {
             let entry = entry.as_object_mut().expect("entry is object");
-            if entry.get("args") == Some(&want_args) {
-                false
-            } else {
-                entry.insert("args".to_string(), want_args);
-                true
+            let mut changed = false;
+            if entry.get("args") != Some(&want_args) {
+                entry.insert("args".to_string(), want_args.clone());
+                changed = true;
             }
+            let should_refresh_command =
+                entry
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_none_or(|command| {
+                        command_string_is_clarion(command) && command != want_command
+                    });
+            if should_refresh_command {
+                entry.insert("command".to_string(), Value::String(want_command.clone()));
+                changed = true;
+            }
+            changed
         }
         // No entry (or a malformed non-object one we own): write a fresh entry
         // with the bare PATH-resolved command.
@@ -162,7 +204,7 @@ pub fn install_mcp_entry(project_root: &Path) -> Result<bool> {
                 SERVER_KEY.to_string(),
                 json!({
                     "type": "stdio",
-                    "command": "clarion",
+                    "command": want_command,
                     "args": want_args,
                     "env": {},
                 }),
@@ -184,6 +226,128 @@ pub fn install_mcp_entry(project_root: &Path) -> Result<bool> {
         let _ = fs::remove_file(&tmp);
         return Err(err);
     }
+    Ok(true)
+}
+
+/// Return the default Codex MCP config path.
+///
+/// Codex reads a global config, so tests use [`install_codex_mcp_entry`] with
+/// an explicit path rather than writing to the real user config.
+pub fn codex_config_path() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("CLARION_CODEX_CONFIG") {
+        return Ok(PathBuf::from(path));
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        bail!("HOME is not set; cannot locate ~/.codex/config.toml");
+    };
+    Ok(PathBuf::from(home).join(".codex").join("config.toml"))
+}
+
+/// Merge Clarion's stdio MCP server into Codex's TOML config.
+///
+/// The global Codex entry deliberately does not include a project path; Codex
+/// starts the stdio server in the active workspace and Clarion's `serve`
+/// default path (`.`) resolves from there.
+pub fn install_codex_mcp_entry(config_path: &Path) -> Result<bool> {
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+
+    let existing = if config_path.exists() {
+        fs::read_to_string(config_path)
+            .with_context(|| format!("read {}", config_path.display()))?
+    } else {
+        String::new()
+    };
+    if !existing.trim().is_empty() {
+        let parsed: toml::Value = existing
+            .parse()
+            .with_context(|| format!("parse {}", config_path.display()))?;
+        if codex_config_has_desired_clarion(&parsed) {
+            return Ok(false);
+        }
+    }
+
+    let updated = upsert_toml_table(
+        &existing,
+        "mcp_servers.clarion",
+        &codex_server_block(&clarion_command()),
+    );
+    write_text_if_changed(config_path, &updated)
+}
+
+fn codex_config_has_desired_clarion(parsed: &toml::Value) -> bool {
+    let Some(entry) = parsed
+        .get("mcp_servers")
+        .and_then(|servers| servers.get("clarion"))
+        .and_then(toml::Value::as_table)
+    else {
+        return false;
+    };
+    let command_ok = entry
+        .get("command")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|command| !command.is_empty() && toml_command_is_current_or_custom(command));
+    let args_ok = entry
+        .get("args")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|args| {
+            args.iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>()
+                == desired_arg_strings()
+        });
+    command_ok && args_ok
+}
+
+fn toml_command_is_current_or_custom(command: &str) -> bool {
+    !command_string_is_clarion(command) || command == clarion_command()
+}
+
+fn codex_server_block(command: &str) -> String {
+    format!(
+        "[mcp_servers.clarion]\ncommand = \"{}\"\nargs = [\"serve\"]\n",
+        toml_quote(command)
+    )
+}
+
+fn toml_quote(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn upsert_toml_table(content: &str, table_name: &str, table_block: &str) -> String {
+    let mut lines: Vec<&str> = content.lines().collect();
+    let header = format!("[{table_name}]");
+    let start = lines.iter().position(|line| line.trim() == header);
+    if let Some(start) = start {
+        let end = lines
+            .iter()
+            .enumerate()
+            .skip(start + 1)
+            .find_map(|(idx, line)| line.trim_start().starts_with('[').then_some(idx))
+            .unwrap_or(lines.len());
+        lines.splice(start..end, table_block.trim_end().lines());
+        let mut updated = lines.join("\n");
+        updated.push('\n');
+        updated
+    } else {
+        let mut updated = content.to_owned();
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        if !updated.is_empty() {
+            updated.push('\n');
+        }
+        updated.push_str(table_block);
+        updated
+    }
+}
+
+fn write_text_if_changed(path: &Path, content: &str) -> Result<bool> {
+    if fs::read_to_string(path).is_ok_and(|existing| existing == content) {
+        return Ok(false);
+    }
+    fs::write(path, content).with_context(|| format!("write {}", path.display()))?;
     Ok(true)
 }
 
@@ -214,36 +378,35 @@ mod tests {
     }
 
     #[test]
-    fn fresh_entry_uses_bare_command_and_pins_this_project() {
+    fn fresh_entry_uses_runtime_project_autodiscovery() {
         let dir = tempfile::tempdir().unwrap();
         install_mcp_entry(dir.path()).unwrap();
         let raw = fs::read_to_string(dir.path().join(".mcp.json")).unwrap();
         let v: Value = serde_json::from_str(&raw).unwrap();
         let entry = &v["mcpServers"]["clarion"];
-        assert_eq!(
-            entry["command"], "clarion",
-            "fresh entry must be PATH-resolved"
+        assert!(
+            entry["command"].as_str().unwrap().ends_with("clarion"),
+            "fresh entry should point at a clarion executable: {entry:?}"
         );
         assert_eq!(entry["type"], "stdio");
-        let canon = dir.path().canonicalize().unwrap().display().to_string();
         assert_eq!(
             entry["args"],
-            serde_json::json!(["serve", "--path", canon]),
-            "args must pin this project"
+            serde_json::json!(["serve"]),
+            "stdio MCP must use runtime project autodiscovery, not a pinned --path"
         );
     }
 
     #[test]
-    fn install_preserves_other_servers_and_keeps_custom_command() {
+    fn install_preserves_other_servers_and_keeps_custom_wrapper_command() {
         let dir = tempfile::tempdir().unwrap();
         // Pre-existing file with a sibling server and a clarion entry that has a
-        // deliberately customised command but a WRONG --path.
+        // deliberately customised wrapper command but a WRONG --path.
         fs::write(
             dir.path().join(".mcp.json"),
             r#"{
   "mcpServers": {
     "filigree": {"type": "stdio", "command": "/opt/filigree-mcp", "args": []},
-    "clarion": {"type": "stdio", "command": "/custom/bin/clarion", "args": ["serve", "--path", "/old/proj"], "env": {}}
+    "clarion": {"type": "stdio", "command": "/custom/bin/clarion-wrapper", "args": ["serve", "--path", "/old/proj"], "env": {}}
   }
 }"#,
         )
@@ -261,17 +424,103 @@ mod tests {
                 .unwrap();
         // Sibling untouched.
         assert_eq!(v["mcpServers"]["filigree"]["command"], "/opt/filigree-mcp");
-        // Custom command PRESERVED, args corrected to this project.
+        // Custom wrapper command PRESERVED, args corrected to runtime autodiscovery.
         assert_eq!(
-            v["mcpServers"]["clarion"]["command"], "/custom/bin/clarion",
-            "a customised command must be preserved, not clobbered"
+            v["mcpServers"]["clarion"]["command"], "/custom/bin/clarion-wrapper",
+            "a customised wrapper command must be preserved, not clobbered"
         );
         let canon = dir.path().canonicalize().unwrap().display().to_string();
         assert_eq!(
             v["mcpServers"]["clarion"]["args"],
-            serde_json::json!(["serve", "--path", canon])
+            serde_json::json!(["serve"]),
+            "stale --path pin should be removed: {canon}"
         );
         assert_eq!(mcp_entry_state(dir.path()), McpState::Present);
+    }
+
+    #[test]
+    fn install_refreshes_stale_clarion_executable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".mcp.json"),
+            r#"{
+  "mcpServers": {
+    "clarion": {"type": "stdio", "command": "/tmp/old-target/release/clarion", "args": ["serve"], "env": {}}
+  }
+}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            mcp_entry_state(dir.path()),
+            McpState::Stale,
+            "a stale clarion executable path is Stale even when args are already correct"
+        );
+        assert!(install_mcp_entry(dir.path()).unwrap());
+
+        let v: Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join(".mcp.json")).unwrap())
+                .unwrap();
+        assert!(
+            v["mcpServers"]["clarion"]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("clarion"),
+            "clarion command should be refreshed to the current executable"
+        );
+        assert_ne!(
+            v["mcpServers"]["clarion"]["command"], "/tmp/old-target/release/clarion",
+            "stale clarion executable path should not be preserved"
+        );
+        assert_eq!(mcp_entry_state(dir.path()), McpState::Present);
+    }
+
+    #[test]
+    fn codex_entry_upserts_clarion_without_touching_other_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            "[mcp_servers.filigree]\ncommand = \"filigree-mcp\"\nargs = []\n",
+        )
+        .unwrap();
+
+        assert!(super::install_codex_mcp_entry(&config_path).unwrap());
+        assert!(!super::install_codex_mcp_entry(&config_path).unwrap());
+
+        let raw = fs::read_to_string(&config_path).unwrap();
+        assert!(
+            raw.contains("[mcp_servers.filigree]\ncommand = \"filigree-mcp\"\nargs = []"),
+            "sibling server was not preserved: {raw}"
+        );
+        assert!(
+            raw.contains("[mcp_servers.clarion]"),
+            "clarion Codex server missing: {raw}"
+        );
+        assert!(
+            raw.contains("args = [\"serve\"]"),
+            "Codex MCP must use runtime project autodiscovery: {raw}"
+        );
+    }
+
+    #[test]
+    fn codex_entry_refreshes_stale_clarion_executable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            "[mcp_servers.clarion]\ncommand = \"/tmp/old-target/release/clarion\"\nargs = [\"serve\"]\n",
+        )
+        .unwrap();
+
+        assert!(super::install_codex_mcp_entry(&config_path).unwrap());
+
+        let raw = fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !raw.contains("/tmp/old-target/release/clarion"),
+            "stale clarion executable path should not be preserved: {raw}"
+        );
+        assert!(raw.contains("args = [\"serve\"]"));
     }
 
     #[test]

@@ -5,7 +5,15 @@ use rusqlite::Connection;
 use sha1::{Digest, Sha1};
 
 fn clarion_bin() -> Command {
-    Command::cargo_bin("clarion").expect("clarion binary")
+    let mut cmd = Command::cargo_bin("clarion").expect("clarion binary");
+    cmd.env(
+        "CLARION_CODEX_CONFIG",
+        std::env::temp_dir().join(format!(
+            "clarion-test-codex-config-{}.toml",
+            std::process::id()
+        )),
+    );
+    cmd
 }
 
 const PLUGIN_SCRIPT: &str = r#"#!/usr/bin/python3

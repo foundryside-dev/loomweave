@@ -735,6 +735,19 @@ mod tests {
         clarion_storage::Writer,
         tempfile::TempDir,
     ) {
+        wardline_write_test_state_with_bindings(secret, seed_ids, &[])
+    }
+
+    fn wardline_write_test_state_with_bindings(
+        secret: &str,
+        seed_ids: &[&str],
+        sei_bindings: &[(&str, &str)],
+    ) -> (
+        AppState,
+        std::path::PathBuf,
+        clarion_storage::Writer,
+        tempfile::TempDir,
+    ) {
         use clarion_storage::ReaderPool;
         use clarion_storage::schema::apply_migrations;
 
@@ -761,6 +774,16 @@ mod tests {
                 ],
             )
             .expect("seed entity row");
+        }
+        for (sei, locator) in sei_bindings {
+            conn.execute(
+                "INSERT INTO sei_bindings \
+                    (sei, current_locator, body_hash, signature, status, \
+                     born_run_id, updated_run_id, updated_at) \
+                 VALUES (?1, ?2, NULL, NULL, 'alive', 'run-0', 'run-0', 't')",
+                rusqlite::params![sei, locator],
+            )
+            .expect("seed SEI binding row");
         }
         drop(conn);
 
@@ -865,18 +888,8 @@ mod tests {
         let secret = "wardline-write-secret";
         let locator = "python:function:a.b.c";
         let resolved_sei = "clarion:eid:resolved";
-        let (state, db_path, writer, _tempdir) = wardline_write_test_state(secret, &[locator]);
-        {
-            let conn = rusqlite::Connection::open(&db_path).expect("open db");
-            conn.execute(
-                "INSERT INTO sei_bindings \
-                    (sei, current_locator, body_hash, signature, status, \
-                     born_run_id, updated_run_id, updated_at) \
-                 VALUES (?1, ?2, NULL, NULL, 'alive', 'run-0', 'run-0', 't')",
-                rusqlite::params![resolved_sei, locator],
-            )
-            .expect("insert binding");
-        }
+        let (state, db_path, writer, _tempdir) =
+            wardline_write_test_state_with_bindings(secret, &[locator], &[(resolved_sei, locator)]);
 
         let body = br#"{"facts":[{"qualname":"a.b.c","sei":"clarion:eid:other","wardline_json":{"v":1}}]}"#;
         let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body);
@@ -900,18 +913,8 @@ mod tests {
         let secret = "wardline-write-secret";
         let locator = "python:function:a.b.c";
         let resolved_sei = "clarion:eid:resolved";
-        let (state, db_path, writer, _tempdir) = wardline_write_test_state(secret, &[locator]);
-        {
-            let conn = rusqlite::Connection::open(&db_path).expect("open db");
-            conn.execute(
-                "INSERT INTO sei_bindings \
-                    (sei, current_locator, body_hash, signature, status, \
-                     born_run_id, updated_run_id, updated_at) \
-                 VALUES (?1, ?2, NULL, NULL, 'alive', 'run-0', 'run-0', 't')",
-                rusqlite::params![resolved_sei, locator],
-            )
-            .expect("insert binding");
-        }
+        let (state, db_path, writer, _tempdir) =
+            wardline_write_test_state_with_bindings(secret, &[locator], &[(resolved_sei, locator)]);
 
         let body = br#"{"facts":[{"qualname":"a.b.c","sei":"clarion:eid:resolved","wardline_json":{"v":1}}]}"#;
         let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body);
@@ -1714,20 +1717,9 @@ mod tests {
         let new = "python:function:new.pkg.fn";
         let sei = "clarion:eid:rename-stable";
         // Both pre- and post-rename entity rows exist (entities is cumulative).
-        let (state, db_path, _writer, _tempdir) = wardline_write_test_state(secret, &[old, new]);
-
         // Alive SEI binding at the OLD locator, as it stands at write time.
-        {
-            let conn = rusqlite::Connection::open(&db_path).expect("open db");
-            conn.execute(
-                "INSERT INTO sei_bindings \
-                    (sei, current_locator, body_hash, signature, status, \
-                     born_run_id, updated_run_id, updated_at) \
-                 VALUES (?1, ?2, NULL, NULL, 'alive', 'run-0', 'run-0', 't')",
-                rusqlite::params![sei, old],
-            )
-            .expect("insert binding");
-        }
+        let (state, db_path, _writer, _tempdir) =
+            wardline_write_test_state_with_bindings(secret, &[old, new], &[(sei, old)]);
 
         // 1. Write a fact for the OLD qualname. The request omits `sei`; the
         //    server resolves and stamps it from the alive binding.

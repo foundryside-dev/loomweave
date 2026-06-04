@@ -1,19 +1,30 @@
 {
   "mcpServers": {
-    "filigree": {
-      "type": "stdio",
-      "command": "/home/john/.local/bin/filigree-mcp",
-      "args": []
-    },
     "clarion": {
-      "type": "stdio",
-      "command": "/home/john/clarion/target/release/clarion",
       "args": [
-        "serve",
-        "--path",
-        "/home/john/clarion"
+        "serve"
       ],
-      "env": {}
+      "command": "/home/john/.local/bin/clarion",
+      "env": {},
+      "type": "stdio"
+    },
+    "filigree": {
+      "args": [],
+      "command": "/home/john/.local/bin/filigree-mcp",
+      "type": "stdio"
+    },
+    "wardline": {
+      "args": [
+        "mcp",
+        "--root",
+        ".",
+        "--clarion-url",
+        "http://127.0.0.1:9111",
+        "--filigree-url",
+        "http://127.0.0.1:8542/api/loom/scan-results"
+      ],
+      "command": "/home/john/.local/bin/wardline",
+      "type": "stdio"
     }
   }
 }

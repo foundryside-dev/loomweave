@@ -150,7 +150,7 @@ Open issues for the v1.0 known limitations and any post-release follow-ups live 
   protection (timestamp + nonce window) is ADR-034 forward-work tracked for
   post-1.0 hardening.
 
-<!-- filigree:instructions:v2.3.0:108d0005 -->
+<!-- filigree:instructions:v2.3.0:d0668ee1 -->
 ## Filigree Issue Tracker
 
 `filigree` tracks tasks for this project. Data lives in `.filigree/`. Prefer
@@ -252,8 +252,8 @@ Errors return `{error: str, code: ErrorCode, details?: dict}`. Switch on
 `code`, not on message text. Codes: `VALIDATION`, `NOT_FOUND`, `CONFLICT`,
 `INVALID_TRANSITION`, `PERMISSION`, `NOT_INITIALIZED`, `IO`,
 `INVALID_API_URL`, `FILE_REGISTRY_DISPLACED`, `REGISTRY_UNAVAILABLE`,
-`CLARION_REGISTRY_VERSION_MISMATCH`, `BRIEFING_BLOCKED`, `STOP_FAILED`,
-`SCHEMA_MISMATCH`, `INTERNAL`.
+`CLARION_REGISTRY_VERSION_MISMATCH`, `CLARION_OUT_OF_SYNC`,
+`BRIEFING_BLOCKED`, `STOP_FAILED`, `SCHEMA_MISMATCH`, `INTERNAL`.
 
 On `INVALID_TRANSITION`, call `workflow_transition_list` (MCP) or
 `filigree transitions <id>` to see what the workflow allows from here.
