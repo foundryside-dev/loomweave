@@ -126,9 +126,10 @@ documented in
 
 ## Contributing
 
-Read [CLAUDE.md](CLAUDE.md) for repository conventions, work-package
-vocabulary, and where canonical truth lives. The CI floor every PR must clear
-is fixed by [ADR-023](docs/clarion/adr/ADR-023-tooling-baseline.md):
+Read the [v1.0 docset README](docs/clarion/1.0/README.md) for the canonical
+design ladder, its reading order, and where canonical truth lives. The CI
+floor every PR must clear is fixed by
+[ADR-023](docs/clarion/adr/ADR-023-tooling-baseline.md):
 
 ```bash
 # Rust gates

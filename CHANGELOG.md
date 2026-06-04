@@ -24,8 +24,8 @@ only when an incompatible change is made to that surface. See
   receive `wardline` entity metadata and `wardline:*` tags when the descriptor is
   available; a missing, invalid, or version-skewed descriptor degrades honestly to
   normal structural extraction. This **fully retires** the Clarion-side
-  `wardline.core.registry` startup coupling in [`docs/suite/loom.md`](docs/suite/loom.md)
-  §5 (asterisk 2): plugin startup performs zero in-process Wardline import, so the
+  `wardline.core.registry` startup coupling (federation asterisk 2, registered at
+  `~/loom/asterisk-register.md`): plugin startup performs zero in-process Wardline import, so the
   plugin no longer requires a co-installed Wardline and is robust to Wardline's
   upcoming native core. Plugin-only change (no Rust-core / protocol / ontology
   change); tracked at `clarion-881e9834bc`.
@@ -42,6 +42,17 @@ only when an incompatible change is made to that surface. See
   verification list.
 - Archived tracked architecture-analysis working notes out of live `temp/`
   directories under `docs/archive/working-notes/`.
+
+### Removed
+
+- **Release-governance gate script (`scripts/check-github-release-governance.py`).**
+  Release-governance enforcement is handed off to Legis; `release.yml` no longer
+  invokes the script and the standalone check is removed from the tree.
+- **In-repo agent-instruction files (`CLAUDE.md`, `AGENTS.md`).** Agent
+  conventions now derive from the `~/loom` federation hub plus local untracked
+  copies; both files are removed from the tracked tree and gitignored.
+- **Bundled Filigree-workflow skill (`.agents/skills/filigree-workflow/SKILL.md`).**
+  Removed from the tracked tree alongside the agent-instruction files.
 
 ### Fixed
 

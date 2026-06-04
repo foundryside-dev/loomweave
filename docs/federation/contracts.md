@@ -15,12 +15,12 @@ Filigree is absent (loom.md §5).
 
 > **Federation-pattern sources (pointers).** The federation axiom and composition
 > law cited as `loom.md §5` throughout this document are now authoritative at the
-> federation hub: [`~/loom/doctrine.md`](file:///home/john/loom/doctrine.md) §5
+> federation hub: `~/loom/doctrine.md` §5
 > (as of 2026-06-05; `loom.md` is now a pointer stub that preserves the original
 > section numbers, so `loom.md §5` resolves there). The cross-product **contract
 > index** — the suite-level list of every live cross-product contract and its
 > owning authority — lives at
-> [`~/loom/contracts-index.md`](file:///home/john/loom/contracts-index.md). The
+> `~/loom/contracts-index.md`. The
 > endpoint specs below are **Clarion-owned and authoritative**; the hub indexes
 > them, it does not restate them.
 

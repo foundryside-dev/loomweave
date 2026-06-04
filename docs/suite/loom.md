@@ -3,7 +3,7 @@
 > **This founding doctrine has been promoted to the Loom federation hub.**
 > The canonical, authoritative Loom federation doctrine — federation axiom,
 > roster, composition law, enrichment-not-load-bearing test, and the go/no-go
-> gate for new products — now lives at **[`~/loom/doctrine.md`](file:///home/john/loom/doctrine.md)** (authoritative as of 2026-06-05).
+> gate for new products — now lives at **`~/loom/doctrine.md`** (authoritative as of 2026-06-05).
 > This file is retained as a **pointer stub** so existing references resolve.
 >
 > The doctrine was promoted faithfully and **preserves the original section
@@ -18,7 +18,7 @@
 The body of this file (the suite doctrine: bounded authority, federation axiom,
 composition law, the enrichment failure-test, the asterisk discipline, the
 go/no-go test, and naming) is now authoritative at
-[`~/loom/doctrine.md`](file:///home/john/loom/doctrine.md). Read it there.
+`~/loom/doctrine.md`. Read it there.
 
 One substantive update the hub makes over the old body of this file: the
 **federation roster is now 5 realized members** — Clarion, Filigree, Wardline,
@@ -31,12 +31,12 @@ the body that declares the roster. See the doctrine's §1 roster note and
 
 ## Companion hub docs
 
-- [`~/loom/doctrine.md`](file:///home/john/loom/doctrine.md) — the authoritative federation doctrine (this file's promoted body)
-- [`~/loom/glossary.md`](file:///home/john/loom/glossary.md) — the cross-product vocabulary catalogue
-- [`~/loom/sei-standard.md`](file:///home/john/loom/sei-standard.md) — the Stable Entity Identity conformance standard
-- [`~/loom/federation-map.md`](file:///home/john/loom/federation-map.md) — the integration matrix
-- [`~/loom/contracts-index.md`](file:///home/john/loom/contracts-index.md) — the cross-product contract index
-- [`~/loom/asterisk-register.md`](file:///home/john/loom/asterisk-register.md) — the live/retired federation asterisks
+- `~/loom/doctrine.md` — the authoritative federation doctrine (this file's promoted body)
+- `~/loom/glossary.md` — the cross-product vocabulary catalogue
+- `~/loom/sei-standard.md` — the Stable Entity Identity conformance standard
+- `~/loom/federation-map.md` — the integration matrix
+- `~/loom/contracts-index.md` — the cross-product contract index
+- `~/loom/asterisk-register.md` — the live/retired federation asterisks
 
 ## Clarion-local notes
 
