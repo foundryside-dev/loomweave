@@ -48,14 +48,14 @@ for the language plugin via GitHub Releases (per
 fallback below only when testing unreleased commits.
 
 ```bash
-TAG=v1.2.0
+TAG=v1.3.0
 curl -L -o clarion-x86_64-unknown-linux-gnu.tar.gz \
   "https://github.com/tachyon-beep/clarion/releases/download/${TAG}/clarion-x86_64-unknown-linux-gnu.tar.gz"
 tar xzf clarion-x86_64-unknown-linux-gnu.tar.gz
 install clarion-x86_64-unknown-linux-gnu/clarion ~/.local/bin/
 
 pipx install \
-  "https://github.com/tachyon-beep/clarion/releases/download/${TAG}/clarion-plugin-python-1.2.0.tar.gz"
+  "https://github.com/tachyon-beep/clarion/releases/download/${TAG}/clarion-plugin-python-1.3.0.tar.gz"
 ```
 
 Source-install fallback:

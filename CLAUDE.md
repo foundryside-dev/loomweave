@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-**v1.2.0 — current pre-release working version.** The `v1.0.0` (first publishable release), `v1.0.1`, and `v1.1.0` tags are cut; pre-release working tags `v0.1-sprint-1` and `v0.1-sprint-2` remain in the repo as historical anchors. Workspace + Python plugin are at 1.2.0; ADR-014 federation HTTP read API ships with bearer auth, batch resolution, briefing-blocked propagation, and stable per-project `instance_id`. See [`CHANGELOG.md`](CHANGELOG.md) for the full scope and [`docs/implementation/`](docs/implementation/) for sprint-closure artifacts.
+**v1.3.0 — current pre-release working version.** The `v1.0.0` (first publishable release), `v1.0.1`, and `v1.1.0` tags are cut; pre-release working tags `v0.1-sprint-1` and `v0.1-sprint-2` remain in the repo as historical anchors. Workspace + Python plugin are at 1.3.0 (the 1.2.0 line is changelog-cut but not yet git-tagged). 1.3.0 adds descriptor-based Wardline trust-vocabulary consumption — the Python plugin reads Wardline's NG-25 descriptor instead of importing `wardline.core.registry`, fully retiring `loom.md` §5 asterisk 2 (ADR-018 Revision 3). ADR-014 federation HTTP read API ships with bearer auth, batch resolution, briefing-blocked propagation, and stable per-project `instance_id`. See [`CHANGELOG.md`](CHANGELOG.md) for the full scope and [`docs/implementation/`](docs/implementation/) for sprint-closure artifacts.
 
 ### Layout (post-1.0)
 
@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - `crates/clarion-mcp/` — the MCP protocol surface (the `clarion serve` tool catalogue, Filigree HTTP client, scan-results emission, snapshot reader).
   - `crates/clarion-scanner/` — core-owned pre-ingest secret scanner; stores only positions, rule IDs, and a detect-secrets-compatible SHA-1 digest (literal secret values never leave the scan).
   - `crates/clarion-plugin-fixture/` — test-only fixture plugin used by `wp2_e2e` integration tests.
-- **Python plugin** at `plugins/python/` (editable install: `pip install -e plugins/python[dev]`). Speaks the L4 JSON-RPC protocol; emits function entities with L7 qualnames; runs the L8 Wardline probe.
+- **Python plugin** at `plugins/python/` (editable install: `pip install -e plugins/python[dev]`). Speaks the L4 JSON-RPC protocol; emits function entities with L7 qualnames; reads Wardline's NG-25 trust-vocabulary descriptor (`wardline_descriptor.py`) to tag trust-decorated entities, without importing Wardline.
 - **Shared cross-language fixture** at `fixtures/entity_id.json` — the L2 byte-for-byte parity proof (consumed by Rust + Python tests both).
 - **End-to-end test** at `tests/e2e/sprint_1_walking_skeleton.sh` — runs the README §3 demo verbatim and asserts the sqlite output.
 - **CI** at `.github/workflows/ci.yml` — three jobs: `rust` (fmt, clippy `-D warnings`, nextest, doc, deny), `python-plugin` (ruff, ruff-format check, mypy --strict, pytest), `walking-skeleton` (depends on the first two; runs the e2e script).
@@ -63,7 +63,7 @@ The Loom federation axiom in `docs/suite/loom.md` (especially §3–§5) is **lo
 
 Before proposing or accepting any change that adds a new dependency, "lightweight glue layer," shared registry, or cross-product mediator, run it against the §5 failure test (semantic / initialization / pipeline coupling). Centralisation creeps back in naturally; treat any "wouldn't it be easier if we just..." proposal as suspicious.
 
-Two named asterisks (Wardline→Filigree pipeline coupling via Clarion; Python plugin's `wardline.core.registry.REGISTRY` import) have written retirement conditions in `loom.md` §5. Both persist into v1.0 and retire post-release per the conditions named there. Do not add new asterisks without the same discipline.
+Two named asterisks were registered in `loom.md` §5 with written retirement conditions. **Asterisk 2** (Python plugin's `wardline.core.registry.REGISTRY` import) is **retired as of 1.3.0** — the plugin now reads Wardline's NG-25 descriptor instead (ADR-018 Revision 3). **Asterisk 1** (Wardline→Filigree pipeline coupling via Clarion) remains live until Wardline's native Filigree emitter ships. Do not add new asterisks without the same discipline.
 
 ## Documentation map
 
@@ -150,7 +150,7 @@ Open issues for the v1.0 known limitations and any post-release follow-ups live 
   protection (timestamp + nonce window) is ADR-034 forward-work tracked for
   post-1.0 hardening.
 
-<!-- filigree:instructions:v2.3.0:d0668ee1 -->
+<!-- filigree:instructions:v2.3.0:108d0005 -->
 ## Filigree Issue Tracker
 
 `filigree` tracks tasks for this project. Data lives in `.filigree/`. Prefer
@@ -252,8 +252,8 @@ Errors return `{error: str, code: ErrorCode, details?: dict}`. Switch on
 `code`, not on message text. Codes: `VALIDATION`, `NOT_FOUND`, `CONFLICT`,
 `INVALID_TRANSITION`, `PERMISSION`, `NOT_INITIALIZED`, `IO`,
 `INVALID_API_URL`, `FILE_REGISTRY_DISPLACED`, `REGISTRY_UNAVAILABLE`,
-`CLARION_REGISTRY_VERSION_MISMATCH`, `CLARION_OUT_OF_SYNC`,
-`BRIEFING_BLOCKED`, `STOP_FAILED`, `SCHEMA_MISMATCH`, `INTERNAL`.
+`CLARION_REGISTRY_VERSION_MISMATCH`, `BRIEFING_BLOCKED`, `STOP_FAILED`,
+`SCHEMA_MISMATCH`, `INTERNAL`.
 
 On `INVALID_TRANSITION`, call `workflow_transition_list` (MCP) or
 `filigree transitions <id>` to see what the workflow allows from here.

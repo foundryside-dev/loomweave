@@ -12,22 +12,47 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-06-05
+
+### Added
+
+- **Python plugin consumes Wardline's NG-25 trust-vocabulary descriptor
+  (ADR-018 Revision 3).** The Python plugin now reads Wardline's descriptor from
+  `.wardline/vocabulary.yaml` or the installed `wardline/core/vocabulary.yaml`
+  data file **without importing Wardline**. Functions and classes decorated with
+  Wardline trust decorators (`external_boundary` / `trust_boundary` / `trusted`)
+  receive `wardline` entity metadata and `wardline:*` tags when the descriptor is
+  available; a missing, invalid, or version-skewed descriptor degrades honestly to
+  normal structural extraction. This **fully retires** the Clarion-side
+  `wardline.core.registry` startup coupling in [`docs/suite/loom.md`](docs/suite/loom.md)
+  §5 (asterisk 2): plugin startup performs zero in-process Wardline import, so the
+  plugin no longer requires a co-installed Wardline and is robust to Wardline's
+  upcoming native core. Plugin-only change (no Rust-core / protocol / ontology
+  change); tracked at `clarion-881e9834bc`.
+
 ### Changed
 
-- **Python plugin Wardline descriptor metadata (ADR-018 Revision 3).** The
-  Python plugin now reads Wardline's NG-25 trust-vocabulary descriptor from
-  `.wardline/vocabulary.yaml` or the installed `wardline/core/vocabulary.yaml`
-  data file without importing Wardline. Decorated functions/classes receive
-  `wardline` entity metadata and `wardline:*` tags when the descriptor is
-  available; missing or invalid descriptors degrade to normal structural
-  extraction. This retires the Clarion-side `wardline.core.registry` startup
-  asterisk in `docs/suite/loom.md`.
-- Refreshed release-facing README/index documentation for the current 1.2.0
-  release line, including the 39-tool MCP surface, current install artifact
-  names, fixed ADR/docset links, current web/operator quick starts, and the full
-  end-to-end verification list.
+- **Filigree issue lookups key by Stable Entity Identity (SEI).** The MCP
+  `entity_issue_list` path and the federation Filigree client resolve issues by
+  SEI rather than source locator, aligning issue enrichment with Clarion's stable
+  identity (one key per entity — SEI xor locator, no per-row fallback).
+- Refreshed release-facing README / index documentation for the 1.3.0 release
+  line, including the 39-tool MCP surface, current install artifact names, fixed
+  ADR/docset links, current web/operator quick starts, and the full end-to-end
+  verification list.
 - Archived tracked architecture-analysis working notes out of live `temp/`
   directories under `docs/archive/working-notes/`.
+
+### Fixed
+
+- **`clarion doctor` reports enrich-only integration bindings as a warning, not a
+  gate failure (federation-axiom compliance).** A missing or stale
+  Clarion+Filigree+Wardline binding previously mapped to `problem` (exit 1),
+  which made an enrich-only sibling effectively required — contradicting
+  `loom.md` §5. Both the JSON and text doctor paths now report `warning` for
+  missing/stale bindings; unparseable bindings and `--fix` repair failures remain
+  `problem`. A bare `clarion doctor` on a no-bindings (Clarion-solo or
+  Clarion+Filigree-only) project now exits 0 with the warning surfaced.
 
 ## [1.2.0] — 2026-06-03
 
@@ -474,7 +499,8 @@ normative.
 - Operator guides under [`docs/operator/`](docs/operator/) — getting-started,
   OpenRouter setup, HTTP read API.
 
-[Unreleased]: https://github.com/tachyon-beep/clarion/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/tachyon-beep/clarion/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/tachyon-beep/clarion/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/tachyon-beep/clarion/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/tachyon-beep/clarion/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/tachyon-beep/clarion/compare/v1.0.0...v1.0.1

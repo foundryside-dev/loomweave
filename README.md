@@ -13,7 +13,7 @@ and trust-topology tools.
 
 ## Status
 
-**v1.2.0 — current release line.** Scope:
+**v1.3.0 — current release line.** Scope:
 
 - **Python only.** Other-language plugins (`NG-15`) are v2.0+ scope.
 - **Structural extraction + on-demand LLM summarisation.** `clarion analyze`
@@ -23,8 +23,14 @@ and trust-topology tools.
   egress is the LLM provider during `summary` calls.
 - **Stable identity and suite enrichment.** Clarion mints Stable Entity
   Identity (SEI) tokens, serves the federation HTTP read API, emits opted-in
-  Filigree scan findings, and enriches MCP reads with Filigree/Wardline context
-  without making sibling products mandatory.
+  Filigree scan findings (issue lookups now key by SEI), and enriches MCP reads
+  with Filigree/Wardline context without making sibling products mandatory.
+- **Wardline trust vocabulary via on-disk descriptor.** The Python plugin reads
+  Wardline's NG-25 trust-vocabulary descriptor as a plain file and tags
+  trust-decorated entities (`wardline:*`) — without importing Wardline, so a
+  co-installed Wardline is not required. Degrades cleanly when the descriptor is
+  absent. (Retires the last Clarion-side federation asterisk; see
+  [`docs/suite/loom.md`](docs/suite/loom.md) §5.)
 - **Guidance authoring.** Operators can author, import, export, and review
   guidance sheets through `clarion guidance`; consult agents consume them
   through MCP and summary cache invalidation.
@@ -56,13 +62,13 @@ instead of grep-and-read. The core tool families are:
 
 ```bash
 # 1. Install from the current GitHub Release
-TAG=v1.2.0
+TAG=v1.3.0
 curl -L -o clarion-x86_64-unknown-linux-gnu.tar.gz \
   "https://github.com/tachyon-beep/clarion/releases/download/${TAG}/clarion-x86_64-unknown-linux-gnu.tar.gz"
 tar xzf clarion-x86_64-unknown-linux-gnu.tar.gz
 install clarion-x86_64-unknown-linux-gnu/clarion ~/.local/bin/
 pipx install \
-  "https://github.com/tachyon-beep/clarion/releases/download/${TAG}/clarion-plugin-python-1.2.0.tar.gz"
+  "https://github.com/tachyon-beep/clarion/releases/download/${TAG}/clarion-plugin-python-1.3.0.tar.gz"
 
 # 2. Initialise a project
 cd /path/to/your/python/repo
