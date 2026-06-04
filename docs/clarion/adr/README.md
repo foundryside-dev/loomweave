@@ -10,10 +10,10 @@ This folder is the canonical home for authored Clarion architecture decision rec
 | [ADR-002](./ADR-002-plugin-transport-json-rpc.md) | Plugin transport: Content-Length framed JSON-RPC subprocess | Accepted |
 | [ADR-003](./ADR-003-entity-id-scheme.md) | Entity ID scheme: symbolic canonical names | Accepted |
 | [ADR-004](./ADR-004-finding-exchange-format.md) | Finding-exchange format: Filigree-native intake | Accepted |
-| [ADR-005](./ADR-005-clarion-dir-tracking.md) | `.clarion/` git-committable by default; DB included, run logs excluded | Accepted; amended by ADR-041 |
+| [ADR-005](./ADR-005-clarion-dir-tracking.md) | `.clarion/` git-committable by default; DB included, run logs excluded | Accepted |
 | [ADR-006](./ADR-006-clustering-algorithm.md) | Clustering algorithm — Leiden on imports+calls subgraph; fallback amended by ADR-032 | Accepted; amended |
 | [ADR-007](./ADR-007-summary-cache-key.md) | Summary cache key — 5-part composite with TTL backstop and churn-eager invalidation | Accepted |
-| [ADR-011](./ADR-011-writer-actor-concurrency.md) | Writer-actor concurrency with per-N-files transactions; `--shadow-db` opt-in | Accepted; amended by ADR-041 |
+| [ADR-011](./ADR-011-writer-actor-concurrency.md) | Writer-actor concurrency with per-N-files transactions; `--shadow-db` opt-in | Accepted |
 | [ADR-012](./ADR-012-http-auth-default.md) | HTTP read-API authentication — UDS default with token fallback | Superseded for ADR-014 registry-backend API |
 | [ADR-013](./ADR-013-pre-ingest-secret-scanner.md) | Pre-ingest secret scanner with LLM-dispatch block | Accepted |
 | [ADR-014](./ADR-014-filigree-registry-backend.md) | Filigree `registry_backend` flag and pluggable `RegistryProtocol` | Accepted; partially extended by ADR-034 |
@@ -26,7 +26,7 @@ This folder is the canonical home for authored Clarion architecture decision rec
 | [ADR-023](./ADR-023-tooling-baseline.md) | Rust + Python tooling baseline (edition 2024, pedantic, cargo-deny, nextest, CI; ruff + mypy-strict + pre-commit) | Accepted |
 | [ADR-024](./ADR-024-guidance-schema-vocabulary.md) | Guidance schema vocabulary rename (priority→scope_level/scope_rank; critical→pinned; source→provenance) and in-place migration policy | Accepted |
 | [ADR-025](./ADR-025-minor-shared-standards.md) | Minor shared standards — registry of small project-wide conventions; first entry MSS-1 locks the `tier:*` filigree label namespace | Accepted |
-| [ADR-026](./ADR-026-containment-wire-and-edge-identity.md) | Containment wire shape and edge identity (top-level `edges` field; drop `edges.id` column; per-kind `source_byte_start/end` contract) | Accepted |
+| [ADR-026](./ADR-026-containment-wire-and-edge-identity.md) | Containment wire shape and edge identity (top-level `edges` field; drop `edges.id` column; per-kind `source_byte_start/end` contract) | Accepted; amended by ADR-043 |
 | [ADR-027](./ADR-027-ontology-version-semver.md) | Ontology version semver policy (MAJOR/MINOR/PATCH semantics for `[ontology].ontology_version`; clarifies ADR-022) | Accepted |
 | [ADR-028](./ADR-028-edge-confidence-tiers.md) | Edge confidence tiers (`resolved` / `ambiguous` / `inferred`); MCP queries default to `>= resolved`; inferred edges lazy-computed at query time | Accepted |
 | [ADR-029](./ADR-029-entity-associations-binding.md) | Entity associations — Filigree-side `entity_associations` table; `add_entity_association` MCP tool on Filigree; `issues_for` MCP tool on Clarion; WP9 split into A (binding, v0.1) and B (findings emission) | Accepted |
@@ -34,7 +34,7 @@ This folder is the canonical home for authored Clarion architecture decision rec
 | [ADR-031](./ADR-031-schema-validation-policy.md) | Schema-validation policy — CHECK on closed core-owned vocabularies (`findings.{kind,severity,status}`, `runs.status`); writer-actor + manifest are the only enforcement layer for plugin-extensible vocabularies (`entities.kind`, `edges.kind`) | Accepted |
 | [ADR-032](./ADR-032-weighted-components-clustering-fallback.md) | Weighted-components clustering fallback naming | Accepted |
 | [ADR-033](./ADR-033-v1.0-distribution.md) | v1.0 distribution via GitHub Releases (binary matrix + Python sdist; promote to crates.io/PyPI at v2.0) | Accepted |
-| [ADR-034](./ADR-034-federation-http-read-api-hardening.md) | Federation HTTP read API hardening — bearer auth, batch resolution, `BRIEFING_BLOCKED`, instance ID | Accepted; amended by ADR-042 |
+| [ADR-034](./ADR-034-federation-http-read-api-hardening.md) | Federation HTTP read API hardening — bearer auth, batch resolution, `BRIEFING_BLOCKED`, instance ID | Accepted |
 | [ADR-035](./ADR-035-operational-tuning-discipline.md) | Operational tuning discipline — declared basis / override surface / retune trigger / coupling per constant; file-LOC + crate-boundary budgets; CI lint gate | Accepted |
 | [ADR-036](./ADR-036-wardline-taint-fact-store.md) | Clarion as Wardline taint-fact store — `wardline_taint_facts` table + `/api/wardline/*` routes; first read+write HTTP surface (optional writer-actor, default off); passes loom.md §3–§5 (ADR, not asterisk) | Accepted |
 | [ADR-037](./ADR-037-shared-error-vocabulary.md) | Shared error vocabulary (`clarion-core::errors`) — two typed enums (`HttpErrorCode`, `McpErrorCode`) as single source of truth; wire spelling unchanged on both surfaces; relates to ADR-034 | Accepted |
@@ -43,10 +43,11 @@ This folder is the canonical home for authored Clarion architecture decision rec
 | [ADR-040](./ADR-040-semantic-search-embeddings.md) | Semantic search (`search_semantic`) — opt-in `EmbeddingProvider` trait (recording + API-endpoint impls), git-ignored `.clarion/embeddings.db` sidecar keyed `(entity_id, content_hash, model_id)` (extends ADR-005's gitignore list), bounded exact cosine scan, policy-engine cost governance | Accepted |
 | [ADR-041](./ADR-041-resume-is-idempotent-reemit.md) | Analyze resume is idempotent re-emit, not checkpoint recovery; amends ADR-005/ADR-011 resume language | Accepted |
 | [ADR-042](./ADR-042-hmac-freshness-and-replay-window.md) | HMAC freshness and replay window — timestamp + nonce headers, crate-backed HMAC, process-local replay cache | Accepted |
+| [ADR-043](./ADR-043-edge-reanalysis-replacement.md) | Edge reanalysis replacement — per-source-file anchored-edge replacement and edge metadata upsert; amends ADR-026 | Accepted |
 
 ## Backlog still tracked in the detailed design
 
-The following decisions are still backlog items rather than authored ADR files. Their current summaries live in [../1.0/detailed-design.md](../1.0/detailed-design.md) §11 and [../1.0/system-design.md](../1.0/system-design.md) §12.
+The following decisions are still backlog items rather than authored ADR files. Their current summaries live in [../v0.1/detailed-design.md](../v0.1/detailed-design.md) §11 and [../v0.1/system-design.md](../v0.1/system-design.md) §12.
 
 | ADR | Title | Current state |
 |---|---|---|

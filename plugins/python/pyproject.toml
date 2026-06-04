@@ -27,6 +27,8 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
     "pre-commit>=3.8",
+    "pip-audit>=2.9",
+    "build>=1.2",
 ]
 
 [project.scripts]
@@ -90,13 +92,9 @@ files = ["src", "tests"]
 module = "yaml"
 ignore_missing_imports = true
 
-[[tool.mypy.overrides]]
-module = "clarion_plugin_python.wardline_probe"
-warn_unused_ignores = false
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--strict-markers --cov=clarion_plugin_python --cov-report=term-missing"
+addopts = "--strict-markers --cov=clarion_plugin_python --cov-report=term-missing --cov-fail-under=85"
 pythonpath = ["src"]
 markers = [
     "pyright: requires pyright-langserver on PATH or in the active virtualenv",

@@ -2,9 +2,8 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
+use clarion_analysis::ClusterAlgorithm;
 use serde::{Deserialize, Serialize};
-
-use crate::clustering::ClusterAlgorithm;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]

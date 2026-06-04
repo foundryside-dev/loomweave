@@ -203,6 +203,7 @@ fn unquote_c_path(raw: &str) -> String {
 /// Index state read from the DB inside the reader.
 pub(crate) struct IndexState {
     pub analyzed_at: Option<String>,
+    pub analyzed_commit: Option<String>,
     pub latest_run: Option<Value>,
     pub files: Vec<IndexedFile>,
     pub plugin_stats: Value,
@@ -219,7 +220,7 @@ pub(crate) struct IndexedFile {
 pub(crate) fn read_index_state(conn: &rusqlite::Connection) -> Result<IndexState, StorageError> {
     let latest = conn
         .query_row(
-            "SELECT id, started_at, completed_at, status, stats FROM runs \
+            "SELECT id, started_at, completed_at, status, stats, analyzed_at_commit FROM runs \
              WHERE status = 'completed' AND completed_at IS NOT NULL \
              ORDER BY completed_at DESC LIMIT 1",
             [],
@@ -230,23 +231,30 @@ pub(crate) fn read_index_state(conn: &rusqlite::Connection) -> Result<IndexState
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             },
         )
         .ok();
 
-    let (analyzed_at, latest_run, plugin_stats) = match latest {
-        Some((id, started_at, completed_at, run_status, stats_json)) => {
+    let (analyzed_at, analyzed_commit, latest_run, plugin_stats) = match latest {
+        Some((id, started_at, completed_at, run_status, stats_json, analyzed_commit)) => {
             let parsed_stats = serde_json::from_str::<Value>(&stats_json).unwrap_or(Value::Null);
             let run = json!({
                 "id": id,
                 "started_at": started_at,
                 "completed_at": completed_at,
                 "status": run_status,
+                "analyzed_at_commit": analyzed_commit,
             });
-            (completed_at, Some(run), plugin_stats_subset(&parsed_stats))
+            (
+                completed_at,
+                analyzed_commit,
+                Some(run),
+                plugin_stats_subset(&parsed_stats),
+            )
         }
-        None => (None, None, Value::Null),
+        None => (None, None, None, Value::Null),
     };
 
     let mut stmt = conn.prepare(
@@ -265,6 +273,7 @@ pub(crate) fn read_index_state(conn: &rusqlite::Connection) -> Result<IndexState
 
     Ok(IndexState {
         analyzed_at,
+        analyzed_commit,
         latest_run,
         files,
         plugin_stats,
@@ -365,6 +374,10 @@ pub(crate) fn build_report(
         });
     };
     let analyzed_time = parse_rfc3339(analyzed_at);
+    let commit_mismatch = match (git.head_commit.as_deref(), state.analyzed_commit.as_deref()) {
+        (Some(current), Some(analyzed)) => Some(current != analyzed),
+        _ => None,
+    };
 
     // HEAD-vs-analyze by committer date — independent of source mtimes.
     let head_newer_than_analyze = match (
@@ -405,7 +418,8 @@ pub(crate) fn build_report(
         }));
     }
 
-    let drift_detected = head_newer_than_analyze == Some(true)
+    let drift_detected = commit_mismatch == Some(true)
+        || (commit_mismatch.is_none() && head_newer_than_analyze == Some(true))
         || !file_drift.modified.is_empty()
         || !file_drift.missing.is_empty()
         || dirty_indexed_count > 0;
@@ -413,7 +427,8 @@ pub(crate) fn build_report(
     // Verdict: drift if any signal fired; fresh if we could observe state and
     // nothing fired; unknown only when every observation channel was blind
     // (no files statted AND git gave us no HEAD comparison).
-    let could_observe = file_drift.statted > 0 || head_newer_than_analyze.is_some();
+    let could_observe =
+        file_drift.statted > 0 || commit_mismatch.is_some() || head_newer_than_analyze.is_some();
     let overall = if drift_detected {
         "drift"
     } else if could_observe {
@@ -427,8 +442,8 @@ pub(crate) fn build_report(
     let (dirty, dirty_omitted) = cap_list(dirty, cap);
 
     let mut notes = vec![
-        "analyzed_commit is null: Clarion does not persist an analyze-time SHA; \
-         HEAD-vs-analyze staleness uses HEAD committer date vs run completion time"
+        "when both commits are known, current_commit != analyzed_commit is the \
+         primary staleness signal; HEAD committer date remains a fallback diagnostic"
             .to_owned(),
         "added (never-indexed) source files are not enumerated here beyond the \
          git dirty set; a new commit still flips head_newer_than_analyze"
@@ -446,9 +461,10 @@ pub(crate) fn build_report(
         "overall": overall,
         "drift_detected": drift_detected,
         "analyzed_at": analyzed_at,
-        "analyzed_commit": Value::Null,
+        "analyzed_commit": state.analyzed_commit,
         "latest_run": state.latest_run,
         "git": git_json,
+        "commit_mismatch": commit_mismatch,
         "head_newer_than_analyze": head_newer_than_analyze,
         "indexed_files": state.files.len(),
         "modified_since_analyze": modified,
@@ -558,9 +574,20 @@ mod tests {
         }
     }
 
+    fn git_facts_with_commit(
+        head_commit: &str,
+        head_committed_at: Option<&str>,
+        dirty: &[(&str, &str)],
+    ) -> GitFacts {
+        let mut facts = git_facts(head_committed_at, dirty);
+        facts.head_commit = Some(head_commit.to_owned());
+        facts
+    }
+
     fn state_with_file(path: &str, entity_count: i64, analyzed_at: &str) -> IndexState {
         IndexState {
             analyzed_at: Some(analyzed_at.to_owned()),
+            analyzed_commit: None,
             latest_run: Some(json!({"id": "run-1", "status": "completed"})),
             files: vec![IndexedFile {
                 source_file_path: path.to_owned(),
@@ -575,6 +602,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = IndexState {
             analyzed_at: None,
+            analyzed_commit: None,
             latest_run: None,
             files: Vec::new(),
             plugin_stats: Value::Null,
@@ -607,6 +635,30 @@ mod tests {
         assert_eq!(report["drift_detected"], false);
         assert_eq!(report["modified_since_analyze"], json!([]));
         assert_eq!(report["analyzed_commit"], Value::Null);
+    }
+
+    #[test]
+    fn different_current_commit_is_stale_even_when_head_is_older() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "x = 1\n").unwrap();
+        let abs = dir.path().join("a.py").to_string_lossy().into_owned();
+        let mut state = state_with_file(&abs, 3, "2999-01-01T00:00:00.000Z");
+        state.analyzed_commit = Some("newer-indexed-commit".to_owned());
+        let report = build_report(
+            dir.path(),
+            &state,
+            &git_facts_with_commit(
+                "older-checked-out-commit",
+                Some("2000-01-01T00:00:00+00:00"),
+                &[],
+            ),
+            DEFAULT_MAX_ENTRIES,
+        );
+        assert_eq!(report["analyzed_commit"], "newer-indexed-commit");
+        assert_eq!(report["git"]["current_commit"], "older-checked-out-commit");
+        assert_eq!(report["commit_mismatch"], true);
+        assert_eq!(report["head_newer_than_analyze"], false);
+        assert_eq!(report["overall"], "drift");
     }
 
     #[test]

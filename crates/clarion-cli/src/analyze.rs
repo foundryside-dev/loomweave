@@ -4,8 +4,8 @@
 //! - Discover plugins via L9 `$PATH` convention (Task 5).
 //! - For each plugin: spawn, handshake, walk the source tree, call
 //!   `analyze_file` for every matching file, persist via writer-actor.
-//! - File output streams through a bounded channel to the writer actor; import
-//!   edges are deferred until the plugin's module set is known.
+//! - Pattern A buffering: collect entities in the blocking task, flush
+//!   `InsertEntity` commands from async context after the blocking task returns.
 //! - On unrecoverable error (cap, escape, spawn, transport) → `FailRun`.
 //! - Zero successful plugins discovered → `SkippedNoPlugins` (existing path).
 
@@ -23,14 +23,14 @@ use uuid::Uuid;
 
 use clarion_core::{
     AcceptedEdge, AcceptedEntity, AnalyzeFileOutcome, CrashLoopBreaker, CrashLoopState,
-    DiscoveredPlugin, EmbeddingProvider, FINDING_DISABLED_CRASH_LOOP, HostError, HostFinding,
-    UnresolvedCallSite, discover,
+    DiscoveredPlugin, FINDING_DISABLED_CRASH_LOOP, HostError, HostFinding, UnresolvedCallSite,
+    discover,
 };
 use clarion_storage::{
-    DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, EmbeddingKey, EmbeddingStore, GitRename,
-    NewEntityDescriptor, PriorIndexEntry, SeiBindingRecord, SeiDecision, SeiLineageEntry,
-    UnresolvedCallSiteRecord, Writer, alive_bindings_snapshot,
-    commands::{EdgeConfidence, EdgeRecord, EntityRecord, FindingRecord, RunStatus, WriterCmd},
+    DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, GitRename, NewEntityDescriptor, PriorIndexEntry,
+    SeiBindingRecord, SeiDecision, SeiLineageEntry, UnresolvedCallSiteRecord, Writer,
+    alive_bindings_snapshot,
+    commands::{EdgeRecord, EntityRecord, FindingRecord, RunStatus, WriterCmd},
     mint_sei, module_dependency_edges, orphaned_bindings, prior_analyzed_commit, rebind_or_mint,
     sei::{BindingStatus, LineageEvent},
 };
@@ -39,13 +39,15 @@ use clarion_federation::config::{FiligreeConfig, McpConfig, SemanticSearchConfig
 use clarion_federation::filigree::FiligreeHttpClient;
 use clarion_federation::filigree_url::resolve_filigree_url;
 use clarion_federation::scan_results::{
-    CLARION_SCAN_SOURCE, CleanStaleRequest, CleanStaleResponse, EmitOptions, PreparedBatch,
-    ScanResultsResponse, clean_stale_url, prepare_batch, scan_results_url,
+    CLARION_SCAN_SOURCE, CleanStaleRequest, CleanStaleResponse, EmitOptions, FindingForEmit,
+    PreparedBatch, ScanResultsResponse, clean_stale_url, prepare_batch, scan_results_url,
 };
 
-use crate::clustering::{ClusterConfig, ModuleEdge, ModuleGraph, cluster_hash, cluster_modules};
 use crate::config::{AnalyzeConfig, ClusteringConfig};
 use crate::stats::P95Accumulator;
+use clarion_analysis::{
+    ClusterAlgorithm, ClusterConfig, ModuleEdge, ModuleGraph, cluster_hash, cluster_modules,
+};
 
 const WEAK_MODULARITY_RULE_ID: &str = "CLA-FACT-CLUSTERING-WEAK-MODULARITY";
 
@@ -57,36 +59,6 @@ const ENTITY_DELETED_RULE_ID: &str = "CLA-FACT-ENTITY-DELETED";
 /// deleted entity — the guidance is stranded and should not enrich briefings for
 /// an entity that no longer exists.
 const GUIDANCE_ORPHAN_RULE_ID: &str = "CLA-FACT-GUIDANCE-ORPHAN";
-
-/// Bounded handoff from the blocking plugin worker to the async writer loop.
-/// Mirrors detailed-design §11's `file_analyzed` backpressure cap.
-const PLUGIN_FILE_BATCH_CHANNEL_CAPACITY: usize = 100;
-const PROGRESS_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-const SEMANTIC_EMBEDDING_BATCH_SIZE: usize = 64;
-type DescribedEdgeRecord = (String, EdgeRecord);
-
-/// REQ-GUIDANCE-05 (WS6 T4a): a guidance sheet whose `expires` instant is in the
-/// past. The read path already excludes expired sheets from composition; this
-/// finding surfaces the state operatively (the sheet is not deleted).
-const GUIDANCE_EXPIRED_RULE_ID: &str = "CLA-FACT-GUIDANCE-EXPIRED";
-
-/// REQ-GUIDANCE-05 (WS6 T4a): a guidance sheet whose matched entities carry a high
-/// aggregate `git_churn_count` — the code under the sheet has churned enough that
-/// the guidance is likely stale. Heuristic (confidence 0.7); inert until the
-/// churn-history pipeline (clarion-997c93ec4e) populates `git_churn_count`.
-const GUIDANCE_CHURN_STALE_RULE_ID: &str = "CLA-FACT-GUIDANCE-CHURN-STALE";
-
-/// REQ-GUIDANCE-05 (WS6 T4): a Wardline-derived guidance sheet was preserved as
-/// an operator override while `wardline.yaml` changed underneath it.
-const GUIDANCE_STALE_RULE_ID: &str = "CLA-FACT-GUIDANCE-STALE";
-
-/// Aggregate `git_churn_count` (summed over a sheet's matched entities) at or above
-/// which a non-pinned sheet is flagged `CLA-FACT-GUIDANCE-CHURN-STALE`.
-const CHURN_STALE_THRESHOLD: i64 = 50;
-
-/// The lower (stricter) churn threshold for `pinned: true` sheets — pinned guidance
-/// is asserted institutional knowledge, so it goes stale on less churn.
-const CHURN_STALE_THRESHOLD_PINNED: i64 = 20;
 
 /// REQ-ANALYZE-05: a subsystem whose tier-bearing members declare ≥2 distinct
 /// Wardline tiers (a trust-boundary smell — the cluster straddles tiers).
@@ -109,9 +81,6 @@ const TIER_UNANIMOUS_RULE_ID: &str = "CLA-FACT-SUBSYSTEM-TIER-UNANIMOUS";
 const POST_RUN_FINDING_RULES: &[&str] = &[
     ENTITY_DELETED_RULE_ID,
     GUIDANCE_ORPHAN_RULE_ID,
-    GUIDANCE_EXPIRED_RULE_ID,
-    GUIDANCE_CHURN_STALE_RULE_ID,
-    GUIDANCE_STALE_RULE_ID,
     TIER_MIXING_RULE_ID,
     TIER_UNANIMOUS_RULE_ID,
 ];
@@ -120,10 +89,9 @@ const POST_RUN_FINDING_RULES: &[&str] = &[
 /// is surfaced by the plugin as a degraded `module` entity carrying
 /// `parse_status="syntax_error"` (extractor.py). The core mints a persisted
 /// finding from that property so the failure is visible in the store, not just
-/// in the plugin's stderr. The subcode is python-namespaced per the requirement;
-/// the architecturally-pure form (plugin emits the finding over a findings wire
-/// channel, owning its own namespace per loom.md Principle 3) is forward work —
-/// `AnalyzeFileResult` carries no findings field today.
+/// in the plugin's stderr. Pyright degradation findings now ride the plugin
+/// findings wire, but the syntax-error module property remains the stable
+/// source for parse failures because the degraded module entity is the anchor.
 const SYNTAX_ERROR_RULE_ID: &str = "CLA-PY-SYNTAX-ERROR";
 
 /// Writes structured run progress to a JSON file for the MCP `analyze_status`
@@ -134,7 +102,7 @@ const SYNTAX_ERROR_RULE_ID: &str = "CLA-PY-SYNTAX-ERROR";
 /// last-write-wins via an atomic temp-file rename; a failed write is logged and
 /// dropped (progress is advisory, never run-fatal).
 struct ProgressReporter {
-    inner: Option<Arc<ProgressInner>>,
+    inner: Option<ProgressInner>,
 }
 
 struct ProgressInner {
@@ -148,14 +116,12 @@ struct ProgressInner {
 impl ProgressReporter {
     fn new(progress_file: Option<PathBuf>, run_id: String) -> Self {
         Self {
-            inner: progress_file.map(|path| {
-                Arc::new(ProgressInner {
-                    path,
-                    run_id,
-                    pid: std::process::id(),
-                    total_files: AtomicU64::new(0),
-                    processed_files: AtomicU64::new(0),
-                })
+            inner: progress_file.map(|path| ProgressInner {
+                path,
+                run_id,
+                pid: std::process::id(),
+                total_files: AtomicU64::new(0),
+                processed_files: AtomicU64::new(0),
             }),
         }
     }
@@ -185,55 +151,13 @@ impl ProgressReporter {
             "total_files": inner.total_files.load(Ordering::Relaxed),
             "heartbeat_at": iso8601_now(),
         });
-        Self::write_atomic_inner(inner, &snapshot);
+        self.write_atomic(&snapshot);
     }
 
     /// Snapshot at the start of a file (so `current_file` reflects in-flight
     /// work); the file is counted as processed by [`Self::file_completed`].
     fn file_started(&self, plugin_id: &str, file: &str) {
         self.phase("analyzing", Some(plugin_id), Some(file));
-    }
-
-    fn file_heartbeat_guard(
-        &self,
-        plugin_id: String,
-        file: String,
-    ) -> Option<ProgressHeartbeatGuard> {
-        self.file_heartbeat_guard_with_interval(plugin_id, file, PROGRESS_HEARTBEAT_INTERVAL)
-    }
-
-    fn file_heartbeat_guard_with_interval(
-        &self,
-        plugin_id: String,
-        file: String,
-        interval: std::time::Duration,
-    ) -> Option<ProgressHeartbeatGuard> {
-        let inner = Arc::clone(self.inner.as_ref()?);
-        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            loop {
-                match stop_rx.recv_timeout(interval) {
-                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        let snapshot = serde_json::json!({
-                            "run_id": inner.run_id,
-                            "pid": inner.pid,
-                            "phase": "analyzing",
-                            "current_plugin": plugin_id,
-                            "current_file": file,
-                            "processed_files": inner.processed_files.load(Ordering::Relaxed),
-                            "total_files": inner.total_files.load(Ordering::Relaxed),
-                            "heartbeat_at": iso8601_now(),
-                        });
-                        ProgressReporter::write_atomic_inner(&inner, &snapshot);
-                    }
-                }
-            }
-        });
-        Some(ProgressHeartbeatGuard {
-            stop_tx: Some(stop_tx),
-            handle: Some(handle),
-        })
     }
 
     /// Increment the processed-file counter after a file finishes.
@@ -260,12 +184,15 @@ impl ProgressReporter {
                 "total_files": inner.total_files.load(Ordering::Relaxed),
                 "heartbeat_at": iso8601_now(),
             });
-            Self::write_atomic_inner(inner, &snapshot);
+            self.write_atomic(&snapshot);
             inner.processed_files.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    fn write_atomic_inner(inner: &ProgressInner, snapshot: &serde_json::Value) {
+    fn write_atomic(&self, snapshot: &serde_json::Value) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
         let body = snapshot.to_string();
         let tmp = inner.path.with_extension("json.tmp");
         if let Err(err) = fs::write(&tmp, &body).and_then(|()| fs::rename(&tmp, &inner.path)) {
@@ -274,22 +201,6 @@ impl ProgressReporter {
                 path = %inner.path.display(),
                 "failed to write analyze progress snapshot (advisory; ignored)",
             );
-        }
-    }
-}
-
-struct ProgressHeartbeatGuard {
-    stop_tx: Option<std::sync::mpsc::Sender<()>>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Drop for ProgressHeartbeatGuard {
-    fn drop(&mut self) {
-        if let Some(stop_tx) = self.stop_tx.take() {
-            let _ = stop_tx.send(());
-        }
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
         }
     }
 }
@@ -318,9 +229,8 @@ pub(crate) struct AnalyzeOptions {
     /// the durable graph is unaffected (SEI is enrich-only).
     pub(crate) no_sei: bool,
     /// `--no-incremental`: force a full re-analysis, disabling the Wave 2 / T3.1
-    /// skip of unchanged files. Incremental skip is speed-only (entities are
-    /// cumulative, edges are `INSERT OR IGNORE`), so this is an escape hatch for a
-    /// clean re-index, not a correctness switch.
+    /// skip of unchanged files. A full re-analysis replays the per-source-file
+    /// edge replacement boundary; use it when a clean graph refresh matters.
     pub(crate) no_incremental: bool,
     /// `--legis-url`: `legis`'s read-API base URL, enabling the WS9 git-rename
     /// provider seam (REQ-C-05). Enrich-only and capability-aware: the operative
@@ -374,15 +284,6 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         clarion_storage::schema::apply_migrations(&mut conn)
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("apply pending migrations")?;
-        let repaired = clarion_storage::mark_stale_running_runs_failed(&conn)
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .context("mark stale running analyze runs failed")?;
-        if repaired > 0 {
-            tracing::warn!(
-                repaired,
-                "marked stale running analyze runs failed before starting new analyze"
-            );
-        }
     }
 
     let analyze_config = AnalyzeConfig::load(&project_root, options.config_path.as_deref())?;
@@ -554,20 +455,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     }
 
     // ── Walk the source tree (once, union of all extensions) ─────────────────
-    let source_walk = collect_source_files(&project_root, &wanted_extensions);
-    let source_walk_skipped_entries =
-        u64::try_from(source_walk.skipped_errors.len()).unwrap_or(u64::MAX);
-    let source_walk_error_samples = source_walk
-        .skipped_errors
-        .iter()
-        .take(SOURCE_WALK_ERROR_SAMPLE_LIMIT)
-        .cloned()
-        .collect::<Vec<_>>();
-    let source_walk_errors_omitted = source_walk
-        .skipped_errors
-        .len()
-        .saturating_sub(source_walk_error_samples.len());
-    let source_files = source_walk.files;
+    let source_files = collect_source_files(&project_root, &wanted_extensions);
     tracing::info!(file_count = source_files.len(), "source tree walk complete");
     progress.set_total(source_files.len() as u64);
     progress.phase("analyzing", None, None);
@@ -599,8 +487,9 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // decay after one run). Read from a fresh connection BEFORE this run writes
     // anything, so it reflects exactly the previous successful run. `--no-
     // incremental` and a first run (empty prior index) both degrade to a full
-    // analysis. Skip is speed-only: entities are cumulative, edges are `INSERT
-    // OR IGNORE`, so a skipped file's durable rows are untouched.
+    // analysis. Skipped files deliberately leave their durable rows untouched;
+    // changed files pass through the per-source-file edge replacement boundary
+    // before their current edge set is inserted.
     //
     // Caveat (benign): a skipped file's core `file` entity keeps last run's
     // `briefing_blocked` / `language` properties, which a full re-analysis would
@@ -686,17 +575,6 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // synthetic project entity minted just before persistence.
     let mut failure_findings: Vec<FindingRecord> = Vec::new();
     let project_anchor = project_anchor_id(&project_root);
-    if source_walk_skipped_entries > 0 {
-        failure_findings.push(source_walk_finding_record(
-            &project_root,
-            source_walk_skipped_entries,
-            &source_walk_error_samples,
-            source_walk_errors_omitted,
-            &project_anchor,
-            &run_id,
-            &started_at,
-        ));
-    }
     let file_timeout = plugin_file_timeout();
     let briefing_blocks = secret_scan_outcome.briefing_blocks_shared();
     let scanned_files = secret_scan_outcome.scanned_files_shared();
@@ -735,7 +613,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         let (plugin_files, skipped_files): (Vec<PathBuf>, Vec<PathBuf>) =
             plugin_files.into_iter().partition(|path| {
                 secret_finding_files.contains(&crate::secret_scan::canonical_or_original(path))
-                    || file_needs_reanalysis(&project_root, path, &prior_file_hashes)
+                    || file_needs_reanalysis(path, &prior_file_hashes)
             });
         for path in &skipped_files {
             skipped_files_total += 1;
@@ -767,9 +645,8 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             "processing plugin"
         );
 
-        // Run the blocking plugin work on the tokio threadpool. Completed file
-        // output flows through a bounded channel so writer backpressure applies
-        // during extraction rather than after the whole plugin has returned.
+        // Run the blocking plugin work on the tokio threadpool.
+        // Pattern A: collect all entities into memory, return to async side.
         let manifest = plugin.manifest.clone();
         let project_root_clone = project_root.clone();
         let pid_clone = plugin_id.clone();
@@ -779,125 +656,6 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         let scanned_files_clone = Arc::clone(&scanned_files);
         let progress_clone = Arc::clone(&progress);
 
-        let (batch_tx, mut batch_rx) =
-            tokio::sync::mpsc::channel(PLUGIN_FILE_BATCH_CHANNEL_CAPACITY);
-        let join_handle = tokio::task::spawn_blocking(move || {
-            run_plugin_blocking(
-                manifest,
-                &project_root_clone,
-                &pid_clone,
-                &exec_clone,
-                &files_clone,
-                &briefing_blocks_clone,
-                &scanned_files_clone,
-                &progress_clone,
-                file_timeout,
-                &batch_tx,
-            )
-        });
-
-        let mut insert_err: Option<anyhow::Error> = None;
-        let mut plugin_entity_count: u64 = 0;
-        let mut plugin_edge_count: u64 = 0;
-        let mut seen_plugin_entity_ids: BTreeSet<String> = BTreeSet::new();
-        let mut pending_plugin_edges: Vec<DescribedEdgeRecord> = Vec::new();
-        while let Some(message) = batch_rx.recv().await {
-            if insert_err.is_some() {
-                continue;
-            }
-
-            match message {
-                PluginBatchMessage::File(mut batch) => {
-                    unresolved_call_sites_total += batch.stats.unresolved_call_sites_total;
-                    reference_sites_total += batch.stats.reference_sites_total;
-                    references_resolved_total += batch.stats.references_resolved_total;
-                    references_skipped_external_total +=
-                        batch.stats.references_skipped_external_total;
-                    references_skipped_cap_total += batch.stats.references_skipped_cap_total;
-                    imports_skipped_external_total += batch.stats.imports_skipped_external_total;
-                    unresolved_reference_sites_total +=
-                        batch.stats.unresolved_reference_sites_total;
-                    pyright_latency.record_many(batch.stats.pyright_query_latency_ms.clone());
-                    pyright_index_parse_latency
-                        .record_many(batch.stats.pyright_index_parse_latency_ms.clone());
-                    extractor_parse_latency
-                        .record_many(batch.stats.extractor_parse_latency_ms.clone());
-
-                    secret_scan_outcome.remember_finding_anchors(&batch.entities);
-                    let batch_entity_ids: Vec<String> =
-                        batch.entities.iter().map(|(id, _)| id.clone()).collect();
-                    let batch_edges = std::mem::take(&mut batch.edges);
-                    match persist_plugin_file_batch(
-                        &writer,
-                        batch,
-                        &run_id,
-                        &started_at,
-                        head_commit.as_deref(),
-                    )
-                    .await
-                    {
-                        Ok(effects) => {
-                            plugin_entity_count += effects.entity_count;
-                            seen_plugin_entity_ids.extend(batch_entity_ids);
-                            pending_plugin_edges.extend(batch_edges);
-                            let ready_edges = drain_ready_plugin_edges(
-                                &mut pending_plugin_edges,
-                                &seen_plugin_entity_ids,
-                            );
-                            match persist_plugin_edges(&writer, ready_edges).await {
-                                Ok(edge_count) => {
-                                    plugin_edge_count += edge_count;
-                                }
-                                Err(e) => {
-                                    insert_err = Some(e);
-                                }
-                            }
-                            prior_index_entries.extend(effects.prior_index_entries);
-                            sei_descriptors.extend(effects.sei_descriptors);
-                            failure_findings.extend(effects.failure_findings);
-                        }
-                        Err(e) => {
-                            insert_err = Some(e);
-                        }
-                    }
-                }
-                PluginBatchMessage::DeferredImportEdges {
-                    edges,
-                    imports_skipped_external,
-                } => {
-                    imports_skipped_external_total += imports_skipped_external;
-                    pending_plugin_edges.extend(edges);
-                    let ready_edges = drain_ready_plugin_edges(
-                        &mut pending_plugin_edges,
-                        &seen_plugin_entity_ids,
-                    );
-                    match persist_plugin_edges(&writer, ready_edges).await {
-                        Ok(edge_count) => {
-                            plugin_edge_count += edge_count;
-                            if !pending_plugin_edges.is_empty() {
-                                match persist_plugin_edges(
-                                    &writer,
-                                    std::mem::take(&mut pending_plugin_edges),
-                                )
-                                .await
-                                {
-                                    Ok(edge_count) => {
-                                        plugin_edge_count += edge_count;
-                                    }
-                                    Err(e) => {
-                                        insert_err = Some(e);
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            insert_err = Some(e);
-                        }
-                    }
-                }
-            }
-        }
-
         // A JoinError here means the blocking task panicked (OOM, stack
         // overflow, internal unwrap, abort — anything that unwinds past the
         // top of `run_plugin_blocking`). Earlier revisions `?`-propagated
@@ -906,20 +664,23 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         // permanently. Treat the panic as a crash reason: it flows into the
         // existing crash-recording path below, ticks the crash-loop breaker,
         // and resolves the run via SoftFailed → CommitRun(Failed) with exit 1.
-        let spawn_result: Result<BatchResult, PluginRunError> =
-            handle_plugin_task_join_result(join_handle.await, &plugin_id);
-
-        if let Some(e) = insert_err {
-            tracing::error!(
-                plugin_id = %plugin_id,
-                error = %e,
-                "writer-actor rejected streamed insert; failing run"
-            );
-            run_outcome = RunOutcome::HardFailed {
-                reason: format!("{e:#}"),
-            };
-            break 'plugins;
-        }
+        let spawn_result: Result<BatchResult, PluginRunError> = handle_plugin_task_join_result(
+            tokio::task::spawn_blocking(move || {
+                run_plugin_blocking(
+                    manifest,
+                    &project_root_clone,
+                    &pid_clone,
+                    &exec_clone,
+                    &files_clone,
+                    &briefing_blocks_clone,
+                    &scanned_files_clone,
+                    &progress_clone,
+                    file_timeout,
+                )
+            })
+            .await,
+            &plugin_id,
+        );
 
         match spawn_result {
             Err(plugin_error) => {
@@ -933,10 +694,11 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     .iter()
                     .any(|hf| hf.subcode == PLUGIN_TIMEOUT_RULE_ID);
                 for hf in &plugin_error.findings {
+                    let anchor_id = host_finding_anchor_id(hf, &project_root, &project_anchor);
                     failure_findings.push(host_finding_to_record(
                         hf,
                         &plugin_id,
-                        &project_anchor,
+                        &anchor_id,
                         &run_id,
                         &started_at,
                     ));
@@ -968,27 +730,156 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 // Fall through to the next iteration — nothing else to do
                 // for a crashed plugin, and there's no code after the match.
             }
-            Ok(BatchResult { findings }) => {
+            Ok(BatchResult {
+                entities,
+                edges,
+                unresolved_call_sites,
+                stats,
+                findings,
+                signatures,
+            }) => {
+                unresolved_call_sites_total += stats.unresolved_call_sites_total;
+                reference_sites_total += stats.reference_sites_total;
+                references_resolved_total += stats.references_resolved_total;
+                references_skipped_external_total += stats.references_skipped_external_total;
+                references_skipped_cap_total += stats.references_skipped_cap_total;
+                imports_skipped_external_total += stats.imports_skipped_external_total;
+                unresolved_reference_sites_total += stats.unresolved_reference_sites_total;
+                pyright_latency.record_many(stats.pyright_query_latency_ms);
+                pyright_index_parse_latency.record_many(stats.pyright_index_parse_latency_ms);
+                extractor_parse_latency.record_many(stats.extractor_parse_latency_ms);
+
                 // Log findings individually (operator-facing stderr) and persist
                 // them (REQ-ANALYZE-06) so an ontology check, malformed-JSON drop,
                 // or path-jail violation is visible in the store, not just logs.
                 log_plugin_findings(&plugin_id, &findings);
                 for hf in &findings {
+                    let anchor_id = host_finding_anchor_id(hf, &project_root, &project_anchor);
                     failure_findings.push(host_finding_to_record(
                         hf,
                         &plugin_id,
-                        &project_anchor,
+                        &anchor_id,
                         &run_id,
                         &started_at,
                     ));
                 }
 
-                total_entity_count += plugin_entity_count;
-                total_edge_count += plugin_edge_count;
+                // Persist entities + edges via writer-actor (async side).
+                //
+                // A writer-actor error here (per-kind contract violation,
+                // unique-key constraint, disk full) must NOT short-circuit
+                // `run()` via `?` — that would bypass the CommitRun/FailRun
+                // block below and leave `runs.status = 'running'` permanently.
+                // Convert to a terminal `RunOutcome::HardFailed` so FailRun
+                // marks the run. Entities are inserted before edges so the
+                // edge FK references resolve at insert time (B.3 §5).
+                let entity_count = entities.len() as u64;
+                let edge_count = edges.len() as u64;
+                secret_scan_outcome.remember_finding_anchors(&entities);
+                let mut insert_err: Option<anyhow::Error> = None;
+                for (id_str, record) in entities {
+                    // Capture the prior-index row and the SEI descriptor BEFORE
+                    // `record` is moved into the command. `signature` (WS1) is the
+                    // plugin-declared matcher input, now carried into both the
+                    // prior-index snapshot and the SEI descriptor list.
+                    let signature = signatures.get(&id_str).cloned();
+                    let prior_entry =
+                        record
+                            .content_hash
+                            .clone()
+                            .map(|body_hash| PriorIndexEntry {
+                                locator: record.id.clone(),
+                                body_hash,
+                                signature: signature.clone(),
+                            });
+                    // Every accepted entity gets a descriptor (even ones with no
+                    // body hash — they still carry/mint an SEI on the
+                    // locator-unchanged path; only the move case needs a body).
+                    let descriptor = NewEntityDescriptor {
+                        locator: record.id.clone(),
+                        body_hash: record.content_hash.clone(),
+                        signature,
+                    };
+                    // REQ-ANALYZE-06: capture a parse-failure finding from the
+                    // degraded entity BEFORE `record` is moved into the command.
+                    // Anchors to this same entity (inserted just below), so the
+                    // finding's FK resolves.
+                    if let Some(finding) = syntax_error_finding(&record, &run_id, &started_at) {
+                        failure_findings.push(finding);
+                    }
+                    let res = writer
+                        .send_wait(|ack| WriterCmd::InsertEntity {
+                            entity: Box::new(record),
+                            ack,
+                        })
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))
+                        .with_context(|| format!("InsertEntity for {id_str}"));
+                    if let Err(e) = res {
+                        insert_err = Some(e);
+                        break;
+                    }
+                    // Recorded only after a successful insert so neither the
+                    // snapshot nor the SEI pass claims an entity the durable
+                    // graph lacks.
+                    if let Some(prior_entry) = prior_entry {
+                        prior_index_entries.push(prior_entry);
+                    }
+                    sei_descriptors.push(descriptor);
+                }
+                if insert_err.is_none() {
+                    for pending in unresolved_call_sites {
+                        let caller_id = pending.caller_entity_id.clone();
+                        let res = writer
+                            .send_wait(|ack| WriterCmd::ReplaceUnresolvedCallSitesForCaller {
+                                caller_entity_id: pending.caller_entity_id,
+                                caller_content_hash: pending.caller_content_hash,
+                                sites: pending.sites,
+                                ack,
+                            })
+                            .await
+                            .map_err(|e| anyhow::anyhow!("{e}"))
+                            .with_context(|| {
+                                format!("ReplaceUnresolvedCallSitesForCaller for {caller_id}")
+                            });
+                        if let Err(e) = res {
+                            insert_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if insert_err.is_none() {
+                    for (descr, record) in edges {
+                        let res = writer
+                            .send_wait(|ack| WriterCmd::InsertEdge {
+                                edge: Box::new(record),
+                                ack,
+                            })
+                            .await
+                            .map_err(|e| anyhow::anyhow!("{e}"))
+                            .with_context(|| format!("InsertEdge {descr}"));
+                        if let Err(e) = res {
+                            insert_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if let Some(e) = insert_err {
+                    tracing::error!(
+                        plugin_id = %plugin_id,
+                        error = %e,
+                        "writer-actor rejected insert; failing run"
+                    );
+                    run_outcome = RunOutcome::HardFailed {
+                        reason: format!("{e:#}"),
+                    };
+                    break 'plugins;
+                }
+                total_entity_count += entity_count;
+                total_edge_count += edge_count;
                 tracing::info!(
                     plugin_id = %plugin_id,
-                    entity_count = plugin_entity_count,
-                    edge_count = plugin_edge_count,
+                    entity_count, edge_count,
                     "plugin complete",
                 );
             }
@@ -997,13 +888,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
 
     if !matches!(run_outcome, RunOutcome::HardFailed { .. })
         && let Err(e) = secret_scan_outcome
-            .persist_findings(
-                &writer,
-                &run_id,
-                &project_root,
-                &started_at,
-                head_commit.as_deref(),
-            )
+            .persist_findings(&writer, &run_id, &project_root, &started_at)
             .await
     {
         tracing::error!(run_id = %run_id, error = %e, "secret finding persistence failed");
@@ -1024,9 +909,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             .iter()
             .any(|f| f.entity_id == project_anchor);
         if needs_project_anchor
-            && let Err(e) =
-                ensure_project_anchor(&writer, &project_root, &started_at, head_commit.as_deref())
-                    .await
+            && let Err(e) = ensure_project_anchor(&writer, &project_root, &started_at).await
         {
             tracing::error!(run_id = %run_id, error = %e, "project finding-anchor insert failed");
             run_outcome = RunOutcome::HardFailed {
@@ -1087,15 +970,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let phase3_output = if matches!(run_outcome, RunOutcome::HardFailed { .. }) {
         Phase3Output::not_run()
     } else {
-        match run_phase3_clustering(
-            &writer,
-            &db_path,
-            &run_id,
-            &analyze_config,
-            head_commit.as_deref(),
-        )
-        .await
-        {
+        match run_phase3_clustering(&writer, &db_path, &run_id, &analyze_config).await {
             Ok(output) => {
                 total_entity_count += output.subsystems_inserted;
                 total_edge_count += output.in_subsystem_edges_inserted;
@@ -1195,9 +1070,6 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "references_skipped_external_total": references_skipped_external_total,
                 "references_skipped_cap_total": references_skipped_cap_total,
                 "imports_skipped_external_total": imports_skipped_external_total,
-                "source_walk_skipped_entries": source_walk_skipped_entries,
-                "source_walk_error_samples": source_walk_error_samples,
-                "source_walk_errors_omitted": source_walk_errors_omitted,
                 "skipped_files": skipped_files_total,
                 "unresolved_reference_sites_total": unresolved_reference_sites_total,
                 "pyright_query_latency_p95_ms": pyright_query_latency_p95_ms,
@@ -1311,87 +1183,6 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     "tier-subsystem findings skipped (run already committed successfully)"
                 ),
             }
-            // REQ-GUIDANCE-04: when `wardline.yaml` is present, keep the
-            // generated guidance sheets in sync before evaluating guidance
-            // staleness. Operator edits are preserved as
-            // `wardline_derived_overridden`, so the following staleness pass can
-            // surface manifest drift instead of overwriting human review.
-            match crate::wardline_guidance::sync_wardline_guidance(&db_path, &project_root) {
-                Ok(stats) if stats.generated > 0 || stats.overridden > 0 => tracing::info!(
-                    run_id = %run_id,
-                    wardline_guidance_generated = stats.generated,
-                    wardline_guidance_overridden = stats.overridden,
-                    "Wardline-derived guidance synced"
-                ),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(
-                    run_id = %run_id,
-                    error = %e,
-                    "Wardline-derived guidance skipped (run already committed successfully)"
-                ),
-            }
-            let mcp_config = load_mcp_config(&project_root, options.config_path.as_deref());
-            match crate::serve::build_embedding_provider(&mcp_config.semantic_search, |name| {
-                std::env::var(name).ok()
-            }) {
-                Ok(Some(provider)) => match populate_semantic_embeddings(
-                    &project_root,
-                    &db_path,
-                    &mcp_config.semantic_search,
-                    provider,
-                )
-                .await
-                {
-                    Ok(stats) if stats.embedded > 0 || stats.skipped_fresh > 0 => tracing::info!(
-                        run_id = %run_id,
-                        model_id = %stats.model_id,
-                        considered = stats.considered,
-                        skipped_fresh = stats.skipped_fresh,
-                        embedded = stats.embedded,
-                        tokens_input = stats.tokens_input,
-                        "semantic embedding population complete"
-                    ),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(
-                        run_id = %run_id,
-                        error = %e,
-                        "semantic embedding population skipped (run already committed successfully)"
-                    ),
-                },
-                Ok(None) => {}
-                Err(e) => tracing::warn!(
-                    run_id = %run_id,
-                    error = %e,
-                    "semantic embedding provider unavailable (run already committed successfully)"
-                ),
-            }
-            // REQ-GUIDANCE-05 (WS6 T4a): guidance-staleness findings (EXPIRED +
-            // CHURN-STALE). Runs on EVERY analyze, deliberately OUTSIDE the SEI
-            // `if no_sei { … } else { … }` block above and independent of any
-            // deletion: these surface a sheet's own state, not an identity event,
-            // so `--no-sei` must NOT suppress them. Best-effort + enrich-only like
-            // the tier pass: a failure logs and never un-commits the graph.
-            match emit_guidance_staleness_findings(
-                &writer,
-                &db_path,
-                &project_root,
-                &run_id,
-                &iso8601_now(),
-            )
-            .await
-            {
-                Ok(emitted) if emitted > 0 => tracing::info!(
-                    run_id = %run_id,
-                    guidance_staleness_findings = emitted,
-                    "guidance-staleness findings emitted"
-                ),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(
-                    run_id = %run_id,
-                    error = %e,
-                    "guidance-staleness findings skipped (run already committed successfully)"
-                ),
-            }
             // Phase 8c (clarion-ef8f64d5fd): the deletion + tier findings above
             // are persisted via `PersistPostRunFinding` *after* the Phase-8
             // emission already ran, so without this they reach the store but
@@ -1450,9 +1241,6 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "references_skipped_external_total": references_skipped_external_total,
                 "references_skipped_cap_total": references_skipped_cap_total,
                 "imports_skipped_external_total": imports_skipped_external_total,
-                "source_walk_skipped_entries": source_walk_skipped_entries,
-                "source_walk_error_samples": source_walk_error_samples,
-                "source_walk_errors_omitted": source_walk_errors_omitted,
                 "skipped_files": skipped_files_total,
                 "unresolved_reference_sites_total": unresolved_reference_sites_total,
                 "pyright_query_latency_p95_ms": pyright_query_latency_p95_ms,
@@ -1785,11 +1573,9 @@ async fn run_sei_mint_pass(
 ///
 /// For each deleted entity: emit one `CLA-FACT-ENTITY-DELETED` (anchored to the
 /// entity's own row — `entities` is never pruned, so the FK resolves) and
-/// invalidate its cached summaries. Then, for every guidance sheet stranded on a
-/// deleted entity — via an explicit `guides` edge OR a `match_rules`
-/// `{"type":"entity","id":X}` entry (detailed-design.md §5) — emit one
-/// `CLA-FACT-GUIDANCE-ORPHAN` (anchored to the sheet, deleted target as a related
-/// id). A sheet that strands the same target via both paths emits one finding.
+/// invalidate its cached summaries. Then, for every guidance sheet whose explicit
+/// `guides` edge targets a deleted entity, emit one `CLA-FACT-GUIDANCE-ORPHAN`
+/// (anchored to the guidance sheet, the deleted target carried as a related id).
 ///
 /// Returns `Ok(0)` for an empty deleted set without opening a connection.
 async fn emit_deletion_findings(
@@ -1828,19 +1614,17 @@ async fn emit_deletion_findings(
             .with_context(|| format!("InvalidateSummaryCacheForEntity {entity_id}"))?;
     }
 
-    // Guidance sheets stranded on a now-deleted entity are orphaned via EITHER an
-    // explicit `guides` edge OR a `match_rules` `{"type":"entity","id":X}` entry
-    // pointing at a deleted target (detailed-design.md §5). Collect both into one
-    // de-duped, sorted `(sheet, target)` set so a sheet that orphans the same
-    // target via both paths emits exactly ONE finding. Both survive the target's
-    // vanishing because `entities` is never pruned.
-    let orphaned_guidance: std::collections::BTreeSet<(String, String)> = {
+    // Guidance sheets that explicitly `guides` a now-deleted entity are orphaned.
+    // Read the (sheet, target) pairs once, filter to deleted targets, sort for
+    // determinism. The `guides` edge survives the target's vanishing because
+    // `entities` is never pruned (the ON DELETE CASCADE never fires).
+    let orphaned_guidance = {
         let conn =
             Connection::open(db_path).context("open read connection for guidance-orphan scan")?;
-
-        let mut pairs: std::collections::BTreeSet<(String, String)> = conn
+        let mut stmt = conn
             .prepare("SELECT from_id, to_id FROM edges WHERE kind = 'guides'")
-            .context("prepare guides-edge scan")?
+            .context("prepare guides-edge scan")?;
+        let mut pairs: Vec<(String, String)> = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
@@ -1850,31 +1634,7 @@ async fn emit_deletion_findings(
             .into_iter()
             .filter(|(_, to_id)| deleted_set.contains(to_id.as_str()))
             .collect();
-
-        // Scan every guidance sheet's `match_rules` for `{type:entity, id:X}`
-        // entries whose X is in the deleted set. Reuse the shared rule shape
-        // (`clarion_storage::rule_match` reads `{"type":"entity","id":…}`), not a
-        // hand-rolled key.
-        for sheet in clarion_storage::list_guidance_sheets(&conn)
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .context("list guidance sheets for match-rule orphan scan")?
-        {
-            let Some(rules) = sheet
-                .properties
-                .get("match_rules")
-                .and_then(serde_json::Value::as_array)
-            else {
-                continue;
-            };
-            for rule in rules {
-                if rule.get("type").and_then(serde_json::Value::as_str) == Some("entity")
-                    && let Some(target) = rule.get("id").and_then(serde_json::Value::as_str)
-                    && deleted_set.contains(target)
-                {
-                    pairs.insert((sheet.id.clone(), target.to_owned()));
-                }
-            }
-        }
+        pairs.sort();
         pairs
     };
 
@@ -1938,7 +1698,7 @@ fn guidance_orphan_finding(
         kind: "fact".to_owned(),
         severity: "WARN".to_owned(),
         confidence: Some(1.0),
-        confidence_basis: Some("guidance sheet target deleted".to_owned()),
+        confidence_basis: Some("guidance `guides`-edge target deleted".to_owned()),
         entity_id: guidance_id.to_owned(),
         related_entities_json: serde_json::json!([deleted_entity_id]).to_string(),
         message: format!(
@@ -1947,294 +1707,6 @@ fn guidance_orphan_finding(
         evidence_json: serde_json::json!({
             "guidance_id": guidance_id,
             "deleted_entity_id": deleted_entity_id,
-        })
-        .to_string(),
-        properties_json: "{}".to_owned(),
-        supports_json: "[]".to_owned(),
-        supported_by_json: "[]".to_owned(),
-        created_at: now.to_owned(),
-        updated_at: now.to_owned(),
-    }
-}
-
-/// REQ-GUIDANCE-05 (WS6 T4a): persist guidance-staleness findings over the
-/// committed graph and return the count. Independent signals per sheet:
-///
-/// - **`CLA-FACT-GUIDANCE-EXPIRED`** — the sheet's `expires` instant is lexically
-///   `< now` (both are the fixed-width `YYYY-MM-DDTHH:MM:SS.sssZ` form
-///   [`iso8601_now`] emits, so a byte compare is a valid instant compare). Absent
-///   or malformed `expires` ⇒ skip.
-/// - **`CLA-FACT-GUIDANCE-CHURN-STALE`** — the aggregate `git_churn_count` over the
-///   sheet's matched entities meets the staleness threshold (asymmetric: 20 for
-///   `pinned` sheets, 50 otherwise).
-/// - **`CLA-FACT-GUIDANCE-STALE`** — a Wardline-derived override still carries
-///   the old `wardline.yaml` manifest hash after the manifest changed.
-///
-/// Runs post-`CommitRun`, unconditionally (NOT gated on the SEI pass or on
-/// deletions) — see the call site. Deterministic: sheets in
-/// [`clarion_storage::list_guidance_sheets`] order; matched ids sorted.
-///
-/// Churn proxy note: the design wants "churn since `authored_at`/`reviewed_at`",
-/// but there is no churn-history to compute a true delta and `git_churn_count` is
-/// not populated by analyze in v1.0 (so this is honest-empty in production). We
-/// implement the computable proxy — the aggregate current `git_churn_count` over
-/// matched entities vs the threshold. A true since-authored delta awaits the
-/// churn-history pipeline (clarion-997c93ec4e); `authored_at`/`reviewed_at` are
-/// deliberately unused here because no real delta is computable.
-enum PendingGuidanceStaleness {
-    Expired(String),
-    WardlineStale {
-        sheet_id: String,
-        stored_manifest_hash: String,
-        current_manifest_hash: String,
-    },
-    ChurnStale {
-        sheet_id: String,
-        agg: i64,
-        matched: Vec<String>,
-    },
-}
-
-fn plan_guidance_staleness_findings(
-    db_path: &Path,
-    project_root: &Path,
-    now: &str,
-) -> anyhow::Result<Vec<PendingGuidanceStaleness>> {
-    let current_wardline_hash = crate::wardline_guidance::current_manifest_hash(project_root)?;
-    let conn = Connection::open(db_path)
-        .context("open read connection for guidance-staleness findings")?;
-    let canonical_root = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
-
-    let sheets = clarion_storage::list_guidance_sheets(&conn)
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("list guidance sheets for staleness scan")?;
-
-    // Entities carrying a populated churn count (the only ones that can move an
-    // aggregate). Empty in production today (see fn doc).
-    let churned: Vec<(String, i64)> = conn
-        .prepare(
-            "SELECT id, git_churn_count FROM entities \
-                 WHERE git_churn_count IS NOT NULL ORDER BY id",
-        )
-        .context("prepare churned-entity scan")?
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })
-        .context("query churned entities")?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .context("collect churned entities")?;
-
-    let mut plan = Vec::new();
-    for sheet in &sheets {
-        // EXPIRED: lexical (instant) compare against `now`.
-        if let Some(expires) = sheet
-            .properties
-            .get("expires")
-            .and_then(serde_json::Value::as_str)
-            && expires < now
-        {
-            plan.push(PendingGuidanceStaleness::Expired(sheet.id.clone()));
-        }
-
-        if let Some(current_hash) = current_wardline_hash.as_deref()
-            && crate::wardline_guidance::is_wardline_derived(&sheet.properties)
-            && let Some(stored_hash) = sheet
-                .properties
-                .get("wardline_manifest_hash")
-                .and_then(serde_json::Value::as_str)
-            && stored_hash != current_hash
-        {
-            plan.push(PendingGuidanceStaleness::WardlineStale {
-                sheet_id: sheet.id.clone(),
-                stored_manifest_hash: stored_hash.to_owned(),
-                current_manifest_hash: current_hash.to_owned(),
-            });
-        }
-
-        // CHURN-STALE: aggregate churn over matched entities vs asymmetric
-        // threshold. Reuse the shared matcher; only churned entities can matter.
-        let pinned = sheet
-            .properties
-            .get("pinned")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let threshold = if pinned {
-            CHURN_STALE_THRESHOLD_PINNED
-        } else {
-            CHURN_STALE_THRESHOLD
-        };
-
-        let mut agg: i64 = 0;
-        let mut matched: Vec<String> = Vec::new();
-        for (entity_id, churn) in &churned {
-            if clarion_storage::guidance_sheet_matches_entity(
-                &conn,
-                sheet,
-                entity_id,
-                &canonical_root,
-            )
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .with_context(|| format!("match {entity_id} against {}", sheet.id))?
-            {
-                agg = agg.saturating_add(*churn);
-                matched.push(entity_id.clone());
-            }
-        }
-        if agg >= threshold {
-            matched.sort();
-            plan.push(PendingGuidanceStaleness::ChurnStale {
-                sheet_id: sheet.id.clone(),
-                agg,
-                matched,
-            });
-        }
-    }
-    Ok(plan)
-}
-
-async fn emit_guidance_staleness_findings(
-    writer: &Writer,
-    db_path: &Path,
-    project_root: &Path,
-    run_id: &str,
-    now: &str,
-) -> anyhow::Result<u64> {
-    // Build the (sheet, [matched churn pairs]) plan in one read pass, then emit.
-    // Drive the churn scan off the populated churn set only — `WHERE
-    // git_churn_count IS NOT NULL` — so the work is O(sheets × churned), and so
-    // production (no churn populated) yields an empty candidate set and CHURN-STALE
-    // never fires, with no special-casing.
-    let plan = plan_guidance_staleness_findings(db_path, project_root, now)?;
-    let mut count: u64 = 0;
-    for pending in &plan {
-        let finding = match pending {
-            PendingGuidanceStaleness::Expired(sheet_id) => {
-                guidance_expired_finding(sheet_id, run_id, now)
-            }
-            PendingGuidanceStaleness::WardlineStale {
-                sheet_id,
-                stored_manifest_hash,
-                current_manifest_hash,
-            } => guidance_stale_finding(
-                sheet_id,
-                stored_manifest_hash,
-                current_manifest_hash,
-                run_id,
-                now,
-            ),
-            PendingGuidanceStaleness::ChurnStale {
-                sheet_id,
-                agg,
-                matched,
-            } => guidance_churn_stale_finding(sheet_id, *agg, matched, run_id, now),
-        };
-        let finding_id = finding.id.clone();
-        writer
-            .send_wait(|ack| WriterCmd::PersistPostRunFinding {
-                finding: Box::new(finding),
-                ack,
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .with_context(|| format!("PersistPostRunFinding {finding_id}"))?;
-        count += 1;
-    }
-    Ok(count)
-}
-
-/// Build a `CLA-FACT-GUIDANCE-EXPIRED` finding anchored to the expired sheet.
-/// Run-scoped, deterministic id; INFO, confidence 1.0.
-fn guidance_expired_finding(guidance_id: &str, run_id: &str, now: &str) -> FindingRecord {
-    FindingRecord {
-        id: format!("core:finding:{run_id}:guidance-expired:{guidance_id}"),
-        tool: "clarion".to_owned(),
-        tool_version: env!("CARGO_PKG_VERSION").to_owned(),
-        run_id: run_id.to_owned(),
-        rule_id: GUIDANCE_EXPIRED_RULE_ID.to_owned(),
-        kind: "fact".to_owned(),
-        severity: "INFO".to_owned(),
-        confidence: Some(1.0),
-        confidence_basis: Some("guidance sheet past its `expires`".to_owned()),
-        entity_id: guidance_id.to_owned(),
-        related_entities_json: "[]".to_owned(),
-        message: format!("Guidance sheet {guidance_id} is past its `expires` instant"),
-        evidence_json: serde_json::json!({ "guidance_id": guidance_id }).to_string(),
-        properties_json: "{}".to_owned(),
-        supports_json: "[]".to_owned(),
-        supported_by_json: "[]".to_owned(),
-        created_at: now.to_owned(),
-        updated_at: now.to_owned(),
-    }
-}
-
-fn guidance_stale_finding(
-    guidance_id: &str,
-    stored_manifest_hash: &str,
-    current_manifest_hash: &str,
-    run_id: &str,
-    now: &str,
-) -> FindingRecord {
-    FindingRecord {
-        id: format!("core:finding:{run_id}:guidance-stale:{guidance_id}"),
-        tool: "clarion".to_owned(),
-        tool_version: env!("CARGO_PKG_VERSION").to_owned(),
-        run_id: run_id.to_owned(),
-        rule_id: GUIDANCE_STALE_RULE_ID.to_owned(),
-        kind: "fact".to_owned(),
-        severity: "WARN".to_owned(),
-        confidence: Some(1.0),
-        confidence_basis: Some("Wardline manifest hash drift".to_owned()),
-        entity_id: guidance_id.to_owned(),
-        related_entities_json: "[]".to_owned(),
-        message: format!(
-            "Wardline-derived guidance sheet {guidance_id} is stale relative to wardline.yaml"
-        ),
-        evidence_json: serde_json::json!({
-            "guidance_id": guidance_id,
-            "stored_manifest_hash": stored_manifest_hash,
-            "current_manifest_hash": current_manifest_hash,
-        })
-        .to_string(),
-        properties_json: "{}".to_owned(),
-        supports_json: "[]".to_owned(),
-        supported_by_json: "[]".to_owned(),
-        created_at: now.to_owned(),
-        updated_at: now.to_owned(),
-    }
-}
-
-/// Build a `CLA-FACT-GUIDANCE-CHURN-STALE` finding anchored to the sheet, carrying
-/// the matched entities (sorted) as related ids and the aggregate churn +
-/// threshold as evidence. Run-scoped, deterministic id; WARN, confidence 0.7
-/// (heuristic).
-fn guidance_churn_stale_finding(
-    guidance_id: &str,
-    aggregate_churn: i64,
-    matched: &[String],
-    run_id: &str,
-    now: &str,
-) -> FindingRecord {
-    FindingRecord {
-        id: format!("core:finding:{run_id}:guidance-churn-stale:{guidance_id}"),
-        tool: "clarion".to_owned(),
-        tool_version: env!("CARGO_PKG_VERSION").to_owned(),
-        run_id: run_id.to_owned(),
-        rule_id: GUIDANCE_CHURN_STALE_RULE_ID.to_owned(),
-        kind: "fact".to_owned(),
-        severity: "WARN".to_owned(),
-        confidence: Some(0.7),
-        confidence_basis: Some("heuristic".to_owned()),
-        entity_id: guidance_id.to_owned(),
-        related_entities_json: serde_json::to_string(matched).unwrap_or_else(|_| "[]".to_owned()),
-        message: format!(
-            "Guidance sheet {guidance_id} covers high-churn code (aggregate git_churn_count = {aggregate_churn})"
-        ),
-        evidence_json: serde_json::json!({
-            "guidance_id": guidance_id,
-            "aggregate_git_churn_count": aggregate_churn,
-            "matched_entities": matched,
         })
         .to_string(),
         properties_json: "{}".to_owned(),
@@ -2460,7 +1932,6 @@ async fn run_phase3_clustering(
     db_path: &Path,
     run_id: &str,
     analyze_config: &AnalyzeConfig,
-    head_commit: Option<&str>,
 ) -> Result<Phase3Output> {
     let started = std::time::Instant::now();
     let config = &analyze_config.analysis.clustering;
@@ -2593,33 +2064,30 @@ async fn run_phase3_clustering(
             "weight_by": config.weight_by.as_str(),
         })
         .to_string();
-        let mut entity = EntityRecord {
-            id: subsystem_id.clone(),
-            plugin_id: "core".to_owned(),
-            kind: "subsystem".to_owned(),
-            name: subsystem_name,
-            short_name: subsystem_short_name,
-            parent_id: None,
-            source_file_id: None,
-            source_file_path: None,
-            source_byte_start: None,
-            source_byte_end: None,
-            source_line_start: None,
-            source_line_end: None,
-            properties_json,
-            tags: Vec::new(),
-            content_hash: None,
-            summary_json: None,
-            wardline_json: None,
-            first_seen_commit: None,
-            last_seen_commit: None,
-            created_at: now.clone(),
-            updated_at: now,
-        };
-        stamp_entity_git_provenance(&mut entity, head_commit);
         writer
             .send_wait(|ack| WriterCmd::InsertEntity {
-                entity: Box::new(entity),
+                entity: Box::new(EntityRecord {
+                    id: subsystem_id.clone(),
+                    plugin_id: "core".to_owned(),
+                    kind: "subsystem".to_owned(),
+                    name: subsystem_name,
+                    short_name: subsystem_short_name,
+                    parent_id: None,
+                    source_file_id: None,
+                    source_file_path: None,
+                    source_byte_start: None,
+                    source_byte_end: None,
+                    source_line_start: None,
+                    source_line_end: None,
+                    properties_json,
+                    content_hash: None,
+                    summary_json: None,
+                    wardline_json: None,
+                    first_seen_commit: None,
+                    last_seen_commit: None,
+                    created_at: now.clone(),
+                    updated_at: now,
+                }),
                 ack,
             })
             .await
@@ -2704,7 +2172,7 @@ fn subsystem_display_name(member_ids: &[String], cluster_hash: &str) -> (String,
 }
 
 fn common_module_prefix(member_ids: &[String]) -> Option<String> {
-    let mut names = member_ids.iter().filter_map(|id| module_qualified_name(id));
+    let mut names = member_ids.iter().filter_map(|id| entity_qualified_name(id));
     let first = names.next()?;
     let mut common = first.split('.').collect::<Vec<_>>();
     for name in names {
@@ -2726,15 +2194,15 @@ fn common_module_prefix(member_ids: &[String]) -> Option<String> {
     }
 }
 
-fn module_qualified_name(entity_id: &str) -> Option<&str> {
+fn entity_qualified_name(entity_id: &str) -> Option<&str> {
     let mut parts = entity_id.splitn(3, ':');
     let _plugin_id = parts.next()?;
-    let kind = parts.next()?;
+    let _kind = parts.next()?;
     let qualified = parts.next()?;
-    if kind == "module" && !qualified.is_empty() {
-        Some(qualified)
-    } else {
+    if qualified.is_empty() {
         None
+    } else {
+        Some(qualified)
     }
 }
 
@@ -2804,10 +2272,19 @@ async fn insert_weak_modularity_finding(
 /// flagged `parse_status="syntax_error"`, or `None` for cleanly-parsed entities.
 ///
 /// The finding anchors to the degraded entity itself (the plugin still emits one
-/// `module` entity for a syntax-failed file), so no synthetic anchor is needed.
+/// manifest-declared degraded-syntax entity for a syntax-failed file), so no
+/// synthetic anchor is needed.
 /// The id is deterministic and run-scoped so a `--resume` re-walk regenerates the
 /// same id and `InsertFinding`'s upsert is idempotent (REQ-FINDING-05).
-fn syntax_error_finding(record: &EntityRecord, run_id: &str, now: &str) -> Option<FindingRecord> {
+fn syntax_error_finding(
+    record: &EntityRecord,
+    kind_roles: &PluginKindRoles,
+    run_id: &str,
+    now: &str,
+) -> Option<FindingRecord> {
+    if !kind_roles.is_syntax_degraded_module(&record.kind) {
+        return None;
+    }
     let props: serde_json::Value = serde_json::from_str(&record.properties_json).ok()?;
     if props
         .get("parse_status")
@@ -2829,7 +2306,7 @@ fn syntax_error_finding(record: &EntityRecord, run_id: &str, now: &str) -> Optio
         entity_id: record.id.clone(),
         related_entities_json: "[]".to_owned(),
         message: format!(
-            "{}: syntax error prevented full extraction; file ingested as a degraded module entity",
+            "{}: syntax error prevented full extraction; file ingested as a degraded plugin entity",
             record.name
         ),
         evidence_json: serde_json::json!({
@@ -2849,8 +2326,6 @@ fn syntax_error_finding(record: &EntityRecord, run_id: &str, now: &str) -> Optio
 /// breaker subcode (`FINDING_DISABLED_CRASH_LOOP`): this fires per plugin crash,
 /// the breaker subcode fires once when the breaker trips.
 const INFRA_CRASH_RULE_ID: &str = "CLA-INFRA-PLUGIN-CRASH";
-const SOURCE_WALK_SKIPPED_RULE_ID: &str = "CLA-INFRA-SOURCE-WALK-SKIPPED";
-const SOURCE_WALK_ERROR_SAMPLE_LIMIT: usize = 10;
 
 /// Anchor entity id for project/plugin-level findings that are not file-scoped
 /// (plugin crash, OOM, protocol/ontology violations). `findings.entity_id` is
@@ -2870,7 +2345,6 @@ async fn ensure_project_anchor(
     writer: &Writer,
     project_root: &Path,
     started_at: &str,
-    head_commit: Option<&str>,
 ) -> Result<String> {
     let id = project_anchor_id(project_root);
     let name = project_root
@@ -2879,7 +2353,7 @@ async fn ensure_project_anchor(
         .unwrap_or("root")
         .to_owned();
     let properties = serde_json::json!({ "finding_anchor": true }).to_string();
-    let mut record = EntityRecord {
+    let record = EntityRecord {
         id: id.clone(),
         plugin_id: "core".to_owned(),
         kind: "project".to_owned(),
@@ -2893,7 +2367,6 @@ async fn ensure_project_anchor(
         source_line_start: None,
         source_line_end: None,
         properties_json: properties,
-        tags: Vec::new(),
         content_hash: None,
         summary_json: None,
         wardline_json: None,
@@ -2902,7 +2375,6 @@ async fn ensure_project_anchor(
         created_at: started_at.to_owned(),
         updated_at: started_at.to_owned(),
     };
-    stamp_entity_git_provenance(&mut record, head_commit);
     writer
         .send_wait(|ack| WriterCmd::InsertEntity {
             entity: Box::new(record),
@@ -2917,6 +2389,7 @@ async fn ensure_project_anchor(
 /// Core-emitted per-file analysis-timeout subcode (REQ-ANALYZE-06). Host-side:
 /// the plugin is killed when a single `analyze_file` exceeds the deadline.
 const PLUGIN_TIMEOUT_RULE_ID: &str = "CLA-PY-TIMEOUT";
+const PLUGIN_JAIL_OPEN_RULE_ID: &str = "CLA-INFRA-PLUGIN-JAIL-OPEN-FAILED";
 
 /// Per-file `analyze_file` deadline. ADR-035 tuning: basis — a single file's
 /// extraction (incl. pyright queries) completes in well under a second on
@@ -2975,9 +2448,9 @@ fn host_finding_to_record(
         tool: "clarion".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
-        rule_id: hf.subcode.to_owned(),
+        rule_id: hf.subcode.clone(),
         kind: "defect".to_owned(),
-        severity: infra_severity(hf.subcode).to_owned(),
+        severity: infra_severity(hf.subcode.as_str()).to_owned(),
         confidence: Some(1.0),
         confidence_basis: Some("host enforcement".to_owned()),
         entity_id: anchor_id.to_owned(),
@@ -2989,6 +2462,40 @@ fn host_finding_to_record(
         supported_by_json: "[]".to_owned(),
         created_at: now.to_owned(),
         updated_at: now.to_owned(),
+    }
+}
+
+fn host_finding_anchor_id(hf: &HostFinding, project_root: &Path, project_anchor: &str) -> String {
+    hf.metadata
+        .get("anchor_file_path")
+        .and_then(|path| core_file_entity_id(project_root, Path::new(path)).ok())
+        .unwrap_or_else(|| project_anchor.to_owned())
+}
+
+fn verified_plugin_dispatch_path(project_root: &Path, file: &Path) -> Result<PathBuf> {
+    let _handle = clarion_core::plugin::jail::safe_open(project_root, file)
+        .with_context(|| format!("safe-open {}", file.display()))?;
+    let jailed = clarion_core::plugin::jail::jail_to_string(project_root, file)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("jail-check {}", file.display()))?;
+    Ok(PathBuf::from(jailed))
+}
+
+fn jail_open_failed_finding(file: &Path, error: &anyhow::Error) -> HostFinding {
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        "anchor_file_path".to_owned(),
+        file.to_string_lossy().into_owned(),
+    );
+    metadata.insert("file_path".to_owned(), file.to_string_lossy().into_owned());
+    metadata.insert("error".to_owned(), format!("{error:#}"));
+    HostFinding {
+        subcode: PLUGIN_JAIL_OPEN_RULE_ID.to_owned(),
+        message: format!(
+            "source file skipped before plugin dispatch because jail-safe open failed: {}",
+            file.display()
+        ),
+        metadata,
     }
 }
 
@@ -3025,54 +2532,11 @@ fn crash_finding_record(
     }
 }
 
-fn source_walk_finding_record(
-    project_root: &Path,
-    skipped_entries: u64,
-    error_samples: &[String],
-    errors_omitted: usize,
-    anchor_id: &str,
-    run_id: &str,
-    now: &str,
-) -> FindingRecord {
-    let discriminator =
-        blake3::hash(format!("{}\u{0}{skipped_entries}", project_root.display()).as_bytes())
-            .to_hex();
-    FindingRecord {
-        id: format!("core:finding:{run_id}:source-walk:{discriminator}"),
-        tool: "clarion".to_owned(),
-        tool_version: env!("CARGO_PKG_VERSION").to_owned(),
-        run_id: run_id.to_owned(),
-        rule_id: SOURCE_WALK_SKIPPED_RULE_ID.to_owned(),
-        kind: "defect".to_owned(),
-        severity: "WARN".to_owned(),
-        confidence: Some(1.0),
-        confidence_basis: Some("source tree walk".to_owned()),
-        entity_id: anchor_id.to_owned(),
-        related_entities_json: "[]".to_owned(),
-        message: format!(
-            "source tree walk skipped {skipped_entries} unreadable or invalid entr{}; analysis is incomplete for those paths",
-            if skipped_entries == 1 { "y" } else { "ies" }
-        ),
-        evidence_json: serde_json::json!({
-            "project_root": project_root.display().to_string(),
-            "skipped_entries": skipped_entries,
-            "error_samples": error_samples,
-            "errors_omitted": errors_omitted,
-        })
-        .to_string(),
-        properties_json: "{}".to_owned(),
-        supports_json: "[]".to_owned(),
-        supported_by_json: "[]".to_owned(),
-        created_at: now.to_owned(),
-        updated_at: now.to_owned(),
-    }
-}
-
 /// Load the MCP-side config (Filigree integration) from the same `clarion.yaml`
 /// `clarion serve` reads. A missing or unparseable file falls back to the
 /// default (Filigree disabled), so a config problem never fails the run — it
 /// just means no emission.
-pub(crate) fn load_mcp_config(project_root: &Path, config_path: Option<&Path>) -> McpConfig {
+fn load_mcp_config(project_root: &Path, config_path: Option<&Path>) -> McpConfig {
     let path = config_path.map_or_else(|| project_root.join("clarion.yaml"), Path::to_path_buf);
     if !path.exists() {
         return McpConfig::default();
@@ -3085,185 +2549,6 @@ pub(crate) fn load_mcp_config(project_root: &Path, config_path: Option<&Path>) -
         );
         McpConfig::default()
     })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SemanticEmbeddingStats {
-    considered: u64,
-    skipped_fresh: u64,
-    embedded: u64,
-    tokens_input: u64,
-    model_id: String,
-}
-
-#[derive(Debug)]
-struct SemanticEmbeddingCandidate {
-    entity_id: String,
-    content_hash: String,
-    text: String,
-}
-
-async fn populate_semantic_embeddings(
-    project_root: &Path,
-    db_path: &Path,
-    config: &SemanticSearchConfig,
-    provider: Arc<dyn EmbeddingProvider>,
-) -> Result<SemanticEmbeddingStats> {
-    let model_id = provider.model_id().to_owned();
-    let mut stats = SemanticEmbeddingStats {
-        considered: 0,
-        skipped_fresh: 0,
-        embedded: 0,
-        tokens_input: 0,
-        model_id: model_id.clone(),
-    };
-    if !config.enabled {
-        return Ok(stats);
-    }
-
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("open Clarion database {}", db_path.display()))?;
-    let store = EmbeddingStore::open_in_clarion_dir(project_root)
-        .map_err(|err| anyhow::anyhow!("{err}"))
-        .context("open semantic embedding sidecar")?;
-    let pending = semantic_embedding_candidates(&conn, &store, &model_id, &mut stats)?;
-    if pending.is_empty() {
-        return Ok(stats);
-    }
-
-    let token_estimates: Vec<u32> = pending
-        .iter()
-        .map(|candidate| {
-            u32::try_from(provider.estimate_tokens(std::slice::from_ref(&candidate.text)))
-                .unwrap_or(u32::MAX)
-        })
-        .collect();
-    stats.tokens_input = token_estimates
-        .iter()
-        .map(|tokens| u64::from(*tokens))
-        .sum();
-    if stats.tokens_input > config.session_token_ceiling {
-        bail!(
-            "semantic embedding token estimate {} exceeds semantic_search.session_token_ceiling {}",
-            stats.tokens_input,
-            config.session_token_ceiling
-        );
-    }
-
-    let now = iso8601_now();
-    for (batch_index, batch) in pending.chunks(SEMANTIC_EMBEDDING_BATCH_SIZE).enumerate() {
-        let texts: Vec<String> = batch
-            .iter()
-            .map(|candidate| candidate.text.clone())
-            .collect();
-        let vectors = provider
-            .embed(&texts)
-            .await
-            .with_context(|| format!("embed {} semantic candidate(s)", texts.len()))?;
-        if vectors.len() != batch.len() {
-            bail!(
-                "embedding provider returned {} vectors for {} semantic candidate(s)",
-                vectors.len(),
-                batch.len()
-            );
-        }
-        for (local_index, (candidate, vector)) in batch.iter().zip(vectors.iter()).enumerate() {
-            if vector.len() != provider.dimensions() {
-                bail!(
-                    "embedding provider returned {} dims for {}; expected {}",
-                    vector.len(),
-                    candidate.entity_id,
-                    provider.dimensions()
-                );
-            }
-            let token_index = batch_index * SEMANTIC_EMBEDDING_BATCH_SIZE + local_index;
-            store
-                .upsert(
-                    &EmbeddingKey {
-                        entity_id: candidate.entity_id.clone(),
-                        content_hash: candidate.content_hash.clone(),
-                        model_id: model_id.clone(),
-                    },
-                    vector,
-                    0.0,
-                    token_estimates[token_index],
-                    &now,
-                )
-                .map_err(|err| anyhow::anyhow!("{err}"))
-                .with_context(|| {
-                    format!("persist semantic embedding for {}", candidate.entity_id)
-                })?;
-            stats.embedded += 1;
-        }
-    }
-
-    Ok(stats)
-}
-
-fn semantic_embedding_candidates(
-    conn: &Connection,
-    store: &EmbeddingStore,
-    model_id: &str,
-    stats: &mut SemanticEmbeddingStats,
-) -> Result<Vec<SemanticEmbeddingCandidate>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, name, short_name, properties, content_hash \
-             FROM entities \
-             WHERE content_hash IS NOT NULL \
-               AND briefing_blocked IS NULL \
-             ORDER BY id",
-        )
-        .context("query semantic embedding candidates")?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })
-        .context("read semantic embedding candidates")?;
-
-    let mut pending = Vec::new();
-    for row in rows {
-        let (entity_id, name, short_name, properties_json, content_hash) =
-            row.context("read semantic embedding candidate")?;
-        stats.considered += 1;
-        let fresh = store
-            .get_vector(&entity_id, &content_hash, model_id)
-            .map_err(|err| anyhow::anyhow!("{err}"))
-            .with_context(|| format!("check semantic embedding freshness for {entity_id}"))?;
-        if fresh.is_some() {
-            stats.skipped_fresh += 1;
-            continue;
-        }
-        pending.push(SemanticEmbeddingCandidate {
-            entity_id,
-            content_hash,
-            text: semantic_embedding_text(&short_name, &name, &properties_json),
-        });
-    }
-    Ok(pending)
-}
-
-fn semantic_embedding_text(short_name: &str, name: &str, properties_json: &str) -> String {
-    if let Ok(properties) = serde_json::from_str::<serde_json::Value>(properties_json)
-        && let Some(docstring) = properties
-            .get("docstring")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|docstring| !docstring.is_empty())
-    {
-        return format!("{short_name}\n{docstring}");
-    }
-    if name == short_name {
-        short_name.to_owned()
-    } else {
-        format!("{short_name}\n{name}")
-    }
 }
 
 /// Phase 8 (WP9-B, REQ-FINDING-03): POST this run's persisted findings to
@@ -3341,6 +2626,10 @@ async fn emit_findings_to_filigree(
         None => rows,
     };
     let total_findings = rows.len();
+    let rows = rows
+        .into_iter()
+        .map(federation_finding_for_emit)
+        .collect::<Vec<_>>();
 
     // In the Phase-8c (post-`CommitRun`, filtered) pass, anchor path-less
     // synthetic-entity findings — the subsystem-anchored tier facts — to the
@@ -3388,13 +2677,32 @@ async fn emit_findings_to_filigree(
     .await
 }
 
+fn federation_finding_for_emit(row: clarion_storage::FindingForEmitRow) -> FindingForEmit {
+    FindingForEmit {
+        id: row.id,
+        rule_id: row.rule_id,
+        kind: row.kind,
+        severity: row.severity,
+        confidence: row.confidence,
+        confidence_basis: row.confidence_basis,
+        message: row.message,
+        entity_id: row.entity_id,
+        related_entities_json: row.related_entities_json,
+        supports_json: row.supports_json,
+        supported_by_json: row.supported_by_json,
+        source_file_path: row.source_file_path,
+        source_line_start: row.source_line_start,
+        source_line_end: row.source_line_end,
+    }
+}
+
 /// POST a prepared scan-results batch to the live Filigree endpoint and render
 /// the `filigree_emission` stats blob. Split out of [`emit_findings_to_filigree`]
 /// so the Phase-8 read/filter logic and this network lifecycle stay independently
 /// readable. Best-effort: a build/transport failure becomes an
 /// `CLA-INFRA-FILIGREE-UNREACHABLE` stats blob via [`unreachable_stats`].
 async fn post_findings_batch(
-    filigree_cfg: &FiligreeConfig,
+    filigree_cfg: &clarion_mcp::config::FiligreeConfig,
     project_root: &Path,
     run_id: &str,
     batch: PreparedBatch,
@@ -3638,7 +2946,7 @@ fn module_entity_ids(conn: &Connection) -> Result<Vec<String>> {
 #[allow(clippy::too_many_arguments)]
 fn phase3_stats_json(
     config: &ClusteringConfig,
-    algorithm: crate::clustering::ClusterAlgorithm,
+    algorithm: ClusterAlgorithm,
     status: &str,
     skipped_reason: Option<&str>,
     module_count: usize,
@@ -3755,6 +3063,7 @@ struct BatchResult {
     findings: Vec<clarion_core::HostFinding>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum PluginBatchMessage {
     File(PluginFileBatch),
     DeferredImportEdges {
@@ -3764,21 +3073,74 @@ enum PluginBatchMessage {
 }
 
 struct PluginFileBatch {
+    /// Core file entity id for the analyzed file. Used as the authoritative
+    /// replacement key for scan-time anchored edges from that source file.
+    source_file_id: String,
     /// `(entity_id_string, record)` pairs accepted from one analyzed file.
     entities: Vec<(String, EntityRecord)>,
+    /// Manifest-declared semantic roles for this plugin's entity kinds.
+    kind_roles: PluginKindRoles,
     /// Non-import edges accepted from one analyzed file. Import edges are
     /// deferred because local-vs-external classification needs the plugin's
     /// complete module set.
     edges: Vec<(String, EdgeRecord)>,
     /// Per-caller unresolved site replacements derived from authoritative
-    /// plugin stats for this file.
+    /// plugin stats for this batch.
     unresolved_call_sites: Vec<PendingUnresolvedCallSites>,
-    /// Observability stats reported by the plugin for this file.
+    /// Per-file observability stats reported by the plugin and folded by the CLI.
     stats: BatchStats,
+    /// Findings accumulated by the host during the session.
+    findings: Vec<clarion_core::HostFinding>,
     /// `locator -> canonical SEI signature JSON` for entities the plugin
     /// declared a signature for (WS1 / ADR-038). The SEI mint pass reads it as
     /// the move-case matcher input and persists it to `entities.signature`.
     signatures: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PluginKindRoles {
+    file_scope: BTreeSet<String>,
+    callable: BTreeSet<String>,
+    syntax_degraded_module: BTreeSet<String>,
+}
+
+impl PluginKindRoles {
+    fn from_manifest(manifest: &clarion_core::Manifest) -> Self {
+        let mut roles = Self::default();
+        for kind in &manifest.ontology.entity_kinds {
+            if manifest
+                .ontology
+                .kind_has_role(kind, clarion_core::OntologyEntityRole::FileScope)
+            {
+                roles.file_scope.insert(kind.clone());
+            }
+            if manifest
+                .ontology
+                .kind_has_role(kind, clarion_core::OntologyEntityRole::Callable)
+            {
+                roles.callable.insert(kind.clone());
+            }
+            if manifest
+                .ontology
+                .kind_has_role(kind, clarion_core::OntologyEntityRole::SyntaxDegradedModule)
+            {
+                roles.syntax_degraded_module.insert(kind.clone());
+            }
+        }
+        roles
+    }
+
+    fn is_file_scope(&self, kind: &str) -> bool {
+        self.file_scope.contains(kind)
+    }
+
+    fn is_callable(&self, kind: &str) -> bool {
+        self.callable.contains(kind)
+    }
+
+    fn is_syntax_degraded_module(&self, kind: &str) -> bool {
+        self.syntax_degraded_module.contains(kind)
+    }
 }
 
 struct PersistedPluginBatch {
@@ -3844,7 +3206,8 @@ async fn persist_plugin_file_batch(
         // REQ-ANALYZE-06: capture a parse-failure finding from the degraded
         // entity BEFORE `record` is moved into the command. Anchors to this
         // same entity (inserted just below), so the finding's FK resolves.
-        if let Some(finding) = syntax_error_finding(&record, run_id, started_at) {
+        if let Some(finding) = syntax_error_finding(&record, &batch.kind_roles, run_id, started_at)
+        {
             failure_findings.push(finding);
         }
         stamp_entity_git_provenance(&mut record, head_commit);
@@ -3863,6 +3226,20 @@ async fn persist_plugin_file_batch(
         }
         sei_descriptors.push(descriptor);
     }
+
+    writer
+        .send_wait(|ack| WriterCmd::ReplaceAnchoredEdgesForSourceFile {
+            source_file_id: batch.source_file_id.clone(),
+            ack,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| {
+            format!(
+                "ReplaceAnchoredEdgesForSourceFile for {}",
+                batch.source_file_id
+            )
+        })?;
 
     for pending in batch.unresolved_call_sites {
         let caller_id = pending.caller_entity_id.clone();
@@ -3945,6 +3322,16 @@ struct PendingUnresolvedCallSites {
     caller_content_hash: String,
     sites: Vec<UnresolvedCallSiteRecord>,
 }
+
+type Collected = (
+    Vec<(String, EntityRecord)>,
+    Vec<(String, EdgeRecord)>,
+    Vec<PendingUnresolvedCallSites>,
+    BatchStats,
+    // locator -> canonical SEI signature JSON (WS1). Only entities the plugin
+    // declared a signature for appear; absent ⇒ null signature.
+    BTreeMap<String, String>,
+);
 
 /// Per-file analysis-timeout watchdog (REQ-ANALYZE-06, `CLA-PY-TIMEOUT`).
 ///
@@ -4048,11 +3435,11 @@ fn run_plugin_blocking(
     scanned_source_files: &Arc<BTreeSet<PathBuf>>,
     progress: &ProgressReporter,
     file_timeout: std::time::Duration,
-    batch_tx: &tokio::sync::mpsc::Sender<PluginBatchMessage>,
 ) -> Result<BatchResult, PluginRunError> {
     use clarion_core::PluginHost;
 
     let manifest_language = manifest.plugin.language.clone();
+    let kind_roles = PluginKindRoles::from_manifest(&manifest);
     let (mut host, child) =
         PluginHost::spawn(manifest, project_root, executable).map_err(|e| match e {
             HostError::Spawn(msg) => {
@@ -4078,51 +3465,70 @@ fn run_plugin_blocking(
         plugin_id.to_owned(),
     );
 
+    let mut dispatch_findings: Vec<HostFinding> = Vec::new();
     let work_result: Result<(), String> = (|| {
-        let mut module_entity_ids: BTreeSet<String> = BTreeSet::new();
+        let mut file_scope_entity_ids: BTreeSet<String> = BTreeSet::new();
         let mut deferred_import_edges: Vec<(String, EdgeRecord)> = Vec::new();
         for file in files {
             let file_display = file.to_string_lossy().into_owned();
             progress.file_started(plugin_id, &file_display);
             let heartbeat_guard = progress.file_heartbeat_guard(plugin_id.to_owned(), file_display);
+            let dispatch_file = match verified_plugin_dispatch_path(project_root, file) {
+                Ok(path) => path,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin_id = %plugin_id,
+                        file = %file.display(),
+                        error = %e,
+                        "source file skipped before plugin dispatch; jail-safe open failed",
+                    );
+                    dispatch_findings.push(jail_open_failed_finding(file, &e));
+                    drop(heartbeat_guard);
+                    progress.file_completed();
+                    continue;
+                }
+            };
             watchdog.arm(file_timeout);
-            let analyze_outcome = host.analyze_file(file);
+            let analyze_outcome = host.analyze_file(&dispatch_file);
             watchdog.disarm();
-            drop(heartbeat_guard);
             let AnalyzeFileOutcome {
                 entities,
                 edges,
                 stats,
             } = analyze_outcome.map_err(|e| classify_host_error(plugin_id, e))?;
             progress.file_completed();
-            let mut file_stats = BatchStats {
-                unresolved_call_sites_total: stats.unresolved_call_sites_total,
-                reference_sites_total: stats.reference_sites_total,
-                references_resolved_total: stats.references_resolved_total,
-                references_skipped_external_total: stats.references_skipped_external_total,
-                references_skipped_cap_total: stats.references_skipped_cap_total,
-                imports_skipped_external_total: 0,
-                unresolved_reference_sites_total: stats.unresolved_reference_sites_total,
-                pyright_query_latency_ms: stats.pyright_query_latency_ms.clone(),
-                pyright_index_parse_latency_ms: stats.pyright_index_parse_latency_ms.clone(),
-                extractor_parse_latency_ms: Vec::new(),
-            };
+            collected_stats.unresolved_call_sites_total += stats.unresolved_call_sites_total;
+            collected_stats.reference_sites_total += stats.reference_sites_total;
+            collected_stats.references_resolved_total += stats.references_resolved_total;
+            collected_stats.references_skipped_external_total +=
+                stats.references_skipped_external_total;
+            collected_stats.references_skipped_cap_total += stats.references_skipped_cap_total;
+            collected_stats.unresolved_reference_sites_total +=
+                stats.unresolved_reference_sites_total;
+            collected_stats
+                .pyright_query_latency_ms
+                .extend(stats.pyright_query_latency_ms.iter().copied());
+            collected_stats
+                .pyright_index_parse_latency_ms
+                .extend(stats.pyright_index_parse_latency_ms.iter().copied());
             if stats.extractor_parse_latency_ms > 0 {
-                file_stats
+                collected_stats
                     .extractor_parse_latency_ms
                     .push(stats.extractor_parse_latency_ms);
             }
+            let source_file_id = entities
+                .iter()
+                .find(|entity| entity.kind == "module")
+                .map(|entity| entity.id.to_string());
             let mut file_entities: Vec<(String, EntityRecord)> = Vec::new();
-            let mut file_edges: Vec<(String, EdgeRecord)> = Vec::new();
-            let mut file_signatures: BTreeMap<String, String> = BTreeMap::new();
             let (file_entity_id, file_record) = core_file_entity_record(
                 project_root,
-                file,
+                &dispatch_file,
                 &manifest_language,
                 briefing_blocks,
                 scanned_source_files,
             )
-            .map_err(|e| format!("core file entity for {}: {e:#}", file.display()))?;
+            .map_err(|e| format!("core file entity for {}: {e:#}", dispatch_file.display()))?;
             file_entities.push((file_entity_id.clone(), file_record));
             for entity in &entities {
                 let id_str = entity.id.to_string();
@@ -4137,9 +3543,10 @@ fn run_plugin_blocking(
                     entity,
                     plugin_id,
                     Some(file_entity_id.clone()),
+                    &kind_roles,
                 );
-                if entity.kind == "module" {
-                    module_entity_ids.insert(id_str.clone());
+                if kind_roles.is_file_scope(&entity.kind) {
+                    file_scope_entity_ids.insert(id_str.clone());
                     record.parent_id = Some(file_entity_id.clone());
                     file_edges.push((
                         format!(
@@ -4150,15 +3557,19 @@ fn run_plugin_blocking(
                         core_file_contains_edge(&file_entity_id, entity.id.as_str()),
                     ));
                 }
+                let record = map_entity_to_record(entity, plugin_id, source_file_id.clone());
                 file_entities.push((id_str.clone(), record.clone()));
+                collected_entities.push((id_str, record));
             }
-            let unresolved_for_file =
-                map_unresolved_call_sites_for_file(&stats, &file_entities, &iso8601_now())
-                    .map_err(|e| {
-                        format!(
-                            "plugin {plugin_id} emitted invalid unresolved call-site stats: {e:#}"
-                        )
-                    })?;
+            let unresolved_for_file = map_unresolved_call_sites_for_file(
+                &stats,
+                &file_entities,
+                &kind_roles,
+                &iso8601_now(),
+            )
+            .map_err(|e| {
+                format!("plugin {plugin_id} emitted invalid unresolved call-site stats: {e:#}")
+            })?;
             for edge in edges {
                 let descr = format!(
                     "({kind} {from} -> {to})",
@@ -4166,14 +3577,16 @@ fn run_plugin_blocking(
                     from = edge.from_id,
                     to = edge.to_id,
                 );
-                let record = map_edge_to_record(edge, Some(file_entity_id.clone()));
-                file_edges.push((descr, record));
+                let record = map_edge_to_record(edge);
+                collected_edges.push((descr, record));
             }
             let (immediate_edges, import_edges) = split_deferred_import_edges(file_edges);
             deferred_import_edges.extend(import_edges);
             batch_tx
                 .blocking_send(PluginBatchMessage::File(PluginFileBatch {
+                    source_file_id: file_entity_id.clone(),
                     entities: file_entities,
+                    kind_roles: kind_roles.clone(),
                     edges: immediate_edges,
                     unresolved_call_sites: unresolved_for_file,
                     stats: file_stats,
@@ -4182,7 +3595,7 @@ fn run_plugin_blocking(
                 .map_err(|_| "plugin batch receiver closed".to_owned())?;
         }
         let imports_skipped_external = filter_external_import_edges_by_module_ids(
-            &module_entity_ids,
+            &file_scope_entity_ids,
             &mut deferred_import_edges,
         );
         batch_tx
@@ -4235,6 +3648,7 @@ fn run_plugin_blocking(
     }
 
     let mut findings = host.take_findings();
+    findings.extend(dispatch_findings);
     drop(host);
 
     // REQ-ANALYZE-06: a per-file timeout is a recoverable failure that must be
@@ -4248,7 +3662,7 @@ fn run_plugin_blocking(
             file_timeout.as_millis().to_string(),
         );
         findings.push(HostFinding {
-            subcode: PLUGIN_TIMEOUT_RULE_ID,
+            subcode: PLUGIN_TIMEOUT_RULE_ID.to_owned(),
             message: format!(
                 "plugin {plugin_id} exceeded the per-file analysis timeout ({} ms) and was killed",
                 file_timeout.as_millis()
@@ -4261,7 +3675,14 @@ fn run_plugin_blocking(
     reap_and_classify_exit(&mut child, plugin_id, &mut findings);
 
     match work_result {
-        Ok(()) => Ok(BatchResult { findings }),
+        Ok((entities, edges, unresolved_call_sites, stats, signatures)) => Ok(BatchResult {
+            entities,
+            edges,
+            unresolved_call_sites,
+            stats,
+            findings,
+            signatures,
+        }),
         Err(reason) => Err(PluginRunError::with_findings(reason, findings)),
     }
 }
@@ -4413,38 +3834,23 @@ fn classify_host_error(plugin_id: &str, e: HostError) -> String {
     }
 }
 
-#[cfg(test)]
 fn filter_external_import_edges(
     entities: &[(String, EntityRecord)],
+    kind_roles: &PluginKindRoles,
     edges: &mut Vec<(String, EdgeRecord)>,
 ) -> u64 {
     let module_entity_ids: BTreeSet<&str> = entities
         .iter()
-        .filter(|(_, record)| record.kind == "module")
+        .filter(|(_, record)| kind_roles.is_file_scope(&record.kind))
         .map(|(id, _)| id.as_str())
         .collect();
-    filter_external_import_edges_by_module_refs(&module_entity_ids, edges)
-}
-
-fn filter_external_import_edges_by_module_ids(
-    module_entity_ids: &BTreeSet<String>,
-    edges: &mut Vec<(String, EdgeRecord)>,
-) -> u64 {
-    let module_entity_ids: BTreeSet<&str> = module_entity_ids.iter().map(String::as_str).collect();
-    filter_external_import_edges_by_module_refs(&module_entity_ids, edges)
-}
-
-fn filter_external_import_edges_by_module_refs(
-    module_entity_ids: &BTreeSet<&str>,
-    edges: &mut Vec<(String, EdgeRecord)>,
-) -> u64 {
     let before = edges.len();
     edges.retain_mut(|(_, edge)| {
         if edge.kind != "imports" {
             return true;
         }
         if let Some(local_submodule) =
-            absolute_from_import_submodule_target(edge, module_entity_ids)
+            absolute_from_import_submodule_target(edge, &module_entity_ids)
         {
             edge.to_id = local_submodule;
             return true;
@@ -4452,14 +3858,6 @@ fn filter_external_import_edges_by_module_refs(
         module_entity_ids.contains(edge.to_id.as_str())
     });
     u64::try_from(before - edges.len()).unwrap_or(u64::MAX)
-}
-
-fn split_deferred_import_edges(
-    edges: Vec<DescribedEdgeRecord>,
-) -> (Vec<DescribedEdgeRecord>, Vec<DescribedEdgeRecord>) {
-    edges
-        .into_iter()
-        .partition(|(_, edge)| edge.kind != "imports")
 }
 
 fn absolute_from_import_submodule_target(
@@ -4505,17 +3903,8 @@ fn core_file_entity_record(
     let canonical_file = file
         .canonicalize()
         .with_context(|| format!("canonicalize source file {}", file.display()))?;
-    let relative = canonical_file
-        .strip_prefix(&canonical_root)
-        .with_context(|| {
-            format!(
-                "source file {} is outside project root {}",
-                canonical_file.display(),
-                canonical_root.display()
-            )
-        })?;
-    let qualified_name = project_relative_posix(relative)?;
-    let id = clarion_core::entity_id::entity_id("core", "file", &qualified_name)?.to_string();
+    let (id, qualified_name) =
+        core_file_entity_id_from_canonical(&canonical_root, &canonical_file)?;
     let briefing_blocked = briefing_blocks.get(&canonical_file).copied().or_else(|| {
         (!scanned_source_files.contains(&canonical_file))
             .then_some(clarion_core::BriefingBlockReason::UnscannedSource)
@@ -4531,7 +3920,7 @@ fn core_file_entity_record(
         .and_then(|name| name.to_str())
         .unwrap_or(&qualified_name)
         .to_owned();
-    let content_hash = whole_file_hash(&canonical_root, Path::new(&source_file_path))
+    let content_hash = whole_file_hash(Path::new(&source_file_path))
         .with_context(|| format!("read source file {source_file_path}"))?;
     let mut properties = serde_json::Map::new();
     properties.insert(
@@ -4563,7 +3952,6 @@ fn core_file_entity_record(
             source_line_start: None,
             source_line_end: None,
             properties_json,
-            tags: Vec::new(),
             content_hash: Some(content_hash),
             summary_json: None,
             wardline_json: None,
@@ -4573,6 +3961,35 @@ fn core_file_entity_record(
             updated_at: now,
         },
     ))
+}
+
+fn core_file_entity_id(project_root: &Path, file: &Path) -> Result<String> {
+    let canonical_root = project_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize project root {}", project_root.display()))?;
+    let canonical_file = file
+        .canonicalize()
+        .with_context(|| format!("canonicalize source file {}", file.display()))?;
+    let (id, _) = core_file_entity_id_from_canonical(&canonical_root, &canonical_file)?;
+    Ok(id)
+}
+
+fn core_file_entity_id_from_canonical(
+    canonical_root: &Path,
+    canonical_file: &Path,
+) -> Result<(String, String)> {
+    let relative = canonical_file
+        .strip_prefix(canonical_root)
+        .with_context(|| {
+            format!(
+                "source file {} is outside project root {}",
+                canonical_file.display(),
+                canonical_root.display()
+            )
+        })?;
+    let qualified_name = project_relative_posix(relative)?;
+    let id = clarion_core::entity_id::entity_id("core", "file", &qualified_name)?.to_string();
+    Ok((id, qualified_name))
 }
 
 fn project_relative_posix(path: &Path) -> Result<String> {
@@ -4606,10 +4023,10 @@ fn project_relative_posix(path: &Path) -> Result<String> {
 
 /// Map an `AcceptedEntity` to an `EntityRecord` for the writer-actor.
 fn map_entity_to_record(
-    project_root: &Path,
     entity: &AcceptedEntity,
     plugin_id: &str,
     source_file_id: Option<String>,
+    kind_roles: &PluginKindRoles,
 ) -> EntityRecord {
     let short_name = entity
         .qualified_name
@@ -4639,7 +4056,7 @@ fn map_entity_to_record(
         source_line_end: source_line_range.map(|range| range.end_line),
         properties_json,
         tags: normalised_entity_tags(&entity.raw.tags),
-        content_hash: content_hash_for_entity(project_root, entity, source_line_range),
+        content_hash: content_hash_for_entity(project_root, entity, source_line_range, kind_roles),
         summary_json: None,
         wardline_json: None,
         first_seen_commit: None,
@@ -4647,16 +4064,6 @@ fn map_entity_to_record(
         created_at: now.clone(),
         updated_at: now,
     }
-}
-
-fn normalised_entity_tags(tags: &[String]) -> Vec<String> {
-    tags.iter()
-        .map(|tag| tag.trim())
-        .filter(|tag| !tag.is_empty())
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4680,16 +4087,13 @@ fn source_line_range(entity: &AcceptedEntity) -> Option<SourceLineRange> {
 
 /// The blake3 hex of a file's whole contents — the single canonical whole-file
 /// hash used everywhere the "did this file change?" question is asked: the core
-/// `file` entity's `content_hash` (`core_file_entity`), a plugin `module`
+/// `file` entity's `content_hash` (`core_file_entity`), a plugin file-scope
 /// entity's `content_hash` (`content_hash_for_entity`), and the Wave 2
 /// incremental-skip check. They MUST agree byte-for-byte or the skip silently
 /// never matches; one helper guarantees that. `None` when the file cannot be
 /// read — callers fail toward re-analysis.
-fn whole_file_hash(project_root: &Path, path: &Path) -> Option<String> {
-    use std::io::Read;
-    let mut file = clarion_core::plugin::jail::safe_open(project_root, path).ok()?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).ok()?;
+fn whole_file_hash(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
     Some(blake3::hash(&bytes).to_hex().to_string())
 }
 
@@ -4710,40 +4114,32 @@ fn canonical_path_key(path: &Path) -> Option<String> {
 /// fail-toward-work direction — on any uncertainty: the path cannot be
 /// canonicalised, the prior run recorded no whole-file hash for it (a new file),
 /// or the file is unhashable now. Skips only on a confident byte-identical match.
-fn file_needs_reanalysis(
-    project_root: &Path,
-    path: &Path,
-    prior_file_hashes: &HashMap<String, String>,
-) -> bool {
+fn file_needs_reanalysis(path: &Path, prior_file_hashes: &HashMap<String, String>) -> bool {
     let Some(key) = canonical_path_key(path) else {
         return true;
     };
     let Some(prior) = prior_file_hashes.get(&key) else {
         return true;
     };
-    match whole_file_hash(project_root, path) {
+    match whole_file_hash(path) {
         Some(current) => &current != prior,
         None => true,
     }
 }
 
 fn content_hash_for_entity(
-    project_root: &Path,
     entity: &AcceptedEntity,
     source_line_range: Option<SourceLineRange>,
+    kind_roles: &PluginKindRoles,
 ) -> Option<String> {
     use std::io::Read;
 
-    if entity.kind == "module" {
+    if kind_roles.is_file_scope(&entity.kind) {
         return whole_file_hash(project_root, Path::new(&entity.source_file_path));
     }
 
     let range = source_line_range?;
-    let mut file =
-        clarion_core::plugin::jail::safe_open(project_root, Path::new(&entity.source_file_path))
-            .ok()?;
-    let mut source = String::new();
-    file.read_to_string(&mut source).ok()?;
+    let source = fs::read_to_string(&entity.source_file_path).ok()?;
     let lines: Vec<&str> = source.lines().collect();
     let start = usize::try_from(range.start_line - 1).ok()?;
     let mut end = usize::try_from(range.end_line).ok()?;
@@ -4765,20 +4161,7 @@ fn canonical_signature(value: &serde_json::Value) -> String {
 }
 
 /// Map an `AcceptedEdge` to an `EdgeRecord` for the writer-actor (B.3).
-fn core_file_contains_edge(file_entity_id: &str, child_entity_id: &str) -> EdgeRecord {
-    EdgeRecord {
-        kind: "contains".to_owned(),
-        from_id: file_entity_id.to_owned(),
-        to_id: child_entity_id.to_owned(),
-        confidence: EdgeConfidence::Resolved,
-        properties_json: None,
-        source_file_id: Some(file_entity_id.to_owned()),
-        source_byte_start: None,
-        source_byte_end: None,
-    }
-}
-
-fn map_edge_to_record(edge: AcceptedEdge, source_file_id: Option<String>) -> EdgeRecord {
+fn map_edge_to_record(edge: AcceptedEdge) -> EdgeRecord {
     let properties_json = edge
         .raw
         .properties
@@ -4790,7 +4173,7 @@ fn map_edge_to_record(edge: AcceptedEdge, source_file_id: Option<String>) -> Edg
         to_id: edge.to_id,
         confidence: edge.confidence,
         properties_json,
-        source_file_id,
+        source_file_id: edge.source_file_id,
         source_byte_start: edge.raw.source_byte_start,
         source_byte_end: edge.raw.source_byte_end,
     }
@@ -4799,6 +4182,7 @@ fn map_edge_to_record(edge: AcceptedEdge, source_file_id: Option<String>) -> Edg
 fn map_unresolved_call_sites_for_file(
     stats: &clarion_core::AnalyzeFileStats,
     entities: &[(String, EntityRecord)],
+    kind_roles: &PluginKindRoles,
     created_at: &str,
 ) -> Result<Vec<PendingUnresolvedCallSites>> {
     let entities_by_id: BTreeMap<&str, &EntityRecord> = entities
@@ -4811,7 +4195,7 @@ fn map_unresolved_call_sites_for_file(
 
     if authoritative {
         for (id, record) in entities {
-            if record.kind != "function" {
+            if !kind_roles.is_callable(&record.kind) {
                 continue;
             }
             let Some(content_hash) = &record.content_hash else {
@@ -4838,6 +4222,13 @@ fn map_unresolved_call_sites_for_file(
                     site.caller_entity_id
                 )
             })?;
+        if !kind_roles.is_callable(&caller.kind) {
+            bail!(
+                "unresolved call site caller kind {:?} is not manifest-declared callable: {}",
+                caller.kind,
+                site.caller_entity_id
+            );
+        }
         let content_hash = caller.content_hash.clone().with_context(|| {
             format!(
                 "unresolved call site caller lacks content_hash: {}",
@@ -4924,15 +4315,10 @@ const SKIP_DIRS: &[&str] = &[
 
 /// Collect all source files under `root` whose extension is in `wanted`.
 ///
-#[derive(Debug, Default)]
-struct SourceWalkResult {
-    files: Vec<PathBuf>,
-    skipped_errors: Vec<String>,
-}
-
 /// Uses the `ignore` crate so `.gitignore` / `.ignore` / global gitignore
-/// policy filters the source set before plugin dispatch. Symlinks are skipped
-/// (path-jail concerns for Sprint 1).
+/// policy filters the source set before plugin dispatch. Matching files must
+/// also pass the path-jail safe-open check before they enter the shared source
+/// list used by secret scanning and plugin dispatch.
 ///
 /// Per-entry I/O errors (a dirent we couldn't stat, a file whose
 /// `file_type()` probe failed) are logged at `warn` level and counted.
@@ -4940,9 +4326,9 @@ struct SourceWalkResult {
 /// the operator can see that the file list is incomplete — silently
 /// dropping those entries would mask the same "incomplete analysis"
 /// class that the WP1 `read_applied_versions` `.ok()` pattern did.
-fn collect_source_files(root: &Path, wanted_extensions: &BTreeSet<String>) -> SourceWalkResult {
+fn collect_source_files(root: &Path, wanted_extensions: &BTreeSet<String>) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let mut skipped_errors = Vec::new();
+    let mut skipped: u64 = 0;
     let mut builder = WalkBuilder::new(root);
     builder
         .follow_links(false)
@@ -4968,23 +4354,24 @@ fn collect_source_files(root: &Path, wanted_extensions: &BTreeSet<String>) -> So
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                     let ext_lower = ext.to_ascii_lowercase();
                     if wanted_extensions.contains(&ext_lower) {
-                        out.push(path);
+                        match verified_plugin_dispatch_path(root, &path) {
+                            Ok(safe_path) => out.push(safe_path),
+                            Err(err) => skipped_errors.push(format!("{}: {err:#}", path.display())),
+                        }
                     }
                 }
             }
             Err(err) => {
-                let message = err.to_string();
                 tracing::warn!(
-                    error = %message,
+                    error = %err,
                     "source walk: skipping unreadable or ignored-path-error entry",
                 );
-                skipped_errors.push(message);
+                skipped += 1;
             }
         }
     }
 
-    if !skipped_errors.is_empty() {
-        let skipped = skipped_errors.len();
+    if skipped > 0 {
         tracing::warn!(
             skipped = skipped,
             root = %root.display(),
@@ -4993,10 +4380,7 @@ fn collect_source_files(root: &Path, wanted_extensions: &BTreeSet<String>) -> So
             suffix = if skipped == 1 { "y" } else { "ies" },
         );
     }
-    SourceWalkResult {
-        files: out,
-        skipped_errors,
-    }
+    out
 }
 
 fn is_skipped_dir(entry: &DirEntry) -> bool {
@@ -5117,33 +4501,6 @@ mod tests {
     }
 
     #[test]
-    fn progress_reporter_refreshes_heartbeat_for_in_flight_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("runs").join("run-1.progress.json");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let reporter = ProgressReporter::new(Some(path.clone()), "run-1".to_owned());
-
-        reporter.file_started("python", "src/slow.py");
-        let before: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).expect("progress file")).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let guard = reporter.file_heartbeat_guard_with_interval(
-            "python".to_owned(),
-            "src/slow.py".to_owned(),
-            std::time::Duration::from_millis(10),
-        );
-        std::thread::sleep(std::time::Duration::from_millis(35));
-        drop(guard);
-
-        let after: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).expect("progress file")).unwrap();
-        assert_eq!(after["phase"], "analyzing");
-        assert_eq!(after["current_plugin"], "python");
-        assert_eq!(after["current_file"], "src/slow.py");
-        assert_ne!(before["heartbeat_at"], after["heartbeat_at"]);
-    }
-
-    #[test]
     fn subsystem_entity_id_rejects_invalid_hash_segment() {
         let err = subsystem_entity_id("bad:hash").expect_err("colon must be rejected");
 
@@ -5167,11 +4524,7 @@ mod tests {
             .expect("ignored dir source");
 
         let wanted = BTreeSet::from(["py".to_owned()]);
-        let SourceWalkResult {
-            mut files,
-            skipped_errors,
-        } = collect_source_files(root, &wanted);
-        assert!(skipped_errors.is_empty());
+        let mut files = collect_source_files(root, &wanted);
         files.sort();
         let relative = files
             .into_iter()
@@ -5187,43 +4540,6 @@ mod tests {
     }
 
     #[test]
-    fn source_walk_returns_errors_instead_of_only_logging_them() {
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let missing_root = tempdir.path().join("missing");
-        let wanted = BTreeSet::from(["py".to_owned()]);
-
-        let result = collect_source_files(&missing_root, &wanted);
-
-        assert!(result.files.is_empty());
-        assert!(
-            !result.skipped_errors.is_empty(),
-            "missing root must be carried as a skipped walk error"
-        );
-    }
-
-    #[test]
-    fn source_walk_finding_record_is_project_anchored_with_samples() {
-        let rec = source_walk_finding_record(
-            Path::new("/tmp/project"),
-            2,
-            &["permission denied".to_owned()],
-            1,
-            "core:project:project",
-            "run-1",
-            "2026-06-04T00:00:00.000Z",
-        );
-
-        assert_eq!(rec.rule_id, SOURCE_WALK_SKIPPED_RULE_ID);
-        assert_eq!(rec.severity, "WARN");
-        assert_eq!(rec.entity_id, "core:project:project");
-        let evidence: serde_json::Value =
-            serde_json::from_str(&rec.evidence_json).expect("evidence json");
-        assert_eq!(evidence["skipped_entries"], 2);
-        assert_eq!(evidence["error_samples"][0], "permission denied");
-        assert_eq!(evidence["errors_omitted"], 1);
-    }
-
-    #[test]
     fn filter_import_edges_prefers_absolute_from_import_submodule_when_local() {
         let entities = vec![
             module_record("python:module:pkg"),
@@ -5235,7 +4551,7 @@ mod tests {
             "service",
         )];
 
-        let skipped = filter_external_import_edges(&entities, &mut edges);
+        let skipped = filter_external_import_edges(&entities, &python_kind_roles(), &mut edges);
 
         assert_eq!(skipped, 0);
         assert_eq!(edges[0].1.to_id, "python:module:pkg.service");
@@ -5250,7 +4566,7 @@ mod tests {
             "helper",
         )];
 
-        let skipped = filter_external_import_edges(&entities, &mut edges);
+        let skipped = filter_external_import_edges(&entities, &python_kind_roles(), &mut edges);
 
         assert_eq!(skipped, 0);
         assert_eq!(edges[0].1.to_id, "python:module:pkg");
@@ -5265,7 +4581,7 @@ mod tests {
             "service",
         )];
 
-        let skipped = filter_external_import_edges(&entities, &mut edges);
+        let skipped = filter_external_import_edges(&entities, &python_kind_roles(), &mut edges);
 
         assert_eq!(skipped, 0);
         assert_eq!(edges[0].1.to_id, "python:module:pkg.service");
@@ -5280,7 +4596,7 @@ mod tests {
             "service",
         )];
 
-        let skipped = filter_external_import_edges(&entities, &mut edges);
+        let skipped = filter_external_import_edges(&entities, &python_kind_roles(), &mut edges);
 
         assert_eq!(skipped, 1);
         assert!(edges.is_empty());
@@ -5321,7 +4637,7 @@ mod tests {
 
         let stats = phase3_stats_json(
             &config,
-            crate::clustering::ClusterAlgorithm::WeightedComponents,
+            ClusterAlgorithm::WeightedComponents,
             "completed",
             None,
             3,
@@ -5355,7 +4671,6 @@ mod tests {
                 source_line_start: None,
                 source_line_end: None,
                 properties_json: "{}".to_owned(),
-                tags: Vec::new(),
                 content_hash: None,
                 summary_json: None,
                 wardline_json: None,
@@ -5382,7 +4697,6 @@ mod tests {
             source_line_start: None,
             source_line_end: None,
             properties_json: properties_json.to_owned(),
-            tags: Vec::new(),
             content_hash: None,
             summary_json: None,
             wardline_json: None,
@@ -5393,14 +4707,27 @@ mod tests {
         }
     }
 
+    fn python_kind_roles() -> PluginKindRoles {
+        PluginKindRoles {
+            file_scope: BTreeSet::from(["module".to_owned()]),
+            callable: BTreeSet::from(["function".to_owned()]),
+            syntax_degraded_module: BTreeSet::from(["module".to_owned()]),
+        }
+    }
+
     #[test]
     fn syntax_error_finding_minted_for_degraded_entity() {
         let record = entity_with_properties(
             "python:module:pkg.broken",
             r#"{"parse_status":"syntax_error"}"#,
         );
-        let finding = syntax_error_finding(&record, "run-1", "2026-06-02T00:00:00.000Z")
-            .expect("syntax_error entity must mint a finding");
+        let finding = syntax_error_finding(
+            &record,
+            &python_kind_roles(),
+            "run-1",
+            "2026-06-02T00:00:00.000Z",
+        )
+        .expect("syntax_error entity must mint a finding");
         assert_eq!(finding.rule_id, SYNTAX_ERROR_RULE_ID);
         assert_eq!(finding.entity_id, "python:module:pkg.broken");
         assert_eq!(finding.kind, "defect");
@@ -5416,11 +4743,21 @@ mod tests {
     #[test]
     fn syntax_error_finding_absent_for_clean_or_unflagged_entities() {
         let ok = entity_with_properties("python:module:pkg.ok", r#"{"parse_status":"ok"}"#);
-        assert!(syntax_error_finding(&ok, "run-1", "t").is_none());
+        assert!(syntax_error_finding(&ok, &python_kind_roles(), "run-1", "t").is_none());
         let plain = entity_with_properties("python:module:pkg.plain", "{}");
-        assert!(syntax_error_finding(&plain, "run-1", "t").is_none());
+        assert!(syntax_error_finding(&plain, &python_kind_roles(), "run-1", "t").is_none());
         let malformed = entity_with_properties("python:module:pkg.bad", "not json");
-        assert!(syntax_error_finding(&malformed, "run-1", "t").is_none());
+        assert!(syntax_error_finding(&malformed, &python_kind_roles(), "run-1", "t").is_none());
+    }
+
+    #[test]
+    fn syntax_error_finding_requires_manifest_role() {
+        let record = entity_with_properties(
+            "fixture:widget:pkg.broken",
+            r#"{"parse_status":"syntax_error"}"#,
+        );
+
+        assert!(syntax_error_finding(&record, &PluginKindRoles::default(), "run-1", "t").is_none());
     }
 
     #[test]
@@ -5536,7 +4873,7 @@ mod tests {
     #[test]
     fn host_finding_to_record_anchors_and_carries_subcode() {
         let hf = HostFinding {
-            subcode: "CLA-INFRA-PLUGIN-MALFORMED-ENTITY",
+            subcode: "CLA-INFRA-PLUGIN-MALFORMED-ENTITY".to_owned(),
             message: "entity failed to deserialise".to_owned(),
             metadata: std::collections::BTreeMap::new(),
         };
@@ -5547,6 +4884,48 @@ mod tests {
         assert_eq!(rec.kind, "defect");
         assert_eq!(rec.tool, "clarion");
         assert!(rec.evidence_json.contains("python"));
+    }
+
+    #[test]
+    fn host_finding_anchor_id_uses_file_anchor_metadata_when_present() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let source = tempdir.path().join("pkg").join("demo.py");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "def demo():\n    pass\n").unwrap();
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert(
+            "anchor_file_path".to_owned(),
+            source.to_string_lossy().into_owned(),
+        );
+        let hf = HostFinding {
+            subcode: "CLA-PY-PYRIGHT-RESTART".to_owned(),
+            message: "pyright restarted".to_owned(),
+            metadata,
+        };
+
+        let anchor = host_finding_anchor_id(&hf, tempdir.path(), "core:project:demo");
+
+        assert_eq!(anchor, "core:file:pkg/demo.py");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_plugin_dispatch_path_rejects_out_of_tree_symlink() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let project = tempdir.path().join("project");
+        let outside = tempdir.path().join("outside.py");
+        fs::create_dir(&project).expect("create project");
+        fs::write(&outside, "def secret():\n    pass\n").expect("write outside");
+        let link = project.join("demo.py");
+        std::os::unix::fs::symlink(&outside, &link).expect("symlink outside");
+
+        let err = verified_plugin_dispatch_path(&project, &link)
+            .expect_err("out-of-tree symlink must not be dispatched");
+
+        assert!(
+            format!("{err:#}").contains("safe-open"),
+            "dispatch failure should identify safe-open boundary: {err:#}"
+        );
     }
 
     #[test]
@@ -5609,7 +4988,12 @@ mod tests {
     #[test]
     fn handle_task_passes_through_ok_ok() {
         let br = BatchResult {
+            entities: Vec::new(),
+            edges: Vec::new(),
+            unresolved_call_sites: Vec::new(),
+            stats: BatchStats::default(),
             findings: Vec::new(),
+            signatures: BTreeMap::new(),
         };
         let out = handle_plugin_task_join_result(Ok(Ok(br)), "python");
         assert!(out.is_ok());
@@ -5718,11 +5102,6 @@ mod tests {
                 signature: Some(
                     serde_json::json!({"v": 1, "params": ["x: int"], "return_ann": "bool"}),
                 ),
-                tags: vec![
-                    "entry-point".to_owned(),
-                    "entry-point".to_owned(),
-                    " ".to_owned(),
-                ],
                 extra: serde_json::Map::new(),
             },
         };
@@ -5732,16 +5111,16 @@ mod tests {
             &entity,
             "python",
             Some("core:file:demo.py".to_owned()),
+            &python_kind_roles(),
         );
 
         assert_eq!(
             record.source_file_path.as_deref(),
             Some(source_path.to_str().unwrap())
         );
-        assert_eq!(record.source_file_id.as_deref(), Some("core:file:demo.py"));
+        assert_eq!(record.source_file_id.as_deref(), Some("python:module:demo"));
         assert_eq!(record.source_line_start, Some(1));
         assert_eq!(record.source_line_end, Some(2));
-        assert_eq!(record.tags, vec!["entry-point".to_owned()]);
         let expected_hash = blake3::hash("def hello():\n    return 'hé'".as_bytes())
             .to_hex()
             .to_string();
@@ -5757,14 +5136,13 @@ mod tests {
             name: "demo.caller".to_owned(),
             short_name: "caller".to_owned(),
             parent_id: Some("python:module:demo".to_owned()),
-            source_file_id: Some("core:file:demo.py".to_owned()),
+            source_file_id: Some("python:module:demo".to_owned()),
             source_file_path: Some("demo.py".to_owned()),
             source_byte_start: None,
             source_byte_end: None,
             source_line_start: Some(1),
             source_line_end: Some(3),
             properties_json: "{}".to_owned(),
-            tags: Vec::new(),
             content_hash: Some("hash-python:function:demo.caller".to_owned()),
             summary_json: None,
             wardline_json: None,
@@ -5796,9 +5174,13 @@ mod tests {
             ..clarion_core::AnalyzeFileStats::default()
         };
 
-        let mapped =
-            map_unresolved_call_sites_for_file(&stats, &entities, "2026-05-17T00:00:00.000Z")
-                .unwrap();
+        let mapped = map_unresolved_call_sites_for_file(
+            &stats,
+            &entities,
+            &python_kind_roles(),
+            "2026-05-17T00:00:00.000Z",
+        )
+        .unwrap();
 
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].caller_entity_id, "python:function:demo.caller");
@@ -5809,7 +5191,7 @@ mod tests {
         assert_eq!(mapped[0].sites.len(), 1);
         assert_eq!(
             mapped[0].sites[0].source_file_id.as_deref(),
-            Some("core:file:demo.py")
+            Some("python:module:demo")
         );
         assert_eq!(mapped[0].sites[0].callee_expr, "dynamic_target");
         assert_eq!(
@@ -5827,14 +5209,13 @@ mod tests {
             name: "demo.caller".to_owned(),
             short_name: "caller".to_owned(),
             parent_id: Some("python:module:demo".to_owned()),
-            source_file_id: Some("core:file:demo.py".to_owned()),
+            source_file_id: Some("python:module:demo".to_owned()),
             source_file_path: Some("demo.py".to_owned()),
             source_byte_start: None,
             source_byte_end: None,
             source_line_start: Some(1),
             source_line_end: Some(3),
             properties_json: "{}".to_owned(),
-            tags: Vec::new(),
             content_hash: Some("hash-python:function:demo.caller".to_owned()),
             summary_json: None,
             wardline_json: None,
@@ -5846,134 +5227,16 @@ mod tests {
         let entities = vec![("python:function:demo.caller".to_owned(), caller)];
         let stats = clarion_core::AnalyzeFileStats::default();
 
-        let mapped =
-            map_unresolved_call_sites_for_file(&stats, &entities, "2026-05-17T00:00:00.000Z")
-                .unwrap();
+        let mapped = map_unresolved_call_sites_for_file(
+            &stats,
+            &entities,
+            &python_kind_roles(),
+            "2026-05-17T00:00:00.000Z",
+        )
+        .unwrap();
 
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].caller_entity_id, "python:function:demo.caller");
         assert!(mapped[0].sites.is_empty());
-    }
-
-    #[tokio::test]
-    async fn semantic_embedding_population_skips_fresh_sidecar_rows() {
-        use std::sync::Arc;
-
-        use clarion_core::{EmbeddingProvider, EmbeddingRecording, RecordingEmbeddingProvider};
-        use clarion_federation::config::SemanticSearchConfig;
-        use clarion_storage::{EmbeddingKey, EmbeddingStore, pragma, schema};
-
-        let project = tempfile::tempdir().unwrap();
-        std::fs::create_dir(project.path().join(".clarion")).unwrap();
-        let db_path = project.path().join(".clarion/clarion.db");
-        let mut conn = rusqlite::Connection::open(&db_path).unwrap();
-        pragma::apply_write_pragmas(&conn).unwrap();
-        schema::apply_migrations(&mut conn).unwrap();
-        conn.execute(
-            "INSERT INTO entities \
-                (id, plugin_id, kind, name, short_name, properties, content_hash, created_at, updated_at) \
-             VALUES \
-                ('python:function:demo.fresh', 'python', 'function', 'demo.fresh', 'fresh', \
-                 '{\"docstring\":\"already embedded\"}', 'hash-fresh', 't', 't')",
-            [],
-        )
-        .unwrap();
-        drop(conn);
-
-        let store = EmbeddingStore::open_in_clarion_dir(project.path()).unwrap();
-        store
-            .upsert(
-                &EmbeddingKey {
-                    entity_id: "python:function:demo.fresh".to_owned(),
-                    content_hash: "hash-fresh".to_owned(),
-                    model_id: "test-model".to_owned(),
-                },
-                &[1.0, 0.0],
-                0.0,
-                2,
-                "t",
-            )
-            .unwrap();
-        drop(store);
-
-        let provider = Arc::new(RecordingEmbeddingProvider::from_recordings(
-            "test-model",
-            2,
-            Vec::<EmbeddingRecording>::new(),
-        ));
-        let stats = populate_semantic_embeddings(
-            project.path(),
-            &db_path,
-            &SemanticSearchConfig {
-                enabled: true,
-                model_id: "test-model".to_owned(),
-                dimensions: 2,
-                ..SemanticSearchConfig::default()
-            },
-            provider.clone() as Arc<dyn EmbeddingProvider>,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(stats.considered, 1);
-        assert_eq!(stats.skipped_fresh, 1);
-        assert_eq!(stats.embedded, 0);
-        assert!(
-            provider.invocations().is_empty(),
-            "fresh sidecar rows must not be re-embedded"
-        );
-    }
-
-    #[tokio::test]
-    async fn semantic_embedding_population_skips_briefing_blocked_entities() {
-        use std::sync::Arc;
-
-        use clarion_core::{EmbeddingProvider, EmbeddingRecording, RecordingEmbeddingProvider};
-        use clarion_federation::config::SemanticSearchConfig;
-        use clarion_storage::{pragma, schema};
-
-        let project = tempfile::tempdir().unwrap();
-        std::fs::create_dir(project.path().join(".clarion")).unwrap();
-        let db_path = project.path().join(".clarion/clarion.db");
-        let mut conn = rusqlite::Connection::open(&db_path).unwrap();
-        pragma::apply_write_pragmas(&conn).unwrap();
-        schema::apply_migrations(&mut conn).unwrap();
-        conn.execute(
-            "INSERT INTO entities \
-                (id, plugin_id, kind, name, short_name, properties, content_hash, created_at, updated_at) \
-             VALUES \
-                ('python:function:demo.secret', 'python', 'function', 'demo.secret', 'secret', \
-                 '{\"docstring\":\"SECRET_TOKEN=abc123\", \"briefing_blocked\":\"secret_present\"}', \
-                 'hash-secret', 't', 't')",
-            [],
-        )
-        .unwrap();
-        drop(conn);
-
-        let provider = Arc::new(RecordingEmbeddingProvider::from_recordings(
-            "test-model",
-            2,
-            Vec::<EmbeddingRecording>::new(),
-        ));
-        let stats = populate_semantic_embeddings(
-            project.path(),
-            &db_path,
-            &SemanticSearchConfig {
-                enabled: true,
-                model_id: "test-model".to_owned(),
-                dimensions: 2,
-                ..SemanticSearchConfig::default()
-            },
-            provider.clone() as Arc<dyn EmbeddingProvider>,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(stats.considered, 0);
-        assert_eq!(stats.embedded, 0);
-        assert!(
-            provider.invocations().is_empty(),
-            "briefing-blocked docstrings must not be sent to the embedding provider"
-        );
     }
 }

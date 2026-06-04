@@ -278,7 +278,17 @@ pub struct IntegrationsConfig {
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default)]
 pub struct ServeConfig {
+    pub mcp: McpServeConfig,
     pub http: HttpReadConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[serde(default)]
+pub struct McpServeConfig {
+    /// Enable MCP tools that can mutate state, spawn processes, or call an LLM.
+    /// Default false: `clarion serve` exposes consult-mode read tools unless an
+    /// operator explicitly opts into write-capable MCP operations.
+    pub enable_write_tools: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -895,6 +905,22 @@ serve:
     #[test]
     fn http_allow_non_loopback_defaults_false() {
         assert!(!McpConfig::default().serve.http.allow_non_loopback);
+    }
+
+    #[test]
+    fn mcp_write_tools_default_false_and_can_be_enabled() {
+        assert!(!McpConfig::default().serve.mcp.enable_write_tools);
+
+        let cfg = McpConfig::from_yaml_str(
+            r"
+serve:
+  mcp:
+    enable_write_tools: true
+",
+        )
+        .expect("parse MCP write-tool policy");
+
+        assert!(cfg.serve.mcp.enable_write_tools);
     }
 
     #[test]

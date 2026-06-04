@@ -36,15 +36,15 @@ pub use limits::{
     FINDING_FRAME_OVERSIZE, FINDING_OOM_KILLED, FINDING_PATH_ESCAPE, PathEscapeBreaker,
     apply_prlimit_as, apply_prlimit_nofile_nproc, effective_rss_mib,
 };
-pub use manifest::{Manifest, ManifestError, parse_manifest};
+pub use manifest::{Manifest, ManifestError, OntologyEntityRole, parse_manifest};
 // `make_notification` and `make_request` are intentionally omitted —
 // they're `pub(crate)` because they panic on serde failure for a
 // property (well-formed param types) that external callers cannot
 // guarantee. External consumers should build envelopes directly and
 // handle the serde error.
 pub use protocol::{
-    AnalyzeFileParams, AnalyzeFileResult, AnalyzeFileStats, EdgeConfidence, ExitNotification,
-    InitializeParams, InitializeResult, InitializedNotification, JsonRpcVersion,
+    AnalyzeFileFinding, AnalyzeFileParams, AnalyzeFileResult, AnalyzeFileStats, EdgeConfidence,
+    ExitNotification, InitializeParams, InitializeResult, InitializedNotification, JsonRpcVersion,
     NotificationEnvelope, ProtocolError, RequestEnvelope, ResponseEnvelope, ResponsePayload,
     ShutdownParams, ShutdownResult, UnresolvedCallSite,
 };

@@ -86,10 +86,10 @@ def test_initialize_roundtrip() -> None:
         assert response["id"] == 1
         result = response["result"]
         assert result["name"] == "clarion-plugin-python"
-        assert result["version"] == "1.2.0"
+        assert result["version"] == "1.1.0"
         assert result["ontology_version"] == "0.6.0"
         # Wardline is not advertised until the plugin emits real Wardline
-        # semantic signals, not just package/version probe metadata.
+        # semantic signals.
         assert result["capabilities"] == {}
 
         # Graceful shutdown: shutdown → ack `{}`, then exit notification.
@@ -148,22 +148,6 @@ def test_analyze_file_before_initialized_returns_error() -> None:
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=2)
-
-
-def test_malformed_non_ascii_header_uses_protocol_error_exit_path() -> None:
-    """Malformed header bytes exit cleanly without emitting framed stdout."""
-    proc = subprocess.Popen(  # noqa: S603
-        _SERVER_CMD,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-
-    stdout, stderr = proc.communicate(b"Content-L\xe9ngth: 0\r\n\r\n", timeout=5)
-
-    assert proc.returncode == 1
-    assert stdout == b""
-    assert b"Traceback" not in stderr
 
 
 def test_analyze_file_returns_extracted_entities(tmp_path: Path) -> None:
@@ -341,6 +325,14 @@ def test_analyze_file_reports_call_resolver_stats(
                 ],
                 pyright_query_latency_ms=[11, 29],
                 pyright_index_parse_latency_ms=[5],
+                findings=[
+                    {
+                        "subcode": "CLA-PY-PYRIGHT-UNAVAILABLE",
+                        "severity": "warning",
+                        "message": "pyright unavailable",
+                        "metadata": {"reason": "test"},
+                    }
+                ],
             )
 
         def resolve_references(
@@ -404,6 +396,14 @@ def test_analyze_file_reports_call_resolver_stats(
         "pyright_query_latency_ms": [11, 29, 31],
         "pyright_index_parse_latency_ms": [5, 7],
     }
+    assert response["findings"] == [
+        {
+            "subcode": "CLA-PY-PYRIGHT-UNAVAILABLE",
+            "severity": "warning",
+            "message": "pyright unavailable",
+            "metadata": {"reason": "test"},
+        }
+    ]
     assert any(edge["kind"] == "references" for edge in response["edges"])
 
 
@@ -476,6 +476,59 @@ def test_shutdown_closes_pyright_session() -> None:
     assert response == {"jsonrpc": "2.0", "id": 1, "result": {}}
     assert fake.closed is True
     assert state.pyright is None
+
+
+def test_analyze_file_returns_pyright_findings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FindingPyrightSession:
+        def __init__(self, project_root: Path, **kwargs: Any) -> None:
+            _ = (project_root, kwargs)
+
+        def resolve_calls(
+            self,
+            file_path: str,
+            function_ids: list[str],
+        ) -> CallResolutionResult:
+            _ = (file_path, function_ids)
+            return CallResolutionResult(
+                findings=[
+                    {
+                        "subcode": FINDING_PYRIGHT_RESTART,
+                        "severity": "warning",
+                        "message": "pyright subprocess died and was restarted",
+                        "metadata": {"restart_count": 1},
+                    }
+                ],
+            )
+
+        def resolve_references(
+            self,
+            file_path: str,
+            sites: Sequence[ReferenceSite],
+        ) -> ReferenceResolutionResult:
+            _ = (file_path, sites)
+            return ReferenceResolutionResult()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(server_module, "PyrightSession", FindingPyrightSession, raising=False)
+    demo = tmp_path / "demo.py"
+    demo.write_text("def hello():\n    pass\n", encoding="utf-8")
+    state = server_module.ServerState(initialized=True, project_root=tmp_path)
+
+    response = server_module.handle_analyze_file({"file_path": str(demo)}, state)
+
+    assert response["findings"] == [
+        {
+            "subcode": FINDING_PYRIGHT_RESTART,
+            "severity": "warning",
+            "message": "pyright subprocess died and was restarted",
+            "metadata": {"restart_count": 1},
+        },
+    ]
 
 
 def test_restart_budget_survives_session_recycle(

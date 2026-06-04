@@ -13,7 +13,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use clarion_mcp::ServerState;
+use clarion_mcp::{McpToolPolicy, ServerState};
 use clarion_storage::{ReaderPool, pragma, schema};
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -32,7 +32,9 @@ fn open_project() -> (tempfile::TempDir, PathBuf) {
 
 fn state_for(project_root: &Path, db_path: &Path, stub: &Path) -> ServerState {
     let pool = ReaderPool::open(db_path, 2).expect("reader pool");
-    ServerState::new(project_root.to_path_buf(), pool).with_analyze_command(stub.to_path_buf())
+    ServerState::new(project_root.to_path_buf(), pool)
+        .with_tool_policy(McpToolPolicy::allow_write_tools())
+        .with_analyze_command(stub.to_path_buf())
 }
 
 /// Write an executable stub that stands in for `clarion analyze`: it parses
@@ -217,20 +219,6 @@ fn seed_run(db_path: &Path, id: &str, run_status: &str, stats_json: &str) {
     .expect("insert runs row");
 }
 
-fn seed_stale_running_run(db_path: &Path, id: &str) {
-    let conn = Connection::open(db_path).expect("open db");
-    conn.execute(
-        "INSERT INTO runs ( \
-            id, started_at, completed_at, config, stats, status, owner_pid, heartbeat_at \
-         ) VALUES ( \
-            ?1, '2026-01-01T00:00:00.000Z', NULL, '{}', '{}', \
-            'running', 999999, '2000-01-01T00:00:00.000Z' \
-         )",
-        rusqlite::params![id],
-    )
-    .expect("insert stale running run");
-}
-
 #[tokio::test]
 async fn analyze_status_maps_terminal_run_states_from_the_runs_table() {
     let (project, db_path) = open_project();
@@ -262,7 +250,7 @@ async fn analyze_status_maps_terminal_run_states_from_the_runs_table() {
 }
 
 #[tokio::test]
-async fn analyze_status_marks_stale_running_run_failed_in_db() {
+async fn analyze_status_does_not_mutate_stale_running_run() {
     let (project, db_path) = open_project();
     let stub = write_stub(project.path());
     let state = state_for(project.path(), &db_path, &stub);
@@ -280,14 +268,11 @@ async fn analyze_status_marks_stale_running_run_failed_in_db() {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .expect("read repaired run");
-    assert_eq!(run_status, "failed");
-    assert_eq!(run_owner_pid, None);
+        .expect("read run");
+    assert_eq!(run_status, "running");
+    assert_eq!(run_owner_pid, Some(999_999));
     let repair_stats: Value = serde_json::from_str(&stats_json).expect("stats json");
-    assert_eq!(
-        repair_stats["failure_reason"],
-        "analyze run abandoned: stale heartbeat"
-    );
+    assert_eq!(repair_stats, json!({}));
 }
 
 #[tokio::test]

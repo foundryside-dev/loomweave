@@ -170,12 +170,20 @@ pub enum WriterCmd {
         entity: Box<EntityRecord>,
         ack: Ack<()>,
     },
-    /// Insert an edge under the natural PK `(kind, from_id, to_id)`. The
-    /// writer enforces the per-kind source-range contract (ADR-026) and
-    /// silently dedupes UNIQUE conflicts via `INSERT OR IGNORE`, incrementing
-    /// `Writer::dropped_edges_total` on dedupe. Also advances the per-batch
-    /// write counter — edges and entities share one batch boundary.
+    /// Insert or refresh an edge under the natural PK `(kind, from_id, to_id)`.
+    /// The writer enforces the per-kind source-range contract (ADR-026) and
+    /// upserts metadata when the same triple is observed with a new range,
+    /// confidence tier, properties bag, or source file.
     InsertEdge { edge: Box<EdgeRecord>, ack: Ack<()> },
+    /// Delete all scan-time AST-anchored edges emitted from one source file
+    /// before the current file's authoritative edge set is inserted. This is
+    /// the re-analysis replacement boundary for calls/references/imports and
+    /// other anchored relationships; structural edges remain governed by their
+    /// own invariants.
+    ReplaceAnchoredEdgesForSourceFile {
+        source_file_id: String,
+        ack: Ack<()>,
+    },
     /// Insert one finding. The writer initializes lifecycle status to `open`
     /// and leaves suppression / Filigree-link fields empty. Idempotent on
     /// `id` (ON CONFLICT DO UPDATE): a `--resume` re-walk regenerates the same

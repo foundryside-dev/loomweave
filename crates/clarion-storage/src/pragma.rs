@@ -80,6 +80,25 @@ pub fn apply_read_pragmas(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Validate the database identity for read-only surfaces without mutating the
+/// header. Accepts legacy zero-id files, accepts Clarion's id, and rejects any
+/// other non-zero `application_id`.
+pub fn validate_application_id_for_read(conn: &Connection) -> Result<()> {
+    let raw: i64 = conn.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+    let id = u32::try_from(raw).map_err(|_| {
+        StorageError::PragmaInvariant(format!(
+            "PRAGMA application_id returned out-of-range value {raw}; expected 0..=u32::MAX"
+        ))
+    })?;
+    match id {
+        0 => Ok(()),
+        id if id == CLARION_APPLICATION_ID => Ok(()),
+        other => Err(StorageError::ForeignDatabase {
+            application_id: other,
+        }),
+    }
+}
+
 /// Read `application_id`; on `0` set it to [`CLARION_APPLICATION_ID`]; on
 /// [`CLARION_APPLICATION_ID`] continue; on any other value refuse with
 /// [`StorageError::ForeignDatabase`].

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/clarion-analysis",
     "crates/clarion-core",
     "crates/clarion-federation",
     "crates/clarion-storage",

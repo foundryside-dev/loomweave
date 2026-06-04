@@ -113,28 +113,39 @@ jobs:
       - name: cargo deny
         run: cargo deny check
 
-      - name: check B.4* gate result freshness
-        run: python scripts/check-b4-gate-result.py
-
       - name: check Python ontology version lockstep
         run: |
           python scripts/check-python-ontology-version.py --self-test
           python scripts/check-python-ontology-version.py
 
-      - name: install plugin (dev extras)
-        run: python -m pip install -e 'plugins/python[dev]'
+      - name: install uv
+        run: python -m pip install uv==0.10.2
+
+      - name: sync plugin (locked dev extras)
+        run: uv sync --project plugins/python --locked --extra dev
+
+      - name: audit locked Python dependencies
+        run: |
+          uv export --project plugins/python --locked --extra dev --no-emit-project \
+            --format requirements.txt \
+            --output-file /tmp/clarion-python-dev-requirements.txt
+          uv run --project plugins/python --extra dev pip-audit \
+            -r /tmp/clarion-python-dev-requirements.txt
+
+      - name: check B.4*/B.5 performance gates
+        run: uv run --project plugins/python --extra dev python scripts/check-b4-gate-result.py --run-b5-smoke
 
       - name: ruff check
-        run: ruff check plugins/python
+        run: uv run --project plugins/python --extra dev ruff check plugins/python
 
       - name: ruff format check
-        run: ruff format --check plugins/python
+        run: uv run --project plugins/python --extra dev ruff format --check plugins/python
 
       - name: mypy
-        run: mypy --strict plugins/python
+        run: uv run --project plugins/python --extra dev mypy --strict plugins/python
 
       - name: pytest
-        run: pytest plugins/python
+        run: uv run --project plugins/python --extra dev pytest plugins/python
 
       - name: install sqlite3 cli
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends sqlite3
@@ -245,19 +256,31 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: install build
-        run: python -m pip install --upgrade build
+      - name: install uv
+        run: python -m pip install uv==0.10.2
+
+      - name: sync plugin build tools (locked)
+        run: uv sync --project plugins/python --locked --extra dev
 
       - name: build sdist
-        run: python -m build --sdist --outdir dist plugins/python
+        run: uv run --project plugins/python --extra dev python -m build --sdist --outdir dist plugins/python
+
+      - name: export locked Python runtime dependencies
+        run: |
+          uv export --project plugins/python --locked --no-dev --no-emit-project \
+            --format requirements.txt \
+            --output-file dist/clarion-plugin-python-runtime-requirements.txt
+          uv export --project plugins/python --locked --no-dev --no-emit-project \
+            --format cyclonedx1.5 \
+            --output-file dist/clarion-plugin-python-sbom.cdx.json
 
       - name: smoke install sdist
         run: |
           set -euo pipefail
           python -m venv .venv-smoke
           . .venv-smoke/bin/activate
-          python -m pip install --upgrade pip
-          python -m pip install dist/*.tar.gz
+          python -m pip install --require-hashes -r dist/clarion-plugin-python-runtime-requirements.txt
+          python -m pip install --no-deps dist/*.tar.gz
           # Version-agnostic: assert the module constant matches the installed
           # distribution metadata (the sdist's packaged version) rather than a
           # hardcoded literal, so a release version bump can't silently break

@@ -1,6 +1,6 @@
 # ADR-026: Containment Wire Shape and Edge Identity
 
-**Status**: Accepted
+**Status**: Accepted; amended by [ADR-043](./ADR-043-edge-reanalysis-replacement.md)
 **Date**: 2026-05-05
 **Deciders**: qacona@gmail.com
 **Context**: B.3 (Sprint 2 Tier B) introduces the first edge kind Clarion has ever persisted (`contains`). Sprint-1 locked entity wire shape but explicitly deferred edge wire shape: the kickoff handoff at `docs/implementation/handoffs/2026-04-30-sprint-2-kickoff.md` §"Edge wire shape" states "B.3's first edge will define the protocol-level wire shape". Three coupled decisions arise — the wire envelope, the edge-row identity in storage, and the per-kind contract for `source_byte_start/end`. Locking them together prevents the four later edge kinds (`calls`, `imports`, `decorates`, `inherits_from`) from inheriting an under-specified precedent.

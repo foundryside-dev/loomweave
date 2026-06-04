@@ -99,6 +99,9 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
         semantic_search_state(&config.semantic_search, embedding_provider),
         filigree_client,
         diagnostics,
+        clarion_mcp::McpToolPolicy {
+            enable_write_tools: config.serve.mcp.enable_write_tools,
+        },
     )?;
     supervise_stdio_with_http(stdio, http_server)
 }
@@ -129,6 +132,7 @@ struct StdioServe {
 
 type SemanticSearchState = (SemanticSearchConfig, Arc<dyn EmbeddingProvider>);
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_mcp_stdio(
     project_root: PathBuf,
     db_path: PathBuf,
@@ -138,6 +142,7 @@ fn spawn_mcp_stdio(
     semantic_search: Option<SemanticSearchState>,
     filigree_client: Option<FiligreeHttpClient>,
     diagnostics: clarion_mcp::DiagnosticsContext,
+    tool_policy: clarion_mcp::McpToolPolicy,
 ) -> Result<StdioServe> {
     let (result_tx, result_rx) = mpsc::channel();
     let join = thread::Builder::new()
@@ -152,6 +157,7 @@ fn spawn_mcp_stdio(
                 semantic_search,
                 filigree_client,
                 diagnostics,
+                tool_policy,
             );
             let _ = result_tx.send(result);
         })
@@ -159,6 +165,7 @@ fn spawn_mcp_stdio(
     Ok(StdioServe { result_rx, join })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_mcp_stdio(
     project_root: PathBuf,
     db_path: &Path,
@@ -168,17 +175,19 @@ fn run_mcp_stdio(
     semantic_search: Option<SemanticSearchState>,
     filigree_client: Option<FiligreeHttpClient>,
     diagnostics: clarion_mcp::DiagnosticsContext,
+    tool_policy: clarion_mcp::McpToolPolicy,
 ) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    let mut reader = BufReader::new(stdin.lock());
+    let mut reader = BufReader::new(stdin);
     let mut writer = stdout.lock();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("create MCP runtime")?;
     let _runtime_guard = runtime.enter();
-    let mut state = clarion_mcp::ServerState::new(project_root, readers);
+    let mut state =
+        clarion_mcp::ServerState::new(project_root, readers).with_tool_policy(tool_policy);
     let mut llm_writer = None;
     let mut llm_writer_join = None;
     if let Some(provider) = llm_provider {

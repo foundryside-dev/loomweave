@@ -44,8 +44,18 @@ JOB_RE = re.compile(r"^  (?P<name>[A-Za-z0-9_-]+):\s*(?:#.*)?$")
 REQUIRED_STATUS_CHECKS = frozenset(
     {
         "Rust",
+        "Rust (aarch64-apple-darwin)",
         "Python plugin",
         "Sprint 1 walking skeleton (end-to-end)",
+    }
+)
+REQUIRED_GOVERNANCE_DOC_SNIPPETS = frozenset(
+    {
+        "active repository ruleset protects `refs/tags/v*`",
+        '"target": "tag"',
+        '"include": ["refs/tags/v*"]',
+        "Pull-request flow is required before changes reach `main`.",
+        "Workflow action references stay pinned to full commit SHAs.",
     }
 )
 
@@ -545,6 +555,24 @@ def check_release_workflow_governance_gate(repo_root: Path) -> list[str]:
     return ["release workflow build jobs require the GitHub governance gate"]
 
 
+def check_governance_doc_lockstep(repo_root: Path) -> list[str]:
+    doc = repo_root / "docs" / "operator" / "v1.0-release-governance.md"
+    if not doc.is_file():
+        raise CheckError(f"{doc}: release governance operator doc is missing")
+    text = doc.read_text(encoding="utf-8")
+    missing = sorted(
+        snippet
+        for snippet in REQUIRED_GOVERNANCE_DOC_SNIPPETS
+        if snippet not in text
+    )
+    if missing:
+        raise CheckError(
+            f"{doc}: missing documented release governance control(s): "
+            + ", ".join(repr(item) for item in missing)
+        )
+    return ["release governance operator doc covers every required live control"]
+
+
 def run_self_test() -> None:
     responses: dict[str, ApiResponse] = {
         "/repos/acme/clarion/branches/main/protection": ApiResponse(
@@ -638,6 +666,7 @@ def run_self_test() -> None:
                     "parameters": {
                         "required_status_checks": [
                             {"context": "Rust"},
+                            {"context": "Rust (aarch64-apple-darwin)"},
                             {"context": "Python plugin"},
                             {"context": "Sprint 1 walking skeleton (end-to-end)"},
                         ]
@@ -687,6 +716,7 @@ def run_self_test() -> None:
                     "parameters": {
                         "required_status_checks": [
                             {"context": "Rust"},
+                            {"context": "Rust (aarch64-apple-darwin)"},
                             {"context": "Python plugin"},
                             {"context": "Sprint 1 walking skeleton (end-to-end)"},
                         ]
@@ -810,6 +840,9 @@ def run_self_test() -> None:
         )
         assert check_release_workflow_governance_gate(root)
 
+    repo_root = Path(__file__).resolve().parents[1]
+    assert check_governance_doc_lockstep(repo_root)
+
     print("GitHub release governance guard self-test passed")
 
 
@@ -865,6 +898,7 @@ def main(argv: list[str]) -> int:
             *check_workflow_action_pins(args.repo_root),
             *check_dependabot_github_actions_updates(args.repo_root),
             *check_release_workflow_governance_gate(args.repo_root),
+            *check_governance_doc_lockstep(args.repo_root),
         ]
     except CheckError as exc:
         print("GitHub release governance guard failed:", file=sys.stderr)

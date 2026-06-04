@@ -580,9 +580,16 @@ def _is_type_checking_guard(expr: ast.expr) -> bool:
     if isinstance(expr, ast.Name):
         return expr.id == "TYPE_CHECKING"
     if isinstance(expr, ast.Attribute):
-        return expr.attr == "TYPE_CHECKING"
+        return (
+            expr.attr == "TYPE_CHECKING"
+            and isinstance(expr.value, ast.Name)
+            and expr.value.id == "typing"
+        )
     if isinstance(expr, ast.BoolOp):
-        return any(_is_type_checking_guard(value) for value in expr.values)
+        if isinstance(expr.op, ast.And):
+            return any(_is_type_checking_guard(value) for value in expr.values)
+        if isinstance(expr.op, ast.Or):
+            return all(_is_type_checking_guard(value) for value in expr.values)
     return False
 
 

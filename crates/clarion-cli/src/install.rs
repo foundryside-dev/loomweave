@@ -71,6 +71,8 @@ integrations:
     token_env: FILIGREE_API_TOKEN
     timeout_seconds: 5
 serve:
+  mcp:
+    enable_write_tools: false
   http:
     enabled: false
     bind: 127.0.0.1:9111

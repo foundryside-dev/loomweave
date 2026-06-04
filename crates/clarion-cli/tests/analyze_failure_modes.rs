@@ -148,6 +148,253 @@ entity_kinds = ["module"]
 edge_kinds = ["bogus_edge"]
 rule_id_prefix = "CLA-BOGUS-"
 ontology_version = "0.6.0"
+
+[ontology.roles]
+file_scope = ["module"]
+"#;
+
+/// Fixture plugin that successfully emits one module, then exits without
+/// replying to the next `analyze_file` request. The test below pins the H5
+/// contract: already completed file output is durable even when a later file
+/// crashes the plugin.
+const PARTIAL_CRASH_PLUGIN_SCRIPT: &str = r#"#!/usr/bin/python3
+import json
+import pathlib
+import sys
+
+
+seen_files = 0
+
+
+def read_frame():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if line in (b"", b"\r\n"):
+            break
+        name, value = line.decode("ascii").strip().split(":", 1)
+        headers[name.lower()] = value.strip()
+    length = int(headers["content-length"])
+    return json.loads(sys.stdin.buffer.read(length))
+
+
+def write_frame(message):
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n")
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+
+while True:
+    msg = read_frame()
+    method = msg.get("method")
+    if method == "initialized":
+        continue
+    if method == "exit":
+        raise SystemExit(0)
+    ident = msg["id"]
+    if method == "initialize":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "name": "clarion-plugin-partial",
+                "version": "0.1.0",
+                "ontology_version": "0.6.0",
+                "capabilities": {},
+            },
+        })
+    elif method == "analyze_file":
+        seen_files += 1
+        if seen_files > 1:
+            raise SystemExit(7)
+        path = msg["params"]["file_path"]
+        stem = pathlib.Path(path).stem
+        module_id = f"partialfixture:module:{stem}"
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "entities": [
+                    {
+                        "id": module_id,
+                        "kind": "module",
+                        "qualified_name": stem,
+                        "source": {"file_path": path},
+                    },
+                ],
+                "edges": [],
+                "stats": {},
+            },
+        })
+    elif method == "shutdown":
+        write_frame({"jsonrpc": "2.0", "id": ident, "result": {}})
+    else:
+        raise SystemExit(1)
+"#;
+
+const PARTIAL_CRASH_PLUGIN_MANIFEST: &str = r#"
+[plugin]
+name = "clarion-plugin-partial"
+plugin_id = "partialfixture"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "clarion-plugin-partial"
+language = "partialfixture"
+extensions = ["part"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 256
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+entity_kinds = ["module"]
+edge_kinds = []
+rule_id_prefix = "CLA-PARTIAL-"
+ontology_version = "0.6.0"
+
+[ontology.roles]
+file_scope = ["module"]
+"#;
+
+/// Fixture plugin that emits a cross-file call edge before the callee entity is
+/// emitted by a later file. This pins the streaming writer ordering contract:
+/// file entities may be streamed immediately, but edges must wait until both
+/// endpoints exist in storage.
+const CROSS_FILE_EDGE_PLUGIN_SCRIPT: &str = r#"#!/usr/bin/python3
+import json
+import pathlib
+import sys
+
+
+def read_frame():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if line in (b"", b"\r\n"):
+            break
+        name, value = line.decode("ascii").strip().split(":", 1)
+        headers[name.lower()] = value.strip()
+    length = int(headers["content-length"])
+    return json.loads(sys.stdin.buffer.read(length))
+
+
+def write_frame(message):
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n")
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+
+while True:
+    msg = read_frame()
+    method = msg.get("method")
+    if method == "initialized":
+        continue
+    if method == "exit":
+        raise SystemExit(0)
+    ident = msg["id"]
+    if method == "initialize":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "name": "clarion-plugin-cross-file",
+                "version": "0.1.0",
+                "ontology_version": "0.6.0",
+                "capabilities": {},
+            },
+        })
+    elif method == "analyze_file":
+        path = msg["params"]["file_path"]
+        stem = pathlib.Path(path).stem
+        module_id = f"crossfixture:module:{stem}"
+        entities = [
+            {
+                "id": module_id,
+                "kind": "module",
+                "qualified_name": stem,
+                "source": {"file_path": path},
+            },
+        ]
+        edges = []
+        if stem == "00_caller":
+            caller_id = "crossfixture:function:00_caller.preview"
+            entities.append({
+                "id": caller_id,
+                "kind": "function",
+                "qualified_name": "00_caller.preview",
+                "source": {
+                    "file_path": path,
+                    "line_start": 1,
+                    "line_end": 1,
+                    "byte_start": 0,
+                    "byte_end": 7,
+                },
+            })
+            edges.append({
+                "kind": "calls",
+                "from_id": caller_id,
+                "to_id": "crossfixture:function:99_callee.record",
+                "source_byte_start": 0,
+                "source_byte_end": 7,
+                "confidence": "resolved",
+            })
+        else:
+            entities.append({
+                "id": "crossfixture:function:99_callee.record",
+                "kind": "function",
+                "qualified_name": "99_callee.record",
+                "source": {
+                    "file_path": path,
+                    "line_start": 1,
+                    "line_end": 1,
+                    "byte_start": 0,
+                    "byte_end": 6,
+                },
+            })
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "entities": entities,
+                "edges": edges,
+                "stats": {},
+            },
+        })
+    elif method == "shutdown":
+        write_frame({"jsonrpc": "2.0", "id": ident, "result": {}})
+    else:
+        raise SystemExit(1)
+"#;
+
+const CROSS_FILE_EDGE_PLUGIN_MANIFEST: &str = r#"
+[plugin]
+name = "clarion-plugin-cross-file"
+plugin_id = "crossfixture"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "clarion-plugin-cross-file"
+language = "crossfixture"
+extensions = ["cross"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 256
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+entity_kinds = ["module", "function"]
+edge_kinds = ["calls"]
+rule_id_prefix = "CLA-CROSS-"
+ontology_version = "0.6.0"
+
+[ontology.roles]
+file_scope = ["module"]
+callable = ["function"]
 "#;
 
 /// Fixture plugin that successfully emits one module, then exits without

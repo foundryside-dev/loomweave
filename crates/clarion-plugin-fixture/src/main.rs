@@ -110,6 +110,7 @@ fn main() {
                     entities: vec![entity],
                     edges: vec![],
                     stats: AnalyzeFileStats::default(),
+                    findings: vec![],
                 };
                 send_result(&mut writer, id, serde_json::to_value(result).unwrap());
             }

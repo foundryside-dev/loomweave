@@ -105,6 +105,9 @@ entity_kinds = ["module"]
 edge_kinds = []
 rule_id_prefix = "CLA-SECRET-FIXTURE-"
 ontology_version = "0.1.0"
+
+[ontology.roles]
+file_scope = ["module"]
 "#;
 
 fn write_secret_fixture_plugin(plugin_dir: &std::path::Path) {

@@ -65,8 +65,10 @@ impl ReaderPool {
     ///
     /// The probe is a throwaway read-only connection running
     /// `PRAGMA schema_version`, the same cheap corruption check
-    /// `clarion hook session-start` uses. It runs *before* the pool is built so
-    /// a bad DB never produces a half-live pool.
+    /// `clarion hook session-start` uses. It also validates the Clarion
+    /// `application_id` and refuses a future `user_version` without mutating
+    /// legacy zero-id files. It runs *before* the pool is built so a bad DB
+    /// never produces a half-live pool.
     ///
     /// It validates file-level openability and readability only; it does not
     /// prove the pool can acquire a connection under concurrent load (that
@@ -87,6 +89,8 @@ impl ReaderPool {
         // Force a real read of the database header so a present-but-corrupt file
         // is rejected here rather than reported as an empty index later.
         conn.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))?;
+        pragma::validate_application_id_for_read(&conn)?;
+        crate::schema::verify_user_version(&conn)?;
         drop(conn);
         Self::open(db_path, max_size)
     }

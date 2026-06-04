@@ -105,9 +105,9 @@ pub enum Command {
         no_sei: bool,
 
         /// Force a full re-analysis, disabling the incremental skip of files
-        /// unchanged since the last run (Wave 2 / T3.1). The skip is speed-only
-        /// (entities are cumulative, edges are insert-or-ignore); use this for a
-        /// clean re-index. Without this flag unchanged files are skipped.
+        /// unchanged since the last run (Wave 2 / T3.1). A full re-analysis
+        /// replays per-source-file edge replacement; use this for a clean
+        /// graph refresh. Without this flag unchanged files are skipped.
         #[arg(long)]
         no_incremental: bool,
 

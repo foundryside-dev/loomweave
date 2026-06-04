@@ -7,13 +7,14 @@ import shutil
 import sys
 import textwrap
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
 from clarion_plugin_python.call_resolver import CallResolutionResult
 from clarion_plugin_python.extractor import (
     ExtractResult,
+    ImportsEdgeProperties,
     RawEdge,
     _module_source_range,
     extract,
@@ -126,6 +127,10 @@ def _call_edges(edges: Sequence[RawEdge]) -> list[RawEdge]:
 
 def _import_edges(edges: Sequence[RawEdge]) -> list[RawEdge]:
     return [edge for edge in edges if edge["kind"] == "imports"]
+
+
+def _import_properties(edge: RawEdge) -> ImportsEdgeProperties:
+    return cast("ImportsEdgeProperties", edge["properties"])
 
 
 def _reference_sites_for(source: str) -> list[ReferenceSite]:
@@ -494,6 +499,35 @@ def test_type_checking_and_function_local_imports_carry_runtime_scope() -> None:
         "level": 0,
         "scope": "function",
     }
+
+
+def test_type_checking_boolean_guards_are_conservative() -> None:
+    source = (
+        "from typing import TYPE_CHECKING\n"
+        "runtime_flag = True\n"
+        "if TYPE_CHECKING or runtime_flag:\n"
+        "    import pkg.runtime_or\n"
+        "if TYPE_CHECKING and runtime_flag:\n"
+        "    import pkg.type_and\n"
+        "if not TYPE_CHECKING:\n"
+        "    import pkg.not_type_checking\n"
+        "if typing.TYPE_CHECKING:\n"
+        "    import pkg.typing_attr\n"
+        "if config.TYPE_CHECKING:\n"
+        "    import pkg.other_attr\n"
+    )
+    _entities, edges = extract(source, "consumer.py")
+    imports_by_target = {edge["to_id"]: edge for edge in _import_edges(edges)}
+
+    assert "type_only" not in _import_properties(imports_by_target["python:module:pkg.runtime_or"])
+    assert _import_properties(imports_by_target["python:module:pkg.type_and"])["type_only"] is True
+    assert "type_only" not in _import_properties(
+        imports_by_target["python:module:pkg.not_type_checking"]
+    )
+    assert (
+        _import_properties(imports_by_target["python:module:pkg.typing_attr"])["type_only"] is True
+    )
+    assert "type_only" not in _import_properties(imports_by_target["python:module:pkg.other_attr"])
 
 
 def test_import_edges_have_source_byte_range_and_resolved_confidence() -> None:

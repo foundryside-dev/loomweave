@@ -600,6 +600,14 @@ const HTTP_BODY_LIMIT_BYTES: usize = 16 * 1024;
 /// Wardline chunks client-side against `WARDLINE_TAINT_BATCH_MAX` (mirrors how
 /// Filigree splits against `BATCH_MAX_QUERIES`). Pinned in contracts.md (W.5).
 const WARDLINE_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+
+const SCRUBBED_REQUEST_LOG_HEADERS: &[&str] = &[
+    "authorization",
+    "x-loom-component",
+    "x-loom-timestamp",
+    "x-loom-nonce",
+];
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RequestLogContext {
     loom_component: Option<String>,
@@ -608,14 +616,31 @@ struct RequestLogContext {
 
 fn request_log_context(headers: &HeaderMap) -> RequestLogContext {
     RequestLogContext {
-        loom_component: log_header_value(headers, "x-loom-component"),
-        filigree_actor: log_header_value(headers, "x-filigree-actor"),
+        loom_component: log_loom_component_kind(headers),
+        filigree_actor: log_non_sensitive_header_value(headers, "x-filigree-actor"),
     }
 }
 
-fn log_header_value(headers: &HeaderMap, name: &'static str) -> Option<String> {
+fn log_loom_component_kind(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get("x-loom-component")?.to_str().ok()?.trim();
+    let component = value
+        .split_once(':')
+        .map_or(value, |(component, _)| component);
+    (!component.is_empty()).then(|| component.to_owned())
+}
+
+fn log_non_sensitive_header_value(headers: &HeaderMap, name: &'static str) -> Option<String> {
+    if is_scrubbed_request_log_header(name) {
+        return None;
+    }
     let value = headers.get(name)?.to_str().ok()?.trim();
     (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn is_scrubbed_request_log_header(name: &str) -> bool {
+    SCRUBBED_REQUEST_LOG_HEADERS
+        .iter()
+        .any(|scrubbed| scrubbed.eq_ignore_ascii_case(name))
 }
 
 fn http_request_span<B>(request: &Request<B>) -> tracing::Span {
@@ -711,13 +736,27 @@ mod tests {
     #[test]
     fn request_log_context_reads_optional_actor_headers() {
         let mut headers = HeaderMap::new();
-        headers.insert("X-Loom-Component", HeaderValue::from_static("loom"));
+        headers.insert(
+            "X-Loom-Component",
+            HeaderValue::from_static("clarion:deadbeefsignature"),
+        );
+        headers.insert("X-Loom-Timestamp", HeaderValue::from_static("123456"));
+        headers.insert("X-Loom-Nonce", HeaderValue::from_static("nonce-value"));
+        headers.insert("Authorization", HeaderValue::from_static("Bearer secret"));
         headers.insert("X-Filigree-Actor", HeaderValue::from_static("worker-f"));
 
         let context = request_log_context(&headers);
 
-        assert_eq!(context.loom_component.as_deref(), Some("loom"));
+        assert_eq!(context.loom_component.as_deref(), Some("clarion"));
         assert_eq!(context.filigree_actor.as_deref(), Some("worker-f"));
+        assert!(is_scrubbed_request_log_header("authorization"));
+        assert!(is_scrubbed_request_log_header("x-loom-component"));
+        assert!(is_scrubbed_request_log_header("x-loom-timestamp"));
+        assert!(is_scrubbed_request_log_header("x-loom-nonce"));
+        assert_eq!(
+            log_non_sensitive_header_value(&headers, "authorization"),
+            None
+        );
     }
 
     #[test]
