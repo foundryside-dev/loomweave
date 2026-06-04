@@ -378,25 +378,8 @@ dependencies = [
 [[package]]
 name = "clarion-federation"
 version = "1.2.0"
-<<<<<<< HEAD
-=======
 dependencies = [
  "clarion-core",
- "reqwest",
- "serde",
- "serde_json",
- "serde_norway",
- "tempfile",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "clarion-mcp"
-version = "1.1.0"
->>>>>>> bdc078b (fix audit findings across MCP, storage, and plugin)
-dependencies = [
- "clarion-core",
- "clarion-storage",
  "reqwest",
  "serde",
  "serde_json",

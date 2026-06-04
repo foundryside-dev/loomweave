@@ -37,3 +37,4 @@ tests/e2e/external-operator-smoke-results-*.md
 
 # Documentation site build output (mkdocs `site_dir`, web/mkdocs.yml).
 /site-build/
+.clarion/clarion.lock
