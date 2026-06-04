@@ -31,8 +31,9 @@ from clarion_plugin_python import __version__
 from clarion_plugin_python.extractor import extract_with_stats
 from clarion_plugin_python.pyright_session import PyrightRunState, PyrightSession
 from clarion_plugin_python.stdout_guard import install_stdio
+from clarion_plugin_python.wardline_descriptor import WardlineVocabulary, load_wardline_descriptor
 
-ONTOLOGY_VERSION = "0.6.0"
+ONTOLOGY_VERSION = "0.7.0"
 
 # Plugin-side Content-Length sanity cap. Matches the host's ADR-021 §2b
 # default (8 MiB) so the plugin never emits a frame the host would kill us
@@ -61,6 +62,7 @@ class ServerState:
     pyright: PyrightSession | None = field(default=None)
     pyright_files_since_restart: int = 0
     pyright_run_state: PyrightRunState = field(default_factory=PyrightRunState)
+    wardline_vocabulary: WardlineVocabulary | None = field(default=None)
 
 
 def read_frame(stream: IO[bytes]) -> dict[str, Any] | None:
@@ -142,11 +144,18 @@ def handle_initialize(params: dict[str, Any], state: ServerState) -> dict[str, A
     root_raw = params.get("project_root")
     if isinstance(root_raw, str) and root_raw:
         state.project_root = Path(root_raw).resolve()
+    wardline = load_wardline_descriptor(state.project_root)
+    state.wardline_vocabulary = wardline.vocabulary
+    if wardline.status == "absent":
+        sys.stderr.write(
+            "clarion-plugin-python: Wardline vocabulary descriptor unavailable; "
+            "continuing without Wardline annotation metadata\n",
+        )
     return {
         "name": "clarion-plugin-python",
         "version": __version__,
         "ontology_version": ONTOLOGY_VERSION,
-        "capabilities": {},
+        "capabilities": {"wardline": wardline.as_capability()},
     }
 
 
@@ -209,6 +218,7 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
         module_prefix_path=module_prefix,
         call_resolver=state.pyright,
         reference_resolver=state.pyright,
+        wardline_vocabulary=state.wardline_vocabulary,
     )
     state.pyright_files_since_restart += 1
     if state.pyright_files_since_restart >= MAX_FILES_PER_PYRIGHT_SESSION:

@@ -1,6 +1,6 @@
 # ADR-018: Identity Reconciliation — Clarion Translates; Wardline Owns Its Qualnames
 
-**Status**: Accepted
+**Status**: Accepted (Revision 3, 2026-06-05 — direct REGISTRY import asterisk retired; Python plugin reads Wardline's NG-25 descriptor without importing Wardline.)
 **Date**: 2026-04-18
 **Deciders**: qacona@gmail.com
 **Context**: three independent identity schemes exist across Clarion, Wardline, and Wardline's exception register; one-way translation is the federation-compatible answer
@@ -92,6 +92,28 @@ Pin policy: `REGISTRY_VERSION` is updated at Clarion release time alongside the 
 The REGISTRY import is a property of the Wardline-aware plugin specifically, not of the Clarion core (`loom.md` §5 asterisk 2). The Rust core has no import path to Wardline; it's the Python plugin's startup that walks `sys.path` to load `wardline.core.registry`. The asterisk is named in `loom.md` §5 with an explicit retirement condition: when Wardline publishes a YAML/JSON descriptor export of its REGISTRY (NG-25, v0.2), non-Python plugins can consume it without a Python import, and the initialization coupling retires to a plain file-descriptor read.
 
 This preserves the federation test: removing Wardline breaks Wardline-derived annotation detection but does not prevent the Clarion core from starting, does not prevent non-Wardline-aware plugins from running, and does not alter the meaning of Clarion's own catalog entries.
+
+### Revision 3 (2026-06-05): direct-import asterisk retired
+
+Wardline now publishes the NG-25 trust-vocabulary descriptor as `vocabulary.yaml`
+and through `wardline vocab`. Clarion's Python plugin consumes that descriptor
+instead of importing `wardline.core.registry.REGISTRY`. Resolution is
+project-local `.wardline/vocabulary.yaml` first, then the installed Wardline
+distribution data file `wardline/core/vocabulary.yaml`; both paths are plain
+file reads and neither imports `wardline`, `wardline.core`, or
+`wardline.core.registry`.
+
+The plugin records source-observed decorator facts on Clarion entities as
+Wardline metadata and `wardline:*` tags. Wardline remains authoritative for the
+vocabulary and policy semantics; Clarion stores only what it parsed from source
+against the descriptor. Missing or invalid descriptors continue to degrade
+honestly: normal structural extraction proceeds, `capabilities.wardline` reports
+the degraded state, and no Wardline entity metadata is emitted.
+
+This closes the `loom.md` §5 initialization-coupling asterisk on the Clarion
+side. The identity translation rules and `REGISTRY_VERSION`/descriptor-version
+skew posture remain bilateral compatibility concerns; the load-bearing change is
+that plugin startup no longer requires Wardline to be importable.
 
 ## Alternatives Considered
 

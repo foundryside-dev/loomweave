@@ -14,6 +14,14 @@ only when an incompatible change is made to that surface. See
 
 ### Changed
 
+- **Python plugin Wardline descriptor metadata (ADR-018 Revision 3).** The
+  Python plugin now reads Wardline's NG-25 trust-vocabulary descriptor from
+  `.wardline/vocabulary.yaml` or the installed `wardline/core/vocabulary.yaml`
+  data file without importing Wardline. Decorated functions/classes receive
+  `wardline` entity metadata and `wardline:*` tags when the descriptor is
+  available; missing or invalid descriptors degrade to normal structural
+  extraction. This retires the Clarion-side `wardline.core.registry` startup
+  asterisk in `docs/suite/loom.md`.
 - Refreshed release-facing README/index documentation for the current 1.2.0
   release line, including the 39-tool MCP surface, current install artifact
   names, fixed ADR/docset links, current web/operator quick starts, and the full
