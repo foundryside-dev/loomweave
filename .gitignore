@@ -30,14 +30,19 @@ tests/e2e/external-operator-smoke-results-*.md
 # Generated skill fingerprint (rewritten by `clarion install --skills`).
 .agents/skills/clarion-workflow/.fingerprint
 
-# Clarion runtime artifacts — the index DB and per-project instance fingerprint
-# change on every analyze run, so they are not tracked (see .clarion/.gitignore).
+# Clarion runtime artifacts — the index DB, per-project instance fingerprint,
+# and analyze lock change on every run, so they are not tracked
+# (see .clarion/.gitignore).
 .clarion/clarion.db
 .clarion/instance_id
+.clarion/clarion.lock
 
 # Documentation site build output (mkdocs `site_dir`, web/mkdocs.yml).
 /site-build/
-.clarion/clarion.lock
+
+# Filigree-managed docs — a running filigree process rewrites its managed
+# instruction blocks in these every session; untracked to avoid diff churn
+# (filigree regenerates them on demand).
 AGENTS.md
 CLAUDE.md
 .agents/skills/filigree-workflow/SKILL.md
