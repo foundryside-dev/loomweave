@@ -10,6 +10,8 @@
 
 **Loom** is a suite for enterprise-grade code governance on small teams. Its v0.1 products — **Clarion**, **Filigree**, and **Wardline** — are three independent tools that enrich one another through narrow additive protocols. Each is fully authoritative in its domain and fully usable on its own. Clarion builds a trustworthy catalog of a codebase and answers structural questions. Filigree tracks the issues, findings, and observations that arise from examining that codebase. Wardline declares and enforces the trust topology that constrains how code is allowed to behave. Together they deliver rigor that normally requires enterprise-scale platform teams — without the operational weight, and without any shared runtime, store, or orchestrator. A fourth product, **Shuttle**, is proposed for transactional scoped change execution; see [loom.md](./loom.md) for the suite's founding doctrine, the enrichment-not-load-bearing principle, and the go/no-go test that governs future products.
 
+> **Authoritative source.** The Loom federation axiom, roster, and composition law are now authoritative at the federation hub: [`~/loom/doctrine.md`](file:///home/john/loom/doctrine.md) (as of 2026-06-05). The hub's canonical roster is **5 realized members** — Clarion, Filigree, Wardline, **Legis**, and **Charter** — plus **Shuttle as a roadmap thought-bubble**; the three-member v0.1 framing in this briefing predates Legis and Charter and is kept as Clarion's local intro. This briefing remains Clarion's own introduction to the suite as Clarion sees it.
+
 ---
 
 ## The Loom products
