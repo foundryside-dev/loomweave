@@ -23,18 +23,23 @@ serve:
 
 When `identity_token_env` is configured, Clarion refuses to start unless the env
 var is present and non-empty. Protected `/api/v1/files` routes then require
-`X-Loom-Component: clarion:<hmac>`. The HMAC is lowercase hex HMAC-SHA256 over:
+`X-Loom-Component: clarion:<hmac>`, `X-Loom-Timestamp: <unix-seconds>`, and
+`X-Loom-Nonce: <opaque-nonce>`. The HMAC is lowercase hex HMAC-SHA256 over:
 
 ```text
 <METHOD>
 <PATH_AND_QUERY>
 <SHA256_HEX_OF_REQUEST_BODY>
+<X_LOOM_TIMESTAMP>
+<X_LOOM_NONCE>
 ```
 
 For example, a GET of `/api/v1/files?path=demo.py&language=python` signs the
 method `GET`, that exact path-and-query string, and the SHA-256 hash of an empty
-body. `GET /api/v1/_capabilities` stays unauthenticated so siblings can probe
-the API surface before sending protected reads.
+body, followed by the timestamp and nonce header values. Clarion accepts a
+five-minute timestamp skew and rejects reuse of the same nonce inside that
+process-local window. `GET /api/v1/_capabilities` stays unauthenticated so
+siblings can probe the API surface before sending protected reads.
 
 Clarion still accepts the older `serve.http.token_env` bearer-token path for
 compatibility. Prefer `identity_token_env` for new deployments.

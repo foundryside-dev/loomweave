@@ -123,20 +123,42 @@ fi
 # ── 8. Verify source metadata for MCP entity_at/summary cache (B.6a) ─────────
 log "verifying persisted Python function source metadata ..."
 SOURCE_METADATA=$(sqlite3 "$DEMO_DIR/.clarion/clarion.db" \
-    "select source_file_path, source_line_start, source_line_end, length(content_hash) from entities where id = 'python:function:demo.hello';")
-SOURCE_METADATA_EXPECTED="$DEMO_DIR/demo.py|10|11|64"
+    "select source_file_id, source_file_path, source_line_start, source_line_end, length(content_hash) from entities where id = 'python:function:demo.hello';")
+SOURCE_METADATA_EXPECTED="core:file:demo.py|$DEMO_DIR/demo.py|10|11|64"
 if [ "$SOURCE_METADATA" != "$SOURCE_METADATA_EXPECTED" ]; then
     log "DB entity source metadata:"
     sqlite3 "$DEMO_DIR/.clarion/clarion.db" \
-        "select id, source_file_path, source_line_start, source_line_end, content_hash from entities order by id;" >&2 || true
+        "select id, source_file_id, source_file_path, source_line_start, source_line_end, content_hash from entities order by id;" >&2 || true
     fail "expected Python function source metadata:\n$SOURCE_METADATA_EXPECTED\ngot:\n$SOURCE_METADATA"
+fi
+
+log "verifying core file anchor metadata and module parent chain ..."
+FILE_ANCHOR=$(sqlite3 "$DEMO_DIR/.clarion/clarion.db" \
+    "select id, plugin_id, kind, name, source_file_id, source_file_path, json_extract(properties, '\$.language'), length(content_hash) from entities where id = 'core:file:demo.py';")
+FILE_ANCHOR_EXPECTED="core:file:demo.py|core|file|demo.py||$DEMO_DIR/demo.py|python|64"
+if [ "$FILE_ANCHOR" != "$FILE_ANCHOR_EXPECTED" ]; then
+    log "DB file anchor metadata:"
+    sqlite3 "$DEMO_DIR/.clarion/clarion.db" \
+        "select id, plugin_id, kind, name, parent_id, source_file_id, source_file_path, properties, content_hash from entities order by id;" >&2 || true
+    fail "expected core file anchor metadata:\n$FILE_ANCHOR_EXPECTED\ngot:\n$FILE_ANCHOR"
+fi
+
+MODULE_PARENT=$(sqlite3 "$DEMO_DIR/.clarion/clarion.db" \
+    "select parent_id, source_file_id from entities where id = 'python:module:demo';")
+MODULE_PARENT_EXPECTED="core:file:demo.py|core:file:demo.py"
+if [ "$MODULE_PARENT" != "$MODULE_PARENT_EXPECTED" ]; then
+    log "DB module parent/source metadata:"
+    sqlite3 "$DEMO_DIR/.clarion/clarion.db" \
+        "select id, parent_id, source_file_id from entities order by id;" >&2 || true
+    fail "expected module parent/source metadata:\n$MODULE_PARENT_EXPECTED\ngot:\n$MODULE_PARENT"
 fi
 
 # ── 9. Verify contains edge via sqlite3 (B.3) ────────────────────────────────
 log "verifying persisted contains edge via sqlite3 ..."
 EDGE_RESULT=$(sqlite3 "$DEMO_DIR/.clarion/clarion.db" \
     "select kind, from_id, to_id from edges where kind = 'contains' order by from_id, to_id;")
-EDGE_EXPECTED="contains|python:module:demo|python:class:demo.Marker
+EDGE_EXPECTED="contains|core:file:demo.py|python:module:demo
+contains|python:module:demo|python:class:demo.Marker
 contains|python:module:demo|python:function:demo.annotated
 contains|python:module:demo|python:function:demo.hello
 contains|python:module:demo|python:function:demo.via_dispatch

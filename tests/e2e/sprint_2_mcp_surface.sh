@@ -141,6 +141,7 @@ world_prompt = (
     f"Entity id: {world_entity[0]}\n"
     f"Kind: {world_entity[1]}\n"
     f"Name: {world_entity[2]}\n"
+    "Matching guidance:\nNo matching guidance.\n"
     f"Source excerpt:\n{world_excerpt}\n"
     "Return JSON with purpose, behavior, relationships, and risks fields."
 )
@@ -418,23 +419,44 @@ tools = responses["tools"]["result"]["tools"]
 tool_names = [tool["name"] for tool in tools]
 assert tool_names == [
     "entity_at",
-    "find_entity",
-    "callers_of",
-    "execution_paths_from",
-    "summary",
-    "issues_for",
-    "neighborhood",
-    "subsystem_members",
-    "subsystem_of",
-    "project_status",
-    "summary_preview_cost",
-    "source_for_entity",
-    "call_sites",
-    "orientation_pack",
+    "entity_find",
+    "entity_callers_list",
+    "entity_execution_path_list",
+    "entity_summary_get",
+    "entity_issue_list",
+    "entity_neighborhood_get",
+    "subsystem_member_list",
+    "entity_subsystem_get",
+    "project_status_get",
+    "entity_summary_preview_cost_get",
+    "entity_source_get",
+    "entity_call_site_list",
+    "entity_orientation_pack_get",
     "analyze_start",
-    "analyze_status",
+    "analyze_status_get",
     "analyze_cancel",
-    "index_diff",
+    "index_diff_get",
+    "entity_guidance_list",
+    "propose_guidance",
+    "promote_guidance",
+    "entity_finding_list",
+    "entity_wardline_get",
+    "entity_tag_list",
+    "entity_kind_list",
+    "entity_wardline_list",
+    "module_circular_import_list",
+    "entity_coupling_hotspot_list",
+    "entity_entry_point_list",
+    "entity_http_route_list",
+    "entity_data_model_list",
+    "entity_test_list",
+    "entity_deprecation_list",
+    "entity_todo_list",
+    "entity_test_caller_list",
+    "entity_high_churn_list",
+    "entity_recent_change_list",
+    "entity_dead_list",
+    "entity_semantic_search_list",
 ], tool_names
 # Single-source check (clarion-71f0d6c3dd): the initialize `instructions` tool
 # enumeration is derived from list_tools(), so every advertised tool must appear
@@ -535,4 +557,4 @@ assert "staleness" in ctx, ctx
 assert ctx["degraded"] is False, ctx
 PY
 
-log "PASS: MCP stdio surface returned eighteen tool definitions and nine tool responses"
+log "PASS: MCP stdio surface returned the full tool catalogue and all expected tool responses"

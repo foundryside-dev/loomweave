@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-**v1.1.0 — current pre-release working version.** The `v1.0.0` tag (first publishable release) is cut; pre-release working tags `v0.1-sprint-1` and `v0.1-sprint-2` remain in the repo as historical anchors. Workspace + Python plugin are at 1.1.0; ADR-014 federation HTTP read API ships with bearer auth, batch resolution, briefing-blocked propagation, and stable per-project `instance_id`. See [`CHANGELOG.md`](CHANGELOG.md) for the full 1.0 scope and [`docs/implementation/`](docs/implementation/) for sprint-closure artifacts.
+**v1.2.0 — current pre-release working version.** The `v1.0.0` (first publishable release), `v1.0.1`, and `v1.1.0` tags are cut; pre-release working tags `v0.1-sprint-1` and `v0.1-sprint-2` remain in the repo as historical anchors. Workspace + Python plugin are at 1.2.0; ADR-014 federation HTTP read API ships with bearer auth, batch resolution, briefing-blocked propagation, and stable per-project `instance_id`. See [`CHANGELOG.md`](CHANGELOG.md) for the full scope and [`docs/implementation/`](docs/implementation/) for sprint-closure artifacts.
 
 ### Layout (post-1.0)
 
@@ -150,7 +150,7 @@ Open issues for the v1.0 known limitations and any post-release follow-ups live 
   protection (timestamp + nonce window) is ADR-034 forward-work tracked for
   post-1.0 hardening.
 
-<!-- filigree:instructions:v2.2.0:9dff6e6d -->
+<!-- filigree:instructions:v2.3.0:108d0005 -->
 ## Filigree Issue Tracker
 
 `filigree` tracks tasks for this project. Data lives in `.filigree/`. Prefer
@@ -172,29 +172,29 @@ filigree start-work <id> --assignee <name>
 filigree close <id>
 ```
 
-Use the atomic claim+transition verbs — `start_work` / `start_next_work`
+Use the atomic claim+transition verbs — `work_start` / `work_start_next`
 (MCP) or `start-work` / `start-next-work` (CLI). Do **not** chain
-`claim_issue` (MCP) or `filigree claim` (CLI) with a subsequent status
+`work_claim` (MCP) or `filigree claim` (CLI) with a subsequent status
 update — the two-step form races against other agents; the combined verb is
 atomic.
 
 **Ready ≠ startable.** The working status is type-specific (tasks →
 `in_progress`, features → `building`). Bugs start at `triage`, which has no
 single-hop transition into work (`triage → confirmed → fixing`), so a triage
-bug is *ready* but not directly *startable*: `start_work` on one returns
-`INVALID_TRANSITION` naming the next status, and `start_next_work` skips it.
-`get_ready` items carry a `startable` flag (plus a `next_action` hint when
+bug is *ready* but not directly *startable*: `work_start` on one returns
+`INVALID_TRANSITION` naming the next status, and `work_start_next` skips it.
+`work_ready` items carry a `startable` flag (plus a `next_action` hint when
 false). Pass `advance=true` (MCP) / `--advance` (CLI) to walk the soft
 transitions to the nearest working status automatically.
 
 ### Observations: when (and when not) to use them
 
-`observe` is a fire-and-forget scratchpad for *incidental* defects — things
+`observation_create` is a fire-and-forget scratchpad for *incidental* defects — things
 you notice *outside the scope of your current task* (a code smell in a
 neighbouring file, a stale TODO, a missing test for an edge case you happened
 to spot). Notes expire after 14 days unless promoted. Include `file_path` and
-`line` when relevant. At session end, skim `list_observations` and either
-`dismiss_observation` or `promote_observation` for what has accumulated.
+`line` when relevant. At session end, skim `observation_list` and either
+`observation_dismiss` or `observation_promote` for what has accumulated.
 
 **You fix bugs in your currently defined scope. You do NOT use observations
 to finish work prematurely.** If a defect, gap, or follow-up belongs to your
@@ -219,27 +219,27 @@ MCP tool schemas describe each tool; `filigree --help` and `filigree <verb>
 --help` are the authoritative CLI reference. You do not need to memorise
 either catalogue. The verbs you will reach for most:
 
-- **Find work:** `get_ready`, `get_blocked`, `list_issues`, `search_issues`
-- **Claim work:** `start_work`, `start_next_work`
-- **Update:** `add_comment`, `add_label`, `update_issue`, `close_issue`
-- **Admin (irreversible):** `delete_issue` (MCP) / `delete-issue` (CLI) —
-  hard-deletes a terminal issue and its rows; `undo_last` cannot reverse it.
-- **Scratchpad:** `observe`, `list_observations`, `promote_observation`, `dismiss_observation`
-- **Cross-product entity bindings (ADR-029):** `add_entity_association`,
-  `remove_entity_association`, `list_entity_associations`,
-  `list_associations_by_entity`. Used when a sibling tool (e.g.
+- **Find work:** `work_ready`, `work_blocked`, `issue_list`, `issue_search`
+- **Claim work:** `work_start`, `work_start_next`
+- **Update:** `comment_add`, `label_add`, `issue_update`, `issue_close`
+- **Admin (irreversible):** `issue_delete` (MCP) / `delete-issue` (CLI) —
+  hard-deletes a terminal issue and its rows; `admin_undo_last` cannot reverse it.
+- **Scratchpad:** `observation_create`, `observation_list`, `observation_promote`, `observation_dismiss`
+- **Cross-product entity bindings (ADR-029):** `entity_association_add`,
+  `entity_association_remove`, `entity_association_list`,
+  `entity_association_list_by_entity`. Used when a sibling tool (e.g.
   Clarion) needs to bind a Filigree issue to a function, class, or
   module identifier it owns. The `entity_id` is an opaque string
   from Filigree's perspective; the consumer (the sibling tool's read
   path) does drift detection against the stored
-  `content_hash_at_attach`. `list_associations_by_entity` is the
+  `content_hash_at_attach`. `entity_association_list_by_entity` is the
   reverse-lookup surface — given a Clarion entity ID, return every
   Filigree issue bound to it (project isolation is by DB file). Also
   reachable over HTTP as
   `GET/POST /api/issue/{issue_id}/entity-associations`,
   `DELETE /api/issue/{issue_id}/entity-associations?entity_id=…`,
   and `GET /api/entity-associations?entity_id=…`.
-- **Health:** `get_stats`, `get_metrics`, `get_mcp_status`
+- **Health:** `stats_get`, `metrics_get`, `mcp_status_get`
 
 Pass `--actor <name>` (CLI) so events attribute to your agent identity. It
 works in either position — before the verb (`filigree --actor X update …`) or
@@ -255,7 +255,7 @@ Errors return `{error: str, code: ErrorCode, details?: dict}`. Switch on
 `CLARION_REGISTRY_VERSION_MISMATCH`, `BRIEFING_BLOCKED`, `STOP_FAILED`,
 `SCHEMA_MISMATCH`, `INTERNAL`.
 
-On `INVALID_TRANSITION`, call `get_valid_transitions` (MCP) or
+On `INVALID_TRANSITION`, call `workflow_transition_list` (MCP) or
 `filigree transitions <id>` to see what the workflow allows from here.
 
 Two failure modes deserve a specific response:

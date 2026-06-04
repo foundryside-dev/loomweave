@@ -25,7 +25,7 @@ If a step fails, see [Troubleshooting](#troubleshooting) at the end.
 | An MCP client | any MCP-speaking client | see [§3](#3-serve) |
 
 The Python plugin will fail at runtime if `pyright-langserver` is not on
-`$PATH` at the pinned version (1.1.409 in v1.0). Install via
+`$PATH` at the pinned version (currently 1.1.409). Install via
 `npm install -g pyright@1.1.409` or `pipx install pyright==1.1.409`.
 
 ### Required environment variables
@@ -36,31 +36,26 @@ For step 4's `summary` question you need an OpenRouter API key:
 export OPENROUTER_API_KEY=sk-or-v1-...
 ```
 
-`clarion analyze` (step 2) and the structural MCP tools (`entity_at`,
-`find_entity`, `callers_of`, `execution_paths_from`, `issues_for`,
-`neighborhood`, `subsystem_members`, `subsystem_of`, `project_status`,
-`summary_preview_cost`, `source_for_entity`, `call_sites`, `orientation_pack`,
-`analyze_start`, `analyze_status`, `analyze_cancel`, `index_diff`) work without
-any LLM credentials — seventeen of the eighteen MCP tools are credential-free.
-The key is only consulted when an MCP client calls `summary(id)` against an entity that does not
-yet have a cached summary.
+`clarion analyze` (step 2) and the structural MCP tools work without any LLM
+credentials. The key is only consulted when an MCP client calls `summary(id)`
+against an entity that does not yet have a cached summary.
 
 ## 1. Install
 
-Tagged v1.0 releases ship a platform archive for the Rust binary and a Python
-sdist for the language plugin via GitHub Releases (per
-[ADR-033](../clarion/adr/ADR-033-v1.0-distribution.md)). Until the first tag
-fires, use the source-install fallback below.
+Tagged releases ship a platform archive for the Rust binary and a Python sdist
+for the language plugin via GitHub Releases (per
+[ADR-033](../clarion/adr/ADR-033-v1.0-distribution.md)). Use the source-install
+fallback below only when testing unreleased commits.
 
 ```bash
-TAG=v1.0.0
+TAG=v1.2.0
 curl -L -o clarion-x86_64-unknown-linux-gnu.tar.gz \
   "https://github.com/tachyon-beep/clarion/releases/download/${TAG}/clarion-x86_64-unknown-linux-gnu.tar.gz"
 tar xzf clarion-x86_64-unknown-linux-gnu.tar.gz
 install clarion-x86_64-unknown-linux-gnu/clarion ~/.local/bin/
 
 pipx install \
-  "https://github.com/tachyon-beep/clarion/releases/download/${TAG}/clarion-plugin-python-1.0.0.tar.gz"
+  "https://github.com/tachyon-beep/clarion/releases/download/${TAG}/clarion-plugin-python-1.2.0.tar.gz"
 ```
 
 Source-install fallback:
@@ -100,7 +95,7 @@ slsa-verifier verify-artifact \
   clarion-x86_64-unknown-linux-gnu.tar.gz
 ```
 
-The v1.0 release deliberately does not publish to PyPI or crates.io. GitHub
+The current 1.x release line deliberately does not publish to PyPI or crates.io. GitHub
 Release assets are the source of truth until public registries are introduced
 by a later ADR.
 

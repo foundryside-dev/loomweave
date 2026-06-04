@@ -23,10 +23,11 @@ Each answer is structured, paginated where needed, and carries enough metadata
 (confidence, `scope_excludes`, freshness) for the agent to know how much to
 trust it.
 
-## The eight core tools
+## Core tool families
 
-These eight consult tools are the stable heart of the surface — the ones the
-v1.0 README commits to and the place to start:
+Clarion exposes a 39-tool MCP surface. Start with the navigation and briefing
+tools, then reach for catalogue shortcuts when you need a targeted structural
+query:
 
 | Tool | What it answers |
 | --- | --- |
@@ -38,18 +39,20 @@ v1.0 README commits to and the place to start:
 | `issues_for(id)` | "What Filigree issues are attached to this entity?" |
 | `neighborhood(id)` | "Show callers, callees, container, contained, references, imports in one hop." |
 | `subsystem_members(id)` | "Which entities belong to this subsystem?" |
+| `source_for_entity(id)` | "Show the indexed source span and context." |
+| `orientation_pack(id or file/line)` | "Give me the entity, context, neighbors, paths, issues, and freshness in one packet." |
+| `guidance_for(id)` | "Which guidance sheets apply to this entity?" |
+| `find_dead_code(scope?)` / `search_semantic(query)` | "Run advanced reachability or semantic-search queries when their inputs are available." |
 
 See the [MCP tool reference](../reference/mcp-tools.md) for parameters and the
 shape of each response.
 
 ## A broader, growing catalogue
 
-The eight above are the foundation, but they aren't the whole surface. The
-running server also exposes navigation and structural-search tools —
-`subsystem_of`, `neighborhood` roll-ups at module altitude, `find_by_kind`,
-`source_for_entity`, an `orientation_pack` for cold-start onboarding, and more —
-and the catalogue keeps growing as new query shapes prove useful. Connect an MCP
-client to a live `clarion serve` to see the full, current `tools/list`.
+The running server also exposes analyze lifecycle tools, freshness checks,
+faceted search, guidance/finding inspection, source/call-site evidence, and
+exploration-elimination shortcuts. Connect an MCP client to a live
+`clarion serve` to see the full, current `tools/list`.
 
 ## Enrich-only by design
 

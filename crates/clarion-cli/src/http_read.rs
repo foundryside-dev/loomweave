@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clarion_core::HttpErrorCode as ErrorCode;
-use clarion_mcp::config::HttpReadConfig;
+use clarion_federation::config::HttpReadConfig;
 use clarion_storage::ReaderPool;
 use serde::Serialize;
 use tokio::sync::oneshot;
@@ -145,8 +145,9 @@ pub(crate) struct AppState {
     /// is always unauthenticated so siblings can probe pre-auth.
     pub(crate) auth_token: Option<Arc<String>>,
     /// Resolved Loom component identity HMAC secret. When present, protected
-    /// routes require `X-Loom-Component: clarion:<hmac>`.
+    /// routes require `X-Loom-Component: clarion:<hmac>` plus freshness headers.
     pub(crate) identity_secret: Option<Arc<String>>,
+    pub(crate) hmac_replay_cache: auth::SharedHmacReplayCache,
     /// Present only when `serve.http.wardline_taint_write` is true (ADR-036).
     /// `None` ⇒ the write API is disabled and returns 403 `WRITE_DISABLED`.
     pub(crate) taint_writer: Option<tokio::sync::mpsc::Sender<clarion_storage::WriterCmd>>,
@@ -388,6 +389,7 @@ fn run_http_read_server(
             instance_id,
             auth_token,
             identity_secret,
+            hmac_replay_cache: auth::new_hmac_replay_cache(),
             taint_writer,
         };
         let serve_future = axum::serve(listener, router(state))
@@ -662,10 +664,20 @@ fn json_error(status: StatusCode, code: ErrorCode, message: &str) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
+    use std::sync::{Mutex, MutexGuard, mpsc};
 
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
+
+    static HTTP_RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn http_runtime_test_guard() -> MutexGuard<'static, ()> {
+        let guard = HTTP_RUNTIME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        HTTP_THREAD_PANIC_TRIGGER.store(false, std::sync::atomic::Ordering::SeqCst);
+        guard
+    }
 
     // REQ-F-02 (ADR-038 §4): `resolve(locator)` must reject an SEI-shaped input
     // by the RESERVED PREFIX, not a colon count — an SEI carries the same two
@@ -727,11 +739,10 @@ mod tests {
     /// "without authentication".
     #[test]
     fn spawn_emits_loopback_no_token_trust_warning() {
-        use clarion_mcp::config::HttpReadConfig;
+        use clarion_federation::config::HttpReadConfig;
         use clarion_storage::ReaderPool;
         use std::io;
         use std::net::{SocketAddr, TcpListener};
-        use std::sync::Mutex;
         use tracing_subscriber::fmt::MakeWriter;
 
         #[derive(Clone)]
@@ -758,6 +769,8 @@ mod tests {
                 self.clone()
             }
         }
+
+        let _guard = http_runtime_test_guard();
 
         let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CaptureWriter {
@@ -837,9 +850,11 @@ mod tests {
     /// spawn→drop→join sequence end to end.
     #[test]
     fn spawn_with_taint_writer_shuts_down_cleanly() {
-        use clarion_mcp::config::HttpReadConfig;
+        use clarion_federation::config::HttpReadConfig;
         use clarion_storage::ReaderPool;
         use std::net::{SocketAddr, TcpListener};
+
+        let _guard = http_runtime_test_guard();
 
         let probe = TcpListener::bind(("127.0.0.1", 0)).expect("probe bind");
         let bind: SocketAddr = probe.local_addr().expect("probe local addr");
@@ -888,9 +903,11 @@ mod tests {
     /// absorb the panic (i.e. anything outside per-request middleware).
     #[test]
     fn check_running_surfaces_supervisor_signal_after_runtime_panic() {
-        use clarion_mcp::config::HttpReadConfig;
+        use clarion_federation::config::HttpReadConfig;
         use clarion_storage::ReaderPool;
         use std::net::{SocketAddr, TcpListener};
+
+        let _guard = http_runtime_test_guard();
 
         // Hold-and-drop: bind to ephemeral 0 to discover a free port, then
         // drop so the HTTP server can re-bind it. The micro-race is fine
@@ -914,9 +931,6 @@ mod tests {
         let instance_id =
             crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-000000000001")
                 .expect("parse synthetic instance id");
-
-        // Defensive: clear any stale trigger from a prior test.
-        HTTP_THREAD_PANIC_TRIGGER.store(false, std::sync::atomic::Ordering::SeqCst);
 
         let mut server = spawn(
             tempdir.path().to_path_buf(),

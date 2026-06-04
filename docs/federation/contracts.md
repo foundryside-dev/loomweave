@@ -41,7 +41,8 @@ pool; its read paths still use the reader pool.
 ### Authentication
 
 The `/api/v1/files`-family endpoints require
-`X-Loom-Component: clarion:<hmac>` when Clarion has resolved
+`X-Loom-Component: clarion:<hmac>`, `X-Loom-Timestamp: <unix-seconds>`, and
+`X-Loom-Nonce: <opaque-nonce>` when Clarion has resolved
 `serve.http.identity_token_env` at startup. The HMAC is lowercase hex
 HMAC-SHA256 over the canonical message:
 
@@ -49,7 +50,16 @@ HMAC-SHA256 over the canonical message:
 <METHOD>
 <PATH_AND_QUERY>
 <SHA256_HEX_OF_REQUEST_BODY>
+<X_LOOM_TIMESTAMP>
+<X_LOOM_NONCE>
 ```
+
+Clarion accepts timestamps within a five-minute skew window and rejects nonce
+reuse inside that same process-local window. Nonces are scoped to one Clarion
+server process and one shared secret; clients should use high-entropy unique
+nonces for every signed request. Replays, stale timestamps, missing freshness
+headers, malformed freshness headers, and wrong signatures all return the same
+`401 UNAUTHENTICATED` envelope.
 
 `/api/v1/_capabilities` is **always** unauthenticated so siblings can probe the
 API surface pre-auth. Clarion still accepts the older
@@ -69,7 +79,7 @@ startup, before binding):
 | Non-loopback | unset | unset | **Refuse to start** with `CLA-CONFIG-HTTP-NO-AUTH`. |
 
 Authentication rejection (header absent, wrong scheme/prefix, wrong token or
-signature, blank token or signature) returns:
+signature, blank token or signature, stale timestamp, or reused nonce) returns:
 
 ```http
 HTTP/1.1 401 Unauthorized
@@ -836,9 +846,10 @@ directory name returns `403` with `code: "PROJECT_MISMATCH"`. (Reference:
 ### Sub-router framing, auth, and limits
 
 The `/api/wardline/*` routes sit behind the **same identity middleware** as the
-protected `/api/v1/*` routes (HMAC `X-Loom-Component: clarion:<hmac>` preferred per
-ADR-034, legacy `Authorization: Bearer` accepted as fallback, loopback-unauth
-allowed; see [Authentication](#authentication)). The only difference is the body
+protected `/api/v1/*` routes (HMAC `X-Loom-Component: clarion:<hmac>` plus
+timestamp/nonce freshness preferred per ADR-034/ADR-042, legacy
+`Authorization: Bearer` accepted as fallback, loopback-unauth allowed; see
+[Authentication](#authentication)). The only difference is the body
 limit used while reading the request to verify the HMAC signature: the wardline
 guard reads up to **4 MiB** (`WARDLINE_BODY_LIMIT_BYTES`) rather than the
 `/api/v1/*` 16 KiB, because batched resolves/writes carry thousands of qualnames.

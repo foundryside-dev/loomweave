@@ -19,6 +19,7 @@ use clarion_core::{
     EdgeConfidence, EmbeddingProvider, LlmProvider, LlmProviderError, LlmRequest, LlmResponse,
     McpErrorCode,
 };
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -37,7 +38,13 @@ use clarion_storage::{
 };
 
 use crate::config::{LlmConfig, SemanticSearchConfig};
-use crate::filigree::{EntityAssociation, EntityAssociationsResponse, FiligreeLookup, IssueDetail};
+use crate::filigree::{
+    EntityAssociation, EntityAssociationsResponse, FiligreeLookup, IssueDetail,
+    ObservationCreateRequest,
+};
+use clarion_storage::{
+    GuidanceProposal, GuidanceSheetInput, invalidate_summaries_for_sheet, upsert_guidance_sheet,
+};
 
 /// MCP protocol revision supported by the B.6 stdio server.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -69,12 +76,12 @@ instead of re-reading or grepping the tree.
 
 Entity IDs are `{{plugin}}:{{kind}}:{{qualified_name}}` (e.g. \
 `python:function:pkg.mod.func`); subsystems are `core:subsystem:{{hash}}`. You \
-almost never type IDs — get one from `find_entity` or `entity_at`, then copy it \
+almost never type IDs — get one from `entity_find` or `entity_at`, then copy it \
 verbatim into the next tool.
 
-Tools: {tool_names}. `callers_of` / `neighborhood` / `execution_paths_from` \
+Tools: {tool_names}. `entity_callers_list` / `entity_neighborhood_get` / `entity_execution_path_list` \
 take a `confidence` tier (resolved | ambiguous | inferred; default resolved). \
-`project_status` reports index freshness, counts, LLM policy, and the resolved \
+`project_status_get` reports index freshness, counts, LLM policy, and the resolved \
 Filigree endpoint.
 
 For the full workflow see the clarion-workflow skill (installed by \
@@ -85,6 +92,57 @@ project counts and index freshness are in the `clarion://context` resource."
 
 type InferredInflight =
     Arc<AsyncMutex<HashMap<InferredEdgeCacheKey, broadcast::Sender<InferredDispatchOutcome>>>>;
+
+pub const RENAME_MAP: &[(&str, &str)] = &[
+    ("entity_at", "entity_at"),
+    ("find_entity", "entity_find"),
+    ("callers_of", "entity_callers_list"),
+    ("execution_paths_from", "entity_execution_path_list"),
+    ("summary", "entity_summary_get"),
+    ("issues_for", "entity_issue_list"),
+    ("neighborhood", "entity_neighborhood_get"),
+    ("subsystem_members", "subsystem_member_list"),
+    ("subsystem_of", "entity_subsystem_get"),
+    ("project_status", "project_status_get"),
+    ("summary_preview_cost", "entity_summary_preview_cost_get"),
+    ("source_for_entity", "entity_source_get"),
+    ("call_sites", "entity_call_site_list"),
+    ("orientation_pack", "entity_orientation_pack_get"),
+    ("analyze_start", "analyze_start"),
+    ("analyze_status", "analyze_status_get"),
+    ("analyze_cancel", "analyze_cancel"),
+    ("index_diff", "index_diff_get"),
+    ("guidance_for", "entity_guidance_list"),
+    ("propose_guidance", "propose_guidance"),
+    ("promote_guidance", "promote_guidance"),
+    ("findings_for", "entity_finding_list"),
+    ("wardline_for", "entity_wardline_get"),
+    ("find_by_tag", "entity_tag_list"),
+    ("find_by_kind", "entity_kind_list"),
+    ("find_by_wardline", "entity_wardline_list"),
+    ("find_circular_imports", "module_circular_import_list"),
+    ("find_coupling_hotspots", "entity_coupling_hotspot_list"),
+    ("find_entry_points", "entity_entry_point_list"),
+    ("find_http_routes", "entity_http_route_list"),
+    ("find_data_models", "entity_data_model_list"),
+    ("find_tests", "entity_test_list"),
+    ("find_deprecations", "entity_deprecation_list"),
+    ("find_todos", "entity_todo_list"),
+    ("what_tests_this", "entity_test_caller_list"),
+    ("high_churn", "entity_high_churn_list"),
+    ("recently_changed", "entity_recent_change_list"),
+    ("find_dead_code", "entity_dead_list"),
+    ("search_semantic", "entity_semantic_search_list"),
+];
+
+pub fn rename_old_to_new(name: &str) -> &str {
+    for &(old, new) in RENAME_MAP {
+        if name == old {
+            return new;
+        }
+    }
+    name
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ToolDefinition {
@@ -113,7 +171,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "find_entity",
+            name: "entity_find",
             description: "Search Clarion entities by id, name, short name, and summary text stored on entity rows. Results are paginated and ranked by FTS match where possible. This does not traverse the graph and does not search on-demand summary_cache entries. Pass an optional `kind` (e.g. \"subsystem\", \"function\", \"class\", \"module\") to return only entities of that kind — the way to locate a subsystem without visually filtering results.",
             input_schema: json!({
                 "type": "object",
@@ -128,12 +186,12 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "callers_of",
+            name: "entity_callers_list",
             description: "Return entities that call the given entity. Default confidence is resolved, so ambiguous static candidates and LLM-inferred edges are excluded unless explicitly requested. Ambiguous edges expand all candidates; inferred edges may trigger bounded LLM dispatch. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls) so an empty callers list is never read as a guaranteed true negative.",
             input_schema: id_confidence_schema(),
         },
         ToolDefinition {
-            name: "execution_paths_from",
+            name: "entity_execution_path_list",
             description: "Return bounded calls-only execution paths starting at an entity. Default confidence is resolved. max_depth defaults to 3. Results are compact: a deduplicated nodes table plus paths as arrays of node ids (under a root), ranked longest-first. Traversal stops at the server edge cap and the response is capped at a maximum number of ranked paths; truncated/truncation_reason report edge-cap or path-cap when either trims. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls).",
             input_schema: json!({
                 "type": "object",
@@ -147,12 +205,12 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "summary",
+            name: "entity_summary_get",
             description: "Return an on-demand cached summary for one entity. In v0.1 this is leaf scope only: module summaries describe the module docstring and top-level members, not an aggregation of contained function/class summaries. If the LLM returns non-JSON the response degrades to a deterministic structural summary (kind: structural-fallback) built from the entity source, and that fallback is cached so a retry is a free cache hit rather than a re-billed failure.",
             input_schema: id_schema(),
         },
         ToolDefinition {
-            name: "issues_for",
+            name: "entity_issue_list",
             description: "Return Filigree issues attached to this Clarion entity, optionally including issues attached to contained entities. Filigree is an enrichment source; if unavailable, the tool returns an unavailable envelope instead of failing Clarion. The result carries a result_kind (matched | no_matches | unavailable) so a reachable-but-empty Filigree is distinct from an unreachable one, and a filigree_endpoint block (configured vs resolved URL + resolution_source) so you can see which endpoint — e.g. a live ethereal port — the answer came from. Each matched/drifted entry carries an `issue` object with the issue's title, status, and priority (fetched once per distinct issue, no N+1); `issue` is null when the issue-detail route is unavailable, so the match still resolves without a second hop into Filigree. Includes a `wardline_findings` section (enrich-only) reconciling Wardline findings to the entity by qualname; `result_kind` is matched|no_matches|unavailable.",
             input_schema: json!({
                 "type": "object",
@@ -165,22 +223,22 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "neighborhood",
+            name: "entity_neighborhood_get",
             description: "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, references, and imports (imports_in = who imports this module, imports_out = what it imports; module-to-module). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. On references_in each rolled-up neighbor also carries `importer_module` — the importing symbol's containing module — so reverse-import names importing modules, not just symbols. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls) so empty sections are never read as guaranteed true negatives.",
             input_schema: id_confidence_schema(),
         },
         ToolDefinition {
-            name: "subsystem_members",
+            name: "subsystem_member_list",
             description: "List module entities assigned to a subsystem entity.",
             input_schema: id_schema(),
         },
         ToolDefinition {
-            name: "subsystem_of",
+            name: "entity_subsystem_get",
             description: "Return the subsystem an entity belongs to — the reverse of subsystem_members. Accepts any entity id: a module resolves directly, while a function/class resolves through its nearest containing module. Returns the subsystem id/name and the module the membership was resolved through, or a no-subsystem result when the entity has no subsystem-assigned module ancestor.",
             input_schema: id_schema(),
         },
         ToolDefinition {
-            name: "project_status",
+            name: "project_status_get",
             description: "Return deterministic Clarion diagnostics: repo root, db path, latest run (id/status/started/completed), entity/subsystem/edge/finding/briefing-blocked counts, index staleness, per-plugin entity counts from the current index, LLM policy (provider/live/cache), and the resolved Filigree endpoint (configured vs resolved URL + resolution source). Answers \"is the graph fresh, plugin-less, LLM-live, Filigree-reachable?\" without shelling out. No LLM call.",
             input_schema: json!({
                 "type": "object",
@@ -189,12 +247,12 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "summary_preview_cost",
+            name: "entity_summary_preview_cost_get",
             description: "Preview what calling summary(id) would cost BEFORE spending. Reports cache_status (hit | expired | miss), the cached row's real tokens/cost/age on a hit, an input-token estimate on a miss, the configured model, the LLM policy (provider/live/allow_live_provider/cache horizon), and live_spend_would_occur — true only when no fresh cache row exists AND a live provider is wired. A disabled/unconfigured LLM is reported distinctly from a cache miss. Never invokes the LLM provider.",
             input_schema: id_schema(),
         },
         ToolDefinition {
-            name: "source_for_entity",
+            name: "entity_source_get",
             description: "Return the exact indexed source span for one entity (its source_line_start..source_line_end, which includes any decorators/signature/docstring the plugin captured) plus a bounded window of surrounding context, as line-numbered lines each flagged in_entity true/false. No LLM call. Lets an agent read and trust the entity without shelling out. source_status reports `ok`, or — instead of a misleading stale snippet — `missing` (file gone), `no_range`/`no_source_path` (entity has no anchor), `binary` (non-UTF-8), or `drifted` (the file no longer matches the indexed content_hash; rerun `clarion analyze`). context_lines defaults to 10.",
             input_schema: json!({
                 "type": "object",
@@ -207,7 +265,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "call_sites",
+            name: "entity_call_site_list",
             description: "Show the actual source sites behind calls/references edges, so an agent can see WHY Clarion believes an edge exists rather than trusting it blind. role=caller (default) returns this entity's outgoing sites (what it calls/references); role=callee returns incoming sites (who calls/references it). Each site carries the file path, 1-based line, byte column, the source line text, edge kind, confidence, and a resolution of resolved | ambiguous (with candidate ids) | unresolved (a static call Clarion could not bind, kept separate so it is never mixed with resolved evidence). Filter by edge kind (`calls`/`references`) and by a best-effort production/test path heuristic (`all`/`production`/`test`; path partitioning is not indexed — the heuristic matches conventional test paths). Output is bounded; truncated flags when the site cap trims. No LLM call.",
             input_schema: json!({
                 "type": "object",
@@ -223,7 +281,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "orientation_pack",
+            name: "entity_orientation_pack_get",
             description: "Assemble one deterministic orientation packet for a code location — the replacement for hand-composing find_entity + entity_at + source reads + neighborhood + issues_for + freshness on every question. Resolve EITHER by `entity` id OR by `file`+`line` (exactly one form). The packet bundles: the primary entity, the entity_context evidence (match_reason / containing stack / decl-body-decorator ranges — so a decorator-line query is explained, not guessed), a compact source-span summary, one-hop neighbors (callers, callees, container, contained, references, imports — for a module, references_in/out are rolled up over contained symbols with references_rolled_up=true), compact resolved execution paths, related Filigree issues, index/Filigree/LLM health, warnings, and suggested next reads. No LLM summary is invoked. Every list is bounded; an `omitted` block reports per-section truncation counts and `degraded` sections name surfaces that were unavailable (e.g. Filigree down) so an empty section is never read as a guaranteed negative. Includes a `wardline_findings` section (enrich-only) reconciling Wardline findings to the entity by qualname; `result_kind` is matched|no_matches|unavailable.",
             input_schema: json!({
                 "type": "object",
@@ -245,7 +303,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "analyze_status",
+            name: "analyze_status_get",
             description: "Report the live status of an analyze run started via analyze_start. status is one of queued (spawned, not yet recording) | running | completed | failed | cancelled | skipped_no_plugins. While running it exposes phase (discovering / analyzing / clustering), current_plugin, processed_files / total_files, current_file, the latest heartbeat_at, elapsed_seconds, and progress_observed (false when the heartbeat has gone stale — the run may be wedged). On a terminal status it carries the recorded run stats. Reads structured progress, never logs.",
             input_schema: json!({
                 "type": "object",
@@ -269,7 +327,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "index_diff",
+            name: "index_diff_get",
             description: "Report what changed since the last analyze and whether this checkout is newer than the graph — so an agent need not hand-roll git + mtime freshness checks. Compares: analyzed_at (last completed run) vs current git HEAD (with head_newer_than_analyze derived from HEAD's committer date vs run completion, true even when source mtimes are ambiguous); indexed source files modified or now-missing since analyze; dirty working-tree files flagged when they touch an indexed path; and per-run aggregate plugin skip/drop counters. Git is read at query time, read-only, and fail-soft: a missing git binary or non-repo dir degrades to git.available=false with a reason rather than failing. analyzed_commit is null by design (Clarion persists no analyze-time SHA). overall is fresh | drift | unknown | never_analyzed; lists are bounded with an `omitted` block. entity-level add/remove/change diff is unavailable in v0.1 (only the current graph is retained). No LLM call.",
             input_schema: json!({
                 "type": "object",
@@ -280,7 +338,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "guidance_for",
+            name: "entity_guidance_list",
             description: "Return the guidance sheets applicable to one entity, composed at query time and ranked by scope_rank (project → subsystem → package → module → class → function), ties broken by authored_at then id. Read-only: this surfaces composed institutional knowledge; authoring (propose/promote) is a separate lifecycle. A sheet applies via an explicit `guides` edge OR a `match_rules` entry resolved against the entity (path glob / tag / kind / subsystem / entity). `wardline_group` rules are not evaluated here (the Wardline blob is opaque) and are reported in `notes`, never guessed. Expired sheets are excluded. Each sheet carries its `sei`. Bounded (limit/offset, page.total/truncated). Honest-empty when no sheet applies. No LLM call.",
             input_schema: json!({
                 "type": "object",
@@ -294,7 +352,41 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "findings_for",
+            name: "propose_guidance",
+            description: "Propose a guidance sheet for operator review by creating a Filigree observation. This is deliberately inert: it does not write a Clarion guidance entity and cannot enter summaries until `promote_guidance` or `clarion guidance promote` consumes the observation.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "entity_id": {"type": "string", "minLength": 1},
+                    "content": {"type": "string", "minLength": 1},
+                    "scope_level": {
+                        "type": "string",
+                        "enum": ["project", "subsystem", "package", "module", "class", "function"],
+                        "default": "function"
+                    },
+                    "match_rules": {"type": "array", "items": {"type": "object"}},
+                    "name": {"type": "string", "minLength": 1},
+                    "pinned": {"type": "boolean", "default": false},
+                    "expires": {"type": "string", "minLength": 1}
+                },
+                "required": ["entity_id", "content"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "promote_guidance",
+            description: "Promote a reviewed Filigree observation produced by `propose_guidance` into a local Clarion guidance sheet. This operator action is the anti-poisoning boundary: only promoted observations become prompt-composed guidance.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "observation_id": {"type": "string", "minLength": 1}
+                },
+                "required": ["observation_id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "entity_finding_list",
             description: "Return findings anchored to one entity, optionally filtered by `filter.kind` (defect/fact/classification/metric/suggestion), `filter.severity` (INFO/WARN/ERROR/CRITICAL/NONE), and `filter.status` (open/acknowledged/suppressed/promoted_to_issue). The queried entity carries its `sei`; each finding's `related_entities` are raw locator ids (references, not the primary return). Bounded (limit/offset, page.total/truncated). An entity with no findings returns an empty list, not an error. No LLM call.",
             input_schema: json!({
                 "type": "object",
@@ -317,27 +409,27 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "wardline_for",
+            name: "entity_wardline_get",
             description: "Return the Wardline metadata recorded for one entity (declared tier, groups, boundary contracts) returned VERBATIM — the `wardline_json` blob is opaque to Clarion. result_kind is `present` when a taint fact exists, else `no_facts` with a missing-signal note: facts are populated via Filigree Flow-B (POST /api/wardline/taint-facts), so a locally-empty result is honest, not an error. The entity carries its `sei`. No LLM call.",
             input_schema: id_schema(),
         },
         ToolDefinition {
-            name: "find_by_tag",
-            description: "Return entities carrying a plugin-emitted categorisation `tag`, within an optional `scope` (an entity id → its descendants, OR a path glob like \"src/auth/**\"; omitted → whole project). Bounded (limit/offset, page.total/truncated; scope_truncated/scan_truncated flag cap hits). Entities carry their `sei`. Honest-empty with a missing-signal note when no entity carries the tag — the Python plugin emits no categorisation tags today. No LLM call.",
+            name: "entity_tag_list",
+            description: "Return entities carrying a plugin-emitted categorisation `tag`, within an optional `scope` (an entity id → its descendants, OR a path glob like \"src/auth/**\"; omitted → whole project). Bounded (limit/offset, page.total/truncated; scope_truncated/scan_truncated flag cap hits). Entities carry their `sei`. Honest-empty with a missing-signal note when no entity in the current index carries the tag. No LLM call.",
             input_schema: scope_facet_schema(&[("tag", true)]),
         },
         ToolDefinition {
-            name: "find_by_kind",
+            name: "entity_kind_list",
             description: "Return entities of a plugin-declared `kind` (e.g. \"function\", \"class\", \"module\"), within an optional `scope` (entity id → descendants, OR path glob; omitted → whole project). Bounded (limit/offset, page.total/truncated). Entities carry their `sei`. An unknown kind matches no rows. No LLM call.",
             input_schema: scope_facet_schema(&[("kind", true)]),
         },
         ToolDefinition {
-            name: "find_by_wardline",
+            name: "entity_wardline_list",
             description: "Return entities carrying a Wardline taint fact, optionally filtered by `tier` and/or `group`, within an optional `scope` (entity id → descendants, OR path glob; omitted → whole project). The Wardline blob is opaque to Clarion: tier/group filtering is best-effort against a top-level field on the blob and honest-empty when absent. Each entity carries its `wardline` blob verbatim plus its `sei`. Bounded (limit/offset, page.total/truncated). Facts are populated via Filigree Flow-B. No LLM call.",
             input_schema: scope_facet_schema(&[("tier", false), ("group", false)]),
         },
         ToolDefinition {
-            name: "find_circular_imports",
+            name: "module_circular_import_list",
             description: "Return import cycles in the module import graph (`imports` edges) — each a strongly-connected component of size > 1 (or a self-import), members sorted. On-demand graph query (no analyze-time precompute). Edge-derived: default `confidence` is resolved (the tier is a ceiling — resolved → resolved only, inferred → all) and is echoed in the result. Optional `scope` (entity id → descendants, OR path glob) restricts to cycles whose members are all in scope. Bounded (limit/offset, page.total/truncated). Each member carries its `sei`. No LLM call.",
             input_schema: json!({
                 "type": "object",
@@ -351,7 +443,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "find_coupling_hotspots",
+            name: "entity_coupling_hotspot_list",
             description: "Return entities ranked by coupling (distinct fan-in + fan-out over the edge graph), most-coupled first. On-demand graph query (no analyze-time precompute). Edge-derived: default `confidence` is resolved (a ceiling) and is echoed. Optional `scope` (entity id → descendants, OR path glob; omitted → whole project). Bounded (limit default 20, max 200; page.total/truncated). Each entity carries its `sei`. No LLM call.",
             input_schema: json!({
                 "type": "object",
@@ -365,37 +457,37 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "find_entry_points",
-            description: "Return entities tagged as entry points, within an optional `scope` (entity id → descendants, OR path glob). Reads the `entry-point` categorisation tag. HONEST-EMPTY: the active plugins emit no entry-point categorisation today, so an empty result means the signal is absent (a missing-signal note says so), NOT that there are no entry points. Bounded; SEI-carrying. No LLM call.",
+            name: "entity_entry_point_list",
+            description: "Return entities tagged as entry points, within an optional `scope` (entity id → descendants, OR path glob). Reads the `entry-point` categorisation tag. HONEST-EMPTY when no entity in the current index carries the tag, so an empty result means the signal is absent, NOT that there are no entry points. Bounded; SEI-carrying. No LLM call.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
-            name: "find_http_routes",
+            name: "entity_http_route_list",
             description: "Return entities tagged as HTTP routes, within an optional `scope`. Reads the `http-route` categorisation tag. HONEST-EMPTY when route categorisation is not emitted (missing-signal note). Bounded; SEI-carrying. No LLM call.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
-            name: "find_data_models",
+            name: "entity_data_model_list",
             description: "Return entities tagged as data models, within an optional `scope`. Reads the `data-model` categorisation tag. HONEST-EMPTY when data-model categorisation is not emitted (missing-signal note). Bounded; SEI-carrying. No LLM call.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
-            name: "find_tests",
+            name: "entity_test_list",
             description: "Return entities tagged as tests, within an optional `scope`. Reads the `test` categorisation tag. HONEST-EMPTY when test categorisation is not emitted (missing-signal note). Bounded; SEI-carrying. No LLM call.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
-            name: "find_deprecations",
+            name: "entity_deprecation_list",
             description: "Return entities tagged deprecated, within an optional `scope`. Reads the `deprecated` categorisation tag. HONEST-EMPTY when deprecation categorisation is not emitted (missing-signal note). Bounded; SEI-carrying. No LLM call.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
-            name: "find_todos",
+            name: "entity_todo_list",
             description: "Return entities carrying a TODO/FIXME marker, within an optional `scope`. Reads the `todo` categorisation tag. HONEST-EMPTY when TODO extraction is not emitted (missing-signal note). Bounded; SEI-carrying. No LLM call.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
-            name: "what_tests_this",
+            name: "entity_test_caller_list",
             description: "Return the test entities that exercise an entity — its callers carrying the `test` categorisation tag. HONEST-EMPTY when test categorisation is not emitted, so an empty result is NOT a guarantee the entity is untested (a missing-signal note says so). Bounded; tests carry their `sei`. No LLM call.",
             input_schema: json!({
                 "type": "object",
@@ -409,22 +501,22 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "high_churn",
+            name: "entity_high_churn_list",
             description: "Return entities ranked by git churn (`git_churn_count`) descending, within an optional `scope`. The analyze pipeline does not populate churn in v1.0, so this is HONEST-EMPTY in practice (missing-signal note); the query is real and lights up if churn is ever populated. Bounded; SEI-carrying. No LLM call.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
-            name: "recently_changed",
+            name: "entity_recent_change_list",
             description: "Return entities changed since a timestamp (`since?`), within an optional `scope`. Clarion does not index a per-entity git change timestamp in v1.0, so this is an HONEST NO-OP: it returns an empty set with a missing-signal note pointing at `index_diff` for repo-level freshness (HEAD vs last analyze). Never fabricates a change set. No LLM call.",
             input_schema: scope_page_schema(true),
         },
         ToolDefinition {
-            name: "find_dead_code",
-            description: "Return entities NOT reachable from the root set (entry points ∪ exported API ∪ tests ∪ HTTP routes ∪ CLI commands ∪ data models) over the call+import graph, within an optional `scope`. On-demand graph query (no analyze-time precompute). CONSERVATIVE (fails toward `live`): reachability counts ALL edge confidence tiers (resolved ∪ ambiguous ∪ inferred), dynamic-dispatch/reflection barrier tags force their entities live, and framework-magic kinds are excluded from candidacy — so it under-reports rather than over-reports. No `confidence` argument (a ceiling would only make more code look dead). HONEST SIGNAL-UNAVAILABLE: the active plugins emit no root categorisation today, so the root set is empty and the tool returns zero candidates with a missing-signal note (NOT a flood of false positives, and NOT a guarantee there is no dead code). Heuristic results (CLA-FACT-DEAD-CODE-CANDIDATE, confidence < 1) — never certain. Bounded; SEI-carrying. No LLM call.",
+            name: "entity_dead_list",
+            description: "Return entities NOT reachable from the root set (entry points ∪ exported API ∪ tests ∪ HTTP routes ∪ CLI commands ∪ data models) over the call+import graph, within an optional `scope`. On-demand graph query (no analyze-time precompute). CONSERVATIVE (fails toward `live`): reachability counts ALL edge confidence tiers (resolved ∪ ambiguous ∪ inferred), dynamic-dispatch/reflection barrier tags force their entities live, and framework-magic kinds are excluded from candidacy — so it under-reports rather than over-reports. No `confidence` argument (a ceiling would only make more code look dead). HONEST SIGNAL-UNAVAILABLE: if the current index has no root categorisation tags, the tool returns zero candidates with a missing-signal note (NOT a flood of false positives, and NOT a guarantee there is no dead code). Heuristic results (CLA-FACT-DEAD-CODE-CANDIDATE, confidence < 1) — never certain. Bounded; SEI-carrying. No LLM call.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
-            name: "search_semantic",
+            name: "entity_semantic_search_list",
             description: "Rank entities by semantic (embedding cosine) similarity to a `query` string, within an optional `scope`. OPT-IN: semantic search is OFF by default; when disabled or no embedding provider is configured the tool returns result_kind=`not_enabled` with a missing-signal note (never a faked or empty-as-complete result). When enabled it embeds the query and runs a bounded exact cosine scan over the git-ignored `.clarion/embeddings.db` sidecar (built at analyze time), considering only embeddings whose content_hash matches the entity's current hash (stale vectors never surface). Bounded (limit default 20, max 100; page.total/truncated). Each result carries its `sei` and a `score`.",
             input_schema: json!({
                 "type": "object",
@@ -747,7 +839,8 @@ impl ServerState {
         let Some(name) = params.get("name").and_then(Value::as_str) else {
             return error_response(id, -32602, "invalid tools/call params: missing name");
         };
-        if !list_tools().iter().any(|tool| tool.name == name) {
+        let canonical_name = rename_old_to_new(name);
+        if !list_tools().iter().any(|tool| tool.name == canonical_name) {
             return error_response(id, -32601, &format!("unknown tool: {name}"));
         }
         let arguments = params.get("arguments").unwrap_or(&Value::Null);
@@ -759,60 +852,62 @@ impl ServerState {
             );
         };
 
-        let envelope = match name {
+        let envelope = match canonical_name {
             "entity_at" => match self.tool_entity_at(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "find_entity" => match self.tool_find_entity(arguments).await {
+            "entity_find" => match self.tool_find_entity(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "callers_of" => match self.tool_callers_of(arguments).await {
+            "entity_callers_list" => match self.tool_callers_of(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "execution_paths_from" => match self.tool_execution_paths_from(arguments).await {
+            "entity_execution_path_list" => match self.tool_execution_paths_from(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "neighborhood" => match self.tool_neighborhood(arguments).await {
+            "entity_neighborhood_get" => match self.tool_neighborhood(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "summary" => match self.tool_summary(arguments).await {
+            "entity_summary_get" => match self.tool_summary(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "issues_for" => match self.tool_issues_for(arguments).await {
+            "entity_issue_list" => match self.tool_issues_for(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "subsystem_members" => match self.tool_subsystem_members(arguments).await {
+            "subsystem_member_list" => match self.tool_subsystem_members(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "subsystem_of" => match self.tool_subsystem_of(arguments).await {
+            "entity_subsystem_get" => match self.tool_subsystem_of(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "project_status" => match self.tool_project_status(arguments).await {
+            "project_status_get" => match self.tool_project_status(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "summary_preview_cost" => match self.tool_summary_preview_cost(arguments).await {
+            "entity_summary_preview_cost_get" => {
+                match self.tool_summary_preview_cost(arguments).await {
+                    Ok(value) => value,
+                    Err(response) => return response.to_json_rpc(id),
+                }
+            }
+            "entity_source_get" => match self.tool_source_for_entity(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "source_for_entity" => match self.tool_source_for_entity(arguments).await {
+            "entity_call_site_list" => match self.tool_call_sites(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "call_sites" => match self.tool_call_sites(arguments).await {
-                Ok(value) => value,
-                Err(response) => return response.to_json_rpc(id),
-            },
-            "orientation_pack" => match self.tool_orientation_pack(arguments).await {
+            "entity_orientation_pack_get" => match self.tool_orientation_pack(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
@@ -820,7 +915,7 @@ impl ServerState {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "analyze_status" => match self.tool_analyze_status(arguments).await {
+            "analyze_status_get" => match self.tool_analyze_status(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
@@ -828,83 +923,94 @@ impl ServerState {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "index_diff" => match self.tool_index_diff(arguments).await {
+            "index_diff_get" => match self.tool_index_diff(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "guidance_for" => match self.tool_guidance_for(arguments).await {
+            "entity_guidance_list" => match self.tool_guidance_for(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "findings_for" => match self.tool_findings_for(arguments).await {
+            "propose_guidance" => match self.tool_propose_guidance(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "wardline_for" => match self.tool_wardline_for(arguments).await {
+            "promote_guidance" => match self.tool_promote_guidance(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "find_by_tag" => match self.tool_find_by_tag(arguments).await {
+            "entity_finding_list" => match self.tool_findings_for(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "find_by_kind" => match self.tool_find_by_kind(arguments).await {
+            "entity_wardline_get" => match self.tool_wardline_for(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "find_by_wardline" => match self.tool_find_by_wardline(arguments).await {
+            "entity_tag_list" => match self.tool_find_by_tag(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "find_circular_imports" => match self.tool_find_circular_imports(arguments).await {
+            "entity_kind_list" => match self.tool_find_by_kind(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "find_coupling_hotspots" => match self.tool_find_coupling_hotspots(arguments).await {
+            "entity_wardline_list" => match self.tool_find_by_wardline(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "find_entry_points" => match self.tool_find_entry_points(arguments).await {
+            "module_circular_import_list" => match self.tool_find_circular_imports(arguments).await
+            {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "find_http_routes" => match self.tool_find_http_routes(arguments).await {
+            "entity_coupling_hotspot_list" => {
+                match self.tool_find_coupling_hotspots(arguments).await {
+                    Ok(value) => value,
+                    Err(response) => return response.to_json_rpc(id),
+                }
+            }
+            "entity_entry_point_list" => match self.tool_find_entry_points(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "find_data_models" => match self.tool_find_data_models(arguments).await {
+            "entity_http_route_list" => match self.tool_find_http_routes(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "find_tests" => match self.tool_find_tests(arguments).await {
+            "entity_data_model_list" => match self.tool_find_data_models(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "find_deprecations" => match self.tool_find_deprecations(arguments).await {
+            "entity_test_list" => match self.tool_find_tests(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "find_todos" => match self.tool_find_todos(arguments).await {
+            "entity_deprecation_list" => match self.tool_find_deprecations(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "what_tests_this" => match self.tool_what_tests_this(arguments).await {
+            "entity_todo_list" => match self.tool_find_todos(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "high_churn" => match self.tool_high_churn(arguments).await {
+            "entity_test_caller_list" => match self.tool_what_tests_this(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "recently_changed" => match self.tool_recently_changed(arguments).await {
+            "entity_high_churn_list" => match self.tool_high_churn(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "find_dead_code" => match self.tool_find_dead_code(arguments).await {
+            "entity_recent_change_list" => match self.tool_recently_changed(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
-            "search_semantic" => match self.tool_search_semantic(arguments).await {
+            "entity_dead_list" => match self.tool_find_dead_code(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "entity_semantic_search_list" => match self.tool_search_semantic(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
@@ -965,18 +1071,265 @@ impl ServerState {
             }
         }
     }
+
+    async fn tool_propose_guidance(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let entity_id = required_str(arguments, "entity_id")?.to_owned();
+        let content = required_str(arguments, "content")?.to_owned();
+        let scope_level = arguments
+            .get("scope_level")
+            .and_then(Value::as_str)
+            .unwrap_or("function")
+            .to_owned();
+        let pinned = optional_bool(arguments, "pinned")?.unwrap_or(false);
+        let name = arguments
+            .get("name")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let expires = arguments
+            .get("expires")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let match_rules = arguments
+            .get("match_rules")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| vec![json!({"type": "entity", "id": entity_id})]);
+
+        let project_root = self.project_root.clone();
+        let entity_lookup_id = entity_id.clone();
+        let entity = match self
+            .readers
+            .with_reader(move |conn| entity_by_id(conn, &entity_lookup_id))
+            .await
+        {
+            Ok(Some(entity)) => entity,
+            Ok(None) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::EntityNotFound,
+                    &format!("entity {entity_id} was not found"),
+                    false,
+                ));
+            }
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::StorageError,
+                    &format!("read entity for guidance proposal: {err}"),
+                    storage_retryable(&err),
+                ));
+            }
+        };
+
+        let proposal = GuidanceProposal {
+            entity_id: entity_id.clone(),
+            content,
+            scope_level,
+            match_rules,
+            name,
+            pinned,
+            expires,
+        };
+        let detail = match proposal.to_observation_detail() {
+            Ok(detail) => detail,
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::StorageError,
+                    &format!("build guidance proposal: {err}"),
+                    false,
+                ));
+            }
+        };
+
+        let Some(client) = self.filigree_client.clone() else {
+            return Ok(tool_error_envelope(
+                McpErrorCode::IoError,
+                "Filigree integration is not configured; cannot create guidance proposal observation",
+                true,
+            ));
+        };
+        let file_path = entity.source_file_path.as_deref().map(|path| {
+            std::path::Path::new(path)
+                .strip_prefix(&project_root)
+                .ok()
+                .and_then(|rel| rel.to_str())
+                .unwrap_or(path)
+                .to_owned()
+        });
+        let request = ObservationCreateRequest {
+            summary: format!("Clarion guidance proposal for {entity_id}"),
+            detail,
+            file_path,
+            line: entity.source_line_start,
+            priority: 2,
+            actor: "clarion".to_owned(),
+        };
+
+        let response =
+            match tokio::task::spawn_blocking(move || client.create_observation(request)).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(err)) => {
+                    return Ok(tool_error_envelope(
+                        McpErrorCode::IoError,
+                        &format!("create Filigree guidance proposal observation: {err}"),
+                        true,
+                    ));
+                }
+                Err(err) => {
+                    return Ok(tool_error_envelope(
+                        McpErrorCode::Internal,
+                        &format!("create Filigree guidance proposal task failed: {err}"),
+                        true,
+                    ));
+                }
+            };
+
+        Ok(success_envelope(json!({
+            "observation_id": response.observation_id,
+            "promoted": false,
+        })))
+    }
+
+    async fn tool_promote_guidance(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let observation_id = required_str(arguments, "observation_id")?.to_owned();
+        let Some(client) = self.filigree_client.clone() else {
+            return Ok(tool_error_envelope(
+                McpErrorCode::IoError,
+                "Filigree integration is not configured; cannot read guidance proposal observation",
+                true,
+            ));
+        };
+        let lookup_client = client.clone();
+        let lookup_id = observation_id.clone();
+        let observation =
+            match tokio::task::spawn_blocking(move || lookup_client.observation_by_id(&lookup_id))
+                .await
+            {
+                Ok(Ok(Some(observation))) => observation,
+                Ok(Ok(None)) => {
+                    return Ok(tool_error_envelope(
+                        McpErrorCode::NotFound,
+                        &format!("observation {observation_id} was not found"),
+                        false,
+                    ));
+                }
+                Ok(Err(err)) => {
+                    return Ok(tool_error_envelope(
+                        McpErrorCode::IoError,
+                        &format!("read Filigree observation {observation_id}: {err}"),
+                        true,
+                    ));
+                }
+                Err(err) => {
+                    return Ok(tool_error_envelope(
+                        McpErrorCode::Internal,
+                        &format!("read Filigree observation task failed: {err}"),
+                        true,
+                    ));
+                }
+            };
+
+        let proposal = match GuidanceProposal::from_observation_detail(&observation.detail) {
+            Ok(proposal) => proposal,
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::StorageError,
+                    &format!("observation {observation_id} is not a guidance proposal: {err}"),
+                    false,
+                ));
+            }
+        };
+        let authored_at = guidance_authored_at_from_clock(&(self.clock)());
+        let promoted = match proposal.to_promoted_sheet(&authored_at) {
+            Ok(promoted) => promoted,
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::StorageError,
+                    &format!("build promoted guidance sheet: {err}"),
+                    false,
+                ));
+            }
+        };
+
+        let db_path = self.project_root.join(".clarion").join("clarion.db");
+        let project_root = self.project_root.clone();
+        let sheet_id = promoted.id.clone();
+        let write_result =
+            tokio::task::spawn_blocking(move || -> std::result::Result<usize, String> {
+                let conn =
+                    open_guidance_write_connection(&db_path).map_err(|err| err.to_string())?;
+                upsert_guidance_sheet(
+                    &conn,
+                    &GuidanceSheetInput {
+                        id: &promoted.id,
+                        name: &promoted.name,
+                        short_name: &promoted.short_name,
+                        properties: &promoted.properties,
+                    },
+                )
+                .map_err(|err| err.to_string())?;
+                let Some(sheet) = clarion_storage::get_guidance_sheet(&conn, &promoted.id)
+                    .map_err(|err| err.to_string())?
+                else {
+                    return Ok(0);
+                };
+                invalidate_summaries_for_sheet(&conn, &sheet, &project_root)
+                    .map_err(|err| err.to_string())
+            })
+            .await;
+        let invalidated = match write_result {
+            Ok(Ok(invalidated)) => invalidated,
+            Ok(Err(err)) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::StorageError,
+                    &format!("write promoted guidance sheet {sheet_id}: {err}"),
+                    true,
+                ));
+            }
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::Internal,
+                    &format!("write promoted guidance sheet task failed: {err}"),
+                    true,
+                ));
+            }
+        };
+
+        let dismiss_id = observation_id.clone();
+        let dismissed = tokio::task::spawn_blocking(move || {
+            client.dismiss_observation(&dismiss_id, "promoted to Clarion guidance sheet")
+        })
+        .await
+        .is_ok_and(|result| result.is_ok());
+
+        Ok(success_envelope(json!({
+            "observation_id": observation_id,
+            "sheet_id": sheet_id,
+            "invalidated_summaries": invalidated,
+            "observation_dismissed": dismissed,
+        })))
+    }
 }
 
 async fn invoke_llm_provider(
     provider: Arc<dyn LlmProvider>,
     request: LlmRequest,
 ) -> Result<LlmResponse, LlmProviderError> {
-    tokio::task::spawn_blocking(move || provider.invoke(request))
-        .await
-        .map_err(|err| LlmProviderError::InvalidResponse {
-            message: format!("LLM provider task failed: {err}"),
-            retryable: true,
-        })?
+    provider.invoke(request).await
+}
+
+fn open_guidance_write_connection(path: &std::path::Path) -> rusqlite::Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(conn)
 }
 
 struct SummaryLlmState {
@@ -1058,6 +1411,7 @@ struct SummaryReady {
     entity_json: Value,
     key: SummaryCacheKey,
     cached: Option<SummaryCacheEntry>,
+    guidance_text: String,
     caller_count: i64,
     fan_out: i64,
 }
@@ -1957,7 +2311,7 @@ fn plugin_entity_counts(conn: &rusqlite::Connection) -> Value {
 /// `completed` one). Fail-soft: no rows or a query error → `null`.
 fn latest_run_row(conn: &rusqlite::Connection) -> Value {
     match conn.query_row(
-        "SELECT id, status, started_at, completed_at FROM runs \
+        "SELECT id, status, started_at, completed_at, owner_pid, heartbeat_at FROM runs \
          ORDER BY started_at DESC LIMIT 1",
         [],
         |row| {
@@ -1966,6 +2320,8 @@ fn latest_run_row(conn: &rusqlite::Connection) -> Value {
                 "status": row.get::<_, String>(1)?,
                 "started_at": row.get::<_, String>(2)?,
                 "completed_at": row.get::<_, Option<String>>(3)?,
+                "owner_pid": row.get::<_, Option<i64>>(4)?,
+                "heartbeat_at": row.get::<_, Option<String>>(5)?,
             }))
         },
     ) {
@@ -2699,12 +3055,12 @@ fn orientation_suggested_reads(
     };
     let mut reads = vec![
         json!({
-            "tool": "source_for_entity",
+            "tool": "entity_source_get",
             "args": {"id": primary_id},
             "why": "read the entity's source with line numbers",
         }),
         json!({
-            "tool": "summary_preview_cost",
+            "tool": "entity_summary_preview_cost_get",
             "args": {"id": primary_id},
             "why": "estimate the cost of an LLM briefing before spending",
         }),
@@ -2713,13 +3069,13 @@ fn orientation_suggested_reads(
     // the owning subsystem.
     if primary_kind == Some("subsystem") {
         reads.push(json!({
-            "tool": "subsystem_members",
+            "tool": "subsystem_member_list",
             "args": {"id": primary_id},
             "why": "list the entities clustered into this subsystem",
         }));
     } else {
         reads.push(json!({
-            "tool": "subsystem_of",
+            "tool": "entity_subsystem_get",
             "args": {"id": primary_id},
             "why": "see which subsystem this entity belongs to",
         }));
@@ -2735,7 +3091,7 @@ fn orientation_suggested_reads(
         .and_then(Value::as_str)
     {
         reads.push(json!({
-            "tool": "orientation_pack",
+            "tool": "entity_orientation_pack_get",
             "args": {"entity": callee_id},
             "why": "orient on the primary callee",
         }));
@@ -2776,7 +3132,7 @@ fn read_progress_snapshot(path: &std::path::Path) -> Option<Value> {
 /// Parse a timestamp to Unix seconds, accepting both the MCP clock's
 /// `unix:<seconds>` form and the RFC3339 form analyze writes into the progress
 /// file's `heartbeat_at`. `None` if neither parses.
-fn parse_to_unix_seconds(value: &str) -> Option<i64> {
+pub(crate) fn parse_to_unix_seconds(value: &str) -> Option<i64> {
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
     if let Some(rest) = value.strip_prefix("unix:") {
@@ -3524,6 +3880,26 @@ fn default_now_string() -> String {
     format!("unix:{seconds}")
 }
 
+fn guidance_authored_at_from_clock(raw: &str) -> String {
+    const ISO_MILLIS_UTC: &[time::format_description::FormatItem<'_>] =
+        format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
+
+    let parsed = if let Some(seconds) = raw.strip_prefix("unix:") {
+        seconds
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .and_then(|seconds| OffsetDateTime::from_unix_timestamp(seconds).ok())
+    } else {
+        parse_to_unix_seconds(raw)
+            .and_then(|seconds| OffsetDateTime::from_unix_timestamp(seconds).ok())
+    };
+
+    parsed
+        .and_then(|timestamp| timestamp.format(&ISO_MILLIS_UTC).ok())
+        .unwrap_or_else(|| raw.to_owned())
+}
+
 fn caller_json(
     conn: &rusqlite::Connection,
     edge: &CallEdgeMatch,
@@ -3766,7 +4142,7 @@ fn error_response(id: &Value, code: i64, message: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use clarion_core::{CachingModel, LlmProvider, LlmProviderError, LlmRequest, LlmResponse};
@@ -3782,73 +4158,73 @@ mod tests {
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 37);
+        assert_eq!(tools.len(), 39);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
             "Return the innermost Clarion entity whose source range contains a file and line, plus an `entity_context` evidence block: match_reason (decorator_range / declaration / body_range / containing_range / no_match) explaining why the line matched, the module→entity containing stack, the matched entity's decl/body/decorator sub-ranges, any same-granularity ambiguity alternatives, and index freshness. Paths are normalized relative to the project root. A blank or comment line that only a module spans reports containing_range — never a fabricated exact match."
         );
-        assert_eq!(tools[1].name, "find_entity");
+        assert_eq!(tools[1].name, "entity_find");
         assert_eq!(
             tools[1].description,
             "Search Clarion entities by id, name, short name, and summary text stored on entity rows. Results are paginated and ranked by FTS match where possible. This does not traverse the graph and does not search on-demand summary_cache entries. Pass an optional `kind` (e.g. \"subsystem\", \"function\", \"class\", \"module\") to return only entities of that kind — the way to locate a subsystem without visually filtering results."
         );
-        assert_eq!(tools[2].name, "callers_of");
+        assert_eq!(tools[2].name, "entity_callers_list");
         assert_eq!(
             tools[2].description,
             "Return entities that call the given entity. Default confidence is resolved, so ambiguous static candidates and LLM-inferred edges are excluded unless explicitly requested. Ambiguous edges expand all candidates; inferred edges may trigger bounded LLM dispatch. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls) so an empty callers list is never read as a guaranteed true negative."
         );
-        assert_eq!(tools[3].name, "execution_paths_from");
+        assert_eq!(tools[3].name, "entity_execution_path_list");
         assert_eq!(
             tools[3].description,
             "Return bounded calls-only execution paths starting at an entity. Default confidence is resolved. max_depth defaults to 3. Results are compact: a deduplicated nodes table plus paths as arrays of node ids (under a root), ranked longest-first. Traversal stops at the server edge cap and the response is capped at a maximum number of ranked paths; truncated/truncation_reason report edge-cap or path-cap when either trims. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls)."
         );
-        assert_eq!(tools[4].name, "summary");
+        assert_eq!(tools[4].name, "entity_summary_get");
         assert_eq!(
             tools[4].description,
             "Return an on-demand cached summary for one entity. In v0.1 this is leaf scope only: module summaries describe the module docstring and top-level members, not an aggregation of contained function/class summaries. If the LLM returns non-JSON the response degrades to a deterministic structural summary (kind: structural-fallback) built from the entity source, and that fallback is cached so a retry is a free cache hit rather than a re-billed failure."
         );
-        assert_eq!(tools[5].name, "issues_for");
+        assert_eq!(tools[5].name, "entity_issue_list");
         assert_eq!(
             tools[5].description,
             "Return Filigree issues attached to this Clarion entity, optionally including issues attached to contained entities. Filigree is an enrichment source; if unavailable, the tool returns an unavailable envelope instead of failing Clarion. The result carries a result_kind (matched | no_matches | unavailable) so a reachable-but-empty Filigree is distinct from an unreachable one, and a filigree_endpoint block (configured vs resolved URL + resolution_source) so you can see which endpoint — e.g. a live ethereal port — the answer came from. Each matched/drifted entry carries an `issue` object with the issue's title, status, and priority (fetched once per distinct issue, no N+1); `issue` is null when the issue-detail route is unavailable, so the match still resolves without a second hop into Filigree. Includes a `wardline_findings` section (enrich-only) reconciling Wardline findings to the entity by qualname; `result_kind` is matched|no_matches|unavailable."
         );
-        assert_eq!(tools[6].name, "neighborhood");
+        assert_eq!(tools[6].name, "entity_neighborhood_get");
         assert_eq!(
             tools[6].description,
             "Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, references, and imports (imports_in = who imports this module, imports_out = what it imports; module-to-module). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. On references_in each rolled-up neighbor also carries `importer_module` — the importing symbol's containing module — so reverse-import names importing modules, not just symbols. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls) so empty sections are never read as guaranteed true negatives."
         );
-        assert_eq!(tools[7].name, "subsystem_members");
+        assert_eq!(tools[7].name, "subsystem_member_list");
         assert_eq!(
             tools[7].description,
             "List module entities assigned to a subsystem entity."
         );
-        assert_eq!(tools[8].name, "subsystem_of");
+        assert_eq!(tools[8].name, "entity_subsystem_get");
         assert_eq!(
             tools[8].description,
             "Return the subsystem an entity belongs to — the reverse of subsystem_members. Accepts any entity id: a module resolves directly, while a function/class resolves through its nearest containing module. Returns the subsystem id/name and the module the membership was resolved through, or a no-subsystem result when the entity has no subsystem-assigned module ancestor."
         );
-        assert_eq!(tools[9].name, "project_status");
+        assert_eq!(tools[9].name, "project_status_get");
         assert_eq!(
             tools[9].description,
             "Return deterministic Clarion diagnostics: repo root, db path, latest run (id/status/started/completed), entity/subsystem/edge/finding/briefing-blocked counts, index staleness, per-plugin entity counts from the current index, LLM policy (provider/live/cache), and the resolved Filigree endpoint (configured vs resolved URL + resolution source). Answers \"is the graph fresh, plugin-less, LLM-live, Filigree-reachable?\" without shelling out. No LLM call."
         );
-        assert_eq!(tools[10].name, "summary_preview_cost");
+        assert_eq!(tools[10].name, "entity_summary_preview_cost_get");
         assert_eq!(
             tools[10].description,
             "Preview what calling summary(id) would cost BEFORE spending. Reports cache_status (hit | expired | miss), the cached row's real tokens/cost/age on a hit, an input-token estimate on a miss, the configured model, the LLM policy (provider/live/allow_live_provider/cache horizon), and live_spend_would_occur — true only when no fresh cache row exists AND a live provider is wired. A disabled/unconfigured LLM is reported distinctly from a cache miss. Never invokes the LLM provider."
         );
-        assert_eq!(tools[11].name, "source_for_entity");
+        assert_eq!(tools[11].name, "entity_source_get");
         assert_eq!(
             tools[11].description,
             "Return the exact indexed source span for one entity (its source_line_start..source_line_end, which includes any decorators/signature/docstring the plugin captured) plus a bounded window of surrounding context, as line-numbered lines each flagged in_entity true/false. No LLM call. Lets an agent read and trust the entity without shelling out. source_status reports `ok`, or — instead of a misleading stale snippet — `missing` (file gone), `no_range`/`no_source_path` (entity has no anchor), `binary` (non-UTF-8), or `drifted` (the file no longer matches the indexed content_hash; rerun `clarion analyze`). context_lines defaults to 10."
         );
-        assert_eq!(tools[12].name, "call_sites");
+        assert_eq!(tools[12].name, "entity_call_site_list");
         assert_eq!(
             tools[12].description,
             "Show the actual source sites behind calls/references edges, so an agent can see WHY Clarion believes an edge exists rather than trusting it blind. role=caller (default) returns this entity's outgoing sites (what it calls/references); role=callee returns incoming sites (who calls/references it). Each site carries the file path, 1-based line, byte column, the source line text, edge kind, confidence, and a resolution of resolved | ambiguous (with candidate ids) | unresolved (a static call Clarion could not bind, kept separate so it is never mixed with resolved evidence). Filter by edge kind (`calls`/`references`) and by a best-effort production/test path heuristic (`all`/`production`/`test`; path partitioning is not indexed — the heuristic matches conventional test paths). Output is bounded; truncated flags when the site cap trims. No LLM call."
         );
-        assert_eq!(tools[13].name, "orientation_pack");
+        assert_eq!(tools[13].name, "entity_orientation_pack_get");
         assert_eq!(
             tools[13].description,
             "Assemble one deterministic orientation packet for a code location — the replacement for hand-composing find_entity + entity_at + source reads + neighborhood + issues_for + freshness on every question. Resolve EITHER by `entity` id OR by `file`+`line` (exactly one form). The packet bundles: the primary entity, the entity_context evidence (match_reason / containing stack / decl-body-decorator ranges — so a decorator-line query is explained, not guessed), a compact source-span summary, one-hop neighbors (callers, callees, container, contained, references, imports — for a module, references_in/out are rolled up over contained symbols with references_rolled_up=true), compact resolved execution paths, related Filigree issues, index/Filigree/LLM health, warnings, and suggested next reads. No LLM summary is invoked. Every list is bounded; an `omitted` block reports per-section truncation counts and `degraded` sections name surfaces that were unavailable (e.g. Filigree down) so an empty section is never read as a guaranteed negative. Includes a `wardline_findings` section (enrich-only) reconciling Wardline findings to the entity by qualname; `result_kind` is matched|no_matches|unavailable."
@@ -3858,7 +4234,7 @@ mod tests {
             tools[14].description,
             "Start a `clarion analyze` run over this project in the background and return its run handle immediately — do not block on the (possibly many-minute) run. Re-indexes the source tree and refreshes entities/edges/subsystems. Returns run_id, status (`started`), and the progress-file path. Only one analyze may run per project at a time (a cross-process lock enforces it); a second start while one is active is rejected. Poll analyze_status for progress; analyze_cancel to stop. No arguments."
         );
-        assert_eq!(tools[15].name, "analyze_status");
+        assert_eq!(tools[15].name, "analyze_status_get");
         assert_eq!(
             tools[15].description,
             "Report the live status of an analyze run started via analyze_start. status is one of queued (spawned, not yet recording) | running | completed | failed | cancelled | skipped_no_plugins. While running it exposes phase (discovering / analyzing / clustering), current_plugin, processed_files / total_files, current_file, the latest heartbeat_at, elapsed_seconds, and progress_observed (false when the heartbeat has gone stale — the run may be wedged). On a terminal status it carries the recorded run stats. Reads structured progress, never logs."
@@ -3868,26 +4244,28 @@ mod tests {
             tools[16].description,
             "Cancel a running analyze. SIGKILLs the run's whole process group — terminating the language plugin and its pyright-langserver child — then marks the run terminal (status `cancelled`) so it is never left dangling as `running`. Idempotent: cancelling an already-terminal run reports its current state. Partial work already written is kept (cancel discards in-flight work, not the index)."
         );
-        assert_eq!(tools[17].name, "index_diff");
-        assert_eq!(tools[18].name, "guidance_for");
-        assert_eq!(tools[19].name, "findings_for");
-        assert_eq!(tools[20].name, "wardline_for");
-        assert_eq!(tools[21].name, "find_by_tag");
-        assert_eq!(tools[22].name, "find_by_kind");
-        assert_eq!(tools[23].name, "find_by_wardline");
-        assert_eq!(tools[24].name, "find_circular_imports");
-        assert_eq!(tools[25].name, "find_coupling_hotspots");
-        assert_eq!(tools[26].name, "find_entry_points");
-        assert_eq!(tools[27].name, "find_http_routes");
-        assert_eq!(tools[28].name, "find_data_models");
-        assert_eq!(tools[29].name, "find_tests");
-        assert_eq!(tools[30].name, "find_deprecations");
-        assert_eq!(tools[31].name, "find_todos");
-        assert_eq!(tools[32].name, "what_tests_this");
-        assert_eq!(tools[33].name, "high_churn");
-        assert_eq!(tools[34].name, "recently_changed");
-        assert_eq!(tools[35].name, "find_dead_code");
-        assert_eq!(tools[36].name, "search_semantic");
+        assert_eq!(tools[17].name, "index_diff_get");
+        assert_eq!(tools[18].name, "entity_guidance_list");
+        assert_eq!(tools[19].name, "propose_guidance");
+        assert_eq!(tools[20].name, "promote_guidance");
+        assert_eq!(tools[21].name, "entity_finding_list");
+        assert_eq!(tools[22].name, "entity_wardline_get");
+        assert_eq!(tools[23].name, "entity_tag_list");
+        assert_eq!(tools[24].name, "entity_kind_list");
+        assert_eq!(tools[25].name, "entity_wardline_list");
+        assert_eq!(tools[26].name, "module_circular_import_list");
+        assert_eq!(tools[27].name, "entity_coupling_hotspot_list");
+        assert_eq!(tools[28].name, "entity_entry_point_list");
+        assert_eq!(tools[29].name, "entity_http_route_list");
+        assert_eq!(tools[30].name, "entity_data_model_list");
+        assert_eq!(tools[31].name, "entity_test_list");
+        assert_eq!(tools[32].name, "entity_deprecation_list");
+        assert_eq!(tools[33].name, "entity_todo_list");
+        assert_eq!(tools[34].name, "entity_test_caller_list");
+        assert_eq!(tools[35].name, "entity_high_churn_list");
+        assert_eq!(tools[36].name, "entity_recent_change_list");
+        assert_eq!(tools[37].name, "entity_dead_list");
+        assert_eq!(tools[38].name, "entity_semantic_search_list");
     }
 
     #[test]
@@ -4190,9 +4568,19 @@ mod tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], "tools-1");
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 37);
+        let tools = response["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 39);
+        let tool_names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+        assert!(tool_names.contains(&"propose_guidance"));
+        assert!(tool_names.contains(&"promote_guidance"));
         assert_eq!(response["result"]["tools"][0]["name"], "entity_at");
-        assert_eq!(response["result"]["tools"][7]["name"], "subsystem_members");
+        assert_eq!(
+            response["result"]["tools"][7]["name"],
+            "subsystem_member_list"
+        );
     }
 
     #[test]
@@ -4291,7 +4679,14 @@ mod tests {
 
         assert_eq!(decoded["jsonrpc"], "2.0");
         assert_eq!(decoded["id"], 10);
-        assert_eq!(decoded["result"]["tools"].as_array().unwrap().len(), 37);
+        let tools = decoded["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 39);
+        let tool_names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+        assert!(tool_names.contains(&"propose_guidance"));
+        assert!(tool_names.contains(&"promote_guidance"));
     }
 
     #[test]
@@ -4366,7 +4761,14 @@ mod tests {
         assert_eq!(first_json["id"], 11);
         assert_eq!(first_json["result"]["serverInfo"]["name"], "clarion");
         assert_eq!(second_json["id"], 12);
-        assert_eq!(second_json["result"]["tools"].as_array().unwrap().len(), 37);
+        let tools = second_json["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 39);
+        let tool_names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+        assert!(tool_names.contains(&"propose_guidance"));
+        assert!(tool_names.contains(&"promote_guidance"));
     }
 
     #[test]
@@ -4560,12 +4962,12 @@ mod tests {
         let key = inferred_test_key();
         let read = inferred_test_read(key.clone());
         let (writer, _rx) = mpsc::channel(1);
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = tokio::sync::mpsc::channel(1);
         let llm = InferenceLlmState {
             writer,
             config: LlmConfig::default(),
             provider: Arc::new(BlockingProvider {
-                release: Mutex::new(release_rx),
+                release: tokio::sync::Mutex::new(release_rx),
             }),
         };
 
@@ -4581,7 +4983,7 @@ mod tests {
         handle.abort();
         let _ = handle.await;
         let removed = wait_until_inferred_inflight_removed(&state, &key).await;
-        let _ = release_tx.send(());
+        let _ = release_tx.send(()).await;
 
         assert!(
             removed,
@@ -4707,20 +5109,18 @@ mod tests {
     }
 
     struct BlockingProvider {
-        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        release: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<()>>,
     }
 
+    #[async_trait::async_trait]
     impl LlmProvider for BlockingProvider {
         fn name(&self) -> &'static str {
             "blocking"
         }
 
-        fn invoke(&self, _request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
-            let _ = self
-                .release
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .recv();
+        async fn invoke(&self, _request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
+            let mut rx = self.release.lock().await;
+            let _ = rx.recv().await;
             Ok(LlmResponse {
                 model_id: "test-model".to_owned(),
                 output_json: r#"{"edges":[]}"#.to_owned(),

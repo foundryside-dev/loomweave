@@ -5,15 +5,15 @@ Clarion is a code-archaeology tool. It ingests a codebase, extracts entities
 `references`), persists the structural graph to a local SQLite store, and serves
 the result to consult-mode LLM agents over MCP. A coding agent that would
 otherwise re-explore the tree on every question reaches Clarion first and asks a
-graph-aware tool. v1.0 ships a Rust core plus a Python language plugin; other
-languages land in v2.0+.
+graph-aware tool. The current release line ships a Rust core plus a Python
+language plugin; other languages remain future scope.
 
 Part of the [Loom suite](docs/suite/loom.md) of code-archaeology, issue-tracking,
 and trust-topology tools.
 
 ## Status
 
-**v1.0 — first publishable release.** Scope:
+**v1.2.0 — current release line.** Scope:
 
 - **Python only.** Other-language plugins (`NG-15`) are v2.0+ scope.
 - **Structural extraction + on-demand LLM summarisation.** `clarion analyze`
@@ -21,46 +21,48 @@ and trust-topology tools.
   dispatches the LLM lazily, one entity at a time.
 - **Local-first.** No mandatory cloud component; the only required network
   egress is the LLM provider during `summary` calls.
-- **Filigree finding emission deferred to v0.2.** Clarion v1.0 surfaces issues
-  attached to entities via its own `issues_for` MCP tool (the WP9-A binding);
-  cross-product POSTing of Clarion-generated findings into Filigree's intake is
-  WP9-B, deferred per the
-  [Sprint 2 scope amendment](docs/implementation/sprint-2/scope-amendment-2026-05.md#4-v01-planmd-resequencing).
+- **Stable identity and suite enrichment.** Clarion mints Stable Entity
+  Identity (SEI) tokens, serves the federation HTTP read API, emits opted-in
+  Filigree scan findings, and enriches MCP reads with Filigree/Wardline context
+  without making sibling products mandatory.
+- **Guidance authoring.** Operators can author, import, export, and review
+  guidance sheets through `clarion guidance`; consult agents consume them
+  through MCP and summary cache invalidation.
 
-**Known v1.0 limitations:**
+**Known limitations:**
 
 - **HTTP file language inference uses stored plugin identity plus a narrow
-  core-extension fallback.** Plugin manifests already declare language and
-  extensions, but v1.0 does not persist a manifest language registry for the
-  `/api/v1/files` read path. This is tracked as post-v1.0 hardening.
+  core-extension fallback.** Plugin manifests declare language and extensions,
+  but Clarion does not yet persist a manifest language registry for the
+  `/api/v1/files` read path.
+- **Some guidance lifecycle surfaces remain deferred.** The in-browser
+  staleness-review UI is still tracked separately; authored guidance is
+  available through the CLI and MCP read path today.
 
 ## What it does today
 
-`clarion serve` exposes eight MCP tools that a consult-mode agent calls instead
-of grep-and-read:
+`clarion serve` exposes a 39-tool MCP surface that a consult-mode agent calls
+instead of grep-and-read. The core tool families are:
 
-| Tool | What it answers |
+| Family | Examples |
 |---|---|
-| `entity_at(file, line)` | "Which entity covers this source location?" |
-| `find_entity(pattern)` | "Find entities whose name or summary text matches X." |
-| `callers_of(id)` | "Who calls this function?" |
-| `execution_paths_from(id, max_depth)` | "Show me up to N hops of call paths starting here." |
-| `summary(id)` | "Give me a one-paragraph summary of this entity." (lazy LLM dispatch + cached) |
-| `issues_for(id)` | "What Filigree issues are attached to this entity?" |
-| `neighborhood(id)` | "Show callers, callees, container, contained entities, and references in one hop." |
-| `subsystem_members(id)` | "Which entities belong to this subsystem?" (clustering output) |
+| Navigation and graph traversal | `entity_at`, `entity_find`, `entity_callers_list`, `entity_execution_path_list`, `entity_neighborhood_get`, `subsystem_member_list`, `entity_call_site_list` |
+| Briefing and source inspection | `entity_summary_get`, `entity_summary_preview_cost_get`, `entity_source_get`, `entity_orientation_pack_get`, `project_status_get` |
+| Guidance, findings, and federation context | `entity_guidance_list`, `propose_guidance`, `promote_guidance`, `entity_finding_list`, `entity_wardline_get`, `entity_issue_list` |
+| Analyze lifecycle and freshness | `analyze_start`, `analyze_status_get`, `analyze_cancel`, `index_diff_get` |
+| Faceted and shortcut queries | `entity_tag_list`, `entity_kind_list`, `module_circular_import_list`, `entity_coupling_hotspot_list`, `entity_entry_point_list`, `entity_dead_list`, `entity_semantic_search_list` |
 
 ## Quick start
 
 ```bash
-# 1. Install from the v1.0 GitHub Release
-TAG=v1.0.0
+# 1. Install from the current GitHub Release
+TAG=v1.2.0
 curl -L -o clarion-x86_64-unknown-linux-gnu.tar.gz \
   "https://github.com/tachyon-beep/clarion/releases/download/${TAG}/clarion-x86_64-unknown-linux-gnu.tar.gz"
 tar xzf clarion-x86_64-unknown-linux-gnu.tar.gz
 install clarion-x86_64-unknown-linux-gnu/clarion ~/.local/bin/
 pipx install \
-  "https://github.com/tachyon-beep/clarion/releases/download/${TAG}/clarion-plugin-python-1.0.0.tar.gz"
+  "https://github.com/tachyon-beep/clarion/releases/download/${TAG}/clarion-plugin-python-1.2.0.tar.gz"
 
 # 2. Initialise a project
 cd /path/to/your/python/repo
@@ -87,9 +89,10 @@ in [docs/operator/getting-started.md](docs/operator/getting-started.md).
 crates/                 Rust workspace
 ├── clarion-core/       Entity-ID assembler, plugin host, manifest parser
 ├── clarion-storage/    Writer-actor + reader-pool over SQLite (ADR-011)
+├── clarion-federation/ Shared federation HTTP types
 ├── clarion-scanner/    Pre-ingest secret scanner (ADR-013, WP5)
 ├── clarion-cli/        The `clarion` binary (install, analyze, serve)
-└── clarion-mcp/        MCP server exposing the eight consult tools
+└── clarion-mcp/        MCP server exposing the consult tools
 plugins/python/         Python language plugin (pyright-backed)
 docs/clarion/1.0/      Design ladder — requirements → system-design → detailed-design
 docs/clarion/adr/       Authored architecture decision records
@@ -103,9 +106,9 @@ federation doctrine that anchors every cross-product decision is in
 
 ## Storage and operations
 
-Clarion v1.0 keeps all state in a project-local `.clarion/` directory.
+Clarion keeps project state in a local `.clarion/` directory.
 The local-first storage model, the no-NFS constraint, the no-double-analyze
-constraint (fs2 advisory lock), and the v1.0 backup/restore procedure are
+constraint (fs2 advisory lock), and the backup/restore procedure are
 documented in
 [docs/clarion/1.0/operations.md](docs/clarion/1.0/operations.md).
 
@@ -132,6 +135,8 @@ plugins/python/.venv/bin/pytest plugins/python
 
 # End-to-end
 bash tests/e2e/sprint_1_walking_skeleton.sh
+bash tests/e2e/sprint_2_mcp_surface.sh
+bash tests/e2e/phase3_subsystems.sh
 ```
 
 Pre-commit hooks at [.pre-commit-config.yaml](.pre-commit-config.yaml) wire

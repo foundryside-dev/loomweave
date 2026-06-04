@@ -1,0 +1,22 @@
+[package]
+name = "clarion-federation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+clarion-core = { path = "../clarion-core", version = "1.2.0" }
+clarion-storage = { path = "../clarion-storage", version = "1.2.0" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_norway.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

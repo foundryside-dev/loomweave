@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "clarion-plugin-python"
-version = "1.1.0"
+version = "1.2.0"
 description = "Clarion Python language plugin — v1.0 release"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -85,6 +85,14 @@ python_version = "3.11"
 strict = true
 warn_unused_configs = true
 files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+module = "yaml"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "clarion_plugin_python.wardline_probe"
+warn_unused_ignores = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -63,7 +63,10 @@ fn install_applies_each_migration_exactly_once() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(count, 7);
+    assert_eq!(
+        count,
+        i64::from(clarion_storage::schema::CURRENT_SCHEMA_VERSION)
+    );
     let versions: Vec<i64> = {
         let mut stmt = conn
             .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -71,7 +74,9 @@ fn install_applies_each_migration_exactly_once() {
         let rows = stmt.query_map([], |row| row.get(0)).unwrap();
         rows.map(std::result::Result::unwrap).collect()
     };
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
+    let expected: Vec<i64> =
+        (1..=i64::from(clarion_storage::schema::CURRENT_SCHEMA_VERSION)).collect();
+    assert_eq!(versions, expected);
 }
 
 #[test]

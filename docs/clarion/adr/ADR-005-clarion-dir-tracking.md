@@ -1,6 +1,6 @@
 # ADR-005: `.clarion/` Directory Git-Tracking Policy
 
-**Status**: Accepted
+**Status**: Accepted; amended by ADR-041
 **Date**: 2026-04-18
 **Deciders**: qacona@gmail.com
 **Context**: `clarion install` must write a `.gitignore` inside `.clarion/` that

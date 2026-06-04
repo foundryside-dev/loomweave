@@ -10,23 +10,22 @@ use std::collections::HashSet;
 use serde_json::{Value, json};
 
 use clarion_core::McpErrorCode;
-use clarion_storage::{entity_by_id, get_taint_facts, sei_for_locator, subsystem_of_entity};
+use clarion_storage::{
+    MatchFacts, RuleVerdict, entity_by_id, get_taint_facts, rule_match, sei_for_locator,
+};
 
 use crate::ParamError;
 use crate::ServerState;
 use crate::catalogue::{Page, missing_signal, paginate};
 use crate::{
-    entity_json, flatten_storage_envelope_result, required_str, success_envelope,
-    tool_error_envelope,
+    entity_json, flatten_storage_envelope_result, parse_to_unix_seconds, required_str,
+    success_envelope, tool_error_envelope,
 };
 
 /// Bound on guidance sheets scanned per `guidance_for` call. Guidance is
 /// authored, low-cardinality institutional knowledge; this only guards a
 /// pathological project.
 const GUIDANCE_SCAN_CAP: usize = 2000;
-
-/// Bound on findings scanned per `findings_for` call before in-memory filtering.
-const FINDINGS_SCAN_CAP: usize = 5000;
 
 /// Default / max page size for `findings_for`.
 const FINDINGS_PAGE_DEFAULT: usize = 50;
@@ -63,7 +62,7 @@ impl ServerState {
                     ));
                 };
 
-                let facts = EntityFacts::load(conn, &entity, &project_root)?;
+                let facts = MatchFacts::from_entity_row(conn, &entity, &project_root)?;
                 let guides_targets = guides_edge_sources(conn, &entity.id)?;
 
                 let mut wardline_group_skipped = false;
@@ -92,8 +91,16 @@ impl ServerState {
                     scanned += 1;
                     let sheet = GuidanceRow::from_row(row)?;
 
-                    // Expiry: lexical ISO-8601 compare against the server clock.
-                    if sheet.expires.as_deref().is_some_and(|exp| exp < now.as_str()) {
+                    // Expiry: parse both `expires` and the server clock to Unix
+                    // seconds (accepting `unix:<secs>` and RFC3339) and compare
+                    // numerically. Skip only when both parse and the sheet's
+                    // expiry precedes `now`. Fail open: a missing or unparseable
+                    // `expires` (or an unparseable clock) never hides a sheet.
+                    if let Some(exp) = sheet.expires.as_deref()
+                        && let Some(exp_secs) = parse_to_unix_seconds(exp)
+                        && let Some(now_secs) = parse_to_unix_seconds(&now)
+                        && exp_secs < now_secs
+                    {
                         continue;
                     }
 
@@ -189,35 +196,59 @@ impl ServerState {
                     ));
                 };
 
+                let kind = filter.kind.as_deref();
+                let severity = filter.severity.as_deref();
+                let status = filter.status.as_deref();
+                let total: usize = conn.query_row(
+                    "SELECT COUNT(*) \
+                       FROM findings \
+                      WHERE entity_id = ?1 \
+                        AND (?2 IS NULL OR kind = ?2) \
+                        AND (?3 IS NULL OR severity = ?3) \
+                        AND (?4 IS NULL OR status = ?4)",
+                    rusqlite::params![entity.id, kind, severity, status],
+                    |row| {
+                        let count: i64 = row.get(0)?;
+                        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+                    },
+                )?;
                 let mut stmt = conn.prepare(
                     "SELECT id, tool, rule_id, kind, severity, status, message, \
                             related_entities, confidence, created_at \
-                       FROM findings WHERE entity_id = ?1 \
-                      ORDER BY created_at DESC, id LIMIT ?2",
+                       FROM findings \
+                      WHERE entity_id = ?1 \
+                        AND (?2 IS NULL OR kind = ?2) \
+                        AND (?3 IS NULL OR severity = ?3) \
+                        AND (?4 IS NULL OR status = ?4) \
+                      ORDER BY created_at DESC, id \
+                      LIMIT ?5 OFFSET ?6",
                 )?;
-                let cap = i64::try_from(FINDINGS_SCAN_CAP).unwrap_or(i64::MAX);
-                let mut rows = stmt.query(rusqlite::params![entity.id, cap])?;
-                let mut all: Vec<FindingRow> = Vec::new();
-                let mut scan_truncated = false;
+                let limit = i64::try_from(page.limit).unwrap_or(i64::MAX);
+                let offset = i64::try_from(page.offset).unwrap_or(i64::MAX);
+                let mut rows = stmt.query(rusqlite::params![
+                    entity.id, kind, severity, status, limit, offset
+                ])?;
+                let mut page_rows: Vec<FindingRow> = Vec::new();
                 while let Some(row) = rows.next()? {
-                    if all.len() >= FINDINGS_SCAN_CAP {
-                        scan_truncated = true;
-                        break;
-                    }
-                    all.push(FindingRow::from_row(row)?);
+                    page_rows.push(FindingRow::from_row(row)?);
                 }
-                let filtered: Vec<FindingRow> =
-                    all.into_iter().filter(|f| filter.matches(f)).collect();
 
-                let (slice, meta) = paginate(&filtered, page);
-                let findings: Vec<Value> = slice.iter().map(FindingRow::to_json).collect();
+                let returned = page_rows.len();
+                let findings: Vec<Value> = page_rows.iter().map(FindingRow::to_json).collect();
+                let meta = json!({
+                    "total": total,
+                    "offset": page.offset,
+                    "limit": page.limit,
+                    "returned": returned,
+                    "truncated": page.offset.saturating_add(returned) < total,
+                });
 
                 Ok(success_envelope(json!({
                     "entity": entity_json(conn, &entity),
                     "findings": findings,
                     "filter": filter.to_json(),
                     "page": meta,
-                    "scan_truncated": scan_truncated,
+                    "scan_truncated": false,
                 })))
             })
             .await;
@@ -277,49 +308,6 @@ impl ServerState {
             })
             .await;
         Ok(flatten_storage_envelope_result(result))
-    }
-}
-
-/// Entity facts a guidance `match_rules` evaluation needs.
-struct EntityFacts {
-    kind: String,
-    rel_path: Option<String>,
-    tags: HashSet<String>,
-    subsystem_id: Option<String>,
-    entity_id: String,
-}
-
-impl EntityFacts {
-    fn load(
-        conn: &rusqlite::Connection,
-        entity: &clarion_storage::EntityRow,
-        project_root: &std::path::Path,
-    ) -> clarion_storage::Result<Self> {
-        let rel_path = entity.source_file_path.as_ref().map(|path| {
-            std::path::Path::new(path)
-                .strip_prefix(project_root)
-                .ok()
-                .and_then(|rel| rel.to_str())
-                .unwrap_or(path)
-                .to_owned()
-        });
-
-        let mut tags = HashSet::new();
-        let mut stmt = conn.prepare("SELECT tag FROM entity_tags WHERE entity_id = ?1")?;
-        let mut rows = stmt.query(rusqlite::params![entity.id])?;
-        while let Some(row) = rows.next()? {
-            tags.insert(row.get::<_, String>(0)?);
-        }
-
-        let subsystem_id = subsystem_of_entity(conn, &entity.id)?.map(|found| found.subsystem_id);
-
-        Ok(Self {
-            kind: entity.kind.clone(),
-            rel_path,
-            tags,
-            subsystem_id,
-            entity_id: entity.id.clone(),
-        })
     }
 }
 
@@ -400,53 +388,6 @@ impl ComposedSheet {
     }
 }
 
-/// The verdict of evaluating one guidance match-rule against an entity.
-enum RuleVerdict {
-    Matched(&'static str),
-    NoMatch,
-    /// The rule cannot be evaluated at this surface (e.g. `wardline_group`,
-    /// which would require parsing the opaque Wardline blob).
-    Unevaluable,
-}
-
-fn rule_match(rule: &Value, facts: &EntityFacts) -> RuleVerdict {
-    let Some(rule_type) = rule.get("type").and_then(Value::as_str) else {
-        return RuleVerdict::NoMatch;
-    };
-    match rule_type {
-        "path" => match (
-            rule.get("pattern").and_then(Value::as_str),
-            facts.rel_path.as_deref(),
-        ) {
-            (Some(pattern), Some(path)) if super::glob_match(pattern, path) => {
-                RuleVerdict::Matched("path")
-            }
-            _ => RuleVerdict::NoMatch,
-        },
-        "tag" => match rule.get("value").and_then(Value::as_str) {
-            Some(value) if facts.tags.contains(value) => RuleVerdict::Matched("tag"),
-            _ => RuleVerdict::NoMatch,
-        },
-        "kind" => match rule.get("value").and_then(Value::as_str) {
-            Some(value) if value == facts.kind => RuleVerdict::Matched("kind"),
-            _ => RuleVerdict::NoMatch,
-        },
-        "subsystem" => match (
-            rule.get("id").and_then(Value::as_str),
-            facts.subsystem_id.as_deref(),
-        ) {
-            (Some(id), Some(sub)) if id == sub => RuleVerdict::Matched("subsystem"),
-            _ => RuleVerdict::NoMatch,
-        },
-        "entity" => match rule.get("id").and_then(Value::as_str) {
-            Some(id) if id == facts.entity_id => RuleVerdict::Matched("entity"),
-            _ => RuleVerdict::NoMatch,
-        },
-        "wardline_group" => RuleVerdict::Unevaluable,
-        _ => RuleVerdict::NoMatch,
-    }
-}
-
 /// Optional `findings_for` filter (`kind` / `severity` / `status`).
 struct FindingFilter {
     kind: Option<String>,
@@ -478,15 +419,6 @@ impl FindingFilter {
             severity: field("severity")?,
             status: field("status")?,
         })
-    }
-
-    fn matches(&self, finding: &FindingRow) -> bool {
-        self.kind.as_ref().is_none_or(|k| *k == finding.kind)
-            && self
-                .severity
-                .as_ref()
-                .is_none_or(|s| *s == finding.severity)
-            && self.status.as_ref().is_none_or(|s| *s == finding.status)
     }
 
     fn to_json(&self) -> Value {

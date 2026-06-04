@@ -17,13 +17,15 @@
 //! 3. **Jail check** (ADR-021 §2a): `entity.source.file_path` must canonicalise
 //!    inside `project_root`. Escape → drop + finding; tick [`PathEscapeBreaker`].
 //!    Breaker tripped → kill plugin, return [`HostError::PathEscapeBreakerTripped`].
-//! 4. **Entity cap check** (ADR-021 §2c): run-cumulative count must stay ≤ 500k.
+//! 4. **Item cap check** (ADR-021 §2c): run-cumulative accepted entities,
+//!    accepted edges, and plugin-output-derived findings must stay ≤ 500k.
 //!    Exceeded → kill plugin, return [`HostError::EntityCapExceeded`].
 //!
 //! # Memory limit
 //!
-//! On Linux, [`PluginHost::spawn`] calls [`apply_prlimit_as`] inside
-//! `CommandExt::pre_exec` to set `RLIMIT_AS` before `exec()`. The closure body
+//! On Linux/macOS, [`PluginHost::spawn`] calls [`apply_prlimit_as`] inside
+//! `CommandExt::pre_exec` to set `RLIMIT_AS` before `exec()`. On Linux the same
+//! closure also applies `RLIMIT_NOFILE` and `RLIMIT_NPROC`. The closure body
 //! only calls `setrlimit(2)`, which is async-signal-safe per POSIX.1-2017
 //! §2.4.3. The `unsafe` block is the minimum required by the `pre_exec` API.
 
@@ -45,16 +47,15 @@ use crate::plugin::jail::{JailError, jail_to_string};
 use crate::plugin::limits::{
     BreakerState, CapExceeded, ContentLengthCeiling, EntityCountCap, PathEscapeBreaker,
 };
-// The prlimit application path is Linux-only (see the `#[cfg(target_os =
-// "linux")]` pre_exec block in `spawn`); these symbols are unused on other
-// targets and would trip `-D warnings`. Gate the imports to match their usage.
+// The prlimit application path is Linux/macOS-only (see the matching
+// `pre_exec` block in `spawn`); these symbols are unused on other targets and
+// would trip `-D warnings`. Gate the imports to match their usage.
 #[cfg(target_os = "linux")]
-use crate::plugin::limits::{
-    DEFAULT_MAX_NOFILE, DEFAULT_MAX_RSS_MIB, apply_prlimit_as, apply_prlimit_nofile_nproc,
-    effective_rss_mib,
-};
-// `DEFAULT_MAX_NPROC` is also reached from the unit tests below, so it needs
-// the `test` arm in addition to Linux.
+use crate::plugin::limits::{DEFAULT_MAX_NOFILE, apply_prlimit_nofile_nproc};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::plugin::limits::{DEFAULT_MAX_RSS_MIB, apply_prlimit_as, effective_rss_mib};
+// `DEFAULT_MAX_NPROC` is also reached from the unit tests below, so it needs the
+// `test` arm in addition to Linux.
 #[cfg(any(target_os = "linux", test))]
 use crate::plugin::limits::DEFAULT_MAX_NPROC;
 use crate::plugin::manifest::{Manifest, ManifestError};
@@ -96,8 +97,8 @@ pub const MAX_ENTITY_EXTRA_BYTES: usize = 64 * 1024;
 /// against all processes/threads for the user, not just descendants of the
 /// plugin, so the Sprint-1 single-plugin ceiling is too low for B.4* call
 /// resolution on ordinary developer workstations.
-// Used only from the Linux pre_exec limit path and from unit tests; gate to
-// match so non-Linux release builds don't see it as dead code under
+// Used only from the Linux pre_exec limit path and from unit tests; gate
+// to match so other release builds don't see it as dead code under
 // `-D warnings`.
 #[cfg(any(target_os = "linux", test))]
 const PYRIGHT_MAX_NPROC: u64 = 4096;
@@ -143,6 +144,11 @@ pub struct RawEntity {
     /// load-bearing identity input a string-key typo must not silently drop.
     #[serde(default)]
     pub signature: Option<serde_json::Value>,
+    /// Plugin-emitted categorisation tags for catalogue shortcuts and `WS5b`
+    /// reachability roots. Typed top-level because the core denormalises these
+    /// into `entity_tags`; default empty keeps the wire addition non-breaking.
+    #[serde(default)]
+    pub tags: Vec<String>,
     /// Extra fields — accepted without interpretation.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -258,6 +264,12 @@ fn oversize_field(raw: &RawEntity) -> Option<(&'static str, usize)> {
             return Some((name, len));
         }
     }
+    if !raw.tags.is_empty() {
+        let len = serde_json::to_vec(&raw.tags).map_or(0, |b| b.len());
+        if len > MAX_ENTITY_EXTRA_BYTES {
+            return Some(("tags", len));
+        }
+    }
 
     None
 }
@@ -329,9 +341,9 @@ pub struct AcceptedEdge {
     pub from_id: String,
     /// `to_id` as received; FK-checked at storage time.
     pub to_id: String,
-    /// Module entity id for the file this `analyze_file` call processed, if
-    /// the plugin emitted a module entity. Derived host-side (ADR-022
-    /// boundary: plugin does not encode the file entity id formula).
+    /// Core file entity id for the file this `analyze_file` call processed,
+    /// when the caller has attached one. The plugin never encodes the file
+    /// entity id formula (ADR-022 boundary).
     pub source_file_id: Option<String>,
     /// Confidence tier from the plugin wire.
     pub confidence: EdgeConfidence,
@@ -438,6 +450,8 @@ where
     /// discarded on overflow so the plugin cannot back-pressure the host
     /// via stderr writes.
     stderr_tail: Option<Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>>,
+    /// Background thread draining stderr from the plugin subprocess.
+    stderr_thread: Option<std::thread::JoinHandle<()>>,
     /// Canonical source paths whose entities must not be sent for LLM briefing.
     briefing_blocks: Arc<BTreeMap<PathBuf, BriefingBlockReason>>,
     /// Canonical source paths that were covered by the core pre-ingest scanner.
@@ -583,25 +597,30 @@ impl
             // cannot spoof host output.
             .stderr(std::process::Stdio::piped());
 
-        // SAFETY: Each `setrlimit` call inside the closure is listed as
-        // async-signal-safe in POSIX.1-2017 §2.4.3. The `pre_exec` closure
-        // runs in the forked child after `fork()` but before `exec()`, so
-        // only the child's limits are affected. No Rust allocation, no Drop
-        // and no non-async-signal-safe call occurs inside the closure;
-        // `u64` captures are trivially Copy.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             use std::os::unix::process::CommandExt;
             let rss_mib = effective_rss_mib(
                 manifest.capabilities.runtime.expected_max_rss_mb,
                 DEFAULT_MAX_RSS_MIB,
             );
+
+            #[cfg(target_os = "linux")]
             let max_nofile = DEFAULT_MAX_NOFILE;
+            #[cfg(target_os = "linux")]
             let max_nproc = effective_max_nproc(&manifest);
+
+            // SAFETY: Each `setrlimit` call inside the closure is listed as
+            // async-signal-safe in POSIX.1-2017 §2.4.3. The `pre_exec` closure
+            // runs in the forked child after `fork()` but before `exec()`, so
+            // only the child's limits are affected. No Rust allocation, no Drop
+            // and no non-async-signal-safe call occurs inside the closure;
+            // `u64` captures are trivially Copy.
             #[allow(unsafe_code)]
             unsafe {
                 command.pre_exec(move || {
                     apply_prlimit_as(rss_mib)?;
+                    #[cfg(target_os = "linux")]
                     apply_prlimit_nofile_nproc(max_nofile, max_nproc)?;
                     Ok(())
                 });
@@ -634,7 +653,7 @@ impl
                 std::collections::VecDeque::with_capacity(STDERR_TAIL_BYTES),
             ));
         let stderr_tail_for_thread = std::sync::Arc::clone(&stderr_tail);
-        std::thread::Builder::new()
+        let stderr_thread = std::thread::Builder::new()
             .name(format!(
                 "clarion-plugin-stderr-drain:{}",
                 manifest.plugin.plugin_id
@@ -649,6 +668,7 @@ impl
             std::io::BufWriter::new(stdin),
         );
         host.stderr_tail = Some(stderr_tail);
+        host.stderr_thread = Some(stderr_thread);
 
         // Reap on handshake failure. `std::process::Child::Drop` does NOT
         // waitpid on Unix, so returning Err while `child` goes out of scope
@@ -706,6 +726,7 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
             terminated: false,
             ontology_version: None,
             stderr_tail: None,
+            stderr_thread: None,
             briefing_blocks: Arc::new(BTreeMap::new()),
             scanned_source_files: Arc::new(BTreeSet::new()),
         }
@@ -893,8 +914,9 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
                     // Drop the entity, but record the serde error so operators
                     // can distinguish "plugin returned nothing" from "plugin
                     // returned garbage that failed to parse."
-                    self.findings
-                        .push(HostFinding::malformed_entity(&e.to_string()));
+                    self.record_plugin_output_finding(HostFinding::malformed_entity(
+                        &e.to_string(),
+                    ))?;
                     continue;
                 }
             };
@@ -910,14 +932,16 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
             if let Some((field, len)) = oversize_field(&raw) {
                 let finding =
                     HostFinding::entity_field_oversize(field, len, MAX_ENTITY_FIELD_BYTES);
-                self.findings.push(finding);
+                self.record_plugin_output_finding(finding)?;
                 continue;
             }
 
             // 1. Ontology check (ADR-022).
             if !declared_kinds.contains(&raw.kind) {
-                self.findings
-                    .push(HostFinding::undeclared_kind(&raw.kind, &raw.qualified_name));
+                self.record_plugin_output_finding(HostFinding::undeclared_kind(
+                    &raw.kind,
+                    &raw.qualified_name,
+                ))?;
                 continue;
             }
 
@@ -925,18 +949,18 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
             let expected_id = match entity_id(&plugin_id, &raw.kind, &raw.qualified_name) {
                 Ok(eid) => eid,
                 Err(e) => {
-                    self.findings.push(HostFinding::entity_id_mismatch(
+                    self.record_plugin_output_finding(HostFinding::entity_id_mismatch(
                         &raw.id,
                         &format!("<invalid: {e}>"),
-                    ));
+                    ))?;
                     continue;
                 }
             };
             if raw.id != expected_id.as_str() {
-                self.findings.push(HostFinding::entity_id_mismatch(
+                self.record_plugin_output_finding(HostFinding::entity_id_mismatch(
                     &raw.id,
                     expected_id.as_str(),
-                ));
+                ))?;
                 continue;
             }
 
@@ -955,10 +979,10 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
                         }
                         JailError::Io(_) => raw.source.file_path.clone(),
                     };
-                    self.findings.push(HostFinding::path_escape(&offender));
+                    self.record_plugin_output_finding(HostFinding::path_escape(&offender))?;
                     let state = self.path_breaker.record_escape();
                     if state == BreakerState::Tripped {
-                        self.findings.push(HostFinding::disabled_path_escape());
+                        self.record_plugin_output_finding(HostFinding::disabled_path_escape())?;
                         if let Err(e) = self.do_shutdown() {
                             tracing::warn!(
                                 error = %e,
@@ -971,20 +995,8 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
                 }
             };
 
-            // 4. Entity cap check (ADR-021 §2c).
-            if let Err(e) = self.entity_cap.try_admit(1) {
-                self.findings.push(HostFinding::entity_cap_exceeded_finding(
-                    e.cap,
-                    e.would_reach,
-                ));
-                if let Err(se) = self.do_shutdown() {
-                    tracing::warn!(
-                        error = %se,
-                        "best-effort shutdown after entity-cap exceeded hit an error",
-                    );
-                }
-                return Err(HostError::EntityCapExceeded(e));
-            }
+            // 4. Combined item cap check (ADR-021 §2c).
+            self.admit_plugin_output_items(1)?;
 
             self.apply_briefing_block(&mut raw, &jailed);
 
@@ -997,8 +1009,8 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
             });
         }
 
-        let accepted_edges = self.process_edges(afr.edges, &accepted);
-        let stats = self.process_stats(afr.stats, &accepted, path);
+        let accepted_edges = self.process_edges(afr.edges, &accepted)?;
+        let stats = self.process_stats(afr.stats, &accepted, path)?;
 
         Ok(AnalyzeFileOutcome {
             entities: accepted,
@@ -1027,59 +1039,53 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
     }
 
     /// B.3: per-edge validation pipeline. Mirrors the entity loop's
-    /// drop-on-violation/emit-finding posture but without the kill paths —
-    /// edges do not participate in the path-escape breaker or entity cap
-    /// (those are entity-only). Returns the accepted edges; findings flow
-    /// through `self.findings`.
+    /// drop-on-violation/emit-finding posture. Accepted edges and findings
+    /// emitted for invalid plugin output both count toward ADR-021's combined
+    /// entity + edge + finding cap.
     ///
-    /// `source_file_id` is derived from the single `module`-kind accepted
-    /// entity for this file (the host, not the plugin, owns the file-id
-    /// formula per ADR-022). If the plugin's ontology has no module kind
-    /// (fixture plugin, etc.), `source_file_id` stays `None` and the writer
-    /// persists `NULL`.
+    /// `source_file_id` is intentionally left unset here. The CLI mints the
+    /// `core:file:*` entity for the analyzed path and attaches that id when it
+    /// maps the accepted edge to storage, preserving the ADR-022 boundary that
+    /// plugins do not encode core file identity.
     fn process_edges(
         &mut self,
         raw_edges: Vec<serde_json::Value>,
-        accepted_entities: &[AcceptedEntity],
-    ) -> Vec<AcceptedEdge> {
-        let module_entity_id = accepted_entities
-            .iter()
-            .find(|e| e.kind == "module")
-            .map(|e| e.id.as_str().to_owned());
+        _accepted_entities: &[AcceptedEntity],
+    ) -> Result<Vec<AcceptedEdge>, HostError> {
         let declared_edge_kinds = self.manifest.ontology.edge_kinds.clone();
         let mut accepted_edges = Vec::with_capacity(raw_edges.len());
         for raw_val in raw_edges {
             let raw: RawEdge = match serde_json::from_value(raw_val) {
                 Ok(e) => e,
                 Err(e) => {
-                    self.findings
-                        .push(HostFinding::malformed_edge(&e.to_string()));
+                    self.record_plugin_output_finding(HostFinding::malformed_edge(&e.to_string()))?;
                     continue;
                 }
             };
             if let Some((field, len)) = oversize_edge_field(&raw) {
                 let finding = HostFinding::edge_field_oversize(field, len, MAX_ENTITY_FIELD_BYTES);
-                self.findings.push(finding);
+                self.record_plugin_output_finding(finding)?;
                 continue;
             }
             if !declared_edge_kinds.contains(&raw.kind) {
-                self.findings.push(HostFinding::undeclared_edge_kind(
+                self.record_plugin_output_finding(HostFinding::undeclared_edge_kind(
                     &raw.kind,
                     &raw.from_id,
                     &raw.to_id,
-                ));
+                ))?;
                 continue;
             }
+            self.admit_plugin_output_items(1)?;
             accepted_edges.push(AcceptedEdge {
                 kind: raw.kind.clone(),
                 from_id: raw.from_id.clone(),
                 to_id: raw.to_id.clone(),
-                source_file_id: module_entity_id.clone(),
+                source_file_id: None,
                 confidence: raw.confidence,
                 raw,
             });
         }
-        accepted_edges
+        Ok(accepted_edges)
     }
 
     fn process_stats(
@@ -1087,7 +1093,7 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
         mut stats: AnalyzeFileStats,
         accepted_entities: &[AcceptedEntity],
         analyzed_path: &Path,
-    ) -> AnalyzeFileStats {
+    ) -> Result<AnalyzeFileStats, HostError> {
         let accepted_ids: BTreeSet<String> = accepted_entities
             .iter()
             .map(|entity| entity.id.as_str().to_owned())
@@ -1101,14 +1107,15 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
             if let Some(reason) =
                 invalid_unresolved_call_site_reason(&site, &accepted_ids, file_len)
             {
-                self.findings
-                    .push(HostFinding::malformed_unresolved_call_site(&site, &reason));
+                self.record_plugin_output_finding(HostFinding::malformed_unresolved_call_site(
+                    &site, &reason,
+                ))?;
                 continue;
             }
             retained.push(site);
         }
         stats.unresolved_call_sites = retained;
-        stats
+        Ok(stats)
     }
 
     /// Send `shutdown` request followed by the `exit` notification.
@@ -1176,6 +1183,32 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
         let id = self.next_request_id;
         self.next_request_id += 1;
         id
+    }
+
+    fn admit_plugin_output_items(&mut self, delta: usize) -> Result<(), HostError> {
+        self.entity_cap
+            .try_admit(delta)
+            .map_err(|e| self.entity_cap_exceeded(e))
+    }
+
+    fn record_plugin_output_finding(&mut self, finding: HostFinding) -> Result<(), HostError> {
+        self.admit_plugin_output_items(1)?;
+        self.findings.push(finding);
+        Ok(())
+    }
+
+    fn entity_cap_exceeded(&mut self, e: CapExceeded) -> HostError {
+        self.findings.push(HostFinding::entity_cap_exceeded_finding(
+            e.cap,
+            e.would_reach,
+        ));
+        if let Err(se) = self.do_shutdown() {
+            tracing::warn!(
+                error = %se,
+                "best-effort shutdown after entity-cap exceeded hit an error",
+            );
+        }
+        HostError::EntityCapExceeded(e)
     }
 
     fn do_shutdown(&mut self) -> Result<(), HostError> {
@@ -2415,6 +2448,174 @@ ontology_version = "0.1.0"
             cap_finding.metadata.get("would_reach").map(String::as_str),
             Some("3"),
             "would_reach metadata must be 3; got {:?}",
+            cap_finding.metadata
+        );
+    }
+
+    #[test]
+    fn t9b_edge_admission_counts_toward_combined_item_cap() {
+        let manifest = calls_manifest();
+        let mut mock = MockPlugin::new_compliant();
+        let (mut host, project_dir) = connect_and_handshake(manifest, &mut mock);
+
+        // Three entities are admitted exactly at the cap; the following valid
+        // edge is the fourth plugin output item and must trip ADR-021's combined
+        // entity + edge + finding cap.
+        host.set_entity_cap_test(EntityCountCap::new(3));
+
+        let sample = project_dir.path().join("demo.mock");
+        std::fs::write(&sample, b"").unwrap();
+        let sample_path = sample.to_string_lossy().into_owned();
+        let response_id = host.next_request_id_test();
+        let response_json = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": response_id,
+            "result": {
+                "entities": [
+                    {
+                        "id": "mock:module:demo",
+                        "kind": "module",
+                        "qualified_name": "demo",
+                        "source": { "file_path": sample_path }
+                    },
+                    {
+                        "id": "mock:function:demo.caller",
+                        "kind": "function",
+                        "qualified_name": "demo.caller",
+                        "source": { "file_path": sample_path },
+                        "parent_id": "mock:module:demo"
+                    },
+                    {
+                        "id": "mock:function:demo.callee",
+                        "kind": "function",
+                        "qualified_name": "demo.callee",
+                        "source": { "file_path": sample_path },
+                        "parent_id": "mock:module:demo"
+                    }
+                ],
+                "edges": [{
+                    "kind": "calls",
+                    "from_id": "mock:function:demo.caller",
+                    "to_id": "mock:function:demo.callee",
+                    "source_byte_start": 0,
+                    "source_byte_end": 6,
+                    "confidence": "resolved"
+                }]
+            }
+        });
+        let body = serde_json::to_vec(&response_json).unwrap();
+        {
+            let reader = host.reader_mut_test();
+            let pos_before = reader.position();
+            let old_end = reader.get_ref().len() as u64;
+            let mut framed: Vec<u8> = Vec::new();
+            write_frame(&mut framed, &Frame { body }).unwrap();
+            reader.get_mut().extend_from_slice(&framed);
+            if pos_before == old_end {
+                reader.set_position(old_end);
+            }
+        }
+
+        let err = host
+            .analyze_file(&sample)
+            .expect_err("valid edge must trip combined item cap after three entities");
+        assert!(
+            matches!(err, HostError::EntityCapExceeded(_)),
+            "expected EntityCapExceeded; got {err:?}"
+        );
+        let findings = host.take_findings();
+        let cap_finding = findings
+            .iter()
+            .find(|f| f.subcode == FINDING_ENTITY_CAP)
+            .unwrap_or_else(|| panic!("expected FINDING_ENTITY_CAP finding; got {findings:?}"));
+        assert_eq!(
+            cap_finding.metadata.get("would_reach").map(String::as_str),
+            Some("4"),
+            "would_reach metadata must count the edge; got {:?}",
+            cap_finding.metadata
+        );
+    }
+
+    #[test]
+    fn t9c_plugin_output_findings_count_toward_combined_item_cap() {
+        let manifest = calls_manifest();
+        let mut mock = MockPlugin::new_compliant();
+        let (mut host, project_dir) = connect_and_handshake(manifest, &mut mock);
+
+        // Three valid entities fill the cap. The undeclared edge is dropped, but
+        // the host finding emitted for that plugin output is still an output item
+        // under ADR-021's combined entity + edge + finding cap.
+        host.set_entity_cap_test(EntityCountCap::new(3));
+
+        let sample = project_dir.path().join("demo.mock");
+        std::fs::write(&sample, b"").unwrap();
+        let sample_path = sample.to_string_lossy().into_owned();
+        let response_id = host.next_request_id_test();
+        let response_json = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": response_id,
+            "result": {
+                "entities": [
+                    {
+                        "id": "mock:module:demo",
+                        "kind": "module",
+                        "qualified_name": "demo",
+                        "source": { "file_path": sample_path }
+                    },
+                    {
+                        "id": "mock:function:demo.caller",
+                        "kind": "function",
+                        "qualified_name": "demo.caller",
+                        "source": { "file_path": sample_path },
+                        "parent_id": "mock:module:demo"
+                    },
+                    {
+                        "id": "mock:function:demo.callee",
+                        "kind": "function",
+                        "qualified_name": "demo.callee",
+                        "source": { "file_path": sample_path },
+                        "parent_id": "mock:module:demo"
+                    }
+                ],
+                "edges": [{
+                    "kind": "references",
+                    "from_id": "mock:function:demo.caller",
+                    "to_id": "mock:function:demo.callee",
+                    "source_byte_start": 0,
+                    "source_byte_end": 6,
+                    "confidence": "resolved"
+                }]
+            }
+        });
+        let body = serde_json::to_vec(&response_json).unwrap();
+        {
+            let reader = host.reader_mut_test();
+            let pos_before = reader.position();
+            let old_end = reader.get_ref().len() as u64;
+            let mut framed: Vec<u8> = Vec::new();
+            write_frame(&mut framed, &Frame { body }).unwrap();
+            reader.get_mut().extend_from_slice(&framed);
+            if pos_before == old_end {
+                reader.set_position(old_end);
+            }
+        }
+
+        let err = host
+            .analyze_file(&sample)
+            .expect_err("undeclared-edge finding must trip combined item cap");
+        assert!(
+            matches!(err, HostError::EntityCapExceeded(_)),
+            "expected EntityCapExceeded; got {err:?}"
+        );
+        let findings = host.take_findings();
+        let cap_finding = findings
+            .iter()
+            .find(|f| f.subcode == FINDING_ENTITY_CAP)
+            .unwrap_or_else(|| panic!("expected FINDING_ENTITY_CAP finding; got {findings:?}"));
+        assert_eq!(
+            cap_finding.metadata.get("would_reach").map(String::as_str),
+            Some("4"),
+            "would_reach metadata must count the plugin-output finding; got {:?}",
             cap_finding.metadata
         );
     }

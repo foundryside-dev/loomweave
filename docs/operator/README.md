@@ -13,7 +13,10 @@ Practical notes for configuring and running Clarion.
   `clarion analyze` concurrency against one `.clarion/clarion.db`.
 - [Secret scanning](./secret-scanning.md) — pre-ingest scanner behavior,
   baseline false-positive workflow, override confirmation, and audit queries.
-- [v1.0 release governance](./v1.0-release-governance.md) — maintainer steps
+- [Guidance](./guidance.md) — authoring guidance sheets with the `clarion
+  guidance` CLI, `--match`/`--scope-level`/`--expires` semantics, staleness
+  findings, and the export/import team-sharing workflow.
+- [Release governance](./v1.0-release-governance.md) — maintainer steps
   for GitHub branch/ruleset enforcement, Actions policy, release dry run, and
   final tag gating.
 - [Federation contracts](../federation/contracts.md) — read-side HTTP

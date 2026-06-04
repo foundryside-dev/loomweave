@@ -86,18 +86,11 @@ def test_initialize_roundtrip() -> None:
         assert response["id"] == 1
         result = response["result"]
         assert result["name"] == "clarion-plugin-python"
-        assert result["version"] == "1.1.0"
+        assert result["version"] == "1.2.0"
         assert result["ontology_version"] == "0.6.0"
-        # Capabilities carry the L8 Wardline probe result. We don't pin a
-        # specific status here because the probe's output depends on whether
-        # wardline is installed in the test environment — all three legal
-        # states (`absent`, `enabled`, `version_out_of_range`) pass.
-        assert "wardline" in result["capabilities"]
-        assert result["capabilities"]["wardline"]["status"] in {
-            "absent",
-            "enabled",
-            "version_out_of_range",
-        }
+        # Wardline is not advertised until the plugin emits real Wardline
+        # semantic signals, not just package/version probe metadata.
+        assert result["capabilities"] == {}
 
         # Graceful shutdown: shutdown → ack `{}`, then exit notification.
         proc.stdin.write(
@@ -155,6 +148,22 @@ def test_analyze_file_before_initialized_returns_error() -> None:
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=2)
+
+
+def test_malformed_non_ascii_header_uses_protocol_error_exit_path() -> None:
+    """Malformed header bytes exit cleanly without emitting framed stdout."""
+    proc = subprocess.Popen(  # noqa: S603
+        _SERVER_CMD,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    stdout, stderr = proc.communicate(b"Content-L\xe9ngth: 0\r\n\r\n", timeout=5)
+
+    assert proc.returncode == 1
+    assert stdout == b""
+    assert b"Traceback" not in stderr
 
 
 def test_analyze_file_returns_extracted_entities(tmp_path: Path) -> None:

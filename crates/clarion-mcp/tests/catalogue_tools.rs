@@ -132,7 +132,11 @@ async fn call_tool(state: &ServerState, name: &str, arguments: Value) -> Value {
 #[test]
 fn tools_list_includes_ws5_inspection_tools() {
     let names: Vec<&str> = list_tools().iter().map(|t| t.name).collect();
-    for expected in ["guidance_for", "findings_for", "wardline_for"] {
+    for expected in [
+        "entity_guidance_list",
+        "entity_finding_list",
+        "entity_wardline_get",
+    ] {
         assert!(names.contains(&expected), "missing tool {expected}");
     }
 }
@@ -308,6 +312,50 @@ async fn findings_for_paginates_with_total_and_truncated() {
 }
 
 #[tokio::test]
+async fn findings_for_applies_filter_before_large_result_cap() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
+    for i in 0..5000 {
+        insert_finding(
+            &conn,
+            &format!("f-{i:04}"),
+            "python:function:m.f",
+            "defect",
+            "WARN",
+            "open",
+        );
+    }
+    insert_finding(
+        &conn,
+        "z-critical",
+        "python:function:m.f",
+        "defect",
+        "CRITICAL",
+        "open",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "findings_for",
+        json!({"id": "python:function:m.f", "filter": {"severity": "CRITICAL"}}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 1, "{env}");
+    assert_eq!(env["result"]["findings"][0]["id"], "z-critical");
+    assert_eq!(env["result"]["scan_truncated"], false, "{env}");
+}
+
+#[tokio::test]
 async fn findings_for_empty_entity_is_not_an_error() {
     let (project, db, conn) = open_project();
     insert_entity(
@@ -400,6 +448,55 @@ async fn guidance_for_excludes_expired_sheets() {
         env["result"]["guidance"].as_array().unwrap().len(),
         0,
         "{env}"
+    );
+}
+
+#[tokio::test]
+async fn guidance_for_honors_unix_clock_for_expiry() {
+    // Regression for clarion-3153e74f0b: production `serve` uses the default
+    // `unix:<seconds>` clock (never `.with_clock(...)`). A raw lexical compare
+    // against an ISO `expires` (which starts with '2' < 'u') wrongly classified
+    // EVERY sheet with any `expires` as expired. This exercises the production
+    // clock path: a far-future sheet must survive; a far-past one must be dropped.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
+    insert_guidance(
+        &conn,
+        "core:guidance:future",
+        r#"{"scope_level":"project","scope_rank":1,"content":"F","authored_at":"2026-01-01",
+            "expires":"2999-12-31T00:00:00.000Z","match_rules":[{"type":"kind","value":"function"}]}"#,
+    );
+    insert_guidance(
+        &conn,
+        "core:guidance:past",
+        r#"{"scope_level":"project","scope_rank":1,"content":"P","authored_at":"2026-01-01",
+            "expires":"2000-01-01T00:00:00.000Z","match_rules":[{"type":"kind","value":"function"}]}"#,
+    );
+    drop(conn);
+    // Production-style clock: `unix:<seconds>` (here a fixed mid-2025 instant),
+    // matching `default_now_string`'s form — between the past (2000) and
+    // future (2999) expiries.
+    let pool = ReaderPool::open(&db, 2).expect("reader pool");
+    let state = ServerState::new(project.path().to_path_buf(), pool)
+        .with_clock(|| "unix:1748822400".to_owned());
+
+    let env = call_tool(&state, "guidance_for", json!({"id": "python:function:m.f"})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let sheets = env["result"]["guidance"].as_array().unwrap();
+    let ids: Vec<&str> = sheets.iter().map(|s| s["id"].as_str().unwrap()).collect();
+    assert!(
+        ids.contains(&"core:guidance:future"),
+        "far-future sheet must survive under the unix: clock, got {ids:?} in {env}"
+    );
+    assert!(
+        !ids.contains(&"core:guidance:past"),
+        "far-past sheet must be excluded, got {ids:?} in {env}"
     );
 }
 
@@ -645,6 +742,22 @@ fn insert_edge(conn: &Connection, kind: &str, from: &str, to: &str, confidence: 
     .expect("insert edge");
 }
 
+fn insert_edge_with_properties(
+    conn: &Connection,
+    kind: &str,
+    from: &str,
+    to: &str,
+    confidence: &str,
+    properties: &Value,
+) {
+    conn.execute(
+        "INSERT INTO edges (kind, from_id, to_id, confidence, properties) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![kind, from, to, confidence, properties.to_string()],
+    )
+    .expect("insert edge with properties");
+}
+
 #[tokio::test]
 async fn find_circular_imports_detects_a_cycle() {
     let (project, db, conn) = open_project();
@@ -741,6 +854,51 @@ async fn find_circular_imports_default_confidence_excludes_inferred() {
     .await;
     assert_eq!(env["result"]["page"]["total"], 1, "{env}");
     assert_eq!(env["result"]["confidence"], "inferred");
+}
+
+#[tokio::test]
+async fn find_circular_imports_ignores_type_only_and_function_local_imports() {
+    let (project, db, conn) = open_project();
+    for id in ["python:module:a", "python:module:b", "python:module:c"] {
+        insert_entity(&conn, id, "module", "a.py", Some((1, 5)));
+    }
+    insert_edge(
+        &conn,
+        "imports",
+        "python:module:a",
+        "python:module:b",
+        "resolved",
+    );
+    insert_edge_with_properties(
+        &conn,
+        "imports",
+        "python:module:b",
+        "python:module:a",
+        "resolved",
+        &json!({"type_only": true}),
+    );
+    insert_edge(
+        &conn,
+        "imports",
+        "python:module:b",
+        "python:module:c",
+        "resolved",
+    );
+    insert_edge_with_properties(
+        &conn,
+        "imports",
+        "python:module:c",
+        "python:module:b",
+        "resolved",
+        &json!({"scope": "function"}),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_circular_imports", json!({})).await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 0, "{env}");
 }
 
 #[tokio::test]
@@ -1044,10 +1202,23 @@ fn insert_calls_edge(conn: &Connection, from: &str, to: &str, confidence: &str) 
     .expect("insert calls edge");
 }
 
+fn insert_ambiguous_calls_edge(conn: &Connection, from: &str, to: &str, candidates: &[&str]) {
+    let properties = json!({ "candidates": candidates }).to_string();
+    conn.execute(
+        "INSERT INTO edges (kind, from_id, to_id, confidence, properties) \
+         VALUES ('calls', ?1, ?2, 'ambiguous', ?3)",
+        params![from, to, properties],
+    )
+    .expect("insert ambiguous calls edge");
+}
+
 #[test]
 fn tools_list_includes_find_dead_code() {
     let names: Vec<&str> = list_tools().iter().map(|t| t.name).collect();
-    assert!(names.contains(&"find_dead_code"), "missing find_dead_code");
+    assert!(
+        names.contains(&"entity_dead_list"),
+        "missing entity_dead_list"
+    );
 }
 
 // Safety case (and the catastrophe guard): with no reachability roots emitted,
@@ -1113,11 +1284,18 @@ async fn find_dead_code_flags_unreachable_and_spares_live() {
         "app.py",
         Some((11, 15)),
     );
-    insert_calls_edge(
+    insert_entity(
+        &conn,
+        "python:function:maybe_other",
+        "function",
+        "app.py",
+        Some((16, 17)),
+    );
+    insert_ambiguous_calls_edge(
         &conn,
         "python:function:helper",
         "python:function:maybe",
-        "ambiguous",
+        &["python:function:maybe", "python:function:maybe_other"],
     );
     // Reflectively reached: no static edge, but barrier-tagged → live.
     insert_entity(
@@ -1125,7 +1303,7 @@ async fn find_dead_code_flags_unreachable_and_spares_live() {
         "python:function:reflected",
         "function",
         "app.py",
-        Some((16, 20)),
+        Some((18, 20)),
     );
     insert_tag(&conn, "python:function:reflected", "dynamic-dispatch");
     // Genuinely dead leaf.
@@ -1203,8 +1381,8 @@ async fn find_dead_code_excludes_framework_magic() {
 fn tools_list_includes_search_semantic() {
     let names: Vec<&str> = list_tools().iter().map(|t| t.name).collect();
     assert!(
-        names.contains(&"search_semantic"),
-        "missing search_semantic"
+        names.contains(&"entity_semantic_search_list"),
+        "missing entity_semantic_search_list"
     );
 }
 

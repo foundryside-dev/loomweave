@@ -6,11 +6,11 @@
 //!   and `find_coupling_hotspots`. No analyze-time precompute (ADR-030): each is a
 //!   cheap read over `edges`. Edge-derived, so results declare a confidence tier
 //!   (ADR-028), default `>= resolved`.
-//! - **Honest-empty categorisation/churn shortcuts** (Task 4) — added alongside,
-//!   each reading an existing signal (categorisation tag / git churn) and returning
-//!   an honest empty result with a missing-signal note where the signal is absent.
+//! - **Categorisation/churn shortcuts** (Task 4) — added alongside, each reading
+//!   an existing signal (categorisation tag / git churn) and returning an honest
+//!   empty result with a missing-signal note where the signal is absent.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde_json::{Value, json};
 
@@ -29,11 +29,13 @@ use crate::{
 const EDGE_SCAN_CAP: usize = 500_000;
 /// Scan bound on entities materialised for the dead-code candidate set.
 const ENTITY_SCAN_CAP: usize = 500_000;
+const EDGE_SCAN_ORDER_BY: &str = "ORDER BY kind, from_id, to_id, confidence, \
+     COALESCE(source_byte_start, -1), COALESCE(source_byte_end, -1)";
 
 /// Categorisation tags whose union is the reachability root set for
-/// `find_dead_code` — entities "called from outside" the codebase. None are
-/// emitted by the active plugins today (the tag-emission pipeline is tracked
-/// follow-up work), so the empty-root guard fires in practice.
+/// `find_dead_code` — entities "called from outside" the codebase. Tag-emitting
+/// plugins populate these; the empty-root guard protects indexes with no root
+/// tags from a flood of false positives.
 const DEAD_CODE_ROOT_TAGS: &[&str] = &[
     "entry-point",
     "http-route",
@@ -53,6 +55,15 @@ const DEAD_CODE_BARRIER_TAGS: &[&str] = &["dynamic-dispatch", "reflection"];
 /// framework-magic entry kinds (decorated handlers, plugin hooks) whose callers
 /// are invisible to static analysis.
 const DEAD_CODE_EXCLUDED_TAGS: &[&str] = &["framework-handler", "plugin-hook"];
+
+/// Runtime import predicate used by graph shortcuts. Missing or malformed
+/// properties fail toward inclusion; explicit `type_only=true` or
+/// `scope="function"` marks an import as non-module-runtime evidence.
+const RUNTIME_IMPORT_EDGE_SQL: &str = "\
+    (properties IS NULL \
+     OR json_valid(properties) = 0 \
+     OR (COALESCE(json_extract(properties, '$.type_only'), 0) != 1 \
+         AND COALESCE(json_extract(properties, '$.scope'), 'module') = 'module'))";
 
 /// Rule id for an emitted dead-code candidate (ADR-017 `CLA-FACT-*` namespace).
 const DEAD_CODE_RULE_ID: &str = "CLA-FACT-DEAD-CODE-CANDIDATE";
@@ -102,31 +113,20 @@ impl ServerState {
                 let (in_scope, scope_truncated) = filter.in_scope_ids(conn, &project_root)?;
 
                 // Build the import adjacency, restricted to in-scope endpoints.
-                let in_clause = confidence_in_clause(confidence);
-                let sql = format!(
-                    "SELECT from_id, to_id FROM edges \
-                     WHERE kind = 'imports' AND confidence IN ({in_clause}) LIMIT ?1"
-                );
-                let cap = i64::try_from(EDGE_SCAN_CAP.saturating_add(1)).unwrap_or(i64::MAX);
-                let mut stmt = conn.prepare(&sql)?;
-                let mut rows = stmt.query(rusqlite::params![cap])?;
-                let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
-                let mut edge_count = 0usize;
-                let mut scan_truncated = false;
-                while let Some(row) = rows.next()? {
-                    if edge_count >= EDGE_SCAN_CAP {
-                        scan_truncated = true;
-                        break;
-                    }
-                    edge_count += 1;
-                    let from: String = row.get(0)?;
-                    let to: String = row.get(1)?;
-                    let keep = in_scope
-                        .as_ref()
-                        .is_none_or(|ids| ids.contains(&from) && ids.contains(&to));
-                    if keep {
-                        adjacency.entry(from).or_default().push(to);
-                    }
+                let (mut adjacency, scan_truncated) =
+                    import_adjacency_for_cycles(conn, confidence, EDGE_SCAN_CAP)?;
+                if let Some(in_scope) = &in_scope {
+                    adjacency = adjacency
+                        .into_iter()
+                        .filter_map(|(from, tos)| {
+                            if !in_scope.contains(&from) {
+                                return None;
+                            }
+                            let tos: Vec<String> =
+                                tos.into_iter().filter(|to| in_scope.contains(to)).collect();
+                            (!tos.is_empty()).then_some((from, tos))
+                        })
+                        .collect();
                 }
 
                 let cycles = strongly_connected_cycles(&adjacency);
@@ -196,7 +196,8 @@ impl ServerState {
                 // emits_finding) all carry confidence='resolved', so including
                 // them would make the ranking dominated by containment /
                 // membership fan-out, not actionable coupling.
-                let kinds = "kind IN ('calls', 'imports')";
+                let kinds =
+                    format!("(kind = 'calls' OR (kind = 'imports' AND {RUNTIME_IMPORT_EDGE_SQL}))");
                 // out-degree (distinct callees / targets)
                 let out_sql = format!(
                     "SELECT from_id, COUNT(DISTINCT to_id) FROM edges \
@@ -300,7 +301,7 @@ impl ServerState {
                 let filter = scope.resolve(conn)?;
                 let (in_scope, scope_truncated) = filter.in_scope_ids(conn, &project_root)?;
 
-                // Roots = "called from outside" categorisations. Absent today.
+                // Roots = "called from outside" categorisations.
                 let roots = ids_with_any_tag(conn, DEAD_CODE_ROOT_TAGS)?;
                 if roots.is_empty() {
                     return Ok(success_envelope(json!({
@@ -313,10 +314,9 @@ impl ServerState {
                         "scan_truncated": false,
                         "signal": missing_signal(
                             "entity_tags",
-                            "reachability roots are not emitted by the active plugins \
-                             (entry-point / http-route / test / data-model / cli-command / \
-                             exported-api categorisation tags are absent), so dead code cannot be \
-                             determined — this is NOT a guarantee there is no dead code",
+                            "this index has no reachability root tags (entry-point / http-route / \
+                             test / data-model / cli-command / exported-api), so dead code cannot \
+                             be determined — this is NOT a guarantee there is no dead code",
                         ),
                     })));
                 }
@@ -402,8 +402,8 @@ impl ServerState {
         self.categorisation_shortcut(
             arguments,
             "entry-point",
-            "no entity is tagged as an entry point; entry-point categorisation is not emitted by \
-             the active plugins (honest-empty, not a guaranteed absence of entry points)",
+            "no entity is tagged as an entry point in this index (honest-empty, not a guaranteed \
+             absence of entry points)",
         )
         .await
     }
@@ -417,8 +417,7 @@ impl ServerState {
         self.categorisation_shortcut(
             arguments,
             "http-route",
-            "no entity is tagged as an HTTP route; route categorisation is not emitted by the \
-             active plugins",
+            "no entity is tagged as an HTTP route in this index",
         )
         .await
     }
@@ -432,8 +431,7 @@ impl ServerState {
         self.categorisation_shortcut(
             arguments,
             "data-model",
-            "no entity is tagged as a data model; data-model categorisation is not emitted by the \
-             active plugins",
+            "no entity is tagged as a data model in this index",
         )
         .await
     }
@@ -447,8 +445,7 @@ impl ServerState {
         self.categorisation_shortcut(
             arguments,
             "test",
-            "no entity is tagged as a test; test categorisation is not emitted by the active \
-             plugins",
+            "no entity is tagged as a test in this index",
         )
         .await
     }
@@ -462,8 +459,7 @@ impl ServerState {
         self.categorisation_shortcut(
             arguments,
             "deprecated",
-            "no entity is tagged as deprecated; deprecation categorisation is not emitted by the \
-             active plugins",
+            "no entity is tagged as deprecated in this index",
         )
         .await
     }
@@ -477,8 +473,7 @@ impl ServerState {
         self.categorisation_shortcut(
             arguments,
             "todo",
-            "no entity is tagged with a TODO/FIXME marker; TODO extraction is not emitted by the \
-             active plugins",
+            "no entity is tagged with a TODO/FIXME marker in this index",
         )
         .await
     }
@@ -562,8 +557,8 @@ impl ServerState {
                         "signal".to_owned(),
                         missing_signal(
                             "entity_tags",
-                            "no test-tagged caller found; test categorisation is not emitted by \
-                             the active plugins, so this is not a guarantee the entity is untested",
+                            "no test-tagged caller found in this index, so this is not a guarantee \
+                             the entity is untested",
                         ),
                     );
                 }
@@ -738,15 +733,31 @@ fn all_entity_ids(conn: &rusqlite::Connection) -> clarion_storage::Result<(Vec<S
 fn call_import_adjacency(
     conn: &rusqlite::Connection,
 ) -> clarion_storage::Result<(HashMap<String, Vec<String>>, bool)> {
-    let cap = i64::try_from(EDGE_SCAN_CAP.saturating_add(1)).unwrap_or(i64::MAX);
-    let mut stmt = conn
-        .prepare("SELECT from_id, to_id FROM edges WHERE kind IN ('calls', 'imports') LIMIT ?1")?;
+    call_import_adjacency_with_cap(conn, EDGE_SCAN_CAP)
+}
+
+fn import_adjacency_for_cycles(
+    conn: &rusqlite::Connection,
+    confidence: EdgeConfidence,
+    scan_cap: usize,
+) -> clarion_storage::Result<(HashMap<String, Vec<String>>, bool)> {
+    let in_clause = confidence_in_clause(confidence);
+    let sql = format!(
+        "SELECT from_id, to_id FROM edges \
+         WHERE kind = 'imports' \
+           AND confidence IN ({in_clause}) \
+           AND {RUNTIME_IMPORT_EDGE_SQL} \
+         {EDGE_SCAN_ORDER_BY} \
+         LIMIT ?1"
+    );
+    let cap = i64::try_from(scan_cap.saturating_add(1)).unwrap_or(i64::MAX);
+    let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query(rusqlite::params![cap])?;
     let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
     let mut edge_count = 0usize;
     let mut truncated = false;
     while let Some(row) = rows.next()? {
-        if edge_count >= EDGE_SCAN_CAP {
+        if edge_count >= scan_cap {
             truncated = true;
             break;
         }
@@ -756,6 +767,67 @@ fn call_import_adjacency(
         adjacency.entry(from).or_default().push(to);
     }
     Ok((adjacency, truncated))
+}
+
+fn call_import_adjacency_with_cap(
+    conn: &rusqlite::Connection,
+    scan_cap: usize,
+) -> clarion_storage::Result<(HashMap<String, Vec<String>>, bool)> {
+    let cap = i64::try_from(scan_cap.saturating_add(1)).unwrap_or(i64::MAX);
+    let mut stmt = conn.prepare(
+        "SELECT kind, from_id, to_id, confidence, properties \
+         FROM edges \
+         WHERE (kind = 'calls' OR (kind = 'imports' AND \
+               (properties IS NULL \
+                OR json_valid(properties) = 0 \
+                OR (COALESCE(json_extract(properties, '$.type_only'), 0) != 1 \
+                    AND COALESCE(json_extract(properties, '$.scope'), 'module') = 'module')))) \
+         ORDER BY kind, from_id, to_id, confidence, \
+              COALESCE(source_byte_start, -1), COALESCE(source_byte_end, -1) \
+         LIMIT ?1",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![cap])?;
+    let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
+    let mut edge_count = 0usize;
+    let mut truncated = false;
+    while let Some(row) = rows.next()? {
+        if edge_count >= scan_cap {
+            truncated = true;
+            break;
+        }
+        edge_count += 1;
+        let kind: String = row.get(0)?;
+        let from: String = row.get(1)?;
+        let to: String = row.get(2)?;
+        let confidence: String = row.get(3)?;
+        let properties: Option<String> = row.get(4)?;
+        let targets = reachability_targets(&kind, &to, &confidence, properties.as_deref());
+        adjacency.entry(from).or_default().extend(targets);
+    }
+    Ok((adjacency, truncated))
+}
+
+fn reachability_targets(
+    kind: &str,
+    to_id: &str,
+    confidence: &str,
+    properties_json: Option<&str>,
+) -> Vec<String> {
+    let mut targets = BTreeSet::from([to_id.to_owned()]);
+    if kind == "calls" && confidence == "ambiguous" {
+        targets.extend(candidate_ids(properties_json));
+    }
+    targets.into_iter().collect()
+}
+
+fn candidate_ids(properties_json: Option<&str>) -> BTreeSet<String> {
+    properties_json
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| value.get("candidates").and_then(|c| c.as_array()).cloned())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+        .collect()
 }
 
 /// Forward-reachable closure of `seed` over `adjacency` (iterative BFS/DFS).
@@ -860,6 +932,48 @@ fn strongly_connected_cycles(adjacency: &HashMap<String, Vec<String>>) -> Vec<Ve
 mod tests {
     use super::*;
 
+    fn edge_scan_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE edges (
+                kind TEXT NOT NULL,
+                from_id TEXT NOT NULL,
+                to_id TEXT NOT NULL,
+                properties TEXT,
+                source_file_id TEXT,
+                source_byte_start INTEGER,
+                source_byte_end INTEGER,
+                confidence TEXT NOT NULL DEFAULT 'resolved'
+            );",
+        )
+        .expect("create edges table");
+        conn
+    }
+
+    fn insert_edge(
+        conn: &rusqlite::Connection,
+        kind: &str,
+        from_id: &str,
+        to_id: &str,
+        properties: Option<&str>,
+        source_byte_start: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO edges (
+                kind, from_id, to_id, confidence, properties, source_byte_start, source_byte_end
+            ) VALUES (?1, ?2, ?3, 'resolved', ?4, ?5, ?6)",
+            rusqlite::params![
+                kind,
+                from_id,
+                to_id,
+                properties,
+                source_byte_start,
+                source_byte_start + 1
+            ],
+        )
+        .expect("insert edge");
+    }
+
     fn graph(edges: &[(&str, &str)]) -> HashMap<String, Vec<String>> {
         let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
         for (from, to) in edges {
@@ -869,6 +983,86 @@ mod tests {
                 .push((*to).to_owned());
         }
         adjacency
+    }
+
+    #[test]
+    fn import_cycle_scan_truncates_in_deterministic_order() {
+        let conn = edge_scan_conn();
+        insert_edge(
+            &conn,
+            "imports",
+            "python:module:z",
+            "python:module:a",
+            None,
+            30,
+        );
+        insert_edge(
+            &conn,
+            "imports",
+            "python:module:a",
+            "python:module:c",
+            None,
+            20,
+        );
+        insert_edge(
+            &conn,
+            "imports",
+            "python:module:a",
+            "python:module:b",
+            None,
+            10,
+        );
+
+        let (adjacency, truncated) =
+            import_adjacency_for_cycles(&conn, EdgeConfidence::Resolved, 2).unwrap();
+
+        assert!(truncated);
+        assert_eq!(
+            adjacency.get("python:module:a").unwrap(),
+            &vec!["python:module:b".to_owned(), "python:module:c".to_owned()]
+        );
+        assert!(!adjacency.contains_key("python:module:z"));
+    }
+
+    #[test]
+    fn dead_code_edge_scan_truncates_in_deterministic_order() {
+        let conn = edge_scan_conn();
+        insert_edge(
+            &conn,
+            "calls",
+            "python:function:z",
+            "python:function:a",
+            None,
+            30,
+        );
+        insert_edge(
+            &conn,
+            "calls",
+            "python:function:a",
+            "python:function:c",
+            None,
+            20,
+        );
+        insert_edge(
+            &conn,
+            "calls",
+            "python:function:a",
+            "python:function:b",
+            None,
+            10,
+        );
+
+        let (adjacency, truncated) = call_import_adjacency_with_cap(&conn, 2).unwrap();
+
+        assert!(truncated);
+        assert_eq!(
+            adjacency.get("python:function:a").unwrap(),
+            &vec![
+                "python:function:b".to_owned(),
+                "python:function:c".to_owned()
+            ]
+        );
+        assert!(!adjacency.contains_key("python:function:z"));
     }
 
     #[test]

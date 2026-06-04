@@ -88,7 +88,7 @@ in its owning WP doc.
 
 | # | Lock-in | Owning WP | Canonical section | `↗` cross-product touch |
 |---|---|---|---|---|
-| L1 | SQLite schema shape per [detailed-design §3](../../clarion/v0.1/detailed-design.md#3-storage-implementation) — tables `entities`, `entity_tags`, `edges`, `findings`, `summary_cache`, `runs`, `schema_migrations`; `entity_fts` FTS5 virtual table + triggers; generated columns + indexes; `guidance_sheets` view _(locked on 2026-04-18)_ | WP1 | [`wp1-scaffold.md#l1--sqlite-schema-shape`](./wp1-scaffold.md#l1--sqlite-schema-shape) | `↗` Filigree `registry_backend: clarion` (WP10) reads via entity-ID columns |
+| L1 | SQLite schema shape per [detailed-design §3](../../clarion/1.0/detailed-design.md#3-storage-implementation) — tables `entities`, `entity_tags`, `edges`, `findings`, `summary_cache`, `runs`, `schema_migrations`; `entity_fts` FTS5 virtual table + triggers; generated columns + indexes; `guidance_sheets` view _(locked on 2026-04-18)_ | WP1 | [`wp1-scaffold.md#l1--sqlite-schema-shape`](./wp1-scaffold.md#l1--sqlite-schema-shape) | `↗` Filigree `registry_backend: clarion` (WP10) reads via entity-ID columns |
 | L2 | Entity-ID 3-segment format `{plugin_id}:{kind}:{canonical_qualified_name}` per ADR-003 + ADR-022 _(locked on 2026-04-18)_ | WP1 + WP3 | [`wp1-scaffold.md#l2--entity-id-canonical-name-format`](./wp1-scaffold.md#l2--entity-id-canonical-name-format) | `↗` Wardline qualname reconciliation (ADR-018) uses the third segment as its Clarion-side join key |
 | L3 | Writer-actor command protocol (`tokio::task` + bounded `mpsc` + per-N commit) per ADR-011 _(locked on 2026-04-18)_ | WP1 | [`wp1-scaffold.md#l3--writer-actor-command-protocol`](./wp1-scaffold.md#l3--writer-actor-command-protocol) | — |
 | L4 | JSON-RPC method set + Content-Length framing per ADR-002 _(locked on 2026-04-24)_ | WP2 | [`wp2-plugin-host.md#l4--json-rpc-method-set--content-length-framing`](./wp2-plugin-host.md#l4--json-rpc-method-set--content-length-framing) | — |
@@ -173,8 +173,8 @@ and pointed at [`signoffs.md`](./signoffs.md) Tier A.
 ## 9. References
 
 - [Clarion v0.1 high-level implementation plan](../v0.1-plan.md)
-- [Clarion v0.1 system design](../../clarion/v0.1/system-design.md) — §2 (core/plugin), §4 (storage)
-- [Clarion v0.1 detailed design](../../clarion/v0.1/detailed-design.md) — §1 (plugin transport), §3 (storage impl)
+- [Clarion system design](../../clarion/1.0/system-design.md) — §2 (core/plugin), §4 (storage)
+- [Clarion detailed design](../../clarion/1.0/detailed-design.md) — §1 (plugin transport), §3 (storage impl)
 - [ADR-001 Rust for core](../../clarion/adr/ADR-001-rust-for-core.md)
 - [ADR-002 Plugin transport JSON-RPC](../../clarion/adr/ADR-002-plugin-transport-json-rpc.md)
 - [ADR-003 Entity ID scheme](../../clarion/adr/ADR-003-entity-id-scheme.md)

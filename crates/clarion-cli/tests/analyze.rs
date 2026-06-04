@@ -522,6 +522,332 @@ analysis:
     )
 }
 
+#[cfg(unix)]
+const CATEGORISED_PLUGIN_SCRIPT: &str = r#"#!/usr/bin/python3
+import json
+import sys
+
+
+def read_frame():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if line in (b"", b"\r\n"):
+            break
+        name, value = line.decode("ascii").strip().split(":", 1)
+        headers[name.lower()] = value.strip()
+    length = int(headers["content-length"])
+    return json.loads(sys.stdin.buffer.read(length))
+
+
+def write_frame(message):
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n")
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+
+while True:
+    msg = read_frame()
+    method = msg.get("method")
+    if method == "initialized":
+        continue
+    if method == "exit":
+        raise SystemExit(0)
+    ident = msg["id"]
+    if method == "initialize":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "name": "clarion-plugin-categorised",
+                "version": "0.1.0",
+                "ontology_version": "0.1.0",
+                "capabilities": {},
+            },
+        })
+    elif method == "analyze_file":
+        path = msg["params"]["file_path"]
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "entities": [
+                    {
+                        "id": "catfixture:module:app",
+                        "kind": "module",
+                        "qualified_name": "app",
+                        "source": {
+                            "file_path": path,
+                            "source_range": {
+                                "start_line": 1,
+                                "start_col": 0,
+                                "end_line": 3,
+                                "end_col": 0
+                            },
+                        },
+                    },
+                    {
+                        "id": "catfixture:function:app.main",
+                        "kind": "function",
+                        "qualified_name": "app.main",
+                        "source": {
+                            "file_path": path,
+                            "source_range": {
+                                "start_line": 1,
+                                "start_col": 0,
+                                "end_line": 2,
+                                "end_col": 8
+                            },
+                        },
+                        "parent_id": "catfixture:module:app",
+                        "tags": ["entry-point"],
+                        "docstring": "Launches service",
+                    },
+                ],
+                "edges": [
+                    {
+                        "kind": "contains",
+                        "from_id": "catfixture:module:app",
+                        "to_id": "catfixture:function:app.main",
+                    }
+                ],
+                "stats": {},
+            },
+        })
+    elif method == "shutdown":
+        write_frame({"jsonrpc": "2.0", "id": ident, "result": {}})
+"#;
+
+#[cfg(unix)]
+const CATEGORISED_PLUGIN_MANIFEST: &str = r#"
+[plugin]
+name = "clarion-plugin-categorised"
+plugin_id = "catfixture"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "clarion-plugin-categorised"
+language = "catfixture"
+extensions = ["cat"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 128
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+entity_kinds = ["module", "function"]
+edge_kinds = ["contains"]
+rule_id_prefix = "CLA-CAT-"
+ontology_version = "0.1.0"
+"#;
+
+#[cfg(unix)]
+fn write_categorised_plugin(plugin_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let plugin_script = plugin_dir.join("clarion-plugin-categorised");
+    std::fs::write(&plugin_script, CATEGORISED_PLUGIN_SCRIPT)
+        .expect("write categorised plugin script");
+    let mut perms = std::fs::metadata(&plugin_script)
+        .expect("stat categorised plugin")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&plugin_script, perms).expect("chmod categorised plugin");
+
+    std::fs::write(plugin_dir.join("plugin.toml"), CATEGORISED_PLUGIN_MANIFEST)
+        .expect("write categorised plugin manifest");
+}
+
+#[cfg(unix)]
+fn spawn_embedding_mock() -> (String, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let mut header_end = None;
+        while header_end.is_none() {
+            let read = stream.read(&mut chunk).expect("read headers");
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            header_end = buffer
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|i| i + 4);
+        }
+        let Some(header_end) = header_end else {
+            return String::from_utf8_lossy(&buffer).into_owned();
+        };
+        let headers = String::from_utf8_lossy(&buffer[..header_end]).to_ascii_lowercase();
+        let content_length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while buffer.len().saturating_sub(header_end) < content_length {
+            let read = stream.read(&mut chunk).expect("read body");
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding mock");
+    let addr = listener.local_addr().expect("mock addr");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking embedding mock");
+    let handle = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut requests = Vec::new();
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let request = read_http_request(&mut stream);
+                    let body = request.split("\r\n\r\n").nth(1).unwrap_or("{}");
+                    let payload: serde_json::Value =
+                        serde_json::from_str(body).expect("embedding request json");
+                    let count = payload["input"].as_array().map_or(0, Vec::len);
+                    let data: Vec<serde_json::Value> = (0..count)
+                        .map(|index| {
+                            let first_dim =
+                                f64::from(u32::try_from(index + 1).expect("fixture index fits"));
+                            serde_json::json!({
+                                "object": "embedding",
+                                "index": index,
+                                "embedding": [first_dim, 1.0],
+                            })
+                        })
+                        .collect();
+                    let response = serde_json::json!({
+                        "object": "list",
+                        "data": data,
+                        "model": "test-embed",
+                    })
+                    .to_string();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        response.len(),
+                        response
+                    )
+                    .expect("write embedding response");
+                    requests.push(request);
+                    return requests;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(err) => panic!("embedding mock accept failed: {err}"),
+            }
+        }
+        requests
+    });
+    (format!("http://{addr}"), handle)
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_persists_plugin_tags_and_populates_embedding_sidecar() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_categorised_plugin(plugin_dir.path());
+    let (embedding_url, embedding_server) = spawn_embedding_mock();
+
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    std::fs::write(
+        project_dir.path().join("app.cat"),
+        "def main():\n    pass\n",
+    )
+    .expect("write categorised fixture source");
+    let config_path = project_dir.path().join("clarion.yaml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r"
+semantic_search:
+  enabled: true
+  allow_live_provider: true
+  endpoint_url: {embedding_url}
+  model_id: test-embed
+  dimensions: 2
+  api_key_env: TEST_EMBEDDING_KEY
+  timeout_seconds: 2
+  session_token_ceiling: 10000
+"
+        ),
+    )
+    .expect("write semantic search config");
+
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    clarion_bin()
+        .args(["analyze", "--config"])
+        .arg(&config_path)
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("TEST_EMBEDDING_KEY", "test-key")
+        .assert()
+        .success();
+
+    let requests = embedding_server.join().expect("embedding mock thread");
+    assert_eq!(
+        requests.len(),
+        1,
+        "analyze should call the embedding provider"
+    );
+    assert!(
+        requests[0].contains("Launches service"),
+        "embedding text should include plugin docstring; request was {}",
+        requests[0]
+    );
+
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    let tag_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entity_tags \
+             WHERE entity_id = 'catfixture:function:app.main' \
+               AND plugin_id = 'catfixture' \
+               AND tag = 'entry-point'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query persisted tags");
+    assert_eq!(tag_count, 1, "plugin-emitted tags must be persisted");
+
+    let sidecar = project_dir.path().join(".clarion/embeddings.db");
+    assert!(sidecar.exists(), "analyze should create embeddings sidecar");
+    let sidecar_conn = Connection::open(sidecar).unwrap();
+    let embedding_count: i64 = sidecar_conn
+        .query_row(
+            "SELECT COUNT(*) FROM entity_embeddings \
+             WHERE entity_id = 'catfixture:function:app.main' \
+               AND model_id = 'test-embed'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sidecar embeddings");
+    assert_eq!(
+        embedding_count, 1,
+        "function embedding should be present after analyze"
+    );
+}
+
 #[test]
 fn analyze_without_plugins_writes_skipped_run_row() {
     let dir = tempfile::tempdir().unwrap();
@@ -608,7 +934,11 @@ fn analyze_migrates_a_stale_db_instead_of_failing() {
     let uv: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(uv, 7, "analyze must apply the pending migration");
+    assert_eq!(
+        uv,
+        i64::from(clarion_storage::schema::CURRENT_SCHEMA_VERSION),
+        "analyze must apply all pending migrations"
+    );
     let has_column: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name = 'analyzed_at_commit'",
@@ -1224,6 +1554,702 @@ fn analyze_emits_guidance_orphan_and_invalidates_summary_cache_on_deletion() {
     assert_eq!(
         cached, 0,
         "deleted entity's summary cache must be invalidated"
+    );
+}
+
+/// T4a (WS6): a guidance sheet whose `match_rules` carries `{"type":"entity","id":X}`
+/// pointing at a deleted entity also produces `CLA-FACT-GUIDANCE-ORPHAN`. When the
+/// SAME deleted target is reachable via BOTH a `guides` edge and a `match_rule`, only
+/// one finding is emitted for that (sheet, target) pair (idempotent run-scoped id).
+#[cfg(unix)]
+#[test]
+fn analyze_emits_guidance_orphan_for_match_rule_entity_and_dedupes() {
+    let (project_dir, plugin_dir, config_path) =
+        phase3_project_for_rerun(&["auth_a", "auth_b", "billing_a", "billing_b"]);
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let db_path = project_dir.path().join(".clarion/clarion.db");
+    let target = "phase3fixture:module:billing_a";
+
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        // g_match: orphans `target` via a match_rule {type:entity, id:target} only.
+        let props = serde_json::json!({
+            "match_rules": [{ "type": "entity", "id": target }],
+            "authored_at": "2026-01-01T00:00:00.000Z",
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO entities \
+             (id, plugin_id, kind, name, short_name, properties, created_at, updated_at) \
+             VALUES ('core:guidance:g_match', 'core', 'guidance', 'g_match', 'g_match', ?1, \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [&props],
+        )
+        .unwrap();
+        // g_both: orphans `target` via a `guides` edge AND a match_rule → one finding.
+        conn.execute(
+            "INSERT INTO entities \
+             (id, plugin_id, kind, name, short_name, properties, created_at, updated_at) \
+             VALUES ('core:guidance:g_both', 'core', 'guidance', 'g_both', 'g_both', ?1, \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [&props],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edges (kind, from_id, to_id, confidence) \
+             VALUES ('guides', 'core:guidance:g_both', ?1, 'resolved')",
+            [target],
+        )
+        .unwrap();
+    }
+
+    std::fs::remove_file(project_dir.path().join("billing_a.p3")).expect("delete a source file");
+    run_phase3_analyze(
+        project_dir.path(),
+        std::path::Path::new(&config_path),
+        &plugin_path,
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    // g_match emits exactly one orphan finding for target.
+    let match_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM findings \
+             WHERE rule_id = 'CLA-FACT-GUIDANCE-ORPHAN' AND entity_id = 'core:guidance:g_match'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(match_count, 1, "match_rule entity orphan should emit");
+
+    // g_both: guides-edge + match_rule to the same target ⇒ exactly one finding.
+    let both_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM findings \
+             WHERE rule_id = 'CLA-FACT-GUIDANCE-ORPHAN' AND entity_id = 'core:guidance:g_both'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        both_count, 1,
+        "guides-edge + match_rule to same target must dedupe to one finding"
+    );
+}
+
+/// T4a (WS6): `CLA-FACT-GUIDANCE-EXPIRED` fires for a sheet whose `expires` is in
+/// the past, and does NOT fire for a future `expires` or a sheet with no `expires`.
+/// Runs on every analyze (independent of deletions), so this re-runs with no source
+/// change. Severity INFO, confidence 1.0.
+#[cfg(unix)]
+#[test]
+fn analyze_emits_guidance_expired_for_past_expiry_only() {
+    let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["auth_a", "auth_b"]);
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let db_path = project_dir.path().join(".clarion/clarion.db");
+
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        let insert = |conn: &Connection, slug: &str, expires: Option<&str>| {
+            let mut props = serde_json::json!({ "authored_at": "2026-01-01T00:00:00.000Z" });
+            if let Some(e) = expires {
+                props["expires"] = serde_json::Value::String(e.to_owned());
+            }
+            conn.execute(
+                "INSERT INTO entities \
+                 (id, plugin_id, kind, name, short_name, properties, created_at, updated_at) \
+                 VALUES (?1, 'core', 'guidance', ?2, ?2, ?3, \
+                         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                rusqlite::params![format!("core:guidance:{slug}"), slug, props.to_string()],
+            )
+            .unwrap();
+        };
+        insert(&conn, "g_past", Some("2020-01-01T00:00:00.000Z"));
+        insert(&conn, "g_future", Some("2999-01-01T00:00:00.000Z"));
+        insert(&conn, "g_none", None);
+    }
+
+    run_phase3_analyze(
+        project_dir.path(),
+        std::path::Path::new(&config_path),
+        &plugin_path,
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let anchors: Vec<String> = conn
+        .prepare("SELECT entity_id FROM findings WHERE rule_id = 'CLA-FACT-GUIDANCE-EXPIRED'")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(anchors, vec!["core:guidance:g_past".to_owned()]);
+
+    let (severity, confidence): (String, f64) = conn
+        .query_row(
+            "SELECT severity, confidence FROM findings \
+             WHERE rule_id = 'CLA-FACT-GUIDANCE-EXPIRED'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(severity, "INFO");
+    assert!((confidence - 1.0).abs() < f64::EPSILON);
+}
+
+/// T4a (WS6): EXPIRED fires even under `--no-sei` — the guidance-staleness pass is
+/// independent of the SEI mint pass (deletion detection is SEI-gated; staleness is
+/// not). Guards the load-bearing placement decision.
+#[cfg(unix)]
+#[test]
+fn analyze_emits_guidance_expired_under_no_sei() {
+    let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["auth_a", "auth_b"]);
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let db_path = project_dir.path().join(".clarion/clarion.db");
+
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO entities \
+             (id, plugin_id, kind, name, short_name, properties, created_at, updated_at) \
+             VALUES ('core:guidance:g_past', 'core', 'guidance', 'g_past', 'g_past', ?1, \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [&serde_json::json!({
+                "authored_at": "2026-01-01T00:00:00.000Z",
+                "expires": "2020-01-01T00:00:00.000Z",
+            })
+            .to_string()],
+        )
+        .unwrap();
+    }
+
+    clarion_bin()
+        .args(["analyze", "--config"])
+        .arg(std::path::Path::new(&config_path))
+        .arg("--no-sei")
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    let conn = Connection::open(&db_path).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'CLA-FACT-GUIDANCE-EXPIRED'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "EXPIRED must fire under --no-sei");
+}
+
+/// T4a (WS6): `CLA-FACT-GUIDANCE-CHURN-STALE` asymmetric threshold. A pinned sheet
+/// matching entities whose aggregate `git_churn_count` is in [20, 49] fires; an
+/// identical non-pinned sheet at the same churn does not. Below 20 neither fires;
+/// at/above 50 both fire. With churn unpopulated (production), nothing fires.
+#[cfg(unix)]
+#[test]
+fn analyze_emits_guidance_churn_stale_with_asymmetric_pinned_threshold() {
+    let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["auth_a", "auth_b"]);
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let db_path = project_dir.path().join(".clarion/clarion.db");
+
+    // Seed git_churn_count on the matched module via properties JSON (the analyze
+    // pipeline does not populate it). A `kind:module` match_rule selects both
+    // auth modules; we control the aggregate by choosing the per-module value.
+    let seed_run = |churn_each: i64, pinned: bool, slug: &str| {
+        let conn = Connection::open(&db_path).unwrap();
+        // Set churn on auth_a + auth_b (both kind=module) via properties merge.
+        for stem in ["auth_a", "auth_b"] {
+            conn.execute(
+                "UPDATE entities SET properties = json_set(properties, '$.git_churn_count', ?2) \
+                 WHERE id = ?1",
+                rusqlite::params![format!("phase3fixture:module:{stem}"), churn_each],
+            )
+            .unwrap();
+        }
+        let props = serde_json::json!({
+            "match_rules": [{ "type": "kind", "value": "module" }],
+            "authored_at": "2026-01-01T00:00:00.000Z",
+            "pinned": pinned,
+        })
+        .to_string();
+        conn.execute(
+            "INSERT OR REPLACE INTO entities \
+             (id, plugin_id, kind, name, short_name, properties, created_at, updated_at) \
+             VALUES (?1, 'core', 'guidance', ?2, ?2, ?3, \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            rusqlite::params![format!("core:guidance:{slug}"), slug, props],
+        )
+        .unwrap();
+        drop(conn);
+        run_phase3_analyze(
+            project_dir.path(),
+            std::path::Path::new(&config_path),
+            &plugin_path,
+        );
+        let conn = Connection::open(&db_path).unwrap();
+        let fired: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM findings \
+                 WHERE rule_id = 'CLA-FACT-GUIDANCE-CHURN-STALE' AND entity_id = ?1",
+                rusqlite::params![format!("core:guidance:{slug}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        fired > 0
+    };
+
+    // Aggregate 30 (15 each): pinned fires (>=20), non-pinned does not (<50).
+    assert!(seed_run(15, true, "g_pinned_30"), "pinned@30 should fire");
+    assert!(
+        !seed_run(15, false, "g_plain_30"),
+        "non-pinned@30 should NOT fire"
+    );
+    // Aggregate 10 (5 each): neither fires (<20).
+    assert!(
+        !seed_run(5, true, "g_pinned_10"),
+        "pinned@10 should NOT fire"
+    );
+    // Aggregate 60 (30 each): both fire (>=50).
+    assert!(seed_run(30, true, "g_pinned_60"), "pinned@60 should fire");
+    assert!(
+        seed_run(30, false, "g_plain_60"),
+        "non-pinned@60 should fire"
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let (severity, confidence): (String, f64) = conn
+        .query_row(
+            "SELECT severity, confidence FROM findings \
+             WHERE rule_id = 'CLA-FACT-GUIDANCE-CHURN-STALE' LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(severity, "WARN");
+    assert!((confidence - 0.7).abs() < 1e-9);
+}
+
+/// T4a (WS6): honest-empty churn. With `git_churn_count` unpopulated (the
+/// production reality — analyze never writes it), CHURN-STALE does not fire even
+/// for a sheet that matches many entities.
+#[cfg(unix)]
+#[test]
+fn analyze_guidance_churn_stale_is_honest_empty_without_churn() {
+    let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["auth_a", "auth_b"]);
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let db_path = project_dir.path().join(".clarion/clarion.db");
+
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        let props = serde_json::json!({
+            "match_rules": [{ "type": "kind", "value": "module" }],
+            "authored_at": "2026-01-01T00:00:00.000Z",
+            "pinned": true,
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO entities \
+             (id, plugin_id, kind, name, short_name, properties, created_at, updated_at) \
+             VALUES ('core:guidance:g_inert', 'core', 'guidance', 'g_inert', 'g_inert', ?1, \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [&props],
+        )
+        .unwrap();
+    }
+
+    run_phase3_analyze(
+        project_dir.path(),
+        std::path::Path::new(&config_path),
+        &plugin_path,
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'CLA-FACT-GUIDANCE-CHURN-STALE'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "no churn populated ⇒ CHURN-STALE inert");
+}
+
+#[cfg(unix)]
+fn write_wardline_manifest(project_root: &std::path::Path, tier_content: &str) {
+    std::fs::write(
+        project_root.join("wardline.yaml"),
+        format!(
+            r#"version: 1
+tiers:
+  integral:
+    paths:
+      - auth_a.p3
+    content: "{tier_content}"
+boundaries:
+  payment_api:
+    paths:
+      - billing_a.p3
+annotation_groups:
+  secrets:
+    paths:
+      - auth_b.p3
+"#
+        ),
+    )
+    .expect("write wardline.yaml");
+}
+
+#[cfg(unix)]
+fn write_real_wardline_output_fixture(project_root: &std::path::Path) {
+    std::fs::create_dir_all(project_root.join("src/payments"))
+        .expect("create Wardline overlay dir");
+    std::fs::write(
+        project_root.join("wardline.yaml"),
+        r#"tiers:
+  - id: AUDIT_TRAIL
+    tier: 1
+    description: "Fully audited code"
+  - id: EXTERNAL_RAW
+    tier: 4
+    description: "Unvetted external input"
+
+module_tiers:
+  - path: "src/core"
+    default_taint: "AUDIT_TRAIL"
+  - path: "src/integrations"
+    default_taint: "EXTERNAL_RAW"
+"#,
+    )
+    .expect("write real wardline.yaml");
+    std::fs::write(
+        project_root.join("wardline.fingerprint.json"),
+        r#"{
+  "python_version": "3.12",
+  "generated_at": "2026-03-01T00:00:00Z",
+  "coverage": {
+    "annotated": 2,
+    "total": 3,
+    "ratio": 0.66,
+    "tier1_annotated": 1,
+    "tier1_total": 1
+  },
+  "fingerprints": [
+    {
+      "qualified_name": "core.auth.validate_token",
+      "module": "core.auth",
+      "decorators": ["wardline.tier"],
+      "annotation_hash": "sha256:aaa111",
+      "tier_context": 1,
+      "artefact_class": "policy"
+    },
+    {
+      "qualified_name": "integrations.handler.process",
+      "module": "integrations.handler",
+      "decorators": ["wardline.tier", "wardline.external_boundary"],
+      "annotation_hash": "sha256:bbb222",
+      "tier_context": 4,
+      "boundary_transition": "shape_validation",
+      "artefact_class": "enforcement"
+    }
+  ]
+}
+"#,
+    )
+    .expect("write real wardline.fingerprint.json");
+    std::fs::write(
+        project_root.join("wardline.exceptions.json"),
+        r#"{
+  "exceptions": [
+    {
+      "id": "EXC-001",
+      "rule": "PY-WL-001",
+      "taint_state": "EXTERNAL_RAW",
+      "location": "src/integrations/handler.py::process",
+      "exceptionability": "STANDARD",
+      "severity_at_grant": "ERROR",
+      "rationale": "Legacy integration pending migration",
+      "reviewer": "j.smith",
+      "expires": "2027-12-01"
+    }
+  ]
+}
+"#,
+    )
+    .expect("write real wardline.exceptions.json");
+    std::fs::write(
+        project_root.join("src/payments/wardline.overlay.yaml"),
+        r#"overlay_for: "src/payments"
+
+boundaries:
+  - function: "process_payment"
+    transition: "construction"
+    from_tier: 1
+    to_tier: 3
+  - function: "validate_receipt"
+    transition: "shape_validation"
+    from_tier: 3
+    to_tier: 2
+"#,
+    )
+    .expect("write real wardline.overlay.yaml");
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_generates_pinned_wardline_derived_guidance() {
+    let (project_dir, plugin_dir, config_path) =
+        phase3_project_for_rerun(&["auth_a", "auth_b", "billing_a"]);
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let db_path = project_dir.path().join(".clarion/clarion.db");
+    write_wardline_manifest(project_dir.path(), "Keep integral code isolated.");
+
+    run_phase3_analyze(
+        project_dir.path(),
+        std::path::Path::new(&config_path),
+        &plugin_path,
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let rows: Vec<(String, serde_json::Value)> = conn
+        .prepare(
+            "SELECT id, properties FROM entities \
+             WHERE kind = 'guidance' AND id LIKE 'core:guidance:wardline-%' \
+             ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let raw: String = row.get(1)?;
+            Ok((id, serde_json::from_str(&raw).unwrap()))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let ids: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
+    assert_eq!(
+        ids,
+        vec![
+            "core:guidance:wardline-annotation-group-secrets".to_owned(),
+            "core:guidance:wardline-boundary-payment_api".to_owned(),
+            "core:guidance:wardline-tier-integral".to_owned(),
+        ]
+    );
+
+    let tier = rows
+        .iter()
+        .find(|(id, _)| id == "core:guidance:wardline-tier-integral")
+        .expect("tier guidance")
+        .1
+        .clone();
+    assert_eq!(tier["provenance"], "wardline_derived");
+    assert_eq!(tier["pinned"], true);
+    assert_eq!(tier["wardline_kind"], "tier");
+    assert_eq!(tier["wardline_key"], "integral");
+    assert_eq!(tier["content"], "Keep integral code isolated.");
+    assert!(
+        tier["wardline_manifest_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("blake3:")
+    );
+    assert_eq!(
+        tier["match_rules"][0],
+        serde_json::json!({"type":"path","pattern":"auth_a.p3"})
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_accepts_real_wardline_output_bundle() {
+    let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["seed"]);
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let db_path = project_dir.path().join(".clarion/clarion.db");
+    write_real_wardline_output_fixture(project_dir.path());
+
+    run_phase3_analyze(
+        project_dir.path(),
+        std::path::Path::new(&config_path),
+        &plugin_path,
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let rows: Vec<(String, serde_json::Value)> = conn
+        .prepare(
+            "SELECT id, properties FROM entities \
+             WHERE kind = 'guidance' AND id LIKE 'core:guidance:wardline-%' \
+             ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let raw: String = row.get(1)?;
+            Ok((id, serde_json::from_str(&raw).unwrap()))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let ids: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
+    assert!(ids.contains(&"core:guidance:wardline-tier-src-core-AUDIT_TRAIL".to_owned()));
+    assert!(ids.contains(&"core:guidance:wardline-tier-src-integrations-EXTERNAL_RAW".to_owned()));
+    assert!(
+        ids.contains(&"core:guidance:wardline-boundary-src-payments-process_payment".to_owned())
+    );
+    assert!(
+        ids.contains(&"core:guidance:wardline-boundary-src-payments-validate_receipt".to_owned())
+    );
+    assert!(ids.contains(&"core:guidance:wardline-annotation-group-wardline.tier".to_owned()));
+    assert!(ids.contains(
+        &"core:guidance:wardline-annotation-group-wardline.external_boundary".to_owned()
+    ));
+
+    let tier = rows
+        .iter()
+        .find(|(id, _)| id == "core:guidance:wardline-tier-src-core-AUDIT_TRAIL")
+        .expect("module-tier guidance")
+        .1
+        .clone();
+    assert_eq!(tier["provenance"], "wardline_derived");
+    assert_eq!(tier["pinned"], true);
+    assert_eq!(tier["wardline_kind"], "tier");
+    assert_eq!(tier["wardline_key"], "src/core-AUDIT_TRAIL");
+    assert_eq!(
+        tier["match_rules"][0],
+        serde_json::json!({"type":"path","pattern":"src/core/**"})
+    );
+    assert_eq!(tier["wardline_fingerprint_count"], 2);
+    assert_eq!(tier["wardline_exception_count"], 1);
+    assert!(
+        tier["wardline_fingerprint_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("blake3:")
+    );
+    assert!(
+        tier["wardline_exceptions_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("blake3:")
+    );
+
+    let boundary = rows
+        .iter()
+        .find(|(id, _)| id == "core:guidance:wardline-boundary-src-payments-process_payment")
+        .expect("overlay boundary guidance")
+        .1
+        .clone();
+    assert_eq!(boundary["scope_level"], "subsystem");
+    assert!(
+        boundary["content"]
+            .as_str()
+            .unwrap()
+            .contains("construction")
+    );
+    assert_eq!(
+        boundary["match_rules"][0],
+        serde_json::json!({"type":"path","pattern":"src/payments/**"})
+    );
+
+    let group = rows
+        .iter()
+        .find(|(id, _)| id == "core:guidance:wardline-annotation-group-wardline.tier")
+        .expect("fingerprint annotation-group guidance")
+        .1
+        .clone();
+    assert_eq!(group["scope_level"], "project");
+    assert_eq!(
+        group["match_rules"][0],
+        serde_json::json!({"type":"wardline_group","name":"wardline.tier"})
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_preserves_wardline_override_and_emits_guidance_stale() {
+    let (project_dir, plugin_dir, config_path) =
+        phase3_project_for_rerun(&["auth_a", "auth_b", "billing_a"]);
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let db_path = project_dir.path().join(".clarion/clarion.db");
+    write_wardline_manifest(project_dir.path(), "Initial Wardline guidance.");
+    run_phase3_analyze(
+        project_dir.path(),
+        std::path::Path::new(&config_path),
+        &plugin_path,
+    );
+
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT properties FROM entities WHERE id = 'core:guidance:wardline-tier-integral'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut props: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        props["content"] = serde_json::Value::String("Operator override text.".to_owned());
+        conn.execute(
+            "UPDATE entities SET properties = ?1 WHERE id = 'core:guidance:wardline-tier-integral'",
+            [props.to_string()],
+        )
+        .unwrap();
+    }
+
+    write_wardline_manifest(project_dir.path(), "Updated Wardline guidance.");
+    run_phase3_analyze(
+        project_dir.path(),
+        std::path::Path::new(&config_path),
+        &plugin_path,
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let raw: String = conn
+        .query_row(
+            "SELECT properties FROM entities WHERE id = 'core:guidance:wardline-tier-integral'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let props: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(props["content"], "Operator override text.");
+    assert_eq!(props["provenance"], "wardline_derived_overridden");
+
+    let (severity, confidence, evidence): (String, f64, String) = conn
+        .query_row(
+            "SELECT severity, confidence, evidence FROM findings \
+             WHERE rule_id = 'CLA-FACT-GUIDANCE-STALE' \
+               AND entity_id = 'core:guidance:wardline-tier-integral'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("guidance-stale finding");
+    assert_eq!(severity, "WARN");
+    assert!((confidence - 1.0).abs() < f64::EPSILON);
+    let evidence: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+    assert_eq!(
+        evidence["guidance_id"],
+        "core:guidance:wardline-tier-integral"
+    );
+    assert!(
+        evidence["stored_manifest_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("blake3:")
+    );
+    assert!(
+        evidence["current_manifest_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("blake3:")
     );
 }
 
@@ -2716,6 +3742,78 @@ fn phase3_env() -> (tempfile::TempDir, tempfile::TempDir, std::ffi::OsString) {
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
     (project_dir, plugin_dir, plugin_path)
+}
+
+#[cfg(unix)]
+fn run_git(project_root: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(args)
+        .status()
+        .expect("run git");
+    assert!(status.success(), "git {args:?} failed with {status}");
+}
+
+#[cfg(unix)]
+fn git_stdout(project_root: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(output.status.success(), "git {args:?} failed");
+    String::from_utf8(output.stdout)
+        .expect("git stdout is utf8")
+        .trim()
+        .to_owned()
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_stamps_entities_with_git_head_commit() {
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    let mut analyze_paths: Vec<std::path::PathBuf> = std::env::split_paths(&plugin_path).collect();
+    if let Some(system_path) = std::env::var_os("PATH") {
+        analyze_paths.extend(std::env::split_paths(&system_path));
+    }
+    let analyze_path = std::env::join_paths(analyze_paths).expect("join analyze PATH");
+    std::fs::write(project_dir.path().join("demo.p3"), b"module\n").expect("write fixture file");
+    run_git(project_dir.path(), &["init", "-q"]);
+    run_git(project_dir.path(), &["config", "user.email", "t@t"]);
+    run_git(project_dir.path(), &["config", "user.name", "t"]);
+    run_git(project_dir.path(), &["add", "demo.p3"]);
+    run_git(project_dir.path(), &["commit", "-qm", "initial"]);
+    let head = git_stdout(project_dir.path(), &["rev-parse", "HEAD"]);
+
+    clarion_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &analyze_path)
+        .assert()
+        .success();
+
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    for entity_id in ["core:file:demo.p3", "phase3fixture:module:demo"] {
+        let (first_seen, last_seen): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT first_seen_commit, last_seen_commit FROM entities WHERE id = ?1",
+                [entity_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or_else(|err| panic!("query provenance for {entity_id}: {err}"));
+        assert_eq!(
+            first_seen.as_deref(),
+            Some(head.as_str()),
+            "{entity_id} first_seen_commit"
+        );
+        assert_eq!(
+            last_seen.as_deref(),
+            Some(head.as_str()),
+            "{entity_id} last_seen_commit"
+        );
+    }
 }
 
 #[test]

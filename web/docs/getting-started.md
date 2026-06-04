@@ -10,14 +10,14 @@ Clarion is a single Rust binary; Python support ships as a separate language
 plugin. Pull both from the latest GitHub Release:
 
 ```bash
-TAG=v1.0.0
+TAG=v1.2.0
 curl -L -o clarion.tar.gz \
   "https://github.com/tachyon-beep/clarion/releases/download/${TAG}/clarion-x86_64-unknown-linux-gnu.tar.gz"
 tar xzf clarion.tar.gz
 install clarion-x86_64-unknown-linux-gnu/clarion ~/.local/bin/
 
 pipx install \
-  "https://github.com/tachyon-beep/clarion/releases/download/${TAG}/clarion-plugin-python-1.0.0.tar.gz"
+  "https://github.com/tachyon-beep/clarion/releases/download/${TAG}/clarion-plugin-python-1.2.0.tar.gz"
 ```
 
 Confirm the binary is on your `PATH`:

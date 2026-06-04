@@ -28,7 +28,7 @@ The 2026-05-22 architecture analysis (`docs/arch-analysis-2026-05-22-1924/04-fin
 
 ### The roundtable's diagnosis
 
-Five SME reports (`docs/arch-analysis-2026-05-22-1924/temp/answer-{solution-architect,systems-thinker,python-engineer,quality-engineer,security-engineer}.md`) converged on a single root cause. The systems thinker named it most directly:
+Five SME reports (archived under `docs/archive/working-notes/arch-analysis-2026-05-22-1924/answer-{solution-architect,systems-thinker,python-engineer,quality-engineer,security-engineer}.md`) converged on a single root cause. The systems thinker named it most directly:
 
 > "The five questions look like five concerns. They are one. Each is a missing-feedback-loop symptom: a place where operational reality has no path back to the artifact that would change behavior. They wear 'parameter' clothing (Level 12) but live at Level 6 (information flows) and Level 5 (rules)." — `answer-systems-thinker.md`
 
@@ -341,11 +341,11 @@ The four-axis declaration is the floor — additional discipline can be layered 
 
 ### SME roundtable (2026-05-23)
 
-- Solution architect: [`temp/answer-solution-architect.md`](../../arch-analysis-2026-05-22-1924/temp/answer-solution-architect.md) — WP6 home triangulation; the "ship 1.0 with limits hardcoded; land config surface in WP6 as one ADR-021-aligned change" frame; the per-file split-trigger table.
-- Systems thinker: [`temp/answer-systems-thinker.md`](../../arch-analysis-2026-05-22-1924/temp/answer-systems-thinker.md) — the level-5 (rules) leverage argument; the drift-to-low-performance archetype; the `analyze.rs:74` and `breaker.rs:7` smoking-gun tells (line numbers as recorded at analysis time; current `analyze.rs` `#[allow(clippy::too_many_lines)]` site has shifted to line 65 with two additional sites at 650 and 1190; the rule applies to all three).
-- Python engineer: [`temp/answer-python-engineer.md`](../../arch-analysis-2026-05-22-1924/temp/answer-python-engineer.md) — the wire-contract-pinned vs. operational-tunable Python constant classification; the `MAX_PYRIGHT_RESTARTS_PER_RUN` "per run" name vs. per-instance implementation interaction failure; the basis for the `Coupling` axis.
-- Quality engineer: [`temp/answer-quality-engineer.md`](../../arch-analysis-2026-05-22-1924/temp/answer-quality-engineer.md) — the per-constant test-coverage matrix; the `DEFAULT_MAX_RSS_MIB`/`DEFAULT_MAX_NOFILE`/`DEFAULT_MAX_NPROC` security-enforcement cluster as the highest-risk untested area.
-- Security engineer: [`temp/answer-security-engineer.md`](../../arch-analysis-2026-05-22-1924/temp/answer-security-engineer.md) — the STRIDE-D/STRIDE-E framing of recompile-to-tune as a security-posture stance; the `clarion-llm` extraction as STRIDE-T/STRIDE-I defense-in-depth; the security-uniformity argument for keeping some constants `Override = recompile`.
+- Solution architect: [`answer-solution-architect.md`](../../archive/working-notes/arch-analysis-2026-05-22-1924/answer-solution-architect.md) — WP6 home triangulation; the "ship 1.0 with limits hardcoded; land config surface in WP6 as one ADR-021-aligned change" frame; the per-file split-trigger table.
+- Systems thinker: [`answer-systems-thinker.md`](../../archive/working-notes/arch-analysis-2026-05-22-1924/answer-systems-thinker.md) — the level-5 (rules) leverage argument; the drift-to-low-performance archetype; the `analyze.rs:74` and `breaker.rs:7` smoking-gun tells (line numbers as recorded at analysis time; current `analyze.rs` `#[allow(clippy::too_many_lines)]` site has shifted to line 65 with two additional sites at 650 and 1190; the rule applies to all three).
+- Python engineer: [`answer-python-engineer.md`](../../archive/working-notes/arch-analysis-2026-05-22-1924/answer-python-engineer.md) — the wire-contract-pinned vs. operational-tunable Python constant classification; the `MAX_PYRIGHT_RESTARTS_PER_RUN` "per run" name vs. per-instance implementation interaction failure; the basis for the `Coupling` axis.
+- Quality engineer: [`answer-quality-engineer.md`](../../archive/working-notes/arch-analysis-2026-05-22-1924/answer-quality-engineer.md) — the per-constant test-coverage matrix; the `DEFAULT_MAX_RSS_MIB`/`DEFAULT_MAX_NOFILE`/`DEFAULT_MAX_NPROC` security-enforcement cluster as the highest-risk untested area.
+- Security engineer: [`answer-security-engineer.md`](../../archive/working-notes/arch-analysis-2026-05-22-1924/answer-security-engineer.md) — the STRIDE-D/STRIDE-E framing of recompile-to-tune as a security-posture stance; the `clarion-llm` extraction as STRIDE-T/STRIDE-I defense-in-depth; the security-uniformity argument for keeping some constants `Override = recompile`.
 
 ### Source-of-truth code locations
 

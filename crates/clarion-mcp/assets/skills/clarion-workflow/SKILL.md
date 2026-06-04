@@ -141,18 +141,28 @@ analyze-time precompute):
 
 `find_circular_imports` and `find_coupling_hotspots` are edge-derived, so they
 take a `confidence` tier (default `resolved`, a ceiling) and echo it. The
-categorisation shortcuts read plugin-emitted tags; the **Python plugin emits no
-categorisation tags today**, so `find_entry_points`/`find_http_routes`/
-`find_data_models`/`find_tests`/`find_deprecations`/`find_todos`/`what_tests_this`
-return honest-empty with a missing-signal note — an empty result means "the
-signal is absent", not "there is nothing here". Likewise `high_churn` and
+categorisation shortcuts read plugin-emitted tags. The Python plugin emits
+conservative tags for common conventions (`entry-point`, `http-route`, `test`,
+`data-model`, `cli-command`, `exported-api`), so root/tag shortcuts and
+`find_dead_code` light up on freshly analyzed Python projects where those
+signals are present. `find_deprecations` / `find_todos` still return
+honest-empty unless a plugin emits those tags. Likewise `high_churn` and
 `recently_changed` are honest-empty until churn/change signals are populated (use
 `index_diff` for repo-level freshness).
 
-> Not in this catalogue: `search_semantic` and `find_dead_code` (need embedding
-> / whole-graph-reachability infrastructure — a separate wave), guidance
-> *authoring* (`propose_guidance`/`promote_guidance` — `guidance_for` is read
-> only), and `emit_observation` (no observation-write transport ships yet).
+`search_semantic` is also in the catalogue. It is opt-in under
+`semantic_search:`; when enabled, `clarion analyze` populates the git-ignored
+`.clarion/embeddings.db` sidecar and the query path filters stale vectors by
+content hash.
+
+> Not in this catalogue: `emit_observation` as a general-purpose write surface.
+
+**Guidance authoring has an operator boundary.** Operators can manage sheets via
+`clarion guidance create/edit/show/list/delete/promote` (plus `export`/`import`
+for team sharing). Agents may call `propose_guidance` to create a Filigree
+observation, but that proposal is inert until an operator promotes it through
+`promote_guidance` or the CLI. Promoted sheets reach you through `guidance_for`
+and are composed into `summary` prompts with a real guidance fingerprint.
 
 ## Workflow: orient, then navigate
 

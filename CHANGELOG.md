@@ -12,8 +12,44 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+### Changed
+
+- Refreshed release-facing README/index documentation for the current 1.2.0
+  release line, including the 39-tool MCP surface, current install artifact
+  names, fixed ADR/docset links, current web/operator quick starts, and the full
+  end-to-end verification list.
+- Archived tracked architecture-analysis working notes out of live `temp/`
+  directories under `docs/archive/working-notes/`.
+
+## [1.2.0] — 2026-06-03
+
 ### Added
 
+- **Guidance maturity — WS6 (REQ-GUIDANCE-03/-05/-06; ADR-007, ADR-024).** The
+  guidance system moves from schema baseline to operator-usable.
+  - **`clarion guidance` CLI** — `create` / `edit` (`$EDITOR`) / `show` / `list`
+    / `delete` / `export` / `import`. Match-rule syntax (`path:` / `tag:` /
+    `kind:` / `subsystem:` / `entity:`), scope-levels (project→function), and
+    `--expires` normalisation to a full ISO-8601 instant. Sheets are written via a
+    new non-run-scoped `clarion-storage` guidance API, and the rule-matcher is
+    lifted into `clarion-storage` as the single source of truth shared by the CLI,
+    `analyze`, and the MCP read path.
+  - **Staleness findings (`analyze`).** `CLA-FACT-GUIDANCE-ORPHAN` (WARN) now also
+    fires for a `match_rules {entity:…}` rule pointing at a deleted entity (was
+    `guides`-edge only); new `CLA-FACT-GUIDANCE-EXPIRED` (INFO) and
+    `CLA-FACT-GUIDANCE-CHURN-STALE` (WARN, confidence 0.7 heuristic, asymmetric
+    threshold 50 / 20-pinned). Surfaced via `clarion guidance list --stale`
+    (review-cadence age) / `--expired`. CHURN-STALE is honest-empty until
+    `git_churn_count` population lands.
+  - **Team import/export.** `export --to <dir>` / `import <dir>` — deterministic
+    one-file-per-sheet sorted-key JSON, additive idempotent import, loud-fail on
+    malformed input.
+  - **Cache invalidation.** Authoring (create / edit / delete / import) eagerly
+    invalidates the summary cache of matched entities (ADR-007 churn-eager
+    invalidation).
+  - Deferred with tracking issues: the agent-mediated propose→promote lifecycle
+    (no observation-write transport), Wardline-derived generation, the in-browser
+    staleness-review UI, and guidance composition into summary generation.
 - **Git-rename provider seam now operative — WS9 / SEI §6 (REQ-C-05).** `analyze`
   drives the committed rename window so the `legis` `GitRenameSource` is actually
   consulted, closing the window gap previously surfaced in
@@ -106,6 +142,16 @@ only when an incompatible change is made to that surface. See
   - **No trust adjudication.** Clarion carries the trust vocabulary verbatim and
     adds no policy/attestation engine — Wardline analyses, `legis` governs,
     attestations key on Clarion's SEI.
+
+### Fixed
+
+- **`guidance_for` no longer drops expiry-bearing sheets in production.** The MCP
+  read path compared a sheet's ISO `expires` lexically against the server clock,
+  whose production default is a `unix:<seconds>` string — so every sheet carrying
+  any `expires` sorted as "expired" and was silently excluded from composition.
+  The comparison now parses both forms to seconds (fail-open on unparseable
+  input), guarded by a regression test that runs under the production clock
+  (clarion-3153e74f0b).
 
 ## [1.1.0] — 2026-05-31
 
@@ -420,7 +466,8 @@ normative.
 - Operator guides under [`docs/operator/`](docs/operator/) — getting-started,
   OpenRouter setup, HTTP read API.
 
-[Unreleased]: https://github.com/tachyon-beep/clarion/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/tachyon-beep/clarion/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/tachyon-beep/clarion/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/tachyon-beep/clarion/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/tachyon-beep/clarion/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/tachyon-beep/clarion/releases/tag/v1.0.0

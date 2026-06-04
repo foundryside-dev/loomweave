@@ -177,6 +177,37 @@ def test_pyright_session_resolves_direct_call(tmp_path: Path, pyright_langserver
 
 
 @pytest.mark.pyright
+def test_pyright_session_call_range_uses_utf16_lsp_positions_but_emits_bytes(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    source = textwrap.dedent(
+        """
+        def callee():
+            pass
+
+        def caller():
+            marker = "🐍"; callee()
+        """,
+    ).lstrip()
+    module = _write_module(tmp_path, source)
+
+    with PyrightSession(tmp_path, executable=pyright_langserver) as session:
+        result = session.resolve_calls(
+            module,
+            ["python:function:demo.caller", "python:function:demo.callee"],
+        )
+
+    assert len(result.edges) == 1
+    edge = result.edges[0]
+    assert edge["source_byte_start"] == source.encode().find(
+        b"callee", source.encode().find(b"marker")
+    )
+    assert edge["source_byte_end"] == edge["source_byte_start"] + len(b"callee")
+    assert source.encode()[edge["source_byte_start"] : edge["source_byte_end"]] == b"callee"
+
+
+@pytest.mark.pyright
 def test_pyright_session_emits_unresolved_call_site_details(
     tmp_path: Path,
     pyright_langserver: str,

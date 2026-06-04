@@ -10,9 +10,11 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
 blake3.workspace = true
-clarion-core = { path = "../clarion-core", version = "1.1.0" }
-clarion-storage = { path = "../clarion-storage", version = "1.1.0" }
+clarion-core = { path = "../clarion-core", version = "1.2.0" }
+clarion-federation = { path = "../clarion-federation", version = "1.2.0" }
+clarion-storage = { path = "../clarion-storage", version = "1.2.0" }
 reqwest.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

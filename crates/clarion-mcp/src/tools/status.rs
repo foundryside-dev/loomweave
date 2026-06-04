@@ -63,7 +63,7 @@ impl ServerState {
         let entity_id = required_str(arguments, "id")?.to_owned();
         let now = (self.clock)();
         let read = match self
-            .read_summary_inputs(entity_id, self.summary_model_id())
+            .read_summary_inputs(entity_id, self.summary_model_id(), now.clone())
             .await
         {
             Ok(read) => read,
@@ -138,6 +138,7 @@ impl ServerState {
                         entity_id: ready.entity.id.clone(),
                         kind: ready.entity.kind.clone(),
                         name: ready.entity.name.clone(),
+                        guidance: ready.guidance_text.clone(),
                         source_excerpt,
                     });
                     estimate_tokens_from_chars(&prompt.body)
@@ -180,6 +181,21 @@ impl ServerState {
         let storage = self
             .readers
             .with_reader(move |conn| {
+                match clarion_storage::mark_stale_running_runs_failed(conn) {
+                    Ok(repaired) if repaired > 0 => {
+                        tracing::warn!(
+                            repaired,
+                            "project_status marked stale running analyze runs failed"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "project_status stale-run reconciliation failed; continuing"
+                        );
+                    }
+                }
                 let snapshot = crate::snapshot::project_snapshot(conn, &project_root);
                 let edge_count = scalar_count_fail_soft(conn, "SELECT COUNT(*) FROM edges");
                 // Entities withheld from briefings/federation exposure (secret

@@ -66,36 +66,13 @@ language_id: python
 kinds:
   function:      { leaf: true, searchable: true, has_callers: true }
   class:         { leaf: true, searchable: true, has_members: true }
-  protocol:      { leaf: true, searchable: true, subtype_of: class }
-  enum:          { leaf: true, searchable: true, subtype_of: class }
-  typed_dict:    { leaf: true, searchable: true, subtype_of: class }
-  global:        { leaf: true, searchable: true }
-  decorator:     { leaf: true, searchable: true, subtype_of: function }
-  type_alias:    { leaf: true, searchable: true, subtype_of: global }
-  module:        { leaf: false, searchable: true, contains: [function, class, global, ...] }
-  package:       { leaf: false, searchable: true, contains: [module, package] }
+  module:        { leaf: false, searchable: true, contains: [function, class] }
 
 edges:
   contains:      { cardinality: one_to_many }
   calls:         { cardinality: many_to_many, weighted: true }
-  imports:       { cardinality: many_to_many }
-  inherits_from: { cardinality: many_to_many }
-  implements:    { cardinality: many_to_many }
-  decorated_by:  { cardinality: many_to_many }
   references:    { cardinality: many_to_many }
-
-tags:
-  - entry_point
-  - http_route
-  - cli_command
-  - data_model
-  - config_loader
-  - test_function
-  - test_class
-  - fixture
-  - deprecated
-  - has_wardline_annotation
-  - is_dependency_hub
+  imports:       { cardinality: many_to_many }
 
 capabilities:
   parse_files: true
@@ -107,17 +84,8 @@ capabilities:
                                                                       # approximate (name-match) for method calls;
                                                                       # no dynamic dispatch (see "Call graph precision"
                                                                       # under Python plugin specifics below)
-    inherits_from: { supported: true, confidence_basis: ast_match }
-    decorated_by:  { supported: true, confidence_basis: ast_match }
-  annotation_detection:
-    # All 17 Wardline groups are decorator-based (verified against
-    # wardline.core.registry.REGISTRY: 42 canonical names + 1 legacy alias).
-    # Supplementary manifest declarations exist only for Groups 1 and 17
-    # via overlay boundaries[]; those are ingested in Phase 7 and augment
-    # (don't replace) decorator detection.
-    wardline_groups:           [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
-    wardline_overlay_groups:   [1, 17]      # boundaries[] in overlay.schema.json — additive
-    wardline_registry_import:  "wardline.core.registry:REGISTRY"  # direct Python import; see §9
+    references:    { supported: true, confidence_basis: name_match }
+  annotation_detection: false
   structural_findings: true
   factual_findings: true
 
@@ -140,34 +108,28 @@ prompt_templates:
 
 ### Error handling posture
 
-- Plugin crash during batch → core records which files completed (by completed `file_analyzed` messages); unfinished files logged as `CLA-INFRA-PLUGIN-CRASH`; partial run manifest written. Crash-loop circuit breaker (>3 crashes in 60s) halts the plugin permanently for the run.
+- Plugin crash during batch → core records files whose `analyze_file` responses have already crossed the bounded internal file-batch channel into the writer actor; unfinished files are represented by `CLA-INFRA-PLUGIN-CRASH` / plugin-specific findings and the run row ends `failed` with partial committed rows. Crash-loop circuit breaker (>3 crashes in 60s) halts the plugin permanently for the run.
 - Plugin timeout on one file (default 30s, configurable per-plugin) → emit `CLA-INFRA-PLUGIN-TIMEOUT`; skip; continue.
 - Plugin malformed JSON or framing error → core logs, skips the message; continues. Never crashes on plugin misbehaviour.
 - No silent fallbacks. Every skip/error produces a finding.
 - **stdout hygiene**: the plugin protocol reserves stdout for framed JSON-RPC. Plugin authors must redirect logging to stderr; a stray `print()` breaks the stream. This is documented as a plugin-author requirement and enforced by the reference Python client.
 
-### Python plugin specifics — decorator-detection table
+### Python plugin specifics — decorator policy
 
-| Case | Pattern | Policy |
-|---|---|---|
-| Direct named | `@validates_shape` | Exact name match against `wardline.core.registry.REGISTRY` (the 42 canonical names). Imported directly; see §9 prerequisite on `REGISTRY_VERSION` pinning. |
-| Factory | `@validates_shape("User")` | Match on the callee name; arguments captured into `decorated_by.properties.args` for Wardline to consume |
-| Stacked | `@a\n@b\ndef f():` | Emits edges in source order; ordering preserved in `decorated_by.properties.stack_index` (Wardline semantics depend on this) |
-| Function decorator | `@register\ndef f():` | Fully supported — matches Wardline's own scanner coverage |
-| Class decorator | `@register\nclass C:` | Recorded as decorator edges. **Clarion-side augmentation**: Wardline's own scanner does not visit class-level decoration (`scanner/discovery.py:_walk_functions` only walks FunctionDef/AsyncFunctionDef). Clarion findings derived from class-decoration carry `confidence_basis: "clarion_augmentation"` to distinguish them from Wardline-authoritative claims. |
-| Aliased | `validates = validates_shape` | Detected when `validates_shape` is imported and aliased within a module; edge annotated `via_alias: true` |
-| Dotted single-level | `@wardline.validates_shape` | Edge records `(module, name)` pair; matched against `REGISTRY` |
-| Dotted call | `@app.route("/health")` | Edge records full call chain (`app.route`); tag lookup resolves `app.route` via Wardline's annotation descriptor (see Appendix A — deferred to v0.2) |
-| Legacy alias | `@tier_transition` | Resolved via Wardline's `LEGACY_DECORATOR_ALIASES` (`core/registry.py:12-14`); canonical name (`trust_boundary`) recorded in `decorated_by.properties.canonical_name`; `via_legacy_alias: true` |
-
-Cases the plugin does *not* claim to handle (and emits `CLA-PY-ANNOTATION-AMBIGUOUS` for): dynamic decorator selection (`if cond: deco = a else b`), runtime-computed attribute decoration, decorators applied via `__init_subclass__`, arbitrary dotted chains (`a.b.c`), star imports (refused by Wardline itself), metaclass-based decoration, lambdas/subscripts as decorators. These are shared blind spots with Wardline's scanner.
+Decorator semantics are deferred in v1.0. The Python extractor uses decorator
+line ranges to make definition spans and source navigation cover the decorated
+declaration, but it does not declare `decorated_by`, Wardline tags, Wardline
+annotation metadata, decorator arguments, or alias-resolved decorator facts.
+Future decorator extraction must first extend the plugin manifest and then add
+fixture coverage for direct, factory, stacked, class, dotted, aliased, and
+legacy Wardline decorator forms.
 
 ### Python plugin specifics — import resolution
 
-- `sys.path` discovery: via the `python_executable` declared in `plugins.toml` (default: the pipx venv) invoked as `python -m site --user-site` plus project-local `PYTHONPATH`. Virtualenvs in `<project>/.venv/` or `<project>/venv/` detected automatically; user can override via `clarion.yaml:analysis.python.sys_path`.
-- Unresolvable imports: emit `CLA-PY-UNRESOLVED-IMPORT` finding (kind: fact, severity: INFO); create a **stub** entity with id `python:unresolved:<module.path>` and an `imports` edge to it. Stubs are reconciled against real entities if the import becomes resolvable in a later run; never promoted silently.
-- Re-exports: definition site wins. `__init__.py` re-exports produce an `alias_of` edge from the re-export entity to the defining entity (not a new top-level entity). Entity IDs reference the definition site; consult tools resolve aliases transparently.
-- Conditional imports: `TYPE_CHECKING` blocks are extracted as `imports` edges with `type_only: true` property — the edge exists so `goto`/search finds them, but graph algorithms (circular-import detection, coupling hotspots) filter them out. `try/except ImportError` blocks: first branch wins (the one that represents the "normal" path); fallback branches emit `CLA-FACT-CONDITIONAL-IMPORT` findings. `if sys.version_info`: all branches union.
+- `imports` edges are emitted from `import` and `from ... import` statements by the AST walk.
+- Relative imports are normalized against the current module; `__init__.py` collapses to the package module name.
+- `TYPE_CHECKING` blocks are extracted as `imports` edges with `type_only: true`; function-local imports carry `scope: "function"`. Graph algorithms that need runtime imports filter those properties.
+- The v1.0 plugin does not emit `alias_of` edges for `__init__.py` re-exports, does not create `python:unresolved:<module.path>` stubs, and does not emit conditional-import findings for `try/except ImportError` or `sys.version_info` branches.
 
 ### Python plugin specifics — call graph precision
 
@@ -231,11 +193,11 @@ struct Entity {
 - **Files**: `core:file:{qualified_name}` where `qualified_name` is the project-relative POSIX canonical path. File IDs may not contain `@`; content hashes are carried as drift metadata, not embedded in the ID.
 - **Subsystems**: `core:subsystem:{cluster_hash}` (from sorted member module IDs).
 - **Guidance sheets**: `core:guidance:{content_hash_short}`.
-- **Unresolvable Python imports** (stub): `python:unresolved:{module.path}` — reconciled to real entities when resolution becomes possible.
+- **Python import targets**: `imports` edges point at syntactic target module IDs such as `python:module:pkg.mod`. The v1.0 plugin does not create a separate `python:unresolved:{module.path}` stub namespace.
 
 ### Canonical-name policy (Python)
 
-- **Definition site wins**. `TokenManager` defined in `auth/tokens.py` and re-exported from `auth/__init__.py` has ID `python:class:auth.tokens::TokenManager`. The re-export entity is an `alias_of` edge, not a new top-level entity. Consult tools resolve aliases transparently.
+- **Definition site wins for emitted definitions**. `TokenManager` defined in `auth/tokens.py` has ID `python:class:auth.tokens.TokenManager`. The v1.0 plugin collapses `__init__.py` to the package module name, but it does not emit `alias_of` edges for package re-exports.
 - **`src.` prefix stripped**. Projects using `src/` layout get `src.auth.tokens` → `auth.tokens` canonicalisation; policy configurable via `clarion.yaml:analysis.python.canonical_root` (default: auto-detect from `pyproject.toml` `[tool.setuptools.packages.find]` or `[project.optional-dependencies]`).
 - **Test and script modules** keep their on-disk module path (no canonicalisation) because they lack a deterministic install path.
 
@@ -914,7 +876,7 @@ CREATE INDEX ix_sei_lineage_sei ON sei_lineage(sei);
 
 - WAL mode: `PRAGMA journal_mode = WAL`, `synchronous = NORMAL`, `busy_timeout = 5000ms`, `wal_autocheckpoint = 1000` (default).
 - `clarion analyze` and `clarion serve` each instantiate exactly one **writer actor** task (a `tokio::task` owning a dedicated `rusqlite::Connection`). All mutations route through a bounded `mpsc::Sender<WriteOp>` with backpressure. There is no in-process write contention; there are no cross-process writers because `clarion analyze` and `clarion serve` don't run the same DB concurrently in v0.1 (see operational posture below).
-- **Transaction scope**: `clarion analyze` commits on a rolling boundary of **N files per transaction** (default `N=50`, configurable via `clarion.yaml:storage.tx_batch_size`). This keeps the WAL bounded, lets checkpointing run between batches, and makes `--resume` checkpoints meaningful. A full-batch single transaction is explicitly not used.
+- **Transaction scope**: `clarion analyze` commits on a rolling boundary of **N writes per transaction** (default `N=50`). This keeps the WAL bounded and lets SQLite checkpointing run between batches. Per ADR-041, v1.x `--resume` is idempotent same-run re-emit, not durable phase/file checkpoint recovery. A full-batch single transaction is explicitly not used.
 - **Consult-mode writes** (summary cache, session state) during `clarion serve` are dispatched on the same writer actor; they interleave with analyze-time writes if a user starts `clarion analyze` against a running `clarion serve` (not recommended but survivable). Writes are applied in arrival order; no starvation because consult writes are tiny and sparse.
 - **Readers** (plugin processes, MCP tool calls, HTTP API handlers, the markdown renderer) open read-only `rusqlite` connections from a `deadpool-sqlite` pool (configurable max: default 16). WAL lets them read against the committed snapshot without blocking writers.
 - **Checkpointing**: truncate-mode checkpoint issued after each 10 analyze-transactions or after `clarion analyze` completes, whichever comes first.
@@ -945,7 +907,7 @@ CREATE INDEX ix_sei_lineage_sei ON sei_lineage(sei);
             config.yaml     # snapshot of clarion.yaml at run time
             log.jsonl       # per-run log
             stats.json      # run statistics
-            partial.json    # present if run ended partial
+            partial.json    # not part of the v1.x resume contract (ADR-041)
 
 ~/.config/clarion/          # user-level
     providers.toml          # API keys, model tier mappings
@@ -1149,6 +1111,8 @@ These rules combine signals Clarion uniquely holds — clusters from Phase 3, Wa
 | `CLA-FACT-TIER-SUBSYSTEM-MIXING` | WARN | heuristic | A subsystem has members declared across disagreeing tiers (e.g., 11 members `INTEGRAL`, 3 `GUARDED`). Either a misclassification Wardline can't see or a latent tier boundary worth naming. Emitted against the subsystem entity with `related_entities` listing the outliers. |
 | `CLA-FACT-ENTITY-DELETED` | INFO | deterministic | Entity present in the previous run's catalog is absent in this run. Compared against prior run's entity set at Phase-7 boundary. Emitted per deleted entity. Surfaces silently orphaned Filigree issues, silently-no-op guidance sheets, and persistent-until-TTL cache rows. |
 | `CLA-FACT-SUBSYSTEM-TIER-UNANIMOUS` | INFO (fact) | deterministic | Subsystem members share a uniform declared tier. Useful positive signal for tier-consistency reports; cheap companion to the mixing rule. |
+| `CLA-FACT-GUIDANCE-EXPIRED` | INFO | deterministic | A guidance sheet's `expires` instant is in the past. The read path already excludes expired sheets from composition; this surfaces the state operatively (the sheet is not deleted). Emitted once per expired sheet, anchored to the sheet, on every analyze (independent of deletions/SEI). |
+| `CLA-FACT-GUIDANCE-CHURN-STALE` | WARN | heuristic (0.7) | A guidance sheet covers high-churn code: the aggregate `git_churn_count` over the sheet's matched entities meets the staleness threshold (asymmetric — 20 for `pinned` sheets, 50 otherwise). Anchored to the sheet with matched entities as `related_entities`. Inert until the churn-history pipeline populates `git_churn_count` (proxy for the design's true "churn since `authored_at`/`reviewed_at`" delta). |
 
 **Why these belong in Phase 7, not the plugin's Phase-1 emission**: the rules depend on clustering output (Phase 3) and prior-run state, which are core-side concerns. Emitting them from the plugin would require the plugin to know about subsystems and prior runs — violation of Principle 3.
 
@@ -1816,7 +1780,7 @@ The v0.1 core is Rust (locked — see §11 ADR-001). Crate choices below are rec
 
 - Content-Length framed JSON-RPC 2.0 (§1). Implementation: `tower-lsp-server`-derived framing or hand-rolled (simple enough — ~80 lines). Use `serde_json` for payload encoding; `jsonrpc-core` is over-featured for our two-endpoint protocol.
 - **tokio::process::Child** for plugin subprocess lifecycle. Explicit `wait()` to reap zombies. SIGPIPE handling (Unix only): ignore the signal so a dead plugin doesn't crash the core when we write to its stdin.
-- **Bounded `tokio::sync::mpsc`** for the `file_analyzed` stream from plugin → core. Backpressure cap: default 100 messages. Prevents a runaway plugin from OOMing the core.
+- **Bounded `tokio::sync::mpsc`** for the completed-file handoff from the blocking plugin worker → async writer loop. Backpressure cap: default 100 messages. Prevents a runaway plugin session from OOMing the core while preserving a simple request/response plugin wire protocol.
 - **Crash-loop circuit breaker**: >3 plugin crashes in 60 seconds → permanently disable the plugin for the run and emit `CLA-INFRA-PLUGIN-DISABLED-CRASH-LOOP`.
 - **stdout hygiene**: documented plugin-author requirement (§1 Error handling). Reference Python client redirects `logging.basicConfig(stream=sys.stderr)` at import time.
 
@@ -1896,7 +1860,7 @@ Revision 5 (2026-04-17) restructures the single design document into a three-lay
 | §1 headline: suite fabric does not exist yet | Reframed v0.1 scope as "weaving the Loom fabric"; Abstract rewritten; new §11 Suite Bootstrap | System-design, §9 |
 | §3.1 Wire format wrong — `properties`→`metadata`, `line`→`line_start/line_end` | Finding struct and wire-format block rewritten; full example JSON emitted | §2, §7 |
 | §3.2 Severity enum wrong — wire values `{critical,high,medium,low,info}` | Mapping table added; internal vocabulary preserved in `metadata.clarion.internal_severity`; `warnings[]` response inspection required | §7 |
-| §3.3 Wardline groups 9/12/13 are decorator-based (Rev 2 fix was wrong) | All 17 groups listed under `wardline_groups`; `wardline_overlay_groups: [1, 17]` notes supplementary overlay declarations | §1 manifest |
+| §3.3 Wardline groups 9/12/13 are decorator-based (Rev 2 fix was wrong) | v1.0 no longer advertises Wardline group detection in the Python manifest; decorator/Wardline ontology is deferred until extractor support exists | §1 manifest |
 | §3.4 Wardline tier vocabulary uses `INTEGRAL/ASSURED/GUARDED/EXTERNAL_RAW`, not T1–T4 | Glossary and WardlineMeta struct corrected; `declared_tier: Option<TierName>` | §2, Appendix B |
 | §3.5 Wardline has no Filigree integration today | SARIF→Filigree translator (Clarion-side `clarion sarif import`) specified in §7; §9.2 documents Wardline prerequisite | §7, §9.2 |
 | §3.6 `registry_backend` flag does not exist in Filigree | ADR-014 added; §9.1 names the schema surgery (4 NOT-NULL FKs, 3 auto-create paths, 5–8 hot files); degraded-mode fallback in System-design §11 | §7, §9.1, ADR-014 |

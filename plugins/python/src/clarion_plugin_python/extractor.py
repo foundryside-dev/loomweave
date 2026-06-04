@@ -174,6 +174,11 @@ class RawEntity(TypedDict):
     # modules (the move case abstains — fail closed). Typed top-level field on
     # the host's RawEntity, not routed through `extra`.
     signature: NotRequired[FunctionSignature | ClassSignature]
+    # WS5b catalogue/reachability categorisations. Typed top-level because the
+    # core denormalises these into `entity_tags`; unknown/empty means no signal.
+    tags: NotRequired[list[str]]
+    # Short natural-language text used by analyze-time semantic embeddings.
+    docstring: NotRequired[str]
 
 
 class RawEdge(TypedDict):
@@ -197,6 +202,8 @@ class ImportsEdgeProperties(TypedDict):
     imported_name: str
     import_style: Literal["import", "from_import"]
     level: int
+    type_only: NotRequired[bool]
+    scope: NotRequired[Literal["function"]]
 
 
 @dataclass
@@ -297,9 +304,10 @@ def _build_module_entity(
     dotted_module: str,
     file_path: str,
     parse_status: Literal["ok", "syntax_error"],
+    docstring: str | None = None,
 ) -> RawEntity:
     """Build the per-file module entity (Q1 + Q4 resolutions)."""
-    return {
+    entity: RawEntity = {
         "id": entity_id(_PLUGIN_ID, "module", dotted_module),
         "kind": "module",
         "qualified_name": dotted_module,
@@ -309,6 +317,8 @@ def _build_module_entity(
         },
         "parse_status": parse_status,
     }
+    _attach_optional_entity_metadata(entity, docstring=docstring, tags=[])
+    return entity
 
 
 def extract(
@@ -393,11 +403,17 @@ def extract_with_stats(
         )
     parse_latency_ms = _elapsed_ms(parse_started_ns)
 
-    module_entity = _build_module_entity(source, dotted_module, file_path, "ok")
+    module_entity = _build_module_entity(
+        source, dotted_module, file_path, "ok", ast.get_docstring(tree)
+    )
     entities: list[RawEntity] = [module_entity]
     edges: list[RawEdge] = []
     function_ids: list[str] = []
-    walk_state = _WalkState(seen_ids={module_entity["id"]}, file_path=file_path)
+    walk_state = _WalkState(
+        seen_ids={module_entity["id"]},
+        file_path=file_path,
+        exported_names=_module_export_names(tree),
+    )
     _walk(
         tree,
         [tree],
@@ -465,6 +481,35 @@ class _ImportEdgeCollector(ast.NodeVisitor):
         self.module_entity_id = module_entity_id
         self.is_package_module = is_package_module
         self.edges: list[RawEdge] = []
+        self._function_depth = 0
+        self._type_only_depth = 0
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._function_depth += 1
+        try:
+            self.generic_visit(node)
+        finally:
+            self._function_depth -= 1
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._function_depth += 1
+        try:
+            self.generic_visit(node)
+        finally:
+            self._function_depth -= 1
+
+    def visit_If(self, node: ast.If) -> None:
+        if _is_type_checking_guard(node.test):
+            self._type_only_depth += 1
+            try:
+                for child in node.body:
+                    self.visit(child)
+            finally:
+                self._type_only_depth -= 1
+            for child in node.orelse:
+                self.visit(child)
+            return
+        self.generic_visit(node)
 
     def visit_Import(self, node: ast.Import) -> None:
         source_byte_start, source_byte_end = _node_byte_range(self.source, node)
@@ -511,6 +556,15 @@ class _ImportEdgeCollector(ast.NodeVisitor):
         source_range: tuple[int, int],
     ) -> RawEdge:
         source_byte_start, source_byte_end = source_range
+        properties: ImportsEdgeProperties = {
+            "imported_name": imported_name,
+            "import_style": import_style,
+            "level": level,
+        }
+        if self._type_only_depth > 0:
+            properties["type_only"] = True
+        if self._function_depth > 0:
+            properties["scope"] = "function"
         return {
             "kind": "imports",
             "from_id": self.module_entity_id,
@@ -518,12 +572,18 @@ class _ImportEdgeCollector(ast.NodeVisitor):
             "source_byte_start": source_byte_start,
             "source_byte_end": source_byte_end,
             "confidence": "resolved",
-            "properties": {
-                "imported_name": imported_name,
-                "import_style": import_style,
-                "level": level,
-            },
+            "properties": properties,
         }
+
+
+def _is_type_checking_guard(expr: ast.expr) -> bool:
+    if isinstance(expr, ast.Name):
+        return expr.id == "TYPE_CHECKING"
+    if isinstance(expr, ast.Attribute):
+        return expr.attr == "TYPE_CHECKING"
+    if isinstance(expr, ast.BoolOp):
+        return any(_is_type_checking_guard(value) for value in expr.values)
+    return False
 
 
 def _import_from_target(
@@ -664,8 +724,11 @@ class _ReferenceSiteCollector(ast.NodeVisitor):
             self.visit(keyword.value)
 
     def visit_Name(self, node: ast.Name) -> None:
-        if isinstance(node.ctx, ast.Load) and node.id not in self.bound_stack[-1]:
+        if isinstance(node.ctx, ast.Load) and not self._is_non_entity_local(node.id):
             self.sites.append(self._site_for_name(node))
+
+    def _is_non_entity_local(self, name: str) -> bool:
+        return any(name in scope for scope in self.bound_stack[1:])
 
     def _visit_function_signature(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         for arg in [
@@ -793,6 +856,7 @@ class _WalkState:
 
     seen_ids: set[str]
     file_path: str
+    exported_names: set[str] = field(default_factory=set)
     duplicate_entities_dropped: int = 0
 
 
@@ -856,7 +920,11 @@ def _walk(  # noqa: PLR0913 - recursive walker needs both accumulators + parent 
                 if _has_overload_decorator(child):
                     continue
                 entity, child_id = _build_function_entity(
-                    child, parents, dotted_module, file_path, parent_entity_id
+                    child,
+                    parents,
+                    dotted_module,
+                    parent_entity_id,
+                    state,
                 )
                 if child_id in state.seen_ids:
                     state.duplicate_entities_dropped += 1
@@ -873,7 +941,11 @@ def _walk(  # noqa: PLR0913 - recursive walker needs both accumulators + parent 
                 new_parent_id = child_id
             case ast.ClassDef():
                 entity, child_id = _build_class_entity(
-                    child, parents, dotted_module, file_path, parent_entity_id
+                    child,
+                    parents,
+                    dotted_module,
+                    parent_entity_id,
+                    state,
                 )
                 if child_id in state.seen_ids:
                     state.duplicate_entities_dropped += 1
@@ -939,6 +1011,114 @@ def _contains_edge(parent_id: str, child_id: str) -> RawEdge:
     }
 
 
+_HTTP_ROUTE_DECORATOR_NAMES = {
+    "get",
+    "post",
+    "put",
+    "patch",
+    "delete",
+    "options",
+    "head",
+    "route",
+    "websocket",
+}
+_CLI_DECORATOR_NAMES = {"command", "group", "callback"}
+_DATA_MODEL_BASE_NAMES = {"BaseModel", "Model", "SQLModel", "TypedDict"}
+
+
+def _attach_optional_entity_metadata(
+    entity: RawEntity,
+    *,
+    docstring: str | None,
+    tags: set[str] | list[str],
+) -> None:
+    if docstring:
+        entity["docstring"] = docstring
+    if tags:
+        entity["tags"] = sorted(tags)
+
+
+def _module_export_names(tree: ast.Module) -> set[str]:
+    exported: set[str] = set()
+    for statement in tree.body:
+        if not isinstance(statement, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "__all__" for target in statement.targets
+        ):
+            continue
+        match statement.value:
+            case ast.List(elts=elts) | ast.Tuple(elts=elts) | ast.Set(elts=elts):
+                for elt in elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        exported.add(elt.value)
+    return exported
+
+
+def _expr_qualified_name(expr: ast.expr) -> str | None:
+    match expr:
+        case ast.Call(func=func):
+            return _expr_qualified_name(func)
+        case ast.Name(id=name):
+            return name
+        case ast.Attribute(value=value, attr=attr):
+            base = _expr_qualified_name(value)
+            return f"{base}.{attr}" if base else attr
+        case _:
+            return None
+
+
+def _decorator_names(
+    node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+) -> list[str]:
+    return [name for decorator in node.decorator_list if (name := _expr_qualified_name(decorator))]
+
+
+def _last_name(name: str) -> str:
+    return name.rsplit(".", 1)[-1]
+
+
+def _is_module_level(parents: list[ast.AST]) -> bool:
+    return len(parents) == 1
+
+
+def _function_tags(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    parents: list[ast.AST],
+    exported_names: set[str],
+) -> set[str]:
+    tags: set[str] = set()
+    if _is_module_level(parents) and node.name == "main":
+        tags.add("entry-point")
+    if _is_module_level(parents) and node.name in exported_names:
+        tags.add("exported-api")
+    if node.name.startswith("test_") or any(
+        isinstance(parent, ast.ClassDef) and parent.name.startswith("Test") for parent in parents
+    ):
+        tags.add("test")
+    decorator_names = _decorator_names(node)
+    if any(_last_name(name) in _HTTP_ROUTE_DECORATOR_NAMES for name in decorator_names):
+        tags.update({"http-route", "framework-handler"})
+    if any(_last_name(name) in _CLI_DECORATOR_NAMES for name in decorator_names):
+        tags.update({"cli-command", "framework-handler"})
+    return tags
+
+
+def _class_tags(node: ast.ClassDef, parents: list[ast.AST], exported_names: set[str]) -> set[str]:
+    tags: set[str] = set()
+    if _is_module_level(parents) and node.name in exported_names:
+        tags.add("exported-api")
+    if node.name.startswith("Test"):
+        tags.add("test")
+    decorator_names = _decorator_names(node)
+    base_names = [_expr_qualified_name(base) for base in node.bases]
+    if any(_last_name(name) == "dataclass" for name in decorator_names) or any(
+        name is not None and _last_name(name) in _DATA_MODEL_BASE_NAMES for name in base_names
+    ):
+        tags.add("data-model")
+    return tags
+
+
 def _annotation_str(node: ast.expr | None) -> str | None:
     """Unparse an annotation/expression node to its canonical source text, or
     ``None`` when absent. ``ast.unparse`` is deterministic for a given AST."""
@@ -983,8 +1163,8 @@ def _build_function_entity(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
     parents: list[ast.AST],
     dotted_module: str,
-    file_path: str,
     parent_entity_id: str,
+    state: _WalkState,
 ) -> tuple[RawEntity, str]:
     python_qualname = reconstruct_qualname(node, parents)
     qualified_name = f"{dotted_module}.{python_qualname}" if dotted_module else python_qualname
@@ -997,7 +1177,7 @@ def _build_function_entity(
         "kind": "function",
         "qualified_name": qualified_name,
         "source": {
-            "file_path": file_path,
+            "file_path": state.file_path,
             "source_range": {
                 "start_line": start_line,
                 "start_col": start_col,
@@ -1009,6 +1189,11 @@ def _build_function_entity(
         "definition": definition,
         "signature": _function_signature(node),
     }
+    _attach_optional_entity_metadata(
+        entity,
+        docstring=ast.get_docstring(node),
+        tags=_function_tags(node, parents, state.exported_names),
+    )
     return entity, child_id
 
 
@@ -1016,8 +1201,8 @@ def _build_class_entity(
     node: ast.ClassDef,
     parents: list[ast.AST],
     dotted_module: str,
-    file_path: str,
     parent_entity_id: str,
+    state: _WalkState,
 ) -> tuple[RawEntity, str]:
     """Build a class entity. Uses real ast.end_lineno/end_col_offset (not the module sentinel).
 
@@ -1037,7 +1222,7 @@ def _build_class_entity(
         "kind": "class",
         "qualified_name": qualified_name,
         "source": {
-            "file_path": file_path,
+            "file_path": state.file_path,
             "source_range": {
                 "start_line": start_line,
                 "start_col": start_col,
@@ -1049,4 +1234,9 @@ def _build_class_entity(
         "definition": definition,
         "signature": _class_signature(node),
     }
+    _attach_optional_entity_metadata(
+        entity,
+        docstring=ast.get_docstring(node),
+        tags=_class_tags(node, parents, state.exported_names),
+    )
     return entity, child_id

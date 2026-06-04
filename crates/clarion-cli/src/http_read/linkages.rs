@@ -444,6 +444,7 @@ mod tests {
             instance_id,
             auth_token: None,
             identity_secret: Some(Arc::new(secret.to_owned())),
+            hmac_replay_cache: crate::http_read::auth::new_hmac_replay_cache(),
             taint_writer: None,
         };
         (state, tempdir)

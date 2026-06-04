@@ -62,36 +62,28 @@ impl ServerState {
         let model_id = state.provider.model_id().to_owned();
         let provider = state.provider.clone();
 
-        // Embed the query off the async runtime (the provider call is blocking).
+        // Embed the query using the async provider.
         let embed_query = query.clone();
-        let query_vector =
-            match tokio::task::spawn_blocking(move || provider.embed(&[embed_query])).await {
-                Ok(Ok(mut vectors)) => match vectors.pop() {
-                    Some(vector) => vector,
-                    None => {
-                        return Ok(tool_error_envelope(
-                            McpErrorCode::LlmProviderError,
-                            "embedding provider returned no vector for the query",
-                            true,
-                        ));
-                    }
-                },
-                Ok(Err(err)) => {
-                    let retryable = err.retryable();
+        let query_vector = match provider.embed(&[embed_query]).await {
+            Ok(mut vectors) => match vectors.pop() {
+                Some(vector) => vector,
+                None => {
                     return Ok(tool_error_envelope(
                         McpErrorCode::LlmProviderError,
-                        &format!("query embedding failed: {err}"),
-                        retryable,
-                    ));
-                }
-                Err(err) => {
-                    return Ok(tool_error_envelope(
-                        McpErrorCode::Internal,
-                        &format!("embedding task failed: {err}"),
+                        "embedding provider returned no vector for the query",
                         true,
                     ));
                 }
-            };
+            },
+            Err(err) => {
+                let retryable = err.retryable();
+                return Ok(tool_error_envelope(
+                    McpErrorCode::LlmProviderError,
+                    &format!("query embedding failed: {err}"),
+                    retryable,
+                ));
+            }
+        };
 
         let project_root = self.project_root.clone();
         let sidecar_path = embeddings_db_path(&project_root);

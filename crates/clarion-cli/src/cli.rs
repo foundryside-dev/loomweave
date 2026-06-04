@@ -144,6 +144,13 @@ pub enum Command {
         command: DbCommand,
     },
 
+    /// Author guidance sheets — institutional knowledge attached to entities
+    /// that the MCP read path composes into briefings (REQ-GUIDANCE-03).
+    Guidance {
+        #[command(subcommand)]
+        command: GuidanceCommand,
+    },
+
     /// Verify (and optionally repair) the installed agent-orientation surfaces:
     /// the `clarion-workflow` skill pack, the `SessionStart` hook, and the
     /// `.mcp.json` MCP registration. Prints a per-surface report plus the index
@@ -158,6 +165,12 @@ pub enum Command {
         /// only reports.
         #[arg(long)]
         fix: bool,
+    },
+
+    /// Import external findings in SARIF format and post them to Filigree.
+    Sarif {
+        #[command(subcommand)]
+        command: SarifCommand,
     },
 }
 
@@ -182,10 +195,171 @@ pub enum DbCommand {
 }
 
 #[derive(Subcommand)]
+pub enum GuidanceCommand {
+    /// Create a new guidance sheet (`kind: guidance`, provenance: manual).
+    ///
+    /// `--match` syntax is `<type>:<value>` (split on the first colon):
+    /// `path:<glob>`, `tag:<tag>`, `kind:<entity-kind>`, `subsystem:<id>`,
+    /// `entity:<entity-id>`. Content comes from `--content`, else stdin (when
+    /// piped) or `$EDITOR`/`$VISUAL`.
+    Create {
+        /// Project directory containing .clarion/clarion.db (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// A match rule (`<type>:<value>`); repeatable.
+        #[arg(long = "match", value_name = "RULE")]
+        r#match: Vec<String>,
+
+        /// Scope level: project | subsystem | package | module | class | function.
+        #[arg(long, value_name = "LEVEL")]
+        scope_level: String,
+
+        /// Guidance text (markdown). Omit to author via stdin or $EDITOR.
+        #[arg(long)]
+        content: Option<String>,
+
+        /// Slug for the entity id's third segment (`core:guidance:<name>`).
+        /// Defaults to a slug derived from the first match rule.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Mark the sheet pinned (preserved under token-budget pressure).
+        #[arg(long)]
+        pinned: bool,
+
+        /// Optional expiry. Accepts an ISO-8601 instant (e.g.
+        /// `2026-12-31T23:59:59Z`), an offset form (converted to UTC), or a bare
+        /// date (e.g. `2026-12-31`, taken as start-of-day UTC). Stored
+        /// normalized to UTC so the read path's lexical expiry compare is
+        /// correct; unparseable input is rejected.
+        #[arg(long, value_name = "WHEN")]
+        expires: Option<String>,
+    },
+
+    /// Edit a sheet's content in `$EDITOR`/`$VISUAL` (other properties, including
+    /// `authored_at` and provenance, are preserved).
+    Edit {
+        /// Project directory containing .clarion/clarion.db (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// The guidance sheet id (`core:guidance:<slug>`).
+        id: String,
+    },
+
+    /// Print a guidance sheet (human-readable).
+    Show {
+        /// Project directory containing .clarion/clarion.db (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// The guidance sheet id.
+        id: String,
+    },
+
+    /// List guidance sheets, ordered by `scope_rank` (project → function).
+    ///
+    /// `--expired` and `--stale` are independent filters that compose by
+    /// intersection (AND): a sheet is shown only if it passes every active
+    /// filter (including `--for-entity`). Without any of them, behaves as the
+    /// plain list.
+    List {
+        /// Project directory containing .clarion/clarion.db (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Only list sheets whose `match_rules` apply to this entity id.
+        #[arg(long, value_name = "ENTITY_ID")]
+        for_entity: Option<String>,
+        /// Only show sheets whose `expires` instant is in the past (mirrors the
+        /// read path's expiry exclusion). Sheets with no `expires` are excluded.
+        #[arg(long)]
+        expired: bool,
+        /// Only show sheets not "touched" (the later of `reviewed_at` /
+        /// `authored_at`) within `--days`. This is the review-cadence/age signal
+        /// (system-design §7.741), NOT the churn-based staleness finding.
+        #[arg(long)]
+        stale: bool,
+        /// Staleness window in days for `--stale` (default: 90). Ignored without
+        /// `--stale`.
+        #[arg(long, value_name = "N", default_value_t = 90)]
+        days: u32,
+    },
+
+    /// Delete a guidance sheet.
+    Delete {
+        /// Project directory containing .clarion/clarion.db (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// The guidance sheet id.
+        id: String,
+    },
+
+    /// Promote a reviewed Filigree guidance-proposal observation into a local
+    /// guidance sheet. The observation must have been produced by MCP
+    /// `propose_guidance`; arbitrary observations are rejected.
+    Promote {
+        /// Project directory containing .clarion/clarion.db (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Path to clarion.yaml (default: project-root/clarion.yaml if present).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// The Filigree observation id to promote.
+        observation_id: String,
+    },
+
+    /// Export every guidance sheet to a directory as one deterministic,
+    /// diff-friendly JSON file per sheet, for committing to a shared repo
+    /// (REQ-GUIDANCE-06). Output is byte-stable across runs on identical DB
+    /// state. The target directory is created if absent.
+    Export {
+        /// Project directory containing .clarion/clarion.db (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Directory to write the exported sheet files into. Export does NOT
+        /// prune: a sheet deleted locally keeps its file here, and a teammate's
+        /// additive `import` would resurrect it. To mirror, clear the directory
+        /// before exporting.
+        #[arg(long)]
+        to: PathBuf,
+    },
+
+    /// Import guidance sheets from a directory of exported JSON files
+    /// (REQ-GUIDANCE-06). Additive: each sheet is upserted by id, preserving ids
+    /// exactly; existing local sheets not present in the directory are left
+    /// untouched (never a destructive mirror). A malformed `*.json` aborts the
+    /// import naming the offending file (a dropped sheet is silent data loss).
+    Import {
+        /// Project directory containing .clarion/clarion.db (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Directory of exported sheet files to import.
+        dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum HookCommand {
     /// Print a project snapshot and re-sync the skill pack on drift.
     SessionStart {
         /// Project directory containing .clarion/clarion.db.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SarifCommand {
+    /// Translate SARIF findings and post them to Filigree.
+    Import {
+        /// The SARIF file path to import.
+        file: PathBuf,
+
+        /// Scan source name to tag the findings (e.g. wardline, semgrep, codeql).
+        /// If omitted, defaults to the driver name from the SARIF file.
+        #[arg(long)]
+        scan_source: Option<String>,
+
+        /// Project directory containing .clarion/clarion.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },

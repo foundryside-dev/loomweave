@@ -5,6 +5,7 @@ mod clustering;
 mod config;
 mod db;
 mod doctor;
+mod guidance;
 mod hook;
 mod hooks_settings;
 mod http_read;
@@ -12,11 +13,13 @@ mod install;
 mod instance;
 mod mcp_registration;
 mod run_lifecycle;
+mod sarif;
 mod secret_scan;
 mod sei_git;
 mod serve;
 mod skill_pack;
 mod stats;
+mod wardline_guidance;
 
 use anyhow::Result;
 use clap::Parser;
@@ -96,6 +99,7 @@ fn main() -> Result<()> {
                 force,
             } => db::backup(&path, &output, force),
         },
+        cli::Command::Guidance { command } => guidance::run(command),
         cli::Command::Doctor { path, fix } => {
             // doctor prints its own report; map an unhealthy result to a
             // non-zero exit so it can gate CI / pre-commit. The Result<()> arm
@@ -106,6 +110,13 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        cli::Command::Sarif { command } => match command {
+            cli::SarifCommand::Import {
+                file,
+                scan_source,
+                path,
+            } => sarif::run_import(&file, scan_source, &path),
+        },
     }
 }
 

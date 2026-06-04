@@ -4,9 +4,10 @@ The Python language plugin for [Clarion](../../README.md). Extracts Python
 entities from source files and serves them to the Clarion core over the
 JSON-RPC protocol defined in [WP2 L4](../../docs/implementation/sprint-1/wp2-plugin-host.md#l4--json-rpc-method-set--content-length-framing).
 
-**Status**: Sprint 1 walking-skeleton baseline. Functions only (module-level
-and class methods). Classes, decorators, imports, and call graphs are
-WP3-feature-complete scope.
+**Status**: Python structural extractor. It emits modules, classes, functions,
+`contains`, `calls`, `references`, `imports`, and versioned entity signatures
+for Stable Entity Identity (SEI) matching. Wardline semantic enrichment is not
+advertised until the plugin emits real Wardline-derived signals.
 
 ## Install (development)
 
@@ -35,8 +36,8 @@ CI runs the same four gates in the `python-plugin` job.
 ## Design references
 
 - [WP3 plan](../../docs/implementation/sprint-1/wp3-python-plugin.md) — task
-  ledger, lock-ins (L7 qualname, L8 Wardline probe), UQ resolutions.
-- [ADR-003](../../docs/clarion/adr/ADR-003-entity-id-format.md) — 3-segment
+  ledger, lock-ins, and UQ resolutions.
+- [ADR-003](../../docs/clarion/adr/ADR-003-entity-id-scheme.md) — 3-segment
   `EntityId` format this plugin produces.
 - [ADR-018](../../docs/clarion/adr/ADR-018-identity-reconciliation.md) —
   cross-product identity join with Wardline.
