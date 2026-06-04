@@ -909,6 +909,21 @@ fn association(issue_id: &str, entity_id: &str, content_hash: &str) -> EntityAss
     }
 }
 
+fn seed_alive_sei_binding(db_path: &std::path::Path, sei: &str, locator: &str) {
+    let conn = Connection::open(db_path).expect("open sqlite");
+    conn.execute(
+        "INSERT INTO sei_bindings (
+            sei, current_locator, body_hash, signature, status,
+            born_run_id, updated_run_id, updated_at
+         ) VALUES (
+            ?1, ?2, 'hash-entry', NULL, 'alive', 'run-1', 'run-1',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        params![sei, locator],
+    )
+    .expect("insert alive SEI binding");
+}
+
 async fn call_tool(state: &ServerState, name: &str, arguments: Value) -> Value {
     let response = state
         .handle_json_rpc(&json!({
@@ -1284,20 +1299,11 @@ async fn issues_for_includes_contained_entities_and_flags_drift() {
 #[tokio::test]
 async fn issues_for_queries_sei_before_locator_and_aliases_match_to_current_entity() {
     let (project, db_path) = open_project();
-    let conn = Connection::open(&db_path).expect("open sqlite");
-    conn.execute(
-        "INSERT INTO sei_bindings (
-            sei, current_locator, body_hash, signature, status,
-            born_run_id, updated_run_id, updated_at
-         ) VALUES (
-            'clarion:eid:demo-entry', 'python:function:demo.entry',
-            'hash-entry', NULL, 'alive', 'run-1', 'run-1',
-            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         )",
-        [],
-    )
-    .expect("insert alive SEI binding");
-    drop(conn);
+    seed_alive_sei_binding(
+        &db_path,
+        "clarion:eid:demo-entry",
+        "python:function:demo.entry",
+    );
     let client = Arc::new(FakeFiligreeClient::default().with_response(
         "clarion:eid:demo-entry",
         vec![association(
@@ -1324,52 +1330,23 @@ async fn issues_for_queries_sei_before_locator_and_aliases_match_to_current_enti
     assert_eq!(matched["entity"]["sei"], "clarion:eid:demo-entry");
     assert_eq!(
         client.calls(),
-        vec![
-            "clarion:eid:demo-entry".to_owned(),
-            "python:function:demo.entry".to_owned()
-        ],
-        "SEI should be queried before locator fallback"
+        vec!["clarion:eid:demo-entry".to_owned()],
+        "SEI should be the only lookup key when it is available"
     );
 }
 
 #[tokio::test]
-async fn issues_for_dedupes_same_issue_returned_by_sei_and_locator() {
+async fn issues_for_falls_back_to_locator_when_sei_is_unavailable() {
     let (project, db_path) = open_project();
-    let conn = Connection::open(&db_path).expect("open sqlite");
-    conn.execute(
-        "INSERT INTO sei_bindings (
-            sei, current_locator, body_hash, signature, status,
-            born_run_id, updated_run_id, updated_at
-         ) VALUES (
-            'clarion:eid:demo-entry', 'python:function:demo.entry',
-            'hash-entry', NULL, 'alive', 'run-1', 'run-1',
-            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         )",
-        [],
-    )
-    .expect("insert alive SEI binding");
-    drop(conn);
-    let hash = expected_content_hash(project.path(), "python:function:demo.entry");
-    let client = Arc::new(
-        FakeFiligreeClient::default()
-            .with_response(
-                "clarion:eid:demo-entry",
-                vec![association(
-                    "filigree-same",
-                    "clarion:eid:demo-entry",
-                    &hash,
-                )],
-            )
-            .with_response(
-                "python:function:demo.entry",
-                vec![association(
-                    "filigree-same",
-                    "python:function:demo.entry",
-                    &hash,
-                )],
-            ),
-    );
-    let state = state_for_filigree(project.path(), &db_path, client);
+    let client = Arc::new(FakeFiligreeClient::default().with_response(
+        "python:function:demo.entry",
+        vec![association(
+            "filigree-locator",
+            "python:function:demo.entry",
+            &expected_content_hash(project.path(), "python:function:demo.entry"),
+        )],
+    ));
+    let state = state_for_filigree(project.path(), &db_path, client.clone());
 
     let envelope = call_tool(
         &state,
@@ -1379,13 +1356,56 @@ async fn issues_for_dedupes_same_issue_returned_by_sei_and_locator() {
     .await;
 
     assert_eq!(envelope["ok"], true);
-    let matched = envelope["result"]["matched"].as_array().unwrap();
-    assert_eq!(matched.len(), 1, "same issue must be deduped: {envelope}");
-    assert_eq!(matched[0]["issue_id"], "filigree-same");
     assert_eq!(
-        matched[0]["association_entity_id"],
-        "clarion:eid:demo-entry"
+        envelope["result"]["matched"][0]["issue_id"],
+        "filigree-locator"
     );
+    assert_eq!(
+        envelope["result"]["matched"][0]["entity_id"],
+        "python:function:demo.entry"
+    );
+    assert_eq!(
+        client.calls(),
+        vec!["python:function:demo.entry".to_owned()],
+        "locator should be queried only when no SEI is available"
+    );
+}
+
+#[tokio::test]
+async fn issues_for_flags_drift_for_sei_bound_association() {
+    let (project, db_path) = open_project();
+    seed_alive_sei_binding(
+        &db_path,
+        "clarion:eid:demo-entry",
+        "python:function:demo.entry",
+    );
+    let current_hash = expected_content_hash(project.path(), "python:function:demo.entry");
+    let client = Arc::new(FakeFiligreeClient::default().with_response(
+        "clarion:eid:demo-entry",
+        vec![association(
+            "filigree-drifted-sei",
+            "clarion:eid:demo-entry",
+            "old-hash",
+        )],
+    ));
+    let state = state_for_filigree(project.path(), &db_path, client.clone());
+
+    let envelope = call_tool(
+        &state,
+        "issues_for",
+        json!({"id": "python:function:demo.entry", "include_contained": false}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true);
+    let drifted = &envelope["result"]["drifted"][0];
+    assert_eq!(drifted["issue_id"], "filigree-drifted-sei");
+    assert_eq!(drifted["entity_id"], "python:function:demo.entry");
+    assert_eq!(drifted["association_entity_id"], "clarion:eid:demo-entry");
+    assert_eq!(drifted["content_hash_at_attach"], "old-hash");
+    assert_eq!(drifted["current_content_hash"], current_hash);
+    assert_eq!(drifted["drift_status"], "drifted");
+    assert_eq!(client.calls(), vec!["clarion:eid:demo-entry".to_owned()]);
 }
 
 #[tokio::test]

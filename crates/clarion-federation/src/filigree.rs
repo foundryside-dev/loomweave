@@ -72,6 +72,9 @@ pub struct ObservationRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct EntityAssociation {
     pub issue_id: String,
+    /// Opaque Clarion association key as stored by Filigree. New bindings use
+    /// the entity's SEI (`clarion:eid:*`); legacy rows may still carry the
+    /// mutable locator (`{plugin}:{kind}:{qualname}`).
     pub clarion_entity_id: String,
     pub content_hash_at_attach: String,
     pub attached_at: String,
@@ -877,12 +880,48 @@ mod tests {
     }
 
     #[test]
+    fn parses_reverse_entity_association_response_with_sei_key() {
+        let parsed = parse_entity_associations_response(
+            r#"{
+                "associations": [
+                    {
+                        "issue_id": "filigree-1234567890",
+                        "clarion_entity_id": "clarion:eid:0123456789abcdef0123456789abcdef",
+                        "content_hash_at_attach": "hash-a",
+                        "attached_at": "2026-05-17T00:00:00.000Z",
+                        "attached_by": "codex"
+                    }
+                ]
+            }"#,
+        )
+        .expect("parse SEI-keyed Filigree reverse route response");
+
+        assert_eq!(
+            parsed.associations[0].clarion_entity_id,
+            "clarion:eid:0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
     fn builds_reverse_route_url_with_encoded_entity_id() {
         let url = entity_associations_url("http://127.0.0.1:8766/", "python:function:demo.hello");
 
         assert_eq!(
             url,
             "http://127.0.0.1:8766/api/entity-associations?entity_id=python%3Afunction%3Ademo.hello"
+        );
+    }
+
+    #[test]
+    fn builds_reverse_route_url_with_encoded_sei_key() {
+        let url = entity_associations_url(
+            "http://127.0.0.1:8766/",
+            "clarion:eid:0123456789abcdef0123456789abcdef",
+        );
+
+        assert_eq!(
+            url,
+            "http://127.0.0.1:8766/api/entity-associations?entity_id=clarion%3Aeid%3A0123456789abcdef0123456789abcdef"
         );
     }
 

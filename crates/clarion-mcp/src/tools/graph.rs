@@ -443,46 +443,40 @@ impl ServerState {
             IssuesForAccumulator::new(&read.entities, read.entity_json_by_id.clone());
         let mut requests_total = 0_usize;
         for (idx, entity) in read.entities.iter().enumerate() {
-            let mut lookup_ids = Vec::with_capacity(2);
-            if let Some(sei) = read
+            let lookup_id = read
                 .entity_json_by_id
                 .get(&entity.id)
                 .and_then(|json| json.get("sei"))
                 .and_then(Value::as_str)
                 .filter(|sei| !sei.trim().is_empty())
-            {
-                lookup_ids.push(sei.to_owned());
-            }
-            lookup_ids.push(entity.id.clone());
-            lookup_ids.dedup();
+                .map_or_else(|| entity.id.clone(), ToOwned::to_owned);
 
-            for lookup_id in lookup_ids {
-                let client = client.clone();
-                let response =
-                    match tokio::task::spawn_blocking(move || client.associations_for(&lookup_id))
-                        .await
-                    {
-                        Ok(Ok(response)) => response,
-                        Ok(Err(err)) => {
-                            return Ok(issues_unavailable(
-                                &endpoint,
-                                "filigree-unreachable",
-                                &err.to_string(),
-                            ));
-                        }
-                        Err(err) => {
-                            return Ok(issues_unavailable(
-                                &endpoint,
-                                "filigree-client-error",
-                                &format!("Filigree client task failed: {err}"),
-                            ));
-                        }
-                    };
-                requests_total += 1;
-                accumulator.add_response(response);
-                if accumulator.issue_cap_truncated {
-                    break;
+            let client = client.clone();
+            let response = match tokio::task::spawn_blocking(move || {
+                client.associations_for(&lookup_id)
+            })
+            .await
+            {
+                Ok(Ok(response)) => response,
+                Ok(Err(err)) => {
+                    return Ok(issues_unavailable(
+                        &endpoint,
+                        "filigree-unreachable",
+                        &err.to_string(),
+                    ));
                 }
+                Err(err) => {
+                    return Ok(issues_unavailable(
+                        &endpoint,
+                        "filigree-client-error",
+                        &format!("Filigree client task failed: {err}"),
+                    ));
+                }
+            };
+            requests_total += 1;
+            accumulator.add_response(response);
+            if accumulator.issue_cap_truncated {
+                break;
             }
             if accumulator.emitted >= 100 && idx + 1 < read.entities.len() {
                 accumulator.issue_cap_truncated = true;

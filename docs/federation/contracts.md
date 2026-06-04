@@ -1272,6 +1272,23 @@ folding of corrupt / zero ports to the configured URL. Because the port file is 
 *read* of a Filigree-owned convention, a change on Filigree's side (path or
 format) would be caught by re-reading its `ephemeral.py`, not by Clarion CI.
 
+## Consumed Filigree route: entity associations
+
+This pins the Filigree reverse-association route Clarion consumes for
+`issues_for` / `entity_issue_list`:
+
+```text
+GET {filigree_base}/api/entity-associations?entity_id={association_key}
+```
+
+`association_key` is opaque to Filigree. Current Clarion callers use the
+entity's SEI (`clarion:eid:*`) when the served index has one, and fall back to
+the mutable locator (`{plugin}:{kind}:{qualname}`) only for pre-SEI or unbound
+indexes. The response field remains `clarion_entity_id` for wire compatibility;
+new rows normally echo the SEI key, while legacy rows may echo a locator.
+Clarion maps a returned SEI key back to the current locator before comparing
+`content_hash_at_attach` against the current entity content hash.
+
 ## Consumed Filigree route: issue detail (enrichment)
 
 This pins the single Filigree route Clarion *consumes* (against the endpoint
