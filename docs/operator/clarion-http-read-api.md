@@ -64,7 +64,7 @@ catalog, or unavailable because of storage errors.
 
 When both `serve.http.token_env` (legacy bearer) and
 `serve.http.identity_token_env` (HMAC, preferred per
-[ADR-034](../clarion/adr/ADR-034-federation-hardening.md)) are unset and the
+[ADR-034](../clarion/adr/ADR-034-federation-http-read-api-hardening.md)) are unset and the
 bind is loopback (default: `127.0.0.1:9111`), the HTTP read API serves
 unauthenticated. This is the intended single-user developer-workstation
 trust model — the loopback socket is reachable only from processes on the

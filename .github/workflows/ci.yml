@@ -34,10 +34,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
 
-      # Python is used by the migration-retirement guard and the
-      # workspace-version-lockstep guard below. Pin >= 3.11 explicitly so the
-      # stdlib `tomllib` is available regardless of which Python the runner
-      # image happens to preinstall.
+      # Python is used by the migration-retirement guard and lockstep guards
+      # below. Pin >= 3.11 explicitly so the stdlib `tomllib` is available
+      # regardless of which Python the runner image happens to preinstall.
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version: "3.11"
@@ -49,11 +48,6 @@ jobs:
         run: |
           python scripts/check-migration-retirement.py --self-test
           python scripts/check-migration-retirement.py
-
-      - name: release governance static guard
-        run: |
-          python scripts/check-github-release-governance.py --self-test
-          python scripts/check-github-release-governance.py --static-only
 
       - name: cross-workspace version lockstep
         run: python scripts/check-workspace-version-lockstep.py

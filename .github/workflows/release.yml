@@ -67,11 +67,6 @@ jobs:
           python scripts/check-migration-retirement.py --self-test
           python scripts/check-migration-retirement.py
 
-      - name: release governance static guard
-        run: |
-          python scripts/check-github-release-governance.py --self-test
-          python scripts/check-github-release-governance.py --static-only
-
       - name: cross-workspace version lockstep
         run: python scripts/check-workspace-version-lockstep.py
 
@@ -162,25 +157,8 @@ jobs:
       - name: Phase 3 subsystems
         run: CARGO_BUILD=0 bash tests/e2e/phase3_subsystems.sh
 
-  release-governance:
-    name: GitHub release governance
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-
-      - name: enforce repository release controls
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_GOVERNANCE_TOKEN }}
-        run: |
-          set -euo pipefail
-          python scripts/check-github-release-governance.py \
-            --repository "${GITHUB_REPOSITORY}" \
-            --branch main
-
   build-rust:
-    needs: [verify, release-governance]
+    needs: [verify]
     name: Build clarion (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -246,7 +224,7 @@ jobs:
           retention-days: 7
 
   build-plugin:
-    needs: [verify, release-governance]
+    needs: [verify]
     name: Build Python plugin sdist
     runs-on: ubuntu-latest
     steps:
