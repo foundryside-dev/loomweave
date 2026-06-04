@@ -197,6 +197,8 @@ class ImportsEdgeProperties(TypedDict):
     imported_name: str
     import_style: Literal["import", "from_import"]
     level: int
+    type_only: NotRequired[bool]
+    scope: NotRequired[Literal["function"]]
 
 
 @dataclass
@@ -465,6 +467,35 @@ class _ImportEdgeCollector(ast.NodeVisitor):
         self.module_entity_id = module_entity_id
         self.is_package_module = is_package_module
         self.edges: list[RawEdge] = []
+        self._function_depth = 0
+        self._type_only_depth = 0
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._function_depth += 1
+        try:
+            self.generic_visit(node)
+        finally:
+            self._function_depth -= 1
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._function_depth += 1
+        try:
+            self.generic_visit(node)
+        finally:
+            self._function_depth -= 1
+
+    def visit_If(self, node: ast.If) -> None:
+        if _is_type_checking_guard(node.test):
+            self._type_only_depth += 1
+            try:
+                for child in node.body:
+                    self.visit(child)
+            finally:
+                self._type_only_depth -= 1
+            for child in node.orelse:
+                self.visit(child)
+            return
+        self.generic_visit(node)
 
     def visit_Import(self, node: ast.Import) -> None:
         source_byte_start, source_byte_end = _node_byte_range(self.source, node)
@@ -511,6 +542,15 @@ class _ImportEdgeCollector(ast.NodeVisitor):
         source_range: tuple[int, int],
     ) -> RawEdge:
         source_byte_start, source_byte_end = source_range
+        properties: ImportsEdgeProperties = {
+            "imported_name": imported_name,
+            "import_style": import_style,
+            "level": level,
+        }
+        if self._type_only_depth > 0:
+            properties["type_only"] = True
+        if self._function_depth > 0:
+            properties["scope"] = "function"
         return {
             "kind": "imports",
             "from_id": self.module_entity_id,
@@ -518,12 +558,18 @@ class _ImportEdgeCollector(ast.NodeVisitor):
             "source_byte_start": source_byte_start,
             "source_byte_end": source_byte_end,
             "confidence": "resolved",
-            "properties": {
-                "imported_name": imported_name,
-                "import_style": import_style,
-                "level": level,
-            },
+            "properties": properties,
         }
+
+
+def _is_type_checking_guard(expr: ast.expr) -> bool:
+    if isinstance(expr, ast.Name):
+        return expr.id == "TYPE_CHECKING"
+    if isinstance(expr, ast.Attribute):
+        return expr.attr == "TYPE_CHECKING"
+    if isinstance(expr, ast.BoolOp):
+        return any(_is_type_checking_guard(value) for value in expr.values)
+    return False
 
 
 def _import_from_target(
@@ -664,8 +710,11 @@ class _ReferenceSiteCollector(ast.NodeVisitor):
             self.visit(keyword.value)
 
     def visit_Name(self, node: ast.Name) -> None:
-        if isinstance(node.ctx, ast.Load) and node.id not in self.bound_stack[-1]:
+        if isinstance(node.ctx, ast.Load) and not self._is_non_entity_local(node.id):
             self.sites.append(self._site_for_name(node))
+
+    def _is_non_entity_local(self, name: str) -> bool:
+        return any(name in scope for scope in self.bound_stack[1:])
 
     def _visit_function_signature(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         for arg in [

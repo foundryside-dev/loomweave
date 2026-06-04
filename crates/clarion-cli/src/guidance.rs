@@ -33,8 +33,8 @@ use serde_json::{Value, json};
 use clarion_storage::{
     GuidanceSheet, GuidanceSheetInput, PortableSheet, delete_guidance_sheet, get_guidance_sheet,
     guidance_sheet_is_expired, guidance_sheet_is_stale, guidance_sheet_matches_entity,
-    import_portable_sheet, invalidate_summaries_for_sheet, list_guidance_sheets,
-    upsert_guidance_sheet,
+    import_portable_sheet, insert_guidance_sheet, invalidate_summaries_for_sheet,
+    list_guidance_sheets, upsert_guidance_sheet,
 };
 
 use crate::cli::GuidanceCommand;
@@ -226,12 +226,6 @@ fn create(project_root: &Path, args: CreateArgs<'_>) -> Result<()> {
     let short_name = slug.rsplit('.').next().unwrap_or(&slug).to_owned();
 
     let conn = open_db(project_root)?;
-    // Non-atomic guard: a concurrent `create` for the same id between this read
-    // and the upsert below could race. Acceptable for a single-operator CLI;
-    // the worst case is the later writer's upsert overwriting the earlier sheet.
-    if get_guidance_sheet(&conn, &id).into_anyhow()?.is_some() {
-        bail!("guidance sheet {id} already exists; use `clarion guidance edit {id}`");
-    }
 
     // Normalise `--expires` *before* the write so the stored instant is
     // byte-format-identical to the read path's `now` (the expiry compare is
@@ -257,7 +251,7 @@ fn create(project_root: &Path, args: CreateArgs<'_>) -> Result<()> {
         obj.insert("expires".to_owned(), json!(expires));
     }
 
-    upsert_guidance_sheet(
+    insert_guidance_sheet(
         &conn,
         &GuidanceSheetInput {
             id: &id,

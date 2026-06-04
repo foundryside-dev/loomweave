@@ -13,6 +13,7 @@ use clarion_core::{
     LEAF_SUMMARY_PROMPT_TEMPLATE_ID,
     plugin::{ContentLengthCeiling, Frame, read_frame, write_frame},
 };
+use hmac::{Hmac, Mac};
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -206,6 +207,10 @@ fn serve_http_responses_match_federation_fixture_contracts() {
         "post-api-v1-files-resolve.batch.json",
         include_str!("../../../docs/federation/fixtures/post-api-v1-files-resolve.batch.json"),
     );
+    let files_batch_fixture = load_contract_fixture(
+        "post-api-v1-files-batch.json",
+        include_str!("../../../docs/federation/fixtures/post-api-v1-files-batch.json"),
+    );
     let dir = tempfile::tempdir().expect("temp project");
     clarion_bin()
         .args(["install", "--path"])
@@ -231,8 +236,41 @@ fn serve_http_responses_match_federation_fixture_contracts() {
         &files_resolve_fixture,
         "post-api-v1-files-resolve.batch.json",
     );
+    validate_fixture_examples_matching(
+        &bind,
+        &files_batch_fixture,
+        "post-api-v1-files-batch.json",
+        |example_name| example_name != "batch_unauthorized_401",
+    );
     validate_fixture_examples(&bind, &capabilities_fixture, "get-api-v1-capabilities.json");
     stop_serve(&mut child);
+
+    let auth_dir = tempfile::tempdir().expect("temp auth project");
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(auth_dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    seed_file_entity(auth_dir.path());
+    let auth_bind = free_loopback_bind();
+    write_http_config_with_token_env(
+        auth_dir.path(),
+        &auth_bind,
+        "CLARION_TEST_FIXTURE_BATCH_TOKEN",
+    );
+
+    let mut auth_child = spawn_serve_with_env(
+        auth_dir.path(),
+        &[("CLARION_TEST_FIXTURE_BATCH_TOKEN", "fixture-secret")],
+    );
+    validate_fixture_examples_matching(
+        &auth_bind,
+        &files_batch_fixture,
+        "post-api-v1-files-batch.json",
+        |example_name| example_name == "batch_unauthorized_401",
+    );
+    stop_serve(&mut auth_child);
 }
 
 #[test]
@@ -1391,8 +1429,17 @@ fn serve_http_files_endpoint_requires_hmac_identity_when_configured() {
     );
     let path = "/api/v1/files?path=demo.py&language=python";
     let missing = wait_for_http_raw_response(&bind, path, &[]);
-    let signed_header = hmac_component_header("shared-secret", "GET", path, b"");
-    let signed = wait_for_http_raw_response(&bind, path, &[("X-Loom-Component", &signed_header)]);
+    let (signed_header, signed_timestamp, signed_nonce) =
+        hmac_component_headers("shared-secret", "GET", path, b"");
+    let signed = wait_for_http_raw_response(
+        &bind,
+        path,
+        &[
+            ("X-Loom-Component", &signed_header),
+            ("X-Loom-Timestamp", &signed_timestamp),
+            ("X-Loom-Nonce", &signed_nonce),
+        ],
+    );
     stop_serve(&mut child);
     let missing = missing.expect("missing identity response");
     let signed = signed.expect("signed identity response");
@@ -1428,8 +1475,17 @@ fn serve_http_files_endpoint_rejects_wrong_hmac_identity() {
         &[("CLARION_TEST_LOOM_IDENTITY_WRONG", "shared-secret")],
     );
     let path = "/api/v1/files?path=demo.py&language=python";
-    let wrong_header = hmac_component_header("other-secret", "GET", path, b"");
-    let response = wait_for_http_raw_response(&bind, path, &[("X-Loom-Component", &wrong_header)]);
+    let (wrong_header, wrong_timestamp, wrong_nonce) =
+        hmac_component_headers("other-secret", "GET", path, b"");
+    let response = wait_for_http_raw_response(
+        &bind,
+        path,
+        &[
+            ("X-Loom-Component", &wrong_header),
+            ("X-Loom-Timestamp", &wrong_timestamp),
+            ("X-Loom-Nonce", &wrong_nonce),
+        ],
+    );
     stop_serve(&mut child);
     let response = response.expect("wrong identity response");
     let body: Value = serde_json::from_str(&response.body).expect("wrong identity body is JSON");
@@ -2037,6 +2093,15 @@ fn fixture_example_body<'a>(fixture: &'a Value, example_name: &str) -> &'a Value
 }
 
 fn validate_fixture_examples(bind: &str, fixture: &Value, fixture_name: &str) {
+    validate_fixture_examples_matching(bind, fixture, fixture_name, |_| true);
+}
+
+fn validate_fixture_examples_matching(
+    bind: &str,
+    fixture: &Value,
+    fixture_name: &str,
+    should_validate: impl Fn(&str) -> bool,
+) {
     let shapes = fixture
         .pointer("/shape_decl/shapes")
         .and_then(Value::as_object)
@@ -2050,6 +2115,9 @@ fn validate_fixture_examples(bind: &str, fixture: &Value, fixture_name: &str) {
             .get("name")
             .and_then(Value::as_str)
             .expect("example name");
+        if !should_validate(example_name) {
+            continue;
+        }
         let method = example
             .pointer("/request/method")
             .and_then(Value::as_str)
@@ -2075,10 +2143,7 @@ fn validate_fixture_examples(bind: &str, fixture: &Value, fixture_name: &str) {
                 panic!("{fixture_name}:{example_name} HTTP request failed: {err}")
             }),
             "POST" => {
-                let body = example
-                    .pointer("/request/body")
-                    .unwrap_or_else(|| panic!("{fixture_name}:{example_name} missing request.body"))
-                    .to_string();
+                let body = fixture_request_body(example, fixture_name, example_name);
                 wait_for_http_post_json(bind, path, &body, &[]).unwrap_or_else(|err| {
                     panic!("{fixture_name}:{example_name} HTTP POST request failed: {err}")
                 })
@@ -2111,6 +2176,19 @@ fn validate_fixture_examples(bind: &str, fixture: &Value, fixture_name: &str) {
             example_name,
         );
     }
+}
+
+fn fixture_request_body(example: &Value, fixture_name: &str, example_name: &str) -> String {
+    let body = example
+        .pointer("/request/body")
+        .unwrap_or_else(|| panic!("{fixture_name}:{example_name} missing request.body"));
+    if fixture_name == "post-api-v1-files-batch.json" && example_name == "batch_too_large_400" {
+        let queries: Vec<Value> = (0..257)
+            .map(|index| serde_json::json!({"path": format!("p{index}.py"), "language": ""}))
+            .collect();
+        return serde_json::json!({"queries": queries}).to_string();
+    }
+    body.to_string()
 }
 
 fn assert_normative_example_fields(
@@ -2249,6 +2327,33 @@ fn assert_value_matches_decl(
                 "{fixture_name}:{example_name} field {field} is not an array"
             );
         }
+        "array_of_strings" => {
+            let values = value.as_array().unwrap_or_else(|| {
+                panic!("{fixture_name}:{example_name} field {field} is not an array")
+            });
+            for item in values {
+                assert!(
+                    item.as_str().is_some(),
+                    "{fixture_name}:{example_name} field {field} contains a non-string item"
+                );
+            }
+        }
+        "array_of_resolved_items" => {
+            let values = value.as_array().unwrap_or_else(|| {
+                panic!("{fixture_name}:{example_name} field {field} is not an array")
+            });
+            for item in values {
+                assert_batch_resolved_item(item, fixture_name, example_name, field);
+            }
+        }
+        "array_of_error_items" => {
+            let values = value.as_array().unwrap_or_else(|| {
+                panic!("{fixture_name}:{example_name} field {field} is not an array")
+            });
+            for item in values {
+                assert_batch_error_item(item, fixture_name, example_name, field);
+            }
+        }
         "non_empty_string" => {
             let value = value.as_str().unwrap_or_else(|| {
                 panic!("{fixture_name}:{example_name} field {field} is not a string")
@@ -2300,6 +2405,58 @@ fn assert_value_matches_decl(
         }
         other => panic!("{fixture_name}:{example_name} unknown field type {other} for {field}"),
     }
+}
+
+fn assert_batch_resolved_item(item: &Value, fixture_name: &str, example_name: &str, field: &str) {
+    let item = item.as_object().unwrap_or_else(|| {
+        panic!("{fixture_name}:{example_name} field {field} contains a non-object item")
+    });
+    for required in [
+        "requested_path",
+        "entity_id",
+        "content_hash",
+        "canonical_path",
+        "language",
+    ] {
+        let value = item.get(required).unwrap_or_else(|| {
+            panic!("{fixture_name}:{example_name} field {field} item missing {required}")
+        });
+        assert!(
+            value.as_str().is_some_and(|value| !value.is_empty()),
+            "{fixture_name}:{example_name} field {field} item {required} is not a non-empty string"
+        );
+    }
+    assert!(
+        item.keys().all(|key| [
+            "requested_path",
+            "entity_id",
+            "content_hash",
+            "canonical_path",
+            "language"
+        ]
+        .contains(&key.as_str())),
+        "{fixture_name}:{example_name} field {field} resolved item has unexpected keys: {item:?}"
+    );
+}
+
+fn assert_batch_error_item(item: &Value, fixture_name: &str, example_name: &str, field: &str) {
+    let item = item.as_object().unwrap_or_else(|| {
+        panic!("{fixture_name}:{example_name} field {field} contains a non-object item")
+    });
+    for required in ["requested_path", "code", "message"] {
+        let value = item.get(required).unwrap_or_else(|| {
+            panic!("{fixture_name}:{example_name} field {field} item missing {required}")
+        });
+        assert!(
+            value.as_str().is_some_and(|value| !value.is_empty()),
+            "{fixture_name}:{example_name} field {field} item {required} is not a non-empty string"
+        );
+    }
+    assert!(
+        item.keys()
+            .all(|key| ["requested_path", "code", "message"].contains(&key.as_str())),
+        "{fixture_name}:{example_name} field {field} error item has unexpected keys: {item:?}"
+    );
 }
 
 fn seed_file_entity(project_root: &Path) -> (String, String, String) {
@@ -2440,47 +2597,63 @@ fn write_http_config_with_identity_token_env(project_root: &Path, bind: &str, to
     .expect("write HTTP serve config with identity_token_env");
 }
 
-fn hmac_component_header(secret: &str, method: &str, path_and_query: &str, body: &[u8]) -> String {
+fn hmac_component_headers(
+    secret: &str,
+    method: &str,
+    path_and_query: &str,
+    body: &[u8],
+) -> (String, String, String) {
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
+    let nonce = Uuid::new_v4().to_string();
+    let component = hmac_component_header_with_freshness(
+        secret,
+        method,
+        path_and_query,
+        body,
+        timestamp,
+        &nonce,
+    );
+    (component, timestamp.to_string(), nonce)
+}
+
+fn hmac_component_header_with_freshness(
+    secret: &str,
+    method: &str,
+    path_and_query: &str,
+    body: &[u8],
+    timestamp: i64,
+    nonce: &str,
+) -> String {
     format!(
         "clarion:{}",
         hmac_sha256_hex(
             secret.as_bytes(),
-            canonical_hmac_message(method, path_and_query, body).as_bytes()
+            canonical_hmac_message(method, path_and_query, body, timestamp, nonce).as_bytes()
         )
     )
 }
 
-fn canonical_hmac_message(method: &str, path_and_query: &str, body: &[u8]) -> String {
+fn canonical_hmac_message(
+    method: &str,
+    path_and_query: &str,
+    body: &[u8],
+    timestamp: i64,
+    nonce: &str,
+) -> String {
     format!(
-        "{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}",
         method,
         path_and_query,
-        hex_lower(&Sha256::digest(body))
+        hex_lower(&Sha256::digest(body)),
+        timestamp,
+        nonce
     )
 }
 
 fn hmac_sha256_hex(secret: &[u8], message: &[u8]) -> String {
-    const BLOCK_SIZE: usize = 64;
-    let mut key = [0_u8; BLOCK_SIZE];
-    if secret.len() > BLOCK_SIZE {
-        key[..32].copy_from_slice(&Sha256::digest(secret));
-    } else {
-        key[..secret.len()].copy_from_slice(secret);
-    }
-    let mut ipad = [0x36_u8; BLOCK_SIZE];
-    let mut opad = [0x5c_u8; BLOCK_SIZE];
-    for index in 0..BLOCK_SIZE {
-        ipad[index] ^= key[index];
-        opad[index] ^= key[index];
-    }
-    let mut inner = Sha256::new();
-    inner.update(ipad);
-    inner.update(message);
-    let inner = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(opad);
-    outer.update(inner);
-    hex_lower(&outer.finalize())
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts keys of any size");
+    mac.update(message);
+    hex_lower(&mac.finalize().into_bytes())
 }
 
 fn hex_lower(bytes: &[u8]) -> String {

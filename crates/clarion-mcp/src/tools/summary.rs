@@ -5,6 +5,7 @@
 //! shared free-function helpers, the tool catalogue, and the JSON-RPC dispatch.
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 
 use clarion_core::{
@@ -16,10 +17,11 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use clarion_storage::{
-    InferredCallEdgeRecord, InferredEdgeCacheEntry, InferredEdgeCacheKey, StorageError,
+    EntityRow, InferredCallEdgeRecord, InferredEdgeCacheEntry, InferredEdgeCacheKey, StorageError,
     SummaryCacheEntry, SummaryCacheKey, WriterCmd, call_edges_from, call_edges_targeting,
     candidate_entities_for_unresolved_sites, entity_by_id, existing_entity_ids,
-    inferred_edge_cache_lookup, summary_cache_lookup, unresolved_call_sites_for_caller,
+    guidance_sheet_is_expired, guidance_sheet_matches_entity, inferred_edge_cache_lookup,
+    list_guidance_sheets, summary_cache_lookup, unresolved_call_sites_for_caller,
     unresolved_callers_for_target,
 };
 
@@ -34,6 +36,55 @@ use crate::{
     verified_source_excerpt,
 };
 
+fn composed_summary_guidance(
+    conn: &rusqlite::Connection,
+    entity: &EntityRow,
+    project_root: &Path,
+    now: &str,
+) -> Result<String, StorageError> {
+    let explicit_sheet_ids: HashSet<String> = {
+        let mut stmt =
+            conn.prepare("SELECT from_id FROM edges WHERE kind = 'guides' AND to_id = ?1")?;
+        let rows = stmt.query_map(rusqlite::params![entity.id], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let mut blocks = Vec::new();
+    for sheet in list_guidance_sheets(conn)? {
+        if guidance_sheet_is_expired(&sheet, now) {
+            continue;
+        }
+        let matched = explicit_sheet_ids.contains(&sheet.id)
+            || guidance_sheet_matches_entity(conn, &sheet, &entity.id, &canonical_root)?;
+        if !matched {
+            continue;
+        }
+        let Some(content) = sheet.properties.get("content").and_then(Value::as_str) else {
+            continue;
+        };
+        let content = content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        blocks.push(format!("Guidance sheet {}:\n{}", sheet.id, content));
+    }
+    Ok(blocks.join("\n\n"))
+}
+
+fn guidance_fingerprint(guidance_text: &str) -> String {
+    if guidance_text.trim().is_empty() {
+        EMPTY_GUIDANCE_FINGERPRINT.to_owned()
+    } else {
+        format!(
+            "guidance:{}",
+            blake3::hash(guidance_text.as_bytes()).to_hex()
+        )
+    }
+}
+
 impl ServerState {
     pub(crate) async fn tool_summary(
         &self,
@@ -42,7 +93,7 @@ impl ServerState {
         let entity_id = required_str(arguments, "id")?.to_owned();
         let now = (self.clock)();
         let read = match self
-            .read_summary_inputs(entity_id, self.summary_model_id())
+            .read_summary_inputs(entity_id, self.summary_model_id(), now.clone())
             .await
         {
             Ok(read) => read,
@@ -426,7 +477,9 @@ impl ServerState {
         &self,
         entity_id: String,
         summary_model_id: String,
+        now: String,
     ) -> Result<SummaryRead, StorageError> {
+        let project_root = self.project_root.clone();
         self.readers
             .with_reader(move |conn| {
                 let Some(entity) = entity_by_id(conn, &entity_id)? else {
@@ -444,12 +497,14 @@ impl ServerState {
                 let Some(content_hash) = entity.content_hash.clone() else {
                     return Ok(SummaryRead::MissingContentHash(entity.id));
                 };
+                let guidance_text = composed_summary_guidance(conn, &entity, &project_root, &now)?;
+                let guidance_fingerprint = guidance_fingerprint(&guidance_text);
                 let key = SummaryCacheKey {
                     entity_id: entity.id.clone(),
                     content_hash,
                     prompt_template_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
                     model_tier: summary_model_id,
-                    guidance_fingerprint: EMPTY_GUIDANCE_FINGERPRINT.to_owned(),
+                    guidance_fingerprint,
                 };
                 let cached = summary_cache_lookup(conn, &key)?;
                 let caller_count = i64::try_from(
@@ -466,6 +521,7 @@ impl ServerState {
                     entity_json: entity_payload,
                     key,
                     cached,
+                    guidance_text,
                     caller_count,
                     fan_out,
                 })))
@@ -522,6 +578,7 @@ impl ServerState {
             entity_id: ready.entity.id.clone(),
             kind: ready.entity.kind.clone(),
             name: ready.entity.name.clone(),
+            guidance: ready.guidance_text.clone(),
             source_excerpt: source_excerpt.clone(),
         });
         let request = LlmRequest {

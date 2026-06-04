@@ -27,9 +27,6 @@ use crate::{
 /// pathological project.
 const GUIDANCE_SCAN_CAP: usize = 2000;
 
-/// Bound on findings scanned per `findings_for` call before in-memory filtering.
-const FINDINGS_SCAN_CAP: usize = 5000;
-
 /// Default / max page size for `findings_for`.
 const FINDINGS_PAGE_DEFAULT: usize = 50;
 const FINDINGS_PAGE_MAX: usize = 200;
@@ -199,35 +196,59 @@ impl ServerState {
                     ));
                 };
 
+                let kind = filter.kind.as_deref();
+                let severity = filter.severity.as_deref();
+                let status = filter.status.as_deref();
+                let total: usize = conn.query_row(
+                    "SELECT COUNT(*) \
+                       FROM findings \
+                      WHERE entity_id = ?1 \
+                        AND (?2 IS NULL OR kind = ?2) \
+                        AND (?3 IS NULL OR severity = ?3) \
+                        AND (?4 IS NULL OR status = ?4)",
+                    rusqlite::params![entity.id, kind, severity, status],
+                    |row| {
+                        let count: i64 = row.get(0)?;
+                        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+                    },
+                )?;
                 let mut stmt = conn.prepare(
                     "SELECT id, tool, rule_id, kind, severity, status, message, \
                             related_entities, confidence, created_at \
-                       FROM findings WHERE entity_id = ?1 \
-                      ORDER BY created_at DESC, id LIMIT ?2",
+                       FROM findings \
+                      WHERE entity_id = ?1 \
+                        AND (?2 IS NULL OR kind = ?2) \
+                        AND (?3 IS NULL OR severity = ?3) \
+                        AND (?4 IS NULL OR status = ?4) \
+                      ORDER BY created_at DESC, id \
+                      LIMIT ?5 OFFSET ?6",
                 )?;
-                let cap = i64::try_from(FINDINGS_SCAN_CAP).unwrap_or(i64::MAX);
-                let mut rows = stmt.query(rusqlite::params![entity.id, cap])?;
-                let mut all: Vec<FindingRow> = Vec::new();
-                let mut scan_truncated = false;
+                let limit = i64::try_from(page.limit).unwrap_or(i64::MAX);
+                let offset = i64::try_from(page.offset).unwrap_or(i64::MAX);
+                let mut rows = stmt.query(rusqlite::params![
+                    entity.id, kind, severity, status, limit, offset
+                ])?;
+                let mut page_rows: Vec<FindingRow> = Vec::new();
                 while let Some(row) = rows.next()? {
-                    if all.len() >= FINDINGS_SCAN_CAP {
-                        scan_truncated = true;
-                        break;
-                    }
-                    all.push(FindingRow::from_row(row)?);
+                    page_rows.push(FindingRow::from_row(row)?);
                 }
-                let filtered: Vec<FindingRow> =
-                    all.into_iter().filter(|f| filter.matches(f)).collect();
 
-                let (slice, meta) = paginate(&filtered, page);
-                let findings: Vec<Value> = slice.iter().map(FindingRow::to_json).collect();
+                let returned = page_rows.len();
+                let findings: Vec<Value> = page_rows.iter().map(FindingRow::to_json).collect();
+                let meta = json!({
+                    "total": total,
+                    "offset": page.offset,
+                    "limit": page.limit,
+                    "returned": returned,
+                    "truncated": page.offset.saturating_add(returned) < total,
+                });
 
                 Ok(success_envelope(json!({
                     "entity": entity_json(conn, &entity),
                     "findings": findings,
                     "filter": filter.to_json(),
                     "page": meta,
-                    "scan_truncated": scan_truncated,
+                    "scan_truncated": false,
                 })))
             })
             .await;
@@ -398,15 +419,6 @@ impl FindingFilter {
             severity: field("severity")?,
             status: field("status")?,
         })
-    }
-
-    fn matches(&self, finding: &FindingRow) -> bool {
-        self.kind.as_ref().is_none_or(|k| *k == finding.kind)
-            && self
-                .severity
-                .as_ref()
-                .is_none_or(|s| *s == finding.severity)
-            && self.status.as_ref().is_none_or(|s| *s == finding.status)
     }
 
     fn to_json(&self) -> Value {

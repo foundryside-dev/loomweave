@@ -13,9 +13,9 @@ Response shapes (required by the Rust host's typed deserialise path):
 - ``shutdown`` → ``{}`` (empty ``ShutdownResult`` struct — *not* ``null``).
 - ``initialized`` / ``exit`` — notifications, no response.
 
-Task 2 ships the dispatch skeleton with ``analyze_file`` returning an empty
-entity list. Task 6 wires the Wardline probe result into ``capabilities``;
-Task 7 replaces ``handle_analyze_file`` with the extractor.
+Task 2 shipped the dispatch skeleton with ``analyze_file`` returning an empty
+entity list. The current plugin does not advertise Wardline capabilities until
+it emits real Wardline-derived semantic signals.
 """
 
 from __future__ import annotations
@@ -31,16 +31,8 @@ from clarion_plugin_python import __version__
 from clarion_plugin_python.extractor import extract_with_stats
 from clarion_plugin_python.pyright_session import PyrightRunState, PyrightSession
 from clarion_plugin_python.stdout_guard import install_stdio
-from clarion_plugin_python.wardline_probe import probe as wardline_probe
 
 ONTOLOGY_VERSION = "0.6.0"
-
-# Sprint 1 defaults for the Wardline version pin (WP3 L8 + plugin.toml
-# `[integrations.wardline]`). Kept as module constants so Task 7's
-# manifest values match by inspection; a future sprint can flow these
-# through from the parsed manifest on demand.
-WARDLINE_MIN_VERSION = "1.0.0"
-WARDLINE_MAX_VERSION = "2.0.0"
 
 # Plugin-side Content-Length sanity cap. Matches the host's ADR-021 §2b
 # default (8 MiB) so the plugin never emits a frame the host would kill us
@@ -80,7 +72,11 @@ def read_frame(stream: IO[bytes]) -> dict[str, Any] | None:
             return None
         if line in (b"\r\n", b"\n"):
             break
-        decoded = line.decode("ascii").rstrip("\r\n")
+        try:
+            decoded = line.decode("ascii").rstrip("\r\n")
+        except UnicodeDecodeError as exc:
+            msg = "malformed non-ASCII header line"
+            raise ProtocolError(msg) from exc
         if ":" not in decoded:
             msg = f"malformed header line: {decoded!r}"
             raise ProtocolError(msg)
@@ -150,9 +146,7 @@ def handle_initialize(params: dict[str, Any], state: ServerState) -> dict[str, A
         "name": "clarion-plugin-python",
         "version": __version__,
         "ontology_version": ONTOLOGY_VERSION,
-        "capabilities": {
-            "wardline": wardline_probe(WARDLINE_MIN_VERSION, WARDLINE_MAX_VERSION),
-        },
+        "capabilities": {},
     }
 
 

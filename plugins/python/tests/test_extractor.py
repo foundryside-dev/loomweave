@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 import textwrap
@@ -24,6 +25,11 @@ from clarion_plugin_python.reference_resolver import ReferenceResolutionResult, 
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+WARDLINE_QUALNAME_FIXTURE = (
+    Path(__file__).resolve().parents[3]
+    / "docs/federation/fixtures/wardline-qualname-normalization.json"
+)
 
 
 class FakeCallResolver:
@@ -464,6 +470,32 @@ def test_level_three_relative_import_from_deep_package_init_targets_root_sibling
     ]
 
 
+def test_type_checking_and_function_local_imports_carry_runtime_scope() -> None:
+    source = (
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    import pkg.types\n"
+        "\n"
+        "def load():\n"
+        "    import pkg.local\n"
+    )
+    _entities, edges = extract(source, "consumer.py")
+    imports_by_target = {edge["to_id"]: edge for edge in _import_edges(edges)}
+
+    assert imports_by_target["python:module:pkg.types"]["properties"] == {
+        "imported_name": "pkg.types",
+        "import_style": "import",
+        "level": 0,
+        "type_only": True,
+    }
+    assert imports_by_target["python:module:pkg.local"]["properties"] == {
+        "imported_name": "pkg.local",
+        "import_style": "import",
+        "level": 0,
+        "scope": "function",
+    }
+
+
 def test_import_edges_have_source_byte_range_and_resolved_confidence() -> None:
     source = "é = 1\nimport pkg.service\n"
     _entities, edges = extract(source, "consumer.py")
@@ -527,6 +559,36 @@ def test_extractor_emits_resolved_calls(tmp_path: Path, pyright_langserver: str)
     assert calls[0]["to_id"] == "python:function:demo.callee"
     assert calls[0]["confidence"] == "resolved"
     assert calls[0]["source_byte_start"] < calls[0]["source_byte_end"]
+
+
+@pytest.mark.pyright
+def test_extractor_skips_calls_from_dropped_duplicate_definition(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    result = _extract_with_pyright(
+        tmp_path,
+        """
+        def callee():
+            pass
+
+        def dup():
+            pass
+
+        def dup():
+            callee()
+        """,
+        pyright_langserver,
+    )
+
+    calls = _call_edges(result.edges)
+    assert result.stats.duplicate_entities_dropped_total == 1
+    assert [
+        edge
+        for edge in calls
+        if edge["from_id"] == "python:function:demo.dup"
+        and edge["to_id"] == "python:function:demo.callee"
+    ] == []
 
 
 @pytest.mark.pyright
@@ -767,11 +829,27 @@ def test_module_prefix_path_decouples_file_path_and_dotted_prefix() -> None:
 
 
 def test_module_dotted_name_helper() -> None:
-    assert module_dotted_name("demo.py") == "demo"
-    assert module_dotted_name("src/demo.py") == "demo"
-    assert module_dotted_name("pkg/__init__.py") == "pkg"
-    assert module_dotted_name("src/pkg/mod.py") == "pkg.mod"
-    assert module_dotted_name("src/pkg/sub/mod.py") == "pkg.sub.mod"
+    fixture = json.loads(WARDLINE_QUALNAME_FIXTURE.read_text(encoding="utf-8"))
+    vectors = fixture["module_normalization_vectors"]
+    assert vectors
+    for vector in vectors:
+        assert module_dotted_name(vector["file_path"]) == vector["expected_module"], vector[
+            "description"
+        ]
+
+
+def test_wardline_qualname_fixture_composes_with_module_dotted_name() -> None:
+    fixture = json.loads(WARDLINE_QUALNAME_FIXTURE.read_text(encoding="utf-8"))
+    vectors = fixture["qualified_name_vectors"]
+    assert vectors
+    for vector in vectors:
+        module_name = module_dotted_name(vector["file_path"])
+        qualname = vector["qualname"]
+        qualified_name = module_name if qualname is None else f"{module_name}.{qualname}"
+        assert qualified_name == vector["expected_qualified_name"], vector["description"]
+        assert f"python:{vector['kind']}:{qualified_name}" == vector["expected_entity_id"], vector[
+            "description"
+        ]
 
 
 def test_source_range_end_fields_populated() -> None:
@@ -1253,6 +1331,41 @@ def test_references_inside_overload_implementation_body_are_emitted() -> None:
     impl_sites = [s for s in sites if s.from_id == "python:function:demo.foo"]
     assert len(impl_sites) == 1
     assert impl_sites[0].kind == "name"
+
+
+@pytest.mark.pyright
+def test_extractor_does_not_turn_closure_local_into_module_reference(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    source = textwrap.dedent(
+        """
+        def outer():
+            token = object()
+
+            def inner():
+                return token
+
+            return inner
+        """,
+    ).lstrip()
+    path = tmp_path / "demo.py"
+    path.write_text(source, encoding="utf-8")
+
+    with PyrightSession(tmp_path, executable=pyright_langserver) as resolver:
+        result = extract_with_stats(
+            source,
+            str(path),
+            module_prefix_path="demo.py",
+            reference_resolver=resolver,
+        )
+
+    references = [edge for edge in result.edges if edge["kind"] == "references"]
+    assert not any(
+        edge["from_id"] == "python:function:demo.outer.<locals>.inner"
+        and edge["to_id"] == "python:module:demo"
+        for edge in references
+    )
 
 
 def test_safety_net_drops_duplicate_non_overload_definitions(

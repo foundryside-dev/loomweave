@@ -141,6 +141,7 @@ world_prompt = (
     f"Entity id: {world_entity[0]}\n"
     f"Kind: {world_entity[1]}\n"
     f"Name: {world_entity[2]}\n"
+    "Matching guidance:\nNo matching guidance.\n"
     f"Source excerpt:\n{world_excerpt}\n"
     "Return JSON with purpose, behavior, relationships, and risks fields."
 )

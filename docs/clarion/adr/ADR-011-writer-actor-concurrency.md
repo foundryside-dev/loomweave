@@ -1,6 +1,6 @@
 # ADR-011: Writer-Actor Concurrency Model with Per-N-Files Transactions
 
-**Status**: Accepted
+**Status**: Accepted; amended by ADR-041
 **Date**: 2026-04-18
 **Deciders**: qacona@gmail.com
 **Context**: SQLite concurrency model for `clarion analyze` + `clarion serve` against a shared `.clarion/clarion.db`; design-review `§2.2` flagged the original single-transaction posture as CRITICAL

@@ -7,6 +7,7 @@
 # change on every analyze run, so they are NOT tracked (untracked 2026-06-02).
 clarion.db
 instance_id
+clarion.lock
 
 # SQLite write-ahead files never belong in the repo.
 *-wal

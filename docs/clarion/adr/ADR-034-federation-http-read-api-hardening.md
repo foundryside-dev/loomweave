@@ -1,6 +1,6 @@
 # ADR-034: Federation HTTP Read API Hardening — Identity Auth, Batch Resolution, `BRIEFING_BLOCKED`, Instance ID
 
-**Status**: Accepted
+**Status**: Accepted; HMAC freshness amended by [ADR-042](./ADR-042-hmac-freshness-and-replay-window.md)
 **Date**: 2026-05-19
 **Deciders**: qacona@gmail.com
 **Context**: Sprint 3 Loom federation hardening (see [`docs/implementation/sprint-3/2026-05-19-loom-federation-hardening-tasking.md`](../../implementation/sprint-3/2026-05-19-loom-federation-hardening-tasking.md)); extends ADR-014's read-API §"Security Posture" and §"Error Envelope"

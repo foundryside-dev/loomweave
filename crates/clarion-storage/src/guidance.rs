@@ -153,6 +153,47 @@ const SELECT_COLUMNS: &str = "id, name, short_name, scope_level, properties, \
 /// canonical name) follows.
 const GUIDANCE_ID_PREFIX: &str = "core:guidance:";
 
+fn validate_guidance_id(id: &str) -> Result<()> {
+    if !id.starts_with(GUIDANCE_ID_PREFIX) {
+        return Err(StorageError::InvalidQuery(format!(
+            "guidance sheet id '{id}' is not a guidance id (must start with `{GUIDANCE_ID_PREFIX}`); \
+             refusing to write — this would corrupt the entity it names"
+        )));
+    }
+    Ok(())
+}
+
+/// Insert a new guidance sheet. Unlike [`upsert_guidance_sheet`], this is
+/// create-only: an existing id is reported as an error and the stored row is
+/// left unchanged.
+///
+/// # Errors
+///
+/// Returns [`StorageError::InvalidQuery`] if `sheet.id` does not start with
+/// `core:guidance:` or if a row with the same id already exists. Returns
+/// [`StorageError::Sqlite`] on any other `SQLite` failure.
+pub fn insert_guidance_sheet(conn: &Connection, sheet: &GuidanceSheetInput<'_>) -> Result<()> {
+    validate_guidance_id(sheet.id)?;
+    let properties = serde_json::to_string(sheet.properties)
+        .map_err(|e| StorageError::InvalidQuery(format!("serialize guidance properties: {e}")))?;
+    let rows = conn.execute(
+        "INSERT INTO entities \
+            (id, plugin_id, kind, name, short_name, properties, created_at, updated_at) \
+         VALUES \
+            (?1, 'core', 'guidance', ?2, ?3, ?4, \
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
+         ON CONFLICT(id) DO NOTHING",
+        params![sheet.id, sheet.name, sheet.short_name, properties],
+    )?;
+    if rows == 0 {
+        return Err(StorageError::InvalidQuery(format!(
+            "guidance sheet '{}' already exists; use edit to modify it",
+            sheet.id
+        )));
+    }
+    Ok(())
+}
+
 /// Insert or replace a guidance sheet. On a fresh id this inserts; on an
 /// existing id it updates `name`, `short_name`, `properties`, and bumps
 /// `updated_at` (preserving `created_at`). The generated columns recompute from
@@ -178,13 +219,7 @@ const GUIDANCE_ID_PREFIX: &str = "core:guidance:";
 /// `core:guidance:` (nothing is written). Returns [`StorageError::Sqlite`] on
 /// any `SQLite` failure (lock, constraint).
 pub fn upsert_guidance_sheet(conn: &Connection, sheet: &GuidanceSheetInput<'_>) -> Result<()> {
-    if !sheet.id.starts_with(GUIDANCE_ID_PREFIX) {
-        return Err(StorageError::InvalidQuery(format!(
-            "guidance sheet id '{}' is not a guidance id (must start with `{GUIDANCE_ID_PREFIX}`); \
-             refusing to write — this would corrupt the entity it names",
-            sheet.id
-        )));
-    }
+    validate_guidance_id(sheet.id)?;
     let properties = serde_json::to_string(sheet.properties)
         .map_err(|e| StorageError::InvalidQuery(format!("serialize guidance properties: {e}")))?;
     conn.execute(

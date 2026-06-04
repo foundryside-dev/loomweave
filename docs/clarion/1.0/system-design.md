@@ -190,9 +190,9 @@ Each plugin declares its ontology at startup. The manifest is the contract betwe
 
 Key fields:
 - `plugin_id` — the namespace for this plugin's emissions (e.g., `python`, `java`, `core`)
-- `kinds` — every entity kind the plugin can emit (`function`, `class`, `protocol`, `global`, `module`, `package`, ...)
-- `edge_kinds` — plugin-defined edge kinds (`imports`, `calls`, `inherits_from`, `decorated_by`, `uses_type`, `alias_of`, ...). Core reserves `contains`, `guides`, `emits_finding`, `in_subsystem`.
-- `tags` — declared tag vocabulary (including Wardline annotation names for the Python plugin)
+- `kinds` — every entity kind the plugin can emit; the v1.0 Python plugin declares only `function`, `class`, and `module`
+- `edge_kinds` — plugin-defined edge kinds; the v1.0 Python plugin declares only `contains`, `calls`, `references`, and `imports`. Core reserves `guides`, `emits_finding`, `in_subsystem`, and core-owned containment/source anchors.
+- `tags` — declared tag vocabulary
 - `capabilities` — boolean flags per capability (`calls`, `imports`, `inherits_from`, ...) with `confidence_basis` per capability (`ast_match`, `name_match`, `clarion_augmentation`, ...)
 - `supported_rule_ids` — rule IDs this plugin may emit, namespaced by prefix
 - `prompt_templates` — list of named templates (`python:class:v1`, `python:module:v1`, ...) with per-segment slot specifications
@@ -210,30 +210,21 @@ hash-pinning are deferred (NG-16).
 
 The Python plugin is the v0.1 validating plugin and the reference implementation of the manifest contract.
 
-**Parser dispatch**. The plugin parses with the standard-library `ast` module — there is **no tree-sitter and no LibCST dependency**. Structural extraction (`function` / `class` / `module` entities, qualnames, `imports` and decorator edges) walks the `ast` tree directly. Call-graph and reference resolution is delegated to a managed **pyright** subprocess session (`PyrightSession`, recycled every 25 files), which serves as both the call resolver and the reference resolver. There is no `CLA-PY-PARTIAL-PARSE` fallback path.
+**Parser dispatch**. The plugin parses with the standard-library `ast` module — there is **no tree-sitter and no LibCST dependency**. Structural extraction (`function` / `class` / `module` entities, qualnames, and `imports` edges) walks the `ast` tree directly. Decorator source ranges are retained in entity definition metadata, but decorator semantics are not emitted as edges in v1.0. Call-graph and reference resolution is delegated to a managed **pyright** subprocess session (`PyrightSession`, recycled every 25 files), which serves as both the call resolver and the reference resolver. There is no `CLA-PY-PARTIAL-PARSE` fallback path.
 
-**Import resolution** (REQ-PLUGIN-05). Resolution uses an explicit policy:
-- `sys.path` discovered via virtualenv introspection (`python -m site` against the supplied `python_executable` from `plugins.toml`) or, if none supplied, the ambient Python
-- `src.` prefix stripped by default; configurable via `clarion.yaml:analysis.python.canonical_root`
-- `__init__.py` re-exports resolve to the definition site (which wins for the canonical ID). The plugin does **not** emit a separate `alias_of` edge in v1.0 — the kind is reserved in the manifest but unused.
-- Calls and references that pyright cannot resolve are recorded as **unresolved call / reference sites** (counted in run stats; unresolved *call* sites persist to `entity_unresolved_call_sites` for query-time inferred dispatch) rather than dropped. The plugin does **not** mint `python:unresolved:*` placeholder entities.
-- `imports` edges are emitted from `import` / `from … import` statements via the `ast` walk; `TYPE_CHECKING`-guarded imports are **not** excluded in v1.0 (the type-only-import filter is not implemented).
+**Import extraction** (REQ-PLUGIN-05). `imports` edges are emitted from `import` / `from ... import` statements via the `ast` walk. Relative imports are normalized against the current module, `__init__.py` collapses to the package module name, `TYPE_CHECKING`-guarded imports carry `properties.type_only = true`, and function-local imports carry `properties.scope = "function"`. Graph algorithms filter those properties when they need runtime-only imports. Calls and references that pyright cannot resolve are recorded as **unresolved call / reference sites** (counted in run stats; unresolved *call* sites persist to `entity_unresolved_call_sites` for query-time inferred dispatch) rather than dropped. The plugin does **not** mint `python:unresolved:*` placeholder entities and does not emit `alias_of` edges for package re-exports in v1.0.
 
-**Decorator detection** (REQ-PLUGIN-06). Direct-name match is insufficient — real Python code uses decorator factories (`@app.route("/health")`), stacked decorators (order matters), class decorators, and aliases (`validates = validates_shape`). Detection handles:
-- Factory invocations: record the decorator name + call arguments as edge properties
-- Stacked decorators: preserve order in a `decoration_order` edge property (matters for Wardline semantics)
-- Aliases: follow name resolution; an alias to a Wardline-registered decorator counts as that decorator
-- Legacy renames: consult Wardline's `LEGACY_DECORATOR_ALIASES` (from the directly-imported REGISTRY) to avoid double-counting old-name + new-name
+**Decorator detection** (REQ-PLUGIN-06). Decorator semantics are deferred in v1.0. The extractor includes decorator lines in function/class source spans for navigation, but the manifest does not declare `decorated_by`, Wardline tags, or Wardline-aware capability, and the plugin emits no decorator edges, decorator arguments, or alias-resolved decorator facts.
 
 **Serial-or-parallel posture**. v0.1 is serial within the plugin (one file at a time). Parallelism happens at the core level (multiple plugins, multiple LLM calls). Parallelism inside the plugin is deferred to v0.2.
 
 ### Observe-vs-enforce boundary (Principle 5)
 
-The Python plugin detects *that* a Wardline annotation is present on a function (e.g., `@validates_shape`); Wardline's enforcer determines *whether* the function actually validates what it claims. Clarion tags the entity with `wardline.groups` / `wardline.annotations`; Wardline's findings (surfaced via Filigree) fill in the "does it actually comply?" answer.
+The Python plugin is not Wardline-aware in v1.0. Future Wardline-aware extraction may detect *that* a Wardline annotation is present on a function (e.g., `@validates_shape`), while Wardline's enforcer remains responsible for deciding *whether* the function actually validates what it claims. Clarion must not tag entities with `wardline.groups` / `wardline.annotations` until the manifest advertises that capability and the extractor emits the corresponding signals.
 
 This boundary is preserved by:
-- Clarion importing Wardline's REGISTRY directly rather than redefining the decorator vocabulary (`CON-WARDLINE-01`)
-- Clarion's plugin declaring Wardline decorator names in its manifest `tags`, but not re-implementing Wardline's rule logic
+- Clarion not redefining Wardline's decorator vocabulary in v1.0
+- Clarion's plugin keeping `wardline_aware = false` until it emits usable Wardline-derived signals
 - `CLA-FACT-TIER-SUBSYSTEM-MIXING` (structural observation) being core-emitted (uses clustering) — Clarion is flagging that tiers disagree; Wardline would be the tool that decides *which* tier is correct
 
 ---
@@ -438,7 +429,12 @@ flowchart LR
 
 ### Crash safety
 
-SQLite WAL + per-N-files transactions + explicit `PRAGMA synchronous=NORMAL` give crash-safe semantics: a SIGKILL during analyze loses at most the last N-files batch. `clarion analyze --resume <run_id>` reads the run's checkpoint file (`runs/<run_id>/checkpoints.jsonl`) and continues from the last clean phase boundary.
+SQLite WAL + writer-actor transactions + explicit `PRAGMA synchronous=NORMAL`
+give crash-safe storage semantics: a SIGKILL during analyze must not corrupt
+`.clarion/clarion.db`, and committed rows survive. Per ADR-041, v1.x
+`clarion analyze --resume <run_id>` reopens the existing run id and re-walks
+idempotently; it does not read `checkpoints.jsonl` or continue from a phase/file
+checkpoint.
 
 ### Git-friendly storage
 
@@ -591,18 +587,21 @@ flowchart TB
 
     Phase0 --> Phase1 --> Phase15 --> Phase2 --> Phase3 --> Phase4 --> Phase5 --> Phase6 --> Phase7 --> Phase8
 
-    Phase0 -.->|"checkpoint"| CheckPt0([checkpoint])
-    Phase1 -.->|"checkpoint"| CheckPt1([checkpoint])
-    Phase15 -.->|"checkpoint"| CheckPt15([checkpoint])
-    Phase2 -.->|"checkpoint"| CheckPt2([checkpoint])
-    Phase3 -.->|"checkpoint"| CheckPt3([checkpoint])
-    Phase4 -.->|"checkpoint"| CheckPt4([checkpoint])
-    Phase5 -.->|"checkpoint"| CheckPt5([checkpoint])
-    Phase6 -.->|"checkpoint"| CheckPt6([checkpoint])
-    Phase7 -.->|"checkpoint"| CheckPt7([checkpoint])
+    Phase0 -.->|"ADR-041: no v1.x checkpoint resume"| CheckPt0([same-run re-emit])
+    Phase1 -.->|"idempotent writes"| CheckPt1([same-run re-emit])
+    Phase15 -.->|"idempotent writes"| CheckPt15([same-run re-emit])
+    Phase2 -.->|"idempotent writes"| CheckPt2([same-run re-emit])
+    Phase3 -.->|"idempotent writes"| CheckPt3([same-run re-emit])
+    Phase4 -.->|"cache may avoid work"| CheckPt4([same-run re-emit])
+    Phase5 -.->|"cache may avoid work"| CheckPt5([same-run re-emit])
+    Phase6 -.->|"cache may avoid work"| CheckPt6([same-run re-emit])
+    Phase7 -.->|"idempotent writes"| CheckPt7([same-run re-emit])
 ```
 
-Each phase transition writes a checkpoint to `runs/<run_id>/checkpoints.jsonl`. `clarion analyze --resume <run_id>` reads the checkpoint file and resumes from the last clean phase boundary. Content-hash caching means resumed runs naturally skip unchanged-file work.
+Per ADR-041, v1.x phase transitions do not write a durable checkpoint file.
+`clarion analyze --resume <run_id>` reuses the run id, re-walks safely, and
+relies on existing caches where they independently apply. A future checkpoint
+ADR may reintroduce phase/file skipping with explicit provider-call accounting.
 
 ### Parallelism
 
@@ -1014,14 +1013,17 @@ Why this exists: every sibling tool consuming Clarion should ask in *their* nati
 
 404 behaviour: returns 200 with `resolution_confidence: "none"` and empty `entity_id` — distinguishes "Clarion doesn't know this" from "Clarion is down."
 
-#### Authentication — ADR-014 registry-backend read API
+#### Authentication — ADR-014 / ADR-034 / ADR-042 registry-backend read API
 
 ADR-014 supersedes ADR-012 for the Filigree `registry_backend: clarion`
-HTTP read surface. The registry-backend API is unauthenticated and
-loopback-only by default. It refuses non-loopback binds unless
-`serve.http.allow_non_loopback: true`; that opt-in requires an
-operator-managed authenticated reverse proxy or equivalent access-control
-layer in front of Clarion.
+HTTP read surface. The registry-backend API is loopback-only by default and may
+run unauthenticated only in that local sidecar posture. ADR-034 closes the
+non-loopback gap: a non-loopback bind requires both
+`serve.http.allow_non_loopback: true` and a resolved authentication secret
+(preferred HMAC identity via `serve.http.identity_token_env`, or legacy bearer
+via `serve.http.token_env`). ADR-042 hardens the HMAC form with timestamp and
+nonce freshness, while `docs/federation/contracts.md` remains the authoritative
+wire surface.
 
 ADR-012's UDS/token design is retained as historical context for the earlier
 broad v0.1 HTTP API proposal, but it is not the implementation contract for the
@@ -1029,9 +1031,9 @@ registry-backend file-resolution endpoint.
 
 Loopback is not a complete security boundary on modern dev hosts (shared
 containers, devcontainers, and other local processes all sit on 127.0.0.1).
-The ADR-014 stance accepts that local-read exposure for the bounded
+The current stance accepts that local-read exposure for the bounded
 registry-backend API and prevents accidental network exposure through the
-non-loopback guard.
+non-loopback guard plus mandatory authentication.
 
 **Default — loopback only**:
 - Binds only to loopback addresses.

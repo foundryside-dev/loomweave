@@ -67,8 +67,28 @@ jobs:
           python scripts/check-migration-retirement.py --self-test
           python scripts/check-migration-retirement.py
 
+      - name: release governance static guard
+        run: |
+          python scripts/check-github-release-governance.py --self-test
+          python scripts/check-github-release-governance.py --static-only
+
       - name: cross-workspace version lockstep
         run: python scripts/check-workspace-version-lockstep.py
+
+      - name: pyright pin lockstep
+        run: |
+          python scripts/check-pyright-pin-lockstep.py --self-test
+          python scripts/check-pyright-pin-lockstep.py
+
+      - name: wardline version bounds
+        run: |
+          python scripts/check-wardline-version-bounds.py --self-test
+          python scripts/check-wardline-version-bounds.py
+
+      - name: entity-cap ADR/code lockstep
+        run: |
+          python scripts/check-entity-cap-lockstep.py --self-test
+          python scripts/check-entity-cap-lockstep.py
 
       - name: rust clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings

@@ -15,6 +15,7 @@ pub mod prior_index;
 pub mod query;
 pub mod reader;
 pub mod retry;
+pub mod runs;
 pub mod schema;
 pub mod sei;
 pub mod unresolved;
@@ -37,8 +38,8 @@ pub use glob::glob_match;
 pub use guidance::{
     GuidanceSheet, GuidanceSheetInput, MatchFacts, PortableSheet, RuleVerdict,
     delete_guidance_sheet, get_guidance_sheet, guidance_sheet_is_expired, guidance_sheet_is_stale,
-    guidance_sheet_matches_entity, import_portable_sheet, invalidate_summaries_for_sheet,
-    list_guidance_sheets, rule_match, upsert_guidance_sheet,
+    guidance_sheet_matches_entity, import_portable_sheet, insert_guidance_sheet,
+    invalidate_summaries_for_sheet, list_guidance_sheets, rule_match, upsert_guidance_sheet,
 };
 pub use prior_index::{
     PriorIndexEntry, clear_prior_index, load_prior_index, previously_analyzed_files,
@@ -60,6 +61,7 @@ pub use query::{
 };
 pub use reader::ReaderPool;
 pub use retry::{RetryPolicy, begin_immediate};
+pub use runs::mark_stale_running_runs_failed;
 pub use sei::{
     BindingStatus, GitRename, GitRenameSource, LineageEvent, NewEntityDescriptor, SEI_PREFIX,
     SeiBinding, SeiBindingRecord, SeiDecision, SeiLineageEntry, SeiLineageRow, SeiLookupResult,

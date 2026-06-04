@@ -194,8 +194,17 @@ impl SecretScanOutcome {
         run_id: &str,
         project_root: &Path,
         started_at: &str,
+        head_commit: Option<&str>,
     ) -> Result<()> {
-        anchors::ensure_and_emit_findings(self, writer, run_id, project_root, started_at).await
+        anchors::ensure_and_emit_findings(
+            self,
+            writer,
+            run_id,
+            project_root,
+            started_at,
+            head_commit,
+        )
+        .await
     }
 }
 

@@ -9,7 +9,8 @@ use clarion_storage::{
     entity_at_line, entity_briefing_block_reason, entity_by_id, find_entities, findings_for_emit,
     module_dependency_edges, module_reference_rollup, normalize_source_path, pragma,
     reference_edges_for_entity, resolve_file, resolve_file_catalog_entry, schema,
-    subsystem_for_member, subsystem_members, subsystem_of_entity,
+    subsystem_for_member, subsystem_members, subsystem_of_entity, unresolved_call_sites_for_caller,
+    unresolved_callers_for_target,
 };
 use rusqlite::{Connection, params};
 
@@ -23,6 +24,21 @@ fn open_fresh(tempdir: &tempfile::TempDir) -> Connection {
 
 fn insert_entity(conn: &Connection, id: &str, kind: &str) {
     insert_named_entity(conn, id, kind, id, id, None);
+}
+
+fn insert_entity_with_hash(conn: &Connection, id: &str, kind: &str, content_hash: &str) {
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, properties, content_hash, created_at,
+            updated_at
+         ) VALUES (
+            ?1, 'python', ?2, ?1, ?1, '{}', ?3,
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        params![id, kind, content_hash],
+    )
+    .expect("insert entity with hash");
 }
 
 fn insert_named_entity(
@@ -103,6 +119,23 @@ fn insert_contains_edge(conn: &Connection, from_id: &str, to_id: &str) {
         params![from_id, to_id],
     )
     .expect("insert contains edge");
+}
+
+fn insert_unresolved_call_site(
+    conn: &Connection,
+    caller_id: &str,
+    caller_content_hash: &str,
+    site_key: &str,
+    callee_expr: &str,
+) {
+    conn.execute(
+        "INSERT INTO entity_unresolved_call_sites (
+            caller_entity_id, caller_content_hash, site_key, site_ordinal,
+            source_byte_start, source_byte_end, callee_expr, created_at
+         ) VALUES (?1, ?2, ?3, 0, 10, 20, ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        params![caller_id, caller_content_hash, site_key, callee_expr],
+    )
+    .expect("insert unresolved call site");
 }
 
 fn insert_references_edge(
@@ -399,6 +432,79 @@ fn module_dependency_edges_expands_ambiguous_call_candidates() {
             },
         ],
     );
+}
+
+#[test]
+fn unresolved_call_sites_for_caller_filters_stale_content_hash_rows() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity_with_hash(
+        &conn,
+        "python:function:pkg.caller",
+        "function",
+        "hash-current",
+    );
+    insert_unresolved_call_site(
+        &conn,
+        "python:function:pkg.caller",
+        "hash-old",
+        "stale-site",
+        "dynamic_old",
+    );
+    insert_unresolved_call_site(
+        &conn,
+        "python:function:pkg.caller",
+        "hash-current",
+        "current-site",
+        "dynamic_current",
+    );
+
+    let sites = unresolved_call_sites_for_caller(&conn, "python:function:pkg.caller", 10).unwrap();
+
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].site_key, "current-site");
+    assert_eq!(sites[0].caller_content_hash, "hash-current");
+}
+
+#[test]
+fn unresolved_callers_for_target_filters_stale_caller_content_hash_rows() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity_with_hash(
+        &conn,
+        "python:function:pkg.caller",
+        "function",
+        "hash-current",
+    );
+    insert_entity_with_hash(
+        &conn,
+        "python:function:pkg.target",
+        "function",
+        "hash-target",
+    );
+    insert_unresolved_call_site(
+        &conn,
+        "python:function:pkg.caller",
+        "hash-old",
+        "stale-site",
+        "target",
+    );
+    insert_unresolved_call_site(
+        &conn,
+        "python:function:pkg.caller",
+        "hash-current",
+        "current-site",
+        "target",
+    );
+    let target = entity_by_id(&conn, "python:function:pkg.target")
+        .unwrap()
+        .expect("target");
+
+    let sites = unresolved_callers_for_target(&conn, &target, 10).unwrap();
+
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].site_key, "current-site");
+    assert_eq!(sites[0].caller_content_hash, "hash-current");
 }
 
 #[test]

@@ -608,7 +608,11 @@ fn analyze_migrates_a_stale_db_instead_of_failing() {
     let uv: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(uv, 7, "analyze must apply the pending migration");
+    assert_eq!(
+        uv,
+        i64::from(clarion_storage::schema::CURRENT_SCHEMA_VERSION),
+        "analyze must apply all pending migrations"
+    );
     let has_column: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name = 'analyzed_at_commit'",
@@ -3040,6 +3044,78 @@ fn phase3_env() -> (tempfile::TempDir, tempfile::TempDir, std::ffi::OsString) {
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
     (project_dir, plugin_dir, plugin_path)
+}
+
+#[cfg(unix)]
+fn run_git(project_root: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(args)
+        .status()
+        .expect("run git");
+    assert!(status.success(), "git {args:?} failed with {status}");
+}
+
+#[cfg(unix)]
+fn git_stdout(project_root: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(output.status.success(), "git {args:?} failed");
+    String::from_utf8(output.stdout)
+        .expect("git stdout is utf8")
+        .trim()
+        .to_owned()
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_stamps_entities_with_git_head_commit() {
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    let mut analyze_paths: Vec<std::path::PathBuf> = std::env::split_paths(&plugin_path).collect();
+    if let Some(system_path) = std::env::var_os("PATH") {
+        analyze_paths.extend(std::env::split_paths(&system_path));
+    }
+    let analyze_path = std::env::join_paths(analyze_paths).expect("join analyze PATH");
+    std::fs::write(project_dir.path().join("demo.p3"), b"module\n").expect("write fixture file");
+    run_git(project_dir.path(), &["init", "-q"]);
+    run_git(project_dir.path(), &["config", "user.email", "t@t"]);
+    run_git(project_dir.path(), &["config", "user.name", "t"]);
+    run_git(project_dir.path(), &["add", "demo.p3"]);
+    run_git(project_dir.path(), &["commit", "-qm", "initial"]);
+    let head = git_stdout(project_dir.path(), &["rev-parse", "HEAD"]);
+
+    clarion_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &analyze_path)
+        .assert()
+        .success();
+
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    for entity_id in ["core:file:demo.p3", "phase3fixture:module:demo"] {
+        let (first_seen, last_seen): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT first_seen_commit, last_seen_commit FROM entities WHERE id = ?1",
+                [entity_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or_else(|err| panic!("query provenance for {entity_id}: {err}"));
+        assert_eq!(
+            first_seen.as_deref(),
+            Some(head.as_str()),
+            "{entity_id} first_seen_commit"
+        );
+        assert_eq!(
+            last_seen.as_deref(),
+            Some(head.as_str()),
+            "{entity_id} last_seen_commit"
+        );
+    }
 }
 
 #[test]

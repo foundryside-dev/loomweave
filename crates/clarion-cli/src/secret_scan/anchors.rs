@@ -33,8 +33,9 @@ pub(super) async fn ensure_and_emit_findings(
     run_id: &str,
     project_root: &Path,
     started_at: &str,
+    head_commit: Option<&str>,
 ) -> Result<()> {
-    ensure_finding_anchors(outcome, writer, project_root, started_at).await?;
+    ensure_finding_anchors(outcome, writer, project_root, started_at, head_commit).await?;
     emit_findings(
         writer,
         run_id,
@@ -50,6 +51,7 @@ async fn ensure_finding_anchors(
     writer: &Writer,
     project_root: &Path,
     started_at: &str,
+    head_commit: Option<&str>,
 ) -> Result<()> {
     // Pass 1: paths with active findings this run get anchored with whatever
     // briefing_blocks reason applies (or none, if an override cleared it).
@@ -58,7 +60,7 @@ async fn ensure_finding_anchors(
         if outcome.finding_anchors.contains_key(&key) {
             continue;
         }
-        upsert_finding_anchor(outcome, writer, project_root, started_at, key).await?;
+        upsert_finding_anchor(outcome, writer, project_root, started_at, head_commit, key).await?;
     }
     // Pass 2: every sidecar path scanned this run that pass 1 did not anchor
     // (i.e. no current finding). The upsert refreshes properties + content_hash
@@ -77,7 +79,7 @@ async fn ensure_finding_anchors(
         if outcome.finding_anchors.contains_key(&key) {
             continue;
         }
-        upsert_finding_anchor(outcome, writer, project_root, started_at, key).await?;
+        upsert_finding_anchor(outcome, writer, project_root, started_at, head_commit, key).await?;
     }
     Ok(())
 }
@@ -87,6 +89,7 @@ async fn upsert_finding_anchor(
     writer: &Writer,
     project_root: &Path,
     started_at: &str,
+    head_commit: Option<&str>,
     key: PathBuf,
 ) -> Result<()> {
     let id = secret_finding_anchor_id(project_root, &key);
@@ -104,7 +107,7 @@ async fn upsert_finding_anchor(
             serde_json::Value::String(reason.as_str().to_owned()),
         );
     }
-    let record = EntityRecord {
+    let mut record = EntityRecord {
         id: id.clone(),
         plugin_id: "core".to_owned(),
         kind: "file".to_owned(),
@@ -126,6 +129,10 @@ async fn upsert_finding_anchor(
         created_at: started_at.to_owned(),
         updated_at: started_at.to_owned(),
     };
+    if let Some(commit) = head_commit {
+        record.first_seen_commit = Some(commit.to_owned());
+        record.last_seen_commit = Some(commit.to_owned());
+    }
     writer
         .send_wait(|ack| WriterCmd::InsertEntity {
             entity: Box::new(record),

@@ -320,12 +320,14 @@ dependencies = [
  "blake3",
  "clap",
  "clarion-core",
+ "clarion-federation",
  "clarion-mcp",
  "clarion-plugin-fixture",
  "clarion-scanner",
  "clarion-storage",
  "dotenvy",
  "fs2",
+ "hmac",
  "ignore",
  "reqwest",
  "rusqlite",
@@ -334,6 +336,7 @@ dependencies = [
  "serde_norway",
  "sha1",
  "sha2",
+ "subtle",
  "tempfile",
  "time",
  "tokio",
@@ -363,12 +366,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "clarion-federation"
+version = "1.2.0"
+dependencies = [
+ "clarion-storage",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "clarion-mcp"
 version = "1.2.0"
 dependencies = [
  "async-trait",
  "blake3",
  "clarion-core",
+ "clarion-federation",
  "clarion-storage",
  "nix",
  "reqwest",
@@ -566,6 +583,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -821,6 +839,15 @@ name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "home"

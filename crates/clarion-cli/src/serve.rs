@@ -11,10 +11,10 @@ use clarion_core::{
     CodexCliProvider, CodexCliProviderConfig, EmbeddingProvider, EmbeddingProviderError,
     LlmProvider, OpenRouterProvider, OpenRouterProviderConfig, Recording, RecordingProvider,
 };
-use clarion_mcp::config::{
+use clarion_federation::config::{
     LlmConfig, McpConfig, ProviderSelection, SemanticSearchConfig, select_provider_with_env,
 };
-use clarion_mcp::filigree::FiligreeHttpClient;
+use clarion_federation::filigree::FiligreeHttpClient;
 use clarion_storage::{DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, ReaderPool, Writer};
 
 pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
@@ -50,7 +50,7 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
     // (which goes stale, the dogfood bug) — then build the client against the
     // resolved URL so `issues_for` reaches the running dashboard. The same
     // resolution is surfaced by `project_status`.
-    let filigree_resolution = clarion_mcp::filigree_url::resolve_filigree_url(
+    let filigree_resolution = clarion_federation::filigree_url::resolve_filigree_url(
         &config.integrations.filigree,
         &project_root,
     );

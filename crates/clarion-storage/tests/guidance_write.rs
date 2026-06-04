@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use clarion_storage::{
     GuidanceSheetInput, delete_guidance_sheet, get_guidance_sheet, guidance_sheet_matches_entity,
-    list_guidance_sheets, pragma, schema, upsert_guidance_sheet,
+    insert_guidance_sheet, list_guidance_sheets, pragma, schema, upsert_guidance_sheet,
 };
 
 fn open_fresh(tempdir: &tempfile::TempDir) -> Connection {
@@ -81,6 +81,59 @@ fn upsert_then_get_roundtrips_properties_and_kind() {
     assert_eq!(
         sheet.properties.get("provenance").and_then(Value::as_str),
         Some("manual")
+    );
+}
+
+#[test]
+fn insert_guidance_sheet_rejects_existing_id_without_overwrite() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    let first_props = base_props("module", "2026-06-01T00:00:00.000Z");
+    let second_props = json!({
+        "content": "second writer must not win",
+        "scope_level": "function",
+        "match_rules": [],
+        "pinned": true,
+        "provenance": "manual",
+        "authored_at": "2026-06-02T00:00:00.000Z",
+    });
+
+    insert_guidance_sheet(
+        &conn,
+        &GuidanceSheetInput {
+            id: "core:guidance:race.sheet",
+            name: "race.sheet",
+            short_name: "sheet",
+            properties: &first_props,
+        },
+    )
+    .expect("first insert succeeds");
+    let err = insert_guidance_sheet(
+        &conn,
+        &GuidanceSheetInput {
+            id: "core:guidance:race.sheet",
+            name: "race.sheet",
+            short_name: "sheet",
+            properties: &second_props,
+        },
+    )
+    .expect_err("second create must fail instead of overwriting");
+
+    assert!(
+        err.to_string().contains("already exists"),
+        "duplicate create error should name existing sheet; got {err}"
+    );
+    let sheet = get_guidance_sheet(&conn, "core:guidance:race.sheet")
+        .unwrap()
+        .expect("sheet present");
+    assert_eq!(
+        sheet.properties.get("content").and_then(Value::as_str),
+        Some("guidance for module")
+    );
+    assert_eq!(sheet.scope_level.as_deref(), Some("module"));
+    assert_eq!(
+        sheet.properties.get("pinned").and_then(Value::as_bool),
+        Some(false)
     );
 }
 

@@ -967,11 +967,13 @@ pub fn unresolved_call_sites_for_caller(
         StorageError::InvalidQuery("unresolved call-site limit is too large".to_owned())
     })?;
     let mut stmt = conn.prepare(
-        "SELECT caller_entity_id, caller_content_hash, site_key, site_ordinal, \
-                source_file_id, source_byte_start, source_byte_end, callee_expr \
-         FROM entity_unresolved_call_sites \
-         WHERE caller_entity_id = ?1 \
-         ORDER BY site_ordinal, site_key \
+        "SELECT u.caller_entity_id, u.caller_content_hash, u.site_key, u.site_ordinal, \
+                u.source_file_id, u.source_byte_start, u.source_byte_end, u.callee_expr \
+         FROM entity_unresolved_call_sites u \
+         JOIN entities caller ON caller.id = u.caller_entity_id \
+         WHERE u.caller_entity_id = ?1 \
+           AND caller.content_hash = u.caller_content_hash \
+         ORDER BY u.site_ordinal, u.site_key \
          LIMIT ?2",
     )?;
     let rows = stmt.query_map(params![caller_id, limit_i64], map_unresolved_call_site_row)?;
@@ -998,9 +1000,10 @@ pub fn unresolved_callers_for_target(
                 u.source_file_id, u.source_byte_start, u.source_byte_end, u.callee_expr \
          FROM entity_unresolved_call_sites u \
          JOIN entities caller ON caller.id = u.caller_entity_id \
-         WHERE u.callee_expr = ?1 \
-            OR u.callee_expr = ?2 \
-            OR u.callee_expr LIKE ?3 ESCAPE '\\' \
+         WHERE caller.content_hash = u.caller_content_hash \
+           AND (u.callee_expr = ?1 \
+             OR u.callee_expr = ?2 \
+             OR u.callee_expr LIKE ?3 ESCAPE '\\') \
          ORDER BY CASE WHEN caller.source_file_id = ?4 THEN 0 ELSE 1 END, \
                   u.caller_entity_id, u.site_ordinal, u.site_key \
          LIMIT ?5",

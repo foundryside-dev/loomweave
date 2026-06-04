@@ -4,8 +4,8 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Map, Value, json};
 
-use clarion_mcp::filigree::FiligreeHttpClient;
-use clarion_mcp::scan_results::ScanResultsRequest;
+use clarion_federation::filigree::FiligreeHttpClient;
+use clarion_federation::scan_results::ScanResultsRequest;
 
 /// Translate SARIF findings from a file and post them to Filigree.
 #[allow(clippy::too_many_lines, clippy::collapsible_if)]

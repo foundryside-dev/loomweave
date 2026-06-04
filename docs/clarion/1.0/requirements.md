@@ -149,11 +149,24 @@ Within a single phase, LLM calls execute in parallel up to a configurable cap (d
 
 #### REQ-ANALYZE-03 — Resumable after crash or interrupt
 
-`clarion analyze --resume <run_id>` continues from the last successful phase checkpoint, skipping already-completed LLM work via content-hash caching.
+> **v1.x status amended by ADR-041.** `clarion analyze --resume <run_id>`
+> reopens the existing run row, re-walks idempotently, and emits Filigree
+> findings with `mark_unseen=false`. It does **not** promise durable
+> phase/file checkpoint recovery or skipped provider calls.
 
-**Rationale**: At elspeth scale a full run takes ~30-40 minutes and costs ~$15. A crash at 80% completion must not waste the prior 24 minutes / $12 of LLM spend. Checkpointing on phase transitions is coarse enough to avoid write amplification but fine enough to bound re-work.
-**Verification**: Interrupt (SIGINT) `clarion analyze` during Phase 5; resume with `--resume`; assert phases 1-4 are skipped and Phase 5 picks up at the last completed entity.
-**See**: System Design §6 (Analysis Pipeline, Resumability).
+`clarion analyze --resume <run_id>` is a same-run repair path: it preserves
+Filigree seen/unseen semantics while safely repeating deterministic writes.
+Checkpoint recovery is deferred until a successor ADR defines the durable
+checkpoint schema and provider-call accounting.
+
+**Rationale**: The shipped run-lifecycle contract is coherent and necessary for
+federated finding emission. Durable checkpoint recovery is a separate scheduler
+feature with plugin-session, import-edge, and provider-side-effect ordering
+requirements.
+**Verification**: Resume a prior run id and assert the row is reopened, writes
+are idempotent, and Filigree emission uses `mark_unseen=false`. Do not assert
+phase/file skipping unless a successor checkpoint ADR lands.
+**See**: ADR-041; System Design §6 (Analysis Pipeline, Resumability).
 
 #### REQ-ANALYZE-04 — Deletion detection via entity-set diff
 
@@ -547,34 +560,51 @@ Each plugin ships a manifest declaring its entity kinds, edge kinds, tags, capab
 
 #### REQ-PLUGIN-03 — Lifecycle methods (analyze, build_prompt)
 
-Plugins implement two phases of lifecycle calls: batch (`initialize`, `file_list`, `analyze_file(path) → stream of entities + edges + findings`) and consult (`build_prompt(entity_id, query_type, context)`). Calls are JSON-RPC methods; streams use a separate `file_analyzed` notification channel.
+Plugins implement two phases of lifecycle calls: batch (`initialize`, `analyze_file(path) -> {entities[], edges[], stats}`) and consult (`build_prompt(entity_id, query_type, context)`). Calls are Content-Length framed JSON-RPC request/response methods. The plugin returns one result per file; the core streams each completed file result through a bounded internal file-batch channel to the writer actor.
 
-**Rationale**: Splitting lifecycle into batch and consult lets plugins optimise each independently — batch is throughput-oriented; consult is latency-oriented. Streaming from `analyze_file` lets the core commit entities incrementally rather than buffering a whole file's worth.
-**Verification**: Fixture plugin responds to each method; streaming behaviour commits entities as they arrive.
+**Rationale**: Splitting lifecycle into batch and consult lets plugins optimise each independently — batch is throughput-oriented; consult is latency-oriented. Keeping the wire protocol request/response makes plugin authorship simple, while the bounded internal handoff applies writer backpressure and commits completed file output incrementally instead of buffering a whole plugin run.
+**Verification**: Fixture plugin responds to each method; a plugin that emits one file successfully and crashes on a later file leaves the completed file's rows durable and marks the run failed.
 **See**: System Design §2 (Core / Plugin Architecture, Lifecycle).
 
-#### REQ-PLUGIN-04 — Python plugin (v0.1)
+#### REQ-PLUGIN-04 — Python plugin (v1.0)
 
-Clarion ships a Python plugin supporting Python ≥3.11 that extracts functions, classes, protocols, globals, modules, packages, and their edges (`imports`, `calls`, `inherits_from`, `decorated_by`, `uses_type`, `alias_of`). Installation via `pipx install clarion-plugin-python` for isolation.
+Clarion ships a Python plugin supporting Python >=3.11. The v1.0 plugin
+declares and emits the narrower ontology that is present in
+`plugins/python/plugin.toml`: `function`, `class`, and `module` entities, plus
+`contains`, `calls`, `references`, and `imports` edges. The plugin is not
+Wardline-aware in v1.0 and does not declare or emit `protocol`, `global`, or
+`package` entity kinds, nor `inherits_from`, `decorated_by`, `uses_type`, or
+`alias_of` edges. Those signals are deferred until the manifest declares them
+and the extractor has fixture-backed support for them.
 
-**Rationale**: Python is the validating first-customer language (elspeth is ~425k LOC Python). Shipping the plugin alongside the core for v0.1 establishes the plugin-authoring contract and validates the plugin protocol against a real workload; `pipx` isolation prevents venv conflicts with the analysed project.
-**Verification**: `tests/fixtures/elspeth-slice/` runs through the Python plugin and produces expected entity/edge counts; installation via pipx succeeds.
+**Rationale**: Python is the validating first-customer language (elspeth is ~425k LOC Python). Shipping the plugin alongside the core for v1.0 establishes the plugin-authoring contract and validates the plugin protocol against a real workload, while keeping the advertised ontology limited to signals that are actually emitted. `pipx` isolation prevents venv conflicts with the analysed project.
+**Verification**: The plugin manifest smoke test pins the v1.0 entity/edge kinds and `wardline_aware = false`; `tests/fixtures/elspeth-slice/` runs through the Python plugin and produces expected entity/edge counts; installation via pipx succeeds.
 **See**: System Design §2 (Python plugin specifics).
 
 #### REQ-PLUGIN-05 — Python import resolution policy
 
-The Python plugin resolves imports per a declared policy: `sys.path` discovered via virtualenv introspection or user-supplied `python_executable`; `src.` prefix stripped by default; `__init__.py` re-exports become `alias_of` edges (definition site wins); unresolvable imports produce `python:unresolved:{module.path}` placeholder entities; `TYPE_CHECKING` blocks excluded from runtime-import edges.
+The Python plugin emits `imports` edges from `import` and `from ... import`
+statements using the standard-library AST. Relative imports are normalized
+against the current module, `__init__.py` collapses to the package module name,
+and `TYPE_CHECKING`-guarded imports carry `properties.type_only = true` while
+function-local imports carry `properties.scope = "function"` so graph algorithms
+can filter non-runtime edges. The v1.0 plugin does not emit `alias_of` edges for
+package re-exports and does not mint `python:unresolved:*` placeholder entities.
 
-**Rationale**: Python's import model is the single hardest static-analysis problem at elspeth scale; leaving it undefined produces an entity graph that is subtly wrong in different ways on different installations. An explicit policy makes the behaviour testable and predictable.
-**Verification**: Fixture with each import shape produces the documented resolution; `TYPE_CHECKING` imports don't generate spurious circular-import findings.
+**Rationale**: Python's import model is the single hardest static-analysis problem at elspeth scale; leaving it undefined produces an entity graph that is subtly wrong in different ways on different installations. An explicit, narrower v1.0 policy makes the behaviour testable and predictable without advertising resolver features that are not implemented.
+**Verification**: Fixture with each import shape produces the documented target and properties; `TYPE_CHECKING` and function-local imports do not generate spurious circular-import findings.
 **See**: System Design §2 (Python plugin specifics, Import resolution).
 
 #### REQ-PLUGIN-06 — Decorator detection policy
 
-The Python plugin detects decorators including factory invocations (`@app.route("/health")`), stacked decorators (preserving order — matters for Wardline semantics), class decorators, and aliases (`validates = validates_shape`). Each decoration produces a `decorated_by` edge with optional `properties` capturing decorator arguments.
+Decorator semantics are deferred for the Python plugin until the ontology grows.
+In v1.0 the extractor preserves decorator source spans in entity definition
+metadata so source navigation covers the decorated declaration, but it does not
+declare or emit `decorated_by` edges, decorator tags, Wardline annotation
+metadata, decorator arguments, or alias-resolved decorator facts.
 
-**Rationale**: Decorator-as-DSL is widespread in Python (FastAPI, Pydantic, Wardline itself). Naive direct-name matching misses most decorator usage; explicit handling makes the entity metadata faithful to what the code actually declares.
-**Verification**: Fixture with each decorator shape produces the expected `decorated_by` edges with preserved argument metadata.
+**Rationale**: Decorator-as-DSL is widespread in Python (FastAPI, Pydantic, Wardline itself). The v1.0 plugin keeps source spans honest while avoiding a false ontology claim. A later implementation must add the edge kind to the manifest and fixture-backed extraction for direct, factory, stacked, class, and aliased decorators before advertising decorator semantics.
+**Verification**: Current fixtures assert decorated entity spans include decorator lines and that the manifest does not advertise Wardline semantics. Future decorator extraction must add fixtures for direct, factory, stacked, class, and aliased decorators and assert emitted `decorated_by` edges with preserved order/arguments.
 **See**: System Design §2 (Python plugin specifics, Decorator detection).
 
 ---
@@ -609,7 +639,8 @@ For Filigree `registry_backend: clarion`, Clarion's HTTP read API is
 loopback-only by default. Non-loopback binds require **both**
 `serve.http.allow_non_loopback: true` **and** a resolved authentication secret
 — either HMAC identity via `serve.http.identity_token_env` (preferred per
-ADR-034) or a legacy bearer token via `serve.http.token_env`. A non-loopback
+ADR-034, hardened with timestamp/nonce replay protection by ADR-042) or a
+legacy bearer token via `serve.http.token_env`. A non-loopback
 bind with the opt-in but no resolved secret is refused at startup with
 `CLA-CONFIG-HTTP-NO-AUTH`. The loopback-without-token mode remains
 unauthenticated and emits a startup warning that any local process can read the
@@ -628,6 +659,8 @@ the non-loopback HMAC-required path (line 1579), and the non-loopback
 legacy-bearer path (line 1614). The loopback startup-warning surface is covered
 by config-layer tests.
 **See**: System Design §9 (Integrations, HTTP Read API), ADR-014, ADR-034.
+For the exact HMAC header and canonical-message shape, use
+`docs/federation/contracts.md` §Authentication.
 
 #### REQ-HTTP-04 — ETag-style response caching
 
@@ -999,10 +1032,18 @@ The dry-run cost estimate is within ±50% of actual spend on representative proj
 
 #### NFR-RELIABILITY-01 — Crash-surviving store
 
-`.clarion/clarion.db` survives unclean shutdown (SIGKILL during analyze) without corruption. Subsequent `clarion analyze --resume <run_id>` continues from the last checkpoint.
+> **v1.x status amended by ADR-041.** `.clarion/clarion.db` must survive
+> unclean shutdown (SIGKILL during analyze) without corruption. Subsequent
+> `clarion analyze --resume <run_id>` safely reopens and re-walks the same run
+> id; it does not continue from a phase/file checkpoint.
 
-**Rationale**: SQLite WAL + writer-actor per-N-files transactions + checkpoint discipline produce crash-safe semantics when configured correctly. Getting this right in v0.1 is non-negotiable — a corrupt store costs the user everything.
-**Verification**: Test harness: `clarion analyze` → `kill -9` mid-run → next invocation loads the DB cleanly → `--resume` continues.
+**Rationale**: SQLite WAL + writer-actor transactions protect the store from
+corruption. Same-run re-emit protects federated finding lifecycle semantics;
+skipping already completed work is deferred checkpoint-recovery behavior, not
+the v1.x guarantee.
+**Verification**: Test harness: `clarion analyze` → `kill -9` mid-run → next
+invocation opens the DB cleanly → `--resume <run_id>` reopens the row and can
+complete or fail deterministically without Filigree unseen flapping.
 **See**: System Design §4 (Storage, Concurrency).
 
 #### NFR-RELIABILITY-02 — Degraded modes for missing siblings

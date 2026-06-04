@@ -38,9 +38,15 @@ def test_plugin_version_lockstep_across_pyproject_manifest_and_module() -> None:
     )
 
 
-def test_manifest_declares_references_edge_kind() -> None:
+def test_manifest_declares_current_v1_ontology_only() -> None:
     manifest = _read_toml(_PLUGIN_ROOT / "plugin.toml")
 
     assert manifest["plugin"]["version"] == "1.2.0"
+    assert manifest["capabilities"]["runtime"]["wardline_aware"] is False
     assert manifest["ontology"]["ontology_version"] == "0.6.0"
+    assert manifest["ontology"]["entity_kinds"] == ["function", "class", "module"]
     assert manifest["ontology"]["edge_kinds"] == ["contains", "calls", "references", "imports"]
+    assert "decorated_by" not in manifest["ontology"]["edge_kinds"]
+    assert "inherits_from" not in manifest["ontology"]["edge_kinds"]
+    assert "uses_type" not in manifest["ontology"]["edge_kinds"]
+    assert "alias_of" not in manifest["ontology"]["edge_kinds"]

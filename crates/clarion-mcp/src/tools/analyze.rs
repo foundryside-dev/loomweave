@@ -258,6 +258,7 @@ impl ServerState {
         let run_id = run_id.to_owned();
         self.readers
             .with_reader(move |conn| {
+                clarion_storage::mark_stale_running_runs_failed(conn)?;
                 match conn.query_row(
                     "SELECT status, stats FROM runs WHERE id = ?1",
                     rusqlite::params![run_id],

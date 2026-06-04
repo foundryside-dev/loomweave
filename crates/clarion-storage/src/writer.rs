@@ -355,7 +355,8 @@ fn cleanup_after_channel_close(conn: &mut Connection, state: &mut ActorState) {
         let _ = conn.execute(
             "UPDATE runs SET status = 'failed', \
                 completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
-                stats = ?1 \
+                stats = ?1, \
+                owner_pid = NULL \
               WHERE id = ?2",
             params![stats_json, run_id],
         );
@@ -411,6 +412,10 @@ fn begin_write_tx(conn: &Connection, state: &ActorState) -> Result<()> {
     crate::retry::begin_immediate(conn, &state.retry_policy)
 }
 
+fn owner_pid() -> i64 {
+    i64::from(std::process::id())
+}
+
 fn begin_run(
     conn: &mut Connection,
     state: &mut ActorState,
@@ -425,9 +430,11 @@ fn begin_run(
         ));
     }
     conn.execute(
-        "INSERT INTO runs (id, started_at, completed_at, config, stats, status, analyzed_at_commit) \
-         VALUES (?1, ?2, NULL, ?3, '{}', 'running', ?4)",
-        params![run_id, started_at, config_json, head_commit],
+        "INSERT INTO runs ( \
+            id, started_at, completed_at, config, stats, status, analyzed_at_commit, \
+            owner_pid, heartbeat_at \
+         ) VALUES (?1, ?2, NULL, ?3, '{}', 'running', ?4, ?5, ?2)",
+        params![run_id, started_at, config_json, head_commit, owner_pid()],
     )?;
     begin_write_tx(conn, state)?;
     state.in_tx = true;
@@ -452,8 +459,13 @@ fn resume_run(conn: &mut Connection, state: &mut ActorState, run_id: &str) -> Re
         ));
     }
     let reopened = conn.execute(
-        "UPDATE runs SET status = 'running', completed_at = NULL WHERE id = ?1",
-        params![run_id],
+        "UPDATE runs \
+            SET status = 'running', \
+                completed_at = NULL, \
+                owner_pid = ?1, \
+                heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+          WHERE id = ?2",
+        params![owner_pid(), run_id],
     )?;
     if reopened == 0 {
         return Err(StorageError::WriterProtocol(format!(
@@ -568,9 +580,10 @@ fn enforce_entity_kind_contract(entity: &EntityRecord) -> Result<()> {
     Ok(())
 }
 
-// B.6 stores module ids as source anchors until core-minted `file` entities
-// land; keep both accepted so the storage contract survives that handoff.
-const SOURCE_FILE_ANCHOR_KINDS: &[&str] = &["file", "module"];
+// Core-minted file entities are the single canonical source anchor. Module
+// entities live below the file in the parent/contains chain, but may not stand
+// in for the file-level identity.
+const SOURCE_FILE_ANCHOR_KINDS: &[&str] = &["file"];
 
 fn validate_source_file_anchor(
     conn: &Connection,
@@ -980,6 +993,7 @@ fn bump_writes_and_maybe_commit(
     if state.writes_in_batch >= state.batch_size {
         state.writes_in_batch = 0;
         state.in_tx = false;
+        refresh_current_run_heartbeat(conn, state)?;
         conn.execute_batch("COMMIT")?;
         commits_observed.fetch_add(1, Ordering::Relaxed);
         // Open the next batch eagerly so the next write doesn't pay
@@ -987,6 +1001,19 @@ fn bump_writes_and_maybe_commit(
         begin_write_tx(conn, state)?;
         state.in_tx = true;
     }
+    Ok(())
+}
+
+fn refresh_current_run_heartbeat(conn: &Connection, state: &ActorState) -> Result<()> {
+    let Some(run_id) = state.current_run.as_deref() else {
+        return Ok(());
+    };
+    conn.execute(
+        "UPDATE runs \
+            SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), owner_pid = ?1 \
+          WHERE id = ?2",
+        params![owner_pid(), run_id],
+    )?;
     Ok(())
 }
 
@@ -1011,6 +1038,7 @@ fn flush_run_batch(
     if state.in_tx {
         state.in_tx = false;
         state.writes_in_batch = 0;
+        refresh_current_run_heartbeat(conn, state)?;
         conn.execute_batch("COMMIT")?;
         commits_observed.fetch_add(1, Ordering::Relaxed);
     }
@@ -1029,6 +1057,7 @@ fn query_time_write<T>(
     if state.in_tx {
         state.in_tx = false;
         state.writes_in_batch = 0;
+        refresh_current_run_heartbeat(conn, state)?;
         conn.execute_batch("COMMIT")?;
         commits_observed.fetch_add(1, Ordering::Relaxed);
     }
@@ -1072,8 +1101,9 @@ fn commit_run(
             })
             .to_string();
             let changed = conn.execute(
-                "UPDATE runs SET status = 'failed', completed_at = ?1, stats = ?2 \
-                 WHERE id = ?3",
+                "UPDATE runs \
+                    SET status = 'failed', completed_at = ?1, stats = ?2, owner_pid = NULL \
+                  WHERE id = ?3",
                 params![completed_at, failure_stats, run_id],
             )?;
             if let Err(err) = ensure_run_update_changed_one(changed, run_id) {
@@ -1084,7 +1114,9 @@ fn commit_run(
             return Err(StorageError::WriterProtocol(mismatch));
         }
         let changed = conn.execute(
-            "UPDATE runs SET status = ?1, completed_at = ?2, stats = ?3 WHERE id = ?4",
+            "UPDATE runs \
+                SET status = ?1, completed_at = ?2, stats = ?3, owner_pid = NULL \
+              WHERE id = ?4",
             params![status.as_str(), completed_at, stats_json, run_id],
         )?;
         if let Err(err) = ensure_run_update_changed_one(changed, run_id) {
@@ -1104,7 +1136,9 @@ fn commit_run(
         // staged-and-not-committed, so the parent-id check has nothing to
         // catch that would change the durable state.
         let changed = conn.execute(
-            "UPDATE runs SET status = ?1, completed_at = ?2, stats = ?3 WHERE id = ?4",
+            "UPDATE runs \
+                SET status = ?1, completed_at = ?2, stats = ?3, owner_pid = NULL \
+              WHERE id = ?4",
             params![status.as_str(), completed_at, stats_json, run_id],
         )?;
         if let Err(err) = ensure_run_update_changed_one(changed, run_id) {
@@ -1201,7 +1235,9 @@ fn fail_run(
     }
     let stats_json = serde_json::json!({ "failure_reason": reason }).to_string();
     let changed = conn.execute(
-        "UPDATE runs SET status = 'failed', completed_at = ?1, stats = ?2 WHERE id = ?3",
+        "UPDATE runs \
+            SET status = 'failed', completed_at = ?1, stats = ?2, owner_pid = NULL \
+          WHERE id = ?3",
         params![completed_at, stats_json, run_id],
     )?;
     if let Err(err) = ensure_run_update_changed_one(changed, run_id) {

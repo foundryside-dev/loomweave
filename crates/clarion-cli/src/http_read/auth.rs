@@ -2,18 +2,68 @@
 //!
 //! Split out of `http_read.rs` (mechanical relocation; behaviour unchanged).
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use axum::body::{Body, to_bytes};
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
 use clarion_core::HttpErrorCode as ErrorCode;
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+use time::OffsetDateTime;
 use tower::BoxError;
 use tower::load_shed;
 use tower::timeout;
 
 use super::errors::format_dyn_error_chain;
 use super::{AppState, HTTP_BODY_LIMIT_BYTES, WARDLINE_BODY_LIMIT_BYTES, json_error};
+
+type HmacSha256 = Hmac<Sha256>;
+pub(crate) type SharedHmacReplayCache = Arc<Mutex<HmacReplayCache>>;
+
+/// Wire-pinned HMAC freshness window.
+///
+/// Basis: local sibling HTTP calls should complete in milliseconds; five
+/// minutes tolerates moderate clock skew without making a captured request
+/// useful for long. Override: none, this is part of the federation auth wire
+/// contract. Retune: successor ADR if sibling deployments demonstrate a wider
+/// skew requirement.
+const HMAC_FRESHNESS_WINDOW_SECONDS: i64 = 300;
+const HMAC_NONCE_MAX_LEN: usize = 128;
+
+#[derive(Debug, Default)]
+pub(crate) struct HmacReplayCache {
+    seen: HashMap<String, i64>,
+}
+
+pub(crate) fn new_hmac_replay_cache() -> SharedHmacReplayCache {
+    Arc::new(Mutex::new(HmacReplayCache::default()))
+}
+
+impl HmacReplayCache {
+    fn check_and_record(
+        &mut self,
+        nonce: &str,
+        request_timestamp: i64,
+        now_timestamp: i64,
+    ) -> bool {
+        let oldest_allowed = now_timestamp.saturating_sub(HMAC_FRESHNESS_WINDOW_SECONDS);
+        self.seen.retain(|_, seen_at| *seen_at >= oldest_allowed);
+        if request_timestamp < oldest_allowed
+            || request_timestamp > now_timestamp.saturating_add(HMAC_FRESHNESS_WINDOW_SECONDS)
+        {
+            return false;
+        }
+        if self.seen.contains_key(nonce) {
+            return false;
+        }
+        self.seen.insert(nonce.to_owned(), request_timestamp);
+        true
+    }
+}
 
 /// Enforce configured identity on protected routes. Prefer the Loom HMAC
 /// identity when `identity_token_env` is configured; otherwise preserve the
@@ -45,7 +95,8 @@ pub(crate) async fn require_http_identity_with_limit(
     next: axum::middleware::Next,
 ) -> Response {
     if let Some(secret) = state.identity_secret.as_ref() {
-        return require_hmac_identity(secret, body_limit, request, next).await;
+        return require_hmac_identity(secret, &state.hmac_replay_cache, body_limit, request, next)
+            .await;
     }
     let Some(expected) = state.auth_token.as_ref() else {
         return next.run(request).await;
@@ -70,6 +121,7 @@ pub(crate) async fn require_http_identity_with_limit(
 
 pub(crate) async fn require_hmac_identity(
     secret: &str,
+    replay_cache: &SharedHmacReplayCache,
     body_limit: usize,
     request: Request<Body>,
     next: axum::middleware::Next,
@@ -90,6 +142,24 @@ pub(crate) async fn require_hmac_identity(
     let Some(presented) = presented else {
         return unauthenticated_response();
     };
+    let timestamp = parts
+        .headers
+        .get("x-loom-timestamp")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<i64>().ok());
+    let Some(timestamp) = timestamp else {
+        return unauthenticated_response();
+    };
+    let nonce = parts
+        .headers
+        .get("x-loom-nonce")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|nonce| !nonce.is_empty() && nonce.len() <= HMAC_NONCE_MAX_LEN)
+        .map(str::to_owned);
+    let Some(nonce) = nonce else {
+        return unauthenticated_response();
+    };
     let Ok(body_bytes) = to_bytes(body, body_limit).await else {
         // CI-02 fix: a body read failure here is not a path-validation
         // problem. The outer `RequestBodyLimitLayer` already rejects
@@ -103,8 +173,22 @@ pub(crate) async fn require_hmac_identity(
             "request body could not be read",
         );
     };
-    let expected = component_hmac_hex(secret.as_bytes(), &method, &path_and_query, &body_bytes);
+    let expected = component_hmac_hex(
+        secret.as_bytes(),
+        &method,
+        &path_and_query,
+        &body_bytes,
+        timestamp,
+        &nonce,
+    );
     if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        return unauthenticated_response();
+    }
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let fresh_and_unseen = replay_cache
+        .lock()
+        .is_ok_and(|mut cache| cache.check_and_record(&nonce, timestamp, now));
+    if !fresh_and_unseen {
         return unauthenticated_response();
     }
     next.run(Request::from_parts(parts, Body::from(body_bytes)))
@@ -124,44 +208,36 @@ pub(crate) fn component_hmac_hex(
     method: &str,
     path_and_query: &str,
     body: &[u8],
+    timestamp: i64,
+    nonce: &str,
 ) -> String {
     hmac_sha256_hex(
         secret,
-        canonical_hmac_message(method, path_and_query, body).as_bytes(),
+        canonical_hmac_message(method, path_and_query, body, timestamp, nonce).as_bytes(),
     )
 }
 
-pub(crate) fn canonical_hmac_message(method: &str, path_and_query: &str, body: &[u8]) -> String {
+pub(crate) fn canonical_hmac_message(
+    method: &str,
+    path_and_query: &str,
+    body: &[u8],
+    timestamp: i64,
+    nonce: &str,
+) -> String {
     format!(
-        "{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}",
         method,
         path_and_query,
-        hex_lower(&Sha256::digest(body))
+        hex_lower(&Sha256::digest(body)),
+        timestamp,
+        nonce
     )
 }
 
 pub(crate) fn hmac_sha256_hex(secret: &[u8], message: &[u8]) -> String {
-    const BLOCK_SIZE: usize = 64;
-    let mut key = [0_u8; BLOCK_SIZE];
-    if secret.len() > BLOCK_SIZE {
-        key[..32].copy_from_slice(&Sha256::digest(secret));
-    } else {
-        key[..secret.len()].copy_from_slice(secret);
-    }
-    let mut ipad = [0x36_u8; BLOCK_SIZE];
-    let mut opad = [0x5c_u8; BLOCK_SIZE];
-    for index in 0..BLOCK_SIZE {
-        ipad[index] ^= key[index];
-        opad[index] ^= key[index];
-    }
-    let mut inner = Sha256::new();
-    inner.update(ipad);
-    inner.update(message);
-    let inner = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(opad);
-    outer.update(inner);
-    hex_lower(&outer.finalize())
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts keys of any size");
+    mac.update(message);
+    hex_lower(&mac.finalize().into_bytes())
 }
 
 pub(crate) fn hex_lower(bytes: &[u8]) -> String {
@@ -175,14 +251,7 @@ pub(crate) fn hex_lower(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0_u8;
-    for (left, right) in a.iter().zip(b.iter()) {
-        diff |= left ^ right;
-    }
-    diff == 0
+    a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
 pub(crate) async fn handle_middleware_error(err: BoxError) -> Response {
@@ -224,6 +293,43 @@ mod tests {
     use tower::{BoxError, Service, ServiceBuilder, load_shed};
 
     use super::*;
+
+    #[test]
+    fn hmac_sha256_matches_known_vector() {
+        let digest = hmac_sha256_hex(b"key", b"The quick brown fox jumps over the lazy dog");
+        assert_eq!(
+            digest,
+            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+        );
+    }
+
+    #[test]
+    fn hmac_replay_cache_rejects_reused_and_stale_nonces() {
+        let mut cache = HmacReplayCache::default();
+        let now = 1_900_000_000;
+
+        assert!(cache.check_and_record("nonce-1", now, now));
+        assert!(
+            !cache.check_and_record("nonce-1", now, now),
+            "same nonce inside the freshness window must be rejected"
+        );
+        assert!(
+            !cache.check_and_record("nonce-old", now - HMAC_FRESHNESS_WINDOW_SECONDS - 1, now,),
+            "stale timestamps must be rejected"
+        );
+        assert!(
+            !cache.check_and_record("nonce-future", now + HMAC_FRESHNESS_WINDOW_SECONDS + 1, now,),
+            "far-future timestamps must be rejected"
+        );
+        assert!(
+            cache.check_and_record(
+                "nonce-1",
+                now + HMAC_FRESHNESS_WINDOW_SECONDS + 1,
+                now + HMAC_FRESHNESS_WINDOW_SECONDS + 1,
+            ),
+            "expired nonce entries should be pruned"
+        );
+    }
 
     #[test]
     fn load_shed_converts_concurrency_backpressure_to_overload_response() {
@@ -342,6 +448,11 @@ mod tests {
                 .method("POST")
                 .uri("/api/v1/files/batch")
                 .header("X-Loom-Component", "clarion:deadbeef")
+                .header(
+                    "X-Loom-Timestamp",
+                    OffsetDateTime::now_utc().unix_timestamp().to_string(),
+                )
+                .header("X-Loom-Nonce", "body-read-failure")
                 .body(Body::from(oversize))
                 .expect("request");
 
@@ -352,7 +463,15 @@ mod tests {
             let app: Router<()> = Router::new()
                 .route("/api/v1/files/batch", post(never_called))
                 .layer(axum::middleware::from_fn(|request, next| async move {
-                    require_hmac_identity("test-secret", HTTP_BODY_LIMIT_BYTES, request, next).await
+                    let replay_cache = new_hmac_replay_cache();
+                    require_hmac_identity(
+                        "test-secret",
+                        &replay_cache,
+                        HTTP_BODY_LIMIT_BYTES,
+                        request,
+                        next,
+                    )
+                    .await
                 }));
 
             let response = app.oneshot(request).await.expect("oneshot response");

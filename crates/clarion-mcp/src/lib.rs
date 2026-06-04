@@ -1108,6 +1108,7 @@ struct SummaryReady {
     entity_json: Value,
     key: SummaryCacheKey,
     cached: Option<SummaryCacheEntry>,
+    guidance_text: String,
     caller_count: i64,
     fan_out: i64,
 }
@@ -2007,7 +2008,7 @@ fn plugin_entity_counts(conn: &rusqlite::Connection) -> Value {
 /// `completed` one). Fail-soft: no rows or a query error → `null`.
 fn latest_run_row(conn: &rusqlite::Connection) -> Value {
     match conn.query_row(
-        "SELECT id, status, started_at, completed_at FROM runs \
+        "SELECT id, status, started_at, completed_at, owner_pid, heartbeat_at FROM runs \
          ORDER BY started_at DESC LIMIT 1",
         [],
         |row| {
@@ -2016,6 +2017,8 @@ fn latest_run_row(conn: &rusqlite::Connection) -> Value {
                 "status": row.get::<_, String>(1)?,
                 "started_at": row.get::<_, String>(2)?,
                 "completed_at": row.get::<_, Option<String>>(3)?,
+                "owner_pid": row.get::<_, Option<i64>>(4)?,
+                "heartbeat_at": row.get::<_, Option<String>>(5)?,
             }))
         },
     ) {

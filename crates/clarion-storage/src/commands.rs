@@ -86,8 +86,8 @@ pub struct EdgeRecord {
     pub confidence: EdgeConfidence,
     /// JSON string; writer inserts verbatim. None ⇒ NULL.
     pub properties_json: Option<String>,
-    /// Module entity id for the file the edge was emitted from. Derived by
-    /// the host, not the plugin (ADR-022 boundary).
+    /// Core file entity id for the file the edge was emitted from. Derived by
+    /// the host/CLI, not the plugin (ADR-022 boundary).
     pub source_file_id: Option<String>,
     pub source_byte_start: Option<i64>,
     pub source_byte_end: Option<i64>,

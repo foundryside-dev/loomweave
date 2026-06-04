@@ -421,7 +421,7 @@ class PyrightSession:
                             continue
                         for from_range in from_ranges:
                             key = _range_key(from_range)
-                            if key is not None:
+                            if key is not None and _range_within_function(key, function):
                                 grouped.setdefault(key, set()).add(to_id)
 
                 for range_key, candidates in _ambiguous_dict_dispatches(index, function).items():
@@ -970,7 +970,7 @@ def _build_function_index(project_root: Path, path: Path, source: str) -> _Funct
     functions: list[_FunctionInfo] = []
     entities: list[_EntityInfo] = []
     source_lines = source.splitlines()
-    _collect_entities(tree, [tree], dotted_module, source_lines, functions, entities)
+    _collect_entities(tree, [tree], dotted_module, source_lines, functions, entities, set())
     line_starts = _line_starts(source)
     module_id = entity_id("python", "module", dotted_module)
     by_id = {function.entity_id: function for function in functions}
@@ -1004,20 +1004,28 @@ def _collect_entities(  # noqa: PLR0913 - keeps function/class indexes in one tr
     source_lines: list[str],
     out: list[_FunctionInfo],
     out_entities: list[_EntityInfo],
+    seen_ids: set[str],
 ) -> None:
     for child in ast.iter_child_nodes(node):
         match child:
             case ast.FunctionDef() | ast.AsyncFunctionDef():
                 python_qualname = reconstruct_qualname(child, parents)
                 qualified_name = f"{dotted_module}.{python_qualname}"
+                child_id = entity_id("python", "function", qualified_name)
+                if child_id in seen_ids:
+                    continue
+                seen_ids.add(child_id)
                 line_text = (
                     source_lines[child.lineno - 1] if child.lineno <= len(source_lines) else ""
                 )
-                character = line_text.find(child.name)
-                if character < 0:
-                    character = child.col_offset
+                name_character = line_text.find(child.name)
+                character = (
+                    _codepoint_col_to_utf16(line_text, name_character)
+                    if name_character >= 0
+                    else _byte_col_to_utf16(line_text, child.col_offset)
+                )
                 entity = _EntityInfo(
-                    entity_id=entity_id("python", "function", qualified_name),
+                    entity_id=child_id,
                     line=child.lineno - 1,
                     character=character,
                 )
@@ -1030,8 +1038,12 @@ def _collect_entities(  # noqa: PLR0913 - keeps function/class indexes in one tr
                         line=child.lineno - 1,
                         character=character,
                         end_line=(child.end_lineno or child.lineno) - 1,
-                        end_character=child.end_col_offset or child.col_offset,
-                        call_sites=tuple(_function_call_sites(child)),
+                        end_character=_ast_position_to_lsp(
+                            source_lines,
+                            (child.end_lineno or child.lineno) - 1,
+                            child.end_col_offset or child.col_offset,
+                        ),
+                        call_sites=tuple(_function_call_sites(child, source_lines)),
                         node=child,
                     ),
                 )
@@ -1042,19 +1054,27 @@ def _collect_entities(  # noqa: PLR0913 - keeps function/class indexes in one tr
                     source_lines,
                     out,
                     out_entities,
+                    seen_ids,
                 )
             case ast.ClassDef():
                 python_qualname = reconstruct_qualname(child, parents)
                 qualified_name = f"{dotted_module}.{python_qualname}"
+                child_id = entity_id("python", "class", qualified_name)
+                if child_id in seen_ids:
+                    continue
+                seen_ids.add(child_id)
                 line_text = (
                     source_lines[child.lineno - 1] if child.lineno <= len(source_lines) else ""
                 )
-                character = line_text.find(child.name)
-                if character < 0:
-                    character = child.col_offset
+                name_character = line_text.find(child.name)
+                character = (
+                    _codepoint_col_to_utf16(line_text, name_character)
+                    if name_character >= 0
+                    else _byte_col_to_utf16(line_text, child.col_offset)
+                )
                 out_entities.append(
                     _EntityInfo(
-                        entity_id=entity_id("python", "class", qualified_name),
+                        entity_id=child_id,
                         line=child.lineno - 1,
                         character=character,
                     ),
@@ -1066,6 +1086,7 @@ def _collect_entities(  # noqa: PLR0913 - keeps function/class indexes in one tr
                     source_lines,
                     out,
                     out_entities,
+                    seen_ids,
                 )
             case _:
                 _collect_entities(
@@ -1075,6 +1096,7 @@ def _collect_entities(  # noqa: PLR0913 - keeps function/class indexes in one tr
                     source_lines,
                     out,
                     out_entities,
+                    seen_ids,
                 )
 
 
@@ -1144,8 +1166,11 @@ def _reference_accumulator_to_edge(
     return edge
 
 
-def _function_call_sites(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[_CallSite]:
-    visitor = _CallSiteVisitor()
+def _function_call_sites(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    source_lines: Sequence[str],
+) -> list[_CallSite]:
+    visitor = _CallSiteVisitor(source_lines)
     for statement in node.body:
         visitor.visit(statement)
     return visitor.call_sites
@@ -1200,7 +1225,8 @@ def _unresolved_call_sites_for_function(
 
 
 class _CallSiteVisitor(ast.NodeVisitor):
-    def __init__(self) -> None:
+    def __init__(self, source_lines: Sequence[str]) -> None:
+        self.source_lines = source_lines
         self.call_sites: list[_CallSite] = []
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -1209,9 +1235,17 @@ class _CallSiteVisitor(ast.NodeVisitor):
         self.call_sites.append(
             _CallSite(
                 func.lineno - 1,
-                func.col_offset,
+                _ast_position_to_lsp(
+                    self.source_lines,
+                    func.lineno - 1,
+                    func.col_offset,
+                ),
                 (func.end_lineno or func.lineno) - 1,
-                func.end_col_offset or func.col_offset,
+                _ast_position_to_lsp(
+                    self.source_lines,
+                    (func.end_lineno or func.lineno) - 1,
+                    func.end_col_offset or func.col_offset,
+                ),
                 callee_expr,
             ),
         )
@@ -1234,7 +1268,7 @@ def _ambiguous_dict_dispatches(
     candidate_maps = _callable_dict_maps(index, function.node)
     if not candidate_maps:
         return {}
-    visitor = _DictDispatchVisitor(candidate_maps)
+    visitor = _DictDispatchVisitor(candidate_maps, index.source.splitlines())
     for statement in function.node.body:
         visitor.visit(statement)
     return visitor.dispatches
@@ -1246,7 +1280,10 @@ def _dunder_call_dispatches(
 ) -> dict[tuple[int, int, int, int], set[str]]:
     if not index.dunder_call_by_class:
         return {}
-    visitor = _DunderCallDispatchVisitor(index.dunder_call_by_class)
+    visitor = _DunderCallDispatchVisitor(
+        index.dunder_call_by_class,
+        index.source.splitlines(),
+    )
     for statement in function.node.body:
         visitor.visit(statement)
     return visitor.dispatches
@@ -1301,8 +1338,13 @@ def _callable_dict_assignment(
 
 
 class _DictDispatchVisitor(ast.NodeVisitor):
-    def __init__(self, candidate_maps: dict[str, set[str]]) -> None:
+    def __init__(
+        self,
+        candidate_maps: dict[str, set[str]],
+        source_lines: Sequence[str],
+    ) -> None:
         self.candidate_maps = candidate_maps
+        self.source_lines = source_lines
         self.dispatches: dict[tuple[int, int, int, int], set[str]] = {}
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -1314,9 +1356,17 @@ class _DictDispatchVisitor(ast.NodeVisitor):
         ):
             key = (
                 func.lineno - 1,
-                func.col_offset,
+                _ast_position_to_lsp(
+                    self.source_lines,
+                    func.lineno - 1,
+                    func.col_offset,
+                ),
                 (func.end_lineno or func.lineno) - 1,
-                func.end_col_offset or func.col_offset,
+                _ast_position_to_lsp(
+                    self.source_lines,
+                    (func.end_lineno or func.lineno) - 1,
+                    func.end_col_offset or func.col_offset,
+                ),
             )
             self.dispatches[key] = set(self.candidate_maps[func.value.id])
         self.generic_visit(node)
@@ -1332,8 +1382,13 @@ class _DictDispatchVisitor(ast.NodeVisitor):
 
 
 class _DunderCallDispatchVisitor(ast.NodeVisitor):
-    def __init__(self, dunder_call_by_class: dict[str, str]) -> None:
+    def __init__(
+        self,
+        dunder_call_by_class: dict[str, str],
+        source_lines: Sequence[str],
+    ) -> None:
         self.dunder_call_by_class = dunder_call_by_class
+        self.source_lines = source_lines
         self.instance_targets: dict[str, str] = {}
         self.dispatches: dict[tuple[int, int, int, int], set[str]] = {}
 
@@ -1355,9 +1410,17 @@ class _DunderCallDispatchVisitor(ast.NodeVisitor):
         if isinstance(func, ast.Name) and func.id in self.instance_targets:
             key = (
                 func.lineno - 1,
-                func.col_offset,
+                _ast_position_to_lsp(
+                    self.source_lines,
+                    func.lineno - 1,
+                    func.col_offset,
+                ),
                 (func.end_lineno or func.lineno) - 1,
-                func.end_col_offset or func.col_offset,
+                _ast_position_to_lsp(
+                    self.source_lines,
+                    (func.end_lineno or func.lineno) - 1,
+                    func.end_col_offset or func.col_offset,
+                ),
             )
             self.dispatches[key] = {self.instance_targets[func.id]}
         self.generic_visit(node)
@@ -1381,12 +1444,51 @@ def _line_starts(source: str) -> tuple[int, ...]:
     return tuple(starts)
 
 
+def _utf16_units(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _byte_col_to_utf16(line_text: str, byte_col: int) -> int:
+    line_bytes = line_text.encode("utf-8")
+    prefix = line_bytes[: max(0, min(byte_col, len(line_bytes)))]
+    return _utf16_units(prefix.decode("utf-8", errors="ignore"))
+
+
+def _codepoint_col_to_utf16(line_text: str, codepoint_col: int) -> int:
+    return _utf16_units(line_text[: max(0, codepoint_col)])
+
+
+def _ast_position_to_lsp(
+    source_lines: Sequence[str],
+    line: int,
+    byte_col: int,
+) -> int:
+    if line < 0 or line >= len(source_lines):
+        return 0
+    return _byte_col_to_utf16(source_lines[line], byte_col)
+
+
+def _utf16_col_to_byte(line_text: str, utf16_col: int) -> int:
+    target = max(0, utf16_col)
+    units = 0
+    byte_count = 0
+    for char in line_text:
+        char_units = _utf16_units(char)
+        if units + char_units > target:
+            break
+        units += char_units
+        byte_count += len(char.encode("utf-8"))
+        if units == target:
+            break
+    return byte_count
+
+
 def _position_to_byte(index: _FunctionIndex, line: int, character: int) -> int:
     if line >= len(index.line_starts):
         return len(index.source.encode("utf-8"))
     line_start = index.line_starts[line]
     line_text = index.source.splitlines(keepends=True)[line] if index.source else ""
-    return line_start + len(line_text[:character].encode("utf-8"))
+    return line_start + _utf16_col_to_byte(line_text, character)
 
 
 def _range_key(raw_range: object) -> tuple[int, int, int, int] | None:
@@ -1409,6 +1511,18 @@ def _range_key(raw_range: object) -> tuple[int, int, int, int] | None:
     if not isinstance(end_character, int):
         return None
     return (start_line, start_character, end_line, end_character)
+
+
+def _range_within_function(
+    range_key: tuple[int, int, int, int],
+    function: _FunctionInfo,
+) -> bool:
+    start_line, start_character, end_line, end_character = range_key
+    if start_line < function.line or end_line > function.end_line:
+        return False
+    if start_line == function.line and start_character < function.character:
+        return False
+    return not (end_line == function.end_line and end_character > function.end_character)
 
 
 def _range_start_key(raw_range: dict[object, object]) -> tuple[int, int] | None:

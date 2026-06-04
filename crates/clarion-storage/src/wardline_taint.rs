@@ -343,35 +343,51 @@ mod tests {
         }
     }
 
+    fn wardline_qualname_fixture() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../../../docs/federation/fixtures/wardline-qualname-normalization.json"
+        ))
+        .expect("parse wardline qualname fixture")
+    }
+
     #[test]
     fn resolves_fixture_vectors_exact() {
         let conn = migrated_conn();
-        // expected_entity_id values copied verbatim from
-        // fixtures/wardline-qualname-normalization.json qualified_name_vectors.
-        seed(
-            &conn,
-            &[
-                "python:function:auth.tokens.TokenManager.verify",
-                "python:function:auth.tokens.refresh.<locals>.helper",
-                "python:function:pkg.sub.mod.Outer.Inner.method",
-                "python:function:lib.foo.Service.handle",
-                "python:function:myns.pkg.mod.widget",
-            ],
-        );
-        for qualname in [
-            "auth.tokens.TokenManager.verify",
-            "auth.tokens.refresh.<locals>.helper",
-            "pkg.sub.mod.Outer.Inner.method",
-            "lib.foo.Service.handle",
-            "myns.pkg.mod.widget",
-        ] {
+        let fixture = wardline_qualname_fixture();
+        let vectors = fixture["qualified_name_vectors"]
+            .as_array()
+            .expect("qualified_name_vectors array");
+
+        for vector in vectors
+            .iter()
+            .filter(|vector| vector["kind"].as_str() == Some("function"))
+        {
+            insert_entity(
+                &conn,
+                vector["expected_entity_id"]
+                    .as_str()
+                    .expect("expected_entity_id string"),
+                None,
+            );
+        }
+        for vector in vectors
+            .iter()
+            .filter(|vector| vector["kind"].as_str() == Some("function"))
+        {
+            let qualname = vector["expected_qualified_name"]
+                .as_str()
+                .expect("expected_qualified_name string");
+            let expected_entity_id = vector["expected_entity_id"]
+                .as_str()
+                .expect("expected_entity_id string");
             let r = resolve_wardline_qualname(&conn, qualname).unwrap();
             assert_eq!(
                 r,
                 Resolution::Exact {
-                    entity_id: format!("python:function:{qualname}"),
+                    entity_id: expected_entity_id.to_owned(),
                 },
-                "{qualname}"
+                "{}",
+                vector["description"].as_str().unwrap_or(qualname)
             );
         }
     }

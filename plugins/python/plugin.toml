@@ -19,9 +19,10 @@ expected_max_rss_mb = 2048
 # core cap (warning emission itself is deferred to Tier B — Sprint 1
 # only lands the declaration).
 expected_entities_per_file = 5000
-# L8 integration point — the plugin probes wardline at initialize and
-# reports the outcome in the handshake's capabilities field.
-wardline_aware = true
+# Wardline semantic extraction is not implemented in this plugin yet. Keep this
+# false until the plugin emits usable Wardline-derived signals, not just a
+# package/version probe.
+wardline_aware = false
 # v0.1 rejects `true` at initialize with CLA-INFRA-MANIFEST-UNSUPPORTED-CAPABILITY.
 reads_outside_project_root = false
 
@@ -45,15 +46,6 @@ rule_id_prefix = "CLA-PY-"
 # cache-key component. New edge rows miss the cache by component-1 of
 # the 5-tuple organically (no edges live in the 5-tuple yet anyway).
 ontology_version = "0.6.0"
-
-[integrations.wardline]
-# Verified present in Wardline source (src/wardline/core/registry.py:55,
-# src/wardline/__init__.py:3) at sprint close 2026-04-28; current
-# Wardline version is 1.0.0. Pin range admits 1.x; 2.0.0 is an exclusive
-# upper bound so a future major version triggers an explicit re-pin
-# rather than silent drift.
-min_version = "1.0.0"
-max_version = "2.0.0"
 
 # SEI signature declaration (ADR-038 REQ-C-01 / Wave 1). The plugin emits a
 # versioned `signature` object per function/class entity, stored verbatim by the

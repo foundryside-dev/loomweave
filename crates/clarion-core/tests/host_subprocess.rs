@@ -190,12 +190,8 @@ fn t1_subprocess_happy_path() {
 /// stdout and returns a transport error.
 ///
 /// **What this test asserts**: `spawn()` returns `Err` and the whole call
-/// completes well under 5 s. That's strictly a "did we hang?" probe — it
-/// does NOT directly verify the zombie-reap behaviour added in commit
-/// 0fcc57f (that fix is covered by code review of `host.rs::spawn`'s
-/// `if let Err(e) = host.handshake()` block). Direct zombie observation
-/// requires walking `/proc`, which is Linux-only and brittle across kernel
-/// versions.
+/// completes well under 5 s. Zombie-reap coverage lives in the Linux-only
+/// `/proc` test below.
 ///
 /// The earlier name `t9_handshake_failure_exits_cleanly_without_hanging`
 /// overstated this — "exits cleanly" implied zombie-reap coverage.
@@ -231,6 +227,85 @@ fn t9_handshake_failure_on_immediate_exit_returns_err_promptly() {
         elapsed < std::time::Duration::from_secs(5),
         "handshake failure must return promptly; took {elapsed:?}"
     );
+}
+
+/// T9a: handshake failure reaps the subprocess.
+///
+/// The stub records its PID then exits without speaking JSON-RPC. If
+/// `PluginHost::spawn` drops the `Child` without `wait()`, Linux keeps that PID
+/// as a zombie owned by this test process. The assertion below must fail in
+/// that regression.
+#[test]
+#[cfg(target_os = "linux")]
+fn t9a_handshake_failure_reaps_exited_subprocess() {
+    let manifest = parse_manifest(FIXTURE_MANIFEST_BYTES).expect("fixture manifest must parse");
+
+    let project_dir = tempfile::TempDir::new().expect("tmpdir");
+    let stub_dir = tempfile::TempDir::new().expect("stub dir");
+    let pid_file = stub_dir.path().join("plugin.pid");
+    let stub_exec = stub_dir.path().join("clarion-plugin-fixture");
+    std::fs::write(
+        &stub_exec,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > {}\nexit 0\n",
+            shell_quote(&pid_file)
+        ),
+    )
+    .expect("write handshake-failing stub");
+    let mut perms = std::fs::metadata(&stub_exec)
+        .expect("stub metadata")
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    std::fs::set_permissions(&stub_exec, perms).expect("chmod stub");
+
+    let result = PluginHost::spawn(manifest, project_dir.path(), &stub_exec);
+
+    assert!(
+        result.is_err(),
+        "spawn must fail when executable exits before handshake response"
+    );
+    let pid = read_recorded_pid(&pid_file);
+    assert_not_linux_zombie(pid);
+}
+
+#[cfg(target_os = "linux")]
+fn read_recorded_pid(path: &std::path::Path) -> u32 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            return contents
+                .trim()
+                .parse::<u32>()
+                .expect("stub must record numeric pid");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stub did not record its pid at {}",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn assert_not_linux_zombie(pid: u32) {
+    let status_path = std::path::PathBuf::from(format!("/proc/{pid}/status"));
+    let Ok(status) = std::fs::read_to_string(&status_path) else {
+        return;
+    };
+    let state = status
+        .lines()
+        .find(|line| line.starts_with("State:"))
+        .unwrap_or("State: <missing>");
+    assert!(
+        !state.contains("zombie") && !state.contains("\tZ"),
+        "handshake-failed subprocess pid {pid} was not reaped: {state}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn shell_quote(path: &std::path::Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
 
 /// T9b: `stderr_tail()` is wired on subprocess-backed hosts. The fixture

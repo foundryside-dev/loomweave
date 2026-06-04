@@ -1392,6 +1392,7 @@ pub struct LeafSummaryPromptInput {
     pub entity_id: String,
     pub kind: String,
     pub name: String,
+    pub guidance: String,
     pub source_excerpt: String,
 }
 
@@ -1405,6 +1406,11 @@ pub struct InferredCallsPromptInput {
 }
 
 pub fn build_leaf_summary_prompt(input: &LeafSummaryPromptInput) -> PromptTemplate {
+    let guidance = if input.guidance.trim().is_empty() {
+        "No matching guidance."
+    } else {
+        input.guidance.as_str()
+    };
     PromptTemplate {
         id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID,
         body: format!(
@@ -1412,11 +1418,13 @@ pub fn build_leaf_summary_prompt(input: &LeafSummaryPromptInput) -> PromptTempla
              Entity id: {entity_id}\n\
              Kind: {kind}\n\
              Name: {name}\n\
+             Matching guidance:\n{guidance}\n\
              Source excerpt:\n{source}\n\
              Return JSON with purpose, behavior, relationships, and risks fields.",
             entity_id = input.entity_id,
             kind = input.kind,
             name = input.name,
+            guidance = guidance,
             source = input.source_excerpt,
         ),
     }
@@ -1488,6 +1496,7 @@ mod tests {
             entity_id: "python:function:demo.hello".to_owned(),
             kind: "function".to_owned(),
             name: "demo.hello".to_owned(),
+            guidance: String::new(),
             source_excerpt: "def hello():\n    return 42\n".to_owned(),
         });
         assert_eq!(summary.id, LEAF_SUMMARY_PROMPT_TEMPLATE_ID);

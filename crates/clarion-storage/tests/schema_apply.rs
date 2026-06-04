@@ -124,6 +124,26 @@ fn entity_tags_primary_key_includes_tag_owner_plugin() {
 }
 
 #[test]
+fn runs_table_records_owner_pid_and_heartbeat() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    let columns = table_columns(&conn, "runs");
+
+    for expected in ["owner_pid", "heartbeat_at"] {
+        assert!(
+            columns.iter().any(|column| column == expected),
+            "missing runs.{expected} in {columns:?}"
+        );
+    }
+
+    let indexes = index_names(&conn);
+    assert!(
+        indexes.iter().any(|idx| idx == "ix_runs_running_heartbeat"),
+        "missing running-heartbeat index in {indexes:?}"
+    );
+}
+
+#[test]
 fn migration_0001_creates_entity_fts_virtual_table() {
     let tempdir = tempfile::tempdir().unwrap();
     let conn = open_fresh(&tempdir);
@@ -775,7 +795,7 @@ fn migrations_are_idempotent() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut conn = open_fresh(&tempdir);
     schema::apply_migrations(&mut conn).expect("second apply should be a no-op");
-    assert_eq!(schema::applied_count(&conn).unwrap(), 7);
+    assert_eq!(schema::applied_count(&conn).unwrap(), 8);
     let tables_after = table_names(&conn);
     assert!(tables_after.contains(&"entities".to_owned()));
 }
@@ -789,7 +809,7 @@ fn schema_migrations_records_each_applied_migration() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(count, 7);
+    assert_eq!(count, 8);
     let names: Vec<String> = {
         let mut stmt = conn
             .prepare("SELECT name FROM schema_migrations ORDER BY version")
@@ -807,6 +827,7 @@ fn schema_migrations_records_each_applied_migration() {
             "0005_sei",
             "0006_wardline_taint_sei",
             "0007_run_analyzed_commit",
+            "0008_run_owner_heartbeat",
         ]
     );
 }

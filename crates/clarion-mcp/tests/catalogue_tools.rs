@@ -312,6 +312,50 @@ async fn findings_for_paginates_with_total_and_truncated() {
 }
 
 #[tokio::test]
+async fn findings_for_applies_filter_before_large_result_cap() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
+    for i in 0..5000 {
+        insert_finding(
+            &conn,
+            &format!("f-{i:04}"),
+            "python:function:m.f",
+            "defect",
+            "WARN",
+            "open",
+        );
+    }
+    insert_finding(
+        &conn,
+        "z-critical",
+        "python:function:m.f",
+        "defect",
+        "CRITICAL",
+        "open",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "findings_for",
+        json!({"id": "python:function:m.f", "filter": {"severity": "CRITICAL"}}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 1, "{env}");
+    assert_eq!(env["result"]["findings"][0]["id"], "z-critical");
+    assert_eq!(env["result"]["scan_truncated"], false, "{env}");
+}
+
+#[tokio::test]
 async fn findings_for_empty_entity_is_not_an_error() {
     let (project, db, conn) = open_project();
     insert_entity(
@@ -698,6 +742,22 @@ fn insert_edge(conn: &Connection, kind: &str, from: &str, to: &str, confidence: 
     .expect("insert edge");
 }
 
+fn insert_edge_with_properties(
+    conn: &Connection,
+    kind: &str,
+    from: &str,
+    to: &str,
+    confidence: &str,
+    properties: &Value,
+) {
+    conn.execute(
+        "INSERT INTO edges (kind, from_id, to_id, confidence, properties) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![kind, from, to, confidence, properties.to_string()],
+    )
+    .expect("insert edge with properties");
+}
+
 #[tokio::test]
 async fn find_circular_imports_detects_a_cycle() {
     let (project, db, conn) = open_project();
@@ -794,6 +854,51 @@ async fn find_circular_imports_default_confidence_excludes_inferred() {
     .await;
     assert_eq!(env["result"]["page"]["total"], 1, "{env}");
     assert_eq!(env["result"]["confidence"], "inferred");
+}
+
+#[tokio::test]
+async fn find_circular_imports_ignores_type_only_and_function_local_imports() {
+    let (project, db, conn) = open_project();
+    for id in ["python:module:a", "python:module:b", "python:module:c"] {
+        insert_entity(&conn, id, "module", "a.py", Some((1, 5)));
+    }
+    insert_edge(
+        &conn,
+        "imports",
+        "python:module:a",
+        "python:module:b",
+        "resolved",
+    );
+    insert_edge_with_properties(
+        &conn,
+        "imports",
+        "python:module:b",
+        "python:module:a",
+        "resolved",
+        &json!({"type_only": true}),
+    );
+    insert_edge(
+        &conn,
+        "imports",
+        "python:module:b",
+        "python:module:c",
+        "resolved",
+    );
+    insert_edge_with_properties(
+        &conn,
+        "imports",
+        "python:module:c",
+        "python:module:b",
+        "resolved",
+        &json!({"scope": "function"}),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_circular_imports", json!({})).await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 0, "{env}");
 }
 
 #[tokio::test]
@@ -1097,6 +1202,16 @@ fn insert_calls_edge(conn: &Connection, from: &str, to: &str, confidence: &str) 
     .expect("insert calls edge");
 }
 
+fn insert_ambiguous_calls_edge(conn: &Connection, from: &str, to: &str, candidates: &[&str]) {
+    let properties = json!({ "candidates": candidates }).to_string();
+    conn.execute(
+        "INSERT INTO edges (kind, from_id, to_id, confidence, properties) \
+         VALUES ('calls', ?1, ?2, 'ambiguous', ?3)",
+        params![from, to, properties],
+    )
+    .expect("insert ambiguous calls edge");
+}
+
 #[test]
 fn tools_list_includes_find_dead_code() {
     let names: Vec<&str> = list_tools().iter().map(|t| t.name).collect();
@@ -1169,11 +1284,18 @@ async fn find_dead_code_flags_unreachable_and_spares_live() {
         "app.py",
         Some((11, 15)),
     );
-    insert_calls_edge(
+    insert_entity(
+        &conn,
+        "python:function:maybe_other",
+        "function",
+        "app.py",
+        Some((16, 17)),
+    );
+    insert_ambiguous_calls_edge(
         &conn,
         "python:function:helper",
         "python:function:maybe",
-        "ambiguous",
+        &["python:function:maybe", "python:function:maybe_other"],
     );
     // Reflectively reached: no static edge, but barrier-tagged → live.
     insert_entity(
@@ -1181,7 +1303,7 @@ async fn find_dead_code_flags_unreachable_and_spares_live() {
         "python:function:reflected",
         "function",
         "app.py",
-        Some((16, 20)),
+        Some((18, 20)),
     );
     insert_tag(&conn, "python:function:reflected", "dynamic-dispatch");
     // Genuinely dead leaf.

@@ -22,7 +22,8 @@ use clarion_mcp::{
     list_tools,
 };
 use clarion_storage::{
-    ReaderPool, SummaryCacheEntry, SummaryCacheKey, Writer, pragma, schema, upsert_summary_cache,
+    GuidanceSheetInput, ReaderPool, SummaryCacheEntry, SummaryCacheKey, Writer, pragma, schema,
+    upsert_guidance_sheet, upsert_summary_cache,
 };
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -56,6 +57,7 @@ fn seed_graph(conn: &Connection, project_root: &std::path::Path) {
     )
     .expect("write demo source");
 
+    insert_file_entity(conn, "core:file:demo.py", &source_path);
     insert_entity(
         conn,
         "python:module:demo",
@@ -160,6 +162,29 @@ fn seed_graph(conn: &Connection, project_root: &std::path::Path) {
         "resolved",
         None,
     );
+}
+
+fn insert_file_entity(conn: &Connection, id: &str, source_path: &std::path::Path) {
+    let content_hash = blake3::hash(&std::fs::read(source_path).expect("read file source"))
+        .to_hex()
+        .to_string();
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, source_file_path, properties, content_hash,
+            created_at, updated_at
+         ) VALUES (
+            ?1, 'core', 'file', ?2, ?2, ?3, '{}', ?4,
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        params![
+            id,
+            source_path.file_name().unwrap().to_string_lossy().as_ref(),
+            source_path.display().to_string(),
+            content_hash,
+        ],
+    )
+    .expect("insert file entity");
 }
 
 fn insert_entity(
@@ -288,7 +313,7 @@ fn insert_unresolved_call_site(conn: &Connection, caller_id: &str, site_key: &st
         "INSERT INTO entity_unresolved_call_sites (
             caller_entity_id, caller_content_hash, site_key, site_ordinal,
             source_file_id, source_byte_start, source_byte_end, callee_expr, created_at
-         ) VALUES (?1, ?2, ?3, 0, 'python:module:demo', 30, 37, ?4, '2026-05-17T00:00:00.000Z')",
+         ) VALUES (?1, ?2, ?3, 0, 'core:file:demo.py', 30, 37, ?4, '2026-05-17T00:00:00.000Z')",
         params![caller_id, caller_content_hash, site_key, expr],
     )
     .expect("insert unresolved call site");
@@ -381,6 +406,7 @@ fn expected_summary_request(project_root: &std::path::Path, entity_id: &str) -> 
         entity_id: entity_id.to_owned(),
         kind: "function".to_owned(),
         name: entity_id.to_owned(),
+        guidance: String::new(),
         source_excerpt,
     });
     LlmRequest {
@@ -422,7 +448,7 @@ fn expected_inferred_request(
         "caller_content_hash": caller_content_hash,
         "site_key": site_key,
         "site_ordinal": 0,
-        "source_file_id": "python:module:demo",
+        "source_file_id": "core:file:demo.py",
         "source_byte_start": 30,
         "source_byte_end": 37,
         "callee_expr": callee_expr
@@ -850,7 +876,7 @@ async fn subsystem_members_returns_member_modules() {
 
     let envelope = call_tool(&state, "subsystem_members", json!({"id": subsystem_id})).await;
 
-    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["ok"], true, "{envelope}");
     assert_eq!(
         envelope["result"]["subsystem"]["id"],
         "core:subsystem:abc123def456"
@@ -1384,6 +1410,127 @@ async fn summary_cold_miss_records_provider_response_then_hits_cache() {
     assert_eq!(warm["result"]["cache"]["hit"], true);
     assert_eq!(warm["result"]["summary"]["purpose"], "cached demo");
     assert_eq!(warm["stats_delta"]["summary_cache_hits_total"], 1);
+    assert_eq!(provider.invocations().len(), 1);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_cache_key_and_prompt_include_matching_guidance() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    upsert_summary_cache(
+        &conn,
+        &SummaryCacheEntry {
+            key: SummaryCacheKey {
+                entity_id: "python:function:demo.entry".to_owned(),
+                content_hash: expected_content_hash(project.path(), "python:function:demo.entry"),
+                prompt_template_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+                model_tier: "anthropic/claude-sonnet-4.6".to_owned(),
+                guidance_fingerprint: "guidance-empty".to_owned(),
+            },
+            summary_json: r#"{"purpose":"unguided"}"#.to_owned(),
+            cost_usd: 0.001,
+            tokens_input: 100,
+            tokens_output: 20,
+            caller_count: 0,
+            fan_out: 2,
+            stale_semantic: false,
+            created_at: "2026-05-17T00:00:00.000Z".to_owned(),
+            last_accessed_at: "2026-05-17T00:00:00.000Z".to_owned(),
+        },
+    )
+    .unwrap();
+    let guidance_properties = json!({
+        "content": "Prefer operational risk notes when summarising functions.",
+        "scope_level": "function",
+        "match_rules": [{"type": "entity", "id": "python:function:demo.entry"}],
+        "provenance": {"author": "test"},
+        "authored_at": "2026-05-17T00:00:00.000Z"
+    });
+    upsert_guidance_sheet(
+        &conn,
+        &GuidanceSheetInput {
+            id: "core:guidance:test-summary",
+            name: "test-summary",
+            short_name: "test-summary",
+            properties: &guidance_properties,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnySummaryProvider::new_output(
+        r#"{"purpose":"guided"}"#,
+        120,
+        0.0,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let cold = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(cold["ok"], true, "{cold}");
+    assert_eq!(cold["result"]["cache"]["hit"], false);
+    assert_eq!(cold["result"]["summary"]["purpose"], "guided");
+    let invocation = provider
+        .invocations()
+        .into_iter()
+        .next()
+        .expect("summary provider invocation");
+    assert!(
+        invocation
+            .prompt
+            .contains("Prefer operational risk notes when summarising functions."),
+        "summary prompt should include matching guidance: {}",
+        invocation.prompt
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let fingerprints: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT guidance_fingerprint FROM summary_cache \
+                 WHERE entity_id = 'python:function:demo.entry' \
+                 ORDER BY guidance_fingerprint",
+            )
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    assert!(fingerprints.iter().any(|fp| fp == "guidance-empty"));
+    assert!(
+        fingerprints
+            .iter()
+            .any(|fp| fp.starts_with("guidance:") && fp != "guidance-empty"),
+        "guided summary should use a non-empty guidance fingerprint: {fingerprints:?}"
+    );
+    drop(conn);
+
+    let warm = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(warm["ok"], true, "{warm}");
+    assert_eq!(warm["result"]["cache"]["hit"], true);
+    assert_eq!(warm["result"]["summary"]["purpose"], "guided");
     assert_eq!(provider.invocations().len(), 1);
 
     drop(state);
@@ -2947,7 +3094,7 @@ async fn callers_of_inferred_dispatches_and_materializes_recording_result() {
     )
     .await;
 
-    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["ok"], true, "{envelope}");
     assert_eq!(
         envelope["result"]["callers"][0]["entity"]["id"],
         "python:function:demo.entry"
@@ -2975,6 +3122,60 @@ async fn callers_of_inferred_dispatches_and_materializes_recording_result() {
     .await;
     assert_eq!(warm["ok"], true);
     assert_eq!(provider.invocations().len(), 1);
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn callers_of_inferred_ignores_stale_unresolved_call_sites() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    add_dynamic_source(project.path());
+    let source_path = project.path().join("demo.py");
+    insert_entity(
+        &conn,
+        "python:function:demo.dynamic",
+        "function",
+        &source_path,
+        Some((9, 10)),
+        Some("python:module:demo"),
+    );
+    insert_unresolved_call_site(&conn, "python:function:demo.entry", "site-stale", "dynamic");
+    conn.execute(
+        "UPDATE entities SET content_hash = 'hash-after-body-change' \
+         WHERE id = 'python:function:demo.entry'",
+        [],
+    )
+    .expect("simulate a changed caller body without authoritative unresolved rows");
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnyInferredProvider::new(
+        r#"{"edges":[{"site_key":"site-stale","target_id":"python:function:demo.dynamic","confidence":0.91,"rationale":"stale"}]}"#,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.dynamic", "confidence": "inferred"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(envelope["result"]["callers"].as_array().unwrap().len(), 0);
+    assert!(
+        provider.invocations().is_empty(),
+        "stale unresolved rows must not trigger inferred dispatch"
+    );
 
     drop(state);
     drop(writer);
@@ -4084,6 +4285,60 @@ async fn project_status_marks_skipped_no_plugins_run() {
     assert_eq!(
         envelope["result"]["latest_run"]["status"],
         "skipped_no_plugins"
+    );
+}
+
+#[tokio::test]
+async fn project_status_marks_stale_running_run_failed() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "INSERT INTO runs ( \
+            id, started_at, completed_at, config, stats, status, owner_pid, heartbeat_at \
+         ) VALUES ( \
+            'run-stale', '2026-02-04T00:00:00.000Z', NULL, '{}', '{}', \
+            'running', 999999, '2000-01-01T00:00:00.000Z' \
+         )",
+        [],
+    )
+    .expect("insert stale running run");
+    drop(conn);
+
+    let state = state_for(project.path(), &db_path);
+    let envelope = call_tool(&state, "project_status", json!({})).await;
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    let latest = &envelope["result"]["latest_run"];
+    assert_eq!(latest["id"], "run-stale");
+    assert_eq!(latest["status"], "failed");
+    assert_eq!(latest["owner_pid"], Value::Null);
+    assert_eq!(latest["heartbeat_at"], "2000-01-01T00:00:00.000Z");
+    assert!(
+        latest["completed_at"]
+            .as_str()
+            .is_some_and(|value| value.ends_with('Z')),
+        "completed_at should be recorded on stale-run repair: {latest}"
+    );
+
+    let conn = Connection::open(&db_path).expect("reopen sqlite");
+    let (run_status, completed_at, run_owner_pid, stats_json): (
+        String,
+        Option<String>,
+        Option<i64>,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT status, completed_at, owner_pid, stats FROM runs WHERE id = 'run-stale'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("read repaired run");
+    assert_eq!(run_status, "failed");
+    assert!(completed_at.is_some());
+    assert_eq!(run_owner_pid, None);
+    let repair_stats: Value = serde_json::from_str(&stats_json).expect("stats json");
+    assert_eq!(
+        repair_stats["failure_reason"],
+        "analyze run abandoned: stale heartbeat"
     );
 }
 
