@@ -170,7 +170,11 @@ fn local_weighted_components(graph: &ModuleGraph, min_cluster_size: usize) -> Ve
     }
 
     let threshold = average_positive_weight(graph).max(1.0);
-    let modules = graph.modules.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let modules = graph
+        .modules
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
     let mut neighbors = modules
         .iter()
         .map(|&module_id| (module_id, BTreeSet::new()))
