@@ -4,6 +4,12 @@
 **Closes**: every gap in [`gap-register.md`](gap-register.md).
 **Total effort**: ~13 hours engineering + ~3.5 hours operator.
 
+> **Superseded note (2026-06-05, post-1.3.0).** Historical v1.0.0 tag-cut
+> record. `scripts/check-github-release-governance.py` (and the `gap-register.md`
+> gaps that reference it) was **removed** after v1.0; release-governance
+> enforcement is handed off to Legis and `release.yml` no longer invokes it. The
+> steps below that run that script are dead — retained as-is for v1.0 provenance.
+
 This plan sequences the gaps into three days of focused work, with explicit
 parallel-execution markers. The first day is mechanical doc + bug fixes
 that have no inter-dependencies and can run as parallel PRs. Day 2 is the

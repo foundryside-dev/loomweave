@@ -11,7 +11,8 @@ project-local descriptor location or the ``schema: wardline.vocabulary/v1``
 format-version field. The parser ignores unknown top-level keys, so a future
 ``schema`` field is tolerated without change; acting on it (format-version
 compatibility decisions) is deferred until Task B pins the contract. Confirm
-both assumptions against the Wardline descriptor ADR when it lands.
+both assumptions against the Wardline descriptor ADR when it lands
+(tracked: filigree clarion-6ab5668d82).
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import yaml
 
 # PO-confirm against Wardline Task B (descriptor ADR) — canonical project-local
 # location and descriptor-version semantics are not yet pinned by Wardline.
+# Tracked: filigree clarion-6ab5668d82.
 EXPECTED_DESCRIPTOR_VERSION = "wardline-generic-2"
 PROJECT_DESCRIPTOR_PATH = Path(".wardline/vocabulary.yaml")
 
