@@ -317,7 +317,7 @@ pub fn apply_prlimit_as(max_rss_mib: u64) -> std::io::Result<()> {
 /// # Errors
 ///
 /// Returns `std::io::Error` on the first `setrlimit` failure.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 pub fn apply_prlimit_nofile_nproc(max_nofile: u64, max_nproc: u64) -> std::io::Result<()> {
     use nix::sys::resource::{Resource, setrlimit};
 
@@ -325,8 +325,11 @@ pub fn apply_prlimit_nofile_nproc(max_nofile: u64, max_nproc: u64) -> std::io::R
     setrlimit(Resource::RLIMIT_NPROC, max_nproc, max_nproc).map_err(std::io::Error::from)
 }
 
-/// Non-Linux/macOS stub for [`apply_prlimit_nofile_nproc`].
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Non-Linux stub for [`apply_prlimit_nofile_nproc`].
+///
+/// `nix` 0.28 does not expose `Resource::RLIMIT_NPROC` on macOS, so the real
+/// implementation stays restricted to Linux.
+#[cfg(not(target_os = "linux"))]
 pub fn apply_prlimit_nofile_nproc(_max_nofile: u64, _max_nproc: u64) -> std::io::Result<()> {
     Ok(())
 }
@@ -562,11 +565,31 @@ mod tests {
         assert!(result.is_ok(), "apply_prlimit_as must succeed: {result:?}");
     }
 
-    /// On non-Linux/macOS: the stub path compiles and returns Ok (type-level check).
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn nofile_nproc_limit_is_not_enabled_for_macos() {
+        let source = include_str!("limits.rs");
+        assert!(
+            source.contains(
+                "#[cfg(target_os = \"linux\")]\n\
+pub fn apply_prlimit_nofile_nproc"
+            ),
+            "RLIMIT_NOFILE/RLIMIT_NPROC helper must stay Linux-only; \
+             nix 0.28 does not expose Resource::RLIMIT_NPROC on macOS"
+        );
+        assert!(
+            !source.contains(
+                "#[cfg(any(target_os = \"linux\", target_os = \"macos\"))]\n\
+pub fn apply_prlimit_nofile_nproc"
+            ),
+            "macOS must not compile the RLIMIT_NPROC branch"
+        );
+    }
+
+    /// On non-Linux: the stub path compiles and returns Ok (type-level check).
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn apply_prlimit_non_linux_stub_returns_ok() {
-        let result = apply_prlimit_as(DEFAULT_MAX_RSS_MIB);
+        let result = apply_prlimit_nofile_nproc(DEFAULT_MAX_NOFILE, DEFAULT_MAX_NPROC);
         assert!(result.is_ok());
     }
 }

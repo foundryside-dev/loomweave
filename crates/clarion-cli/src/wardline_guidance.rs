@@ -584,7 +584,9 @@ fn module_tier_content(
 
 fn path_glob(path: &str) -> String {
     let path = path.trim().trim_matches('/');
-    if path.contains('*') || path.contains('?') {
+    if path.is_empty() {
+        "**".to_owned()
+    } else if path.contains('*') || path.contains('?') {
         path.to_owned()
     } else {
         format!("{path}/**")
@@ -754,4 +756,21 @@ fn now_iso8601(conn: &Connection) -> Result<String> {
         })
         .context("mint guidance timestamp")?;
     Ok(ts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{overlay_scope, path_glob};
+    use clarion_storage::glob_match;
+
+    #[test]
+    fn root_overlay_scope_glob_matches_project_relative_paths() {
+        let scope = overlay_scope("wardline.overlay.yaml", None);
+        let pattern = path_glob(&scope);
+
+        assert_eq!(scope, "");
+        assert_eq!(pattern, "**");
+        assert!(glob_match(&pattern, "src/foo.py"));
+        assert!(glob_match(&pattern, "foo.py"));
+    }
 }

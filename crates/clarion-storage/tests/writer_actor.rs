@@ -11,7 +11,7 @@ use clarion_storage::{
     InferredCallEdgeRecord, InferredEdgeCacheEntry, InferredEdgeCacheKey, ReaderPool,
     SummaryCacheEntry, SummaryCacheKey, UnresolvedCallSiteRecord, Writer,
     commands::{EdgeConfidence, EdgeRecord, EntityRecord, FindingRecord, RunStatus, WriterCmd},
-    pragma, schema,
+    mark_stale_running_runs_failed, pragma, schema,
 };
 
 fn prepared_db(dir: &tempfile::TempDir) -> std::path::PathBuf {
@@ -1041,6 +1041,53 @@ async fn run_lifecycle_records_owner_pid_and_heartbeat_until_terminal() {
     drop(tx);
     drop(writer);
     handle.await.unwrap().unwrap();
+}
+
+#[test]
+fn stale_running_repair_fails_pre_migration_rows_with_null_heartbeat() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let conn = Connection::open(path).unwrap();
+    conn.execute(
+        "INSERT INTO runs ( \
+            id, started_at, completed_at, config, stats, status, owner_pid, heartbeat_at \
+         ) VALUES ( \
+            'run-null-heartbeat', '2026-02-04T00:00:00.000Z', NULL, '{}', '{}', \
+            'running', 999999, NULL \
+         )",
+        [],
+    )
+    .expect("insert upgraded pre-heartbeat running row");
+
+    let changed = mark_stale_running_runs_failed(&conn).expect("repair stale runs");
+    assert_eq!(changed, 1);
+
+    let (status, owner_pid, completed_at, stats_json): (
+        String,
+        Option<i64>,
+        Option<String>,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT status, owner_pid, completed_at, stats \
+             FROM runs WHERE id = 'run-null-heartbeat'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("read repaired run");
+    assert_eq!(status, "failed");
+    assert_eq!(owner_pid, None);
+    assert!(
+        completed_at
+            .as_deref()
+            .is_some_and(|value| value.ends_with('Z')),
+        "repair should stamp completed_at: {completed_at:?}"
+    );
+    let repair_stats: serde_json::Value = serde_json::from_str(&stats_json).expect("stats json");
+    assert_eq!(
+        repair_stats["failure_reason"],
+        "analyze run abandoned: stale heartbeat"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1609,10 +1609,152 @@ async fn summary_cache_key_and_prompt_include_matching_guidance() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_keeps_future_guidance_under_unix_clock() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    let guidance_properties = json!({
+        "content": "Future-dated guidance must still reach summary prompts.",
+        "scope_level": "function",
+        "expires": "2999-12-31T00:00:00.000Z",
+        "match_rules": [{"type": "entity", "id": "python:function:demo.entry"}],
+        "provenance": {"author": "test"},
+        "authored_at": "2026-05-17T00:00:00.000Z"
+    });
+    upsert_guidance_sheet(
+        &conn,
+        &GuidanceSheetInput {
+            id: "core:guidance:test-summary-future",
+            name: "test-summary-future",
+            short_name: "test-summary-future",
+            properties: &guidance_properties,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnySummaryProvider::new_output(
+        r#"{"purpose":"guided"}"#,
+        120,
+        0.0,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    )
+    .with_clock(|| "unix:1748822400".to_owned());
+
+    let cold = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(cold["ok"], true, "{cold}");
+    let invocation = provider
+        .invocations()
+        .into_iter()
+        .next()
+        .expect("summary provider invocation");
+    assert!(
+        invocation
+            .prompt
+            .contains("Future-dated guidance must still reach summary prompts."),
+        "summary prompt should include future guidance under unix clock: {}",
+        invocation.prompt
+    );
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn summary_preview_cost_counts_future_guidance_under_unix_clock() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).unwrap();
+    let guidance_properties = json!({
+        "content": "Future-dated guidance must still reach preview estimates.",
+        "scope_level": "function",
+        "expires": "2999-12-31T00:00:00.000Z",
+        "match_rules": [{"type": "entity", "id": "python:function:demo.entry"}],
+        "provenance": {"author": "test"},
+        "authored_at": "2026-05-17T00:00:00.000Z"
+    });
+    upsert_guidance_sheet(
+        &conn,
+        &GuidanceSheetInput {
+            id: "core:guidance:test-summary-preview-future",
+            name: "test-summary-preview-future",
+            short_name: "test-summary-preview-future",
+            properties: &guidance_properties,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnySummaryProvider::new_output(
+        r#"{"purpose":"unused"}"#,
+        120,
+        0.0,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    )
+    .with_clock(|| "unix:1748822400".to_owned());
+
+    let envelope = call_tool(
+        &state,
+        "summary_preview_cost",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    let prompt = build_leaf_summary_prompt(&LeafSummaryPromptInput {
+        entity_id: "python:function:demo.entry".to_owned(),
+        kind: "function".to_owned(),
+        name: "python:function:demo.entry".to_owned(),
+        guidance: "Guidance sheet core:guidance:test-summary-preview-future:\n\
+                   Future-dated guidance must still reach preview estimates."
+            .to_owned(),
+        source_excerpt: expected_source_excerpt(project.path(), "python:function:demo.entry"),
+    });
+    let expected_tokens = i64::try_from(prompt.body.chars().count())
+        .unwrap_or(i64::MAX)
+        .saturating_add(3)
+        / 4;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(envelope["result"]["cache_status"], "miss");
+    assert_eq!(
+        envelope["result"]["estimated_input_tokens"], expected_tokens,
+        "preview estimate should include future guidance under unix clock: {envelope}"
+    );
+    assert!(
+        provider.invocations().is_empty(),
+        "preview must not call the LLM provider"
+    );
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn propose_guidance_creates_observation_and_promote_makes_sheet_visible() {
     let (project, db_path) = open_project();
     let client = Arc::new(FakeFiligreeClient::default());
-    let state = state_for_filigree(project.path(), &db_path, client.clone());
+    let state = state_for_filigree(project.path(), &db_path, client.clone())
+        .with_clock(|| "unix:1748822400".to_owned());
 
     let proposed = call_tool(
         &state,
@@ -1683,6 +1825,17 @@ async fn propose_guidance_creates_observation_and_promote_makes_sheet_visible() 
     );
     assert_eq!(sheets[0]["provenance"], "filigree_promotion");
     assert_eq!(sheets[0]["matched_by"], json!(["entity"]));
+
+    let conn = Connection::open(&db_path).unwrap();
+    let authored_at: String = conn
+        .query_row(
+            "SELECT json_extract(properties, '$.authored_at') \
+             FROM entities WHERE id = 'core:guidance:demo-entry-risk'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(authored_at, "2025-06-02T00:00:00.000Z");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

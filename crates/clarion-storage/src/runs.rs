@@ -33,8 +33,10 @@ pub fn mark_stale_running_runs_failed(conn: &Connection) -> Result<usize> {
                 stats = ?1, \
                 owner_pid = NULL \
           WHERE status = 'running' \
-            AND heartbeat_at IS NOT NULL \
-            AND heartbeat_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?2)",
+            AND ( \
+                heartbeat_at IS NULL \
+                OR heartbeat_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?2) \
+            )",
         params![failure_stats, STALE_RUNNING_HEARTBEAT_SQL],
     )?;
     Ok(changed)

@@ -24,7 +24,8 @@
 //! # Memory limit
 //!
 //! On Linux/macOS, [`PluginHost::spawn`] calls [`apply_prlimit_as`] inside
-//! `CommandExt::pre_exec` to set `RLIMIT_AS` before `exec()`. The closure body
+//! `CommandExt::pre_exec` to set `RLIMIT_AS` before `exec()`. On Linux the same
+//! closure also applies `RLIMIT_NOFILE` and `RLIMIT_NPROC`. The closure body
 //! only calls `setrlimit(2)`, which is async-signal-safe per POSIX.1-2017
 //! §2.4.3. The `unsafe` block is the minimum required by the `pre_exec` API.
 
@@ -49,14 +50,13 @@ use crate::plugin::limits::{
 // The prlimit application path is Linux/macOS-only (see the matching
 // `pre_exec` block in `spawn`); these symbols are unused on other targets and
 // would trip `-D warnings`. Gate the imports to match their usage.
+#[cfg(target_os = "linux")]
+use crate::plugin::limits::{DEFAULT_MAX_NOFILE, apply_prlimit_nofile_nproc};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::plugin::limits::{
-    DEFAULT_MAX_NOFILE, DEFAULT_MAX_RSS_MIB, apply_prlimit_as, apply_prlimit_nofile_nproc,
-    effective_rss_mib,
-};
-// `DEFAULT_MAX_NPROC` is also reached from the unit tests below, so it needs
-// the `test` arm in addition to Linux/macOS.
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+use crate::plugin::limits::{DEFAULT_MAX_RSS_MIB, apply_prlimit_as, effective_rss_mib};
+// `DEFAULT_MAX_NPROC` is also reached from the unit tests below, so it needs the
+// `test` arm in addition to Linux.
+#[cfg(any(target_os = "linux", test))]
 use crate::plugin::limits::DEFAULT_MAX_NPROC;
 use crate::plugin::manifest::{Manifest, ManifestError};
 use crate::plugin::protocol::{
@@ -93,17 +93,17 @@ pub const MAX_UNRESOLVED_CALLEE_EXPR_BYTES: usize = 512;
 pub const MAX_ENTITY_EXTRA_BYTES: usize = 64 * 1024;
 
 /// Pyright's Node-based language server spawns helper threads/processes and
-/// inherits the plugin child's `RLIMIT_NPROC`. On Linux and macOS that limit
-/// is checked against all processes/threads for the user, not just descendants
-/// of the plugin, so the Sprint-1 single-plugin ceiling is too low for B.4*
-/// call resolution on ordinary developer workstations.
-// Used only from the Linux/macOS pre_exec limit path and from unit tests; gate
+/// inherits the plugin child's `RLIMIT_NPROC`. On Linux that limit is checked
+/// against all processes/threads for the user, not just descendants of the
+/// plugin, so the Sprint-1 single-plugin ceiling is too low for B.4* call
+/// resolution on ordinary developer workstations.
+// Used only from the Linux pre_exec limit path and from unit tests; gate
 // to match so other release builds don't see it as dead code under
 // `-D warnings`.
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", test))]
 const PYRIGHT_MAX_NPROC: u64 = 4096;
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", test))]
 fn effective_max_nproc(manifest: &Manifest) -> u64 {
     if manifest.capabilities.runtime.pyright.is_some() {
         PYRIGHT_MAX_NPROC
@@ -597,12 +597,6 @@ impl
             // cannot spoof host output.
             .stderr(std::process::Stdio::piped());
 
-        // SAFETY: Each `setrlimit` call inside the closure is listed as
-        // async-signal-safe in POSIX.1-2017 §2.4.3. The `pre_exec` closure
-        // runs in the forked child after `fork()` but before `exec()`, so
-        // only the child's limits are affected. No Rust allocation, no Drop
-        // and no non-async-signal-safe call occurs inside the closure;
-        // `u64` captures are trivially Copy.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             use std::os::unix::process::CommandExt;
@@ -610,12 +604,23 @@ impl
                 manifest.capabilities.runtime.expected_max_rss_mb,
                 DEFAULT_MAX_RSS_MIB,
             );
+
+            #[cfg(target_os = "linux")]
             let max_nofile = DEFAULT_MAX_NOFILE;
+            #[cfg(target_os = "linux")]
             let max_nproc = effective_max_nproc(&manifest);
+
+            // SAFETY: Each `setrlimit` call inside the closure is listed as
+            // async-signal-safe in POSIX.1-2017 §2.4.3. The `pre_exec` closure
+            // runs in the forked child after `fork()` but before `exec()`, so
+            // only the child's limits are affected. No Rust allocation, no Drop
+            // and no non-async-signal-safe call occurs inside the closure;
+            // `u64` captures are trivially Copy.
             #[allow(unsafe_code)]
             unsafe {
                 command.pre_exec(move || {
                     apply_prlimit_as(rss_mib)?;
+                    #[cfg(target_os = "linux")]
                     apply_prlimit_nofile_nproc(max_nofile, max_nproc)?;
                     Ok(())
                 });

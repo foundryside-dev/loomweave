@@ -1243,7 +1243,7 @@ impl ServerState {
                 ));
             }
         };
-        let authored_at = (self.clock)();
+        let authored_at = guidance_authored_at_from_clock(&(self.clock)());
         let promoted = match proposal.to_promoted_sheet(&authored_at) {
             Ok(promoted) => promoted,
             Err(err) => {
@@ -3878,6 +3878,26 @@ fn estimate_tokens_from_chars(text: &str) -> i64 {
 fn default_now_string() -> String {
     let seconds = OffsetDateTime::now_utc().unix_timestamp();
     format!("unix:{seconds}")
+}
+
+fn guidance_authored_at_from_clock(raw: &str) -> String {
+    const ISO_MILLIS_UTC: &[time::format_description::FormatItem<'_>] =
+        format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
+
+    let parsed = if let Some(seconds) = raw.strip_prefix("unix:") {
+        seconds
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .and_then(|seconds| OffsetDateTime::from_unix_timestamp(seconds).ok())
+    } else {
+        parse_to_unix_seconds(raw)
+            .and_then(|seconds| OffsetDateTime::from_unix_timestamp(seconds).ok())
+    };
+
+    parsed
+        .and_then(|timestamp| timestamp.format(&ISO_MILLIS_UTC).ok())
+        .unwrap_or_else(|| raw.to_owned())
 }
 
 fn caller_json(

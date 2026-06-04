@@ -112,19 +112,33 @@ impl GuidanceSheet {
 
 /// True if `sheet`'s `expires` instant is in the past relative to `now`.
 ///
-/// This is the **review-cadence/expiry** predicate that mirrors the MCP read
-/// path's expiry exclusion (`clarion-mcp` `catalogue::inspection`) and the
-/// `CLA-FACT-GUIDANCE-EXPIRED` finding exactly: a lexical `expires < now`
-/// compare. `now` MUST be in the same fixed-width `YYYY-MM-DDTHH:MM:SS.mmmZ`
-/// shape the write path stamps timestamps with, so the byte compare is a valid
-/// instant compare. A sheet with **no `expires`** is never expired.
+/// This is the **review-cadence/expiry** predicate that mirrors the MCP
+/// `guidance_for` read path's expiry exclusion and the
+/// `CLA-FACT-GUIDANCE-EXPIRED` finding: parse both values to Unix seconds,
+/// accepting either `unix:<seconds>` or RFC3339 timestamps, and compare
+/// numerically. Fail open: a sheet with no `expires`, an unparseable `expires`,
+/// or an unparseable clock is never hidden as expired.
 #[must_use]
 pub fn guidance_sheet_is_expired(sheet: &GuidanceSheet, now: &str) -> bool {
     sheet
         .properties
         .get("expires")
         .and_then(Value::as_str)
-        .is_some_and(|expires| expires < now)
+        .and_then(parse_guidance_timestamp_to_unix_seconds)
+        .zip(parse_guidance_timestamp_to_unix_seconds(now))
+        .is_some_and(|(expires, now)| expires < now)
+}
+
+fn parse_guidance_timestamp_to_unix_seconds(value: &str) -> Option<i64> {
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+
+    if let Some(rest) = value.strip_prefix("unix:") {
+        return rest.trim().parse().ok();
+    }
+    OffsetDateTime::parse(value, &Rfc3339)
+        .ok()
+        .map(OffsetDateTime::unix_timestamp)
 }
 
 /// True if `sheet` has not been "touched" since `stale_before` — the
@@ -964,6 +978,24 @@ mod tests {
             &sheet,
             "2026-06-03T12:00:00.000Z"
         ));
+    }
+
+    #[test]
+    fn expired_future_expires_is_not_expired_with_unix_clock() {
+        let sheet = sheet_with(json!({ "expires": "2999-01-01T00:00:00.000Z" }));
+        assert!(!guidance_sheet_is_expired(&sheet, "unix:1748822400"));
+    }
+
+    #[test]
+    fn expired_past_expires_is_expired_with_unix_clock() {
+        let sheet = sheet_with(json!({ "expires": "2000-01-01T00:00:00.000Z" }));
+        assert!(guidance_sheet_is_expired(&sheet, "unix:1748822400"));
+    }
+
+    #[test]
+    fn expired_unparseable_clock_fails_open() {
+        let sheet = sheet_with(json!({ "expires": "2000-01-01T00:00:00.000Z" }));
+        assert!(!guidance_sheet_is_expired(&sheet, "not-a-clock"));
     }
 
     // ── guidance_sheet_is_stale ──────────────────────────────────────────────
