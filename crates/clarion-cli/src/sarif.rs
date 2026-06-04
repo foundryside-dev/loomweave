@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Map, Value, json};
@@ -89,17 +89,7 @@ pub fn run_import(file: &Path, scan_source_opt: Option<String>, project_path: &P
                             if let Some(phys_loc) = loc.get("physicalLocation") {
                                 if let Some(al) = phys_loc.get("artifactLocation") {
                                     if let Some(uri) = al.get("uri").and_then(|u| u.as_str()) {
-                                        let clean_uri = if let Some(stripped) =
-                                            uri.strip_prefix("file://")
-                                        {
-                                            stripped
-                                        } else if let Some(stripped) = uri.strip_prefix("file:///")
-                                        {
-                                            stripped
-                                        } else {
-                                            uri
-                                        };
-                                        path = Some(clean_uri.trim_start_matches('/').to_owned());
+                                        path = Some(normalize_sarif_uri(uri, &project_root));
                                     }
                                 }
                                 if let Some(region) = phys_loc.get("region") {
@@ -193,4 +183,52 @@ pub fn run_import(file: &Path, scan_source_opt: Option<String>, project_path: &P
     );
 
     Ok(())
+}
+
+fn normalize_sarif_uri(uri: &str, project_root: &Path) -> String {
+    let path = if let Some(stripped) = uri.strip_prefix("file://localhost/") {
+        PathBuf::from(format!("/{stripped}"))
+    } else if let Some(stripped) = uri.strip_prefix("file:///") {
+        PathBuf::from(format!("/{stripped}"))
+    } else if let Some(stripped) = uri.strip_prefix("file://") {
+        PathBuf::from(stripped)
+    } else {
+        PathBuf::from(uri)
+    };
+
+    if path.is_absolute()
+        && let Ok(relative) = path.strip_prefix(project_root)
+    {
+        return relative.to_string_lossy().into_owned();
+    }
+    path.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_sarif_uri;
+
+    #[test]
+    fn normalize_sarif_uri_relativizes_project_absolute_file_uri() {
+        let root = std::path::Path::new("/home/john/project");
+        assert_eq!(
+            normalize_sarif_uri("file:///home/john/project/src/a.py", root),
+            "src/a.py"
+        );
+    }
+
+    #[test]
+    fn normalize_sarif_uri_preserves_unresolved_absolute_file_uri() {
+        let root = std::path::Path::new("/home/john/project");
+        assert_eq!(
+            normalize_sarif_uri("file:///tmp/other/src/a.py", root),
+            "/tmp/other/src/a.py"
+        );
+    }
+
+    #[test]
+    fn normalize_sarif_uri_keeps_relative_uri_relative() {
+        let root = std::path::Path::new("/home/john/project");
+        assert_eq!(normalize_sarif_uri("src/a.py", root), "src/a.py");
+    }
 }

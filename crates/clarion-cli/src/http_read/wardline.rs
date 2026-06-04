@@ -49,9 +49,8 @@ pub(crate) struct TaintFactInput {
     content_hash_at_compute: Option<String>,
     /// Optional caller-supplied Stable Entity Identity (T3.4, migration 0006).
     /// Opaque — stored verbatim, never parsed. When omitted, the write path
-    /// resolves the alive SEI for the resolved locator server-side. A
-    /// caller-supplied value wins (Wardline already holds the SEI from its
-    /// `SeiResolver`).
+    /// resolves the alive SEI for the resolved locator server-side. When both
+    /// caller and server values are present, they must match.
     #[serde(default)]
     sei: Option<String>,
 }
@@ -257,13 +256,21 @@ pub(crate) async fn post_wardline_taint_facts(
             unresolved_qualnames.push(fact.qualname);
             continue;
         };
-        // SEI key: a caller-supplied value wins (opaque, verbatim); otherwise
-        // the alive binding resolved for this locator. `None` on a pre-SEI DB /
-        // unbound locator — the fact is still written, locator-keyed only.
-        let sei = fact
-            .sei
-            .clone()
-            .or_else(|| seis_by_locator.get(&entity_id).cloned());
+        // SEI key: the server-resolved alive binding is authoritative for the
+        // resolved locator. A caller-supplied value is accepted only when it
+        // matches that binding; otherwise it would let a client write facts for
+        // locator A under locator B's stable identity.
+        let resolved_sei = seis_by_locator.get(&entity_id).cloned();
+        if let (Some(caller_sei), Some(resolved_sei)) = (&fact.sei, &resolved_sei)
+            && caller_sei != resolved_sei
+        {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidPath,
+                "caller-supplied sei conflicts with server-resolved locator identity",
+            );
+        }
+        let sei = fact.sei.clone().or(resolved_sei);
         let taint_fact = clarion_storage::TaintFact {
             entity_id,
             // Opaque + byte-verbatim: `RawValue::get()` returns the original
@@ -848,6 +855,78 @@ mod tests {
             stored, resolved_blob,
             "wardline_json stored byte-verbatim (key order preserved)"
         );
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_write_rejects_conflicting_caller_sei() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let locator = "python:function:a.b.c";
+        let resolved_sei = "clarion:eid:resolved";
+        let (state, db_path, writer, _tempdir) = wardline_write_test_state(secret, &[locator]);
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open db");
+            conn.execute(
+                "INSERT INTO sei_bindings \
+                    (sei, current_locator, body_hash, signature, status, \
+                     born_run_id, updated_run_id, updated_at) \
+                 VALUES (?1, ?2, NULL, NULL, 'alive', 'run-0', 'run-0', 't')",
+                rusqlite::params![resolved_sei, locator],
+            )
+            .expect("insert binding");
+        }
+
+        let body = br#"{"facts":[{"qualname":"a.b.c","sei":"clarion:eid:other","wardline_json":{"v":1}}]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body);
+        let response = router(state).oneshot(request).await.expect("oneshot");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(parsed["code"], "INVALID_PATH");
+        assert!(
+            read_taint_blob(&db_path, locator).is_none(),
+            "conflicting SEI write must not persist"
+        );
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_write_accepts_matching_caller_sei() {
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let locator = "python:function:a.b.c";
+        let resolved_sei = "clarion:eid:resolved";
+        let (state, db_path, writer, _tempdir) = wardline_write_test_state(secret, &[locator]);
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open db");
+            conn.execute(
+                "INSERT INTO sei_bindings \
+                    (sei, current_locator, body_hash, signature, status, \
+                     born_run_id, updated_run_id, updated_at) \
+                 VALUES (?1, ?2, NULL, NULL, 'alive', 'run-0', 'run-0', 't')",
+                rusqlite::params![resolved_sei, locator],
+            )
+            .expect("insert binding");
+        }
+
+        let body = br#"{"facts":[{"qualname":"a.b.c","sei":"clarion:eid:resolved","wardline_json":{"v":1}}]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body);
+        let response = router(state).oneshot(request).await.expect("oneshot");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let conn = rusqlite::Connection::open(&db_path).expect("open db");
+        let stored_sei: String = conn
+            .query_row(
+                "SELECT sei FROM wardline_taint_facts WHERE entity_id = ?1",
+                rusqlite::params![locator],
+                |row| row.get(0),
+            )
+            .expect("stored fact sei");
+        assert_eq!(stored_sei, resolved_sei);
         drop(writer);
     }
 
@@ -1656,7 +1735,14 @@ mod tests {
             br#"{"facts":[{"qualname":"old.pkg.fn","wardline_json":{"taint":"EXTERNAL"}}]}"#;
         let write = hmac_request(secret, "POST", "/api/wardline/taint-facts", write_body);
         let resp = router(state.clone()).oneshot(write).await.expect("oneshot");
-        assert_eq!(resp.status(), StatusCode::OK);
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), 4096).await.expect("body");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "write response: {}",
+            String::from_utf8_lossy(&body)
+        );
 
         // The fact stored under the OLD locator carries the resolved SEI.
         {

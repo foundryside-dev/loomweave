@@ -296,3 +296,69 @@ async fn open_validated_fails_on_corrupt_db() {
         Ok(_) => panic!("open_validated must reject a corrupt DB"),
     }
 }
+
+#[tokio::test]
+async fn open_validated_rejects_foreign_application_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("foreign.db");
+    {
+        let conn = Connection::open(&path).expect("open");
+        conn.execute_batch(
+            "PRAGMA application_id = 0x7AFEBABE; \
+             CREATE TABLE marker(id INTEGER);",
+        )
+        .expect("seed foreign db");
+    }
+
+    match ReaderPool::open_validated(&path, 2) {
+        Err(clarion_storage::StorageError::ForeignDatabase { application_id }) => {
+            assert_eq!(application_id, 0x7AFE_BABE);
+        }
+        Err(other) => panic!("expected ForeignDatabase, got {other:?}"),
+        Ok(_) => panic!("open_validated must reject a foreign application_id"),
+    }
+}
+
+#[tokio::test]
+async fn open_validated_rejects_future_user_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    {
+        let conn = Connection::open(&path).expect("open");
+        conn.execute_batch(&format!(
+            "PRAGMA user_version = {};",
+            schema::CURRENT_SCHEMA_VERSION + 1
+        ))
+        .expect("bump user_version");
+    }
+
+    match ReaderPool::open_validated(&path, 2) {
+        Err(clarion_storage::StorageError::FutureUserVersion { found, current }) => {
+            assert_eq!(found, schema::CURRENT_SCHEMA_VERSION + 1);
+            assert_eq!(current, schema::CURRENT_SCHEMA_VERSION);
+        }
+        Err(other) => panic!("expected FutureUserVersion, got {other:?}"),
+        Ok(_) => panic!("open_validated must reject future user_version"),
+    }
+}
+
+#[tokio::test]
+async fn open_validated_accepts_legacy_zero_application_id_without_mutating() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.db");
+    {
+        let mut conn = Connection::open(&path).expect("open");
+        schema::apply_migrations(&mut conn).expect("migrate");
+        let app_id: i64 = conn
+            .query_row("PRAGMA application_id", [], |row| row.get(0))
+            .expect("read app id");
+        assert_eq!(app_id, 0);
+    }
+
+    let _pool = ReaderPool::open_validated(&path, 2).expect("legacy zero id accepted");
+    let conn = Connection::open(&path).expect("reopen");
+    let app_id: i64 = conn
+        .query_row("PRAGMA application_id", [], |row| row.get(0))
+        .expect("read app id");
+    assert_eq!(app_id, 0, "read validation must not stamp legacy DBs");
+}

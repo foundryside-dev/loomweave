@@ -13,7 +13,9 @@ import subprocess
 import sys
 import threading
 import time
+import tokenize
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, Literal, Self
 from urllib.parse import unquote, urlparse
@@ -483,7 +485,9 @@ class PyrightSession:
         )
         try:
             accumulators: dict[tuple[str, str], _ReferenceEdgeAccumulator] = {}
-            lookup_cache: dict[tuple[str, str, str], tuple[list[str], bool]] = {}
+            lookup_cache: dict[
+                tuple[str, str, str, int, int, int, int], tuple[list[str], bool]
+            ] = {}
             source_bytes = index.source.encode("utf-8")
             resolved_total = 0
             skipped_external_total = 0
@@ -997,6 +1001,29 @@ def _build_function_index(project_root: Path, path: Path, source: str) -> _Funct
     )
 
 
+def _declaration_name_character(
+    line_text: str,
+    expected_name: str,
+    declaration_kind: Literal["function", "class"],
+) -> int:
+    keyword = "def" if declaration_kind == "function" else "class"
+    try:
+        tokens = tokenize.generate_tokens(StringIO(line_text).readline)
+        seen_keyword = False
+        for token in tokens:
+            if token.type != tokenize.NAME:
+                continue
+            if not seen_keyword:
+                if token.string == keyword:
+                    seen_keyword = True
+                continue
+            if token.string == expected_name:
+                return token.start[1]
+    except tokenize.TokenError:
+        return -1
+    return -1
+
+
 def _collect_entities(  # noqa: PLR0913 - keeps function/class indexes in one traversal.
     node: ast.AST,
     parents: list[ast.AST],
@@ -1009,6 +1036,8 @@ def _collect_entities(  # noqa: PLR0913 - keeps function/class indexes in one tr
     for child in ast.iter_child_nodes(node):
         match child:
             case ast.FunctionDef() | ast.AsyncFunctionDef():
+                if _has_overload_decorator(child):
+                    continue
                 python_qualname = reconstruct_qualname(child, parents)
                 qualified_name = f"{dotted_module}.{python_qualname}"
                 child_id = entity_id("python", "function", qualified_name)
@@ -1018,7 +1047,7 @@ def _collect_entities(  # noqa: PLR0913 - keeps function/class indexes in one tr
                 line_text = (
                     source_lines[child.lineno - 1] if child.lineno <= len(source_lines) else ""
                 )
-                name_character = line_text.find(child.name)
+                name_character = _declaration_name_character(line_text, child.name, "function")
                 character = (
                     _codepoint_col_to_utf16(line_text, name_character)
                     if name_character >= 0
@@ -1066,7 +1095,7 @@ def _collect_entities(  # noqa: PLR0913 - keeps function/class indexes in one tr
                 line_text = (
                     source_lines[child.lineno - 1] if child.lineno <= len(source_lines) else ""
                 )
-                name_character = line_text.find(child.name)
+                name_character = _declaration_name_character(line_text, child.name, "class")
                 character = (
                     _codepoint_col_to_utf16(line_text, name_character)
                     if name_character >= 0
@@ -1100,6 +1129,19 @@ def _collect_entities(  # noqa: PLR0913 - keeps function/class indexes in one tr
                 )
 
 
+def _has_overload_decorator(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    for decorator in node.decorator_list:
+        match decorator:
+            case ast.Name(id="overload"):
+                return True
+            case ast.Attribute(
+                value=ast.Name(id="typing" | "typing_extensions"),
+                attr="overload",
+            ):
+                return True
+    return False
+
+
 def _merge_reference_site(
     accumulators: dict[tuple[str, str], _ReferenceEdgeAccumulator],
     site: ReferenceSite,
@@ -1130,9 +1172,17 @@ def _merge_reference_site(
 def _reference_lookup_cache_key(
     site: ReferenceSite,
     source_bytes: bytes,
-) -> tuple[str, str, str]:
+) -> tuple[str, str, str, int, int, int, int]:
     lexeme = source_bytes[site.source_byte_start : site.source_byte_end].decode("utf-8")
-    return site.from_id, site.kind, lexeme
+    return (
+        site.from_id,
+        site.kind,
+        lexeme,
+        site.line,
+        site.character,
+        site.source_byte_start,
+        site.source_byte_end,
+    )
 
 
 def _sorted_reference_accumulators(
@@ -1541,12 +1591,25 @@ def _containing_function_id(index: _FunctionIndex, raw_range: dict[object, objec
     if key is None:
         return None
     line, character = key
+    candidates: list[_FunctionInfo] = []
     for function in index.functions:
-        if function.line <= line <= function.end_line and (
-            line != function.line or character >= function.character
-        ):
-            return function.entity_id
-    return None
+        starts_inside = function.line < line or (
+            function.line == line and character >= function.character
+        )
+        ends_inside = line < function.end_line or (
+            line == function.end_line and character <= function.end_character
+        )
+        if starts_inside and ends_inside:
+            candidates.append(function)
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda function: (
+            function.end_line - function.line,
+            function.end_character - function.character,
+        ),
+    ).entity_id
 
 
 def _path_from_uri(uri: str) -> Path | None:

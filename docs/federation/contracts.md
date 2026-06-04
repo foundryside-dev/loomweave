@@ -342,7 +342,7 @@ Query parameters:
 
 | Name | Required | Default | Meaning |
 |---|---:|---|---|
-| `confidence` | no | `all` | Tier ceiling: `resolved`, `ambiguous`, `inferred`, or `all`. `resolved` returns resolved edges only; `ambiguous` adds ambiguous; `inferred`/`all` add inferred. |
+| `confidence` | no | `resolved` | Tier ceiling: `resolved`, `ambiguous`, `inferred`, or `all`. Omitted/`resolved` returns resolved edges only; `ambiguous` adds ambiguous; `inferred`/`all` add inferred. |
 | `limit` | no | 50 | Page size, clamped to a maximum of **200**. |
 | `offset` | no | 0 | Number of leading entries to skip (entries are ordered by `entity_id`). |
 
@@ -390,12 +390,12 @@ Failure envelopes:
 | 403 | `BRIEFING_BLOCKED` | The **queried** entity carries a `briefing_blocked` marker — refused exactly like `GET /api/v1/files`, so a sibling cannot read structure around a withheld entity. |
 | 404 | `NOT_FOUND` | No entity row exists for `:entity_id`. |
 
-**Briefing-block policy.** Only the *queried* entity is checked for
-`briefing_blocked` (→ 403). **Neighbour** entities in the result are **not**
-filtered: the payload is structural topology (ids + counts + tier), not file
-content, and this matches Clarion's MCP call-graph surface (`callers_of` /
-`neighborhood`), which likewise does not filter briefing-blocked neighbours. The
-content-bearing surface (`GET /api/v1/files`) is where the block is load-bearing.
+**Briefing-block policy.** The *queried* entity is checked for
+`briefing_blocked` (→ 403). Returned neighbours are also visibility-filtered:
+briefing-blocked neighbour ids are omitted and counted in
+`blocked_neighbor_count` (single-entity routes) or `blocked_neighbor_counts`
+(batch routes). This preserves structural density signals without exposing
+withheld entity identities.
 
 ### `POST /api/v1/entities/callers:batch-get` and `…/callees:batch-get`
 
@@ -411,7 +411,7 @@ Request body (`application/json`, max 16 KiB):
 }
 ```
 
-`confidence` (default `all`) and `limit` (default 50, max 200) apply to every
+`confidence` (default `resolved`) and `limit` (default 50, max 200) apply to every
 entity; there is no `offset` on the batch surface.
 
 Successful response (`200 OK`):

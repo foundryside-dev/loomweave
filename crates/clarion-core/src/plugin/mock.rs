@@ -515,6 +515,7 @@ impl MockPlugin {
             entities,
             edges: vec![],
             stats: AnalyzeFileStats::default(),
+            findings: vec![],
         };
         let env = ResponseEnvelope {
             jsonrpc: JsonRpcVersion,

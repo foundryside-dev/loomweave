@@ -21,7 +21,9 @@ from clarion_plugin_python.pyright_session import (
     FINDING_PYRIGHT_UNAVAILABLE,
     LspTimeoutError,
     PyrightSession,
+    _build_function_index,
     _CallSite,
+    _containing_function_id,
     _FunctionIndex,
     _FunctionInfo,
     _unresolved_call_site_total_for_function,
@@ -105,6 +107,56 @@ def _finding_codes(result_findings: Sequence[Finding]) -> set[str]:
     return {str(finding["subcode"]) for finding in result_findings}
 
 
+def test_pyright_index_uses_declaration_name_token_positions(tmp_path: Path) -> None:
+    source = textwrap.dedent(
+        """
+        def f():
+            pass
+
+        def d(d):
+            return d
+
+        class c:
+            pass
+
+        async def af():
+            pass
+        """,
+    ).lstrip()
+    path = _write_module(tmp_path, source)
+
+    index = _build_function_index(tmp_path, path, source)
+
+    assert index.by_id["python:function:demo.f"].character == 4
+    assert index.by_id["python:function:demo.d"].character == 4
+    assert index.entity_by_name_position[(6, 6)] == "python:class:demo.c"
+    assert index.by_id["python:function:demo.af"].character == 10
+
+
+def test_containing_function_fallback_prefers_deepest_span(tmp_path: Path) -> None:
+    source = textwrap.dedent(
+        """
+        def outer():
+            def inner():
+                return helper()
+            return inner()
+        """,
+    ).lstrip()
+    path = _write_module(tmp_path, source)
+    index = _build_function_index(tmp_path, path, source)
+
+    assert (
+        _containing_function_id(
+            index,
+            {
+                "start": {"line": 2, "character": 15},
+                "end": {"line": 2, "character": 21},
+            },
+        )
+        == "python:function:demo.outer.<locals>.inner"
+    )
+
+
 def _reference_site(
     source: str,
     *,
@@ -174,6 +226,48 @@ def test_pyright_session_resolves_direct_call(tmp_path: Path, pyright_langserver
     assert result.pyright_query_latency_ms[0] > 0
     assert result.pyright_index_parse_latency_ms[0] > 0
     assert result.unresolved_call_sites_total == 0
+
+
+@pytest.mark.pyright
+def test_pyright_session_overload_index_uses_implementation_body(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    module = _write_module(
+        tmp_path,
+        """
+        from typing import overload
+
+        def helper(value: object) -> object:
+            return value
+
+        @overload
+        def parse(value: str) -> str: ...
+
+        @overload
+        def parse(value: int) -> int: ...
+
+        def parse(value: object) -> object:
+            return helper(value)
+        """,
+    )
+
+    with PyrightSession(tmp_path, executable=pyright_langserver) as session:
+        result = session.resolve_calls(
+            module,
+            [
+                "python:function:demo.helper",
+                "python:function:demo.parse",
+            ],
+        )
+
+    assert [(edge["from_id"], edge["to_id"], edge["confidence"]) for edge in result.edges] == [
+        (
+            "python:function:demo.parse",
+            "python:function:demo.helper",
+            "resolved",
+        ),
+    ]
 
 
 @pytest.mark.pyright
@@ -507,7 +601,7 @@ def test_pyright_session_reference_resolution_timeout(
     assert FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT in _finding_codes(result.findings)
 
 
-def test_pyright_session_reuses_same_owner_reference_lookup(tmp_path: Path) -> None:
+def test_pyright_session_reference_lookup_cache_includes_source_position(tmp_path: Path) -> None:
     source = textwrap.dedent(
         """
         def world():
@@ -528,7 +622,7 @@ def test_pyright_session_reuses_same_owner_reference_lookup(tmp_path: Path) -> N
         result = session.resolve_references(module, [first, second])
         requested_starts = session.requested_starts
 
-    assert requested_starts == [first.source_byte_start]
+    assert requested_starts == [first.source_byte_start, second.source_byte_start]
     assert result.reference_sites_total == 2
     assert result.references_resolved_total == 2
     assert result.unresolved_reference_sites_total == 0

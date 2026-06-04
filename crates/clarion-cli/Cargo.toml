@@ -19,6 +19,7 @@ axum.workspace = true
 blake3.workspace = true
 clap.workspace = true
 clarion-core = { path = "../clarion-core", version = "1.2.0" }
+clarion-analysis = { path = "../clarion-analysis", version = "1.2.0" }
 clarion-federation = { path = "../clarion-federation", version = "1.2.0" }
 clarion-mcp = { path = "../clarion-mcp", version = "1.2.0" }
 clarion-scanner = { path = "../clarion-scanner", version = "1.2.0" }
@@ -41,7 +42,6 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
-xgraph.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true

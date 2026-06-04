@@ -49,6 +49,7 @@ pub use plugin::{
     // manifest (Task 1) — callers parse manifests from disk
     Manifest,
     ManifestError,
+    OntologyEntityRole,
     PluginHost,
     UnresolvedCallSite,
     discover,

@@ -33,6 +33,8 @@
 //! Full bidirectional dispatch is Task 6's concern.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use std::collections::BTreeMap;
+
 use serde_json::{Map, Value};
 
 /// Edge-confidence tier carried on edge rows and wire records (ADR-028).
@@ -411,6 +413,25 @@ impl AnalyzeFileStats {
     }
 }
 
+/// One plugin-reported diagnostic emitted with an `analyze_file` result.
+///
+/// The host validates the prefix, field sizes, and metadata shape before
+/// accepting this into its run-level finding queue.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AnalyzeFileFinding {
+    /// Plugin-owned rule id. Must be under the manifest's `rule_id_prefix`.
+    pub subcode: String,
+    /// Plugin severity label. Stored as metadata by the host; ADR-017
+    /// persistence severity remains host-controlled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+    /// Human-readable diagnostic message.
+    pub message: String,
+    /// Plugin-provided context. Values are validated and stringified by the host.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, Value>,
+}
+
 /// One unresolved call site emitted by a plugin for lazy inferred-call dispatch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UnresolvedCallSite {
@@ -444,6 +465,9 @@ pub struct AnalyzeFileResult {
     /// Observability counters and samples. Defaults keep pre-B.4 plugins valid.
     #[serde(default, skip_serializing_if = "AnalyzeFileStats::is_empty")]
     pub stats: AnalyzeFileStats,
+    /// Plugin-reported diagnostics. Defaults keep older plugins valid.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<AnalyzeFileFinding>,
 }
 
 // ── shutdown ──────────────────────────────────────────────────────────────────
@@ -702,6 +726,12 @@ mod tests {
                 pyright_index_parse_latency_ms: vec![8, 13],
                 extractor_parse_latency_ms: 5,
             },
+            findings: vec![AnalyzeFileFinding {
+                subcode: "CLA-PY-PYRIGHT-RESTART".to_owned(),
+                severity: Some("warning".to_owned()),
+                message: "pyright subprocess died and was restarted".to_owned(),
+                metadata: BTreeMap::new(),
+            }],
         };
         let back: AnalyzeFileResult =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
@@ -723,6 +753,10 @@ mod tests {
         assert_eq!(
             back.stats.reference_sites_total, 0,
             "missing stats field must default reference-site counter to zero"
+        );
+        assert!(
+            back.findings.is_empty(),
+            "missing findings field must default to empty vec"
         );
         assert_eq!(
             back.stats.references_resolved_total, 0,

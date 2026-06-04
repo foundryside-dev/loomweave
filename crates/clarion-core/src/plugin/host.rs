@@ -38,9 +38,9 @@ use thiserror::Error;
 
 pub use super::host_findings::{
     FINDING_EDGE_FIELD_OVERSIZE, FINDING_ENTITY_FIELD_OVERSIZE, FINDING_ENTITY_ID_MISMATCH,
-    FINDING_MALFORMED_EDGE, FINDING_MALFORMED_ENTITY, FINDING_MALFORMED_UNRESOLVED_CALL_SITE,
-    FINDING_NON_UTF8_PATH, FINDING_UNDECLARED_EDGE_KIND, FINDING_UNDECLARED_KIND,
-    FINDING_UNSUPPORTED_CAPABILITY, HostFinding,
+    FINDING_MALFORMED_EDGE, FINDING_MALFORMED_ENTITY, FINDING_MALFORMED_FINDING,
+    FINDING_MALFORMED_UNRESOLVED_CALL_SITE, FINDING_NON_UTF8_PATH, FINDING_UNDECLARED_EDGE_KIND,
+    FINDING_UNDECLARED_KIND, FINDING_UNSUPPORTED_CAPABILITY, HostFinding,
 };
 use crate::entity_id::{EntityId, EntityIdError, entity_id};
 use crate::plugin::jail::{JailError, jail_to_string};
@@ -60,9 +60,10 @@ use crate::plugin::limits::{DEFAULT_MAX_RSS_MIB, apply_prlimit_as, effective_rss
 use crate::plugin::limits::DEFAULT_MAX_NPROC;
 use crate::plugin::manifest::{Manifest, ManifestError};
 use crate::plugin::protocol::{
-    AnalyzeFileParams, AnalyzeFileResult, AnalyzeFileStats, EdgeConfidence, ExitNotification,
-    InitializeParams, InitializeResult, InitializedNotification, ProtocolError, ResponseEnvelope,
-    ResponsePayload, ShutdownParams, UnresolvedCallSite, make_notification, make_request,
+    AnalyzeFileFinding, AnalyzeFileParams, AnalyzeFileResult, AnalyzeFileStats, EdgeConfidence,
+    ExitNotification, InitializeParams, InitializeResult, InitializedNotification, ProtocolError,
+    ResponseEnvelope, ResponsePayload, ShutdownParams, UnresolvedCallSite, make_notification,
+    make_request,
 };
 use crate::plugin::transport::{Frame, TransportError, read_frame, write_frame};
 
@@ -79,6 +80,15 @@ pub const MAX_ENTITY_FIELD_BYTES: usize = 4 * 1024;
 /// Maximum UTF-8 byte length for one unresolved callee expression retained for
 /// query-time inferred dispatch.
 pub const MAX_UNRESOLVED_CALLEE_EXPR_BYTES: usize = 512;
+
+/// Maximum plugin-reported findings accepted from one `analyze_file` response.
+pub const MAX_PLUGIN_FINDINGS_PER_FILE: usize = 100;
+
+/// Maximum UTF-8 byte length for one plugin-reported finding subcode.
+pub const MAX_FINDING_SUBCODE_BYTES: usize = 128;
+
+/// Maximum UTF-8 byte length for one plugin-reported severity label.
+pub const MAX_FINDING_SEVERITY_BYTES: usize = 32;
 
 /// Per-entity cap on the total serialised size of the untyped passthrough
 /// maps [`RawEntity::extra`] and [`RawSource::extra`].
@@ -305,6 +315,91 @@ fn invalid_unresolved_call_site_reason(
         ));
     }
     None
+}
+
+fn stringify_finding_metadata_value(value: serde_json::Value) -> Result<String, String> {
+    match value {
+        serde_json::Value::Null => Ok("null".to_owned()),
+        serde_json::Value::Bool(v) => Ok(v.to_string()),
+        serde_json::Value::Number(v) => Ok(v.to_string()),
+        serde_json::Value::String(v) => Ok(v),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => serde_json::to_string(&value)
+            .map_err(|e| format!("metadata value is not serializable: {e}")),
+    }
+}
+
+fn validate_plugin_finding(
+    raw: AnalyzeFileFinding,
+    rule_id_prefix: &str,
+    analyzed_path: &Path,
+) -> Result<HostFinding, String> {
+    if raw.subcode.is_empty() {
+        return Err("subcode is empty".to_owned());
+    }
+    if raw.subcode.len() > MAX_FINDING_SUBCODE_BYTES {
+        return Err(format!("subcode exceeds {MAX_FINDING_SUBCODE_BYTES} bytes"));
+    }
+    if !raw.subcode.starts_with(rule_id_prefix) {
+        return Err(format!(
+            "subcode {:?} is outside manifest rule_id_prefix {:?}",
+            raw.subcode, rule_id_prefix
+        ));
+    }
+    if raw.message.is_empty() {
+        return Err("message is empty".to_owned());
+    }
+    if raw.message.len() > MAX_ENTITY_FIELD_BYTES {
+        return Err(format!("message exceeds {MAX_ENTITY_FIELD_BYTES} bytes"));
+    }
+    if !raw.metadata.is_empty() {
+        let len = serde_json::to_vec(&raw.metadata).map_or(0, |bytes| bytes.len());
+        if len > MAX_ENTITY_EXTRA_BYTES {
+            return Err(format!("metadata exceeds {MAX_ENTITY_EXTRA_BYTES} bytes"));
+        }
+    }
+
+    let mut metadata = BTreeMap::new();
+    if let Some(severity) = raw.severity {
+        if severity.is_empty() {
+            return Err("severity is empty".to_owned());
+        }
+        if severity.len() > MAX_FINDING_SEVERITY_BYTES {
+            return Err(format!(
+                "severity exceeds {MAX_FINDING_SEVERITY_BYTES} bytes"
+            ));
+        }
+        if !matches!(severity.as_str(), "info" | "warning" | "error") {
+            return Err(format!("unsupported severity {severity:?}"));
+        }
+        metadata.insert("severity".to_owned(), severity);
+    }
+    for (key, value) in raw.metadata {
+        if key.is_empty() {
+            return Err("metadata key is empty".to_owned());
+        }
+        if key.len() > MAX_ENTITY_FIELD_BYTES {
+            return Err(format!(
+                "metadata key exceeds {MAX_ENTITY_FIELD_BYTES} bytes"
+            ));
+        }
+        let value = stringify_finding_metadata_value(value)?;
+        if value.len() > MAX_ENTITY_FIELD_BYTES {
+            return Err(format!(
+                "metadata value for {key:?} exceeds {MAX_ENTITY_FIELD_BYTES} bytes"
+            ));
+        }
+        metadata.insert(key, value);
+    }
+    metadata.insert(
+        "anchor_file_path".to_owned(),
+        analyzed_path.to_string_lossy().into_owned(),
+    );
+
+    Ok(HostFinding::plugin_reported(
+        raw.subcode,
+        raw.message,
+        metadata,
+    ))
 }
 
 /// An entity that has passed all validation checks.
@@ -901,13 +996,23 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
             }
         };
 
+        let AnalyzeFileResult {
+            entities,
+            edges,
+            stats,
+            findings,
+        } = afr;
+
+        let rule_id_prefix = self.manifest.ontology.rule_id_prefix.clone();
+        self.process_reported_findings(findings, &rule_id_prefix, path)?;
+
         let plugin_id = self.manifest.plugin.plugin_id.clone();
         let declared_kinds = self.manifest.ontology.entity_kinds.clone();
         let project_root = self.project_root.clone();
 
         let mut accepted = Vec::new();
 
-        for raw_val in afr.entities {
+        for raw_val in entities {
             let mut raw: RawEntity = match serde_json::from_value(raw_val) {
                 Ok(e) => e,
                 Err(e) => {
@@ -1009,8 +1114,8 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
             });
         }
 
-        let accepted_edges = self.process_edges(afr.edges, &accepted)?;
-        let stats = self.process_stats(afr.stats, &accepted, path)?;
+        let accepted_edges = self.process_edges(edges, &accepted)?;
+        let stats = self.process_stats(stats, &accepted, path)?;
 
         Ok(AnalyzeFileOutcome {
             entities: accepted,
@@ -1086,6 +1191,29 @@ impl<R: BufRead, W: Write> PluginHost<R, W> {
             });
         }
         Ok(accepted_edges)
+    }
+
+    fn process_reported_findings(
+        &mut self,
+        raw_findings: Vec<AnalyzeFileFinding>,
+        rule_id_prefix: &str,
+        analyzed_path: &Path,
+    ) -> Result<(), HostError> {
+        if raw_findings.len() > MAX_PLUGIN_FINDINGS_PER_FILE {
+            self.record_plugin_output_finding(HostFinding::malformed_finding(&format!(
+                "findings count {} exceeds per-file cap {MAX_PLUGIN_FINDINGS_PER_FILE}",
+                raw_findings.len()
+            )))?;
+        }
+        for raw in raw_findings.into_iter().take(MAX_PLUGIN_FINDINGS_PER_FILE) {
+            match validate_plugin_finding(raw, rule_id_prefix, analyzed_path) {
+                Ok(finding) => self.record_plugin_output_finding(finding)?,
+                Err(reason) => {
+                    self.record_plugin_output_finding(HostFinding::malformed_finding(&reason))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn process_stats(
@@ -2897,6 +3025,66 @@ ontology_version = "0.1.0"
         assert_eq!(result.edges.len(), 1);
         assert_eq!(result.edges[0].confidence, EdgeConfidence::Ambiguous);
         assert_eq!(result.edges[0].raw.confidence, EdgeConfidence::Ambiguous);
+    }
+
+    #[test]
+    fn plugin_reported_findings_survive_host_round_trip() {
+        let manifest = calls_manifest();
+        let mut mock = MockPlugin::new_compliant();
+        let (mut host, project_dir) = connect_and_handshake(manifest, &mut mock);
+
+        let sample = project_dir.path().join("demo.mock");
+        std::fs::write(&sample, b"").unwrap();
+
+        let response_id = host.next_request_id_test();
+        let response_json = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": response_id,
+            "result": {
+                "entities": [],
+                "edges": [],
+                "findings": [{
+                    "subcode": "CLA-MOCK-PYRIGHT-RESTART",
+                    "severity": "warning",
+                    "message": "pyright subprocess died and was restarted",
+                    "metadata": { "restart_count": 1 }
+                }]
+            }
+        });
+        let body = serde_json::to_vec(&response_json).unwrap();
+        {
+            let reader = host.reader_mut_test();
+            let pos_before = reader.position();
+            let old_end = reader.get_ref().len() as u64;
+            let mut framed: Vec<u8> = Vec::new();
+            write_frame(&mut framed, &Frame { body }).unwrap();
+            reader.get_mut().extend_from_slice(&framed);
+            if pos_before == old_end {
+                reader.set_position(old_end);
+            }
+        }
+
+        let result = host.analyze_file(&sample).expect("must not error");
+        assert!(result.entities.is_empty());
+        assert!(result.edges.is_empty());
+        let findings = host.take_findings();
+        let finding = findings
+            .iter()
+            .find(|f| f.subcode == "CLA-MOCK-PYRIGHT-RESTART")
+            .unwrap_or_else(|| panic!("plugin finding must survive host path; got: {findings:?}"));
+        assert_eq!(finding.message, "pyright subprocess died and was restarted");
+        assert_eq!(
+            finding.metadata.get("severity").map(String::as_str),
+            Some("warning")
+        );
+        assert_eq!(
+            finding.metadata.get("restart_count").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            finding.metadata.get("anchor_file_path").map(String::as_str),
+            Some(sample.to_string_lossy().as_ref())
+        );
     }
 
     #[test]

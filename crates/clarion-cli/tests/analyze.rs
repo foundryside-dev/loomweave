@@ -181,6 +181,10 @@ entity_kinds = ["module", "function"]
 edge_kinds = ["contains", "calls"]
 rule_id_prefix = "CLA-CALLS-"
 ontology_version = "0.4.0"
+
+[ontology.roles]
+file_scope = ["module"]
+callable = ["function"]
 "#;
 
 #[cfg(unix)]
@@ -298,6 +302,9 @@ entity_kinds = ["module"]
 edge_kinds = ["imports"]
 rule_id_prefix = "CLA-IMPORTS-"
 ontology_version = "0.6.0"
+
+[ontology.roles]
+file_scope = ["module"]
 "#;
 
 #[cfg(unix)]
@@ -414,6 +421,9 @@ entity_kinds = ["module"]
 edge_kinds = ["imports"]
 rule_id_prefix = "CLA-PHASE3-"
 ontology_version = "0.6.0"
+
+[ontology.roles]
+file_scope = ["module"]
 "#;
 
 #[cfg(unix)]
@@ -641,6 +651,10 @@ entity_kinds = ["module", "function"]
 edge_kinds = ["contains"]
 rule_id_prefix = "CLA-CAT-"
 ontology_version = "0.1.0"
+
+[ontology.roles]
+file_scope = ["module"]
+callable = ["function"]
 "#;
 
 #[cfg(unix)]
@@ -4066,6 +4080,10 @@ entity_kinds = ["module"]
 edge_kinds = []
 rule_id_prefix = "CLA-SYN-"
 ontology_version = "0.6.0"
+
+[ontology.roles]
+file_scope = ["module"]
+syntax_degraded_module = ["module"]
 "#;
 
 #[cfg(unix)]
@@ -4218,6 +4236,9 @@ entity_kinds = ["module"]
 edge_kinds = []
 rule_id_prefix = "CLA-CRASH-"
 ontology_version = "0.6.0"
+
+[ontology.roles]
+file_scope = ["module"]
 "#;
 
 #[cfg(unix)]
@@ -4388,6 +4409,9 @@ entity_kinds = ["module"]
 edge_kinds = []
 rule_id_prefix = "CLA-HANG-"
 ontology_version = "0.6.0"
+
+[ontology.roles]
+file_scope = ["module"]
 "#;
 
 #[cfg(unix)]

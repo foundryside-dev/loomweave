@@ -20,8 +20,7 @@ expected_max_rss_mb = 2048
 # only lands the declaration).
 expected_entities_per_file = 5000
 # Wardline semantic extraction is not implemented in this plugin yet. Keep this
-# false until the plugin emits usable Wardline-derived signals, not just a
-# package/version probe.
+# false until the plugin emits usable Wardline-derived signals.
 wardline_aware = false
 # v0.1 rejects `true` at initialize with CLA-INFRA-MANIFEST-UNSUPPORTED-CAPABILITY.
 reads_outside_project_root = false
@@ -46,6 +45,11 @@ rule_id_prefix = "CLA-PY-"
 # cache-key component. New edge rows miss the cache by component-1 of
 # the 5-tuple organically (no edges live in the 5-tuple yet anyway).
 ontology_version = "0.6.0"
+
+[ontology.roles]
+file_scope = ["module"]
+callable = ["function"]
+syntax_degraded_module = ["module"]
 
 # SEI signature declaration (ADR-038 REQ-C-01 / Wave 1). The plugin emits a
 # versioned `signature` object per function/class entity, stored verbatim by the

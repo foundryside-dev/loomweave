@@ -99,6 +99,14 @@ fn make_file_entity(id: &str) -> EntityRecord {
     e
 }
 
+fn make_file_entity_named(id: &str, path: &str) -> EntityRecord {
+    let mut e = make_file_entity(id);
+    path.clone_into(&mut e.name);
+    path.clone_into(&mut e.short_name);
+    e.content_hash = Some(format!("hash-{id}"));
+    e
+}
+
 fn make_contains_edge(from_id: &str, to_id: &str) -> EdgeRecord {
     EdgeRecord {
         kind: "contains".to_owned(),
@@ -2226,9 +2234,10 @@ async fn unknown_edge_kind_rejected_strictly() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn duplicate_contains_edge_is_deduped_and_counter_increments() {
-    // B.3 §6 / ADR-026: idempotent re-analyze means UNIQUE-conflicting edges
-    // are silently deduped and counted on dropped_edges_total.
+async fn duplicate_contains_edge_upsert_keeps_one_row_without_drop_counter() {
+    // H-01: idempotent re-analyze refreshes existing edge rows via upsert.
+    // Duplicate triples still collapse to one row, but they are accepted writes
+    // rather than silent drops.
     let dir = tempfile::tempdir().unwrap();
     let path = prepared_db(&dir);
     let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
@@ -2272,7 +2281,7 @@ async fn duplicate_contains_edge_is_deduped_and_counter_increments() {
     .await
     .unwrap();
 
-    assert_eq!(writer.dropped_edges_total.load(Ordering::Relaxed), 1);
+    assert_eq!(writer.dropped_edges_total.load(Ordering::Relaxed), 0);
 
     send::<()>(&tx, |ack| WriterCmd::CommitRun {
         run_id: "run-d".into(),
@@ -2297,6 +2306,219 @@ async fn duplicate_contains_edge_is_deduped_and_counter_increments() {
         .await
         .unwrap();
     assert_eq!(count, 1, "duplicate contains edge should be deduped");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_anchored_edge_updates_source_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-edge-upsert").await;
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(make_file_entity("core:file:demo.py")),
+        ack,
+    })
+    .await
+    .unwrap();
+    seed_module_and_functions(&tx).await;
+    seed_contains_edges_for_demo_functions(&tx).await;
+
+    let mut first = make_calls_edge(
+        "python:function:demo.caller",
+        "python:function:demo.callee",
+        EdgeConfidence::Resolved,
+    );
+    first.source_file_id = Some("core:file:demo.py".to_owned());
+    first.source_byte_start = Some(10);
+    first.source_byte_end = Some(18);
+    first.properties_json = Some(r#"{"site":"old"}"#.to_owned());
+    send::<()>(&tx, |ack| WriterCmd::InsertEdge {
+        edge: Box::new(first),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    let mut updated = make_calls_edge(
+        "python:function:demo.caller",
+        "python:function:demo.callee",
+        EdgeConfidence::Ambiguous,
+    );
+    updated.source_file_id = Some("core:file:demo.py".to_owned());
+    updated.source_byte_start = Some(30);
+    updated.source_byte_end = Some(42);
+    updated.properties_json = Some(r#"{"site":"new"}"#.to_owned());
+    send::<()>(&tx, |ack| WriterCmd::InsertEdge {
+        edge: Box::new(updated),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        writer.dropped_edges_total.load(Ordering::Relaxed),
+        0,
+        "metadata refreshes are accepted edge writes, not dropped dedupes"
+    );
+
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-edge-upsert".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let pool = ReaderPool::open(&path, 1).unwrap();
+    let row: (i64, i64, String, String) = pool
+        .with_reader(|conn| {
+            conn.query_row(
+                "SELECT source_byte_start, source_byte_end, confidence, properties \
+                 FROM edges WHERE kind = 'calls'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        row,
+        (
+            30,
+            42,
+            "ambiguous".to_owned(),
+            r#"{"site":"new"}"#.to_owned()
+        )
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replace_edges_for_source_file_removes_only_stale_anchored_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-edge-replace").await;
+    for entity in [
+        make_file_entity_named("core:file:demo.py", "demo.py"),
+        make_file_entity_named("core:file:other.py", "other.py"),
+    ] {
+        send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+            entity: Box::new(entity),
+            ack,
+        })
+        .await
+        .unwrap();
+    }
+    seed_module_and_functions(&tx).await;
+    seed_contains_edges_for_demo_functions(&tx).await;
+
+    let mut stale_call = make_calls_edge(
+        "python:function:demo.caller",
+        "python:function:demo.callee",
+        EdgeConfidence::Resolved,
+    );
+    stale_call.source_file_id = Some("core:file:demo.py".to_owned());
+    let mut stale_ref = make_references_edge(
+        "python:function:demo.caller",
+        "python:function:demo.callee",
+        EdgeConfidence::Resolved,
+    );
+    stale_ref.source_file_id = Some("core:file:demo.py".to_owned());
+    let mut other_file_call = make_calls_edge(
+        "python:function:demo.callee",
+        "python:function:demo.caller",
+        EdgeConfidence::Resolved,
+    );
+    other_file_call.source_file_id = Some("core:file:other.py".to_owned());
+    for edge in [stale_call, stale_ref, other_file_call] {
+        send::<()>(&tx, |ack| WriterCmd::InsertEdge {
+            edge: Box::new(edge),
+            ack,
+        })
+        .await
+        .unwrap();
+    }
+
+    send::<()>(&tx, |ack| WriterCmd::ReplaceAnchoredEdgesForSourceFile {
+        source_file_id: "core:file:demo.py".to_owned(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    let mut fresh_call = make_calls_edge(
+        "python:function:demo.caller",
+        "python:function:demo.callee",
+        EdgeConfidence::Resolved,
+    );
+    fresh_call.source_file_id = Some("core:file:demo.py".to_owned());
+    fresh_call.source_byte_start = Some(100);
+    fresh_call.source_byte_end = Some(108);
+    send::<()>(&tx, |ack| WriterCmd::InsertEdge {
+        edge: Box::new(fresh_call),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-edge-replace".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let pool = ReaderPool::open(&path, 1).unwrap();
+    let rows: Vec<(String, Option<String>, String, String)> = pool
+        .with_reader(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT kind, source_file_id, from_id, to_id \
+                 FROM edges ORDER BY kind, source_file_id, from_id, to_id",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .unwrap();
+    assert!(
+        rows.iter()
+            .any(|(kind, source_file_id, _, _)| { kind == "contains" && source_file_id.is_none() })
+    );
+    assert!(rows.iter().any(|(kind, source_file_id, from_id, _)| {
+        kind == "calls"
+            && source_file_id.as_deref() == Some("core:file:demo.py")
+            && from_id == "python:function:demo.caller"
+    }));
+    assert!(rows.iter().any(|(kind, source_file_id, from_id, _)| {
+        kind == "calls"
+            && source_file_id.as_deref() == Some("core:file:other.py")
+            && from_id == "python:function:demo.callee"
+    }));
+    assert!(!rows.iter().any(|(kind, source_file_id, _, _)| {
+        kind == "references" && source_file_id.as_deref() == Some("core:file:demo.py")
+    }));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

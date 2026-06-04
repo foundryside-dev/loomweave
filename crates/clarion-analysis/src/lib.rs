@@ -7,13 +7,13 @@ use xgraph::graph::graph::Graph;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ClusterAlgorithm {
+pub enum ClusterAlgorithm {
     Leiden,
     WeightedComponents,
 }
 
 impl ClusterAlgorithm {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             ClusterAlgorithm::Leiden => "leiden",
             ClusterAlgorithm::WeightedComponents => "weighted_components",
@@ -22,38 +22,35 @@ impl ClusterAlgorithm {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ModuleEdge {
-    pub(crate) from: String,
-    pub(crate) to: String,
-    pub(crate) reference_count: u64,
+pub struct ModuleEdge {
+    pub from: String,
+    pub to: String,
+    pub reference_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ModuleGraph {
-    pub(crate) modules: Vec<String>,
-    pub(crate) edges: Vec<ModuleEdge>,
+pub struct ModuleGraph {
+    pub modules: Vec<String>,
+    pub edges: Vec<ModuleEdge>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ClusterConfig {
-    pub(crate) algorithm: ClusterAlgorithm,
-    pub(crate) seed: u64,
-    pub(crate) resolution: f64,
-    pub(crate) max_iterations: u32,
-    pub(crate) min_cluster_size: usize,
+pub struct ClusterConfig {
+    pub algorithm: ClusterAlgorithm,
+    pub seed: u64,
+    pub resolution: f64,
+    pub max_iterations: u32,
+    pub min_cluster_size: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ClusterResult {
-    pub(crate) communities: Vec<Vec<String>>,
-    pub(crate) modularity_score: f64,
-    pub(crate) algorithm_used: ClusterAlgorithm,
+pub struct ClusterResult {
+    pub communities: Vec<Vec<String>>,
+    pub modularity_score: f64,
+    pub algorithm_used: ClusterAlgorithm,
 }
 
-pub(crate) fn cluster_modules(
-    graph: &ModuleGraph,
-    config: &ClusterConfig,
-) -> Result<ClusterResult> {
+pub fn cluster_modules(graph: &ModuleGraph, config: &ClusterConfig) -> Result<ClusterResult> {
     cluster_modules_with_algorithms(graph, config, leiden_communities, local_weighted_components)
 }
 
@@ -100,7 +97,7 @@ fn cluster_modules_with_algorithms(
     })
 }
 
-pub(crate) fn cluster_hash(member_ids: &[String]) -> String {
+pub fn cluster_hash(member_ids: &[String]) -> String {
     let mut sorted = member_ids.to_vec();
     sorted.sort();
 

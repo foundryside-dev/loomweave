@@ -227,7 +227,12 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
         "pyright_index_parse_latency_ms": result.stats.pyright_index_parse_latency_ms,
         "extractor_parse_latency_ms": result.stats.extractor_parse_latency_ms,
     }
-    return {"entities": result.entities, "edges": result.edges, "stats": stats}
+    return {
+        "entities": result.entities,
+        "edges": result.edges,
+        "stats": stats,
+        "findings": result.stats.findings,
+    }
 
 
 Handler = Callable[[dict[str, Any], ServerState], dict[str, Any]]

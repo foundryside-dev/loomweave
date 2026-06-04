@@ -311,6 +311,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "clarion-analysis"
+version = "1.2.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "sha2",
+ "xgraph",
+]
+
+[[package]]
 name = "clarion-cli"
 version = "1.2.0"
 dependencies = [
@@ -319,6 +329,7 @@ dependencies = [
  "axum",
  "blake3",
  "clap",
+ "clarion-analysis",
  "clarion-core",
  "clarion-federation",
  "clarion-mcp",
@@ -345,7 +356,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "xgraph",
 ]
 
 [[package]]
@@ -370,7 +380,6 @@ name = "clarion-federation"
 version = "1.2.0"
 dependencies = [
  "clarion-core",
- "clarion-storage",
  "reqwest",
  "serde",
  "serde_json",

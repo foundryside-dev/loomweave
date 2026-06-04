@@ -15,7 +15,7 @@
 //! ADR-021 §Layer 1 capability checks that the supervisor (Task 6) needs
 //! before completing the `initialize` handshake.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -273,6 +273,49 @@ pub struct Ontology {
     /// Ontology version (semver). Bumped when entity/edge/rule set changes.
     /// WP6 includes this in the cache key (ADR-007).
     pub ontology_version: String,
+
+    /// Optional plugin-owned semantic roles for entity kinds. Roles let the core
+    /// ask "which declared kinds are file scopes/callables/degraded parse
+    /// anchors?" without hardcoding language-specific kind names.
+    #[serde(default)]
+    pub roles: OntologyRoles,
+}
+
+/// Manifest-declared semantic roles for plugin-owned entity kinds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OntologyRoles {
+    /// Entity kinds that represent a source-file scope and should be linked
+    /// beneath the core `file` entity for file-level hashing and containment.
+    #[serde(default)]
+    pub file_scope: Vec<String>,
+
+    /// Entity kinds that can own unresolved call-site stats.
+    #[serde(default)]
+    pub callable: Vec<String>,
+
+    /// Entity kinds that can anchor `parse_status="syntax_error"` findings.
+    #[serde(default)]
+    pub syntax_degraded_module: Vec<String>,
+}
+
+/// Supported semantic roles for plugin-owned entity kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OntologyEntityRole {
+    FileScope,
+    Callable,
+    SyntaxDegradedModule,
+}
+
+impl Ontology {
+    pub fn kind_has_role(&self, kind: &str, role: OntologyEntityRole) -> bool {
+        let role_kinds = match role {
+            OntologyEntityRole::FileScope => &self.roles.file_scope,
+            OntologyEntityRole::Callable => &self.roles.callable,
+            OntologyEntityRole::SyntaxDegradedModule => &self.roles.syntax_degraded_module,
+        };
+        role_kinds.iter().any(|role_kind| role_kind == kind)
+    }
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -389,6 +432,21 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, ManifestError> {
             });
         }
     }
+    validate_role_kinds(
+        "ontology.roles.file_scope",
+        &manifest.ontology.roles.file_scope,
+        &manifest.ontology.entity_kinds,
+    )?;
+    validate_role_kinds(
+        "ontology.roles.callable",
+        &manifest.ontology.roles.callable,
+        &manifest.ontology.entity_kinds,
+    )?;
+    validate_role_kinds(
+        "ontology.roles.syntax_degraded_module",
+        &manifest.ontology.roles.syntax_degraded_module,
+        &manifest.ontology.entity_kinds,
+    )?;
 
     // 4. edge_kinds grammar (core-reserved names are permitted — they bind the
     //    plugin to core semantics per ADR-022, not redefine them).
@@ -428,6 +486,26 @@ fn validate_kind_string(field: &'static str, value: &str) -> Result<(), Manifest
             field,
             value: value.to_owned(),
         });
+    }
+    Ok(())
+}
+
+fn validate_role_kinds(
+    field: &'static str,
+    role_kinds: &[String],
+    entity_kinds: &[String],
+) -> Result<(), ManifestError> {
+    let declared = entity_kinds
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for kind in role_kinds {
+        validate_kind_string(field, kind)?;
+        if !declared.contains(kind.as_str()) {
+            return Err(ManifestError::Malformed {
+                message: format!("{field} kind {kind:?} is not declared in ontology.entity_kinds"),
+            });
+        }
     }
     Ok(())
 }
@@ -525,6 +603,11 @@ entity_kinds = ["function", "class", "module", "decorator"]
 edge_kinds = ["imports", "calls", "decorates", "contains"]
 rule_id_prefix = "CLA-PY-"
 ontology_version = "0.1.0"
+
+[ontology.roles]
+file_scope = ["module"]
+callable = ["function", "decorator"]
+syntax_degraded_module = ["module"]
 "#;
 
     fn manifest_with(field_override: &str) -> String {
@@ -611,6 +694,25 @@ ontology_version = "0.1.0"
         );
         assert_eq!(manifest.ontology.rule_id_prefix, "CLA-PY-");
         assert_eq!(manifest.ontology.ontology_version, "0.1.0");
+        assert_eq!(manifest.ontology.roles.file_scope, vec!["module"]);
+        assert_eq!(
+            manifest.ontology.roles.callable,
+            vec!["function", "decorator"]
+        );
+        assert_eq!(
+            manifest.ontology.roles.syntax_degraded_module,
+            vec!["module"]
+        );
+        assert!(
+            manifest
+                .ontology
+                .kind_has_role("function", OntologyEntityRole::Callable)
+        );
+        assert!(
+            !manifest
+                .ontology
+                .kind_has_role("class", OntologyEntityRole::Callable)
+        );
     }
 
     // ── Positive: core-reserved edge kind allowed in edge_kinds ──────────────
@@ -649,6 +751,42 @@ ontology_version = "0.1.0"
                 .contains(&"contains".to_owned())
         );
         assert!(manifest.ontology.edge_kinds.contains(&"calls".to_owned()));
+    }
+
+    #[test]
+    fn positive_non_python_manifest_roles_parse_successfully() {
+        let toml = r#"
+[plugin]
+name = "clarion-plugin-fixture"
+plugin_id = "fixture"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "clarion-plugin-fixture"
+language = "fixture"
+extensions = ["mt"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 256
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+entity_kinds = ["widget"]
+edge_kinds = ["uses"]
+rule_id_prefix = "CLA-FIXTURE-"
+ontology_version = "0.1.0"
+
+[ontology.roles]
+file_scope = ["widget"]
+"#;
+        let manifest = parse_manifest(toml.as_bytes()).unwrap();
+
+        assert!(
+            manifest
+                .ontology
+                .kind_has_role("widget", OntologyEntityRole::FileScope)
+        );
     }
 
     // ── Positive: [integrations.*] passthrough ────────────────────────────────
@@ -831,11 +969,31 @@ ontology_version = "0.1.0"
 
     #[test]
     fn negative_empty_entity_kinds_rejected() {
-        let toml = manifest_with("entity_kinds = []");
+        let mut toml = manifest_with("entity_kinds = []");
+        toml = toml.replace("file_scope = [\"module\"]", "file_scope = []");
+        toml = toml.replace("callable = [\"function\", \"decorator\"]", "callable = []");
+        toml = toml.replace(
+            "syntax_degraded_module = [\"module\"]",
+            "syntax_degraded_module = []",
+        );
         let err = parse_manifest(toml.as_bytes()).unwrap_err();
         assert_eq!(err.subcode(), "CLA-INFRA-MANIFEST-MALFORMED");
         assert!(
             matches!(err, ManifestError::Malformed { message } if message.contains("entity_kinds"))
+        );
+    }
+
+    #[test]
+    fn negative_role_kind_must_be_declared_entity_kind() {
+        let toml = VALID_MANIFEST.replace(
+            r#"file_scope = ["module"]"#,
+            r#"file_scope = ["module", "package"]"#,
+        );
+        let err = parse_manifest(toml.as_bytes()).unwrap_err();
+
+        assert!(
+            matches!(err, ManifestError::Malformed { ref message } if message.contains("ontology.roles.file_scope") && message.contains("package")),
+            "{err}"
         );
     }
 

@@ -75,6 +75,10 @@ pub const FINDING_EDGE_FIELD_OVERSIZE: &str = "CLA-INFRA-PLUGIN-EDGE-FIELD-OVERS
 pub const FINDING_MALFORMED_UNRESOLVED_CALL_SITE: &str =
     "CLA-INFRA-PLUGIN-MALFORMED-UNRESOLVED-CALL-SITE";
 
+/// Emitted when a plugin-reported `analyze_file.findings[]` row fails host
+/// validation. The row is dropped and this infrastructure finding is retained.
+pub const FINDING_MALFORMED_FINDING: &str = "CLA-INFRA-PLUGIN-MALFORMED-FINDING";
+
 /// Informational diagnostic accumulated during a host's lifetime.
 ///
 /// Collected into `self.findings` on each enforcement action. Drained via
@@ -83,7 +87,7 @@ pub const FINDING_MALFORMED_UNRESOLVED_CALL_SITE: &str =
 #[derive(Debug, Clone)]
 pub struct HostFinding {
     /// Finding subcode, e.g. `"CLA-INFRA-PLUGIN-PATH-ESCAPE"`.
-    pub subcode: &'static str,
+    pub subcode: String,
     /// Human-readable message.
     pub message: String,
     /// Structured metadata (keys: `"offending_path"`, `"entity_id"`, etc.).
@@ -96,7 +100,7 @@ impl HostFinding {
         metadata.insert("kind".to_owned(), kind.to_owned());
         metadata.insert("qualified_name".to_owned(), qualified_name.to_owned());
         Self {
-            subcode: FINDING_UNDECLARED_KIND,
+            subcode: FINDING_UNDECLARED_KIND.to_owned(),
             message: format!("entity kind {kind:?} is not declared in the manifest ontology"),
             metadata,
         }
@@ -107,7 +111,7 @@ impl HostFinding {
         metadata.insert("got".to_owned(), got.to_owned());
         metadata.insert("expected".to_owned(), expected.to_owned());
         Self {
-            subcode: FINDING_ENTITY_ID_MISMATCH,
+            subcode: FINDING_ENTITY_ID_MISMATCH.to_owned(),
             message: format!("entity id mismatch: got {got:?}, expected {expected:?}"),
             metadata,
         }
@@ -117,7 +121,7 @@ impl HostFinding {
         let mut metadata = BTreeMap::new();
         metadata.insert("offending_path".to_owned(), offending_path.to_owned());
         Self {
-            subcode: FINDING_PATH_ESCAPE,
+            subcode: FINDING_PATH_ESCAPE.to_owned(),
             message: format!("entity source path escapes project root: {offending_path:?}"),
             metadata,
         }
@@ -125,7 +129,7 @@ impl HostFinding {
 
     pub(super) fn disabled_path_escape() -> Self {
         Self {
-            subcode: FINDING_DISABLED_PATH_ESCAPE,
+            subcode: FINDING_DISABLED_PATH_ESCAPE.to_owned(),
             message: "path-escape circuit breaker tripped; plugin killed".to_owned(),
             metadata: BTreeMap::new(),
         }
@@ -136,7 +140,7 @@ impl HostFinding {
         metadata.insert("cap".to_owned(), cap.to_string());
         metadata.insert("would_reach".to_owned(), would_reach.to_string());
         Self {
-            subcode: FINDING_ENTITY_CAP,
+            subcode: FINDING_ENTITY_CAP.to_owned(),
             message: format!("entity cap {cap} would be exceeded (would reach {would_reach})"),
             metadata,
         }
@@ -146,7 +150,7 @@ impl HostFinding {
         let mut metadata = BTreeMap::new();
         metadata.insert("detail".to_owned(), msg.to_owned());
         Self {
-            subcode: FINDING_UNSUPPORTED_CAPABILITY,
+            subcode: FINDING_UNSUPPORTED_CAPABILITY.to_owned(),
             message: format!("manifest has unsupported capability: {msg}"),
             metadata,
         }
@@ -156,7 +160,7 @@ impl HostFinding {
         let mut metadata = BTreeMap::new();
         metadata.insert("path_lossy".to_owned(), lossy_repr.to_owned());
         Self {
-            subcode: FINDING_NON_UTF8_PATH,
+            subcode: FINDING_NON_UTF8_PATH.to_owned(),
             message: format!(
                 "file skipped: path is not valid UTF-8 and cannot be expressed \
                  on the JSON wire protocol: {lossy_repr:?}"
@@ -169,7 +173,7 @@ impl HostFinding {
         let mut metadata = BTreeMap::new();
         metadata.insert("serde_error".to_owned(), serde_err.to_owned());
         Self {
-            subcode: FINDING_MALFORMED_ENTITY,
+            subcode: FINDING_MALFORMED_ENTITY.to_owned(),
             message: format!("plugin emitted an entity that failed to deserialise: {serde_err}"),
             metadata,
         }
@@ -179,7 +183,7 @@ impl HostFinding {
         let mut metadata = BTreeMap::new();
         metadata.insert("serde_error".to_owned(), serde_err.to_owned());
         Self {
-            subcode: FINDING_MALFORMED_EDGE,
+            subcode: FINDING_MALFORMED_EDGE.to_owned(),
             message: format!("plugin emitted an edge that failed to deserialise: {serde_err}"),
             metadata,
         }
@@ -191,7 +195,7 @@ impl HostFinding {
         metadata.insert("from_id".to_owned(), from_id.to_owned());
         metadata.insert("to_id".to_owned(), to_id.to_owned());
         Self {
-            subcode: FINDING_UNDECLARED_EDGE_KIND,
+            subcode: FINDING_UNDECLARED_EDGE_KIND.to_owned(),
             message: format!("edge kind {kind:?} is not declared in the manifest ontology"),
             metadata,
         }
@@ -207,7 +211,7 @@ impl HostFinding {
         metadata.insert("actual_bytes".to_owned(), actual_bytes.to_string());
         metadata.insert("limit_bytes".to_owned(), limit_bytes.to_string());
         Self {
-            subcode: FINDING_EDGE_FIELD_OVERSIZE,
+            subcode: FINDING_EDGE_FIELD_OVERSIZE.to_owned(),
             message: format!(
                 "edge field {field:?} is {actual_bytes} bytes, over the {limit_bytes}-byte limit"
             ),
@@ -229,7 +233,7 @@ impl HostFinding {
         );
         metadata.insert("reason".to_owned(), reason.to_owned());
         Self {
-            subcode: FINDING_MALFORMED_UNRESOLVED_CALL_SITE,
+            subcode: FINDING_MALFORMED_UNRESOLVED_CALL_SITE.to_owned(),
             message: format!("plugin emitted malformed unresolved call site: {reason}"),
             metadata,
         }
@@ -245,7 +249,7 @@ impl HostFinding {
         metadata.insert("actual_bytes".to_owned(), actual_bytes.to_string());
         metadata.insert("limit_bytes".to_owned(), limit_bytes.to_string());
         Self {
-            subcode: FINDING_ENTITY_FIELD_OVERSIZE,
+            subcode: FINDING_ENTITY_FIELD_OVERSIZE.to_owned(),
             message: format!(
                 "entity field {field:?} is {actual_bytes} bytes, over the {limit_bytes}-byte limit"
             ),
@@ -262,11 +266,33 @@ impl HostFinding {
         metadata.insert("plugin_id".to_owned(), plugin_id.to_owned());
         metadata.insert("signal".to_owned(), signal.to_string());
         Self {
-            subcode: FINDING_OOM_KILLED,
+            subcode: FINDING_OOM_KILLED.to_owned(),
             message: format!(
                 "plugin {plugin_id} killed by signal {signal} \
                  (likely RLIMIT_AS enforcement per ADR-021 §2d)"
             ),
+            metadata,
+        }
+    }
+
+    pub(super) fn plugin_reported(
+        subcode: String,
+        message: String,
+        metadata: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            subcode,
+            message,
+            metadata,
+        }
+    }
+
+    pub(super) fn malformed_finding(reason: &str) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("reason".to_owned(), reason.to_owned());
+        Self {
+            subcode: FINDING_MALFORMED_FINDING.to_owned(),
+            message: format!("plugin emitted malformed finding: {reason}"),
             metadata,
         }
     }

@@ -1069,7 +1069,7 @@ mod tests {
         .expect("build client")
         .expect("enabled client");
 
-        let row = clarion_storage::FindingForEmitRow {
+        let row = crate::scan_results::FindingForEmit {
             id: "core:finding:run-1:circular".to_owned(),
             rule_id: "CLA-PY-STRUCTURE-001".to_owned(),
             kind: "defect".to_owned(),

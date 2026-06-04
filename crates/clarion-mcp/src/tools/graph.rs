@@ -367,18 +367,10 @@ impl ServerState {
                     .filter_map(|child_id| entity_by_id(conn, child_id).transpose())
                     .map(|row| row.map(|entity| entity_json(conn, &entity)))
                     .collect::<Result<Vec<_>, StorageError>>()?;
-                let (references_in, references_rolled_up) = reference_neighbors_for(
-                    conn,
-                    &entity_id,
-                    &entity.kind,
-                    ReferenceDirection::In,
-                )?;
-                let (references_out, _) = reference_neighbors_for(
-                    conn,
-                    &entity_id,
-                    &entity.kind,
-                    ReferenceDirection::Out,
-                )?;
+                let (references_in, references_rolled_up) =
+                    reference_neighbors_for(conn, &entity, ReferenceDirection::In)?;
+                let (references_out, _) =
+                    reference_neighbors_for(conn, &entity, ReferenceDirection::Out)?;
                 let imports_in = import_neighbors(conn, &entity_id, ReferenceDirection::In)?;
                 let imports_out = import_neighbors(conn, &entity_id, ReferenceDirection::Out)?;
                 let scope_excludes = call_graph_scope_excludes(confidence);

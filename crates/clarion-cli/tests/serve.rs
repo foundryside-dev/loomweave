@@ -1684,7 +1684,7 @@ fn serve_wires_recording_llm_provider_and_writer_for_cached_summary_touches() {
     drop(conn);
     fs::write(
         dir.path().join("clarion.yaml"),
-        "llm:\n  enabled: true\n  provider: recording\n",
+        "llm:\n  enabled: true\n  provider: recording\nserve:\n  mcp:\n    enable_write_tools: true\n",
     )
     .expect("write config");
 
@@ -1733,7 +1733,7 @@ fn serve_wires_recording_llm_provider_and_writer_for_cached_summary_touches() {
         .expect("tool text");
     let envelope: serde_json::Value = serde_json::from_str(tool_text).expect("tool envelope");
 
-    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["ok"], true, "{envelope}");
     assert_eq!(envelope["result"]["cache"]["hit"], true);
 
     let conn = Connection::open(&db_path).expect("reopen sqlite");
@@ -1819,7 +1819,7 @@ printf '%s' '{{"purpose":"via codex serve","behavior":"served through fake Codex
 
     let envelope = call_summary_through_serve(dir.path());
 
-    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["ok"], true, "{envelope}");
     assert_eq!(envelope["result"]["cache"]["hit"], false);
     assert_eq!(envelope["result"]["summary"]["purpose"], "via codex serve");
     assert_eq!(envelope["result"]["usage"]["tokens_cached_input"], 9);
@@ -1986,6 +1986,9 @@ fn write_provider_config(
                 "  session_token_ceiling: 1000000\n",
                 "  max_inferred_edges_per_caller: 8\n",
                 "  cache_max_age_days: 180\n",
+                "serve:\n",
+                "  mcp:\n",
+                "    enable_write_tools: true\n",
             ),
             provider = provider,
             provider_block = provider_block,

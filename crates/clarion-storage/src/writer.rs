@@ -49,13 +49,11 @@ pub struct Writer {
     /// Read this field before dropping the [`Writer`]: the actor holds its
     /// own `Arc` clone that lives until the `JoinHandle` resolves.
     pub commits_observed: Arc<AtomicUsize>,
-    /// Process-lifetime count of edges silently deduped or rejected by the writer.
+    /// Process-lifetime count of edges rejected by the writer.
     ///
-    /// `InsertEdge` uses `INSERT OR IGNORE`; a UNIQUE conflict on
-    /// `(kind, from_id, to_id)` increments this counter. Walking-skeleton
-    /// e2e asserts this is zero post-analyze (B.3 §6). B.4* extends the
-    /// counter to per-kind contract rejections so malformed plugin edges are
-    /// visible in the same run stat.
+    /// Per-kind contract failures increment this counter so malformed plugin
+    /// edges are visible in the same run stat. Re-observed edge triples refresh
+    /// metadata via upsert and are not counted as drops.
     pub dropped_edges_total: Arc<AtomicUsize>,
     /// Process-lifetime count of accepted ambiguous-confidence edges.
     pub ambiguous_edges_total: Arc<AtomicUsize>,
@@ -195,6 +193,18 @@ fn run_actor(
                     commits_observed,
                     dropped_edges_total,
                     ambiguous_edges_total,
+                );
+                reply(ack, res);
+            }
+            WriterCmd::ReplaceAnchoredEdgesForSourceFile {
+                source_file_id,
+                ack,
+            } => {
+                let res = replace_anchored_edges_for_source_file(
+                    conn,
+                    &mut state,
+                    &source_file_id,
+                    commits_observed,
                 );
                 reply(ack, res);
             }
@@ -761,11 +771,17 @@ fn insert_edge(
         edge.source_file_id.as_deref(),
         "InsertEdge source_file_id",
     )?;
-    let changed = conn.execute(
-        "INSERT OR IGNORE INTO edges ( \
+    conn.execute(
+        "INSERT INTO edges ( \
             kind, from_id, to_id, properties, source_file_id, \
             source_byte_start, source_byte_end, confidence \
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+         ON CONFLICT(kind, from_id, to_id) DO UPDATE SET \
+            properties = excluded.properties, \
+            source_file_id = excluded.source_file_id, \
+            source_byte_start = excluded.source_byte_start, \
+            source_byte_end = excluded.source_byte_end, \
+            confidence = excluded.confidence",
         params![
             edge.kind,
             edge.from_id,
@@ -777,12 +793,38 @@ fn insert_edge(
             edge.confidence.as_str(),
         ],
     )?;
-    if changed == 0 {
-        // UNIQUE conflict on (kind, from_id, to_id) — silent dedupe is the
-        // idempotent-re-analyze contract (B.3 §6).
-        dropped_edges_total.fetch_add(1, Ordering::Relaxed);
-    } else if edge.confidence == EdgeConfidence::Ambiguous {
+    if edge.confidence == EdgeConfidence::Ambiguous {
         ambiguous_edges_total.fetch_add(1, Ordering::Relaxed);
+    }
+    bump_writes_and_maybe_commit(conn, state, commits_observed)?;
+    Ok(())
+}
+
+fn replace_anchored_edges_for_source_file(
+    conn: &mut Connection,
+    state: &mut ActorState,
+    source_file_id: &str,
+    commits_observed: &AtomicUsize,
+) -> Result<()> {
+    if state.current_run.is_none() {
+        return Err(StorageError::WriterProtocol(
+            "ReplaceAnchoredEdgesForSourceFile received without a preceding BeginRun".to_owned(),
+        ));
+    }
+    if !state.in_tx {
+        begin_write_tx(conn, state)?;
+        state.in_tx = true;
+    }
+    validate_source_file_anchor(
+        conn,
+        Some(source_file_id),
+        "ReplaceAnchoredEdgesForSourceFile source_file_id",
+    )?;
+    for kind in ANCHORED_EDGE_KINDS {
+        conn.execute(
+            "DELETE FROM edges WHERE source_file_id = ?1 AND kind = ?2",
+            params![source_file_id, kind],
+        )?;
     }
     bump_writes_and_maybe_commit(conn, state, commits_observed)?;
     Ok(())

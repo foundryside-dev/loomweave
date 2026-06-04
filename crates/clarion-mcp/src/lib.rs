@@ -20,11 +20,12 @@ use clarion_core::{
     McpErrorCode,
 };
 use rusqlite::{Connection, OpenFlags};
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use time::{Date, Month, OffsetDateTime, macros::format_description};
-use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, mpsc};
 
 use clarion_core::plugin::{ContentLengthCeiling, Frame, TransportError};
 use clarion_storage::{
@@ -144,12 +145,140 @@ pub fn rename_old_to_new(name: &str) -> &str {
     name
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ToolMetadata {
+    pub read_only: bool,
+    pub writes_local_state: bool,
+    pub writes_external_state: bool,
+    pub spawns_process: bool,
+    pub may_call_llm: bool,
+}
+
+impl ToolMetadata {
+    const fn read_only() -> Self {
+        Self {
+            read_only: true,
+            writes_local_state: false,
+            writes_external_state: false,
+            spawns_process: false,
+            may_call_llm: false,
+        }
+    }
+
+    #[allow(clippy::fn_params_excessive_bools)]
+    const fn write_tool(
+        writes_local_state: bool,
+        writes_external_state: bool,
+        spawns_process: bool,
+        may_call_llm: bool,
+    ) -> Self {
+        Self {
+            read_only: false,
+            writes_local_state,
+            writes_external_state,
+            spawns_process,
+            may_call_llm,
+        }
+    }
+
+    const fn conditional_llm() -> Self {
+        Self {
+            read_only: true,
+            writes_local_state: false,
+            writes_external_state: false,
+            spawns_process: false,
+            may_call_llm: true,
+        }
+    }
+}
+
+pub fn tool_metadata(name: &str) -> ToolMetadata {
+    match name {
+        "entity_summary_get" => ToolMetadata::write_tool(true, false, false, true),
+        "entity_callers_list" | "entity_neighborhood_get" | "entity_execution_path_list" => {
+            ToolMetadata::conditional_llm()
+        }
+        "analyze_start" => ToolMetadata::write_tool(true, false, true, false),
+        "analyze_cancel" | "promote_guidance" => {
+            ToolMetadata::write_tool(true, false, false, false)
+        }
+        "propose_guidance" => ToolMetadata::write_tool(false, true, false, false),
+        _ => ToolMetadata::read_only(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct McpToolPolicy {
+    pub enable_write_tools: bool,
+}
+
+impl McpToolPolicy {
+    #[must_use]
+    pub const fn read_only() -> Self {
+        Self {
+            enable_write_tools: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn allow_write_tools() -> Self {
+        Self {
+            enable_write_tools: true,
+        }
+    }
+
+    #[must_use]
+    pub fn allows(self, name: &str) -> bool {
+        self.enable_write_tools || tool_metadata(name).read_only
+    }
+
+    fn allows_arguments(self, name: &str, arguments: &serde_json::Map<String, Value>) -> bool {
+        self.enable_write_tools || !tool_uses_conditional_inferred_dispatch(name, arguments)
+    }
+}
+
+fn tool_uses_conditional_inferred_dispatch(
+    name: &str,
+    arguments: &serde_json::Map<String, Value>,
+) -> bool {
+    if !matches!(
+        name,
+        "entity_callers_list" | "entity_neighborhood_get" | "entity_execution_path_list"
+    ) {
+        return false;
+    }
+    matches!(
+        arguments.get("confidence").and_then(Value::as_str),
+        Some("inferred" | "all")
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolDefinition {
     pub name: &'static str,
     pub description: &'static str,
-    #[serde(rename = "inputSchema")]
     pub input_schema: Value,
+}
+
+impl Serialize for ToolDefinition {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let metadata = tool_metadata(self.name);
+        let mut state = serializer.serialize_struct("ToolDefinition", 9)?;
+        state.serialize_field("name", self.name)?;
+        state.serialize_field("description", self.description)?;
+        state.serialize_field("inputSchema", &self.input_schema)?;
+        state.serialize_field("metadata", &metadata)?;
+        state.serialize_field("read_only", &metadata.read_only)?;
+        state.serialize_field("writes_local_state", &metadata.writes_local_state)?;
+        state.serialize_field("writes_external_state", &metadata.writes_external_state)?;
+        state.serialize_field("spawns_process", &metadata.spawns_process)?;
+        state.serialize_field("may_call_llm", &metadata.may_call_llm)?;
+        state.end()
+    }
 }
 
 #[must_use]
@@ -328,7 +457,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "index_diff_get",
-            description: "Report what changed since the last analyze and whether this checkout is newer than the graph — so an agent need not hand-roll git + mtime freshness checks. Compares: analyzed_at (last completed run) vs current git HEAD (with head_newer_than_analyze derived from HEAD's committer date vs run completion, true even when source mtimes are ambiguous); indexed source files modified or now-missing since analyze; dirty working-tree files flagged when they touch an indexed path; and per-run aggregate plugin skip/drop counters. Git is read at query time, read-only, and fail-soft: a missing git binary or non-repo dir degrades to git.available=false with a reason rather than failing. analyzed_commit is null by design (Clarion persists no analyze-time SHA). overall is fresh | drift | unknown | never_analyzed; lists are bounded with an `omitted` block. entity-level add/remove/change diff is unavailable in v0.1 (only the current graph is retained). No LLM call.",
+            description: "Report what changed since the last analyze and whether this checkout is newer than the graph — so an agent need not hand-roll git + mtime freshness checks. Compares: analyzed_commit (the persisted commit analyzed by the latest completed run) vs current git HEAD when both are known, falling back to analyzed_at vs HEAD committer date when needed; indexed source files modified or now-missing since analyze; dirty working-tree files flagged when they touch an indexed path; and per-run aggregate plugin skip/drop counters. Git is read at query time, read-only, and fail-soft: a missing git binary or non-repo dir degrades to git.available=false with a reason rather than failing. overall is fresh | drift | unknown | never_analyzed; lists are bounded with an `omitted` block. entity-level add/remove/change diff is unavailable in v0.1 (only the current graph is retained). No LLM call.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -533,6 +662,14 @@ pub fn list_tools() -> Vec<ToolDefinition> {
     ]
 }
 
+#[must_use]
+pub fn list_tools_for_policy(policy: McpToolPolicy) -> Vec<ToolDefinition> {
+    list_tools()
+        .into_iter()
+        .filter(|tool| policy.allows(tool.name))
+        .collect()
+}
+
 /// Input schema for the scope-aware shortcut tools: optional `scope` (entity id
 /// or path glob) plus `limit`/`offset` bounds, and — when `with_since` —
 /// an optional ISO-8601 `since`.
@@ -652,7 +789,10 @@ pub fn handle_json_rpc(request: &Value) -> Option<Value> {
 
     Some(match method {
         "initialize" => result_response(&id, &initialize_result(false)),
-        "tools/list" => result_response(&id, &json!({"tools": list_tools()})),
+        "tools/list" => result_response(
+            &id,
+            &json!({"tools": list_tools_for_policy(McpToolPolicy::default())}),
+        ),
         "tools/call" => error_response(
             &id,
             -32601,
@@ -688,6 +828,7 @@ pub struct LlmDiagnostics {
     pub cache_max_age_days: u32,
 }
 
+#[derive(Clone)]
 pub struct ServerState {
     project_root: PathBuf,
     readers: ReaderPool,
@@ -700,8 +841,12 @@ pub struct ServerState {
     inferred_inflight: InferredInflight,
     filigree_client: Option<Arc<dyn FiligreeLookup>>,
     diagnostics: Option<DiagnosticsContext>,
+    tool_policy: McpToolPolicy,
     /// Supervised `clarion analyze` runs launched via `analyze_start`.
     analyze_runs: crate::analyze_runs::RunRegistry,
+    active_requests: Arc<AsyncMutex<BTreeSet<String>>>,
+    cancelled_requests: Arc<AsyncMutex<BTreeSet<String>>>,
+    cancellation_notify: Arc<Notify>,
     /// Launcher for `analyze_start` to spawn. `None` → `current_exe()`; tests
     /// inject a stub via [`ServerState::with_analyze_command`].
     analyze_program: Option<PathBuf>,
@@ -722,7 +867,11 @@ impl ServerState {
             inferred_inflight: Arc::new(AsyncMutex::new(HashMap::new())),
             filigree_client: None,
             diagnostics: None,
+            tool_policy: McpToolPolicy::default(),
             analyze_runs: Arc::new(Mutex::new(HashMap::new())),
+            active_requests: Arc::new(AsyncMutex::new(BTreeSet::new())),
+            cancelled_requests: Arc::new(AsyncMutex::new(BTreeSet::new())),
+            cancellation_notify: Arc::new(Notify::new()),
             analyze_program: None,
         }
     }
@@ -733,6 +882,12 @@ impl ServerState {
     #[must_use]
     pub fn with_analyze_command(mut self, program: PathBuf) -> Self {
         self.analyze_program = Some(program);
+        self
+    }
+
+    #[must_use]
+    pub fn with_tool_policy(mut self, policy: McpToolPolicy) -> Self {
+        self.tool_policy = policy;
         self
     }
 
@@ -810,23 +965,98 @@ impl ServerState {
 
     pub async fn handle_json_rpc(&self, request: &Value) -> Option<Value> {
         if is_json_rpc_notification(request) {
+            self.handle_json_rpc_notification(request).await;
             return None;
         }
         let id = request.get("id").cloned().unwrap_or(Value::Null);
         let Some(method) = request.get("method").and_then(Value::as_str) else {
             return Some(error_response(&id, -32600, "invalid request"));
         };
+        let request_key = request_id_key(&id);
+        if let Some(key) = &request_key {
+            self.begin_request(key).await;
+        }
 
-        Some(match method {
-            "initialize" => result_response(&id, &initialize_result(true)),
-            "tools/list" => result_response(&id, &json!({"tools": list_tools()})),
-            "tools/call" => self.handle_tool_call(&id, request.get("params")).await,
-            "resources/list" => result_response(&id, &resources_list()),
-            "resources/read" => self.handle_resources_read(&id, request.get("params")).await,
-            "prompts/list" => result_response(&id, &prompts_list()),
-            "prompts/get" => prompts_get(&id, request.get("params")),
-            _ => error_response(&id, -32601, "method not found"),
-        })
+        let dispatch = async {
+            match method {
+                "initialize" => result_response(&id, &initialize_result(true)),
+                "tools/list" => result_response(
+                    &id,
+                    &json!({"tools": list_tools_for_policy(self.tool_policy)}),
+                ),
+                "tools/call" => self.handle_tool_call(&id, request.get("params")).await,
+                "resources/list" => result_response(&id, &resources_list()),
+                "resources/read" => self.handle_resources_read(&id, request.get("params")).await,
+                "prompts/list" => result_response(&id, &prompts_list()),
+                "prompts/get" => prompts_get(&id, request.get("params")),
+                _ => error_response(&id, -32601, "method not found"),
+            }
+        };
+
+        let response = if let Some(key) = request_key.clone() {
+            tokio::select! {
+                response = dispatch => response,
+                () = self.wait_for_cancellation(key) => {
+                    error_response(&id, -32800, "request cancelled")
+                }
+            }
+        } else {
+            dispatch.await
+        };
+
+        if let Some(key) = &request_key {
+            self.finish_request(key).await;
+        }
+        Some(response)
+    }
+
+    async fn handle_json_rpc_notification(&self, request: &Value) {
+        let Some(method) = request.get("method").and_then(Value::as_str) else {
+            return;
+        };
+        if method != "notifications/cancelled" {
+            return;
+        }
+        let Some(request_id) = request
+            .get("params")
+            .and_then(Value::as_object)
+            .and_then(|params| params.get("requestId"))
+            .and_then(request_id_key)
+        else {
+            return;
+        };
+        self.cancel_request(&request_id).await;
+    }
+
+    async fn begin_request(&self, request_id: &str) {
+        self.active_requests
+            .lock()
+            .await
+            .insert(request_id.to_owned());
+    }
+
+    async fn finish_request(&self, request_id: &str) {
+        self.active_requests.lock().await.remove(request_id);
+        self.cancelled_requests.lock().await.remove(request_id);
+    }
+
+    async fn cancel_request(&self, request_id: &str) {
+        if self.active_requests.lock().await.contains(request_id) {
+            self.cancelled_requests
+                .lock()
+                .await
+                .insert(request_id.to_owned());
+            self.cancellation_notify.notify_waiters();
+        }
+    }
+
+    async fn wait_for_cancellation(&self, request_id: String) {
+        loop {
+            if self.cancelled_requests.lock().await.contains(&request_id) {
+                return;
+            }
+            self.cancellation_notify.notified().await;
+        }
     }
 
     // A flat dispatch table over every tool; length tracks the tool count by
@@ -840,8 +1070,18 @@ impl ServerState {
             return error_response(id, -32602, "invalid tools/call params: missing name");
         };
         let canonical_name = rename_old_to_new(name);
-        if !list_tools().iter().any(|tool| tool.name == canonical_name) {
+        let Some(tool) = list_tools()
+            .into_iter()
+            .find(|tool| tool.name == canonical_name)
+        else {
             return error_response(id, -32601, &format!("unknown tool: {name}"));
+        };
+        if !self.tool_policy.allows(canonical_name) {
+            return error_response(
+                id,
+                -32601,
+                &format!("tool disabled by MCP tool policy: {canonical_name}"),
+            );
         }
         let arguments = params.get("arguments").unwrap_or(&Value::Null);
         let Some(arguments) = arguments.as_object() else {
@@ -851,6 +1091,16 @@ impl ServerState {
                 "invalid tools/call params: arguments must be object",
             );
         };
+        if let Err(err) = validate_tool_arguments_against_schema(&tool, arguments) {
+            return err.to_json_rpc(id);
+        }
+        if !self.tool_policy.allows_arguments(canonical_name, arguments) {
+            return error_response(
+                id,
+                -32602,
+                "confidence=inferred/all is disabled by MCP tool policy because it may call an LLM and write inferred-edge cache rows",
+            );
+        }
 
         let envelope = match canonical_name {
             "entity_at" => match self.tool_entity_at(arguments).await {
@@ -1332,12 +1582,14 @@ fn open_guidance_write_connection(path: &std::path::Path) -> rusqlite::Result<Co
     Ok(conn)
 }
 
+#[derive(Clone)]
 struct SummaryLlmState {
     writer: mpsc::Sender<WriterCmd>,
     config: LlmConfig,
     provider: Arc<dyn LlmProvider>,
 }
 
+#[derive(Clone)]
 struct SemanticSearchState {
     config: SemanticSearchConfig,
     provider: Arc<dyn EmbeddingProvider>,
@@ -1885,6 +2137,13 @@ pub async fn handle_frame_with_state(
     frame: &Frame,
 ) -> Result<Option<Frame>, McpError> {
     let request = serde_json::from_slice(&frame.body)?;
+    handle_request_value_with_state(state, request).await
+}
+
+async fn handle_request_value_with_state(
+    state: &ServerState,
+    request: Value,
+) -> Result<Option<Frame>, McpError> {
     let Some(response) = state.handle_json_rpc(&request).await else {
         return Ok(None);
     };
@@ -1893,13 +2152,6 @@ pub async fn handle_frame_with_state(
 
 fn handle_stdio_frame(frame: &Frame) -> Result<Option<Frame>, McpError> {
     handle_frame(frame)
-}
-
-async fn handle_stdio_frame_with_state(
-    state: &ServerState,
-    frame: &Frame,
-) -> Result<Option<Frame>, McpError> {
-    handle_frame_with_state(state, frame).await
 }
 
 fn encode_response_frame(response: &Value) -> Result<Frame, McpError> {
@@ -1912,6 +2164,14 @@ fn is_json_rpc_notification(request: &Value) -> bool {
     request
         .as_object()
         .is_some_and(|object| object.get("method").is_some() && object.get("id").is_none())
+}
+
+fn request_id_key(id: &Value) -> Option<String> {
+    match id {
+        Value::String(value) => Some(format!("s:{value}")),
+        Value::Number(value) => Some(format!("n:{value}")),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2016,10 +2276,11 @@ pub fn serve_stdio(
 
 pub fn serve_stdio_with_state(
     state: &ServerState,
-    reader: &mut impl std::io::BufRead,
+    reader: &mut (impl std::io::BufRead + Send),
     writer: &mut impl std::io::Write,
 ) -> Result<(), McpError> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()?;
     serve_stdio_with_state_on_runtime(&runtime, state, reader, writer)
@@ -2028,22 +2289,93 @@ pub fn serve_stdio_with_state(
 pub fn serve_stdio_with_state_on_runtime(
     runtime: &tokio::runtime::Runtime,
     state: &ServerState,
-    reader: &mut impl std::io::BufRead,
+    reader: &mut (impl std::io::BufRead + Send),
     writer: &mut impl std::io::Write,
 ) -> Result<(), McpError> {
     let _guard = runtime.enter();
+    let (frame_tx, frame_rx) = mpsc::unbounded_channel();
+    let state = state.clone();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            loop {
+                let message = read_stdio_frame(reader);
+                let done = !matches!(message, Ok(Some(_)));
+                if frame_tx.send(message).is_err() || done {
+                    break;
+                }
+            }
+        });
+        runtime.block_on(serve_stdio_with_state_event_loop(state, frame_rx, writer))
+    })
+}
+
+async fn serve_stdio_with_state_event_loop(
+    state: ServerState,
+    mut frame_rx: mpsc::UnboundedReceiver<Result<Option<StdioFrame>, McpError>>,
+    writer: &mut impl std::io::Write,
+) -> Result<(), McpError> {
+    let (response_tx, mut response_rx) =
+        mpsc::unbounded_channel::<(StdioFraming, Result<Option<Frame>, McpError>)>();
+    let mut input_closed = false;
+    let mut pending_responses = 0usize;
+
     loop {
-        let Some(frame) = read_stdio_frame(reader)? else {
-            return Ok(());
-        };
-        let framing = frame.framing;
-        if let Some(response) = runtime.block_on(handle_stdio_frame_with_state(
-            state,
-            &Frame { body: frame.body },
-        ))? {
-            write_stdio_response(writer, &response, framing)?;
+        tokio::select! {
+            maybe_frame = frame_rx.recv(), if !input_closed => {
+                match maybe_frame {
+                    Some(Ok(Some(frame))) => {
+                        let request: Value = serde_json::from_slice(&frame.body)?;
+                        if should_spawn_stateful_stdio_request(&request) {
+                            if let Some(key) = request.get("id").and_then(request_id_key) {
+                                state.begin_request(&key).await;
+                            }
+                            pending_responses += 1;
+                            let task_state = state.clone();
+                            let task_tx = response_tx.clone();
+                            let framing = frame.framing;
+                            tokio::spawn(async move {
+                                let result = handle_request_value_with_state(&task_state, request).await;
+                                let _ = task_tx.send((framing, result));
+                            });
+                        } else if let Some(response) = handle_request_value_with_state(&state, request).await? {
+                            write_stdio_response(writer, &response, frame.framing)?;
+                        }
+                    }
+                    Some(Ok(None)) | None => {
+                        input_closed = true;
+                    }
+                    Some(Err(err)) => return Err(err),
+                }
+            }
+            maybe_response = response_rx.recv(), if pending_responses > 0 => {
+                let Some((framing, result)) = maybe_response else {
+                    return Err(McpError::Runtime(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "MCP stdio response channel closed with pending requests",
+                    )));
+                };
+                pending_responses = pending_responses.saturating_sub(1);
+                if let Some(response) = result? {
+                    write_stdio_response(writer, &response, framing)?;
+                }
+            }
+            else => {
+                if input_closed && pending_responses == 0 {
+                    return Ok(());
+                }
+            }
         }
     }
+}
+
+fn should_spawn_stateful_stdio_request(request: &Value) -> bool {
+    request
+        .as_object()
+        .is_some_and(|object| object.get("id").is_some())
+        && request
+            .get("method")
+            .and_then(Value::as_str)
+            .is_some_and(|method| method == "tools/call")
 }
 
 /// Build the `initialize` result, advertising only the capabilities the
@@ -2113,6 +2445,36 @@ fn prompts_get(id: &Value, params: Option<&Value>) -> Value {
             ]
         }),
     )
+}
+
+fn validate_tool_arguments_against_schema(
+    tool: &ToolDefinition,
+    arguments: &serde_json::Map<String, Value>,
+) -> std::result::Result<(), ParamError> {
+    if tool
+        .input_schema
+        .get("additionalProperties")
+        .and_then(Value::as_bool)
+        != Some(false)
+    {
+        return Ok(());
+    }
+    let Some(properties) = tool
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    for key in arguments.keys() {
+        if !properties.contains_key(key) {
+            return Err(ParamError::new(&format!(
+                "unknown argument for {}: {key}",
+                tool.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -2235,13 +2597,17 @@ fn optional_bool(
 fn optional_confidence(
     arguments: &serde_json::Map<String, Value>,
 ) -> std::result::Result<EdgeConfidence, ParamError> {
-    match arguments.get("confidence").and_then(Value::as_str) {
-        None | Some("resolved") => Ok(EdgeConfidence::Resolved),
+    let Some(value) = arguments.get("confidence") else {
+        return Ok(EdgeConfidence::Resolved);
+    };
+    match value.as_str() {
+        Some("resolved") => Ok(EdgeConfidence::Resolved),
         Some("ambiguous") => Ok(EdgeConfidence::Ambiguous),
         Some("inferred") => Ok(EdgeConfidence::Inferred),
         Some(_) => Err(ParamError::new(
             "confidence must be one of resolved, ambiguous, inferred",
         )),
+        None => Err(ParamError::new("confidence must be a string")),
     }
 }
 
@@ -2311,7 +2677,8 @@ fn plugin_entity_counts(conn: &rusqlite::Connection) -> Value {
 /// `completed` one). Fail-soft: no rows or a query error → `null`.
 fn latest_run_row(conn: &rusqlite::Connection) -> Value {
     match conn.query_row(
-        "SELECT id, status, started_at, completed_at, owner_pid, heartbeat_at FROM runs \
+        "SELECT id, status, started_at, completed_at, owner_pid, heartbeat_at, \
+            analyzed_at_commit FROM runs \
          ORDER BY started_at DESC LIMIT 1",
         [],
         |row| {
@@ -2322,6 +2689,7 @@ fn latest_run_row(conn: &rusqlite::Connection) -> Value {
                 "completed_at": row.get::<_, Option<String>>(3)?,
                 "owner_pid": row.get::<_, Option<i64>>(4)?,
                 "heartbeat_at": row.get::<_, Option<String>>(5)?,
+                "analyzed_at_commit": row.get::<_, Option<String>>(6)?,
             }))
         },
     ) {
@@ -2852,12 +3220,13 @@ impl DefinitionSpan {
 }
 
 /// Classify *why* `line` resolved to `entity`: a decorator line, the
-/// declaration/signature, the body, or merely a containing scope (module, or
-/// an entity without recorded sub-ranges). Honest by construction — a blank or
-/// comment line that only the module spans reports `containing_range`, never a
-/// fabricated exact match (clarion-460def6a51 acceptance #3).
+/// declaration/signature, the body, or merely a containing scope (file-scope
+/// plugin entity, or an entity without recorded sub-ranges). Honest by
+/// construction — a blank or comment line that only a file-scope entity spans
+/// reports `containing_range`, never a fabricated exact match
+/// (clarion-460def6a51 acceptance #3).
 fn match_reason_for(line: i64, entity: &EntityRow) -> &'static str {
-    if entity.kind == "module" {
+    if is_plugin_file_scope_entity(entity) {
         return "containing_range";
     }
     let def = DefinitionSpan::from_entity(entity);
@@ -3691,7 +4060,7 @@ fn current_source_content_hash(
     file_bytes: &[u8],
     source: Option<&str>,
 ) -> Option<String> {
-    if entity.kind == "module" {
+    if is_plugin_file_scope_entity(entity) {
         return Some(blake3::hash(file_bytes).to_hex().to_string());
     }
     let source = source?;
@@ -4026,28 +4395,46 @@ fn import_neighbors(
 }
 
 /// Reference neighbors for `neighborhood` / `orientation_pack`, rolled up to
-/// module altitude when the entity is a module (clarion-79d0ff6e14).
+/// file-scope altitude when the entity is a manifest-declared file-scope entity
+/// (clarion-79d0ff6e14).
 ///
-/// References are tracked symbol-to-symbol, so a module's OWN reference edges
-/// are almost always empty — "who imports this module / contract?" used to
-/// answer `[]`. For a module we instead aggregate the `references` edges of
-/// every transitively contained symbol (excluding intra-module wiring) and tag
-/// each neighbor with the contained `via` symbol it touches. For any other
-/// kind the direct symbol-level edges are returned unchanged (no `via`).
+/// References are tracked symbol-to-symbol, so a file-scope entity's OWN
+/// reference edges are almost always empty — "who imports this module /
+/// contract?" used to answer `[]`. For a file-scope entity we instead aggregate
+/// the `references` edges of every transitively contained symbol (excluding
+/// intra-file wiring) and tag each neighbor with the contained `via` symbol it
+/// touches. For any other kind the direct symbol-level edges are returned
+/// unchanged (no `via`).
 ///
-/// Returns `(neighbors, rolled_up)`; `rolled_up` is true only for modules.
+/// Returns `(neighbors, rolled_up)`; `rolled_up` is true only for file scopes.
 fn reference_neighbors_for(
     conn: &rusqlite::Connection,
-    entity_id: &str,
-    entity_kind: &str,
+    entity: &EntityRow,
     direction: ReferenceDirection,
 ) -> Result<(Vec<Value>, bool), StorageError> {
-    if entity_kind == "module" {
-        let edges = module_reference_rollup(conn, entity_id, direction)?;
+    if is_plugin_file_scope_entity(entity) {
+        let edges = module_reference_rollup(conn, &entity.id, direction)?;
         Ok((rolled_up_neighbors_json(conn, edges, direction)?, true))
     } else {
-        Ok((reference_neighbors(conn, entity_id, direction)?, false))
+        Ok((reference_neighbors(conn, &entity.id, direction)?, false))
     }
+}
+
+fn is_plugin_file_scope_entity(entity: &EntityRow) -> bool {
+    if entity.plugin_id == "core" {
+        return false;
+    }
+    if let Some(source_file_id) = entity.source_file_id.as_deref()
+        && entity.parent_id.as_deref() == Some(source_file_id)
+        && source_file_id.starts_with("core:file:")
+    {
+        return true;
+    }
+    entity.kind == "module"
+        && entity.parent_id.is_none()
+        && entity.source_file_path.is_some()
+        && entity.source_line_start.is_some()
+        && entity.source_line_end.is_some()
 }
 
 fn rolled_up_neighbors_json(
@@ -4152,7 +4539,9 @@ mod tests {
     use rusqlite::Connection;
     use tokio::sync::mpsc;
 
-    use super::{InferenceLlmState, InferredRead, ServerState, config::LlmConfig, list_tools};
+    use super::{
+        InferenceLlmState, InferredRead, McpToolPolicy, ServerState, config::LlmConfig, list_tools,
+    };
 
     #[test]
     fn tools_list_exposes_exact_docstrings() {
@@ -4328,6 +4717,32 @@ mod tests {
         assert!(
             response["result"]["capabilities"]["resources"].is_null(),
             "stateless initialize must not advertise resources: {response:?}"
+        );
+    }
+
+    #[test]
+    fn optional_confidence_rejects_non_string_json_types() {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(1),
+            serde_json::json!(["resolved"]),
+            serde_json::json!({"tier": "resolved"}),
+        ] {
+            let mut arguments = serde_json::Map::new();
+            arguments.insert("confidence".to_owned(), value);
+            let err = super::optional_confidence(&arguments).expect_err("non-string must reject");
+            assert_eq!(err.message, "confidence must be a string");
+        }
+    }
+
+    #[test]
+    fn optional_confidence_rejects_unknown_string() {
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("confidence".to_owned(), serde_json::json!("all"));
+        let err = super::optional_confidence(&arguments).expect_err("unknown string must reject");
+        assert_eq!(
+            err.message,
+            "confidence must be one of resolved, ambiguous, inferred"
         );
     }
 
@@ -4557,7 +4972,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_request_wraps_all_tools() {
+    fn tools_list_request_wraps_read_only_tools_by_default() {
         let response = super::handle_json_rpc(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": "tools-1",
@@ -4569,17 +4984,299 @@ mod tests {
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], "tools-1");
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 39);
         let tool_names: Vec<&str> = tools
             .iter()
             .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
             .collect();
-        assert!(tool_names.contains(&"propose_guidance"));
-        assert!(tool_names.contains(&"promote_guidance"));
+        assert!(tool_names.contains(&"entity_at"));
+        assert!(!tool_names.contains(&"analyze_start"));
+        assert!(!tool_names.contains(&"propose_guidance"));
+        assert!(!tool_names.contains(&"promote_guidance"));
         assert_eq!(response["result"]["tools"][0]["name"], "entity_at");
+        assert_eq!(response["result"]["tools"][0]["read_only"], true);
+        assert_eq!(response["result"]["tools"][0]["writes_local_state"], false);
+        assert!(
+            tool_names.contains(&"subsystem_member_list"),
+            "read-only list should include subsystem_member_list: {tool_names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_policy_hides_and_blocks_write_tools_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("clarion.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            pragma::apply_write_pragmas(&conn).unwrap();
+            schema::apply_migrations(&mut conn).unwrap();
+        }
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        let state = ServerState::new(dir.path().to_path_buf(), readers);
+
+        let listed = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "tools-readonly",
+                "method": "tools/list",
+                "params": {}
+            }))
+            .await
+            .expect("tools/list response");
+        let names: Vec<&str> = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(names.contains(&"entity_at"));
+        assert!(!names.contains(&"analyze_start"));
+        assert!(!names.contains(&"entity_summary_get"));
+
+        let blocked = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "blocked",
+                "method": "tools/call",
+                "params": {"name": "analyze_start", "arguments": {}}
+            }))
+            .await
+            .expect("tools/call response");
+        assert_eq!(blocked["error"]["code"], -32601);
+        assert!(
+            blocked["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("tool disabled by MCP tool policy")
+        );
+    }
+
+    #[tokio::test]
+    async fn server_policy_can_advertise_write_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("clarion.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            pragma::apply_write_pragmas(&conn).unwrap();
+            schema::apply_migrations(&mut conn).unwrap();
+        }
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        let state = ServerState::new(dir.path().to_path_buf(), readers)
+            .with_tool_policy(McpToolPolicy::allow_write_tools());
+
+        let listed = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "tools-write",
+                "method": "tools/list",
+                "params": {}
+            }))
+            .await
+            .expect("tools/list response");
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        let analyze = tools
+            .iter()
+            .find(|tool| tool["name"] == "analyze_start")
+            .expect("analyze_start advertised when write tools enabled");
+        assert_eq!(analyze["read_only"], false);
+        assert_eq!(analyze["writes_local_state"], true);
+        assert_eq!(analyze["spawns_process"], true);
+        assert!(tools.iter().any(|tool| tool["name"] == "propose_guidance"));
+    }
+
+    #[tokio::test]
+    async fn stateful_tools_list_filters_write_tools_when_policy_disables_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("clarion.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            pragma::apply_write_pragmas(&conn).unwrap();
+            schema::apply_migrations(&mut conn).unwrap();
+        }
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        let state = ServerState::new(dir.path().to_path_buf(), readers)
+            .with_tool_policy(McpToolPolicy::read_only());
+
+        let response = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "policy-list",
+                "method": "tools/list",
+                "params": {}
+            }))
+            .await
+            .expect("response");
+        let tools = response["result"]["tools"].as_array().unwrap();
+        let tool_names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+        assert!(tool_names.contains(&"project_status_get"));
+        assert!(tool_names.contains(&"entity_callers_list"));
+        assert!(!tool_names.contains(&"analyze_start"));
+        assert!(!tool_names.contains(&"analyze_cancel"));
+        assert!(!tool_names.contains(&"entity_summary_get"));
+        assert!(!tool_names.contains(&"propose_guidance"));
+        assert!(!tool_names.contains(&"promote_guidance"));
+        let callers = tools
+            .iter()
+            .find(|tool| tool["name"] == "entity_callers_list")
+            .expect("callers tool still listed");
+        assert_eq!(callers["metadata"]["read_only"], true);
+        assert_eq!(callers["metadata"]["may_call_llm"], true);
+    }
+
+    #[tokio::test]
+    async fn stateful_tools_call_rejects_disabled_write_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("clarion.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            pragma::apply_write_pragmas(&conn).unwrap();
+            schema::apply_migrations(&mut conn).unwrap();
+        }
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        let state = ServerState::new(dir.path().to_path_buf(), readers)
+            .with_tool_policy(McpToolPolicy::read_only());
+
+        let response = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "policy-call",
+                "method": "tools/call",
+                "params": {"name": "analyze_start", "arguments": {}}
+            }))
+            .await
+            .expect("response");
+        assert_eq!(response["error"]["code"], -32601);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("disabled by MCP tool policy"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stateful_tools_call_rejects_inferred_confidence_when_write_tools_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("clarion.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            pragma::apply_write_pragmas(&conn).unwrap();
+            schema::apply_migrations(&mut conn).unwrap();
+        }
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        let state = ServerState::new(dir.path().to_path_buf(), readers)
+            .with_tool_policy(McpToolPolicy::read_only());
+
+        let response = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "policy-inferred",
+                "method": "tools/call",
+                "params": {
+                    "name": "entity_callers_list",
+                    "arguments": {"id": "python:function:demo.f", "confidence": "inferred"}
+                }
+            }))
+            .await
+            .expect("response");
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("confidence=inferred"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stateful_tools_call_rejects_malformed_confidence_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("clarion.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            pragma::apply_write_pragmas(&conn).unwrap();
+            schema::apply_migrations(&mut conn).unwrap();
+        }
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        let state = ServerState::new(dir.path().to_path_buf(), readers)
+            .with_tool_policy(McpToolPolicy::allow_write_tools());
+
+        for (idx, (value, expected)) in [
+            (serde_json::Value::Null, "confidence must be a string"),
+            (serde_json::json!(1), "confidence must be a string"),
+            (
+                serde_json::json!(["resolved"]),
+                "confidence must be a string",
+            ),
+            (
+                serde_json::json!({"tier": "resolved"}),
+                "confidence must be a string",
+            ),
+            (
+                serde_json::json!("all"),
+                "confidence must be one of resolved, ambiguous, inferred",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = state
+                .handle_json_rpc(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("bad-confidence-{idx}"),
+                    "method": "tools/call",
+                    "params": {
+                        "name": "entity_callers_list",
+                        "arguments": {
+                            "id": "python:function:demo.f",
+                            "confidence": value
+                        }
+                    }
+                }))
+                .await
+                .expect("response");
+            assert_eq!(response["error"]["code"], -32602, "{response}");
+            assert_eq!(response["error"]["message"], expected, "{response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stateful_tools_call_rejects_unknown_arguments_from_strict_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("clarion.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            pragma::apply_write_pragmas(&conn).unwrap();
+            schema::apply_migrations(&mut conn).unwrap();
+        }
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        let state = ServerState::new(dir.path().to_path_buf(), readers)
+            .with_tool_policy(McpToolPolicy::allow_write_tools());
+
+        let response = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "unknown-argument",
+                "method": "tools/call",
+                "params": {
+                    "name": "entity_summary_get",
+                    "arguments": {
+                        "id": "python:function:demo.f",
+                        "safety_override": true
+                    }
+                }
+            }))
+            .await
+            .expect("response");
+        assert_eq!(response["error"]["code"], -32602, "{response}");
         assert_eq!(
-            response["result"]["tools"][7]["name"],
-            "subsystem_member_list"
+            response["error"]["message"],
+            "unknown argument for entity_summary_get: safety_override",
+            "{response}"
         );
     }
 
@@ -4680,13 +5377,13 @@ mod tests {
         assert_eq!(decoded["jsonrpc"], "2.0");
         assert_eq!(decoded["id"], 10);
         let tools = decoded["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 39);
         let tool_names: Vec<&str> = tools
             .iter()
             .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
             .collect();
-        assert!(tool_names.contains(&"propose_guidance"));
-        assert!(tool_names.contains(&"promote_guidance"));
+        assert!(tool_names.contains(&"entity_at"));
+        assert!(!tool_names.contains(&"propose_guidance"));
+        assert!(!tool_names.contains(&"promote_guidance"));
     }
 
     #[test]
@@ -4762,13 +5459,13 @@ mod tests {
         assert_eq!(first_json["result"]["serverInfo"]["name"], "clarion");
         assert_eq!(second_json["id"], 12);
         let tools = second_json["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 39);
         let tool_names: Vec<&str> = tools
             .iter()
             .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
             .collect();
-        assert!(tool_names.contains(&"propose_guidance"));
-        assert!(tool_names.contains(&"promote_guidance"));
+        assert!(tool_names.contains(&"entity_at"));
+        assert!(!tool_names.contains(&"propose_guidance"));
+        assert!(!tool_names.contains(&"promote_guidance"));
     }
 
     #[test]
@@ -4968,6 +5665,7 @@ mod tests {
             config: LlmConfig::default(),
             provider: Arc::new(BlockingProvider {
                 release: tokio::sync::Mutex::new(release_rx),
+                started: None,
             }),
         };
 
@@ -4991,6 +5689,96 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cancellation_notification_aborts_in_flight_llm_request() {
+        let project = tempfile::tempdir().expect("temp project");
+        let source_path = project.path().join("demo.py");
+        std::fs::write(&source_path, "def target():\n    return 1\n").expect("write source");
+        let content_hash = blake3::hash("def target():\n    return 1".as_bytes())
+            .to_hex()
+            .to_string();
+        let db_path = project.path().join("clarion.db");
+        let mut conn = Connection::open(&db_path).expect("open sqlite");
+        pragma::apply_write_pragmas(&conn).expect("write pragmas");
+        schema::apply_migrations(&mut conn).expect("apply migrations");
+        conn.execute(
+            "INSERT INTO entities (
+                id, plugin_id, kind, name, short_name, source_file_path,
+                source_line_start, source_line_end, properties, content_hash,
+                created_at, updated_at
+             ) VALUES (
+                'python:function:demo.target', 'python', 'function', 'target', 'target', ?1,
+                1, 2, '{}', ?2,
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             )",
+            rusqlite::params![source_path.display().to_string(), content_hash],
+        )
+        .expect("insert entity");
+        drop(conn);
+
+        let readers = ReaderPool::open(&db_path, 1).expect("reader pool");
+        let (writer, _rx) = mpsc::channel(1);
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
+        let (_release_tx, release_rx) = tokio::sync::mpsc::channel(1);
+        let config = LlmConfig {
+            enabled: true,
+            allow_live_provider: true,
+            ..LlmConfig::default()
+        };
+        let state = Arc::new(
+            ServerState::new(project.path().to_path_buf(), readers)
+                .with_tool_policy(McpToolPolicy::allow_write_tools())
+                .with_summary_llm(
+                    writer,
+                    config,
+                    Arc::new(BlockingProvider {
+                        started: Some(started_tx),
+                        release: tokio::sync::Mutex::new(release_rx),
+                    }),
+                ),
+        );
+
+        let request_state = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            request_state
+                .handle_json_rpc(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 99,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "entity_summary_get",
+                        "arguments": {"id": "python:function:demo.target"}
+                    }
+                }))
+                .await
+                .expect("cancelled response")
+        });
+        wait_until_active_request(&state, "n:99").await;
+        tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
+            .await
+            .expect("provider should start before cancellation")
+            .expect("provider start channel should remain open");
+
+        let notification = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": 99}
+            }))
+            .await;
+        assert!(notification.is_none());
+
+        let response = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("cancelled request should complete promptly")
+            .expect("request task should not panic");
+        assert_eq!(response["id"], 99);
+        assert_eq!(response["error"]["code"], -32800);
+        assert_eq!(response["error"]["message"], "request cancelled");
+        wait_until_inactive_request(&state, "n:99").await;
+    }
+
     async fn assert_inferred_inflight_contains(state: &ServerState, key: &InferredEdgeCacheKey) {
         for _ in 0..50 {
             if state.inferred_inflight.lock().await.contains_key(key) {
@@ -5012,6 +5800,28 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         false
+    }
+
+    async fn wait_until_active_request(state: &ServerState, request_id: &str) {
+        for _ in 0..50 {
+            if state.active_requests.lock().await.contains(request_id) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("request {request_id} never became active");
+    }
+
+    async fn wait_until_inactive_request(state: &ServerState, request_id: &str) {
+        for _ in 0..50 {
+            if !state.active_requests.lock().await.contains(request_id)
+                && !state.cancelled_requests.lock().await.contains(request_id)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("request {request_id} stayed active after cancellation");
     }
 
     fn inferred_test_key() -> InferredEdgeCacheKey {
@@ -5110,6 +5920,7 @@ mod tests {
 
     struct BlockingProvider {
         release: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<()>>,
+        started: Option<tokio::sync::mpsc::Sender<()>>,
     }
 
     #[async_trait::async_trait]
@@ -5119,6 +5930,9 @@ mod tests {
         }
 
         async fn invoke(&self, _request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
+            if let Some(started) = &self.started {
+                let _ = started.send(()).await;
+            }
             let mut rx = self.release.lock().await;
             let _ = rx.recv().await;
             Ok(LlmResponse {

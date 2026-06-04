@@ -13,11 +13,30 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use clarion_storage::FindingForEmitRow;
-
 /// The `scan_source` Clarion stamps on every emitted finding. Filigree's dedup
 /// key includes `scan_source`, so this is stable across runs.
 pub const CLARION_SCAN_SOURCE: &str = "clarion";
+
+/// Federation-owned Clarion finding projection for Filigree scan-results
+/// emission. Storage maps persistence rows into this DTO at the caller
+/// boundary so this contract layer does not depend on `SQLite` row shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FindingForEmit {
+    pub id: String,
+    pub rule_id: String,
+    pub kind: String,
+    pub severity: String,
+    pub confidence: Option<f64>,
+    pub confidence_basis: Option<String>,
+    pub message: String,
+    pub entity_id: String,
+    pub related_entities_json: String,
+    pub supports_json: String,
+    pub supported_by_json: String,
+    pub source_file_path: Option<String>,
+    pub source_line_start: Option<i64>,
+    pub source_line_end: Option<i64>,
+}
 
 /// Map Clarion's internal severity vocabulary (`INFO` | `WARN` | `ERROR` |
 /// `CRITICAL` | `NONE`) to Filigree's wire vocabulary (detailed-design §7
@@ -92,7 +111,7 @@ pub struct PreparedBatch {
 /// Build a scan-results batch from persisted findings. Findings whose anchor
 /// entity has no source path are skipped and counted, not emitted.
 #[must_use]
-pub fn prepare_batch(rows: &[FindingForEmitRow], opts: &EmitOptions) -> PreparedBatch {
+pub fn prepare_batch(rows: &[FindingForEmit], opts: &EmitOptions) -> PreparedBatch {
     let mut findings = Vec::with_capacity(rows.len());
     let mut skipped_no_path = 0;
     for row in rows {
@@ -125,7 +144,7 @@ pub fn prepare_batch(rows: &[FindingForEmitRow], opts: &EmitOptions) -> Prepared
 /// is supplied, the finding emits against it and is flagged
 /// `metadata.clarion.synthetic_anchor=true`. A synthetic anchor never carries
 /// line numbers (the placeholder path has no meaningful position).
-fn wire_finding(row: &FindingForEmitRow, default_path: Option<&str>) -> Option<Value> {
+fn wire_finding(row: &FindingForEmit, default_path: Option<&str>) -> Option<Value> {
     let row_path = row
         .source_file_path
         .as_deref()
@@ -164,7 +183,7 @@ fn wire_finding(row: &FindingForEmitRow, default_path: Option<&str>) -> Option<V
 
 /// Nest Clarion's richer fields under `metadata` (top level) and
 /// `metadata.clarion` (Clarion-owned slot), per ADR-004 + detailed-design §7.
-fn wire_metadata(row: &FindingForEmitRow, synthetic_anchor: bool) -> Value {
+fn wire_metadata(row: &FindingForEmit, synthetic_anchor: bool) -> Value {
     let mut meta = Map::new();
     meta.insert("kind".to_owned(), json!(row.kind));
     if let Some(confidence) = row.confidence {
@@ -294,8 +313,8 @@ pub fn parse_clean_stale_response(body: &str) -> Result<CleanStaleResponse, serd
 mod tests {
     use super::*;
 
-    fn defect_row() -> FindingForEmitRow {
-        FindingForEmitRow {
+    fn defect_row() -> FindingForEmit {
+        FindingForEmit {
             id: "core:finding:run-1:circular".to_owned(),
             rule_id: "CLA-PY-STRUCTURE-001".to_owned(),
             kind: "defect".to_owned(),

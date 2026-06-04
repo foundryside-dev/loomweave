@@ -39,13 +39,15 @@ use clarion_federation::config::{FiligreeConfig, McpConfig, SemanticSearchConfig
 use clarion_federation::filigree::FiligreeHttpClient;
 use clarion_federation::filigree_url::resolve_filigree_url;
 use clarion_federation::scan_results::{
-    CLARION_SCAN_SOURCE, CleanStaleRequest, CleanStaleResponse, EmitOptions, PreparedBatch,
-    ScanResultsResponse, clean_stale_url, prepare_batch, scan_results_url,
+    CLARION_SCAN_SOURCE, CleanStaleRequest, CleanStaleResponse, EmitOptions, FindingForEmit,
+    PreparedBatch, ScanResultsResponse, clean_stale_url, prepare_batch, scan_results_url,
 };
 
-use crate::clustering::{ClusterConfig, ModuleEdge, ModuleGraph, cluster_hash, cluster_modules};
 use crate::config::{AnalyzeConfig, ClusteringConfig};
 use crate::stats::P95Accumulator;
+use clarion_analysis::{
+    ClusterAlgorithm, ClusterConfig, ModuleEdge, ModuleGraph, cluster_hash, cluster_modules,
+};
 
 const WEAK_MODULARITY_RULE_ID: &str = "CLA-FACT-CLUSTERING-WEAK-MODULARITY";
 
@@ -120,10 +122,9 @@ const POST_RUN_FINDING_RULES: &[&str] = &[
 /// is surfaced by the plugin as a degraded `module` entity carrying
 /// `parse_status="syntax_error"` (extractor.py). The core mints a persisted
 /// finding from that property so the failure is visible in the store, not just
-/// in the plugin's stderr. The subcode is python-namespaced per the requirement;
-/// the architecturally-pure form (plugin emits the finding over a findings wire
-/// channel, owning its own namespace per loom.md Principle 3) is forward work —
-/// `AnalyzeFileResult` carries no findings field today.
+/// in the plugin's stderr. Pyright degradation findings now ride the plugin
+/// findings wire, but the syntax-error module property remains the stable
+/// source for parse failures because the degraded module entity is the anchor.
 const SYNTAX_ERROR_RULE_ID: &str = "CLA-PY-SYNTAX-ERROR";
 
 /// Writes structured run progress to a JSON file for the MCP `analyze_status`
@@ -318,9 +319,8 @@ pub(crate) struct AnalyzeOptions {
     /// the durable graph is unaffected (SEI is enrich-only).
     pub(crate) no_sei: bool,
     /// `--no-incremental`: force a full re-analysis, disabling the Wave 2 / T3.1
-    /// skip of unchanged files. Incremental skip is speed-only (entities are
-    /// cumulative, edges are `INSERT OR IGNORE`), so this is an escape hatch for a
-    /// clean re-index, not a correctness switch.
+    /// skip of unchanged files. A full re-analysis replays the per-source-file
+    /// edge replacement boundary; use it when a clean graph refresh matters.
     pub(crate) no_incremental: bool,
     /// `--legis-url`: `legis`'s read-API base URL, enabling the WS9 git-rename
     /// provider seam (REQ-C-05). Enrich-only and capability-aware: the operative
@@ -599,8 +599,9 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // decay after one run). Read from a fresh connection BEFORE this run writes
     // anything, so it reflects exactly the previous successful run. `--no-
     // incremental` and a first run (empty prior index) both degrade to a full
-    // analysis. Skip is speed-only: entities are cumulative, edges are `INSERT
-    // OR IGNORE`, so a skipped file's durable rows are untouched.
+    // analysis. Skipped files deliberately leave their durable rows untouched;
+    // changed files pass through the per-source-file edge replacement boundary
+    // before their current edge set is inserted.
     //
     // Caveat (benign): a skipped file's core `file` entity keeps last run's
     // `briefing_blocked` / `language` properties, which a full re-analysis would
@@ -933,10 +934,11 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     .iter()
                     .any(|hf| hf.subcode == PLUGIN_TIMEOUT_RULE_ID);
                 for hf in &plugin_error.findings {
+                    let anchor_id = host_finding_anchor_id(hf, &project_root, &project_anchor);
                     failure_findings.push(host_finding_to_record(
                         hf,
                         &plugin_id,
-                        &project_anchor,
+                        &anchor_id,
                         &run_id,
                         &started_at,
                     ));
@@ -974,10 +976,11 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 // or path-jail violation is visible in the store, not just logs.
                 log_plugin_findings(&plugin_id, &findings);
                 for hf in &findings {
+                    let anchor_id = host_finding_anchor_id(hf, &project_root, &project_anchor);
                     failure_findings.push(host_finding_to_record(
                         hf,
                         &plugin_id,
-                        &project_anchor,
+                        &anchor_id,
                         &run_id,
                         &started_at,
                     ));
@@ -2704,7 +2707,7 @@ fn subsystem_display_name(member_ids: &[String], cluster_hash: &str) -> (String,
 }
 
 fn common_module_prefix(member_ids: &[String]) -> Option<String> {
-    let mut names = member_ids.iter().filter_map(|id| module_qualified_name(id));
+    let mut names = member_ids.iter().filter_map(|id| entity_qualified_name(id));
     let first = names.next()?;
     let mut common = first.split('.').collect::<Vec<_>>();
     for name in names {
@@ -2726,15 +2729,15 @@ fn common_module_prefix(member_ids: &[String]) -> Option<String> {
     }
 }
 
-fn module_qualified_name(entity_id: &str) -> Option<&str> {
+fn entity_qualified_name(entity_id: &str) -> Option<&str> {
     let mut parts = entity_id.splitn(3, ':');
     let _plugin_id = parts.next()?;
-    let kind = parts.next()?;
+    let _kind = parts.next()?;
     let qualified = parts.next()?;
-    if kind == "module" && !qualified.is_empty() {
-        Some(qualified)
-    } else {
+    if qualified.is_empty() {
         None
+    } else {
+        Some(qualified)
     }
 }
 
@@ -2804,10 +2807,19 @@ async fn insert_weak_modularity_finding(
 /// flagged `parse_status="syntax_error"`, or `None` for cleanly-parsed entities.
 ///
 /// The finding anchors to the degraded entity itself (the plugin still emits one
-/// `module` entity for a syntax-failed file), so no synthetic anchor is needed.
+/// manifest-declared degraded-syntax entity for a syntax-failed file), so no
+/// synthetic anchor is needed.
 /// The id is deterministic and run-scoped so a `--resume` re-walk regenerates the
 /// same id and `InsertFinding`'s upsert is idempotent (REQ-FINDING-05).
-fn syntax_error_finding(record: &EntityRecord, run_id: &str, now: &str) -> Option<FindingRecord> {
+fn syntax_error_finding(
+    record: &EntityRecord,
+    kind_roles: &PluginKindRoles,
+    run_id: &str,
+    now: &str,
+) -> Option<FindingRecord> {
+    if !kind_roles.is_syntax_degraded_module(&record.kind) {
+        return None;
+    }
     let props: serde_json::Value = serde_json::from_str(&record.properties_json).ok()?;
     if props
         .get("parse_status")
@@ -2829,7 +2841,7 @@ fn syntax_error_finding(record: &EntityRecord, run_id: &str, now: &str) -> Optio
         entity_id: record.id.clone(),
         related_entities_json: "[]".to_owned(),
         message: format!(
-            "{}: syntax error prevented full extraction; file ingested as a degraded module entity",
+            "{}: syntax error prevented full extraction; file ingested as a degraded plugin entity",
             record.name
         ),
         evidence_json: serde_json::json!({
@@ -2917,6 +2929,7 @@ async fn ensure_project_anchor(
 /// Core-emitted per-file analysis-timeout subcode (REQ-ANALYZE-06). Host-side:
 /// the plugin is killed when a single `analyze_file` exceeds the deadline.
 const PLUGIN_TIMEOUT_RULE_ID: &str = "CLA-PY-TIMEOUT";
+const PLUGIN_JAIL_OPEN_RULE_ID: &str = "CLA-INFRA-PLUGIN-JAIL-OPEN-FAILED";
 
 /// Per-file `analyze_file` deadline. ADR-035 tuning: basis — a single file's
 /// extraction (incl. pyright queries) completes in well under a second on
@@ -2975,9 +2988,9 @@ fn host_finding_to_record(
         tool: "clarion".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
-        rule_id: hf.subcode.to_owned(),
+        rule_id: hf.subcode.clone(),
         kind: "defect".to_owned(),
-        severity: infra_severity(hf.subcode).to_owned(),
+        severity: infra_severity(hf.subcode.as_str()).to_owned(),
         confidence: Some(1.0),
         confidence_basis: Some("host enforcement".to_owned()),
         entity_id: anchor_id.to_owned(),
@@ -2989,6 +3002,40 @@ fn host_finding_to_record(
         supported_by_json: "[]".to_owned(),
         created_at: now.to_owned(),
         updated_at: now.to_owned(),
+    }
+}
+
+fn host_finding_anchor_id(hf: &HostFinding, project_root: &Path, project_anchor: &str) -> String {
+    hf.metadata
+        .get("anchor_file_path")
+        .and_then(|path| core_file_entity_id(project_root, Path::new(path)).ok())
+        .unwrap_or_else(|| project_anchor.to_owned())
+}
+
+fn verified_plugin_dispatch_path(project_root: &Path, file: &Path) -> Result<PathBuf> {
+    let _handle = clarion_core::plugin::jail::safe_open(project_root, file)
+        .with_context(|| format!("safe-open {}", file.display()))?;
+    let jailed = clarion_core::plugin::jail::jail_to_string(project_root, file)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("jail-check {}", file.display()))?;
+    Ok(PathBuf::from(jailed))
+}
+
+fn jail_open_failed_finding(file: &Path, error: &anyhow::Error) -> HostFinding {
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        "anchor_file_path".to_owned(),
+        file.to_string_lossy().into_owned(),
+    );
+    metadata.insert("file_path".to_owned(), file.to_string_lossy().into_owned());
+    metadata.insert("error".to_owned(), format!("{error:#}"));
+    HostFinding {
+        subcode: PLUGIN_JAIL_OPEN_RULE_ID.to_owned(),
+        message: format!(
+            "source file skipped before plugin dispatch because jail-safe open failed: {}",
+            file.display()
+        ),
+        metadata,
     }
 }
 
@@ -3341,6 +3388,10 @@ async fn emit_findings_to_filigree(
         None => rows,
     };
     let total_findings = rows.len();
+    let rows = rows
+        .into_iter()
+        .map(federation_finding_for_emit)
+        .collect::<Vec<_>>();
 
     // In the Phase-8c (post-`CommitRun`, filtered) pass, anchor path-less
     // synthetic-entity findings — the subsystem-anchored tier facts — to the
@@ -3386,6 +3437,25 @@ async fn emit_findings_to_filigree(
         mark_unseen,
     )
     .await
+}
+
+fn federation_finding_for_emit(row: clarion_storage::FindingForEmitRow) -> FindingForEmit {
+    FindingForEmit {
+        id: row.id,
+        rule_id: row.rule_id,
+        kind: row.kind,
+        severity: row.severity,
+        confidence: row.confidence,
+        confidence_basis: row.confidence_basis,
+        message: row.message,
+        entity_id: row.entity_id,
+        related_entities_json: row.related_entities_json,
+        supports_json: row.supports_json,
+        supported_by_json: row.supported_by_json,
+        source_file_path: row.source_file_path,
+        source_line_start: row.source_line_start,
+        source_line_end: row.source_line_end,
+    }
 }
 
 /// POST a prepared scan-results batch to the live Filigree endpoint and render
@@ -3638,7 +3708,7 @@ fn module_entity_ids(conn: &Connection) -> Result<Vec<String>> {
 #[allow(clippy::too_many_arguments)]
 fn phase3_stats_json(
     config: &ClusteringConfig,
-    algorithm: crate::clustering::ClusterAlgorithm,
+    algorithm: ClusterAlgorithm,
     status: &str,
     skipped_reason: Option<&str>,
     module_count: usize,
@@ -3755,6 +3825,7 @@ struct BatchResult {
     findings: Vec<clarion_core::HostFinding>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum PluginBatchMessage {
     File(PluginFileBatch),
     DeferredImportEdges {
@@ -3764,8 +3835,13 @@ enum PluginBatchMessage {
 }
 
 struct PluginFileBatch {
+    /// Core file entity id for the analyzed file. Used as the authoritative
+    /// replacement key for scan-time anchored edges from that source file.
+    source_file_id: String,
     /// `(entity_id_string, record)` pairs accepted from one analyzed file.
     entities: Vec<(String, EntityRecord)>,
+    /// Manifest-declared semantic roles for this plugin's entity kinds.
+    kind_roles: PluginKindRoles,
     /// Non-import edges accepted from one analyzed file. Import edges are
     /// deferred because local-vs-external classification needs the plugin's
     /// complete module set.
@@ -3779,6 +3855,52 @@ struct PluginFileBatch {
     /// declared a signature for (WS1 / ADR-038). The SEI mint pass reads it as
     /// the move-case matcher input and persists it to `entities.signature`.
     signatures: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PluginKindRoles {
+    file_scope: BTreeSet<String>,
+    callable: BTreeSet<String>,
+    syntax_degraded_module: BTreeSet<String>,
+}
+
+impl PluginKindRoles {
+    fn from_manifest(manifest: &clarion_core::Manifest) -> Self {
+        let mut roles = Self::default();
+        for kind in &manifest.ontology.entity_kinds {
+            if manifest
+                .ontology
+                .kind_has_role(kind, clarion_core::OntologyEntityRole::FileScope)
+            {
+                roles.file_scope.insert(kind.clone());
+            }
+            if manifest
+                .ontology
+                .kind_has_role(kind, clarion_core::OntologyEntityRole::Callable)
+            {
+                roles.callable.insert(kind.clone());
+            }
+            if manifest
+                .ontology
+                .kind_has_role(kind, clarion_core::OntologyEntityRole::SyntaxDegradedModule)
+            {
+                roles.syntax_degraded_module.insert(kind.clone());
+            }
+        }
+        roles
+    }
+
+    fn is_file_scope(&self, kind: &str) -> bool {
+        self.file_scope.contains(kind)
+    }
+
+    fn is_callable(&self, kind: &str) -> bool {
+        self.callable.contains(kind)
+    }
+
+    fn is_syntax_degraded_module(&self, kind: &str) -> bool {
+        self.syntax_degraded_module.contains(kind)
+    }
 }
 
 struct PersistedPluginBatch {
@@ -3844,7 +3966,8 @@ async fn persist_plugin_file_batch(
         // REQ-ANALYZE-06: capture a parse-failure finding from the degraded
         // entity BEFORE `record` is moved into the command. Anchors to this
         // same entity (inserted just below), so the finding's FK resolves.
-        if let Some(finding) = syntax_error_finding(&record, run_id, started_at) {
+        if let Some(finding) = syntax_error_finding(&record, &batch.kind_roles, run_id, started_at)
+        {
             failure_findings.push(finding);
         }
         stamp_entity_git_provenance(&mut record, head_commit);
@@ -3863,6 +3986,20 @@ async fn persist_plugin_file_batch(
         }
         sei_descriptors.push(descriptor);
     }
+
+    writer
+        .send_wait(|ack| WriterCmd::ReplaceAnchoredEdgesForSourceFile {
+            source_file_id: batch.source_file_id.clone(),
+            ack,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| {
+            format!(
+                "ReplaceAnchoredEdgesForSourceFile for {}",
+                batch.source_file_id
+            )
+        })?;
 
     for pending in batch.unresolved_call_sites {
         let caller_id = pending.caller_entity_id.clone();
@@ -4053,6 +4190,7 @@ fn run_plugin_blocking(
     use clarion_core::PluginHost;
 
     let manifest_language = manifest.plugin.language.clone();
+    let kind_roles = PluginKindRoles::from_manifest(&manifest);
     let (mut host, child) =
         PluginHost::spawn(manifest, project_root, executable).map_err(|e| match e {
             HostError::Spawn(msg) => {
@@ -4078,15 +4216,31 @@ fn run_plugin_blocking(
         plugin_id.to_owned(),
     );
 
+    let mut dispatch_findings: Vec<HostFinding> = Vec::new();
     let work_result: Result<(), String> = (|| {
-        let mut module_entity_ids: BTreeSet<String> = BTreeSet::new();
+        let mut file_scope_entity_ids: BTreeSet<String> = BTreeSet::new();
         let mut deferred_import_edges: Vec<(String, EdgeRecord)> = Vec::new();
         for file in files {
             let file_display = file.to_string_lossy().into_owned();
             progress.file_started(plugin_id, &file_display);
             let heartbeat_guard = progress.file_heartbeat_guard(plugin_id.to_owned(), file_display);
+            let dispatch_file = match verified_plugin_dispatch_path(project_root, file) {
+                Ok(path) => path,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin_id = %plugin_id,
+                        file = %file.display(),
+                        error = %e,
+                        "source file skipped before plugin dispatch; jail-safe open failed",
+                    );
+                    dispatch_findings.push(jail_open_failed_finding(file, &e));
+                    drop(heartbeat_guard);
+                    progress.file_completed();
+                    continue;
+                }
+            };
             watchdog.arm(file_timeout);
-            let analyze_outcome = host.analyze_file(file);
+            let analyze_outcome = host.analyze_file(&dispatch_file);
             watchdog.disarm();
             drop(heartbeat_guard);
             let AnalyzeFileOutcome {
@@ -4117,12 +4271,12 @@ fn run_plugin_blocking(
             let mut file_signatures: BTreeMap<String, String> = BTreeMap::new();
             let (file_entity_id, file_record) = core_file_entity_record(
                 project_root,
-                file,
+                &dispatch_file,
                 &manifest_language,
                 briefing_blocks,
                 scanned_source_files,
             )
-            .map_err(|e| format!("core file entity for {}: {e:#}", file.display()))?;
+            .map_err(|e| format!("core file entity for {}: {e:#}", dispatch_file.display()))?;
             file_entities.push((file_entity_id.clone(), file_record));
             for entity in &entities {
                 let id_str = entity.id.to_string();
@@ -4137,9 +4291,10 @@ fn run_plugin_blocking(
                     entity,
                     plugin_id,
                     Some(file_entity_id.clone()),
+                    &kind_roles,
                 );
-                if entity.kind == "module" {
-                    module_entity_ids.insert(id_str.clone());
+                if kind_roles.is_file_scope(&entity.kind) {
+                    file_scope_entity_ids.insert(id_str.clone());
                     record.parent_id = Some(file_entity_id.clone());
                     file_edges.push((
                         format!(
@@ -4152,13 +4307,15 @@ fn run_plugin_blocking(
                 }
                 file_entities.push((id_str.clone(), record.clone()));
             }
-            let unresolved_for_file =
-                map_unresolved_call_sites_for_file(&stats, &file_entities, &iso8601_now())
-                    .map_err(|e| {
-                        format!(
-                            "plugin {plugin_id} emitted invalid unresolved call-site stats: {e:#}"
-                        )
-                    })?;
+            let unresolved_for_file = map_unresolved_call_sites_for_file(
+                &stats,
+                &file_entities,
+                &kind_roles,
+                &iso8601_now(),
+            )
+            .map_err(|e| {
+                format!("plugin {plugin_id} emitted invalid unresolved call-site stats: {e:#}")
+            })?;
             for edge in edges {
                 let descr = format!(
                     "({kind} {from} -> {to})",
@@ -4173,7 +4330,9 @@ fn run_plugin_blocking(
             deferred_import_edges.extend(import_edges);
             batch_tx
                 .blocking_send(PluginBatchMessage::File(PluginFileBatch {
+                    source_file_id: file_entity_id.clone(),
                     entities: file_entities,
+                    kind_roles: kind_roles.clone(),
                     edges: immediate_edges,
                     unresolved_call_sites: unresolved_for_file,
                     stats: file_stats,
@@ -4182,7 +4341,7 @@ fn run_plugin_blocking(
                 .map_err(|_| "plugin batch receiver closed".to_owned())?;
         }
         let imports_skipped_external = filter_external_import_edges_by_module_ids(
-            &module_entity_ids,
+            &file_scope_entity_ids,
             &mut deferred_import_edges,
         );
         batch_tx
@@ -4235,6 +4394,7 @@ fn run_plugin_blocking(
     }
 
     let mut findings = host.take_findings();
+    findings.extend(dispatch_findings);
     drop(host);
 
     // REQ-ANALYZE-06: a per-file timeout is a recoverable failure that must be
@@ -4248,7 +4408,7 @@ fn run_plugin_blocking(
             file_timeout.as_millis().to_string(),
         );
         findings.push(HostFinding {
-            subcode: PLUGIN_TIMEOUT_RULE_ID,
+            subcode: PLUGIN_TIMEOUT_RULE_ID.to_owned(),
             message: format!(
                 "plugin {plugin_id} exceeded the per-file analysis timeout ({} ms) and was killed",
                 file_timeout.as_millis()
@@ -4416,11 +4576,12 @@ fn classify_host_error(plugin_id: &str, e: HostError) -> String {
 #[cfg(test)]
 fn filter_external_import_edges(
     entities: &[(String, EntityRecord)],
+    kind_roles: &PluginKindRoles,
     edges: &mut Vec<(String, EdgeRecord)>,
 ) -> u64 {
     let module_entity_ids: BTreeSet<&str> = entities
         .iter()
-        .filter(|(_, record)| record.kind == "module")
+        .filter(|(_, record)| kind_roles.is_file_scope(&record.kind))
         .map(|(id, _)| id.as_str())
         .collect();
     filter_external_import_edges_by_module_refs(&module_entity_ids, edges)
@@ -4505,17 +4666,8 @@ fn core_file_entity_record(
     let canonical_file = file
         .canonicalize()
         .with_context(|| format!("canonicalize source file {}", file.display()))?;
-    let relative = canonical_file
-        .strip_prefix(&canonical_root)
-        .with_context(|| {
-            format!(
-                "source file {} is outside project root {}",
-                canonical_file.display(),
-                canonical_root.display()
-            )
-        })?;
-    let qualified_name = project_relative_posix(relative)?;
-    let id = clarion_core::entity_id::entity_id("core", "file", &qualified_name)?.to_string();
+    let (id, qualified_name) =
+        core_file_entity_id_from_canonical(&canonical_root, &canonical_file)?;
     let briefing_blocked = briefing_blocks.get(&canonical_file).copied().or_else(|| {
         (!scanned_source_files.contains(&canonical_file))
             .then_some(clarion_core::BriefingBlockReason::UnscannedSource)
@@ -4575,6 +4727,35 @@ fn core_file_entity_record(
     ))
 }
 
+fn core_file_entity_id(project_root: &Path, file: &Path) -> Result<String> {
+    let canonical_root = project_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize project root {}", project_root.display()))?;
+    let canonical_file = file
+        .canonicalize()
+        .with_context(|| format!("canonicalize source file {}", file.display()))?;
+    let (id, _) = core_file_entity_id_from_canonical(&canonical_root, &canonical_file)?;
+    Ok(id)
+}
+
+fn core_file_entity_id_from_canonical(
+    canonical_root: &Path,
+    canonical_file: &Path,
+) -> Result<(String, String)> {
+    let relative = canonical_file
+        .strip_prefix(canonical_root)
+        .with_context(|| {
+            format!(
+                "source file {} is outside project root {}",
+                canonical_file.display(),
+                canonical_root.display()
+            )
+        })?;
+    let qualified_name = project_relative_posix(relative)?;
+    let id = clarion_core::entity_id::entity_id("core", "file", &qualified_name)?.to_string();
+    Ok((id, qualified_name))
+}
+
 fn project_relative_posix(path: &Path) -> Result<String> {
     let mut parts = Vec::new();
     for component in path.components() {
@@ -4610,6 +4791,7 @@ fn map_entity_to_record(
     entity: &AcceptedEntity,
     plugin_id: &str,
     source_file_id: Option<String>,
+    kind_roles: &PluginKindRoles,
 ) -> EntityRecord {
     let short_name = entity
         .qualified_name
@@ -4639,7 +4821,7 @@ fn map_entity_to_record(
         source_line_end: source_line_range.map(|range| range.end_line),
         properties_json,
         tags: normalised_entity_tags(&entity.raw.tags),
-        content_hash: content_hash_for_entity(project_root, entity, source_line_range),
+        content_hash: content_hash_for_entity(project_root, entity, source_line_range, kind_roles),
         summary_json: None,
         wardline_json: None,
         first_seen_commit: None,
@@ -4680,7 +4862,7 @@ fn source_line_range(entity: &AcceptedEntity) -> Option<SourceLineRange> {
 
 /// The blake3 hex of a file's whole contents — the single canonical whole-file
 /// hash used everywhere the "did this file change?" question is asked: the core
-/// `file` entity's `content_hash` (`core_file_entity`), a plugin `module`
+/// `file` entity's `content_hash` (`core_file_entity`), a plugin file-scope
 /// entity's `content_hash` (`content_hash_for_entity`), and the Wave 2
 /// incremental-skip check. They MUST agree byte-for-byte or the skip silently
 /// never matches; one helper guarantees that. `None` when the file cannot be
@@ -4731,10 +4913,11 @@ fn content_hash_for_entity(
     project_root: &Path,
     entity: &AcceptedEntity,
     source_line_range: Option<SourceLineRange>,
+    kind_roles: &PluginKindRoles,
 ) -> Option<String> {
     use std::io::Read;
 
-    if entity.kind == "module" {
+    if kind_roles.is_file_scope(&entity.kind) {
         return whole_file_hash(project_root, Path::new(&entity.source_file_path));
     }
 
@@ -4799,6 +4982,7 @@ fn map_edge_to_record(edge: AcceptedEdge, source_file_id: Option<String>) -> Edg
 fn map_unresolved_call_sites_for_file(
     stats: &clarion_core::AnalyzeFileStats,
     entities: &[(String, EntityRecord)],
+    kind_roles: &PluginKindRoles,
     created_at: &str,
 ) -> Result<Vec<PendingUnresolvedCallSites>> {
     let entities_by_id: BTreeMap<&str, &EntityRecord> = entities
@@ -4811,7 +4995,7 @@ fn map_unresolved_call_sites_for_file(
 
     if authoritative {
         for (id, record) in entities {
-            if record.kind != "function" {
+            if !kind_roles.is_callable(&record.kind) {
                 continue;
             }
             let Some(content_hash) = &record.content_hash else {
@@ -4838,6 +5022,13 @@ fn map_unresolved_call_sites_for_file(
                     site.caller_entity_id
                 )
             })?;
+        if !kind_roles.is_callable(&caller.kind) {
+            bail!(
+                "unresolved call site caller kind {:?} is not manifest-declared callable: {}",
+                caller.kind,
+                site.caller_entity_id
+            );
+        }
         let content_hash = caller.content_hash.clone().with_context(|| {
             format!(
                 "unresolved call site caller lacks content_hash: {}",
@@ -4931,8 +5122,9 @@ struct SourceWalkResult {
 }
 
 /// Uses the `ignore` crate so `.gitignore` / `.ignore` / global gitignore
-/// policy filters the source set before plugin dispatch. Symlinks are skipped
-/// (path-jail concerns for Sprint 1).
+/// policy filters the source set before plugin dispatch. Matching files must
+/// also pass the path-jail safe-open check before they enter the shared source
+/// list used by secret scanning and plugin dispatch.
 ///
 /// Per-entry I/O errors (a dirent we couldn't stat, a file whose
 /// `file_type()` probe failed) are logged at `warn` level and counted.
@@ -4968,7 +5160,10 @@ fn collect_source_files(root: &Path, wanted_extensions: &BTreeSet<String>) -> So
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                     let ext_lower = ext.to_ascii_lowercase();
                     if wanted_extensions.contains(&ext_lower) {
-                        out.push(path);
+                        match verified_plugin_dispatch_path(root, &path) {
+                            Ok(safe_path) => out.push(safe_path),
+                            Err(err) => skipped_errors.push(format!("{}: {err:#}", path.display())),
+                        }
                     }
                 }
             }
@@ -5235,7 +5430,7 @@ mod tests {
             "service",
         )];
 
-        let skipped = filter_external_import_edges(&entities, &mut edges);
+        let skipped = filter_external_import_edges(&entities, &python_kind_roles(), &mut edges);
 
         assert_eq!(skipped, 0);
         assert_eq!(edges[0].1.to_id, "python:module:pkg.service");
@@ -5250,7 +5445,7 @@ mod tests {
             "helper",
         )];
 
-        let skipped = filter_external_import_edges(&entities, &mut edges);
+        let skipped = filter_external_import_edges(&entities, &python_kind_roles(), &mut edges);
 
         assert_eq!(skipped, 0);
         assert_eq!(edges[0].1.to_id, "python:module:pkg");
@@ -5265,7 +5460,7 @@ mod tests {
             "service",
         )];
 
-        let skipped = filter_external_import_edges(&entities, &mut edges);
+        let skipped = filter_external_import_edges(&entities, &python_kind_roles(), &mut edges);
 
         assert_eq!(skipped, 0);
         assert_eq!(edges[0].1.to_id, "python:module:pkg.service");
@@ -5280,7 +5475,7 @@ mod tests {
             "service",
         )];
 
-        let skipped = filter_external_import_edges(&entities, &mut edges);
+        let skipped = filter_external_import_edges(&entities, &python_kind_roles(), &mut edges);
 
         assert_eq!(skipped, 1);
         assert!(edges.is_empty());
@@ -5321,7 +5516,7 @@ mod tests {
 
         let stats = phase3_stats_json(
             &config,
-            crate::clustering::ClusterAlgorithm::WeightedComponents,
+            ClusterAlgorithm::WeightedComponents,
             "completed",
             None,
             3,
@@ -5393,14 +5588,27 @@ mod tests {
         }
     }
 
+    fn python_kind_roles() -> PluginKindRoles {
+        PluginKindRoles {
+            file_scope: BTreeSet::from(["module".to_owned()]),
+            callable: BTreeSet::from(["function".to_owned()]),
+            syntax_degraded_module: BTreeSet::from(["module".to_owned()]),
+        }
+    }
+
     #[test]
     fn syntax_error_finding_minted_for_degraded_entity() {
         let record = entity_with_properties(
             "python:module:pkg.broken",
             r#"{"parse_status":"syntax_error"}"#,
         );
-        let finding = syntax_error_finding(&record, "run-1", "2026-06-02T00:00:00.000Z")
-            .expect("syntax_error entity must mint a finding");
+        let finding = syntax_error_finding(
+            &record,
+            &python_kind_roles(),
+            "run-1",
+            "2026-06-02T00:00:00.000Z",
+        )
+        .expect("syntax_error entity must mint a finding");
         assert_eq!(finding.rule_id, SYNTAX_ERROR_RULE_ID);
         assert_eq!(finding.entity_id, "python:module:pkg.broken");
         assert_eq!(finding.kind, "defect");
@@ -5416,11 +5624,21 @@ mod tests {
     #[test]
     fn syntax_error_finding_absent_for_clean_or_unflagged_entities() {
         let ok = entity_with_properties("python:module:pkg.ok", r#"{"parse_status":"ok"}"#);
-        assert!(syntax_error_finding(&ok, "run-1", "t").is_none());
+        assert!(syntax_error_finding(&ok, &python_kind_roles(), "run-1", "t").is_none());
         let plain = entity_with_properties("python:module:pkg.plain", "{}");
-        assert!(syntax_error_finding(&plain, "run-1", "t").is_none());
+        assert!(syntax_error_finding(&plain, &python_kind_roles(), "run-1", "t").is_none());
         let malformed = entity_with_properties("python:module:pkg.bad", "not json");
-        assert!(syntax_error_finding(&malformed, "run-1", "t").is_none());
+        assert!(syntax_error_finding(&malformed, &python_kind_roles(), "run-1", "t").is_none());
+    }
+
+    #[test]
+    fn syntax_error_finding_requires_manifest_role() {
+        let record = entity_with_properties(
+            "fixture:widget:pkg.broken",
+            r#"{"parse_status":"syntax_error"}"#,
+        );
+
+        assert!(syntax_error_finding(&record, &PluginKindRoles::default(), "run-1", "t").is_none());
     }
 
     #[test]
@@ -5536,7 +5754,7 @@ mod tests {
     #[test]
     fn host_finding_to_record_anchors_and_carries_subcode() {
         let hf = HostFinding {
-            subcode: "CLA-INFRA-PLUGIN-MALFORMED-ENTITY",
+            subcode: "CLA-INFRA-PLUGIN-MALFORMED-ENTITY".to_owned(),
             message: "entity failed to deserialise".to_owned(),
             metadata: std::collections::BTreeMap::new(),
         };
@@ -5547,6 +5765,48 @@ mod tests {
         assert_eq!(rec.kind, "defect");
         assert_eq!(rec.tool, "clarion");
         assert!(rec.evidence_json.contains("python"));
+    }
+
+    #[test]
+    fn host_finding_anchor_id_uses_file_anchor_metadata_when_present() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let source = tempdir.path().join("pkg").join("demo.py");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "def demo():\n    pass\n").unwrap();
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert(
+            "anchor_file_path".to_owned(),
+            source.to_string_lossy().into_owned(),
+        );
+        let hf = HostFinding {
+            subcode: "CLA-PY-PYRIGHT-RESTART".to_owned(),
+            message: "pyright restarted".to_owned(),
+            metadata,
+        };
+
+        let anchor = host_finding_anchor_id(&hf, tempdir.path(), "core:project:demo");
+
+        assert_eq!(anchor, "core:file:pkg/demo.py");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_plugin_dispatch_path_rejects_out_of_tree_symlink() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let project = tempdir.path().join("project");
+        let outside = tempdir.path().join("outside.py");
+        fs::create_dir(&project).expect("create project");
+        fs::write(&outside, "def secret():\n    pass\n").expect("write outside");
+        let link = project.join("demo.py");
+        std::os::unix::fs::symlink(&outside, &link).expect("symlink outside");
+
+        let err = verified_plugin_dispatch_path(&project, &link)
+            .expect_err("out-of-tree symlink must not be dispatched");
+
+        assert!(
+            format!("{err:#}").contains("safe-open"),
+            "dispatch failure should identify safe-open boundary: {err:#}"
+        );
     }
 
     #[test]
@@ -5732,6 +5992,7 @@ mod tests {
             &entity,
             "python",
             Some("core:file:demo.py".to_owned()),
+            &python_kind_roles(),
         );
 
         assert_eq!(
@@ -5796,9 +6057,13 @@ mod tests {
             ..clarion_core::AnalyzeFileStats::default()
         };
 
-        let mapped =
-            map_unresolved_call_sites_for_file(&stats, &entities, "2026-05-17T00:00:00.000Z")
-                .unwrap();
+        let mapped = map_unresolved_call_sites_for_file(
+            &stats,
+            &entities,
+            &python_kind_roles(),
+            "2026-05-17T00:00:00.000Z",
+        )
+        .unwrap();
 
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].caller_entity_id, "python:function:demo.caller");
@@ -5846,9 +6111,13 @@ mod tests {
         let entities = vec![("python:function:demo.caller".to_owned(), caller)];
         let stats = clarion_core::AnalyzeFileStats::default();
 
-        let mapped =
-            map_unresolved_call_sites_for_file(&stats, &entities, "2026-05-17T00:00:00.000Z")
-                .unwrap();
+        let mapped = map_unresolved_call_sites_for_file(
+            &stats,
+            &entities,
+            &python_kind_roles(),
+            "2026-05-17T00:00:00.000Z",
+        )
+        .unwrap();
 
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].caller_entity_id, "python:function:demo.caller");

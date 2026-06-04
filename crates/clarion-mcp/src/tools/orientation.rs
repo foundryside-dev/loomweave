@@ -162,18 +162,10 @@ impl ServerState {
                     .filter_map(|child_id| entity_by_id(conn, child_id).transpose())
                     .map(|row| row.map(|entity| entity_json(conn, &entity)))
                     .collect::<Result<Vec<_>, StorageError>>()?;
-                let (refs_in, references_rolled_up) = reference_neighbors_for(
-                    conn,
-                    &entity.id,
-                    &entity.kind,
-                    ReferenceDirection::In,
-                )?;
-                let (refs_out, _) = reference_neighbors_for(
-                    conn,
-                    &entity.id,
-                    &entity.kind,
-                    ReferenceDirection::Out,
-                )?;
+                let (refs_in, references_rolled_up) =
+                    reference_neighbors_for(conn, &entity, ReferenceDirection::In)?;
+                let (refs_out, _) =
+                    reference_neighbors_for(conn, &entity, ReferenceDirection::Out)?;
                 let imports_in = import_neighbors(conn, &entity.id, ReferenceDirection::In)?;
                 let imports_out = import_neighbors(conn, &entity.id, ReferenceDirection::Out)?;
 

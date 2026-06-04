@@ -76,11 +76,12 @@ impl LinkageDirection {
 }
 
 /// Map the `confidence` query value to the storage layer's `max_confidence`
-/// CEILING (`confidence_allowed` is `actual <= max`). `all` and `inferred` both
-/// admit every tier; `ambiguous` admits resolved+ambiguous; `resolved` admits
-/// only resolved. Returns `None` for an unrecognised value (→ 400).
+/// CEILING (`confidence_allowed` is `actual <= max`). Omitted confidence and
+/// `resolved` admit only resolved edges; `ambiguous` admits resolved+ambiguous;
+/// `all` and `inferred` admit every tier. Returns `None` for an unrecognised
+/// value (→ 400).
 pub(crate) fn parse_max_confidence(raw: Option<&str>) -> Option<EdgeConfidence> {
-    match raw.unwrap_or("all") {
+    match raw.unwrap_or("resolved") {
         "all" | "inferred" => Some(EdgeConfidence::Inferred),
         "ambiguous" => Some(EdgeConfidence::Ambiguous),
         "resolved" => Some(EdgeConfidence::Resolved),
@@ -144,9 +145,12 @@ pub(crate) fn linkages_for(
                 LinkageDirection::Callers => call_edges_targeting(conn, entity_id, max_confidence)?,
                 LinkageDirection::Callees => call_edges_from(conn, entity_id, max_confidence)?,
             };
-            Ok(LinkageLookup::Found(aggregate_linkages(
-                &matches, direction,
-            )))
+            let entries = aggregate_linkages(&matches, direction);
+            let (entries, blocked_neighbor_count) = filter_visible_neighbors(conn, entries)?;
+            Ok(LinkageLookup::Found {
+                entries,
+                blocked_neighbor_count,
+            })
         }
     }
 }
@@ -154,7 +158,26 @@ pub(crate) fn linkages_for(
 pub(crate) enum LinkageLookup {
     NotFound,
     Blocked,
-    Found(Vec<LinkageEntry>),
+    Found {
+        entries: Vec<LinkageEntry>,
+        blocked_neighbor_count: usize,
+    },
+}
+
+fn filter_visible_neighbors(
+    conn: &rusqlite::Connection,
+    entries: Vec<LinkageEntry>,
+) -> Result<(Vec<LinkageEntry>, usize), StorageError> {
+    let mut visible = Vec::with_capacity(entries.len());
+    let mut blocked_neighbor_count = 0;
+    for entry in entries {
+        match entity_visibility(conn, &entry.entity_id)? {
+            EntityVisibility::Visible => visible.push(entry),
+            EntityVisibility::Blocked(_) => blocked_neighbor_count += 1,
+            EntityVisibility::NotFound => {}
+        }
+    }
+    Ok((visible, blocked_neighbor_count))
 }
 
 /// Single-entity linkage handler (callers or callees).
@@ -201,7 +224,10 @@ pub(crate) async fn linkage_single(
             ErrorCode::BriefingBlocked,
             "entity is briefing-blocked and cannot be exposed",
         ),
-        Ok(LinkageLookup::Found(entries)) => {
+        Ok(LinkageLookup::Found {
+            entries,
+            blocked_neighbor_count,
+        }) => {
             let total = entries.len();
             let page: Vec<LinkageEntry> = entries.into_iter().skip(offset).take(limit).collect();
             let truncated = offset.saturating_add(page.len()) < total;
@@ -209,6 +235,7 @@ pub(crate) async fn linkage_single(
                 "entity_id": entity_id,
                 direction.field(): page,
                 "total": total,
+                "blocked_neighbor_count": blocked_neighbor_count,
                 "truncated": truncated,
             });
             (StatusCode::OK, Json(body)).into_response()
@@ -259,22 +286,30 @@ pub(crate) async fn linkage_batch(
             // BTreeMap → deterministic JSON object key order.
             let mut results: std::collections::BTreeMap<String, Vec<LinkageEntry>> =
                 std::collections::BTreeMap::new();
+            let mut blocked_neighbor_counts: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
             for entity_id in entity_ids {
-                if let LinkageLookup::Found(mut entries) =
-                    linkages_for(conn, &entity_id, direction, max_confidence)?
+                if let LinkageLookup::Found {
+                    mut entries,
+                    blocked_neighbor_count,
+                } = linkages_for(conn, &entity_id, direction, max_confidence)?
                 {
                     entries.truncate(limit);
+                    blocked_neighbor_counts.insert(entity_id.clone(), blocked_neighbor_count);
                     results.insert(entity_id, entries);
                 }
             }
-            Ok::<_, StorageError>(results)
+            Ok::<_, StorageError>((results, blocked_neighbor_counts))
         })
         .await;
 
     match result {
-        Ok(results) => (
+        Ok((results, blocked_neighbor_counts)) => (
             StatusCode::OK,
-            Json(serde_json::json!({ "results": results })),
+            Json(serde_json::json!({
+                "results": results,
+                "blocked_neighbor_counts": blocked_neighbor_counts,
+            })),
         )
             .into_response(),
         Err(err) => json_read_error(&err),
@@ -365,7 +400,7 @@ mod tests {
 
     #[test]
     fn parse_max_confidence_maps_tiers_and_rejects_garbage() {
-        assert_eq!(parse_max_confidence(None), Some(EdgeConfidence::Inferred));
+        assert_eq!(parse_max_confidence(None), Some(EdgeConfidence::Resolved));
         assert_eq!(
             parse_max_confidence(Some("all")),
             Some(EdgeConfidence::Inferred)
@@ -481,6 +516,7 @@ mod tests {
         let parsed = json_body(response).await;
         assert_eq!(parsed["entity_id"], "python:function:t");
         assert_eq!(parsed["total"], 2);
+        assert_eq!(parsed["blocked_neighbor_count"], 0);
         assert_eq!(parsed["truncated"], false);
         let callers = parsed["callers"].as_array().expect("callers array");
         let by_id: std::collections::HashMap<&str, &serde_json::Value> = callers
@@ -552,7 +588,26 @@ mod tests {
             )
         };
 
-        // resolved-only: the ambiguous caller `b` must be excluded.
+        // Omitted confidence defaults to resolved-only: the ambiguous caller
+        // `b` must be excluded.
+        let (state, _t0) = seed(secret);
+        let defaulted = router(state)
+            .oneshot(hmac_request(
+                secret,
+                "GET",
+                "/api/v1/entities/python:function:t/callers",
+                b"",
+            ))
+            .await
+            .expect("oneshot");
+        let defaulted = json_body(defaulted).await;
+        assert_eq!(
+            defaulted["total"], 1,
+            "omitted confidence defaults to resolved: {defaulted}"
+        );
+        assert_eq!(defaulted["callers"][0]["entity_id"], "python:function:a");
+
+        // Explicit resolved is the same filter.
         let (state, _t1) = seed(secret);
         let resolved = router(state)
             .oneshot(hmac_request(
@@ -625,6 +680,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn linkage_filters_briefing_blocked_neighbours() {
+        use tower::ServiceExt;
+        let secret = "linkage-secret";
+        let (state, _tempdir) = linkage_test_state(
+            secret,
+            &[
+                ("python:function:t", None),
+                ("python:function:visible", None),
+                ("python:function:secret", Some("secret-scan")),
+            ],
+            &[
+                (
+                    "python:function:visible",
+                    "python:function:t",
+                    "resolved",
+                    &[],
+                ),
+                (
+                    "python:function:secret",
+                    "python:function:t",
+                    "resolved",
+                    &[],
+                ),
+            ],
+        );
+
+        let response = router(state)
+            .oneshot(hmac_request(
+                secret,
+                "GET",
+                "/api/v1/entities/python:function:t/callers?confidence=all",
+                b"",
+            ))
+            .await
+            .expect("oneshot");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let parsed = json_body(response).await;
+        assert_eq!(parsed["total"], 1);
+        assert_eq!(parsed["blocked_neighbor_count"], 1);
+        let callers = parsed["callers"].as_array().expect("callers array");
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0]["entity_id"], "python:function:visible");
+    }
+
+    #[tokio::test]
     async fn linkage_requires_authentication() {
         use tower::ServiceExt;
         let secret = "linkage-secret";
@@ -671,10 +772,58 @@ mod tests {
             1,
             "only the known visible entity appears: {parsed}"
         );
+        assert_eq!(parsed["blocked_neighbor_counts"]["python:function:t"], 0);
         assert_eq!(
             results["python:function:t"][0]["entity_id"],
             "python:function:a"
         );
+    }
+
+    #[tokio::test]
+    async fn linkage_batch_filters_briefing_blocked_neighbours() {
+        use tower::ServiceExt;
+        let secret = "linkage-secret";
+        let (state, _tempdir) = linkage_test_state(
+            secret,
+            &[
+                ("python:function:t", None),
+                ("python:function:visible", None),
+                ("python:function:secret", Some("secret-scan")),
+            ],
+            &[
+                (
+                    "python:function:visible",
+                    "python:function:t",
+                    "resolved",
+                    &[],
+                ),
+                (
+                    "python:function:secret",
+                    "python:function:t",
+                    "resolved",
+                    &[],
+                ),
+            ],
+        );
+        let body = br#"{"entity_ids":["python:function:t"],"confidence":"all"}"#;
+        let response = router(state)
+            .oneshot(hmac_request(
+                secret,
+                "POST",
+                "/api/v1/entities/callers:batch-get",
+                body,
+            ))
+            .await
+            .expect("oneshot");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let parsed = json_body(response).await;
+        let callers = parsed["results"]["python:function:t"]
+            .as_array()
+            .expect("callers array");
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0]["entity_id"], "python:function:visible");
+        assert_eq!(parsed["blocked_neighbor_counts"]["python:function:t"], 1);
     }
 
     #[tokio::test]

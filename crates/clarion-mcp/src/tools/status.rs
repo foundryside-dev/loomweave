@@ -181,21 +181,6 @@ impl ServerState {
         let storage = self
             .readers
             .with_reader(move |conn| {
-                match clarion_storage::mark_stale_running_runs_failed(conn) {
-                    Ok(repaired) if repaired > 0 => {
-                        tracing::warn!(
-                            repaired,
-                            "project_status marked stale running analyze runs failed"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "project_status stale-run reconciliation failed; continuing"
-                        );
-                    }
-                }
                 let snapshot = crate::snapshot::project_snapshot(conn, &project_root);
                 let edge_count = scalar_count_fail_soft(conn, "SELECT COUNT(*) FROM edges");
                 // Entities withheld from briefings/federation exposure (secret
@@ -249,6 +234,10 @@ impl ServerState {
         // The on-disk size, paired with data_version, exposes a swapped or
         // truncated DB the server may still be serving from a stale handle.
         let db_size_bytes = std::fs::metadata(&db_path).map(|meta| meta.len()).ok();
+        let analyzed_git_sha = latest_run
+            .get("analyzed_at_commit")
+            .cloned()
+            .unwrap_or(Value::Null);
 
         // A served index that has a completed run but no entities is almost
         // always a wrong/empty/swapped corpus — surface it in the log so an
@@ -282,9 +271,7 @@ impl ServerState {
             "staleness": serde_json::to_value(snapshot.staleness()).unwrap_or(Value::Null),
             "scan_truncated": snapshot.scan_truncated(),
             "last_analyzed_at": snapshot.last_analyzed_at(),
-            // No analyze-time git SHA is persisted and Clarion has no git
-            // integration; report null rather than fabricate one.
-            "git_sha": Value::Null,
+            "git_sha": analyzed_git_sha,
             "plugins": plugins,
             // Whether this build understands SEIs (always true here) and whether
             // the served index actually has SEI bindings populated (REQ-C-04 /

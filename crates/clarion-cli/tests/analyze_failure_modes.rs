@@ -148,6 +148,9 @@ entity_kinds = ["module"]
 edge_kinds = ["bogus_edge"]
 rule_id_prefix = "CLA-BOGUS-"
 ontology_version = "0.6.0"
+
+[ontology.roles]
+file_scope = ["module"]
 "#;
 
 /// Fixture plugin that successfully emits one module, then exits without
@@ -251,6 +254,9 @@ entity_kinds = ["module"]
 edge_kinds = []
 rule_id_prefix = "CLA-PARTIAL-"
 ontology_version = "0.6.0"
+
+[ontology.roles]
+file_scope = ["module"]
 "#;
 
 /// Fixture plugin that emits a cross-file call edge before the callee entity is
@@ -385,6 +391,10 @@ entity_kinds = ["module", "function"]
 edge_kinds = ["calls"]
 rule_id_prefix = "CLA-CROSS-"
 ontology_version = "0.6.0"
+
+[ontology.roles]
+file_scope = ["module"]
+callable = ["function"]
 "#;
 
 fn write_bogus_edge_plugin(plugin_dir: &std::path::Path) {

@@ -110,7 +110,7 @@ integrations:
                 {
                   "physicalLocation": {
                     "artifactLocation": {
-                      "uri": "file:///src/lib.rs"
+                      "uri": "src/lib.rs"
                     },
                     "region": {
                       "startLine": 42,

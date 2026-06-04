@@ -14,10 +14,10 @@ under ``[integrations.wardline]``:
 This guard enforces the *local* half of the contract. If
 ``capabilities.runtime.wardline_aware`` is ``true``, both bounds must be
 present, parse as semver, and form a sane half-open range ``[min, max)``. If the
-capability is ``false``, the bounds block must be absent so a dormant
-package/version probe cannot look like usable semantic integration. The
-*server-side* cross-check (confirming the resolved Wardline actually advertises
-a version inside the range at integration time) is future work — see
+capability is ``false``, the bounds block must be absent so dormant manifest
+metadata cannot look like usable semantic integration. The *server-side*
+cross-check (confirming the resolved Wardline actually advertises a version
+inside the range at integration time) is future work — see
 ``server_side_cross_check_hook`` for the documented seam.
 
 Closes V11-TEST-03 (docs/implementation/v1.0-tag-cut/gap-register.md).

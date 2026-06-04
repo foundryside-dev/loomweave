@@ -8,8 +8,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -224,7 +223,8 @@ pub(crate) fn pre_ingest(
     let mut baseline_matches = Vec::new();
     let mut scanned_files = BTreeSet::new();
     let mut scanned_sidecars = BTreeSet::new();
-    let scans = scan_source_files_parallel(source_files, |buf| scanner.scan_bytes(buf))?;
+    let scans =
+        scan_source_files_parallel(project_root, source_files, |buf| scanner.scan_bytes(buf))?;
 
     for scan in scans {
         let canonical_file = scan.canonical_file;
@@ -340,6 +340,7 @@ struct SourceFileScan {
 }
 
 fn scan_source_files_parallel<F>(
+    project_root: &Path,
     source_files: &[PathBuf],
     scan_bytes: F,
 ) -> Result<Vec<SourceFileScan>>
@@ -371,7 +372,7 @@ where
                     let Some(file) = source_files.get(idx) else {
                         break;
                     };
-                    let result = scan_one_source_file(file, scan_bytes);
+                    let result = scan_one_source_file(project_root, file, scan_bytes);
                     *results[idx]
                         .lock()
                         .expect("parallel secret-scan result lock poisoned") = Some(result);
@@ -390,12 +391,21 @@ where
         .collect()
 }
 
-fn scan_one_source_file<F>(file: &Path, scan_bytes: &F) -> Result<SourceFileScan>
+fn scan_one_source_file<F>(
+    project_root: &Path,
+    file: &Path,
+    scan_bytes: &F,
+) -> Result<SourceFileScan>
 where
     F: Fn(&[u8]) -> Vec<Detection> + Sync + ?Sized,
 {
+    let mut handle = clarion_core::plugin::jail::safe_open(project_root, file)
+        .with_context(|| format!("safe-open {}", file.display()))?;
     let canonical_file = canonical_or_original(file);
-    let buf = fs::read(file).with_context(|| format!("read {}", file.display()))?;
+    let mut buf = Vec::new();
+    handle
+        .read_to_end(&mut buf)
+        .with_context(|| format!("read {}", file.display()))?;
     let detections = scan_bytes(&buf);
     Ok(SourceFileScan {
         canonical_file,
@@ -523,7 +533,7 @@ mod tests {
         let scan_threads = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&scan_threads);
 
-        let scans = scan_source_files_parallel(&files, |buf| {
+        let scans = scan_source_files_parallel(tmp.path(), &files, |buf| {
             seen.lock()
                 .expect("record thread")
                 .push(std::thread::current().id());
@@ -549,6 +559,27 @@ mod tests {
                 .iter()
                 .any(|thread_id| *thread_id != caller_thread),
             "expected at least one scan to run on a worker thread"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_source_files_parallel_rejects_out_of_tree_symlink() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("project");
+        let outside = tmp.path().join("outside.txt");
+        std::fs::create_dir(&project).expect("create project");
+        std::fs::write(&outside, b"outside secret\n").expect("write outside");
+        let link = project.join("link.txt");
+        std::os::unix::fs::symlink(&outside, &link).expect("symlink outside");
+
+        let err = scan_source_files_parallel(&project, &[link], |_| Vec::new())
+            .expect_err("out-of-tree symlink must not be read");
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("safe-open"),
+            "error should identify safe-open boundary; got {message}"
         );
     }
 

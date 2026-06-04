@@ -150,7 +150,7 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: plugins/python/pyproject.toml
+          cache-dependency-path: plugins/python/uv.lock
 
       - name: cache pyright runtime
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
@@ -158,28 +158,39 @@ jobs:
           path: ~/.cache/pyright-python/
           key: pyright-python-1.1.409-${{ runner.os }}
 
-      - name: check B.4* gate result freshness
-        run: python scripts/check-b4-gate-result.py
-
       - name: check Python ontology version lockstep
         run: |
           python scripts/check-python-ontology-version.py --self-test
           python scripts/check-python-ontology-version.py
 
-      - name: install plugin (dev extras)
-        run: python -m pip install -e 'plugins/python[dev]'
+      - name: install uv
+        run: python -m pip install uv==0.10.2
+
+      - name: sync plugin (locked dev extras)
+        run: uv sync --project plugins/python --locked --extra dev
+
+      - name: audit locked Python dependencies
+        run: |
+          uv export --project plugins/python --locked --extra dev --no-emit-project \
+            --format requirements.txt \
+            --output-file /tmp/clarion-python-dev-requirements.txt
+          uv run --project plugins/python --extra dev pip-audit \
+            -r /tmp/clarion-python-dev-requirements.txt
+
+      - name: check B.4*/B.5 performance gates
+        run: uv run --project plugins/python --extra dev python scripts/check-b4-gate-result.py --run-b5-smoke
 
       - name: ruff check
-        run: ruff check plugins/python
+        run: uv run --project plugins/python --extra dev ruff check plugins/python
 
       - name: ruff format check
-        run: ruff format --check plugins/python
+        run: uv run --project plugins/python --extra dev ruff format --check plugins/python
 
       - name: mypy
-        run: mypy --strict plugins/python
+        run: uv run --project plugins/python --extra dev mypy --strict plugins/python
 
       - name: pytest
-        run: pytest plugins/python
+        run: uv run --project plugins/python --extra dev pytest plugins/python
 
   walking-skeleton:
     name: Sprint 1 walking skeleton (end-to-end)

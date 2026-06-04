@@ -12,7 +12,7 @@ use clarion_core::{
     RecordingProvider, build_inferred_calls_prompt, build_leaf_summary_prompt,
 };
 use clarion_mcp::{
-    DiagnosticsContext, LlmDiagnostics, ServerState,
+    DiagnosticsContext, LlmDiagnostics, McpToolPolicy, ServerState,
     config::{FiligreeConfig, LlmConfig, LlmProviderKind},
     filigree::{
         EntityAssociation, EntityAssociationsResponse, FiligreeClientError, FiligreeLookup,
@@ -388,6 +388,7 @@ fn state_for_summary(
 ) -> ServerState {
     let pool = ReaderPool::open(db_path, 2).expect("reader pool");
     ServerState::new(project_root.to_path_buf(), pool)
+        .with_tool_policy(McpToolPolicy::allow_write_tools())
         .with_summary_llm(writer.sender(), config, provider)
         .with_clock(|| "2026-05-17T00:00:02.000Z".to_owned())
 }
@@ -398,7 +399,9 @@ fn state_for_filigree(
     client: Arc<dyn FiligreeLookup>,
 ) -> ServerState {
     let pool = ReaderPool::open(db_path, 2).expect("reader pool");
-    ServerState::new(project_root.to_path_buf(), pool).with_filigree_client(client)
+    ServerState::new(project_root.to_path_buf(), pool)
+        .with_tool_policy(McpToolPolicy::allow_write_tools())
+        .with_filigree_client(client)
 }
 
 fn expected_summary_request(project_root: &std::path::Path, entity_id: &str) -> LlmRequest {
@@ -1427,7 +1430,8 @@ async fn issues_for_stops_filigree_calls_after_issue_cap() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn summary_returns_disabled_when_cache_empty_and_llm_off() {
     let (project, db_path) = open_project();
-    let state = state_for(project.path(), &db_path);
+    let state =
+        state_for(project.path(), &db_path).with_tool_policy(McpToolPolicy::allow_write_tools());
 
     let envelope = call_tool(
         &state,
@@ -4399,6 +4403,11 @@ async fn index_diff_is_reachable_over_mcp_and_reports_freshness() {
             "completed",
             Some("2999-01-01T00:00:05.000Z"),
         );
+        conn.execute(
+            "UPDATE runs SET analyzed_at_commit = ?1 WHERE id = 'run-fresh'",
+            params!["abc123fresh"],
+        )
+        .expect("set analyzed commit");
     }
     let state = state_for(project.path(), &db_path);
 
@@ -4408,8 +4417,7 @@ async fn index_diff_is_reachable_over_mcp_and_reports_freshness() {
     let result = &envelope["result"];
     assert_eq!(result["overall"], "fresh");
     assert_eq!(result["drift_detected"], false);
-    // analyzed_commit is null by design; the git block is always present.
-    assert_eq!(result["analyzed_commit"], Value::Null);
+    assert_eq!(result["analyzed_commit"], "abc123fresh");
     assert!(result["git"]["available"].is_boolean());
     assert_eq!(result["analyzed_at"], "2999-01-01T00:00:05.000Z");
     assert_eq!(
@@ -4509,6 +4517,11 @@ async fn project_status_reports_counts_latest_run_and_plugins() {
         "completed",
         Some("2026-02-02T00:00:00.000Z"),
     );
+    conn.execute(
+        "UPDATE runs SET analyzed_at_commit = ?1 WHERE id = 'run-1'",
+        params!["abc123status"],
+    )
+    .expect("set analyzed commit");
     insert_finding(&conn, "f-1", "run-1", "python:function:demo.entry");
     // One entity withheld from briefings (secret scan set briefing_blocked).
     conn.execute(
@@ -4544,6 +4557,7 @@ async fn project_status_reports_counts_latest_run_and_plugins() {
         result["latest_run"]["completed_at"],
         "2026-02-02T00:00:00.000Z"
     );
+    assert_eq!(result["latest_run"]["analyzed_at_commit"], "abc123status");
     assert_eq!(result["last_analyzed_at"], "2026-02-02T00:00:00.000Z");
 
     let plugin_ids: Vec<&str> = result["plugins"]
@@ -4560,8 +4574,7 @@ async fn project_status_reports_counts_latest_run_and_plugins() {
             .unwrap()
             .ends_with(".clarion/clarion.db")
     );
-    // No analyze-time git SHA is persisted; reported as null, not fabricated.
-    assert_eq!(result["git_sha"], Value::Null);
+    assert_eq!(result["git_sha"], "abc123status");
     // A bare ServerState carries no diagnostics context.
     assert_eq!(result["llm"], Value::Null);
     assert_eq!(result["filigree"], Value::Null);
@@ -4589,7 +4602,7 @@ async fn project_status_marks_skipped_no_plugins_run() {
 }
 
 #[tokio::test]
-async fn project_status_marks_stale_running_run_failed() {
+async fn project_status_does_not_mutate_stale_running_run() {
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).expect("open sqlite");
     conn.execute(
@@ -4609,15 +4622,10 @@ async fn project_status_marks_stale_running_run_failed() {
     assert_eq!(envelope["ok"], true, "{envelope}");
     let latest = &envelope["result"]["latest_run"];
     assert_eq!(latest["id"], "run-stale");
-    assert_eq!(latest["status"], "failed");
-    assert_eq!(latest["owner_pid"], Value::Null);
+    assert_eq!(latest["status"], "running");
+    assert_eq!(latest["owner_pid"], 999_999);
     assert_eq!(latest["heartbeat_at"], "2000-01-01T00:00:00.000Z");
-    assert!(
-        latest["completed_at"]
-            .as_str()
-            .is_some_and(|value| value.ends_with('Z')),
-        "completed_at should be recorded on stale-run repair: {latest}"
-    );
+    assert_eq!(latest["completed_at"], Value::Null);
 
     let conn = Connection::open(&db_path).expect("reopen sqlite");
     let (run_status, completed_at, run_owner_pid, stats_json): (
@@ -4631,15 +4639,12 @@ async fn project_status_marks_stale_running_run_failed() {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
-        .expect("read repaired run");
-    assert_eq!(run_status, "failed");
-    assert!(completed_at.is_some());
-    assert_eq!(run_owner_pid, None);
+        .expect("read run");
+    assert_eq!(run_status, "running");
+    assert_eq!(completed_at, None);
+    assert_eq!(run_owner_pid, Some(999_999));
     let repair_stats: Value = serde_json::from_str(&stats_json).expect("stats json");
-    assert_eq!(
-        repair_stats["failure_reason"],
-        "analyze run abandoned: stale heartbeat"
-    );
+    assert_eq!(repair_stats, json!({}));
 }
 
 #[tokio::test]
