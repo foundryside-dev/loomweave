@@ -63,6 +63,8 @@ pub struct EntityRecord {
     pub source_line_end: Option<i64>,
     /// JSON string; writer inserts verbatim.
     pub properties_json: String,
+    /// Plugin-emitted categorisation tags to denormalise into `entity_tags`.
+    pub tags: Vec<String>,
     pub content_hash: Option<String>,
     pub summary_json: Option<String>,
     pub wardline_json: Option<String>,

@@ -522,6 +522,332 @@ analysis:
     )
 }
 
+#[cfg(unix)]
+const CATEGORISED_PLUGIN_SCRIPT: &str = r#"#!/usr/bin/python3
+import json
+import sys
+
+
+def read_frame():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if line in (b"", b"\r\n"):
+            break
+        name, value = line.decode("ascii").strip().split(":", 1)
+        headers[name.lower()] = value.strip()
+    length = int(headers["content-length"])
+    return json.loads(sys.stdin.buffer.read(length))
+
+
+def write_frame(message):
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n")
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+
+while True:
+    msg = read_frame()
+    method = msg.get("method")
+    if method == "initialized":
+        continue
+    if method == "exit":
+        raise SystemExit(0)
+    ident = msg["id"]
+    if method == "initialize":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "name": "clarion-plugin-categorised",
+                "version": "0.1.0",
+                "ontology_version": "0.1.0",
+                "capabilities": {},
+            },
+        })
+    elif method == "analyze_file":
+        path = msg["params"]["file_path"]
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "entities": [
+                    {
+                        "id": "catfixture:module:app",
+                        "kind": "module",
+                        "qualified_name": "app",
+                        "source": {
+                            "file_path": path,
+                            "source_range": {
+                                "start_line": 1,
+                                "start_col": 0,
+                                "end_line": 3,
+                                "end_col": 0
+                            },
+                        },
+                    },
+                    {
+                        "id": "catfixture:function:app.main",
+                        "kind": "function",
+                        "qualified_name": "app.main",
+                        "source": {
+                            "file_path": path,
+                            "source_range": {
+                                "start_line": 1,
+                                "start_col": 0,
+                                "end_line": 2,
+                                "end_col": 8
+                            },
+                        },
+                        "parent_id": "catfixture:module:app",
+                        "tags": ["entry-point"],
+                        "docstring": "Launches service",
+                    },
+                ],
+                "edges": [
+                    {
+                        "kind": "contains",
+                        "from_id": "catfixture:module:app",
+                        "to_id": "catfixture:function:app.main",
+                    }
+                ],
+                "stats": {},
+            },
+        })
+    elif method == "shutdown":
+        write_frame({"jsonrpc": "2.0", "id": ident, "result": {}})
+"#;
+
+#[cfg(unix)]
+const CATEGORISED_PLUGIN_MANIFEST: &str = r#"
+[plugin]
+name = "clarion-plugin-categorised"
+plugin_id = "catfixture"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "clarion-plugin-categorised"
+language = "catfixture"
+extensions = ["cat"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 128
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+entity_kinds = ["module", "function"]
+edge_kinds = ["contains"]
+rule_id_prefix = "CLA-CAT-"
+ontology_version = "0.1.0"
+"#;
+
+#[cfg(unix)]
+fn write_categorised_plugin(plugin_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let plugin_script = plugin_dir.join("clarion-plugin-categorised");
+    std::fs::write(&plugin_script, CATEGORISED_PLUGIN_SCRIPT)
+        .expect("write categorised plugin script");
+    let mut perms = std::fs::metadata(&plugin_script)
+        .expect("stat categorised plugin")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&plugin_script, perms).expect("chmod categorised plugin");
+
+    std::fs::write(plugin_dir.join("plugin.toml"), CATEGORISED_PLUGIN_MANIFEST)
+        .expect("write categorised plugin manifest");
+}
+
+#[cfg(unix)]
+fn spawn_embedding_mock() -> (String, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let mut header_end = None;
+        while header_end.is_none() {
+            let read = stream.read(&mut chunk).expect("read headers");
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            header_end = buffer
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|i| i + 4);
+        }
+        let Some(header_end) = header_end else {
+            return String::from_utf8_lossy(&buffer).into_owned();
+        };
+        let headers = String::from_utf8_lossy(&buffer[..header_end]).to_ascii_lowercase();
+        let content_length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while buffer.len().saturating_sub(header_end) < content_length {
+            let read = stream.read(&mut chunk).expect("read body");
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding mock");
+    let addr = listener.local_addr().expect("mock addr");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking embedding mock");
+    let handle = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut requests = Vec::new();
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let request = read_http_request(&mut stream);
+                    let body = request.split("\r\n\r\n").nth(1).unwrap_or("{}");
+                    let payload: serde_json::Value =
+                        serde_json::from_str(body).expect("embedding request json");
+                    let count = payload["input"].as_array().map_or(0, Vec::len);
+                    let data: Vec<serde_json::Value> = (0..count)
+                        .map(|index| {
+                            let first_dim =
+                                f64::from(u32::try_from(index + 1).expect("fixture index fits"));
+                            serde_json::json!({
+                                "object": "embedding",
+                                "index": index,
+                                "embedding": [first_dim, 1.0],
+                            })
+                        })
+                        .collect();
+                    let response = serde_json::json!({
+                        "object": "list",
+                        "data": data,
+                        "model": "test-embed",
+                    })
+                    .to_string();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        response.len(),
+                        response
+                    )
+                    .expect("write embedding response");
+                    requests.push(request);
+                    return requests;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(err) => panic!("embedding mock accept failed: {err}"),
+            }
+        }
+        requests
+    });
+    (format!("http://{addr}"), handle)
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_persists_plugin_tags_and_populates_embedding_sidecar() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_categorised_plugin(plugin_dir.path());
+    let (embedding_url, embedding_server) = spawn_embedding_mock();
+
+    clarion_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    std::fs::write(
+        project_dir.path().join("app.cat"),
+        "def main():\n    pass\n",
+    )
+    .expect("write categorised fixture source");
+    let config_path = project_dir.path().join("clarion.yaml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r"
+semantic_search:
+  enabled: true
+  allow_live_provider: true
+  endpoint_url: {embedding_url}
+  model_id: test-embed
+  dimensions: 2
+  api_key_env: TEST_EMBEDDING_KEY
+  timeout_seconds: 2
+  session_token_ceiling: 10000
+"
+        ),
+    )
+    .expect("write semantic search config");
+
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    clarion_bin()
+        .args(["analyze", "--config"])
+        .arg(&config_path)
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("TEST_EMBEDDING_KEY", "test-key")
+        .assert()
+        .success();
+
+    let requests = embedding_server.join().expect("embedding mock thread");
+    assert_eq!(
+        requests.len(),
+        1,
+        "analyze should call the embedding provider"
+    );
+    assert!(
+        requests[0].contains("Launches service"),
+        "embedding text should include plugin docstring; request was {}",
+        requests[0]
+    );
+
+    let conn = Connection::open(project_dir.path().join(".clarion/clarion.db")).unwrap();
+    let tag_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entity_tags \
+             WHERE entity_id = 'catfixture:function:app.main' \
+               AND plugin_id = 'catfixture' \
+               AND tag = 'entry-point'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query persisted tags");
+    assert_eq!(tag_count, 1, "plugin-emitted tags must be persisted");
+
+    let sidecar = project_dir.path().join(".clarion/embeddings.db");
+    assert!(sidecar.exists(), "analyze should create embeddings sidecar");
+    let sidecar_conn = Connection::open(sidecar).unwrap();
+    let embedding_count: i64 = sidecar_conn
+        .query_row(
+            "SELECT COUNT(*) FROM entity_embeddings \
+             WHERE entity_id = 'catfixture:function:app.main' \
+               AND model_id = 'test-embed'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sidecar embeddings");
+    assert_eq!(
+        embedding_count, 1,
+        "function embedding should be present after analyze"
+    );
+}
+
 #[test]
 fn analyze_without_plugins_writes_skipped_run_row() {
     let dir = tempfile::tempdir().unwrap();

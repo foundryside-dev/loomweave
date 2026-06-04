@@ -144,6 +144,11 @@ pub struct RawEntity {
     /// load-bearing identity input a string-key typo must not silently drop.
     #[serde(default)]
     pub signature: Option<serde_json::Value>,
+    /// Plugin-emitted categorisation tags for catalogue shortcuts and `WS5b`
+    /// reachability roots. Typed top-level because the core denormalises these
+    /// into `entity_tags`; default empty keeps the wire addition non-breaking.
+    #[serde(default)]
+    pub tags: Vec<String>,
     /// Extra fields — accepted without interpretation.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -257,6 +262,12 @@ fn oversize_field(raw: &RawEntity) -> Option<(&'static str, usize)> {
         let len = serde_json::to_vec(map).map_or(0, |b| b.len());
         if len > MAX_ENTITY_EXTRA_BYTES {
             return Some((name, len));
+        }
+    }
+    if !raw.tags.is_empty() {
+        let len = serde_json::to_vec(&raw.tags).map_or(0, |b| b.len());
+        if len > MAX_ENTITY_EXTRA_BYTES {
+            return Some(("tags", len));
         }
     }
 

@@ -66,6 +66,7 @@ fn make_entity(id: &str) -> EntityRecord {
         source_line_start: None,
         source_line_end: None,
         properties_json: "{}".to_owned(),
+        tags: Vec::new(),
         content_hash: None,
         summary_json: None,
         wardline_json: None,
@@ -623,6 +624,66 @@ async fn round_trip_insert_persists_entity() {
         .await
         .unwrap();
     assert_eq!(kind, "function");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn insert_entity_replaces_entity_tags_for_same_plugin_entity() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-tags").await;
+    let mut first = make_entity("python:function:demo.hello");
+    first.tags = vec!["entry-point".to_owned(), "test".to_owned()];
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(first),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    let mut second = make_entity("python:function:demo.hello");
+    second.tags = vec!["http-route".to_owned()];
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(second),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-tags".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let conn = Connection::open(path).unwrap();
+    let tags: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT tag FROM entity_tags \
+                 WHERE entity_id = ?1 AND plugin_id = ?2 \
+                 ORDER BY tag",
+            )
+            .unwrap();
+        stmt.query_map(
+            rusqlite::params!["python:function:demo.hello", "python"],
+            |row| row.get(0),
+        )
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    };
+    assert_eq!(tags, vec!["http-route".to_owned()]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -269,7 +269,7 @@ fn supervise_stdio_with_http(
 /// `None` (honest degrade — the tool reports "not enabled") when semantic search
 /// is disabled, or when it is enabled but live access is not opted in / no API
 /// key is present. A genuine misconfiguration (e.g. zero dimensions) fails fast.
-fn build_embedding_provider(
+pub(crate) fn build_embedding_provider(
     config: &SemanticSearchConfig,
     read_env: impl Fn(&str) -> Option<String>,
 ) -> Result<Option<Arc<dyn EmbeddingProvider>>> {

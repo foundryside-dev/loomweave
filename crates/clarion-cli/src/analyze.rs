@@ -23,19 +23,19 @@ use uuid::Uuid;
 
 use clarion_core::{
     AcceptedEdge, AcceptedEntity, AnalyzeFileOutcome, CrashLoopBreaker, CrashLoopState,
-    DiscoveredPlugin, FINDING_DISABLED_CRASH_LOOP, HostError, HostFinding, UnresolvedCallSite,
-    discover,
+    DiscoveredPlugin, EmbeddingProvider, FINDING_DISABLED_CRASH_LOOP, HostError, HostFinding,
+    UnresolvedCallSite, discover,
 };
 use clarion_storage::{
-    DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, GitRename, NewEntityDescriptor, PriorIndexEntry,
-    SeiBindingRecord, SeiDecision, SeiLineageEntry, UnresolvedCallSiteRecord, Writer,
-    alive_bindings_snapshot,
+    DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, EmbeddingKey, EmbeddingStore, GitRename,
+    NewEntityDescriptor, PriorIndexEntry, SeiBindingRecord, SeiDecision, SeiLineageEntry,
+    UnresolvedCallSiteRecord, Writer, alive_bindings_snapshot,
     commands::{EdgeConfidence, EdgeRecord, EntityRecord, FindingRecord, RunStatus, WriterCmd},
     mint_sei, module_dependency_edges, orphaned_bindings, prior_analyzed_commit, rebind_or_mint,
     sei::{BindingStatus, LineageEvent},
 };
 
-use clarion_federation::config::{FiligreeConfig, McpConfig};
+use clarion_federation::config::{FiligreeConfig, McpConfig, SemanticSearchConfig};
 use clarion_federation::filigree::FiligreeHttpClient;
 use clarion_federation::filigree_url::resolve_filigree_url;
 use clarion_federation::scan_results::{
@@ -62,6 +62,7 @@ const GUIDANCE_ORPHAN_RULE_ID: &str = "CLA-FACT-GUIDANCE-ORPHAN";
 /// Mirrors detailed-design §11's `file_analyzed` backpressure cap.
 const PLUGIN_FILE_BATCH_CHANNEL_CAPACITY: usize = 100;
 const PROGRESS_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const SEMANTIC_EMBEDDING_BATCH_SIZE: usize = 64;
 type DescribedEdgeRecord = (String, EdgeRecord);
 
 /// REQ-GUIDANCE-05 (WS6 T4a): a guidance sheet whose `expires` instant is in the
@@ -1329,6 +1330,41 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     "Wardline-derived guidance skipped (run already committed successfully)"
                 ),
             }
+            let mcp_config = load_mcp_config(&project_root, options.config_path.as_deref());
+            match crate::serve::build_embedding_provider(&mcp_config.semantic_search, |name| {
+                std::env::var(name).ok()
+            }) {
+                Ok(Some(provider)) => match populate_semantic_embeddings(
+                    &project_root,
+                    &db_path,
+                    &mcp_config.semantic_search,
+                    provider,
+                )
+                .await
+                {
+                    Ok(stats) if stats.embedded > 0 || stats.skipped_fresh > 0 => tracing::info!(
+                        run_id = %run_id,
+                        model_id = %stats.model_id,
+                        considered = stats.considered,
+                        skipped_fresh = stats.skipped_fresh,
+                        embedded = stats.embedded,
+                        tokens_input = stats.tokens_input,
+                        "semantic embedding population complete"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        run_id = %run_id,
+                        error = %e,
+                        "semantic embedding population skipped (run already committed successfully)"
+                    ),
+                },
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    run_id = %run_id,
+                    error = %e,
+                    "semantic embedding provider unavailable (run already committed successfully)"
+                ),
+            }
             // REQ-GUIDANCE-05 (WS6 T4a): guidance-staleness findings (EXPIRED +
             // CHURN-STALE). Runs on EVERY analyze, deliberately OUTSIDE the SEI
             // `if no_sei { … } else { … }` block above and independent of any
@@ -2571,6 +2607,7 @@ async fn run_phase3_clustering(
             source_line_start: None,
             source_line_end: None,
             properties_json,
+            tags: Vec::new(),
             content_hash: None,
             summary_json: None,
             wardline_json: None,
@@ -2856,6 +2893,7 @@ async fn ensure_project_anchor(
         source_line_start: None,
         source_line_end: None,
         properties_json: properties,
+        tags: Vec::new(),
         content_hash: None,
         summary_json: None,
         wardline_json: None,
@@ -3047,6 +3085,185 @@ pub(crate) fn load_mcp_config(project_root: &Path, config_path: Option<&Path>) -
         );
         McpConfig::default()
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SemanticEmbeddingStats {
+    considered: u64,
+    skipped_fresh: u64,
+    embedded: u64,
+    tokens_input: u64,
+    model_id: String,
+}
+
+#[derive(Debug)]
+struct SemanticEmbeddingCandidate {
+    entity_id: String,
+    content_hash: String,
+    text: String,
+}
+
+async fn populate_semantic_embeddings(
+    project_root: &Path,
+    db_path: &Path,
+    config: &SemanticSearchConfig,
+    provider: Arc<dyn EmbeddingProvider>,
+) -> Result<SemanticEmbeddingStats> {
+    let model_id = provider.model_id().to_owned();
+    let mut stats = SemanticEmbeddingStats {
+        considered: 0,
+        skipped_fresh: 0,
+        embedded: 0,
+        tokens_input: 0,
+        model_id: model_id.clone(),
+    };
+    if !config.enabled {
+        return Ok(stats);
+    }
+
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("open Clarion database {}", db_path.display()))?;
+    let store = EmbeddingStore::open_in_clarion_dir(project_root)
+        .map_err(|err| anyhow::anyhow!("{err}"))
+        .context("open semantic embedding sidecar")?;
+    let pending = semantic_embedding_candidates(&conn, &store, &model_id, &mut stats)?;
+    if pending.is_empty() {
+        return Ok(stats);
+    }
+
+    let token_estimates: Vec<u32> = pending
+        .iter()
+        .map(|candidate| {
+            u32::try_from(provider.estimate_tokens(std::slice::from_ref(&candidate.text)))
+                .unwrap_or(u32::MAX)
+        })
+        .collect();
+    stats.tokens_input = token_estimates
+        .iter()
+        .map(|tokens| u64::from(*tokens))
+        .sum();
+    if stats.tokens_input > config.session_token_ceiling {
+        bail!(
+            "semantic embedding token estimate {} exceeds semantic_search.session_token_ceiling {}",
+            stats.tokens_input,
+            config.session_token_ceiling
+        );
+    }
+
+    let now = iso8601_now();
+    for (batch_index, batch) in pending.chunks(SEMANTIC_EMBEDDING_BATCH_SIZE).enumerate() {
+        let texts: Vec<String> = batch
+            .iter()
+            .map(|candidate| candidate.text.clone())
+            .collect();
+        let vectors = provider
+            .embed(&texts)
+            .await
+            .with_context(|| format!("embed {} semantic candidate(s)", texts.len()))?;
+        if vectors.len() != batch.len() {
+            bail!(
+                "embedding provider returned {} vectors for {} semantic candidate(s)",
+                vectors.len(),
+                batch.len()
+            );
+        }
+        for (local_index, (candidate, vector)) in batch.iter().zip(vectors.iter()).enumerate() {
+            if vector.len() != provider.dimensions() {
+                bail!(
+                    "embedding provider returned {} dims for {}; expected {}",
+                    vector.len(),
+                    candidate.entity_id,
+                    provider.dimensions()
+                );
+            }
+            let token_index = batch_index * SEMANTIC_EMBEDDING_BATCH_SIZE + local_index;
+            store
+                .upsert(
+                    &EmbeddingKey {
+                        entity_id: candidate.entity_id.clone(),
+                        content_hash: candidate.content_hash.clone(),
+                        model_id: model_id.clone(),
+                    },
+                    vector,
+                    0.0,
+                    token_estimates[token_index],
+                    &now,
+                )
+                .map_err(|err| anyhow::anyhow!("{err}"))
+                .with_context(|| {
+                    format!("persist semantic embedding for {}", candidate.entity_id)
+                })?;
+            stats.embedded += 1;
+        }
+    }
+
+    Ok(stats)
+}
+
+fn semantic_embedding_candidates(
+    conn: &Connection,
+    store: &EmbeddingStore,
+    model_id: &str,
+    stats: &mut SemanticEmbeddingStats,
+) -> Result<Vec<SemanticEmbeddingCandidate>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, short_name, properties, content_hash \
+             FROM entities \
+             WHERE content_hash IS NOT NULL \
+               AND briefing_blocked IS NULL \
+             ORDER BY id",
+        )
+        .context("query semantic embedding candidates")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .context("read semantic embedding candidates")?;
+
+    let mut pending = Vec::new();
+    for row in rows {
+        let (entity_id, name, short_name, properties_json, content_hash) =
+            row.context("read semantic embedding candidate")?;
+        stats.considered += 1;
+        let fresh = store
+            .get_vector(&entity_id, &content_hash, model_id)
+            .map_err(|err| anyhow::anyhow!("{err}"))
+            .with_context(|| format!("check semantic embedding freshness for {entity_id}"))?;
+        if fresh.is_some() {
+            stats.skipped_fresh += 1;
+            continue;
+        }
+        pending.push(SemanticEmbeddingCandidate {
+            entity_id,
+            content_hash,
+            text: semantic_embedding_text(&short_name, &name, &properties_json),
+        });
+    }
+    Ok(pending)
+}
+
+fn semantic_embedding_text(short_name: &str, name: &str, properties_json: &str) -> String {
+    if let Ok(properties) = serde_json::from_str::<serde_json::Value>(properties_json)
+        && let Some(docstring) = properties
+            .get("docstring")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|docstring| !docstring.is_empty())
+    {
+        return format!("{short_name}\n{docstring}");
+    }
+    if name == short_name {
+        short_name.to_owned()
+    } else {
+        format!("{short_name}\n{name}")
+    }
 }
 
 /// Phase 8 (WP9-B, REQ-FINDING-03): POST this run's persisted findings to
@@ -4346,6 +4563,7 @@ fn core_file_entity_record(
             source_line_start: None,
             source_line_end: None,
             properties_json,
+            tags: Vec::new(),
             content_hash: Some(content_hash),
             summary_json: None,
             wardline_json: None,
@@ -4420,6 +4638,7 @@ fn map_entity_to_record(
         source_line_start: source_line_range.map(|range| range.start_line),
         source_line_end: source_line_range.map(|range| range.end_line),
         properties_json,
+        tags: normalised_entity_tags(&entity.raw.tags),
         content_hash: content_hash_for_entity(project_root, entity, source_line_range),
         summary_json: None,
         wardline_json: None,
@@ -4428,6 +4647,16 @@ fn map_entity_to_record(
         created_at: now.clone(),
         updated_at: now,
     }
+}
+
+fn normalised_entity_tags(tags: &[String]) -> Vec<String> {
+    tags.iter()
+        .map(|tag| tag.trim())
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5126,6 +5355,7 @@ mod tests {
                 source_line_start: None,
                 source_line_end: None,
                 properties_json: "{}".to_owned(),
+                tags: Vec::new(),
                 content_hash: None,
                 summary_json: None,
                 wardline_json: None,
@@ -5152,6 +5382,7 @@ mod tests {
             source_line_start: None,
             source_line_end: None,
             properties_json: properties_json.to_owned(),
+            tags: Vec::new(),
             content_hash: None,
             summary_json: None,
             wardline_json: None,
@@ -5487,6 +5718,11 @@ mod tests {
                 signature: Some(
                     serde_json::json!({"v": 1, "params": ["x: int"], "return_ann": "bool"}),
                 ),
+                tags: vec![
+                    "entry-point".to_owned(),
+                    "entry-point".to_owned(),
+                    " ".to_owned(),
+                ],
                 extra: serde_json::Map::new(),
             },
         };
@@ -5505,6 +5741,7 @@ mod tests {
         assert_eq!(record.source_file_id.as_deref(), Some("core:file:demo.py"));
         assert_eq!(record.source_line_start, Some(1));
         assert_eq!(record.source_line_end, Some(2));
+        assert_eq!(record.tags, vec!["entry-point".to_owned()]);
         let expected_hash = blake3::hash("def hello():\n    return 'hé'".as_bytes())
             .to_hex()
             .to_string();
@@ -5527,6 +5764,7 @@ mod tests {
             source_line_start: Some(1),
             source_line_end: Some(3),
             properties_json: "{}".to_owned(),
+            tags: Vec::new(),
             content_hash: Some("hash-python:function:demo.caller".to_owned()),
             summary_json: None,
             wardline_json: None,
@@ -5596,6 +5834,7 @@ mod tests {
             source_line_start: Some(1),
             source_line_end: Some(3),
             properties_json: "{}".to_owned(),
+            tags: Vec::new(),
             content_hash: Some("hash-python:function:demo.caller".to_owned()),
             summary_json: None,
             wardline_json: None,
@@ -5614,5 +5853,127 @@ mod tests {
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].caller_entity_id, "python:function:demo.caller");
         assert!(mapped[0].sites.is_empty());
+    }
+
+    #[tokio::test]
+    async fn semantic_embedding_population_skips_fresh_sidecar_rows() {
+        use std::sync::Arc;
+
+        use clarion_core::{EmbeddingProvider, EmbeddingRecording, RecordingEmbeddingProvider};
+        use clarion_federation::config::SemanticSearchConfig;
+        use clarion_storage::{EmbeddingKey, EmbeddingStore, pragma, schema};
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".clarion")).unwrap();
+        let db_path = project.path().join(".clarion/clarion.db");
+        let mut conn = rusqlite::Connection::open(&db_path).unwrap();
+        pragma::apply_write_pragmas(&conn).unwrap();
+        schema::apply_migrations(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO entities \
+                (id, plugin_id, kind, name, short_name, properties, content_hash, created_at, updated_at) \
+             VALUES \
+                ('python:function:demo.fresh', 'python', 'function', 'demo.fresh', 'fresh', \
+                 '{\"docstring\":\"already embedded\"}', 'hash-fresh', 't', 't')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = EmbeddingStore::open_in_clarion_dir(project.path()).unwrap();
+        store
+            .upsert(
+                &EmbeddingKey {
+                    entity_id: "python:function:demo.fresh".to_owned(),
+                    content_hash: "hash-fresh".to_owned(),
+                    model_id: "test-model".to_owned(),
+                },
+                &[1.0, 0.0],
+                0.0,
+                2,
+                "t",
+            )
+            .unwrap();
+        drop(store);
+
+        let provider = Arc::new(RecordingEmbeddingProvider::from_recordings(
+            "test-model",
+            2,
+            Vec::<EmbeddingRecording>::new(),
+        ));
+        let stats = populate_semantic_embeddings(
+            project.path(),
+            &db_path,
+            &SemanticSearchConfig {
+                enabled: true,
+                model_id: "test-model".to_owned(),
+                dimensions: 2,
+                ..SemanticSearchConfig::default()
+            },
+            provider.clone() as Arc<dyn EmbeddingProvider>,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.considered, 1);
+        assert_eq!(stats.skipped_fresh, 1);
+        assert_eq!(stats.embedded, 0);
+        assert!(
+            provider.invocations().is_empty(),
+            "fresh sidecar rows must not be re-embedded"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_embedding_population_skips_briefing_blocked_entities() {
+        use std::sync::Arc;
+
+        use clarion_core::{EmbeddingProvider, EmbeddingRecording, RecordingEmbeddingProvider};
+        use clarion_federation::config::SemanticSearchConfig;
+        use clarion_storage::{pragma, schema};
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".clarion")).unwrap();
+        let db_path = project.path().join(".clarion/clarion.db");
+        let mut conn = rusqlite::Connection::open(&db_path).unwrap();
+        pragma::apply_write_pragmas(&conn).unwrap();
+        schema::apply_migrations(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO entities \
+                (id, plugin_id, kind, name, short_name, properties, content_hash, created_at, updated_at) \
+             VALUES \
+                ('python:function:demo.secret', 'python', 'function', 'demo.secret', 'secret', \
+                 '{\"docstring\":\"SECRET_TOKEN=abc123\", \"briefing_blocked\":\"secret_present\"}', \
+                 'hash-secret', 't', 't')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let provider = Arc::new(RecordingEmbeddingProvider::from_recordings(
+            "test-model",
+            2,
+            Vec::<EmbeddingRecording>::new(),
+        ));
+        let stats = populate_semantic_embeddings(
+            project.path(),
+            &db_path,
+            &SemanticSearchConfig {
+                enabled: true,
+                model_id: "test-model".to_owned(),
+                dimensions: 2,
+                ..SemanticSearchConfig::default()
+            },
+            provider.clone() as Arc<dyn EmbeddingProvider>,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.considered, 0);
+        assert_eq!(stats.embedded, 0);
+        assert!(
+            provider.invocations().is_empty(),
+            "briefing-blocked docstrings must not be sent to the embedding provider"
+        );
     }
 }

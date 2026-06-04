@@ -175,8 +175,8 @@ the guidance sheet). See `detailed-design.md` §5 for the canonical catalogue.
 
 > **`CLA-FACT-GUIDANCE-CHURN-STALE` is currently inert.** It is emitted only
 > when churn data is available, and the analyze pipeline does not yet populate
-> `git_churn_count` (tracked: clarion-997c93ec4e). In production today it never
-> fires. The other guidance findings are live.
+> `git_churn_count`. In production today it never fires. The other guidance
+> findings are live.
 
 ## Team sharing: export / import (`REQ-GUIDANCE-06`)
 

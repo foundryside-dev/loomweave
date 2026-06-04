@@ -917,6 +917,45 @@ def test_definition_metadata_multiple_decorators_uses_topmost() -> None:
     assert definition["decl_line"] == 5
 
 
+def test_categorisation_tags_and_docstrings_are_emitted() -> None:
+    """WS5b root categorisations are emitted by the Python plugin, not fabricated by MCP."""
+
+    source = """\
+import dataclasses
+from fastapi import APIRouter
+
+router = APIRouter()
+
+@router.get("/health")
+def health():
+    \"\"\"Report service health.\"\"\"
+    return {"ok": True}
+
+def main():
+    return health()
+
+def test_health():
+    assert health()["ok"]
+
+@dataclasses.dataclass
+class Config:
+    retries: int = 3
+"""
+    entities, _ = extract(source, "service.py")
+
+    health = next(e for e in entities if e["id"] == "python:function:service.health")
+    main = next(e for e in entities if e["id"] == "python:function:service.main")
+    test = next(e for e in entities if e["id"] == "python:function:service.test_health")
+    config = next(e for e in entities if e["id"] == "python:class:service.Config")
+
+    assert health["docstring"] == "Report service health."
+    assert "http-route" in health["tags"]
+    assert "framework-handler" in health["tags"]
+    assert "entry-point" in main["tags"]
+    assert "test" in test["tags"]
+    assert "data-model" in config["tags"]
+
+
 def test_module_source_range_no_trailing_newline() -> None:
     """File ending without `\\n` still produces correct end_line.
 

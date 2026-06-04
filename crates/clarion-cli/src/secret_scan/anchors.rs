@@ -121,6 +121,7 @@ async fn upsert_finding_anchor(
         source_line_start: None,
         source_line_end: None,
         properties_json: serde_json::Value::Object(properties).to_string(),
+        tags: Vec::new(),
         content_hash: file_content_hash(&key),
         summary_json: None,
         wardline_json: None,

@@ -561,6 +561,16 @@ fn insert_entity(
             entity.updated_at,
         ],
     )?;
+    conn.execute(
+        "DELETE FROM entity_tags WHERE entity_id = ?1 AND plugin_id = ?2",
+        params![entity.id, entity.plugin_id],
+    )?;
+    for tag in &entity.tags {
+        conn.execute(
+            "INSERT OR IGNORE INTO entity_tags (entity_id, plugin_id, tag) VALUES (?1, ?2, ?3)",
+            params![entity.id, entity.plugin_id, tag],
+        )?;
+    }
     bump_writes_and_maybe_commit(conn, state, commits_observed)?;
     Ok(())
 }

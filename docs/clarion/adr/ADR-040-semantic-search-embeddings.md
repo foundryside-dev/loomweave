@@ -38,12 +38,13 @@ Ship `search_semantic` as an opt-in tool behind the `EmbeddingProvider` trait, w
 - The API-endpoint default requires an external embedding service + key when enabled; the local-model alternative (no network) is not yet shipped.
 - Two storage files (`clarion.db` + `embeddings.db`) to manage operationally; the sidecar is rebuildable, so loss is non-fatal.
 
-## Status of delivery (2026-06-02)
+## Status of delivery (2026-06-04)
 
-Shipped and tested at acceptance: the `EmbeddingProvider` trait + `RecordingEmbeddingProvider` + `ApiEmbeddingProvider` (clarion-core), `semantic_search:` config (off by default), the `.clarion/embeddings.db` sidecar (`clarion-storage::embeddings`), the `search_semantic` MCP tool (honest-degrade + bounded cosine + content-hash freshness), `serve` provider construction (`build_embedding_provider` → `with_semantic_search`), the gitignore entry, and this ADR. The read + enable path is complete; the sidecar is populated directly in tests to prove the search path.
+Shipped and tested at acceptance: the `EmbeddingProvider` trait + `RecordingEmbeddingProvider` + `ApiEmbeddingProvider` (clarion-core), `semantic_search:` config (off by default), the `.clarion/embeddings.db` sidecar (`clarion-storage::embeddings`), the `search_semantic` MCP tool (honest-degrade + bounded cosine + content-hash freshness), `serve` provider construction (`build_embedding_provider` → `with_semantic_search`), the gitignore entry, and this ADR. The read + enable path is complete.
+
+Delivery update: `clarion analyze` now runs an opt-in post-commit embedding population pass when `semantic_search.enabled` has a configured provider. It embeds content-hashed entities into `.clarion/embeddings.db`, skips fresh `(entity_id, content_hash, model_id)` rows, and enforces `semantic_search.session_token_ceiling`.
 
 ## Follow-up
 
-- **Analyze-time embedding population** — the write path that fills the sidecar during `clarion analyze` so the tool has data on a real project. Carries a design decision the original plan did not anticipate: summaries are on-demand (ADR-030), so there is no summary text at analyze time; the recommended text to embed is `short_name + docstring`. Cost folds into the policy-engine budget. **Tracked: `clarion-610743d7bc`.** Until it lands, `search_semantic` works but returns an empty ranked set on a freshly-analyzed real project (the sidecar is unpopulated).
 - **Local-model `EmbeddingProvider`** (`candle`/`ort`) — the no-network alternative behind the same trait.
 - **ANN backend** (sqlite-vec / HNSW) — only if the exact scan misses NFR-PERF-02; logged with that trigger, never silent.

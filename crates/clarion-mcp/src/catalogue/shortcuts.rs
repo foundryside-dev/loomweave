@@ -6,9 +6,9 @@
 //!   and `find_coupling_hotspots`. No analyze-time precompute (ADR-030): each is a
 //!   cheap read over `edges`. Edge-derived, so results declare a confidence tier
 //!   (ADR-028), default `>= resolved`.
-//! - **Honest-empty categorisation/churn shortcuts** (Task 4) — added alongside,
-//!   each reading an existing signal (categorisation tag / git churn) and returning
-//!   an honest empty result with a missing-signal note where the signal is absent.
+//! - **Categorisation/churn shortcuts** (Task 4) — added alongside, each reading
+//!   an existing signal (categorisation tag / git churn) and returning an honest
+//!   empty result with a missing-signal note where the signal is absent.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -33,9 +33,9 @@ const EDGE_SCAN_ORDER_BY: &str = "ORDER BY kind, from_id, to_id, confidence, \
      COALESCE(source_byte_start, -1), COALESCE(source_byte_end, -1)";
 
 /// Categorisation tags whose union is the reachability root set for
-/// `find_dead_code` — entities "called from outside" the codebase. None are
-/// emitted by the active plugins today (the tag-emission pipeline is tracked
-/// follow-up work), so the empty-root guard fires in practice.
+/// `find_dead_code` — entities "called from outside" the codebase. Tag-emitting
+/// plugins populate these; the empty-root guard protects indexes with no root
+/// tags from a flood of false positives.
 const DEAD_CODE_ROOT_TAGS: &[&str] = &[
     "entry-point",
     "http-route",
@@ -301,7 +301,7 @@ impl ServerState {
                 let filter = scope.resolve(conn)?;
                 let (in_scope, scope_truncated) = filter.in_scope_ids(conn, &project_root)?;
 
-                // Roots = "called from outside" categorisations. Absent today.
+                // Roots = "called from outside" categorisations.
                 let roots = ids_with_any_tag(conn, DEAD_CODE_ROOT_TAGS)?;
                 if roots.is_empty() {
                     return Ok(success_envelope(json!({
@@ -314,10 +314,9 @@ impl ServerState {
                         "scan_truncated": false,
                         "signal": missing_signal(
                             "entity_tags",
-                            "reachability roots are not emitted by the active plugins \
-                             (entry-point / http-route / test / data-model / cli-command / \
-                             exported-api categorisation tags are absent), so dead code cannot be \
-                             determined — this is NOT a guarantee there is no dead code",
+                            "this index has no reachability root tags (entry-point / http-route / \
+                             test / data-model / cli-command / exported-api), so dead code cannot \
+                             be determined — this is NOT a guarantee there is no dead code",
                         ),
                     })));
                 }
@@ -403,8 +402,8 @@ impl ServerState {
         self.categorisation_shortcut(
             arguments,
             "entry-point",
-            "no entity is tagged as an entry point; entry-point categorisation is not emitted by \
-             the active plugins (honest-empty, not a guaranteed absence of entry points)",
+            "no entity is tagged as an entry point in this index (honest-empty, not a guaranteed \
+             absence of entry points)",
         )
         .await
     }
@@ -418,8 +417,7 @@ impl ServerState {
         self.categorisation_shortcut(
             arguments,
             "http-route",
-            "no entity is tagged as an HTTP route; route categorisation is not emitted by the \
-             active plugins",
+            "no entity is tagged as an HTTP route in this index",
         )
         .await
     }
@@ -433,8 +431,7 @@ impl ServerState {
         self.categorisation_shortcut(
             arguments,
             "data-model",
-            "no entity is tagged as a data model; data-model categorisation is not emitted by the \
-             active plugins",
+            "no entity is tagged as a data model in this index",
         )
         .await
     }
@@ -448,8 +445,7 @@ impl ServerState {
         self.categorisation_shortcut(
             arguments,
             "test",
-            "no entity is tagged as a test; test categorisation is not emitted by the active \
-             plugins",
+            "no entity is tagged as a test in this index",
         )
         .await
     }
@@ -463,8 +459,7 @@ impl ServerState {
         self.categorisation_shortcut(
             arguments,
             "deprecated",
-            "no entity is tagged as deprecated; deprecation categorisation is not emitted by the \
-             active plugins",
+            "no entity is tagged as deprecated in this index",
         )
         .await
     }
@@ -478,8 +473,7 @@ impl ServerState {
         self.categorisation_shortcut(
             arguments,
             "todo",
-            "no entity is tagged with a TODO/FIXME marker; TODO extraction is not emitted by the \
-             active plugins",
+            "no entity is tagged with a TODO/FIXME marker in this index",
         )
         .await
     }
@@ -563,8 +557,8 @@ impl ServerState {
                         "signal".to_owned(),
                         missing_signal(
                             "entity_tags",
-                            "no test-tagged caller found; test categorisation is not emitted by \
-                             the active plugins, so this is not a guarantee the entity is untested",
+                            "no test-tagged caller found in this index, so this is not a guarantee \
+                             the entity is untested",
                         ),
                     );
                 }
