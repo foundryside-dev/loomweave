@@ -16,7 +16,7 @@ Practical notes for configuring and running Clarion.
 - [Guidance](./guidance.md) — authoring guidance sheets with the `clarion
   guidance` CLI, `--match`/`--scope-level`/`--expires` semantics, staleness
   findings, and the export/import team-sharing workflow.
-- [v1.0 release governance](./v1.0-release-governance.md) — maintainer steps
+- [Release governance](./v1.0-release-governance.md) — maintainer steps
   for GitHub branch/ruleset enforcement, Actions policy, release dry run, and
   final tag gating.
 - [Federation contracts](../federation/contracts.md) — read-side HTTP

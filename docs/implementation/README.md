@@ -1,6 +1,6 @@
 # Implementation Archive
 
-This folder is the consolidated archive of Clarion's implementation and planning history. It is **not** part of the release-facing doc surface — readers entering via [`docs/README.md`](../README.md) and the [Clarion v0.1 docset](../clarion/v0.1/README.md) are not expected to need anything here.
+This folder is the consolidated archive of Clarion's implementation and planning history. It is **not** part of the release-facing doc surface — readers entering via [`docs/README.md`](../README.md) and the [Clarion 1.0 docset](../clarion/1.0/README.md) are not expected to need anything here.
 
 Material is kept rather than deleted because the [ADRs](../clarion/adr/README.md) cite it for historical context (panel reviews, the v0.1 scope-commitment memo, sprint plans, and agent handoffs that motivated specific decisions).
 
@@ -21,7 +21,7 @@ Material is kept rather than deleted because the [ADRs](../clarion/adr/README.md
 
 ## Relationship to release-facing docs
 
-- **Authoritative design**: [`../clarion/v0.1/system-design.md`](../clarion/v0.1/system-design.md) and [`../clarion/v0.1/detailed-design.md`](../clarion/v0.1/detailed-design.md). Each work package under this folder names the sections it implements.
+- **Authoritative design**: [`../clarion/1.0/system-design.md`](../clarion/1.0/system-design.md) and [`../clarion/1.0/detailed-design.md`](../clarion/1.0/detailed-design.md). Each work package under this folder names the sections it implements.
 - **Decisions**: [`../clarion/adr/README.md`](../clarion/adr/README.md). Each work package names the accepted ADRs it depends on and any backlog ADRs it is expected to surface.
 - **Scope and commitments**: [`v0.1-scope-plans/v0.1-scope-commitments.md`](./v0.1-scope-plans/v0.1-scope-commitments.md). That memo locks *what* v0.1 ships; the work-package plans describe *how* the build proceeds.
 

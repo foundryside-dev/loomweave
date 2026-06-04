@@ -46,7 +46,7 @@ This folder is the canonical home for authored Clarion architecture decision rec
 
 ## Backlog still tracked in the detailed design
 
-The following decisions are still backlog items rather than authored ADR files. Their current summaries live in [../v0.1/detailed-design.md](../v0.1/detailed-design.md) §11 and [../v0.1/system-design.md](../v0.1/system-design.md) §12.
+The following decisions are still backlog items rather than authored ADR files. Their current summaries live in [../1.0/detailed-design.md](../1.0/detailed-design.md) §11 and [../1.0/system-design.md](../1.0/system-design.md) §12.
 
 | ADR | Title | Current state |
 |---|---|---|

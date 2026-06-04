@@ -1,17 +1,18 @@
-# Clarion v1.0.0 — Tag-Cut Readiness
+# Clarion v1.0.0 — Tag-Cut Readiness Archive
 
-**Status**: RC1 hardening — `v1.0.0` tag held pending closure of the gap register.
+**Status**: Historical archive. `v1.0.0` was tagged on 2026-05-19, but the
+release did not publish artifacts; `v1.0.1` became the first published build.
 
-This directory holds the canonical pre-tag-cut artifacts for Clarion v1.0.0.
+This directory preserves the canonical pre-tag-cut artifacts for Clarion v1.0.0.
 It supersedes `docs/implementation/v0.1-publish/` (which was renamed in intent
-when the v0.1 → v1.0 rebrand landed but never moved on disk) as the current
-program-of-work surface for the tag.
+when the v0.1 → v1.0 rebrand landed but never moved on disk) for that historical
+tag-cut program.
 
 ## Documents
 
 | File | Purpose |
 |------|---------|
-| [`gap-register.md`](gap-register.md) | Single source of truth for every gap between the current RC1 commit and a defensible `v1.0.0` tag. 24 gaps in 7 categories with evidence, fix, and effort. |
+| [`gap-register.md`](gap-register.md) | Historical source of truth for every gap between the RC1 commit and a defensible `v1.0.0` tag. 24 gaps in 7 categories with evidence, fix, and effort. |
 | [`execution-plan.md`](execution-plan.md) | Day-by-day sequenced execution plan, with parallel-execution markers, operator-vs-engineering split, and the exit criteria for each day. |
 | [`filigree-issue-bodies.md`](filigree-issue-bodies.md) | Pre-drafted bodies for the Filigree issues that track each gap. Reference for issue creation; the live issues are authoritative once created. |
 

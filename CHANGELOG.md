@@ -12,6 +12,15 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+### Changed
+
+- Refreshed release-facing README/index documentation for the current 1.2.0
+  release line, including the 39-tool MCP surface, current install artifact
+  names, fixed ADR/docset links, current web/operator quick starts, and the full
+  end-to-end verification list.
+- Archived tracked architecture-analysis working notes out of live `temp/`
+  directories under `docs/archive/working-notes/`.
+
 ## [1.2.0] — 2026-06-03
 
 ### Added

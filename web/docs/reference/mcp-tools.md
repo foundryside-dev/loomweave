@@ -1,9 +1,10 @@
 # MCP tool reference
 
-The tools below are the eight core consult tools, served by `clarion serve` over
-the MCP stdio transport. Descriptions match the tool docstrings shipped in the
-binary. A live server exposes additional navigation and structural-search tools;
-connect an MCP client and read `tools/list` for the complete, current catalogue.
+The tools below are the core consult tools served by `clarion serve` over the
+MCP stdio transport. The live 1.2.x surface exposes 39 tools, including
+navigation, briefing, source inspection, guidance/finding enrichment, analyze
+lifecycle, freshness, faceted search, and structural shortcuts. Connect an MCP
+client and read `tools/list` for the complete, current catalogue.
 
 !!! note "Default confidence is `resolved`"
     Graph-traversal tools (`callers_of`, `neighborhood`, `execution_paths_from`)
@@ -51,9 +52,9 @@ when an edge-cap or path-cap trims the result.
 ## `summary(id)`
 
 Returns an on-demand, cached one-paragraph summary for one entity, dispatching
-the LLM lazily. In v1.0 this is **leaf scope** — a module summary describes the
-module docstring and top-level members, not an aggregation of contained
-summaries. If the model returns non-JSON, the response degrades to a
+the LLM lazily. A module summary describes the module docstring and top-level
+members, not an aggregation of contained summaries. If the model returns
+non-JSON, the response degrades to a
 deterministic `structural-fallback` summary built from the source, and that
 fallback is cached so a retry is a free cache hit rather than a re-billed
 failure.
@@ -85,3 +86,19 @@ Lists the module entities assigned to a subsystem entity. The reverse lookup —
 "which subsystem does this entity belong to?" — is `subsystem_of(id)`, which
 accepts any entity id and resolves a function or class through its nearest
 containing module.
+
+## Additional catalogue
+
+Use `tools/list` for exact schemas. The remaining tool families include:
+
+- Source and orientation: `source_for_entity`, `call_sites`,
+  `orientation_pack`, `project_status`, `summary_preview_cost`.
+- Guidance and findings: `guidance_for`, `propose_guidance`,
+  `promote_guidance`, `findings_for`, `wardline_for`.
+- Analyze and freshness: `analyze_start`, `analyze_status`,
+  `analyze_cancel`, `index_diff`.
+- Facets and shortcuts: `find_by_tag`, `find_by_kind`, `find_by_wardline`,
+  `find_circular_imports`, `find_coupling_hotspots`, `find_entry_points`,
+  `find_http_routes`, `find_data_models`, `find_tests`, `find_deprecations`,
+  `find_todos`, `what_tests_this`, `high_churn`, `recently_changed`,
+  `find_dead_code`, `search_semantic`.
