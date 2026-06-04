@@ -191,12 +191,8 @@ fn run_mcp_stdio(
     let mut llm_writer = None;
     let mut llm_writer_join = None;
     if let Some(provider) = llm_provider {
-        let (writer, handle) = Writer::spawn(
-            db_path.to_owned(),
-            DEFAULT_BATCH_SIZE,
-            DEFAULT_CHANNEL_CAPACITY,
-        )
-        .map_err(|err| anyhow!("spawn MCP LLM writer for {}: {err}", db_path.display()))?;
+        let (writer, handle) = Writer::spawn(db_path, DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY)
+            .map_err(|err| anyhow!("spawn MCP LLM writer for {}: {err}", db_path.display()))?;
         state = state.with_summary_llm(writer.sender(), llm_config, provider);
         llm_writer = Some(writer);
         llm_writer_join = Some(handle);
