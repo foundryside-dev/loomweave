@@ -361,10 +361,10 @@ pub(crate) async fn respond_taint_facts(
                 .filter_map(|(_, r)| r.entity_id().map(str::to_owned))
                 .collect();
             let rows = loomweave_storage::get_taint_facts(conn, &entity_ids)?;
-            let by_entity: std::collections::HashMap<String, loomweave_storage::TaintFactRow> = rows
-                .into_iter()
-                .map(|row| (row.entity_id.clone(), row))
-                .collect();
+            let by_entity: std::collections::HashMap<String, loomweave_storage::TaintFactRow> =
+                rows.into_iter()
+                    .map(|row| (row.entity_id.clone(), row))
+                    .collect();
 
             // 3. Build a view per qualname, deduping file hashing by path.
             let mut file_hash_cache: std::collections::HashMap<String, Option<String>> =

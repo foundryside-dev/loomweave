@@ -23,13 +23,13 @@ mod files;
 mod findings;
 
 use anyhow::{Context, Result};
-use loomweave_core::BriefingBlockReason;
-use loomweave_scanner::{Detection, Scanner, SuppressionResult};
-use loomweave_storage::{Writer, commands::EntityRecord};
 pub(crate) use files::collect_scan_files;
 use findings::{
     FindingConfidence, FindingKind, FindingSeverity, PendingFinding, secret_detected_finding,
 };
+use loomweave_core::BriefingBlockReason;
+use loomweave_scanner::{Detection, Scanner, SuppressionResult};
+use loomweave_storage::{Writer, commands::EntityRecord};
 use serde_json::json;
 
 const SECRET_OVERRIDE_ALLOWED: &str = "LMWV-SEC-UNREDACTED-SECRETS-ALLOWED";

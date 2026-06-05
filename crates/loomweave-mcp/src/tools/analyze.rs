@@ -30,7 +30,9 @@ impl ServerState {
                 Err(err) => {
                     return Ok(tool_error_envelope(
                         McpErrorCode::SpawnFailed,
-                        &format!("cannot resolve the loomweave executable to launch analyze: {err}"),
+                        &format!(
+                            "cannot resolve the loomweave executable to launch analyze: {err}"
+                        ),
                         false,
                     ));
                 }

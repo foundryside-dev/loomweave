@@ -2084,7 +2084,9 @@ async fn summary_openrouter_provider_runs_outside_async_runtime() {
         let mut request = [0_u8; 8192];
         let read = stream.read(&mut request).expect("read OpenRouter request");
         let request = String::from_utf8_lossy(&request[..read]);
-        assert!(request.contains(r#""response_format":{"json_schema":{"name":"loomweave_summary""#));
+        assert!(
+            request.contains(r#""response_format":{"json_schema":{"name":"loomweave_summary""#)
+        );
         let body = r#"{
             "id": "gen-01",
             "object": "chat.completion",

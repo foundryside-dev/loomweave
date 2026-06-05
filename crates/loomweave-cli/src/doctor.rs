@@ -166,12 +166,18 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
         .iter()
         .filter(|check| check.status == "problem" || check.status == "warning")
         .map(|check| match check.id {
-            "skill.pack" => "Run `loomweave doctor --fix` or `loomweave install --skills`.".to_owned(),
+            "skill.pack" => {
+                "Run `loomweave doctor --fix` or `loomweave install --skills`.".to_owned()
+            }
             "hook.session_start" => {
                 "Run `loomweave doctor --fix` or `loomweave install --hooks`.".to_owned()
             }
-            "mcp.registration" | "integration.bindings" => "Run `loomweave doctor --fix`.".to_owned(),
-            "index.freshness" => "Run `loomweave analyze <project>` to refresh the index.".to_owned(),
+            "mcp.registration" | "integration.bindings" => {
+                "Run `loomweave doctor --fix`.".to_owned()
+            }
+            "index.freshness" => {
+                "Run `loomweave analyze <project>` to refresh the index.".to_owned()
+            }
             "plugin.availability" => {
                 "Install a Loomweave language plugin (the Python plugin ships with `pip install \
                  loomweave`)."
@@ -332,9 +338,10 @@ fn check_hook_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
 
 fn check_mcp_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
     match mcp_registration::mcp_entry_state(project_root) {
-        McpState::Present => {
-            DoctorJsonCheck::ok("mcp.registration", ".mcp.json loomweave serve entry present")
-        }
+        McpState::Present => DoctorJsonCheck::ok(
+            "mcp.registration",
+            ".mcp.json loomweave serve entry present",
+        ),
         McpState::Unparseable => {
             DoctorJsonCheck::problem("mcp.registration", ".mcp.json is not parseable JSON")
         }

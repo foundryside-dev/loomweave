@@ -81,8 +81,11 @@ fn install_skills_is_idempotent() {
             .assert()
             .success();
     }
-    let body =
-        fs::read_to_string(dir.path().join(".claude/skills/loomweave-workflow/SKILL.md")).unwrap();
+    let body = fs::read_to_string(
+        dir.path()
+            .join(".claude/skills/loomweave-workflow/SKILL.md"),
+    )
+    .unwrap();
     assert!(body.contains("name: loomweave-workflow"));
 }
 
@@ -147,7 +150,10 @@ fn install_all_does_init_skills_and_hooks() {
         "no Codex skill"
     );
     let raw = fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
-    assert!(raw.contains("loomweave hook session-start"), "no hook: {raw}");
+    assert!(
+        raw.contains("loomweave hook session-start"),
+        "no hook: {raw}"
+    );
     let mcp_raw = fs::read_to_string(dir.path().join(".mcp.json")).unwrap();
     assert!(
         mcp_raw.contains("\"loomweave\""),

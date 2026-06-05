@@ -205,7 +205,12 @@ mod tests {
             "--match",
             "kind:function",
         ]));
-        assert!(!loads(&["loomweave", "guidance", "edit", "core:guidance:x"]));
+        assert!(!loads(&[
+            "loomweave",
+            "guidance",
+            "edit",
+            "core:guidance:x"
+        ]));
     }
 
     #[test]

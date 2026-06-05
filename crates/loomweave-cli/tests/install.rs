@@ -31,8 +31,14 @@ fn install_creates_loomweave_dir_with_expected_contents() {
         .success();
 
     let loomweave = dir.path().join(".loomweave");
-    assert!(loomweave.join("loomweave.db").exists(), "loomweave.db missing");
-    assert!(loomweave.join("config.json").exists(), "config.json missing");
+    assert!(
+        loomweave.join("loomweave.db").exists(),
+        "loomweave.db missing"
+    );
+    assert!(
+        loomweave.join("config.json").exists(),
+        "config.json missing"
+    );
     assert!(loomweave.join(".gitignore").exists(), ".gitignore missing");
     assert!(
         dir.path().join("loomweave.yaml").exists(),
@@ -240,7 +246,10 @@ fn install_force_replaces_existing_loomweave_dir_without_overwriting_yaml() {
         !loomweave.join("stale.tmp").exists(),
         "--force should remove stale .loomweave/ contents"
     );
-    assert!(loomweave.join("loomweave.db").exists(), "loomweave.db missing");
+    assert!(
+        loomweave.join("loomweave.db").exists(),
+        "loomweave.db missing"
+    );
     let yaml = read_yaml(&dir.path().join("loomweave.yaml"));
     assert_eq!(yaml["custom"], serde_json::json!(true));
     assert_eq!(

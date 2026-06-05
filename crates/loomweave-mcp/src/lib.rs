@@ -56,7 +56,8 @@ const EMPTY_GUIDANCE_FINGERPRINT: &str = "guidance-empty";
 /// in this crate's own tree; the CLI (which depends on loomweave-mcp) reaches
 /// down into it to embed the same bytes for its on-disk `install --skills`
 /// copy (clarion-04391392c7).
-pub const LOOMWEAVE_WORKFLOW_SKILL: &str = include_str!("../assets/skills/loomweave-workflow/SKILL.md");
+pub const LOOMWEAVE_WORKFLOW_SKILL: &str =
+    include_str!("../assets/skills/loomweave-workflow/SKILL.md");
 
 /// Orientation text returned in the MCP `initialize` result's `instructions`
 /// field. The `Tools:` enumeration is derived from [`list_tools`] (the single

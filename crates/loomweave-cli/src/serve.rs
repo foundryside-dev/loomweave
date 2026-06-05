@@ -109,7 +109,10 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
 /// Capture the LLM policy posture for `project_status`. `live` means a provider
 /// that actually dispatches (`OpenRouter` / Codex / Claude CLIs); the recording
 /// fixture and the disabled state are not live.
-fn llm_diagnostics(selection: &ProviderSelection, llm: &LlmConfig) -> loomweave_mcp::LlmDiagnostics {
+fn llm_diagnostics(
+    selection: &ProviderSelection,
+    llm: &LlmConfig,
+) -> loomweave_mcp::LlmDiagnostics {
     let (provider, live) = match selection {
         ProviderSelection::Disabled => ("disabled", false),
         ProviderSelection::Recording => ("recording", false),
@@ -205,9 +208,13 @@ fn run_mcp_stdio(
     }
     state = state.with_diagnostics(diagnostics);
 
-    let serve_result =
-        loomweave_mcp::serve_stdio_with_state_on_runtime(&runtime, &state, &mut reader, &mut writer)
-            .context("serve MCP stdio");
+    let serve_result = loomweave_mcp::serve_stdio_with_state_on_runtime(
+        &runtime,
+        &state,
+        &mut reader,
+        &mut writer,
+    )
+    .context("serve MCP stdio");
     drop(state);
     drop(llm_writer);
     let writer_result = if let Some(handle) = llm_writer_join {

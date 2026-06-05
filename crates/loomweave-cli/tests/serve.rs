@@ -9,11 +9,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
+use hmac::{Hmac, Mac};
 use loomweave_core::{
     LEAF_SUMMARY_PROMPT_TEMPLATE_ID,
     plugin::{ContentLengthCeiling, Frame, read_frame, write_frame},
 };
-use hmac::{Hmac, Mac};
 use rusqlite::{Connection, params};
 use serde::Deserialize;
 use serde_json::Value;
@@ -451,8 +451,9 @@ fn serve_http_identity_resolve_rejects_sei_shaped_input_and_resolves_unknown() {
     write_http_config(dir.path(), &bind);
     let mut child = spawn_serve(dir.path());
 
-    let sei_body = serde_json::json!({ "locator": "loomweave:eid:0123456789abcdef0123456789abcdef" })
-        .to_string();
+    let sei_body =
+        serde_json::json!({ "locator": "loomweave:eid:0123456789abcdef0123456789abcdef" })
+            .to_string();
     let rejected = wait_for_http_post_json(&bind, "/api/v1/identity/resolve", &sei_body, &[]);
 
     let unknown_body = serde_json::json!({ "locator": "python:function:nope.absent" }).to_string();
@@ -1309,10 +1310,7 @@ fn serve_http_batch_requires_auth_when_configured() {
     let bind = free_loopback_bind();
     write_http_config_with_token_env(dir.path(), &bind, "WEFT_TEST_TOKEN_BATCH");
 
-    let mut child = spawn_serve_with_env(
-        dir.path(),
-        &[("WEFT_TEST_TOKEN_BATCH", "batch-secret")],
-    );
+    let mut child = spawn_serve_with_env(dir.path(), &[("WEFT_TEST_TOKEN_BATCH", "batch-secret")]);
     let body = serde_json::json!({
         "queries": [{"path": "demo.py", "language": "python"}]
     })
@@ -1351,10 +1349,8 @@ fn serve_http_files_endpoint_requires_bearer_token_when_configured() {
     let bind = free_loopback_bind();
     write_http_config_with_token_env(dir.path(), &bind, "WEFT_TEST_TOKEN_REQ");
 
-    let mut child = spawn_serve_with_env(
-        dir.path(),
-        &[("WEFT_TEST_TOKEN_REQ", "shh-its-a-secret")],
-    );
+    let mut child =
+        spawn_serve_with_env(dir.path(), &[("WEFT_TEST_TOKEN_REQ", "shh-its-a-secret")]);
     let unauthenticated =
         wait_for_http_response(&bind, "/api/v1/files?path=demo.py&language=python");
     let authenticated = wait_for_http_raw_response(
@@ -1387,10 +1383,7 @@ fn serve_http_files_endpoint_rejects_wrong_token() {
     let bind = free_loopback_bind();
     write_http_config_with_token_env(dir.path(), &bind, "WEFT_TEST_TOKEN_WRONG");
 
-    let mut child = spawn_serve_with_env(
-        dir.path(),
-        &[("WEFT_TEST_TOKEN_WRONG", "correct-horse")],
-    );
+    let mut child = spawn_serve_with_env(dir.path(), &[("WEFT_TEST_TOKEN_WRONG", "correct-horse")]);
     let wrong = wait_for_http_raw_response(
         &bind,
         "/api/v1/files?path=demo.py&language=python",
@@ -1436,10 +1429,8 @@ fn serve_http_files_endpoint_requires_hmac_identity_when_configured() {
     let bind = free_loopback_bind();
     write_http_config_with_identity_token_env(dir.path(), &bind, "WEFT_TEST_IDENTITY_REQ");
 
-    let mut child = spawn_serve_with_env(
-        dir.path(),
-        &[("WEFT_TEST_IDENTITY_REQ", "shared-secret")],
-    );
+    let mut child =
+        spawn_serve_with_env(dir.path(), &[("WEFT_TEST_IDENTITY_REQ", "shared-secret")]);
     let path = "/api/v1/files?path=demo.py&language=python";
     let missing = wait_for_http_raw_response(&bind, path, &[]);
     let (signed_header, signed_timestamp, signed_nonce) =
@@ -1477,16 +1468,10 @@ fn serve_http_files_endpoint_rejects_wrong_hmac_identity() {
         .success();
     seed_file_entity(dir.path());
     let bind = free_loopback_bind();
-    write_http_config_with_identity_token_env(
-        dir.path(),
-        &bind,
-        "WEFT_TEST_IDENTITY_WRONG",
-    );
+    write_http_config_with_identity_token_env(dir.path(), &bind, "WEFT_TEST_IDENTITY_WRONG");
 
-    let mut child = spawn_serve_with_env(
-        dir.path(),
-        &[("WEFT_TEST_IDENTITY_WRONG", "shared-secret")],
-    );
+    let mut child =
+        spawn_serve_with_env(dir.path(), &[("WEFT_TEST_IDENTITY_WRONG", "shared-secret")]);
     let path = "/api/v1/files?path=demo.py&language=python";
     let (wrong_header, wrong_timestamp, wrong_nonce) =
         hmac_component_headers("other-secret", "GET", path, b"");
@@ -1519,10 +1504,8 @@ fn serve_http_capabilities_does_not_require_token() {
     let bind = free_loopback_bind();
     write_http_config_with_token_env(dir.path(), &bind, "WEFT_TEST_TOKEN_CAPS");
 
-    let mut child = spawn_serve_with_env(
-        dir.path(),
-        &[("WEFT_TEST_TOKEN_CAPS", "any-token-value")],
-    );
+    let mut child =
+        spawn_serve_with_env(dir.path(), &[("WEFT_TEST_TOKEN_CAPS", "any-token-value")]);
     let response = wait_for_http_response(&bind, "/api/v1/_capabilities");
     stop_serve(&mut child);
     let response = response.expect("capabilities probe response");
@@ -1576,11 +1559,7 @@ fn serve_http_refuses_startup_when_identity_env_is_missing() {
         .assert()
         .success();
     let bind = free_loopback_bind();
-    write_http_config_with_identity_token_env(
-        dir.path(),
-        &bind,
-        "WEFT_TEST_IDENTITY_MISSING",
-    );
+    write_http_config_with_identity_token_env(dir.path(), &bind, "WEFT_TEST_IDENTITY_MISSING");
 
     let child = spawn_serve_with_env(dir.path(), &[]);
     let output = wait_for_child_exit(child, Duration::from_secs(2))

@@ -1746,11 +1746,9 @@ mod tests {
             let mut request = [0_u8; 8192];
             let read = stream.read(&mut request).expect("read request");
             let request = String::from_utf8_lossy(&request[..read]);
-            assert!(
-                request.contains(
-                    r#""response_format":{"json_schema":{"name":"loomweave_inferred_calls""#
-                )
-            );
+            assert!(request.contains(
+                r#""response_format":{"json_schema":{"name":"loomweave_inferred_calls""#
+            ));
             assert!(request.contains(r#""required":["edges"]"#));
             assert!(
                 request.contains(r#""required":["site_key","target_id","confidence","rationale"]"#)

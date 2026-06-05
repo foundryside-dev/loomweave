@@ -66,7 +66,11 @@ fn hook_session_start_exits_zero_with_corrupt_db() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join(".loomweave")).unwrap();
     // Garbage where loomweave.db should be — not a valid SQLite file.
-    std::fs::write(dir.path().join(".loomweave/loomweave.db"), b"NOT A SQLITE DB").unwrap();
+    std::fs::write(
+        dir.path().join(".loomweave/loomweave.db"),
+        b"NOT A SQLITE DB",
+    )
+    .unwrap();
     let assert = loomweave_bin()
         .args(["hook", "session-start", "--path"])
         .arg(dir.path())
@@ -87,7 +91,9 @@ fn hook_session_start_resyncs_skill_when_present_and_drifted() {
         .arg(dir.path())
         .assert()
         .success();
-    let skill = dir.path().join(".claude/skills/loomweave-workflow/SKILL.md");
+    let skill = dir
+        .path()
+        .join(".claude/skills/loomweave-workflow/SKILL.md");
     std::fs::write(&skill, "STALE").unwrap();
 
     loomweave_bin()

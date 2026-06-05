@@ -332,7 +332,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        HOOK_COMMAND, HookState, loomweave_commands, install_session_start_hook,
+        HOOK_COMMAND, HookState, install_session_start_hook, loomweave_commands,
         merge_session_start_hook, session_start_hook_state,
     };
 

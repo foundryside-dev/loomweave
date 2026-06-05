@@ -317,7 +317,8 @@ mod tests {
         super::install_skill_pack(dir.path()).unwrap();
         // Corrupt content (not delete) so the file is present but mismatched.
         std::fs::write(
-            dir.path().join(".claude/skills/loomweave-workflow/SKILL.md"),
+            dir.path()
+                .join(".claude/skills/loomweave-workflow/SKILL.md"),
             "STALE",
         )
         .unwrap();
@@ -339,7 +340,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         install_skill_pack(dir.path()).unwrap();
         std::fs::write(
-            dir.path().join(".claude/skills/loomweave-workflow/SKILL.md"),
+            dir.path()
+                .join(".claude/skills/loomweave-workflow/SKILL.md"),
             "STALE",
         )
         .unwrap();
@@ -360,7 +362,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         install_skill_pack(dir.path()).unwrap();
         // Corrupt one installed copy + its fingerprint to simulate drift.
-        let skill = dir.path().join(".claude/skills/loomweave-workflow/SKILL.md");
+        let skill = dir
+            .path()
+            .join(".claude/skills/loomweave-workflow/SKILL.md");
         std::fs::write(&skill, "STALE").unwrap();
         let fp = dir
             .path()

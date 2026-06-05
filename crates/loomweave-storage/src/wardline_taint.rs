@@ -727,7 +727,12 @@ mod tests {
     #[test]
     fn seis_for_locators_returns_only_alive_bindings() {
         let conn = migrated_conn();
-        insert_binding(&conn, "loomweave:eid:alive", "python:function:live", "alive");
+        insert_binding(
+            &conn,
+            "loomweave:eid:alive",
+            "python:function:live",
+            "alive",
+        );
         insert_binding(
             &conn,
             "loomweave:eid:dead",

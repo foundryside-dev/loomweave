@@ -330,7 +330,8 @@ fn initialise_project(project_root: &Path, force: bool) -> Result<()> {
             .with_context(|| format!("remove existing {}", loomweave_dir.display()))?;
     }
 
-    fs::create_dir_all(&loomweave_dir).with_context(|| format!("mkdir {}", loomweave_dir.display()))?;
+    fs::create_dir_all(&loomweave_dir)
+        .with_context(|| format!("mkdir {}", loomweave_dir.display()))?;
 
     // Cleanup guard: if any post-mkdir step fails, remove .loomweave/ before
     // bubbling the error so the next install attempt isn't blocked by the

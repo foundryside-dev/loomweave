@@ -833,7 +833,12 @@ mod tests {
     fn matcher_carries_unchanged_locator_with_no_event() {
         let alive = HashMap::from([(
             "python:function:m.f".to_owned(),
-            binding("loomweave:eid:0001", "python:function:m.f", "h1", Some("s1")),
+            binding(
+                "loomweave:eid:0001",
+                "python:function:m.f",
+                "h1",
+                Some("s1"),
+            ),
         )]);
         let cur = locset(&["python:function:m.f"]);
         let decision = rebind_or_mint(
@@ -857,7 +862,12 @@ mod tests {
         // A changed body on the SAME locator is the content axis, not identity.
         let alive = HashMap::from([(
             "python:function:m.f".to_owned(),
-            binding("loomweave:eid:0001", "python:function:m.f", "h1", Some("s1")),
+            binding(
+                "loomweave:eid:0001",
+                "python:function:m.f",
+                "h1",
+                Some("s1"),
+            ),
         )]);
         let cur = locset(&["python:function:m.f"]);
         let decision = rebind_or_mint(
@@ -1093,7 +1103,10 @@ mod tests {
     #[test]
     fn alive_snapshot_excludes_orphaned_and_keys_by_locator() {
         let conn = migrated_conn();
-        insert_binding(&conn, &binding("loomweave:eid:0001", "a.f", "h1", Some("s1")));
+        insert_binding(
+            &conn,
+            &binding("loomweave:eid:0001", "a.f", "h1", Some("s1")),
+        );
         insert_binding(
             &conn,
             &SeiBinding {
@@ -1118,7 +1131,10 @@ mod tests {
     fn has_any_alive_binding_reflects_state() {
         let conn = migrated_conn();
         assert!(!has_any_alive_binding(&conn).unwrap());
-        insert_binding(&conn, &binding("loomweave:eid:0001", "a.f", "h1", Some("s1")));
+        insert_binding(
+            &conn,
+            &binding("loomweave:eid:0001", "a.f", "h1", Some("s1")),
+        );
         assert!(has_any_alive_binding(&conn).unwrap());
     }
 

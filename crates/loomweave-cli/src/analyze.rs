@@ -39,7 +39,7 @@ use loomweave_federation::config::{FiligreeConfig, McpConfig, SemanticSearchConf
 use loomweave_federation::filigree::FiligreeHttpClient;
 use loomweave_federation::filigree_url::resolve_filigree_url;
 use loomweave_federation::scan_results::{
-    LOOMWEAVE_SCAN_SOURCE, CleanStaleRequest, CleanStaleResponse, EmitOptions, FindingForEmit,
+    CleanStaleRequest, CleanStaleResponse, EmitOptions, FindingForEmit, LOOMWEAVE_SCAN_SOURCE,
     PreparedBatch, ScanResultsResponse, clean_stale_url, prepare_batch, scan_results_url,
 };
 
@@ -370,7 +370,8 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     {
         let mut conn =
             Connection::open(&db_path).context("open database to apply pending migrations")?;
-        loomweave_storage::pragma::apply_write_pragmas(&conn).map_err(|e| anyhow::anyhow!("{e}"))?;
+        loomweave_storage::pragma::apply_write_pragmas(&conn)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         loomweave_storage::schema::apply_migrations(&mut conn)
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("apply pending migrations")?;
@@ -3880,10 +3881,10 @@ impl PluginKindRoles {
             {
                 roles.callable.insert(kind.clone());
             }
-            if manifest
-                .ontology
-                .kind_has_role(kind, loomweave_core::OntologyEntityRole::SyntaxDegradedModule)
-            {
+            if manifest.ontology.kind_has_role(
+                kind,
+                loomweave_core::OntologyEntityRole::SyntaxDegradedModule,
+            ) {
                 roles.syntax_degraded_module.insert(kind.clone());
             }
         }

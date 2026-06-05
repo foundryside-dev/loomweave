@@ -404,7 +404,9 @@ fn promote_observation_creates_guidance_sheet() {
         .success();
     let out = String::from_utf8_lossy(&promoted.get_output().stdout);
     assert!(
-        out.contains("Promoted observation loomweave-obs-guidance to core:guidance:auth-token-risk"),
+        out.contains(
+            "Promoted observation loomweave-obs-guidance to core:guidance:auth-token-risk"
+        ),
         "unexpected promote output: {out}"
     );
     handle.join().expect("observations server");
