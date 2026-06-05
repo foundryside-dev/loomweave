@@ -690,9 +690,10 @@ is re-established at the governance boundary, never assumed from the store.
 The SEI matcher consumes a typed, locator-level git-rename signal behind the
 `GitRenameSource` trait (SEI spec §6). `legis` owns the git interface, so it is
 the intended external supplier: `LegisGitRenameSource`
-(`crates/clarion-cli/src/sei_git.rs`) reads `legis`'s
-`GET /git/renames?rev_range=…` and feeds the **same** file→locator translation as
-the v1 `ShellGitRenameSource`, behind the same trait — no matcher change.
+(`crates/clarion-cli/src/sei_git.rs`) reads the **committed** leg of `legis`'s
+`GET /git/rename-feed?base=…&head=HEAD` and feeds the **same** file→locator
+translation as the v1 `ShellGitRenameSource`, behind the same trait — no matcher
+change.
 Selection is enrich-only and **capability-aware** (`select_git_rename_source`):
 `ShellGitRenameSource` is the default and the fallback; `legis` is consulted only
 when configured (`--legis-url`) **and** reachable. Unset/unreachable `legis`
@@ -713,8 +714,16 @@ renames, so `analyze` now **unions** both each run (`gather_git_renames`):
   `0007`) and reads the *prior* run's commit (`prior_analyzed_commit`, excluding
   the current run) to form the range. So `legis` is now **operatively consulted**
   for renames committed between runs — the gap formerly disclosed here is closed
-  by option 2 (Clarion drives a committed rev-range). Option 1 (a `legis`
-  working-tree surface) remains unnecessary.
+  by option 2 (Clarion drives a committed rev-range).
+
+`legis` now *also* exposes a working-tree surface (`GET /git/rename-feed?…&include_worktree=true`
+returns a `working_tree` leg alongside `committed`), so the earlier disclosure
+that working-tree renames can *never* reach `legis` no longer holds. But this
+re-point reads the `committed` leg **only** (`include_worktree` omitted): Clarion's
+shell source stays the sole working-tree authority and committed-window semantics
+are unchanged. Consuming `legis`'s `working_tree` leg — which would let `legis`
+answer the uncommitted window and relax the shell-only guard — is deliberately
+out of scope here and left as future work.
 
 Enrich-only and never a regression: with `legis` unset, or no prior commit, only
 the working-tree window runs — byte-identical to pre-WS9, no HTTP. The matcher is

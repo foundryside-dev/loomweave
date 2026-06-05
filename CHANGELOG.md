@@ -12,6 +12,20 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+### Changed
+
+- **`LegisGitRenameSource` re-pointed from `GET /git/renames` to the committed
+  leg of `GET /git/rename-feed`.** `legis`'s additive superset endpoint
+  (`/git/rename-feed?base=…&head=HEAD`) returns an object whose `committed` array
+  is byte-identical to the legacy `/git/renames` array (legis pins this with a
+  contract-lock test), so committed renames resolve exactly as before. The parser
+  now reads `.committed` and ignores the `working_tree` leg; `include_worktree` is
+  omitted, preserving committed-only semantics — the shell source remains the sole
+  working-tree authority. Federation note: `legis` now *can* surface working-tree
+  renames via `include_worktree=true`, so `docs/federation/contracts.md` no longer
+  claims they can never reach `legis`; consuming that leg is left as future work
+  in the federation rename-feed migration.
+
 ## [1.3.0] — 2026-06-05
 
 ### Added

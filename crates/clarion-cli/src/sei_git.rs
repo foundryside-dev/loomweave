@@ -11,8 +11,9 @@
 //!   window — rather than a working-tree diff — is what keeps the probe from
 //!   executing repo-controlled filters on an untrusted corpus (clarion-4b5a8aff54);
 //!   see [`hardened_git_command`] and `ShellGitRenameSource::run_git_diff`.
-//! - [`LegisGitRenameSource`] — the WS9 supplier: reads `legis`'s
-//!   `GET /git/renames?rev_range=…` over HTTP and feeds the *same* translation,
+//! - [`LegisGitRenameSource`] — the WS9 supplier: reads the committed leg of
+//!   `legis`'s `GET /git/rename-feed?base=…&head=HEAD` over HTTP and feeds the
+//!   *same* translation,
 //!   so `legis` becomes the first external supplier with no change to the matcher
 //!   (SEI spec §6 / REQ-C-05). Enrich-only: never required, fail-soft to empty.
 //!
@@ -216,7 +217,8 @@ fn file_renames_to_locator_renames(
     out
 }
 
-/// The WS9 `GitRenameSource`: reads `legis`'s `GET /git/renames` over HTTP and
+/// The WS9 `GitRenameSource`: reads the committed leg of `legis`'s
+/// `GET /git/rename-feed` over HTTP and
 /// feeds the *same* file→locator translation as the shell source. `legis` owns
 /// the git interface (SEI §6 / REQ-C-05); this supplier moves the signal behind
 /// it with no change to the matcher. Enrich-only — any failure degrades to an
@@ -251,17 +253,18 @@ impl GitRenameSource for LegisGitRenameSource {
         let Some(body) = self.fetch_renames(base_commit) else {
             return Vec::new();
         };
-        let file_renames = parse_legis_rename_json(&body);
+        let file_renames = parse_legis_rename_feed_json(&body);
         file_renames_to_locator_renames(&file_renames, &self.current_locators)
     }
 }
 
 impl LegisGitRenameSource {
-    /// GET `legis`'s renames for the committed range `<base_commit>..HEAD`,
-    /// returning the raw JSON body, or `None` on any failure (build/connect/
-    /// non-2xx/read) — fail-soft, never propagated into the run.
+    /// GET `legis`'s rename-feed for the committed range `<base_commit>..HEAD`
+    /// (committed leg only; see [`legis_rename_feed_url`]), returning the raw JSON
+    /// body, or `None` on any failure (build/connect/non-2xx/read) — fail-soft,
+    /// never propagated into the run.
     fn fetch_renames(&self, base_commit: &str) -> Option<String> {
-        let url = legis_renames_url(&self.base_url, base_commit);
+        let url = legis_rename_feed_url(&self.base_url, base_commit);
         let client = reqwest::blocking::Client::builder()
             .timeout(LEGIS_HTTP_TIMEOUT)
             .build()
@@ -274,26 +277,42 @@ impl LegisGitRenameSource {
     }
 }
 
-/// Build the `legis` renames URL for the committed range `<base_commit>..HEAD`.
-/// A commit-ish base contains only `[A-Za-z0-9._/~^-]`, all query-safe, so no
-/// percent-encoding is required.
-fn legis_renames_url(base_url: &str, base_commit: &str) -> String {
+/// Build the `legis` rename-feed URL for the committed range `<base_commit>..HEAD`.
+/// Targets the additive superset endpoint `GET /git/rename-feed`, whose
+/// `committed` leg is byte-identical to the legacy `/git/renames` array (legis
+/// pins this with a contract-lock test). `include_worktree` is deliberately
+/// omitted — it defaults to `false` on `legis`, so this re-point reads the
+/// committed leg only and preserves committed-window semantics. A commit-ish base
+/// contains only `[A-Za-z0-9._/~^-]`, all query-safe, so no percent-encoding is
+/// required (same as the prior `/git/renames` builder).
+fn legis_rename_feed_url(base_url: &str, base_commit: &str) -> String {
     format!(
-        "{}/git/renames?rev_range={}..HEAD",
+        "{}/git/rename-feed?base={}&head=HEAD",
         base_url.trim_end_matches('/'),
         base_commit
     )
 }
 
-/// Parse `legis`'s `GET /git/renames` JSON (`[{old_path, new_path, …}]`) into
-/// `(old_path, new_path)` pairs. Entries missing/empty in either path are
-/// skipped; a non-array or unparseable body yields an empty list (fail-soft).
-/// The shape mirrors `legis`'s `RenameEvidence` dataclass.
-fn parse_legis_rename_json(body: &str) -> Vec<(String, String)> {
+/// Parse `legis`'s `GET /git/rename-feed` JSON into `(old_path, new_path)` pairs,
+/// reading the **committed** leg only:
+/// `{"committed": [{old_path, new_path, …}], "working_tree": […], …}`. Entries
+/// missing/empty in either path are skipped; a non-object body, a missing
+/// `committed` key, or a non-array `committed` yields an empty list (fail-soft).
+///
+/// Each `committed[]` entry is byte-identical to a legacy `/git/renames[]` entry
+/// (legis pins this with a contract-lock test), so the per-item `old_path`/`new_path`
+/// extraction below is unchanged from the prior `/git/renames` parser — the only
+/// change is the array source (top-level → `.committed`). A legacy flat-array body
+/// therefore now yields empty, but [`LegisGitRenameSource::fetch_renames`] only
+/// ever builds the rename-feed URL, so a flat array can no longer come back: this
+/// is a clean switch, not a dual-parse. The `working_tree` leg is ignored
+/// (committed-window semantics; see [`legis_rename_feed_url`]). The entry shape
+/// mirrors `legis`'s `RenameEvidence` dataclass.
+fn parse_legis_rename_feed_json(body: &str) -> Vec<(String, String)> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
         return Vec::new();
     };
-    let Some(arr) = value.as_array() else {
+    let Some(arr) = value.get("committed").and_then(serde_json::Value::as_array) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -551,14 +570,23 @@ mod tests {
     }
 
     #[test]
-    fn parses_legis_rename_json_into_path_pairs() {
-        let body = r#"[
-          {"commit_sha":"abc","old_path":"auth.py","new_path":"authn.py","similarity":96},
-          {"commit_sha":"abc","old_path":"","new_path":"x.py","similarity":0},
-          {"commit_sha":"def","old_path":"pkg/a/old.py","new_path":"pkg/a/new.py","similarity":100}
-        ]"#;
+    fn parses_legis_rename_feed_committed_into_path_pairs() {
+        // The rename-feed object: only the `committed` leg is read; `working_tree`
+        // (even when populated) is ignored for committed-window semantics.
+        let body = r#"{
+          "status":"committed_and_worktree","worktree_checked":true,
+          "base":"base123","head":"HEAD",
+          "committed":[
+            {"commit_sha":"abc","old_path":"auth.py","new_path":"authn.py","similarity":96},
+            {"commit_sha":"abc","old_path":"","new_path":"x.py","similarity":0},
+            {"commit_sha":"def","old_path":"pkg/a/old.py","new_path":"pkg/a/new.py","similarity":100}
+          ],
+          "working_tree":[
+            {"commit_sha":null,"old_path":"wt.py","new_path":"wt2.py","similarity":99}
+          ]
+        }"#;
         assert_eq!(
-            parse_legis_rename_json(body),
+            parse_legis_rename_feed_json(body),
             vec![
                 ("auth.py".to_owned(), "authn.py".to_owned()),
                 ("pkg/a/old.py".to_owned(), "pkg/a/new.py".to_owned()),
@@ -567,9 +595,31 @@ mod tests {
     }
 
     #[test]
-    fn malformed_legis_body_yields_empty_pairs() {
-        assert!(parse_legis_rename_json("not json").is_empty());
-        assert!(parse_legis_rename_json(r#"{"not":"an array"}"#).is_empty());
+    fn malformed_legis_feed_body_yields_empty_pairs() {
+        assert!(parse_legis_rename_feed_json("not json").is_empty());
+        // Object without a `committed` array → empty (fail-soft).
+        assert!(parse_legis_rename_feed_json(r#"{"status":"committed_only"}"#).is_empty());
+        // `committed` present but not an array → empty.
+        assert!(parse_legis_rename_feed_json(r#"{"committed":"nope"}"#).is_empty());
+        // A bare array (the legacy `/git/renames` shape) is no longer the contract:
+        // it has no `committed` key, so it yields empty. This is the documented
+        // clean-switch behaviour — `fetch_renames` only ever builds the rename-feed
+        // URL, so a flat array can no longer come back.
+        assert!(
+            parse_legis_rename_feed_json(r#"[{"old_path":"a.py","new_path":"b.py"}]"#).is_empty()
+        );
+    }
+
+    #[test]
+    fn rename_feed_url_targets_committed_leg_without_worktree() {
+        let url = legis_rename_feed_url("http://127.0.0.1:8615/", "base123");
+        assert_eq!(
+            url,
+            "http://127.0.0.1:8615/git/rename-feed?base=base123&head=HEAD"
+        );
+        // Committed-only re-point: this builder must never request the working-tree
+        // leg (legis defaults `include_worktree` to false when the param is absent).
+        assert!(!url.contains("include_worktree"));
     }
 
     #[test]
@@ -583,8 +633,8 @@ mod tests {
             "python:module:authn".to_owned(),
         ];
         let shell_pairs = parse_git_rename_lines("R096\tauth.py\tauthn.py\n");
-        let legis_pairs = parse_legis_rename_json(
-            r#"[{"old_path":"auth.py","new_path":"authn.py","similarity":96}]"#,
+        let legis_pairs = parse_legis_rename_feed_json(
+            r#"{"committed":[{"old_path":"auth.py","new_path":"authn.py","similarity":96}],"working_tree":[]}"#,
         );
         assert_eq!(shell_pairs, legis_pairs);
         assert_eq!(
@@ -595,8 +645,7 @@ mod tests {
 
     #[test]
     fn legis_source_fetches_and_translates_renames_over_http() {
-        let body =
-            r#"[{"commit_sha":"c","old_path":"auth.py","new_path":"authn.py","similarity":96}]"#;
+        let body = r#"{"status":"committed_only","worktree_checked":false,"base":"base123","head":"HEAD","committed":[{"commit_sha":"c","old_path":"auth.py","new_path":"authn.py","similarity":96}],"working_tree":[]}"#;
         let (addr, handle) = spawn_legis_mock(1, body);
         let src = LegisGitRenameSource::new(
             format!("http://{addr}"),
@@ -654,9 +703,8 @@ mod tests {
 
     #[test]
     fn selector_uses_legis_for_committed_base_when_reachable() {
-        let body =
-            r#"[{"commit_sha":"c","old_path":"auth.py","new_path":"authn.py","similarity":96}]"#;
-        // Two connections: the /health probe, then the /git/renames read.
+        let body = r#"{"status":"committed_only","worktree_checked":false,"base":"base123","head":"HEAD","committed":[{"commit_sha":"c","old_path":"auth.py","new_path":"authn.py","similarity":96}],"working_tree":[]}"#;
+        // Two connections: the /health probe, then the /git/rename-feed read.
         let (addr, handle) = spawn_legis_mock(2, body);
         let tmp = std::env::temp_dir();
         let src = select_git_rename_source(
@@ -717,8 +765,14 @@ mod tests {
         // committed-range query — just as a real pre-commit re-analyze would be.
         run_git(repo, &["mv", "auth.py", "authn.py"]);
 
-        // A *reachable* legis that (correctly) reports no committed rename.
-        let (addr, handle) = spawn_legis_mock(2, "[]");
+        // A *reachable* legis that (correctly) reports no committed rename. (This
+        // body is never actually parsed: the empty-base window short-circuits to
+        // the shell source before any fetch — the empty `committed` leg just
+        // documents what a reachable legis would return for the committed window.)
+        let (addr, handle) = spawn_legis_mock(
+            2,
+            r#"{"status":"committed_only","committed":[],"working_tree":[]}"#,
+        );
         let src = select_git_rename_source(
             repo,
             Some(format!("http://{addr}")),
@@ -807,9 +861,8 @@ mod tests {
         run_git(repo, &["mv", "extra.py", "extras.py"]);
 
         // legis mock answers the committed window with the committed rename.
-        let body =
-            r#"[{"commit_sha":"c","old_path":"auth.py","new_path":"authn.py","similarity":100}]"#;
-        // /health probe + /git/renames read for the committed window = 2 conns.
+        let body = r#"{"status":"committed_only","worktree_checked":false,"base":"x","head":"HEAD","committed":[{"commit_sha":"c","old_path":"auth.py","new_path":"authn.py","similarity":100}],"working_tree":[]}"#;
+        // /health probe + /git/rename-feed read for the committed window = 2 conns.
         let (addr, handle) = spawn_legis_mock(2, body);
 
         let got = gather_git_renames(
