@@ -8,7 +8,7 @@ Branch: `sprint-2/openrouter-swap`
 ## Purpose
 
 This memo scopes the focused provider replacement that must land before B.8.
-B.8 should measure the provider Clarion actually ships with in v0.1, so the
+B.8 should measure the provider Loomweave actually ships with in v0.1, so the
 just-shipped `AnthropicProvider` is replaced by an `OpenRouterProvider`.
 
 The `LlmProvider` trait remains. OpenRouter is the canonical v0.1 provider;
@@ -17,7 +17,7 @@ added in v0.2+ without changing MCP call sites.
 
 ## S1. Wire Format
 
-Clarion speaks OpenAI-compatible Chat Completions HTTP to OpenRouter.
+Loomweave speaks OpenAI-compatible Chat Completions HTTP to OpenRouter.
 
 - Base URL default: `https://openrouter.ai/api/v1`
 - Chat endpoint: `POST {endpoint_url}/chat/completions`
@@ -26,12 +26,12 @@ Clarion speaks OpenAI-compatible Chat Completions HTTP to OpenRouter.
 - Request body: `model`, `messages`, `temperature`, and a completion limit
   (`max_completion_tokens` preferred; `max_tokens` accepted/deprecated by
   OpenRouter), plus future OpenAI-compatible fields as needed.
-- v0.1 message shape: one user message containing the rendered Clarion prompt.
+- v0.1 message shape: one user message containing the rendered Loomweave prompt.
 - Response body: `choices[]` with a non-streaming `message`, plus `usage`.
 
 The response parser consumes the first choice whose `message.content` is
 non-empty. `usage.prompt_tokens`, `usage.completion_tokens`, and
-`usage.total_tokens` are copied into Clarion's response/accounting path.
+`usage.total_tokens` are copied into Loomweave's response/accounting path.
 Streaming is out of scope for this swap.
 
 Sources: OpenRouter quickstart and API reference describe `/api/v1/chat/completions`,
@@ -39,16 +39,16 @@ Bearer auth, OpenAI-compatible messages, non-streaming choices, and usage.
 
 ## S2. OpenRouter Attribution Headers
 
-Clarion sends attribution headers on live OpenRouter calls:
+Loomweave sends attribution headers on live OpenRouter calls:
 
-- `HTTP-Referer`: default `https://github.com/qacona/clarion`
-- `X-OpenRouter-Title`: default `Clarion`
+- `HTTP-Referer`: default `https://github.com/qacona/loomweave`
+- `X-OpenRouter-Title`: default `Loomweave`
 
 OpenRouter documents `X-OpenRouter-Title` as the canonical app-title header and
-still accepts `X-Title` for backwards compatibility. Clarion should emit the
+still accepts `X-Title` for backwards compatibility. Loomweave should emit the
 canonical header.
 
-Both values are configurable in `clarion.yaml`. They are not required for auth.
+Both values are configurable in `loomweave.yaml`. They are not required for auth.
 `HTTP-Referer` is required for app attribution/rankings; `X-OpenRouter-Title`
 sets the display name when paired with `HTTP-Referer`, and `X-Title` is accepted
 for backwards compatibility.
@@ -65,7 +65,7 @@ API and normally include an organization/provider prefix, such as:
 Examples are illustrative; defaults should be refreshed from `/api/v1/models`
 before release.
 
-Clarion does not implement tier-name to model-ID resolution in v0.1. Operators
+Loomweave does not implement tier-name to model-ID resolution in v0.1. Operators
 choose the concrete `model_id` in config. ADR-007's `model_tier` cache-key
 component stores that concrete string verbatim. The cache-key shape is unchanged;
 only values move from native Anthropic model IDs to OpenRouter `vendor/model`
@@ -76,19 +76,19 @@ strings.
 B.6 added Anthropic-specific pricing tables and dollar-budget estimates. Those
 tables are removed.
 
-Clarion records token counts from OpenRouter usage:
+Loomweave records token counts from OpenRouter usage:
 
 - prompt tokens
 - completion tokens
 - total tokens
 
-Cost-per-token math stays outside Clarion. Operators already have OpenRouter's
-billing dashboard and can choose models based on their own budget. Clarion's
+Cost-per-token math stays outside Loomweave. Operators already have OpenRouter's
+billing dashboard and can choose models based on their own budget. Loomweave's
 enforcement becomes a token ceiling:
 
 - Config: `llm_policy.session_token_ceiling`
 - Default: `1000000`
-- Scope: one `clarion serve` process/session
+- Scope: one `loomweave serve` process/session
 - Cache hits do not spend tokens
 
 Existing cache storage columns named `cost_usd` can remain for compatibility and
@@ -110,20 +110,20 @@ Classification:
 
 - 4xx auth, insufficient credits, forbidden, moderation, model/request errors:
   non-retryable unless OpenRouter explicitly returns a retryable code.
-- 429 and 503: OpenRouter may return a standard `Retry-After` header. Clarion
+- 429 and 503: OpenRouter may return a standard `Retry-After` header. Loomweave
   v0.1 may choose not to sleep-and-retry inside a single MCP call, but the
   provider/MCP envelope must preserve retryability and retry-after context so
   callers can retry later.
 - 5xx and connection/transport failures: retryable.
-- Malformed JSON or schema mismatch is a Clarion parse/transport error;
-  retryability is Clarion policy, not an OpenRouter-documented cause.
+- Malformed JSON or schema mismatch is a Loomweave parse/transport error;
+  retryability is Loomweave policy, not an OpenRouter-documented cause.
 
 MCP envelopes should preserve retryability instead of always marking provider
 errors retryable.
 
 ## S6. Config Surface
 
-`clarion.yaml`:
+`loomweave.yaml`:
 
 ```yaml
 llm_policy:
@@ -134,8 +134,8 @@ llm_policy:
     endpoint_url: https://openrouter.ai/api/v1
     api_key_env: OPENROUTER_API_KEY
     attribution:
-      referer: https://github.com/qacona/clarion
-      title: Clarion
+      referer: https://github.com/qacona/loomweave
+      title: Loomweave
   model_id: anthropic/claude-sonnet-4.6
   session_token_ceiling: 1000000
   max_inferred_edges_per_caller: 8
@@ -148,11 +148,11 @@ OpenRouter direct.
 
 The existing implementation also accepts the earlier `llm:` key as a
 compatibility alias. The old `anthropic_api_key_env` or `provider: anthropic`
-shape should produce a clear `CLA-CONFIG-DEPRECATED-PROVIDER` configuration
+shape should produce a clear `LMWV-CONFIG-DEPRECATED-PROVIDER` configuration
 error/finding that points operators to `provider: openrouter` and
 `llm_policy.openrouter.api_key_env`.
 
-`clarion serve` must not panic at startup with no API key. If live provider use
+`loomweave serve` must not panic at startup with no API key. If live provider use
 is not explicitly enabled, no provider is constructed. If live use is enabled
 and the configured env var is missing, config validation reports the missing
 OpenRouter key.
@@ -200,7 +200,7 @@ Corrections folded from review:
 - Remove unsupported free-tier attribution wording and undocumented parse-cause
   wording.
 - Treat OpenRouter usage as token accounting and do not recompute provider
-  pricing inside Clarion.
+  pricing inside Loomweave.
 
 ## Task Ledger
 
@@ -208,8 +208,8 @@ Corrections folded from review:
 2. TDD provider replacement: happy path, error envelope, choice-level error,
    retryability, headers, and usage tokens.
 3. Remove Anthropic pricing math and switch MCP ledger to token ceiling.
-4. Update `clarion.yaml` parsing and deprecation diagnostics.
-5. Wire `clarion serve` to construct `OpenRouterProvider`.
+4. Update `loomweave.yaml` parsing and deprecation diagnostics.
+5. Wire `loomweave serve` to construct `OpenRouterProvider`.
 6. Keep `RecordingProvider` trait compatibility.
 7. Amend ADR-030, ADR-007, and operator docs.
 8. Extend the Sprint 2 MCP e2e with a RecordingProvider `summary()` smoke.

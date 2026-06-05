@@ -1,8 +1,8 @@
-site_name: Clarion
+site_name: Loomweave
 site_description: Code archaeology for coding agents — entity-level facts about your codebase, served over MCP
-site_url: https://clarion.foundryside.dev
-repo_url: https://github.com/tachyon-beep/clarion
-repo_name: tachyon-beep/clarion
+site_url: https://loomweave.foundryside.dev
+repo_url: https://github.com/foundryside-dev/loomweave
+repo_name: foundryside-dev/loomweave
 edit_uri: edit/main/web/docs/
 
 # Source lives under web/; the default `site/` name is reserved for the build
@@ -14,9 +14,9 @@ theme:
   custom_dir: overrides
   palette:
     # The named palette only seeds Material's on-primary text colour (white).
-    # The visible accent is remapped to Clarion amber/brass in
+    # The visible accent is remapped to Loomweave amber/brass in
     # docs/stylesheets/extra.css under each [data-md-color-scheme] selector,
-    # exactly as Wardline remaps the shared Loom ramp to teal.
+    # exactly as Wardline remaps the shared Weft ramp to teal.
     - scheme: default
       primary: indigo
       accent: indigo
@@ -61,6 +61,6 @@ nav:
       - MCP tool reference: reference/mcp-tools.md
       - CLI: reference/cli.md
   - About:
-      - Changelog: https://github.com/tachyon-beep/clarion/blob/main/CHANGELOG.md
-      - Contributing: https://github.com/tachyon-beep/clarion/blob/main/CLAUDE.md
-      - License: https://github.com/tachyon-beep/clarion/blob/main/LICENSE
+      - Changelog: https://github.com/foundryside-dev/loomweave/blob/main/CHANGELOG.md
+      - Contributing: https://github.com/foundryside-dev/loomweave/blob/main/CLAUDE.md
+      - License: https://github.com/foundryside-dev/loomweave/blob/main/LICENSE

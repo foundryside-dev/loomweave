@@ -1,11 +1,11 @@
 [plugin]
-name = "clarion-plugin-python"
+name = "loomweave-plugin-python"
 plugin_id = "python"
-version = "1.3.0"
+version = "1.0.0"
 protocol_version = "1.0"
 # Bare basename per ADR-021 §Layer 1 + WP2 scrub commit eb0a41d — the host
 # refuses manifests whose `executable` carries any path component.
-executable = "clarion-plugin-python"
+executable = "loomweave-plugin-python"
 language = "python"
 extensions = ["py"]
 
@@ -15,14 +15,14 @@ extensions = ["py"]
 # inherits this limit from the plugin process, so B.4* declares the core
 # ceiling rather than the Sprint-1 CPython-only working set.
 expected_max_rss_mb = 2048
-# Triggers CLA-INFRA-PLUGIN-ENTITY-OVERRUN-WARNING well before the 500k
+# Triggers LMWV-INFRA-PLUGIN-ENTITY-OVERRUN-WARNING well before the 500k
 # core cap (warning emission itself is deferred to Tier B — Sprint 1
 # only lands the declaration).
 expected_entities_per_file = 5000
 # Wardline semantic extraction reads the NG-25 vocabulary descriptor without
 # importing Wardline, then emits source-observed decorator metadata on entities.
 wardline_aware = true
-# v0.1 rejects `true` at initialize with CLA-INFRA-MANIFEST-UNSUPPORTED-CAPABILITY.
+# v0.1 rejects `true` at initialize with LMWV-INFRA-MANIFEST-UNSUPPORTED-CAPABILITY.
 reads_outside_project_root = false
 
 [capabilities.runtime.pyright]
@@ -35,9 +35,9 @@ pin = "1.1.409"
 # `imports` candidate edges.
 entity_kinds = ["function", "class", "module"]
 edge_kinds = ["contains", "calls", "references", "imports"]
-# Per ADR-022: uppercase `CLA-{PLUGIN_ID_UPPER}-`. Reserved at parse
-# against the CLA-INFRA-* and CLA-FACT-* namespaces.
-rule_id_prefix = "CLA-PY-"
+# Per ADR-022: uppercase `LMWV-{PLUGIN_ID_UPPER}-`. Reserved at parse
+# against the LMWV-INFRA-* and LMWV-FACT-* namespaces.
+rule_id_prefix = "LMWV-PY-"
 # Bumps per ADR-027 when the entity/edge/rule set shifts. Phase 3 Task 3 is a
 # MINOR bump (additive `imports` edge kind). NOTE: ADR-007's summary-cache key
 # is the 5-tuple (entity_id, content_hash, prompt_template_id, model_tier,

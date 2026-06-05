@@ -3,7 +3,7 @@
 The 2026-05-18T1138Z Phase 3 perf run used the B.8 elspeth corpus at:
 
 ```text
-/tmp/clarion-b8-elspeth-full-20260518T0016Z
+/tmp/loomweave-b8-elspeth-full-20260518T0016Z
 ```
 
 That temporary directory is not committed. The committed provenance from the
@@ -21,8 +21,8 @@ ignored virtualenv or frontend dependency trees.
 ```bash
 bash tests/perf/b8_scale_test/derive-elspeth-corpus.sh \
   /path/to/elspeth \
-  /tmp/clarion-b8-elspeth-corpus-$(date -u +%Y%m%dT%H%M%SZ)
+  /tmp/loomweave-b8-elspeth-corpus-$(date -u +%Y%m%dT%H%M%SZ)
 ```
 
-Then use the emitted output directory as the `clarion install --path` and
-`clarion analyze` target.
+Then use the emitted output directory as the `loomweave install --path` and
+`loomweave analyze` target.

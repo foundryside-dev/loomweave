@@ -73,7 +73,7 @@ jobs:
       - name: install cargo-nextest
         uses: taiki-e/install-action@e310bff3ef77234d477d6bb655da153a5c49d1db
 
-      # Ensure all workspace binaries (notably clarion-plugin-fixture) are built
+      # Ensure all workspace binaries (notably loomweave-plugin-fixture) are built
       # before nextest runs. wp2_e2e tests need the fixture binary on disk and
       # nextest's CARGO_BIN_EXE_* propagation is not reliably set for cross-package
       # dev-dep binaries (deferred issue clarion-adeff0916d).
@@ -167,9 +167,9 @@ jobs:
         run: |
           uv export --project plugins/python --locked --extra dev --no-emit-project \
             --format requirements.txt \
-            --output-file /tmp/clarion-python-dev-requirements.txt
+            --output-file /tmp/loomweave-python-dev-requirements.txt
           uv run --project plugins/python --extra dev pip-audit \
-            -r /tmp/clarion-python-dev-requirements.txt
+            -r /tmp/loomweave-python-dev-requirements.txt
 
       - name: check B.4*/B.5 performance gates
         run: uv run --project plugins/python --extra dev python scripts/check-b4-gate-result.py --run-b5-smoke

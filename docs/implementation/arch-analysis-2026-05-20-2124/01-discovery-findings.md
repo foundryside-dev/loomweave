@@ -8,7 +8,7 @@
 
 ## Executive Discovery
 
-Clarion is a local-first code archaeology system. It ingests a repository,
+Loomweave is a local-first code archaeology system. It ingests a repository,
 extracts code entities and relationships, persists a SQLite graph, and serves
 consult-mode agents through MCP and a federation HTTP read API. The v1.0
 implementation is a Rust 2024 workspace plus a Python language plugin.
@@ -24,12 +24,12 @@ high-blast-radius files that need restraint before tag.
 
 | Area | Role |
 |---|---|
-| `crates/clarion-core` | Shared contracts, entity IDs, plugin host, manifest/protocol/transport validation, LLM provider adapters. |
-| `crates/clarion-storage` | SQLite schema, writer actor, reader pool, typed graph queries, summary/inferred-edge caches. |
-| `crates/clarion-cli` | `clarion` binary: install, analyze, serve, HTTP read API, release-facing operator paths. |
-| `crates/clarion-mcp` | MCP consult-mode JSON-RPC server and tool handlers. |
-| `crates/clarion-scanner` | Pre-ingest secret detector and detect-secrets-style baseline handling. |
-| `crates/clarion-plugin-fixture` | Subprocess fixture plugin for host/integration tests. |
+| `crates/loomweave-core` | Shared contracts, entity IDs, plugin host, manifest/protocol/transport validation, LLM provider adapters. |
+| `crates/loomweave-storage` | SQLite schema, writer actor, reader pool, typed graph queries, summary/inferred-edge caches. |
+| `crates/loomweave-cli` | `loomweave` binary: install, analyze, serve, HTTP read API, release-facing operator paths. |
+| `crates/loomweave-mcp` | MCP consult-mode JSON-RPC server and tool handlers. |
+| `crates/loomweave-scanner` | Pre-ingest secret detector and detect-secrets-style baseline handling. |
+| `crates/loomweave-plugin-fixture` | Subprocess fixture plugin for host/integration tests. |
 | `plugins/python` | Python language extractor, JSON-RPC stdio server, Pyright-backed resolution, Wardline probe. |
 
 Approximate source inventory from this pass:
@@ -44,21 +44,21 @@ Largest/highest-blast-radius files:
 
 | File | Approx LOC | Why It Matters |
 |---|---:|---|
-| `crates/clarion-mcp/src/lib.rs` | 3127 | Tool catalog, MCP envelope, LLM summary/inferred-edge paths, Filigree enrichment. |
-| `crates/clarion-core/src/plugin/host.rs` | 2935 | Plugin subprocess supervision, boundary validation, path/resource breakers. |
-| `crates/clarion-cli/src/analyze.rs` | 2427 | Main ingestion orchestration and subsystem clustering path. |
-| `crates/clarion-core/src/llm_provider.rs` | 2467 | Live-provider adapters, CLI/HTTP calls, usage accounting. |
-| `crates/clarion-cli/src/http_read.rs` | 1532 | Federation HTTP contract, auth, envelopes, limits. |
-| `plugins/python/src/clarion_plugin_python/pyright_session.py` | 1406 | LSP lifecycle, timeouts, target mapping. |
+| `crates/loomweave-mcp/src/lib.rs` | 3127 | Tool catalog, MCP envelope, LLM summary/inferred-edge paths, Filigree enrichment. |
+| `crates/loomweave-core/src/plugin/host.rs` | 2935 | Plugin subprocess supervision, boundary validation, path/resource breakers. |
+| `crates/loomweave-cli/src/analyze.rs` | 2427 | Main ingestion orchestration and subsystem clustering path. |
+| `crates/loomweave-core/src/llm_provider.rs` | 2467 | Live-provider adapters, CLI/HTTP calls, usage accounting. |
+| `crates/loomweave-cli/src/http_read.rs` | 1532 | Federation HTTP contract, auth, envelopes, limits. |
+| `plugins/python/src/loomweave_plugin_python/pyright_session.py` | 1406 | LSP lifecycle, timeouts, target mapping. |
 
 ## Source Of Truth
 
 The governing ladder is explicit and healthy:
 
-1. Accepted ADRs under `docs/clarion/adr/`.
-2. `docs/clarion/1.0/requirements.md`.
-3. `docs/clarion/1.0/system-design.md`.
-4. `docs/clarion/1.0/detailed-design.md`.
+1. Accepted ADRs under `docs/loomweave/adr/`.
+2. `docs/loomweave/1.0/requirements.md`.
+3. `docs/loomweave/1.0/system-design.md`.
+4. `docs/loomweave/1.0/detailed-design.md`.
 5. Implementation history under `docs/implementation/`.
 
 Implementation-history documents are evidence, not governing design. Accepted
@@ -82,22 +82,22 @@ operator documentation.
 
 ## Architecture Pattern Summary
 
-1. `clarion install` creates `.clarion/clarion.db`, config files, ignore rules,
+1. `loomweave install` creates `.loomweave/loomweave.db`, config files, ignore rules,
    and applies migrations.
-2. `clarion analyze` discovers plugins, scans source before ingest, runs plugin
+2. `loomweave analyze` discovers plugins, scans source before ingest, runs plugin
    analysis, writes core file/plugin entities and edges, runs graph completion
    and subsystem clustering, records run state, and persists findings.
-3. `clarion serve` opens storage, starts MCP stdio serving, and optionally
+3. `loomweave serve` opens storage, starts MCP stdio serving, and optionally
    starts the federation HTTP read API.
 4. MCP clients query the graph for entity lookup, paths, neighborhoods,
    summaries, inferred calls, Filigree issue associations, and subsystem
    membership.
 5. Federation consumers use the HTTP read API for file resolution and
-   briefing-safe content reads without making Clarion depend on sibling
+   briefing-safe content reads without making Loomweave depend on sibling
    products.
 
-The design preserves the Loom doctrine: sibling integrations enrich Clarion,
-but Clarion remains useful alone.
+The design preserves the Weft doctrine: sibling integrations enrich Loomweave,
+but Loomweave remains useful alone.
 
 ## High-Confidence Strengths
 
@@ -122,10 +122,10 @@ but Clarion remains useful alone.
   not every end-to-end gate named in `AGENTS.md`.
 - `CHANGELOG.md` contains a federation auth error-code drift: `UNAUTHORIZED`
   versus canonical `UNAUTHENTICATED`.
-- `crates/clarion-core/src/plugin/limits.rs` describes `EntityCountCap` as
+- `crates/loomweave-core/src/plugin/limits.rs` describes `EntityCountCap` as
   covering entities, edges, and findings, while host edge processing says edges
   do not participate in the entity cap.
-- HTTP HMAC is hand-rolled in `crates/clarion-cli/src/http_read.rs`; future
+- HTTP HMAC is hand-rolled in `crates/loomweave-cli/src/http_read.rs`; future
   edits need crypto-specific review.
 - Python plugin pins and Wardline bounds are duplicated across manifest/config
   code without a direct drift test.

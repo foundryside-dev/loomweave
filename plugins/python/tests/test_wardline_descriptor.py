@@ -3,7 +3,7 @@ from __future__ import annotations
 import builtins
 from typing import TYPE_CHECKING, Any
 
-from clarion_plugin_python.wardline_descriptor import (
+from loomweave_plugin_python.wardline_descriptor import (
     EXPECTED_DESCRIPTOR_VERSION,
     load_wardline_descriptor,
 )
@@ -53,7 +53,7 @@ def test_project_descriptor_wins_over_package_descriptor(
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        "clarion_plugin_python.wardline_descriptor.metadata.files",
+        "loomweave_plugin_python.wardline_descriptor.metadata.files",
         lambda name: [_FakePackagePath(package_descriptor)] if name == "wardline" else None,
     )
 
@@ -86,7 +86,7 @@ def test_package_descriptor_loads_without_importing_wardline(
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(
-        "clarion_plugin_python.wardline_descriptor.metadata.files",
+        "loomweave_plugin_python.wardline_descriptor.metadata.files",
         lambda name: [_FakePackagePath(package_descriptor)] if name == "wardline" else None,
     )
     monkeypatch.setattr(
@@ -104,7 +104,7 @@ def test_package_descriptor_loads_without_importing_wardline(
 
 def test_absent_descriptor_degrades_without_vocabulary(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.setattr(
-        "clarion_plugin_python.wardline_descriptor.metadata.files",
+        "loomweave_plugin_python.wardline_descriptor.metadata.files",
         lambda _name: None,
     )
 

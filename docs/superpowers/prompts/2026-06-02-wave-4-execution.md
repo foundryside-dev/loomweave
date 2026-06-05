@@ -5,7 +5,7 @@
 catalogue completion**, the first standalone-first-class wave.
 **Position:** Wave 4. **Ungated** — runs concurrently with the suite waves (0–3); does not wait
 for core paradise. Committed slot, not "as capacity allows."
-**Source of truth:** `docs/superpowers/specs/2026-06-02-clarion-ws5-mcp-catalogue-design.md` (the
+**Source of truth:** `docs/superpowers/specs/2026-06-02-loomweave-ws5-mcp-catalogue-design.md` (the
 design — read it fully); program §2/§4 (WS5 = Wave 4).
 **Companion:** Wave 5 (WS5b — `search_semantic` + `find_dead_code`) extends this surface; those two
 tools are **NOT** in Wave 4.
@@ -13,15 +13,15 @@ tools are **NOT** in Wave 4.
 ---
 
 ```
-You are implementing **Wave 4 — WS5: MCP catalogue completion** of the Clarion first-class
-program, in the Clarion repo at /home/john/clarion. WS5 completes the consult-mode MCP
+You are implementing **Wave 4 — WS5: MCP catalogue completion** of the Loomweave first-class
+program, in the Loomweave repo at /home/john/loomweave. WS5 completes the consult-mode MCP
 surface — the tools agents actually reach for — as a **stateless** catalogue. Your job is to
 PLAN and EXECUTE it: real code, real tests, all CI gates green.
 
 ## Position & gate
 Wave 4 is **ungated** — start anytime; it runs concurrently with the suite waves (0–3). There
 is no hard gate. Two things to confirm before building (verify, don't assume):
-1. **Ground-truth the current MCP surface.** WS5 EXTENDS a live surface — `crates/clarion-mcp/`
+1. **Ground-truth the current MCP surface.** WS5 EXTENDS a live surface — `crates/loomweave-mcp/`
    already ships ~19 stateless tools (entity_at, find_entity, callers_of, neighborhood,
    summary, metadata, source_for_entity, orientation_pack, issues_for, subsystem_*, …). Read
    the actual registration before adding tools; do not duplicate what exists.
@@ -31,12 +31,12 @@ is no hard gate. Two things to confirm before building (verify, don't assume):
    Design the field in now; do not block on Wave 1.
 
 ## Read these first
-1. docs/superpowers/specs/2026-06-02-clarion-ws5-mcp-catalogue-design.md — THE design. Read all
+1. docs/superpowers/specs/2026-06-02-loomweave-ws5-mcp-catalogue-design.md — THE design. Read all
    of it: §1 stateless decision, §2 current-surface inventory, §3 the tool catalogue, §4 SEI,
    §5 bounds, §6 the WS5/WS6 boundary, §7 the Wave-5 split-out.
-2. docs/clarion/1.0/system-design.md §8 — the INTENDED catalogue. Its cursor/session model is
+2. docs/loomweave/1.0/system-design.md §8 — the INTENDED catalogue. Its cursor/session model is
    **ratified-away** (see below); read it to know what NOT to build.
-3. docs/clarion/adr/ADR-030-on-demand-summary-scope.md (on-demand posture), ADR-028 (edge
+3. docs/loomweave/adr/ADR-030-on-demand-summary-scope.md (on-demand posture), ADR-028 (edge
    confidence tiers), ADR-038 (the SEI field). CLAUDE.md (CI gates, Filigree, ADR immutability).
 
 ## Scope — the WS5 tools (stateless; explicit IDs/scopes; bounded; SEI-carrying)
@@ -77,7 +77,7 @@ is no hard gate. Two things to confirm before building (verify, don't assume):
 - Do NOT build the cursor/session model (see above) — stateless only.
 - Do NOT build `search_semantic` or `find_dead_code` — those are **Wave 5 (WS5b)**, they need
   infrastructure beyond a catalog query. (`…-ws5b-advanced-queries-plan.md`.)
-- Do NOT build guidance AUTHORING — `propose_guidance`, `promote_guidance`, the `clarion guidance`
+- Do NOT build guidance AUTHORING — `propose_guidance`, `promote_guidance`, the `loomweave guidance`
   CLI, staleness review are **WS6 (Wave 6)**. WS5 owns guidance READ (`guidance_for`) only.
 - Do NOT add analyze-time precompute. Do NOT edit Accepted ADRs. Do NOT touch archived docs.
 
@@ -102,7 +102,7 @@ ADR-028/030. Close as you land each.
   including empty-result honesty where a categorisation signal is absent.
 - Faceted search + the cheap shortcuts ship; `search_semantic` + `find_dead_code` are explicitly
   left to Wave 5 (not built here, not silently dropped).
-- The `clarion-workflow` skill / MCP tool docs describe the new tools (stateless, SEI-carrying);
+- The `loomweave-workflow` skill / MCP tool docs describe the new tools (stateless, SEI-carrying);
   the §8-cursor-model reconciliation note is filed as a doc task.
 - All CI gates green.
 

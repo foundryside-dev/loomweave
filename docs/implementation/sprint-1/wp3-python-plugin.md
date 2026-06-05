@@ -1,8 +1,8 @@
 # WP3 — Python Plugin v0.1 Baseline (Sprint 1)
 
 **Status**: DRAFT — blocked-by WP2
-**Anchoring design**: [detailed-design.md §1 (Plugin implementation — Python specifics)](../../clarion/v0.1/detailed-design.md#1-plugin-implementation-detail), [system-design.md §2](../../clarion/v0.1/system-design.md#2-core--plugin-architecture)
-**Accepted ADRs**: [ADR-018](../../clarion/adr/ADR-018-identity-reconciliation.md), [ADR-022](../../clarion/adr/ADR-022-core-plugin-ontology.md), [ADR-023](../../clarion/adr/ADR-023-tooling-baseline.md)
+**Anchoring design**: [detailed-design.md §1 (Plugin implementation — Python specifics)](../../loomweave/v0.1/detailed-design.md#1-plugin-implementation-detail), [system-design.md §2](../../loomweave/v0.1/system-design.md#2-core--plugin-architecture)
+**Accepted ADRs**: [ADR-018](../../loomweave/adr/ADR-018-identity-reconciliation.md), [ADR-022](../../loomweave/adr/ADR-022-core-plugin-ontology.md), [ADR-023](../../loomweave/adr/ADR-023-tooling-baseline.md)
 **Predecessor**: [WP2](./wp2-plugin-host.md).
 **Blocks**: the Sprint 1 walking-skeleton demo.
 
@@ -17,15 +17,15 @@ and makes one real pass at the Wardline `REGISTRY` integration surface (even if 
 pass is a graceful-no-op probe).
 
 Feature-completeness for the Python plugin — every entity kind, every edge, every
-`CLA-PY-*` rule — is **not** Sprint 1. That's the WP3-feature-complete sprint,
+`LMWV-PY-*` rule — is **not** Sprint 1. That's the WP3-feature-complete sprint,
 reached after WP4 exists and can consume richer plugin output.
 
 **In scope for Sprint 1:**
 
-- Python package `clarion-plugin-python` installable via `pip install -e
+- Python package `loomweave-plugin-python` installable via `pip install -e
   plugins/python/` from the monorepo.
 - `plugin.toml` manifest matching WP2's L5 schema.
-- `clarion-plugin-python` executable (entry point) on `$PATH` after install.
+- `loomweave-plugin-python` executable (entry point) on `$PATH` after install.
 - JSON-RPC server speaking WP2's L4 method set: `initialize`, `initialized`,
   `analyze_file`, `shutdown`, `exit`.
 - `ast`-based function extraction: for a `.py` file, emit one entity per
@@ -58,8 +58,8 @@ reached after WP4 exists and can consume richer plugin output.
 - All edge kinds — deferred. _Sprint 2 / B.3 realises the first edge kind (**contains**), the dual-encoded `parent_id` field, the per-kind source-range contract, and the writer-actor's parent/contains consistency check; see [`../sprint-2/b3-contains-edges.md`](../sprint-2/b3-contains-edges.md) and the ADRs it locks (ADR-026, ADR-027). Calls/imports/decorates/inherits_from remain deferred to later WP3-feature-complete sprints._
 - Dynamic imports (`importlib`, `__import__`) — deferred; deliberately not solved
   in v0.1 per the out-of-scope list in `../v0.1-plan.md`.
-- All `CLA-PY-*` findings — WP4 consumes, WP3-feature-complete emits.
-- Type-inference, dataflow, taint — NG-05, never in scope for Clarion.
+- All `LMWV-PY-*` findings — WP4 consumes, WP3-feature-complete emits.
+- Type-inference, dataflow, taint — NG-05, never in scope for Loomweave.
 - Multi-file incremental analysis — WP6/WP7 territory.
 
 ## 2. Lock-in callouts
@@ -95,8 +95,8 @@ assert against hand-written expectations derived from Python's documented
 `src/` prefix stripping; UQ-WP3-05).
 
 **Why now**: `↗` ADR-018 — Wardline stores qualnames produced by the same rule
-and uses this segment (not the full 3-segment `EntityId`) as its Clarion-side
-join key. Divergence means Filigree's triage state can't join Clarion's
+and uses this segment (not the full 3-segment `EntityId`) as its Loomweave-side
+join key. Divergence means Filigree's triage state can't join Loomweave's
 entities to Wardline's annotations. This is the single most important
 cross-product alignment in Sprint 1.
 
@@ -104,7 +104,7 @@ cross-product alignment in Sprint 1.
 - WP1's L2 `entity_id()` concatenates `python`, `function`, and this
   segment. Shared fixture (Task 5) is the byte-for-byte parity proof.
 - `↗` Wardline must produce the same qualnames. If Wardline's rule diverges, either
-  Wardline changes or Clarion adds translation. ADR-018 names direct-production as
+  Wardline changes or Loomweave adds translation. ADR-018 names direct-production as
   the default; WP3's tests are the executable spec for what "match Wardline" means.
 
 **Mitigation if Wardline diverges**: discovered via the first real cross-check (either
@@ -116,12 +116,12 @@ change.
 `FingerprintEntry` (`wardline/src/wardline/manifest/models.py:86-97`)
 stores `(module: str, qualified_name: str)` as **separate fields** —
 `module` is the source file path (e.g. `demo.py`) and `qualified_name`
-is Python's bare `__qualname__` (e.g. `Foo.bar`). Clarion's L7 emits a
+is Python's bare `__qualname__` (e.g. `Foo.bar`). Loomweave's L7 emits a
 single combined `{dotted_module}.{__qualname__}` string. The two
 encodings carry the same information but are not byte-equal — joining
 requires a translator that composes
 `f"{module_dotted_name(wardline.module)}.{wardline.qualified_name}"` on
-the Wardline side using Clarion's `module_dotted_name` rules. Sprint 1
+the Wardline side using Loomweave's `module_dotted_name` rules. Sprint 1
 does not exercise the join (the L8 probe verifies presence + version
 only), so no Sprint-1 code path is broken. Tracked in
 **`clarion-889200006a`** for ADR-018 amendment when WP9 attempts the
@@ -169,7 +169,7 @@ WP3 commits the plugin's consumption pattern.
 
 **Cross-product implication**: `↗` **Wardline should not rename
 `wardline.core.registry.REGISTRY` or drop `wardline.__version__` without a
-coordinated Clarion-side release**. ADR-018 already states this; WP3 makes it a
+coordinated Loomweave-side release**. ADR-018 already states this; WP3 makes it a
 real dependency. Same-author note: this is within-scope Wardline discipline, not
 cross-team coordination — but the constraint is real.
 
@@ -178,7 +178,7 @@ import. Symbol existence was verified pre-sprint
 (`wardline/src/wardline/core/registry.py:55`,
 `wardline/src/wardline/__init__.py:3`), so the probe runs against a real
 `pip install wardline` in the dev venv rather than stubbing behind a
-`CLARION_WARDLINE_ENABLED` env var. This locks L8 completely — the
+`LOOMWEAVE_WARDLINE_ENABLED` env var. This locks L8 completely — the
 exercised lock-in is the honest one.
 
 ## 3. File decomposition
@@ -190,7 +190,7 @@ exercised lock-in is the honest one.
   .pre-commit-config.yaml         # ADR-023: ruff-check, ruff-format, mypy hooks
   README.md                       # install + dev notes
   src/
-    clarion_plugin_python/
+    loomweave_plugin_python/
       __init__.py
       py.typed                    # PEP 561 marker so downstream mypy picks up stubs
       __main__.py                 # entry point; runs the JSON-RPC server loop
@@ -236,7 +236,7 @@ Minimal. `pyproject.toml` declares:
   runs `ruff check`, `ruff format --check`, `mypy --strict`, and `pytest`.
 - Optional dep: `wardline` (declared in `[project.optional-dependencies] integrations`).
   The plugin works without Wardline; declaring it optional allows `pip install
-  clarion-plugin-python[integrations]` to pull Wardline when desired.
+  loomweave-plugin-python[integrations]` to pull Wardline when desired.
 
 ## 5. Unresolved questions
 
@@ -251,7 +251,7 @@ Minimal. `pyproject.toml` declares:
 - **UQ-WP3-02** — **Syntax-error handling**: ~~open~~ — **resolved as
   "skip + stderr log"** per the original proposal. `extract()` catches
   `SyntaxError` from `ast.parse`, writes one line to `sys.stderr`
-  (`clarion-plugin-python: skipping <path>: syntax error at line N: <msg>`),
+  (`loomweave-plugin-python: skipping <path>: syntax error at line N: <msg>`),
   and returns `[]`. The run continues; WP4 may later attach a finding.
   `test_syntax_error_yields_empty_list_and_logs_to_stderr` is the
   discriminating test. **Resolved**: Task 4 / `plugin.extractor`.
@@ -264,13 +264,13 @@ Minimal. `pyproject.toml` declares:
   **Resolved**: Task 6.
 - **UQ-WP3-04** — **Minimum Python version**: **Resolved — 3.11**. Picked
   for `ast.unparse` availability and better error messages; 3.12 raises the
-  install barrier without a Sprint 1 payoff. Clarion users are developers
+  install barrier without a Sprint 1 payoff. Loomweave users are developers
   with reasonable Python versions available. **Resolved**: Task 1.
 - **UQ-WP3-05** — **Module-path normalisation**: ~~open~~ — **resolved
   as plugin-side relativisation** (diverges from original proposal). The
   host sends absolute paths (WP2's CLI canonicalises `project_root`
   and walks via `entry.path()` — see
-  `crates/clarion-cli/src/analyze.rs`), so the plugin captures
+  `crates/loomweave-cli/src/analyze.rs`), so the plugin captures
   `project_root` from the `initialize` handshake and relativises
   incoming `file_path` values against it when deriving the dotted-module
   prefix for `qualified_name`. `source.file_path` emitted on the wire
@@ -289,7 +289,7 @@ Minimal. `pyproject.toml` declares:
   **resolved as "regular function entities"**. Overloaded methods are
   `FunctionDef`s with a decorator list — the extractor emits each one
   as a separate entity with the same `qualified_name`, matching Python's
-  own `__qualname__` behaviour. A future `CLA-PY-OVERLOAD` rule can add
+  own `__qualname__` behaviour. A future `LMWV-PY-OVERLOAD` rule can add
   semantic annotation in a later sprint. `test_overloaded_method_gets_
   regular_qualname` covers three overloads + the implementation.
   **Resolved**: Task 3 / `plugin.qualname`.
@@ -298,7 +298,7 @@ Minimal. `pyproject.toml` declares:
   at the repo root has 20 rows covering module-level functions, class
   methods, `<locals>`-marked nested functions, core file/subsystem
   entities, and hypothetical go/rust plugin IDs. Both
-  `crates/clarion-core/src/entity_id.rs::tests::shared_fixture_byte_for_byte_parity`
+  `crates/loomweave-core/src/entity_id.rs::tests::shared_fixture_byte_for_byte_parity`
   and `plugins/python/tests/test_entity_id.py::test_matches_shared_fixture`
   consume the same file and assert byte-equal output; divergence fails
   CI on both sides in lockstep. **Resolved**: Task 5 / `fixtures/entity_id.json`.
@@ -307,13 +307,13 @@ Minimal. `pyproject.toml` declares:
   read-error messages to `sys.stderr` via `sys.stderr.write`. The host
   captures stderr into a bounded 64 KiB ring buffer (WP2 scrub commit
   `b3c91a7`, resolving UQ-WP2-07); diagnostics are surfaced via
-  `host.stderr_tail()`. `.clarion/logs/` as a persistent log destination
+  `host.stderr_tail()`. `.loomweave/logs/` as a persistent log destination
   is a Sprint 2+ decision. **Resolved**: Task 2 + Task 4 / `plugin.server`,
   `plugin.extractor`.
 - **UQ-WP3-10** — **Testing + tooling infrastructure**: ~~"pytest + ruff;
   mypy adoption deferred until the plugin grows enough to benefit."~~ —
   **reopened 2026-04-18 and re-resolved by
-  [ADR-023](../../clarion/adr/ADR-023-tooling-baseline.md)**. The deferred
+  [ADR-023](../../loomweave/adr/ADR-023-tooling-baseline.md)**. The deferred
   framing was the canonical tell for unexamined tech debt: every Python
   module written without mypy would be a module to retrofit later. ADR-023
   adopts `pytest`, `ruff` (strict `select = ["ALL"]` config minus pragmatic
@@ -328,7 +328,7 @@ Minimal. `pyproject.toml` declares:
   **Resolved**: Task 4 / `plugin.extractor`.
 - **UQ-WP3-12** — **`initialize` response identity**: ~~open~~ —
   **resolved as "match the manifest exactly"**. The handshake returns
-  `{name: "clarion-plugin-python", version: "0.1.0", ontology_version:
+  `{name: "loomweave-plugin-python", version: "0.1.0", ontology_version:
   "0.1.0", capabilities: {...}}` — every field populated from the
   package `__version__` + the `ONTOLOGY_VERSION` module constant in
   `plugin.server`. Cross-check against manifest happens on the host side
@@ -343,24 +343,24 @@ Minimal. `pyproject.toml` declares:
 **Files**:
 - Create `/plugins/python/pyproject.toml` (package metadata + `[tool.ruff]` strict config + `[tool.mypy]` `strict = true` + `[tool.pytest.ini_options]`)
 - Create `/plugins/python/.pre-commit-config.yaml` (ruff-check, ruff-format, mypy hooks)
-- Create `/plugins/python/src/clarion_plugin_python/__init__.py`
-- Create `/plugins/python/src/clarion_plugin_python/py.typed` (PEP 561 marker)
-- Create `/plugins/python/src/clarion_plugin_python/__main__.py`
+- Create `/plugins/python/src/loomweave_plugin_python/__init__.py`
+- Create `/plugins/python/src/loomweave_plugin_python/py.typed` (PEP 561 marker)
+- Create `/plugins/python/src/loomweave_plugin_python/__main__.py`
 - Create `/plugins/python/README.md`
 - Create `/plugins/python/tests/__init__.py`
 - Extend `/.github/workflows/ci.yml` with a `python-plugin` job running ruff + mypy + pytest
 
 Steps:
 
-- [ ] Write `pyproject.toml` with `project.name = "clarion-plugin-python"`, `requires-python = ">=3.11"` (UQ-WP3-04), `project.scripts.clarion-plugin-python = "clarion_plugin_python.__main__:main"`, no runtime deps, dev deps `pytest`, `pytest-cov`, `ruff`, `mypy`, `pre-commit` (ADR-023).
+- [ ] Write `pyproject.toml` with `project.name = "loomweave-plugin-python"`, `requires-python = ">=3.11"` (UQ-WP3-04), `project.scripts.loomweave-plugin-python = "loomweave_plugin_python.__main__:main"`, no runtime deps, dev deps `pytest`, `pytest-cov`, `ruff`, `mypy`, `pre-commit` (ADR-023).
 - [ ] Configure `[tool.ruff]` with `target-version = "py311"`, `line-length = 100`, `select = ["ALL"]`, pragmatic excludes per ADR-023 (`D` docstring lints relaxed; `COM812`/`ISC001` to avoid format conflict; per-file-ignores for `tests/` and fixtures). `[tool.ruff.format]` matches defaults.
 - [ ] Configure `[tool.mypy]` with `strict = true`, `python_version = "3.11"`, `warn_unused_configs = true`. Add `[[tool.mypy.overrides]]` entries for any third-party modules without stubs (Sprint 1: none yet; Task 6 may add `packaging` once it's pulled in).
-- [ ] Configure `[tool.pytest.ini_options]` with `testpaths = ["tests"]`, `addopts = "--strict-markers --cov=clarion_plugin_python --cov-report=term-missing"`.
+- [ ] Configure `[tool.pytest.ini_options]` with `testpaths = ["tests"]`, `addopts = "--strict-markers --cov=loomweave_plugin_python --cov-report=term-missing"`.
 - [ ] Write `.pre-commit-config.yaml` with hooks for `ruff check --fix`, `ruff format`, and `mypy` (using `additional_dependencies` to install stubs mypy needs inside the hook env).
 - [ ] Write `py.typed` as an empty file — PEP 561 marker making the package's own type hints visible to downstream mypy consumers.
-- [ ] Write `__main__.py` with a typed `def main() -> int:` that writes `clarion-plugin-python 0.1.0\n` to `sys.stderr` and returns 0 (so `pip install -e .` produces a verifiable binary with full type coverage).
+- [ ] Write `__main__.py` with a typed `def main() -> int:` that writes `loomweave-plugin-python 0.1.0\n` to `sys.stderr` and returns 0 (so `pip install -e .` produces a verifiable binary with full type coverage).
 - [ ] `pip install -e plugins/python[dev]` (dev extras) and verify locally:
-  - `which clarion-plugin-python` returns a path and running it exits 0.
+  - `which loomweave-plugin-python` returns a path and running it exits 0.
   - `ruff check plugins/python` passes.
   - `ruff format --check plugins/python` passes.
   - `mypy --strict plugins/python` passes (Sprint 1's tiny surface makes this trivial; the discipline is set for every subsequent task).
@@ -372,22 +372,22 @@ Steps:
 ### Task 2 — JSON-RPC server loop + stdout discipline
 
 **Files**:
-- Create `/plugins/python/src/clarion_plugin_python/stdout_guard.py`
-- Create `/plugins/python/src/clarion_plugin_python/server.py`
-- Modify `/plugins/python/src/clarion_plugin_python/__main__.py`
+- Create `/plugins/python/src/loomweave_plugin_python/stdout_guard.py`
+- Create `/plugins/python/src/loomweave_plugin_python/server.py`
+- Modify `/plugins/python/src/loomweave_plugin_python/__main__.py`
 
 Steps:
 
 - [ ] In `stdout_guard.py`: on import, replace `sys.stdout` with an object whose `.buffer` is the real stdout bytes stream and whose `.write` raises. Provide a context manager `jsonrpc_output()` that yields the real bytes stream. This enforces WP2 UQ-WP2-08.
 - [ ] In `server.py`: implement Content-Length frame read/write from `sys.stdin.buffer` / the real stdout bytes stream. Implement a dispatch loop handling `initialize`, `initialized`, `analyze_file`, `shutdown`, `exit` by method name; each dispatches to a handler function.
-- [ ] Handlers for `initialize` (returns `{"name": "clarion-plugin-python", "version": "0.1.0", "ontology_version": "0.1.0"}`, UQ-WP3-12) and `shutdown` (returns `null`, then the next loop iteration exits on `exit`). `analyze_file` returns `{"entities": []}` for now; filled in later tasks.
+- [ ] Handlers for `initialize` (returns `{"name": "loomweave-plugin-python", "version": "0.1.0", "ontology_version": "0.1.0"}`, UQ-WP3-12) and `shutdown` (returns `null`, then the next loop iteration exits on `exit`). `analyze_file` returns `{"entities": []}` for now; filled in later tasks.
 - [ ] Failing integration test in `test_server.py`: spin up the server in a subprocess, send an `initialize` frame, receive a response with the expected shape.
 - [ ] Implement and verify. Commit: `feat(wp3): L4-compatible JSON-RPC server + stdout guard`.
 
 ### Task 3 — Qualname reconstruction (L7)
 
 **Files**:
-- Create `/plugins/python/src/clarion_plugin_python/qualname.py`
+- Create `/plugins/python/src/loomweave_plugin_python/qualname.py`
 - Create `/plugins/python/tests/test_qualname.py`
 
 Steps:
@@ -400,8 +400,8 @@ Steps:
 ### Task 4 — Extractor (ast → entities)
 
 **Files**:
-- Create `/plugins/python/src/clarion_plugin_python/extractor.py`
-- Create `/plugins/python/src/clarion_plugin_python/entity_id.py`
+- Create `/plugins/python/src/loomweave_plugin_python/extractor.py`
+- Create `/plugins/python/src/loomweave_plugin_python/entity_id.py`
 - Create `/plugins/python/tests/test_extractor.py`
 - Create `/plugins/python/tests/fixtures/` with sample `.py` files + expected-entity YAML
 
@@ -420,20 +420,20 @@ Steps:
 
 **Files**:
 - Create `/fixtures/entity_id.json` at repo root
-- Modify `/crates/clarion-core/src/entity_id.rs` tests to consume it
+- Modify `/crates/loomweave-core/src/entity_id.rs` tests to consume it
 - Modify `/plugins/python/tests/test_entity_id.py` to consume it
 
 Steps:
 
 - [ ] Write the fixture: JSON array of objects each with `plugin_id`, `kind`, `canonical_qualified_name`, and `expected_entity_id` fields. At least 20 rows covering the representative cases from ADR-003 (both plugin-emitted `python:function:*` rows and core-reserved `core:file:*`/`core:subsystem:*` rows).
-- [ ] Add a test in `clarion-core` that loads the fixture at test time, runs `entity_id()` for each row, asserts equality. Same-shaped test in `plugins/python` (the Python side concatenates its three segments; assertion is on the final string).
+- [ ] Add a test in `loomweave-core` that loads the fixture at test time, runs `entity_id()` for each row, asserts equality. Same-shaped test in `plugins/python` (the Python side concatenates its three segments; assertion is on the final string).
 - [ ] Run both test suites; expect pass in both.
 - [ ] Commit: `test(wp3): shared EntityId fixture (UQ-WP3-08 resolution)`.
 
 ### Task 6 — Wardline probe (L8)
 
 **Files**:
-- Create `/plugins/python/src/clarion_plugin_python/wardline_probe.py`
+- Create `/plugins/python/src/loomweave_plugin_python/wardline_probe.py`
 - Create `/plugins/python/tests/test_wardline_probe.py`
 
 Steps:
@@ -451,12 +451,12 @@ Steps:
 
 **Files**:
 - Create `/plugins/python/plugin.toml`
-- Modify `/plugins/python/src/clarion_plugin_python/server.py` `analyze_file` handler
+- Modify `/plugins/python/src/loomweave_plugin_python/server.py` `analyze_file` handler
 
 Steps:
 
-- [ ] Write `plugin.toml` matching WP2 L5 schema: `[plugin]` (name, `plugin_id = "python"`, version, protocol_version, executable, `language = "python"`, `extensions = ["py"]`), `[capabilities.runtime]` per ADR-021 §Layer 1 (`expected_max_rss_mb = 512`, `expected_entities_per_file = 5000`, `wardline_aware = true`, `reads_outside_project_root = false`), `[ontology]` (kinds = `["function"]`, edge_kinds = `[]`, `rule_id_prefix = "CLA-PY-"`, `ontology_version = "0.1.0"`), `[integrations.wardline]` (`min_version = "0.1.0"`, `max_version = "0.2.0"`). The Wardline-specific values in `[integrations.wardline]` flow from the `wardline_aware = true` declaration.
-- [ ] Arrange installation to place `plugin.toml` where WP2's discovery (L9) finds it: at install-prefix `share/clarion/plugins/clarion-plugin-python/plugin.toml`. Using `tool.setuptools` or `hatch` data-file declarations in `pyproject.toml`. Verify after `pip install -e .` the file is discoverable.
+- [ ] Write `plugin.toml` matching WP2 L5 schema: `[plugin]` (name, `plugin_id = "python"`, version, protocol_version, executable, `language = "python"`, `extensions = ["py"]`), `[capabilities.runtime]` per ADR-021 §Layer 1 (`expected_max_rss_mb = 512`, `expected_entities_per_file = 5000`, `wardline_aware = true`, `reads_outside_project_root = false`), `[ontology]` (kinds = `["function"]`, edge_kinds = `[]`, `rule_id_prefix = "LMWV-PY-"`, `ontology_version = "0.1.0"`), `[integrations.wardline]` (`min_version = "0.1.0"`, `max_version = "0.2.0"`). The Wardline-specific values in `[integrations.wardline]` flow from the `wardline_aware = true` declaration.
+- [ ] Arrange installation to place `plugin.toml` where WP2's discovery (L9) finds it: at install-prefix `share/loomweave/plugins/loomweave-plugin-python/plugin.toml`. Using `tool.setuptools` or `hatch` data-file declarations in `pyproject.toml`. Verify after `pip install -e .` the file is discoverable.
 - [ ] Modify `analyze_file` handler: read the requested path, run `extractor.extract()`, return `{"entities": [...]}`.
 - [ ] Commit: `feat(wp3): plugin.toml manifest + analyze_file wired to extractor`.
 
@@ -467,7 +467,7 @@ Steps:
 
 Steps:
 
-- [ ] Test: spawn the installed plugin as a subprocess; complete handshake; call `analyze_file` on `plugins/python/src/clarion_plugin_python/extractor.py`; assert the returned entities include specific expected ones (the `extract` function itself, etc.); shutdown cleanly.
+- [ ] Test: spawn the installed plugin as a subprocess; complete handshake; call `analyze_file` on `plugins/python/src/loomweave_plugin_python/extractor.py`; assert the returned entities include specific expected ones (the `extract` function itself, etc.); shutdown cleanly.
 - [ ] Commit: `test(wp3): round-trip self-test against plugin's own source`.
 
 ### Task 9 — Sprint 1 walking-skeleton end-to-end
@@ -496,11 +496,11 @@ WP3 is done for Sprint 1 when all of:
 - The walking-skeleton demo script (README §3) passes end-to-end on a clean machine.
 - L7 (qualname) and L8 (Wardline probe) each have passing positive and negative tests.
 - The shared `EntityId` fixture (`fixtures/entity_id.json`) passes in both the
-  Rust (`clarion-core::entity_id`) and Python (`test_entity_id.py`) test suites.
+  Rust (`loomweave-core::entity_id`) and Python (`test_entity_id.py`) test suites.
 - Round-trip self-test passes.
 - Every UQ-WP3-* is marked resolved in §5.
 - `pip install -e plugins/python[dev]` works on a clean Python 3.11 venv and
-  `clarion-plugin-python` is on `$PATH`.
+  `loomweave-plugin-python` is on `$PATH`.
 - **ADR-023 gates green** (all four): `ruff check plugins/python`,
   `ruff format --check plugins/python`, `mypy --strict plugins/python`, and
   `pytest plugins/python` all pass on the WP3 closing commit.

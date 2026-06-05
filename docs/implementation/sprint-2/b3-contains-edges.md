@@ -1,8 +1,8 @@
 # B.3 — Python plugin: `contains` edges (Sprint 2 / Tier B / first edge kind)
 
 **Status**: DRAFT — Sprint 2 Tier-B B.3 work-package design
-**Anchoring design**: [system-design.md §6 (Guidance composition; clustering)](../../clarion/v0.1/system-design.md#6-guidance-system), [detailed-design.md §3 (Schemas, edge tables)](../../clarion/v0.1/detailed-design.md), [B.2 design doc](./b2-class-module-entities.md) (predecessor)
-**Accepted ADRs**: [ADR-002](../../clarion/adr/ADR-002-plugin-transport-json-rpc.md), [ADR-003](../../clarion/adr/ADR-003-entity-id-scheme.md), [ADR-006](../../clarion/adr/ADR-006-clustering-algorithm.md), [ADR-007](../../clarion/adr/ADR-007-summary-cache-key.md), [ADR-022](../../clarion/adr/ADR-022-core-plugin-ontology.md), [ADR-023](../../clarion/adr/ADR-023-tooling-baseline.md), [ADR-024](../../clarion/adr/ADR-024-guidance-schema-vocabulary.md), [ADR-026](../../clarion/adr/ADR-026-containment-wire-and-edge-identity.md), [ADR-027](../../clarion/adr/ADR-027-ontology-version-semver.md)
+**Anchoring design**: [system-design.md §6 (Guidance composition; clustering)](../../loomweave/v0.1/system-design.md#6-guidance-system), [detailed-design.md §3 (Schemas, edge tables)](../../loomweave/v0.1/detailed-design.md), [B.2 design doc](./b2-class-module-entities.md) (predecessor)
+**Accepted ADRs**: [ADR-002](../../loomweave/adr/ADR-002-plugin-transport-json-rpc.md), [ADR-003](../../loomweave/adr/ADR-003-entity-id-scheme.md), [ADR-006](../../loomweave/adr/ADR-006-clustering-algorithm.md), [ADR-007](../../loomweave/adr/ADR-007-summary-cache-key.md), [ADR-022](../../loomweave/adr/ADR-022-core-plugin-ontology.md), [ADR-023](../../loomweave/adr/ADR-023-tooling-baseline.md), [ADR-024](../../loomweave/adr/ADR-024-guidance-schema-vocabulary.md), [ADR-026](../../loomweave/adr/ADR-026-containment-wire-and-edge-identity.md), [ADR-027](../../loomweave/adr/ADR-027-ontology-version-semver.md)
 **Predecessor**: [B.2 — class + module entity emission](./b2-class-module-entities.md)
 **Successor**: B.1 (multi-file dispatch — WP4 Phase 0+1) and B.4 (catalog rendering)
 **Sprint-2 kickoff handoff**: [`docs/superpowers/handoffs/2026-04-30-sprint-2-kickoff.md`](../handoffs/2026-04-30-sprint-2-kickoff.md) §"What's in scope for Sprint 2" Tier B row B.3
@@ -11,7 +11,7 @@
 
 ## 1. Scope
 
-B.3 introduces the first edge kind Clarion has ever persisted. Three things change in lockstep:
+B.3 introduces the first edge kind Loomweave has ever persisted. Three things change in lockstep:
 
 - **Plugin emits `contains` edges** for every immediate-parent containment relationship (module → top-level function/class, class → method, class → nested class, function → nested function, function → nested class).
 - **Plugin emits `parent_id` on every entity** (dual encoding with the contains edge for the same fact). The writer-actor enforces consistency.
@@ -28,7 +28,7 @@ B.3 introduces the first edge kind Clarion has ever persisted. Three things chan
 
 These are caller-observable surfaces locked at `v0.1-sprint-1` close + B.2 close. B.3 must not change them; if a change is genuinely needed, write an ADR amendment per the kickoff-handoff convention.
 
-- **Wire shape entity portion** (`crates/clarion-core/src/plugin/host.rs:132-154`): `RawEntity { id, kind, qualified_name, source: RawSource, extra }` with `#[serde(flatten)] extra`. `RawSource { file_path, extra }` likewise. B.3 adds `parent_id: Option<String>` as a NEW typed field on `RawEntity` (NOT via `extra`) — it's load-bearing for the writer's parent-id consistency check (§3 Q2 below).
+- **Wire shape entity portion** (`crates/loomweave-core/src/plugin/host.rs:132-154`): `RawEntity { id, kind, qualified_name, source: RawSource, extra }` with `#[serde(flatten)] extra`. `RawSource { file_path, extra }` likewise. B.3 adds `parent_id: Option<String>` as a NEW typed field on `RawEntity` (NOT via `extra`) — it's load-bearing for the writer's parent-id consistency check (§3 Q2 below).
 - **L7 qualname format**: `{dotted_module}.{__qualname__}`. Class-in-class chains class names with no `<locals>`; function-parent boundary inserts `<locals>`. B.3 unchanged.
 - **L4 JSON-RPC method set**: `initialize`, `initialized`, `analyze_file`, `shutdown`, `exit`. B.3 changes none of these.
 - **L5 manifest schema**: B.3 amends only `[ontology].edge_kinds` (adds `"contains"`), `[ontology].ontology_version` (`0.2.0` → `0.3.0`), and corresponding constants. No structural change.
@@ -83,7 +83,7 @@ Contains edges omit the byte-offset fields entirely (NotRequired absent ⇒ JSON
 
 ### Q2 — `parent_id` provenance: dual encoding with writer-actor enforcement
 
-**Decision**: Plugin emits BOTH `parent_id` on `RawEntity` (as a typed top-level field) AND a `contains` edge for the same fact. The writer-actor enforces the consistency invariant on commit: every entity's `parent_id` MUST match exactly one `contains` edge `(kind=contains, from_id=parent_id, to_id=entity.id)`; mismatches reject the run with `CLA-INFRA-PARENT-CONTAINS-MISMATCH`.
+**Decision**: Plugin emits BOTH `parent_id` on `RawEntity` (as a typed top-level field) AND a `contains` edge for the same fact. The writer-actor enforces the consistency invariant on commit: every entity's `parent_id` MUST match exactly one `contains` edge `(kind=contains, from_id=parent_id, to_id=entity.id)`; mismatches reject the run with `LMWV-INFRA-PARENT-CONTAINS-MISMATCH`.
 
 **Why**:
 
@@ -127,7 +127,7 @@ The full case list:
 
 ### Q4 — Edge row identity: drop the `id` column
 
-**Decision**: Drop the `id TEXT PRIMARY KEY` column from `crates/clarion-storage/migrations/0001_initial_schema.sql:66-79`. Promote `(kind, from_id, to_id)` from `UNIQUE` constraint to `PRIMARY KEY`. Add `WITHOUT ROWID` clause for SQLite optimization (the natural PK makes the rowid redundant).
+**Decision**: Drop the `id TEXT PRIMARY KEY` column from `crates/loomweave-storage/migrations/0001_initial_schema.sql:66-79`. Promote `(kind, from_id, to_id)` from `UNIQUE` constraint to `PRIMARY KEY`. Add `WITHOUT ROWID` clause for SQLite optimization (the natural PK makes the rowid redundant).
 
 **Why**: Panel split 2-2-1; reconciliation favored (c) drop-the-column based on the strongest concrete arguments:
 
@@ -137,7 +137,7 @@ The full case list:
 
 **Migration mechanics** (per ADR-024's edit-in-place migration policy):
 
-We're at the zero-cost frontier for the edges table — it has never been written. Edit `migrations/0001_initial_schema.sql` in place rather than authoring a new migration file. ADR-024's retirement trigger (first external operator pulls a published Clarion build) hasn't fired; the in-place edit is permissible.
+We're at the zero-cost frontier for the edges table — it has never been written. Edit `migrations/0001_initial_schema.sql` in place rather than authoring a new migration file. ADR-024's retirement trigger (first external operator pulls a published Loomweave build) hasn't fired; the in-place edit is permissible.
 
 The schema becomes:
 
@@ -176,7 +176,7 @@ The three indexes survive (they're query-driving, not PK-derived).
 | `decorates` | MUST be `Some` |
 | `inherits_from` | MUST be `Some` |
 
-Writer rejects on violation with `CLA-INFRA-EDGE-SOURCE-RANGE-CONTRACT`.
+Writer rejects on violation with `LMWV-INFRA-EDGE-SOURCE-RANGE-CONTRACT`.
 
 **Why**: Five-reviewer panel unanimous (5×(a) high confidence). Containment is a structural fact derived from the AST; its "location" is identical to the contained entity's source range (already on the entity). Adding line columns to the schema (option b) is scope creep beyond B.3; computing byte offsets in the plugin (option c) requires byte-offset tracking the plugin doesn't otherwise need. The per-kind contract converts the schema's ambient `NULL` permissiveness into a kind-dispatched invariant — consumers can write `assert edge.source_byte_start is not None` for `calls`/`imports` and rely on it.
 
@@ -187,8 +187,8 @@ Writer rejects on violation with `CLA-INFRA-EDGE-SOURCE-RANGE-CONTRACT`.
 | File | Change |
 |---|---|
 | `plugins/python/plugin.toml` | `[ontology].edge_kinds = ["contains"]`; `[ontology].ontology_version = "0.3.0"` |
-| `plugins/python/src/clarion_plugin_python/server.py` | `ONTOLOGY_VERSION = "0.3.0"` |
-| `plugins/python/src/clarion_plugin_python/__init__.py` | `__version__ = "0.1.2"` (PATCH — no breaking API change; new edge emission is additive via `serde(default)`) |
+| `plugins/python/src/loomweave_plugin_python/server.py` | `ONTOLOGY_VERSION = "0.3.0"` |
+| `plugins/python/src/loomweave_plugin_python/__init__.py` | `__version__ = "0.1.2"` (PATCH — no breaking API change; new edge emission is additive via `serde(default)`) |
 
 ADR-027 is the policy citation: this is a MINOR ontology bump (additive `contains` edge kind). PATCH on package version because the public Python API surface (`extract()` signature) becomes `tuple[list[RawEntity], list[RawEdge]]` — that IS technically a return-type change, but the only consumer is the plugin's own server module which is updated in lockstep, so the patch designation is faithful to "no breaking external API change."
 
@@ -213,7 +213,7 @@ Note: graduating `entities` from `Vec<Value>` to `Vec<RawEntity>` is a follow-up
 
 ## 5. Storage protocol additions
 
-**`WriterCmd::InsertEdge`** new variant in `crates/clarion-storage/src/commands.rs`:
+**`WriterCmd::InsertEdge`** new variant in `crates/loomweave-storage/src/commands.rs`:
 
 ```rust
 #[derive(Debug, Clone)]
@@ -259,7 +259,7 @@ WHERE e.parent_id IS NOT NULL
   AND (ce.from_id IS NULL OR ce.from_id != e.parent_id);
 ```
 
-Any non-empty result rejects the run with `CLA-INFRA-PARENT-CONTAINS-MISMATCH` and rolls back the in-flight transaction. Inverse check (every contains edge has a matching parent_id):
+Any non-empty result rejects the run with `LMWV-INFRA-PARENT-CONTAINS-MISMATCH` and rolls back the in-flight transaction. Inverse check (every contains edge has a matching parent_id):
 
 ```sql
 SELECT ce.from_id, ce.to_id, e.parent_id
@@ -279,7 +279,7 @@ The writer-actor exposes a per-run `dropped_edges_total` field on `AnalyzeFileOu
 
 - `(kind, from_id, to_id)` UNIQUE conflicts (idempotent re-analyze).
 - Dangling FK references (edge whose `from_id` or `to_id` is not in the entities table).
-- Per-kind source-range contract violations (`CLA-INFRA-EDGE-SOURCE-RANGE-CONTRACT`).
+- Per-kind source-range contract violations (`LMWV-INFRA-EDGE-SOURCE-RANGE-CONTRACT`).
 
 The walking-skeleton e2e (`tests/e2e/sprint_1_walking_skeleton.sh`) asserts `dropped_edges_total == 0` post-analyze. Without this assertion, "VER-without-VAL" applies: schema is correct, tests pass, catalog is wrong because edges silently dropped.
 
@@ -288,8 +288,8 @@ The walking-skeleton e2e (`tests/e2e/sprint_1_walking_skeleton.sh`) asserts `dro
 ### Task 1 — Storage schema migration (drop edges.id, add WITHOUT ROWID)
 
 Files:
-- Modify: `crates/clarion-storage/migrations/0001_initial_schema.sql` (in-place edit per ADR-024 / ADR-026 retirement rule).
-- Modify: `crates/clarion-storage/tests/schema_apply.rs` (any test asserting on `edges.id` column).
+- Modify: `crates/loomweave-storage/migrations/0001_initial_schema.sql` (in-place edit per ADR-024 / ADR-026 retirement rule).
+- Modify: `crates/loomweave-storage/tests/schema_apply.rs` (any test asserting on `edges.id` column).
 
 Steps:
 - Failing test: schema_apply test asserting edges has primary key `(kind, from_id, to_id)` and no `id` column.
@@ -302,9 +302,9 @@ Steps:
 ### Task 2 — `WriterCmd::InsertEdge` + `EdgeRecord` + writer-actor integration
 
 Files:
-- Modify: `crates/clarion-storage/src/commands.rs` (add `EdgeRecord`, add `WriterCmd::InsertEdge`).
-- Modify: `crates/clarion-storage/src/writer.rs` (add INSERT logic; rename `inserts_in_batch` → `writes_in_batch`; per-kind source-range contract enforcement; dropped-edge counter).
-- Modify: `crates/clarion-storage/tests/writer_actor.rs` (round-trip insert tests; per-kind contract violation tests; dropped-edge counter tests).
+- Modify: `crates/loomweave-storage/src/commands.rs` (add `EdgeRecord`, add `WriterCmd::InsertEdge`).
+- Modify: `crates/loomweave-storage/src/writer.rs` (add INSERT logic; rename `inserts_in_batch` → `writes_in_batch`; per-kind source-range contract enforcement; dropped-edge counter).
+- Modify: `crates/loomweave-storage/tests/writer_actor.rs` (round-trip insert tests; per-kind contract violation tests; dropped-edge counter tests).
 
 Steps:
 - Failing test: writer-actor inserts a contains edge, asserts row visible to a reader.
@@ -320,22 +320,22 @@ Steps:
 ### Task 3 — Host wire shape: `RawEdge` + `RawEntity.parent_id` + `AnalyzeFileResult.edges`
 
 Files:
-- Modify: `crates/clarion-core/src/plugin/protocol.rs` (add `RawEdge` struct; add `edges: Vec<RawEdge>` to `AnalyzeFileResult`; add `parent_id: Option<String>` to `RawEntity` if/when it graduates from `Vec<Value>` — Sprint-1 `protocol.rs:328` notes this is Task 6 graduation work).
-- Modify: `crates/clarion-core/src/plugin/host.rs` (deserialise `edges` from `AnalyzeFileResult`; pass through to writer; derive `source_file_id` from module entity).
-- Modify: `crates/clarion-core/tests/host_subprocess.rs` (test edge round-trip).
+- Modify: `crates/loomweave-core/src/plugin/protocol.rs` (add `RawEdge` struct; add `edges: Vec<RawEdge>` to `AnalyzeFileResult`; add `parent_id: Option<String>` to `RawEntity` if/when it graduates from `Vec<Value>` — Sprint-1 `protocol.rs:328` notes this is Task 6 graduation work).
+- Modify: `crates/loomweave-core/src/plugin/host.rs` (deserialise `edges` from `AnalyzeFileResult`; pass through to writer; derive `source_file_id` from module entity).
+- Modify: `crates/loomweave-core/tests/host_subprocess.rs` (test edge round-trip).
 
 Steps:
 - Failing test: a fixture plugin returns one entity and one contains edge; host deserialises both; storage persists both.
 - Implement minimal `RawEdge` deserialise + pass-through.
-- Failing test: parent-id consistency check (entity declares parent_id but no matching contains edge → run rejected with `CLA-INFRA-PARENT-CONTAINS-MISMATCH`).
+- Failing test: parent-id consistency check (entity declares parent_id but no matching contains edge → run rejected with `LMWV-INFRA-PARENT-CONTAINS-MISMATCH`).
 - Implement consistency check at commit time.
 - Commit: `feat(host): RawEdge wire shape + parent_id consistency check (B.3)`.
 
 ### Task 4 — Python plugin: emit `contains` edges + `parent_id` on entities
 
 Files:
-- Modify: `plugins/python/src/clarion_plugin_python/extractor.py` (add `RawEdge` TypedDict; change `extract()` return to `tuple[list[RawEntity], list[RawEdge]]`; per-kind builders return `tuple[RawEntity, str]`; `_walk` accumulates dual lists; module entity `parent_id` is None — module is the root within-file).
-- Modify: `plugins/python/src/clarion_plugin_python/server.py` (update `handle_analyze_file` to pass both entities and edges through to the response).
+- Modify: `plugins/python/src/loomweave_plugin_python/extractor.py` (add `RawEdge` TypedDict; change `extract()` return to `tuple[list[RawEntity], list[RawEdge]]`; per-kind builders return `tuple[RawEntity, str]`; `_walk` accumulates dual lists; module entity `parent_id` is None — module is the root within-file).
+- Modify: `plugins/python/src/loomweave_plugin_python/server.py` (update `handle_analyze_file` to pass both entities and edges through to the response).
 - Modify: `plugins/python/tests/test_extractor.py` (new tests for edge emission and parent_id).
 
 Steps:
@@ -353,8 +353,8 @@ Steps:
 
 Files:
 - Modify: `plugins/python/plugin.toml` (`[ontology].edge_kinds = ["contains"]`; `[ontology].ontology_version = "0.3.0"`).
-- Modify: `plugins/python/src/clarion_plugin_python/server.py` (`ONTOLOGY_VERSION = "0.3.0"`).
-- Modify: `plugins/python/src/clarion_plugin_python/__init__.py` (`__version__ = "0.1.2"`).
+- Modify: `plugins/python/src/loomweave_plugin_python/server.py` (`ONTOLOGY_VERSION = "0.3.0"`).
+- Modify: `plugins/python/src/loomweave_plugin_python/__init__.py` (`__version__ = "0.1.2"`).
 - Modify: `plugins/python/tests/test_server.py` and `plugins/python/tests/test_package.py` (update version-string assertions).
 
 Steps:
@@ -415,7 +415,7 @@ B.3 is done for Sprint 2 when ALL of:
 - Cross-language fixture parity passes on Rust + Python sides.
 - Walking-skeleton e2e PASSES with `dropped_edges_total == 0`.
 - All ADR-023 gates green on the closing commit.
-- ADR-026 + ADR-027 in Accepted state, indexed in `docs/clarion/adr/README.md`.
+- ADR-026 + ADR-027 in Accepted state, indexed in `docs/loomweave/adr/README.md`.
 
 ## 10. Open questions for the implementation phase (lower stakes)
 
@@ -431,7 +431,7 @@ Six design questions taken to a five-reviewer panel (systems-thinker, solution-a
 | Q | Decision | Vote pattern | Reconciliation |
 |---|---|---|---|
 | Q1 | (a) top-level `edges` field on `AnalyzeFileResult` | 5×(a) high confidence | unanimous; cross-file resolution explicitly documented in ADR-026 |
-| Q2 | (a) dual-encoding parent_id + contains edge WITH writer-actor enforcement | 3×(a), 2×(b) split | reconciled to (a)+enforcement per architecture-critic's `CLA-INFRA-PARENT-CONTAINS-MISMATCH` requirement |
+| Q2 | (a) dual-encoding parent_id + contains edge WITH writer-actor enforcement | 3×(a), 2×(b) split | reconciled to (a)+enforcement per architecture-critic's `LMWV-INFRA-PARENT-CONTAINS-MISMATCH` requirement |
 | Q3 | (a) all immediate-parent containments | 5×(a) high confidence | unanimous; non-goal locked: "emitter is exhaustive; renderer-side filtering owns presentation" |
 | Q4 | (c) drop `edges.id` column | 2×(b), 2×(c), 1×(b)+ADR | reconciled to (c) per architecture-critic + Python/Rust engineer concrete byte-cost arguments + no-current-reader |
 | Q5 | (a) None — emit nothing for contains source range | 5×(a) high confidence | unanimous; per-kind contract documented in ADR-026 decision 3 |

@@ -1,11 +1,11 @@
-# Clarion v0.1 skeleton audit — vocabulary, schema, and test-debt sweep
+# Loomweave v0.1 skeleton audit — vocabulary, schema, and test-debt sweep
 
 **Date**: 2026-05-03
 **Trigger**: Investigating filigree issue `clarion-4cd11905e2`
 (`entities.priority` TEXT-affinity bug) revealed the issue body assumed P0–P4
 numeric urgency while the design says `priority` is a six-level string enum
 (`project | subsystem | package | module | class | function`). That misframing
-is itself a symptom: the same word is doing different work in Clarion vs in
+is itself a symptom: the same word is doing different work in Loomweave vs in
 Filigree, with no ADR mediating the clash.
 
 User direction (paraphrased): *"Don't shuffle one bone of the skeleton in
@@ -20,9 +20,9 @@ class of problem one issue at a time during Sprint 2.
 
 In scope:
 
-1. **Cross-product vocabulary clashes** (Clarion vs Filigree, Clarion vs
+1. **Cross-product vocabulary clashes** (Loomweave vs Filigree, Loomweave vs
    Wardline) — same word, different meaning, no managing ADR.
-2. **Within-Clarion overloads** — same word doing distinct jobs in the
+2. **Within-Loomweave overloads** — same word doing distinct jobs in the
    product's own model.
 3. **Schema affinity / type concerns** in `0001_initial_schema.sql` — the
    class of bug `clarion-4cd11905e2` belongs to.
@@ -42,14 +42,14 @@ Out of scope (deliberate; flag for separate audit if useful):
 
 For each candidate concept:
 
-1. Locate every site in `docs/clarion/1.0/{requirements,system-design,detailed-design}.md`,
-   `docs/clarion/adr/`, `crates/clarion-storage/migrations/0001_initial_schema.sql`,
+1. Locate every site in `docs/loomweave/1.0/{requirements,system-design,detailed-design}.md`,
+   `docs/loomweave/adr/`, `crates/loomweave-storage/migrations/0001_initial_schema.sql`,
    and any code path that reads/writes the column.
 2. Cross-reference Filigree's vocabulary via `filigree taxonomy` and
    `filigree types` (the project's `.filigree/` instance, currently active).
-3. Cross-reference Wardline references in Clarion docs (we don't have the
-   Wardline repo vendored, but ADR-015/ADR-017/ADR-018 + `loom.md` §5
-   carry the cross-product names Clarion already commits to).
+3. Cross-reference Wardline references in Loomweave docs (we don't have the
+   Wardline repo vendored, but ADR-015/ADR-017/ADR-018 + `weft.md` §5
+   carry the cross-product names Loomweave already commits to).
 4. Severity-rate by:
    - Will Tier B / WP4 / WP6 trip on this? (HIGH if yes)
    - Is there a managing ADR? (downgrade if yes)
@@ -59,15 +59,15 @@ For each candidate concept:
 
 | ID | Concept | Class | Severity | Status |
 |----|---------|-------|----------|--------|
-| F-1 | `priority` overload | Cross-product (Clarion ↔ Filigree) | **HIGH** | Unmanaged |
-| F-2 | `critical` overload | Cross-product (Clarion ↔ Filigree) | **MEDIUM** | Unmanaged |
-| F-3 | `source` triple-overload | Within-Clarion + cross-product | **MEDIUM** | Unmanaged |
+| F-1 | `priority` overload | Cross-product (Loomweave ↔ Filigree) | **HIGH** | Unmanaged |
+| F-2 | `critical` overload | Cross-product (Loomweave ↔ Filigree) | **MEDIUM** | Unmanaged |
+| F-3 | `source` triple-overload | Within-Loomweave + cross-product | **MEDIUM** | Unmanaged |
 | F-4 | `tags` vs `labels` | Cross-product naming difference | **LOW** | Acceptable, document |
-| F-5 | `kind` triple-overload (`entity`/`edge`/`finding`) | Within-Clarion | **LOW** | Structural disambiguation; document |
-| F-6 | `status` overload (`runs`/`findings`/Filigree issues) | Within-Clarion + cross-product | **LOW** | Already partially managed (finding-status mapping per §7); document |
+| F-5 | `kind` triple-overload (`entity`/`edge`/`finding`) | Within-Loomweave | **LOW** | Structural disambiguation; document |
+| F-6 | `status` overload (`runs`/`findings`/Filigree issues) | Within-Loomweave + cross-product | **LOW** | Already partially managed (finding-status mapping per §7); document |
 | F-7 | `priority` schema affinity | Schema design | **HIGH** | Resolved by F-1 rename + new column |
 | F-8 | `schema_apply.rs` priority test asserts the bug | Test debt | **MEDIUM** | Resolved alongside F-1/F-7 |
-| F-9 | `severity` (CLARION/FILIGREE vocabulary) | Cross-product | — | **MANAGED** by ADR-017 (model finding) |
+| F-9 | `severity` (LOOMWEAVE/FILIGREE vocabulary) | Cross-product | — | **MANAGED** by ADR-017 (model finding) |
 | F-10 | `rule_id` namespace | Cross-product | — | **MANAGED** by ADR-017+ADR-022 (model finding) |
 | F-11 | `finding` cross-product record shape | Cross-product | — | **MANAGED** by ADR-004 (model finding) |
 | F-12 | L7 qualname vs Wardline `FingerprintEntry` | Cross-product | — | Tracked: `clarion-889200006a` (deferred to WP9) |
@@ -75,27 +75,27 @@ For each candidate concept:
 ## F-1: `priority` is the same word for two different things
 
 **Sites**:
-- Clarion: `docs/clarion/1.0/detailed-design.md:453` — guidance entity
+- Loomweave: `docs/loomweave/1.0/detailed-design.md:453` — guidance entity
   property; values `"project" | "subsystem" | "package" | "module" | "class" | "function"`.
-- Clarion: `docs/clarion/1.0/system-design.md:346` — same definition,
+- Loomweave: `docs/loomweave/1.0/system-design.md:346` — same definition,
   semantic ordering `project → subsystem → package → module → class → function`
   (outer-overrides-inner composition order).
-- Clarion schema: `crates/clarion-storage/migrations/0001_initial_schema.sql:163-165`
+- Loomweave schema: `crates/loomweave-storage/migrations/0001_initial_schema.sql:163-165`
   generated column + index.
-- Clarion test: `crates/clarion-storage/tests/schema_apply.rs:142-167`.
+- Loomweave test: `crates/loomweave-storage/tests/schema_apply.rs:142-167`.
 - Filigree: `P0 | P1 | P2 | P3 | P4` numeric urgency; CLI `--priority=N`,
   MCP tool field, taxonomy entry `priority`. Different domain, different shape,
   different meaning.
 
 **Why HIGH**: The bug at `clarion-4cd11905e2` was misframed because the issue
 author defaulted to Filigree's meaning of "priority" (P0–P4) when reading
-Clarion's design. The same misread will happen to every cross-product reader
+Loomweave's design. The same misread will happen to every cross-product reader
 until the word is disambiguated. WP6 (briefing serving) will write the first
 `ORDER BY priority` query against this column, and TEXT-affinity lexicographic
 order doesn't match the semantic ordering — INTEGER affinity wouldn't help
 either, because the input is a string enum, not a number. Both the **bug** and
 the **vocabulary clash** are downstream of the same root cause: "priority"
-isn't the right name for what Clarion stores.
+isn't the right name for what Loomweave stores.
 
 **Suggested fix**:
 
@@ -110,8 +110,8 @@ isn't the right name for what Clarion stores.
 3. Update the test in `schema_apply.rs:142` to round-trip a real enum value
    (`{"composition_level": "subsystem"}`) and assert both columns.
 4. Write a short ADR (suggested **ADR-024**: "Guidance composition-level
-   schema and Loom vocabulary") capturing the rename, the rank-mapping table,
-   and the rule that "priority" in Clarion docs always refers to Filigree's
+   schema and Weft vocabulary") capturing the rename, the rank-mapping table,
+   and the rule that "priority" in Loomweave docs always refers to Filigree's
    P0–P4.
 
 **Open policy question** (will recur): edit `0001_initial_schema.sql` in
@@ -121,10 +121,10 @@ DB) or stack `0002_*.sql`? Decide once for the project.
 ## F-2: `critical` is the same word for two different things
 
 **Sites**:
-- Clarion: `docs/clarion/1.0/detailed-design.md:467` — guidance entity
+- Loomweave: `docs/loomweave/1.0/detailed-design.md:467` — guidance entity
   `critical: bool` flag — semantics: "preserved across token-budget pressure"
   (i.e., do-not-drop).
-- Clarion: `detailed-design.md:449` — `tags: ["critical"]` literal as the
+- Loomweave: `detailed-design.md:449` — `tags: ["critical"]` literal as the
   serialised form (also overlapping the dedicated boolean field).
 - Filigree: `severity:critical` enum value (highest severity tier) AND
   P0 priority is conventionally "Critical" in informal usage.
@@ -143,7 +143,7 @@ Filigree's severity tier.
    authoritative source.
 3. Bundle into the same ADR-024 if F-1 lands.
 
-## F-3: `source` is overloaded three ways inside Clarion plus once outside
+## F-3: `source` is overloaded three ways inside Loomweave plus once outside
 
 **Sites**:
 - `entity.source` = `SourceRange { file_id, byte_start, byte_end, line_start, line_end }`
@@ -172,23 +172,23 @@ three different things.
 3. Rename `guidance.source` → `guidance.origin` (describes authorship origin).
 4. Bundle into ADR-024 if F-1 lands; otherwise file as separate ADR.
 
-## F-4: `tags` (Clarion) vs `labels` (Filigree)
+## F-4: `tags` (Loomweave) vs `labels` (Filigree)
 
 **Sites**:
-- Clarion: `entity_tags(entity_id, tag)` table; `entity.tags: BTreeSet<String>`
+- Loomweave: `entity_tags(entity_id, tag)` table; `entity.tags: BTreeSet<String>`
   (free-form).
 - Filigree: namespaced `labels` (`area:`, `cluster:`, `effort:`, …) with a
   reserved-namespace taxonomy.
 
-**Why LOW**: Different word, different semantics — Clarion's `tags` are
+**Why LOW**: Different word, different semantics — Loomweave's `tags` are
 free-form and plugin/LLM-emitted; Filigree's `labels` are a curated
 taxonomy. The naming actually reflects the design difference correctly.
 
 **Suggested fix**: leave the names. Add a one-paragraph note in the v0.1
 glossary (or in ADR-024) that maps the two so a cross-product reader doesn't
-assume they're the same shape. WP9 (Loom integrations) will need this anyway.
+assume they're the same shape. WP9 (Weft integrations) will need this anyway.
 
-## F-5: `kind` is overloaded three ways within Clarion
+## F-5: `kind` is overloaded three ways within Loomweave
 
 **Sites**:
 - `entity.kind` (`detailed-design.md:195`) — entity taxonomy
@@ -210,11 +210,11 @@ removes, because `kind` is the right word for all three jobs.
 namespaces explicit. (Filigree uses `type` for the analogous concept, which
 is fine — different products, different taste; no clash.)
 
-## F-6: `status` is overloaded across Clarion and Filigree
+## F-6: `status` is overloaded across Loomweave and Filigree
 
 **Sites**:
-- Clarion `runs.status` — analyze-run lifecycle.
-- Clarion `findings.status` — `open | acknowledged | suppressed | promoted_to_issue`
+- Loomweave `runs.status` — analyze-run lifecycle.
+- Loomweave `findings.status` — `open | acknowledged | suppressed | promoted_to_issue`
   (`detailed-design.md:295`).
 - Filigree finding-status — `open | acknowledged | fixed | false_positive | unseen_in_latest`
   (`detailed-design.md:294` comment + ADR-017).
@@ -223,7 +223,7 @@ is fine — different products, different taste; no clash.)
   etc.).
 
 **Why LOW**: Already partially managed — `detailed-design.md §7` is supposed
-to carry the Clarion-finding-status to Filigree-finding-status mapping, and
+to carry the Loomweave-finding-status to Filigree-finding-status mapping, and
 ADR-017 references it. Distinct state machines on distinct objects are normal
 and unambiguous given the table/struct context.
 
@@ -241,7 +241,7 @@ the audit's resolution: closing F-1 closes F-7.
 ## F-8: `schema_apply.rs:142` test asserts the bug, not the design
 
 **Sites**:
-- `crates/clarion-storage/tests/schema_apply.rs:142` —
+- `crates/loomweave-storage/tests/schema_apply.rs:142` —
   `let props = r#"{"priority": 2, "git_churn_count": 42}"#;` — inserts an
   integer `2` into `properties.priority`, which is **not a valid value** per
   `detailed-design.md:453` (priority is a six-level string enum).
@@ -274,18 +274,18 @@ time, and which the unmanaged findings above should follow.
 
 ### F-9: `severity` — managed by ADR-017
 
-- Clarion internal: `INFO | WARN | ERROR | CRITICAL` for defects, `NONE` for facts.
+- Loomweave internal: `INFO | WARN | ERROR | CRITICAL` for defects, `NONE` for facts.
 - Filigree wire: `critical | high | medium | low | info` (lowercase).
 - Mapping: explicit one-to-one table (`detailed-design.md §7`,
   `ADR-017-severity-and-dedup.md`); round-trip preserved via
-  `metadata.clarion.internal_severity`.
+  `metadata.loomweave.internal_severity`.
 - **Lesson**: explicit ADR + mapping table + metadata round-trip = no clash.
 
 ### F-10: `rule_id` namespacing — managed by ADR-017 + ADR-022
 
-- Namespace prefix per emitter: `CLA-PY-*`, `CLA-INFRA-*`, `CLA-FACT-*`,
-  `CLA-SEC-*`, `WLN-*`, `FIL-*`.
-- Grammar-checked at the Clarion-plugin boundary per ADR-022.
+- Namespace prefix per emitter: `LMWV-PY-*`, `LMWV-INFRA-*`, `LMWV-FACT-*`,
+  `LMWV-SEC-*`, `WLN-*`, `FIL-*`.
+- Grammar-checked at the Loomweave-plugin boundary per ADR-022.
 - **Lesson**: namespacing convention + grammar enforcement = no clash even
   when many emitters share the field.
 
@@ -313,16 +313,16 @@ viable bundling strategies, in order of my preference:
 
 Bundle the three vocabulary renames (`priority`, `critical`, `source` on
 finding/guidance) plus the schema change and test fix into a single ADR-024
-("Loom vocabulary discipline and guidance schema") and a single PR before
+("Weft vocabulary discipline and guidance schema") and a single PR before
 Tier B starts. Touches:
 
-- `docs/clarion/1.0/detailed-design.md` (multiple sites)
-- `docs/clarion/1.0/system-design.md` (one site)
-- `docs/clarion/adr/ADR-024-*.md` (new)
-- `crates/clarion-storage/migrations/0001_initial_schema.sql` (priority
+- `docs/loomweave/1.0/detailed-design.md` (multiple sites)
+- `docs/loomweave/1.0/system-design.md` (one site)
+- `docs/loomweave/adr/ADR-024-*.md` (new)
+- `crates/loomweave-storage/migrations/0001_initial_schema.sql` (priority
   column + index; possibly add `0002_*.sql` instead — see migration policy
   question below)
-- `crates/clarion-storage/tests/schema_apply.rs` (rewrite the priority test)
+- `crates/loomweave-storage/tests/schema_apply.rs` (rewrite the priority test)
 - Pre-existing filigree issues: close `clarion-4cd11905e2` with an
   audit-resolution pointer.
 
@@ -405,9 +405,9 @@ naming and split doctrine vs. schema fix) shaped Phase 2.
 | F-16 | `source_file_id TEXT REFERENCES entities(id)` has implicit "rows referenced by `source_file_id` must have `kind='file'`" invariant; nothing enforces it | MEDIUM | `clarion-523b2eebad` (P2) |
 | F-17 | `runs.id` ↔ `findings.run_id` is string-match only, no FK; provenance link untracked at the schema layer | LOW | `clarion-ba198ee96b` (P4, doc note) |
 
-F-1 through F-8 are absorbed by ADR-024 (`docs/clarion/adr/ADR-024-guidance-schema-vocabulary.md`) and the Phase 1 + Phase 2 commits on this branch. The original priority-affinity bug `clarion-4cd11905e2` is closed with the audit-resolution comment.
+F-1 through F-8 are absorbed by ADR-024 (`docs/loomweave/adr/ADR-024-guidance-schema-vocabulary.md`) and the Phase 1 + Phase 2 commits on this branch. The original priority-affinity bug `clarion-4cd11905e2` is closed with the audit-resolution comment.
 
-F-13 is absorbed by [ADR-031](../../clarion/adr/ADR-031-schema-validation-policy.md) (2026-05-18): CHECK constraints on closed core-owned vocabularies (`findings.{kind,severity,status}`, `runs.status`); writer-actor + ADR-022 manifest acceptance remain the only enforcement layer for plugin-extensible vocabularies (`entities.kind`, `edges.kind`). Filigree issue `clarion-fbe50aa6e1` closed.
+F-13 is absorbed by [ADR-031](../../loomweave/adr/ADR-031-schema-validation-policy.md) (2026-05-18): CHECK constraints on closed core-owned vocabularies (`findings.{kind,severity,status}`, `runs.status`); writer-actor + ADR-022 manifest acceptance remain the only enforcement layer for plugin-extensible vocabularies (`entities.kind`, `edges.kind`). Filigree issue `clarion-fbe50aa6e1` closed.
 
 ### Naming refinements applied to Phase 2
 
@@ -432,6 +432,6 @@ ADR-024 lands with the refined names.
 Both reviewers (critic explicitly, leverage analyst implicitly) called
 the migration-policy punt the audit's biggest weakness. ADR-024 makes
 the call: **edit `0001` in place**, with a written retirement trigger
-(first external operator pulls a published Clarion build → policy
+(first external operator pulls a published Loomweave build → policy
 switches to stack-only thereafter). No supersession of ADR-024 needed
 for the trigger; the trigger is observable and named in the ADR.

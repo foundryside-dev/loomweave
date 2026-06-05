@@ -4,9 +4,9 @@ Each subsystem uses the archaeologist catalog contract: Location,
 Responsibility, Key Components, Dependencies, Patterns Observed, Concerns, and
 Confidence.
 
-## 1. Clarion Core
+## 1. Loomweave Core
 
-**Location:** `crates/clarion-core`
+**Location:** `crates/loomweave-core`
 
 **Responsibility:** Shared runtime contracts and enforcement: entity ID
 assembly, plugin manifest/protocol/transport/discovery/supervision, resource
@@ -32,18 +32,18 @@ radius.
 
 **Confidence:** High.
 
-## 2. Clarion Plugin Fixture
+## 2. Loomweave Plugin Fixture
 
-**Location:** `crates/clarion-plugin-fixture`
+**Location:** `crates/loomweave-plugin-fixture`
 
-**Responsibility:** Minimal binary test plugin that speaks Clarion JSON-RPC
+**Responsibility:** Minimal binary test plugin that speaks Loomweave JSON-RPC
 framing over stdin/stdout and gives `PluginHost::spawn` a real subprocess
 target.
 
 **Key Components:** `src/main.rs`, `src/lib.rs`, `Cargo.toml`, and
-`crates/clarion-core/tests/fixtures/plugin.toml`.
+`crates/loomweave-core/tests/fixtures/plugin.toml`.
 
-**Dependencies:** consumed by core subprocess tests; depends on `clarion-core`,
+**Dependencies:** consumed by core subprocess tests; depends on `loomweave-core`,
 `serde_json`, and Unix-only `nix` features for memory-limit testing.
 
 **Patterns Observed:** reuses production framing/protocol types; fails closed
@@ -55,11 +55,11 @@ stress coverage is platform-shaped.
 
 **Confidence:** High.
 
-## 3. Clarion Storage
+## 3. Loomweave Storage
 
-**Location:** `crates/clarion-storage`
+**Location:** `crates/loomweave-storage`
 
-**Responsibility:** SQLite persistence for Clarion's graph, runs, findings,
+**Responsibility:** SQLite persistence for Loomweave's graph, runs, findings,
 search indexes, LLM/query caches, writer serialization, and pooled reads.
 
 **Key Components:** `migrations/0001_initial_schema.sql`, `src/schema.rs`,
@@ -67,7 +67,7 @@ search indexes, LLM/query caches, writer serialization, and pooled reads.
 `src/cache.rs`, `src/unresolved.rs`.
 
 **Dependencies:** consumed by CLI, MCP, and HTTP read paths; depends on
-`clarion-core`, `rusqlite`, `deadpool-sqlite`, `tokio`, `serde`,
+`loomweave-core`, `rusqlite`, `deadpool-sqlite`, `tokio`, `serde`,
 `serde_json`, `blake3`, `tracing`, and `thiserror`.
 
 **Patterns Observed:** single writer actor serializes all durable mutation;
@@ -81,11 +81,11 @@ transactions to commit.
 
 **Confidence:** High.
 
-## 4. Clarion CLI, Analyze, Serve, And HTTP Read API
+## 4. Loomweave CLI, Analyze, Serve, And HTTP Read API
 
-**Location:** `crates/clarion-cli`
+**Location:** `crates/loomweave-cli`
 
-**Responsibility:** Owns the `clarion` binary: project install, analyze
+**Responsibility:** Owns the `loomweave` binary: project install, analyze
 orchestration, pre-ingest secret scanning, MCP stdio serving, and federation
 HTTP read API.
 
@@ -93,8 +93,8 @@ HTTP read API.
 `src/secret_scan/*`, `src/serve.rs`, `src/http_read.rs`.
 
 **Dependencies:** consumed by operators, CI/E2E scripts, federation consumers,
-and MCP clients; depends on `clarion-core`, `clarion-storage`, `clarion-mcp`,
-`clarion-scanner`, `clap`, `axum`, `tokio`, `tower`, `rusqlite`, `ignore`,
+and MCP clients; depends on `loomweave-core`, `loomweave-storage`, `loomweave-mcp`,
+`loomweave-scanner`, `clap`, `axum`, `tokio`, `tower`, `rusqlite`, `ignore`,
 `serde`, and `xgraph`.
 
 **Patterns Observed:** explicit run terminal states; plugin execution isolated
@@ -109,9 +109,9 @@ future concerns.
 
 **Confidence:** High.
 
-## 5. Clarion Scanner
+## 5. Loomweave Scanner
 
-**Location:** `crates/clarion-scanner`
+**Location:** `crates/loomweave-scanner`
 
 **Responsibility:** Core-owned pre-ingest scanner: detects secret-like byte
 ranges, returns redacted metadata plus SHA-1 hashes, and applies
@@ -133,11 +133,11 @@ only handles `#` comments.
 
 **Confidence:** High.
 
-## 6. Clarion MCP Consult Surface
+## 6. Loomweave MCP Consult Surface
 
-**Location:** `crates/clarion-mcp`
+**Location:** `crates/loomweave-mcp`
 
-**Responsibility:** Exposes Clarion's MCP JSON-RPC/tool surface for code-graph
+**Responsibility:** Exposes Loomweave's MCP JSON-RPC/tool surface for code-graph
 lookup, graph traversal, summaries, inferred calls, subsystem membership, and
 optional Filigree issue enrichment.
 
@@ -145,7 +145,7 @@ optional Filigree issue enrichment.
 path, `config.rs`, `filigree.rs`.
 
 **Dependencies:** consumed by MCP clients and CLI `serve`; depends on
-`clarion-storage`, `clarion-core`, optional Filigree HTTP, `blake3`, `reqwest`,
+`loomweave-storage`, `loomweave-core`, optional Filigree HTTP, `blake3`, `reqwest`,
 `rusqlite`, `serde`, `serde_json`, `serde_norway`, `time`, `tokio`, and
 `tracing`.
 
@@ -163,14 +163,14 @@ Filigree HTTP error bodies can appear in MCP envelope error strings.
 
 **Location:** `plugins/python`
 
-**Responsibility:** Clarion's v1.0 Python language plugin: JSON-RPC stdio
+**Responsibility:** Loomweave's v1.0 Python language plugin: JSON-RPC stdio
 server, AST entity/edge extraction, Pyright-backed call/reference resolution,
 and fail-soft Wardline compatibility reporting.
 
 **Key Components:** `plugin.toml`, `pyproject.toml`, `server.py`,
 `extractor.py`, `pyright_session.py`, `wardline_probe.py`, `stdout_guard.py`.
 
-**Dependencies:** consumed by Clarion plugin host and discovery; depends on
+**Dependencies:** consumed by Loomweave plugin host and discovery; depends on
 Python stdlib AST/JSON/subprocess/select/pathlib, `packaging`, pinned
 `pyright==1.1.409`, optional Wardline import, and `pyright-langserver`.
 
@@ -189,7 +189,7 @@ runtime health because plugin tests were not executed in this pass.
 
 ## 8. Release, Governance, And Federation Evidence
 
-**Location:** `docs/clarion/1.0`, `docs/clarion/adr`, `docs/federation`,
+**Location:** `docs/loomweave/1.0`, `docs/loomweave/adr`, `docs/federation`,
 `docs/operator`, `.github/workflows`, `scripts`, `tests/e2e`, `tests/perf`.
 
 **Responsibility:** Defines the v1.0 release contract, federation HTTP read
@@ -200,7 +200,7 @@ publish checks, and scale/perf evidence.
 ADR-034, federation contracts and fixtures, release workflows, governance
 guard scripts, E2E/perf artifacts.
 
-**Dependencies:** used by release maintainers, Filigree's `ClarionRegistry`,
+**Dependencies:** used by release maintainers, Filigree's `LoomweaveRegistry`,
 MCP clients, consult-mode agents, and external operators; depends on GitHub
 Releases/Actions/rulesets, Dependabot, cosign, SLSA generator, cargo/nextest,
 Python tooling, sqlite3, pyright, and optional Filigree/Wardline.

@@ -1,8 +1,8 @@
 # Implementation Archive
 
-This folder is the consolidated archive of Clarion's implementation and planning history. It is **not** part of the release-facing doc surface — readers entering via [`docs/README.md`](../README.md) and the [Clarion 1.0 docset](../clarion/1.0/README.md) are not expected to need anything here.
+This folder is the consolidated archive of Loomweave's implementation and planning history. It is **not** part of the release-facing doc surface — readers entering via [`docs/README.md`](../README.md) and the [Loomweave 1.0 docset](../loomweave/1.0/README.md) are not expected to need anything here.
 
-Material is kept rather than deleted because the [ADRs](../clarion/adr/README.md) cite it for historical context (panel reviews, the v0.1 scope-commitment memo, sprint plans, and agent handoffs that motivated specific decisions).
+Material is kept rather than deleted because the [ADRs](../loomweave/adr/README.md) cite it for historical context (panel reviews, the v0.1 scope-commitment memo, sprint plans, and agent handoffs that motivated specific decisions).
 
 ## Layout
 
@@ -21,8 +21,8 @@ Material is kept rather than deleted because the [ADRs](../clarion/adr/README.md
 
 ## Relationship to release-facing docs
 
-- **Authoritative design**: [`../clarion/1.0/system-design.md`](../clarion/1.0/system-design.md) and [`../clarion/1.0/detailed-design.md`](../clarion/1.0/detailed-design.md). Each work package under this folder names the sections it implements.
-- **Decisions**: [`../clarion/adr/README.md`](../clarion/adr/README.md). Each work package names the accepted ADRs it depends on and any backlog ADRs it is expected to surface.
+- **Authoritative design**: [`../loomweave/1.0/system-design.md`](../loomweave/1.0/system-design.md) and [`../loomweave/1.0/detailed-design.md`](../loomweave/1.0/detailed-design.md). Each work package under this folder names the sections it implements.
+- **Decisions**: [`../loomweave/adr/README.md`](../loomweave/adr/README.md). Each work package names the accepted ADRs it depends on and any backlog ADRs it is expected to surface.
 - **Scope and commitments**: [`v0.1-scope-plans/v0.1-scope-commitments.md`](./v0.1-scope-plans/v0.1-scope-commitments.md). That memo locks *what* v0.1 ships; the work-package plans describe *how* the build proceeds.
 
 ## Conventions

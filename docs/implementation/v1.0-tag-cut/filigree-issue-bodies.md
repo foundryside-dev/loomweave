@@ -51,20 +51,20 @@ v1.1 backlog items get `release:v1.1` + the same category labels.
 ### DOC-03 — NFR-SEC-03 stale post-ADR-034
 - **title**: `[v1.0 blocker] Refresh NFR-SEC-03 for ADR-034 authenticated-non-loopback rule`
 - **priority**: P1, **type**: docs, **labels**: `release:v1.0`, `category:docs`, `adr:034`
-- **body**: Closes DOC-03. Rewrite at `docs/clarion/1.0/requirements.md:771-783`.
+- **body**: Closes DOC-03. Rewrite at `docs/loomweave/1.0/requirements.md:771-783`.
 
 ### DOC-04 — REQ-HTTP-03 stale post-ADR-034
 - **title**: `[v1.0 blocker] Refresh REQ-HTTP-03 for ADR-034 authenticated-non-loopback rule`
 - **priority**: P1, **type**: docs, **labels**: `release:v1.0`, `category:docs`, `adr:034`
-- **body**: Closes DOC-04. Rewrite at `docs/clarion/1.0/requirements.md:558-573`.
+- **body**: Closes DOC-04. Rewrite at `docs/loomweave/1.0/requirements.md:558-573`.
 
 ### DOC-05 — REQ-HTTP-03 See line missing ADR-034
 - **title**: `[v1.0] Add ADR-034 to REQ-HTTP-03 See line`
 - **priority**: P2, **type**: docs, **labels**: `release:v1.0`, `category:docs`
 - **body**: Closes DOC-05. One-line edit.
 
-### DOC-06 — loom.md "v0.1 asterisks" labels
-- **title**: `[v1.0 blocker] Rename loom.md "v0.1 asterisks" to "v1.0 asterisks"; CHANGELOG "deferred to v0.2" → "v1.1"`
+### DOC-06 — weft.md "v0.1 asterisks" labels
+- **title**: `[v1.0 blocker] Rename weft.md "v0.1 asterisks" to "v1.0 asterisks"; CHANGELOG "deferred to v0.2" → "v1.1"`
 - **priority**: P1, **type**: docs, **labels**: `release:v1.0`, `category:docs`
 - **body**: Closes DOC-06.
 
@@ -91,12 +91,12 @@ v1.1 backlog items get `release:v1.1` + the same category labels.
 ### DOC-11 — Storage operator constraints in README
 - **title**: `[v1.0 blocker] Document storage deployment constraints (NFS, double-analyze, backup)`
 - **priority**: P1, **type**: docs, **labels**: `release:v1.0`, `category:docs`, `category:storage`
-- **body**: Closes DOC-11. New `docs/clarion/1.0/operations.md` or README §Storage.
+- **body**: Closes DOC-11. New `docs/loomweave/1.0/operations.md` or README §Storage.
 
 ### SEC-01 — entity_briefing_block_reason fail-open
 - **title**: `[v1.0 blocker] Fail-closed: entity_briefing_block_reason on malformed properties JSON`
 - **priority**: P1, **type**: bug, **labels**: `release:v1.0`, `category:security`, `crate:storage`
-- **body**: Closes SEC-01. One-line code change at `crates/clarion-storage/src/query.rs:296-302` plus malformed-JSON unit test.
+- **body**: Closes SEC-01. One-line code change at `crates/loomweave-storage/src/query.rs:296-302` plus malformed-JSON unit test.
 
 ### SEC-02 — Loopback-no-token trust assumption
 - **title**: `[v1.0 blocker] Document loopback-no-token trust + emit startup banner`
@@ -104,7 +104,7 @@ v1.1 backlog items get `release:v1.1` + the same category labels.
 - **body**: Closes SEC-02. Operator-doc additions + startup-banner warning.
 
 ### SEC-03 — Pre-WP5 catalogue upgrade requirement
-- **title**: `[v1.0 blocker] Document pre-WP5 .clarion/ upgrade requirement (re-analyze needed)`
+- **title**: `[v1.0 blocker] Document pre-WP5 .loomweave/ upgrade requirement (re-analyze needed)`
 - **priority**: P1, **type**: docs, **labels**: `release:v1.0`, `category:security`, `category:docs`
 - **body**: Closes SEC-03.
 
@@ -116,7 +116,7 @@ v1.1 backlog items get `release:v1.1` + the same category labels.
 ### CI-02 — Federation error code on body parse failure
 - **title**: `[v1.0 blocker] Fix HMAC body-parse error code (currently returns InvalidPath)`
 - **priority**: P1, **type**: bug, **labels**: `release:v1.0`, `category:federation`, `crate:cli`
-- **body**: Closes CI-02. Edit `crates/clarion-cli/src/http_read.rs:426-431`.
+- **body**: Closes CI-02. Edit `crates/loomweave-cli/src/http_read.rs:426-431`.
 
 ### CI-03 — SLSA coverage for Python sdist
 - **title**: `[v1.0 blocker] Extend SLSA provenance to Python plugin sdist`
@@ -129,7 +129,7 @@ v1.1 backlog items get `release:v1.1` + the same category labels.
 - **body**: Closes CI-04. Optional for v1.0; defer to v1.1 if time-constrained.
 
 ### STO-01 — Cross-process lock
-- **title**: `[v1.0 blocker] fs2 advisory lock for clarion analyze (prevent concurrent corruption)`
+- **title**: `[v1.0 blocker] fs2 advisory lock for loomweave analyze (prevent concurrent corruption)`
 - **priority**: P1, **type**: bug, **labels**: `release:v1.0`, `category:storage`, `crate:cli`, `crate:storage`
 - **body**: Closes STO-01. Add fs2 + lock + test.
 
@@ -169,7 +169,7 @@ v1.1 backlog items get `release:v1.1` + the same category labels.
 
 (File these before tag-cut so post-1.0 work is tracked.)
 
-### V11-ARCH-01 — Extract clarion-core::errors shared error vocabulary
+### V11-ARCH-01 — Extract loomweave-core::errors shared error vocabulary
 - priority: P2, type: feature, labels: `release:v1.1`, `category:architecture`
 - body: deep-dive-arch v1.1 priority #1. Closes the MCP/HTTP error-code drift smell.
 
@@ -181,7 +181,7 @@ v1.1 backlog items get `release:v1.1` + the same category labels.
 - priority: P2, type: feature, labels: `release:v1.1`, `category:architecture`, `crate:core`
 - body: deep-dive-arch v1.1 priority #3. `openrouter.rs` / `cli_provider.rs` (Codex + Claude on shared base) / `prompts.rs`.
 
-### V11-ARCH-04 — Split clarion-mcp/src/lib.rs into tools/ subdir
+### V11-ARCH-04 — Split loomweave-mcp/src/lib.rs into tools/ subdir
 - priority: P3, type: feature, labels: `release:v1.1`, `category:architecture`, `crate:mcp`
 - body: deep-dive-arch v1.1 priority #4.
 
@@ -205,7 +205,7 @@ v1.1 backlog items get `release:v1.1` + the same category labels.
 - priority: P2, type: feature, labels: `release:v1.1`, `category:storage`
 - body: deep-dive-db. Schema-additive 0002_*; refine recovery WHERE-clause.
 
-### V11-STO-02 — clarion db backup subcommand
+### V11-STO-02 — loomweave db backup subcommand
 - priority: P2, type: feature, labels: `release:v1.1`, `category:storage`, `crate:cli`
 - body: deep-dive-db. `rusqlite::backup::Backup`-based.
 
@@ -227,7 +227,7 @@ v1.1 backlog items get `release:v1.1` + the same category labels.
 
 ### V11-STO-07 — ReaderPool eager validation
 - priority: P3, type: feature, labels: `release:v1.1`, `category:storage`
-- body: `clarion serve` boot should fail-fast on bad DB.
+- body: `loomweave serve` boot should fail-fast on bad DB.
 
 ### V11-STO-08 — briefing_blocked typed column
 - priority: P3, type: feature, labels: `release:v1.1`, `category:storage`

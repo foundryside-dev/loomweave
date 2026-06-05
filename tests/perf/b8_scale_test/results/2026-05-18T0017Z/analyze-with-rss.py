@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run clarion analyze and sample peak RSS for B.8 measurement.
+"""Run loomweave analyze and sample peak RSS for B.8 measurement.
 
 Mirrors the analyze-metrics.json schema from the 2026-05-17 B.8 run.
 """
@@ -48,13 +48,13 @@ def _rss_bytes_for_tree(root_pid: int) -> int:
 
 def main() -> int:
     if len(sys.argv) < 3:
-        print("usage: analyze-with-rss.py <output-json> <clarion-bin> [args...]")
+        print("usage: analyze-with-rss.py <output-json> <loomweave-bin> [args...]")
         return 2
     output = Path(sys.argv[1])
     cmd = sys.argv[2:]
 
     env = os.environ.copy()
-    plugin_bin_dir = "/home/john/clarion/plugins/python/.venv/bin"
+    plugin_bin_dir = "/home/john/loomweave/plugins/python/.venv/bin"
     env["PATH"] = plugin_bin_dir + ":" + env.get("PATH", "")
 
     start = time.monotonic()

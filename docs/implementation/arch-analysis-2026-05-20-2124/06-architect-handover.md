@@ -5,7 +5,7 @@
 This handover is for a system architect or release owner taking over RC1
 review. It supersedes the removed `arch-analysis-2026-05-18-1244` snapshot.
 
-Clarion is a local-first code archaeology tool. It analyzes a target repo,
+Loomweave is a local-first code archaeology tool. It analyzes a target repo,
 stores a graph in SQLite, and serves consult-mode agents through MCP and the
 federation HTTP read API. The RC1 branch is coherent and near release
 hardening, but not yet release-ready by policy.
@@ -41,9 +41,9 @@ from the release checklist.
 
 ## Architecture Guardrails
 
-- No shared runtime, shared registry, or mediator across Loom products.
-- Clarion must remain useful alone.
-- Federation enriches Clarion; it does not define Clarion semantics.
+- No shared runtime, shared registry, or mediator across Weft products.
+- Loomweave must remain useful alone.
+- Federation enriches Loomweave; it does not define Loomweave semantics.
 - Plugin subprocesses are untrusted.
 - Source-to-LLM flow stays behind pre-ingest scanning, live-provider opt-in,
   source-hash verification, and token budgeting.
@@ -54,12 +54,12 @@ from the release checklist.
 
 | File | Review Rule |
 |---|---|
-| `crates/clarion-cli/src/analyze.rs` | Require focused tests for pipeline/run-state/subsystem changes. |
-| `crates/clarion-cli/src/http_read.rs` | Require federation contract tests and security review for auth/path/limits. |
-| `crates/clarion-core/src/plugin/host.rs` | Require plugin boundary tests for protocol/path/resource changes. |
-| `crates/clarion-core/src/llm_provider.rs` | Require provider/accounting tests for usage, JSONL parsing, live calls. |
-| `crates/clarion-mcp/src/lib.rs` | Require MCP envelope/tool tests for response shape or LLM behavior changes. |
-| `plugins/python/src/clarion_plugin_python/pyright_session.py` | Require Pyright timeout/cap/target-mapping tests. |
+| `crates/loomweave-cli/src/analyze.rs` | Require focused tests for pipeline/run-state/subsystem changes. |
+| `crates/loomweave-cli/src/http_read.rs` | Require federation contract tests and security review for auth/path/limits. |
+| `crates/loomweave-core/src/plugin/host.rs` | Require plugin boundary tests for protocol/path/resource changes. |
+| `crates/loomweave-core/src/llm_provider.rs` | Require provider/accounting tests for usage, JSONL parsing, live calls. |
+| `crates/loomweave-mcp/src/lib.rs` | Require MCP envelope/tool tests for response shape or LLM behavior changes. |
+| `plugins/python/src/loomweave_plugin_python/pyright_session.py` | Require Pyright timeout/cap/target-mapping tests. |
 
 ## Immediate Work Queue
 

@@ -2,26 +2,26 @@
 
 **Date:** 2026-06-02
 **Use:** Drop the fenced prompt below into an agent to plan and execute **Wave 0** (WS2 HTTP
-linkages + WS3 prior-index retention) of the Clarion first-class program.
+linkages + WS3 prior-index retention) of the Loomweave first-class program.
 **Gate:** None — Wave 0 is autonomous and un-gated. Start anytime.
-**Source of truth:** `docs/superpowers/plans/2026-06-02-clarion-integrated-delivery-plan.md`
-Phase 1 (T1.1–T1.7); `docs/superpowers/specs/2026-06-02-clarion-first-class-program-design.md` §4.
+**Source of truth:** `docs/superpowers/plans/2026-06-02-loomweave-integrated-delivery-plan.md`
+Phase 1 (T1.1–T1.7); `docs/superpowers/specs/2026-06-02-loomweave-first-class-program-design.md` §4.
 **Companion:** [`2026-06-02-wave-1-execution.md`](./2026-06-02-wave-1-execution.md) (the next wave; gated on SEI lock).
 
 ---
 
 ```
-You are implementing **Wave 0** of the Clarion "road to first-class" program, in the
-Clarion repo at /home/john/clarion. Wave 0 is autonomous, un-gated, and on the suite
+You are implementing **Wave 0** of the Loomweave "road to first-class" program, in the
+Loomweave repo at /home/john/loomweave. Wave 0 is autonomous, un-gated, and on the suite
 critical path: completing it lets the suite-wide SEI identity standard lock. Your job is to
 PLAN and EXECUTE it end-to-end — real code, real tests, all CI gates green.
 
 ## Read these first (authoritative, in order)
-1. docs/superpowers/specs/2026-06-02-clarion-first-class-program-design.md — the program
+1. docs/superpowers/specs/2026-06-02-loomweave-first-class-program-design.md — the program
    map. You are doing **Wave 0** only (§4). Read §1–§4 and the §5 invariants.
-2. docs/superpowers/plans/2026-06-02-clarion-integrated-delivery-plan.md — your task
+2. docs/superpowers/plans/2026-06-02-loomweave-integrated-delivery-plan.md — your task
    source. Wave 0 = **Phase 1 tasks T1.1 through T1.7**. (T1.0, ADR-038, is already DONE.)
-3. docs/clarion/adr/ADR-038-sei-token-and-signature.md — the locked SEI decisions. Do NOT
+3. docs/loomweave/adr/ADR-038-sei-token-and-signature.md — the locked SEI decisions. Do NOT
    relitigate these; they constrain you but you are not implementing them in Wave 0.
 4. CLAUDE.md — the repo's CI gates, ADR/immutability rules, and Filigree workflow.
 
@@ -29,7 +29,7 @@ PLAN and EXECUTE it end-to-end — real code, real tests, all CI gates green.
 - **WS2 — HTTP linkages** (plan T1.5–T1.7): add `callers`/`callees` (+ batch) to the HTTP
   read API with pagination + confidence-tier filtering, and a `linkages: { http: true }`
   capability flag. These wrap the EXISTING storage queries
-  `clarion-storage/src/query.rs::call_edges_targeting` (callers) and `call_edges_from`
+  `loomweave-storage/src/query.rs::call_edges_targeting` (callers) and `call_edges_from`
   (callees). Routes are HMAC-protected, same as the `/api/v1/files` routes.
 - **WS3 — prior-index retention, side table only** (plan T1.1–T1.4): migration
   `0004_sei_prior_index.sql` creating `sei_prior_index(locator, body_hash, signature,
@@ -79,7 +79,7 @@ Track the work in Filigree per CLAUDE.md (use the atomic start-work/start-next-w
   confidence-filtered, HMAC-gated, and tested against known fixtures.
 - `_capabilities` reports `linkages: { http: true }`.
 - `sei_prior_index` exists (migration 0004) and is correctly repopulated after every
-  successful `clarion analyze` (stale rows from the prior run removed), with a regression
+  successful `loomweave analyze` (stale rows from the prior run removed), with a regression
   test proving the snapshot equals the current run's entity set.
 - `docs/federation/contracts.md` pins the new linkage routes + capability flag.
 - All CI gates green.

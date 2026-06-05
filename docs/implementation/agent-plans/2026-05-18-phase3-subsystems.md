@@ -7,13 +7,13 @@
 > the Phase 1 review artifact; do not start implementation until the human
 > approves it in writing.
 
-**Goal:** Add WP4 Phase 3 subsystem clustering to `clarion analyze`, satisfying
+**Goal:** Add WP4 Phase 3 subsystem clustering to `loomweave analyze`, satisfying
 `REQ-CATALOG-05`, `REQ-ANALYZE-01`, and ADR-006: module-level clustering over
 `imports` plus `calls`, one `core:subsystem:{cluster_hash}` entity per cluster,
 `in_subsystem` edges from member modules, run stats, the weak-modularity fact,
 MCP membership lookup, determinism coverage, and operator documentation.
 
-**Architecture:** `clarion analyze` remains the single write path. Phase 3 plugs
+**Architecture:** `loomweave analyze` remains the single write path. Phase 3 plugs
 in after plugin entities/edges are inserted and before `CommitRun`. Storage
 gets read helpers that aggregate module-level dependency edges from the
 persisted graph. A new CLI-side clustering module turns that graph into
@@ -25,8 +25,8 @@ serde_norway, sha2 for ADR-006 subsystem hashes, a graph-clustering crate
 candidate qualified in Task 1, Python 3.11 AST extraction for import edges,
 pytest, mypy, ruff, cargo nextest, cargo-deny, and existing shell E2E scripts.
 
-**Spec:** ADR-006, ADR-003, ADR-022, `docs/clarion/1.0/requirements.md`,
-`docs/clarion/1.0/system-design.md`, and the Phase 3 handoff
+**Spec:** ADR-006, ADR-003, ADR-022, `docs/loomweave/1.0/requirements.md`,
+`docs/loomweave/1.0/system-design.md`, and the Phase 3 handoff
 `docs/superpowers/handoffs/2026-05-18-phase3-subsystems-handoff.md`.
 
 **Filigree umbrella:** `clarion-1dfeebfa36` (P1 work_package;
@@ -39,7 +39,7 @@ pytest, mypy, ruff, cargo nextest, cargo-deny, and existing shell E2E scripts.
 
 1. **Schema accepts subsystem and in_subsystem without a new migration.**
    `entities.kind` is plugin-extensible and has no CHECK constraint
-   (`crates/clarion-storage/migrations/0001_initial_schema.sql:30-37`).
+   (`crates/loomweave-storage/migrations/0001_initial_schema.sql:30-37`).
    `edges.kind` is also plugin-extensible with writer-side enforcement rather
    than a CHECK (`:80-85`). The migration header still documents the ADR-024
    edit-in-place policy and the 2026-05-18 CHECK edits (`:1-16`). The existing
@@ -47,16 +47,16 @@ pytest, mypy, ruff, cargo nextest, cargo-deny, and existing shell E2E scripts.
 
 2. **Structural ingest ends in `analyze::run` after plugin edges are inserted.**
    The per-plugin loop collects accepted entities, edges, unresolved sites, and
-   stats (`crates/clarion-cli/src/analyze.rs:216-405`). Entities are inserted
+   stats (`crates/loomweave-cli/src/analyze.rs:216-405`). Entities are inserted
    before unresolved sites, then edges, so edge foreign keys resolve at insert
    time (`:322-396`). Run-commit outcome handling begins immediately after the
    plugin loop (`:407-424`). Phase 3 belongs between those two blocks.
 
 3. **Subsystem entities can use the existing writer path.** `EntityRecord`
    already supports `source_* = None`, `content_hash = None`, and arbitrary
-   `properties_json` (`crates/clarion-storage/src/commands.rs:48-70`), and
+   `properties_json` (`crates/loomweave-storage/src/commands.rs:48-70`), and
    `WriterCmd::InsertEntity` is generic (`:112-174`). `writer.rs` inserts the
-   generic record after `BeginRun` (`crates/clarion-storage/src/writer.rs:332-385`).
+   generic record after `BeginRun` (`crates/loomweave-storage/src/writer.rs:332-385`).
    No `InsertSubsystem` command is required. A new `InsertFinding` command is
    required for the weak-modularity fact because findings currently have a
    table but no writer command.
@@ -64,24 +64,24 @@ pytest, mypy, ruff, cargo nextest, cargo-deny, and existing shell E2E scripts.
 4. **Module-level dependency data is incomplete today.** Module entities and
    `contains` parent edges exist. `calls` and `references` are emitted at
    function/entity level. There is no storage helper that aggregates those
-   edges to module-to-module dependencies (`crates/clarion-storage/src/query.rs`
+   edges to module-to-module dependencies (`crates/loomweave-storage/src/query.rs`
    currently has call, reference, and contains helpers but no subsystem graph
    helper). The Python plugin manifest declares `contains`, `calls`, and
    `references` only (`plugins/python/plugin.toml:31-46`), and the extractor
    docs still say import emission is future scope
-   (`plugins/python/src/clarion_plugin_python/extractor.py:1-44`). Phase 3
+   (`plugins/python/src/loomweave_plugin_python/extractor.py:1-44`). Phase 3
    therefore needs Python `imports` edge emission plus a storage aggregation
    helper for both `imports` and function-level `calls`.
 
-5. **Entity ID shape is already valid.** `clarion_core::entity_id` accepts
+5. **Entity ID shape is already valid.** `loomweave_core::entity_id` accepts
    `plugin_id = "core"`, `kind = "subsystem"`, and a 12-hex canonical name;
    an existing unit test already covers `core:subsystem:a1b2c3d4`
-   (`crates/clarion-core/src/entity_id.rs:90-105`, `:192-194`). Verification
+   (`crates/loomweave-core/src/entity_id.rs:90-105`, `:192-194`). Verification
    run during planning:
 
    ```bash
-   cargo test -p clarion-core core_reserved_subsystem_kind -- --nocapture
-   cargo test -p clarion-core shared_ -- --nocapture
+   cargo test -p loomweave-core core_reserved_subsystem_kind -- --nocapture
+   cargo test -p loomweave-core shared_ -- --nocapture
    plugins/python/.venv/bin/pytest \
      plugins/python/tests/test_entity_id.py::test_matches_shared_fixture \
      plugins/python/tests/test_entity_id.py::test_matches_shared_contains_edge_fixture \
@@ -129,7 +129,7 @@ with a fixed seed in tests, stop and amend this plan before Task 2.
 
 **Recommendation:** keep `in_subsystem` structural and core-owned. The writer
 already lists it in `STRUCTURAL_EDGE_KINDS`
-(`crates/clarion-storage/src/writer.rs:450-457`) and rejects source ranges on
+(`crates/loomweave-storage/src/writer.rs:450-457`) and rejects source ranges on
 structural edges (`:478-502`). The Python plugin must not declare or emit it;
 the core clustering module emits it after the subsystem entity is inserted.
 
@@ -140,7 +140,7 @@ Direction: `member_module -> subsystem`. The MCP membership helper queries
 
 **Recommendation:** add a new `subsystem_members(id)` MCP tool rather than
 folding the behavior into `neighborhood`. Requirements already name
-`subsystem_members` (`docs/clarion/1.0/requirements.md:365-371`), and a
+`subsystem_members` (`docs/loomweave/1.0/requirements.md:365-371`), and a
 separate tool keeps the response schema narrow: subsystem metadata plus an
 ordered member list. `neighborhood` can later include subsystem links
 additively, but that should not be the only way to inspect a subsystem.
@@ -168,7 +168,7 @@ dispatch. Subsystem summarization remains out of scope.
 }
 ```
 
-Do not create `CLA-FACT-CLUSTERING-NO-INPUT`; the handoff explicitly limits
+Do not create `LMWV-FACT-CLUSTERING-NO-INPUT`; the handoff explicitly limits
 Phase 7 scope to the weak-modularity finding. Single-module and no-plugin
 fixtures should remain quiet but inspectable through `runs.stats`.
 
@@ -215,17 +215,17 @@ object. Hard failures before Phase 3 keep the existing failure stats.
 test fixture needs an index or helper view added; the current implementation
 should not need that. `entities.kind` and `edges.kind` are already open by
 policy, and `findings.kind`/`severity` already accept `fact` and `INFO`
-(`crates/clarion-storage/migrations/0001_initial_schema.sql:103-136`).
+(`crates/loomweave-storage/migrations/0001_initial_schema.sql:103-136`).
 
 ### 7. Weak-modularity finding anchor
 
-**Recommendation:** persist `CLA-FACT-CLUSTERING-WEAK-MODULARITY` as a `fact`
+**Recommendation:** persist `LMWV-FACT-CLUSTERING-WEAK-MODULARITY` as a `fact`
 with severity `INFO`, anchored to the largest emitted subsystem entity. Put all
 subsystem IDs in `related_entities` and include `run_id`, `modularity_score`,
 `threshold`, and `algorithm` in `properties`.
 
 Reason: the current findings schema requires `entity_id NOT NULL`
-(`crates/clarion-storage/migrations/0001_initial_schema.sql:119`). Making
+(`crates/loomweave-storage/migrations/0001_initial_schema.sql:119`). Making
 run-level findings nullable or inventing a `core:run:*` entity is a schema and
 ontology change outside this handoff. If modularity is unavailable because
 there are no emitted subsystems, record the skip reason in `runs.stats` and do
@@ -239,29 +239,29 @@ not emit a finding.
 |---|---|---|
 | `Cargo.toml` | Add graph/hash dependencies after Task 1 qualification | 1 |
 | `Cargo.lock` | Lock dependency graph | 1 |
-| `crates/clarion-cli/src/main.rs` | Pass analyze config path into `analyze::run` | 2 |
-| `crates/clarion-cli/src/cli.rs` | Add `clarion analyze --config <path>` | 2 |
-| `crates/clarion-cli/src/config.rs` | New analyze config parser and defaults for `analysis.clustering` | 2 |
-| `crates/clarion-cli/src/analyze.rs` | Accept config, persist config JSON, filter candidate `imports` before writer insertion, call Phase 3 before commit, merge clustering stats | 2, 3, 5 |
-| `crates/clarion-cli/src/clustering.rs` | New Phase 3 graph/algorithm/subsystem writer orchestration | 1, 4, 5 |
-| `crates/clarion-cli/Cargo.toml` | Wire dependencies used by config/clustering | 1, 2 |
-| `crates/clarion-cli/tests/analyze.rs` | Config/run-stats/import-filter/Phase-3 integration tests | 2, 3, 5 |
+| `crates/loomweave-cli/src/main.rs` | Pass analyze config path into `analyze::run` | 2 |
+| `crates/loomweave-cli/src/cli.rs` | Add `loomweave analyze --config <path>` | 2 |
+| `crates/loomweave-cli/src/config.rs` | New analyze config parser and defaults for `analysis.clustering` | 2 |
+| `crates/loomweave-cli/src/analyze.rs` | Accept config, persist config JSON, filter candidate `imports` before writer insertion, call Phase 3 before commit, merge clustering stats | 2, 3, 5 |
+| `crates/loomweave-cli/src/clustering.rs` | New Phase 3 graph/algorithm/subsystem writer orchestration | 1, 4, 5 |
+| `crates/loomweave-cli/Cargo.toml` | Wire dependencies used by config/clustering | 1, 2 |
+| `crates/loomweave-cli/tests/analyze.rs` | Config/run-stats/import-filter/Phase-3 integration tests | 2, 3, 5 |
 | `plugins/python/plugin.toml` | Add `imports`; bump plugin and ontology versions | 3 |
-| `plugins/python/src/clarion_plugin_python/__init__.py` | Bump package version | 3 |
-| `plugins/python/src/clarion_plugin_python/server.py` | Bump ontology constant; pass import resolver inputs if needed | 3 |
-| `plugins/python/src/clarion_plugin_python/extractor.py` | Extract AST import sites and emit candidate `imports` edges | 3 |
+| `plugins/python/src/loomweave_plugin_python/__init__.py` | Bump package version | 3 |
+| `plugins/python/src/loomweave_plugin_python/server.py` | Bump ontology constant; pass import resolver inputs if needed | 3 |
+| `plugins/python/src/loomweave_plugin_python/extractor.py` | Extract AST import sites and emit candidate `imports` edges | 3 |
 | `plugins/python/tests/test_extractor.py` | Import-edge unit coverage | 3 |
 | `plugins/python/tests/test_round_trip.py` | Manifest/round-trip coverage for `imports` | 3 |
 | `fixtures/entity_id.json` | Shared import-edge fixture rows if parity helpers grow | 3 |
-| `crates/clarion-core/src/entity_id.rs` | Optional shared fixture parity for `imports` edge shape | 3 |
-| `crates/clarion-storage/src/query.rs` | Module dependency graph and subsystem membership helpers | 4, 6 |
-| `crates/clarion-storage/src/lib.rs` | Re-export new query structs/helpers if needed | 4, 6 |
-| `crates/clarion-storage/src/commands.rs` | Add `FindingRecord` and `WriterCmd::InsertFinding` | 5 |
-| `crates/clarion-storage/src/writer.rs` | Persist findings through writer actor | 5 |
-| `crates/clarion-storage/tests/writer_actor.rs` | Finding writer and subsystem edge contract tests | 5 |
-| `crates/clarion-storage/tests/schema_apply.rs` | Guard existing open vocabulary assumptions | 4, 5 |
-| `crates/clarion-mcp/src/lib.rs` | Add `subsystem_members`; summary policy branch for subsystems | 6 |
-| `crates/clarion-mcp/tests/storage_tools.rs` | MCP tool list, membership response, summary no-LLM tests | 6 |
+| `crates/loomweave-core/src/entity_id.rs` | Optional shared fixture parity for `imports` edge shape | 3 |
+| `crates/loomweave-storage/src/query.rs` | Module dependency graph and subsystem membership helpers | 4, 6 |
+| `crates/loomweave-storage/src/lib.rs` | Re-export new query structs/helpers if needed | 4, 6 |
+| `crates/loomweave-storage/src/commands.rs` | Add `FindingRecord` and `WriterCmd::InsertFinding` | 5 |
+| `crates/loomweave-storage/src/writer.rs` | Persist findings through writer actor | 5 |
+| `crates/loomweave-storage/tests/writer_actor.rs` | Finding writer and subsystem edge contract tests | 5 |
+| `crates/loomweave-storage/tests/schema_apply.rs` | Guard existing open vocabulary assumptions | 4, 5 |
+| `crates/loomweave-mcp/src/lib.rs` | Add `subsystem_members`; summary policy branch for subsystems | 6 |
+| `crates/loomweave-mcp/tests/storage_tools.rs` | MCP tool list, membership response, summary no-LLM tests | 6 |
 | `tests/e2e/phase3_subsystems.sh` | New multi-module subsystem E2E and determinism check | 7 |
 | `tests/e2e/sprint_1_walking_skeleton.sh` | Verify unchanged; only edit if necessary to keep current assertions honest | 7 |
 | `tests/fixtures/phase3_subsystems/` | New multi-module Python fixture, if the E2E does not build it inline | 7 |
@@ -275,9 +275,9 @@ not emit a finding.
 **Files:**
 - Modify: `Cargo.toml`
 - Modify: `Cargo.lock`
-- Modify: `crates/clarion-cli/Cargo.toml`
-- Add: `crates/clarion-cli/src/clustering.rs`
-- Modify: `crates/clarion-cli/src/main.rs` only to `mod clustering;`
+- Modify: `crates/loomweave-cli/Cargo.toml`
+- Add: `crates/loomweave-cli/src/clustering.rs`
+- Modify: `crates/loomweave-cli/src/main.rs` only to `mod clustering;`
 
 **Scope:** Qualify the graph crate and create a tiny adapter boundary before
 any analyze integration. This task does not write database rows.
@@ -298,9 +298,9 @@ any analyze integration. This task does not write database rows.
 - [x] Run qualification gates:
 
 ```bash
-cargo test -p clarion-cli clustering -- --nocapture
+cargo test -p loomweave-cli clustering -- --nocapture
 cargo deny check
-cargo tree -p clarion-cli
+cargo tree -p loomweave-cli
 ```
 
 **Exit:** The tests prove fixed-seed determinism, directed weighted behavior,
@@ -314,13 +314,13 @@ without broadening `deny.toml`. If not, stop and amend this plan.
 ## Task 2: Analyze Config Plumbing
 
 **Files:**
-- Modify: `crates/clarion-cli/src/cli.rs`
-- Modify: `crates/clarion-cli/src/main.rs`
-- Add: `crates/clarion-cli/src/config.rs`
-- Modify: `crates/clarion-cli/src/analyze.rs`
-- Modify: `crates/clarion-cli/tests/analyze.rs`
+- Modify: `crates/loomweave-cli/src/cli.rs`
+- Modify: `crates/loomweave-cli/src/main.rs`
+- Add: `crates/loomweave-cli/src/config.rs`
+- Modify: `crates/loomweave-cli/src/analyze.rs`
+- Modify: `crates/loomweave-cli/tests/analyze.rs`
 
-**Scope:** Give `clarion analyze` the `analysis.clustering` configuration
+**Scope:** Give `loomweave analyze` the `analysis.clustering` configuration
 surface and persist the resolved config in `runs.config`. No subsystem rows yet.
 
 - [x] Write failing tests:
@@ -342,8 +342,8 @@ analysis:
     weight_by: reference_count
 ```
 
-- [x] Add `clarion analyze --config <path>`, defaulting to
-  `<project-root>/clarion.yaml` if present, otherwise defaults.
+- [x] Add `loomweave analyze --config <path>`, defaulting to
+  `<project-root>/loomweave.yaml` if present, otherwise defaults.
 - [x] Change `analyze::run(path)` to accept an options/config value while
   preserving tests that call the default path.
 - [x] Replace the current `BeginRun.config_json = "{}"` with the resolved
@@ -353,10 +353,10 @@ analysis:
 existing no-plugin/skipped tests still pass.
 
 ```bash
-cargo test -p clarion-cli analyze_default_config_records_clustering_defaults -- --nocapture
-cargo test -p clarion-cli analyze_config_file_overrides_clustering_seed_and_algorithm -- --nocapture
-cargo test -p clarion-cli analyze_rejects_invalid_clustering_algorithm -- --nocapture
-cargo test -p clarion-cli analyze_without_plugins_writes_skipped_run_row -- --nocapture
+cargo test -p loomweave-cli analyze_default_config_records_clustering_defaults -- --nocapture
+cargo test -p loomweave-cli analyze_config_file_overrides_clustering_seed_and_algorithm -- --nocapture
+cargo test -p loomweave-cli analyze_rejects_invalid_clustering_algorithm -- --nocapture
+cargo test -p loomweave-cli analyze_without_plugins_writes_skipped_run_row -- --nocapture
 ```
 
 **Commit:** `feat(wp4): add analyze clustering config (phase3 task 2)`
@@ -366,16 +366,16 @@ cargo test -p clarion-cli analyze_without_plugins_writes_skipped_run_row -- --no
 ## Task 3: Python imports Edge Emission
 
 **Files:**
-- Modify: `crates/clarion-cli/src/analyze.rs`
-- Modify: `crates/clarion-cli/tests/analyze.rs`
+- Modify: `crates/loomweave-cli/src/analyze.rs`
+- Modify: `crates/loomweave-cli/tests/analyze.rs`
 - Modify: `plugins/python/plugin.toml`
-- Modify: `plugins/python/src/clarion_plugin_python/__init__.py`
-- Modify: `plugins/python/src/clarion_plugin_python/server.py`
-- Modify: `plugins/python/src/clarion_plugin_python/extractor.py`
+- Modify: `plugins/python/src/loomweave_plugin_python/__init__.py`
+- Modify: `plugins/python/src/loomweave_plugin_python/server.py`
+- Modify: `plugins/python/src/loomweave_plugin_python/extractor.py`
 - Modify: `plugins/python/tests/test_extractor.py`
 - Modify: `plugins/python/tests/test_round_trip.py`
 - Modify: `fixtures/entity_id.json` if shared parity is extended
-- Modify: `crates/clarion-core/src/entity_id.rs` if shared parity is extended
+- Modify: `crates/loomweave-core/src/entity_id.rs` if shared parity is extended
 
 **Scope:** Emit anchored `imports` candidate edges from module entities. The
 host filters candidate imports whose `to_id` module is not present in the same
@@ -419,7 +419,7 @@ plugins/python/.venv/bin/pytest plugins/python/tests/test_round_trip.py -q
 plugins/python/.venv/bin/mypy --strict plugins/python
 plugins/python/.venv/bin/ruff check plugins/python
 plugins/python/.venv/bin/ruff format --check plugins/python
-cargo test -p clarion-cli analyze_filters_external_import_edges_before_writer_insert -- --nocapture
+cargo test -p loomweave-cli analyze_filters_external_import_edges_before_writer_insert -- --nocapture
 ```
 
 **Commit:** `feat(wp3): emit python imports edges (phase3 task 3)`
@@ -429,9 +429,9 @@ cargo test -p clarion-cli analyze_filters_external_import_edges_before_writer_in
 ## Task 4: Storage Query Helpers for the Module Graph
 
 **Files:**
-- Modify: `crates/clarion-storage/src/query.rs`
-- Modify: `crates/clarion-storage/src/lib.rs`
-- Modify: `crates/clarion-storage/tests/schema_apply.rs`
+- Modify: `crates/loomweave-storage/src/query.rs`
+- Modify: `crates/loomweave-storage/src/lib.rs`
+- Modify: `crates/loomweave-storage/tests/schema_apply.rs`
 - Add or modify storage query tests in the existing storage test suite
 
 **Scope:** Read the persisted graph into a module-level dependency graph, and
@@ -470,9 +470,9 @@ pub struct SubsystemMember {
 **Exit:** Query tests pass and existing writer/schema tests still pass.
 
 ```bash
-cargo test -p clarion-storage module_dependency_edges -- --nocapture
-cargo test -p clarion-storage subsystem_members -- --nocapture
-cargo test -p clarion-storage schema_accepts_open_entity_and_edge_kinds -- --nocapture
+cargo test -p loomweave-storage module_dependency_edges -- --nocapture
+cargo test -p loomweave-storage subsystem_members -- --nocapture
+cargo test -p loomweave-storage schema_accepts_open_entity_and_edge_kinds -- --nocapture
 ```
 
 **Commit:** `feat(storage): add subsystem graph queries (phase3 task 4)`
@@ -482,15 +482,15 @@ cargo test -p clarion-storage schema_accepts_open_entity_and_edge_kinds -- --noc
 ## Task 5: Analyze Phase 3 Writes, Stats, and Weak-Modularity Finding
 
 **Files:**
-- Modify: `crates/clarion-cli/src/analyze.rs`
-- Modify: `crates/clarion-cli/src/clustering.rs`
-- Modify: `crates/clarion-cli/tests/analyze.rs`
-- Modify: `crates/clarion-storage/src/commands.rs`
-- Modify: `crates/clarion-storage/src/writer.rs`
-- Modify: `crates/clarion-storage/tests/writer_actor.rs`
+- Modify: `crates/loomweave-cli/src/analyze.rs`
+- Modify: `crates/loomweave-cli/src/clustering.rs`
+- Modify: `crates/loomweave-cli/tests/analyze.rs`
+- Modify: `crates/loomweave-storage/src/commands.rs`
+- Modify: `crates/loomweave-storage/src/writer.rs`
+- Modify: `crates/loomweave-storage/tests/writer_actor.rs`
 
 **Scope:** Insert subsystem entities and `in_subsystem` edges during
-`clarion analyze`, then persist run-level clustering stats and the weak
+`loomweave analyze`, then persist run-level clustering stats and the weak
 modularity fact.
 
 - [x] Write failing Rust tests:
@@ -536,10 +536,10 @@ and skipped/no-plugin stats tests still pass, proving stats additions are
 additive.
 
 ```bash
-cargo test -p clarion-cli analyze_phase3 -- --nocapture
-cargo test -p clarion-storage writer_inserts_fact_findings -- --nocapture
-cargo test -p clarion-cli analyze_stats_reports_ambiguous_edges_total -- --nocapture
-cargo test -p clarion-cli analyze_without_plugins_writes_skipped_run_row -- --nocapture
+cargo test -p loomweave-cli analyze_phase3 -- --nocapture
+cargo test -p loomweave-storage writer_inserts_fact_findings -- --nocapture
+cargo test -p loomweave-cli analyze_stats_reports_ambiguous_edges_total -- --nocapture
+cargo test -p loomweave-cli analyze_without_plugins_writes_skipped_run_row -- --nocapture
 ```
 
 **Commit:** `feat(wp4): write subsystem clusters in analyze (phase3 task 5)`
@@ -549,9 +549,9 @@ cargo test -p clarion-cli analyze_without_plugins_writes_skipped_run_row -- --no
 ## Task 6: MCP subsystem_members and Subsystem Summary Policy
 
 **Files:**
-- Modify: `crates/clarion-mcp/src/lib.rs`
-- Modify: `crates/clarion-mcp/tests/storage_tools.rs`
-- Modify: `crates/clarion-storage/src/query.rs` only if Task 4 helpers need
+- Modify: `crates/loomweave-mcp/src/lib.rs`
+- Modify: `crates/loomweave-mcp/tests/storage_tools.rs`
+- Modify: `crates/loomweave-storage/src/query.rs` only if Task 4 helpers need
   response-shape refinements
 
 **Scope:** Surface persisted subsystems through MCP without invoking the LLM.
@@ -598,9 +598,9 @@ cargo test -p clarion-cli analyze_without_plugins_writes_skipped_run_row -- --no
 the additive eighth tool.
 
 ```bash
-cargo test -p clarion-mcp subsystem_members -- --nocapture
-cargo test -p clarion-mcp summary_on_subsystem_returns_policy_envelope_without_llm_call -- --nocapture
-cargo test -p clarion-mcp tools_list -- --nocapture
+cargo test -p loomweave-mcp subsystem_members -- --nocapture
+cargo test -p loomweave-mcp summary_on_subsystem_returns_policy_envelope_without_llm_call -- --nocapture
+cargo test -p loomweave-mcp tools_list -- --nocapture
 ```
 
 **Commit:** `feat(mcp): expose subsystem membership tool (phase3 task 6)`
@@ -623,12 +623,12 @@ gate before declaring Phase 3 ready.
   dependency groups and sparse cross-group edges.
 - [x] Add E2E script:
   - install project
-  - run `clarion analyze`
+  - run `loomweave analyze`
   - assert at least two `subsystem` rows
   - assert each subsystem has at least `min_cluster_size` module members
   - assert `runs.stats.clustering.status = "completed"`
   - run a second clean analysis and assert subsystem IDs and modularity match
-  - run `clarion serve` fixture interaction or a direct MCP harness call for
+  - run `loomweave serve` fixture interaction or a direct MCP harness call for
     `subsystem_members`
 - [x] Add `docs/operator/clustering.md` with:
   - config keys and defaults
@@ -679,7 +679,7 @@ plugins/python/.venv/bin/pytest plugins/python/tests -q
 - `in_subsystem` edges link every member module to its subsystem.
 - `runs.stats.clustering` records status, config, counts, modularity, duration,
   and skip/finding state.
-- `CLA-FACT-CLUSTERING-WEAK-MODULARITY` persists when modularity is below 0.3
+- `LMWV-FACT-CLUSTERING-WEAK-MODULARITY` persists when modularity is below 0.3
   and there is an emitted subsystem anchor.
 - `subsystem_members(id)` is available through MCP.
 - `summary(id)` on a subsystem returns the no-subsystem-summary policy envelope

@@ -1,8 +1,8 @@
 # Changelog
 
-All notable changes to Clarion are documented here. The format is loosely based
-on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Clarion
-follows [Semantic Versioning](https://semver.org/) for the `clarion` binary,
+All notable changes to Loomweave are documented here. The format is loosely based
+on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Loomweave
+follows [Semantic Versioning](https://semver.org/) for the `loomweave` binary,
 the workspace crates, and the Python plugin.
 
 API versioning for the federation HTTP read API (`/api/v1/...`) is independent
@@ -11,6 +11,63 @@ only when an incompatible change is made to that surface. See
 [`docs/federation/contracts.md`](docs/federation/contracts.md).
 
 ## [Unreleased]
+
+## [1.0.0] — Loomweave — 2026-06-05
+
+**This release renames the product and re-baselines its version.** What shipped
+as **Clarion 1.3.0** is now **Loomweave 1.0.0**. The entries below this header
+(`[1.3.0]` and earlier) are the pre-rename Clarion lineage, preserved verbatim
+as history; they describe the same software under its former name.
+
+This is a **clean break with no users yet** — there are no migration shims,
+on-disk path auto-detection, dual-magic fallbacks, binary symlinks, plugin-prefix
+fallbacks, or MCP server-name aliases. Existing local state (a `.clarion/` index)
+is not migrated; re-run `loomweave analyze` to rebuild under the new paths.
+
+### Changed — naming
+
+- **Product `Clarion` → `Loomweave`** and **framework/suite `Loom` → `Weft`**.
+  Hierarchy: the **Weft** framework comprises **Loomweave** (this product, the
+  flagship code-archaeology tool), Filigree, Wardline, and Legis (+ Shuttle planned).
+- **Binary** `clarion` → `loomweave`; **workspace crates** `clarion-{core,cli,mcp,
+  storage,analysis,federation,scanner,plugin-fixture}` → `loomweave-*`.
+- **Python plugin** package `clarion-plugin-python` → `loomweave-plugin-python`,
+  module `clarion_plugin_python` → `loomweave_plugin_python`, shared-data path
+  `share/clarion/plugins/` → `share/loomweave/plugins/`.
+- **Persisted identity**: `.clarion/` → `.loomweave/`, `clarion.db` →
+  `loomweave.db`, `clarion.yaml` → `loomweave.yaml`; the SQLite `application_id`
+  magic `0x434C524E` (`"CLRN"`) → `0x4C4D5756` (`"LMWV"`).
+- **MCP server identity** `clarion` → `loomweave`; the `clarion-workflow` prompt/
+  skill → `loomweave-workflow`.
+- **Environment variables** `CLARION_*` → `LOOMWEAVE_*`; the federation/suite
+  variables `CLARION_LOOM_*` (e.g. `CLARION_LOOM_TOKEN`) → `WEFT_*` (e.g.
+  `WEFT_TOKEN`) — they name the framework, not the product.
+- **Error / diagnostic codes** prefix `CLA-` → `LMWV-` (e.g.
+  `CLA-INFRA-STORAGE-FOREIGN-DB` → `LMWV-INFRA-STORAGE-FOREIGN-DB`); the
+  ADR-022 plugin `rule_id_prefix` grammar core prefix `CLA-` → `LMWV-`.
+- **Documentation/site** repository `github.com/tachyon-beep/clarion` →
+  `github.com/foundryside-dev/loomweave`; docs domain `clarion.foundryside.dev`
+  → `loomweave.foundryside.dev`.
+
+### Changed — federation contract (cross-product; Filigree + Wardline move in lockstep)
+
+These touch the wire contract shared with sibling products and require the peers
+to be updated in step (the peer pins/clients are being renamed together):
+
+- Federation HTTP read API routes `/api/loom/...` → `/api/weft/...`; identity
+  headers `X-Loom-Component` / `X-Loom-Nonce` / `X-Loom-Timestamp` →
+  `X-Weft-*`; the `X-Loom-Component` identity value `clarion:<hmac>` →
+  `loomweave:<hmac>`. `api_version` stays `1` (a rename is not a wire-incompatible change).
+- Federation JSON field names `loom_*` (e.g. `loom_files`, `loom_findings`,
+  `loom_component`) → `weft_*`.
+- The Filigree entity-association field `clarion_entity_id` → `loomweave_entity_id`.
+- The Stable Entity Identifier (SEI) prefix `clarion:eid:` → `loomweave:eid:`
+  (ADR-038 / the Weft SEI conformance standard).
+
+### Version
+
+- Recut `1.3.0` → `1.0.0` across the workspace `Cargo.toml`, every
+  `pyproject.toml`/`plugin.toml`, and the Python plugin `__version__`.
 
 ## [1.3.0] — 2026-06-05
 
@@ -23,7 +80,7 @@ only when an incompatible change is made to that surface. See
   Wardline trust decorators (`external_boundary` / `trust_boundary` / `trusted`)
   receive `wardline` entity metadata and `wardline:*` tags when the descriptor is
   available; a missing, invalid, or version-skewed descriptor degrades honestly to
-  normal structural extraction. This **fully retires** the Clarion-side
+  normal structural extraction. This **fully retires** the Loomweave-side
   `wardline.core.registry` startup coupling (federation asterisk 2, registered at
   `~/loom/asterisk-register.md`): plugin startup performs zero in-process Wardline import, so the
   plugin no longer requires a co-installed Wardline and is robust to Wardline's
@@ -34,7 +91,7 @@ only when an incompatible change is made to that surface. See
 
 - **Filigree issue lookups key by Stable Entity Identity (SEI).** The MCP
   `entity_issue_list` path and the federation Filigree client resolve issues by
-  SEI rather than source locator, aligning issue enrichment with Clarion's stable
+  SEI rather than source locator, aligning issue enrichment with Loomweave's stable
   identity (one key per entity — SEI xor locator, no per-row fallback).
 - Refreshed release-facing README / index documentation for the 1.3.0 release
   line, including the 39-tool MCP surface, current install artifact names, fixed
@@ -56,26 +113,26 @@ only when an incompatible change is made to that surface. See
 
 ### Fixed
 
-- **`clarion doctor` reports enrich-only integration bindings as a warning, not a
+- **`loomweave doctor` reports enrich-only integration bindings as a warning, not a
   gate failure (federation-axiom compliance).** A missing or stale
-  Clarion+Filigree+Wardline binding previously mapped to `problem` (exit 1),
+  Loomweave+Filigree+Wardline binding previously mapped to `problem` (exit 1),
   which made an enrich-only sibling effectively required — contradicting
-  `loom.md` §5. Both the JSON and text doctor paths now report `warning` for
+  `weft.md` §5. Both the JSON and text doctor paths now report `warning` for
   missing/stale bindings; unparseable bindings and `--fix` repair failures remain
-  `problem`. A bare `clarion doctor` on a no-bindings (Clarion-solo or
-  Clarion+Filigree-only) project now exits 0 with the warning surfaced.
+  `problem`. A bare `loomweave doctor` on a no-bindings (Loomweave-solo or
+  Loomweave+Filigree-only) project now exits 0 with the warning surfaced.
 
 ### Security
 
 - **Closed a config-driven command-execution path from untrusted repository
-  contents (`clarion-4b5a8aff54`).** `clarion analyze` (the SEI git-rename
-  signal) and `clarion serve` (the `index_diff_get` freshness/drift report)
+  contents (`clarion-4b5a8aff54`).** `loomweave analyze` (the SEI git-rename
+  signal) and `loomweave serve` (the `index_diff_get` freshness/drift report)
   shelled `git` inside the analyzed repository with repo-local configuration and
   Git attributes enabled, so a malicious repository could execute arbitrary
   commands as the local user during an ordinary analyze/serve — via
   `core.fsmonitor`, an external diff/textconv driver, or a `filter.<name>.clean`
   selected by a `filter` attribute. All corpus-facing `git` calls now route
-  through a single hardened helper (`clarion_core::hardened_git_command`) that
+  through a single hardened helper (`loomweave_core::hardened_git_command`) that
   ignores operator/global/system config, strips config/exec-injecting environment
   variables, overrides the program-naming repo-local keys via highest-precedence
   `-c` flags (including `core.fsmonitor=false` and `core.attributesFile=`), and
@@ -103,18 +160,18 @@ only when an incompatible change is made to that surface. See
 
 - **Guidance maturity — WS6 (REQ-GUIDANCE-03/-05/-06; ADR-007, ADR-024).** The
   guidance system moves from schema baseline to operator-usable.
-  - **`clarion guidance` CLI** — `create` / `edit` (`$EDITOR`) / `show` / `list`
+  - **`loomweave guidance` CLI** — `create` / `edit` (`$EDITOR`) / `show` / `list`
     / `delete` / `export` / `import`. Match-rule syntax (`path:` / `tag:` /
     `kind:` / `subsystem:` / `entity:`), scope-levels (project→function), and
     `--expires` normalisation to a full ISO-8601 instant. Sheets are written via a
-    new non-run-scoped `clarion-storage` guidance API, and the rule-matcher is
-    lifted into `clarion-storage` as the single source of truth shared by the CLI,
+    new non-run-scoped `loomweave-storage` guidance API, and the rule-matcher is
+    lifted into `loomweave-storage` as the single source of truth shared by the CLI,
     `analyze`, and the MCP read path.
-  - **Staleness findings (`analyze`).** `CLA-FACT-GUIDANCE-ORPHAN` (WARN) now also
+  - **Staleness findings (`analyze`).** `LMWV-FACT-GUIDANCE-ORPHAN` (WARN) now also
     fires for a `match_rules {entity:…}` rule pointing at a deleted entity (was
-    `guides`-edge only); new `CLA-FACT-GUIDANCE-EXPIRED` (INFO) and
-    `CLA-FACT-GUIDANCE-CHURN-STALE` (WARN, confidence 0.7 heuristic, asymmetric
-    threshold 50 / 20-pinned). Surfaced via `clarion guidance list --stale`
+    `guides`-edge only); new `LMWV-FACT-GUIDANCE-EXPIRED` (INFO) and
+    `LMWV-FACT-GUIDANCE-CHURN-STALE` (WARN, confidence 0.7 heuristic, asymmetric
+    threshold 50 / 20-pinned). Surfaced via `loomweave guidance list --stale`
     (review-cadence age) / `--expired`. CHURN-STALE is honest-empty until
     `git_churn_count` population lands.
   - **Team import/export.** `export --to <dir>` / `import <dir>` — deterministic
@@ -143,9 +200,9 @@ only when an incompatible change is made to that surface. See
   to `<HEAD>..HEAD`. `analyze` also applies any pending migrations on startup
   (under the analyze lock) so a binary upgrade does not hard-fail on a DB that
   `install` has not re-touched.
-- **Stable Entity Identity (SEI) — Wave 1 / WS1 (ADR-038).** Clarion is now the
+- **Stable Entity Identity (SEI) — Wave 1 / WS1 (ADR-038).** Loomweave is now the
   suite's identity authority: it mints a durable, opaque **SEI**
-  (`clarion:eid:<blake3(locator ++ 0x00 ++ mint_run_id)[:32]>`) for every entity
+  (`loomweave:eid:<blake3(locator ++ 0x00 ++ mint_run_id)[:32]>`) for every entity
   and demotes the `{plugin}:{kind}:{qualname}` id to a mutable **locator**, so
   cross-tool bindings survive rename and move.
   - Migration `0005` adds `sei_bindings` (durable identity store, keyed by SEI,
@@ -164,7 +221,7 @@ only when an incompatible change is made to that surface. See
   - HTTP read API: `POST /api/v1/identity/resolve` (+ `:batch`),
     `GET /api/v1/identity/sei/{sei}`, `GET /api/v1/identity/lineage/{sei}`.
     `resolve` fail-closed-rejects an SEI-shaped input by the reserved
-    `clarion:eid:` prefix (REQ-F-02). `_capabilities` advertises
+    `loomweave:eid:` prefix (REQ-F-02). `_capabilities` advertises
     `sei: { supported: true, version: 1 }`.
   - The MCP tool surface carries the `sei` alongside every entity id (no MCP
     locator exception — REQ-C-04), via a read-time `sei_bindings` join.
@@ -172,7 +229,7 @@ only when an incompatible change is made to that surface. See
     passes; the cross-tool hard-cutover backfill is documented in
     [`docs/federation/sei-migration-playbook.md`](docs/federation/sei-migration-playbook.md)
     and surfaced for owner-gated scheduling.
-- **Incremental analysis — Wave 2 / T3.1.** `clarion analyze` now skips files
+- **Incremental analysis — Wave 2 / T3.1.** `loomweave analyze` now skips files
   whose whole-file hash matches the prior run, reusing their entities (the entity
   graph is cumulative and edges are insert-or-ignore, so the skip is speed-only).
   `skipped_files` is reported in `stats.json` and a `skipped_unchanged` progress
@@ -182,18 +239,18 @@ only when an incompatible change is made to that surface. See
   orphaned, and skipped entries are re-fed into the prior-index rebuild so the
   snapshot does not decay. Files carrying a secret finding are never skipped (their
   finding anchor must stay stable).
-- **Dossier participation surface — Wave 2 / WS4.** The exact Clarion HTTP slices
+- **Dossier participation surface — Wave 2 / WS4.** The exact Loomweave HTTP slices
   the cross-tool dossier *assembler* (Wardline) reads are pinned in
   [`docs/federation/contracts.md`](docs/federation/contracts.md) and specified in
-  [`docs/superpowers/specs/2026-06-02-clarion-dossier-participation.md`](docs/superpowers/specs/2026-06-02-clarion-dossier-participation.md):
+  [`docs/superpowers/specs/2026-06-02-loomweave-dossier-participation.md`](docs/superpowers/specs/2026-06-02-loomweave-dossier-participation.md):
   identity (`resolve` → SEI + content-axis freshness; `resolve_sei`/`lineage` →
   identity-axis freshness), structural linkages (callers/callees), and file
-  context. Clarion contributes slices and the SEI join key; it does **not** proxy
+  context. Loomweave contributes slices and the SEI join key; it does **not** proxy
   Filigree associations (read directly from Filigree's own ADR-029 endpoint) or
   assemble the envelope. Proven end-to-end against a renamed-function fixture
   (`serve_http_dossier_participation_surface_serves_a_renamed_function`).
 - **`legis` governance consumption — Wave 3 / WS9 (governed paradise).** `legis`
-  consumes Clarion's stable identity as an **opt-in** governance layer a solo
+  consumes Loomweave's stable identity as an **opt-in** governance layer a solo
   project never sees; core paradise (Wave 2) does not depend on it.
   - **Git-rename provider seam (REQ-C-05).** A second `GitRenameSource`,
     `LegisGitRenameSource`, reads `legis`'s `GET /git/renames` over HTTP and feeds
@@ -202,22 +259,22 @@ only when an incompatible change is made to that surface. See
     (`select_git_rename_source`, `--legis-url`) is enrich-only and
     capability-aware: the shell source remains the default and fallback; an
     unset/unreachable `legis` issues no HTTP and is byte-identical to before. The
-    two suppliers observe different rename windows (Clarion's `analyze` depends on
+    two suppliers observe different rename windows (Loomweave's `analyze` depends on
     the working-tree window; `legis` serves only committed rev-ranges), so the
     seam is built/tested/ready but inert in the default pipeline until `legis`
-    adds a working-tree surface or Clarion drives a committed re-index — a gap
+    adds a working-tree surface or Loomweave drives a committed re-index — a gap
     surfaced (not papered) in [`docs/federation/contracts.md`](docs/federation/contracts.md).
     The matcher is fail-closed regardless, so neither window can cause a false
     carry. Proven by
     `selector_keeps_working_tree_rename_even_when_a_reachable_legis_sees_nothing`.
-  - **Audit-spine consumption.** `legis` reads Clarion's existing
+  - **Audit-spine consumption.** `legis` reads Loomweave's existing
     `resolve`/`resolve_sei`/`lineage` routes as its governance audit spine; the
     consumption contract is pinned in `docs/federation/contracts.md`. Per REQ-L-01
     (Option 3) `legis` owns integrity at its own boundary (snapshot-hash over
-    polled lineage) — Clarion ships **no** lineage hash-chain or signature.
-  - **No trust adjudication.** Clarion carries the trust vocabulary verbatim and
+    polled lineage) — Loomweave ships **no** lineage hash-chain or signature.
+  - **No trust adjudication.** Loomweave carries the trust vocabulary verbatim and
     adds no policy/attestation engine — Wardline analyses, `legis` governs,
-    attestations key on Clarion's SEI.
+    attestations key on Loomweave's SEI.
 
 ### Fixed
 
@@ -233,15 +290,15 @@ only when an incompatible change is made to that surface. See
 
 ### Added
 
-- **Wardline taint-fact store (ADR-036).** Clarion now serves as the persistent
-  read+write store for Wardline's taint facts over HTTP, keyed to Clarion entity
+- **Wardline taint-fact store (ADR-036).** Loomweave now serves as the persistent
+  read+write store for Wardline's taint facts over HTTP, keyed to Loomweave entity
   qualnames. New migration `0003` adds the `wardline_taint_facts` table; facts
   are written through the storage writer-actor
   (`WriterCmd::UpsertWardlineTaintFact`) and resolved/fetched via the new
   `wardline_taint` storage module. Routes:
   - `POST /api/wardline/resolve` — exact-tier qualname → entity resolution.
   - `POST /api/wardline/taint-facts` — exact-only batch write; the Wardline
-    payload is stored byte-verbatim (`serde_json::value::RawValue`) so Clarion
+    payload is stored byte-verbatim (`serde_json::value::RawValue`) so Loomweave
     never reshapes Wardline's JSON.
   - `GET /api/wardline/taint-facts` and `…:batch-get` — reads carry a live
     freshness hash so a consumer can detect drift against the entity's current
@@ -254,35 +311,35 @@ only when an incompatible change is made to that surface. See
   reconciled against Wardline findings stored in Filigree. A pure
   qualname-reconciliation module matches `metadata.wardline.qualname` byte-exact
   against entity-ID segment-3; a two-hop Filigree read
-  (`GET /api/loom/files` → `GET /api/loom/findings`) resolves a path to its
+  (`GET /api/weft/files` → `GET /api/weft/findings`) resolves a path to its
   findings. Per the enrich-only axiom, any unreachable hop degrades the section
   to `result_kind: "unavailable"` rather than failing the tool.
-- **`clarion doctor [--fix]`.** A new subcommand that verifies — and with
+- **`loomweave doctor [--fix]`.** A new subcommand that verifies — and with
   `--fix` repairs in place — the installed agent-orientation surfaces: the
-  `clarion-workflow` skill pack, the `SessionStart` hook in
-  `.claude/settings.json`, and the `clarion` entry in `.mcp.json` (which
-  `clarion install` does not register automatically). It prints a per-surface
+  `loomweave-workflow` skill pack, the `SessionStart` hook in
+  `.claude/settings.json`, and the `loomweave` entry in `.mcp.json` (which
+  `loomweave install` does not register automatically). It prints a per-surface
   ✓/✗ report plus the index snapshot and exits non-zero when any problem
   remains, so it is usable as a CI / pre-commit gate. Repairs reuse the same
-  idempotent installers as `clarion install`, and the `.mcp.json` merge is
+  idempotent installers as `loomweave install`, and the `.mcp.json` merge is
   never-clobber: sibling servers and a deliberately customised `command` are
   preserved (only the `--path` args are corrected).
 
 ### Changed
 
 - Federation contracts pinned/clarified: the Wardline taint-store routes +
-  freshness contract, the two consumed loom routes for Flow B, Clarion→Filigree
+  freshness contract, the two consumed weft routes for Flow B, Loomweave→Filigree
   ephemeral-port endpoint discovery, and the `scan_run_id` contract (stale
   Phase-0 handshake references removed).
-- `docs/suite/loom.md`: added a written retirement condition to the §5
+- `docs/suite/weft.md`: added a written retirement condition to the §5
   asterisk-2 (Wardline→Filigree pipeline coupling), and refreshed the §9 status
   table to the post-1.0 state.
-- ADR-036 accepted (Clarion as Wardline taint-fact store), documenting the
+- ADR-036 accepted (Loomweave as Wardline taint-fact store), documenting the
   in-process two-writer concurrency posture.
 - The Python round-trip self-test now hard-fails (instead of silently skipping)
-  when the installed `clarion-plugin-python` entry point is missing, so a broken
+  when the installed `loomweave-plugin-python` entry point is missing, so a broken
   editable install cannot pass CI green.
-- **Shared error vocabulary (ADR-037).** New `clarion-core::errors` module is now
+- **Shared error vocabulary (ADR-037).** New `loomweave-core::errors` module is now
   the single typed source of truth for both wire error-code vocabularies:
   `HttpErrorCode` (federation HTTP read API, `SCREAMING_SNAKE_CASE`, moved out of
   `http_read.rs`) and a new `McpErrorCode` (MCP tool envelope, kebab-case) that
@@ -312,9 +369,9 @@ carries the full post-1.0.0 scope below plus the build fix.
 
 ### Added
 
-- `clarion db backup <output>` — a consistent, WAL-safe online backup of
-  `.clarion/clarion.db` via `rusqlite::backup::Backup`. Safe to run during a
-  live `clarion analyze` (captures outstanding WAL frames into a standalone
+- `loomweave db backup <output>` — a consistent, WAL-safe online backup of
+  `.loomweave/loomweave.db` via `rusqlite::backup::Backup`. Safe to run during a
+  live `loomweave analyze` (captures outstanding WAL frames into a standalone
   single-file copy, unlike `cp`), writes atomically (temp sibling + rename),
   refuses to clobber without `--force`, and verifies the copy with
   `PRAGMA integrity_check` before promoting it. Closes gap-register STO-04
@@ -329,25 +386,25 @@ carries the full post-1.0.0 scope below plus the build fix.
 - `call_sites(id, role=caller|callee, kind?, confidence?, path?)` MCP tool —
   shows the actual source sites behind `calls`/`references` edges (file, line,
   byte column, line text, edge kind, confidence) so an agent can see *why*
-  Clarion believes an edge exists. Statically-unbindable calls are returned in
+  Loomweave believes an edge exists. Statically-unbindable calls are returned in
   a separate `unresolved_sites` list, never mixed with resolved evidence.
   Filterable by edge kind and a documented best-effort production/test path
   heuristic. No LLM call. The MCP surface now exposes thirteen tools
   (clarion-9392f74881).
-- **Filigree finding emission (WP9-B core, REQ-FINDING-03).** `clarion analyze`
+- **Filigree finding emission (WP9-B core, REQ-FINDING-03).** `loomweave analyze`
   Phase 8 POSTs the run's persisted findings to Filigree's
-  `POST /api/v1/scan-results` intake, with Clarion's richer fields nested under
-  `metadata.clarion.*` (wire contract pinned in
+  `POST /api/v1/scan-results` intake, with Loomweave's richer fields nested under
+  `metadata.loomweave.*` (wire contract pinned in
   [`docs/federation/contracts.md`](docs/federation/contracts.md)). Emission is
   enrich-only — gated behind `integrations.filigree.{enabled,emit_findings}`
   (now **both default `false`**, so enabling Filigree for `issues_for` reads
   never silently starts outbound emission — clarion-a26de2f368), and any
   Filigree-side failure is recorded in `stats.json`
-  (`CLA-INFRA-FILIGREE-UNREACHABLE`) instead of failing the run. Findings
+  (`LMWV-INFRA-FILIGREE-UNREACHABLE`) instead of failing the run. Findings
   anchored to a `briefing_blocked` entity are excluded, matching the fail-closed
   read posture (clarion-8b32ba0d02). Resolves the 1.0 "finding emission
   deferred" limitation below.
-- **`clarion analyze --resume RUN_ID` (WP9-B, REQ-FINDING-05).** Reopens a prior
+- **`loomweave analyze --resume RUN_ID` (WP9-B, REQ-FINDING-05).** Reopens a prior
   run's `runs` row (a new `WriterCmd::ResumeRun` `UPDATE`s it back to `running`
   instead of `INSERT`ing, which conflicted on the existing run PK), re-walks the
   tree, and emits findings to Filigree with `mark_unseen=false` so the re-emit
@@ -356,20 +413,20 @@ carries the full post-1.0.0 scope below plus the build fix.
   (previously only entities did), so a resumed run reproduces the same durable
   graph as the original. The emitted `mark_unseen` value is recorded in
   `stats.json`. Tracked under clarion-dd29e69e0e.
-- **`clarion analyze --prune-unseen` (WP9-B, REQ-FINDING-06).** After emission
-  (Phase 8b), POSTs Filigree's `POST /api/loom/findings/clean-stale` retention
-  route, scoped to `scan_source=clarion`, asking it to soft-archive its own
-  `unseen_in_latest` Clarion findings older than
+- **`loomweave analyze --prune-unseen` (WP9-B, REQ-FINDING-06).** After emission
+  (Phase 8b), POSTs Filigree's `POST /api/weft/findings/clean-stale` retention
+  route, scoped to `scan_source=loomweave`, asking it to soft-archive its own
+  `unseen_in_latest` Loomweave findings older than
   `integrations.filigree.prune_unseen_days` (default 30). Soft-archive, not
   delete: Filigree moves them to `fixed` and auto-reopens on reappearance
   (Filigree ADR-015). Enrich-only — a Filigree outage or the integration being
   disabled is recorded in `stats.json` (`filigree_prune`) and never fails the
   run; the `scan_source` scoping is enforced server-side so the sweep can only
-  touch Clarion's findings. (Closes the REQ-FINDING-06 piece of
+  touch Loomweave's findings. (Closes the REQ-FINDING-06 piece of
   clarion-dd29e69e0e; the route was found to already exist in Filigree, so the
   earlier "file a request" memo is superseded — see its withdrawal banner.) The
   remaining Phase-0 scan-run-create handshake is an open contract question with
-  Filigree (Clarion relies on the peer tolerating an unknown `scan_run_id`),
+  Filigree (Loomweave relies on the peer tolerating an unknown `scan_run_id`),
   tracked separately under `release:1.1`.
 
 ### Changed
@@ -384,7 +441,7 @@ carries the full post-1.0.0 scope below plus the build fix.
   ADR-024 (no published build). Closes gap-register STO-04 / V11-STO-04
   (clarion-bdabfd6bca).
 - The writer actor now opens its batch transactions with `BEGIN IMMEDIATE`
-  (via a new `clarion_storage::retry::begin_immediate` helper with bounded
+  (via a new `loomweave_storage::retry::begin_immediate` helper with bounded
   `SQLITE_BUSY`/`SQLITE_LOCKED` retry + exponential backoff) instead of a
   deferred `BEGIN`. Taking the write lock up front resolves cross-process
   write contention at lock-acquire — where `busy_timeout` is honored — rather
@@ -394,8 +451,8 @@ carries the full post-1.0.0 scope below plus the build fix.
 ### Fixed
 
 - **macOS release build under `-D warnings`.** The Linux-only `prlimit`
-  helpers imported/defined in `clarion-core::plugin::host` (and two Linux-only
-  test sites in `clarion-mcp` and `clarion-cli`) were unused on
+  helpers imported/defined in `loomweave-core::plugin::host` (and two Linux-only
+  test sites in `loomweave-mcp` and `loomweave-cli`) were unused on
   `*-apple-darwin`, so the release build failed with unused-import / dead-code
   errors. They are now `cfg`-gated to `target_os = "linux"` (plus `test` where
   unit tests reference them). CI gained a native macOS (aarch64) build + clippy
@@ -404,9 +461,9 @@ carries the full post-1.0.0 scope below plus the build fix.
 
 ## [1.0.0] — 2026-05-19
 
-First publishable release. Clarion ships as a Rust core (`clarion` binary, five
+First publishable release. Loomweave ships as a Rust core (`loomweave` binary, five
 workspace crates) plus an editable-install Python language plugin
-(`clarion-plugin-python`). Released under the [MIT License](LICENSE).
+(`loomweave-plugin-python`). Released under the [MIT License](LICENSE).
 
 Targets the `v1.0.0` tag (cut by the operator once all release blockers are
 green); supersedes the pre-release `v0.1-sprint-1` and `v0.1-sprint-2`
@@ -414,16 +471,16 @@ working tags, which remain in the repo as historical anchors.
 
 ### Core
 
-- `clarion install --path` initialises a project's `.clarion/` directory
+- `loomweave install --path` initialises a project's `.loomweave/` directory
   (instance ID, SQLite DB, migrations).
-- `clarion analyze` walks a Python corpus and persists the structural graph
+- `loomweave analyze` walks a Python corpus and persists the structural graph
   (entities + `contains`, `calls`, `references`, `imports` edges) to a local
   SQLite store via the writer-actor pattern (ADR-011).
-- `clarion serve` exposes the MCP stdio surface for consult-mode agents:
+- `loomweave serve` exposes the MCP stdio surface for consult-mode agents:
   `entity_at`, `find_entity`, `callers_of`, `execution_paths_from`,
   `summary`, `issues_for`, `neighborhood`, `subsystem_members`.
 
-### Python plugin (`clarion-plugin-python` 1.0.0)
+### Python plugin (`loomweave-plugin-python` 1.0.0)
 
 - Pyright-backed entity extraction for functions, classes, and modules; resolved
   / ambiguous / inferred call edges per ADR-022.
@@ -434,8 +491,8 @@ working tags, which remain in the repo as historical anchors.
 
 ### Federation HTTP read API (ADR-014)
 
-The publisher-side of Clarion's federation contract with Filigree's
-`ClarionRegistry`. Pinned in [`docs/federation/contracts.md`](docs/federation/contracts.md);
+The publisher-side of Loomweave's federation contract with Filigree's
+`LoomweaveRegistry`. Pinned in [`docs/federation/contracts.md`](docs/federation/contracts.md);
 fixtures under [`docs/federation/fixtures/`](docs/federation/fixtures/) are
 normative.
 
@@ -450,10 +507,10 @@ normative.
   request, single pooled `ReaderPool` checkout per batch. Four-way
   partitioning: `resolved` / `not_found` / `briefing_blocked` / `errors`.
 - **Bearer authentication.** `serve.http.token_env` (default
-  `CLARION_LOOM_TOKEN`) names the env var holding the inbound bearer
+  `WEFT_TOKEN`) names the env var holding the inbound bearer
   token. Loopback-without-token stays unauthenticated for the v0.1 trust
   model; non-loopback-without-token is refused at startup with
-  `CLA-CONFIG-HTTP-NO-AUTH`.
+  `LMWV-CONFIG-HTTP-NO-AUTH`.
 - **Briefing-blocked propagation.** Files flagged by the pre-ingest secret
   scanner return `403 BRIEFING_BLOCKED` on the single-file endpoint and
   surface in the `briefing_blocked[]` partition on the batch endpoint.
@@ -493,7 +550,7 @@ normative.
 
 - **Python only.** Other-language plugins (`NG-15`) are v2.0+ scope.
 - **Filigree finding emission deferred to a future release (tracked under
-  `release:v1.1`).** Cross-product POSTing of Clarion-generated findings into
+  `release:v1.1`).** Cross-product POSTing of Loomweave-generated findings into
   Filigree's intake (WP9-B) is deferred per the [Sprint 2 scope amendment](docs/implementation/sprint-2/scope-amendment-2026-05.md).
   `issues_for(id)` (the WP9-A binding for reading from Filigree) ships in 1.0.
   *(WP9-B core shipped post-1.0 — see the Filigree-finding-emission entry under
@@ -502,11 +559,11 @@ normative.
   available, with a narrow core-extension fallback for files that predate
   manifest capture.
 - **Cooperative HMAC inbound auth** ships for the HTTP read API via
-  `serve.http.identity_token_env` and `X-Loom-Component: clarion:<hmac>`.
+  `serve.http.identity_token_env` and `X-Weft-Component: loomweave:<hmac>`.
   The older bearer-token path remains available for compatibility.
 - **Python plugin imports `wardline.core.registry.REGISTRY` at startup**
-  (loom.md §5 asterisk 2). Initialization coupling scoped to the
-  Wardline-aware plugin only; Clarion core and non-Wardline-aware plugins are
+  (weft.md §5 asterisk 2). Initialization coupling scoped to the
+  Wardline-aware plugin only; Loomweave core and non-Wardline-aware plugins are
   unaffected. *Retirement condition*: Wardline ships a stable runtime probe
   API.
 - **Wardline state-file ingest deferred to a future release (tracked under
@@ -518,33 +575,33 @@ normative.
   with WP9-B / WP10.
 - **Pre-WP5 catalogue upgrade requirement.** Briefing-blocked annotations
   are stored as a JSON property on file entities at v1.0 (v1.1 promotes
-  the field to a typed column). A v1.0 binary opening a `.clarion/clarion.db`
+  the field to a typed column). A v1.0 binary opening a `.loomweave/loomweave.db`
   produced by a pre-WP5 binary finds no `briefing_blocked` properties —
   pre-WP5 analyzers never wrote them — and will serve the entire catalogue
   without refusal. Operators upgrading from a pre-WP5 install MUST run
-  `clarion analyze` (scanner active by default) against the project root
+  `loomweave analyze` (scanner active by default) against the project root
   before exposing the HTTP read API or calling the `summary` MCP tool. See
   [`docs/operator/secret-scanning.md`](docs/operator/secret-scanning.md#pre-wp5-catalogue-upgrade-requirement).
 
 ### Documentation
 
-- Design ladder under [`docs/clarion/1.0/`](docs/clarion/1.0/) — `requirements.md`,
+- Design ladder under [`docs/loomweave/1.0/`](docs/loomweave/1.0/) — `requirements.md`,
   `system-design.md`, `detailed-design.md`.
-- ADRs under [`docs/clarion/adr/`](docs/clarion/adr/) — 28 Accepted at 1.0
+- ADRs under [`docs/loomweave/adr/`](docs/loomweave/adr/) — 28 Accepted at 1.0
   (ADR-001…ADR-034 with the documented Backlog/Superseded subset excluded).
   ADR-012 is superseded by ADR-014, whose Security
   Posture and Error Envelope are in turn partially extended by ADR-034
   for the Sprint 3 federation hardening. Four ADRs (ADR-009, ADR-010,
   ADR-019, ADR-020) remain Backlog and are tracked inside
   `system-design.md` §12 / `detailed-design.md` §11 until promoted.
-- Loom-suite doctrine at [`docs/suite/loom.md`](docs/suite/loom.md).
+- Weft-suite doctrine at [`docs/suite/weft.md`](docs/suite/weft.md).
 - Federation contract surface at [`docs/federation/contracts.md`](docs/federation/contracts.md).
 - Operator guides under [`docs/operator/`](docs/operator/) — getting-started,
   OpenRouter setup, HTTP read API.
 
-[Unreleased]: https://github.com/tachyon-beep/clarion/compare/v1.3.0...HEAD
-[1.3.0]: https://github.com/tachyon-beep/clarion/compare/v1.2.0...v1.3.0
-[1.2.0]: https://github.com/tachyon-beep/clarion/compare/v1.1.0...v1.2.0
-[1.1.0]: https://github.com/tachyon-beep/clarion/compare/v1.0.1...v1.1.0
-[1.0.1]: https://github.com/tachyon-beep/clarion/compare/v1.0.0...v1.0.1
-[1.0.0]: https://github.com/tachyon-beep/clarion/releases/tag/v1.0.0
+[Unreleased]: https://github.com/foundryside-dev/loomweave/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/foundryside-dev/loomweave/compare/v1.2.0...v1.3.0
+[1.2.0]: https://github.com/foundryside-dev/loomweave/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/foundryside-dev/loomweave/compare/v1.0.1...v1.1.0
+[1.0.1]: https://github.com/foundryside-dev/loomweave/compare/v1.0.0...v1.0.1
+[1.0.0]: https://github.com/foundryside-dev/loomweave/releases/tag/v1.0.0

@@ -9,7 +9,7 @@
 
 B.8 is the Sprint 2 full-system validation pass:
 
-- Run `clarion analyze` against the elspeth validation corpus.
+- Run `loomweave analyze` against the elspeth validation corpus.
 - Start the MCP surface from B.6.
 - Verify an agent can navigate real code with `entity_at`, `find_entity`, `callers_of`, `execution_paths_from`, `summary`, `issues_for`, and `neighborhood`.
 - Record scale evidence for wall-clock time, memory, store size, edge counts, confidence distribution, and MCP query latency.

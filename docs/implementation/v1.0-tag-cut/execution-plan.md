@@ -1,4 +1,4 @@
-# Clarion v1.0.0 — Tag-Cut Execution Plan
+# Loomweave v1.0.0 — Tag-Cut Execution Plan
 
 **Date**: 2026-05-22
 **Closes**: every gap in [`gap-register.md`](gap-register.md).
@@ -58,7 +58,7 @@ Bundle these into a single PR titled `docs: pre-tag-cut v1.0 contract drift fixe
 |-----|------|--------|
 | DOC-01 | `CHANGELOG.md:60` | `UNAUTHORIZED` → `UNAUTHENTICATED` |
 | DOC-02 | `CHANGELOG.md:60` | Add `BATCH_TOO_LARGE` |
-| DOC-05 | `docs/clarion/1.0/requirements.md:573` | `See:` line add `, ADR-034` |
+| DOC-05 | `docs/loomweave/1.0/requirements.md:573` | `See:` line add `, ADR-034` |
 | DOC-08 | `docs/operator/secret-scanning.md:83` | drop `in v0.1` qualifier |
 | DOC-10 | `CHANGELOG.md` | adjust "(through ADR-034)" phrasing |
 
@@ -68,9 +68,9 @@ Bundle: `docs: refresh v1.0 docs against ADR-034`.
 
 | Gap | File | Change |
 |-----|------|--------|
-| DOC-03 | `docs/clarion/1.0/requirements.md:771-783` | Rewrite NFR-SEC-03 statement + verification for ADR-034 rules |
-| DOC-04 | `docs/clarion/1.0/requirements.md:558-573` | Rewrite REQ-HTTP-03 statement + verification |
-| DOC-06 | `docs/suite/loom.md:65-70`, `CHANGELOG.md:108` | "v0.1 asterisks" → "v1.0 asterisks"; "deferred to v0.2" → "deferred to v1.1" |
+| DOC-03 | `docs/loomweave/1.0/requirements.md:771-783` | Rewrite NFR-SEC-03 statement + verification for ADR-034 rules |
+| DOC-04 | `docs/loomweave/1.0/requirements.md:558-573` | Rewrite REQ-HTTP-03 statement + verification |
+| DOC-06 | `docs/suite/weft.md:65-70`, `CHANGELOG.md:108` | "v0.1 asterisks" → "v1.0 asterisks"; "deferred to v0.2" → "deferred to v1.1" |
 | DOC-07 | `CLAUDE.md:144` | Rewrite HMAC paragraph; HMAC is preferred in 1.0 |
 | DOC-09 | `CHANGELOG.md` (known limitations) | Add Wardline REGISTRY asterisk entry |
 
@@ -81,8 +81,8 @@ Bundle: `docs(operator): pre-tag-cut governance + storage docs`.
 | Gap | New file | Content |
 |-----|----------|---------|
 | GOV-03 | `docs/operator/v1.0-release-rollback.md` | Rollback / yank runbook (see gap register) |
-| DOC-11 | append §Storage section to `README.md` and / or new `docs/clarion/1.0/operations.md` | Deployment constraints (NFS prohibition, no double-analyze, backup procedure) |
-| SEC-02 | append section to `docs/operator/secret-scanning.md` and `docs/operator/clarion-http-read-api.md` | Loopback-no-token trust statement |
+| DOC-11 | append §Storage section to `README.md` and / or new `docs/loomweave/1.0/operations.md` | Deployment constraints (NFS prohibition, no double-analyze, backup procedure) |
+| SEC-02 | append section to `docs/operator/secret-scanning.md` and `docs/operator/loomweave-http-read-api.md` | Loopback-no-token trust statement |
 | SEC-03 | append to `docs/operator/secret-scanning.md` and CHANGELOG known-limits | Pre-WP5 catalogue upgrade requirement |
 
 ### Stream 1D — One-line code fixes (one PR, ~1 hr including tests)
@@ -91,9 +91,9 @@ Bundle: `fix(v1.0): pre-tag correctness fixes`.
 
 | Gap | File | Change |
 |-----|------|--------|
-| SEC-01 | `crates/clarion-storage/src/query.rs:296-302` | Fail-closed `entity_briefing_block_reason`; add malformed-JSON unit test |
-| CI-02 | `crates/clarion-cli/src/http_read.rs:426-431` | Use a non-`InvalidPath` error code on body-parse failure; add a test exercising oversized body |
-| SEC-02 (code half) | `crates/clarion-mcp/src/config.rs` and / or `crates/clarion-cli/src/serve.rs` startup | Emit explicit startup banner line when loopback-no-token mode is in effect |
+| SEC-01 | `crates/loomweave-storage/src/query.rs:296-302` | Fail-closed `entity_briefing_block_reason`; add malformed-JSON unit test |
+| CI-02 | `crates/loomweave-cli/src/http_read.rs:426-431` | Use a non-`InvalidPath` error code on body-parse failure; add a test exercising oversized body |
+| SEC-02 (code half) | `crates/loomweave-mcp/src/config.rs` and / or `crates/loomweave-cli/src/serve.rs` startup | Emit explicit startup banner line when loopback-no-token mode is in effect |
 
 ### Stream 1E — Filigree issue creation (one batch, ~30 min)
 
@@ -117,17 +117,17 @@ new gates wired.
 
 ### 2.1 — Storage cross-process safety (STO-01, ~2 hr)
 
-PR: `fix(storage): cross-process lock for clarion analyze`.
+PR: `fix(storage): cross-process lock for loomweave analyze`.
 
-- Add `fs2 = "0.4"` to `crates/clarion-cli/Cargo.toml`.
+- Add `fs2 = "0.4"` to `crates/loomweave-cli/Cargo.toml`.
 - At top of `analyze::run` (and `serve` write paths), open
-  `.clarion/clarion.lock`, call `try_lock_exclusive`. Hold for the
+  `.loomweave/loomweave.lock`, call `try_lock_exclusive`. Hold for the
   duration of the writer-actor lifetime.
 - Refuse a second concurrent invocation with a clear error message:
-  "another `clarion analyze` is in progress against this project".
-- Add a test that spawns two `clarion analyze` subprocesses against the
+  "another `loomweave analyze` is in progress against this project".
+- Add a test that spawns two `loomweave analyze` subprocesses against the
   same project root and asserts exactly one succeeds.
-- Update `docs/clarion/1.0/operations.md` (or the README §Storage)
+- Update `docs/loomweave/1.0/operations.md` (or the README §Storage)
   paragraph from Stream 1C to reference the fail-fast behaviour.
 
 ### 2.2 — Storage identity + integrity (STO-02, STO-04, ~1 hr)
@@ -135,7 +135,7 @@ PR: `fix(storage): cross-process lock for clarion analyze`.
 PR: `fix(storage): application_id PRAGMA + e2e integrity check`.
 
 - Add `PRAGMA application_id = 0x434C524E` to
-  `crates/clarion-storage/src/pragma.rs::apply_write_pragmas`.
+  `crates/loomweave-storage/src/pragma.rs::apply_write_pragmas`.
 - On open, assert `application_id == 0` (then set) or `0x434C524E`
   (recognise); refuse any other value with a clear error.
 - Add `PRAGMA integrity_check` final assertion to
@@ -170,7 +170,7 @@ PR: `ci: wire MCP surface, Phase 3, and tag-lineage gates`.
 PR: `ci: extend SLSA provenance to plugin sdist`.
 
 - Edit `release-subjects` step in `.github/workflows/release.yml:201-225`
-  to glob `clarion-*.tar.gz` + `clarion_plugin_python*.tar.gz`.
+  to glob `loomweave-*.tar.gz` + `loomweave_plugin_python*.tar.gz`.
 - Update release notes template to mention plugin-sdist provenance.
 
 ### 2.5 — Post-publish verification (CI-04, ~45 min, optional for v1.0)
@@ -216,7 +216,7 @@ artifacts smoke-tested.
 ### 3.2 — Live governance dry-run (~15 min)
 
 - Run `scripts/check-github-release-governance.py --repository
-  tachyon-beep/clarion --branch main` locally with a token that can
+  foundryside-dev/loomweave --branch main` locally with a token that can
   read the policy settings. Confirm exit 0.
 
 ### 3.3 — Merge the gap-closure PRs to main (~15 min)
@@ -254,15 +254,15 @@ artifacts smoke-tested.
 
 - The final pre-tag commit on `main`:
   ```bash
-  echo "$(git rev-parse HEAD)" > crates/clarion-storage/migrations/published_build.txt
-  git add crates/clarion-storage/migrations/published_build.txt
+  echo "$(git rev-parse HEAD)" > crates/loomweave-storage/migrations/published_build.txt
+  git add crates/loomweave-storage/migrations/published_build.txt
   git commit -m "release: mark v1.0.0 as published-build baseline"
   git push origin main
   ```
 
 ### 3.8 — Cut the tag (~5 min)
 
-- `git tag -a v1.0.0 -m "Clarion v1.0.0"`
+- `git tag -a v1.0.0 -m "Loomweave v1.0.0"`
 - `git push origin v1.0.0`
 - The release workflow fires on the push. Watch the `verify` →
   `release-governance` → `build-rust` / `build-plugin` → `release` →
@@ -270,7 +270,7 @@ artifacts smoke-tested.
 
 ### 3.9 — Public artifact smoke (~30 min)
 
-- Once the release is public, install Clarion from the
+- Once the release is public, install Loomweave from the
   GitHub-Release-hosted assets on a fresh host (or one of the
   external-operator smoke VMs).
 - Verify cosign signatures via `cosign verify-blob` with the

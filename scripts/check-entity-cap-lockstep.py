@@ -5,9 +5,9 @@ ADR-021 §2c fixes the default per-run cumulative cap on ``entity`` + ``edge`` +
 ``finding`` notifications from a single plugin. That number is duplicated in
 two places that must stay in lockstep:
 
-* docs/clarion/adr/ADR-021-plugin-authority-hybrid.md §2c — the normative
+* docs/loomweave/adr/ADR-021-plugin-authority-hybrid.md §2c — the normative
   ``Default: **500,000**`` statement.
-* crates/clarion-core/src/plugin/limits.rs — ``EntityCountCap::DEFAULT_MAX``,
+* crates/loomweave-core/src/plugin/limits.rs — ``EntityCountCap::DEFAULT_MAX``,
   the const the host actually enforces.
 
 If the const drifts from the ADR, the enforced guardrail no longer matches the
@@ -23,8 +23,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-DEFAULT_LIMITS = Path("crates/clarion-core/src/plugin/limits.rs")
-DEFAULT_ADR = Path("docs/clarion/adr/ADR-021-plugin-authority-hybrid.md")
+DEFAULT_LIMITS = Path("crates/loomweave-core/src/plugin/limits.rs")
+DEFAULT_ADR = Path("docs/loomweave/adr/ADR-021-plugin-authority-hybrid.md")
 
 # `pub const DEFAULT_MAX: usize = 500_000;` — underscores are stripped before int().
 _RUST_DEFAULT_MAX_RE = re.compile(

@@ -1,0 +1,30 @@
+[package]
+name = "loomweave-plugin-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# The binary artifact is deliberately named OFF the `loomweave-plugin-*`
+# discovery glob (see loomweave-core/src/plugin/discovery.rs). A workspace
+# build drops this artifact into `target/<profile>/`; if it matched the glob,
+# Phase A's current_exe()-relative discovery would find a manifest-less
+# "plugin" next to the running binary and treat it as a fatal misconfiguration
+# (breaking `loomweave analyze` from a dev build, and the PATH="" tests).
+# Tests stage it under its real `loomweave-plugin-fixture` name via a
+# symlink/copy, so `spawn`'s basename check still sees the glob name.
+# Do NOT rename this back to `loomweave-plugin-fixture`.
+[[bin]]
+name = "loomweave-fixture-plugin"
+path = "src/main.rs"
+
+[dependencies]
+loomweave-core = { path = "../loomweave-core", version = "1.0.0" }
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["mman", "signal"] }

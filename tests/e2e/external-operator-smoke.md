@@ -12,7 +12,7 @@ This document is the procedure overview and the rationale for each step.
 
 Verify that an outside operator, working from a fresh machine and reading
 **only** the top-level `README.md` and `docs/operator/getting-started.md`, can
-install Clarion, analyse a small public Python project, connect a consult-mode
+install Loomweave, analyse a small public Python project, connect a consult-mode
 MCP client, ask substantive questions, re-run idempotently, and observe the
 pre-ingest secret-block fire on a planted credential.
 
@@ -38,14 +38,14 @@ the operator to fill in. A draft results file is written to
 
 ### External-operator smoke (binary install)
 
-The outside-operator scenario assumes Clarion has been installed via the
+The outside-operator scenario assumes Loomweave has been installed via the
 GitHub Release archive and the Python plugin via `pipx`. Tell the harness to
 skip the build step and point it at the operator-installed binaries:
 
 ```bash
 export CARGO_BUILD=0
-export CLARION_BIN=/path/to/installed/clarion
-export CLARION_PLUGIN_BIN=/path/to/installed/clarion-plugin-python
+export LOOMWEAVE_BIN=/path/to/installed/loomweave
+export LOOMWEAVE_PLUGIN_BIN=/path/to/installed/loomweave-plugin-python
 bash external-operator-smoke.sh        # script is published as a release asset
 ```
 
@@ -56,9 +56,9 @@ it from any directory.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CARGO_BUILD` | `1` | Build clarion + plugin from source. `0` skips. |
-| `CLARION_BIN` | (autodetected) | Path to the `clarion` binary. |
-| `CLARION_PLUGIN_BIN` | (autodetected) | Path to `clarion-plugin-python`. |
+| `CARGO_BUILD` | `1` | Build loomweave + plugin from source. `0` skips. |
+| `LOOMWEAVE_BIN` | (autodetected) | Path to the `loomweave` binary. |
+| `LOOMWEAVE_PLUGIN_BIN` | (autodetected) | Path to `loomweave-plugin-python`. |
 | `CORPUS_REPO` | `https://github.com/psf/requests.git` | Public Python corpus to analyse. |
 | `CORPUS_REF` | `v2.32.3` | Pinned tag for reproducibility. |
 | `OPENROUTER_API_KEY` | unset | If unset, step 4.3(c) `summary` is skipped (not failed). |
@@ -81,15 +81,15 @@ fills it into the generated results file.
 
 | # | Step | Pass criteria | Automated? |
 |---|---|---|---|
-| 1 | Install the Rust binary per WS-C's chosen path (GitHub Releases per ADR-033) | `clarion --version` prints a version on `$PATH` | ✅ |
-| 2 | Install the Python plugin via `pipx` per the tutorial | `which clarion-plugin-python` resolves; the binary is on `$PATH` | ✅ |
-| 3 | `clarion install` against a small Python project (the harness uses `psf/requests` at a pinned tag) | `.clarion/` exists; `.clarion/clarion.db` exists; init log line emitted | ✅ |
-| 4.1 | `clarion analyze` | Exit 0; entity count > 0 | ✅ |
-| 4.2 | Start `clarion serve`; connect MCP client | MCP `tools/list` returns the 9 tools (`entity_at`, `find_entity`, `callers_of`, `execution_paths_from`, `summary`, `issues_for`, `neighborhood`, `subsystem_members`, `project_status`) | ✅ |
+| 1 | Install the Rust binary per WS-C's chosen path (GitHub Releases per ADR-033) | `loomweave --version` prints a version on `$PATH` | ✅ |
+| 2 | Install the Python plugin via `pipx` per the tutorial | `which loomweave-plugin-python` resolves; the binary is on `$PATH` | ✅ |
+| 3 | `loomweave install` against a small Python project (the harness uses `psf/requests` at a pinned tag) | `.loomweave/` exists; `.loomweave/loomweave.db` exists; init log line emitted | ✅ |
+| 4.1 | `loomweave analyze` | Exit 0; entity count > 0 | ✅ |
+| 4.2 | Start `loomweave serve`; connect MCP client | MCP `tools/list` returns the 9 tools (`entity_at`, `find_entity`, `callers_of`, `execution_paths_from`, `summary`, `issues_for`, `neighborhood`, `subsystem_members`, `project_status`) | ✅ |
 | 4.3 | Three MCP queries against analyzed corpus: <br>(a) `find_entity(pattern="Session")` lists module-level matches <br>(b) `callers_of(id=<highest-in-degree function>)` returns a non-empty list <br>(c) `summary(id=<any function>)` returns a paragraph | (a) and (b) return non-empty; (c) returns a paragraph (live LLM) or is skipped when `OPENROUTER_API_KEY` is absent | ✅ |
-| 5 | Re-run `clarion analyze` | Idempotent: entity/edge counts on the second run match the first | ✅ |
-| 6 | Plant `.env` with `AWS_ACCESS_KEY_ID=AKIA0123456789ABCDEF`; re-run `clarion analyze` | `briefing_blocked` entities count > 0; `CLA-SEC-SECRET-DETECTED` finding emitted | ✅ |
-| 7 | `clarion serve` against the post-secret-block DB; call `summary(id)` on a blocked entity's id | Returns `briefing_blocked` envelope with no LLM call | ✅ |
+| 5 | Re-run `loomweave analyze` | Idempotent: entity/edge counts on the second run match the first | ✅ |
+| 6 | Plant `.env` with `AWS_ACCESS_KEY_ID=AKIA0123456789ABCDEF`; re-run `loomweave analyze` | `briefing_blocked` entities count > 0; `LMWV-SEC-SECRET-DETECTED` finding emitted | ✅ |
+| 7 | `loomweave serve` against the post-secret-block DB; call `summary(id)` on a blocked entity's id | Returns `briefing_blocked` envelope with no LLM call | ✅ |
 | 8 | Operator-improvisation tally | Total count of "I had to look at the source to understand what to do next" events. **Target: 0.** Any positive count is a B.1/B.2 docs bug. | ❌ (human-judged) |
 
 ## Recording results
@@ -109,7 +109,7 @@ issue) before closing.
 ## Repeating on additional platforms
 
 The release matrix in
-[ADR-033](../../docs/clarion/adr/ADR-033-v1.0-distribution.md) produces
+[ADR-033](../../docs/loomweave/adr/ADR-033-v1.0-distribution.md) produces
 `x86_64-unknown-linux-gnu`, `x86_64-apple-darwin`, and `aarch64-apple-darwin`
 binaries. Run the harness on at least one Linux target and one macOS target
 before the `v1.0.0` tag is treated as generally publishable. Each platform

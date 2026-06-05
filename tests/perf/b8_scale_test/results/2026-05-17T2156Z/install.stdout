@@ -1,3 +1,3 @@
 2026-05-17T21:58:02.731231Z  INFO applying migration version=1 name="0001_initial_schema"
-2026-05-17T21:58:02.736718Z  INFO clarion install complete clarion_dir=/tmp/clarion-b8-elspeth-tests-20260517T2156Z/.clarion
-Initialised /tmp/clarion-b8-elspeth-tests-20260517T2156Z/.clarion
+2026-05-17T21:58:02.736718Z  INFO loomweave install complete loomweave_dir=/tmp/loomweave-b8-elspeth-tests-20260517T2156Z/.loomweave
+Initialised /tmp/loomweave-b8-elspeth-tests-20260517T2156Z/.loomweave

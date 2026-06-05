@@ -1,27 +1,27 @@
-# Clarion
+# Loomweave
 
-Clarion is a code-archaeology tool. It ingests a codebase, extracts entities
+Loomweave is a code-archaeology tool. It ingests a codebase, extracts entities
 (functions, classes, modules) and their relationships (`contains`, `calls`,
 `references`), persists the structural graph to a local SQLite store, and serves
 the result to consult-mode LLM agents over MCP. A coding agent that would
-otherwise re-explore the tree on every question reaches Clarion first and asks a
+otherwise re-explore the tree on every question reaches Loomweave first and asks a
 graph-aware tool. The current release line ships a Rust core plus a Python
 language plugin; other languages remain future scope.
 
-Part of the [Loom suite](docs/suite/loom.md) of code-archaeology, issue-tracking,
+Part of the [Weft suite](docs/suite/weft.md) of code-archaeology, issue-tracking,
 and trust-topology tools.
 
 ## Status
 
-**v1.3.0 — current release line.** Scope:
+**v1.0.0 — current release line.** Scope:
 
 - **Python only.** Other-language plugins (`NG-15`) are v2.0+ scope.
-- **Structural extraction + on-demand LLM summarisation.** `clarion analyze`
+- **Structural extraction + on-demand LLM summarisation.** `loomweave analyze`
   walks the corpus and persists entities + edges; `summary(id)` over MCP
   dispatches the LLM lazily, one entity at a time.
 - **Local-first.** No mandatory cloud component; the only required network
   egress is the LLM provider during `summary` calls.
-- **Stable identity and suite enrichment.** Clarion mints Stable Entity
+- **Stable identity and suite enrichment.** Loomweave mints Stable Entity
   Identity (SEI) tokens, serves the federation HTTP read API, emits opted-in
   Filigree scan findings (issue lookups now key by SEI), and enriches MCP reads
   with Filigree/Wardline context without making sibling products mandatory.
@@ -29,17 +29,17 @@ and trust-topology tools.
   Wardline's NG-25 trust-vocabulary descriptor as a plain file and tags
   trust-decorated entities (`wardline:*`) — without importing Wardline, so a
   co-installed Wardline is not required. Degrades cleanly when the descriptor is
-  absent. (Retires the last Clarion-side federation asterisk; see
-  [`docs/suite/loom.md`](docs/suite/loom.md) §5.)
+  absent. (Retires the last Loomweave-side federation asterisk; see
+  [`docs/suite/weft.md`](docs/suite/weft.md) §5.)
 - **Guidance authoring.** Operators can author, import, export, and review
-  guidance sheets through `clarion guidance`; consult agents consume them
+  guidance sheets through `loomweave guidance`; consult agents consume them
   through MCP and summary cache invalidation.
 
 **Known limitations:**
 
 - **HTTP file language inference uses stored plugin identity plus a narrow
   core-extension fallback.** Plugin manifests declare language and extensions,
-  but Clarion does not yet persist a manifest language registry for the
+  but Loomweave does not yet persist a manifest language registry for the
   `/api/v1/files` read path.
 - **Some guidance lifecycle surfaces remain deferred.** The in-browser
   staleness-review UI is still tracked separately; authored guidance is
@@ -47,7 +47,7 @@ and trust-topology tools.
 
 ## What it does today
 
-`clarion serve` exposes a 39-tool MCP surface that a consult-mode agent calls
+`loomweave serve` exposes a 39-tool MCP surface that a consult-mode agent calls
 instead of grep-and-read. The core tool families are:
 
 | Family | Examples |
@@ -62,32 +62,32 @@ instead of grep-and-read. The core tool families are:
 
 ```bash
 # 1. Install from the current GitHub Release
-TAG=v1.3.0
-curl -L -o clarion-x86_64-unknown-linux-gnu.tar.gz \
-  "https://github.com/tachyon-beep/clarion/releases/download/${TAG}/clarion-x86_64-unknown-linux-gnu.tar.gz"
-tar xzf clarion-x86_64-unknown-linux-gnu.tar.gz
-install clarion-x86_64-unknown-linux-gnu/clarion ~/.local/bin/
+TAG=v1.0.0
+curl -L -o loomweave-x86_64-unknown-linux-gnu.tar.gz \
+  "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave-x86_64-unknown-linux-gnu.tar.gz"
+tar xzf loomweave-x86_64-unknown-linux-gnu.tar.gz
+install loomweave-x86_64-unknown-linux-gnu/loomweave ~/.local/bin/
 pipx install \
-  "https://github.com/tachyon-beep/clarion/releases/download/${TAG}/clarion-plugin-python-1.3.0.tar.gz"
+  "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave-plugin-python-1.0.0.tar.gz"
 
 # 2. Initialise a project
 cd /path/to/your/python/repo
-clarion install --path .
+loomweave install --path .
 
 # 3. Walk the corpus and persist the structural graph
-clarion analyze
+loomweave analyze
 
 # 4. Serve the graph over MCP for consult-mode agents
-clarion serve
+loomweave serve
 ```
 
-`clarion install` is the one-step agent setup path: it initialises `.clarion/`,
-installs the `clarion-workflow` skill for Claude Code and Codex, writes Claude
+`loomweave install` is the one-step agent setup path: it initialises `.loomweave/`,
+installs the `loomweave-workflow` skill for Claude Code and Codex, writes Claude
 Code MCP config, upserts Codex MCP config, and installs the SessionStart hook.
 Use component flags such as `--claude-code`, `--codex`, `--skills`,
 `--codex-skills`, and `--hooks` for partial installs.
 
-`clarion analyze` works without any LLM credentials and is the fastest way to
+`loomweave analyze` works without any LLM credentials and is the fastest way to
 verify the install. `summary(id)` calls require `OPENROUTER_API_KEY` to be set
 (see [docs/operator/openrouter.md](docs/operator/openrouter.md)).
 
@@ -99,37 +99,37 @@ in [docs/operator/getting-started.md](docs/operator/getting-started.md).
 
 ```
 crates/                 Rust workspace
-├── clarion-core/       Entity-ID assembler, plugin host, manifest parser
-├── clarion-storage/    Writer-actor + reader-pool over SQLite (ADR-011)
-├── clarion-federation/ Shared federation HTTP types
-├── clarion-scanner/    Pre-ingest secret scanner (ADR-013, WP5)
-├── clarion-cli/        The `clarion` binary (install, analyze, serve)
-└── clarion-mcp/        MCP server exposing the consult tools
+├── loomweave-core/       Entity-ID assembler, plugin host, manifest parser
+├── loomweave-storage/    Writer-actor + reader-pool over SQLite (ADR-011)
+├── loomweave-federation/ Shared federation HTTP types
+├── loomweave-scanner/    Pre-ingest secret scanner (ADR-013, WP5)
+├── loomweave-cli/        The `loomweave` binary (install, analyze, serve)
+└── loomweave-mcp/        MCP server exposing the consult tools
 plugins/python/         Python language plugin (pyright-backed)
-docs/clarion/1.0/      Design ladder — requirements → system-design → detailed-design
-docs/clarion/adr/       Authored architecture decision records
+docs/loomweave/1.0/      Design ladder — requirements → system-design → detailed-design
+docs/loomweave/adr/       Authored architecture decision records
 ```
 
 For the design ladder start at
-[docs/clarion/1.0/README.md](docs/clarion/1.0/README.md). The full ADR index
-is at [docs/clarion/adr/README.md](docs/clarion/adr/README.md). The Loom
+[docs/loomweave/1.0/README.md](docs/loomweave/1.0/README.md). The full ADR index
+is at [docs/loomweave/adr/README.md](docs/loomweave/adr/README.md). The Weft
 federation doctrine that anchors every cross-product decision is in
-[docs/suite/loom.md](docs/suite/loom.md).
+[docs/suite/weft.md](docs/suite/weft.md).
 
 ## Storage and operations
 
-Clarion keeps project state in a local `.clarion/` directory.
+Loomweave keeps project state in a local `.loomweave/` directory.
 The local-first storage model, the no-NFS constraint, the no-double-analyze
 constraint (fs2 advisory lock), and the backup/restore procedure are
 documented in
-[docs/clarion/1.0/operations.md](docs/clarion/1.0/operations.md).
+[docs/loomweave/1.0/operations.md](docs/loomweave/1.0/operations.md).
 
 ## Contributing
 
-Read the [v1.0 docset README](docs/clarion/1.0/README.md) for the canonical
+Read the [v1.0 docset README](docs/loomweave/1.0/README.md) for the canonical
 design ladder, its reading order, and where canonical truth lives. The CI
 floor every PR must clear is fixed by
-[ADR-023](docs/clarion/adr/ADR-023-tooling-baseline.md):
+[ADR-023](docs/loomweave/adr/ADR-023-tooling-baseline.md):
 
 ```bash
 # Rust gates

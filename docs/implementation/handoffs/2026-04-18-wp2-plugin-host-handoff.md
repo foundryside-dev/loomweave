@@ -1,4 +1,4 @@
-# Clarion Sprint 1 WP2 — Plugin host + hybrid authority (handoff prompt)
+# Loomweave Sprint 1 WP2 — Plugin host + hybrid authority (handoff prompt)
 
 This file is the starting prompt for a fresh Claude Code session that will
 execute WP2. It is designed to be pasted directly as the user's first
@@ -7,7 +7,7 @@ should not need prior conversation context to pick up cleanly.
 
 ---
 
-# Continue Clarion Sprint 1 WP2 execution
+# Continue Loomweave Sprint 1 WP2 execution
 
 I'm handing off WP2 (plugin host + hybrid authority) after completing WP1
 (scaffold + storage). You are continuing the same sprint with the same
@@ -15,16 +15,16 @@ discipline. This prompt is the full handoff.
 
 ## Working directory + branch
 
-- Directory: `/home/john/clarion`
+- Directory: `/home/john/loomweave`
 - Branch: `sprint-1/wp2-plugin-host` (already checked out; off `main` tip `ad8d4ce` which is the WP1 merge commit)
 - `main` has WP1 already merged via `--no-ff` so `git log --first-parent main` shows WP-level boundaries.
 - Do NOT amend existing commits; stack new commits on top.
 
 ## The project
 
-Clarion is a code-archaeology tool, one of four products in the Loom suite
-(Clarion, Filigree, Wardline, proposed Shuttle). Read `CLAUDE.md` at repo
-root for the doctrine, ADR precedence rules, and the Loom federation axiom.
+Loomweave is a code-archaeology tool, one of four products in the Weft suite
+(Loomweave, Filigree, Wardline, proposed Shuttle). Read `CLAUDE.md` at repo
+root for the doctrine, ADR precedence rules, and the Weft federation axiom.
 
 Sprint 1 ships the walking-skeleton across WP1 (scaffold + storage — DONE),
 WP2 (plugin host — in progress), WP3 (Python plugin — blocked-by WP2).
@@ -32,20 +32,20 @@ You are executing WP2.
 
 ## What WP1 delivered (already on `main`)
 
-- Cargo workspace (edition 2024, rustc 1.95) with three crates: `clarion-core`, `clarion-storage`, `clarion-cli`.
+- Cargo workspace (edition 2024, rustc 1.95) with three crates: `loomweave-core`, `loomweave-storage`, `loomweave-cli`.
 - Tooling floor per **ADR-023**: `rust-toolchain.toml`, `rustfmt.toml`, `clippy.toml` (pedantic), `deny.toml`, `.github/workflows/ci.yml`, workspace `[lints]`.
-- `clarion-core`: `entity_id()` assembler (L2 3-segment format per ADR-003 + ADR-022), `EntityIdError`, `LlmProvider` trait + `NoopProvider` stub.
-- `clarion-storage`: SQLite schema migration `0001_initial_schema.sql` (L1 per detailed-design §3 — tables, FTS5, triggers, generated columns, `guidance_sheets` view), `ReaderPool` (deadpool-sqlite), `Writer` actor (L3 per ADR-011 — `tokio::task::spawn_blocking`, bounded mpsc, per-N batch COMMIT, WriterCmd enum with oneshot acks, `WriterProtocol` error variant for contract violations).
-- `clarion-cli`: `clarion install` (creates `.clarion/{clarion.db,config.json,.gitignore}` + `clarion.yaml`; ADR-005 governs the `.gitignore` contents), `clarion analyze` (Sprint 1 stub — BeginRun → CommitRun with status `skipped_no_plugins`; WP2 replaces this stub).
+- `loomweave-core`: `entity_id()` assembler (L2 3-segment format per ADR-003 + ADR-022), `EntityIdError`, `LlmProvider` trait + `NoopProvider` stub.
+- `loomweave-storage`: SQLite schema migration `0001_initial_schema.sql` (L1 per detailed-design §3 — tables, FTS5, triggers, generated columns, `guidance_sheets` view), `ReaderPool` (deadpool-sqlite), `Writer` actor (L3 per ADR-011 — `tokio::task::spawn_blocking`, bounded mpsc, per-N batch COMMIT, WriterCmd enum with oneshot acks, `WriterProtocol` error variant for contract violations).
+- `loomweave-cli`: `loomweave install` (creates `.loomweave/{loomweave.db,config.json,.gitignore}` + `loomweave.yaml`; ADR-005 governs the `.gitignore` contents), `loomweave analyze` (Sprint 1 stub — BeginRun → CommitRun with status `skipped_no_plugins`; WP2 replaces this stub).
 - 48 tests pass, all 7 ADR-023 gates green (build dev + release, fmt, clippy pedantic `-D warnings`, nextest, doc, deny).
 
 **Key exported API that WP2 will consume**:
 
-- `clarion_storage::{Writer, DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, EntityRecord, RunStatus, WriterCmd}`.
+- `loomweave_storage::{Writer, DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, EntityRecord, RunStatus, WriterCmd}`.
 - `Writer::send_wait<T, F>(|ack| WriterCmd::...) -> Result<T, StorageError>` — canonical async helper for enqueuing commands. The WP1 review loop made this the preferred pattern over hand-rolling oneshot channels.
 - `WriterCmd::InsertEntity { entity: Box<EntityRecord>, ack }` — note the `Box` on the entity; it is required by clippy's `large_enum_variant` and is part of the L3 locked-in shape.
-- `clarion_core::{entity_id, EntityId, EntityIdError, LlmProvider, NoopProvider}`.
-- `clarion_storage::StorageError` variants: `Sqlite(#[from] rusqlite::Error)`, `Pool*(#[from] deadpool)`, `PragmaInvariant(String)`, `Migration{version, source}`, `Io(#[from] io::Error)`, `WriterGone`, `WriterProtocol(String)`, `WriterNoResponse`. `StorageError` is `!Sync`; bridge to `anyhow` via `.map_err(|e| anyhow::anyhow!("{e}"))`.
+- `loomweave_core::{entity_id, EntityId, EntityIdError, LlmProvider, NoopProvider}`.
+- `loomweave_storage::StorageError` variants: `Sqlite(#[from] rusqlite::Error)`, `Pool*(#[from] deadpool)`, `PragmaInvariant(String)`, `Migration{version, source}`, `Io(#[from] io::Error)`, `WriterGone`, `WriterProtocol(String)`, `WriterNoResponse`. `StorageError` is `!Sync`; bridge to `anyhow` via `.map_err(|e| anyhow::anyhow!("{e}"))`.
 
 ## The spec
 
@@ -60,7 +60,7 @@ Outline (9 tasks):
 5. Plugin discovery (L9).
 6. Plugin-host supervisor.
 7. Crash-loop breaker.
-8. Wire `clarion analyze` to use the plugin host (replaces the Sprint 1 stub).
+8. Wire `loomweave analyze` to use the plugin host (replaces the Sprint 1 stub).
 9. WP2 end-to-end smoke test.
 
 Anchoring ADRs: **ADR-002** (plugin transport JSON-RPC over stdio), **ADR-021** (plugin authority hybrid — declared capabilities + core-enforced minimums), **ADR-022** (core/plugin ontology ownership boundary).
@@ -103,7 +103,7 @@ below.
 
 - **WP1 issue** `clarion-2eadcfe651` is `delivered`. Do not touch it.
 
-- **Pending observation** `clarion-obs-67175f4486`: priority generated
+- **Pending observation** `loomweave-obs-67175f4486`: priority generated
   column TEXT affinity breaks lexicographic ordering for numeric
   priorities. Flagged during WP1 Task 3 review. It is a design-doc
   question (detailed-design.md §3 §737), not a WP2 task. Leave it pending
@@ -118,7 +118,7 @@ from Task 1:
 
 1. **Cargo hygiene**
    - `cargo nextest run` needs `--no-tests=pass` in any CI / script / doc command.
-   - Internal path deps pin a version: `clarion-core = { path = "...", version = "0.1.0-dev" }` to satisfy `cargo-deny`'s `wildcards = "deny"`.
+   - Internal path deps pin a version: `loomweave-core = { path = "...", version = "0.1.0-dev" }` to satisfy `cargo-deny`'s `wildcards = "deny"`.
    - New workspace deps go in `[workspace.dependencies]` and are referenced via `dep.workspace = true` from crate manifests.
    - `Cargo.lock` is committed.
    - No `#[allow(...)]` for pedantic warnings — fix in-code.
@@ -172,9 +172,9 @@ from Task 1:
 - **L4 — JSON-RPC method set + Content-Length framing (ADR-002)**: `initialize`, `initialized`, `analyze_file`, `shutdown`, `exit`. Reviewer hotspots: Content-Length header parsing (malformed framing, oversized payloads per L6's 8 MiB ceiling), JSON-RPC error code fidelity, mid-message disconnect handling.
 - **L5 — `plugin.toml` schema (ADR-022)**: reviewer hotspots: missing-required-field errors, ontology declaration shape (`[ontology].entity_kinds` drives host-side filtering).
 - **L6 — core-enforced minimums (ADR-021)**: path jail (drop-not-kill on first escape; >10/60s → kill = sub-breaker), 8 MiB Content-Length ceiling, 500k per-run entity cap, 2 GiB `RLIMIT_AS`. Reviewer hotspots: each invariant needs a positive and a negative test; the sub-breaker's sliding-window logic is a timing hazard (flake-check 3x for any test that relies on wall-clock).
-- **L9 — plugin discovery**: finds `clarion-plugin-*` binaries on `$PATH`, loads neighbouring `plugin.toml`. Reviewer hotspots: cross-platform `$PATH` handling (WP2 scope is Linux but don't assume POSIX everywhere in code comments), missing-manifest errors, multiple-plugins-with-same-name behaviour.
+- **L9 — plugin discovery**: finds `loomweave-plugin-*` binaries on `$PATH`, loads neighbouring `plugin.toml`. Reviewer hotspots: cross-platform `$PATH` handling (WP2 scope is Linux but don't assume POSIX everywhere in code comments), missing-manifest errors, multiple-plugins-with-same-name behaviour.
 
-Additionally, WP2 Task 8 **wires `clarion analyze` to use the plugin host**. The current Sprint-1 stub ends with `RunStatus::SkippedNoPlugins`; after WP2 Task 8 it should use `RunStatus::Completed` when at least one plugin runs and produces output. Keep `SkippedNoPlugins` as a valid status for the no-plugins-installed case.
+Additionally, WP2 Task 8 **wires `loomweave analyze` to use the plugin host**. The current Sprint-1 stub ends with `RunStatus::SkippedNoPlugins`; after WP2 Task 8 it should use `RunStatus::Completed` when at least one plugin runs and produces output. Keep `SkippedNoPlugins` as a valid status for the no-plugins-installed case.
 
 ## Execution protocol — FULL DISCIPLINE per task
 
@@ -235,7 +235,7 @@ from WP1 practice; adjust task specifics):
 
 1. Run `mcp__filigree__get_issue clarion-9dee2d24c3` to see current WP2 state.
 2. Read `docs/implementation/sprint-1/wp2-plugin-host.md` end-to-end.
-3. Read `docs/clarion/adr/ADR-002-plugin-transport-json-rpc.md`, `ADR-021-plugin-authority-hybrid.md`, `ADR-022-core-plugin-ontology.md`.
+3. Read `docs/loomweave/adr/ADR-002-plugin-transport-json-rpc.md`, `ADR-021-plugin-authority-hybrid.md`, `ADR-022-core-plugin-ontology.md`.
 4. Optional: skim `docs/superpowers/plans/2026-04-18-wp1-scaffold-storage.md` to see the plan shape.
 5. Invoke `superpowers:writing-plans` and produce `docs/superpowers/plans/<YYYY-MM-DD>-wp2-plugin-host.md`.
 6. Optional: run `axiom-planning:plan-review` on the plan.

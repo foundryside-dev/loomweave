@@ -2,19 +2,19 @@
 
 A **guidance sheet** is institutional knowledge attached to code: a short note
 ("refresh tokens are single-use", "this module owns the retry budget") that
-Clarion serves to consult-mode agents alongside the entities it applies to. A
+Loomweave serves to consult-mode agents alongside the entities it applies to. A
 sheet is a first-class entity of `kind: guidance` (`id` form
 `core:guidance:<slug>`); it carries the note text plus the rules that decide
 which entities it covers, a scope level, and optional pinning / expiry
 (`REQ-GUIDANCE-01`, ADR-024).
 
-Guidance is authored by operators via the `clarion guidance` CLI (this guide)
+Guidance is authored by operators via the `loomweave guidance` CLI (this guide)
 or proposed by agents through MCP and promoted by an operator. Authored and
 promoted sheets reach consult agents through the `guidance_for` MCP read tool
 and are also composed into auto-generated `summary` prompts with a real
 `guidance_fingerprint` cache key.
 
-All subcommands operate on `.clarion/clarion.db`, so **run `clarion analyze`
+All subcommands operate on `.loomweave/loomweave.db`, so **run `loomweave analyze`
 first** — the CLI errors if the database is absent.
 
 ## Authoring workflow (`REQ-GUIDANCE-03`)
@@ -22,7 +22,7 @@ first** — the CLI errors if the database is absent.
 ### `create`
 
 ```bash
-clarion guidance create \
+loomweave guidance create \
   --match path:src/auth/** \
   --match tag:auth \
   --scope-level module \
@@ -51,9 +51,9 @@ preserved.
 ### `show <id>` / `list`
 
 ```bash
-clarion guidance show core:guidance:auth-tokens
-clarion guidance list
-clarion guidance list --for-entity python:function:auth.tokens.refresh
+loomweave guidance show core:guidance:auth-tokens
+loomweave guidance list
+loomweave guidance list --for-entity python:function:auth.tokens.refresh
 ```
 
 `list` is ordered by `scope_rank` (project → function). `--for-entity` filters
@@ -68,12 +68,12 @@ Removes the sheet. Its matched entities' cached summaries are invalidated (see
 ### `promote <observation-id>`
 
 ```bash
-clarion guidance promote clarion-obs-abc123
+loomweave guidance promote loomweave-obs-abc123
 ```
 
 Promotes a reviewed Filigree observation produced by MCP `propose_guidance`
 into a local guidance sheet (`provenance: filigree_promotion`). Arbitrary
-observations are rejected: the observation detail must contain Clarion's
+observations are rejected: the observation detail must contain Loomweave's
 guidance-proposal payload. This is the anti-poisoning boundary (`NFR-SEC-02`):
 an agent proposal is inert until an operator promotes it.
 
@@ -123,7 +123,7 @@ them as a finding (below).
 
 ## Wardline-derived guidance (`REQ-GUIDANCE-04`)
 
-When `wardline.yaml` is present, `clarion analyze` generates deterministic,
+When `wardline.yaml` is present, `loomweave analyze` generates deterministic,
 pinned guidance sheets from the Wardline bundle:
 
 - `core:guidance:wardline-tier-<name>`
@@ -143,37 +143,37 @@ artifact hash/count metadata, and a generated-signature guard.
 If an operator edits a generated sheet, the next analyze preserves the edit and
 marks the sheet `provenance: wardline_derived_overridden`. If the Wardline
 bundle changes while an override remains in place, analyze emits
-`CLA-FACT-GUIDANCE-STALE` so the override can be reviewed instead of silently
+`LMWV-FACT-GUIDANCE-STALE` so the override can be reviewed instead of silently
 overwritten.
 
 ## Staleness
 
 Two independent staleness signals exist, and they are **not** the same thing:
 
-1. **Age / review cadence** — `clarion guidance list --stale [--days N]` shows
+1. **Age / review cadence** — `loomweave guidance list --stale [--days N]` shows
    sheets not touched (the later of `reviewed_at` / `authored_at`) within `N`
    days (default 90). This is a review-cadence prompt, computed at list time.
-2. **Churn-based finding** — `clarion analyze` emits
-   `CLA-FACT-GUIDANCE-CHURN-STALE` when the code under a sheet has churned (see
+2. **Churn-based finding** — `loomweave analyze` emits
+   `LMWV-FACT-GUIDANCE-CHURN-STALE` when the code under a sheet has churned (see
    the findings table). This is a separate heuristic, not the `--days` age
    signal.
 
 `--stale` and `--expired` are independent filters that compose by intersection
-(AND): `clarion guidance list --stale --expired` shows sheets that are both.
+(AND): `loomweave guidance list --stale --expired` shows sheets that are both.
 
 ### Staleness findings (`REQ-GUIDANCE-05`)
 
-`clarion analyze` persists these findings over the committed graph (anchored to
+`loomweave analyze` persists these findings over the committed graph (anchored to
 the guidance sheet). See `detailed-design.md` §5 for the canonical catalogue.
 
 | Rule | Severity | When |
 |---|---|---|
-| `CLA-FACT-GUIDANCE-ORPHAN` | WARN | The sheet's `guides` edge **or** a `match_rules` `entity:<id>` rule points at an entity deleted between runs. The sheet's guidance is stranded. |
-| `CLA-FACT-GUIDANCE-EXPIRED` | INFO | The sheet's `expires` instant is in the past. The read path already excludes it from composition; this surfaces the state operatively (the sheet is not deleted). |
-| `CLA-FACT-GUIDANCE-STALE` | WARN | A Wardline-derived override carries an older `wardline_manifest_hash` than the current Wardline bundle. |
-| `CLA-FACT-GUIDANCE-CHURN-STALE` | WARN (confidence 0.7) | The aggregate `git_churn_count` over the sheet's matched entities meets the staleness threshold (50; 20 for `pinned: true` sheets). |
+| `LMWV-FACT-GUIDANCE-ORPHAN` | WARN | The sheet's `guides` edge **or** a `match_rules` `entity:<id>` rule points at an entity deleted between runs. The sheet's guidance is stranded. |
+| `LMWV-FACT-GUIDANCE-EXPIRED` | INFO | The sheet's `expires` instant is in the past. The read path already excludes it from composition; this surfaces the state operatively (the sheet is not deleted). |
+| `LMWV-FACT-GUIDANCE-STALE` | WARN | A Wardline-derived override carries an older `wardline_manifest_hash` than the current Wardline bundle. |
+| `LMWV-FACT-GUIDANCE-CHURN-STALE` | WARN (confidence 0.7) | The aggregate `git_churn_count` over the sheet's matched entities meets the staleness threshold (50; 20 for `pinned: true` sheets). |
 
-> **`CLA-FACT-GUIDANCE-CHURN-STALE` is currently inert.** It is emitted only
+> **`LMWV-FACT-GUIDANCE-CHURN-STALE` is currently inert.** It is emitted only
 > when churn data is available, and the analyze pipeline does not yet populate
 > `git_churn_count`. In production today it never fires. The other guidance
 > findings are live.
@@ -185,8 +185,8 @@ sorted-key JSON file per sheet (byte-stable across runs on identical DB state,
 diff-friendly):
 
 ```bash
-clarion guidance export --to ./shared/guidance     # --to takes a flag
-clarion guidance import ./shared/guidance           # dir is positional
+loomweave guidance export --to ./shared/guidance     # --to takes a flag
+loomweave guidance import ./shared/guidance           # dir is positional
 ```
 
 Import is **additive and idempotent**: each sheet is upserted by id, ids are

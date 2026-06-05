@@ -9,29 +9,29 @@ archive.
 flowchart LR
     Operator[Local operator]
     Agent[Consult-mode agent / MCP client]
-    Sibling[Sibling Loom products]
+    Sibling[Sibling Weft products]
     Provider[Optional LLM providers]
     Repo[Target repository]
-    Clarion[Clarion local-first code archaeology]
+    Loomweave[Loomweave local-first code archaeology]
     DB[(SQLite graph)]
 
-    Operator -->|install / analyze / serve| Clarion
-    Clarion -->|walks and analyzes| Repo
-    Clarion -->|stores graph/runs/findings| DB
-    Agent -->|MCP JSON-RPC| Clarion
-    Sibling -->|HTTP read API| Clarion
-    Clarion -->|optional summaries / inferred calls| Provider
+    Operator -->|install / analyze / serve| Loomweave
+    Loomweave -->|walks and analyzes| Repo
+    Loomweave -->|stores graph/runs/findings| DB
+    Agent -->|MCP JSON-RPC| Loomweave
+    Sibling -->|HTTP read API| Loomweave
+    Loomweave -->|optional summaries / inferred calls| Provider
 ```
 
 ## Container View
 
 ```mermaid
 flowchart TB
-    CLI[clarion-cli]
-    Core[clarion-core]
-    Storage[clarion-storage]
-    MCP[clarion-mcp]
-    Scanner[clarion-scanner]
+    CLI[loomweave-cli]
+    Core[loomweave-core]
+    Storage[loomweave-storage]
+    MCP[loomweave-mcp]
+    Scanner[loomweave-scanner]
     Py[Python language plugin]
     Fixture[Fixture plugin]
     DB[(SQLite)]
@@ -58,14 +58,14 @@ flowchart TB
 ```mermaid
 sequenceDiagram
     participant Op as Operator
-    participant CLI as clarion analyze
+    participant CLI as loomweave analyze
     participant Scan as Secret scanner
     participant Core as Plugin host
     participant Py as Python plugin
     participant Writer as Storage writer actor
     participant DB as SQLite
 
-    Op->>CLI: clarion analyze
+    Op->>CLI: loomweave analyze
     CLI->>Scan: pre-ingest source scan
     alt secret blocks briefing
         Scan-->>CLI: findings / block summary paths
@@ -89,7 +89,7 @@ sequenceDiagram
 flowchart LR
     DB[(SQLite graph)]
     Reader[ReaderPool]
-    MCP[clarion-mcp tools]
+    MCP[loomweave-mcp tools]
     HTTP[HTTP read API]
     Agent[MCP client]
     Sibling[Filigree/Wardline consumer]
@@ -113,7 +113,7 @@ flowchart TB
     Source[Target source files]
     Scanner[Pre-ingest scanner]
     Plugin[External plugin subprocess]
-    Host[Clarion plugin host]
+    Host[Loomweave plugin host]
     DB[(SQLite)]
     MCP[MCP stdio]
     HTTP[HTTP read API]
@@ -153,7 +153,7 @@ flowchart LR
 
 ## Notes
 
-- Clarion has one durable local graph store. Sibling products enrich Clarion
+- Loomweave has one durable local graph store. Sibling products enrich Loomweave
   through APIs, not shared runtime.
 - The strongest architectural boundary is the storage writer actor: durable
   mutation is serialized while reads are pooled.

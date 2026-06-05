@@ -1,6 +1,6 @@
 # Operator Notes
 
-Practical notes for configuring and running Clarion.
+Practical notes for configuring and running Loomweave.
 
 - [Getting started](./getting-started.md) — single-flow walkthrough: install,
   analyse a small repo, connect an MCP client, ask three questions, verify
@@ -9,15 +9,15 @@ Practical notes for configuring and running Clarion.
   headers, and token-ceiling configuration.
 - [Coding-agent LLM providers](./coding-agent-llm-providers.md) — Codex CLI
   and Claude CLI as local-login alternatives to API-key provider wiring.
-- [Runtime topology](./runtime-topology.md) — supported `clarion serve` and
-  `clarion analyze` concurrency against one `.clarion/clarion.db`.
+- [Runtime topology](./runtime-topology.md) — supported `loomweave serve` and
+  `loomweave analyze` concurrency against one `.loomweave/loomweave.db`.
 - [Secret scanning](./secret-scanning.md) — pre-ingest scanner behavior,
   baseline false-positive workflow, override confirmation, and audit queries.
-- [Guidance](./guidance.md) — authoring guidance sheets with the `clarion
+- [Guidance](./guidance.md) — authoring guidance sheets with the `loomweave
   guidance` CLI, `--match`/`--scope-level`/`--expires` semantics, staleness
   findings, and the export/import team-sharing workflow.
 - [Release handoff](./release-handoff.md) — retired
-  Clarion-owned GitHub ruleset enforcement and current standalone release
+  Loomweave-owned GitHub ruleset enforcement and current standalone release
   sequence.
 - [Federation contracts](../federation/contracts.md) — read-side HTTP
   contracts consumed by sibling products such as Filigree.

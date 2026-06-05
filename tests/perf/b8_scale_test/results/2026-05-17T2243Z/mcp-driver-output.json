@@ -1,6 +1,6 @@
 {
-  "clarion_bin": "/home/john/clarion/target/release/clarion",
-  "config": "/tmp/clarion-b8-elspeth-tests-20260517T2156Z/clarion-b8-live.yaml",
+  "loomweave_bin": "/home/john/loomweave/target/release/loomweave",
+  "config": "/tmp/loomweave-b8-elspeth-tests-20260517T2156Z/loomweave-b8-live.yaml",
   "generated_at_unix": 1779058028,
   "initialize": {
     "id": "init",
@@ -11,7 +11,7 @@
       },
       "protocolVersion": "2025-11-25",
       "serverInfo": {
-        "name": "clarion",
+        "name": "loomweave",
         "version": "0.1.0-dev"
       }
     }
@@ -1085,7 +1085,7 @@
       "tool": "callers_of"
     }
   ],
-  "project": "/tmp/clarion-b8-elspeth-tests-20260517T2156Z",
+  "project": "/tmp/loomweave-b8-elspeth-tests-20260517T2156Z",
   "records": [
     {
       "cache_hit": null,

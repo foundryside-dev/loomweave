@@ -1,6 +1,6 @@
 """Round-trip self-test: plugin analyses its own source (WP3 Task 8).
 
-Drives the *installed* ``clarion-plugin-python`` entry-point binary
+Drives the *installed* ``loomweave-plugin-python`` entry-point binary
 (not ``sys.executable -m``) so the pip-install entry point is exercised
 end-to-end. The plugin's own ``extractor.py`` is the analysis target; the
 test asserts the module's public API functions appear in the returned
@@ -43,11 +43,11 @@ def _read_frame(stream: IO[bytes]) -> dict[str, Any]:
 
 def _locate_binary() -> Path:
     scripts = Path(sysconfig.get_path("scripts"))
-    binary = scripts / "clarion-plugin-python"
+    binary = scripts / "loomweave-plugin-python"
     if not binary.exists():
         pytest.fail(
-            f"clarion-plugin-python not found at {binary}. It is the installed "
-            "console entry point of clarion-plugin-python; a missing binary means "
+            f"loomweave-plugin-python not found at {binary}. It is the installed "
+            "console entry point of loomweave-plugin-python; a missing binary means "
             "`pip install -e plugins/python[dev]` was not run or the install is "
             "broken. Skipping this round-trip test would mask that regression in CI.",
         )
@@ -59,10 +59,10 @@ def test_round_trip_self_analysis() -> None:  # noqa: PLR0915 - by-kind invarian
     binary = _locate_binary()
 
     # plugins/python/src is the package root; using it as project_root lets
-    # the plugin relativise extractor.py to `clarion_plugin_python/extractor.py`,
-    # whose dotted module name is `clarion_plugin_python.extractor`.
+    # the plugin relativise extractor.py to `loomweave_plugin_python/extractor.py`,
+    # whose dotted module name is `loomweave_plugin_python.extractor`.
     plugin_src = Path(__file__).resolve().parents[1] / "src"
-    target = plugin_src / "clarion_plugin_python" / "extractor.py"
+    target = plugin_src / "loomweave_plugin_python" / "extractor.py"
     assert target.is_file(), f"target source not found at {target}"
 
     proc = subprocess.Popen(  # noqa: S603 - invoking our own installed entry point
@@ -92,7 +92,7 @@ def test_round_trip_self_analysis() -> None:  # noqa: PLR0915 - by-kind invarian
         proc.stdin.flush()
         init_response = _read_frame(proc.stdout)
         assert init_response["id"] == 1
-        assert init_response["result"]["name"] == "clarion-plugin-python"
+        assert init_response["result"]["name"] == "loomweave-plugin-python"
 
         proc.stdin.write(
             _encode_frame({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
@@ -124,22 +124,27 @@ def test_round_trip_self_analysis() -> None:  # noqa: PLR0915 - by-kind invarian
         # Invariants — no exact totals (those become merge-conflict generators
         # the moment someone adds a private helper to extractor.py).
         assert len(module_entities) == 1, "exactly one module entity per analyzed file"
-        assert module_entities[0]["id"] == "python:module:clarion_plugin_python.extractor"
+        assert module_entities[0]["id"] == "python:module:loomweave_plugin_python.extractor"
         assert module_entities[0].get("parse_status") == "ok"
 
         # Public extractor API must be present.
-        assert "python:function:clarion_plugin_python.extractor.module_dotted_name" in function_ids
-        assert "python:function:clarion_plugin_python.extractor.extract" in function_ids
+        assert (
+            "python:function:loomweave_plugin_python.extractor.module_dotted_name" in function_ids
+        )
+        assert "python:function:loomweave_plugin_python.extractor.extract" in function_ids
         # Private walker is a FunctionDef too, so it emits.
-        assert "python:function:clarion_plugin_python.extractor._walk" in function_ids
+        assert "python:function:loomweave_plugin_python.extractor._walk" in function_ids
         # B.2 renamed `_build_entity` → `_build_function_entity` and added
         # `_build_class_entity` + `_build_module_entity` (and `_module_source_range`).
         assert (
-            "python:function:clarion_plugin_python.extractor._build_function_entity" in function_ids
+            "python:function:loomweave_plugin_python.extractor._build_function_entity"
+            in function_ids
         )
-        assert "python:function:clarion_plugin_python.extractor._build_class_entity" in function_ids
         assert (
-            "python:function:clarion_plugin_python.extractor._build_module_entity" in function_ids
+            "python:function:loomweave_plugin_python.extractor._build_class_entity" in function_ids
+        )
+        assert (
+            "python:function:loomweave_plugin_python.extractor._build_module_entity" in function_ids
         )
 
         # extractor.py defines its wire-shape TypedDicts at module level
@@ -147,9 +152,9 @@ def test_round_trip_self_analysis() -> None:  # noqa: PLR0915 - by-kind invarian
         # and so emit as `class` entities. Subset assertion only —
         # exhaustive enumeration would be brittle.
         class_ids = {e["id"] for e in class_entities}
-        assert "python:class:clarion_plugin_python.extractor.SourceRange" in class_ids
-        assert "python:class:clarion_plugin_python.extractor.EntitySource" in class_ids
-        assert "python:class:clarion_plugin_python.extractor.RawEntity" in class_ids
+        assert "python:class:loomweave_plugin_python.extractor.SourceRange" in class_ids
+        assert "python:class:loomweave_plugin_python.extractor.EntitySource" in class_ids
+        assert "python:class:loomweave_plugin_python.extractor.RawEntity" in class_ids
 
         # Every entity carries the absolute source.file_path we sent
         # (project_root relativisation only affects the qualified_name prefix).

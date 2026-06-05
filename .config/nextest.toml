@@ -2,5 +2,5 @@
 serve-http = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'package(clarion-cli) and binary(=serve)'
+filter = 'package(loomweave-cli) and binary(=serve)'
 test-group = 'serve-http'

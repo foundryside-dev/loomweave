@@ -1,17 +1,17 @@
 {
   "_meta": {
-    "contract": "loom-sei-conformance-oracle",
-    "standard": "Loom Stable Entity Identity (SEI) conformance standard §8",
-    "authority": "Clarion ADR-038 (token/signature/persistence/reserved-namespace); SEI standard (suite-wide)",
+    "contract": "weft-sei-conformance-oracle",
+    "standard": "Weft Stable Entity Identity (SEI) conformance standard §8",
+    "authority": "Loomweave ADR-038 (token/signature/persistence/reserved-namespace); SEI standard (suite-wide)",
     "fixture_version": 1,
     "stability": "normative",
     "token_format_agnostic": true,
-    "verification": "cargo test -p clarion-storage --test sei_conformance_oracle",
+    "verification": "cargo test -p loomweave-storage --test sei_conformance_oracle",
     "updated": "2026-06-02",
-    "description": "The six shared SEI conformance scenarios every Loom tool runs against a reference Clarion. Asserts BEHAVIOUR and OPACITY, never the SEI's internal form. A subsystem is SEI-conformant only when it passes all six (no grandfathering)."
+    "description": "The six shared SEI conformance scenarios every Weft tool runs against a reference Loomweave. Asserts BEHAVIOUR and OPACITY, never the SEI's internal form. A subsystem is SEI-conformant only when it passes all six (no grandfathering)."
   },
   "invariants": [
-    "SEI is opaque: a consumer never parses it. It carries the reserved `clarion:eid:` prefix and is NOT a locator.",
+    "SEI is opaque: a consumer never parses it. It carries the reserved `loomweave:eid:` prefix and is NOT a locator.",
     "Fail-closed: when sameness cannot be PROVEN, mint a new SEI and orphan the old one — never silently re-point.",
     "Lineage is append-only: born / locator_changed / moved / orphaned / superseded.",
     "Identity is carried (never re-minted) for an unchanged locator; SEI values are not part of the byte-identical-run guarantee, but carry/mint decisions are deterministic given the same bindings + source."
@@ -24,7 +24,7 @@
       "expect": {
         "resolve_locator": { "sei": "<opaque>", "current_locator": "<locator>", "content_hash": "<hash>", "alive": true },
         "resolve_sei": { "current_locator": "<locator>", "alive": true },
-        "opacity": "the returned `sei` begins with `clarion:eid:` and is treated as an opaque string by the consumer (never parsed); it is not equal to the locator"
+        "opacity": "the returned `sei` begins with `loomweave:eid:` and is treated as an opaque string by the consumer (never parsed); it is not equal to the locator"
       }
     },
     {
@@ -73,7 +73,7 @@
     },
     {
       "id": "capability_absent",
-      "given": "A Clarion instance that has not populated SEI (pre-SEI DB, or `_capabilities.sei.supported` false / absent).",
+      "given": "A Loomweave instance that has not populated SEI (pre-SEI DB, or `_capabilities.sei.supported` false / absent).",
       "when": "A consumer probes `_capabilities` and/or resolves.",
       "expect": {
         "consumer": "detects the absent capability and DEGRADES gracefully — keeps working on locators, no crash, honest 'identity unavailable'",

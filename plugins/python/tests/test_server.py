@@ -1,10 +1,10 @@
 """Integration tests for the JSON-RPC server loop (WP3 Task 2).
 
-Spawns the installed `clarion-plugin-python` binary as a subprocess, speaks
+Spawns the installed `loomweave-plugin-python` binary as a subprocess, speaks
 Content-Length-framed JSON-RPC to it over stdin/stdout, and asserts the
 handshake response matches the Rust host's `InitializeResult` contract
 (`{name, version, ontology_version, capabilities}` per
-`crates/clarion-core/src/plugin/protocol.rs` line 293).
+`crates/loomweave-core/src/plugin/protocol.rs` line 293).
 """
 
 from __future__ import annotations
@@ -15,14 +15,14 @@ import sys
 import textwrap
 from typing import IO, TYPE_CHECKING, Any, cast
 
-from clarion_plugin_python import server as server_module
-from clarion_plugin_python.call_resolver import CallResolutionResult
-from clarion_plugin_python.pyright_session import (
+from loomweave_plugin_python import server as server_module
+from loomweave_plugin_python.call_resolver import CallResolutionResult
+from loomweave_plugin_python.pyright_session import (
     FINDING_PYRIGHT_RESTART,
     PyrightRunState,
     PyrightSession,
 )
-from clarion_plugin_python.reference_resolver import ReferenceResolutionResult, ReferenceSite
+from loomweave_plugin_python.reference_resolver import ReferenceResolutionResult, ReferenceSite
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 # the test works regardless of whether the venv's bin dir is on $PATH when
 # pytest runs. Task 8's round-trip test exercises the entry-point binary; this
 # test only needs ``main()`` reached via the package module.
-_SERVER_CMD = [sys.executable, "-m", "clarion_plugin_python"]
+_SERVER_CMD = [sys.executable, "-m", "loomweave_plugin_python"]
 
 
 def _encode_frame(payload: dict[str, Any]) -> bytes:
@@ -85,8 +85,8 @@ def test_initialize_roundtrip() -> None:
         assert response["jsonrpc"] == "2.0"
         assert response["id"] == 1
         result = response["result"]
-        assert result["name"] == "clarion-plugin-python"
-        assert result["version"] == "1.3.0"
+        assert result["name"] == "loomweave-plugin-python"
+        assert result["version"] == "1.0.0"
         assert result["ontology_version"] == "0.7.0"
         assert set(result["capabilities"]) == {"wardline"}
         assert result["capabilities"]["wardline"]["status"] in {
@@ -430,7 +430,7 @@ def test_analyze_file_reports_call_resolver_stats(
                 pyright_index_parse_latency_ms=[5],
                 findings=[
                     {
-                        "subcode": "CLA-PY-PYRIGHT-UNAVAILABLE",
+                        "subcode": "LMWV-PY-PYRIGHT-UNAVAILABLE",
                         "severity": "warning",
                         "message": "pyright unavailable",
                         "metadata": {"reason": "test"},
@@ -501,7 +501,7 @@ def test_analyze_file_reports_call_resolver_stats(
     }
     assert response["findings"] == [
         {
-            "subcode": "CLA-PY-PYRIGHT-UNAVAILABLE",
+            "subcode": "LMWV-PY-PYRIGHT-UNAVAILABLE",
             "severity": "warning",
             "message": "pyright unavailable",
             "metadata": {"reason": "test"},

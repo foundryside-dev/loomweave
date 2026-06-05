@@ -19,12 +19,12 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "plugins/python/src"))
 
-from clarion_plugin_python.extractor import extract_with_stats  # noqa: E402
-from clarion_plugin_python.pyright_session import PyrightSession  # noqa: E402
+from loomweave_plugin_python.extractor import extract_with_stats  # noqa: E402
+from loomweave_plugin_python.pyright_session import PyrightSession  # noqa: E402
 
 EXCLUDED_PARTS = frozenset(
     {
-        ".clarion",
+        ".loomweave",
         ".git",
         ".mypy_cache",
         ".pytest_cache",
@@ -226,7 +226,7 @@ def measure(
         "outcome": "GREEN" if decision_green else "YELLOW",
         "calibration_machine": machine_label(),
         "pyright_pin": read_pyright_pin(),
-        "clarion_commit": current_commit(),
+        "loomweave_commit": current_commit(),
         "corpus": corpus_name,
         "corpus_root": str(corpus_root),
         "file_count": len(files),

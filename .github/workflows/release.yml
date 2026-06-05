@@ -123,9 +123,9 @@ jobs:
         run: |
           uv export --project plugins/python --locked --extra dev --no-emit-project \
             --format requirements.txt \
-            --output-file /tmp/clarion-python-dev-requirements.txt
+            --output-file /tmp/loomweave-python-dev-requirements.txt
           uv run --project plugins/python --extra dev pip-audit \
-            -r /tmp/clarion-python-dev-requirements.txt
+            -r /tmp/loomweave-python-dev-requirements.txt
 
       - name: check B.4*/B.5 performance gates
         run: uv run --project plugins/python --extra dev python scripts/check-b4-gate-result.py --run-b5-smoke
@@ -159,7 +159,7 @@ jobs:
 
   build-rust:
     needs: [verify]
-    name: Build clarion (${{ matrix.target }})
+    name: Build loomweave (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -188,15 +188,15 @@ jobs:
       - name: build release
         run: |
           set -euo pipefail
-          cargo build --release --locked --bin clarion --target ${{ matrix.target }}
+          cargo build --release --locked --bin loomweave --target ${{ matrix.target }}
 
       - name: package
         id: package
         run: |
           set -euo pipefail
-          STAGE="clarion-${{ matrix.target }}"
+          STAGE="loomweave-${{ matrix.target }}"
           mkdir -p "$STAGE"
-          cp "target/${{ matrix.target }}/release/clarion" "$STAGE/"
+          cp "target/${{ matrix.target }}/release/loomweave" "$STAGE/"
           cp README.md "$STAGE/"
           if [ -f LICENSE ]; then cp LICENSE "$STAGE/"; fi
           ARCHIVE="$STAGE.tar.gz"
@@ -210,13 +210,13 @@ jobs:
           fi
           SMOKE_DIR="$(mktemp -d)"
           tar xzf "$ARCHIVE" -C "$SMOKE_DIR"
-          "$SMOKE_DIR/$STAGE/clarion" --version
-          "$SMOKE_DIR/$STAGE/clarion" --help >/dev/null
+          "$SMOKE_DIR/$STAGE/loomweave" --version
+          "$SMOKE_DIR/$STAGE/loomweave" --help >/dev/null
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: clarion-${{ matrix.target }}
+          name: loomweave-${{ matrix.target }}
           path: |
             ${{ steps.package.outputs.archive }}
             ${{ steps.package.outputs.archive }}.sha256
@@ -247,25 +247,25 @@ jobs:
         run: |
           uv export --project plugins/python --locked --no-dev --no-emit-project \
             --format requirements.txt \
-            --output-file dist/clarion-plugin-python-runtime-requirements.txt
+            --output-file dist/loomweave-plugin-python-runtime-requirements.txt
           uv export --project plugins/python --locked --no-dev --no-emit-project \
             --format cyclonedx1.5 \
-            --output-file dist/clarion-plugin-python-sbom.cdx.json
+            --output-file dist/loomweave-plugin-python-sbom.cdx.json
 
       - name: smoke install sdist
         run: |
           set -euo pipefail
           python -m venv .venv-smoke
           . .venv-smoke/bin/activate
-          python -m pip install --require-hashes -r dist/clarion-plugin-python-runtime-requirements.txt
+          python -m pip install --require-hashes -r dist/loomweave-plugin-python-runtime-requirements.txt
           python -m pip install --no-deps dist/*.tar.gz
           # Version-agnostic: assert the module constant matches the installed
           # distribution metadata (the sdist's packaged version) rather than a
           # hardcoded literal, so a release version bump can't silently break
           # this smoke gate (clarion-12667da9f5: a hardcoded '1.0.0' here blocked
           # the v1.0.1 publish after the binaries built fine).
-          python -c "import clarion_plugin_python, importlib.metadata as m; v = clarion_plugin_python.__version__; d = m.version('clarion-plugin-python'); assert v == d, f'module {v!r} != dist {d!r}'"
-          command -v clarion-plugin-python
+          python -c "import loomweave_plugin_python, importlib.metadata as m; v = loomweave_plugin_python.__version__; d = m.version('loomweave-plugin-python'); assert v == d, f'module {v!r} != dist {d!r}'"
+          command -v loomweave-plugin-python
 
       - name: checksum
         run: |
@@ -277,7 +277,7 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: clarion-plugin-python-sdist
+          name: loomweave-plugin-python-sdist
           path: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
@@ -362,25 +362,25 @@ jobs:
           # bump or normalization-rule change would invalidate a literal URL.
           # `|| true` so `set -e` does not abort the script when the glob
           # is empty — we want to fall through to the explicit error below.
-          SDIST_PATH=$(ls release/clarion[-_]plugin[-_]python*.tar.gz 2>/dev/null | head -n1 || true)
+          SDIST_PATH=$(ls release/loomweave[-_]plugin[-_]python*.tar.gz 2>/dev/null | head -n1 || true)
           if [ -z "$SDIST_PATH" ]; then
             echo "::error::no Python plugin sdist found in release/ — refusing to publish notes with a broken install link" >&2
             exit 1
           fi
           SDIST_NAME=$(basename "$SDIST_PATH")
           {
-            echo "## Clarion ${GITHUB_REF_NAME}"
+            echo "## Loomweave ${GITHUB_REF_NAME}"
             echo ""
             echo "### Install"
             echo ""
             echo "Pick the archive for your platform from the Assets list below."
-            echo "Verify the SHA256, extract, and place \`clarion\` on your \`\$PATH\`."
+            echo "Verify the SHA256, extract, and place \`loomweave\` on your \`\$PATH\`."
             echo ""
             echo "\`\`\`bash"
-            echo "curl -L -o clarion.tar.gz \\"
-            echo "  https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/clarion-x86_64-unknown-linux-gnu.tar.gz"
-            echo "tar xzf clarion.tar.gz"
-            echo "install clarion-x86_64-unknown-linux-gnu/clarion ~/.local/bin/"
+            echo "curl -L -o loomweave.tar.gz \\"
+            echo "  https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/loomweave-x86_64-unknown-linux-gnu.tar.gz"
+            echo "tar xzf loomweave.tar.gz"
+            echo "install loomweave-x86_64-unknown-linux-gnu/loomweave ~/.local/bin/"
             echo ""
             echo "pipx install \\"
             echo "  https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${SDIST_NAME}"
@@ -402,7 +402,7 @@ jobs:
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda
         with:
           tag_name: ${{ github.ref_name }}
-          name: Clarion ${{ github.ref_name }}
+          name: Loomweave ${{ github.ref_name }}
           body_path: ${{ steps.notes.outputs.notes-file }}
           draft: false
           prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') }}

@@ -1,9 +1,9 @@
-# Clarion v1.0.0 — Tag-Cut Readiness Archive
+# Loomweave v1.0.0 — Tag-Cut Readiness Archive
 
 **Status**: Historical archive. `v1.0.0` was tagged on 2026-05-19, but the
 release did not publish artifacts; `v1.0.1` became the first published build.
 
-This directory preserves the canonical pre-tag-cut artifacts for Clarion v1.0.0.
+This directory preserves the canonical pre-tag-cut artifacts for Loomweave v1.0.0.
 It supersedes `docs/implementation/v0.1-publish/` (which was renamed in intent
 when the v0.1 → v1.0 rebrand landed but never moved on disk) for that historical
 tag-cut program.

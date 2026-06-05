@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from clarion_plugin_python.pyright_session import (
+from loomweave_plugin_python.pyright_session import (
     FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT,
     FINDING_PYRIGHT_INIT_TIMEOUT,
     FINDING_PYRIGHT_INSTALL_FAILURE,
@@ -29,12 +29,12 @@ from clarion_plugin_python.pyright_session import (
     _unresolved_call_site_total_for_function,
     _unresolved_call_sites_for_function,
 )
-from clarion_plugin_python.reference_resolver import ReferenceSite, ReferenceSiteKind
+from loomweave_plugin_python.reference_resolver import ReferenceSite, ReferenceSiteKind
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from clarion_plugin_python.call_resolver import Finding
+    from loomweave_plugin_python.call_resolver import Finding
 
 
 @pytest.fixture(scope="session")
@@ -46,7 +46,7 @@ def pyright_langserver() -> str:
     if resolved is None:
         pytest.fail(
             "pyright-langserver not found on PATH or in the active virtualenv. "
-            "It is a hard runtime dependency of clarion-plugin-python "
+            "It is a hard runtime dependency of loomweave-plugin-python "
             "(pyproject.toml `dependencies`); a missing executable means the "
             "install is broken. Skipping these tests would mask a regression.",
         )
@@ -475,7 +475,7 @@ def test_pyright_session_reference_unavailable_binary_missing(tmp_path: Path) ->
     module = _write_module(tmp_path, source)
     site = _reference_site(source, from_id="python:module:demo", needle="world", occurrence=1)
 
-    with PyrightSession(tmp_path, executable="clarion-missing-pyright") as session:
+    with PyrightSession(tmp_path, executable="loomweave-missing-pyright") as session:
         result = session.resolve_references(module, [site])
 
     assert result.edges == []
@@ -853,7 +853,7 @@ def test_pyright_session_init_timeout(tmp_path: Path) -> None:
 def test_pyright_session_unavailable_binary_missing(tmp_path: Path) -> None:
     module = _write_module(tmp_path, "def caller():\n    print('x')\n")
 
-    with PyrightSession(tmp_path, executable="clarion-missing-pyright") as session:
+    with PyrightSession(tmp_path, executable="loomweave-missing-pyright") as session:
         result = session.resolve_calls(module, ["python:function:demo.caller"])
 
     assert result.edges == []

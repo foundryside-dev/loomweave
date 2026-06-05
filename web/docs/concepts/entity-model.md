@@ -1,12 +1,12 @@
 # The entity model
 
-Clarion's job is to turn a tree of source files into a queryable graph of
+Loomweave's job is to turn a tree of source files into a queryable graph of
 **entities** and **edges**. Everything an agent asks is answered against that
 graph.
 
 ## Entities
 
-An entity is a named thing Clarion extracted from the source: a function, a
+An entity is a named thing Loomweave extracted from the source: a function, a
 class, a module, or a clustered **subsystem**. Every entity carries a stable
 **entity ID** with three colon-separated segments:
 
@@ -34,11 +34,11 @@ after a rename or move.
 | `function` | A function or method, addressed by its L7 qualified name |
 | `class` | A class definition |
 | `module` | A source module (file-level) |
-| `subsystem` | A cluster of modules, produced by Clarion's clustering pass |
+| `subsystem` | A cluster of modules, produced by Loomweave's clustering pass |
 
 ## Edges
 
-Entities are connected by typed edges. Clarion extracts four:
+Entities are connected by typed edges. Loomweave extracts four:
 
 | Edge | Meaning |
 | --- | --- |
@@ -55,7 +55,7 @@ excluded unless a query explicitly asks for them, so a clean answer stays clean.
 
 Static analysis has blind spots — calls made through an attribute receiver, for
 instance, can't always be resolved statically. Rather than silently dropping
-them, Clarion's traversal results carry a `scope_excludes` block naming exactly
+them, Loomweave's traversal results carry a `scope_excludes` block naming exactly
 what was **not** searched. An empty `callers` list with
 `scope_excludes: ["attribute-receiver-calls"]` means "none found among the
 edges I can see," never "guaranteed nobody calls this." That distinction is what
@@ -63,7 +63,7 @@ lets an agent reason safely about a negative result.
 
 ## Subsystems
 
-Beyond the raw graph, Clarion clusters modules into **subsystems** and persists
+Beyond the raw graph, Loomweave clusters modules into **subsystems** and persists
 them as first-class entities. `subsystem_members(id)` lists a subsystem's
 modules; `subsystem_of(id)` is the reverse — given any entity, find the
 subsystem it belongs to (a function resolves through its containing module).
@@ -71,6 +71,6 @@ subsystem it belongs to (a function resolves through its containing module).
 ## Storage
 
 The whole graph is persisted to a project-local SQLite database at
-`.clarion/clarion.db`, written by a single writer-actor with a reader pool
-(ADR-011). There is no mandatory cloud component: Clarion is local-first, and the
+`.loomweave/loomweave.db`, written by a single writer-actor with a reader pool
+(ADR-011). There is no mandatory cloud component: Loomweave is local-first, and the
 only network egress is the LLM provider during `summary(id)` calls.

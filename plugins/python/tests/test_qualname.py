@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import ast
 
-from clarion_plugin_python.qualname import reconstruct_qualname
+from loomweave_plugin_python.qualname import reconstruct_qualname
 
 
 def _parse(source: str) -> ast.Module:

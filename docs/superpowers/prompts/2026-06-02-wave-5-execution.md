@@ -6,14 +6,14 @@ MCP queries** — the two tools split out of WS5 (`search_semantic`, `find_dead_
 **scheduled, not deferred**; this is their committed delivery.
 **Position:** Wave 5. Ungated/concurrent, **soft-gated on WS5 (Wave 4)** (it extends that surface
 and reuses its categorisations). **Part A is gated on owner-decision D-WS5b-1** (embedding provider).
-**Source of truth:** `docs/superpowers/plans/2026-06-02-clarion-ws5b-advanced-queries-plan.md` (the
+**Source of truth:** `docs/superpowers/plans/2026-06-02-loomweave-ws5b-advanced-queries-plan.md` (the
 plan — read it fully); WS5 design spec §7 (why these split out); program §4 (WS5b = Wave 5).
 
 ---
 
 ```
-You are implementing **Wave 5 — WS5b: advanced MCP queries** of the Clarion first-class
-program, in the Clarion repo at /home/john/clarion. WS5b delivers the two tools split out of
+You are implementing **Wave 5 — WS5b: advanced MCP queries** of the Loomweave first-class
+program, in the Loomweave repo at /home/john/loomweave. WS5b delivers the two tools split out of
 WS5: `search_semantic` (Part A) and `find_dead_code` (Part B). They were split out because
 they need infrastructure beyond a catalog query — and they are SCHEDULED, not deferred. Your
 job is to PLAN and EXECUTE them: real code, real tests, all CI gates green.
@@ -34,12 +34,12 @@ Part A needs an owner decision (D-WS5b-1) and new infrastructure.
   `sei_bindings` exist, populated after). Not gated on Wave 1.
 
 ## Read these first
-1. docs/superpowers/plans/2026-06-02-clarion-ws5b-advanced-queries-plan.md — THE plan. Read all
+1. docs/superpowers/plans/2026-06-02-loomweave-ws5b-advanced-queries-plan.md — THE plan. Read all
    of it: Part A design (A.1) + the D-WS5b-1 decision (A.2) + tasks (A.3); Part B design (B.1) +
    tasks (B.2); sequencing + DoD.
-2. docs/superpowers/specs/2026-06-02-clarion-ws5-mcp-catalogue-design.md §7 (the split-out) — the
+2. docs/superpowers/specs/2026-06-02-loomweave-ws5-mcp-catalogue-design.md §7 (the split-out) — the
    surface these plug into.
-3. docs/clarion/adr/ADR-005-clarion-dir-tracking.md (the git-committable `.clarion/` posture the
+3. docs/loomweave/adr/ADR-005-loomweave-dir-tracking.md (the git-committable `.loomweave/` posture the
    embedding sidecar must respect — do NOT bloat the committed DB), ADR-030 (on-demand posture),
    ADR-028 (edge tiers), ADR-038 (SEI field). CLAUDE.md (gates, Filigree, ADR immutability).
 
@@ -50,7 +50,7 @@ Part A needs an owner decision (D-WS5b-1) and new infrastructure.
   harmful error. Reachability is CONSERVATIVE: count `resolved` AND `ambiguous` AND `inferred`
   edges as reachable; treat dynamic-dispatch/reflection signals as barriers that keep targets
   live. Better to under-report dead code than over-report it.
-- **Heuristic, honestly labelled.** Results are Findings (`CLA-FACT-DEAD-CODE-CANDIDATE`,
+- **Heuristic, honestly labelled.** Results are Findings (`LMWV-FACT-DEAD-CODE-CANDIDATE`,
   `confidence < 1`, `confidence_basis: heuristic`) and the MCP tool returns the same with a
   confidence + the reason reach could not be proven. Never presented as certain. Framework-magic
   entry kinds (decorated handlers, plugin hooks) are excluded by a documented exclusion list.
@@ -64,10 +64,10 @@ Part A needs an owner decision (D-WS5b-1) and new infrastructure.
   may make a hosted service REQUIRED. When off, `search_semantic` returns an honest
   `"semantic search not enabled"` — never a faked/empty-as-if-complete result.
 - **`EmbeddingProvider` trait** mirroring `LlmProvider` (`embed`/`dimensions`/`model_id`); a
-  `RecordingEmbeddingProvider` for deterministic tests. Config under `clarion.yaml: semantic_search:`.
+  `RecordingEmbeddingProvider` for deterministic tests. Config under `loomweave.yaml: semantic_search:`.
 - **Storage (LOAD-BEARING — protects the committable DB).** Vectors are hundreds of MB at the
-  elspeth scale and MUST NOT bloat `.clarion/clarion.db`. They live in a SEPARATE, git-ignored
-  sidecar `.clarion/embeddings.db`, keyed by `(entity_id, content_hash, model_id)` so they
+  elspeth scale and MUST NOT bloat `.loomweave/loomweave.db`. They live in a SEPARATE, git-ignored
+  sidecar `.loomweave/embeddings.db`, keyed by `(entity_id, content_hash, model_id)` so they
   invalidate like the summary cache. Add the sidecar to the gitignore DEFAULTS in code
   (install.rs `GITIGNORE_CONTENTS`); textual export excludes it.
 - **Query.** v1 = a bounded EXACT cosine scan over the (scope-filtered) candidate set, capped +
@@ -90,10 +90,10 @@ Part A needs an owner decision (D-WS5b-1) and new infrastructure.
   Record: opt-in posture, the `EmbeddingProvider` trait, the sidecar-storage decision (it EXTENDS
   ADR-005's tracked-vs-excluded list — reference ADR-005, do NOT edit its immutable body), policy-
   engine cost governance, and the D-WS5b-1 provider choice. Register in the ADR index. Glossary
-  check: `search_semantic`/embeddings are Clarion-local (no cross-product term) — confirm + skip.
+  check: `search_semantic`/embeddings are Loomweave-local (no cross-product term) — confirm + skip.
 
 ## Hard boundaries — do NOT
-- Do NOT bloat the committed `.clarion/clarion.db` with vectors — sidecar only.
+- Do NOT bloat the committed `.loomweave/loomweave.db` with vectors — sidecar only.
 - Do NOT make semantic search required — opt-in + honest degrade (local-first).
 - Do NOT build an ANN vector backend in v1 — exact scan; ANN is a logged follow-on.
 - Part B: do NOT over-report dead code (fail toward "live"); do NOT present heuristic results as
@@ -117,7 +117,7 @@ plan task IDs (A.T*/B.T*), D-WS5b-1, ADR-039, ADR-005/028/030. Close as you land
 
 ## Definition of done (Wave 5 / WS5b)
 - **Part B:** `find_dead_code` ships on-demand + conservative (fails toward "live"); heuristic
-  results labelled with confidence; `CLA-FACT-DEAD-CODE-CANDIDATE` emitted; fixtures prove no
+  results labelled with confidence; `LMWV-FACT-DEAD-CODE-CANDIDATE` emitted; fixtures prove no
   live-code false-positives on reflection / ambiguous edges.
 - **Part A:** `search_semantic` ships opt-in (off by default, honest degrade); embeddings in the
   git-ignored sidecar (committed DB unbloated); cost policy-governed; results carry `sei` + score,

@@ -1,6 +1,6 @@
 # MCP tool reference
 
-The tools below are the core consult tools served by `clarion serve` over the
+The tools below are the core consult tools served by `loomweave serve` over the
 MCP stdio transport. The live 1.2.x surface exposes 39 tools, including
 navigation, briefing, source inspection, guidance/finding enrichment, analyze
 lifecycle, freshness, faceted search, and structural shortcuts. Connect an MCP

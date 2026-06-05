@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract analyze-time measurements from clarion.db for the B.8 memo."""
+"""Extract analyze-time measurements from loomweave.db for the B.8 memo."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 
 def main() -> int:
     if len(sys.argv) != 3:
-        print("usage: extract-metrics.py <clarion.db> <output.json>")
+        print("usage: extract-metrics.py <loomweave.db> <output.json>")
         return 2
     db_path = Path(sys.argv[1])
     out_path = Path(sys.argv[2])

@@ -2,20 +2,20 @@
 
 **Date:** 2026-06-02
 **Use:** Drop the fenced prompt below into an agent to plan and execute **Wave 1** (WS1 — SEI
-authority) of the Clarion first-class program.
+authority) of the Loomweave first-class program.
 **Gate:** ⛔ Gated. Requires (a) Wave 0 complete + merged, and (b) **SEI lock confirmed**
 (program decision D1 — a suite event). The prompt forces a confirm-or-stop gate check first.
-**Source of truth:** `docs/superpowers/plans/2026-06-02-clarion-integrated-delivery-plan.md`
+**Source of truth:** `docs/superpowers/plans/2026-06-02-loomweave-integrated-delivery-plan.md`
 Phase 2 (T2.0–T2.6) + the conformance oracle + the hard-cutover backfill;
-`docs/clarion/adr/ADR-038-sei-token-and-signature.md` (locked decisions);
-`/home/john/wardline/docs/superpowers/specs/2026-06-01-loom-stable-entity-identity-conformance.md` (the SEI standard).
+`docs/loomweave/adr/ADR-038-sei-token-and-signature.md` (locked decisions);
+`/home/john/wardline/docs/superpowers/specs/2026-06-01-weft-stable-entity-identity-conformance.md` (the SEI standard).
 **Companion:** [`2026-06-02-wave-0-execution.md`](./2026-06-02-wave-0-execution.md) (the prerequisite wave).
 
 ---
 
 ```
-You are implementing **Wave 1** of the Clarion "road to first-class" program, in the
-Clarion repo at /home/john/clarion. Wave 1 is **WS1 — SEI authority**: the suite-wide
+You are implementing **Wave 1** of the Loomweave "road to first-class" program, in the
+Loomweave repo at /home/john/loomweave. Wave 1 is **WS1 — SEI authority**: the suite-wide
 stable-entity-identity engine. It is the heaviest single workstream and the one that, once
 shipped, makes every cross-tool binding survive a rename. Your job is to PLAN and EXECUTE
 it — real code, real tests, all CI gates green, and the SEI conformance oracle passing.
@@ -26,8 +26,8 @@ SEI-shaped persistence:
 1. **Wave 0 is complete and merged.** WS3's `sei_prior_index` table exists and is
    populated after every run (the matcher consumes it); WS2's HTTP linkages are live.
    Verify in the code, not just the plan.
-2. **SEI lock is confirmed** (program decision D1 — a SUITE event, not Clarion's alone:
-   all four subsystems reported + the §8 oracle encodes the resolutions). Clarion's shape
+2. **SEI lock is confirmed** (program decision D1 — a SUITE event, not Loomweave's alone:
+   all four subsystems reported + the §8 oracle encodes the resolutions). Loomweave's shape
    obligation is already discharged (ADR-038), but the suite may still adjust the shape in
    response to another subsystem's emerging requirement until lock. **If lock is not yet
    confirmed, STOP and ask the owner.** You may do shape-independent prep (test scaffolds,
@@ -35,17 +35,17 @@ SEI-shaped persistence:
    matcher, or the wire contract until lock is confirmed.
 
 ## Read these first (authoritative, in order)
-1. /home/john/wardline/docs/superpowers/specs/2026-06-01-loom-stable-entity-identity-conformance.md
+1. /home/john/wardline/docs/superpowers/specs/2026-06-01-weft-stable-entity-identity-conformance.md
    — the SEI standard. Read §1–§8 closely: §3 matcher, §4 wire contract, §5 your
    obligations, §7 migration, §8 the conformance oracle you must pass.
-2. docs/clarion/adr/ADR-038-sei-token-and-signature.md — the LOCKED Clarion decisions
+2. docs/loomweave/adr/ADR-038-sei-token-and-signature.md — the LOCKED Loomweave decisions
    (token, signature, persistence, reserved namespace). Implement these as written; do NOT
    re-decide them.
-3. docs/superpowers/plans/2026-06-02-clarion-integrated-delivery-plan.md — your task
+3. docs/superpowers/plans/2026-06-02-loomweave-integrated-delivery-plan.md — your task
    source. Wave 1 = **Phase 2 tasks T2.0 through T2.6**, plus the conformance oracle and
    the hard-cutover backfill. Read the "SEI persistence model" section and REQ-C-02 / the
    peer-review correction notes — they explain WHY the shape is what it is.
-4. docs/superpowers/specs/2026-06-02-clarion-first-class-program-design.md §5 invariants.
+4. docs/superpowers/specs/2026-06-02-loomweave-first-class-program-design.md §5 invariants.
 5. CLAUDE.md — CI gates, ADR immutability, Filigree workflow.
 
 ## Scope — WS1 SEI authority only
@@ -67,7 +67,7 @@ SEI-shaped persistence:
 - **Python plugin**: emit the signature JSON the manifest declares (`signature_schemas` +
   `signature_schema_version`) so `entities.signature` is populated. Python CI gates apply.
 - **Conformance oracle** (SEI spec §8): build/run the fixtures — identity round-trip +
-  opacity, rename, move, ambiguous (fail-closed), delete, capability-absent. Clarion must
+  opacity, rename, move, ambiguous (fail-closed), delete, capability-absent. Loomweave must
   pass all.
 - **Hard-cutover backfill**: build + test the idempotent, resumable backfill that re-keys
   existing bindings locator→SEI. The actual coordinated cross-tool release is owner-gated
@@ -75,7 +75,7 @@ SEI-shaped persistence:
   scheduling, do NOT fire it unilaterally.
 
 ## LOCKED decisions (ADR-038) — implement exactly; do NOT re-derive
-- **Token:** `clarion:eid:<lowercase-hex(blake3(utf8(locator) ++ 0x00 ++ utf8(mint_run_id)))[:32]>`,
+- **Token:** `loomweave:eid:<lowercase-hex(blake3(utf8(locator) ++ 0x00 ++ utf8(mint_run_id)))[:32]>`,
   where `mint_run_id` is the minting run's UUID. **NOT** `first_seen_commit` (it is never
   populated — a token keyed on it collides on locator reuse). SEI allocation is STATEFUL;
   reproducibility comes from `sei_bindings`, not from re-deriving the token. Add a test that
@@ -89,12 +89,12 @@ SEI-shaped persistence:
 - **Signature:** plain non-unique `entities.signature TEXT`, plugin-declared versioned JSON,
   compared by string equality. Near-redundant for the v1 deterministic move; carried for
   spec-conformance + the fuzzy future.
-- **REQ-F-02:** `resolve(locator)` rejects any input with the reserved `clarion:eid:` prefix
+- **REQ-F-02:** `resolve(locator)` rejects any input with the reserved `loomweave:eid:` prefix
   ("not a valid locator") — NOT by colon count (an SEI has the same two colons). Reserve the
-  `clarion:eid:` namespace; no plugin locator may occupy it.
+  `loomweave:eid:` namespace; no plugin locator may occupy it.
 - **REQ-C-05:** git-rename behind the typed `GitRenameSource` interface so legis can supply
   it later without touching the model.
-- **REQ-L-01:** lineage is append-only — no UPDATE path, no Clarion-side hash-chain in v1.
+- **REQ-L-01:** lineage is append-only — no UPDATE path, no Loomweave-side hash-chain in v1.
 - **No binding keyed on a locator on ANY surface** — MCP and HTTP both carry SEI. No MCP
   locator exception.
 - **Fail-closed:** when the matcher cannot PROVE sameness, mint a new SEI and mark the old
@@ -128,7 +128,7 @@ bodies. Close as you land each.
 - Every alive entity has an `alive` `sei_bindings` row after analysis.
 - Matcher handles rename / move / ambiguous(fail-closed) / orphan per the test suite; a
   back-to-back unchanged re-run carries (never re-mints) every SEI.
-- HTTP `resolve`/`resolve_sei`/`lineage` live, with the REQ-F-02 `clarion:eid:` rejection;
+- HTTP `resolve`/`resolve_sei`/`lineage` live, with the REQ-F-02 `loomweave:eid:` rejection;
   `_capabilities` reports `sei: { supported: true, version: 1 }`.
 - MCP responses carry SEI via the binding join (no locator-keyed bindings anywhere).
 - The §8 conformance oracle passes.

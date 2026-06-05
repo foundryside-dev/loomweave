@@ -4,8 +4,8 @@
 **Date opened**: 2026-05-18
 **Filigree umbrella**: `clarion-6222134e0d`
 **Branch**: `sprint-2/b8-scale-test`
-**Purpose**: close Sprint 2 with measured evidence from `clarion analyze` and
-`clarion serve` against an elspeth-scale corpus.
+**Purpose**: close Sprint 2 with measured evidence from `loomweave analyze` and
+`loomweave serve` against an elspeth-scale corpus.
 **Read with**: [scope amendment](./scope-amendment-2026-05.md),
 [B.4* gate results](./b4-gate-results.md),
 [B.8 rollback playbook](./b8-scale-test.md), and
@@ -35,9 +35,9 @@ is larger: 1,519 Python files and 608,930 LOC. The full checkout is useful as a
 future stress target but is not the named B.8 slice.
 
 Representativeness checks before analyze: confirm path, file count, LOC, pinned
-commit, and dirty state; record any Python files Clarion excludes. B.8 measures
-what Clarion actually analyzes, so the memo must distinguish "corpus LOC" from
-"files accepted by Clarion".
+commit, and dirty state; record any Python files Loomweave excludes. B.8 measures
+what Loomweave actually analyzes, so the memo must distinguish "corpus LOC" from
+"files accepted by Loomweave".
 
 Fallback corpus:
 
@@ -58,15 +58,15 @@ records the fields below, even when a field is unavailable. Unknown values use
 
 ### Analyze-Time Fields
 
-Run identity: run_id, timestamps, Clarion commit, elspeth commit, corpus path,
+Run identity: run_id, timestamps, Loomweave commit, elspeth commit, corpus path,
 Python file count, Python LOC, dirty state, command line, pyright pin,
 calibration machine, and operator hardware ratio.
 
 Wall-clock: total analyze time plus phase timings for discovery, plugin
 initialization, per-file analysis, and commit batches.
 
-Resources: peak RSS for the `clarion analyze` process group, peak
-`.clarion/clarion.db` size, and final `.clarion/` directory size.
+Resources: peak RSS for the `loomweave analyze` process group, peak
+`.loomweave/loomweave.db` size, and final `.loomweave/` directory size.
 
 Graph and B.4* comparability: corpus function count, accepted function count,
 entities by kind, edges by kind and by `(kind, confidence)`, calls-edge count by
@@ -75,7 +75,7 @@ confidence, ambiguous ratio, unresolved-per-function, `dropped_edges_total`,
 observed/projected ratio, and whether assumptions changed.
 
 Pyright and findings: pyright per-file p50/p95 latency, restart count,
-`CLA-PY-PYRIGHT-*` findings by code, `CLA-INFRA-*` findings by code, and any
+`LMWV-PY-PYRIGHT-*` findings by code, `LMWV-INFRA-*` findings by code, and any
 other material finding count that changes gate interpretation.
 
 ### MCP-Serve-Time Fields
@@ -247,7 +247,7 @@ Rollback Action, and Raw Artifacts.
 
 The driver lives at `tests/perf/b8_scale_test/driver.py`.
 
-Responsibilities: spawn `clarion serve --path <analyzed-project>`, send
+Responsibilities: spawn `loomweave serve --path <analyzed-project>`, send
 Content-Length framed JSON-RPC, exercise `initialize`, `tools/list`, and all
 seven `tools/call` requests, run manifest `B8-MCP-001`, record per-call
 latency/size/token/envelope stats, summarize by tool/pattern/phase/cache state,
@@ -281,10 +281,10 @@ response parsing before driver implementation, then smoke it against a small
 analyzed project before elspeth scale.
 
 Stage 2 - analyze: source `.env` only when live LLM calls are needed, run
-`clarion analyze` against the pinned corpus, and stop before Stage 3 if analyze
+`loomweave analyze` against the pinned corpus, and stop before Stage 3 if analyze
 is Red.
 
-Stage 3 - serve: start `clarion serve`, run all patterns, and use the second
+Stage 3 - serve: start `loomweave serve`, run all patterns, and use the second
 medium pass as the cache-hit gate.
 
 Stage 4 - decision memo: append one entry to `b8-results.md`, state the verdict
