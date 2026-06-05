@@ -461,6 +461,14 @@ jobs:
 
       - name: install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          # Pin cosign 2.x. The installer's resolved default moved to v3.0.6,
+          # whose `sign-blob` requires a bundle and breaks the
+          # --output-signature/--output-certificate flow ("create bundle file:
+          # open :"). v2.5.2 is the version that signed the last good release
+          # (Clarion v1.1.0). Porting sign-blob/verify-blob to cosign 3.x is a
+          # separate follow-up.
+          cosign-release: 'v2.5.2'
 
       - name: sign release archives
         run: |
@@ -573,6 +581,14 @@ jobs:
     steps:
       - name: install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          # Pin cosign 2.x. The installer's resolved default moved to v3.0.6,
+          # whose `sign-blob` requires a bundle and breaks the
+          # --output-signature/--output-certificate flow ("create bundle file:
+          # open :"). v2.5.2 is the version that signed the last good release
+          # (Clarion v1.1.0). Porting sign-blob/verify-blob to cosign 3.x is a
+          # separate follow-up.
+          cosign-release: 'v2.5.2'
 
       - name: download published assets
         env:
