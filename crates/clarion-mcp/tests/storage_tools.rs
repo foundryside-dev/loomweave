@@ -3096,6 +3096,43 @@ async fn source_for_entity_reports_drift_instead_of_stale_snippet() {
 }
 
 #[tokio::test]
+async fn source_for_entity_reports_context_drift_before_returning_context() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    // Keep demo.mid's indexed span (lines 4-5) unchanged, but mutate a
+    // requested context line. The entity span hash still matches, so this
+    // specifically exercises the source-file hash guard that covers context.
+    std::fs::write(
+        project.path().join("demo.py"),
+        "def entry():
+    return mid()
+API_TOKEN = 'SECRET_CONTEXT_DRIFT'
+def mid():
+    return target()
+
+def target():
+    return 1
+",
+    )
+    .expect("rewrite source context");
+
+    let resp = call_tool(
+        &state,
+        "source_for_entity",
+        json!({"id": "python:function:demo.mid", "context_lines": 1}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp:?}");
+    assert_eq!(resp["result"]["source_status"], "drifted");
+    assert!(resp["result"].get("lines").is_none());
+    assert!(
+        !resp.to_string().contains("SECRET_CONTEXT_DRIFT"),
+        "leaked drifted context: {resp}"
+    );
+}
+
+#[tokio::test]
 async fn source_for_entity_reports_missing_file_and_unknown_entity() {
     let (project, db_path) = open_project();
     let state = state_for(project.path(), &db_path);
