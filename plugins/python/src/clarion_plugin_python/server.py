@@ -14,8 +14,9 @@ Response shapes (required by the Rust host's typed deserialise path):
 - ``initialized`` / ``exit`` — notifications, no response.
 
 Task 2 shipped the dispatch skeleton with ``analyze_file`` returning an empty
-entity list. The current plugin does not advertise Wardline capabilities until
-it emits real Wardline-derived semantic signals.
+entity list. The current plugin advertises its Wardline descriptor state during
+``initialize`` and emits Wardline-derived semantic signals when a compatible
+descriptor is available.
 """
 
 from __future__ import annotations

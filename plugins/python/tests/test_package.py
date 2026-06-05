@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import clarion_plugin_python
+from clarion_plugin_python.wardline_descriptor import EXPECTED_DESCRIPTOR_VERSION
 
 _PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 
@@ -44,7 +45,7 @@ def test_manifest_declares_current_v1_ontology_only() -> None:
     assert manifest["plugin"]["version"] == "1.3.0"
     assert manifest["capabilities"]["runtime"]["wardline_aware"] is True
     assert manifest["integrations"]["wardline"]["expected_descriptor_version"] == (
-        "wardline-generic-2"
+        EXPECTED_DESCRIPTOR_VERSION
     )
     assert manifest["ontology"]["ontology_version"] == "0.7.0"
     assert manifest["ontology"]["entity_kinds"] == ["function", "class", "module"]
