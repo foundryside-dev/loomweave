@@ -630,6 +630,84 @@ fn edit_preserves_authored_at_and_provenance_changes_only_content() {
 }
 
 #[test]
+fn edit_ignores_repo_dotenv_visual_and_uses_inherited_editor() {
+    // A repository-controlled `.env` must not be able to supply VISUAL/EDITOR to
+    // the editor that `guidance edit` spawns: that would be code execution as the
+    // operator who merely opened an untrusted checkout. The inherited (operator)
+    // EDITOR must win, and the malicious `.env` VISUAL must never run.
+    let dir = tempfile::tempdir().unwrap();
+    seed_db(dir.path());
+    let id = "core:guidance:dotenv-editor";
+
+    clarion_bin()
+        .args(["guidance", "create"])
+        .args(["--path"])
+        .arg(dir.path())
+        .args(["--scope-level", "module"])
+        .args(["--name", "dotenv-editor"])
+        .args(["--match", "kind:function"])
+        .args(["--content", "original"])
+        .assert()
+        .success();
+
+    let safe_editor = dir.path().join("safe-editor.sh");
+    std::fs::write(
+        &safe_editor,
+        "#!/bin/sh\nprintf 'safe editor content' > \"$1\"\n",
+    )
+    .unwrap();
+    let malicious_editor = dir.path().join("malicious-editor.sh");
+    let marker = dir.path().join("malicious-ran");
+    std::fs::write(
+        &malicious_editor,
+        format!(
+            "#!/bin/sh\nprintf 'malicious editor content' > \"$1\"\ntouch {}\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for script in [&safe_editor, &malicious_editor] {
+            let mut perms = std::fs::metadata(script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(script, perms).unwrap();
+        }
+    }
+    std::fs::write(
+        dir.path().join(".env"),
+        format!("VISUAL={}\n", malicious_editor.display()),
+    )
+    .unwrap();
+
+    let bin = assert_cmd::cargo::cargo_bin("clarion");
+    let path = std::env::var("PATH").unwrap_or_default();
+    let out = std::process::Command::new(&bin)
+        .current_dir(dir.path())
+        .env_clear()
+        .env("PATH", path)
+        .env("EDITOR", &safe_editor)
+        .args(["guidance", "edit", id])
+        .args(["--path"])
+        .arg(dir.path())
+        .output()
+        .expect("clarion guidance edit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "edit failed; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !marker.exists(),
+        "repo .env VISUAL was executed instead of inherited EDITOR"
+    );
+    assert_eq!(properties(dir.path(), id)["content"], "safe editor content");
+}
+
+#[test]
 fn edit_without_editor_set_fails_cleanly() {
     let dir = tempfile::tempdir().unwrap();
     seed_db(dir.path());

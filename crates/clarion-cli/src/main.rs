@@ -28,10 +28,7 @@ fn main() -> Result<()> {
     let cli = cli::Cli::parse();
     // Load .env before tracing setup for operator-facing commands so a
     // .env-supplied RUST_LOG is in effect by the time the filter is built.
-    // `analyze` is deliberately excluded: project .env contents are scanned
-    // as source sidecars by the pre-ingest secret scanner and must not be
-    // imported into plugin subprocess environments before that gate runs.
-    if !matches!(&cli.command, cli::Command::Analyze { .. }) {
+    if should_load_dotenv(&cli.command) {
         let _ = dotenvy::dotenv();
     }
     init_tracing();
@@ -143,6 +140,33 @@ fn main() -> Result<()> {
     }
 }
 
+/// Whether to load a repository-controlled `.env` for this command.
+///
+/// Most operator commands want `.env` loaded (e.g. a `.env`-supplied `RUST_LOG`,
+/// or a Filigree `token_env` consumed by `guidance promote` / `sarif import`).
+/// Two cases must NOT load it, because they would import repository-controlled
+/// values into a subprocess environment before those values have been vetted:
+///
+/// - `analyze`: project `.env` contents are scanned as source sidecars by the
+///   pre-ingest secret scanner and must not reach plugin subprocess
+///   environments before that gate runs.
+/// - `guidance create` / `guidance edit`: authoring spawns `$VISUAL`/`$EDITOR`
+///   (see `guidance::edit_in_editor`), so a repository `.env` supplying
+///   `VISUAL`/`EDITOR` — or `PATH`, etc. — would execute attacker-controlled
+///   code as the operator who merely opened an untrusted checkout. Only these
+///   two `guidance` subcommands spawn an editor; the rest (`promote`, `show`,
+///   `list`, `export`, `import`, `delete`) keep `.env` so a `.env`-supplied
+///   Filigree token still resolves.
+fn should_load_dotenv(command: &cli::Command) -> bool {
+    !matches!(
+        command,
+        cli::Command::Analyze { .. }
+            | cli::Command::Guidance {
+                command: cli::GuidanceCommand::Create { .. } | cli::GuidanceCommand::Edit { .. },
+            }
+    )
+}
+
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -151,4 +175,52 @@ fn init_tracing() {
         .with_writer(std::io::stderr)
         .with_target(false)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_load_dotenv;
+    use crate::cli::Cli;
+    use clap::Parser;
+
+    fn loads(args: &[&str]) -> bool {
+        let cli = Cli::try_parse_from(args).expect("valid argv");
+        should_load_dotenv(&cli.command)
+    }
+
+    #[test]
+    fn analyze_does_not_load_dotenv() {
+        assert!(!loads(&["clarion", "analyze", "."]));
+    }
+
+    #[test]
+    fn guidance_editor_subcommands_do_not_load_dotenv() {
+        // create/edit spawn $VISUAL/$EDITOR; a repo .env must not feed them.
+        assert!(!loads(&[
+            "clarion",
+            "guidance",
+            "create",
+            "--scope-level",
+            "module",
+            "--match",
+            "kind:function",
+        ]));
+        assert!(!loads(&["clarion", "guidance", "edit", "core:guidance:x"]));
+    }
+
+    #[test]
+    fn non_editor_guidance_subcommands_keep_dotenv() {
+        // promote resolves a Filigree token from a .env-supplied token_env;
+        // excluding it would regress authenticated promotion. These commands
+        // never spawn an editor, so loading .env is safe.
+        assert!(loads(&["clarion", "guidance", "promote", "obs-123"]));
+        assert!(loads(&["clarion", "guidance", "show", "core:guidance:x"]));
+        assert!(loads(&["clarion", "guidance", "list"]));
+        assert!(loads(&["clarion", "guidance", "export", "--to", "out"]));
+    }
+
+    #[test]
+    fn other_commands_load_dotenv() {
+        assert!(loads(&["clarion", "doctor"]));
+    }
 }
