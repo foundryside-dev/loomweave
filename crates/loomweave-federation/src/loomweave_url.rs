@@ -96,4 +96,12 @@ mod tests {
         assert_eq!(res.resolved_url, None);
         assert_eq!(res.source, SOURCE_NONE);
     }
+
+    #[test]
+    fn blank_config_with_no_file_resolves_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let res = resolve_loomweave_url(Some("   "), dir.path());
+        assert_eq!(res.resolved_url, None);
+        assert_eq!(res.source, SOURCE_NONE);
+    }
 }
