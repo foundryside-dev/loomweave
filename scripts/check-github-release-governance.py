@@ -537,8 +537,24 @@ def check_release_workflow_governance_gate(repo_root: Path) -> list[str]:
 
     jobs = release_workflow_job_blocks(workflow)
     failures: list[str] = []
-    if "release-governance" not in jobs:
+    governance_job = jobs.get("release-governance")
+    if governance_job is None:
         failures.append(f"{workflow}: missing release-governance job")
+    else:
+        governance_needs = release_workflow_needs(governance_job)
+        if "verify" not in governance_needs:
+            failures.append(
+                f"{workflow}: release-governance must need verify before exposing RELEASE_GOVERNANCE_TOKEN"
+            )
+        governance_text = "".join(governance_job)
+        if "ref: main" not in governance_text:
+            failures.append(
+                f"{workflow}: release-governance checkout must pin the governance guard to main"
+            )
+        if "persist-credentials: false" not in governance_text:
+            failures.append(
+                f"{workflow}: release-governance checkout must disable persisted credentials"
+            )
 
     for job_name in ("build-rust", "build-plugin"):
         if job_name not in jobs:
@@ -552,7 +568,10 @@ def check_release_workflow_governance_gate(repo_root: Path) -> list[str]:
 
     if failures:
         raise CheckError("\n".join(failures))
-    return ["release workflow build jobs require the GitHub governance gate"]
+    return [
+        "release workflow build jobs require the GitHub governance gate",
+        "release governance token is exposed only after verify and trusted checkout",
+    ]
 
 
 def check_governance_doc_lockstep(repo_root: Path) -> list[str]:
@@ -829,7 +848,12 @@ def run_self_test() -> None:
             "  verify:\n"
             "    steps: []\n"
             "  release-governance:\n"
-            "    steps: []\n"
+            "    needs: verify\n"
+            "    steps:\n"
+            "      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd\n"
+            "        with:\n"
+            "          ref: main\n"
+            "          persist-credentials: false\n"
             "  build-rust:\n"
             "    needs: [verify, release-governance]\n"
             "    steps: []\n"

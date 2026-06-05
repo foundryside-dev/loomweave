@@ -164,11 +164,21 @@ jobs:
 
   release-governance:
     name: GitHub release governance
+    # The governance token can read repository administration and Actions
+    # policy settings. Do not expose it until the untrusted triggering ref has
+    # passed the source-tree verify gate, then run the live check from the
+    # reviewed default branch instead of from the tag/manual ref.
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: check out trusted governance guard
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: enforce repository release controls
         env:
