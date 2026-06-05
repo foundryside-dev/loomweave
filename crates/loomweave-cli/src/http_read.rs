@@ -55,6 +55,20 @@ static HTTP_ERROR_DISPATCH: LazyLock<tracing::Dispatch> = LazyLock::new(|| {
     tracing::Dispatch::new(subscriber)
 });
 
+/// Removes the published `.loomweave/ephemeral.port` on drop — covering
+/// graceful shutdown, error return, and panic-unwind in one place. Only
+/// SIGKILL can strand a stale file, which the read-side validation and the
+/// ADR-034 instance-ID guard tolerate (a stale file degrades, never corrupts).
+struct PublishedPortGuard {
+    project_root: PathBuf,
+}
+
+impl Drop for PublishedPortGuard {
+    fn drop(&mut self) {
+        loomweave_federation::loomweave_port::remove_published_port(&self.project_root);
+    }
+}
+
 #[derive(Debug)]
 pub struct HttpReadServer {
     shutdown: Option<oneshot::Sender<()>>,
@@ -337,8 +351,9 @@ fn run_http_read_server(
     auth_token: Option<Arc<String>>,
     identity_secret: Option<Arc<String>>,
     bind: std::net::SocketAddr,
-    // ADR-044 Task 3 will consume this to drive the ephemeral fallback + publish.
-    _auto_port: bool,
+    // ADR-044: when true (bind auto-selected), an `AddrInUse` falls back to an
+    // OS-assigned ephemeral port; an explicit operator bind never falls back.
+    auto_port: bool,
     shutdown_rx: oneshot::Receiver<()>,
     ready_tx: mpsc::Sender<Result<HttpReadReady>>,
 ) -> Result<()> {
@@ -349,8 +364,22 @@ fn run_http_read_server(
     let readers_identity = readers.identity().clone();
     let runtime = build_http_runtime()?;
     runtime.block_on(async move {
+        // ADR-044: auto-selected ports fall back to an OS-assigned ephemeral
+        // port if the deterministic port is taken; an explicit operator bind
+        // does NOT fall back (a taken explicit port is a hard error).
         let listener = match tokio::net::TcpListener::bind(bind).await {
             Ok(listener) => listener,
+            Err(err) if auto_port && err.kind() == std::io::ErrorKind::AddrInUse => {
+                let fallback = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+                match tokio::net::TcpListener::bind(fallback).await {
+                    Ok(listener) => listener,
+                    Err(err) => {
+                        let _ = ready_tx
+                            .send(Err(anyhow!("bind HTTP read API ephemeral fallback: {err}")));
+                        return Err(anyhow!("bind HTTP read API ephemeral fallback: {err}"));
+                    }
+                }
+            }
             Err(err) => {
                 let _ = ready_tx.send(Err(anyhow!("bind HTTP read API on {bind}: {err}")));
                 return Err(anyhow!("bind HTTP read API on {bind}: {err}"));
@@ -362,6 +391,29 @@ fn run_http_read_server(
                 let _ = ready_tx.send(Err(anyhow!("read HTTP read API local addr: {err}")));
                 return Err(anyhow!("read HTTP read API local addr: {err}"));
             }
+        };
+        // Publish the ACTUALLY-bound port loopback-only (ADR-044 file contract).
+        // A non-loopback bind publishes NO file — consumers fall back to their
+        // configured URL. The guard unlinks the file when this scope unwinds.
+        let _published_port_guard = if local_addr.ip().is_loopback() {
+            if let Err(err) =
+                loomweave_federation::loomweave_port::publish_port(&project_root, local_addr.port())
+            {
+                // Publication is best-effort enrichment: a failure to write the
+                // discovery file must not take the read API down.
+                tracing::warn!(
+                    error = %err,
+                    port = local_addr.port(),
+                    "failed to publish .loomweave/ephemeral.port; consumers will fall back to configured URL"
+                );
+                None
+            } else {
+                Some(PublishedPortGuard {
+                    project_root: project_root.clone(),
+                })
+            }
+        } else {
+            None
         };
         let _ = ready_tx.send(Ok(HttpReadReady {
             local_addr,
@@ -1015,6 +1067,117 @@ mod tests {
         assert!(
             message.contains("HTTP read server thread panicked"),
             "supervisor must report the thread panic; got: {message}"
+        );
+    }
+
+    /// ADR-044: with `bind: None`, two serves on distinct project paths each
+    /// bind their own deterministic port and publish their own
+    /// `.loomweave/ephemeral.port`. Neither fails to bind.
+    #[test]
+    fn auto_port_publishes_distinct_ports_per_project() {
+        use loomweave_federation::config::HttpReadConfig;
+        use loomweave_federation::loomweave_port::read_published_port;
+        use loomweave_storage::ReaderPool;
+
+        let _guard = http_runtime_test_guard();
+
+        let make = |id: &str| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db = dir.path().join("loomweave.db");
+            let readers = ReaderPool::open(&db, 4).expect("reader pool");
+            let cfg = HttpReadConfig {
+                enabled: true,
+                bind: None,
+                ..HttpReadConfig::default()
+            };
+            let iid = crate::instance::parse_instance_id_for_test(id).expect("iid");
+            let server = spawn(dir.path().to_path_buf(), db, readers, iid, &cfg)
+                .expect("spawn")
+                .expect("enabled => Some");
+            (dir, server)
+        };
+
+        let (dir_a, server_a) = make("00000000-0000-4000-8000-0000000000a1");
+        let (dir_b, server_b) = make("00000000-0000-4000-8000-0000000000a2");
+
+        let port_a = read_published_port(dir_a.path()).expect("a published a port");
+        let port_b = read_published_port(dir_b.path()).expect("b published a port");
+        assert!(
+            port_a >= 9400 && port_b >= 9400,
+            "ports in the loomweave band"
+        );
+        // Two live servers => two live ports => they cannot be equal.
+        assert_ne!(port_a, port_b, "concurrent serves must hold distinct ports");
+
+        server_a.shutdown().expect("shutdown a");
+        server_b.shutdown().expect("shutdown b");
+    }
+
+    /// The published file is removed on clean shutdown.
+    #[test]
+    fn auto_port_file_removed_on_clean_shutdown() {
+        use loomweave_federation::config::HttpReadConfig;
+        use loomweave_federation::loomweave_port::{published_port_path, read_published_port};
+        use loomweave_storage::ReaderPool;
+
+        let _guard = http_runtime_test_guard();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("loomweave.db");
+        let readers = ReaderPool::open(&db, 4).expect("reader pool");
+        let cfg = HttpReadConfig {
+            enabled: true,
+            bind: None,
+            ..HttpReadConfig::default()
+        };
+        let iid =
+            crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-0000000000a3")
+                .expect("iid");
+        let server = spawn(dir.path().to_path_buf(), db, readers, iid, &cfg)
+            .expect("spawn")
+            .expect("enabled => Some");
+
+        assert!(
+            read_published_port(dir.path()).is_some(),
+            "published while serving"
+        );
+        server.shutdown().expect("shutdown");
+        assert!(
+            !published_port_path(dir.path()).exists(),
+            "published port file must be gone after clean shutdown"
+        );
+    }
+
+    /// An explicit (operator-set) bind that is already in use is a HARD error —
+    /// the operator asked for that specific port. Only auto-select falls back.
+    #[test]
+    fn explicit_bind_in_use_is_a_hard_error() {
+        use loomweave_federation::config::HttpReadConfig;
+        use loomweave_storage::ReaderPool;
+        use std::net::{SocketAddr, TcpListener};
+
+        let _guard = http_runtime_test_guard();
+
+        // Hold a real listener so the address is genuinely occupied.
+        let held = TcpListener::bind(("127.0.0.1", 0)).expect("hold a port");
+        let bind: SocketAddr = held.local_addr().expect("addr");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("loomweave.db");
+        let readers = ReaderPool::open(&db, 4).expect("reader pool");
+        let cfg = HttpReadConfig {
+            enabled: true,
+            bind: Some(bind),
+            ..HttpReadConfig::default()
+        };
+        let iid =
+            crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-0000000000a4")
+                .expect("iid");
+
+        let result = spawn(dir.path().to_path_buf(), db, readers, iid, &cfg);
+        assert!(
+            result.is_err(),
+            "an explicit in-use bind must fail, not silently fall back to :0"
         );
     }
 
