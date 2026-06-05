@@ -48,6 +48,11 @@ jobs:
           fetch-depth: 0
 
       - name: Assert tagged commit is on main
+        # Only gates real releases (tag pushes). A workflow_dispatch dry-run can
+        # publish solely to TestPyPI (see publish-* job `if`), so it is allowed
+        # to run from any branch — letting the publish workflow itself be
+        # iterated/validated before it is merged to main.
+        if: github.event_name == 'push'
         run: |
           git fetch origin main
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main || \
@@ -354,31 +359,22 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  publish-pypi:
-    name: Publish to PyPI (plugin first, then loomweave)
-    needs: [build-wheels, build-plugin]
+  # Two packages publish from one repo+workflow, so each needs its OWN
+  # environment: PyPI forbids two *pending* publishers sharing
+  # (repository, workflow, environment). Plugin → `pypi-plugin` (real) /
+  # `testpypi-plugin` (dry-run); loomweave → `pypi` / `testpypi`. The index is
+  # chosen by event (dispatch → TestPyPI, tag push → real PyPI), independent of
+  # the environment. Real PyPI is reachable ONLY on a pushed v* tag (the `if`),
+  # which is `verify`-gated via build-*; dispatch dry-runs hit TestPyPI only.
+  publish-plugin:
+    name: Publish loomweave-plugin-python (first)
+    needs: [build-plugin]
     runs-on: ubuntu-latest
-    # Real PyPI: ONLY on a pushed v* tag — already gated on the full `verify`
-    # job via build-wheels/build-plugin (`needs: [verify]`). TestPyPI dry-run
-    # (Phase C8): workflow_dispatch with target_index=testpypi. Dispatch can
-    # NEVER reach real PyPI.
-    #
-    # PRECONDITIONS before the first real run (Phase D2 — owner, on pypi.org):
-    #   * Register a Trusted Publisher for BOTH projects (`loomweave` and
-    #     `loomweave-plugin-python`): owner `foundryside-dev`, repo `loomweave`,
-    #     workflow `release.yml`, environment `pypi` (and a `testpypi`
-    #     environment + TestPyPI publishers for the dry-run).
-    #   * Recommended: add required reviewers to the `pypi` environment so the
-    #     upload pauses for a human before going live.
-    # Until then this job fails the OIDC exchange (fail-safe: it cannot
-    # mis-publish, only error).
-    #
-    # Publish order is plugin-first so that by the time `loomweave` is on the
-    # index its `loomweave-plugin-python==<v>` pin already resolves.
+    # Plugin publishes BEFORE loomweave so its `==<v>` pin resolves on first release.
     if: >-
       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
       (github.event_name == 'workflow_dispatch' && inputs.target_index == 'testpypi')
-    environment: ${{ github.event_name == 'workflow_dispatch' && 'testpypi' || 'pypi' }}
+    environment: ${{ github.event_name == 'workflow_dispatch' && 'testpypi-plugin' || 'pypi-plugin' }}
     permissions:
       id-token: write
     steps:
@@ -395,13 +391,25 @@ jobs:
           cp dl-plugin/*.whl dl-plugin/*.tar.gz pkg-plugin/
           ls -la pkg-plugin
 
-      - name: publish loomweave-plugin-python (FIRST)
+      - name: publish loomweave-plugin-python
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
         with:
           packages-dir: pkg-plugin
           attestations: true
           repository-url: ${{ github.event_name == 'workflow_dispatch' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
 
+  publish-loomweave:
+    name: Publish loomweave (after the plugin)
+    # `needs: publish-plugin` enforces plugin-first; build-wheels supplies the wheels.
+    needs: [build-wheels, publish-plugin]
+    runs-on: ubuntu-latest
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.target_index == 'testpypi')
+    environment: ${{ github.event_name == 'workflow_dispatch' && 'testpypi' || 'pypi' }}
+    permissions:
+      id-token: write
+    steps:
       - name: download loomweave wheels
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -416,7 +424,7 @@ jobs:
           cp dl-loomweave/*.whl pkg-loomweave/
           ls -la pkg-loomweave
 
-      - name: publish loomweave (SECOND)
+      - name: publish loomweave
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
         with:
           packages-dir: pkg-loomweave
