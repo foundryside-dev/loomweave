@@ -1,4 +1,11 @@
-//! Plugin discovery via `$PATH` scanning (ADR-021 §L9).
+//! Plugin discovery via `$PATH` scanning and the running binary's own
+//! directory (ADR-021 §L9).
+//!
+//! Directories are scanned in order: every `$PATH` entry first, then the
+//! directory of the running `clarion` binary (`std::env::current_exe()`'s
+//! parent). The exe-dir level makes a PyPI/venv install work — the plugin's
+//! console script is co-located in the same `bin/` as `clarion` but is not on
+//! the user's `$PATH`.
 //!
 //! # Matching rule
 //!
@@ -36,7 +43,9 @@
 //!
 //! Duplicate `$PATH` directories are skipped.  If the same binary name
 //! appears in multiple directories the first occurrence wins (matching
-//! POSIX shell / `which` semantics).
+//! POSIX shell / `which` semantics).  Because `$PATH` is scanned before the
+//! exe directory, a PATH-installed plugin shadows a same-named sibling
+//! co-located next to the binary.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -52,7 +61,8 @@ use crate::plugin::{Manifest, ManifestError, parse_manifest};
 /// A plugin discovered via a `clarion-plugin-*` executable on `$PATH`.
 #[derive(Debug)]
 pub struct DiscoveredPlugin {
-    /// Path to the plugin executable **as found on `$PATH`**.
+    /// Path to the plugin executable **as found during discovery** (on
+    /// `$PATH`, or co-located in the running binary's directory).
     ///
     /// Intentionally NOT canonicalised. The neighbour-manifest lookup
     /// joins `plugin.toml` with this path's parent directory;
@@ -62,7 +72,7 @@ pub struct DiscoveredPlugin {
     /// next to the symlink.
     ///
     /// Deduplication uses a separate canonicalised key
-    /// (`seen_dirs` inside [`discover_on_path`]), so the raw-path retained
+    /// (`seen_dirs` inside `scan_dir`), so the raw-path retained
     /// here does not defeat shadowing.
     ///
     /// If you need the real binary location for an operator message (e.g.
@@ -139,7 +149,10 @@ pub const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 #[cfg(unix)]
 pub fn discover() -> Vec<Result<DiscoveredPlugin, DiscoveryError>> {
     let path_val = std::env::var_os("PATH").unwrap_or_default();
-    discover_on_path(&path_val)
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+    discover_on_path_and_exe_dir(&path_val, exe_dir.as_deref())
 }
 
 #[cfg(not(unix))]
@@ -161,92 +174,132 @@ pub fn discover() -> Vec<Result<DiscoveredPlugin, DiscoveryError>> {
 /// Primarily useful for testing; production callers should use [`discover`].
 #[cfg(unix)]
 pub fn discover_on_path(path_env: &OsStr) -> Vec<Result<DiscoveredPlugin, DiscoveryError>> {
+    discover_on_path_and_exe_dir(path_env, None)
+}
+
+/// Like [`discover_on_path`], but additionally scans `exe_dir` (the directory of
+/// the running `clarion` binary) **after** the `$PATH` entries. `$PATH` entries
+/// are scanned first, so a plugin found on `$PATH` shadows a same-named sibling
+/// next to the binary (first-match-wins, consistent with PATH shadowing).
+///
+/// This is the discovery source that makes a PyPI/venv install work: the plugin
+/// console script is co-located in the same `bin/` as `clarion` but is not on
+/// the user's `$PATH`. See ADR-021.
+#[cfg(unix)]
+pub fn discover_on_path_and_exe_dir(
+    path_env: &OsStr,
+    exe_dir: Option<&std::path::Path>,
+) -> Vec<Result<DiscoveredPlugin, DiscoveryError>> {
     let mut results = Vec::new();
     let mut seen_dirs: HashSet<PathBuf> = HashSet::new();
     let mut seen_names: HashSet<String> = HashSet::new();
 
-    for dir in std::env::split_paths(path_env) {
-        // Skip empty entries (POSIX: empty means cwd — we don't support that).
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-
-        // Deduplicate directories.
-        let canonical_dir = match dir.canonicalize() {
-            Ok(c) => c,
-            // If the dir doesn't exist or can't be canonicalised, still use the
-            // raw path for dedup so we don't skip a later entry that resolves
-            // differently.
-            Err(_) => dir.clone(),
-        };
-        if !seen_dirs.insert(canonical_dir.clone()) {
-            continue;
-        }
-
-        // Refuse to load plugins from world-writable directories. On a
-        // multi-user machine, any user with write access to a $PATH dir
-        // becomes a plugin installer — a threat model the hybrid-
-        // authority framing (ADR-021) rules out. Production installs
-        // should use `~/.local/bin` (0o755) or `/usr/local/bin` (0o755);
-        // only pathologically misconfigured dirs fail this check.
-        if is_world_writable(&dir) {
-            results.push(Err(DiscoveryError::WorldWritableDir { path: dir.clone() }));
-            continue;
-        }
-
-        // Read directory entries; skip silently on I/O error (non-existent
-        // dirs are common in $PATH).
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-
-        for entry_result in entries {
-            let Ok(entry) = entry_result else {
-                continue;
-            };
-
-            // non-UTF-8 names can't match our prefix.
-            let Ok(file_name) = entry.file_name().into_string() else {
-                continue;
-            };
-
-            // ── Name filter ───────────────────────────────────────────────────
-            let suffix = match extract_plugin_suffix(&file_name) {
-                Some(s) => s.to_owned(),
-                None => continue,
-            };
-
-            // ── Shadowing: first match wins ───────────────────────────────────
-            // Safe to key on String: non-UTF-8 names were filtered above.
-            if !seen_names.insert(file_name.clone()) {
-                continue;
-            }
-
-            // `exec_path` is the raw PATH-relative path (not canonicalised).
-            // Do not canonicalise here — the neighbour-manifest convention
-            // at `load_plugin` / `find_manifest` looks up `plugin.toml` next
-            // to this path, and a symlink install pattern (e.g. `~/bin/` full
-            // of symlinks into `~/.local/pipx/venvs/*/bin/`) expects the
-            // manifest to live next to the symlink, not next to the resolved
-            // binary in the venv. See the `executable` field doc-comment on
-            // `DiscoveredPlugin` for the full consistency story.
-            let exec_path = dir.join(&file_name);
-
-            // ── Exec-bit check ────────────────────────────────────────────────
-            if !is_executable(&exec_path) {
-                continue;
-            }
-
-            // ── Manifest lookup ───────────────────────────────────────────────
-            results.push(load_plugin(exec_path, &suffix));
-        }
+    let exe_dirs = exe_dir.map(std::path::Path::to_path_buf).into_iter();
+    for dir in std::env::split_paths(path_env).chain(exe_dirs) {
+        scan_dir(&dir, &mut seen_dirs, &mut seen_names, &mut results);
     }
 
     results
 }
 
+/// Scan a single directory for `clarion-plugin-*` executables, appending results.
+/// Shared by every discovery source; honours dir/name de-duplication and the
+/// world-writable refusal (ADR-021).
+#[cfg(unix)]
+fn scan_dir(
+    dir: &std::path::Path,
+    seen_dirs: &mut HashSet<PathBuf>,
+    seen_names: &mut HashSet<String>,
+    results: &mut Vec<Result<DiscoveredPlugin, DiscoveryError>>,
+) {
+    // Skip empty entries (POSIX: empty means cwd — we don't support that).
+    if dir.as_os_str().is_empty() {
+        return;
+    }
+
+    // Deduplicate directories.
+    let canonical_dir = match dir.canonicalize() {
+        Ok(c) => c,
+        // If the dir doesn't exist or can't be canonicalised, still use the
+        // raw path for dedup so we don't skip a later entry that resolves
+        // differently.
+        Err(_) => dir.to_path_buf(),
+    };
+    if !seen_dirs.insert(canonical_dir.clone()) {
+        return;
+    }
+
+    // Refuse to load plugins from world-writable directories. On a
+    // multi-user machine, any user with write access to a $PATH dir
+    // becomes a plugin installer — a threat model the hybrid-
+    // authority framing (ADR-021) rules out. Production installs
+    // should use `~/.local/bin` (0o755) or `/usr/local/bin` (0o755);
+    // only pathologically misconfigured dirs fail this check.
+    if is_world_writable(dir) {
+        results.push(Err(DiscoveryError::WorldWritableDir {
+            path: dir.to_path_buf(),
+        }));
+        return;
+    }
+
+    // Read directory entries; skip silently on I/O error (non-existent
+    // dirs are common in $PATH).
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry_result in entries {
+        let Ok(entry) = entry_result else {
+            continue;
+        };
+
+        // non-UTF-8 names can't match our prefix.
+        let Ok(file_name) = entry.file_name().into_string() else {
+            continue;
+        };
+
+        // ── Name filter ───────────────────────────────────────────────────
+        let suffix = match extract_plugin_suffix(&file_name) {
+            Some(s) => s.to_owned(),
+            None => continue,
+        };
+
+        // ── Shadowing: first match wins ───────────────────────────────────
+        // Safe to key on String: non-UTF-8 names were filtered above.
+        if !seen_names.insert(file_name.clone()) {
+            continue;
+        }
+
+        // `exec_path` is the raw PATH-relative path (not canonicalised).
+        // Do not canonicalise here — the neighbour-manifest convention
+        // at `load_plugin` / `find_manifest` looks up `plugin.toml` next
+        // to this path, and a symlink install pattern (e.g. `~/bin/` full
+        // of symlinks into `~/.local/pipx/venvs/*/bin/`) expects the
+        // manifest to live next to the symlink, not next to the resolved
+        // binary in the venv. See the `executable` field doc-comment on
+        // `DiscoveredPlugin` for the full consistency story.
+        let exec_path = dir.join(&file_name);
+
+        // ── Exec-bit check ────────────────────────────────────────────────
+        if !is_executable(&exec_path) {
+            continue;
+        }
+
+        // ── Manifest lookup ───────────────────────────────────────────────
+        results.push(load_plugin(exec_path, &suffix));
+    }
+}
+
 #[cfg(not(unix))]
 pub fn discover_on_path(_path_env: &OsStr) -> Vec<Result<DiscoveredPlugin, DiscoveryError>> {
+    vec![]
+}
+
+#[cfg(not(unix))]
+pub fn discover_on_path_and_exe_dir(
+    _path_env: &OsStr,
+    _exe_dir: Option<&std::path::Path>,
+) -> Vec<Result<DiscoveredPlugin, DiscoveryError>> {
     vec![]
 }
 
@@ -517,6 +570,85 @@ ontology_version = "0.1.0"
             tmp.path()
                 .join("share/clarion/plugins/mocktest/plugin.toml")
         );
+    }
+
+    // ── T2b: current_exe() sibling level (install-prefix, NOT on $PATH) ────────
+
+    #[test]
+    fn t2b_exe_dir_install_prefix_found_when_not_on_path() {
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+
+        make_executable(&bin.join("clarion-plugin-mocktest"));
+        let share = tmp.path().join("share/clarion/plugins/mocktest");
+        fs::create_dir_all(&share).unwrap();
+        fs::write(share.join("plugin.toml"), minimal_manifest_toml("mocktest")).unwrap();
+
+        // $PATH is EMPTY — the plugin is only reachable via the exe dir.
+        let results = discover_on_path_and_exe_dir(std::ffi::OsStr::new(""), Some(bin.as_path()));
+        assert_eq!(results.len(), 1, "exe-dir plugin should be discovered");
+
+        let plugin = results.into_iter().next().unwrap().unwrap();
+        assert_eq!(plugin.manifest.plugin.plugin_id, "mocktest");
+        assert_eq!(
+            plugin.manifest_path,
+            tmp.path()
+                .join("share/clarion/plugins/mocktest/plugin.toml")
+        );
+    }
+
+    #[test]
+    fn t2c_path_entry_shadows_same_named_exe_dir_sibling() {
+        // A plugin on $PATH wins over a same-named sibling next to the binary.
+        let tmp = TempDir::new().unwrap();
+        let path_bin = tmp.path().join("pathbin");
+        let exe_bin = tmp.path().join("exebin");
+        fs::create_dir_all(&path_bin).unwrap();
+        fs::create_dir_all(&exe_bin).unwrap();
+
+        make_executable(&path_bin.join("clarion-plugin-mocktest"));
+        fs::write(
+            path_bin.join("plugin.toml"),
+            minimal_manifest_toml("mocktest"),
+        )
+        .unwrap();
+        make_executable(&exe_bin.join("clarion-plugin-mocktest"));
+        fs::write(
+            exe_bin.join("plugin.toml"),
+            minimal_manifest_toml("mocktest"),
+        )
+        .unwrap();
+
+        let results = discover_on_path_and_exe_dir(&path_os(&[&path_bin]), Some(exe_bin.as_path()));
+        assert_eq!(results.len(), 1, "duplicate name must be de-duplicated");
+        let plugin = results.into_iter().next().unwrap().unwrap();
+        assert_eq!(
+            plugin.executable,
+            path_bin.join("clarion-plugin-mocktest"),
+            "$PATH entry must shadow the exe-dir sibling"
+        );
+    }
+
+    #[test]
+    fn t2d_exe_dir_equal_to_path_dir_is_deduped() {
+        // The exe dir resolving to a dir already on $PATH must not be scanned
+        // twice (seen_dirs gate), so the plugin is reported exactly once.
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        make_executable(&bin.join("clarion-plugin-mocktest"));
+        let share = tmp.path().join("share/clarion/plugins/mocktest");
+        fs::create_dir_all(&share).unwrap();
+        fs::write(share.join("plugin.toml"), minimal_manifest_toml("mocktest")).unwrap();
+
+        let results = discover_on_path_and_exe_dir(&path_os(&[&bin]), Some(bin.as_path()));
+        assert_eq!(
+            results.len(),
+            1,
+            "exe dir == a $PATH dir must be deduped, not double-scanned"
+        );
+        assert!(results.into_iter().next().unwrap().is_ok());
     }
 
     // ── T3: no manifest anywhere → ManifestNotFound ───────────────────────────
