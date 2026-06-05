@@ -11,6 +11,13 @@ use loomweave_core::{
     LlmPurpose, LlmRequest, LlmResponse, OpenRouterProvider, OpenRouterProviderConfig, Recording,
     RecordingProvider, build_inferred_calls_prompt, build_leaf_summary_prompt,
 };
+use loomweave_federation::{
+    loomweave_port::publish_port,
+    loomweave_url::{
+        SOURCE_EPHEMERAL_PORT as LOOMWEAVE_SOURCE_EPHEMERAL_PORT,
+        SOURCE_NONE as LOOMWEAVE_SOURCE_NONE,
+    },
+};
 use loomweave_mcp::{
     DiagnosticsContext, LlmDiagnostics, McpToolPolicy, ServerState,
     config::{FiligreeConfig, LlmConfig, LlmProviderKind},
@@ -4980,6 +4987,37 @@ async fn project_status_filigree_falls_back_to_config_without_port_file() {
     assert_eq!(filigree["resolved_url"], "http://127.0.0.1:8766");
     assert_eq!(filigree["resolution_source"], SOURCE_CONFIG);
     assert_eq!(envelope["result"]["llm"]["live"], true);
+}
+
+#[tokio::test]
+async fn project_status_reports_loomweave_read_api_published_port() {
+    // ADR-044: project_status surfaces the live read-API endpoint resolved from
+    // .loomweave/ephemeral.port (the second in-repo consumer of the resolver,
+    // alongside doctor). No diagnostics context is needed — it resolves the
+    // file at query time from the project root.
+    let (project, db_path) = open_project();
+    publish_port(project.path(), 9412).unwrap();
+
+    let state = state_for(project.path(), &db_path);
+    let envelope = call_tool(&state, "project_status", json!({})).await;
+    let read_api = &envelope["result"]["loomweave_read_api"];
+    assert_eq!(read_api["resolved_url"], "http://127.0.0.1:9412");
+    assert_eq!(
+        read_api["resolution_source"],
+        LOOMWEAVE_SOURCE_EPHEMERAL_PORT
+    );
+}
+
+#[tokio::test]
+async fn project_status_loomweave_read_api_none_without_port_file() {
+    // No published port file → resolution_source is "none" and resolved_url is
+    // null (project_status has no static loomweave URL of its own).
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+    let envelope = call_tool(&state, "project_status", json!({})).await;
+    let read_api = &envelope["result"]["loomweave_read_api"];
+    assert_eq!(read_api["resolved_url"], Value::Null);
+    assert_eq!(read_api["resolution_source"], LOOMWEAVE_SOURCE_NONE);
 }
 
 // ---------------------------------------------------------------------------

@@ -58,6 +58,7 @@ fn install_creates_loomweave_dir_with_expected_contents() {
         "runs/*/log.jsonl",
         "*-wal",
         "*-shm",
+        "ephemeral.port",
     ] {
         assert!(
             gitignore.contains(rule),

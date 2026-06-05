@@ -134,9 +134,15 @@ time today, is the cautionary case (see related follow-up).
 
 **Precedence (highest wins):**
 
-1. An **explicit, deliberate target** — `--loomweave-url` flag or environment
-   override — always wins. The published port must never override a target the
-   operator set on purpose (remote loomweave, debugging a specific instance).
+1. An **explicit, deliberate target** — a `--loomweave-url` flag the operator
+   *types* or an environment override they set — always wins. The published port
+   must never override a target the operator chose on purpose (remote loomweave,
+   debugging a specific instance). Provenance, not flag spelling, is what makes a
+   value level 1: an **installer-seeded `--loomweave-url` baked into `.mcp.json`**
+   (e.g. the deterministic URL `loomweave install` stamps into Wardline's MCP
+   args) is **not** an operator's deliberate choice — it is config-tier
+   (precedence 3), so the published file overrides it and self-heals when an
+   ephemeral fallback fired.
 2. The **published port file** `.loomweave/ephemeral.port` (composed to
    `http://127.0.0.1:<port>`). This **beats a stale/default configured URL** so
    resolution self-heals without a config edit.
@@ -202,3 +208,8 @@ static config URL at scan time, so its filigree leg carries the same latent
 staleness this ADR removes for the loomweave leg. Unifying both consumers on
 consume-time resolution is Wardline-side work, tracked separately; flagged here
 so the two legs are not designed divergently.
+
+- Wardline should treat install-seeded MCP args (the `--loomweave-url` baked into
+  `.mcp.json` by `loomweave install`) as config-tier and resolve consume-time, so
+  the published `.loomweave/ephemeral.port` file wins over the baked deterministic
+  URL when an ephemeral fallback fired. Tracked clarion-7f574bc34f.

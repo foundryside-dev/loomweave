@@ -283,6 +283,7 @@ impl ServerState {
             },
             "llm": self.llm_diagnostics_json(),
             "filigree": self.filigree_diagnostics_json(),
+            "loomweave_read_api": self.loomweave_read_api_json(),
         });
 
         Ok(success_envelope(result))
@@ -352,6 +353,19 @@ impl ServerState {
             }),
             None => Value::Null,
         }
+    }
+
+    /// ADR-044: report the live read-API endpoint resolved from
+    /// `.loomweave/ephemeral.port` (the reference reader; `doctor` reports the
+    /// same). Pass `None` config — `project_status` has no static loomweave URL
+    /// of its own; this surfaces whether serve is currently publishing.
+    pub(crate) fn loomweave_read_api_json(&self) -> Value {
+        let resolution =
+            loomweave_federation::loomweave_url::resolve_loomweave_url(None, &self.project_root);
+        json!({
+            "resolved_url": resolution.resolved_url,
+            "resolution_source": resolution.source,
+        })
     }
 
     pub(crate) async fn read_issues_for_entities(

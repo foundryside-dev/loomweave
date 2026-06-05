@@ -83,7 +83,12 @@ serve:
 const GITIGNORE_CONTENTS: &str = "\
 # Loomweave .gitignore — ADR-005 tracked-vs-excluded list.
 # Tracked (committed): loomweave.db, config.json, .gitignore itself.
-# Excluded (ignored): WAL sidecars, shadow DB, per-run logs, tmp scratch.
+# Excluded (ignored): WAL sidecars, shadow DB, per-run logs, tmp scratch,
+#   the read-API live port discovery file.
+
+# Read-API live port discovery file (ADR-044): present only while serve runs,
+# rewritten per bind, loopback-only — a runtime artifact, never committed.
+ephemeral.port
 
 # SQLite write-ahead files never belong in the repo.
 *-wal
