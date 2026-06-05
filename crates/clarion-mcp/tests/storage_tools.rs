@@ -199,10 +199,10 @@ fn insert_entity(
     let content_hash = fixture_content_hash(kind, source_path, range);
     conn.execute(
         "INSERT INTO entities (
-            id, plugin_id, kind, name, short_name, parent_id, source_file_path,
+            id, plugin_id, kind, name, short_name, parent_id, source_file_id, source_file_path,
             source_line_start, source_line_end, properties, content_hash, created_at, updated_at
          ) VALUES (
-            ?1, 'python', ?2, ?1, ?1, ?3, ?4, ?5, ?6, '{}', ?7,
+            ?1, 'python', ?2, ?1, ?1, ?3, ?4, ?5, ?6, ?7, '{}', ?8,
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          )",
@@ -210,6 +210,10 @@ fn insert_entity(
             id,
             kind,
             parent_id,
+            format!(
+                "core:file:{}",
+                source_path.file_name().unwrap().to_string_lossy()
+            ),
             source_path.display().to_string(),
             range.map(|(start, _)| start),
             range.map(|(_, end)| end),
@@ -234,10 +238,10 @@ fn insert_entity_with_properties(
     let content_hash = fixture_content_hash(kind, source_path, range);
     conn.execute(
         "INSERT INTO entities (
-            id, plugin_id, kind, name, short_name, parent_id, source_file_path,
+            id, plugin_id, kind, name, short_name, parent_id, source_file_id, source_file_path,
             source_line_start, source_line_end, properties, content_hash, created_at, updated_at
          ) VALUES (
-            ?1, 'python', ?2, ?1, ?1, ?3, ?4, ?5, ?6, ?8, ?7,
+            ?1, 'python', ?2, ?1, ?1, ?3, ?4, ?5, ?6, ?7, ?9, ?8,
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          )",
@@ -245,6 +249,10 @@ fn insert_entity_with_properties(
             id,
             kind,
             parent_id,
+            format!(
+                "core:file:{}",
+                source_path.file_name().unwrap().to_string_lossy()
+            ),
             source_path.display().to_string(),
             range.map(|(start, _)| start),
             range.map(|(_, end)| end),
@@ -2953,6 +2961,43 @@ async fn source_for_entity_reports_drift_instead_of_stale_snippet() {
     assert!(resp["result"]["drift"]["current_content_hash"].is_string());
     // No source lines are handed back when the snippet would be stale.
     assert!(resp["result"].get("lines").is_none());
+}
+
+#[tokio::test]
+async fn source_for_entity_reports_context_drift_before_returning_context() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    // Keep demo.mid's indexed span (lines 4-5) unchanged, but mutate a
+    // requested context line. The entity span hash still matches, so this
+    // specifically exercises the source-file hash guard that covers context.
+    std::fs::write(
+        project.path().join("demo.py"),
+        "def entry():
+    return mid()
+API_TOKEN = 'SECRET_CONTEXT_DRIFT'
+def mid():
+    return target()
+
+def target():
+    return 1
+",
+    )
+    .expect("rewrite source context");
+
+    let resp = call_tool(
+        &state,
+        "source_for_entity",
+        json!({"id": "python:function:demo.mid", "context_lines": 1}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp:?}");
+    assert_eq!(resp["result"]["source_status"], "drifted");
+    assert!(resp["result"].get("lines").is_none());
+    assert!(
+        !resp.to_string().contains("SECRET_CONTEXT_DRIFT"),
+        "leaked drifted context: {resp}"
+    );
 }
 
 #[tokio::test]

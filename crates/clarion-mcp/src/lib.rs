@@ -19,7 +19,7 @@ use clarion_core::{
     EdgeConfidence, EmbeddingProvider, LlmProvider, LlmProviderError, LlmRequest, LlmResponse,
     McpErrorCode,
 };
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -32,10 +32,10 @@ use clarion_storage::{
     CallEdgeMatch, EntityRow, InferredCallEdgeRecord, InferredEdgeCacheEntry, InferredEdgeCacheKey,
     InferredEdgeWriteStats, ReaderPool, ReferenceDirection, ReferenceEdgeMatch,
     RolledUpReferenceEdge, StorageError, SummaryCacheEntry, SummaryCacheKey, UnresolvedCallSiteRow,
-    WriterCmd, call_edges_from, call_edges_targeting, containing_module_id, entity_by_id,
-    import_edges_for_entity, inferred_edge_cache_key_id, module_reference_rollup,
-    reference_edges_for_entity, sei_for_locator, unresolved_call_sites_for_caller,
-    unresolved_callers_for_target,
+    WriterCmd, call_edges_from, call_edges_targeting, containing_module_id,
+    entity_briefing_block_reason, entity_by_id, import_edges_for_entity,
+    inferred_edge_cache_key_id, module_reference_rollup, reference_edges_for_entity,
+    sei_for_locator, unresolved_call_sites_for_caller, unresolved_callers_for_target,
 };
 
 use crate::config::{LlmConfig, SemanticSearchConfig};
@@ -3117,10 +3117,7 @@ fn summary_briefing_blocked(entity_json: &Value, reason: &str) -> Value {
 }
 
 fn briefing_block_reason(entity: &EntityRow) -> Option<String> {
-    entity_properties_json(entity)
-        .get("briefing_blocked")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
+    entity_briefing_block_reason(&entity.properties_json)
 }
 
 fn tool_json_rpc_response(id: &Value, envelope: &Value) -> Value {
@@ -3945,6 +3942,20 @@ fn source_for_entity_json(
     let Some(path) = entity.source_file_path.as_deref() else {
         return json!({"entity": identity, "source_status": "no_source_path"});
     };
+
+    let source_anchor = source_anchor_for_entity(conn, entity, path);
+    if let Some(reason) = source_anchor
+        .as_ref()
+        .and_then(|anchor| anchor.briefing_blocked.as_deref())
+    {
+        return json!({
+            "entity": identity,
+            "source_file_path": path,
+            "source_status": "briefing_blocked",
+            "briefing_blocked": reason
+        });
+    }
+
     let (Some(start_line), Some(end_line)) = (entity.source_line_start, entity.source_line_end)
     else {
         return json!({
@@ -3986,13 +3997,33 @@ fn source_for_entity_json(
         });
     }
 
+    let (emitted_context_lines, context_omitted_reason) =
+        match guard_source_context(entity, context_lines, source_anchor.as_ref(), &bytes) {
+            SourceContextGuard::Emit(lines) => (lines, None),
+            SourceContextGuard::Omit(reason) => (0, Some(reason)),
+            SourceContextGuard::Drift {
+                stored_content_hash,
+                current_content_hash,
+            } => {
+                return json!({
+                    "entity": identity,
+                    "source_file_path": path,
+                    "source_status": "drifted",
+                    "drift": {
+                        "stored_content_hash": stored_content_hash,
+                        "current_content_hash": current_content_hash
+                    }
+                });
+            }
+        };
+
     let lines: Vec<&str> = source.lines().collect();
     let total = i64::try_from(lines.len()).unwrap_or(i64::MAX);
     // Clamp the span to the file, then widen by the context window. 1-based,
     // inclusive on both ends.
     let span_start = start_line.max(1);
     let span_end = end_line.min(total).max(span_start);
-    let ctx = i64::try_from(context_lines).unwrap_or(i64::MAX);
+    let ctx = i64::try_from(emitted_context_lines).unwrap_or(i64::MAX);
     let window_start = (span_start - ctx).max(1);
     let window_end = (span_end + ctx).min(total);
 
@@ -4020,12 +4051,93 @@ fn source_for_entity_json(
         "source_status": "ok",
         "line_start": span_start,
         "line_end": span_end,
-        "context_lines": context_lines,
+        "context_lines": emitted_context_lines,
+        "requested_context_lines": context_lines,
+        "context_omitted_reason": context_omitted_reason,
         "window_start": window_start,
         "window_end": window_end,
         "lines": emitted,
         "truncated": truncated
     })
+}
+
+enum SourceContextGuard {
+    Emit(usize),
+    Omit(&'static str),
+    Drift {
+        stored_content_hash: String,
+        current_content_hash: String,
+    },
+}
+
+fn guard_source_context(
+    entity: &EntityRow,
+    context_lines: usize,
+    source_anchor: Option<&SourceAnchorGuard>,
+    bytes: &[u8],
+) -> SourceContextGuard {
+    // Non-file-scope entities store a span hash, but context lines are outside
+    // that span. Only return caller-requested context when we can verify the
+    // enclosing source-file hash; otherwise emit the exact entity span only.
+    if context_lines == 0 || is_plugin_file_scope_entity(entity) {
+        return SourceContextGuard::Emit(context_lines);
+    }
+    let Some(stored_file_hash) = source_anchor.and_then(|anchor| anchor.content_hash.as_deref())
+    else {
+        return SourceContextGuard::Omit("unverified_context");
+    };
+    let current_file_hash = blake3::hash(bytes).to_hex().to_string();
+    if stored_file_hash == current_file_hash {
+        SourceContextGuard::Emit(context_lines)
+    } else {
+        SourceContextGuard::Drift {
+            stored_content_hash: stored_file_hash.to_owned(),
+            current_content_hash: current_file_hash,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SourceAnchorGuard {
+    content_hash: Option<String>,
+    briefing_blocked: Option<String>,
+}
+
+fn source_anchor_for_entity(
+    conn: &rusqlite::Connection,
+    entity: &EntityRow,
+    source_file_path: &str,
+) -> Option<SourceAnchorGuard> {
+    if let Some(source_file_id) = entity.source_file_id.as_deref()
+        && source_file_id != entity.id
+        && let Ok(Some(anchor)) = entity_by_id(conn, source_file_id)
+    {
+        let briefing_blocked = briefing_block_reason(&anchor);
+        return Some(SourceAnchorGuard {
+            content_hash: anchor.content_hash,
+            briefing_blocked,
+        });
+    }
+
+    conn.query_row(
+        "SELECT properties, content_hash \
+         FROM entities \
+         WHERE source_file_path = ?1 AND kind = 'file' \
+         ORDER BY CASE plugin_id WHEN 'core' THEN 0 ELSE 1 END, id ASC \
+         LIMIT 1",
+        [source_file_path],
+        |row| {
+            let properties_json: String = row.get(0)?;
+            let content_hash: Option<String> = row.get(1)?;
+            Ok(SourceAnchorGuard {
+                content_hash,
+                briefing_blocked: entity_briefing_block_reason(&properties_json),
+            })
+        },
+    )
+    .optional()
+    .ok()
+    .flatten()
 }
 
 fn verified_source_excerpt(entity: &EntityRow) -> Result<String, SourceExcerptError> {
