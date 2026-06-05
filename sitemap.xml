@@ -1,27 +1,27 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
-         <loc>https://clarion.foundryside.dev/</loc>
+         <loc>https://loomweave.foundryside.dev/</loc>
          <lastmod>2026-06-05</lastmod>
     </url>
     <url>
-         <loc>https://clarion.foundryside.dev/getting-started/</loc>
+         <loc>https://loomweave.foundryside.dev/getting-started/</loc>
          <lastmod>2026-06-05</lastmod>
     </url>
     <url>
-         <loc>https://clarion.foundryside.dev/concepts/entity-model/</loc>
+         <loc>https://loomweave.foundryside.dev/concepts/entity-model/</loc>
          <lastmod>2026-06-05</lastmod>
     </url>
     <url>
-         <loc>https://clarion.foundryside.dev/concepts/mcp-tools/</loc>
+         <loc>https://loomweave.foundryside.dev/concepts/mcp-tools/</loc>
          <lastmod>2026-06-05</lastmod>
     </url>
     <url>
-         <loc>https://clarion.foundryside.dev/reference/cli/</loc>
+         <loc>https://loomweave.foundryside.dev/reference/cli/</loc>
          <lastmod>2026-06-05</lastmod>
     </url>
     <url>
-         <loc>https://clarion.foundryside.dev/reference/mcp-tools/</loc>
+         <loc>https://loomweave.foundryside.dev/reference/mcp-tools/</loc>
          <lastmod>2026-06-05</lastmod>
     </url>
 </urlset>
