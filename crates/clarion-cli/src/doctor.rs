@@ -327,11 +327,31 @@ fn check_mcp_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
         McpState::Unparseable => {
             DoctorJsonCheck::problem("mcp.registration", ".mcp.json is not parseable JSON")
         }
+        McpState::UntrustedCommand => {
+            let cmd = mcp_registration::clarion_entry_command(project_root)
+                .unwrap_or_else(|| "<unknown>".to_owned());
+            let what = format!(
+                ".mcp.json clarion entry uses an unrecognized command {cmd:?} (not the clarion \
+                 executable); doctor will not auto-replace it"
+            );
+            if !fix {
+                return DoctorJsonCheck::problem("mcp.registration", what);
+            }
+            // `--fix` repairs args but never the command; the entry stays
+            // UntrustedCommand and is surfaced as an advisory warning.
+            let _ = mcp_registration::install_mcp_entry(project_root);
+            DoctorJsonCheck::warning(
+                "mcp.registration",
+                format!("{what}; left the command in place for you to review"),
+            )
+        }
         state => {
             let what = match state {
                 McpState::Missing => ".mcp.json has no clarion serve entry",
                 McpState::Stale => ".mcp.json clarion entry is stale or not runtime-discovered",
-                McpState::Present | McpState::Unparseable => unreachable!(),
+                McpState::Present | McpState::Unparseable | McpState::UntrustedCommand => {
+                    unreachable!()
+                }
             };
             if !fix {
                 return DoctorJsonCheck::problem("mcp.registration", what);
@@ -618,11 +638,38 @@ fn check_mcp(project_root: &Path, fix: bool) -> Tally {
             ".mcp.json is not parseable JSON — fix it by hand, then re-run",
             None,
         ),
+        McpState::UntrustedCommand => {
+            let cmd = mcp_registration::clarion_entry_command(project_root)
+                .unwrap_or_else(|| "<unknown>".to_owned());
+            let what = format!(
+                ".mcp.json clarion entry uses an unrecognized command {cmd:?} (not the clarion \
+                 executable); doctor will not auto-replace it"
+            );
+            if !fix {
+                return problem(
+                    &what,
+                    Some(
+                        "if this is a deliberate wrapper, leave it; otherwise set `command` to \
+                         `clarion` or remove the entry — `--fix` will not clobber it",
+                    ),
+                );
+            }
+            // `--fix` corrects args/type/env but never the command, so the entry
+            // stays UntrustedCommand. Warn (advisory) so the operator
+            // adjudicates the wrapper rather than CI silently passing it.
+            let _ = mcp_registration::install_mcp_entry(project_root);
+            warn(
+                &format!("{what}; left the command in place for you to review"),
+                None,
+            )
+        }
         state => {
             let what = match state {
                 McpState::Missing => ".mcp.json has no clarion serve entry",
                 McpState::Stale => ".mcp.json clarion entry is stale or not runtime-discovered",
-                McpState::Present | McpState::Unparseable => unreachable!(),
+                McpState::Present | McpState::Unparseable | McpState::UntrustedCommand => {
+                    unreachable!()
+                }
             };
             if !fix {
                 return problem(

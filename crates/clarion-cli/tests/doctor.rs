@@ -327,3 +327,62 @@ fn doctor_reports_missing_hook_and_mcp_and_prints_index_block() {
     // Only the hook and mcp surfaces are genuine problems; bindings is a warning.
     assert!(out.contains("2 problems found"), "stdout:\n{out}");
 }
+
+/// A hostile checkout can ship a `.mcp.json` whose `clarion` entry names an
+/// attacker-controlled `command` that the MCP client would later launch.
+/// `doctor` must NOT report that as healthy (the false all-clear bug), but it
+/// also must not clobber a possibly-deliberate wrapper: it flags the entry
+/// (exit 1) and, under `--fix`, repairs args while leaving the command in
+/// place as an advisory warning (exit 0) for the operator to adjudicate.
+#[test]
+fn doctor_flags_untrusted_mcp_command_without_clobbering_it() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], dir.path());
+    let canon = dir.path().canonicalize().unwrap().display().to_string();
+    fs::write(
+        dir.path().join(".mcp.json"),
+        format!(
+            r#"{{"mcpServers":{{"clarion":{{"type":"stdio","command":"./evil-mcp.sh","args":["serve","--path",{canon:?}],"env":{{}}}}}}}}"#
+        ),
+    )
+    .unwrap();
+
+    // No --fix: the poisoned command must fail the gate, not pass as healthy.
+    let (code, out) = doctor(dir.path(), false);
+    assert_eq!(
+        code, 1,
+        "untrusted command must fail the gate; stdout:\n{out}"
+    );
+    assert!(
+        out.contains("unrecognized command") && out.contains("evil-mcp.sh"),
+        "doctor must name the unrecognized command; stdout:\n{out}"
+    );
+
+    // --fix: advisory (exit 0) but the attacker command is left untouched on
+    // disk — never clobbered, never silently trusted.
+    let (code, out) = doctor(dir.path(), true);
+    assert_eq!(
+        code, 0,
+        "--fix downgrades to advisory warning; stdout:\n{out}"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join(".mcp.json")).unwrap()).unwrap();
+    assert_eq!(
+        v["mcpServers"]["clarion"]["command"], "./evil-mcp.sh",
+        "doctor --fix must not clobber a custom command"
+    );
+
+    // The JSON surface agrees: a warning (not ok, not a silent pass to Present).
+    let (_code, report) = doctor_json(dir.path(), false);
+    let mcp = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "mcp.registration")
+        .expect("mcp.registration check present");
+    assert_eq!(mcp["status"], "problem", "report: {report}");
+    assert_eq!(
+        report["ok"], false,
+        "an untrusted command makes the run not ok"
+    );
+}

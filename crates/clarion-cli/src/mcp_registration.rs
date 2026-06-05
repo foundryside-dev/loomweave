@@ -11,6 +11,21 @@
 //! current `clarion` executable; an existing entry refreshes stale `clarion`
 //! executable paths and corrects `args` to the runtime-autodiscovery form while
 //! preserving deliberately customised non-Clarion wrapper commands.
+//!
+//! Security posture for the owned `clarion` entry: `.mcp.json` is a
+//! repository-committed file, so a hostile checkout can ship an entry whose
+//! `command` points at an attacker-controlled executable that the MCP client
+//! will later launch. `doctor` must therefore never report a `clarion` entry
+//! whose `command` is not a Clarion executable as healthy — that would be a
+//! false all-clear on a poisoned config. But Clarion also cannot tell a
+//! malicious command from a *deliberate* wrapper binary (a nix/bazel shim, a
+//! sandbox launcher, a pinned absolute path), so it must not silently clobber
+//! one either. The chosen policy is **warn, don't clobber**: an owned entry
+//! whose `command` basename is not `clarion`/`clarion.exe` is classified
+//! [`McpState::UntrustedCommand`], which `doctor` flags (failing the gate
+//! without `--fix`) while leaving the command in place for the operator to
+//! adjudicate. `--fix` still repairs `args`/stale `clarion` paths but never
+//! replaces a non-Clarion command.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -29,9 +44,16 @@ pub enum McpState {
     /// client's current working directory for project discovery.
     Present,
     /// A `clarion` entry exists but is not the runtime-autodiscovery form
-    /// (wrong args, stale executable path, or not a `serve` invocation).
-    /// Repairable in place.
+    /// (wrong args, stale `clarion` executable path, or not a `serve`
+    /// invocation). Repairable in place.
     Stale,
+    /// A `clarion` entry exists whose `command` is not a Clarion executable
+    /// (its basename is not `clarion`/`clarion.exe`). This may be a deliberate
+    /// wrapper binary or a malicious entry shipped in a hostile checkout;
+    /// `doctor` cannot tell them apart, so it flags the entry for operator
+    /// review and never auto-replaces the command. `--fix` still corrects
+    /// `args` but leaves the `command` untouched.
+    UntrustedCommand,
     /// No `.mcp.json`, or it has no `clarion` server entry.
     Missing,
     /// `.mcp.json` exists but is not parseable JSON (or has a non-object shape).
@@ -72,20 +94,33 @@ fn command_string_is_clarion(command: &str) -> bool {
     executable_name_is_clarion(Path::new(command).file_name())
 }
 
-/// True if `entry.args` runs `serve` and does not pin a project path.
+/// True if `entry.args` runs `serve` (no pinned project path) under the current
+/// Clarion executable. A non-Clarion command is handled separately as
+/// [`McpState::UntrustedCommand`] and is never treated as the healthy form.
 fn entry_uses_runtime_project(entry: &Value) -> bool {
     let Some(args) = entry.get("args").and_then(Value::as_array) else {
         return false;
     };
     let strs: Vec<&str> = args.iter().filter_map(Value::as_str).collect();
-    strs == desired_arg_strings() && entry_command_is_current_or_custom(entry)
+    strs == desired_arg_strings() && entry_command_is_current_clarion(entry)
 }
 
-fn entry_command_is_current_or_custom(entry: &Value) -> bool {
-    let Some(command) = entry.get("command").and_then(Value::as_str) else {
-        return false;
-    };
-    !command_string_is_clarion(command) || command == clarion_command()
+/// True if the entry's `command` is the current Clarion executable.
+fn entry_command_is_current_clarion(entry: &Value) -> bool {
+    entry.get("command").and_then(Value::as_str) == Some(clarion_command().as_str())
+}
+
+/// The `command` string of the owned `clarion` entry, if any. Used by `doctor`
+/// to name an unrecognized command in its report.
+#[must_use]
+pub fn clarion_entry_command(project_root: &Path) -> Option<String> {
+    let raw = fs::read_to_string(project_root.join(".mcp.json")).ok()?;
+    let root: Value = serde_json::from_str(&raw).ok()?;
+    root.get("mcpServers")?
+        .get(SERVER_KEY)?
+        .get("command")?
+        .as_str()
+        .map(ToOwned::to_owned)
 }
 
 /// Classify the `.mcp.json` Clarion entry without writing anything.
@@ -111,6 +146,16 @@ pub fn mcp_entry_state(project_root: &Path) -> McpState {
     let Some(entry) = root.get("mcpServers").and_then(|m| m.get(SERVER_KEY)) else {
         return McpState::Missing;
     };
+    // Security: an owned entry whose command is not a Clarion executable is
+    // never reported healthy and never auto-replaced (see module docs). It is
+    // surfaced for operator review regardless of whether its args look right.
+    if entry
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|command| !command_string_is_clarion(command))
+    {
+        return McpState::UntrustedCommand;
+    }
     if entry_uses_runtime_project(entry) {
         McpState::Present
     } else {
@@ -412,10 +457,12 @@ mod tests {
         )
         .unwrap();
 
+        // A non-Clarion command is flagged for review, never silently healthy —
+        // doctor cannot tell a deliberate wrapper from a malicious entry.
         assert_eq!(
             mcp_entry_state(dir.path()),
-            McpState::Stale,
-            "wrong --path is Stale"
+            McpState::UntrustedCommand,
+            "a non-clarion command is UntrustedCommand, regardless of args"
         );
         assert!(install_mcp_entry(dir.path()).unwrap());
 
@@ -424,7 +471,7 @@ mod tests {
                 .unwrap();
         // Sibling untouched.
         assert_eq!(v["mcpServers"]["filigree"]["command"], "/opt/filigree-mcp");
-        // Custom wrapper command PRESERVED, args corrected to runtime autodiscovery.
+        // Custom wrapper command PRESERVED (never clobbered), args corrected.
         assert_eq!(
             v["mcpServers"]["clarion"]["command"], "/custom/bin/clarion-wrapper",
             "a customised wrapper command must be preserved, not clobbered"
@@ -435,7 +482,54 @@ mod tests {
             serde_json::json!(["serve"]),
             "stale --path pin should be removed: {canon}"
         );
-        assert_eq!(mcp_entry_state(dir.path()), McpState::Present);
+        // ...but it stays flagged: --fix repaired args without trusting the
+        // command, so the operator still has to adjudicate the wrapper.
+        assert_eq!(
+            mcp_entry_state(dir.path()),
+            McpState::UntrustedCommand,
+            "preserving the wrapper command keeps the entry flagged, not Present"
+        );
+    }
+
+    #[test]
+    fn untrusted_command_is_flagged_and_never_clobbered() {
+        let dir = tempfile::tempdir().unwrap();
+        // A hostile checkout ships a poisoned command with otherwise-correct
+        // args; the old design reported this Present (false all-clear).
+        let canon = dir.path().canonicalize().unwrap().display().to_string();
+        fs::write(
+            dir.path().join(".mcp.json"),
+            format!(
+                r#"{{"mcpServers":{{"clarion":{{"type":"stdio","command":"./evil-mcp.sh","args":["serve","--path",{canon:?}],"env":{{}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            mcp_entry_state(dir.path()),
+            McpState::UntrustedCommand,
+            "matching args must NOT make an untrusted command healthy"
+        );
+        assert_eq!(
+            super::clarion_entry_command(dir.path()).as_deref(),
+            Some("./evil-mcp.sh")
+        );
+
+        // --fix corrects args but must leave the attacker command in place
+        // (we cannot distinguish it from a deliberate wrapper) — never Present.
+        let _ = install_mcp_entry(dir.path());
+        let v: Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join(".mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            v["mcpServers"]["clarion"]["command"], "./evil-mcp.sh",
+            "doctor must not clobber the command on --fix"
+        );
+        assert_eq!(
+            mcp_entry_state(dir.path()),
+            McpState::UntrustedCommand,
+            "still flagged after --fix; the operator decides"
+        );
     }
 
     #[test]
