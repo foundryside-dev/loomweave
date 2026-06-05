@@ -27,10 +27,7 @@ fn main() -> Result<()> {
     let cli = cli::Cli::parse();
     // Load .env before tracing setup for operator-facing commands so a
     // .env-supplied RUST_LOG is in effect by the time the filter is built.
-    // `analyze` is deliberately excluded: project .env contents are scanned
-    // as source sidecars by the pre-ingest secret scanner and must not be
-    // imported into plugin subprocess environments before that gate runs.
-    if !matches!(&cli.command, cli::Command::Analyze { .. }) {
+    if should_load_dotenv(&cli.command) {
         let _ = dotenvy::dotenv();
     }
     init_tracing();
@@ -117,6 +114,20 @@ fn main() -> Result<()> {
             } => sarif::run_import(&file, scan_source, &path),
         },
     }
+}
+
+fn should_load_dotenv(command: &cli::Command) -> bool {
+    // `analyze`: project .env contents are scanned as source sidecars by the
+    // pre-ingest secret scanner and must not be imported into plugin subprocess
+    // environments before that gate runs.
+    //
+    // `guidance`: authoring can spawn an editor. Loading repository-controlled
+    // .env values first would let a checkout supply VISUAL/EDITOR or other
+    // subprocess-affecting environment and execute code as the operator.
+    !matches!(
+        command,
+        cli::Command::Analyze { .. } | cli::Command::Guidance { .. }
+    )
 }
 
 fn init_tracing() {
