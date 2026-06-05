@@ -75,7 +75,9 @@ serve:
     enable_write_tools: false
   http:
     enabled: false
-    bind: 127.0.0.1:9111
+    # The read-API port is auto-selected per project (deterministic, with an
+    # ephemeral fallback) and published to .loomweave/ephemeral.port while
+    # serving. Set `bind:` explicitly only to pin a fixed port (ADR-044).
 ";
 
 const GITIGNORE_CONTENTS: &str = "\
