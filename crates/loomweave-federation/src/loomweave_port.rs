@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 /// the same number. Internal only — never part of the cross-product file
 /// contract (consumers read the published file, never recompute).
 pub const PORT_BAND_BASE: u16 = 9400;
-/// Width of the band: ports land in `[9400, 10400)` i.e. `9400..=10399`.
+/// Width of the band: ports land in `[PORT_BAND_BASE, PORT_BAND_BASE + PORT_BAND_SPAN)`.
 pub const PORT_BAND_SPAN: u16 = 1000;
 
 /// Canonical path of the published port file for a project root.
@@ -84,7 +84,11 @@ pub fn publish_port(project_root: &Path, port: u16) -> std::io::Result<()> {
     // within this directory without needing a random suffix.
     let tmp = dir.join(format!("ephemeral.port.{}.tmp", std::process::id()));
     std::fs::write(&tmp, format!("{port}\n"))?;
-    std::fs::rename(&tmp, dir.join("ephemeral.port"))?;
+    if let Err(err) = std::fs::rename(&tmp, published_port_path(project_root)) {
+        // A successful write + failed rename would otherwise strand the temp.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
     Ok(())
 }
 
