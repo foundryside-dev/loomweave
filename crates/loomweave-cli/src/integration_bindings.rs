@@ -12,8 +12,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
-const LOOMWEAVE_HTTP_BIND: &str = "127.0.0.1:9111";
-const LOOMWEAVE_HTTP_URL: &str = "http://127.0.0.1:9111";
 const DEFAULT_FILIGREE_BASE_URL: &str = "http://127.0.0.1:8766";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,9 +21,13 @@ pub enum BindingState {
     Unparseable,
 }
 
+// All three fields are URLs by nature; the `_url` suffix is the meaningful part
+// of each name, not redundant noise.
+#[allow(clippy::struct_field_names)]
 struct DesiredBindings {
     filigree_base_url: String,
     wardline_filigree_url: String,
+    loomweave_url: String,
 }
 
 /// Classify the local three-way integration binding files without writing.
@@ -67,9 +69,16 @@ fn desired_bindings(project_root: &Path) -> DesiredBindings {
         "{}/api/weft/scan-results",
         filigree_base_url.trim_end_matches('/')
     );
+    // ADR-044: seed the consumer's static target with this project's
+    // deterministic read-API port. serve binds the same port (barring an
+    // ephemeral fallback), and the published .loomweave/ephemeral.port file
+    // overrides this at runtime once a consumer resolves consume-time.
+    let port = loomweave_federation::loomweave_port::deterministic_port(project_root);
+    let loomweave_url = format!("http://127.0.0.1:{port}");
     DesiredBindings {
         filigree_base_url,
         wardline_filigree_url,
+        loomweave_url,
     }
 }
 
@@ -114,7 +123,6 @@ fn loomweave_yaml_ok(project_root: &Path, desired: &DesiredBindings) -> Result<b
             .and_then(|serve| serve.get("http"))
             .is_some_and(|http| {
                 http.get("enabled").and_then(Value::as_bool) == Some(true)
-                    && http.get("bind").and_then(Value::as_str) == Some(LOOMWEAVE_HTTP_BIND)
                     && http.get("wardline_taint_write").and_then(Value::as_bool) == Some(true)
             }))
 }
@@ -129,7 +137,7 @@ fn wardline_yaml_ok(project_root: &Path, desired: &DesiredBindings) -> Result<bo
         .get("loomweave")
         .and_then(|loomweave| loomweave.get("url"))
         .and_then(Value::as_str)
-        == Some(LOOMWEAVE_HTTP_URL)
+        == Some(desired.loomweave_url.as_str())
         && value
             .get("filigree")
             .and_then(|filigree| filigree.get("url"))
@@ -181,7 +189,6 @@ fn install_loomweave_yaml(project_root: &Path, desired: &DesiredBindings) -> Res
     let serve = ensure_object(root, "serve")?;
     let http = ensure_object(serve, "http")?;
     http.insert("enabled".to_owned(), json!(true));
-    http.insert("bind".to_owned(), json!(LOOMWEAVE_HTTP_BIND));
     http.insert("wardline_taint_write".to_owned(), json!(true));
     write_yaml_if_changed(&path, &value)
 }
@@ -191,7 +198,7 @@ fn install_wardline_yaml(project_root: &Path, desired: &DesiredBindings) -> Resu
     let mut value = read_yaml_value_or_empty(&path)?;
     let root = object_mut(&mut value, &path)?;
     let loomweave = ensure_object(root, "loomweave")?;
-    loomweave.insert("url".to_owned(), json!(LOOMWEAVE_HTTP_URL));
+    loomweave.insert("url".to_owned(), json!(desired.loomweave_url));
     let filigree = ensure_object(root, "filigree")?;
     filigree.insert("url".to_owned(), json!(desired.wardline_filigree_url));
     write_yaml_if_changed(&path, &value)
@@ -246,7 +253,7 @@ fn desired_wardline_args(desired: &DesiredBindings) -> Value {
         "--root",
         ".",
         "--loomweave-url",
-        LOOMWEAVE_HTTP_URL,
+        desired.loomweave_url,
         "--filigree-url",
         desired.wardline_filigree_url
     ])

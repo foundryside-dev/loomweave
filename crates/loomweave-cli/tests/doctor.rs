@@ -211,6 +211,11 @@ fn doctor_fix_repairs_missing_three_way_integration_bindings() {
         "http://127.0.0.1:8749/api/weft/scan-results"
     );
 
+    let expected_port = loomweave_federation::loomweave_port::deterministic_port(
+        &dir.path().canonicalize().unwrap(),
+    );
+    let expected_loomweave_url = format!("http://127.0.0.1:{expected_port}");
+
     let mcp: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dir.path().join(".mcp.json")).unwrap()).unwrap();
     assert_eq!(
@@ -220,7 +225,7 @@ fn doctor_fix_repairs_missing_three_way_integration_bindings() {
             "--root",
             ".",
             "--loomweave-url",
-            "http://127.0.0.1:9111",
+            expected_loomweave_url,
             "--filigree-url",
             "http://127.0.0.1:8749/api/weft/scan-results"
         ])

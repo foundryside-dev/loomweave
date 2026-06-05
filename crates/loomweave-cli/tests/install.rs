@@ -92,14 +92,20 @@ fn install_all_wires_three_way_integration_bindings() {
         loomweave_yaml["serve"]["http"]["enabled"],
         serde_json::json!(true)
     );
-    assert_eq!(loomweave_yaml["serve"]["http"]["bind"], "127.0.0.1:9111");
+    // ADR-044: no fixed bind is written; the port is auto-selected at serve time.
+    assert!(loomweave_yaml["serve"]["http"].get("bind").is_none());
     assert_eq!(
         loomweave_yaml["serve"]["http"]["wardline_taint_write"],
         serde_json::json!(true)
     );
 
+    let expected_port = loomweave_federation::loomweave_port::deterministic_port(
+        &dir.path().canonicalize().unwrap(),
+    );
+    let expected_loomweave_url = format!("http://127.0.0.1:{expected_port}");
+
     let wardline_yaml = read_yaml(&dir.path().join("wardline.yaml"));
-    assert_eq!(wardline_yaml["loomweave"]["url"], "http://127.0.0.1:9111");
+    assert_eq!(wardline_yaml["loomweave"]["url"], expected_loomweave_url);
     assert_eq!(
         wardline_yaml["filigree"]["url"],
         "http://127.0.0.1:8749/api/weft/scan-results"
@@ -114,7 +120,7 @@ fn install_all_wires_three_way_integration_bindings() {
             "--root",
             ".",
             "--loomweave-url",
-            "http://127.0.0.1:9111",
+            expected_loomweave_url,
             "--filigree-url",
             "http://127.0.0.1:8749/api/weft/scan-results"
         ])
