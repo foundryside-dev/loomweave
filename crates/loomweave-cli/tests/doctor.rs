@@ -391,3 +391,27 @@ fn doctor_flags_untrusted_mcp_command_without_clobbering_it() {
         "an untrusted command makes the run not ok"
     );
 }
+
+#[test]
+fn doctor_reports_published_ephemeral_port() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], dir.path());
+    // Simulate a live serve having published its port.
+    let loomweave_dir = dir.path().join(".loomweave");
+    std::fs::create_dir_all(&loomweave_dir).unwrap();
+    std::fs::write(loomweave_dir.join("ephemeral.port"), "9876\n").unwrap();
+
+    let (code, json) = doctor_json(dir.path(), false);
+    assert_eq!(code, 0, "{json}");
+    let http = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "http.config")
+        .expect("http.config check present");
+    assert_eq!(http["status"], "ok");
+    assert!(
+        http["message"].as_str().unwrap_or("").contains("9876"),
+        "http.config should report the published live port: {http}"
+    );
+}

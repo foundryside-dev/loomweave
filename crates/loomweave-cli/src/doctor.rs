@@ -404,16 +404,37 @@ fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
         .and_then(|http| http.get("enabled"))
         .and_then(Value::as_bool)
         == Some(true);
+    if !enabled {
+        return DoctorJsonCheck::warning(
+            "http.config",
+            "HTTP serve config is disabled or incomplete",
+        );
+    }
+    // ADR-044: prefer the live published port over the (now usually absent)
+    // static bind. A running serve publishes .loomweave/ephemeral.port.
+    let resolution = loomweave_federation::loomweave_url::resolve_loomweave_url(None, project_root);
+    if let Some(url) = resolution.resolved_url {
+        return DoctorJsonCheck::ok(
+            "http.config",
+            format!("HTTP read API published on {url} ({})", resolution.source),
+        );
+    }
     let bind = config
         .get("serve")
         .and_then(|serve| serve.get("http"))
         .and_then(|http| http.get("bind"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    if enabled && !bind.trim().is_empty() {
-        DoctorJsonCheck::ok("http.config", format!("HTTP configured on {bind}"))
+    if bind.trim().is_empty() {
+        DoctorJsonCheck::ok(
+            "http.config",
+            "HTTP enabled; read-API port auto-selected and published to .loomweave/ephemeral.port while serving",
+        )
     } else {
-        DoctorJsonCheck::warning("http.config", "HTTP serve config is disabled or incomplete")
+        DoctorJsonCheck::ok(
+            "http.config",
+            format!("HTTP configured on {bind} (auto-published while serving)"),
+        )
     }
 }
 
