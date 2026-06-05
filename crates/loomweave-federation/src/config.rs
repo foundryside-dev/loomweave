@@ -295,6 +295,9 @@ pub struct McpServeConfig {
 #[serde(default)]
 pub struct HttpReadConfig {
     pub enabled: bool,
+    /// Bind address for the HTTP read API. `None` (the default) auto-selects a
+    /// per-project deterministic port on `127.0.0.1` (ADR-044). `Some(addr)` is
+    /// honored verbatim (operator override).
     #[serde(default, deserialize_with = "deserialize_optional_socket_addr")]
     pub bind: Option<SocketAddr>,
     pub allow_non_loopback: bool,
@@ -333,20 +336,15 @@ impl Default for HttpReadConfig {
 }
 
 impl HttpReadConfig {
-    /// # Panics
-    ///
-    /// This function cannot panic in practice: the `.expect` is only reached
-    /// when `is_loopback_bind()` is `false`, which only occurs when
-    /// `self.bind` is `Some(non-loopback addr)`.
     pub fn validate_loopback_trust(&self) -> Result<(), ConfigError> {
         if self.enabled && !self.allow_non_loopback && !self.is_loopback_bind() {
-            return Err(ConfigError::NonLoopbackHttpBind {
-                code: "LMWV-CONFIG-HTTP-NON-LOOPBACK",
-                // Safe: is_loopback_bind() is false only when bind is Some(non-loopback).
-                bind: self
-                    .bind
-                    .expect("non-loopback bind implies an explicit address"),
-            });
+            // is_loopback_bind() is true for None, so reaching here implies Some(non-loopback).
+            if let Some(bind) = self.bind {
+                return Err(ConfigError::NonLoopbackHttpBind {
+                    code: "LMWV-CONFIG-HTTP-NON-LOOPBACK",
+                    bind,
+                });
+            }
         }
         Ok(())
     }
@@ -355,12 +353,6 @@ impl HttpReadConfig {
     /// token env var is unset. Loopback binds with the env var unset stay
     /// unauthenticated (v0.1 trust matrix); the failure case is the explicit
     /// `allow_non_loopback: true` opt-in plus an unset `token_env`.
-    ///
-    /// # Panics
-    ///
-    /// This function cannot panic in practice: the `.expect` is only reached
-    /// when `is_loopback_bind()` is `false`, which only occurs when
-    /// `self.bind` is `Some(non-loopback addr)`.
     pub fn validate_auth_trust<F>(&self, env_lookup: F) -> Result<(), ConfigError>
     where
         F: Fn(&str) -> Option<String>,
@@ -383,7 +375,11 @@ impl HttpReadConfig {
             }
             None => false,
         };
-        if self.is_loopback_bind() {
+        // None (auto-select) always binds 127.0.0.1, so it is loopback.
+        let Some(bind_addr) = self.bind else {
+            return Ok(());
+        };
+        if bind_addr.ip().is_loopback() {
             return Ok(());
         }
         if has_identity_secret {
@@ -397,9 +393,7 @@ impl HttpReadConfig {
         }
         Err(ConfigError::NonLoopbackHttpNoAuth {
             code: "LMWV-CONFIG-HTTP-NO-AUTH",
-            bind: self
-                .bind
-                .expect("non-loopback bind implies an explicit address"),
+            bind: bind_addr,
             token_env: self.token_env.clone(),
         })
     }
@@ -1121,6 +1115,23 @@ serve:
             cfg.serve.http.bind,
             Some(SocketAddr::from(([127, 0, 0, 1], 9412)))
         );
+    }
+
+    #[test]
+    fn http_bind_none_passes_auth_trust_validation() {
+        let cfg = HttpReadConfig {
+            enabled: true,
+            bind: None,
+            ..HttpReadConfig::default()
+        };
+        assert!(cfg.validate_auth_trust(|_| None).is_ok());
+    }
+
+    #[test]
+    fn http_bind_explicit_null_is_treated_as_auto_select() {
+        let cfg = McpConfig::from_yaml_str("serve:\n  http:\n    enabled: true\n    bind: ~\n")
+            .expect("explicit YAML null should parse as auto-select");
+        assert_eq!(cfg.serve.http.bind, None);
     }
 
     #[test]
