@@ -12,7 +12,20 @@ on:
   # The `release` job is gated on event_name == 'push', so workflow_dispatch
   # never publishes a public Release — it only validates that the build/verify
   # plumbing is healthy before a tag push.
+  #
+  # `target_index: testpypi` additionally runs `publish-pypi` against TestPyPI
+  # (the Phase-C8 dry-run). Real PyPI is NEVER reachable via dispatch — it
+  # publishes solely on a pushed `v*` tag. Leave it `none` for a plain
+  # build/verify dry-run.
   workflow_dispatch:
+    inputs:
+      target_index:
+        description: "Publish dry-run target (real PyPI only ever publishes on a pushed v* tag)"
+        type: choice
+        options:
+          - none
+          - testpypi
+        default: none
 
 env:
   CARGO_TERM_COLOR: always
@@ -223,6 +236,57 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  build-wheels:
+    needs: [verify]
+    name: Build loomweave wheel (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    # maturin bin-wheels for PyPI. Matrix mirrors `build-rust` (Linux x86_64 +
+    # macOS aarch64); the Intel-macOS leg stays dropped until those runners
+    # recover (same note as build-rust). Off-matrix platforms fall back to the
+    # cosign-signed GitHub Release tarballs / cargo-binstall.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            manylinux: "2_28"
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            manylinux: auto
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.11"
+
+      - name: build wheel (maturin)
+        # Reads crates/loomweave-cli/pyproject.toml ([tool.maturin] bindings="bin").
+        # On Linux maturin-action runs inside a manylinux_2_28 container so the
+        # wheel is broadly installable (a bare host build tags the runner's glibc).
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist --manifest-path crates/loomweave-cli/Cargo.toml
+
+      - name: smoke-check wheel carries the binary
+        run: |
+          set -euo pipefail
+          WHL=$(ls dist/loomweave-*.whl | head -1)
+          echo "built: $WHL"
+          python -m zipfile -l "$WHL" | grep -E 'data/scripts/loomweave' \
+            || { echo "::error::wheel $WHL missing data/scripts/loomweave"; exit 1; }
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: loomweave-wheel-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
   build-plugin:
     needs: [verify]
     name: Build Python plugin sdist
@@ -242,6 +306,11 @@ jobs:
 
       - name: build sdist
         run: uv run --project plugins/python --extra dev python -m build --sdist --outdir dist plugins/python
+
+      - name: build wheel
+        # Pure-Python wheel (py3-none-any). Published to PyPI alongside the
+        # sdist by `publish-pypi`; the sdist remains the GitHub-Release asset.
+        run: uv build --wheel --project plugins/python --out-dir dist
 
       - name: export locked Python runtime dependencies
         run: |
@@ -281,8 +350,78 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
+            dist/*.whl
           if-no-files-found: error
           retention-days: 7
+
+  publish-pypi:
+    name: Publish to PyPI (plugin first, then loomweave)
+    needs: [build-wheels, build-plugin]
+    runs-on: ubuntu-latest
+    # Real PyPI: ONLY on a pushed v* tag — already gated on the full `verify`
+    # job via build-wheels/build-plugin (`needs: [verify]`). TestPyPI dry-run
+    # (Phase C8): workflow_dispatch with target_index=testpypi. Dispatch can
+    # NEVER reach real PyPI.
+    #
+    # PRECONDITIONS before the first real run (Phase D2 — owner, on pypi.org):
+    #   * Register a Trusted Publisher for BOTH projects (`loomweave` and
+    #     `loomweave-plugin-python`): owner `foundryside-dev`, repo `loomweave`,
+    #     workflow `release.yml`, environment `pypi` (and a `testpypi`
+    #     environment + TestPyPI publishers for the dry-run).
+    #   * Recommended: add required reviewers to the `pypi` environment so the
+    #     upload pauses for a human before going live.
+    # Until then this job fails the OIDC exchange (fail-safe: it cannot
+    # mis-publish, only error).
+    #
+    # Publish order is plugin-first so that by the time `loomweave` is on the
+    # index its `loomweave-plugin-python==<v>` pin already resolves.
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.target_index == 'testpypi')
+    environment: ${{ github.event_name == 'workflow_dispatch' && 'testpypi' || 'pypi' }}
+    permissions:
+      id-token: write
+    steps:
+      - name: download plugin dists
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: loomweave-plugin-python-sdist
+          path: dl-plugin
+
+      - name: stage plugin package dir (wheel + sdist only)
+        run: |
+          set -euo pipefail
+          mkdir -p pkg-plugin
+          cp dl-plugin/*.whl dl-plugin/*.tar.gz pkg-plugin/
+          ls -la pkg-plugin
+
+      - name: publish loomweave-plugin-python (FIRST)
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
+        with:
+          packages-dir: pkg-plugin
+          attestations: true
+          repository-url: ${{ github.event_name == 'workflow_dispatch' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
+
+      - name: download loomweave wheels
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: loomweave-wheel-*
+          path: dl-loomweave
+          merge-multiple: true
+
+      - name: stage loomweave package dir
+        run: |
+          set -euo pipefail
+          mkdir -p pkg-loomweave
+          cp dl-loomweave/*.whl pkg-loomweave/
+          ls -la pkg-loomweave
+
+      - name: publish loomweave (SECOND)
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
+        with:
+          packages-dir: pkg-loomweave
+          attestations: true
+          repository-url: ${{ github.event_name == 'workflow_dispatch' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
 
   release:
     name: Create GitHub Release
