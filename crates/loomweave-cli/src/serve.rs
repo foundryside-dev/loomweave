@@ -5,7 +5,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow};
 use loomweave_core::{
     ApiEmbeddingProvider, ApiEmbeddingProviderConfig, ClaudeCliProvider, ClaudeCliProviderConfig,
     CodexCliProvider, CodexCliProviderConfig, EmbeddingProvider, EmbeddingProviderError,
@@ -19,12 +19,13 @@ use loomweave_storage::{DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, ReaderPool
 
 pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
     let db_path = path.join(".loomweave").join("loomweave.db");
-    ensure!(
-        db_path.exists(),
-        "Loomweave database not found at {}; run `loomweave install --path {}` first",
-        db_path.display(),
-        path.display()
-    );
+    if !db_path.exists() {
+        // No index yet. Rather than exiting 1 — which leaves the MCP client
+        // staring at a server that died at startup with the reason buried in
+        // stderr — serve a degraded stdio session that answers `initialize` and
+        // chirps "run analyze" from every tool call. clarion-ac36f51c2b.
+        return serve_no_index(path, &db_path);
+    }
 
     let project_root = path
         .canonicalize()
@@ -104,6 +105,28 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
         },
     )?;
     supervise_stdio_with_http(stdio, http_server)
+}
+
+/// Serve a degraded MCP stdio session for a project with no index. No HTTP read
+/// API, no LLM / embedding providers, no Filigree client, no `ReaderPool` —
+/// there is no DB to back any of them. The session answers `initialize` and
+/// chirps "run `loomweave install` + `loomweave analyze`" from every tool call,
+/// so the client connects and is told how to recover instead of seeing the
+/// server exit. clarion-ac36f51c2b.
+fn serve_no_index(project_root: &Path, db_path: &Path) -> Result<()> {
+    // Goes to stderr (the CLI's tracing sink) — never stdout, which carries the
+    // MCP protocol — so it lands in the MCP server log without corrupting framing.
+    tracing::warn!(
+        db = %db_path.display(),
+        "Loomweave has no index; serving a degraded MCP session. Run \
+         `loomweave analyze` to build the graph, then reconnect."
+    );
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut reader = BufReader::new(stdin);
+    let mut writer = stdout.lock();
+    loomweave_mcp::serve_stdio_no_index(project_root, &mut reader, &mut writer)
+        .context("serve degraded MCP stdio (no index)")
 }
 
 /// Capture the LLM policy posture for `project_status`. `live` means a provider

@@ -803,6 +803,112 @@ pub fn handle_json_rpc(request: &Value) -> Option<Value> {
     })
 }
 
+/// Actionable chirp for a project with no index. Mirrors the `SessionStart` hook
+/// wording (`hook.rs`) so the operator sees the same "install then analyze"
+/// sequence whether they read it from the shell or from an MCP client. Surfaced
+/// both in the degraded `initialize` instructions and from every degraded
+/// `tools/call` result.
+fn no_index_message(project_root: &Path) -> String {
+    let root = project_root.display();
+    format!(
+        "Loomweave has no index for this project yet \
+({root}/.loomweave/loomweave.db is missing), so the structural graph has not been \
+built and every Loomweave tool is unavailable. Run `loomweave install --path {root}` \
+then `loomweave analyze {root}` in a terminal to extract the entity / edge graph, \
+then reconnect this MCP server."
+    )
+}
+
+/// Degraded-mode orientation for the `initialize` `instructions` field. Distinct
+/// from [`server_instructions`] (the healthy-index orientation) so the normal
+/// path — and its `server_instructions_enumerate_every_tool` guard — is
+/// untouched.
+fn server_instructions_no_index(project_root: &Path) -> String {
+    format!(
+        "⚠ NO INDEX. {}\n\nNormally Loomweave answers \"what calls X\", \"where is X \
+defined\", \"what subsystem is X in\" from a pre-extracted graph instead of grepping \
+the tree — but it needs an index first. `tools/list` still shows the surface; any tool \
+call returns this same instruction until the index exists.",
+        no_index_message(project_root)
+    )
+}
+
+/// The `initialize` result for the degraded no-index server. Advertises `tools`
+/// and `prompts` (the static `loomweave-workflow` prompt works without a DB) but
+/// not `resources` (the `loomweave://context` resource needs the index).
+fn initialize_result_no_index(project_root: &Path) -> Value {
+    json!({
+        "protocolVersion": MCP_PROTOCOL_VERSION,
+        "capabilities": { "tools": {}, "prompts": {} },
+        "serverInfo": {
+            "name": "loomweave",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "instructions": server_instructions_no_index(project_root)
+    })
+}
+
+/// JSON-RPC dispatch for the degraded "no index" stdio server: the project has
+/// no `.loomweave/loomweave.db`, so there is no graph to query. `initialize`
+/// succeeds (the client connects cleanly rather than seeing the server die) and
+/// `tools/call` returns the actionable chirp as a tool result with
+/// `isError: true` — the load-bearing channel, since not every client surfaces
+/// the `initialize` `instructions`. `tools/list` and the static
+/// `loomweave-workflow` prompt answer normally so the surface looks healthy.
+/// clarion-ac36f51c2b.
+#[must_use]
+pub fn handle_json_rpc_no_index(request: &Value, project_root: &Path) -> Option<Value> {
+    if is_json_rpc_notification(request) {
+        return None;
+    }
+    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    let Some(method) = request.get("method").and_then(Value::as_str) else {
+        return Some(error_response(&id, -32600, "invalid request"));
+    };
+
+    Some(match method {
+        "initialize" => result_response(&id, &initialize_result_no_index(project_root)),
+        "tools/list" => result_response(
+            &id,
+            &json!({"tools": list_tools_for_policy(McpToolPolicy::default())}),
+        ),
+        "tools/call" => result_response(
+            &id,
+            &json!({
+                "content": [
+                    { "type": "text", "text": no_index_message(project_root) }
+                ],
+                "isError": true
+            }),
+        ),
+        "prompts/list" => result_response(&id, &prompts_list()),
+        "prompts/get" => prompts_get(&id, request.get("params")),
+        _ => error_response(&id, -32601, "method not found"),
+    })
+}
+
+/// Serve a degraded MCP stdio session for a project with no index. Mirrors
+/// [`serve_stdio`] (synchronous — there are no storage-backed async tools to
+/// drive) but routes every request through [`handle_json_rpc_no_index`]. Used by
+/// `loomweave serve` when `.loomweave/loomweave.db` is absent, so the client
+/// connects and is told to run analyze rather than watching the server exit.
+pub fn serve_stdio_no_index(
+    project_root: &Path,
+    reader: &mut impl std::io::BufRead,
+    writer: &mut impl std::io::Write,
+) -> Result<(), McpError> {
+    loop {
+        let Some(frame) = read_stdio_frame(reader)? else {
+            return Ok(());
+        };
+        let framing = frame.framing;
+        let request: Value = serde_json::from_slice(&frame.body)?;
+        if let Some(response) = handle_json_rpc_no_index(&request, project_root) {
+            write_stdio_response(writer, &encode_response_frame(&response)?, framing)?;
+        }
+    }
+}
+
 /// Deterministic, non-storage diagnostics threaded in at server construction so
 /// `project_status` can report the LLM policy and the resolved Filigree
 /// endpoint without re-reading config or re-running URL resolution. Optional:
@@ -4954,6 +5060,92 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    #[test]
+    fn no_index_initialize_chirps_install_and_analyze() {
+        let root = std::path::Path::new("/tmp/demo");
+        let request = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"});
+        let response =
+            super::handle_json_rpc_no_index(&request, root).expect("initialize yields a response");
+        assert_eq!(
+            response["result"]["protocolVersion"],
+            super::MCP_PROTOCOL_VERSION
+        );
+        assert_eq!(response["result"]["serverInfo"]["name"], "loomweave");
+        assert!(response["result"]["capabilities"]["tools"].is_object());
+        let instructions = response["result"]["instructions"]
+            .as_str()
+            .expect("instructions present");
+        // Both halves of the canonical hook sequence, plus the project path.
+        assert!(
+            instructions.contains("loomweave install --path /tmp/demo"),
+            "instructions: {instructions}"
+        );
+        assert!(
+            instructions.contains("loomweave analyze /tmp/demo"),
+            "instructions: {instructions}"
+        );
+    }
+
+    #[test]
+    fn no_index_tools_call_returns_actionable_is_error() {
+        let root = std::path::Path::new("/tmp/demo");
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "entity_find", "arguments": {"query": "foo"}}
+        });
+        let response = super::handle_json_rpc_no_index(&request, root).expect("response");
+        // isError is the load-bearing chirp channel — fires the moment the agent
+        // touches any tool, regardless of whether the client surfaced instructions.
+        assert_eq!(response["result"]["isError"], serde_json::json!(true));
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        assert!(
+            text.contains("loomweave analyze /tmp/demo"),
+            "tool chirp text: {text}"
+        );
+    }
+
+    #[test]
+    fn no_index_tools_list_still_advertises_tools() {
+        let root = std::path::Path::new("/tmp/demo");
+        let request = serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"});
+        let response = super::handle_json_rpc_no_index(&request, root).expect("response");
+        let tools = response["result"]["tools"].as_array().expect("tools array");
+        assert!(
+            !tools.is_empty(),
+            "degraded tools/list should still advertise the surface"
+        );
+    }
+
+    #[test]
+    fn no_index_ignores_notifications() {
+        let root = std::path::Path::new("/tmp/demo");
+        // The client sends notifications/initialized right after initialize; it
+        // has no id and must draw no response.
+        let request = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        assert!(super::handle_json_rpc_no_index(&request, root).is_none());
+    }
+
+    #[test]
+    fn serve_stdio_no_index_round_trips_initialize_over_json_line() {
+        let root = std::path::Path::new("/tmp/demo");
+        let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n";
+        let mut reader = std::io::BufReader::new(&input[..]);
+        let mut output = Vec::new();
+        super::serve_stdio_no_index(root, &mut reader, &mut output).expect("degraded serve");
+        let response: serde_json::Value = serde_json::from_slice(&output).expect("framed json");
+        let instructions = response["result"]["instructions"]
+            .as_str()
+            .expect("instructions present");
+        assert!(
+            instructions.contains("loomweave analyze /tmp/demo"),
+            "instructions: {instructions}"
+        );
     }
 
     #[test]
