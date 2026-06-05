@@ -2,31 +2,31 @@
 
 **Date:** 2026-06-02
 **Use:** Drop the fenced prompt below into an agent to plan and execute **Wave 2** (WS4 dossier
-participation + the deferred incremental-analysis skip) of the Clarion first-class program.
+participation + the deferred incremental-analysis skip) of the Loomweave first-class program.
 This is the wave that **closes core paradise**.
-**Gate:** Gated on Clarion's own WS1 (SEI authority) + WS2 (HTTP linkages) — **both internal,
+**Gate:** Gated on Loomweave's own WS1 (SEI authority) + WS2 (HTTP linkages) — **both internal,
 no sibling wait.** The prompt forces a confirm-or-stop gate check first.
-**Source of truth:** `docs/superpowers/plans/2026-06-02-clarion-integrated-delivery-plan.md`
+**Source of truth:** `docs/superpowers/plans/2026-06-02-loomweave-integrated-delivery-plan.md`
 Phase 3 (T3.1 incremental, T3.2 dossier participation);
-`docs/superpowers/specs/2026-06-02-clarion-first-class-program-design.md` §4 (Wave 2) + D3.
+`docs/superpowers/specs/2026-06-02-loomweave-first-class-program-design.md` §4 (Wave 2) + D3.
 **Companion:** [`2026-06-02-wave-1-execution.md`](./2026-06-02-wave-1-execution.md) (the prerequisite wave).
 
 ---
 
 ```
-You are implementing **Wave 2** of the Clarion "road to first-class" program, in the
-Clarion repo at /home/john/clarion. Wave 2 closes the suite's CORE PARADISE: when it lands,
+You are implementing **Wave 2** of the Loomweave "road to first-class" program, in the
+Loomweave repo at /home/john/loomweave. Wave 2 closes the suite's CORE PARADISE: when it lands,
 `dossier(entity)` returns a complete, freshness-stamped, SEI-keyed view of a function that
 stays correct after the function is renamed. Your job is to PLAN and EXECUTE it — real code,
 real tests, all CI gates green.
 
-Two workstreams, and a crucial framing: **Clarion does NOT build the dossier.** The dossier
-is assembled by the consumer (Wardline). Clarion's job in Wave 2 is to (a) guarantee every
+Two workstreams, and a crucial framing: **Loomweave does NOT build the dossier.** The dossier
+is assembled by the consumer (Wardline). Loomweave's job in Wave 2 is to (a) guarantee every
 slice the assembler needs is reachable over HTTP and pin that contract, and (b) ship the
 incremental-analysis skip that was deferred from Wave 1.
 
 ## ⛔ GATE CHECK — do this FIRST
-Confirm BOTH before building (both are internal Clarion gates — no SEI lock, no sibling):
+Confirm BOTH before building (both are internal Loomweave gates — no SEI lock, no sibling):
 1. **Wave 1 (WS1 SEI authority) is complete and merged.** `resolve`/`resolve_sei` are live,
    every alive entity has an `alive` `sei_bindings` row, the conformance oracle passes.
 2. **Wave 0 (WS2 HTTP linkages + WS3 prior-index) is complete and merged.** `callers`/
@@ -34,21 +34,21 @@ Confirm BOTH before building (both are internal Clarion gates — no SEI lock, n
    Verify in the code, not just the plan. If either is missing, STOP and ask the owner.
 
 ## Read these first (authoritative, in order)
-1. docs/superpowers/specs/2026-06-02-clarion-first-class-program-design.md — §4 (Wave 2),
+1. docs/superpowers/specs/2026-06-02-loomweave-first-class-program-design.md — §4 (Wave 2),
    the §5 invariants, and decision D3 (why incremental-skip lands here, not in Wave 1).
-2. docs/superpowers/plans/2026-06-02-clarion-integrated-delivery-plan.md — Phase 3, tasks
+2. docs/superpowers/plans/2026-06-02-loomweave-integrated-delivery-plan.md — Phase 3, tasks
    **T3.1 (incremental analysis)** and **T3.2 (dossier participation)**.
-3. /home/john/wardline/docs/superpowers/specs/2026-06-01-wardline-loom-entity-dossier-design.md
-   — the dossier the assembler builds. Read it to know EXACTLY which Clarion surfaces it
+3. /home/john/wardline/docs/superpowers/specs/2026-06-01-wardline-weft-entity-dossier-design.md
+   — the dossier the assembler builds. Read it to know EXACTLY which Loomweave surfaces it
    calls and what shape it expects back. You are serving this consumer, not replacing it.
-4. docs/clarion/adr/ADR-038-sei-token-and-signature.md — the SEI shape (already implemented
+4. docs/loomweave/adr/ADR-038-sei-token-and-signature.md — the SEI shape (already implemented
    in Wave 1; do not re-decide).
 5. CLAUDE.md — CI gates, ADR immutability, Filigree workflow.
 
 ## Scope — two workstreams
 ### WS4 — dossier participation (plan T3.2) — mostly a contract, not heavy code
-- Write the participation spec `docs/superpowers/specs/2026-06-02-clarion-dossier-participation.md`
-  naming the EXACT Clarion surface the dossier assembler calls and what it returns:
+- Write the participation spec `docs/superpowers/specs/2026-06-02-loomweave-dossier-participation.md`
+  naming the EXACT Loomweave surface the dossier assembler calls and what it returns:
   `resolve(locator)` → SEI + two-axis freshness; `callers`/`callees` over HTTP (structural
   linkages); file context (`GET /api/v1/files/...`); Filigree associations (open work).
 - **Verify the whole surface is reachable over HTTP.** The assembler is an HTTP client (e.g.
@@ -75,9 +75,9 @@ Confirm BOTH before building (both are internal Clarion gates — no SEI lock, n
   and are NOT orphaned.
 
 ## Hard boundaries — do NOT
-- Do NOT build the dossier assembler or a Clarion-owned dossier envelope. Clarion contributes
+- Do NOT build the dossier assembler or a Loomweave-owned dossier envelope. Loomweave contributes
   its slice; the consumer (Wardline) composes. Do NOT aggregate Wardline taint facts or
-  Filigree issues into a Clarion object — Clarion serves, it does not assemble.
+  Filigree issues into a Loomweave object — Loomweave serves, it does not assemble.
 - Do NOT re-decide ADR-038 or change the SEI shape. Do NOT add an `entities.sei` column.
 - Do NOT edit any Accepted ADR body. Do NOT touch archived docs.
 - Do NOT start the parallel band (WS5 MCP catalogue, WS6 guidance, WS7 multi-language, WS8
@@ -92,7 +92,7 @@ Confirm BOTH before building (both are internal Clarion gates — no SEI lock, n
   warnings, deny). Python gates only if you touch the plugin (you likely will not in Wave 2).
 - Hold the §5 invariants: opt-in (incremental skip must not change semantics, only speed),
   fail-closed (the orphan guard is the no-false-green discipline), enrich-only (the dossier
-  surface is additive; Clarion is not load-bearing for the assembler's own semantics).
+  surface is additive; Loomweave is not load-bearing for the assembler's own semantics).
 
 ## Filigree
 Track per CLAUDE.md (atomic start-work verbs, `--actor` your identity). One issue for WS4 and
@@ -105,7 +105,7 @@ close as you land each.
 - The dossier participation spec is written and every endpoint it depends on is reachable
   over HTTP and pinned in `contracts.md` (or a remaining gap is explicitly surfaced with a
   recommendation).
-- `dossier(entity)` is achievable by the Wardline assembler using only Clarion's HTTP surface
+- `dossier(entity)` is achievable by the Wardline assembler using only Loomweave's HTTP surface
   — demonstrate the full set of calls succeeds against a renamed-function fixture (SEI
   carried, facts not orphaned, freshness stamped).
 - All CI gates green.

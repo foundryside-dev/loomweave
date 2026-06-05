@@ -1,0 +1,53 @@
+[package]
+name = "loomweave-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "loomweave"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+blake3.workspace = true
+clap.workspace = true
+loomweave-core = { path = "../loomweave-core", version = "1.0.0" }
+loomweave-analysis = { path = "../loomweave-analysis", version = "1.0.0" }
+loomweave-federation = { path = "../loomweave-federation", version = "1.0.0" }
+loomweave-mcp = { path = "../loomweave-mcp", version = "1.0.0" }
+loomweave-scanner = { path = "../loomweave-scanner", version = "1.0.0" }
+loomweave-storage = { path = "../loomweave-storage", version = "1.0.0" }
+dotenvy.workspace = true
+fs2.workspace = true
+hmac.workspace = true
+ignore.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_norway.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+time.workspace = true
+toml.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+loomweave-plugin-fixture = { path = "../loomweave-plugin-fixture", version = "1.0.0" }
+rusqlite.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+tempfile.workspace = true

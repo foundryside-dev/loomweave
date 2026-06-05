@@ -2,7 +2,7 @@
 
 **Status**: READY-FOR-IMPLEMENTATION after five-reviewer panel revisions
 **Anchoring design**: inherits [B.4* calls edges](./b4-calls-edges.md) except where this memo says otherwise.
-**Accepted ADRs**: [ADR-026](../../clarion/adr/ADR-026-containment-wire-and-edge-identity.md), [ADR-027](../../clarion/adr/ADR-027-ontology-version-semver.md), [ADR-028](../../clarion/adr/ADR-028-edge-confidence-tiers.md)
+**Accepted ADRs**: [ADR-026](../../loomweave/adr/ADR-026-containment-wire-and-edge-identity.md), [ADR-027](../../loomweave/adr/ADR-027-ontology-version-semver.md), [ADR-028](../../loomweave/adr/ADR-028-edge-confidence-tiers.md)
 **Predecessor**: [B.4* - `calls` edges](./b4-calls-edges.md)
 **Filigree umbrella**: `clarion-b0cedfd2bb`
 
@@ -30,7 +30,7 @@ Changes in scope:
 Out of scope:
 
 - Virtual entities for builtins, stdlib, site-packages, typeshed, or
-  third-party packages. Pyright can resolve `int`, but Clarion has no persisted
+  third-party packages. Pyright can resolve `int`, but Loomweave has no persisted
   target entity for it today.
 - Subclassing: `class B(A)` is future `inherits_from`, not `references`.
 - Decorators: future `decorates`.
@@ -55,7 +55,7 @@ Inherited unchanged:
 
 Required B.5* correction to the live tree:
 
-- `crates/clarion-storage/src/writer.rs` currently lists anchored edge kinds as
+- `crates/loomweave-storage/src/writer.rs` currently lists anchored edge kinds as
   `calls`, `imports`, `decorates`, `inherits_from`. Add `references`, and
   tighten the anchored source-range contract so both endpoints are required,
   not merely one endpoint.
@@ -157,7 +157,7 @@ Traffic envelope:
 Target filter and mapping:
 
 - Persist only targets whose resolved URI is under `project_root` and maps to a
-  known Clarion module, class, or function entity.
+  known Loomweave module, class, or function entity.
 - Pyright definition locations are mapped through a shared entity declaration
   index, not B.4*'s function-only index. The index includes:
   - module entity by source file path;
@@ -212,9 +212,9 @@ Lockstep updates:
 
 - `plugins/python/plugin.toml`: `edge_kinds = ["contains", "calls",
   "references"]`; `ontology_version = "0.5.0"`.
-- `plugins/python/src/clarion_plugin_python/server.py`:
+- `plugins/python/src/loomweave_plugin_python/server.py`:
   `ONTOLOGY_VERSION = "0.5.0"`.
-- `plugins/python/src/clarion_plugin_python/__init__.py` and
+- `plugins/python/src/loomweave_plugin_python/__init__.py` and
   `plugins/python/pyproject.toml`: package `0.1.3 -> 0.1.4`.
 
 ### D6 - Pyright Provisioning And Failure Modes
@@ -225,12 +225,12 @@ Failure behavior:
 
 | Case | Finding / observable | Behavior |
 |---|---|---|
-| pyright unavailable | `CLA-PY-PYRIGHT-UNAVAILABLE` | no calls or references from pyright; site counters record skipped/unresolved sites |
-| pyright install failure | `CLA-PY-PYRIGHT-INSTALL-FAILURE` | same |
-| init timeout | `CLA-PY-PYRIGHT-INIT-TIMEOUT` | same |
-| subprocess crash, restart under cap | `CLA-PY-PYRIGHT-RESTART` | retry future work through restarted session |
-| restart cap exceeded | `CLA-PY-PYRIGHT-POISON-FRAME` | session disabled; both calls and references suppressed for remaining files |
-| per-reference lookup timeout | `CLA-PY-REFERENCE-RESOLUTION-TIMEOUT` | current site skipped; run continues |
+| pyright unavailable | `LMWV-PY-PYRIGHT-UNAVAILABLE` | no calls or references from pyright; site counters record skipped/unresolved sites |
+| pyright install failure | `LMWV-PY-PYRIGHT-INSTALL-FAILURE` | same |
+| init timeout | `LMWV-PY-PYRIGHT-INIT-TIMEOUT` | same |
+| subprocess crash, restart under cap | `LMWV-PY-PYRIGHT-RESTART` | retry future work through restarted session |
+| restart cap exceeded | `LMWV-PY-PYRIGHT-POISON-FRAME` | session disabled; both calls and references suppressed for remaining files |
+| per-reference lookup timeout | `LMWV-PY-REFERENCE-RESOLUTION-TIMEOUT` | current site skipped; run continues |
 
 The same `PyrightSession` disabled state suppresses both call and reference
 resolution. Plugin findings remain resolver/extractor test observables in B.5*;
@@ -274,7 +274,7 @@ Rust `AnalyzeFileStats` grows serde-defaulted fields:
 - existing `pyright_query_latency_ms`, now documented as all pyright LSP query
   latency samples, not only call-hierarchy latency.
 
-`clarion analyze` aggregates these into `runs.stats` with the same names plus
+`loomweave analyze` aggregates these into `runs.stats` with the same names plus
 the existing `pyright_query_latency_p95_ms`.
 
 ## 5. Storage, Host, And Consumer Contracts
@@ -292,7 +292,7 @@ Writer requirements:
 Host requirements:
 
 - Before the manifest bump, a `references` edge is dropped with
-  `CLA-INFRA-PLUGIN-UNDECLARED-EDGE-KIND`.
+  `LMWV-INFRA-PLUGIN-UNDECLARED-EDGE-KIND`.
 - After the manifest bump, `process_edges` accepts `references` exactly as it
   accepts other declared edge kinds.
 
@@ -307,7 +307,7 @@ B.6 consumer handoff:
 
 B.5* adds `MAX_REFERENCE_SITES_PER_FILE` (default 2000). If a file exceeds the
 cap, reference resolution for that file is skipped, `references_skipped_cap_total`
-increments by the skipped site count, and a `CLA-PY-REFERENCE-SITE-CAP` warning
+increments by the skipped site count, and a `LMWV-PY-REFERENCE-SITE-CAP` warning
 is emitted. Calls still run.
 
 B.5 reference scale smoke:
@@ -345,11 +345,11 @@ RED matrix:
 
 | Case | Observable |
 |---|---|
-| `references` before manifest declaration | host finding `CLA-INFRA-PLUGIN-UNDECLARED-EDGE-KIND` |
-| no source range | writer error `CLA-INFRA-EDGE-SOURCE-RANGE-CONTRACT` + `dropped_edges_total += 1` |
+| `references` before manifest declaration | host finding `LMWV-INFRA-PLUGIN-UNDECLARED-EDGE-KIND` |
+| no source range | writer error `LMWV-INFRA-EDGE-SOURCE-RANGE-CONTRACT` + `dropped_edges_total += 1` |
 | start-only range | same |
 | end-only range | same |
-| `confidence=inferred` | writer error `CLA-INFRA-EDGE-CONFIDENCE-CONTRACT` + `dropped_edges_total += 1` |
+| `confidence=inferred` | writer error `LMWV-INFRA-EDGE-CONFIDENCE-CONTRACT` + `dropped_edges_total += 1` |
 | resolved with both endpoints | row persisted, no counters |
 | ambiguous with both endpoints | row persisted, `ambiguous_edges_total += 1` |
 | duplicate logical edge | plugin-level dedup test; writer dedupe behavior remains unchanged |
@@ -394,10 +394,10 @@ RED tests:
   no edge and increment skipped/unresolved stats.
 - duplicate references keep earliest byte range and merge candidates.
 - ambiguous result is deterministic and has full sorted `properties.candidates`.
-- `CLA-PY-PYRIGHT-UNAVAILABLE`, `CLA-PY-PYRIGHT-INSTALL-FAILURE`,
-  `CLA-PY-PYRIGHT-INIT-TIMEOUT`, `CLA-PY-PYRIGHT-RESTART`,
-  `CLA-PY-PYRIGHT-POISON-FRAME`, `CLA-PY-REFERENCE-RESOLUTION-TIMEOUT`,
-  and `CLA-PY-REFERENCE-SITE-CAP` each have a targeted negative test.
+- `LMWV-PY-PYRIGHT-UNAVAILABLE`, `LMWV-PY-PYRIGHT-INSTALL-FAILURE`,
+  `LMWV-PY-PYRIGHT-INIT-TIMEOUT`, `LMWV-PY-PYRIGHT-RESTART`,
+  `LMWV-PY-PYRIGHT-POISON-FRAME`, `LMWV-PY-REFERENCE-RESOLUTION-TIMEOUT`,
+  and `LMWV-PY-REFERENCE-SITE-CAP` each have a targeted negative test.
 
 GREEN: extend `PyrightSession` with `resolve_references(file_path, sites)` and
 the shared entity index. Reuse lifecycle, stderr drain, and restart behavior.

@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship the Sprint 1 walking-skeleton storage foundation — Cargo workspace, full SQLite schema migration, writer-actor with per-N-batch transactions, entity-ID assembler, and `clarion install` + `clarion analyze` CLI skeletons. Plugin spawning is WP2's concern; Sprint 1 WP1 must exit with `runs.status = 'skipped_no_plugins'`.
+**Goal:** Ship the Sprint 1 walking-skeleton storage foundation — Cargo workspace, full SQLite schema migration, writer-actor with per-N-batch transactions, entity-ID assembler, and `loomweave install` + `loomweave analyze` CLI skeletons. Plugin spawning is WP2's concern; Sprint 1 WP1 must exit with `runs.status = 'skipped_no_plugins'`.
 
-**Architecture:** Three-crate Cargo workspace: `clarion-core` (domain types + entity-ID + LlmProvider trait stub), `clarion-storage` (SQLite layer + writer-actor over a bounded tokio mpsc channel per ADR-011), `clarion-cli` (binary). Writer-actor is a `tokio::task` owning the sole write `rusqlite::Connection`; readers come from a `deadpool-sqlite` pool. Full schema from `detailed-design.md §3` ships in migration `0001_initial_schema.sql` even though Sprint 1 only writes `entities` + `runs`. The design pressure is applied now so Sprint 2+ doesn't face data-migration work. **Tooling baseline per ADR-023** lands with Task 1 before any other code — edition 2024, workspace `[lints]` pedantic, rustfmt/clippy configs, cargo-nextest, cargo-deny, GitHub Actions CI — so every subsequent commit passes the strict floor from day one.
+**Architecture:** Three-crate Cargo workspace: `loomweave-core` (domain types + entity-ID + LlmProvider trait stub), `loomweave-storage` (SQLite layer + writer-actor over a bounded tokio mpsc channel per ADR-011), `loomweave-cli` (binary). Writer-actor is a `tokio::task` owning the sole write `rusqlite::Connection`; readers come from a `deadpool-sqlite` pool. Full schema from `detailed-design.md §3` ships in migration `0001_initial_schema.sql` even though Sprint 1 only writes `entities` + `runs`. The design pressure is applied now so Sprint 2+ doesn't face data-migration work. **Tooling baseline per ADR-023** lands with Task 1 before any other code — edition 2024, workspace `[lints]` pedantic, rustfmt/clippy configs, cargo-nextest, cargo-deny, GitHub Actions CI — so every subsequent commit passes the strict floor from day one.
 
 **Tech Stack:** **Rust 2024** stable (ADR-023); workspace `[lints]` with `clippy::pedantic = "warn"` + `unsafe_code = "forbid"`; `rusqlite` (bundled SQLite); `deadpool-sqlite`; `tokio` (rt-multi-thread, macros, sync); `clap` (CLI); `thiserror` (library errors); `anyhow` (binary); `tracing` + `tracing-subscriber`; `assert_cmd` + `tempfile` (CLI integration tests); **`cargo-nextest`** (test runner); **`cargo-deny`** (supply chain); **GitHub Actions** (CI gates).
 
@@ -16,11 +16,11 @@
 - **UQ-WP1-01** rusqlite + bundled SQLite (ADR-011).
 - **UQ-WP1-02** tokio from day one (ADR-011).
 - **UQ-WP1-03** per-command oneshot ack. Commit-counter test hook uses an `Arc<AtomicUsize>` threaded through `Writer::spawn` — keeps the hook path identical in release and test builds; no `#[cfg(test)]` branches in the hot loop.
-- **UQ-WP1-04** `.gitignore` seeded with: `tmp/`, `logs/`, `*.shadow.db`, `*.wal`, `*.shm`, `runs/*/log.jsonl`. Tracked: `clarion.db`, `config.json`, schema history in the DB.
+- **UQ-WP1-04** `.gitignore` seeded with: `tmp/`, `logs/`, `*.shadow.db`, `*.wal`, `*.shm`, `runs/*/log.jsonl`. Tracked: `loomweave.db`, `config.json`, schema history in the DB.
 - **UQ-WP1-05** `runs` row shape matches `detailed-design.md §3:695-701` fully; Sprint 1 inserts NULL/JSON-`{}` for plugin-invocation columns, WP2 fills them.
-- **UQ-WP1-06** `clarion-storage` wraps `rusqlite::Error` in a crate-local `StorageError` via `thiserror`.
+- **UQ-WP1-06** `loomweave-storage` wraps `rusqlite::Error` in a crate-local `StorageError` via `thiserror`.
 - **UQ-WP1-07** assembler rejects any segment containing `:` with an `EntityIdError::SegmentContainsColon` — documents the grammar contract as a type-checked invariant.
-- **UQ-WP1-08** `clarion install` refuses if `.clarion/` exists without `--force`; `--force` is recognised in clap but returns `unimplemented in Sprint 1` at runtime.
+- **UQ-WP1-08** `loomweave install` refuses if `.loomweave/` exists without `--force`; `--force` is recognised in clap but returns `unimplemented in Sprint 1` at runtime.
 - **UQ-WP1-09** **reopened and re-resolved by ADR-023**: Rust **edition 2024**, workspace `[lints]` block with `clippy::pedantic = "warn"` + `unsafe_code = "forbid"`, pinned `rustfmt.toml` + `clippy.toml`, **`cargo-nextest`** as the test runner, **`cargo-deny`** for supply-chain hygiene, **GitHub Actions CI** running fmt-check + pedantic clippy + nextest + cargo-doc + cargo-deny on every PR. `rust-toolchain.toml` pins `stable` + `clippy`/`rustfmt`/`llvm-tools-preview`. The original "fine to document and move on" framing was the tell for unexamined tech debt; adopted at the zero-code frontier where retrofit cost is zero.
 
 **Scope note on entity-ID format:** ADR-003 fixes the 3-segment form as `{plugin_id}:{kind}:{canonical_qualified_name}`. The assembler (Task 2) validates `plugin_id` + `kind` against the ADR-022 grammar (`[a-z][a-z0-9_]*`) and rejects any segment containing `:`. It is **format-agnostic on `canonical_qualified_name`** — that segment's internal shape is the emitting plugin's concern (Python plugin: dotted qualname; core file-discovery: `{hash}@{path}`; etc.). Sprint 1 tests use simplified example strings to exercise concatenation; the plugin-specific shapes are validated by WP3 + the core file-discovery pass post-Sprint-1.
@@ -30,38 +30,38 @@
 ## Task 1: Workspace skeleton + ADR-023 tooling baseline
 
 **Files:**
-- Create: `/home/john/clarion/Cargo.toml` (workspace root, `[workspace.package]`, `[workspace.dependencies]`, `[workspace.lints]`)
-- Create: `/home/john/clarion/rust-toolchain.toml`
-- Create: `/home/john/clarion/rustfmt.toml`
-- Create: `/home/john/clarion/clippy.toml`
-- Create: `/home/john/clarion/deny.toml`
-- Create: `/home/john/clarion/.github/workflows/ci.yml`
-- Create: `/home/john/clarion/.gitignore`
-- Create: `/home/john/clarion/crates/clarion-core/Cargo.toml`
-- Create: `/home/john/clarion/crates/clarion-core/src/lib.rs`
-- Create: `/home/john/clarion/crates/clarion-storage/Cargo.toml`
-- Create: `/home/john/clarion/crates/clarion-storage/src/lib.rs`
-- Create: `/home/john/clarion/crates/clarion-cli/Cargo.toml`
-- Create: `/home/john/clarion/crates/clarion-cli/src/main.rs`
+- Create: `/home/john/loomweave/Cargo.toml` (workspace root, `[workspace.package]`, `[workspace.dependencies]`, `[workspace.lints]`)
+- Create: `/home/john/loomweave/rust-toolchain.toml`
+- Create: `/home/john/loomweave/rustfmt.toml`
+- Create: `/home/john/loomweave/clippy.toml`
+- Create: `/home/john/loomweave/deny.toml`
+- Create: `/home/john/loomweave/.github/workflows/ci.yml`
+- Create: `/home/john/loomweave/.gitignore`
+- Create: `/home/john/loomweave/crates/loomweave-core/Cargo.toml`
+- Create: `/home/john/loomweave/crates/loomweave-core/src/lib.rs`
+- Create: `/home/john/loomweave/crates/loomweave-storage/Cargo.toml`
+- Create: `/home/john/loomweave/crates/loomweave-storage/src/lib.rs`
+- Create: `/home/john/loomweave/crates/loomweave-cli/Cargo.toml`
+- Create: `/home/john/loomweave/crates/loomweave-cli/src/main.rs`
 
 - [ ] **Step 1: Create the workspace root `Cargo.toml`**
 
-Write `/home/john/clarion/Cargo.toml`:
+Write `/home/john/loomweave/Cargo.toml`:
 
 ```toml
 [workspace]
 resolver = "3"
 members = [
-    "crates/clarion-core",
-    "crates/clarion-storage",
-    "crates/clarion-cli",
+    "crates/loomweave-core",
+    "crates/loomweave-storage",
+    "crates/loomweave-cli",
 ]
 
 [workspace.package]
 version = "0.1.0-dev"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/qacona/clarion"
+repository = "https://github.com/qacona/loomweave"
 rust-version = "1.85"
 
 [workspace.lints.rust]
@@ -93,7 +93,7 @@ The `resolver = "3"` value is required for edition 2024. Priority `-1` on `clipp
 
 - [ ] **Step 2: Pin the toolchain**
 
-Write `/home/john/clarion/rust-toolchain.toml`:
+Write `/home/john/loomweave/rust-toolchain.toml`:
 
 ```toml
 [toolchain]
@@ -106,7 +106,7 @@ profile = "minimal"
 
 - [ ] **Step 3: Write `rustfmt.toml`**
 
-Write `/home/john/clarion/rustfmt.toml`:
+Write `/home/john/loomweave/rustfmt.toml`:
 
 ```toml
 edition = "2024"
@@ -118,7 +118,7 @@ use_try_shorthand = true
 
 - [ ] **Step 4: Write `clippy.toml`**
 
-Write `/home/john/clarion/clippy.toml`:
+Write `/home/john/loomweave/clippy.toml`:
 
 ```toml
 cognitive-complexity-threshold = 15
@@ -128,7 +128,7 @@ too-many-lines-threshold = 120
 
 - [ ] **Step 5: Write `deny.toml`**
 
-Write `/home/john/clarion/deny.toml`:
+Write `/home/john/loomweave/deny.toml`:
 
 ```toml
 # deny.toml — cargo-deny v2 schema. Anything not in `allow` is denied.
@@ -165,7 +165,7 @@ allow-git = []
 
 - [ ] **Step 6: Write the GitHub Actions CI workflow**
 
-Write `/home/john/clarion/.github/workflows/ci.yml`:
+Write `/home/john/loomweave/.github/workflows/ci.yml`:
 
 ```yaml
 name: CI
@@ -218,14 +218,14 @@ jobs:
 
 - [ ] **Step 7: Write the repo-root `.gitignore`**
 
-Write `/home/john/clarion/.gitignore`:
+Write `/home/john/loomweave/.gitignore`:
 
 ```
 /target
 **/*.rs.bk
 Cargo.lock.bak
 
-# SQLite working files (project-level .clarion/ is tracked per ADR-005)
+# SQLite working files (project-level .loomweave/ is tracked per ADR-005)
 *.db-journal
 *.db-wal
 
@@ -234,15 +234,15 @@ Cargo.lock.bak
 /.vscode
 ```
 
-Note: we do **not** ignore `*.db` here. `.clarion/clarion.db` is tracked per ADR-005 (authored in Task 5); only write-ahead files are excluded.
+Note: we do **not** ignore `*.db` here. `.loomweave/loomweave.db` is tracked per ADR-005 (authored in Task 5); only write-ahead files are excluded.
 
-- [ ] **Step 8: Write `clarion-core`'s `Cargo.toml` and `lib.rs`**
+- [ ] **Step 8: Write `loomweave-core`'s `Cargo.toml` and `lib.rs`**
 
-Write `/home/john/clarion/crates/clarion-core/Cargo.toml`:
+Write `/home/john/loomweave/crates/loomweave-core/Cargo.toml`:
 
 ```toml
 [package]
-name = "clarion-core"
+name = "loomweave-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -258,22 +258,22 @@ serde_json.workspace = true
 thiserror.workspace = true
 ```
 
-Write `/home/john/clarion/crates/clarion-core/src/lib.rs`:
+Write `/home/john/loomweave/crates/loomweave-core/src/lib.rs`:
 
 ```rust
-//! clarion-core — domain types, identifiers, and provider traits.
+//! loomweave-core — domain types, identifiers, and provider traits.
 //!
 //! This crate is dependency-light and contains no I/O. Storage and CLI
 //! crates depend on it; it depends on neither.
 ```
 
-- [ ] **Step 9: Write `clarion-storage`'s `Cargo.toml` and `lib.rs`**
+- [ ] **Step 9: Write `loomweave-storage`'s `Cargo.toml` and `lib.rs`**
 
-Write `/home/john/clarion/crates/clarion-storage/Cargo.toml`:
+Write `/home/john/loomweave/crates/loomweave-storage/Cargo.toml`:
 
 ```toml
 [package]
-name = "clarion-storage"
+name = "loomweave-storage"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -284,7 +284,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-clarion-core = { path = "../clarion-core" }
+loomweave-core = { path = "../loomweave-core" }
 deadpool-sqlite.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
@@ -297,23 +297,23 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
 ```
 
-Write `/home/john/clarion/crates/clarion-storage/src/lib.rs`:
+Write `/home/john/loomweave/crates/loomweave-storage/src/lib.rs`:
 
 ```rust
-//! clarion-storage — SQLite layer, writer-actor, reader pool.
+//! loomweave-storage — SQLite layer, writer-actor, reader pool.
 //!
 //! All mutations route through the writer actor (a single `tokio::task`
 //! owning the sole write `rusqlite::Connection`). Readers come from a
 //! `deadpool-sqlite` pool. See ADR-011.
 ```
 
-- [ ] **Step 10: Write `clarion-cli`'s `Cargo.toml` and `main.rs`**
+- [ ] **Step 10: Write `loomweave-cli`'s `Cargo.toml` and `main.rs`**
 
-Write `/home/john/clarion/crates/clarion-cli/Cargo.toml`:
+Write `/home/john/loomweave/crates/loomweave-cli/Cargo.toml`:
 
 ```toml
 [package]
-name = "clarion-cli"
+name = "loomweave-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -324,14 +324,14 @@ rust-version.workspace = true
 workspace = true
 
 [[bin]]
-name = "clarion"
+name = "loomweave"
 path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-clarion-core = { path = "../clarion-core" }
-clarion-storage = { path = "../clarion-storage" }
+loomweave-core = { path = "../loomweave-core" }
+loomweave-storage = { path = "../loomweave-storage" }
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -342,16 +342,16 @@ assert_cmd.workspace = true
 tempfile.workspace = true
 ```
 
-Write `/home/john/clarion/crates/clarion-cli/src/main.rs`:
+Write `/home/john/loomweave/crates/loomweave-cli/src/main.rs`:
 
 ```rust
-//! clarion — command-line entry point.
+//! loomweave — command-line entry point.
 //!
 //! Real subcommand implementations land in Tasks 5 and 7. This Task-1
 //! stub exists so the workspace compiles pedantic-clean from day one.
 
 fn main() -> anyhow::Result<()> {
-    eprintln!("clarion: unimplemented (Sprint 1 WP1 scaffold — Task 1)");
+    eprintln!("loomweave: unimplemented (Sprint 1 WP1 scaffold — Task 1)");
     std::process::exit(2);
 }
 ```
@@ -372,12 +372,12 @@ CI installs these via `taiki-e/install-action`; local execution needs them once 
 Run each in sequence. Every one must exit zero before committing:
 
 ```bash
-cd /home/john/clarion && cargo build --workspace
-cd /home/john/clarion && cargo fmt --all -- --check
-cd /home/john/clarion && cargo clippy --workspace --all-targets --all-features -- -D warnings
-cd /home/john/clarion && cargo nextest run --workspace --all-features
-cd /home/john/clarion && cargo doc --workspace --no-deps --all-features
-cd /home/john/clarion && cargo deny check
+cd /home/john/loomweave && cargo build --workspace
+cd /home/john/loomweave && cargo fmt --all -- --check
+cd /home/john/loomweave && cargo clippy --workspace --all-targets --all-features -- -D warnings
+cd /home/john/loomweave && cargo nextest run --workspace --all-features
+cd /home/john/loomweave && cargo doc --workspace --no-deps --all-features
+cd /home/john/loomweave && cargo deny check
 ```
 
 Expected: all six commands exit 0. `cargo nextest run` reports "no tests to run" at this stage (Task 2 lands the first tests). `cargo deny check` may warn about `multiple-versions` if two transitive deps resolve different versions of the same crate — warnings are fine; only errors block.
@@ -387,10 +387,10 @@ If `cargo clippy` fires any pedantic warning (from `clippy::pedantic = "warn"` �
 - [ ] **Step 13: Commit**
 
 ```bash
-cd /home/john/clarion && git add Cargo.toml rust-toolchain.toml rustfmt.toml clippy.toml deny.toml .github/ .gitignore crates/ && git commit -m "$(cat <<'EOF'
+cd /home/john/loomweave && git add Cargo.toml rust-toolchain.toml rustfmt.toml clippy.toml deny.toml .github/ .gitignore crates/ && git commit -m "$(cat <<'EOF'
 feat(wp1): workspace skeleton + ADR-023 tooling baseline
 
-Cargo workspace with clarion-core, clarion-storage, clarion-cli members,
+Cargo workspace with loomweave-core, loomweave-storage, loomweave-cli members,
 edition 2024, resolver 3, workspace [lints] block with clippy::pedantic =
 "warn" + unsafe_code = "forbid" (ADR-023). Every member crate declares
 lints.workspace = true so a later-added crate cannot drift off the floor.
@@ -415,17 +415,17 @@ EOF
 ## Task 2: Entity-ID assembler (L2)
 
 **Files:**
-- Create: `/home/john/clarion/crates/clarion-core/src/entity_id.rs`
-- Modify: `/home/john/clarion/crates/clarion-core/src/lib.rs`
+- Create: `/home/john/loomweave/crates/loomweave-core/src/entity_id.rs`
+- Modify: `/home/john/loomweave/crates/loomweave-core/src/lib.rs`
 
 - [ ] **Step 1: Write the failing unit tests**
 
-Write `/home/john/clarion/crates/clarion-core/src/entity_id.rs`:
+Write `/home/john/loomweave/crates/loomweave-core/src/entity_id.rs`:
 
 ```rust
 //! Entity-ID assembler.
 //!
-//! Per ADR-003 + ADR-022, every Clarion entity has a stable 3-segment ID:
+//! Per ADR-003 + ADR-022, every Loomweave entity has a stable 3-segment ID:
 //! `{plugin_id}:{kind}:{canonical_qualified_name}`.
 //!
 //! - `plugin_id` and `kind` must match the grammar `[a-z][a-z0-9_]*`.
@@ -639,10 +639,10 @@ mod tests {
 }
 ```
 
-Modify `/home/john/clarion/crates/clarion-core/src/lib.rs` to:
+Modify `/home/john/loomweave/crates/loomweave-core/src/lib.rs` to:
 
 ```rust
-//! clarion-core — domain types, identifiers, and provider traits.
+//! loomweave-core — domain types, identifiers, and provider traits.
 //!
 //! This crate is dependency-light and contains no I/O. Storage and CLI
 //! crates depend on it; it depends on neither.
@@ -657,7 +657,7 @@ pub use entity_id::{entity_id, EntityId, EntityIdError};
 The tests above compile and drive the implementation at the same time (the implementation is written alongside, not separately). Run:
 
 ```bash
-cd /home/john/clarion && cargo nextest run -p clarion-core -E 'test(entity_id)'
+cd /home/john/loomweave && cargo nextest run -p loomweave-core -E 'test(entity_id)'
 ```
 
 Expected: all 13 tests pass. If any test fails, the implementation above has a bug — fix the code, not the test.
@@ -665,7 +665,7 @@ Expected: all 13 tests pass. If any test fails, the implementation above has a b
 - [ ] **Step 3: Confirm no clippy warnings**
 
 ```bash
-cd /home/john/clarion && cargo clippy -p clarion-core --all-targets -- -D warnings
+cd /home/john/loomweave && cargo clippy -p loomweave-core --all-targets -- -D warnings
 ```
 
 Expected: no warnings. If clippy complains about unused imports or dead code, address before committing.
@@ -673,7 +673,7 @@ Expected: no warnings. If clippy complains about unused imports or dead code, ad
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/john/clarion && git add crates/clarion-core/ && git commit -m "$(cat <<'EOF'
+cd /home/john/loomweave && git add crates/loomweave-core/ && git commit -m "$(cat <<'EOF'
 feat(wp1): L2 entity-ID assembler per ADR-003 + ADR-022
 
 entity_id() assembles {plugin_id}:{kind}:{canonical_qualified_name} with
@@ -695,22 +695,22 @@ EOF
 ## Task 3: Schema migration file (L1)
 
 **Files:**
-- Create: `/home/john/clarion/crates/clarion-storage/migrations/0001_initial_schema.sql`
-- Create: `/home/john/clarion/crates/clarion-storage/src/error.rs`
-- Create: `/home/john/clarion/crates/clarion-storage/src/schema.rs`
-- Create: `/home/john/clarion/crates/clarion-storage/src/pragma.rs`
-- Modify: `/home/john/clarion/crates/clarion-storage/src/lib.rs`
-- Create: `/home/john/clarion/crates/clarion-storage/tests/schema_apply.rs`
+- Create: `/home/john/loomweave/crates/loomweave-storage/migrations/0001_initial_schema.sql`
+- Create: `/home/john/loomweave/crates/loomweave-storage/src/error.rs`
+- Create: `/home/john/loomweave/crates/loomweave-storage/src/schema.rs`
+- Create: `/home/john/loomweave/crates/loomweave-storage/src/pragma.rs`
+- Modify: `/home/john/loomweave/crates/loomweave-storage/src/lib.rs`
+- Create: `/home/john/loomweave/crates/loomweave-storage/tests/schema_apply.rs`
 
 - [ ] **Step 1: Write the migration SQL**
 
-Write `/home/john/clarion/crates/clarion-storage/migrations/0001_initial_schema.sql`. The SQL below is transcribed directly from `detailed-design.md §3:593-755` plus the migration-framework `schema_migrations` meta table. Do not summarise, abbreviate, or drop anything — the full shape is load-bearing per the L1 lock-in.
+Write `/home/john/loomweave/crates/loomweave-storage/migrations/0001_initial_schema.sql`. The SQL below is transcribed directly from `detailed-design.md §3:593-755` plus the migration-framework `schema_migrations` meta table. Do not summarise, abbreviate, or drop anything — the full shape is load-bearing per the L1 lock-in.
 
 ```sql
 -- ============================================================================
--- Clarion migration 0001 — initial schema.
+-- Loomweave migration 0001 — initial schema.
 --
--- Source: docs/clarion/1.0/detailed-design.md §3 (Storage Implementation).
+-- Source: docs/loomweave/1.0/detailed-design.md §3 (Storage Implementation).
 -- Sprint 1 walking skeleton writes only to `entities` and `runs`, but every
 -- table, FTS5 virtual table, trigger, generated column, index, and view
 -- is created here so the full shape is frozen at L1-lock time. See ADR-011
@@ -911,7 +911,7 @@ COMMIT;
 
 - [ ] **Step 2: Write the `StorageError` type**
 
-Write `/home/john/clarion/crates/clarion-storage/src/error.rs`:
+Write `/home/john/loomweave/crates/loomweave-storage/src/error.rs`:
 
 ```rust
 use thiserror::Error;
@@ -946,7 +946,7 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 
 - [ ] **Step 3: Write the PRAGMA application helper**
 
-Write `/home/john/clarion/crates/clarion-storage/src/pragma.rs`:
+Write `/home/john/loomweave/crates/loomweave-storage/src/pragma.rs`:
 
 ```rust
 //! PRAGMAs applied at connection open per ADR-011 §SQLite PRAGMAs.
@@ -985,7 +985,7 @@ pub fn apply_read_pragmas(conn: &Connection) -> Result<()> {
 
 - [ ] **Step 4: Write the schema migration runner**
 
-Write `/home/john/clarion/crates/clarion-storage/src/schema.rs`:
+Write `/home/john/loomweave/crates/loomweave-storage/src/schema.rs`:
 
 ```rust
 //! Schema migration runner.
@@ -1079,10 +1079,10 @@ pub fn applied_count(conn: &Connection) -> Result<u32> {
 
 - [ ] **Step 5: Wire the modules into `lib.rs`**
 
-Replace `/home/john/clarion/crates/clarion-storage/src/lib.rs` with:
+Replace `/home/john/loomweave/crates/loomweave-storage/src/lib.rs` with:
 
 ```rust
-//! clarion-storage — SQLite layer, writer-actor, reader pool.
+//! loomweave-storage — SQLite layer, writer-actor, reader pool.
 //!
 //! All mutations route through [`writer::Writer`] (a single `tokio::task`
 //! owning the sole write `rusqlite::Connection`). Readers come from a
@@ -1097,7 +1097,7 @@ pub use error::{Result, StorageError};
 
 - [ ] **Step 6: Write the integration test**
 
-Write `/home/john/clarion/crates/clarion-storage/tests/schema_apply.rs`:
+Write `/home/john/loomweave/crates/loomweave-storage/tests/schema_apply.rs`:
 
 ```rust
 //! Schema-apply integration tests.
@@ -1108,10 +1108,10 @@ Write `/home/john/clarion/crates/clarion-storage/tests/schema_apply.rs`:
 
 use rusqlite::{params, Connection};
 
-use clarion_storage::{pragma, schema};
+use loomweave_storage::{pragma, schema};
 
 fn open_fresh(tempdir: &tempfile::TempDir) -> Connection {
-    let path = tempdir.path().join("clarion.db");
+    let path = tempdir.path().join("loomweave.db");
     let mut conn = Connection::open(&path).expect("open");
     pragma::apply_write_pragmas(&conn).expect("pragmas");
     schema::apply_migrations(&mut conn).expect("apply migrations");
@@ -1293,17 +1293,17 @@ fn schema_migrations_records_one_row() {
 - [ ] **Step 7: Run the tests**
 
 ```bash
-cd /home/john/clarion && cargo nextest run -p clarion-storage --test schema_apply
+cd /home/john/loomweave && cargo nextest run -p loomweave-storage --test schema_apply
 ```
 
 Expected: 7 tests pass. If any fail, the migration SQL has a bug — fix `0001_initial_schema.sql`, not the tests.
 
-**Checkpoint** (per the plan review): if `cargo nextest run -p clarion-storage --test schema_apply` isn't green by end of day 2 of WP1 execution, pause and reassess before proceeding to Task 4. A half-locked schema is worse than a one-day slip.
+**Checkpoint** (per the plan review): if `cargo nextest run -p loomweave-storage --test schema_apply` isn't green by end of day 2 of WP1 execution, pause and reassess before proceeding to Task 4. A half-locked schema is worse than a one-day slip.
 
 - [ ] **Step 8: Clippy clean**
 
 ```bash
-cd /home/john/clarion && cargo clippy -p clarion-storage --all-targets -- -D warnings
+cd /home/john/loomweave && cargo clippy -p loomweave-storage --all-targets -- -D warnings
 ```
 
 Expected: no warnings.
@@ -1311,7 +1311,7 @@ Expected: no warnings.
 - [ ] **Step 9: Commit**
 
 ```bash
-cd /home/john/clarion && git add crates/clarion-storage/ && git commit -m "$(cat <<'EOF'
+cd /home/john/loomweave && git add crates/loomweave-storage/ && git commit -m "$(cat <<'EOF'
 feat(wp1): L1 SQLite schema migration framework
 
 Migration 0001 transcribes the full detailed-design.md §3 schema: tables
@@ -1339,13 +1339,13 @@ EOF
 ## Task 4: Reader pool
 
 **Files:**
-- Create: `/home/john/clarion/crates/clarion-storage/src/reader.rs`
-- Modify: `/home/john/clarion/crates/clarion-storage/src/lib.rs`
-- Create: `/home/john/clarion/crates/clarion-storage/tests/reader_pool.rs`
+- Create: `/home/john/loomweave/crates/loomweave-storage/src/reader.rs`
+- Modify: `/home/john/loomweave/crates/loomweave-storage/src/lib.rs`
+- Create: `/home/john/loomweave/crates/loomweave-storage/tests/reader_pool.rs`
 
 - [ ] **Step 1: Write the reader pool wrapper**
 
-Write `/home/john/clarion/crates/clarion-storage/src/reader.rs`:
+Write `/home/john/loomweave/crates/loomweave-storage/src/reader.rs`:
 
 ```rust
 //! Read-only connection pool wrapping `deadpool-sqlite` per ADR-011.
@@ -1406,10 +1406,10 @@ impl ReaderPool {
 
 - [ ] **Step 2: Export from `lib.rs`**
 
-Modify `/home/john/clarion/crates/clarion-storage/src/lib.rs` to add the new module:
+Modify `/home/john/loomweave/crates/loomweave-storage/src/lib.rs` to add the new module:
 
 ```rust
-//! clarion-storage — SQLite layer, writer-actor, reader pool.
+//! loomweave-storage — SQLite layer, writer-actor, reader pool.
 
 pub mod error;
 pub mod pragma;
@@ -1422,7 +1422,7 @@ pub use reader::ReaderPool;
 
 - [ ] **Step 3: Write the failing integration test**
 
-Write `/home/john/clarion/crates/clarion-storage/tests/reader_pool.rs`:
+Write `/home/john/loomweave/crates/loomweave-storage/tests/reader_pool.rs`:
 
 ```rust
 //! Reader-pool concurrency tests.
@@ -1431,10 +1431,10 @@ use std::sync::Arc;
 
 use rusqlite::Connection;
 
-use clarion_storage::{pragma, schema, ReaderPool};
+use loomweave_storage::{pragma, schema, ReaderPool};
 
 fn prepared_db(dir: &tempfile::TempDir) -> std::path::PathBuf {
-    let path = dir.path().join("clarion.db");
+    let path = dir.path().join("loomweave.db");
     let mut conn = Connection::open(&path).expect("open");
     pragma::apply_write_pragmas(&conn).expect("write pragmas");
     schema::apply_migrations(&mut conn).expect("migrate");
@@ -1499,7 +1499,7 @@ async fn reader_sees_committed_data() {
 - [ ] **Step 4: Run the tests**
 
 ```bash
-cd /home/john/clarion && cargo nextest run -p clarion-storage --test reader_pool
+cd /home/john/loomweave && cargo nextest run -p loomweave-storage --test reader_pool
 ```
 
 Expected: 2 tests pass.
@@ -1507,13 +1507,13 @@ Expected: 2 tests pass.
 - [ ] **Step 5: Clippy clean**
 
 ```bash
-cd /home/john/clarion && cargo clippy -p clarion-storage --all-targets -- -D warnings
+cd /home/john/loomweave && cargo clippy -p loomweave-storage --all-targets -- -D warnings
 ```
 
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /home/john/clarion && git add crates/clarion-storage/ && git commit -m "$(cat <<'EOF'
+cd /home/john/loomweave && git add crates/loomweave-storage/ && git commit -m "$(cat <<'EOF'
 feat(wp1): reader pool for concurrent read connections
 
 ReaderPool wraps deadpool-sqlite (ADR-011 default max 16, configurable
@@ -1530,19 +1530,19 @@ EOF
 
 ---
 
-## Task 5: `clarion install` subcommand
+## Task 5: `loomweave install` subcommand
 
 **Files:**
-- Create: `/home/john/clarion/crates/clarion-cli/src/install.rs`
-- Create: `/home/john/clarion/crates/clarion-cli/src/cli.rs`
-- Modify: `/home/john/clarion/crates/clarion-cli/src/main.rs`
-- Create: `/home/john/clarion/crates/clarion-cli/tests/install.rs`
-- Create: `/home/john/clarion/docs/clarion/adr/ADR-005-clarion-dir-tracking.md`
-- Modify: `/home/john/clarion/docs/clarion/adr/README.md`
+- Create: `/home/john/loomweave/crates/loomweave-cli/src/install.rs`
+- Create: `/home/john/loomweave/crates/loomweave-cli/src/cli.rs`
+- Modify: `/home/john/loomweave/crates/loomweave-cli/src/main.rs`
+- Create: `/home/john/loomweave/crates/loomweave-cli/tests/install.rs`
+- Create: `/home/john/loomweave/docs/loomweave/adr/ADR-005-loomweave-dir-tracking.md`
+- Modify: `/home/john/loomweave/docs/loomweave/adr/README.md`
 
 - [ ] **Step 1: Write the CLI command enum**
 
-Write `/home/john/clarion/crates/clarion-cli/src/cli.rs`:
+Write `/home/john/loomweave/crates/loomweave-cli/src/cli.rs`:
 
 ```rust
 use std::path::PathBuf;
@@ -1550,7 +1550,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "clarion", version, about = "Clarion code-archaeology tool")]
+#[command(name = "loomweave", version, about = "Loomweave code-archaeology tool")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -1558,9 +1558,9 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Initialise .clarion/ in the current directory.
+    /// Initialise .loomweave/ in the current directory.
     Install {
-        /// Overwrite an existing .clarion/ (not implemented in Sprint 1).
+        /// Overwrite an existing .loomweave/ (not implemented in Sprint 1).
         #[arg(long)]
         force: bool,
 
@@ -1581,19 +1581,19 @@ pub enum Command {
 
 - [ ] **Step 2: Write the install command implementation**
 
-Write `/home/john/clarion/crates/clarion-cli/src/install.rs`:
+Write `/home/john/loomweave/crates/loomweave-cli/src/install.rs`:
 
 ```rust
-//! `clarion install` — initialise .clarion/ in the target directory.
+//! `loomweave install` — initialise .loomweave/ in the target directory.
 //!
 //! Creates:
-//! - `.clarion/clarion.db`        (migrated)
-//! - `.clarion/config.json`       (internal state stub)
-//! - `.clarion/.gitignore`        (UQ-WP1-04 rules; ADR-005)
-//! - `<path>/clarion.yaml`        (user-edited config stub at project root
+//! - `.loomweave/loomweave.db`        (migrated)
+//! - `.loomweave/config.json`       (internal state stub)
+//! - `.loomweave/.gitignore`        (UQ-WP1-04 rules; ADR-005)
+//! - `<path>/loomweave.yaml`        (user-edited config stub at project root
 //!                                  per detailed-design.md §File layout)
 //!
-//! Refuses if `.clarion/` already exists (UQ-WP1-08). `--force` is accepted
+//! Refuses if `.loomweave/` already exists (UQ-WP1-08). `--force` is accepted
 //! by the CLI but currently returns an error — Sprint 1 does not implement
 //! overwrite.
 
@@ -1603,7 +1603,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
-use clarion_storage::{pragma, schema};
+use loomweave_storage::{pragma, schema};
 
 const CONFIG_JSON_STUB: &str = r#"{
     "schema_version": 1,
@@ -1611,15 +1611,15 @@ const CONFIG_JSON_STUB: &str = r#"{
 }
 "#;
 
-const CLARION_YAML_STUB: &str = "# clarion.yaml — user-edited config.\n\
-# Full schema TBD; see docs/clarion/1.0 design. Sprint 1 walking skeleton\n\
+const LOOMWEAVE_YAML_STUB: &str = "# loomweave.yaml — user-edited config.\n\
+# Full schema TBD; see docs/loomweave/1.0 design. Sprint 1 walking skeleton\n\
 # ignores most fields. Do not delete this file: later versions will require\n\
 # it for model-tier mappings and analysis knobs.\n\
 version: 1\n";
 
 const GITIGNORE_CONTENTS: &str = "\
-# Clarion .gitignore — ADR-005 tracked-vs-excluded list.
-# Tracked (committed): clarion.db, config.json, .gitignore itself.
+# Loomweave .gitignore — ADR-005 tracked-vs-excluded list.
+# Tracked (committed): loomweave.db, config.json, .gitignore itself.
 # Excluded (ignored): WAL sidecars, shadow DB, per-run logs, tmp scratch.
 
 # SQLite write-ahead files never belong in the repo.
@@ -1645,7 +1645,7 @@ runs/*/log.jsonl
 pub fn run(path: PathBuf, force: bool) -> Result<()> {
     if force {
         bail!(
-            "--force is not implemented in Sprint 1. Remove .clarion/ manually \
+            "--force is not implemented in Sprint 1. Remove .loomweave/ manually \
              if you need a clean reinit."
         );
     }
@@ -1653,40 +1653,40 @@ pub fn run(path: PathBuf, force: bool) -> Result<()> {
     let project_root = path.canonicalize().with_context(|| {
         format!("cannot canonicalise --path {}", path.display())
     })?;
-    let clarion_dir = project_root.join(".clarion");
-    if clarion_dir.exists() {
+    let loomweave_dir = project_root.join(".loomweave");
+    if loomweave_dir.exists() {
         bail!(
-            ".clarion/ already exists at {}. Delete it (or pass --force when \
+            ".loomweave/ already exists at {}. Delete it (or pass --force when \
              Sprint 2+ implements overwrite) and try again.",
-            clarion_dir.display()
+            loomweave_dir.display()
         );
     }
 
-    fs::create_dir_all(&clarion_dir)
-        .with_context(|| format!("mkdir {}", clarion_dir.display()))?;
+    fs::create_dir_all(&loomweave_dir)
+        .with_context(|| format!("mkdir {}", loomweave_dir.display()))?;
 
-    let db_path = clarion_dir.join("clarion.db");
-    initialise_db(&db_path).context("initialise clarion.db")?;
+    let db_path = loomweave_dir.join("loomweave.db");
+    initialise_db(&db_path).context("initialise loomweave.db")?;
 
-    let config_path = clarion_dir.join("config.json");
+    let config_path = loomweave_dir.join("config.json");
     fs::write(&config_path, CONFIG_JSON_STUB)
         .with_context(|| format!("write {}", config_path.display()))?;
 
-    let gitignore_path = clarion_dir.join(".gitignore");
+    let gitignore_path = loomweave_dir.join(".gitignore");
     fs::write(&gitignore_path, GITIGNORE_CONTENTS)
         .with_context(|| format!("write {}", gitignore_path.display()))?;
 
-    let yaml_path = project_root.join("clarion.yaml");
+    let yaml_path = project_root.join("loomweave.yaml");
     if !yaml_path.exists() {
-        fs::write(&yaml_path, CLARION_YAML_STUB)
+        fs::write(&yaml_path, LOOMWEAVE_YAML_STUB)
             .with_context(|| format!("write {}", yaml_path.display()))?;
     }
 
     tracing::info!(
-        clarion_dir = %clarion_dir.display(),
-        "clarion install complete"
+        loomweave_dir = %loomweave_dir.display(),
+        "loomweave install complete"
     );
-    println!("Initialised {}", clarion_dir.display());
+    println!("Initialised {}", loomweave_dir.display());
     Ok(())
 }
 
@@ -1700,7 +1700,7 @@ fn initialise_db(path: &Path) -> Result<()> {
 
 - [ ] **Step 3: Wire the CLI into `main.rs`**
 
-Replace `/home/john/clarion/crates/clarion-cli/src/main.rs` with:
+Replace `/home/john/loomweave/crates/loomweave-cli/src/main.rs` with:
 
 ```rust
 mod cli;
@@ -1715,8 +1715,8 @@ fn main() -> Result<()> {
     match cli.command {
         cli::Command::Install { force, path } => install::run(path, force),
         cli::Command::Analyze { path: _ } => {
-            // Task 7 implements this. Stubbed so `clarion analyze` is reachable.
-            anyhow::bail!("clarion analyze — unimplemented (landing in Task 7)");
+            // Task 7 implements this. Stubbed so `loomweave analyze` is reachable.
+            anyhow::bail!("loomweave analyze — unimplemented (landing in Task 7)");
         }
     }
 }
@@ -1730,44 +1730,44 @@ fn init_tracing() {
 
 - [ ] **Step 4: Write the integration tests**
 
-Write `/home/john/clarion/crates/clarion-cli/tests/install.rs`:
+Write `/home/john/loomweave/crates/loomweave-cli/tests/install.rs`:
 
 ```rust
-//! `clarion install` integration tests.
+//! `loomweave install` integration tests.
 
 use std::fs;
 
 use assert_cmd::Command;
 use rusqlite::Connection;
 
-fn clarion_bin() -> Command {
-    Command::cargo_bin("clarion").expect("clarion binary")
+fn loomweave_bin() -> Command {
+    Command::cargo_bin("loomweave").expect("loomweave binary")
 }
 
 #[test]
-fn install_creates_clarion_dir_with_expected_contents() {
+fn install_creates_loomweave_dir_with_expected_contents() {
     let dir = tempfile::tempdir().unwrap();
-    clarion_bin()
+    loomweave_bin()
         .args(["install", "--path"])
         .arg(dir.path())
         .assert()
         .success();
 
-    let clarion = dir.path().join(".clarion");
-    assert!(clarion.join("clarion.db").exists(), "clarion.db missing");
-    assert!(clarion.join("config.json").exists(), "config.json missing");
-    assert!(clarion.join(".gitignore").exists(), ".gitignore missing");
+    let loomweave = dir.path().join(".loomweave");
+    assert!(loomweave.join("loomweave.db").exists(), "loomweave.db missing");
+    assert!(loomweave.join("config.json").exists(), "config.json missing");
+    assert!(loomweave.join(".gitignore").exists(), ".gitignore missing");
     assert!(
-        dir.path().join("clarion.yaml").exists(),
-        "clarion.yaml not at project root"
+        dir.path().join("loomweave.yaml").exists(),
+        "loomweave.yaml not at project root"
     );
 
-    let config = fs::read_to_string(clarion.join("config.json")).unwrap();
+    let config = fs::read_to_string(loomweave.join("config.json")).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
     assert_eq!(parsed["schema_version"], 1);
     assert!(parsed["last_run_id"].is_null());
 
-    let gitignore = fs::read_to_string(clarion.join(".gitignore")).unwrap();
+    let gitignore = fs::read_to_string(loomweave.join(".gitignore")).unwrap();
     for rule in &["*.shadow.db", "tmp/", "logs/", "runs/*/log.jsonl", "*-wal", "*-shm"] {
         assert!(
             gitignore.contains(rule),
@@ -1779,13 +1779,13 @@ fn install_creates_clarion_dir_with_expected_contents() {
 #[test]
 fn install_applies_migration_0001_exactly_once() {
     let dir = tempfile::tempdir().unwrap();
-    clarion_bin()
+    loomweave_bin()
         .args(["install", "--path"])
         .arg(dir.path())
         .assert()
         .success();
 
-    let conn = Connection::open(dir.path().join(".clarion/clarion.db")).unwrap();
+    let conn = Connection::open(dir.path().join(".loomweave/loomweave.db")).unwrap();
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
         .unwrap();
@@ -1797,16 +1797,16 @@ fn install_applies_migration_0001_exactly_once() {
 }
 
 #[test]
-fn install_refuses_to_overwrite_existing_clarion_dir() {
+fn install_refuses_to_overwrite_existing_loomweave_dir() {
     let dir = tempfile::tempdir().unwrap();
-    clarion_bin()
+    loomweave_bin()
         .args(["install", "--path"])
         .arg(dir.path())
         .assert()
         .success();
 
     // Second install must fail with a clear message.
-    let out = clarion_bin()
+    let out = loomweave_bin()
         .args(["install", "--path"])
         .arg(dir.path())
         .assert()
@@ -1825,7 +1825,7 @@ fn install_refuses_to_overwrite_existing_clarion_dir() {
 #[test]
 fn install_force_returns_unimplemented_in_sprint_one() {
     let dir = tempfile::tempdir().unwrap();
-    let out = clarion_bin()
+    let out = loomweave_bin()
         .args(["install", "--force", "--path"])
         .arg(dir.path())
         .assert()
@@ -1840,38 +1840,38 @@ fn install_force_returns_unimplemented_in_sprint_one() {
 
 - [ ] **Step 5: Write ADR-005**
 
-Write `/home/john/clarion/docs/clarion/adr/ADR-005-clarion-dir-tracking.md`:
+Write `/home/john/loomweave/docs/loomweave/adr/ADR-005-loomweave-dir-tracking.md`:
 
 ```markdown
-# ADR-005: `.clarion/` Directory Git-Tracking Policy
+# ADR-005: `.loomweave/` Directory Git-Tracking Policy
 
 **Status**: Accepted
 **Date**: 2026-04-18
 **Deciders**: qacona@gmail.com
-**Context**: `clarion install` must write a `.gitignore` inside `.clarion/` that
+**Context**: `loomweave install` must write a `.gitignore` inside `.loomweave/` that
 separates committed analysis state from volatile per-run artefacts. Sprint 1 WP1
 Task 5 is the authoring trigger; before this ADR, the rules were only proposed
 in `docs/implementation/sprint-1/wp1-scaffold.md §UQ-WP1-04`.
 
 ## Summary
 
-`.clarion/clarion.db` and `.clarion/config.json` are committed. WAL sidecars,
+`.loomweave/loomweave.db` and `.loomweave/config.json` are committed. WAL sidecars,
 the shadow-DB intermediate, `tmp/`, `logs/`, and per-run raw LLM request/response
-logs (`runs/*/log.jsonl`) are `.gitignore`d. `clarion.yaml` lives at the project
+logs (`runs/*/log.jsonl`) are `.gitignore`d. `loomweave.yaml` lives at the project
 root and is tracked under the user's existing repo-root `.gitignore`, not under
-`.clarion/.gitignore` (it's a user-edited config, not analysis state).
+`.loomweave/.gitignore` (it's a user-edited config, not analysis state).
 
 ## Context
 
-`.clarion/` mixes artefact kinds that want different tracking posture:
+`.loomweave/` mixes artefact kinds that want different tracking posture:
 
 - **Shared analysis state** (entities, edges, briefings, guidance) — diff-friendly
-  via `clarion db export --textual`; solo-developer and small-team cases benefit
+  via `loomweave db export --textual`; solo-developer and small-team cases benefit
   from having briefings versioned alongside the code they describe
   (`detailed-design.md §3 File layout`).
 - **Runtime write-ahead files** (`*-wal`, `*-shm`) — SQLite bookkeeping that is
   process-local and meaningless on a different machine.
-- **Shadow DB** (`clarion.db.new`, `*.shadow.db`) — ADR-011's `--shadow-db`
+- **Shadow DB** (`loomweave.db.new`, `*.shadow.db`) — ADR-011's `--shadow-db`
   intermediate; deleted on successful atomic rename, would leak as junk
   otherwise.
 - **Per-run LLM bodies** (`runs/<run_id>/log.jsonl`) — raw request/response
@@ -1879,14 +1879,14 @@ root and is tracked under the user's existing repo-root `.gitignore`, not under
   but not appropriate to commit to a public repo.
 - **Scratch** (`tmp/`, `logs/`) — volatile by definition.
 
-Without this ADR, `clarion install` has no normative place to look up the rules,
+Without this ADR, `loomweave install` has no normative place to look up the rules,
 and every developer's install produces their own variant `.gitignore` by accident.
 
 ## Decision
 
-`clarion install` writes `.clarion/.gitignore` with the following contents
+`loomweave install` writes `.loomweave/.gitignore` with the following contents
 (verbatim — the literal file lives at
-`crates/clarion-cli/src/install.rs` and ships as the v0.1 baseline):
+`crates/loomweave-cli/src/install.rs` and ships as the v0.1 baseline):
 
 ```
 *-wal
@@ -1902,16 +1902,16 @@ runs/*/log.jsonl
 
 ### Tracked
 
-- `.clarion/clarion.db` — the main analysis store. SQLite diffs poorly; the
-  `clarion db export --textual` + `clarion db merge-helper` pattern (detailed
+- `.loomweave/loomweave.db` — the main analysis store. SQLite diffs poorly; the
+  `loomweave db export --textual` + `loomweave db merge-helper` pattern (detailed
   design §3 File layout) handles the team case.
-- `.clarion/config.json` — small, human-readable internal state (schema
+- `.loomweave/config.json` — small, human-readable internal state (schema
   version, last run IDs).
-- `.clarion/.gitignore` itself — this file.
-- `.clarion/runs/<run_id>/config.yaml` — the snapshot of `clarion.yaml` at run
+- `.loomweave/.gitignore` itself — this file.
+- `.loomweave/runs/<run_id>/config.yaml` — the snapshot of `loomweave.yaml` at run
   time. Material for provenance replay.
-- `.clarion/runs/<run_id>/stats.json` — run statistics.
-- `.clarion/runs/<run_id>/partial.json` — present only for partial runs;
+- `.loomweave/runs/<run_id>/stats.json` — run statistics.
+- `.loomweave/runs/<run_id>/partial.json` — present only for partial runs;
   material for `--resume`.
 
 ### Excluded
@@ -1921,18 +1921,18 @@ runs/*/log.jsonl
 - `tmp/` and `logs/` (volatile scratch).
 - `runs/*/log.jsonl` (raw LLM bodies — audit-local, not commit-appropriate).
 
-### Out of scope for `.clarion/.gitignore`
+### Out of scope for `.loomweave/.gitignore`
 
-- `clarion.yaml` (the user-edited config) lives at the *project root*, not
-  inside `.clarion/`. Its tracking is governed by the project's own repo-root
+- `loomweave.yaml` (the user-edited config) lives at the *project root*, not
+  inside `.loomweave/`. Its tracking is governed by the project's own repo-root
   `.gitignore`, which is the user's concern. Default posture: tracked.
 
 ### Opt-out for users who don't want the DB committed
 
-`clarion.yaml:storage.commit_db: false` (post-Sprint-1 knob; WP6 authors the
-full `clarion.yaml` schema). When false, Clarion writes an additional
-`.clarion/.gitignore` line excluding `clarion.db`, and emits
-`clarion db sync push/pull` commands. Not implemented in Sprint 1; the knob
+`loomweave.yaml:storage.commit_db: false` (post-Sprint-1 knob; WP6 authors the
+full `loomweave.yaml` schema). When false, Loomweave writes an additional
+`.loomweave/.gitignore` line excluding `loomweave.db`, and emits
+`loomweave db sync push/pull` commands. Not implemented in Sprint 1; the knob
 is documented here so the future change has a home.
 
 ## Alternatives Considered
@@ -1949,7 +1949,7 @@ committed is unbounded.
 
 ### Alternative 2: commit nothing
 
-**Pros**: simplest — `.clarion/` becomes entirely machine-local.
+**Pros**: simplest — `.loomweave/` becomes entirely machine-local.
 
 **Cons**: loses the "shared analysis state" benefit — briefings and guidance
 are derived outputs that are expensive to rebuild. Small teams especially
@@ -1963,7 +1963,7 @@ analysis only opt out via `storage.commit_db: false`.
 
 **Pros**: keeps small-git-diff UX (LFS handles the binary file).
 
-**Cons**: requires git-lfs installed on every developer machine; makes `clarion
+**Cons**: requires git-lfs installed on every developer machine; makes `loomweave
 install` a multi-tool setup; adds failure modes (lfs server availability, large
 file policy). v0.1 target workflows are solo/small-team where the straight-commit
 path works; LFS is a v0.2+ knob.
@@ -1974,7 +1974,7 @@ path works; LFS is a v0.2+ knob.
 
 ### Positive
 
-- Every `clarion install` produces the same `.gitignore`. Ends per-developer
+- Every `loomweave install` produces the same `.gitignore`. Ends per-developer
   drift on "what should be committed."
 - WAL sidecars cannot accidentally land in a commit.
 - Raw LLM bodies stay local to the developer that ran the analysis.
@@ -1984,10 +1984,10 @@ path works; LFS is a v0.2+ knob.
 ### Negative
 
 - Committed SQLite DBs diff poorly by default. Mitigation: the
-  `clarion db export --textual` / merge-helper path (detailed-design §3) is
+  `loomweave db export --textual` / merge-helper path (detailed-design §3) is
   the documented escape hatch.
-- Adding a new excluded pattern requires either a Clarion release or a
-  user-side `.clarion/.gitignore` edit. The post-v0.1 plan is to keep this
+- Adding a new excluded pattern requires either a Loomweave release or a
+  user-side `.loomweave/.gitignore` edit. The post-v0.1 plan is to keep this
   file tool-owned; users adding their own ignores put them in the repo-root
   `.gitignore`, not here.
 
@@ -1998,10 +1998,10 @@ path works; LFS is a v0.2+ knob.
 
 ## Related Decisions
 
-- [ADR-011](../../clarion/adr/ADR-011-writer-actor-concurrency.md) — names the shadow-DB
+- [ADR-011](../../loomweave/adr/ADR-011-writer-actor-concurrency.md) — names the shadow-DB
   intermediate; this ADR excludes it from git.
-- [ADR-014](../../clarion/adr/ADR-014-filigree-registry-backend.md) — cross-tool references
-  rely on `clarion.db` being available to readers (Filigree, Wardline); the
+- [ADR-014](../../loomweave/adr/ADR-014-filigree-registry-backend.md) — cross-tool references
+  rely on `loomweave.db` being available to readers (Filigree, Wardline); the
   commit-by-default posture keeps those references resolvable across machines.
 
 ## References
@@ -2015,18 +2015,18 @@ path works; LFS is a v0.2+ knob.
 
 - [ ] **Step 6: Update the ADR index**
 
-Edit `/home/john/clarion/docs/clarion/adr/README.md` at line 32 (`| ADR-005 | ... | Backlog |`). Change to:
+Edit `/home/john/loomweave/docs/loomweave/adr/README.md` at line 32 (`| ADR-005 | ... | Backlog |`). Change to:
 
 ```
-| ADR-005 | `.clarion/` git-committable by default; DB included, run logs excluded | Accepted |
+| ADR-005 | `.loomweave/` git-committable by default; DB included, run logs excluded | Accepted |
 ```
 
-If the ADR index has a separate "Accepted ADRs" list table elsewhere, also add a row for ADR-005 there (run `grep -n '^| ADR-' docs/clarion/adr/README.md` to locate). The important change is the status moving from `Backlog` to `Accepted`.
+If the ADR index has a separate "Accepted ADRs" list table elsewhere, also add a row for ADR-005 there (run `grep -n '^| ADR-' docs/loomweave/adr/README.md` to locate). The important change is the status moving from `Backlog` to `Accepted`.
 
 - [ ] **Step 7: Run the tests**
 
 ```bash
-cd /home/john/clarion && cargo nextest run -p clarion-cli --test install
+cd /home/john/loomweave && cargo nextest run -p loomweave-cli --test install
 ```
 
 Expected: 4 tests pass.
@@ -2034,22 +2034,22 @@ Expected: 4 tests pass.
 - [ ] **Step 8: Run clippy**
 
 ```bash
-cd /home/john/clarion && cargo clippy -p clarion-cli --all-targets -- -D warnings
+cd /home/john/loomweave && cargo clippy -p loomweave-cli --all-targets -- -D warnings
 ```
 
 - [ ] **Step 9: Commit**
 
 ```bash
-cd /home/john/clarion && git add crates/clarion-cli/ docs/clarion/adr/ && git commit -m "$(cat <<'EOF'
-feat(wp1): clarion install subcommand; author ADR-005
+cd /home/john/loomweave && git add crates/loomweave-cli/ docs/loomweave/adr/ && git commit -m "$(cat <<'EOF'
+feat(wp1): loomweave install subcommand; author ADR-005
 
-clarion install creates .clarion/{clarion.db,config.json,.gitignore} and
-a clarion.yaml stub at the project root per detailed-design.md §File
-layout. Refuses on existing .clarion/ (UQ-WP1-08). --force is recognised
+loomweave install creates .loomweave/{loomweave.db,config.json,.gitignore} and
+a loomweave.yaml stub at the project root per detailed-design.md §File
+layout. Refuses on existing .loomweave/ (UQ-WP1-08). --force is recognised
 by clap but errors out — Sprint 1 does not implement overwrite.
 
-ADR-005 moved from Backlog to Accepted: .clarion/ git-tracking policy
-(committed: clarion.db, config.json, .gitignore, runs/*/config.yaml,
+ADR-005 moved from Backlog to Accepted: .loomweave/ git-tracking policy
+(committed: loomweave.db, config.json, .gitignore, runs/*/config.yaml,
 stats.json, partial.json; excluded: WAL/SHM sidecars, *.shadow.db,
 runs/*/log.jsonl, tmp/, logs/). UQ-WP1-04 resolved.
 
@@ -2064,14 +2064,14 @@ EOF
 ## Task 6: Writer-actor (L3)
 
 **Files:**
-- Create: `/home/john/clarion/crates/clarion-storage/src/commands.rs`
-- Create: `/home/john/clarion/crates/clarion-storage/src/writer.rs`
-- Modify: `/home/john/clarion/crates/clarion-storage/src/lib.rs`
-- Create: `/home/john/clarion/crates/clarion-storage/tests/writer_actor.rs`
+- Create: `/home/john/loomweave/crates/loomweave-storage/src/commands.rs`
+- Create: `/home/john/loomweave/crates/loomweave-storage/src/writer.rs`
+- Modify: `/home/john/loomweave/crates/loomweave-storage/src/lib.rs`
+- Create: `/home/john/loomweave/crates/loomweave-storage/tests/writer_actor.rs`
 
 - [ ] **Step 1: Write the command enum and entity record**
 
-Write `/home/john/clarion/crates/clarion-storage/src/commands.rs`:
+Write `/home/john/loomweave/crates/loomweave-storage/src/commands.rs`:
 
 ```rust
 //! Writer-actor command protocol (L3 lock-in).
@@ -2092,7 +2092,7 @@ use crate::error::StorageError;
 pub type Ack<T> = oneshot::Sender<Result<T, StorageError>>;
 
 /// Run status values. Extended in later WPs; Sprint 1 uses only
-/// `SkippedNoPlugins` (from `clarion analyze` without plugins wired) and
+/// `SkippedNoPlugins` (from `loomweave analyze` without plugins wired) and
 /// `Failed` (explicit FailRun).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunStatus {
@@ -2183,7 +2183,7 @@ pub enum WriterCmd {
 
 - [ ] **Step 2: Write the writer-actor itself**
 
-Write `/home/john/clarion/crates/clarion-storage/src/writer.rs`:
+Write `/home/john/loomweave/crates/loomweave-storage/src/writer.rs`:
 
 ```rust
 //! Writer-actor implementation (L3 lock-in) per ADR-011.
@@ -2488,10 +2488,10 @@ fn fail_run(
 
 - [ ] **Step 3: Export the new modules**
 
-Modify `/home/john/clarion/crates/clarion-storage/src/lib.rs` to:
+Modify `/home/john/loomweave/crates/loomweave-storage/src/lib.rs` to:
 
 ```rust
-//! clarion-storage — SQLite layer, writer-actor, reader pool.
+//! loomweave-storage — SQLite layer, writer-actor, reader pool.
 
 pub mod commands;
 pub mod error;
@@ -2508,7 +2508,7 @@ pub use writer::{Writer, DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY};
 
 - [ ] **Step 4: Write the integration tests**
 
-Write `/home/john/clarion/crates/clarion-storage/tests/writer_actor.rs`:
+Write `/home/john/loomweave/crates/loomweave-storage/tests/writer_actor.rs`:
 
 ```rust
 //! Writer-actor integration tests.
@@ -2520,13 +2520,13 @@ use std::sync::atomic::Ordering;
 use rusqlite::Connection;
 use tokio::sync::oneshot;
 
-use clarion_storage::{
+use loomweave_storage::{
     commands::{EntityRecord, RunStatus, WriterCmd},
     pragma, schema, ReaderPool, Writer,
 };
 
 fn prepared_db(dir: &tempfile::TempDir) -> std::path::PathBuf {
-    let path = dir.path().join("clarion.db");
+    let path = dir.path().join("loomweave.db");
     let mut conn = Connection::open(&path).unwrap();
     pragma::apply_write_pragmas(&conn).unwrap();
     schema::apply_migrations(&mut conn).unwrap();
@@ -2564,8 +2564,8 @@ fn make_entity(id: &str) -> EntityRecord {
 
 async fn send<T>(
     tx: &tokio::sync::mpsc::Sender<WriterCmd>,
-    build: impl FnOnce(oneshot::Sender<Result<T, clarion_storage::StorageError>>) -> WriterCmd,
-) -> Result<T, clarion_storage::StorageError> {
+    build: impl FnOnce(oneshot::Sender<Result<T, loomweave_storage::StorageError>>) -> WriterCmd,
+) -> Result<T, loomweave_storage::StorageError> {
     let (ack_tx, ack_rx) = oneshot::channel();
     tx.send(build(ack_tx)).await.unwrap();
     ack_rx.await.unwrap()
@@ -2763,7 +2763,7 @@ async fn fail_run_rolls_back_pending_inserts() {
 - [ ] **Step 5: Run the tests**
 
 ```bash
-cd /home/john/clarion && cargo nextest run -p clarion-storage --test writer_actor
+cd /home/john/loomweave && cargo nextest run -p loomweave-storage --test writer_actor
 ```
 
 Expected: 3 tests pass. The `batch_size_fifty_commits_every_fifty_inserts` test is the L3 lock-in proof.
@@ -2771,7 +2771,7 @@ Expected: 3 tests pass. The `batch_size_fifty_commits_every_fifty_inserts` test 
 - [ ] **Step 6: Run every storage-crate test**
 
 ```bash
-cd /home/john/clarion && cargo nextest run -p clarion-storage
+cd /home/john/loomweave && cargo nextest run -p loomweave-storage
 ```
 
 Expected: 12 tests pass in total (7 schema + 2 reader + 3 writer).
@@ -2779,13 +2779,13 @@ Expected: 12 tests pass in total (7 schema + 2 reader + 3 writer).
 - [ ] **Step 7: Clippy clean**
 
 ```bash
-cd /home/john/clarion && cargo clippy -p clarion-storage --all-targets -- -D warnings
+cd /home/john/loomweave && cargo clippy -p loomweave-storage --all-targets -- -D warnings
 ```
 
 - [ ] **Step 8: Commit**
 
 ```bash
-cd /home/john/clarion && git add crates/clarion-storage/ && git commit -m "$(cat <<'EOF'
+cd /home/john/loomweave && git add crates/loomweave-storage/ && git commit -m "$(cat <<'EOF'
 feat(wp1): L3 writer-actor (tokio::task) with per-N transaction batch
 
 Writer::spawn() starts a tokio::spawn_blocking task owning the sole write
@@ -2809,21 +2809,21 @@ EOF
 
 ---
 
-## Task 7: `clarion analyze` skeleton (no plugin)
+## Task 7: `loomweave analyze` skeleton (no plugin)
 
 **Files:**
-- Create: `/home/john/clarion/crates/clarion-cli/src/analyze.rs`
-- Modify: `/home/john/clarion/crates/clarion-cli/src/main.rs`
-- Create: `/home/john/clarion/crates/clarion-cli/tests/analyze.rs`
+- Create: `/home/john/loomweave/crates/loomweave-cli/src/analyze.rs`
+- Modify: `/home/john/loomweave/crates/loomweave-cli/src/main.rs`
+- Create: `/home/john/loomweave/crates/loomweave-cli/tests/analyze.rs`
 
 - [ ] **Step 1: Implement the analyze subcommand**
 
-Write `/home/john/clarion/crates/clarion-cli/src/analyze.rs`:
+Write `/home/john/loomweave/crates/loomweave-cli/src/analyze.rs`:
 
 ```rust
-//! `clarion analyze` — Sprint 1 skeleton.
+//! `loomweave analyze` — Sprint 1 skeleton.
 //!
-//! Opens .clarion/clarion.db, begins a run, logs a warning that no plugins
+//! Opens .loomweave/loomweave.db, begins a run, logs a warning that no plugins
 //! are wired, and commits the run with status `skipped_no_plugins`. WP2
 //! replaces this body with real plugin spawning.
 
@@ -2833,7 +2833,7 @@ use anyhow::{bail, Context, Result};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-use clarion_storage::{
+use loomweave_storage::{
     commands::{RunStatus, WriterCmd},
     Writer, DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY,
 };
@@ -2842,14 +2842,14 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
     let project_root = project_path
         .canonicalize()
         .with_context(|| format!("cannot canonicalise path {}", project_path.display()))?;
-    let clarion_dir = project_root.join(".clarion");
-    if !clarion_dir.exists() {
+    let loomweave_dir = project_root.join(".loomweave");
+    if !loomweave_dir.exists() {
         bail!(
-            "{} has no .clarion/ directory. Run `clarion install` first.",
+            "{} has no .loomweave/ directory. Run `loomweave install` first.",
             project_root.display()
         );
     }
-    let db_path = clarion_dir.join("clarion.db");
+    let db_path = loomweave_dir.join("loomweave.db");
 
     let (writer, handle) =
         Writer::spawn(db_path, DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY)
@@ -2937,7 +2937,7 @@ fn gmtime(mut secs: u64) -> (u32, u32, u32, u32, u32, u32) {
 }
 ```
 
-Add the `uuid` dependency to `/home/john/clarion/crates/clarion-cli/Cargo.toml`:
+Add the `uuid` dependency to `/home/john/loomweave/crates/loomweave-cli/Cargo.toml`:
 
 ```toml
 [dependencies]
@@ -2951,11 +2951,11 @@ Also add `uuid` to the root `Cargo.toml` `[workspace.dependencies]`:
 uuid = { version = "1", features = ["v4"] }
 ```
 
-Then reference it from `clarion-cli` with `uuid.workspace = true`. (Prefer the workspace form — keeps version bumps centralised.)
+Then reference it from `loomweave-cli` with `uuid.workspace = true`. (Prefer the workspace form — keeps version bumps centralised.)
 
 - [ ] **Step 2: Wire analyze into `main.rs`**
 
-Replace `/home/john/clarion/crates/clarion-cli/src/main.rs` with:
+Replace `/home/john/loomweave/crates/loomweave-cli/src/main.rs` with:
 
 ```rust
 mod analyze;
@@ -2988,34 +2988,34 @@ fn init_tracing() {
 
 - [ ] **Step 3: Write the integration tests**
 
-Write `/home/john/clarion/crates/clarion-cli/tests/analyze.rs`:
+Write `/home/john/loomweave/crates/loomweave-cli/tests/analyze.rs`:
 
 ```rust
-//! `clarion analyze` Sprint-1 integration test.
+//! `loomweave analyze` Sprint-1 integration test.
 
 use assert_cmd::Command;
 use rusqlite::Connection;
 
-fn clarion_bin() -> Command {
-    Command::cargo_bin("clarion").expect("clarion binary")
+fn loomweave_bin() -> Command {
+    Command::cargo_bin("loomweave").expect("loomweave binary")
 }
 
 #[test]
 fn analyze_without_plugins_writes_skipped_run_row() {
     let dir = tempfile::tempdir().unwrap();
-    clarion_bin()
+    loomweave_bin()
         .args(["install", "--path"])
         .arg(dir.path())
         .assert()
         .success();
 
-    clarion_bin()
+    loomweave_bin()
         .args(["analyze"])
         .arg(dir.path())
         .assert()
         .success();
 
-    let conn = Connection::open(dir.path().join(".clarion/clarion.db")).unwrap();
+    let conn = Connection::open(dir.path().join(".loomweave/loomweave.db")).unwrap();
     let (count, status): (i64, String) = conn
         .query_row(
             "SELECT COUNT(*), COALESCE(MAX(status), '') FROM runs",
@@ -3033,16 +3033,16 @@ fn analyze_without_plugins_writes_skipped_run_row() {
 }
 
 #[test]
-fn analyze_fails_cleanly_if_clarion_dir_missing() {
+fn analyze_fails_cleanly_if_loomweave_dir_missing() {
     let dir = tempfile::tempdir().unwrap();
-    let out = clarion_bin()
+    let out = loomweave_bin()
         .args(["analyze"])
         .arg(dir.path())
         .assert()
         .failure();
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     assert!(
-        stderr.contains("clarion install"),
+        stderr.contains("loomweave install"),
         "error did not point operator at install: {stderr}"
     );
 }
@@ -3051,7 +3051,7 @@ fn analyze_fails_cleanly_if_clarion_dir_missing() {
 - [ ] **Step 4: Run the tests**
 
 ```bash
-cd /home/john/clarion && cargo nextest run -p clarion-cli --test analyze
+cd /home/john/loomweave && cargo nextest run -p loomweave-cli --test analyze
 ```
 
 Expected: 2 tests pass.
@@ -3059,19 +3059,19 @@ Expected: 2 tests pass.
 - [ ] **Step 5: Clippy clean**
 
 ```bash
-cd /home/john/clarion && cargo clippy -p clarion-cli --all-targets -- -D warnings
+cd /home/john/loomweave && cargo clippy -p loomweave-cli --all-targets -- -D warnings
 ```
 
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /home/john/clarion && git add Cargo.toml crates/clarion-cli/ && git commit -m "$(cat <<'EOF'
-feat(wp1): clarion analyze skeleton (plugin wiring deferred to WP2)
+cd /home/john/loomweave && git add Cargo.toml crates/loomweave-cli/ && git commit -m "$(cat <<'EOF'
+feat(wp1): loomweave analyze skeleton (plugin wiring deferred to WP2)
 
-clarion analyze opens .clarion/clarion.db, BeginRun → CommitRun with
+loomweave analyze opens .loomweave/loomweave.db, BeginRun → CommitRun with
 status 'skipped_no_plugins'. Warns via tracing::info! that no plugins
-are wired. Fails cleanly with a `clarion install`-pointing message if
-.clarion/ is missing.
+are wired. Fails cleanly with a `loomweave install`-pointing message if
+.loomweave/ is missing.
 
 uuid v4 added as a workspace dependency for run-id generation. Minimal
 inline gmtime() avoids pulling chrono solely for ISO-8601 formatting;
@@ -3079,7 +3079,7 @@ later WPs that need richer time handling can promote chrono to a
 workspace dependency then.
 
 2 integration tests cover the happy path (one runs row, zero entities)
-and the missing-.clarion/ error path.
+and the missing-.loomweave/ error path.
 EOF
 )"
 ```
@@ -3089,12 +3089,12 @@ EOF
 ## Task 8: LlmProvider trait stub
 
 **Files:**
-- Create: `/home/john/clarion/crates/clarion-core/src/llm_provider.rs`
-- Modify: `/home/john/clarion/crates/clarion-core/src/lib.rs`
+- Create: `/home/john/loomweave/crates/loomweave-core/src/llm_provider.rs`
+- Modify: `/home/john/loomweave/crates/loomweave-core/src/lib.rs`
 
 - [ ] **Step 1: Write the trait and test**
 
-Write `/home/john/clarion/crates/clarion-core/src/llm_provider.rs`:
+Write `/home/john/loomweave/crates/loomweave-core/src/llm_provider.rs`:
 
 ```rust
 //! LlmProvider trait stub.
@@ -3143,10 +3143,10 @@ mod tests {
 
 - [ ] **Step 2: Export from `lib.rs`**
 
-Modify `/home/john/clarion/crates/clarion-core/src/lib.rs` to:
+Modify `/home/john/loomweave/crates/loomweave-core/src/lib.rs` to:
 
 ```rust
-//! clarion-core — domain types, identifiers, and provider traits.
+//! loomweave-core — domain types, identifiers, and provider traits.
 
 pub mod entity_id;
 pub mod llm_provider;
@@ -3158,24 +3158,24 @@ pub use llm_provider::{LlmProvider, NoopProvider};
 - [ ] **Step 3: Run the tests**
 
 ```bash
-cd /home/john/clarion && cargo nextest run -p clarion-core
+cd /home/john/loomweave && cargo nextest run -p loomweave-core
 ```
 
-Expected: all clarion-core tests pass (13 entity_id + 2 llm_provider = 15).
+Expected: all loomweave-core tests pass (13 entity_id + 2 llm_provider = 15).
 
 - [ ] **Step 4: Clippy clean**
 
 ```bash
-cd /home/john/clarion && cargo clippy -p clarion-core --all-targets -- -D warnings
+cd /home/john/loomweave && cargo clippy -p loomweave-core --all-targets -- -D warnings
 ```
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/john/clarion && git add crates/clarion-core/ && git commit -m "$(cat <<'EOF'
+cd /home/john/loomweave && git add crates/loomweave-core/ && git commit -m "$(cat <<'EOF'
 feat(wp1): LlmProvider trait stub for WP6
 
-LlmProvider + NoopProvider in clarion-core. NoopProvider::name() panics
+LlmProvider + NoopProvider in loomweave-core. NoopProvider::name() panics
 loudly — if it ever fires, some WP1 code is reaching for a real provider
 before WP6 is wired. 2 tests: trait implementation and panic contract.
 EOF
@@ -3187,11 +3187,11 @@ EOF
 ## Task 9: End-to-end WP1 smoke test
 
 **Files:**
-- Create: `/home/john/clarion/crates/clarion-cli/tests/wp1_e2e.rs`
+- Create: `/home/john/loomweave/crates/loomweave-cli/tests/wp1_e2e.rs`
 
 - [ ] **Step 1: Write the end-to-end smoke test**
 
-Write `/home/john/clarion/crates/clarion-cli/tests/wp1_e2e.rs`:
+Write `/home/john/loomweave/crates/loomweave-cli/tests/wp1_e2e.rs`:
 
 ```rust
 //! End-to-end WP1 smoke test — the minimum that must work at WP1 close.
@@ -3202,36 +3202,36 @@ Write `/home/john/clarion/crates/clarion-cli/tests/wp1_e2e.rs`:
 use assert_cmd::Command;
 use rusqlite::Connection;
 
-fn clarion_bin() -> Command {
-    Command::cargo_bin("clarion").expect("clarion binary")
+fn loomweave_bin() -> Command {
+    Command::cargo_bin("loomweave").expect("loomweave binary")
 }
 
 #[test]
 fn wp1_walking_skeleton_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
 
-    // Step 1: clarion install
-    clarion_bin()
+    // Step 1: loomweave install
+    loomweave_bin()
         .args(["install", "--path"])
         .arg(dir.path())
         .assert()
         .success();
 
-    let clarion_dir = dir.path().join(".clarion");
-    assert!(clarion_dir.join("clarion.db").exists());
-    assert!(clarion_dir.join("config.json").exists());
-    assert!(clarion_dir.join(".gitignore").exists());
-    assert!(dir.path().join("clarion.yaml").exists());
+    let loomweave_dir = dir.path().join(".loomweave");
+    assert!(loomweave_dir.join("loomweave.db").exists());
+    assert!(loomweave_dir.join("config.json").exists());
+    assert!(loomweave_dir.join(".gitignore").exists());
+    assert!(dir.path().join("loomweave.yaml").exists());
 
-    // Step 2: clarion analyze (no plugins yet — WP2 wires them)
-    clarion_bin()
+    // Step 2: loomweave analyze (no plugins yet — WP2 wires them)
+    loomweave_bin()
         .args(["analyze"])
         .arg(dir.path())
         .assert()
         .success();
 
     // Step 3: verify expected shape in the DB.
-    let conn = Connection::open(clarion_dir.join("clarion.db")).unwrap();
+    let conn = Connection::open(loomweave_dir.join("loomweave.db")).unwrap();
 
     let migration_version: i64 = conn
         .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| row.get(0))
@@ -3261,7 +3261,7 @@ fn wp1_walking_skeleton_end_to_end() {
 - [ ] **Step 2: Run the full workspace test suite one last time**
 
 ```bash
-cd /home/john/clarion && cargo nextest run --workspace --all-features
+cd /home/john/loomweave && cargo nextest run --workspace --all-features
 ```
 
 Expected: all tests green. Count should be ~20 (15 core + 2 reader + 7 schema + 3 writer + 4 install + 2 analyze + 1 e2e = in that neighbourhood; exact count depends on which negative cases expanded).
@@ -3269,20 +3269,20 @@ Expected: all tests green. Count should be ~20 (15 core + 2 reader + 7 schema + 
 - [ ] **Step 3: Release-profile build**
 
 ```bash
-cd /home/john/clarion && cargo build --workspace --release
+cd /home/john/loomweave && cargo build --workspace --release
 ```
 
-Expected: clean compile, `target/release/clarion` exists. If any warning-as-error surfaces, fix it in the relevant crate's code path, not by downgrading the lint.
+Expected: clean compile, `target/release/loomweave` exists. If any warning-as-error surfaces, fix it in the relevant crate's code path, not by downgrading the lint.
 
 - [ ] **Step 4: Full ADR-023 gate sweep before commit**
 
 Every gate below must exit 0 before Task 9 commits. CI runs the same set against the PR; running them locally first avoids PR-cycle churn.
 
 ```bash
-cd /home/john/clarion && cargo fmt --all -- --check
-cd /home/john/clarion && cargo clippy --workspace --all-targets --all-features -- -D warnings
-cd /home/john/clarion && cargo doc --workspace --no-deps --all-features
-cd /home/john/clarion && cargo deny check
+cd /home/john/loomweave && cargo fmt --all -- --check
+cd /home/john/loomweave && cargo clippy --workspace --all-targets --all-features -- -D warnings
+cd /home/john/loomweave && cargo doc --workspace --no-deps --all-features
+cd /home/john/loomweave && cargo deny check
 ```
 
 If any gate fails, fix in-place (don't loosen the lint, don't add allowlist entries without a commit-message justification, don't skip `--all-features`).
@@ -3290,11 +3290,11 @@ If any gate fails, fix in-place (don't loosen the lint, don't add allowlist entr
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/john/clarion && git add crates/clarion-cli/tests/wp1_e2e.rs && git commit -m "$(cat <<'EOF'
+cd /home/john/loomweave && git add crates/loomweave-cli/tests/wp1_e2e.rs && git commit -m "$(cat <<'EOF'
 test(wp1): end-to-end smoke test
 
-wp1_e2e.rs runs the README §3 demo script at WP1 scope: clarion install
-creates .clarion/; clarion analyze commits a run with status
+wp1_e2e.rs runs the README §3 demo script at WP1 scope: loomweave install
+creates .loomweave/; loomweave analyze commits a run with status
 skipped_no_plugins and zero entities; migration 0001 recorded as
 schema_version 1. WP2+WP3 extend this test with non-zero entity asserts.
 EOF
@@ -3306,19 +3306,19 @@ EOF
 ## Task 10: Sign-off ladder updates
 
 **Files:**
-- Modify: `/home/john/clarion/docs/implementation/sprint-1/signoffs.md`
-- Modify: `/home/john/clarion/docs/implementation/sprint-1/README.md`
-- Modify: `/home/john/clarion/docs/implementation/sprint-1/wp1-scaffold.md`
+- Modify: `/home/john/loomweave/docs/implementation/sprint-1/signoffs.md`
+- Modify: `/home/john/loomweave/docs/implementation/sprint-1/README.md`
+- Modify: `/home/john/loomweave/docs/implementation/sprint-1/wp1-scaffold.md`
 
 - [ ] **Step 1: Tick Tier A.1.* boxes in `signoffs.md`**
 
-In `/home/john/clarion/docs/implementation/sprint-1/signoffs.md`, change each Tier A.1 checkbox from `- [ ]` to `- [x]` after verifying the cited proof (commit hash, test-run log, or doc commit). For lock-in rows A.1.3, A.1.4, A.1.5, fill in the `locked on ______` date — use the date the final WP1 commit lands (execute `git log -1 --format=%as HEAD` to get it). Also tick A.1.6, A.1.7, A.1.8, A.1.9, A.1.10.
+In `/home/john/loomweave/docs/implementation/sprint-1/signoffs.md`, change each Tier A.1 checkbox from `- [ ]` to `- [x]` after verifying the cited proof (commit hash, test-run log, or doc commit). For lock-in rows A.1.3, A.1.4, A.1.5, fill in the `locked on ______` date — use the date the final WP1 commit lands (execute `git log -1 --format=%as HEAD` to get it). Also tick A.1.6, A.1.7, A.1.8, A.1.9, A.1.10.
 
 Do **not** tick Tier A.2, A.3, A.4, A.5, A.6 — those belong to WP2/WP3/sprint-close.
 
 - [ ] **Step 2: Stamp lock-in dates in README.md §4**
 
-In `/home/john/clarion/docs/implementation/sprint-1/README.md` §4 Lock-in summary, annotate L1, L2, L3 rows with the same `locked on <date>` stamp added to signoffs.md.
+In `/home/john/loomweave/docs/implementation/sprint-1/README.md` §4 Lock-in summary, annotate L1, L2, L3 rows with the same `locked on <date>` stamp added to signoffs.md.
 
 - [ ] **Step 3: Mark UQ-WP1-* resolved in `wp1-scaffold.md §5`**
 
@@ -3331,13 +3331,13 @@ Each UQ-WP1-01 through UQ-WP1-09 entry gets a `**Resolved**: <outcome>` line tha
 - UQ-WP1-05 — resolved in Task 3: full `runs` shape; plugin-invocation columns carried as JSON in the `config` column, populated by WP2.
 - UQ-WP1-06 — resolved in Task 3: `StorageError` wraps `rusqlite::Error` via `thiserror`.
 - UQ-WP1-07 — resolved in Task 2: `EntityIdError::SegmentContainsColon`.
-- UQ-WP1-08 — resolved in Task 5: refuses if `.clarion/` exists; `--force` stub.
+- UQ-WP1-08 — resolved in Task 5: refuses if `.loomweave/` exists; `--force` stub.
 - UQ-WP1-09 — resolved in Task 1: Rust 2021 + stable via `rust-toolchain.toml`.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/john/clarion && git add docs/implementation/sprint-1/ && git commit -m "$(cat <<'EOF'
+cd /home/john/loomweave && git add docs/implementation/sprint-1/ && git commit -m "$(cat <<'EOF'
 docs(sprint-1): tick WP1 sign-off and stamp L1/L2/L3 lock-ins
 
 Tier A.1 boxes ticked in signoffs.md with the WP1-close commit date.
@@ -3361,9 +3361,9 @@ EOF
 | §6.Task 2 Entity-ID assembler | Task 2 | ✓ |
 | §6.Task 3 Schema migration | Task 3 | ✓ |
 | §6.Task 4 Reader pool | Task 4 | ✓ |
-| §6.Task 5 `clarion install` + ADR-005 | Task 5 | ✓ |
+| §6.Task 5 `loomweave install` + ADR-005 | Task 5 | ✓ |
 | §6.Task 6 Writer-actor | Task 6 | ✓ |
-| §6.Task 7 `clarion analyze` | Task 7 | ✓ |
+| §6.Task 7 `loomweave analyze` | Task 7 | ✓ |
 | §6.Task 8 LlmProvider stub | Task 8 | ✓ |
 | §6.Task 9 E2E smoke | Task 9 | ✓ |
 | §8 Exit criteria sign-off | Task 10 | ✓ |
@@ -3372,7 +3372,7 @@ Every lock-in (L1/L2/L3) has a Task that lands it. Every UQ-WP1-* has a designat
 
 **Type consistency spot-check:**
 
-- `EntityId` / `entity_id()` signature identical between Task 2 definition and Task 8's stub (both re-exported from `clarion-core::lib`).
+- `EntityId` / `entity_id()` signature identical between Task 2 definition and Task 8's stub (both re-exported from `loomweave-core::lib`).
 - `WriterCmd::{BeginRun,InsertEntity,CommitRun,FailRun}` — same four variants in `commands.rs` (Task 6 Step 1), `writer.rs` dispatch (Task 6 Step 2), and the test harness (Task 6 Step 4) and `analyze.rs` (Task 7 Step 1).
 - `RunStatus::{SkippedNoPlugins,Completed,Failed}` — used in `writer.rs`, `commands.rs`, `analyze.rs`, and the integration tests. Strings match migration `0001` implicit values (`skipped_no_plugins`, `completed`, `failed`, plus `running` from `BeginRun`).
 - `Writer::commits_observed` is a public `Arc<AtomicUsize>` — accessed by name in Task 6 tests.

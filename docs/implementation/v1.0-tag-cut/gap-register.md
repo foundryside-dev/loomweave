@@ -1,4 +1,4 @@
-# Clarion v1.0.0 Tag-Cut Gap Register
+# Loomweave v1.0.0 Tag-Cut Gap Register
 
 **Date**: 2026-05-22
 **Branch**: `RC1` at `4dd7b63`
@@ -75,7 +75,7 @@ blocker count is unchanged.)
 - **Runbook**: [`docs/operator/v1.0-release-governance.md`](../../operator/v1.0-release-governance.md)
 - **Effort**: 1 hr operator.
 - **Exit criterion**: `scripts/check-github-release-governance.py
-  --repository tachyon-beep/clarion --branch main` exits 0.
+  --repository foundryside-dev/loomweave --branch main` exits 0.
 
 #### GOV-02 (Critical) — No tag protection rule
 
@@ -136,8 +136,8 @@ blocker count is unchanged.)
 - **Origin**: arch-2026-05-20 R3; deep-dive-docs C1.
 - **Evidence**: `CHANGELOG.md:60` lists `UNAUTHORIZED`. Authoritative
   sources (`docs/federation/contracts.md:82`, `82,202,276`,
-  `docs/clarion/adr/ADR-014:126`, `docs/clarion/adr/ADR-034:45,87,145`,
-  implementation tests at `crates/clarion-cli/tests/serve.rs:1457,1495,1547,1579,1614`)
+  `docs/loomweave/adr/ADR-014:126`, `docs/loomweave/adr/ADR-034:45,87,145`,
+  implementation tests at `crates/loomweave-cli/tests/serve.rs:1457,1495,1547,1579,1614`)
   all use `UNAUTHENTICATED`.
 - **Fix**: `Edit` `UNAUTHORIZED` → `UNAUTHENTICATED` in `CHANGELOG.md:60`.
 - **Effort**: 1 min.
@@ -155,9 +155,9 @@ blocker count is unchanged.)
 #### DOC-03 (High) — NFR-SEC-03 is stale post-ADR-034
 
 - **Origin**: deep-dive-docs H2 (net-new).
-- **Evidence**: `docs/clarion/1.0/requirements.md:771-783` says non-loopback
+- **Evidence**: `docs/loomweave/1.0/requirements.md:771-783` says non-loopback
   "When enabled, startup logs a warning that the endpoint is
-  unauthenticated and must be protected outside Clarion." `ADR-034:43`
+  unauthenticated and must be protected outside Loomweave." `ADR-034:43`
   says "Non-loopback binds require both `allow_non_loopback: true` and a
   resolved HMAC identity secret or legacy bearer token; either alone is
   insufficient." Per CLAUDE.md precedence (ADR > requirements), the
@@ -170,7 +170,7 @@ blocker count is unchanged.)
 #### DOC-04 (High) — REQ-HTTP-03 is stale post-ADR-034
 
 - **Origin**: deep-dive-docs H2.
-- **Evidence**: `docs/clarion/1.0/requirements.md:558-573` still describes
+- **Evidence**: `docs/loomweave/1.0/requirements.md:558-573` still describes
   the HTTP API as "unauthenticated and loopback-only by default" and the
   verification as "unauthenticated-surface warning". Same drift as DOC-03
   but on the routing side.
@@ -188,10 +188,10 @@ blocker count is unchanged.)
 - **Fix**: `Edit` to add `, ADR-034`.
 - **Effort**: 1 min.
 
-#### DOC-06 (High) — loom.md still labels asterisks as "v0.1"
+#### DOC-06 (High) — weft.md still labels asterisks as "v0.1"
 
 - **Origin**: deep-dive-docs H3.
-- **Evidence**: `docs/suite/loom.md:65,69` heads "v0.1 asterisks" and says
+- **Evidence**: `docs/suite/weft.md:65,69` heads "v0.1 asterisks" and says
   "The asterisk ships with v0.1 and retires in v0.2." CLAUDE.md:64 and
   the CHANGELOG say both asterisks persist into v1.0 and retire
   post-release.
@@ -206,8 +206,8 @@ blocker count is unchanged.)
 - **Evidence**: `CLAUDE.md:144` "HMAC inbound auth (C-4) — bearer is the
   1.0 wire surface; HMAC is forward-compatible and tracked for post-1.0
   hardening." Code reads `identity_token_env` and enforces
-  `X-Loom-Component: clarion:<hmac>` today
-  (`crates/clarion-cli/src/http_read.rs:129-130,184,373-374`); ADR-034
+  `X-Weft-Component: loomweave:<hmac>` today
+  (`crates/loomweave-cli/src/http_read.rs:129-130,184,373-374`); ADR-034
   marks HMAC as the preferred mechanism; CHANGELOG:115-117 documents it
   shipping.
 - **Fix**: Update CLAUDE.md HMAC paragraph: HMAC ships in v1.0 per
@@ -225,15 +225,15 @@ blocker count is unchanged.)
 - **Fix**: Drop the version qualifier or change to "in v1.0".
 - **Effort**: 1 min.
 
-#### DOC-09 (Medium) — loom.md asterisk 2 (Wardline REGISTRY) absent from CHANGELOG
+#### DOC-09 (Medium) — weft.md asterisk 2 (Wardline REGISTRY) absent from CHANGELOG
 
 - **Origin**: deep-dive-docs M1.
-- **Evidence**: `loom.md:70` names the Wardline REGISTRY import as
+- **Evidence**: `weft.md:70` names the Wardline REGISTRY import as
   asterisk 2 with no retirement condition citation. CHANGELOG "Known
   v1.0 limitations" (lines 105-117) does not mention it.
 - **Fix**: Add an entry to CHANGELOG "Known limitations": "The Python
   plugin imports `wardline.core.registry.REGISTRY` at startup
-  (loom.md §5 asterisk 2). Retirement condition: Wardline ships a
+  (weft.md §5 asterisk 2). Retirement condition: Wardline ships a
   stable runtime probe API."
 - **Effort**: 5 min.
 
@@ -254,11 +254,11 @@ blocker count is unchanged.)
   because the cross-process race (STO-01) will surface as operator
   confusion without operator-facing guidance.
 - **Evidence**: There is no operator-facing doc that says (a) do not
-  put `.clarion/` on NFS, (b) do not run two `clarion analyze`
+  put `.loomweave/` on NFS, (b) do not run two `loomweave analyze`
   simultaneously, (c) backup procedure is "stop analyze →
   `PRAGMA wal_checkpoint(TRUNCATE)` → file copy".
 - **Fix**: Add a §Storage paragraph to top-level README or a new
-  `docs/clarion/1.0/operations.md` covering deployment constraints.
+  `docs/loomweave/1.0/operations.md` covering deployment constraints.
 - **Effort**: 30 min.
 
 ---
@@ -268,7 +268,7 @@ blocker count is unchanged.)
 #### SEC-01 (Critical) — `entity_briefing_block_reason` fail-open on malformed JSON
 
 - **Origin**: deep-dive-security T-11 (net-new).
-- **Evidence**: `crates/clarion-storage/src/query.rs:296-302`
+- **Evidence**: `crates/loomweave-storage/src/query.rs:296-302`
   `entity_briefing_block_reason` returns `None` (= unblocked) when
   `serde_json::from_str(properties_json)` fails. A plugin emitting
   malformed `properties` JSON silently disables the WP5 briefing
@@ -282,32 +282,32 @@ blocker count is unchanged.)
 #### SEC-02 (High) — Loopback-no-token trust assumption not documented
 
 - **Origin**: deep-dive-security T-9.
-- **Evidence**: `crates/clarion-cli/src/http_read.rs:384-386` admits any
+- **Evidence**: `crates/loomweave-cli/src/http_read.rs:384-386` admits any
   request when both `identity_secret` and `auth_token` are `None`.
-  `validate_auth_trust` (`crates/clarion-mcp/src/config.rs:307-345`)
+  `validate_auth_trust` (`crates/loomweave-mcp/src/config.rs:307-345`)
   only refuses *non-loopback* binds. On a shared developer host or CI
   runner, any local process can read the entire (non-blocked)
   catalogue.
 - **Fix**: (a) Add explicit operator-doc section to
-  `docs/operator/secret-scanning.md` and `docs/operator/clarion-http-read-api.md`
+  `docs/operator/secret-scanning.md` and `docs/operator/loomweave-http-read-api.md`
   describing the loopback-without-token trust assumption. (b) Add a
   startup-banner line when loopback-no-token mode is in effect:
   "HTTP API serving on loopback without authentication; any local
   process can read the catalogue."
 - **Effort**: 20 min docs + 20 min code.
 
-#### SEC-03 (High) — Legacy `.clarion/` upgrade requirement undocumented
+#### SEC-03 (High) — Legacy `.loomweave/` upgrade requirement undocumented
 
 - **Origin**: deep-dive-security T-11 (sub-point).
 - **Evidence**: `entity_briefing_block_reason` reads
   `properties.briefing_blocked`. Pre-WP5 binaries never wrote that
-  property; a 1.0 binary opening a pre-WP5 `.clarion/clarion.db` will
+  property; a 1.0 binary opening a pre-WP5 `.loomweave/loomweave.db` will
   serve the entire catalogue without refusal because every row's
   `briefing_blocked` is structurally absent.
 - **Fix**: Document the upgrade requirement in
   `docs/operator/secret-scanning.md` and in the CHANGELOG "Known
   limitations": "Upgrading from a pre-WP5 binary requires
-  `clarion analyze` re-run before any HTTP API serves the catalogue."
+  `loomweave analyze` re-run before any HTTP API serves the catalogue."
 - **Effort**: 10 min.
 
 ---
@@ -335,7 +335,7 @@ blocker count is unchanged.)
 
 - **Origin**: deep-dive-arch (architecture critic) + deep-dive-security
   (corroborating).
-- **Evidence**: `crates/clarion-cli/src/http_read.rs:426-431` — if
+- **Evidence**: `crates/loomweave-cli/src/http_read.rs:426-431` — if
   `to_bytes(body, HTTP_BODY_LIMIT_BYTES)` fails inside HMAC middleware,
   the response returns `ErrorCode::InvalidPath` with message
   "request body is invalid". A federation client pattern-matching on
@@ -349,12 +349,12 @@ blocker count is unchanged.)
 
 - **Origin**: deep-dive-pipeline.
 - **Evidence**: `release-subjects` in `.github/workflows/release.yml:201-225`
-  globs only `clarion-*.tar.gz` (Rust archives) into the SLSA provenance
+  globs only `loomweave-*.tar.gz` (Rust archives) into the SLSA provenance
   subjects. The Python plugin sdist has cosign signing but no SLSA
   attestation file. A user installing via `pipx install` from the
   release URL has no `slsa-verifier` path.
 - **Fix**: Either (a) extend the glob to include
-  `clarion_plugin_python*.tar.gz` and append to the existing provenance
+  `loomweave_plugin_python*.tar.gz` and append to the existing provenance
   file, or (b) document the gap explicitly in the release notes and in
   `docs/operator/v1.0-release-governance.md`.
 - **Effort**: 30 min for option (a); 5 min for option (b).
@@ -377,30 +377,30 @@ blocker count is unchanged.)
 
 ### Category 5 — Storage / SQLite discipline
 
-#### STO-01 (Critical) — No cross-process lock; second `clarion analyze` corrupts run state
+#### STO-01 (Critical) — No cross-process lock; second `loomweave analyze` corrupts run state
 
 - **Origin**: deep-dive-db (highest-priority finding).
-- **Evidence**: `crates/clarion-cli/src/run_lifecycle.rs:19-25`
+- **Evidence**: `crates/loomweave-cli/src/run_lifecycle.rs:19-25`
   unconditionally executes `UPDATE runs SET status='failed' WHERE
-  status='running'` at the top of every `clarion analyze`, then opens
+  status='running'` at the top of every `loomweave analyze`, then opens
   the writer-actor connection. There is no `fs2::FileExt::try_lock_exclusive()`
-  on `.clarion/clarion.lock` or the DB file. A second concurrent
-  `clarion analyze` flips the live run's status to `failed` while the
+  on `.loomweave/loomweave.lock` or the DB file. A second concurrent
+  `loomweave analyze` flips the live run's status to `failed` while the
   first writer holds an open connection mid-batch.
-- **Fix**: Add `fs2 = "0.4"` to `clarion-cli/Cargo.toml`. At the top
+- **Fix**: Add `fs2 = "0.4"` to `loomweave-cli/Cargo.toml`. At the top
   of `analyze::run` (and `serve` write paths), acquire
-  `File::open(".clarion/clarion.lock")?.try_lock_exclusive()`. Hold for
-  writer-actor lifetime. Fail fast with "another clarion analyze is in
+  `File::open(".loomweave/loomweave.lock")?.try_lock_exclusive()`. Hold for
+  writer-actor lifetime. Fail fast with "another loomweave analyze is in
   progress against this project".
 - **Effort**: 1-2 hr code + test.
 
 #### STO-02 (High) — No `PRAGMA application_id`
 
 - **Origin**: deep-dive-db.
-- **Evidence**: `crates/clarion-storage/src/pragma.rs` sets WAL,
+- **Evidence**: `crates/loomweave-storage/src/pragma.rs` sets WAL,
   synchronous, busy, foreign-keys, but never `application_id` or
   `user_version`. The SQLite file has no identity marker; tooling
-  like `file(1)` or `sqlite3 .dbinfo` cannot distinguish a Clarion DB
+  like `file(1)` or `sqlite3 .dbinfo` cannot distinguish a Loomweave DB
   from any other SQLite file.
 - **Fix**: Add `PRAGMA application_id = 0x434C524E` ("CLRN") to
   `apply_write_pragmas`. On open, assert the application_id is 0
@@ -413,7 +413,7 @@ blocker count is unchanged.)
 - **Origin**: deep-dive-db; arch-2026-05-20 follow-up.
 - **Evidence**: ADR-024 migration retirement guard
   (`scripts/check-migration-retirement.py`) requires
-  `crates/clarion-storage/migrations/published_build.txt` to mark the
+  `crates/loomweave-storage/migrations/published_build.txt` to mark the
   v1.0 commit SHA as the baseline. The file does not exist.
 - **Fix**: Create the file at tag-cut time with the exact
   `v1.0.0` commit SHA. Block CI on its presence going forward.
@@ -427,19 +427,19 @@ blocker count is unchanged.)
 - **Origin**: deep-dive-db.
 - **Evidence**: No `VACUUM INTO`, no `rusqlite::backup::Backup`, no
   `PRAGMA integrity_check` invocation in CI. A user who `cp`s
-  `.clarion/clarion.db` during a live `clarion analyze` gets a torn
-  copy because WAL pages live in `clarion.db-wal` separately.
+  `.loomweave/loomweave.db` during a live `loomweave analyze` gets a torn
+  copy because WAL pages live in `loomweave.db-wal` separately.
 - **Fix v1.0**: (a) Add `PRAGMA integrity_check` final assertion to
   `tests/e2e/sprint_1_walking_skeleton.sh`. (b) Document the
   supported backup procedure in DOC-11's README §Storage paragraph
   (shutdown → `PRAGMA wal_checkpoint(TRUNCATE)` → file copy).
-  (c) `clarion db backup` subcommand deferred to v1.1.
+  (c) `loomweave db backup` subcommand deferred to v1.1.
 - **Effort**: 30 min (parts a and b only).
 
 #### STO-05 (Medium) — `recover_preexisting_running_runs` has no liveness guard
 
 - **Origin**: deep-dive-db.
-- **Evidence**: `crates/clarion-cli/src/run_lifecycle.rs:19-25`
+- **Evidence**: `crates/loomweave-cli/src/run_lifecycle.rs:19-25`
   recovery sweep is `UPDATE runs SET status='failed' WHERE
   status='running'`. No PID column, no heartbeat, no startup-instance
   token. STO-01's fs2 lock is necessary but not sufficient; even
@@ -460,7 +460,7 @@ blocker count is unchanged.)
 - **Evidence**: `tests/e2e/sprint_2_mcp_surface.sh` exists and exercises
   all 8 MCP navigation tools (`entity_at`, `find_entity`, `callers_of`,
   `execution_paths_from`, `summary`, `issues_for`, `neighborhood`,
-  `subsystem_members`) over stdio against a real `clarion analyze`
+  `subsystem_members`) over stdio against a real `loomweave analyze`
   output with the Python plugin venv. The MCP `serve.rs` integration
   test only covers `initialize`; the `storage_tools.rs` test exercises
   the underlying storage layer but not the MCP wire serialization. A
@@ -499,16 +499,16 @@ blocker count is unchanged.)
 Filed as Filigree issues with `release:v1.1` label so they don't get lost.
 
 **Architecture refactors (deep-dive-arch v1.1 priority order):**
-1. Extract `clarion-core::errors` shared error-code vocabulary.
+1. Extract `loomweave-core::errors` shared error-code vocabulary.
 2. Split `analyze.rs` → `analyze/phase3.rs` + `analyze/mapping.rs`.
 3. Split `llm_provider.rs` per-provider.
-4. Split `clarion-mcp/src/lib.rs` into `tools/` subdir.
+4. Split `loomweave-mcp/src/lib.rs` into `tools/` subdir.
 5. Split `plugin/host.rs` validation from transport.
 6. Replace local HMAC-SHA256 with `hmac` + `subtle` crates.
 
 **Storage hardening (deep-dive-db):**
 1. `runs.owner_pid` + `heartbeat_at` columns and refined recovery WHERE-clause.
-2. `clarion db backup` subcommand via `rusqlite::backup::Backup`.
+2. `loomweave db backup` subcommand via `rusqlite::backup::Backup`.
 3. ~~`summary_cache.entity_id` FK via table-rebuild migration (confirmed
    bug — not intentional asymmetry).~~ **Closed in v1.0 (2026-05-24)**:
    landed in-place in migration `0001_initial_schema.sql` under
@@ -559,7 +559,7 @@ All of:
 2. Every Medium documentation gap is closed (operator-facing accuracy
    is non-negotiable on a release artifact).
 3. `scripts/check-github-release-governance.py` exits 0 against live
-   `tachyon-beep/clarion`.
+   `foundryside-dev/loomweave`.
 4. PR #12 (or its successor) is merged to `main` and is the parent of
    the `v1.0.0` tag commit.
 5. `release.yml workflow_dispatch` dry-run from `main` produces all

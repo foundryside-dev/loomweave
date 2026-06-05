@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Phase 3 subsystem clustering end-to-end test.
 #
-# Builds a real Clarion database through `clarion analyze`, verifies persisted
+# Builds a real Loomweave database through `loomweave analyze`, verifies persisted
 # subsystem entities / membership edges / clustering stats, checks deterministic
 # subsystem signatures across two clean project copies, and exercises the MCP
 # `subsystem_members` tool over stdio.
@@ -19,22 +19,22 @@ fail() { printf '[phase3-subsystems] FAIL: %s\n' "$*" >&2; exit 1; }
 cd "$REPO_ROOT"
 
 if [ "$CARGO_BUILD" = "1" ]; then
-    log "building clarion (release) ..."
+    log "building loomweave (release) ..."
     cargo build --workspace --release
 fi
-CLARION_BIN="$REPO_ROOT/target/release/clarion"
-[ -x "$CLARION_BIN" ] || fail "clarion binary missing at $CLARION_BIN"
+LOOMWEAVE_BIN="$REPO_ROOT/target/release/loomweave"
+[ -x "$LOOMWEAVE_BIN" ] || fail "loomweave binary missing at $LOOMWEAVE_BIN"
 
 if [ ! -d "$VENV" ]; then
     log "creating venv at $VENV ..."
     python3 -m venv "$VENV"
 fi
-log "installing clarion-plugin-python (editable) ..."
+log "installing loomweave-plugin-python (editable) ..."
 "$VENV/bin/pip" install --quiet -e "$REPO_ROOT/plugins/python[dev]"
-PLUGIN_BIN="$VENV/bin/clarion-plugin-python"
-[ -x "$PLUGIN_BIN" ] || fail "clarion-plugin-python missing at $PLUGIN_BIN"
+PLUGIN_BIN="$VENV/bin/loomweave-plugin-python"
+[ -x "$PLUGIN_BIN" ] || fail "loomweave-plugin-python missing at $PLUGIN_BIN"
 
-ROOT="$(mktemp -d -t clarion-phase3-XXXXXX)"
+ROOT="$(mktemp -d -t loomweave-phase3-XXXXXX)"
 trap 'rm -rf "$ROOT"' EXIT
 PROJECT_A="$ROOT/project-a"
 PROJECT_B="$ROOT/project-b"
@@ -87,7 +87,7 @@ def apply(amount: int) -> int:
 def preview(amount: int) -> int:
     return ledger.record(amount)
 PY
-    cat > "$dest/clarion.yaml" <<YAML
+    cat > "$dest/loomweave.yaml" <<YAML
 analysis:
   clustering:
     algorithm: weighted_components
@@ -101,10 +101,10 @@ run_analyze() {
     (
         cd "$project"
         export PATH="$REPO_ROOT/target/release:$VENV/bin:$PATH"
-        log "running: clarion install in $project"
-        clarion install
-        log "running: clarion analyze . in $project"
-        clarion analyze .
+        log "running: loomweave install in $project"
+        loomweave install
+        log "running: loomweave analyze . in $project"
+        loomweave analyze .
     )
 }
 
@@ -120,8 +120,8 @@ subsystem_signature() {
 run_analyze "$PROJECT_A"
 run_analyze "$PROJECT_B"
 
-DB_A="$PROJECT_A/.clarion/clarion.db"
-DB_B="$PROJECT_B/.clarion/clarion.db"
+DB_A="$PROJECT_A/.loomweave/loomweave.db"
+DB_B="$PROJECT_B/.loomweave/loomweave.db"
 
 log "verifying subsystem rows ..."
 SUBSYSTEM_COUNT=$(sqlite3 "$DB_A" "SELECT COUNT(*) FROM entities WHERE kind = 'subsystem';")
@@ -165,16 +165,16 @@ if [ "$SIG_A" != "$SIG_B" ]; then
 fi
 
 log "driving MCP subsystem_members ..."
-python3 - "$CLARION_BIN" "$PROJECT_A" <<'PY'
+python3 - "$LOOMWEAVE_BIN" "$PROJECT_A" <<'PY'
 import json
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
-clarion_bin = Path(sys.argv[1])
+loomweave_bin = Path(sys.argv[1])
 project_dir = Path(sys.argv[2])
-conn = sqlite3.connect(project_dir / ".clarion" / "clarion.db")
+conn = sqlite3.connect(project_dir / ".loomweave" / "loomweave.db")
 subsystem_id = conn.execute(
     "SELECT id FROM entities WHERE kind = 'subsystem' ORDER BY id LIMIT 1"
 ).fetchone()[0]
@@ -205,7 +205,7 @@ def read_frame(proc: subprocess.Popen[bytes]) -> dict[str, object]:
 
 
 proc = subprocess.Popen(
-    [str(clarion_bin), "serve", "--path", str(project_dir)],
+    [str(loomweave_bin), "serve", "--path", str(project_dir)],
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,

@@ -1,14 +1,14 @@
-# Loom Federation Hardening Tasking
+# Weft Federation Hardening Tasking
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` or `superpowers:executing-plans` to implement this tasking task-by-task. Steps use checkbox syntax for tracking.
 
-**Goal:** Bring Clarion's HTTP read API and ADR-014 federation contract up to the shared Loom standard required for Clarion 1.0 and Filigree 2.1 registry-backend mode.
+**Goal:** Bring Loomweave's HTTP read API and ADR-014 federation contract up to the shared Weft standard required for Loomweave 1.0 and Filigree 2.1 registry-backend mode.
 
-**Release stance:** This is release-blocking unless ADR-014 Clarion registry mode is explicitly de-scoped from the Clarion 1.0 and Filigree 2.1 tag notes. The current RC1 tests are green, but they validate the old contract shape rather than the hardened federation contract.
+**Release stance:** This is release-blocking unless ADR-014 Loomweave registry mode is explicitly de-scoped from the Loomweave 1.0 and Filigree 2.1 tag notes. The current RC1 tests are green, but they validate the old contract shape rather than the hardened federation contract.
 
-**Architecture:** Clarion owns the publisher side of the file-registry read contract. Filigree's side should implement against Clarion's documented decisions, so Clarion must first pin the wire semantics in ADR-014, then make storage and HTTP behavior match the documented contract.
+**Architecture:** Loomweave owns the publisher side of the file-registry read contract. Filigree's side should implement against Loomweave's documented decisions, so Loomweave must first pin the wire semantics in ADR-014, then make storage and HTTP behavior match the documented contract.
 
-**Tech Stack:** Rust workspace, `axum`, `tower`/`tower-http`, `rusqlite`, `deadpool`, `serde`, `serde_json`, `uuid`, Clarion's local Filigree tracker.
+**Tech Stack:** Rust workspace, `axum`, `tower`/`tower-http`, `rusqlite`, `deadpool`, `serde`, `serde_json`, `uuid`, Loomweave's local Filigree tracker.
 
 ---
 
@@ -16,15 +16,15 @@
 
 Filigree reported, and RC1 source confirms, that the contract hardening prompt is largely not landed:
 
-- C1: `resolve_file` storage errors still map to HTTP 400 with raw `err.to_string()` at `crates/clarion-cli/src/http_read.rs`.
-- C2/C5/C11: `resolve_file` still requires disk existence via canonicalization, still synthesizes `core:file:{content_hash}@{canonical_path}`, and still converts unreadable hash failures to empty strings in `crates/clarion-storage/src/query.rs`.
+- C1: `resolve_file` storage errors still map to HTTP 400 with raw `err.to_string()` at `crates/loomweave-cli/src/http_read.rs`.
+- C2/C5/C11: `resolve_file` still requires disk existence via canonicalization, still synthesizes `core:file:{content_hash}@{canonical_path}`, and still converts unreadable hash failures to empty strings in `crates/loomweave-storage/src/query.rs`.
 - C3: federation fixtures are still bare request/response snippets, and the file fixture still documents an invalid `@` entity ID.
 - C4/C7/C8/C9: HTTP read config has only `enabled` and `bind`; there is no non-loopback guard, no `allow_non_loopback`, no middleware stack, separate reader pools remain, and HTTP thread supervision only happens on shutdown.
 - C6/C10/C12/C13: joint contract decisions are not pinned; capabilities still return `version: "0.1"`, there is no `instance_id`, and errors are still `{ "error": String }`.
 
-## Contract Decisions Clarion Must Own First
+## Contract Decisions Loomweave Must Own First
 
-Clarion owns these publisher-side choices. Land them in `docs/clarion/adr/ADR-014-filigree-registry-backend.md` before implementation so the Filigree agent has a stable reference:
+Loomweave owns these publisher-side choices. Land them in `docs/loomweave/adr/ADR-014-filigree-registry-backend.md` before implementation so the Filigree agent has a stable reference:
 
 1. **Capabilities version field:** use `api_version: 1`.
    `api_version` increments only when the HTTP read API wire contract changes incompatibly for existing Filigree clients. Do not use product semver here.
@@ -32,8 +32,8 @@ Clarion owns these publisher-side choices. Land them in `docs/clarion/adr/ADR-01
    Delete the synthetic `core:file:{content_hash}@{canonical_path}` branch. It violates ADR-003 and creates shadow IDs that will not match future file-discovery rows.
 3. **`canonical_path` semantics:** project-relative POSIX path.
    No leading `/`, no leading `./`, no trailing `/`, separator `/`. This survives project relocation and matches current response intent.
-4. **Instance fingerprint:** stable per-project UUID in `.clarion/instance_id`, surfaced as `instance_id` in capabilities.
-   First creation persists with mode `0600` on Unix. Deleting `.clarion/` may create a new instance ID; that is acceptable and should be detectable by Filigree.
+4. **Instance fingerprint:** stable per-project UUID in `.loomweave/instance_id`, surfaced as `instance_id` in capabilities.
+   First creation persists with mode `0600` on Unix. Deleting `.loomweave/` may create a new instance ID; that is acceptable and should be detectable by Filigree.
 5. **Error envelope:** closed shape `{ "error": String, "code": ErrorCode }`.
    Initial code enum: `INVALID_PATH`, `PATH_OUTSIDE_PROJECT`, `NOT_FOUND`, `STORAGE_ERROR`, `INTERNAL`.
 6. **HTTP trust model:** unauthenticated loopback-only by default.
@@ -53,10 +53,10 @@ T0 contract docs
 
 If the team needs parallelism after T0 lands:
 
-- Worker A owns storage: `crates/clarion-storage/src/query.rs`, `crates/clarion-storage/tests/query_helpers.rs`.
-- Worker B owns HTTP contract: `crates/clarion-cli/src/http_read.rs`, `crates/clarion-cli/tests/serve.rs`, fixtures.
-- Worker C owns runtime guard/supervision: `crates/clarion-mcp/src/config.rs`, `crates/clarion-cli/src/serve.rs`, `crates/clarion-cli/src/http_read.rs`.
-- Worker D owns docs: ADR-014, ADR-003, `docs/federation/contracts.md`, `docs/operator/clarion-http-read-api.md`, `docs/suite/loom.md`.
+- Worker A owns storage: `crates/loomweave-storage/src/query.rs`, `crates/loomweave-storage/tests/query_helpers.rs`.
+- Worker B owns HTTP contract: `crates/loomweave-cli/src/http_read.rs`, `crates/loomweave-cli/tests/serve.rs`, fixtures.
+- Worker C owns runtime guard/supervision: `crates/loomweave-mcp/src/config.rs`, `crates/loomweave-cli/src/serve.rs`, `crates/loomweave-cli/src/http_read.rs`.
+- Worker D owns docs: ADR-014, ADR-003, `docs/federation/contracts.md`, `docs/operator/loomweave-http-read-api.md`, `docs/suite/weft.md`.
 
 Workers are not alone in the codebase. Do not revert or overwrite unrelated RC1 work; keep each task's write set narrow.
 
@@ -65,7 +65,7 @@ Workers are not alone in the codebase. Do not revert or overwrite unrelated RC1 
 Create one P0 epic:
 
 ```text
-Sprint 3 RC1 — Loom federation HTTP read API hardening
+Sprint 3 RC1 — Weft federation HTTP read API hardening
 ```
 
 Create these child phases/tasks:
@@ -84,9 +84,9 @@ Create these child phases/tasks:
 Use:
 
 ```bash
-filigree --actor clarion-agent start-work <id> --assignee clarion-agent
-filigree --actor clarion-agent add-comment <id> "summary, tests, commits"
-filigree --actor clarion-agent close <id> --reason="implemented and tested ..."
+filigree --actor loomweave-agent start-work <id> --assignee loomweave-agent
+filigree --actor loomweave-agent add-comment <id> "summary, tests, commits"
+filigree --actor loomweave-agent close <id> --reason="implemented and tested ..."
 ```
 
 Do not close any tracker item until the code, tests, docs, and commit for that item exist.
@@ -95,11 +95,11 @@ Do not close any tracker item until the code, tests, docs, and commit for that i
 
 **Files:**
 
-- Modify: `docs/clarion/adr/ADR-014-filigree-registry-backend.md`
-- Modify: `docs/clarion/adr/ADR-003-entity-id-scheme.md`
+- Modify: `docs/loomweave/adr/ADR-014-filigree-registry-backend.md`
+- Modify: `docs/loomweave/adr/ADR-003-entity-id-scheme.md`
 - Modify: `docs/federation/contracts.md`
-- Create: `docs/operator/clarion-http-read-api.md`
-- Modify: `docs/suite/loom.md`
+- Create: `docs/operator/loomweave-http-read-api.md`
+- Modify: `docs/suite/weft.md`
 
 **Acceptance criteria:**
 
@@ -113,10 +113,10 @@ Do not close any tracker item until the code, tests, docs, and commit for that i
 - [ ] Patch ADR-014 with the six contract decisions above.
 - [ ] Patch ADR-003 with a file-kind ID grammar note and reject the former `content_hash@path` pattern as non-conforming.
 - [ ] Patch `docs/federation/contracts.md` to show the new request/response and error shapes.
-- [ ] Create `docs/operator/clarion-http-read-api.md` with a `Trust model` section.
-- [ ] Patch `docs/suite/loom.md` to link the operator trust model.
-- [ ] Run `cargo test -p clarion-cli --test serve` to ensure docs-only edits did not disturb tests.
-- [ ] Commit as `C0 docs: pin Loom federation read contract decisions`.
+- [ ] Create `docs/operator/loomweave-http-read-api.md` with a `Trust model` section.
+- [ ] Patch `docs/suite/weft.md` to link the operator trust model.
+- [ ] Run `cargo test -p loomweave-cli --test serve` to ensure docs-only edits did not disturb tests.
+- [ ] Commit as `C0 docs: pin Weft federation read contract decisions`.
 
 ## T1: Storage Resolution Correctness
 
@@ -124,8 +124,8 @@ Do not close any tracker item until the code, tests, docs, and commit for that i
 
 **Files:**
 
-- Modify: `crates/clarion-storage/src/query.rs`
-- Modify: `crates/clarion-storage/tests/query_helpers.rs`
+- Modify: `crates/loomweave-storage/src/query.rs`
+- Modify: `crates/loomweave-storage/tests/query_helpers.rs`
 
 **Implementation requirements:**
 
@@ -136,7 +136,7 @@ Do not close any tracker item until the code, tests, docs, and commit for that i
 - `file_content_hash` must return `Result<String, io::Error>` if still used as a fallback.
 - Never return empty `content_hash` because disk read failed. If no catalog hash exists and a hash fallback fails, propagate the error.
 - `canonical_path` returned by `resolve_file` must be project-relative POSIX and must not start with `/`, `./`, or `../`.
-- Caller-supplied `language` must not poison the catalog response when Clarion can infer a better value.
+- Caller-supplied `language` must not poison the catalog response when Loomweave can infer a better value.
 
 **Tests to add first:**
 
@@ -149,8 +149,8 @@ Do not close any tracker item until the code, tests, docs, and commit for that i
 **Commands:**
 
 ```bash
-cargo test -p clarion-storage resolve_file -- --nocapture
-cargo test -p clarion-storage
+cargo test -p loomweave-storage resolve_file -- --nocapture
+cargo test -p loomweave-storage
 ```
 
 **Commit guidance:**
@@ -165,9 +165,9 @@ cargo test -p clarion-storage
 
 **Files:**
 
-- Modify: `crates/clarion-cli/src/http_read.rs`
-- Modify: `crates/clarion-cli/tests/serve.rs`
-- May modify: `crates/clarion-storage/src/error.rs` only if a small helper is needed.
+- Modify: `crates/loomweave-cli/src/http_read.rs`
+- Modify: `crates/loomweave-cli/tests/serve.rs`
+- May modify: `crates/loomweave-storage/src/error.rs` only if a small helper is needed.
 
 **Implementation requirements:**
 
@@ -194,8 +194,8 @@ cargo test -p clarion-storage
 **Commands:**
 
 ```bash
-cargo test -p clarion-cli --test serve
-cargo test -p clarion-storage
+cargo test -p loomweave-cli --test serve
+cargo test -p loomweave-storage
 ```
 
 **Commit guidance:**
@@ -209,9 +209,9 @@ cargo test -p clarion-storage
 
 **Files:**
 
-- Modify: `crates/clarion-cli/src/http_read.rs`
-- Modify: `crates/clarion-cli/tests/serve.rs`
-- Modify or create helper in: `crates/clarion-cli/src/serve.rs` or a small `instance.rs` module if that keeps `http_read.rs` focused.
+- Modify: `crates/loomweave-cli/src/http_read.rs`
+- Modify: `crates/loomweave-cli/tests/serve.rs`
+- Modify or create helper in: `crates/loomweave-cli/src/serve.rs` or a small `instance.rs` module if that keeps `http_read.rs` focused.
 - Modify: `docs/federation/fixtures/get-api-v1-capabilities.json`
 
 **Implementation requirements:**
@@ -227,14 +227,14 @@ cargo test -p clarion-storage
 }
 ```
 
-- On startup, read `.clarion/instance_id`; if absent, create a UUID v4 and persist it.
+- On startup, read `.loomweave/instance_id`; if absent, create a UUID v4 and persist it.
 - On Unix, persist with mode `0600`.
 - The ID must survive process restarts.
 - The capability fixture must document the shape with `_meta`, `shape_decl`, and `examples`.
 
 **Tests to add first:**
 
-- first startup creates `.clarion/instance_id`
+- first startup creates `.loomweave/instance_id`
 - second startup reuses the same ID
 - capabilities returns `api_version: 1`
 - capabilities includes the stored `instance_id`
@@ -243,13 +243,13 @@ cargo test -p clarion-storage
 **Commands:**
 
 ```bash
-cargo test -p clarion-cli --test serve capabilities -- --nocapture
+cargo test -p loomweave-cli --test serve capabilities -- --nocapture
 ```
 
 **Commit guidance:**
 
 - `C6 fix: expose api_version in HTTP capabilities`
-- `C12 fix: add stable Clarion instance fingerprint`
+- `C12 fix: add stable Loomweave instance fingerprint`
 
 ## T4: Contract Fixtures and Shape Gate
 
@@ -259,7 +259,7 @@ cargo test -p clarion-cli --test serve capabilities -- --nocapture
 
 - Modify: `docs/federation/fixtures/get-api-v1-files.demo-python.json`
 - Modify: `docs/federation/fixtures/get-api-v1-capabilities.json`
-- Modify: `crates/clarion-cli/tests/serve.rs` or create `crates/clarion-cli/tests/http_contract.rs`
+- Modify: `crates/loomweave-cli/tests/serve.rs` or create `crates/loomweave-cli/tests/http_contract.rs`
 
 **Implementation requirements:**
 
@@ -281,7 +281,7 @@ cargo test -p clarion-cli --test serve capabilities -- --nocapture
 **Commands:**
 
 ```bash
-cargo test -p clarion-cli --test serve
+cargo test -p loomweave-cli --test serve
 ```
 
 **Commit guidance:**
@@ -294,12 +294,12 @@ cargo test -p clarion-cli --test serve
 
 **Files:**
 
-- Modify: `crates/clarion-mcp/src/config.rs`
-- Modify: `crates/clarion-cli/src/http_read.rs`
-- Modify: `crates/clarion-cli/src/serve.rs`
-- Modify: `crates/clarion-cli/Cargo.toml`
+- Modify: `crates/loomweave-mcp/src/config.rs`
+- Modify: `crates/loomweave-cli/src/http_read.rs`
+- Modify: `crates/loomweave-cli/src/serve.rs`
+- Modify: `crates/loomweave-cli/Cargo.toml`
 - Modify: workspace `Cargo.toml` and `Cargo.lock` if adding dependencies
-- Modify: `crates/clarion-cli/tests/serve.rs`
+- Modify: `crates/loomweave-cli/tests/serve.rs`
 
 **Implementation requirements:**
 
@@ -315,7 +315,7 @@ cargo test -p clarion-cli --test serve
   - `LoadShedLayer::new()`
 - Share the existing `ReaderPool` between MCP and HTTP; do not open a second pool.
 - Add supervision so a failed HTTP server aborts or fails the serve process visibly before MCP stdio continues pretending healthy.
-- Name threads if a dedicated thread remains: OS thread `clarion-http-read`, Tokio workers `clarion-http-worker`.
+- Name threads if a dedicated thread remains: OS thread `loomweave-http-read`, Tokio workers `loomweave-http-worker`.
 
 **Tests to add first:**
 
@@ -329,7 +329,7 @@ cargo test -p clarion-cli --test serve
 **Commands:**
 
 ```bash
-cargo test -p clarion-cli --test serve
+cargo test -p loomweave-cli --test serve
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
@@ -352,23 +352,23 @@ These do not have to block the tag if the release notes explicitly identify them
 - C15: release reader-pool slots before slow disk hash fallback.
 - C16: support `ETag` and `If-None-Match` on `/api/v1/files`.
 - C17: structured thread/request naming, if not fully covered by T5.
-- C18: per-request structured access log fields including optional `X-Loom-Component` and `X-Filigree-Actor`.
+- C18: per-request structured access log fields including optional `X-Weft-Component` and `X-Filigree-Actor`.
 - C19: `#[serde(deny_unknown_fields)]` on `FileQuery`.
 
-If deferred, add a `Known limitations for 1.0` section to the release notes and create Clarion tracker issues for each item retained beyond the tag.
+If deferred, add a `Known limitations for 1.0` section to the release notes and create Loomweave tracker issues for each item retained beyond the tag.
 
 ## End-to-End Acceptance
 
-Clarion side is in spec when all of the following are true:
+Loomweave side is in spec when all of the following are true:
 
 - ADR-014 documents `api_version`, `canonical_path`, `instance_id`, error envelope, no synthetic IDs, and trust model.
 - ADR-003 no longer permits or implies `@` file IDs.
-- `cargo test -p clarion-cli --test serve` passes.
-- `cargo test -p clarion-storage` passes.
+- `cargo test -p loomweave-cli --test serve` passes.
+- `cargo test -p loomweave-storage` passes.
 - `cargo test --workspace` passes.
 - `cargo clippy --workspace --all-targets -- -D warnings` passes.
 - `cargo fmt --all --check` passes.
-- A local HTTP smoke against `clarion serve` proves:
+- A local HTTP smoke against `loomweave serve` proves:
   - `/api/v1/_capabilities` returns `api_version: 1` and `instance_id`.
   - `/api/v1/files` returns a real `core:file:*` entity ID for a cataloged file.
   - a module-only catalog row does not synthesize a file ID and returns 404.
@@ -387,4 +387,4 @@ When finished or blocked, report:
 - Joint decisions made and exact doc locations.
 - Any reviewer finding that proved wrong, with source evidence.
 
-Do not mutate `/home/john/filigree`; it is read-only for this Clarion hardening pass.
+Do not mutate `/home/john/filigree`; it is read-only for this Loomweave hardening pass.

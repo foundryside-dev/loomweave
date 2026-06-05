@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """B.8 scale-test MCP driver.
 
-The driver assumes `clarion analyze` has already produced `.clarion/clarion.db`
-for the project under test. It starts `clarion serve`, sends Content-Length
+The driver assumes `loomweave analyze` has already produced `.loomweave/loomweave.db`
+for the project under test. It starts `loomweave serve`, sends Content-Length
 framed MCP requests, and writes JSON measurements for the B.8 result memo.
 """
 
@@ -375,12 +375,12 @@ def write_frame(proc: subprocess.Popen[bytes], message: dict[str, Any]) -> None:
 class McpClient:
     def __init__(
         self,
-        clarion_bin: Path,
+        loomweave_bin: Path,
         project: Path,
         config: Path | None,
         timeout_seconds: float,
     ) -> None:
-        command = [str(clarion_bin), "serve", "--path", str(project)]
+        command = [str(loomweave_bin), "serve", "--path", str(project)]
         if config is not None:
             command.extend(["--config", str(config)])
         self.proc = subprocess.Popen(
@@ -411,7 +411,7 @@ class McpClient:
             stderr = self.proc.stderr.read().decode("utf-8", "replace")
         if self.proc.returncode != 0:
             raise RuntimeError(
-                f"clarion serve exited {self.proc.returncode}; stderr={stderr}"
+                f"loomweave serve exited {self.proc.returncode}; stderr={stderr}"
             )
         return stderr
 
@@ -423,7 +423,7 @@ def _rows(
 
 
 def discover_targets(project: Path) -> QueryTargets:
-    db_path = project / ".clarion" / "clarion.db"
+    db_path = project / ".loomweave" / "loomweave.db"
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
@@ -713,14 +713,14 @@ def build_requests(
 
 def run_driver(args: argparse.Namespace) -> dict[str, Any]:
     project = args.project.resolve()
-    clarion_bin = args.clarion_bin.resolve()
+    loomweave_bin = args.loomweave_bin.resolve()
     config = args.config.resolve() if args.config else None
     targets = discover_targets(project)
     requests, skipped_patterns = build_requests(
         targets, args.heavy_count, not args.skip_inferred
     )
 
-    client = McpClient(clarion_bin, project, config, args.timeout_seconds)
+    client = McpClient(loomweave_bin, project, config, args.timeout_seconds)
     records: list[CallRecord] = []
     try:
         init_response, _, initialize_latency_ms = client.request(
@@ -731,7 +731,7 @@ def run_driver(args: argparse.Namespace) -> dict[str, Any]:
                 "params": {
                     "protocolVersion": "2025-11-25",
                     "capabilities": {},
-                    "clientInfo": {"name": "clarion-b8-driver", "version": "0.1.0"},
+                    "clientInfo": {"name": "loomweave-b8-driver", "version": "0.1.0"},
                 },
             }
         )
@@ -766,7 +766,7 @@ def run_driver(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "generated_at_unix": int(time.time()),
         "project": str(project),
-        "clarion_bin": str(clarion_bin),
+        "loomweave_bin": str(loomweave_bin),
         "config": str(config) if config else None,
         "initialize": init_response,
         "initialize_latency_ms": round(initialize_latency_ms, 3),
@@ -786,13 +786,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--project",
         type=Path,
         required=True,
-        help="Analyzed project root containing .clarion/clarion.db",
+        help="Analyzed project root containing .loomweave/loomweave.db",
     )
     parser.add_argument(
-        "--clarion-bin", type=Path, default=Path("target/release/clarion")
+        "--loomweave-bin", type=Path, default=Path("target/release/loomweave")
     )
     parser.add_argument(
-        "--config", type=Path, help="Optional clarion serve config path"
+        "--config", type=Path, help="Optional loomweave serve config path"
     )
     parser.add_argument("--output", type=Path, required=True, help="JSON output path")
     parser.add_argument("--heavy-count", type=int, default=50)

@@ -1,18 +1,18 @@
 {
   "_meta": {
-    "contract": "clarion-http-read-api",
+    "contract": "loomweave-http-read-api",
     "endpoint": "GET /api/v1/files",
     "api_version": 1,
     "fixture_version": 3,
     "stability": "normative",
-    "authority": "Clarion ADR-014 federation registry-backend contract",
-    "verification": "cargo test -p clarion-cli --test serve",
+    "authority": "Loomweave ADR-014 federation registry-backend contract",
+    "verification": "cargo test -p loomweave-cli --test serve",
     "normative": true,
     "updated": "2026-05-19",
-    "description": "Contract examples for Clarion file identity resolution consumed by Filigree registry backends."
+    "description": "Contract examples for Loomweave file identity resolution consumed by Filigree registry backends."
   },
   "shape_decl": {
-    "kind": "clarion-http-fixture-shapes",
+    "kind": "loomweave-http-fixture-shapes",
     "shapes": {
       "file_resolution": {
         "status": 200,
@@ -100,7 +100,7 @@
         "status": 404,
         "shape": "error_envelope",
         "body": {
-          "error": "file is not known to Clarion",
+          "error": "file is not known to Loomweave",
           "code": "NOT_FOUND"
         }
       }

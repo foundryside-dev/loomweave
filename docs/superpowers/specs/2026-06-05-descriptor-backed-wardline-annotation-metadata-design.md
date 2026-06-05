@@ -2,11 +2,11 @@
 
 ## Summary
 
-Clarion's Python plugin consumes Wardline's NG-25 trust-vocabulary descriptor
+Loomweave's Python plugin consumes Wardline's NG-25 trust-vocabulary descriptor
 without importing Wardline. When the descriptor is available, the plugin records
-source-observed Wardline decorator facts on Clarion function/class entities as
+source-observed Wardline decorator facts on Loomweave function/class entities as
 metadata and tags. Wardline remains authoritative for vocabulary and policy
-semantics; Clarion stores only what it observes in source against that
+semantics; Loomweave stores only what it observes in source against that
 descriptor.
 
 ## Design

@@ -2,20 +2,20 @@
 
 This `docs/` tree is organized by reader intent:
 
-- [suite/](./suite/README.md) — Loom-wide doctrine and onboarding.
-- [clarion/](./clarion/README.md) — Clarion product documentation, versioned spec set, reviews, and ADRs.
-- [operator/](./operator/README.md) — practical configuration notes for running Clarion.
+- [suite/](./suite/README.md) — Weft-wide doctrine and onboarding.
+- [loomweave/](./loomweave/README.md) — Loomweave product documentation, versioned spec set, reviews, and ADRs.
+- [operator/](./operator/README.md) — practical configuration notes for running Loomweave.
 
 ## Recommended entry points
 
 - New to the suite: [suite/briefing.md](./suite/briefing.md)
-- Evaluating the Loom doctrine: [suite/loom.md](./suite/loom.md)
-- Starting Clarion: [clarion/1.0/README.md](./clarion/1.0/README.md)
+- Evaluating the Weft doctrine: [suite/weft.md](./suite/weft.md)
+- Starting Loomweave: [loomweave/1.0/README.md](./loomweave/1.0/README.md)
 - Configuring OpenRouter: [operator/openrouter.md](./operator/openrouter.md)
 
 ## Canonical vs supporting docs
 
 - Canonical suite docs live in [suite/](./suite/README.md).
-- Canonical Clarion design docs live in [clarion/1.0/](./clarion/1.0/README.md).
-- Architecture decisions live in [clarion/adr/](./clarion/adr/README.md).
+- Canonical Loomweave design docs live in [loomweave/1.0/](./loomweave/1.0/README.md).
+- Architecture decisions live in [loomweave/adr/](./loomweave/adr/README.md).
 - Supporting reviews, scope memos, sprint plans, and agent handoffs are archived under [implementation/](./implementation/README.md) — non-normative.

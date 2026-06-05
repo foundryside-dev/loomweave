@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # B.4* week-2 gate runner.
 #
-# Calibration baseline: Clarion reference Linux workstation, x86_64,
+# Calibration baseline: Loomweave reference Linux workstation, x86_64,
 # 32 GiB RAM, Python 3.12; reference run date 2026-05-17.
 # Operators on materially slower/faster hardware may set
 # OPERATOR_HARDWARE_RATIO. The ratio scales Green/Yellow/Red thresholds and
@@ -53,9 +53,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from clarion_plugin_python.call_resolver import NoOpCallResolver
-from clarion_plugin_python.extractor import extract_with_stats
-from clarion_plugin_python.pyright_session import PyrightSession
+from loomweave_plugin_python.call_resolver import NoOpCallResolver
+from loomweave_plugin_python.extractor import extract_with_stats
+from loomweave_plugin_python.pyright_session import PyrightSession
 
 
 @dataclass
@@ -120,17 +120,17 @@ def read_pyright_pin(repo_root: Path) -> str:
 
 
 def run_cli(repo_root: Path, venv: Path, corpus_root: Path) -> tuple[int, dict[str, Any]]:
-    with tempfile.TemporaryDirectory(prefix=f"clarion-b4-{corpus_root.name}-") as tmp_raw:
+    with tempfile.TemporaryDirectory(prefix=f"loomweave-b4-{corpus_root.name}-") as tmp_raw:
         tmp = Path(tmp_raw)
         project = tmp / "project"
         shutil.copytree(corpus_root, project)
         env = os.environ.copy()
         env["PATH"] = f"{repo_root / 'target/release'}:{venv / 'bin'}:{env.get('PATH', '')}"
         started = time.perf_counter()
-        subprocess.run(["clarion", "install"], cwd=project, env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        subprocess.run(["clarion", "analyze", "."], cwd=project, env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        subprocess.run(["loomweave", "install"], cwd=project, env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        subprocess.run(["loomweave", "analyze", "."], cwd=project, env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         wall_ms = int(round((time.perf_counter() - started) * 1000))
-        db_path = project / ".clarion" / "clarion.db"
+        db_path = project / ".loomweave" / "loomweave.db"
         with sqlite3.connect(db_path) as conn:
             row = conn.execute("select stats from runs where status = 'completed' order by started_at desc limit 1").fetchone()
         if row is None:
@@ -313,7 +313,7 @@ def main() -> int:
             f"calibration_machine: {machine_label()}",
             f"operator_hardware_ratio: {ratio}",
             f"pyright_pin: {pyright_pin}",
-            f"clarion_commit: {commit}",
+            f"loomweave_commit: {commit}",
             "",
             "### Corpus Results",
             *(format_corpus(metrics) for metrics in measured),

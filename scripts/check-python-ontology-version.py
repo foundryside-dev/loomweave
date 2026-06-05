@@ -4,7 +4,7 @@
 The Python plugin declares the ontology version in two places:
 
 * plugins/python/plugin.toml, consumed by the Rust host during discovery.
-* clarion_plugin_python.server.ONTOLOGY_VERSION, returned during initialize.
+* loomweave_plugin_python.server.ONTOLOGY_VERSION, returned during initialize.
 
 Those values are intentionally duplicated so the plugin can answer the JSON-RPC
 handshake without parsing its installed manifest at runtime. This CI guard keeps
@@ -21,7 +21,7 @@ import tomllib
 from pathlib import Path
 
 DEFAULT_MANIFEST = Path("plugins/python/plugin.toml")
-DEFAULT_SERVER = Path("plugins/python/src/clarion_plugin_python/server.py")
+DEFAULT_SERVER = Path("plugins/python/src/loomweave_plugin_python/server.py")
 
 
 class CheckError(Exception):

@@ -1,29 +1,29 @@
 /* ==========================================================================
-   Clarion — Loom design system + Clarion accent, layered on Material.
+   Loomweave — Weft design system + Loomweave accent, layered on Material.
 
    Convergence strategy (shared with Wardline, Filigree, Legis):
    - Material owns the light/dark toggle. We do NOT add a custom toggle and we
      do NOT use light-dark()/[data-theme]; semantic tokens are mapped under
      Material's own scheme selectors ([data-md-color-scheme="default"|"slate"])
      and we override Material's --md-primary/--md-accent there.
-   - The `--loom-*` primitives, the spacing scale, the fluid type, the radius,
-     and the `.cl-*` landing structure are the SHARED Loom layer — byte-for-byte
+   - The `--weft-*` primitives, the spacing scale, the fluid type, the radius,
+     and the `.cl-*` landing structure are the SHARED Weft layer — byte-for-byte
      portable across the suite. Only the accent ramp differs per product.
-   - Wardline's accent is teal (~195). Clarion's accent is amber/brass (~58–78):
-     a clarion is a brass trumpet — a clear call, illumination, light shed on
+   - Wardline's accent is teal (~195). Loomweave's accent is amber/brass (~58–78):
+     a loomweave is a brass trumpet — a clear call, illumination, light shed on
      the codebase. The deep shades are tuned to clear WCAG AA on white.
    ========================================================================== */
 
 :root {
-  /* ---- Loom primitive ramp (OKLCH, perceptually uniform) — SHARED ---- */
-  /* Slate/ink — shared Loom neutral hue (~255) */
-  --loom-ink-50:  oklch(0.97 0.010 255);
-  --loom-ink-100: oklch(0.93 0.018 255);
-  --loom-ink-200: oklch(0.86 0.028 255);
-  --loom-ink-700: oklch(0.40 0.060 255);
-  --loom-ink-900: oklch(0.22 0.040 255);
+  /* ---- Weft primitive ramp (OKLCH, perceptually uniform) — SHARED ---- */
+  /* Slate/ink — shared Weft neutral hue (~255) */
+  --weft-ink-50:  oklch(0.97 0.010 255);
+  --weft-ink-100: oklch(0.93 0.018 255);
+  --weft-ink-200: oklch(0.86 0.028 255);
+  --weft-ink-700: oklch(0.40 0.060 255);
+  --weft-ink-900: oklch(0.22 0.040 255);
 
-  /* Clarion accent — amber/brass. Hue rotates 78→56 as it deepens so the dark
+  /* Loomweave accent — amber/brass. Hue rotates 78→56 as it deepens so the dark
      end reads as brass, not yellow, and the link shade clears AA on white. */
   --cl-amber-200: oklch(0.88 0.070 78);
   --cl-amber-300: oklch(0.78 0.100 72);  /* dark-scheme links: #dfad6d, 8.7:1 */
@@ -63,9 +63,9 @@
   --cl-bg:          oklch(0.99 0.003 255);
   --cl-bg-subtle:   oklch(0.975 0.006 255);
   --cl-bg-card:     oklch(1 0 0);
-  --cl-text:        var(--loom-ink-900);
+  --cl-text:        var(--weft-ink-900);
   --cl-text-muted:  oklch(0.46 0.020 255);
-  --cl-border:      var(--loom-ink-200);
+  --cl-border:      var(--weft-ink-200);
   --cl-accent:      var(--cl-amber-700);
   --cl-accent-soft: oklch(0.95 0.045 80);
   --cl-on-accent:   oklch(0.99 0.010 80);
@@ -232,7 +232,7 @@
   font-size: 0.85em;
 }
 
-/* ---- Agent-exchange snippet (shared Loom improvement: a terminal-styled
+/* ---- Agent-exchange snippet (shared Weft improvement: a terminal-styled
         illustration of the consult loop, portable to every product) ---- */
 .cl-snippet {
   margin: var(--cl-space-8) auto var(--cl-space-6);
@@ -293,7 +293,7 @@
   margin-bottom: var(--cl-space-6);
 }
 
-/* ---- Loom suite ---- */
+/* ---- Weft suite ---- */
 .cl-suite {
   margin-top: var(--cl-space-10);
   padding-top: var(--cl-space-6);
@@ -374,7 +374,7 @@
 }
 
 /* ==========================================================================
-   Footer Loom suite links (copyright partial override) — site-wide
+   Footer Weft suite links (copyright partial override) — site-wide
    ========================================================================== */
 .cl-footer-suite {
   display: flex;

@@ -1,4 +1,4 @@
-# Build dependencies for the Clarion documentation site (web/).
-# Pinned to the same Material for MkDocs major the rest of the Loom suite uses.
+# Build dependencies for the Loomweave documentation site (web/).
+# Pinned to the same Material for MkDocs major the rest of the Weft suite uses.
 mkdocs>=1.6
 mkdocs-material>=9.5

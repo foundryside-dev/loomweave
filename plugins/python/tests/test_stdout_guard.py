@@ -14,7 +14,7 @@ import sys
 def test_install_stdio_blocks_print() -> None:
     """After install_stdio(), a Python `print()` raises StdoutGuardError."""
     code = (
-        "from clarion_plugin_python.stdout_guard import install_stdio, StdoutGuardError\n"
+        "from loomweave_plugin_python.stdout_guard import install_stdio, StdoutGuardError\n"
         "import sys\n"
         "install_stdio()\n"
         "try:\n"
@@ -39,7 +39,7 @@ def test_install_stdio_blocks_print() -> None:
 def test_install_stdio_returns_real_streams() -> None:
     """install_stdio() yields usable stdin/stdout bytes streams."""
     code = (
-        "from clarion_plugin_python.stdout_guard import install_stdio\n"
+        "from loomweave_plugin_python.stdout_guard import install_stdio\n"
         "stdin, stdout = install_stdio()\n"
         "stdout.write(b'raw-bytes-out')\n"
         "stdout.flush()\n"

@@ -37,7 +37,7 @@ The kickoff handoff named seven Tier B boxes. Two warmup-bug fixes were also in 
 | Filigree issue | Status |
 |---|---|
 | `clarion-5e03cfdd21` — `read_applied_versions` swallows DB errors | **fixed** in PR #3 (merge `da45823`, fix `ad2936b`) |
-| `clarion-ed5017139f` — `clarion install` partial `.clarion/` on failure | **still open** (P2, ready) |
+| `clarion-ed5017139f` — `loomweave install` partial `.loomweave/` on failure | **still open** (P2, ready) |
 | `clarion-b5b1029f5a` — `reader_pool` flaky 100ms sleep | **still open** (P2, ready) |
 | `clarion-4cd11905e2` — `entities.priority` TEXT affinity wrong-order | **resolved** by ADR-024 vocab rename (priority→scope_rank with INTEGER affinity) |
 
@@ -49,7 +49,7 @@ These were not in the kickoff but shipped during the same window:
 - **ADR-025** — Minor shared standards registry; first entry MSS-1 locks `tier:*` filigree label namespace.
 - **ADR-026** — Containment wire shape and edge identity (load-bearing for B.3 design).
 - **ADR-027** — Ontology version semver policy (clarifies ADR-022).
-- **Loom vocabulary glossary** — `docs/suite/loom.md` glossary clause + ADR-acceptance rule.
+- **Weft vocabulary glossary** — `docs/suite/weft.md` glossary clause + ADR-acceptance rule.
 - **Skeleton audit doc** — `docs/implementation/sprint-2/...` audit pass with 5 findings (F-13 through F-17, all open in filigree).
 
 The unplanned ADR cluster (024–027) was net positive: each was a real surface lock-in that downstream sprints need. The skeleton audit findings (F-13 through F-17) are not Sprint 2 blockers but should be triaged before WP9 (B.7 new scope, below) touches any of the affected surfaces.
@@ -97,9 +97,9 @@ Rationale: each of these is a step toward briefings and clustered subsystem view
 |---|---|---|---|
 | **B.4*** — `calls` edges via pyright + confidence tiers | WP3 + ADR-028 | Python plugin emits `calls` edges with `confidence` ∈ {`resolved`, `ambiguous`, `inferred`}; pyright integration; **week-2 go/no-go gate**: can pyright extract elspeth's calls in <5 min? | ADR-026, **ADR-028** |
 | **B.5*** — `references` edges | WP3 + ADR-028 | Python plugin emits `references` edges; same confidence-tier discipline as B.4* | ADR-026, **ADR-028** |
-| **B.6** — WP8 MCP surface (7 tools) | WP8 | New `clarion-mcp` crate exposes: `entity_at(file, line)`, `find_entity(pattern)`, `callers_of(id, confidence)`, `execution_paths_from(id, max_depth, confidence)`, `summary(id)`, `issues_for(id, include_contained)`, `neighborhood(id, confidence)` | ADR-012, **ADR-028**, **ADR-029**, **ADR-030** |
-| **B.7** — WP9-A entity_associations binding | WP9-A (split from WP9) | Filigree-side `entity_associations` migration; Filigree MCP gains `add_entity_association` / `remove_entity_association` / `list_entity_associations`; Clarion MCP gains `issues_for` | **ADR-029** |
-| **B.8** — elspeth scale-test (was original B.6) | original B.6 / WP11 spike | `clarion analyze` + `clarion serve` against elspeth-slice; agent can navigate via the 7 MCP tools; cost ceiling sanity-check on `summary(id)` | — |
+| **B.6** — WP8 MCP surface (7 tools) | WP8 | New `loomweave-mcp` crate exposes: `entity_at(file, line)`, `find_entity(pattern)`, `callers_of(id, confidence)`, `execution_paths_from(id, max_depth, confidence)`, `summary(id)`, `issues_for(id, include_contained)`, `neighborhood(id, confidence)` | ADR-012, **ADR-028**, **ADR-029**, **ADR-030** |
+| **B.7** — WP9-A entity_associations binding | WP9-A (split from WP9) | Filigree-side `entity_associations` migration; Filigree MCP gains `add_entity_association` / `remove_entity_association` / `list_entity_associations`; Loomweave MCP gains `issues_for` | **ADR-029** |
+| **B.8** — elspeth scale-test (was original B.6) | original B.6 / WP11 spike | `loomweave analyze` + `loomweave serve` against elspeth-slice; agent can navigate via the 7 MCP tools; cost ceiling sanity-check on `summary(id)` | — |
 
 Status drift requirements:
 
@@ -112,7 +112,7 @@ Status drift requirements:
 | ADR | What it locks |
 |---|---|
 | **ADR-028** — Edge confidence tiers | resolved / ambiguous / inferred; default MCP queries to `>=resolved`; lazy LLM compute at query time for inferred |
-| **ADR-029** — Entity associations binding | Filigree-side `entity_associations` table; `add_entity_association` MCP tool on Filigree; `issues_for` MCP tool on Clarion; content-hash drift detection; federation §5 audit; WP9 split A/B |
+| **ADR-029** — Entity associations binding | Filigree-side `entity_associations` table; `add_entity_association` MCP tool on Filigree; `issues_for` MCP tool on Loomweave; content-hash drift detection; federation §5 audit; WP9 split A/B |
 | **ADR-030** — On-demand summary scope | Narrow WP6 from batched Phases 4–6 to MCP-driven `summary(id)`; 5-tuple cache key (ADR-007) unchanged; module/subsystem aggregation deferred to v0.2 |
 
 All three are Accepted at the same time as this memo lands.
@@ -134,19 +134,19 @@ This memo is the authoritative resequence record. `v0.1-plan.md` gets a forward-
 
 | WP | Original scope | Narrowed scope | Defers to v0.2 |
 |---|---|---|---|
-| WP3 — Python plugin v0.1 | Functions only at Sprint-1 close → full ontology + edges (calls, imports, decorated_by, inherits_from) + full `CLA-PY-*` rules | + class + module (B.2 ✅) + contains (B.3) + **calls with confidence** (B.4*) + **references** (B.5*) | imports, decorated_by, inherits_from, `CLA-PY-*` finding rules |
+| WP3 — Python plugin v0.1 | Functions only at Sprint-1 close → full ontology + edges (calls, imports, decorated_by, inherits_from) + full `LMWV-PY-*` rules | + class + module (B.2 ✅) + contains (B.3) + **calls with confidence** (B.4*) + **references** (B.5*) | imports, decorated_by, inherits_from, `LMWV-PY-*` finding rules |
 | WP6 — LLM dispatch + cache (Phases 4–6) | Batched-pipeline summarisation across leaf / module / subsystem tiers | **On-demand `summary(id)` MCP tool only**, leaf tier only (ADR-030) | Phases 4–6 batched pipeline; module/subsystem aggregation; `--prewarm-summaries` |
-| WP9 — Loom integrations (Clarion-side) | Findings emission + entity binding + Wardline config ingest + suite-compat probe | **WP9-A only — `entity_associations` binding** (B.7) | WP9-B: findings emission to Filigree, Wardline config ingest, suite-compat probe, observation MCP-spawn |
+| WP9 — Weft integrations (Loomweave-side) | Findings emission + entity binding + Wardline config ingest + suite-compat probe | **WP9-A only — `entity_associations` binding** (B.7) | WP9-B: findings emission to Filigree, Wardline config ingest, suite-compat probe, observation MCP-spawn |
 
 ### WPs deferred to v0.2 (out of Sprint 2 entirely)
 
 | WP | Original Sprint-2 portion deferred | Rationale |
 |---|---|---|
-| **WP4** — Core-only pipeline | Phases 0–3 multi-file orchestration, Phase 3 clustering (ADR-006 Leiden/Louvain), Phase 7 cross-cutting `CLA-*` rules, Phase 8 entity-set diff | The MVP MCP surface queries the SQLite store directly; the pipeline orchestrator and clustering layer aren't on the critical path until briefings / subsystem rendering land |
+| **WP4** — Core-only pipeline | Phases 0–3 multi-file orchestration, Phase 3 clustering (ADR-006 Leiden/Louvain), Phase 7 cross-cutting `LMWV-*` rules, Phase 8 entity-set diff | The MVP MCP surface queries the SQLite store directly; the pipeline orchestrator and clustering layer aren't on the critical path until briefings / subsystem rendering land |
 | **WP5** — Pre-ingest secret scanner | All | Defensible to defer because Sprint 2's MVP runs on a known-safe corpus (elspeth-slice); production deployment against unknown corpora gates on this returning |
-| **WP7** — Guidance system | All | The guidance composition algorithm and `CLA-FACT-GUIDANCE-*` findings have no MCP-tool consumer until briefings ship |
+| **WP7** — Guidance system | All | The guidance composition algorithm and `LMWV-FACT-GUIDANCE-*` findings have no MCP-tool consumer until briefings ship |
 | **WP10** — Cross-product (Filigree-side `registry_backend`, SARIF translator) | All | Independent of MCP surface delivery; will land in v0.2 |
-| **WP11** — Cost validation spike (originally scheduled) | The originally-scheduled batched-pipeline cost measurement | **Re-scoped to B.8** as the elspeth scale-test gate; measures `summary(id)` per-query cost rather than `clarion analyze` per-run cost, which is the more honest metric for an on-demand tool |
+| **WP11** — Cost validation spike (originally scheduled) | The originally-scheduled batched-pipeline cost measurement | **Re-scoped to B.8** as the elspeth scale-test gate; measures `summary(id)` per-query cost rather than `loomweave analyze` per-run cost, which is the more honest metric for an on-demand tool |
 
 ### Critical path under the amendment
 
@@ -205,7 +205,7 @@ Existing open Sprint-2 issues that stay open:
 ## 7. What this memo does NOT change
 
 - Sprint 1 lock-ins (L1–L9) — all unchanged. Walking-skeleton CI stays green.
-- Loom federation axiom (`loom.md` §5) — ADR-029 explicitly audits against it; no relaxation.
+- Weft federation axiom (`weft.md` §5) — ADR-029 explicitly audits against it; no relaxation.
 - ADRs 001–027 — all Accepted, all unchanged. The three new ADRs (028/029/030) are additive.
 - Sprint-1 signoff ladder format — Sprint 2's eventual close (when B.8 ships) will follow the same shape, but is not pre-written here.
 - The original WP6 design (Phases 4–6 batched pipeline) — preserved as the v0.2 target architecture; ADR-030 narrows what ships in v0.1, not what the system aims at long-term.
@@ -219,7 +219,7 @@ Existing open Sprint-2 issues that stay open:
 - [Sprint 2 kickoff handoff](../handoffs/2026-04-30-sprint-2-kickoff.md) — the original 7-box scope
 - [B.2 design](./b2-class-module-entities.md) — shipped
 - [B.3 design](./b3-contains-edges.md) — implementation pending
-- [ADR-028](../../clarion/adr/ADR-028-edge-confidence-tiers.md) — new
-- [ADR-029](../../clarion/adr/ADR-029-entity-associations-binding.md) — new
-- [ADR-030](../../clarion/adr/ADR-030-on-demand-summary-scope.md) — new
-- [`loom.md` §5](../../suite/loom.md) — federation failure modes; ADR-029 audits against this
+- [ADR-028](../../loomweave/adr/ADR-028-edge-confidence-tiers.md) — new
+- [ADR-029](../../loomweave/adr/ADR-029-entity-associations-binding.md) — new
+- [ADR-030](../../loomweave/adr/ADR-030-on-demand-summary-scope.md) — new
+- [`weft.md` §5](../../suite/weft.md) — federation failure modes; ADR-029 audits against this

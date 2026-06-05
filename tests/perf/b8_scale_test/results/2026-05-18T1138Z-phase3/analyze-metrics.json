@@ -1,8 +1,8 @@
 {
   "command": [
-    "/home/john/clarion/target/release/clarion",
+    "/home/john/loomweave/target/release/loomweave",
     "analyze",
-    "/tmp/clarion-b8-elspeth-full-20260518T0016Z"
+    "/tmp/loomweave-b8-elspeth-full-20260518T0016Z"
   ],
   "peak_rss_bytes": 207720448,
   "peak_rss_mb": 198.098,

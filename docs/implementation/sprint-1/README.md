@@ -1,4 +1,4 @@
-# Clarion Sprint 1 — Walking Skeleton
+# Loomweave Sprint 1 — Walking Skeleton
 
 **Status**: DRAFT — pending design review and Filigree seeding
 **Sprint goal**: [Tier A — walking skeleton](./signoffs.md#tier-a--sprint-1-close-walking-skeleton)
@@ -11,9 +11,9 @@
 
 ## 1. Sprint 1 in one paragraph
 
-Sprint 1 ships the smallest end-to-end state of Clarion that exercises every interface
-contract the rest of v0.1 depends on. After Sprint 1 closes, `clarion install` creates a
-real `.clarion/` directory; `clarion analyze <fixture-py-file>` spawns the Python
+Sprint 1 ships the smallest end-to-end state of Loomweave that exercises every interface
+contract the rest of v0.1 depends on. After Sprint 1 closes, `loomweave install` creates a
+real `.loomweave/` directory; `loomweave analyze <fixture-py-file>` spawns the Python
 plugin, the plugin emits at least one entity (a Python function), the writer-actor
 persists it to SQLite, and a shell-level `sqlite3` query reads it back. No clustering,
 no rendering, no findings, no LLM — just the spine. The point is to lock in the storage
@@ -53,18 +53,18 @@ cargo build --workspace --release
 pip install -e plugins/python
 
 # 3. Init a scratch project
-mkdir -p /tmp/clarion-demo && cd /tmp/clarion-demo
+mkdir -p /tmp/loomweave-demo && cd /tmp/loomweave-demo
 echo 'def hello(): return "world"' > demo.py
 
-# 4. Clarion install → .clarion/ created with DB + default config
-clarion install
-test -f .clarion/clarion.db
+# 4. Loomweave install → .loomweave/ created with DB + default config
+loomweave install
+test -f .loomweave/loomweave.db
 
-# 5. Clarion analyze → plugin spawned, entity persisted
-clarion analyze .
+# 5. Loomweave analyze → plugin spawned, entity persisted
+loomweave analyze .
 
 # 6. Entity visible via raw SQL — column is `id` (L2 EntityId), not `canonical_name`
-sqlite3 .clarion/clarion.db "select id, kind from entities;"
+sqlite3 .loomweave/loomweave.db "select id, kind from entities;"
 # expected: python:function:demo.hello|function (per the locked 3-segment L2 format)
 ```
 
@@ -75,7 +75,7 @@ Each of these steps is owned by a Sprint 1 WP:
 | 1 | WP1 | Crate topology, build hygiene |
 | 2 | WP3 | Python plugin packaging, plugin-discovery convention (L9) |
 | 3 | (scratch prep) | — |
-| 4 | WP1 | `clarion install` + schema migration (L1) + writer-actor init (L3) |
+| 4 | WP1 | `loomweave install` + schema migration (L1) + writer-actor init (L3) |
 | 5 | WP1 + WP2 + WP3 | JSON-RPC transport (L4) + manifest validation (L5) + core-enforced minimums (L6) + qualname production (L7) + REGISTRY probe (L8) |
 | 6 | WP1 | Schema shape (L1) + entity-ID 3-segment format (L2) |
 
@@ -88,8 +88,8 @@ in its owning WP doc.
 
 | # | Lock-in | Owning WP | Canonical section | `↗` cross-product touch |
 |---|---|---|---|---|
-| L1 | SQLite schema shape per [detailed-design §3](../../clarion/1.0/detailed-design.md#3-storage-implementation) — tables `entities`, `entity_tags`, `edges`, `findings`, `summary_cache`, `runs`, `schema_migrations`; `entity_fts` FTS5 virtual table + triggers; generated columns + indexes; `guidance_sheets` view _(locked on 2026-04-18)_ | WP1 | [`wp1-scaffold.md#l1--sqlite-schema-shape`](./wp1-scaffold.md#l1--sqlite-schema-shape) | `↗` Filigree `registry_backend: clarion` (WP10) reads via entity-ID columns |
-| L2 | Entity-ID 3-segment format `{plugin_id}:{kind}:{canonical_qualified_name}` per ADR-003 + ADR-022 _(locked on 2026-04-18)_ | WP1 + WP3 | [`wp1-scaffold.md#l2--entity-id-canonical-name-format`](./wp1-scaffold.md#l2--entity-id-canonical-name-format) | `↗` Wardline qualname reconciliation (ADR-018) uses the third segment as its Clarion-side join key |
+| L1 | SQLite schema shape per [detailed-design §3](../../loomweave/1.0/detailed-design.md#3-storage-implementation) — tables `entities`, `entity_tags`, `edges`, `findings`, `summary_cache`, `runs`, `schema_migrations`; `entity_fts` FTS5 virtual table + triggers; generated columns + indexes; `guidance_sheets` view _(locked on 2026-04-18)_ | WP1 | [`wp1-scaffold.md#l1--sqlite-schema-shape`](./wp1-scaffold.md#l1--sqlite-schema-shape) | `↗` Filigree `registry_backend: loomweave` (WP10) reads via entity-ID columns |
+| L2 | Entity-ID 3-segment format `{plugin_id}:{kind}:{canonical_qualified_name}` per ADR-003 + ADR-022 _(locked on 2026-04-18)_ | WP1 + WP3 | [`wp1-scaffold.md#l2--entity-id-canonical-name-format`](./wp1-scaffold.md#l2--entity-id-canonical-name-format) | `↗` Wardline qualname reconciliation (ADR-018) uses the third segment as its Loomweave-side join key |
 | L3 | Writer-actor command protocol (`tokio::task` + bounded `mpsc` + per-N commit) per ADR-011 _(locked on 2026-04-18)_ | WP1 | [`wp1-scaffold.md#l3--writer-actor-command-protocol`](./wp1-scaffold.md#l3--writer-actor-command-protocol) | — |
 | L4 | JSON-RPC method set + Content-Length framing per ADR-002 _(locked on 2026-04-24)_ | WP2 | [`wp2-plugin-host.md#l4--json-rpc-method-set--content-length-framing`](./wp2-plugin-host.md#l4--json-rpc-method-set--content-length-framing) | — |
 | L5 | `plugin.toml` manifest schema per ADR-022 _(locked on 2026-04-24)_ | WP2 | [`wp2-plugin-host.md#l5--plugintoml-manifest-schema`](./wp2-plugin-host.md#l5--plugintoml-manifest-schema) | — |
@@ -99,7 +99,7 @@ in its owning WP doc.
 | L9 | `plugin.toml` discovery convention (where the manifest lives, how the host finds it) _(locked on 2026-04-24)_ | WP2 + WP3 | [`wp2-plugin-host.md#l9--plugin-discovery-convention`](./wp2-plugin-host.md#l9--plugin-discovery-convention) | — |
 
 **Items deliberately NOT locked by Sprint 1** (kept cheap-to-change for later sprints):
-- `clarion.yaml` config schema — stubbed only; WP6 (LLM dispatch) forces the full shape.
+- `loomweave.yaml` config schema — stubbed only; WP6 (LLM dispatch) forces the full shape.
 - Findings emission format — ADR-004 already locked; Sprint 1 does not emit findings.
 - MCP tool catalogue — WP8 owns.
 - Cluster algorithm + subsystem detection — WP4 owns.
@@ -128,7 +128,7 @@ more than one WP (and therefore could force rework if resolved late) are:
 | UQ-S1-01 | ~~Rust async runtime choice~~ — **resolved by ADR-011**: `tokio`. Writer-actor is a `tokio::task`; WP2/WP8 inherit the same runtime. | WP1 + WP2 | Resolved pre-sprint |
 | UQ-S1-02 | ~~SQLite crate choice~~ — **resolved by ADR-011**: `rusqlite` (with `deadpool-sqlite` for the reader pool). | WP1 | Resolved pre-sprint |
 | UQ-S1-03 | JSON-RPC library choice (hand-rolled over `serde_json` vs `jsonrpsee` vs other) | WP2 | Before WP2 Task 2 |
-| UQ-S1-04 | Plugin discovery mechanism (PATH-based like `git` subcommands vs explicit `~/.config/clarion/plugins/` vs config-listed paths) | WP2 + WP3 | Before WP2 Task 5 |
+| UQ-S1-04 | Plugin discovery mechanism (PATH-based like `git` subcommands vs explicit `~/.config/loomweave/plugins/` vs config-listed paths) | WP2 + WP3 | Before WP2 Task 5 |
 | UQ-S1-05 | ~~Whether WP3 imports `wardline.core.registry.REGISTRY` or stubs the probe~~ — **resolved "fully wire"**; symbol existence verified at `wardline/src/wardline/core/registry.py:55` and `wardline/src/wardline/__init__.py:3` (2026-04-18 pre-sprint check). | WP3 | Resolved pre-sprint |
 | UQ-S1-06 | Minimum supported Python version for the plugin (3.11? 3.12?) | WP3 | Before WP3 Task 1 |
 | UQ-S1-07 | Whether the writer-actor batches acks per-transaction or per-command | WP1 | Before WP1 Task 6 |
@@ -146,11 +146,11 @@ re-litigate during the sprint:
 - Clustering, subsystem detection, cross-cutting findings — all WP4 work.
 - LLM dispatch, summary cache, briefings — WP6 work.
 - Guidance system — WP7.
-- `clarion serve` (MCP or HTTP) — WP8; Sprint 1 ships only `install` and `analyze` subcommands.
+- `loomweave serve` (MCP or HTTP) — WP8; Sprint 1 ships only `install` and `analyze` subcommands.
 - Secret scanner — WP5.
 - Findings emission to Filigree, observation transport — WP9.
-- `registry_backend: clarion` mode in Filigree — WP10.
-- Full Python-plugin feature coverage (all `CLA-PY-*` rules, every entity/edge kind) — deferred to the WP3-feature-complete sprint.
+- `registry_backend: loomweave` mode in Filigree — WP10.
+- Full Python-plugin feature coverage (all `LMWV-PY-*` rules, every entity/edge kind) — deferred to the WP3-feature-complete sprint.
 - macOS/Windows support — Sprint 1 is Linux only. Cross-platform is future work.
 
 ## 8. Filigree seeding
@@ -172,14 +172,14 @@ and pointed at [`signoffs.md`](./signoffs.md) Tier A.
 
 ## 9. References
 
-- [Clarion v0.1 high-level implementation plan](../v0.1-plan.md)
-- [Clarion system design](../../clarion/1.0/system-design.md) — §2 (core/plugin), §4 (storage)
-- [Clarion detailed design](../../clarion/1.0/detailed-design.md) — §1 (plugin transport), §3 (storage impl)
-- [ADR-001 Rust for core](../../clarion/adr/ADR-001-rust-for-core.md)
-- [ADR-002 Plugin transport JSON-RPC](../../clarion/adr/ADR-002-plugin-transport-json-rpc.md)
-- [ADR-003 Entity ID scheme](../../clarion/adr/ADR-003-entity-id-scheme.md)
-- [ADR-011 Writer-actor concurrency](../../clarion/adr/ADR-011-writer-actor-concurrency.md)
-- [ADR-018 Identity reconciliation](../../clarion/adr/ADR-018-identity-reconciliation.md)
-- [ADR-021 Plugin authority hybrid](../../clarion/adr/ADR-021-plugin-authority-hybrid.md)
-- [ADR-022 Core/plugin ontology](../../clarion/adr/ADR-022-core-plugin-ontology.md)
-- [ADR-023 Rust + Python tooling baseline](../../clarion/adr/ADR-023-tooling-baseline.md)
+- [Loomweave v0.1 high-level implementation plan](../v0.1-plan.md)
+- [Loomweave system design](../../loomweave/1.0/system-design.md) — §2 (core/plugin), §4 (storage)
+- [Loomweave detailed design](../../loomweave/1.0/detailed-design.md) — §1 (plugin transport), §3 (storage impl)
+- [ADR-001 Rust for core](../../loomweave/adr/ADR-001-rust-for-core.md)
+- [ADR-002 Plugin transport JSON-RPC](../../loomweave/adr/ADR-002-plugin-transport-json-rpc.md)
+- [ADR-003 Entity ID scheme](../../loomweave/adr/ADR-003-entity-id-scheme.md)
+- [ADR-011 Writer-actor concurrency](../../loomweave/adr/ADR-011-writer-actor-concurrency.md)
+- [ADR-018 Identity reconciliation](../../loomweave/adr/ADR-018-identity-reconciliation.md)
+- [ADR-021 Plugin authority hybrid](../../loomweave/adr/ADR-021-plugin-authority-hybrid.md)
+- [ADR-022 Core/plugin ontology](../../loomweave/adr/ADR-022-core-plugin-ontology.md)
+- [ADR-023 Rust + Python tooling baseline](../../loomweave/adr/ADR-023-tooling-baseline.md)

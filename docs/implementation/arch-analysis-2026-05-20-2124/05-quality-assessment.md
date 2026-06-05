@@ -2,7 +2,7 @@
 
 ## Overall Quality Posture
 
-Clarion's quality posture is strong for a release candidate: important
+Loomweave's quality posture is strong for a release candidate: important
 boundaries are tested, the source-of-truth ladder is explicit, and most
 high-risk runtime behavior has focused coverage. Remaining concerns are
 concentrated in drift-prone duplicated facts, large files, release-gate
@@ -20,9 +20,9 @@ mismatches, and a few intentionally permissive or platform-shaped behaviors.
 
 ### Concerns
 
-- `crates/clarion-mcp/src/lib.rs`, `crates/clarion-core/src/plugin/host.rs`,
-  `crates/clarion-cli/src/analyze.rs`, `crates/clarion-core/src/llm_provider.rs`,
-  and `crates/clarion-cli/src/http_read.rs` are large enough that changes need
+- `crates/loomweave-mcp/src/lib.rs`, `crates/loomweave-core/src/plugin/host.rs`,
+  `crates/loomweave-cli/src/analyze.rs`, `crates/loomweave-core/src/llm_provider.rs`,
+  and `crates/loomweave-cli/src/http_read.rs` are large enough that changes need
   local regression tests and careful review.
 - Release/publish history still contains old arch-analysis concepts. Current
   work should use this RC1 report and live source, not old H/L labels.

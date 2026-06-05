@@ -4,12 +4,12 @@
 
 ```mermaid
 flowchart LR
-    Core[clarion-core]
-    Storage[clarion-storage]
-    CLI[clarion-cli]
-    MCP[clarion-mcp]
-    Scanner[clarion-scanner]
-    Fixture[clarion-plugin-fixture]
+    Core[loomweave-core]
+    Storage[loomweave-storage]
+    CLI[loomweave-cli]
+    MCP[loomweave-mcp]
+    Scanner[loomweave-scanner]
+    Fixture[loomweave-plugin-fixture]
     Py[plugins/python]
 
     Storage --> Core
@@ -25,16 +25,16 @@ flowchart LR
 
 ## Internal Coupling Notes
 
-- `clarion-core` is the contract root. Changes to plugin protocol, entity IDs,
+- `loomweave-core` is the contract root. Changes to plugin protocol, entity IDs,
   resource limits, or LLM provider abstractions can affect most of the
   workspace.
-- `clarion-storage` depends on core ontology and is consumed by CLI, MCP, and
+- `loomweave-storage` depends on core ontology and is consumed by CLI, MCP, and
   HTTP read paths.
-- `clarion-cli` is the orchestration hub and therefore depends on almost every
+- `loomweave-cli` is the orchestration hub and therefore depends on almost every
   Rust crate.
-- `clarion-mcp` depends on storage/core and has optional outward coupling to
+- `loomweave-mcp` depends on storage/core and has optional outward coupling to
   Filigree HTTP.
-- `clarion-scanner` is intentionally small and mostly leaf-like.
+- `loomweave-scanner` is intentionally small and mostly leaf-like.
 - `plugins/python` is coupled through process protocol and manifest metadata
   rather than Rust linking.
 

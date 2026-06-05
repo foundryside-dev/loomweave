@@ -4,35 +4,35 @@
 
 **Goal:** When `issues_for` / `orientation_pack` runs for an entity, surface the Wardline findings Filigree holds for that entity, reconciled by qualname — enrich-only, no new Filigree route.
 
-**Architecture:** A new `wardline_reconcile` module does pure qualname matching (`metadata.wardline.qualname` == the entity_id's segment-3 qualname). The Filigree HTTP client (`filigree.rs`) gains a two-hop read (`GET /api/loom/files?path_prefix=` → Filigree `file_id`, then `GET /api/loom/findings?scan_source=wardline&file_id=`). The two MCP tools call the client, reconcile, and attach a `wardline_findings` section. If Filigree is unreachable the section degrades to `unavailable`; the tool never fails.
+**Architecture:** A new `wardline_reconcile` module does pure qualname matching (`metadata.wardline.qualname` == the entity_id's segment-3 qualname). The Filigree HTTP client (`filigree.rs`) gains a two-hop read (`GET /api/weft/files?path_prefix=` → Filigree `file_id`, then `GET /api/weft/findings?scan_source=wardline&file_id=`). The two MCP tools call the client, reconcile, and attach a `wardline_findings` section. If Filigree is unreachable the section degrades to `unavailable`; the tool never fails.
 
-**Tech Stack:** Rust, `reqwest::blocking`, `serde`/`serde_json`, `cargo nextest`. Spec: `docs/superpowers/specs/2026-05-30-clarion-consume-wardline-data-design.md`. Tracked by `clarion-71f995b88a`.
+**Tech Stack:** Rust, `reqwest::blocking`, `serde`/`serde_json`, `cargo nextest`. Spec: `docs/superpowers/specs/2026-05-30-loomweave-consume-wardline-data-design.md`. Tracked by `clarion-71f995b88a`.
 
 ---
 
 ## File Structure
 
-- **Create** `crates/clarion-mcp/src/wardline_reconcile.rs` — pure reconciliation: qualname extraction from an entity_id, qualname extraction from a finding's metadata, the `ResolutionConfidence` enum, and `reconcile_for_entity`. No I/O; fully unit-testable.
-- **Modify** `crates/clarion-mcp/src/filigree.rs` — add the `WardlineFinding` / `LoomFileRecord` wire types + parsers, the `loom_files_url` / `loom_findings_url` builders, a private `get_json` helper, and `FiligreeLookup::wardline_findings_for_path` (default `Ok(vec![])`; HTTP client does the two-hop).
-- **Modify** `crates/clarion-mcp/src/lib.rs` — register `mod wardline_reconcile`; build the `wardline_findings` section in `tool_issues_for` and `tool_orientation_pack`.
-- **Modify** `docs/federation/contracts.md` — pin the two consumed loom read routes.
+- **Create** `crates/loomweave-mcp/src/wardline_reconcile.rs` — pure reconciliation: qualname extraction from an entity_id, qualname extraction from a finding's metadata, the `ResolutionConfidence` enum, and `reconcile_for_entity`. No I/O; fully unit-testable.
+- **Modify** `crates/loomweave-mcp/src/filigree.rs` — add the `WardlineFinding` / `WeftFileRecord` wire types + parsers, the `weft_files_url` / `weft_findings_url` builders, a private `get_json` helper, and `FiligreeLookup::wardline_findings_for_path` (default `Ok(vec![])`; HTTP client does the two-hop).
+- **Modify** `crates/loomweave-mcp/src/lib.rs` — register `mod wardline_reconcile`; build the `wardline_findings` section in `tool_issues_for` and `tool_orientation_pack`.
+- **Modify** `docs/federation/contracts.md` — pin the two consumed weft read routes.
 
-Each task is independently committable. Run the full crate gate after the last code task: `cargo fmt --all -- --check`, `cargo clippy -p clarion-mcp --all-targets -- -D warnings`, `cargo nextest run -p clarion-mcp`.
+Each task is independently committable. Run the full crate gate after the last code task: `cargo fmt --all -- --check`, `cargo clippy -p loomweave-mcp --all-targets -- -D warnings`, `cargo nextest run -p loomweave-mcp`.
 
 ---
 
-## Task 1: Wardline + loom-file wire types and parsers
+## Task 1: Wardline + weft-file wire types and parsers
 
 **Files:**
-- Modify: `crates/clarion-mcp/src/filigree.rs` (add types near the other `Deserialize` structs, ~line 38; tests in the existing `#[cfg(test)] mod tests`)
+- Modify: `crates/loomweave-mcp/src/filigree.rs` (add types near the other `Deserialize` structs, ~line 38; tests in the existing `#[cfg(test)] mod tests`)
 
 - [ ] **Step 1: Write the failing parse tests**
 
-Add to `mod tests` in `crates/clarion-mcp/src/filigree.rs`:
+Add to `mod tests` in `crates/loomweave-mcp/src/filigree.rs`:
 
 ```rust
 #[test]
-fn parses_loom_findings_list_envelope() {
+fn parses_weft_findings_list_envelope() {
     let resp = parse_wardline_findings_response(
         r#"{"items":[
             {"finding_id":"f-1","file_id":"file-9","severity":"high","status":"open",
@@ -56,8 +56,8 @@ fn parses_loom_findings_list_envelope() {
 }
 
 #[test]
-fn parses_loom_files_list_envelope() {
-    let resp = parse_loom_files_response(
+fn parses_weft_files_list_envelope() {
+    let resp = parse_weft_files_response(
         r#"{"items":[
             {"file_id":"file-9","path":"src/demo.py","language":"python","file_type":"source"},
             {"file_id":"file-10","path":"src/demo_helpers.py","language":"python","file_type":"source"}
@@ -72,16 +72,16 @@ fn parses_loom_files_list_envelope() {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo nextest run -p clarion-mcp filigree::tests::parses_loom`
-Expected: FAIL to compile — `parse_wardline_findings_response`, `parse_loom_files_response`, and the types are not defined.
+Run: `cargo nextest run -p loomweave-mcp filigree::tests::parses_weft`
+Expected: FAIL to compile — `parse_wardline_findings_response`, `parse_weft_files_response`, and the types are not defined.
 
 - [ ] **Step 3: Add the types and parsers**
 
-Add to `crates/clarion-mcp/src/filigree.rs` (after `EntityAssociation`, ~line 38). Extra fields in the Filigree rows are ignored by serde, so this reads only the subset Clarion surfaces:
+Add to `crates/loomweave-mcp/src/filigree.rs` (after `EntityAssociation`, ~line 38). Extra fields in the Filigree rows are ignored by serde, so this reads only the subset Loomweave surfaces:
 
 ```rust
-/// One Wardline finding as Clarion surfaces it — the subset of Filigree's
-/// `ScanFindingLoom` (`GET /api/loom/findings`) used for read-time
+/// One Wardline finding as Loomweave surfaces it — the subset of Filigree's
+/// `ScanFindingWeft` (`GET /api/weft/findings`) used for read-time
 /// reconciliation. Unknown fields are ignored so Filigree can grow the row.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct WardlineFinding {
@@ -111,18 +111,18 @@ pub struct WardlineFindingsResponse {
     pub items: Vec<WardlineFinding>,
 }
 
-/// One row of `GET /api/loom/files` — only the fields needed to map a path to
+/// One row of `GET /api/weft/files` — only the fields needed to map a path to
 /// Filigree's `file_id`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct LoomFileRecord {
+pub struct WeftFileRecord {
     pub file_id: String,
     pub path: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct LoomFilesResponse {
+pub struct WeftFilesResponse {
     #[serde(default)]
-    pub items: Vec<LoomFileRecord>,
+    pub items: Vec<WeftFileRecord>,
 }
 
 pub fn parse_wardline_findings_response(
@@ -131,21 +131,21 @@ pub fn parse_wardline_findings_response(
     serde_json::from_str(body).map_err(FiligreeContractError::from)
 }
 
-pub fn parse_loom_files_response(body: &str) -> Result<LoomFilesResponse, FiligreeContractError> {
+pub fn parse_weft_files_response(body: &str) -> Result<WeftFilesResponse, FiligreeContractError> {
     serde_json::from_str(body).map_err(FiligreeContractError::from)
 }
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo nextest run -p clarion-mcp filigree::tests::parses_loom`
+Run: `cargo nextest run -p loomweave-mcp filigree::tests::parses_weft`
 Expected: PASS (2 tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/clarion-mcp/src/filigree.rs
-git commit -m "feat(mcp): Wardline finding + loom-file wire types (Flow B, clarion-71f995b88a)"
+git add crates/loomweave-mcp/src/filigree.rs
+git commit -m "feat(mcp): Wardline finding + weft-file wire types (Flow B, clarion-71f995b88a)"
 ```
 
 ---
@@ -153,20 +153,20 @@ git commit -m "feat(mcp): Wardline finding + loom-file wire types (Flow B, clari
 ## Task 2: Pure qualname reconciliation module
 
 **Files:**
-- Create: `crates/clarion-mcp/src/wardline_reconcile.rs`
-- Modify: `crates/clarion-mcp/src/lib.rs` (add `mod wardline_reconcile;` next to the other `mod` declarations near the top)
+- Create: `crates/loomweave-mcp/src/wardline_reconcile.rs`
+- Modify: `crates/loomweave-mcp/src/lib.rs` (add `mod wardline_reconcile;` next to the other `mod` declarations near the top)
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `crates/clarion-mcp/src/wardline_reconcile.rs` with only the tests first:
+Create `crates/loomweave-mcp/src/wardline_reconcile.rs` with only the tests first:
 
 ```rust
-//! Reconcile Wardline findings to Clarion entities by qualname (Flow B).
+//! Reconcile Wardline findings to Loomweave entities by qualname (Flow B).
 //!
 //! `metadata.wardline.qualname` is the pre-composed dotted name, which for a
 //! function/method entity is byte-identical to the entity_id's segment-3
 //! `canonical_qualified_name` (proven by `fixtures/entity_id.json`). Matching is
-//! therefore a local string compare against Clarion's own catalog — no oracle.
+//! therefore a local string compare against Loomweave's own catalog — no oracle.
 
 #[cfg(test)]
 mod tests {
@@ -232,17 +232,17 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo nextest run -p clarion-mcp wardline_reconcile`
+Run: `cargo nextest run -p loomweave-mcp wardline_reconcile`
 Expected: FAIL to compile — module not registered, symbols undefined.
 
 - [ ] **Step 3: Implement the module**
 
-Add `mod wardline_reconcile;` to `crates/clarion-mcp/src/lib.rs` (with the other module declarations), then prepend the implementation above the `#[cfg(test)]` block in `wardline_reconcile.rs`:
+Add `mod wardline_reconcile;` to `crates/loomweave-mcp/src/lib.rs` (with the other module declarations), then prepend the implementation above the `#[cfg(test)]` block in `wardline_reconcile.rs`:
 
 ```rust
 use crate::filigree::WardlineFinding;
 
-/// A Wardline finding's resolution against a Clarion entity. v1 produces only
+/// A Wardline finding's resolution against a Loomweave entity. v1 produces only
 /// `Exact` (byte-equal qualname) or `None`. `Heuristic` is reserved for a future
 /// best-effort normalization pass and is never returned yet — kept in the enum
 /// so the wire shape is stable when it lands.
@@ -316,13 +316,13 @@ pub fn reconcile_for_entity(entity_id: &str, findings: Vec<WardlineFinding>) -> 
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo nextest run -p clarion-mcp wardline_reconcile`
+Run: `cargo nextest run -p loomweave-mcp wardline_reconcile`
 Expected: PASS (4 tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/clarion-mcp/src/wardline_reconcile.rs crates/clarion-mcp/src/lib.rs
+git add crates/loomweave-mcp/src/wardline_reconcile.rs crates/loomweave-mcp/src/lib.rs
 git commit -m "feat(mcp): pure Wardline qualname reconciliation module (Flow B)"
 ```
 
@@ -331,22 +331,22 @@ git commit -m "feat(mcp): pure Wardline qualname reconciliation module (Flow B)"
 ## Task 3: Filigree client two-hop fetch
 
 **Files:**
-- Modify: `crates/clarion-mcp/src/filigree.rs` (URL builders near `entity_associations_url` ~line 286; `get_json` helper + trait method + HTTP impl; mock-server test in `mod tests`)
+- Modify: `crates/loomweave-mcp/src/filigree.rs` (URL builders near `entity_associations_url` ~line 286; `get_json` helper + trait method + HTTP impl; mock-server test in `mod tests`)
 
 - [ ] **Step 1: Write the failing URL-builder + mock-server tests**
 
-Add to `mod tests` in `crates/clarion-mcp/src/filigree.rs`:
+Add to `mod tests` in `crates/loomweave-mcp/src/filigree.rs`:
 
 ```rust
 #[test]
-fn builds_loom_url_builders_with_encoding() {
+fn builds_weft_url_builders_with_encoding() {
     assert_eq!(
-        loom_files_url("http://127.0.0.1:8542/", "wardline", "src/demo.py"),
-        "http://127.0.0.1:8542/api/loom/files?scan_source=wardline&path_prefix=src%2Fdemo.py"
+        weft_files_url("http://127.0.0.1:8542/", "wardline", "src/demo.py"),
+        "http://127.0.0.1:8542/api/weft/files?scan_source=wardline&path_prefix=src%2Fdemo.py"
     );
     assert_eq!(
-        loom_findings_url("http://127.0.0.1:8542/", "wardline", "file-9"),
-        "http://127.0.0.1:8542/api/loom/findings?scan_source=wardline&file_id=file-9"
+        weft_findings_url("http://127.0.0.1:8542/", "wardline", "file-9"),
+        "http://127.0.0.1:8542/api/weft/findings?scan_source=wardline&file_id=file-9"
     );
 }
 
@@ -355,21 +355,21 @@ fn wardline_findings_for_path_does_two_hops_and_exact_path_filter() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
     let addr = listener.local_addr().expect("local addr");
     let handle = std::thread::spawn(move || {
-        // Hop 1: GET /api/loom/files — path_prefix matches two files; the
+        // Hop 1: GET /api/weft/files — path_prefix matches two files; the
         // exact-path filter must pick file-9, not the helpers file.
         let (mut s1, _) = listener.accept().expect("accept files");
         let mut buf = [0_u8; 4096];
         let n = s1.read(&mut buf).expect("read files req");
         let req = String::from_utf8_lossy(&buf[..n]);
-        assert!(req.contains("GET /api/loom/files?scan_source=wardline&path_prefix=src%2Fdemo.py HTTP/1.1"));
+        assert!(req.contains("GET /api/weft/files?scan_source=wardline&path_prefix=src%2Fdemo.py HTTP/1.1"));
         let body = r#"{"items":[{"file_id":"file-9","path":"src/demo.py","language":"python","file_type":"source"},{"file_id":"file-10","path":"src/demo.py.bak","language":"python","file_type":"source"}],"has_more":false}"#;
         write!(s1, "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}", body.len(), body).unwrap();
 
-        // Hop 2: GET /api/loom/findings for file-9.
+        // Hop 2: GET /api/weft/findings for file-9.
         let (mut s2, _) = listener.accept().expect("accept findings");
         let n = s2.read(&mut buf).expect("read findings req");
         let req = String::from_utf8_lossy(&buf[..n]);
-        assert!(req.contains("GET /api/loom/findings?scan_source=wardline&file_id=file-9 HTTP/1.1"));
+        assert!(req.contains("GET /api/weft/findings?scan_source=wardline&file_id=file-9 HTTP/1.1"));
         let body = r#"{"items":[{"finding_id":"f-1","file_id":"file-9","severity":"high","status":"open","scan_source":"wardline","rule_id":"WLN-TAINT-001","message":"sink","suggestion":"","scan_run_id":"r-1","line_start":12,"line_end":12,"fingerprint":"fp","issue_id":null,"seen_count":1,"metadata":{"wardline":{"qualname":"demo.Foo.bar"}},"data_warnings":[]}],"has_more":false}"#;
         write!(s2, "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}", body.len(), body).unwrap();
     });
@@ -385,26 +385,26 @@ fn wardline_findings_for_path_does_two_hops_and_exact_path_filter() {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo nextest run -p clarion-mcp filigree::tests::wardline_findings_for_path filigree::tests::builds_loom_url`
-Expected: FAIL to compile — `loom_files_url`, `loom_findings_url`, and `wardline_findings_for_path` undefined.
+Run: `cargo nextest run -p loomweave-mcp filigree::tests::wardline_findings_for_path filigree::tests::builds_weft_url`
+Expected: FAIL to compile — `weft_files_url`, `weft_findings_url`, and `wardline_findings_for_path` undefined.
 
 - [ ] **Step 3: Add URL builders**
 
-Add to `crates/clarion-mcp/src/filigree.rs` near `entity_associations_url`:
+Add to `crates/loomweave-mcp/src/filigree.rs` near `entity_associations_url`:
 
 ```rust
-pub fn loom_files_url(base_url: &str, scan_source: &str, path_prefix: &str) -> String {
+pub fn weft_files_url(base_url: &str, scan_source: &str, path_prefix: &str) -> String {
     format!(
-        "{}/api/loom/files?scan_source={}&path_prefix={}",
+        "{}/api/weft/files?scan_source={}&path_prefix={}",
         base_url.trim_end_matches('/'),
         percent_encode_query_value(scan_source),
         percent_encode_query_value(path_prefix)
     )
 }
 
-pub fn loom_findings_url(base_url: &str, scan_source: &str, file_id: &str) -> String {
+pub fn weft_findings_url(base_url: &str, scan_source: &str, file_id: &str) -> String {
     format!(
-        "{}/api/loom/findings?scan_source={}&file_id={}",
+        "{}/api/weft/findings?scan_source={}&file_id={}",
         base_url.trim_end_matches('/'),
         percent_encode_query_value(scan_source),
         percent_encode_query_value(file_id)
@@ -470,29 +470,29 @@ Add to `impl FiligreeLookup for FiligreeHttpClient`:
     ) -> Result<Vec<WardlineFinding>, FiligreeClientError> {
         // Hop 1: path -> Filigree file_id. path_prefix is a prefix filter, so
         // take only the row whose path is byte-exact.
-        let files: LoomFilesResponse =
-            self.get_json(&loom_files_url(&self.base_url, "wardline", path))?;
+        let files: WeftFilesResponse =
+            self.get_json(&weft_files_url(&self.base_url, "wardline", path))?;
         let Some(file_id) = files.items.into_iter().find(|f| f.path == path).map(|f| f.file_id)
         else {
             return Ok(Vec::new());
         };
         // Hop 2: file_id -> wardline findings.
         let findings: WardlineFindingsResponse =
-            self.get_json(&loom_findings_url(&self.base_url, "wardline", &file_id))?;
+            self.get_json(&weft_findings_url(&self.base_url, "wardline", &file_id))?;
         Ok(findings.items)
     }
 ```
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
-Run: `cargo nextest run -p clarion-mcp filigree::tests::wardline_findings_for_path filigree::tests::builds_loom_url`
+Run: `cargo nextest run -p loomweave-mcp filigree::tests::wardline_findings_for_path filigree::tests::builds_weft_url`
 Expected: PASS (2 tests).
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/clarion-mcp/src/filigree.rs
-git commit -m "feat(mcp): Filigree two-hop wardline_findings_for_path (loom files + findings)"
+git add crates/loomweave-mcp/src/filigree.rs
+git commit -m "feat(mcp): Filigree two-hop wardline_findings_for_path (weft files + findings)"
 ```
 
 ---
@@ -500,7 +500,7 @@ git commit -m "feat(mcp): Filigree two-hop wardline_findings_for_path (loom file
 ## Task 4: Wire the `wardline_findings` section into `issues_for`
 
 **Files:**
-- Modify: `crates/clarion-mcp/src/lib.rs` (`tool_issues_for`, ~line 1007–1126; add a helper `wardline_section_for_entity`; integration test in the lib.rs test module)
+- Modify: `crates/loomweave-mcp/src/lib.rs` (`tool_issues_for`, ~line 1007–1126; add a helper `wardline_section_for_entity`; integration test in the lib.rs test module)
 
 - [ ] **Step 1: Write the failing integration tests**
 
@@ -589,12 +589,12 @@ impl crate::filigree::FiligreeLookup for ErroringWardline {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo nextest run -p clarion-mcp issues_for_attaches_exact_wardline_findings issues_for_degrades_when_wardline_fetch_errors`
+Run: `cargo nextest run -p loomweave-mcp issues_for_attaches_exact_wardline_findings issues_for_degrades_when_wardline_fetch_errors`
 Expected: FAIL — `out["wardline_findings"]` is null (section not built yet).
 
 - [ ] **Step 3: Add the section helper**
 
-Add a free function to `crates/clarion-mcp/src/lib.rs` (near the other envelope helpers, e.g. by `issues_unavailable`):
+Add a free function to `crates/loomweave-mcp/src/lib.rs` (near the other envelope helpers, e.g. by `issues_unavailable`):
 
 ```rust
 /// Build the `wardline_findings` enrich section for one entity. Enrich-only:
@@ -679,13 +679,13 @@ Note: if `read` exposes the requested id under a different field name than `requ
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo nextest run -p clarion-mcp issues_for_attaches_exact_wardline_findings issues_for_degrades_when_wardline_fetch_errors`
+Run: `cargo nextest run -p loomweave-mcp issues_for_attaches_exact_wardline_findings issues_for_degrades_when_wardline_fetch_errors`
 Expected: PASS (2 tests).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/clarion-mcp/src/lib.rs
+git add crates/loomweave-mcp/src/lib.rs
 git commit -m "feat(mcp): attach reconciled wardline_findings section to issues_for (Flow B)"
 ```
 
@@ -694,7 +694,7 @@ git commit -m "feat(mcp): attach reconciled wardline_findings section to issues_
 ## Task 5: Wire the section into `orientation_pack`
 
 **Files:**
-- Modify: `crates/clarion-mcp/src/lib.rs` (`tool_orientation_pack`; integration test)
+- Modify: `crates/loomweave-mcp/src/lib.rs` (`tool_orientation_pack`; integration test)
 
 - [ ] **Step 1: Write the failing test**
 
@@ -714,7 +714,7 @@ Reuse the `FakeWardline` / `wf` helpers from Task 4. `orientation_pack_test_serv
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cargo nextest run -p clarion-mcp orientation_pack_includes_wardline_findings`
+Run: `cargo nextest run -p loomweave-mcp orientation_pack_includes_wardline_findings`
 Expected: FAIL — `wardline_findings` key absent from the pack.
 
 - [ ] **Step 3: Attach the section in `tool_orientation_pack`**
@@ -743,22 +743,22 @@ Adapt `primary_entity` / `packet` to the actual local variable names in `tool_or
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `cargo nextest run -p clarion-mcp orientation_pack_includes_wardline_findings`
+Run: `cargo nextest run -p loomweave-mcp orientation_pack_includes_wardline_findings`
 Expected: PASS.
 
 - [ ] **Step 5: Run the full crate gate**
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy -p clarion-mcp --all-targets -- -D warnings
-cargo nextest run -p clarion-mcp
+cargo clippy -p loomweave-mcp --all-targets -- -D warnings
+cargo nextest run -p loomweave-mcp
 ```
 Expected: all green.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/clarion-mcp/src/lib.rs
+git add crates/loomweave-mcp/src/lib.rs
 git commit -m "feat(mcp): attach reconciled wardline_findings section to orientation_pack (Flow B)"
 ```
 
@@ -777,43 +777,43 @@ Append after the existing "Consumed Filigree route: issue detail (enrichment)" s
 ## Consumed Filigree route: Wardline findings (read-time reconciliation)
 
 Flow B (read-time Wardline finding reconciliation) consumes two existing Filigree
-*loom* read routes — no new route is requested. Both are enrich-only: if either
+*weft* read routes — no new route is requested. Both are enrich-only: if either
 is unreachable the `wardline_findings` section degrades to
 `result_kind: "unavailable"` and the tool returns normally.
 
-1. `GET /api/loom/files?scan_source=wardline&path_prefix=<rel-path>` → unified
-   `ListResponse[FileRecordLoom]` (`{items, has_more, next_offset?}`). Clarion
+1. `GET /api/weft/files?scan_source=wardline&path_prefix=<rel-path>` → unified
+   `ListResponse[FileRecordWeft]` (`{items, has_more, next_offset?}`). Loomweave
    takes the item whose `path` is byte-exact (the filter is a prefix) to obtain
-   Filigree's `file_id`. Pinned by Filigree `tests/fixtures/contracts/loom/files.json`.
-2. `GET /api/loom/findings?scan_source=wardline&file_id=<file_id>` →
-   `ListResponse[ScanFindingLoom]`. Clarion reads `rule_id`, `message`,
+   Filigree's `file_id`. Pinned by Filigree `tests/fixtures/contracts/weft/files.json`.
+2. `GET /api/weft/findings?scan_source=wardline&file_id=<file_id>` →
+   `ListResponse[ScanFindingWeft]`. Loomweave reads `rule_id`, `message`,
    `severity`, `status`, `line_start/line_end`, `fingerprint`, and `metadata`
    (the reconciliation key `metadata.wardline.qualname`). Pinned by Filigree
-   `tests/fixtures/contracts/loom/findings.json`.
+   `tests/fixtures/contracts/weft/findings.json`.
 
 Reconciliation: `metadata.wardline.qualname` is matched byte-exact against the
 entity_id's segment-3 `canonical_qualified_name` (`python:function:<qualname>`),
 per the §"Wardline qualname normalization" contract. A match is
 `resolution_confidence: exact`; an unresolved qualname is `none`. (`heuristic` is
 reserved.) `POST /api/v1/files:resolve` is **not** used here — it is a route
-Clarion *exposes*, not one it consumes.
+Loomweave *exposes*, not one it consumes.
 ````
 
 - [ ] **Step 2: Commit**
 
 ```bash
 git add docs/federation/contracts.md
-git commit -m "docs(federation): pin the two consumed loom routes for Flow B reconciliation"
+git commit -m "docs(federation): pin the two consumed weft routes for Flow B reconciliation"
 ```
 
 ---
 
 ## Self-Review
 
-**Spec coverage** (against `2026-05-30-clarion-consume-wardline-data-design.md`):
+**Spec coverage** (against `2026-05-30-loomweave-consume-wardline-data-design.md`):
 - §3 read-time lazy reconciliation → Tasks 2 (match), 4/5 (attach). ✓
 - §3 `resolution_confidence` tiers → Task 2 (`Exact`/`None`; `Heuristic` reserved, documented). ✓
-- §4 two-hop via existing loom routes → Task 3. ✓
+- §4 two-hop via existing weft routes → Task 3. ✓
 - §5 enrich-only / no fabrication / omitted count → Tasks 2 (omitted), 4 (degrade test + no_matches). ✓
 - §6 hermetic tests → injected `FakeWardline`/`ErroringWardline` (Tasks 4/5), mock TcpListener (Task 3). ✓
 - §10.3 pin consumed routes in contracts.md → Task 6. ✓

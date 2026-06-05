@@ -34,7 +34,7 @@ no-alloc, no-drop, no-unwind, and failure-path checks. No action.
 | 1 | `spawn_blocking` JoinError in `analyze.rs:230` bypasses CommitRun/FailRun → `runs.status` stuck at `'running'` on plugin-task panic | Rust F1 | CRITICAL | **FIX-NOW** | Same category as 37b56d9 (exit-code decoupling); blocks A.2 |
 | 2 | `EntityCapExceeded` never reached through `analyze_file` in any test | Coverage 1 | HIGH | **FIX-NOW** | A.2.3 signoff requires positive+negative tests; host wiring (`host.rs:674–685`) untested |
 | 3 | Crash-loop breaker trip is mock-proves-itself (`breaker_06`) — never drives `analyze.rs` wiring added in `a1cc3be` | Test C-1 / Coverage 5 | HIGH | **FIX-NOW** | A.2.7 signoff literally states "test with `MockPlugin::new_crashing`"; existing test does not exercise production wiring |
-| 4 | `analyze_without_plugins_writes_skipped_run_row` leaks parent `$PATH` | Test C-2 | HIGH | **FIX-NOW** | Any machine with `clarion-plugin-fixture` installed fails this; A.1.8 reliability bomb |
+| 4 | `analyze_without_plugins_writes_skipped_run_row` leaks parent `$PATH` | Test C-2 | HIGH | **FIX-NOW** | Any machine with `loomweave-plugin-fixture` installed fails this; A.1.8 reliability bomb |
 | 5 | `make_request` / `make_notification` in `protocol.rs:298,314` are `pub` with `.expect()` panic | Rust F3 | MEDIUM | **FIX-NOW** | Same shape as filed 0b1f8bc940 (`pub` footgun); 2-line visibility fix |
 | 6 | `walk_dir` silently swallows per-entry I/O errors (`analyze.rs:672–674`) | Rust F4 | MEDIUM | **FIX-NOW** | Same WP1 anti-pattern as `read_applied_versions`; `warn!` + counter |
 | 7 | T6 path-escape breaker test uses `any()` instead of pinning count to 10 | Test C-4 | MEDIUM | **FIX-NOW** | Bundle with existing `clarion-f45dd6056f` (T3 has the same weakness) — one commit, closes both |
@@ -81,7 +81,7 @@ nextest, doc, deny).
    before return), assert `runs.status='failed'` + exit 1.
 2. **Finding #3** — E2E crash-loop breaker trip test. New filigree
    issue. Mock plugin that crashes every call + 4+ input files, run
-   `clarion analyze`, assert `FINDING_DISABLED_CRASH_LOOP` and subsequent
+   `loomweave analyze`, assert `FINDING_DISABLED_CRASH_LOOP` and subsequent
    plugins skipped.
 3. **Finding #2** — `EntityCapExceeded` host-level test. New filigree
    issue. Construct `PluginHost` with `EntityCountCap::new(2)`, feed
@@ -120,7 +120,7 @@ nextest, doc, deny).
 
 **Finding #10** is the discriminating call. `host.rs:382` constructs
 `Command::new(&manifest.plugin.executable)` — the host runs whatever
-path the manifest names, not the `clarion-plugin-*` binary discovery
+path the manifest names, not the `loomweave-plugin-*` binary discovery
 found on `$PATH`. A malicious or simply misconfigured `plugin.toml`
 can put `executable = "/bin/sh"` or `executable = "python3"` and the
 host will run that.

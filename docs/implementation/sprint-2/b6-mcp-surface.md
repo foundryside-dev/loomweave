@@ -1,4 +1,4 @@
-# B.6 - WP8 MCP surface: `clarion-mcp` crate with 7 navigation tools
+# B.6 - WP8 MCP surface: `loomweave-mcp` crate with 7 navigation tools
 
 **Status**: PANEL-REVISED STAGE 0 DESIGN - split required; no implementation
 starts before this document is committed.
@@ -6,13 +6,13 @@ starts before this document is committed.
 [B.4* calls edges](./b4-calls-edges.md),
 [B.5* references edges](./b5-references-edges.md)
 **Accepted ADRs**:
-[ADR-007](../../clarion/adr/ADR-007-summary-cache-key.md),
-[ADR-011](../../clarion/adr/ADR-011-writer-actor-concurrency.md),
-[ADR-022](../../clarion/adr/ADR-022-core-plugin-ontology.md),
-[ADR-023](../../clarion/adr/ADR-023-tooling-baseline.md),
-[ADR-028](../../clarion/adr/ADR-028-edge-confidence-tiers.md),
-[ADR-029](../../clarion/adr/ADR-029-entity-associations-binding.md),
-[ADR-030](../../clarion/adr/ADR-030-on-demand-summary-scope.md)
+[ADR-007](../../loomweave/adr/ADR-007-summary-cache-key.md),
+[ADR-011](../../loomweave/adr/ADR-011-writer-actor-concurrency.md),
+[ADR-022](../../loomweave/adr/ADR-022-core-plugin-ontology.md),
+[ADR-023](../../loomweave/adr/ADR-023-tooling-baseline.md),
+[ADR-028](../../loomweave/adr/ADR-028-edge-confidence-tiers.md),
+[ADR-029](../../loomweave/adr/ADR-029-entity-associations-binding.md),
+[ADR-030](../../loomweave/adr/ADR-030-on-demand-summary-scope.md)
 **Predecessor**: B.5* (`references` edges)
 **Successor**: B.8 (elspeth scale-test)
 **Filigree umbrella**: `clarion-e2a3672cc9`
@@ -21,8 +21,8 @@ starts before this document is committed.
 
 ## 1. Scope
 
-B.6 introduces Clarion's MVP consult surface: a new Rust library crate,
-`clarion-mcp`, and a `clarion serve` CLI subcommand exposing seven MCP tools
+B.6 introduces Loomweave's MVP consult surface: a new Rust library crate,
+`loomweave-mcp`, and a `loomweave serve` CLI subcommand exposing seven MCP tools
 over JSON-RPC stdio.
 
 The seven tools are:
@@ -49,34 +49,34 @@ Out of scope:
   function/class summaries.
 - Findings emission to Filigree. ADR-029 split WP9-A binding from WP9-B
   finding export.
-- Editing Filigree main branches from this Clarion checkout. Filigree changes
+- Editing Filigree main branches from this Loomweave checkout. Filigree changes
   happen in the Filigree repo and PR.
 
 Live prerequisite check at this revision:
 
-- Clarion branch is `sprint-2/b6-impl` from `sprint-2/b5-impl`.
+- Loomweave branch is `sprint-2/b6-impl` from `sprint-2/b5-impl`.
 - B.5* commits are present locally.
 - Filigree PR 42 is OPEN, base `main`, head
-  `clarion/b7-entity-associations`, and contains the reverse
+  `loomweave/b7-entity-associations`, and contains the reverse
   `GET /api/entity-associations?entity_id=...` route plus
   `list_associations_by_entity` MCP/data-layer support. Some PR checks were
   still in progress at this design pass; Phase E depends on that PR being
   merged or otherwise available to the integration environment.
-- The global `filigree` binary is older than Clarion's tracker DB schema.
-  Clarion tracker commands must use:
+- The global `filigree` binary is older than Loomweave's tracker DB schema.
+  Loomweave tracker commands must use:
   `uv run --project /home/john/filigree filigree ...`
 
 ## 2. Locked Surfaces
 
 B.6 reads and writes against these existing surfaces:
 
-- Workspace crates today are `clarion-core`, `clarion-storage`,
-  `clarion-cli`, and `clarion-plugin-fixture`. `clarion-mcp` becomes the
+- Workspace crates today are `loomweave-core`, `loomweave-storage`,
+  `loomweave-cli`, and `loomweave-plugin-fixture`. `loomweave-mcp` becomes the
   fifth workspace member.
 - JSON-RPC Content-Length framing already exists in
-  `crates/clarion-core/src/plugin/transport.rs`. B.6 reuses that framing but
-  defines MCP-specific protocol types inside `clarion-mcp`.
-- `crates/clarion-cli/src/cli.rs` currently has `install` and `analyze`.
+  `crates/loomweave-core/src/plugin/transport.rs`. B.6 reuses that framing but
+  defines MCP-specific protocol types inside `loomweave-mcp`.
+- `crates/loomweave-cli/src/cli.rs` currently has `install` and `analyze`.
   `serve` is a new subcommand on the same binary.
 - `ReaderPool` is the read path. MCP tool handlers borrow readers with
   `ReaderPool::with_reader`, do short queries, and drop the connection.
@@ -101,7 +101,7 @@ B.6 reads and writes against these existing surfaces:
 
 ### D1 - MCP SDK choice and process model
 
-Decision: implement a small Rust MCP stdio server in `clarion-mcp`, using the
+Decision: implement a small Rust MCP stdio server in `loomweave-mcp`, using the
 existing Content-Length framing style rather than adopting a third-party SDK
 for B.6.
 
@@ -120,9 +120,9 @@ tools/list, and tools/call.
 
 Process model:
 
-- `clarion serve` runs one foreground MCP stdio process. This is not the
+- `loomweave serve` runs one foreground MCP stdio process. This is not the
   ADR-012 HTTP/UDS read API.
-- It opens a `ReaderPool` to `.clarion/clarion.db`.
+- It opens a `ReaderPool` to `.loomweave/loomweave.db`.
 - It starts the storage writer actor when summary, inferred-edge, or
   query-time stats writes are enabled.
 - It owns `ServerState`: config, readers, optional writer, provider factory,
@@ -130,13 +130,13 @@ Process model:
 
 ### D2 - Crate structure
 
-Decision: create `crates/clarion-mcp/` as a library crate.
+Decision: create `crates/loomweave-mcp/` as a library crate.
 
-`crates/clarion-mcp/Cargo.toml` must use the workspace floor:
+`crates/loomweave-mcp/Cargo.toml` must use the workspace floor:
 
 ```toml
 [package]
-name = "clarion-mcp"
+name = "loomweave-mcp"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -148,9 +148,9 @@ workspace = true
 
 Dependencies:
 
-- `clarion-core`: entity IDs, edge confidence, provider traits, prompt
+- `loomweave-core`: entity IDs, edge confidence, provider traits, prompt
   metadata, and reused framing.
-- `clarion-storage`: `ReaderPool`, writer actor handle, schema helpers, query
+- `loomweave-storage`: `ReaderPool`, writer actor handle, schema helpers, query
   helpers.
 - `serde` / `serde_json`: MCP protocol and tool schemas.
 - `tokio`: stdio loop, writer actor integration, in-flight coalescing.
@@ -158,8 +158,8 @@ Dependencies:
 - `reqwest` with rustls only when Phase E starts and the Filigree client is
   actually implemented.
 
-`clarion-cli` owns CLI parsing and calls `clarion_mcp::serve(options)`.
-`clarion-mcp` is a library so tests can call dispatch functions without
+`loomweave-cli` owns CLI parsing and calls `loomweave_mcp::serve(options)`.
+`loomweave-mcp` is a library so tests can call dispatch functions without
 spawning a process for every unit case.
 
 ### D3 - Query-time writer commands
@@ -329,8 +329,8 @@ use a 60-second timeout; timeout increments
 
 ### D6 - Filigree HTTP client and auth
 
-Decision: `clarion-mcp` owns a small Filigree HTTP client, configured from
-`clarion.yaml`.
+Decision: `loomweave-mcp` owns a small Filigree HTTP client, configured from
+`loomweave.yaml`.
 
 Config:
 
@@ -339,14 +339,14 @@ integrations:
   filigree:
     enabled: true
     base_url: "http://127.0.0.1:8766"
-    actor: "clarion-mcp"
+    actor: "loomweave-mcp"
     token_env: FILIGREE_API_TOKEN
     timeout_seconds: 5
 ```
 
 Auth follows Filigree's actor-identity pattern from PR 42. If the route later
-requires Bearer auth, Clarion reads `token_env`; otherwise it still sends
-`actor` where Filigree accepts it. Filigree absence never breaks Clarion solo
+requires Bearer auth, Loomweave reads `token_env`; otherwise it still sends
+`actor` where Filigree accepts it. Filigree absence never breaks Loomweave solo
 mode: `issues_for` returns an unavailable envelope with reason
 `filigree-unreachable`.
 
@@ -366,7 +366,7 @@ Required response shape from PR 42:
   "associations": [
     {
       "issue_id": "filigree-...",
-      "clarion_entity_id": "python:function:demo.hello",
+      "loomweave_entity_id": "python:function:demo.hello",
       "content_hash_at_attach": "...",
       "attached_at": "...",
       "attached_by": "..."
@@ -378,9 +378,9 @@ Required response shape from PR 42:
 Current PR 42 includes this route, its data-layer helper, HTTP tests, and MCP
 tool tests. B.6 Phase E still treats it as a live external dependency:
 
-- If PR 42 merges before Phase E, Clarion integration tests use the merged
+- If PR 42 merges before Phase E, Loomweave integration tests use the merged
   Filigree route.
-- If PR 42 remains open, Phase E does not close B.6; it may prepare Clarion
+- If PR 42 remains open, Phase E does not close B.6; it may prepare Loomweave
   code against the contract, but the seven-tool MVP requires a real
   route-backed integration test before close.
 
@@ -388,7 +388,7 @@ Why not client-side scan:
 
 - Fetching all issues and then every issue's associations is O(issue_count)
   HTTP calls per `issues_for`.
-- PR 42 already adds the entity association index and reverse route; Clarion
+- PR 42 already adds the entity association index and reverse route; Loomweave
   should use that one-hop lookup.
 
 ### D8 - `include_contained` traversal cap
@@ -438,13 +438,13 @@ inferred-dispatch state.
 ### D10 - Schema additions and migration policy
 
 Decision: edit `0001_initial_schema.sql` in place for B.6 unless a published
-Clarion build has already produced databases with the Sprint 2 branch schema.
+Loomweave build has already produced databases with the Sprint 2 branch schema.
 
 Reasoning:
 
 - `main` / `origin/main` do not contain B.4* or B.5* edge rows.
 - B.4* and B.5* are branch-local Sprint 2 work.
-- More importantly, no external operator has produced a `.clarion/clarion.db`
+- More importantly, no external operator has produced a `.loomweave/loomweave.db`
   from a published build containing these branch schemas. That external
   published-DB boundary is ADR-024's real retirement trigger for in-place
   edits.
@@ -506,7 +506,7 @@ When the ceiling is reached:
 - `summary()` returns `available=false`, reason `cost-ceiling-exceeded`.
 - Inferred-edge dispatch returns the same reason.
 - Server stats increment `cost_ceiling_exceeded_total`.
-- Response diagnostics include `CLA-LLM-COST-CEILING-EXCEEDED`.
+- Response diagnostics include `LMWV-LLM-COST-CEILING-EXCEEDED`.
 
 The ceiling resets on process restart.
 
@@ -515,10 +515,10 @@ The ceiling resets on process restart.
 Decision: the exact MCP tool descriptions are:
 
 `entity_at`:
-"Return the innermost Clarion entity whose source range contains a file and line. Paths are normalized relative to the project root. Returns no match rather than guessing when ranges are absent."
+"Return the innermost Loomweave entity whose source range contains a file and line. Paths are normalized relative to the project root. Returns no match rather than guessing when ranges are absent."
 
 `find_entity`:
-"Search Clarion entities by id, name, short name, and summary text stored on entity rows. Results are paginated and ranked by FTS match where possible. This does not traverse the graph and does not search on-demand summary_cache entries."
+"Search Loomweave entities by id, name, short name, and summary text stored on entity rows. Results are paginated and ranked by FTS match where possible. This does not traverse the graph and does not search on-demand summary_cache entries."
 
 `callers_of`:
 "Return entities that call the given entity. Default confidence is resolved, so ambiguous static candidates and LLM-inferred edges are excluded unless explicitly requested. Ambiguous edges expand all candidates; inferred edges may trigger bounded LLM dispatch."
@@ -530,10 +530,10 @@ Decision: the exact MCP tool descriptions are:
 "Return an on-demand cached summary for one entity. In v0.1 this is leaf scope only: module summaries describe the module docstring and top-level members, not an aggregation of contained function/class summaries."
 
 `issues_for`:
-"Return Filigree issues attached to this Clarion entity, optionally including issues attached to contained entities. Filigree is an enrichment source; if unavailable, the tool returns an unavailable envelope instead of failing Clarion."
+"Return Filigree issues attached to this Loomweave entity, optionally including issues attached to contained entities. Filigree is an enrichment source; if unavailable, the tool returns an unavailable envelope instead of failing Loomweave."
 
 `neighborhood`:
-"Return the one-hop Clarion neighborhood around an entity: callers, callees, container, contained entities, and references. Default confidence is resolved; ambiguous and inferred calls are opt-in. References are not execution flow."
+"Return the one-hop Loomweave neighborhood around an entity: callers, callees, container, contained entities, and references. Default confidence is resolved; ambiguous and inferred calls are opt-in. References are not execution flow."
 
 ### D13 - WP6 narrowing matrix
 
@@ -653,7 +653,7 @@ Config rules:
 - `RecordingProvider` is selected by tests and fixture configs.
 - `AnthropicProvider` is selected only when `llm.enabled=true` and either the
   config has `allow_live_provider=true` or the process has
-  `CLARION_LLM_LIVE=1`.
+  `LOOMWEAVE_LLM_LIVE=1`.
 - Missing API key with live provider selected is a startup/config error.
 - API key present while live provider is not explicitly allowed has no effect.
 
@@ -874,7 +874,7 @@ Semantics:
 - Uses the Filigree reverse route from D7.
 - Missing entity returns `available=false`, reason `entity-not-found`.
 - Entity without content hash can still query Filigree but cannot classify
-  drift; response includes diagnostic `CLA-ENTITY-CONTENT-HASH-MISSING`.
+  drift; response includes diagnostic `LMWV-ENTITY-CONTENT-HASH-MISSING`.
 - Compares `content_hash_at_attach` to current `entities.content_hash`.
 - Includes contained traversal per D8.
 - Filigree unavailable is a normal unavailable envelope.
@@ -949,7 +949,7 @@ B.6a is a checkpoint PR/commit series. It does not close
 
 Task 2 - Crate scaffold and protocol skeleton
 
-- Create `crates/clarion-mcp/` with workspace package metadata and
+- Create `crates/loomweave-mcp/` with workspace package metadata and
   `[lints] workspace = true`.
 - Add workspace member.
 - Implement MCP `initialize`, `tools/list`, `tools/call`, and D15 error
@@ -957,16 +957,16 @@ Task 2 - Crate scaffold and protocol skeleton
 - Add schema/golden protocol tests.
 - Commit: `feat(mcp): scaffold stdio MCP server`.
 
-Task 3 - `clarion serve`
+Task 3 - `loomweave serve`
 
 - Add CLI subcommand and options for project path/config path.
-- Open `.clarion/clarion.db`, build `ReaderPool`, instantiate `ServerState`.
-- Smoke test `clarion serve --help` and stdio initialize.
-- Commit: `feat(cli): add clarion serve subcommand`.
+- Open `.loomweave/loomweave.db`, build `ReaderPool`, instantiate `ServerState`.
+- Smoke test `loomweave serve --help` and stdio initialize.
+- Commit: `feat(cli): add loomweave serve subcommand`.
 
 Task 4 - Config and provider factory shell
 
-- Add `clarion.yaml` config parsing for MCP, LLM disabled defaults, and
+- Add `loomweave.yaml` config parsing for MCP, LLM disabled defaults, and
   Filigree config.
 - Add D16 provider factory tests before live provider implementation.
 - Commit: `feat(config): add MCP and LLM config defaults`.
@@ -999,7 +999,7 @@ Task 7 - Five storage-backed tools
 Task 8 - B.6a end-to-end MCP test
 
 - Add `tests/e2e/sprint_2_mcp_surface.sh`.
-- Start `clarion serve` against a demo DB.
+- Start `loomweave serve` against a demo DB.
 - Send real Content-Length framed `initialize`, `tools/list`, and the five
   storage-backed tool calls.
 - Assert docstrings, response envelopes, confidence defaults, empty paths, and
@@ -1012,7 +1012,7 @@ Task 9 - Summary and inferred cache schema
 
 - Extend `summary_cache` per D10.
 - Add `inferred_edge_cache` per D5.
-- Add cache read/write/touch helpers in `clarion-storage`.
+- Add cache read/write/touch helpers in `loomweave-storage`.
 - Commit: `feat(storage): add MCP LLM cache tables`.
 
 Task 10 - LLM providers and prompt templates
@@ -1052,7 +1052,7 @@ Task 14 - Filigree contract verification
   environment.
 - Add a contract test hitting `GET /api/entity-associations?entity_id=...`.
 - File a Filigree follow-up only if the committed route diverges from D7.
-- Commit Clarion-side contract fixture updates if needed.
+- Commit Loomweave-side contract fixture updates if needed.
 
 Task 15 - `issues_for`
 
@@ -1085,7 +1085,7 @@ Task 18 - ADR-compatible resolution notes and close
   write a new ADR or a supersession note.
 - Move Filigree `clarion-e2a3672cc9` through verifying/done only after all
   gates pass.
-- Close `clarion-73ab0da435` only after the Clarion-side `issues_for` stitch
+- Close `clarion-73ab0da435` only after the Loomweave-side `issues_for` stitch
   is verified.
 - Commit: `docs(wp8): close B.6 ADR resolution notes`.
 
@@ -1094,8 +1094,8 @@ Task 18 - ADR-compatible resolution notes and close
 B.6a checkpoint is done when:
 
 - Stage 0 design doc and panel record are committed.
-- `clarion-mcp` is a workspace member with ADR-023 crate metadata/lints.
-- `clarion serve` starts an MCP stdio server.
+- `loomweave-mcp` is a workspace member with ADR-023 crate metadata/lints.
+- `loomweave serve` starts an MCP stdio server.
 - `tools/list` exposes exact D12 docstrings.
 - Five storage-backed tools respond with documented shapes:
   `entity_at`, `find_entity`, `callers_of`, `execution_paths_from`,
@@ -1118,7 +1118,7 @@ Full B.6 is done when:
 - ADR-028 and ADR-030 resolution notes land without silently rewriting accepted
   ADR decisions.
 - Filigree `clarion-e2a3672cc9` reaches done.
-- `clarion-73ab0da435` closes only after the Clarion-side stitch is in place.
+- `clarion-73ab0da435` closes only after the Loomweave-side stitch is in place.
 
 Exact local gates before any B.6 close commit:
 

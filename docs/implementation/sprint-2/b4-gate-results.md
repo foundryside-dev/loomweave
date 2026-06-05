@@ -9,7 +9,7 @@ outcome: GREEN
 calibration_machine: Linux 6.8.0-110-generic #110-Ubuntu SMP PREEMPT_DYNAMIC Thu Mar 19 15:09:20 UTC 2026 x86_64 GNU/Linux; Python 3.12.3
 operator_hardware_ratio: 1.0
 pyright_pin: 1.1.409
-clarion_commit: 7337506142e12a1fa924867d117c49b054dfce56
+loomweave_commit: 7337506142e12a1fa924867d117c49b054dfce56
 
 ### Corpus Results
 - elspeth_mini:

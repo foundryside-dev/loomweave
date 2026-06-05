@@ -34,32 +34,32 @@ N stubs + 1 impl.
 surfaced_then_dismissed: **`clarion-0cd961dbbc`** — filed and closed as
 `not_a_bug` during this gate's investigation. The "cross-file module
 collision" was actually stale state from the prior RED run; the corpus's
-`.clarion/clarion.db` from `2026-05-18T00:17Z` persisted 30,950 entities
+`.loomweave/loomweave.db` from `2026-05-18T00:17Z` persisted 30,950 entities
 (via batched commits before the failing batch's rollback) including
 `python:module:examples.chroma_rag.seed_collection`. Subsequent analyze
 runs against the same project root appended to that DB and collided. The
-stale `.clarion` was moved aside (preserved at
-`/tmp/clarion-b8-elspeth-full-20260518T0016Z/.clarion.from-2026-05-18T0017Z-RED`)
-and a fresh `clarion install` was run against the corpus root. No
+stale `.loomweave` was moved aside (preserved at
+`/tmp/loomweave-b8-elspeth-full-20260518T0016Z/.loomweave.from-2026-05-18T0017Z-RED`)
+and a fresh `loomweave install` was run against the corpus root. No
 production code change shipped for this issue.
 
 ### Reproducibility
 
 | Field | Value |
 |---|---|
-| Clarion branch at run | `sprint-2/b8-scale-test` |
-| Clarion commit at run | `29f0426` (`fix(wp3): skip @overload stubs to prevent UNIQUE(entities.id) collision`) |
-| Clarion working-tree changes | same untracked / unrelated changes carried from the prior RED entry (see Reproducibility there); none material to this rerun |
+| Loomweave branch at run | `sprint-2/b8-scale-test` |
+| Loomweave commit at run | `29f0426` (`fix(wp3): skip @overload stubs to prevent UNIQUE(entities.id) collision`) |
+| Loomweave working-tree changes | same untracked / unrelated changes carried from the prior RED entry (see Reproducibility there); none material to this rerun |
 | Corpus source | `/home/john/elspeth/` (full checkout) |
 | Corpus commit | `9d3fd55d63bac764c88af04330af2c3f4f651346` |
-| Scratch corpus path | `/tmp/clarion-b8-elspeth-full-20260518T0016Z` (same as the prior RED, reused verbatim) |
+| Scratch corpus path | `/tmp/loomweave-b8-elspeth-full-20260518T0016Z` (same as the prior RED, reused verbatim) |
 | Python files in scratch | 1,532 (1,526 reach the plugin after `SKIP_DIRS` filtering) |
 | Raw artifacts | `tests/perf/b8_scale_test/results/2026-05-18T0114Z/` |
-| Install command | `clarion install --path /tmp/clarion-b8-elspeth-full-20260518T0016Z` |
-| Analyze command | `target/release/clarion analyze /tmp/clarion-b8-elspeth-full-20260518T0016Z` (with python plugin venv bin on PATH) |
+| Install command | `loomweave install --path /tmp/loomweave-b8-elspeth-full-20260518T0016Z` |
+| Analyze command | `target/release/loomweave analyze /tmp/loomweave-b8-elspeth-full-20260518T0016Z` (with python plugin venv bin on PATH) |
 | RSS sampler | `tests/perf/b8_scale_test/results/2026-05-18T0114Z/analyze-with-rss.py` (250 ms poll over proc + 2 generations of descendants; carried verbatim from the prior RED) |
 | Serve driver | `tests/perf/b8_scale_test/driver.py --timeout-seconds 300 --skip-inferred` |
-| Serve config | `/tmp/clarion-b8-elspeth-full-20260518T0016Z/clarion-b8-live.yaml` (with `integrations.filigree.base_url` updated to `http://127.0.0.1:8885` for this run's dashboard binding) |
+| Serve config | `/tmp/loomweave-b8-elspeth-full-20260518T0016Z/loomweave-b8-live.yaml` (with `integrations.filigree.base_url` updated to `http://127.0.0.1:8885` for this run's dashboard binding) |
 | Filigree route | enabled (`http://127.0.0.1:8885`), HTTP reachable, no live entity associations attached to corpus entities |
 
 ### Analyze-Time Measurements
@@ -74,7 +74,7 @@ production code change shipped for this issue.
 | NFR-PERF-01 limit | 60m (≤ 13.46% of envelope) |
 | Peak RSS (sampled) | 197,865,472 bytes / 188.699 MiB |
 | Peak RSS caveat | sampler swept process + 2 generations of descendants at 250 ms; like the prior RED, this RSS number is a lower bound vs. the named-slice 2026-05-17T21:56Z GREEN's 1,939 MiB which used a different harness — treat as not directly comparable |
-| `.clarion/clarion.db` size at completion | 234.66 MiB |
+| `.loomweave/loomweave.db` size at completion | 234.66 MiB |
 | Discovery/source walk | ~0.013s from log start to `source tree walk complete` |
 | Plugin processing | 484.42s (`processing plugin` 01:51:06.169Z → `plugin complete` 01:59:10.586Z); the plugin-driven path dominates the wall-clock since `analyze` is single-plugin |
 | Pyright per-file p95 | 1,194 ms |
@@ -131,7 +131,7 @@ Plugin-host findings observed in stdout (informational; not persisted):
 
 | Subcode | Count | Materiality |
 |---|---:|---|
-| `CLA-INFRA-PLUGIN-MALFORMED-UNRESOLVED-CALL-SITE` | 21 | Same `callee_expr > 512 bytes` signal as prior runs (3 in the named slice, 6 in the prior supplementary RED, 21 here at full-corpus scale). Increases with corpus size; harmless to analyze. |
+| `LMWV-INFRA-PLUGIN-MALFORMED-UNRESOLVED-CALL-SITE` | 21 | Same `callee_expr > 512 bytes` signal as prior runs (3 in the named slice, 6 in the prior supplementary RED, 21 here at full-corpus scale). Increases with corpus size; harmless to analyze. |
 
 ### MCP Serve-Time Measurements (Storage-Backed Slice)
 
@@ -253,7 +253,7 @@ checkout**, with two explicit narrowings:
 
 This run does **prove**:
 
-- The `@overload` fix unblocks `clarion analyze` against any real-world
+- The `@overload` fix unblocks `loomweave analyze` against any real-world
   `src/` tree that uses `@overload`, `@typing.overload`, or
   `@typing_extensions.overload`.
 - The full elspeth corpus (1.48× the named slice's file count) fits
@@ -274,11 +274,11 @@ the full elspeth corpus. The amendment exercises the inferred-edge LLM
 dispatch and cold-cache `summary` path that the
 [2026-05-18T01:14Z entry](#2026-05-18t0114z--green-full-elspeth-supplementary-storage-backed-slice)
 deliberately skipped. 99 of 100 tool calls returned ok; the one failure
-is a Clarion-side defect (`clarion-df58379de4`, see below) not an
+is a Loomweave-side defect (`clarion-df58379de4`, see below) not an
 external-provider failure. LLM cost was $0.897 USD on 219,006 tokens.
 
 scope: Same corpus, same analyze DB
-(`/tmp/clarion-b8-elspeth-full-20260518T0016Z/.clarion/clarion.db`,
+(`/tmp/loomweave-b8-elspeth-full-20260518T0016Z/.loomweave/loomweave.db`,
 run id `3461ded9-…`) as the 01:14Z entry. Before invoking the driver,
 `summary_cache` and `inferred_edge_cache` were both wiped so the run
 measures the true cold-LLM picture rather than warm-cache reads of
@@ -288,7 +288,7 @@ prior calls.
 
 | Field | Value |
 |---|---|
-| Clarion commit at run | `29f0426` (same as 01:14Z entry) |
+| Loomweave commit at run | `29f0426` (same as 01:14Z entry) |
 | Driver command | `tests/perf/b8_scale_test/driver.py … --timeout-seconds 300` (no `--skip-inferred`) |
 | Driver output | `tests/perf/b8_scale_test/results/2026-05-18T0114Z/mcp-driver-output-live.json` |
 | Driver stderr | `tests/perf/b8_scale_test/results/2026-05-18T0114Z/mcp-driver-live.stderr` |
@@ -398,7 +398,7 @@ future stress target on operator request. It does **not** reopen the
 [2026-05-17T22:43Z GREEN](#2026-05-17t2243z--green-rerun-superseding-red)
 verdict on the named slice.
 
-reason: `clarion analyze` failed mid-run with a UNIQUE constraint violation on
+reason: `loomweave analyze` failed mid-run with a UNIQUE constraint violation on
 `entities.id`. The Python plugin emits one entity per `def`, ignoring
 `@typing.overload` stub signatures that legitimately share a qualname with their
 implementation. The named B.8 slice did not surface this because elspeth
@@ -415,20 +415,20 @@ to surface.
 
 | Field | Value |
 |---|---|
-| Clarion branch at run | `sprint-2/b8-scale-test` |
-| Clarion base commit | `a80c31a` |
-| Clarion working-tree changes | 3 src files modified (`crates/clarion-core/src/plugin/manifest.rs`, `crates/clarion-storage/migrations/0001_initial_schema.sql`, `crates/clarion-storage/tests/schema_apply.rs`); untracked `docs/clarion/adr/ADR-031-schema-validation-policy.md`. Binary rebuilt against this state. |
+| Loomweave branch at run | `sprint-2/b8-scale-test` |
+| Loomweave base commit | `a80c31a` |
+| Loomweave working-tree changes | 3 src files modified (`crates/loomweave-core/src/plugin/manifest.rs`, `crates/loomweave-storage/migrations/0001_initial_schema.sql`, `crates/loomweave-storage/tests/schema_apply.rs`); untracked `docs/loomweave/adr/ADR-031-schema-validation-policy.md`. Binary rebuilt against this state. |
 | Corpus source | `/home/john/elspeth/` (full checkout, not just `tests/`) |
 | Corpus commit | `9d3fd55d63bac764c88af04330af2c3f4f651346` |
-| Corpus dirty state | 11 modified files (composer ux-redesign docs and two orchestrator src files); recorded at `/tmp/clarion-b8-full-elspeth-status.txt` |
-| Scratch corpus path | `/tmp/clarion-b8-elspeth-full-20260518T0016Z` |
+| Corpus dirty state | 11 modified files (composer ux-redesign docs and two orchestrator src files); recorded at `/tmp/loomweave-b8-full-elspeth-status.txt` |
+| Scratch corpus path | `/tmp/loomweave-b8-elspeth-full-20260518T0016Z` |
 | Scratch corpus selection | rsync of `*.py` outside `.venv`, `.uv-cache`, `.worktrees`, `node_modules`, `.git`, `__pycache__`, `build`, `dist` |
 | Python files in scratch | 1,532 |
 | Python LOC in scratch | 611,220 |
 | Raw artifacts | `tests/perf/b8_scale_test/results/2026-05-18T0017Z/` |
-| Install command | `clarion install --path <scratch>` (run with python plugin venv bin on PATH) |
-| Analyze command | `target/release/clarion analyze /tmp/clarion-b8-elspeth-full-20260518T0016Z` |
-| RSS sampler | `/tmp/clarion-b8-analyze-with-rss.py` (250 ms poll over proc + 2 levels of descendants) |
+| Install command | `loomweave install --path <scratch>` (run with python plugin venv bin on PATH) |
+| Analyze command | `target/release/loomweave analyze /tmp/loomweave-b8-elspeth-full-20260518T0016Z` |
+| RSS sampler | `/tmp/loomweave-b8-analyze-with-rss.py` (250 ms poll over proc + 2 levels of descendants) |
 | MCP driver | not run (no usable DB) |
 | Filigree route | not exercised |
 
@@ -449,7 +449,7 @@ file count (1,532 vs 1,037), 1.42× the LOC (611k vs 430k), and includes
 | Wall-clock vs 60m envelope | well inside (12.99% of envelope), but irrelevant — run did not complete |
 | Peak RSS (sampled) | 185,541,632 bytes / 176.94 MiB |
 | Peak RSS caveat | sampler swept process + 2 generations of descendants at 250 ms; prior tests-slice run reported 1.94 GiB peak via a different harness. The 11.0× discrepancy is likely sampler under-coverage of pyright subprocess RSS rather than a real memory reduction — treat this RSS number as a lower bound, not a measurement comparable to the prior run. |
-| `.clarion/clarion.db` size at FailRun | 47.25 MiB |
+| `.loomweave/loomweave.db` size at FailRun | 47.25 MiB |
 | Discovery/source walk | ~0.013s from log start to `source tree walk complete` |
 | Plugin processing | ~464.467s from `processing plugin` to `plugin host collected findings` (Python plugin completed all 1,526 files it was handed) |
 | Commit/close phase | did not reach successful completion; writer-actor aborted with UNIQUE constraint failure 3.563s after host findings |
@@ -495,8 +495,8 @@ Plugin-host findings observed in stderr (informational; not persisted):
 
 | Subcode | Count | Materiality |
 |---|---:|---|
-| `CLA-INFRA-PLUGIN-MALFORMED-UNRESOLVED-CALL-SITE` | 6 | Same malformed `callee_expr > 512 bytes` signal observed on the named slice (8 there); harmless |
-| `CLA-PY-PYRIGHT-*` | 0 | No pyright lifecycle finding surfaced |
+| `LMWV-INFRA-PLUGIN-MALFORMED-UNRESOLVED-CALL-SITE` | 6 | Same malformed `callee_expr > 512 bytes` signal observed on the named slice (8 there); harmless |
+| `LMWV-PY-PYRIGHT-*` | 0 | No pyright lifecycle finding surfaced |
 
 ### Failure Detail
 
@@ -523,7 +523,7 @@ Blast radius at this scale: 2 files use `@overload` (both in `src/elspeth/core/l
 
 No files in elspeth `tests/` use `@overload`, which is why the named B.8 slice
 did not surface this. The pattern is standard in typed Python libraries; the
-defect will recur whenever Clarion analyzes any real `src/` tree that uses
+defect will recur whenever Loomweave analyzes any real `src/` tree that uses
 `@overload`, `@typing.overload`, or — by the same reasoning — any decorator
 pattern that produces multiple `def`s sharing a qualname.
 
@@ -538,7 +538,7 @@ characterise the supplementary corpus either (the run did not complete).
 
 A sanitised rerun against the full corpus minus the 2 overload-using files was
 considered and rejected as scope escalation: the methodology's job here is to
-faithfully record what `clarion analyze` does against the full elspeth tree,
+faithfully record what `loomweave analyze` does against the full elspeth tree,
 not to engineer a workaround so the harness can claim "all 7 tools exercised."
 
 ### NFR And Gate Outcome
@@ -591,7 +591,7 @@ rollback_action:
 - Follow-up filed: `clarion-ac5f9bf35b` — OpenRouter-backed summary and inferred
   MCP paths return invalid JSON.
 
-reason: `clarion analyze` completed within the v0.1 scale envelope and the
+reason: `loomweave analyze` completed within the v0.1 scale envelope and the
 storage-backed MCP tools returned useful bounded responses, but every live
 OpenRouter-backed `summary()` call and every inferred-confidence dispatch failed
 with `llm-invalid-json`. The B.8 "all 7 tools" proof is therefore not true, and
@@ -601,18 +601,18 @@ the NFR-COST-02 summary-cache hit-rate target is unmeasurable rather than green.
 
 | Field | Value |
 |---|---|
-| Clarion branch at run | `sprint-2/b8-scale-test` |
-| Clarion commit at run | `80a6af9` |
+| Loomweave branch at run | `sprint-2/b8-scale-test` |
+| Loomweave commit at run | `80a6af9` |
 | Corpus source | `/home/john/elspeth/tests` |
 | Corpus commit | `deab8f5b21335f37e72ed70fb494a30e2c237b21` |
 | Corpus dirty state | one unrelated untracked doc: `docs/superpowers/plans/2026-05-18-report-assemble-aggregation.md` |
-| Scratch corpus path | `/tmp/clarion-b8-elspeth-tests-20260517T2156Z` |
+| Scratch corpus path | `/tmp/loomweave-b8-elspeth-tests-20260517T2156Z` |
 | Python files | 1,037 |
 | Python LOC | 429,870 |
 | Raw artifacts | `tests/perf/b8_scale_test/results/2026-05-17T2156Z/` |
-| Analyze command | `target/release/clarion analyze /tmp/clarion-b8-elspeth-tests-20260517T2156Z` |
+| Analyze command | `target/release/loomweave analyze /tmp/loomweave-b8-elspeth-tests-20260517T2156Z` |
 | Serve driver | `tests/perf/b8_scale_test/driver.py` |
-| Serve config | `/tmp/clarion-b8-elspeth-tests-20260517T2156Z/clarion-b8-live.yaml` |
+| Serve config | `/tmp/loomweave-b8-elspeth-tests-20260517T2156Z/loomweave-b8-live.yaml` |
 | Filigree route | real dashboard at `http://127.0.0.1:9388/api/entity-associations` |
 
 This was the representative elspeth-slice requested by B.8, not the fallback
@@ -628,8 +628,8 @@ excluded non-Python files.
 | Total wall-clock | 447.154s / 7m27s |
 | NFR-PERF-01 limit | 60m |
 | Peak RSS | 2,033,442,816 bytes / 1,939.242 MiB |
-| `.clarion/clarion.db` size | 173 MiB |
-| `.clarion/` size at close | 173 MiB |
+| `.loomweave/loomweave.db` size | 173 MiB |
+| `.loomweave/` size at close | 173 MiB |
 | Discovery/source walk | ~0.002s from first log to `source tree walk complete` |
 | Plugin processing | ~441.346s from `processing plugin` to host findings |
 | Commit/close flush | ~5.699s from host findings to `plugin complete` |
@@ -677,8 +677,8 @@ Analyze findings emitted by code:
 
 | Code | Count | Materiality |
 |---|---:|---|
-| `CLA-INFRA-PLUGIN-MALFORMED-UNRESOLVED-CALL-SITE` | 8 | Material follow-up signal; overlong `callee_expr` entries are dropped from the unresolved-site side table |
-| `CLA-PY-PYRIGHT-*` | 0 | No pyright lifecycle finding surfaced |
+| `LMWV-INFRA-PLUGIN-MALFORMED-UNRESOLVED-CALL-SITE` | 8 | Material follow-up signal; overlong `callee_expr` entries are dropped from the unresolved-site side table |
+| `LMWV-PY-PYRIGHT-*` | 0 | No pyright lifecycle finding surfaced |
 
 ### B.4* Extrapolation Check
 
@@ -799,13 +799,13 @@ cap pressure appeared in this run.
 | Successful LLM-backed responses | 0 |
 | `summary_cache` rows after run | 0 |
 | `inferred_edge_cache` rows after run | 0 |
-| Clarion-reported prompt tokens | 0 |
-| Clarion-reported completion tokens | 0 |
-| Clarion-reported total tokens | 0 |
-| Estimated dollar cost | not computable from Clarion artifacts |
+| Loomweave-reported prompt tokens | 0 |
+| Loomweave-reported completion tokens | 0 |
+| Loomweave-reported total tokens | 0 |
+| Estimated dollar cost | not computable from Loomweave artifacts |
 
 The token/cost ceiling could not be validated. This does not mean the run was
-free; it means the provider path returned text that failed Clarion's JSON
+free; it means the provider path returned text that failed Loomweave's JSON
 contract before the MCP envelope surfaced usage accounting. The v0.2 follow-up
 must either enforce JSON-mode/provider constraints or preserve usage tokens even
 when the semantic JSON parse fails.
@@ -861,8 +861,8 @@ supersedes: **2026-05-17T21:56Z — RED** for the live LLM JSON/cost/cache
 blocker tracked as `clarion-ac5f9bf35b`.
 
 This rerun used the same analyzed elspeth-slice database from the RED entry:
-`/tmp/clarion-b8-elspeth-tests-20260517T2156Z/.clarion/clarion.db`. No analyze
-rerun was performed; the proof is scoped to the missing `clarion serve` live
+`/tmp/loomweave-b8-elspeth-tests-20260517T2156Z/.loomweave/loomweave.db`. No analyze
+rerun was performed; the proof is scoped to the missing `loomweave serve` live
 OpenRouter/cache evidence.
 
 Raw artifacts:
@@ -870,7 +870,7 @@ Raw artifacts:
 - Cold-cache repair run: `tests/perf/b8_scale_test/results/2026-05-17T2243Z/mcp-driver-output.json`
 - Warm-cache steady-state rerun: `tests/perf/b8_scale_test/results/2026-05-17T2243Z/mcp-driver-output-warm-cache.json`
 
-Clarion source at run time: branch `sprint-2/b8-scale-test`, base commit
+Loomweave source at run time: branch `sprint-2/b8-scale-test`, base commit
 `e6bba0f`, with the B.8 repair patch in the working tree. Filigree HTTP was the
 real dashboard route at `http://127.0.0.1:9388/api/entity-associations`.
 

@@ -1,7 +1,7 @@
-# Loom Doctrine Panel — Cross-Panel Synthesis
+# Weft Doctrine Panel — Cross-Panel Synthesis
 
-**Panel ID:** loom-doctrine-2026-04-17
-**Target documents:** `docs/suite/briefing.md`, `docs/suite/loom.md`
+**Panel ID:** weft-doctrine-2026-04-17
+**Target documents:** `docs/suite/briefing.md`, `docs/suite/weft.md`
 **Synthesiser:** Panel Synthesiser Agent
 **Date:** 2026-04-17
 **Panel size:** 5 personas (p1 Priya, p2 Marcus, p3 Yasmin, p4 Dev, p5 Sam)
@@ -17,12 +17,12 @@ naming the stealth-monolith failure mode rather than hand-waving past it.
 
 What every technical reader found, independently and from different angles, is
 that the v0.1 *implementation* described in `briefing.md` embeds two structural
-couplings that the `loom.md` failure test was not designed to catch:
+couplings that the `weft.md` failure test was not designed to catch:
 
-1. A **Wardline -> Clarion -> Filigree findings triangle** that makes the
-   Wardline+Filigree pair functionally dependent on Clarion in v0.1, even though
+1. A **Wardline -> Loomweave -> Filigree findings triangle** that makes the
+   Wardline+Filigree pair functionally dependent on Loomweave in v0.1, even though
    §4's pairwise composability rule declares this prohibited.
-2. A **direct Python import** (`wardline.core.registry.REGISTRY`) from Clarion's
+2. A **direct Python import** (`wardline.core.registry.REGISTRY`) from Loomweave's
    plugin into Wardline's runtime, which is a startup-time, code-level
    dependency categorically different from the HTTP/file couplings in the same
    data-flow table.
@@ -33,31 +33,31 @@ operationally violating the principle the test is meant to enforce. Three of
 five personas surfaced this scope mismatch independently. That is structural.
 
 Secondary finding: the doctrine is well-written but **untested enrichment**.
-Clarion is the product whose absence would most severely stress the architecture
-and it does not yet exist. Every claim the doctrine makes about Clarion's
+Loomweave is the product whose absence would most severely stress the architecture
+and it does not yet exist. Every claim the doctrine makes about Loomweave's
 behaviour is, at present, theoretical.
 
 ---
 
 ## 2. Convergent concerns (ranked high-signal to lower-signal)
 
-### 2.1 The Wardline -> Filigree via Clarion triangle — CONFIDENCE: HIGH
+### 2.1 The Wardline -> Filigree via Loomweave triangle — CONFIDENCE: HIGH
 
 Three personas (p1 Priya, p3 Yasmin, p5 Sam) independently identified that the
-Wardline+Filigree pair is not a pair in v0.1 — it is a triangle with Clarion as
+Wardline+Filigree pair is not a pair in v0.1 — it is a triangle with Loomweave as
 required middleware. A fourth (p4 Dev) flagged the same pattern obliquely via
 the "bootstrapping the suite fabric" phrase.
 
-- **Priya (p1):** "the Filigree + Wardline pair currently requires Clarion as a
+- **Priya (p1):** "the Filigree + Wardline pair currently requires Loomweave as a
   translator ... This is a real violation of §4's pairwise composability rule,
   and neither doc calls it out explicitly."
-- **Yasmin (p3):** "In v0.1, Clarion's translator is the only conduit for
+- **Yasmin (p3):** "In v0.1, Loomweave's translator is the only conduit for
   Wardline findings reaching Filigree's triage store."
 - **Sam (p5):** "Wardline's findings don't go directly to Filigree. They go
-  through Clarion's translator first. This means Clarion is on the critical
+  through Loomweave's translator first. This means Loomweave is on the critical
   path for Wardline findings to reach Filigree."
 - **Dev (p4):** "If those protocols, once landed, become the connective tissue
-  that other products depend on, then Clarion becomes the fabric and 'no Loom
+  that other products depend on, then Loomweave becomes the fabric and 'no Weft
   runtime' becomes a naming convention, not an architectural reality."
 
 This finding passes the **convergent-reasons test**. Priya arrived via §4
@@ -67,7 +67,7 @@ governance framing. The conclusions converge; the reasoning does not — these
 are genuinely independent signals, not one prior repeated in four vocabularies.
 
 The docs acknowledge it obliquely (briefing: "Wardline should eventually have a
-native emitter"; loom.md: silent). All four personas explicitly noted that
+native emitter"; weft.md: silent). All four personas explicitly noted that
 "eventually" is doing heavy lifting. Marcus (p2) is the one persona who did not
 surface this — consistent with his declared blind spot on data-flow details.
 
@@ -79,7 +79,7 @@ is the single most-cited specific text-level concern in the panel.
 - **Priya (p1):** "Direct import. Not a file read. Not an HTTP call. A Python
   import. That is a code-level, startup-time dependency... This is the row that
   concerns me most in the entire document."
-- **Yasmin (p3):** "Clarion's Python plugin takes a direct runtime dependency
+- **Yasmin (p3):** "Loomweave's Python plugin takes a direct runtime dependency
   on Wardline's Python package. That is a tight coupling that the 'each tool is
   independently usable' principle is supposed to prevent."
 - **Dev (p4):** "That's not a narrow interop contract — that's a direct import
@@ -106,7 +106,7 @@ as worded, is too narrow to catch the couplings they observed.
   drift but not initialization coupling. The direct-import row passes the
   stated test while still being a form of coupling that would break in a
   deployment where Wardline isn't on the same Python path."
-- **Yasmin (p3):** "Clarion's SARIF translator is not enrichment in the §5
+- **Yasmin (p3):** "Loomweave's SARIF translator is not enrichment in the §5
   sense; it is a pipeline stage. The doctrine's enrichment principle does not
   directly govern it, and that is a gap in the doctrine's coverage."
 - **Sam (p5):** "I think the doctrine's failure test technically passes. But I
@@ -139,20 +139,20 @@ Marcus reads it as honest self-disclosure (the status table redeems the
 oversold lede); Dev reads it as governance theatre (a doctrine applied to a
 non-design is placeholder-grade). Same fact, two postures.
 
-### 2.5 Identity-translation centralisation in Clarion — CONFIDENCE: MEDIUM-HIGH
+### 2.5 Identity-translation centralisation in Loomweave — CONFIDENCE: MEDIUM-HIGH
 
-Three personas (p1, p3, p5) noted that Clarion's role as reconciler for all
+Three personas (p1, p3, p5) noted that Loomweave's role as reconciler for all
 three identity schemes makes it the de-facto translation authority for the
-suite, even though §6 disclaims a "neutral Loom identity oracle." See the
+suite, even though §6 disclaims a "neutral Weft identity oracle." See the
 unreliable-narrator check (section 4) for Sam's partial recoil from his
 stronger form of this claim.
 
-- **Priya (p1):** "Clarion a de-facto shared identity authority. Not a shared
+- **Priya (p1):** "Loomweave a de-facto shared identity authority. Not a shared
   store — the store is local files — but a shared authority."
 - **Yasmin (p3):** "Three identity schemes, one translator. Honest. Also: a
   significant single point of governance responsibility."
-- **Sam (p5):** "Clarion isn't a 'neutral identity oracle' in the sense
-  loom.md §6 disclaims. But it is *the place where all identity reconciliation
+- **Sam (p5):** "Loomweave isn't a 'neutral identity oracle' in the sense
+  weft.md §6 disclaims. But it is *the place where all identity reconciliation
   happens*."
 
 The reasoning across all three is closely aligned, so I downgrade from HIGH to
@@ -163,14 +163,14 @@ centralised infrastructure") in three vocabularies. Still substantial signal.
 
 Two personas (p3 Yasmin, p5 Sam) raised entity-ID versioning concerns. Yasmin
 framed it as SOC 2 audit continuity; Sam framed it as cross-reference
-resolution. Both asked: what happens to existing Filigree records when Clarion
+resolution. Both asked: what happens to existing Filigree records when Loomweave
 re-keys its catalog?
 
-- **Yasmin Q5:** "When Clarion's EntityId minting algorithm changes between
+- **Yasmin Q5:** "When Loomweave's EntityId minting algorithm changes between
   versions, what is the migration story for Filigree records that carry stale
   EntityId cross-references?"
-- **Sam Q2:** "Filigree issues reference entities by Clarion EntityId. If
-  Clarion is removed from a deployment, those references become opaque
+- **Sam Q2:** "Filigree issues reference entities by Loomweave EntityId. If
+  Loomweave is removed from a deployment, those references become opaque
   strings."
 
 Not universal (p1, p2, p4 did not raise it), so MEDIUM. But Yasmin's original
@@ -181,12 +181,12 @@ verbatim on this question. That makes it a high-quality MEDIUM finding.
 
 One persona (Dev, p4) flagged this with full clarity; Priya (p1) noted it
 partially. The briefing asks Filigree to add a pluggable `registry_backend` "so
-Clarion can own the file registry." Dev noted this reverses the stated
+Loomweave can own the file registry." Dev noted this reverses the stated
 direction of enrichment:
 
-- **Dev (p4):** "What happens to Filigree in `--no-clarion`? If Filigree's
+- **Dev (p4):** "What happens to Filigree in `--no-loomweave`? If Filigree's
   registry backend silently breaks or degrades to an incoherent state without
-  Clarion, that's a load-bearing dependency in the direction loom.md most
+  Loomweave, that's a load-bearing dependency in the direction weft.md most
   explicitly prohibits."
 
 Only one persona raised it to full prominence, but it is a concrete, testable,
@@ -194,7 +194,7 @@ Tier 1 text-surface concern. MEDIUM confidence purely on persona count.
 
 ### 2.8 MCP failure behaviour during consult — CONFIDENCE: LOW-MEDIUM
 
-Priya (p1, Q5) flagged that Clarion's observation-emission path to Filigree
+Priya (p1, Q5) flagged that Loomweave's observation-emission path to Filigree
 via MCP has no documented failure behaviour. No other persona raised it. Low
 persona count but highly specific — keep as a LOW-MEDIUM noted gap.
 
@@ -221,7 +221,7 @@ substitutes doctrine for working code.
 This is the **adoption-vs-contribution tension** that the collision test (see
 section 5) was designed to surface. Marcus is evaluating whether to put
 Filigree+Wardline in front of his platform lead (yes, conditionally).  Dev is
-evaluating whether to invest time contributing to Clarion (not yet, because
+evaluating whether to invest time contributing to Loomweave (not yet, because
 §7's go/no-go test is being applied to a non-design).
 
 **The documents are doing their job for the adopter persona and not yet doing
@@ -230,12 +230,12 @@ their job for the contributor persona.**
 ### 3.2 Yasmin's compliance lens vs Sam's adversarial lens on identity
 
 On the same identity-scheme text (briefing's "three concurrent identity
-schemes" paragraph and loom.md §6's "product that cares does the translation"),
+schemes" paragraph and weft.md §6's "product that cares does the translation"),
 Yasmin and Sam diverged sharply:
 
 - **Yasmin (p3):** The identity scheme passes the principle *at rest* — once
   a finding is in Filigree, Filigree's triage authority is durable. Her
-  concern is *over time*: what happens when Clarion's translator changes?
+  concern is *over time*: what happens when Loomweave's translator changes?
 - **Sam (p5):** The identity scheme passes the doctrine's failure test *as
   worded* but the doctrine's test is scoped narrowly. His concern is *scope
   of the test itself*.
@@ -268,8 +268,8 @@ reject Dev's conclusion; he is the only data point.
 
 ## 4. Unreliable-narrator check (Sam / p5)
 
-**Pre-registered misconception:** Sam will read the Clarion identity
-translation layer as evidence that Clarion is a "secret monolith" by the
+**Pre-registered misconception:** Sam will read the Loomweave identity
+translation layer as evidence that Loomweave is a "secret monolith" by the
 doctrine's own failure test.
 
 **Outcome: REFINED, not CONFIRMED.**
@@ -279,16 +279,16 @@ table ("the pattern I was looking for"), then pulled back after re-reading §5
 and §6. His own words in the Unreliable-Narrator Note at the end of his
 journal:
 
-> "The strongest version of my critique — that Clarion is a 'secret monolith'
+> "The strongest version of my critique — that Loomweave is a 'secret monolith'
 > by the doctrine's own failure test — doesn't actually survive careful
 > reading. The failure test is about whether removing a sibling changes the
 > *meaning* of another product's *own* data. Filigree's issues are meaningful
-> without Clarion. Wardline's scanner output is meaningful without Clarion.
+> without Loomweave. Wardline's scanner output is meaningful without Loomweave.
 > The cross-references become unresolvable, but they don't become
 > *incoherent*. The doctrine draws this line deliberately, and I think the
 > line is defensible, even if I'd draw it in a slightly different place."
 
-He refined the criticism to: "Clarion is structurally central to any workflow
+He refined the criticism to: "Loomweave is structurally central to any workflow
 that crosses tool boundaries, even though the doctrine correctly notes that
 each product's *own* data remains coherent in isolation."
 
@@ -313,9 +313,9 @@ Three pre-registered predictions. Auditing against Marcus's actual journal:
 
 | Prediction | Actual | Match? |
 |---|---|---|
-| **Reading path:** Status table first in briefing, then loom.md §3–§5, skip §7/§8 | "First move: scan the page for a status table. Took about thirty seconds." Then loom.md §3, §4, §5, §6, skipped §7 and §8 explicitly ("Skipped, as intended"). | **YES, exact.** He read §6 which was not predicted but is adjacent to §5. Path otherwise pixel-perfect. |
+| **Reading path:** Status table first in briefing, then weft.md §3–§5, skip §7/§8 | "First move: scan the page for a status table. Took about thirty seconds." Then weft.md §3, §4, §5, §6, skipped §7 and §8 explicitly ("Skipped, as intended"). | **YES, exact.** He read §6 which was not predicted but is adjacent to §5. Path otherwise pixel-perfect. |
 | **Key concern:** Gap between three-product framing and two-tools-actually-running reality | "The lede — the one-paragraph version at the top — reads 'three independent tools that enrich one another.' That's a three-product claim. The table tells me it's two-plus-one-on-paper-plus-one-concept." | **YES, exact.** Language is almost verbatim the predicted reaction. |
-| **Verdict:** Cautiously interested, pass to senior engineer, will not dismiss, local-first positioning lands | Verdict file: "Cautiously interested. Passing to a senior engineer for deeper review of Clarion's detailed design." Notes local-first positioning approvingly ("tells me there's no surprise cloud dependency to audit"). | **YES, exact.** |
+| **Verdict:** Cautiously interested, pass to senior engineer, will not dismiss, local-first positioning lands | Verdict file: "Cautiously interested. Passing to a senior engineer for deeper review of Loomweave's detailed design." Notes local-first positioning approvingly ("tells me there's no surprise cloud dependency to audit"). | **YES, exact.** |
 
 All three predictions matched. The control persona is calibrated. This gives
 us confidence in two things:
@@ -341,7 +341,7 @@ directions. If they do, it is structural.
 **Outcome: CONVERGED, structurally.**
 
 Priya arrived at "direct Python import is startup-time coupling that the
-failure test misses." Sam arrived at "Clarion-as-translation-layer is
+failure test misses." Sam arrived at "Loomweave-as-translation-layer is
 structurally central to cross-tool workflows." Different surface claims;
 identical underlying structural concern. Both converged on "the §5 failure
 test is scoped too narrowly to catch what v0.1 actually does."
@@ -397,11 +397,11 @@ this collision are two framings of the same doctrine gap.
 
 | # | Finding | Personas | Tier | Confidence |
 |---|---|---|---|---|
-| 2.1 | Wardline+Filigree-via-Clarion triangle violates §4 | p1, p3, p5 (+p4 oblique) | Tier 1 text-surface | HIGH |
+| 2.1 | Wardline+Filigree-via-Loomweave triangle violates §4 | p1, p3, p5 (+p4 oblique) | Tier 1 text-surface | HIGH |
 | 2.2 | `wardline.core.registry.REGISTRY` direct import | p1, p3, p4, p5 | Tier 1 text-surface | HIGH |
 | 2.3 | §5 failure test scoped too narrowly | p1, p3, p5 | Tier 2 affective/analytical | HIGH |
 | 2.4 | Doctrine outpaces implementation (untested enrichment) | all 5 | Tier 1 + Tier 3 | HIGH |
-| 2.5 | Identity reconciliation centralised in Clarion | p1, p3, p5 | Tier 2 | MEDIUM-HIGH |
+| 2.5 | Identity reconciliation centralised in Loomweave | p1, p3, p5 | Tier 2 | MEDIUM-HIGH |
 | 2.6 | EntityId stability / schema versioning | p3, p5 | Tier 3 institutional | MEDIUM |
 | 2.7 | `registry_backend` dependency inversion | p4 (+p1 partial) | Tier 1 text-surface | MEDIUM |
 | 2.8 | MCP failure behaviour undocumented | p1 | Tier 1 text-surface | LOW-MEDIUM |
@@ -424,16 +424,16 @@ One gap the panel *did* reveal, not pre-registered:
 
 - **Contributor onboarding persona (not Dev).** Dev is a maintainer of a
   competing OSS tool evaluating whether to contribute. What the panel lacks
-  is someone evaluating "I have been asked to add a Python plugin to Clarion
-  and I do not yet have opinions about Loom as an ecosystem." Dev's Q5 and
+  is someone evaluating "I have been asked to add a Python plugin to Loomweave
+  and I do not yet have opinions about Weft as an ecosystem." Dev's Q5 and
   Q3 point at this gap directly: "What does 'designed, not yet built' mean
   for contribution entry points?" A less-adversarial contributor-oriented
-  reader would test whether `loom.md` is a useful read for someone who has
+  reader would test whether `weft.md` is a useful read for someone who has
   already decided to contribute, or whether it is primarily a doctrine for
   the project author.
 
 The config's "elspeth team member" explicit gap remains unfilled. The docs
-repeatedly reference elspeth as Clarion's first customer. No panel persona
+repeatedly reference elspeth as Loomweave's first customer. No panel persona
 represents that viewpoint. Findings 2.4 and 2.6 would benefit most from that
 reader's ground-truth perspective.
 
@@ -456,7 +456,7 @@ What the documents do *not* yet do is hold up against their own data-flow
 table. Three of five readers, arriving from different angles, concluded that
 the §5 failure test is scoped narrowly enough to pass the two couplings that
 are structurally tightest in v0.1: the `wardline.core.registry.REGISTRY`
-direct Python import, and the Wardline -> Clarion -> Filigree SARIF triangle.
+direct Python import, and the Wardline -> Loomweave -> Filigree SARIF triangle.
 Your doctrine is honest about the former (the briefing's "what the suite
 needs" section names the REGISTRY_VERSION ask explicitly) and evasive about
 the latter ("eventually" is doing heavy lifting in the claim that
@@ -490,9 +490,9 @@ strong enough to survive being this honest about its current scope.
    this edit. Minor. Cheap. High trust payoff. [Addresses 2.4]
 
 3. **Add a "pairwise composability in v0.1" subsection** to `briefing.md` or
-   `loom.md` that enumerates each pair and tests it against §4 honestly.
-   Wardline+Filigree today is a triangle; say so. Wardline+Clarion is a pair;
-   say so. Clarion+Filigree is a pair; say so. This defuses the convergent
+   `weft.md` that enumerates each pair and tests it against §4 honestly.
+   Wardline+Filigree today is a triangle; say so. Wardline+Loomweave is a pair;
+   say so. Loomweave+Filigree is a pair; say so. This defuses the convergent
    concern. [Addresses 2.1]
 
 4. **Document the `wardline.core.registry.REGISTRY` import contract**.
@@ -501,17 +501,17 @@ strong enough to survive being this honest about its current scope.
    release-train gate). Four of five personas asked variants of this
    question. [Addresses 2.2]
 
-5. **Add a contributor-facing "how Loom serves contributors" pointer** or a
-   `CONTRIBUTING.md`. Dev's journal reveals that `loom.md` reads as
+5. **Add a contributor-facing "how Weft serves contributors" pointer** or a
+   `CONTRIBUTING.md`. Dev's journal reveals that `weft.md` reads as
    governance self-binding when viewed from the contributor seat. A one-line
    pointer to contributor docs — even if those docs are "not yet written, see
    `v0.1/README.md`" — repositions the doctrine correctly. [Addresses 6.2]
 
-6. **Specify the finding-deduplication key contract** across Clarion
+6. **Specify the finding-deduplication key contract** across Loomweave
    translator versions. Yasmin's Q1 is the most specific unanswered question
    in the panel and lives below doctrine level — but a single sentence in the
    doctrine ("stable deduplication identity across translator versions is a
-   Clarion release-train gate") would neutralise the concern. [Addresses 2.6]
+   Loomweave release-train gate") would neutralise the concern. [Addresses 2.6]
 
 ---
 
@@ -519,9 +519,9 @@ strong enough to survive being this honest about its current scope.
 
 Worth recording what *did not* surface, because absences matter:
 
-- **No persona challenged the four-product structure** (Clarion, Filigree,
+- **No persona challenged the four-product structure** (Loomweave, Filigree,
   Wardline, Shuttle). The bounded-domain table in §2 was uniformly praised.
-- **No persona found the "loom" metaphor unhelpful**, though Priya flagged it
+- **No persona found the "weft" metaphor unhelpful**, though Priya flagged it
   as discount-worthy marketing. She did not retract that view, but it did not
   harden into a finding.
 - **No persona rejected "local-first, single-binary, git-committable state"**

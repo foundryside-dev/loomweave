@@ -1,8 +1,8 @@
 # B.4* — Python plugin: `calls` edges via pyright + confidence tiers (Sprint 2 amended / Tier B)
 
 **Status**: IMPLEMENTED — Sprint 2 amended Tier-B B.4* work-package design closed; see §9 exit criteria and [B.4* gate results](./b4-gate-results.md)
-**Anchoring design**: [system-design.md §4 (Plugin host / analyze pipeline)](../../clarion/v0.1/system-design.md), [detailed-design.md §"Python plugin specifics — call graph precision"](../../clarion/v0.1/detailed-design.md), [scope-amendment-2026-05.md](./scope-amendment-2026-05.md)
-**Accepted ADRs**: [ADR-002](../../clarion/adr/ADR-002-plugin-transport-json-rpc.md), [ADR-003](../../clarion/adr/ADR-003-entity-id-scheme.md), [ADR-007](../../clarion/adr/ADR-007-summary-cache-key.md), [ADR-022](../../clarion/adr/ADR-022-core-plugin-ontology.md), [ADR-023](../../clarion/adr/ADR-023-tooling-baseline.md), [ADR-024](../../clarion/adr/ADR-024-guidance-schema-vocabulary.md), [ADR-026](../../clarion/adr/ADR-026-containment-wire-and-edge-identity.md), [ADR-027](../../clarion/adr/ADR-027-ontology-version-semver.md), [ADR-028](../../clarion/adr/ADR-028-edge-confidence-tiers.md)
+**Anchoring design**: [system-design.md §4 (Plugin host / analyze pipeline)](../../loomweave/v0.1/system-design.md), [detailed-design.md §"Python plugin specifics — call graph precision"](../../loomweave/v0.1/detailed-design.md), [scope-amendment-2026-05.md](./scope-amendment-2026-05.md)
+**Accepted ADRs**: [ADR-002](../../loomweave/adr/ADR-002-plugin-transport-json-rpc.md), [ADR-003](../../loomweave/adr/ADR-003-entity-id-scheme.md), [ADR-007](../../loomweave/adr/ADR-007-summary-cache-key.md), [ADR-022](../../loomweave/adr/ADR-022-core-plugin-ontology.md), [ADR-023](../../loomweave/adr/ADR-023-tooling-baseline.md), [ADR-024](../../loomweave/adr/ADR-024-guidance-schema-vocabulary.md), [ADR-026](../../loomweave/adr/ADR-026-containment-wire-and-edge-identity.md), [ADR-027](../../loomweave/adr/ADR-027-ontology-version-semver.md), [ADR-028](../../loomweave/adr/ADR-028-edge-confidence-tiers.md)
 **Predecessor**: [B.3 — `contains` edges](./b3-contains-edges.md)
 **Successor**: B.5* (`references` edges), B.6 (WP8 MCP surface)
 **Filigree umbrella**: `clarion-2d2d1d27b5`
@@ -65,7 +65,7 @@ Three viable strategies; each implies a different process model, JSON-RPC traffi
 
 - Pyright's `callHierarchy/incomingCalls` and `outgoingCalls` are the entry points pyright's maintainers shipped for exactly this consumer. (b) re-implements a piece of pyright (its call-site walker) inside the plugin; (c) takes on `pycg` whose last release was 2022 and whose Python-version coverage is shaky against elspeth's tooling envelope.
 - The week-2 gate (§5) measures *pyright's cost at elspeth scale*. That cost dominates regardless of (a)/(b) — pyright still types the project. (a) inherits pyright's incrementality and project caching; (b) re-pays project init cost in pyright on every type-resolution request unless we hold the LSP subprocess open anyway (at which point (b) is just (a) plus an extra AST walk in the plugin).
-- (b) and (c) put *call-pattern recognition* — knowing what "Protocol dispatch" or "dict-of-callables" or "decorated function" looks like — into the plugin. Pyright already knows these. Reimplementing them in the plugin is the kind of "lightweight glue" the Loom federation axiom warns against (cross-product reasoning collapse, not federation).
+- (b) and (c) put *call-pattern recognition* — knowing what "Protocol dispatch" or "dict-of-callables" or "decorated function" looks like — into the plugin. Pyright already knows these. Reimplementing them in the plugin is the kind of "lightweight glue" the Weft federation axiom warns against (cross-product reasoning collapse, not federation).
 - LSP serialization overhead is real but bounded: typical call-hierarchy responses are kilobytes; per-file query counts are bounded by call-site count, which is bounded by file size. At elspeth's ~425k LOC, this is millions of LSP messages, not billions.
 
 **Process model** (panel-revised):
@@ -74,15 +74,15 @@ Three viable strategies; each implies a different process model, JSON-RPC traffi
 - The subprocess is `pyright-langserver --stdio`; the plugin speaks JSON-RPC 2.0 framed with `Content-Length` headers (same framing as the plugin's own protocol — convenient symmetry).
 - **Traffic shape** (panel correction from python-engineering): per `analyze_file`, the plugin: (1) sends `textDocument/didOpen` for the file, (2) walks the AST for *function entities* (not individual call sites), (3) for each function entity, issues `textDocument/prepareCallHierarchy` once + `callHierarchy/outgoingCalls` once — pyright returns *all* outgoing call sites from that function in a single response, including byte ranges, (4) maps response ranges back to AST call-site nodes for byte-offset population, tier-tags edges (resolved if exactly one in-project target; ambiguous if N>1; emitted-nothing if zero), (5) sends `textDocument/didClose`. The cost envelope is `functions_per_file × roundtrip_latency`, not `call_sites_per_file × roundtrip_latency` — material for the week-2 gate math (Q7).
 - **Per-session LSP subprocess lifecycle**: started lazily, kept alive until `shutdown`. Stderr is drained by a daemon thread started before the first LSP write; the drain thread is joined in `PyrightSession.close()` after `process.wait()`.
-- **Init-hang deadline** (panel addition): the `initialize` handshake to pyright is bounded by `PYRIGHT_INIT_TIMEOUT_SECS` (default 30s). On timeout, the plugin emits `CLA-PY-PYRIGHT-INIT-TIMEOUT` and treats pyright as unavailable for the run (no `calls` edges; `unresolved_call_sites_total` += AST-counted call sites). Distinct from per-call-site timeout (5s, also bounded).
-- **Crash + restart with per-run cap** (panel addition): if pyright crashes mid-session, restart count surfaces as `CLA-PY-PYRIGHT-RESTART`. Restarts capped at `MAX_PYRIGHT_RESTARTS_PER_RUN` (default 3). On cap exceeded, the *currently-analysing file* is skipped with `CLA-PY-PYRIGHT-POISON-FRAME`; subsequent files in the same run continue without pyright (treated as unavailable). This prevents a single deterministic-crash file from stalling the entire run indefinitely.
-- **Init-failure (binary missing / bootstrap incomplete)** (panel addition): if pyright cannot be invoked at all (binary missing, node bootstrap failed, version negotiation failed), the plugin emits `CLA-PY-PYRIGHT-UNAVAILABLE` and continues with zero `calls` edges + `unresolved_call_sites_total` += AST-counted call sites. The run completes; the operator sees the finding.
+- **Init-hang deadline** (panel addition): the `initialize` handshake to pyright is bounded by `PYRIGHT_INIT_TIMEOUT_SECS` (default 30s). On timeout, the plugin emits `LMWV-PY-PYRIGHT-INIT-TIMEOUT` and treats pyright as unavailable for the run (no `calls` edges; `unresolved_call_sites_total` += AST-counted call sites). Distinct from per-call-site timeout (5s, also bounded).
+- **Crash + restart with per-run cap** (panel addition): if pyright crashes mid-session, restart count surfaces as `LMWV-PY-PYRIGHT-RESTART`. Restarts capped at `MAX_PYRIGHT_RESTARTS_PER_RUN` (default 3). On cap exceeded, the *currently-analysing file* is skipped with `LMWV-PY-PYRIGHT-POISON-FRAME`; subsequent files in the same run continue without pyright (treated as unavailable). This prevents a single deterministic-crash file from stalling the entire run indefinitely.
+- **Init-failure (binary missing / bootstrap incomplete)** (panel addition): if pyright cannot be invoked at all (binary missing, node bootstrap failed, version negotiation failed), the plugin emits `LMWV-PY-PYRIGHT-UNAVAILABLE` and continues with zero `calls` edges + `unresolved_call_sites_total` += AST-counted call sites. The run completes; the operator sees the finding.
 
 ### Q2 — Pyright provisioning
 
 The pyright binary must be present in the plugin's runtime environment. Three options:
 
-- **(a) Pinned `pyright` PyPI package as a `[project.dependencies]` entry**: `pip install clarion-plugin-python` brings pyright in; pyright's bootstrapper downloads node + the LSP on first run.
+- **(a) Pinned `pyright` PyPI package as a `[project.dependencies]` entry**: `pip install loomweave-plugin-python` brings pyright in; pyright's bootstrapper downloads node + the LSP on first run.
 - **(b) Operator pre-installs pyright separately**: plugin assumes a working `pyright-langserver` on PATH or in a configurable location; refuses to start without it.
 - **(c) Bundle pyright with the plugin distribution**: bake into a wheel or supplementary archive; no first-run network access.
 
@@ -100,17 +100,17 @@ The pyright binary must be present in the plugin's runtime environment. Three op
 
 ```toml
 [capabilities.runtime.pyright]
-# Pyright version the plugin was tested against. Host surfaces a CLA-PY-PYRIGHT-VERSION-DRIFT
+# Pyright version the plugin was tested against. Host surfaces a LMWV-PY-PYRIGHT-VERSION-DRIFT
 # finding (warning, not fatal) if `pyright --version` at runtime differs from this pin.
 pin = "1.1.X"  # exact version set at B.4* impl start
 ```
 
 **First-run hardening** (panel additions):
 
-- After `pip install`, the `pyright` PyPI package downloads node + the LSP binary on *first invocation*, not at install time. The plugin checks `pyright-langserver --version` executability before the first LSP write. On failure (binary absent, node bootstrap failed, network egress restricted), the plugin emits `CLA-PY-PYRIGHT-INSTALL-FAILURE` and treats pyright as unavailable (Q1 init-failure path).
+- After `pip install`, the `pyright` PyPI package downloads node + the LSP binary on *first invocation*, not at install time. The plugin checks `pyright-langserver --version` executability before the first LSP write. On failure (binary absent, node bootstrap failed, network egress restricted), the plugin emits `LMWV-PY-PYRIGHT-INSTALL-FAILURE` and treats pyright as unavailable (Q1 init-failure path).
 - The pyright subprocess is launched with an explicit `env` (passing through `PATH` and `HOME` only, plus the pyright wrapper's expected cache directory `~/.cache/pyright-python/`) so a system-installed `pyright` on `PATH` cannot shadow the managed binary.
 - CI gains a cache key for `~/.cache/pyright-python/` to avoid re-downloading node on every cold run.
-- Dependabot is configured to ignore the `pyright` package (or, if dependabot is not configured, a TODO comment beside the `pyproject.toml` pin documents the manual-bump policy). This prevents auto-bumps from silently breaking the two-source pin parity (`pyproject.toml` + `plugin.toml`) that `CLA-PY-PYRIGHT-VERSION-DRIFT` is designed to catch.
+- Dependabot is configured to ignore the `pyright` package (or, if dependabot is not configured, a TODO comment beside the `pyproject.toml` pin documents the manual-bump policy). This prevents auto-bumps from silently breaking the two-source pin parity (`pyproject.toml` + `plugin.toml`) that `LMWV-PY-PYRIGHT-VERSION-DRIFT` is designed to catch.
 
 ### Q3 — `properties.candidates` shape for ambiguous edges
 
@@ -149,22 +149,22 @@ The writer must enforce that confidence tiers obey the per-kind invariant from A
 
 **Decision** (panel-revised — substantially simpler than the draft):
 
-Extend the *existing* `enforce_edge_contract` function at `crates/clarion-storage/src/writer.rs:343` with a confidence check; do NOT add a parallel `enforce_edge_confidence_contract`. The existing function already dispatches by kind class and emits `CLA-INFRA-EDGE-UNKNOWN-KIND` for unknown kinds; the new confidence check folds into the same per-kind match arms:
+Extend the *existing* `enforce_edge_contract` function at `crates/loomweave-storage/src/writer.rs:343` with a confidence check; do NOT add a parallel `enforce_edge_confidence_contract`. The existing function already dispatches by kind class and emits `LMWV-INFRA-EDGE-UNKNOWN-KIND` for unknown kinds; the new confidence check folds into the same per-kind match arms:
 
 ```rust
 // Inside the existing enforce_edge_contract — new arms folded in:
 match (kind_class, edge.confidence) {
     (EdgeKindClass::Structural, EdgeConfidence::Resolved) => { /* fall through to existing source-range check */ }
     (EdgeKindClass::Structural, _) => return Err(violation(
-        "CLA-INFRA-EDGE-CONFIDENCE-CONTRACT",
+        "LMWV-INFRA-EDGE-CONFIDENCE-CONTRACT",
         "structural edge must carry confidence=resolved",
     )),
     (EdgeKindClass::Anchored, EdgeConfidence::Inferred) => return Err(violation(
-        "CLA-INFRA-EDGE-CONFIDENCE-CONTRACT",
+        "LMWV-INFRA-EDGE-CONFIDENCE-CONTRACT",
         "inferred-tier edges are query-time-only at scan time",
     )),
     (EdgeKindClass::Anchored, _) => { /* fall through to existing source-range check */ }
-    (EdgeKindClass::Unknown, _) => { /* existing arm emits CLA-INFRA-EDGE-UNKNOWN-KIND */ }
+    (EdgeKindClass::Unknown, _) => { /* existing arm emits LMWV-INFRA-EDGE-UNKNOWN-KIND */ }
 }
 ```
 
@@ -182,16 +182,16 @@ The draft introduced a `WriteOrigin::{Scan, Query}` enum on `WriterCmd::InsertEd
 
 - Single-implementer rule. Don't ship an abstraction with one consumer.
 - The check is now strictly local to scan-time — no scan-vs-query coupling.
-- Violations still increment `dropped_edges_total` AND surface as findings (matches B.3's `CLA-INFRA-EDGE-SOURCE-RANGE-CONTRACT` pattern).
+- Violations still increment `dropped_edges_total` AND surface as findings (matches B.3's `LMWV-INFRA-EDGE-SOURCE-RANGE-CONTRACT` pattern).
 - The check runs per-edge, not at batch commit time — fail fast on the first malformed edge rather than aggregating to "20 edges dropped, here's a sample."
 
 **Test coverage required for the contract** (quality-reviewer additions — all of these are required in Task 2's RED tests):
 
-- `(contains, Ambiguous)` → rejected with `CLA-INFRA-EDGE-CONFIDENCE-CONTRACT`; assert `dropped_edges_total == 1`; assert finding list contains the named code.
+- `(contains, Ambiguous)` → rejected with `LMWV-INFRA-EDGE-CONFIDENCE-CONTRACT`; assert `dropped_edges_total == 1`; assert finding list contains the named code.
 - `(contains, Inferred)` → rejected; same assertions (force-traverses the structural-with-non-resolved arm a second way).
 - `(in_subsystem, Inferred)` → rejected (force-coverage of a *second* structural kind, not just `contains`).
-- `(calls, Inferred)` → rejected with `CLA-INFRA-EDGE-CONFIDENCE-CONTRACT`; assert counter + finding.
-- `(unknown_kind, Resolved)` → rejected with `CLA-INFRA-EDGE-UNKNOWN-KIND`; assert counter + finding (currently-untested arm of the existing function).
+- `(calls, Inferred)` → rejected with `LMWV-INFRA-EDGE-CONFIDENCE-CONTRACT`; assert counter + finding.
+- `(unknown_kind, Resolved)` → rejected with `LMWV-INFRA-EDGE-UNKNOWN-KIND`; assert counter + finding (currently-untested arm of the existing function).
 - `(calls, Ambiguous)` → ACCEPTED; assert row inserted; assert `ambiguous_edges_total == 1`.
 - `(calls, Resolved)` → ACCEPTED; assert row inserted; counters untouched.
 
@@ -228,8 +228,8 @@ Mechanical, per ADR-027 precedent (mirrors B.3 Q6 exactly).
 | File | Change |
 |---|---|
 | `plugins/python/plugin.toml` | `[ontology].edge_kinds = ["contains", "calls"]`; `[ontology].ontology_version = "0.4.0"`; NEW `[capabilities.runtime.pyright]` sub-table w/ `pin` (Q2) |
-| `plugins/python/src/clarion_plugin_python/server.py` | `ONTOLOGY_VERSION = "0.4.0"` |
-| `plugins/python/src/clarion_plugin_python/__init__.py` | `__version__` PATCH bump (e.g., `0.1.2` → `0.1.3`) — additive edge kind, no breaking external API |
+| `plugins/python/src/loomweave_plugin_python/server.py` | `ONTOLOGY_VERSION = "0.4.0"` |
+| `plugins/python/src/loomweave_plugin_python/__init__.py` | `__version__` PATCH bump (e.g., `0.1.2` → `0.1.3`) — additive edge kind, no breaking external API |
 | `plugins/python/pyproject.toml` | Add `pyright == X.Y.Z` to `[project.dependencies]` (Q2's pinned version) |
 
 ADR-027 policy: MINOR ontology bump (additive `calls` edge kind), PATCH package bump (no API change to `extract()` signature — the return type is already `tuple[list[RawEntity], list[RawEdge]]` after B.3).
@@ -255,7 +255,7 @@ The scope-amendment memo §5 names the gate but does not specify the test corpus
 
 Required fields per entry:
 - Date, calibration machine, `OPERATOR_HARDWARE_RATIO` (1.0 if reference machine).
-- `pyright_pin` (verbatim from `plugin.toml`); `clarion_commit` (sha).
+- `pyright_pin` (verbatim from `plugin.toml`); `loomweave_commit` (sha).
 - Total wall-clock; breakdown: pyright init, per-file resolution, parent-walk overhead, CLI overhead.
 - Median + p95 per-file resolution time, per-file roundtrip count (pyright LSP `outgoingCalls` requests), ambiguous-edge ratio.
 - Corpus stats: file-count, function-count (drives the per-function-entity LSP traffic, Q1), unresolved-call-site-count.
@@ -357,7 +357,7 @@ pub struct EdgeRecord {
 
 **Writer-actor enforcement** (Q4, panel-revised):
 
-- The existing `enforce_edge_contract` function at `crates/clarion-storage/src/writer.rs:343` is *extended in place* (not replaced or paralleled). New arms cover: (1) structural-with-non-Resolved → reject with `CLA-INFRA-EDGE-CONFIDENCE-CONTRACT`, (2) anchored-with-Inferred → reject with the same code. Existing arms for source-range contract + unknown-kind remain.
+- The existing `enforce_edge_contract` function at `crates/loomweave-storage/src/writer.rs:343` is *extended in place* (not replaced or paralleled). New arms cover: (1) structural-with-non-Resolved → reject with `LMWV-INFRA-EDGE-CONFIDENCE-CONTRACT`, (2) anchored-with-Inferred → reject with the same code. Existing arms for source-range contract + unknown-kind remain.
 - Violations fail the edge (counter increments, finding emitted, run continues — single-edge failure does NOT fail the run, matching B.3's UNIQUE-conflict semantics).
 - The check runs per-edge (not batched at CommitRun) — failing fast on the first malformed edge surfaces the bug to the plugin author at exactly the failing site rather than aggregating to "20 edges dropped, here's a sample."
 - The `ix_edges_kind_confidence` index MUST be exercised by an `EXPLAIN QUERY PLAN` test asserting it's used for `WHERE kind=? AND confidence=?` predicates. Without this, B.6's `callers_of` default (`confidence='resolved'`) silently degrades to a full scan.
@@ -366,17 +366,17 @@ pub struct EdgeRecord {
 
 | Code | Severity | Emitted when |
 |---|---|---|
-| `CLA-INFRA-EDGE-CONFIDENCE-CONTRACT` | error | structural edge has confidence != resolved, OR scan-time anchored edge has confidence == inferred |
-| `CLA-PY-PYRIGHT-RESTART` | warning | pyright subprocess died and was restarted; carries restart count + last-seen exit code |
-| `CLA-PY-PYRIGHT-POISON-FRAME` | warning | per-run restart cap exceeded; file currently being analyzed is skipped; subsequent files in this run continue without pyright |
-| `CLA-PY-PYRIGHT-INIT-TIMEOUT` | warning | pyright `initialize` handshake exceeded `PYRIGHT_INIT_TIMEOUT_SECS` (default 30s); pyright treated as unavailable for the run |
-| `CLA-PY-PYRIGHT-UNAVAILABLE` | warning | pyright cannot be invoked (binary missing, node bootstrap failed); run continues with zero `calls` edges |
-| `CLA-PY-PYRIGHT-INSTALL-FAILURE` | warning | pyright-langserver executability check failed before first LSP write (distinct from `-UNAVAILABLE` — fires at install-bootstrap-time only) |
-| `CLA-PY-PYRIGHT-VERSION-DRIFT` | warning | `pyright --version` at runtime differs from `[capabilities.runtime.pyright].pin` |
-| `CLA-PY-CALL-RESOLUTION-TIMEOUT` | warning | per-call-site LSP query exceeded configured deadline (default 5s); edge omitted |
-| `CLA-PY-CALL-SITE-UNRESOLVED` | info | per-call-site unresolved (no in-project candidates); emitted optionally — see Q4-handoff in §10 / B.6 design (decision deferred for now: counter is required, finding-per-site is an open question for B.6) |
+| `LMWV-INFRA-EDGE-CONFIDENCE-CONTRACT` | error | structural edge has confidence != resolved, OR scan-time anchored edge has confidence == inferred |
+| `LMWV-PY-PYRIGHT-RESTART` | warning | pyright subprocess died and was restarted; carries restart count + last-seen exit code |
+| `LMWV-PY-PYRIGHT-POISON-FRAME` | warning | per-run restart cap exceeded; file currently being analyzed is skipped; subsequent files in this run continue without pyright |
+| `LMWV-PY-PYRIGHT-INIT-TIMEOUT` | warning | pyright `initialize` handshake exceeded `PYRIGHT_INIT_TIMEOUT_SECS` (default 30s); pyright treated as unavailable for the run |
+| `LMWV-PY-PYRIGHT-UNAVAILABLE` | warning | pyright cannot be invoked (binary missing, node bootstrap failed); run continues with zero `calls` edges |
+| `LMWV-PY-PYRIGHT-INSTALL-FAILURE` | warning | pyright-langserver executability check failed before first LSP write (distinct from `-UNAVAILABLE` — fires at install-bootstrap-time only) |
+| `LMWV-PY-PYRIGHT-VERSION-DRIFT` | warning | `pyright --version` at runtime differs from `[capabilities.runtime.pyright].pin` |
+| `LMWV-PY-CALL-RESOLUTION-TIMEOUT` | warning | per-call-site LSP query exceeded configured deadline (default 5s); edge omitted |
+| `LMWV-PY-CALL-SITE-UNRESOLVED` | info | per-call-site unresolved (no in-project candidates); emitted optionally — see Q4-handoff in §10 / B.6 design (decision deferred for now: counter is required, finding-per-site is an open question for B.6) |
 
-The first one belongs to clarion-core (the writer-actor); the rest belong to the Python plugin (prefix `CLA-PY-` per ADR-022).
+The first one belongs to loomweave-core (the writer-actor); the rest belong to the Python plugin (prefix `LMWV-PY-` per ADR-022).
 
 ## 6. Observability additions
 
@@ -394,7 +394,7 @@ The first one belongs to clarion-core (the writer-actor); the rest belong to the
 
 **Counter-vs-finding-per-site decision for B.6 (panel-flagged handoff)**: the counter is a run-level signal. For B.6's `callers_of(entity_id)` tool to know *which* entities have unresolved sites worth querying at `confidence>=Inferred`, an entity-scoped signal is needed. Three options for B.6's design:
 
-- (a) Per-site finding (`CLA-PY-CALL-SITE-UNRESOLVED`, info severity) — entity-anchored, queryable via `findings.entity_id`. Risk: at elspeth-full scale tens of thousands of findings flood Filigree.
+- (a) Per-site finding (`LMWV-PY-CALL-SITE-UNRESOLVED`, info severity) — entity-anchored, queryable via `findings.entity_id`. Risk: at elspeth-full scale tens of thousands of findings flood Filigree.
 - (b) Per-entity counter row in a sibling table (`entity_unresolved_call_sites`) — one row per entity that has any unresolved sites, with a count.
 - (c) Synthesized "edge-with-zero-candidates" rows in the `edges` table (kind=`calls`, confidence=`inferred`, properties.unresolved=true) — fits the existing schema, queryable via existing indexes, but stretches the semantic of "edge" (it's the absence of an edge).
 
@@ -407,8 +407,8 @@ B.4* makes the per-run counter required; B.6's design pass MUST resolve this que
 ### Task 1 — Storage schema: add `confidence` column + index
 
 Files:
-- Modify: `crates/clarion-storage/migrations/0001_initial_schema.sql` (in-place edit per ADR-024 + ADR-028 last-edit clause).
-- Modify: `crates/clarion-storage/tests/schema_apply.rs` (assert `confidence` column exists, CHECK constraint enforced, index present).
+- Modify: `crates/loomweave-storage/migrations/0001_initial_schema.sql` (in-place edit per ADR-024 + ADR-028 last-edit clause).
+- Modify: `crates/loomweave-storage/tests/schema_apply.rs` (assert `confidence` column exists, CHECK constraint enforced, index present).
 
 Steps:
 - RED: schema_apply test asserts a row with `confidence='garbage'` is rejected.
@@ -420,18 +420,18 @@ Steps:
 ### Task 2 — `EdgeRecord.confidence` + extend existing `enforce_edge_contract` (panel-revised)
 
 Files:
-- Modify: `crates/clarion-storage/src/commands.rs` (add `confidence: EdgeConfidence` to `EdgeRecord`). NOTE: `WriteOrigin` enum is DEFERRED to B.6 per Q4 panel reversal — `WriterCmd::InsertEdge` shape unchanged.
-- Modify: `crates/clarion-storage/src/writer.rs` (extend the EXISTING `enforce_edge_contract` function at writer.rs:343 — do not add a parallel function; fold confidence arms into the existing per-kind match; extend `dropped_edges_total` increment to cover the new rejection cause; emit `CLA-INFRA-EDGE-CONFIDENCE-CONTRACT` finding on violation; ensure `ix_edges_kind_confidence` index hint surfaces via `EXPLAIN QUERY PLAN`).
-- Modify: `crates/clarion-storage/tests/writer_actor.rs` (full contract-test matrix; see RED steps).
-- Modify: `crates/clarion-storage/tests/writer_actor.rs::make_contains_edge` helper (add `confidence: EdgeConfidence` arg, default `Resolved`).
-- Add: `crates/clarion-storage/tests/schema_apply.rs` EXPLAIN QUERY PLAN assertion for `WHERE kind=? AND confidence=?` using `ix_edges_kind_confidence`.
+- Modify: `crates/loomweave-storage/src/commands.rs` (add `confidence: EdgeConfidence` to `EdgeRecord`). NOTE: `WriteOrigin` enum is DEFERRED to B.6 per Q4 panel reversal — `WriterCmd::InsertEdge` shape unchanged.
+- Modify: `crates/loomweave-storage/src/writer.rs` (extend the EXISTING `enforce_edge_contract` function at writer.rs:343 — do not add a parallel function; fold confidence arms into the existing per-kind match; extend `dropped_edges_total` increment to cover the new rejection cause; emit `LMWV-INFRA-EDGE-CONFIDENCE-CONTRACT` finding on violation; ensure `ix_edges_kind_confidence` index hint surfaces via `EXPLAIN QUERY PLAN`).
+- Modify: `crates/loomweave-storage/tests/writer_actor.rs` (full contract-test matrix; see RED steps).
+- Modify: `crates/loomweave-storage/tests/writer_actor.rs::make_contains_edge` helper (add `confidence: EdgeConfidence` arg, default `Resolved`).
+- Add: `crates/loomweave-storage/tests/schema_apply.rs` EXPLAIN QUERY PLAN assertion for `WHERE kind=? AND confidence=?` using `ix_edges_kind_confidence`.
 
 Steps (each RED requires the assertion to fail for the right reason, per TDD discipline):
-- RED-1: `(contains, Ambiguous)` rejected — assert: edge rejected, `dropped_edges_total == 1`, finding list contains `CLA-INFRA-EDGE-CONFIDENCE-CONTRACT`.
+- RED-1: `(contains, Ambiguous)` rejected — assert: edge rejected, `dropped_edges_total == 1`, finding list contains `LMWV-INFRA-EDGE-CONFIDENCE-CONTRACT`.
 - RED-2: `(contains, Inferred)` rejected — same assertions (covers the structural arm a second way).
 - RED-3: `(in_subsystem, Inferred)` rejected — covers a second *structural kind* beyond `contains`.
 - RED-4: `(calls, Inferred)` rejected with same assertions.
-- RED-5: `(unknown_kind, Resolved)` rejected with `CLA-INFRA-EDGE-UNKNOWN-KIND`; counter + finding asserted (this arm exists in the current function but is untested).
+- RED-5: `(unknown_kind, Resolved)` rejected with `LMWV-INFRA-EDGE-UNKNOWN-KIND`; counter + finding asserted (this arm exists in the current function but is untested).
 - RED-6: `(calls, Ambiguous)` ACCEPTED; row inserted; assert `ambiguous_edges_total == 1`.
 - RED-7: `(calls, Resolved)` ACCEPTED; row inserted; counters untouched.
 - RED-8: EXPLAIN QUERY PLAN on `SELECT * FROM edges WHERE kind=? AND confidence=?` returns a plan that uses `ix_edges_kind_confidence` (not a full scan).
@@ -441,9 +441,9 @@ Steps (each RED requires the assertion to fail for the right reason, per TDD dis
 ### Task 3 — Host wire shape: `confidence` on `RawEdge` + `AcceptedEdge`
 
 Files:
-- Modify: `crates/clarion-core/src/plugin/protocol.rs` (add `confidence: EdgeConfidence` to `RawEdge` with `#[serde(default)]`).
-- Modify: `crates/clarion-core/src/plugin/host.rs` (`AcceptedEdge` carries `confidence`; `process_edges` threads it through to `EdgeRecord`).
-- Modify: `crates/clarion-core/tests/` (extend edge round-trip test to assert confidence survives the round trip).
+- Modify: `crates/loomweave-core/src/plugin/protocol.rs` (add `confidence: EdgeConfidence` to `RawEdge` with `#[serde(default)]`).
+- Modify: `crates/loomweave-core/src/plugin/host.rs` (`AcceptedEdge` carries `confidence`; `process_edges` threads it through to `EdgeRecord`).
+- Modify: `crates/loomweave-core/tests/` (extend edge round-trip test to assert confidence survives the round trip).
 
 Steps:
 - RED: host test sends a `calls`-kind RawEdge with `confidence="ambiguous"`; expects `AcceptedEdge.confidence == Ambiguous`.
@@ -455,7 +455,7 @@ Steps:
 ### Task 4 — CLI: thread `confidence` through `map_edge_to_record` (panel-revised — no `WriteOrigin`)
 
 Files:
-- Modify: `crates/clarion-cli/src/analyze.rs` (extend `map_edge_to_record` to set `confidence` on the `EdgeRecord` it produces). `WriteOrigin` plumbing is DROPPED per Q4 panel reversal.
+- Modify: `crates/loomweave-cli/src/analyze.rs` (extend `map_edge_to_record` to set `confidence` on the `EdgeRecord` it produces). `WriteOrigin` plumbing is DROPPED per Q4 panel reversal.
 
 Steps:
 - RED: cli integration test asserts `runs.stats` reports `ambiguous_edges_total > 0` after a run that emits at least one ambiguous edge.
@@ -467,9 +467,9 @@ Steps:
 ### Task 5 — Observability: `ambiguous_edges_total`, `unresolved_call_sites_total`, `pyright_query_latency_p95_ms`
 
 Files:
-- Modify: `crates/clarion-storage/src/writer.rs` (new `Arc<AtomicUsize>` counters on `Writer`; increments in the right places).
-- Modify: `crates/clarion-cli/src/analyze.rs` (snapshot counters at CommitRun; fold into `runs.stats` JSON alongside `dropped_edges_total` from B.3).
-- Modify: `crates/clarion-storage/tests/writer_actor.rs` (counter-assertion tests).
+- Modify: `crates/loomweave-storage/src/writer.rs` (new `Arc<AtomicUsize>` counters on `Writer`; increments in the right places).
+- Modify: `crates/loomweave-cli/src/analyze.rs` (snapshot counters at CommitRun; fold into `runs.stats` JSON alongside `dropped_edges_total` from B.3).
+- Modify: `crates/loomweave-storage/tests/writer_actor.rs` (counter-assertion tests).
 - Add: a small p95 accumulator module + deterministic unit test.
 
 Steps:
@@ -485,9 +485,9 @@ Steps:
 ### Task 6 — Pyright integration: `pyright_session.py` module (panel-revised — substantially expanded)
 
 Files:
-- NEW: `plugins/python/src/clarion_plugin_python/pyright_session.py` — owns the pyright LSP subprocess lifecycle, the JSON-RPC framing, the per-function-entity `prepareCallHierarchy` + `outgoingCalls` flow, restart-on-crash logic with per-run cap, stderr drain via daemon thread, init-hang deadline, explicit `subprocess.Popen` `env` handling.
-- NEW: `plugins/python/src/clarion_plugin_python/call_resolver.py` (or co-located in `pyright_session.py`) — defines the `CallResolver` Protocol and `NoOpCallResolver` default. `extract()` accepts a `CallResolver` (no Optional) — `NoOpCallResolver` for tests that don't need pyright; `PyrightSession` for the real path.
-- Modify: `plugins/python/src/clarion_plugin_python/server.py` (`ServerState.pyright: PyrightSession | None`; lazy-init on first `analyze_file`; explicit close at `shutdown` that joins the stderr drain thread).
+- NEW: `plugins/python/src/loomweave_plugin_python/pyright_session.py` — owns the pyright LSP subprocess lifecycle, the JSON-RPC framing, the per-function-entity `prepareCallHierarchy` + `outgoingCalls` flow, restart-on-crash logic with per-run cap, stderr drain via daemon thread, init-hang deadline, explicit `subprocess.Popen` `env` handling.
+- NEW: `plugins/python/src/loomweave_plugin_python/call_resolver.py` (or co-located in `pyright_session.py`) — defines the `CallResolver` Protocol and `NoOpCallResolver` default. `extract()` accepts a `CallResolver` (no Optional) — `NoOpCallResolver` for tests that don't need pyright; `PyrightSession` for the real path.
+- Modify: `plugins/python/src/loomweave_plugin_python/server.py` (`ServerState.pyright: PyrightSession | None`; lazy-init on first `analyze_file`; explicit close at `shutdown` that joins the stderr drain thread).
 - NEW: `plugins/python/tests/test_pyright_session.py` — integration tests against a real pyright (pytest marker `@pytest.mark.pyright`; auto-skipped via a session-scoped fixture when `pyright-langserver` isn't on PATH).
 - Modify: `plugins/python/pyproject.toml` (register the two new markers — `pyright` and `slow` — under `pytest.ini_options.markers`).
 
@@ -497,12 +497,12 @@ Steps:
 - RED: `test_pyright_session_ambiguous_dict_dispatch` — `handlers[k]()` over a dict-of-callables; assert ambiguous-tier edge with `properties.candidates` non-empty.
 - Verify GREEN.
 - RED: `test_pyright_session_ambiguous_determinism` — run analysis twice on the same input; assert byte-identical `to_id` and `candidates` ordering (proves `sorted(candidates)[0]` deterministic across invocations).
-- RED: `test_pyright_session_restart_on_crash` — kill pyright mid-session, assert next query restarts it and emits `CLA-PY-PYRIGHT-RESTART`.
-- RED: `test_pyright_session_restart_cap` — force `MAX_PYRIGHT_RESTARTS_PER_RUN + 1` restarts; assert the currently-analysing file is skipped with `CLA-PY-PYRIGHT-POISON-FRAME`; assert subsequent files in the run continue with `unresolved_call_sites_total` increment.
-- RED: `test_pyright_session_init_timeout` — monkeypatch the pyright handshake to hang past `PYRIGHT_INIT_TIMEOUT_SECS`; assert `CLA-PY-PYRIGHT-INIT-TIMEOUT` emitted; assert run completes with zero `calls` edges.
-- RED: `test_pyright_session_unavailable_binary_missing` — run with `pyright-langserver` not on PATH; assert `CLA-PY-PYRIGHT-UNAVAILABLE` emitted; run completes with zero `calls` edges; `unresolved_call_sites_total` reflects AST call-site count.
-- RED: `test_pyright_session_install_failure` — simulate node-bootstrapper failure (mock the executability check); assert `CLA-PY-PYRIGHT-INSTALL-FAILURE` emitted; behavior matches `-UNAVAILABLE`.
-- RED: `test_pyright_session_call_resolution_timeout` — mock per-call-site LSP query to exceed 5s; assert `CLA-PY-PYRIGHT-CALL-RESOLUTION-TIMEOUT` emitted; edge omitted (NOT silently dropped, NOT a crashed run).
+- RED: `test_pyright_session_restart_on_crash` — kill pyright mid-session, assert next query restarts it and emits `LMWV-PY-PYRIGHT-RESTART`.
+- RED: `test_pyright_session_restart_cap` — force `MAX_PYRIGHT_RESTARTS_PER_RUN + 1` restarts; assert the currently-analysing file is skipped with `LMWV-PY-PYRIGHT-POISON-FRAME`; assert subsequent files in the run continue with `unresolved_call_sites_total` increment.
+- RED: `test_pyright_session_init_timeout` — monkeypatch the pyright handshake to hang past `PYRIGHT_INIT_TIMEOUT_SECS`; assert `LMWV-PY-PYRIGHT-INIT-TIMEOUT` emitted; assert run completes with zero `calls` edges.
+- RED: `test_pyright_session_unavailable_binary_missing` — run with `pyright-langserver` not on PATH; assert `LMWV-PY-PYRIGHT-UNAVAILABLE` emitted; run completes with zero `calls` edges; `unresolved_call_sites_total` reflects AST call-site count.
+- RED: `test_pyright_session_install_failure` — simulate node-bootstrapper failure (mock the executability check); assert `LMWV-PY-PYRIGHT-INSTALL-FAILURE` emitted; behavior matches `-UNAVAILABLE`.
+- RED: `test_pyright_session_call_resolution_timeout` — mock per-call-site LSP query to exceed 5s; assert `LMWV-PY-PYRIGHT-CALL-RESOLUTION-TIMEOUT` emitted; edge omitted (NOT silently dropped, NOT a crashed run).
 - RED: `test_pyright_session_stderr_drain` — feed pyright a working input but ensure stderr fills past the OS pipe buffer (~64 KiB); assert the run does NOT deadlock and the stderr drain thread is joined cleanly in `close()`.
 - Implement each, verify GREEN.
 - Commit: `feat(wp3): PyrightSession — LSP subprocess + per-function callHierarchy + crash/timeout/unavailable handling (B.4* Q1)`.
@@ -510,11 +510,11 @@ Steps:
 ### Task 7 — Extractor: emit `calls` edges via `CallResolver` (panel-revised — Protocol shape, not Optional)
 
 Files:
-- Modify: `plugins/python/src/clarion_plugin_python/extractor.py`:
+- Modify: `plugins/python/src/loomweave_plugin_python/extractor.py`:
   - `extract()` signature gains `call_resolver: CallResolver = NoOpCallResolver()` (panel correction — no `Optional[PyrightSession]`; the Protocol with a no-op default eliminates dual code paths and mypy-strict null-check noise).
   - `RawEdge` TypedDict gains `confidence: NotRequired[Literal["resolved", "ambiguous", "inferred"]]` (panel-flagged: not in the original draft's task ledger; load-bearing for the wire shape).
   - Extractor's `_walk` accumulates function entities into a side list; after the walk, `call_resolver.resolve_calls(file_path, function_ids)` returns the `calls` RawEdges en masse (matches the per-function LSP traffic shape, Q1).
-- Modify: `plugins/python/src/clarion_plugin_python/server.py` (`handle_analyze_file` passes `state.pyright or NoOpCallResolver()` into `extract`).
+- Modify: `plugins/python/src/loomweave_plugin_python/server.py` (`handle_analyze_file` passes `state.pyright or NoOpCallResolver()` into `extract`).
 - Modify: `plugins/python/tests/test_extractor.py` (calls-emission tests; some marked `@pytest.mark.pyright`, others use `NoOpCallResolver` and need no marker).
 
 Steps:
@@ -539,9 +539,9 @@ Files:
     [capabilities.runtime.pyright]
     pin = "1.1.X"  # exact version at impl start
     ```
-- Modify: `crates/clarion-core/src/plugin/manifest.rs` (extend manifest parser to recognise the new `pyright` sub-table under `[capabilities.runtime]`; surface `pin` for `CLA-PY-PYRIGHT-VERSION-DRIFT` detection).
-- Modify: `plugins/python/src/clarion_plugin_python/server.py` (`ONTOLOGY_VERSION = "0.4.0"`).
-- Modify: `plugins/python/src/clarion_plugin_python/__init__.py` (PATCH `__version__` bump).
+- Modify: `crates/loomweave-core/src/plugin/manifest.rs` (extend manifest parser to recognise the new `pyright` sub-table under `[capabilities.runtime]`; surface `pin` for `LMWV-PY-PYRIGHT-VERSION-DRIFT` detection).
+- Modify: `plugins/python/src/loomweave_plugin_python/server.py` (`ONTOLOGY_VERSION = "0.4.0"`).
+- Modify: `plugins/python/src/loomweave_plugin_python/__init__.py` (PATCH `__version__` bump).
 - Modify: `plugins/python/pyproject.toml`:
   - Add `pyright == X.Y.Z` to `[project.dependencies]`.
   - Add `[tool.pytest.ini_options].markers`: register `pyright` and `slow`.
@@ -631,7 +631,7 @@ Steps:
 
 Files:
 - Modify: `docs/implementation/sprint-2/scope-amendment-2026-05.md` (status line: "B.4* complete; see exit criteria §9 of b4-calls-edges.md").
-- Modify: `docs/clarion/adr/ADR-028-edge-confidence-tiers.md` (Open-Questions section: amend "Storage location for inferred edges" with "Resolved by B.4* design Q5 — same `edges` table; sketch of additive migration if reversed inline in b4-calls-edges.md").
+- Modify: `docs/loomweave/adr/ADR-028-edge-confidence-tiers.md` (Open-Questions section: amend "Storage location for inferred edges" with "Resolved by B.4* design Q5 — same `edges` table; sketch of additive migration if reversed inline in b4-calls-edges.md").
 - NEW: `docs/implementation/sprint-2/b8-scale-test.md` (or update an existing B.8 design stub) — pre-write the yellow/red rollback options for B.8 *before B.5* begins* (panel-required handoff from Q7/Systems).
 - Verify all ADR-023 gates green on the closing commit.
 - Commit: `docs(wp3): close B.4* design + ADR-028 amendment + B.8 rollback pre-write (Q5/Q7 panel-required)`.
@@ -649,7 +649,7 @@ B.4* is done for Sprint 2 when ALL of:
 - Plugin emits `calls` edges with `confidence` ∈ {`resolved`, `ambiguous`} for every static call site pyright resolves to ≥1 in-project candidate.
 - Plugin emits zero `calls` edges for call sites pyright cannot resolve (unresolved → `unresolved_call_sites_total` increment, NOT a synthetic edge — inferred is lazy per ADR-028 §"Decision 3").
 - Plugin gracefully handles pyright init-failure, crash, timeout, version-drift; all emit the named findings without crashing the run; restart cap (`MAX_PYRIGHT_RESTARTS_PER_RUN`) prevents infinite loops.
-- Writer-actor extends `enforce_edge_contract` to enforce per-kind confidence contract; structural-with-non-resolved → rejected; anchored-with-inferred-at-scan-time → rejected; both cases increment `dropped_edges_total` AND emit `CLA-INFRA-EDGE-CONFIDENCE-CONTRACT` finding. ALL contract-test matrix permutations from Task 2 (RED-1 through RED-8) pass.
+- Writer-actor extends `enforce_edge_contract` to enforce per-kind confidence contract; structural-with-non-resolved → rejected; anchored-with-inferred-at-scan-time → rejected; both cases increment `dropped_edges_total` AND emit `LMWV-INFRA-EDGE-CONFIDENCE-CONTRACT` finding. ALL contract-test matrix permutations from Task 2 (RED-1 through RED-8) pass.
 - `EXPLAIN QUERY PLAN` on `WHERE kind=? AND confidence=?` uses `ix_edges_kind_confidence`.
 - `plugin.toml::edge_kinds == ["contains", "calls"]`; `ontology_version == "0.4.0"`; `[capabilities.runtime.pyright].pin == X.Y.Z`.
 - Pyright is a pinned `[project.dependencies]` entry in `pyproject.toml`; dependabot ignores it (or TODO comment explains manual-bump policy); CI cache key includes the pin.
@@ -665,17 +665,17 @@ B.4* is done for Sprint 2 when ALL of:
 ## 10. Open questions for the implementation phase (lower stakes — panel-expanded)
 
 - **Pyright LSP subprocess re-init policy on `project_root` change**: the plugin currently captures `project_root` at `initialize` once. If a future host sends multiple `initialize` calls with different roots (currently not the case), pyright would need a re-init. **Recommendation**: defer — single-init is the contract, document as such, raise if changed.
-- **Per-call-site timeout default**: 5s is a guess. Tunable via `clarion.yaml`? **Recommendation**: ship hard-coded 5s; add YAML config in a follow-up if observed.
+- **Per-call-site timeout default**: 5s is a guess. Tunable via `loomweave.yaml`? **Recommendation**: ship hard-coded 5s; add YAML config in a follow-up if observed.
 - **Pyright init-hang deadline default**: 30s. Same recommendation — hard-coded for now, configurable when observed.
 - **Pyright restart cap default**: `MAX_PYRIGHT_RESTARTS_PER_RUN = 3`. Recommendation: hard-coded; tune via YAML when observed.
-- **Counter-vs-finding-per-site for unresolved call sites** (panel-flagged): B.4* ships only the run-level counter. B.6's `callers_of` design MUST pick between (a) per-site finding (`CLA-PY-CALL-SITE-UNRESOLVED`), (b) sibling `entity_unresolved_call_sites` table, or (c) synthesized "edge-with-zero-candidates" rows. Documented in §6 as a B.6 handoff. **Decision deferred to B.6, not B.4*.**
-- **Multi-pin upgrade ordering** (panel-flagged, systems): the plugin now carries TWO independent version pins — `[capabilities.runtime.pyright]` and `[integrations.wardline]`. When both need bumping (e.g., pyright minor break coincides with Wardline release), the operator sees independent findings with no guidance on resolve order. B.5* may add a third pin (references resolution). **Decision needed**: do we author a "Loom suite pin discipline" memo before B.5* ships? **Recommendation**: defer to immediately-pre-B.5*; document the interaction in a one-line tracking note in the scope amendment.
-- **Plugin coupling-accumulation policy** (panel-flagged, architecture): the Python plugin now has three optional heavy dependencies (Wardline probe at Sprint 1, pyright at B.4*, and references-resolution-engine at B.5* — TBD). "Plugin fails gracefully when dependency absent" is implicit but not stated as policy. **Recommendation**: write a brief plugin-resilience policy memo before B.5* begins, citing both `CLA-PY-PYRIGHT-UNAVAILABLE` and the Wardline-probe absence-handling as the templates.
+- **Counter-vs-finding-per-site for unresolved call sites** (panel-flagged): B.4* ships only the run-level counter. B.6's `callers_of` design MUST pick between (a) per-site finding (`LMWV-PY-CALL-SITE-UNRESOLVED`), (b) sibling `entity_unresolved_call_sites` table, or (c) synthesized "edge-with-zero-candidates" rows. Documented in §6 as a B.6 handoff. **Decision deferred to B.6, not B.4*.**
+- **Multi-pin upgrade ordering** (panel-flagged, systems): the plugin now carries TWO independent version pins — `[capabilities.runtime.pyright]` and `[integrations.wardline]`. When both need bumping (e.g., pyright minor break coincides with Wardline release), the operator sees independent findings with no guidance on resolve order. B.5* may add a third pin (references resolution). **Decision needed**: do we author a "Weft suite pin discipline" memo before B.5* ships? **Recommendation**: defer to immediately-pre-B.5*; document the interaction in a one-line tracking note in the scope amendment.
+- **Plugin coupling-accumulation policy** (panel-flagged, architecture): the Python plugin now has three optional heavy dependencies (Wardline probe at Sprint 1, pyright at B.4*, and references-resolution-engine at B.5* — TBD). "Plugin fails gracefully when dependency absent" is implicit but not stated as policy. **Recommendation**: write a brief plugin-resilience policy memo before B.5* begins, citing both `LMWV-PY-PYRIGHT-UNAVAILABLE` and the Wardline-probe absence-handling as the templates.
 - **B.4 → B.4*/B.5* rescoping pattern frequency** (panel-flagged, systems, LOW): governance is fine at n=2 sequential re-scopes. If B.5* or B.6 spawns a *-variant mid-implementation, the WP boundary assumptions in `v0.1-plan.md` warrant structural reassessment before Sprint 3. **Recommendation**: monitor; flag if a third re-scope appears.
 - **Cache-miss storm on concurrent inferred queries** (panel-flagged, systems, for B.6 not B.4*): a single `callers_of(id, confidence>=inferred)` cold-cache call triggers an LLM dispatch. Multiple concurrent MCP queries on the same cold caller fire N parallel LLM calls without coalescing. **Recommendation**: B.6's design pass MUST decide on a per-caller in-flight coalescing guard.
 - **Async call resolution**: `await foo()` — pyright resolves this through coroutine types correctly; no special-case logic needed for B.4*. Implementation should verify with a test case (added in Task 7).
 - **Method call vs. function call distinction**: B.4* treats both as `calls` (no kind split — `method_calls` is YAGNI per ADR-027 / ADR-028 spirit). Detailed-design.md mentions "method calls" as approximate; this is what the ambiguous tier captures.
-- **Pyright stderr handling**: drained in a daemon thread, joined in `PyrightSession.close()`. Fatal errors surfaced as `CLA-PY-PYRIGHT-DIAGNOSTIC` warnings (optional finding, not in the required set).
+- **Pyright stderr handling**: drained in a daemon thread, joined in `PyrightSession.close()`. Fatal errors surfaced as `LMWV-PY-PYRIGHT-DIAGNOSTIC` warnings (optional finding, not in the required set).
 - **Decorated-function calls**: covered by fixture in Task 7 (`test_extractor_decorated_callable_resolves_when_possible`).
 - **`__call__` dispatch**: covered by fixture in Task 7 (`test_extractor_dunder_call_dispatch`).
 
@@ -693,8 +693,8 @@ Reviewer verdicts and the doc changes each forced:
 
 | Q | Draft proposal | Panel verdict | Reconciliation in this doc |
 |---|---|---|---|
-| Q1 | Pyright-as-LSP; per-call-site `prepareCallHierarchy` + `outgoingCalls`; restart on crash | architecture ACCEPT; reality verified LSP method names; python CRITICAL — **traffic shape wrong**; systems BLOCKING — **poison-frame restart unbounded** | adopted python's per-function-entity traffic shape (Q1 process model rewritten); added `MAX_PYRIGHT_RESTARTS_PER_RUN` cap + `CLA-PY-PYRIGHT-POISON-FRAME`; added `PYRIGHT_INIT_TIMEOUT_SECS` deadline + `CLA-PY-PYRIGHT-INIT-TIMEOUT`; added `CLA-PY-PYRIGHT-UNAVAILABLE` for binary-missing; stderr drain promoted from open-question to Task 6 spec |
-| Q2 | Pinned PyPI pyright; new `[runtime.pyright]` manifest block | reality BLOCKING — **manifest path wrong** (existing structure is `[capabilities.runtime]`); architecture ACCEPT-WITH-REVISION — first-run executability check; python WARN — CI cache + dependabot-ignore + explicit subprocess `env` | corrected manifest section to `[capabilities.runtime.pyright]`; added `CLA-PY-PYRIGHT-INSTALL-FAILURE` first-run check; added CI cache key + dependabot-ignore to Task 8; documented explicit `env` for the subprocess; added pyright-vs-Wardline multi-pin drift open-question |
+| Q1 | Pyright-as-LSP; per-call-site `prepareCallHierarchy` + `outgoingCalls`; restart on crash | architecture ACCEPT; reality verified LSP method names; python CRITICAL — **traffic shape wrong**; systems BLOCKING — **poison-frame restart unbounded** | adopted python's per-function-entity traffic shape (Q1 process model rewritten); added `MAX_PYRIGHT_RESTARTS_PER_RUN` cap + `LMWV-PY-PYRIGHT-POISON-FRAME`; added `PYRIGHT_INIT_TIMEOUT_SECS` deadline + `LMWV-PY-PYRIGHT-INIT-TIMEOUT`; added `LMWV-PY-PYRIGHT-UNAVAILABLE` for binary-missing; stderr drain promoted from open-question to Task 6 spec |
+| Q2 | Pinned PyPI pyright; new `[runtime.pyright]` manifest block | reality BLOCKING — **manifest path wrong** (existing structure is `[capabilities.runtime]`); architecture ACCEPT-WITH-REVISION — first-run executability check; python WARN — CI cache + dependabot-ignore + explicit subprocess `env` | corrected manifest section to `[capabilities.runtime.pyright]`; added `LMWV-PY-PYRIGHT-INSTALL-FAILURE` first-run check; added CI cache key + dependabot-ignore to Task 8; documented explicit `env` for the subprocess; added pyright-vs-Wardline multi-pin drift open-question |
 | Q3 | `list[str]` candidates; `total=False` TypedDict | architecture ACCEPT (with B.6 consumer caveat); python WARN — **`total=False` diverges from project convention**; quality WARN — no determinism test | switched `CallsEdgeProperties` to `NotRequired` per project convention; added explicit B.6 consumer constraint (don't treat `to_id` as "best guess"); added determinism RED test to Task 6 |
 | Q4 | `enforce_edge_confidence_contract` new function + `WriteOrigin::{Scan, Query}` enum | architecture BLOCKING — **drop `WriteOrigin` (single-implementer premature abstraction)**; systems WARN — under-specified; reality BLOCKING — **name collides with existing `enforce_edge_contract`**; quality BLOCKING — **VER-without-VAL** on counter+finding emission | dropped `WriteOrigin` entirely; extend the existing `enforce_edge_contract` in place; expanded Task 2 contract-test matrix to 8 cases (RED-1..8) with explicit counter + finding assertions; B.6 introduces scan-vs-query discriminator with the real query write path in hand |
 | Q5 | Same `edges` table; "reversible" framing | architecture ACCEPT-WITH-REVISION — **"reversible" overstated**; quality ACCEPT — add `EXPLAIN QUERY PLAN` assertion; systems WARN — migration plan doesn't exist | replaced "reversible" with explicit two-step migration sketch inline; added `EXPLAIN QUERY PLAN` assertion to Task 1 and Task 2 verifying `ix_edges_kind_confidence` is used |

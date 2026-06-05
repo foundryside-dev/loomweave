@@ -1,4 +1,4 @@
-# Clarion Sprint 2 — Sign-off Ladder
+# Loomweave Sprint 2 — Sign-off Ladder
 
 **Status**: CLOSED — GREEN after B.8 repair rerun
 **Scope**: B.3, B.4*, B.5*, B.6, B.7, B.8 from
@@ -49,14 +49,14 @@ remain part of the audit trail.
 ### A.4 B.6 — Seven-Tool MCP Surface
 
 - [x] **Design doc commit**: `6a9a7b2` (`docs(wp8): design B.6 MCP surface`).
-- [x] **Implementation range**: `b0a12a6` → `a53d2e4` (MCP stdio server, `clarion serve`, storage-backed tools, summary cache, inferred dispatch, `issues_for`, e2e observability, OpenRouter provider swap).
+- [x] **Implementation range**: `b0a12a6` → `a53d2e4` (MCP stdio server, `loomweave serve`, storage-backed tools, summary cache, inferred dispatch, `issues_for`, e2e observability, OpenRouter provider swap).
 - [x] **Panel record**: [`b6-mcp-surface.md`](./b6-mcp-surface.md) Stage 0 panel record and reconciliation.
 - [x] **Exit criteria attestation**: Filigree `clarion-e2a3672cc9` closed `done`; B.6 local gates passed with RecordingProvider coverage, not live-provider proof.
 
 ### A.5 B.7 — Entity Associations Binding
 
-- [x] **Design source**: [ADR-029](../../clarion/adr/ADR-029-entity-associations-binding.md) and B.6 `issues_for` integration design.
-- [x] **Implementation artifacts**: Filigree PR 42 merged; Clarion-side `issues_for` integration commits include `16634ae` and `29d3865`.
+- [x] **Design source**: [ADR-029](../../loomweave/adr/ADR-029-entity-associations-binding.md) and B.6 `issues_for` integration design.
+- [x] **Implementation artifacts**: Filigree PR 42 merged; Loomweave-side `issues_for` integration commits include `16634ae` and `29d3865`.
 - [x] **Panel record**: ADR-029 federation audit and B.6 Filigree reverse-route review.
 - [x] **Exit criteria attestation**: Filigree `clarion-73ab0da435` closed `done`; B.8 measured the real reverse route at p95 3.262 ms.
 

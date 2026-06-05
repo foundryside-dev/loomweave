@@ -11,12 +11,12 @@
 #
 # Modes
 # -----
-# - `CARGO_BUILD=1` (default in repo CI): builds clarion + installs the
+# - `CARGO_BUILD=1` (default in repo CI): builds loomweave + installs the
 #   plugin from the source tree, fetches the canonical corpus, runs the
 #   walkthrough, writes a results file.
-# - `CARGO_BUILD=0` + `CLARION_BIN=...` + `CLARION_PLUGIN_BIN=...`: skips
+# - `CARGO_BUILD=0` + `LOOMWEAVE_BIN=...` + `LOOMWEAVE_PLUGIN_BIN=...`: skips
 #   the source build; expects the operator to have already installed
-#   clarion (via GitHub Release archive) and clarion-plugin-python (via
+#   loomweave (via GitHub Release archive) and loomweave-plugin-python (via
 #   pipx) on $PATH.
 #
 # Outputs
@@ -29,7 +29,7 @@
 # ----------
 # 0 — all technical steps PASS (or explicit SKIPs were declared upfront).
 # 1 — any technical step FAILED.
-# 78 — soft-failure exit (matches `clarion analyze`'s soft-fail convention)
+# 78 — soft-failure exit (matches `loomweave analyze`'s soft-fail convention)
 #      reserved; not currently used but documented for future hardening.
 
 set -euo pipefail
@@ -69,51 +69,51 @@ record() {
 cd "$REPO_ROOT"
 
 if [ "$CARGO_BUILD" = "1" ]; then
-    log "preflight: building clarion (release) ..."
+    log "preflight: building loomweave (release) ..."
     cargo build --workspace --release
-    CLARION_BIN="${CLARION_BIN:-$REPO_ROOT/target/release/clarion}"
+    LOOMWEAVE_BIN="${LOOMWEAVE_BIN:-$REPO_ROOT/target/release/loomweave}"
     if [ ! -d "$VENV" ]; then
         log "preflight: creating plugin venv at $VENV ..."
         python3 -m venv "$VENV"
     fi
-    log "preflight: installing clarion-plugin-python (editable) ..."
+    log "preflight: installing loomweave-plugin-python (editable) ..."
     "$VENV/bin/pip" install --quiet -e "$REPO_ROOT/plugins/python[dev]"
-    CLARION_PLUGIN_BIN="${CLARION_PLUGIN_BIN:-$VENV/bin/clarion-plugin-python}"
+    LOOMWEAVE_PLUGIN_BIN="${LOOMWEAVE_PLUGIN_BIN:-$VENV/bin/loomweave-plugin-python}"
     export PATH="$REPO_ROOT/target/release:$VENV/bin:$PATH"
 else
-    CLARION_BIN="${CLARION_BIN:-$(command -v clarion || true)}"
-    CLARION_PLUGIN_BIN="${CLARION_PLUGIN_BIN:-$(command -v clarion-plugin-python || true)}"
+    LOOMWEAVE_BIN="${LOOMWEAVE_BIN:-$(command -v loomweave || true)}"
+    LOOMWEAVE_PLUGIN_BIN="${LOOMWEAVE_PLUGIN_BIN:-$(command -v loomweave-plugin-python || true)}"
 fi
 
-[ -x "$CLARION_BIN" ] || fail "clarion binary missing at $CLARION_BIN (set CLARION_BIN= or CARGO_BUILD=1)"
-[ -x "$CLARION_PLUGIN_BIN" ] || fail "clarion-plugin-python missing at $CLARION_PLUGIN_BIN (set CLARION_PLUGIN_BIN= or CARGO_BUILD=1)"
+[ -x "$LOOMWEAVE_BIN" ] || fail "loomweave binary missing at $LOOMWEAVE_BIN (set LOOMWEAVE_BIN= or CARGO_BUILD=1)"
+[ -x "$LOOMWEAVE_PLUGIN_BIN" ] || fail "loomweave-plugin-python missing at $LOOMWEAVE_PLUGIN_BIN (set LOOMWEAVE_PLUGIN_BIN= or CARGO_BUILD=1)"
 
-CLARION_VERSION="$("$CLARION_BIN" --version 2>&1 | head -1)"
-PLUGIN_VERSION="$("$CLARION_PLUGIN_BIN" --version 2>&1 | head -1 || true)"
-log "preflight: $CLARION_VERSION / $PLUGIN_VERSION"
+LOOMWEAVE_VERSION="$("$LOOMWEAVE_BIN" --version 2>&1 | head -1)"
+PLUGIN_VERSION="$("$LOOMWEAVE_PLUGIN_BIN" --version 2>&1 | head -1 || true)"
+log "preflight: $LOOMWEAVE_VERSION / $PLUGIN_VERSION"
 
 # Scratch directory for the corpus.
-WORK_DIR="$(mktemp -d -t clarion-smoke-XXXXXX)"
+WORK_DIR="$(mktemp -d -t loomweave-smoke-XXXXXX)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 log "scratch: $WORK_DIR"
 
-# -------- step 1: clarion is on $PATH and --version works --------
+# -------- step 1: loomweave is on $PATH and --version works --------
 
-if [ -n "$CLARION_VERSION" ]; then
-    record "1" "PASS" "clarion --version: $CLARION_VERSION"
+if [ -n "$LOOMWEAVE_VERSION" ]; then
+    record "1" "PASS" "loomweave --version: $LOOMWEAVE_VERSION"
 else
-    record "1" "FAIL" "clarion --version produced no output"
+    record "1" "FAIL" "loomweave --version produced no output"
 fi
 
-# -------- step 2: clarion-plugin-python on $PATH --------
+# -------- step 2: loomweave-plugin-python on $PATH --------
 
-if [ -x "$CLARION_PLUGIN_BIN" ]; then
-    record "2" "PASS" "plugin binary at $CLARION_PLUGIN_BIN; $PLUGIN_VERSION"
+if [ -x "$LOOMWEAVE_PLUGIN_BIN" ]; then
+    record "2" "PASS" "plugin binary at $LOOMWEAVE_PLUGIN_BIN; $PLUGIN_VERSION"
 else
     record "2" "FAIL" "plugin binary not found"
 fi
 
-# -------- step 3: clarion install against a small Python corpus --------
+# -------- step 3: loomweave install against a small Python corpus --------
 
 log "fetching corpus $CORPUS_REPO @ $CORPUS_REF ..."
 cd "$WORK_DIR"
@@ -123,44 +123,44 @@ if ! git clone --quiet --depth 1 --branch "$CORPUS_REF" "$CORPUS_REPO" corpus; t
 fi
 cd corpus
 
-if "$CLARION_BIN" install >/dev/null 2>"$WORK_DIR/install.err"; then
-    if [ -f .clarion/clarion.db ]; then
-        record "3" "PASS" ".clarion/clarion.db created against psf/requests@$CORPUS_REF"
+if "$LOOMWEAVE_BIN" install >/dev/null 2>"$WORK_DIR/install.err"; then
+    if [ -f .loomweave/loomweave.db ]; then
+        record "3" "PASS" ".loomweave/loomweave.db created against psf/requests@$CORPUS_REF"
     else
-        record "3" "FAIL" "install reported success but .clarion/clarion.db missing"
+        record "3" "FAIL" "install reported success but .loomweave/loomweave.db missing"
     fi
 else
-    record "3" "FAIL" "clarion install exited non-zero: $(tr '\n' ' ' < "$WORK_DIR/install.err")"
+    record "3" "FAIL" "loomweave install exited non-zero: $(tr '\n' ' ' < "$WORK_DIR/install.err")"
 fi
 
-# -------- step 4.1: clarion analyze (initial) --------
+# -------- step 4.1: loomweave analyze (initial) --------
 
-log "running clarion analyze ..."
-if "$CLARION_BIN" analyze . >"$WORK_DIR/analyze1.out" 2>"$WORK_DIR/analyze1.err"; then
-    ENTITY_COUNT_1="$(sqlite3 .clarion/clarion.db 'SELECT COUNT(*) FROM entities WHERE kind != "subsystem"' || echo 0)"
-    EDGE_COUNT_1="$(sqlite3 .clarion/clarion.db 'SELECT COUNT(*) FROM edges' || echo 0)"
+log "running loomweave analyze ..."
+if "$LOOMWEAVE_BIN" analyze . >"$WORK_DIR/analyze1.out" 2>"$WORK_DIR/analyze1.err"; then
+    ENTITY_COUNT_1="$(sqlite3 .loomweave/loomweave.db 'SELECT COUNT(*) FROM entities WHERE kind != "subsystem"' || echo 0)"
+    EDGE_COUNT_1="$(sqlite3 .loomweave/loomweave.db 'SELECT COUNT(*) FROM edges' || echo 0)"
     if [ "$ENTITY_COUNT_1" -gt 0 ]; then
         record "4.1" "PASS" "analyze ok; entities=$ENTITY_COUNT_1 edges=$EDGE_COUNT_1"
     else
         record "4.1" "FAIL" "analyze ok but entity count is 0"
     fi
 else
-    record "4.1" "FAIL" "clarion analyze exited non-zero: $(tail -3 "$WORK_DIR/analyze1.err" | tr '\n' ' ')"
+    record "4.1" "FAIL" "loomweave analyze exited non-zero: $(tail -3 "$WORK_DIR/analyze1.err" | tr '\n' ' ')"
 fi
 
-# -------- step 4.2 + 4.3: clarion serve + MCP queries --------
+# -------- step 4.2 + 4.3: loomweave serve + MCP queries --------
 
 log "driving MCP stdio ..."
 MCP_REPORT="$WORK_DIR/mcp.json"
 PROJECT_DIR_FOR_PY="$WORK_DIR/corpus"
-CLARION_BIN_FOR_PY="$CLARION_BIN"
+LOOMWEAVE_BIN_FOR_PY="$LOOMWEAVE_BIN"
 
 set +e
-python3 - "$CLARION_BIN_FOR_PY" "$PROJECT_DIR_FOR_PY" "$MCP_REPORT" "${OPENROUTER_API_KEY:-NONE}" <<'PY'
+python3 - "$LOOMWEAVE_BIN_FOR_PY" "$PROJECT_DIR_FOR_PY" "$MCP_REPORT" "${OPENROUTER_API_KEY:-NONE}" <<'PY'
 import json, sys, subprocess, sqlite3
 from pathlib import Path
 
-clarion_bin, project_dir, report_path, openrouter_key = sys.argv[1:5]
+loomweave_bin, project_dir, report_path, openrouter_key = sys.argv[1:5]
 project_dir = Path(project_dir)
 report = {"step_4_2": None, "step_4_3a": None, "step_4_3b": None, "step_4_3c": None,
           "tools_listed": None, "find_entity_hits": None, "callers_of_hits": None,
@@ -191,7 +191,7 @@ def tool_call(proc, rid, name, args):
     return read_frame(proc)
 
 # Pick a real entity from the analyzed corpus to test against.
-conn = sqlite3.connect(project_dir / ".clarion" / "clarion.db")
+conn = sqlite3.connect(project_dir / ".loomweave" / "loomweave.db")
 ent = conn.execute("""
     SELECT id, kind, name FROM entities
     WHERE kind = 'function' AND name = 'get'
@@ -213,7 +213,7 @@ if not ent:
     Path(report_path).write_text(json.dumps(report))
     sys.exit(2)
 
-proc = subprocess.Popen([clarion_bin, "serve"],
+proc = subprocess.Popen([loomweave_bin, "serve"],
                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE, cwd=str(project_dir))
 
@@ -241,7 +241,7 @@ try:
     report["tools_listed"] = tools
 
     def unwrap(envelope):
-        """Clarion MCP envelope wraps the tool payload under `result`."""
+        """Loomweave MCP envelope wraps the tool payload under `result`."""
         return envelope.get("result") if isinstance(envelope, dict) else None
 
     # 4.3(a) find_entity
@@ -255,7 +255,7 @@ try:
                           if matches else f"FAIL: find_entity('{pattern}') returned empty (envelope: {fe_body})")
 
     # 4.3(b) callers_of — find a function with at least one caller.
-    conn2 = sqlite3.connect(project_dir / ".clarion" / "clarion.db")
+    conn2 = sqlite3.connect(project_dir / ".loomweave" / "loomweave.db")
     row = conn2.execute("""
         SELECT e.id, COUNT(*) AS c FROM entities e
         JOIN edges ed ON ed.to_id = e.id
@@ -326,10 +326,10 @@ fi
 
 # -------- step 5: re-run analyze for idempotency --------
 
-log "running clarion analyze (re-run for idempotency) ..."
-if "$CLARION_BIN" analyze . >"$WORK_DIR/analyze2.out" 2>"$WORK_DIR/analyze2.err"; then
-    ENTITY_COUNT_2="$(sqlite3 .clarion/clarion.db 'SELECT COUNT(*) FROM entities WHERE kind != "subsystem"')"
-    EDGE_COUNT_2="$(sqlite3 .clarion/clarion.db 'SELECT COUNT(*) FROM edges')"
+log "running loomweave analyze (re-run for idempotency) ..."
+if "$LOOMWEAVE_BIN" analyze . >"$WORK_DIR/analyze2.out" 2>"$WORK_DIR/analyze2.err"; then
+    ENTITY_COUNT_2="$(sqlite3 .loomweave/loomweave.db 'SELECT COUNT(*) FROM entities WHERE kind != "subsystem"')"
+    EDGE_COUNT_2="$(sqlite3 .loomweave/loomweave.db 'SELECT COUNT(*) FROM edges')"
     if [ "$ENTITY_COUNT_2" = "$ENTITY_COUNT_1" ] && [ "$EDGE_COUNT_2" = "$EDGE_COUNT_1" ]; then
         record "5" "PASS" "idempotent: entities=$ENTITY_COUNT_2 edges=$EDGE_COUNT_2 unchanged"
     else
@@ -348,34 +348,34 @@ AWS_SECRET_ACCESS_KEY=examplefakefakefakefakefakefakefakefake1234
 ENV
 
 ANALYZE_3_EXIT=0
-"$CLARION_BIN" analyze . >"$WORK_DIR/analyze3.out" 2>"$WORK_DIR/analyze3.err" || ANALYZE_3_EXIT=$?
+"$LOOMWEAVE_BIN" analyze . >"$WORK_DIR/analyze3.out" 2>"$WORK_DIR/analyze3.err" || ANALYZE_3_EXIT=$?
 
 # Expected: soft-failure (exit 78) or success with briefing_blocked recorded.
-BLOCKED_COUNT="$(sqlite3 .clarion/clarion.db "SELECT COUNT(*) FROM entities WHERE json_extract(properties, '\$.briefing_blocked') IS NOT NULL" 2>/dev/null || echo 0)"
-FINDING_COUNT="$(sqlite3 .clarion/clarion.db "SELECT COUNT(*) FROM findings WHERE rule_id = 'CLA-SEC-SECRET-DETECTED'" 2>/dev/null || echo 0)"
+BLOCKED_COUNT="$(sqlite3 .loomweave/loomweave.db "SELECT COUNT(*) FROM entities WHERE json_extract(properties, '\$.briefing_blocked') IS NOT NULL" 2>/dev/null || echo 0)"
+FINDING_COUNT="$(sqlite3 .loomweave/loomweave.db "SELECT COUNT(*) FROM findings WHERE rule_id = 'LMWV-SEC-SECRET-DETECTED'" 2>/dev/null || echo 0)"
 
 if [ "$BLOCKED_COUNT" -gt 0 ] && [ "$FINDING_COUNT" -gt 0 ]; then
     record "6" "PASS" "post-plant: $BLOCKED_COUNT blocked entities, $FINDING_COUNT secret findings (analyze exit $ANALYZE_3_EXIT)"
 elif [ "$BLOCKED_COUNT" -gt 0 ]; then
-    record "6" "PASS" "post-plant: $BLOCKED_COUNT blocked entities (no CLA-SEC-SECRET-DETECTED finding rows; finding code may have changed)"
+    record "6" "PASS" "post-plant: $BLOCKED_COUNT blocked entities (no LMWV-SEC-SECRET-DETECTED finding rows; finding code may have changed)"
 elif [ "$FINDING_COUNT" -gt 0 ]; then
     record "6" "FAIL" "secret finding emitted but no entity marked briefing_blocked"
 else
-    record "6" "FAIL" "no briefing_blocked entities and no CLA-SEC-SECRET-DETECTED finding after planting"
+    record "6" "FAIL" "no briefing_blocked entities and no LMWV-SEC-SECRET-DETECTED finding after planting"
 fi
 
 # -------- step 7: serve against post-block DB; summary on blocked entity returns blocked envelope --------
 
 if [ "$BLOCKED_COUNT" -gt 0 ]; then
     log "verifying blocked-entity summary refusal ..."
-    BLOCKED_ID="$(sqlite3 .clarion/clarion.db "SELECT id FROM entities WHERE json_extract(properties, '\$.briefing_blocked') IS NOT NULL LIMIT 1")"
+    BLOCKED_ID="$(sqlite3 .loomweave/loomweave.db "SELECT id FROM entities WHERE json_extract(properties, '\$.briefing_blocked') IS NOT NULL LIMIT 1")"
     if [ -n "$BLOCKED_ID" ]; then
         set +e
-        python3 - "$CLARION_BIN" "$WORK_DIR/corpus" "$BLOCKED_ID" "$WORK_DIR/step7.json" <<'PY'
+        python3 - "$LOOMWEAVE_BIN" "$WORK_DIR/corpus" "$BLOCKED_ID" "$WORK_DIR/step7.json" <<'PY'
 import json, sys, subprocess
 from pathlib import Path
 
-clarion_bin, project_dir, blocked_id, out_path = sys.argv[1:5]
+loomweave_bin, project_dir, blocked_id, out_path = sys.argv[1:5]
 
 def write_frame(proc, message):
     body = json.dumps(message, separators=(",", ":")).encode("utf-8")
@@ -393,7 +393,7 @@ def read_frame(proc):
         headers[k.lower()] = v.strip()
     return json.loads(proc.stdout.read(int(headers["content-length"])))
 
-proc = subprocess.Popen([clarion_bin, "serve"],
+proc = subprocess.Popen([loomweave_bin, "serve"],
                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE, cwd=project_dir)
 try:
@@ -442,7 +442,7 @@ mkdir -p "$(dirname "$RESULTS_FILE")"
     echo
     echo "**Date (UTC)**: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "**Host**: $(uname -srm)"
-    echo "**Clarion**: $CLARION_VERSION"
+    echo "**Loomweave**: $LOOMWEAVE_VERSION"
     echo "**Plugin**: $PLUGIN_VERSION"
     echo "**Corpus**: $CORPUS_REPO @ $CORPUS_REF"
     echo "**Mode**: $([ "$CARGO_BUILD" = "1" ] && echo "in-repo build (CARGO_BUILD=1)" || echo "external binary")"

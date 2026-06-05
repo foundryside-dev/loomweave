@@ -1,9 +1,9 @@
 # WP1 — Scaffold + Storage (Sprint 1)
 
 **Status**: DRAFT — pending sprint kickoff
-**Anchoring design**: [system-design.md §4 (Storage)](../../clarion/v0.1/system-design.md#4-storage), [detailed-design.md §3 (Storage impl)](../../clarion/v0.1/detailed-design.md#3-storage-implementation)
-**Accepted ADRs**: [ADR-001](../../clarion/adr/ADR-001-rust-for-core.md), [ADR-003](../../clarion/adr/ADR-003-entity-id-scheme.md), [ADR-011](../../clarion/adr/ADR-011-writer-actor-concurrency.md), [ADR-023](../../clarion/adr/ADR-023-tooling-baseline.md)
-**Backlog ADR that may surface**: ADR-005 (`.clarion/` git-committable subpaths)
+**Anchoring design**: [system-design.md §4 (Storage)](../../loomweave/v0.1/system-design.md#4-storage), [detailed-design.md §3 (Storage impl)](../../loomweave/v0.1/detailed-design.md#3-storage-implementation)
+**Accepted ADRs**: [ADR-001](../../loomweave/adr/ADR-001-rust-for-core.md), [ADR-003](../../loomweave/adr/ADR-003-entity-id-scheme.md), [ADR-011](../../loomweave/adr/ADR-011-writer-actor-concurrency.md), [ADR-023](../../loomweave/adr/ADR-023-tooling-baseline.md)
+**Backlog ADR that may surface**: ADR-005 (`.loomweave/` git-committable subpaths)
 **Predecessor**: none — WP1 is the foundation of Sprint 1.
 **Blocks**: WP2, WP3.
 
@@ -20,14 +20,14 @@ to later sprints where those surfaces are first exercised.
 
 - Cargo workspace at repo root.
 - SQLite schema covering the full table set from
-  [detailed-design.md §3](../../clarion/v0.1/detailed-design.md#3-storage-implementation):
+  [detailed-design.md §3](../../loomweave/v0.1/detailed-design.md#3-storage-implementation):
   tables `entities`, `entity_tags`, `edges`, `findings`, `summary_cache`,
   `runs`, plus the `entity_fts` FTS5 virtual table and its three
   insert/update/delete triggers, the generated-column `ALTER TABLE`
   statements plus partial indexes (`ix_entities_priority`,
   `ix_entities_churn` — note: `ix_entities_priority` was renamed to
   `ix_entities_scope_rank` and the underlying column was split into
-  `scope_level` + `scope_rank` by [ADR-024](../../clarion/adr/ADR-024-guidance-schema-vocabulary.md);
+  `scope_level` + `scope_rank` by [ADR-024](../../loomweave/adr/ADR-024-guidance-schema-vocabulary.md);
   the L1 lock at sprint close described the pre-rename shape),
   the `guidance_sheets` view, and a `schema_migrations` meta table. The walking skeleton only writes rows into
   `entities` and `runs`, but every other table, virtual table, trigger,
@@ -46,13 +46,13 @@ to later sprints where those surfaces are first exercised.
 - Entity-ID 3-segment format (L2) per ADR-003 — `{plugin_id}:{kind}:{canonical_qualified_name}`.
   WP1 ships the Rust assembler; WP3 ships the Python-side producer of the
   `canonical_qualified_name` segment.
-- `clarion` binary with two subcommands:
-  - `clarion install` — creates `.clarion/` (DB + `config.json` + `.gitignore`
-    seeded with the run-log exclusion) and writes a stub `clarion.yaml` at the
+- `loomweave` binary with two subcommands:
+  - `loomweave install` — creates `.loomweave/` (DB + `config.json` + `.gitignore`
+    seeded with the run-log exclusion) and writes a stub `loomweave.yaml` at the
     project root per
-    [detailed-design.md §File layout](../../clarion/v0.1/detailed-design.md#file-layout)
+    [detailed-design.md §File layout](../../loomweave/v0.1/detailed-design.md#file-layout)
     (see L1 note below and ADR-005 trigger in §7).
-  - `clarion analyze <path>` — CLI wiring only. Accepts the path, opens the DB,
+  - `loomweave analyze <path>` — CLI wiring only. Accepts the path, opens the DB,
     begins a run, but does **not** yet spawn a plugin (that's WP2's wiring). Exits
     cleanly with run status = `skipped_no_plugins`.
 - RecordingProvider trait stub in core (no implementation — the file exists so
@@ -61,11 +61,11 @@ to later sprints where those surfaces are first exercised.
 **Explicitly out of scope for Sprint 1:**
 
 - Plugin spawning, JSON-RPC, anything subprocess — WP2.
-- `clarion serve`, MCP, HTTP — WP8.
+- `loomweave serve`, MCP, HTTP — WP8.
 - `--shadow-db` flag — deferred; only the default in-place write mode is shipped.
 - Checkpoint/resume mid-run — deferred; runs are either complete or failed, no
   mid-run restart.
-- `clarion analyze --no-llm`, `--dry-run` — deferred.
+- `loomweave analyze --no-llm`, `--dry-run` — deferred.
 - Findings, clustering, briefings — WP4/WP6/WP7.
 - Any multi-platform support — Linux only; macOS and Windows are future work.
 
@@ -75,7 +75,7 @@ Sprint 1 decides these. Sprint 2+ reads and writes against them.
 
 ### L1 — SQLite schema shape
 
-**What locks**: the full table set from [detailed-design.md §3](../../clarion/v0.1/detailed-design.md#3-storage-implementation),
+**What locks**: the full table set from [detailed-design.md §3](../../loomweave/v0.1/detailed-design.md#3-storage-implementation),
 not just the tables the walking skeleton uses. All tables, columns, types, primary
 keys, foreign keys, indexes, and `PRAGMA` settings are written into migration
 `0001_initial_schema.sql` and committed. The walking skeleton only writes rows into
@@ -87,7 +87,7 @@ there is no data; changing later forces migration scripts that each need their o
 tests. Locking the shape now — using the detailed-design as the authoritative source
 — pushes all that rework up-front.
 
-**Canonical source**: [detailed-design.md §3](../../clarion/v0.1/detailed-design.md#3-storage-implementation).
+**Canonical source**: [detailed-design.md §3](../../loomweave/v0.1/detailed-design.md#3-storage-implementation).
 If the detailed-design and the migration file disagree, the migration file wins from
 Sprint 1 onward; the detailed-design must be updated to match.
 
@@ -95,22 +95,22 @@ Sprint 1 onward; the detailed-design must be updated to match.
 - WP4 (clustering, findings) reads from `entities`/`edges` and writes to
   `findings`/`subsystems` — locked shape means WP4 can begin without touching WP1.
 - WP6 writes to `summary_cache`; its composite primary key (`entity_id, content_hash, prompt_template_id, model_tier, guidance_fingerprint`) is locked here. `entity_id` is the L2 3-segment string.
-- `↗` WP10 — Filigree's `registry_backend: clarion` reads `entities` via the
+- `↗` WP10 — Filigree's `registry_backend: loomweave` reads `entities` via the
   documented schema and joins on the 3-segment `EntityId` (L2). Changing
   column names or the ID shape after Sprint 1 breaks Filigree's
   `RegistryProtocol` impl.
 
 **Note on `.gitignore` selectivity**: the migration file + the DB itself are
 git-tracked per ADR-005 (backlog). Run logs, shadow-DB artefacts, and any
-`.clarion/tmp/` subpath are not. `clarion install` writes the `.gitignore` rules;
+`.loomweave/tmp/` subpath are not. `loomweave install` writes the `.gitignore` rules;
 this is the point at which ADR-005 stops being backlog and gets authored (see §7
 trigger).
 
 ### L2 — Entity-ID canonical-name format
 
 **What locks**: the function that assembles an `EntityId` string per
-[ADR-003](../../clarion/adr/ADR-003-entity-id-scheme.md) and
-[ADR-022](../../clarion/adr/ADR-022-core-plugin-ontology.md). The Rust
+[ADR-003](../../loomweave/adr/ADR-003-entity-id-scheme.md) and
+[ADR-022](../../loomweave/adr/ADR-022-core-plugin-ontology.md). The Rust
 implementation ships in WP1; WP3 ships the Python-side producer of the
 `canonical_qualified_name` component that matches byte-for-byte.
 
@@ -133,7 +133,7 @@ module-level `def hello()` in `demo.py`. Sprint 1's Rust implementation plus
 the shared fixture (§Task 5 in WP3) are the executable spec.
 
 **Why now**: this is the cross-sibling identity — every table FK, every finding
-locator, every Filigree `registry_backend: clarion` join (ADR-014), and every
+locator, every Filigree `registry_backend: loomweave` join (ADR-014), and every
 Wardline qualname reconciliation (ADR-018) keys off this string. Changing it
 later requires a schema migration *and* coordinated Filigree/Wardline changes.
 
@@ -141,17 +141,17 @@ later requires a schema migration *and* coordinated Filigree/Wardline changes.
 - L7 (Python qualname production) produces the `canonical_qualified_name`
   segment; WP1's Rust assembler concatenates `plugin_id`, `kind`, and that
   segment. Shared fixture (WP3 §Task 5) is the byte-for-byte parity proof.
-- `↗` WP10 — Filigree's `registry_backend: clarion` joins on this 3-segment
+- `↗` WP10 — Filigree's `registry_backend: loomweave` joins on this 3-segment
   ID; `{kind}` is load-bearing because ADR-014's protocol uses the
   core-owned `file` kind as the join surface.
 - `↗` ADR-018 — Wardline qualname reconciliation uses the
   `canonical_qualified_name` segment (not the full ID) as its join key on the
-  Clarion side.
+  Loomweave side.
 
 ### L3 — Writer-actor command protocol
 
 **What locks**: the command message type, the per-N transaction batch
-contract, and the ack mechanism per [ADR-011](../../clarion/adr/ADR-011-writer-actor-concurrency.md).
+contract, and the ack mechanism per [ADR-011](../../loomweave/adr/ADR-011-writer-actor-concurrency.md).
 The writer-actor is a `tokio::task` (not an OS thread) per ADR-011's
 Decision section.
 
@@ -165,7 +165,7 @@ per-N auto-commit — is locked.
 
 **Per-N batch default**: `N = 50` per ADR-011 §Per-N-files transactions, with
 `mpsc` channel bounded at 256 ops (ADR-011's `mpsc::Sender<WriteOp>`
-capacity). Configurable via `clarion.yaml:storage.tx_batch_size` in later
+capacity). Configurable via `loomweave.yaml:storage.tx_batch_size` in later
 WPs; WP1 ships the ADR-locked default.
 
 **Why now**: every persistence call site in every later WP will follow this
@@ -182,13 +182,13 @@ shift during WP2 or WP3 if shared types emerge. But a reasonable starting shape:
 ```
 /Cargo.toml                              # workspace root
 /crates/
-  clarion-core/                          # library: domain types, traits, stub LlmProvider
+  loomweave-core/                          # library: domain types, traits, stub LlmProvider
     src/
       lib.rs
       entity_id.rs                       # L2 implementation + unit tests
       entity.rs                          # entity, edge, kind types
       llm_provider.rs                    # trait stub for WP6
-  clarion-storage/                       # SQLite layer + writer-actor
+  loomweave-storage/                       # SQLite layer + writer-actor
     src/
       lib.rs
       schema.rs                          # migration runner, schema-version check
@@ -197,11 +197,11 @@ shift during WP2 or WP3 if shared types emerge. But a reasonable starting shape:
       commands.rs                        # WriterCmd enum (L3)
     migrations/
       0001_initial_schema.sql            # L1 — full schema, committed now
-  clarion-cli/                           # binary entry point
+  loomweave-cli/                           # binary entry point
     src/
       main.rs
-      install.rs                         # `clarion install`
-      analyze.rs                         # `clarion analyze` (no-plugin variant)
+      install.rs                         # `loomweave install`
+      analyze.rs                         # `loomweave analyze` (no-plugin variant)
 ```
 
 Tests live under each crate's `tests/` directory (integration) or inline `#[cfg(test)]`
@@ -250,13 +250,13 @@ if they don't block tasks. Each has a proposed resolution-by trigger.
   commits)? Per-command is simpler; per-batch is more efficient under high entity
   volume. **Proposal**: per-command ack in Sprint 1; optimise later if WP3 or WP4
   hit throughput issues. **Resolved**: Task 6 — per-command oneshot ack; `Writer.commits_observed` `Arc<AtomicUsize>` counts COMMITs issued.
-- **UQ-WP1-04** — **What `.gitignore` rules does `clarion install` seed?** ADR-005
+- **UQ-WP1-04** — **What `.gitignore` rules does `loomweave install` seed?** ADR-005
   is backlog; Sprint 1 must decide. **Proposal** (authors ADR-005 as a side effect):
-  ignore `.clarion/tmp/`, `.clarion/logs/`, `.clarion/*.shadow.db`, `.clarion/*.wal`,
-  `.clarion/*.shm`; track `.clarion/clarion.db`, `.clarion/config.json`, and the
-  migration history in the DB itself. (`clarion.yaml` lives at project root and
-  is outside `.clarion/`; its tracking is governed by the user's existing
-  repo-root `.gitignore`, not by Clarion.) **Resolved**: Task 5 — ADR-005 authored and Accepted; `.gitignore` contents shipped in `crates/clarion-cli/src/install.rs`.
+  ignore `.loomweave/tmp/`, `.loomweave/logs/`, `.loomweave/*.shadow.db`, `.loomweave/*.wal`,
+  `.loomweave/*.shm`; track `.loomweave/loomweave.db`, `.loomweave/config.json`, and the
+  migration history in the DB itself. (`loomweave.yaml` lives at project root and
+  is outside `.loomweave/`; its tracking is governed by the user's existing
+  repo-root `.gitignore`, not by Loomweave.) **Resolved**: Task 5 — ADR-005 authored and Accepted; `.gitignore` contents shipped in `crates/loomweave-cli/src/install.rs`.
 - **UQ-WP1-05** — **Schema for `runs` table**: does Sprint 1's `runs` row include
   plugin-invocation metadata (plugin name, manifest version) or only run-level
   status/timestamps? WP2 will add plugin-invocation metadata; if the schema is
@@ -264,10 +264,10 @@ if they don't block tasks. Each has a proposed resolution-by trigger.
   migration. **Proposal**: lock the full shape from detailed-design §3 now,
   including plugin-invocation columns; WP1 inserts with NULL, WP2 fills them in.
   **Resolved**: Task 3 — full `runs` shape shipped in `0001_initial_schema.sql`; plugin-invocation metadata goes into the `config` JSON column, populated by WP2.
-- **UQ-WP1-06** — **Error-type boundary**: does `clarion-storage` re-export
+- **UQ-WP1-06** — **Error-type boundary**: does `loomweave-storage` re-export
   `rusqlite::Error`, or wrap it in a crate-local `StorageError` via `thiserror`?
   Re-export leaks the dependency; wrapping adds boilerplate. **Proposal**: wrap;
-  the crate boundary is a decoupling point. **Resolved**: Task 3 — `StorageError` wraps `rusqlite::Error` via `thiserror` `#[from]` at the `clarion-storage` crate boundary.
+  the crate boundary is a decoupling point. **Resolved**: Task 3 — `StorageError` wraps `rusqlite::Error` via `thiserror` `#[from]` at the `loomweave-storage` crate boundary.
 - **UQ-WP1-07** — **Segment-separator collisions**: ADR-003's 3-segment form
   uses `:` as the segment separator. A segment (any of `plugin_id`, `kind`,
   `canonical_qualified_name`) containing a literal `:` would produce an
@@ -278,13 +278,13 @@ if they don't block tasks. Each has a proposed resolution-by trigger.
   documents the grammar contract. If a future non-Python plugin needs `:` in
   qualified names, introduce escaping via a follow-up ADR amending ADR-003.
   **Resolved**: Task 2 — `EntityIdError::SegmentContainsColon` surfaces any attempted `:` injection; grammar-restricted segments (`plugin_id`, `kind`) cannot produce it in practice.
-- **UQ-WP1-08** — **Does `clarion install` refuse to overwrite an existing
-  `.clarion/`?** **Proposal**: yes, unless `--force`; `--force` is not implemented
-  in Sprint 1 but the error message names it for future use. **Resolved**: Task 5 — `clarion install` refuses an existing `.clarion/`; `--force` accepted by clap but errors out (Sprint 1 does not implement overwrite).
+- **UQ-WP1-08** — **Does `loomweave install` refuse to overwrite an existing
+  `.loomweave/`?** **Proposal**: yes, unless `--force`; `--force` is not implemented
+  in Sprint 1 but the error message names it for future use. **Resolved**: Task 5 — `loomweave install` refuses an existing `.loomweave/`; `--force` accepted by clap but errors out (Sprint 1 does not implement overwrite).
 - **UQ-WP1-09** — **Rust toolchain + workspace tooling baseline**:
   ~~"2021 edition, stable channel. MSRV floats with the latest stable at
   sprint start; fine to document and move on."~~ — **reopened 2026-04-18
-  and re-resolved by [ADR-023](../../clarion/adr/ADR-023-tooling-baseline.md)**.
+  and re-resolved by [ADR-023](../../loomweave/adr/ADR-023-tooling-baseline.md)**.
   The original "move on" framing was the canonical tell for an
   unexamined default. ADR-023 adopts **edition 2024**, workspace-level
   `[lints]` with `clippy::pedantic = "warn"` + `unsafe_code = "forbid"`,
@@ -306,21 +306,21 @@ do not parallelise within WP1. Commits are one-per-task unless noted.
 
 **Files**:
 - Create `/Cargo.toml` (workspace root — `[workspace.package]`, `[workspace.dependencies]`, and `[workspace.lints]` per ADR-023)
-- Create `/crates/clarion-core/{Cargo.toml,src/lib.rs}`
-- Create `/crates/clarion-storage/{Cargo.toml,src/lib.rs}`
-- Create `/crates/clarion-cli/{Cargo.toml,src/main.rs}`
+- Create `/crates/loomweave-core/{Cargo.toml,src/lib.rs}`
+- Create `/crates/loomweave-storage/{Cargo.toml,src/lib.rs}`
+- Create `/crates/loomweave-cli/{Cargo.toml,src/main.rs}`
 - Create `/rust-toolchain.toml` pinning stable with `clippy` + `rustfmt` + `llvm-tools-preview`
 - Create `/rustfmt.toml` (`edition = "2024"`, `max_width = 100`, Unix newlines)
 - Create `/clippy.toml` (relaxed pedantic thresholds per ADR-023)
 - Create `/deny.toml` (cargo-deny v2 schema — advisories, license allowlist, bans, sources)
 - Create `/.github/workflows/ci.yml` (fmt-check + pedantic clippy + nextest + cargo-doc + cargo-deny)
-- Create `/.gitignore` entries for `/target`, `*-wal`, `*-shm` (project-level `.clarion/clarion.db` is tracked per ADR-005 — do **not** blanket-ignore `*.db`)
+- Create `/.gitignore` entries for `/target`, `*-wal`, `*-shm` (project-level `.loomweave/loomweave.db` is tracked per ADR-005 — do **not** blanket-ignore `*.db`)
 
 Steps:
 
 - [ ] Write workspace `Cargo.toml` listing the three members. `[workspace.package]` pins `edition = "2024"` (ADR-023), license, repository, and `rust-version = "1.85"` (or the current stable MSRV at sprint start). Declare `tokio`, `rusqlite` (with `bundled` feature), `deadpool-sqlite`, `thiserror`, `tracing`, `clap`, `anyhow`, `serde` + `serde_json`, plus the `tempfile` and `assert_cmd` dev-deps as workspace dependencies (ADR-011-locked stack; dev-deps centralised).
 - [ ] Add `[workspace.lints.rust]` with `unsafe_code = "forbid"` and `[workspace.lints.clippy]` with `pedantic = "warn"` plus the pragmatic allows from ADR-023 (`module_name_repetitions`, `must_use_candidate`, `missing_errors_doc`).
-- [ ] Write each crate's `Cargo.toml`. Every crate declares `lints.workspace = true` so a later-added crate cannot drift off the ADR-023 floor. `clarion-core` takes `thiserror` + `serde` + `serde_json`. `clarion-storage` takes core + `rusqlite` + `deadpool-sqlite` + `tokio` (features `rt-multi-thread`, `macros`, `sync`). `clarion-cli` takes both + `clap` + `anyhow` + `tracing` + `tracing-subscriber` + `tokio` (same features).
+- [ ] Write each crate's `Cargo.toml`. Every crate declares `lints.workspace = true` so a later-added crate cannot drift off the ADR-023 floor. `loomweave-core` takes `thiserror` + `serde` + `serde_json`. `loomweave-storage` takes core + `rusqlite` + `deadpool-sqlite` + `tokio` (features `rt-multi-thread`, `macros`, `sync`). `loomweave-cli` takes both + `clap` + `anyhow` + `tracing` + `tracing-subscriber` + `tokio` (same features).
 - [ ] Write `rust-toolchain.toml` per ADR-023 (channel `stable`; components `clippy`, `rustfmt`, `llvm-tools-preview`; `profile = "minimal"`).
 - [ ] Write `rustfmt.toml`, `clippy.toml`, `deny.toml` as specified in ADR-023.
 - [ ] Write `.github/workflows/ci.yml` with jobs for fmt-check, pedantic clippy, nextest, cargo-doc, cargo-deny. Use `dtolnay/rust-toolchain@stable`, `Swatinem/rust-cache@v2`, and `taiki-e/install-action` for nextest + cargo-deny installs.
@@ -337,27 +337,27 @@ Steps:
 ### Task 2 — Entity-ID assembler (L2)
 
 **Files**:
-- Create `/crates/clarion-core/src/entity_id.rs`
-- Modify `/crates/clarion-core/src/lib.rs` to `pub mod entity_id;`
+- Create `/crates/loomweave-core/src/entity_id.rs`
+- Modify `/crates/loomweave-core/src/lib.rs` to `pub mod entity_id;`
 
 Steps:
 
 - [ ] Write failing unit tests in `entity_id.rs` covering ADR-003's 3-segment format. Start with at least five cases, including: module-level function (`python:function:demo.hello`), class method (`python:function:demo.Foo.bar`), nested function (`python:function:demo.outer.<locals>.inner`), a core-reserved file entity (`core:file:src/demo.py`), and a core-reserved subsystem entity (`core:subsystem:<cluster_hash>`).
-- [ ] Run `cargo test -p clarion-core entity_id`; expect failures referencing the missing `entity_id()` function.
+- [ ] Run `cargo test -p loomweave-core entity_id`; expect failures referencing the missing `entity_id()` function.
 - [ ] Implement `pub fn entity_id(plugin_id: &str, kind: &str, canonical_qualified_name: &str) -> EntityId` (newtype-wrapped `String`) matching ADR-003's three-segment form. Validate each segment against the ADR-022 grammar (`kind` matches `[a-z][a-z0-9_]*`; `plugin_id` matches the same grammar); return a typed error on malformed input. Assert-unreachable on any segment containing a literal `:` (UQ-WP1-07 — segment separator collisions are a bug at the caller).
-- [ ] Run `cargo test -p clarion-core entity_id`; expect all pass.
+- [ ] Run `cargo test -p loomweave-core entity_id`; expect all pass.
 - [ ] Commit: `feat(wp1): L2 entity-ID assembler per ADR-003 + ADR-022`.
 
 ### Task 3 — Schema migration file (L1)
 
 **Files**:
-- Create `/crates/clarion-storage/migrations/0001_initial_schema.sql`
-- Create `/crates/clarion-storage/src/schema.rs`
-- Modify `/crates/clarion-storage/src/lib.rs` to expose the migration runner
+- Create `/crates/loomweave-storage/migrations/0001_initial_schema.sql`
+- Create `/crates/loomweave-storage/src/schema.rs`
+- Modify `/crates/loomweave-storage/src/lib.rs` to expose the migration runner
 
 Steps:
 
-- [ ] Transcribe the full schema from [detailed-design.md §3](../../clarion/v0.1/detailed-design.md#3-storage-implementation) into `0001_initial_schema.sql`. Concretely:
+- [ ] Transcribe the full schema from [detailed-design.md §3](../../loomweave/v0.1/detailed-design.md#3-storage-implementation) into `0001_initial_schema.sql`. Concretely:
   - Tables: `entities`, `entity_tags`, `edges`, `findings`, `summary_cache`, `runs`, and `schema_migrations` (meta). Every column, primary key, foreign key, and explicit index as written in §3.
   - Virtual table: `entity_fts` (FTS5, `tokenize = 'porter unicode61'`).
   - Triggers: `entities_ai`, `entities_au`, `entities_ad` keeping `entity_fts` synchronised with `entities`.
@@ -365,14 +365,14 @@ Steps:
   - View: `guidance_sheets` over `entities WHERE kind = 'guidance'`.
   - `PRAGMA foreign_keys = ON` applied at connection open (not in the migration file itself — PRAGMA is connection-scoped and is set in `reader.rs` / `writer.rs` on each open per ADR-011's connection open list).
   - Do not truncate; every table, trigger, generated column, and view ships in Sprint 1 even though only `entities` and `runs` are written.
-- [ ] Write failing integration test at `/crates/clarion-storage/tests/schema_apply.rs` that opens a fresh DB, runs migrations, and asserts:
+- [ ] Write failing integration test at `/crates/loomweave-storage/tests/schema_apply.rs` that opens a fresh DB, runs migrations, and asserts:
   - Every expected table exists via `SELECT name FROM sqlite_master WHERE type='table'`.
   - The FTS5 virtual table `entity_fts` exists and is queryable (`SELECT * FROM entity_fts LIMIT 0`).
   - All three FTS triggers exist via `SELECT name FROM sqlite_master WHERE type='trigger'`.
   - The generated columns round-trip: insert an entity with a `properties` JSON containing `priority`, `SELECT priority FROM entities` returns the extracted value. _Post-Sprint-1 note: per ADR-024 the test now uses `scope_level`/`scope_rank` instead of `priority`._
   - The `guidance_sheets` view exists and is queryable.
   - Idempotency: running migrations twice does not fail.
-- [ ] Run `cargo test -p clarion-storage schema_apply`; expect failures referencing missing `apply_migrations()`.
+- [ ] Run `cargo test -p loomweave-storage schema_apply`; expect failures referencing missing `apply_migrations()`.
 - [ ] Implement `schema.rs` with `pub fn apply_migrations(conn: &Connection) -> Result<()>` that reads files from `migrations/` in lexical order, skips those already in `schema_migrations`, and records each successful apply.
 - [ ] Run the integration test; expect pass.
 - [ ] Commit: `feat(wp1): L1 SQLite schema migration framework`.
@@ -380,45 +380,45 @@ Steps:
 ### Task 4 — Reader pool
 
 **Files**:
-- Create `/crates/clarion-storage/src/reader.rs`
-- Modify `/crates/clarion-storage/src/lib.rs` to export `ReaderPool`
+- Create `/crates/loomweave-storage/src/reader.rs`
+- Modify `/crates/loomweave-storage/src/lib.rs` to export `ReaderPool`
 
 Steps:
 
 - [ ] Write failing `#[tokio::test]` integration test: open a DB, apply migrations, construct `ReaderPool::new(path, max_size=2)`, acquire two readers concurrently via `tokio::join!`, each runs a trivial `SELECT 1` without blocking the other.
-- [ ] Run `cargo test -p clarion-storage reader`; expect failure.
+- [ ] Run `cargo test -p loomweave-storage reader`; expect failure.
 - [ ] Implement `ReaderPool` as a thin wrapper around `deadpool-sqlite` (per ADR-011) with `max_size` default 16 (ADR-011 §Reader pool). Readers are opened with `OpenFlags::SQLITE_OPEN_READ_ONLY` and the ADR-011 PRAGMAs applied on each open via the pool's `Manager::post_create` hook.
 - [ ] Run the test; expect pass.
 - [ ] Commit: `feat(wp1): reader pool for concurrent read connections`.
 
-### Task 5 — `clarion install` subcommand
+### Task 5 — `loomweave install` subcommand
 
 **Files**:
-- Create `/crates/clarion-cli/src/install.rs`
-- Modify `/crates/clarion-cli/src/main.rs` for clap subcommand wiring
+- Create `/crates/loomweave-cli/src/install.rs`
+- Modify `/crates/loomweave-cli/src/main.rs` for clap subcommand wiring
 
 Steps:
 
-- [ ] Write failing integration test at `/crates/clarion-cli/tests/install.rs` using `assert_cmd`: run `clarion install` in a tempdir; assert `.clarion/clarion.db` exists, `.clarion/config.json` exists with `{"schema_version": 1}`, `.clarion/.gitignore` exists with expected rules (UQ-WP1-04 resolution), **`<project>/clarion.yaml`** (project root, not `.clarion/`; per [detailed-design.md §File layout](../../clarion/v0.1/detailed-design.md#file-layout) and [system-design.md §Config resolution](../../clarion/v0.1/system-design.md#config-resolution)) exists with stub content, and `schema_migrations` row count = 1.
+- [ ] Write failing integration test at `/crates/loomweave-cli/tests/install.rs` using `assert_cmd`: run `loomweave install` in a tempdir; assert `.loomweave/loomweave.db` exists, `.loomweave/config.json` exists with `{"schema_version": 1}`, `.loomweave/.gitignore` exists with expected rules (UQ-WP1-04 resolution), **`<project>/loomweave.yaml`** (project root, not `.loomweave/`; per [detailed-design.md §File layout](../../loomweave/v0.1/detailed-design.md#file-layout) and [system-design.md §Config resolution](../../loomweave/v0.1/system-design.md#config-resolution)) exists with stub content, and `schema_migrations` row count = 1.
 - [ ] Second test: running `install` twice in the same dir without `--force` returns a non-zero exit and a clear error message referencing `--force`.
 - [ ] Run tests; expect failure.
 - [ ] Implement `install.rs`:
-  - Refuse if `.clarion/` already exists (UQ-WP1-08).
-  - Create `.clarion/` directory.
+  - Refuse if `.loomweave/` already exists (UQ-WP1-08).
+  - Create `.loomweave/` directory.
   - Open fresh DB and apply migrations.
-  - Write `.clarion/config.json` with the internal-state stub (`{"schema_version": 1, "last_run_id": null}`).
-  - Write **`clarion.yaml` at the project root** (not inside `.clarion/`) — a comment-only stub noting "config TBD, see v0.1 design". This matches detailed-design §File layout: `.clarion/` holds internal state; `clarion.yaml` is a user-edited config that lives beside the user's source.
-  - Write `.clarion/.gitignore` with the UQ-WP1-04 rules.
+  - Write `.loomweave/config.json` with the internal-state stub (`{"schema_version": 1, "last_run_id": null}`).
+  - Write **`loomweave.yaml` at the project root** (not inside `.loomweave/`) — a comment-only stub noting "config TBD, see v0.1 design". This matches detailed-design §File layout: `.loomweave/` holds internal state; `loomweave.yaml` is a user-edited config that lives beside the user's source.
+  - Write `.loomweave/.gitignore` with the UQ-WP1-04 rules.
 - [ ] Author ADR-005 as a side effect of this task — short doc recording the `.gitignore` decision. Commit ADR-005 alongside this task.
 - [ ] Run tests; expect pass.
-- [ ] Commit: `feat(wp1): clarion install subcommand; author ADR-005`.
+- [ ] Commit: `feat(wp1): loomweave install subcommand; author ADR-005`.
 
 ### Task 6 — Writer-actor (L3)
 
 **Files**:
-- Create `/crates/clarion-storage/src/commands.rs`
-- Create `/crates/clarion-storage/src/writer.rs`
-- Modify `/crates/clarion-storage/src/lib.rs` to export `Writer` and `WriterCmd`
+- Create `/crates/loomweave-storage/src/commands.rs`
+- Create `/crates/loomweave-storage/src/writer.rs`
+- Modify `/crates/loomweave-storage/src/lib.rs` to export `Writer` and `WriterCmd`
 
 Steps:
 
@@ -435,53 +435,53 @@ Steps:
 - [ ] Run tests; expect pass.
 - [ ] Commit: `feat(wp1): L3 writer-actor (tokio::task) with per-N transaction batch`.
 
-### Task 7 — `clarion analyze` skeleton (no plugin)
+### Task 7 — `loomweave analyze` skeleton (no plugin)
 
 **Files**:
-- Create `/crates/clarion-cli/src/analyze.rs`
-- Modify `/crates/clarion-cli/src/main.rs` for subcommand wiring
+- Create `/crates/loomweave-cli/src/analyze.rs`
+- Modify `/crates/loomweave-cli/src/main.rs` for subcommand wiring
 
 Steps:
 
-- [ ] Write failing integration test: `clarion install` in tempdir, `clarion analyze .`, assert exit code 0, assert a row exists in `runs` with status `skipped_no_plugins`, assert no entities persisted.
+- [ ] Write failing integration test: `loomweave install` in tempdir, `loomweave analyze .`, assert exit code 0, assert a row exists in `runs` with status `skipped_no_plugins`, assert no entities persisted.
 - [ ] Run test; expect failure.
 - [ ] Implement `analyze.rs`:
-  - Resolve `.clarion/` (error if missing, naming `clarion install`).
+  - Resolve `.loomweave/` (error if missing, naming `loomweave install`).
   - Open DB, reader pool, writer.
   - `BeginRun` → `CommitRun` immediately with status `skipped_no_plugins`. Log a `tracing::info!` message "no plugins registered (WP2 will wire this)".
 - [ ] Run test; expect pass.
-- [ ] Commit: `feat(wp1): clarion analyze skeleton (plugin wiring deferred to WP2)`.
+- [ ] Commit: `feat(wp1): loomweave analyze skeleton (plugin wiring deferred to WP2)`.
 
 ### Task 8 — LlmProvider trait stub
 
 **Files**:
-- Create `/crates/clarion-core/src/llm_provider.rs`
-- Modify `/crates/clarion-core/src/lib.rs` to re-export
+- Create `/crates/loomweave-core/src/llm_provider.rs`
+- Modify `/crates/loomweave-core/src/lib.rs` to re-export
 
 Steps:
 
 - [ ] Define `pub trait LlmProvider { fn name(&self) -> &str; }` — intentionally trivial; WP6 fills it out. Provide a `NoopProvider` unit struct that panics if `name()` is called (guard: nothing in Sprint 1 should call it).
 - [ ] Add a unit test that asserts the trait compiles and `NoopProvider` implements it.
-- [ ] `cargo test -p clarion-core`.
+- [ ] `cargo test -p loomweave-core`.
 - [ ] Commit: `feat(wp1): LlmProvider trait stub for WP6`.
 
 ### Task 9 — End-to-end WP1 smoke test
 
 **Files**:
-- Create `/crates/clarion-cli/tests/wp1_e2e.rs`
+- Create `/crates/loomweave-cli/tests/wp1_e2e.rs`
 
 Steps:
 
-- [ ] Integration test that runs the full Sprint 1 WP1 slice: `clarion install` in tempdir, `clarion analyze .`, then open the DB with `rusqlite` directly and assert schema version, run count, and entity count (0 entities, 1 run with `skipped_no_plugins` status).
+- [ ] Integration test that runs the full Sprint 1 WP1 slice: `loomweave install` in tempdir, `loomweave analyze .`, then open the DB with `rusqlite` directly and assert schema version, run count, and entity count (0 entities, 1 run with `skipped_no_plugins` status).
 - [ ] Run; expect pass.
 - [ ] Commit: `test(wp1): end-to-end smoke test`.
 
 ## 7. ADR triggers
 
-- **ADR-005** (`.clarion/` git-committable subpaths) — **authored during Task 5**.
+- **ADR-005** (`.loomweave/` git-committable subpaths) — **authored during Task 5**.
   Sprint 1 must decide which subpaths land in `.gitignore` (see UQ-WP1-04); writing
   the decision down is the act of authoring ADR-005. The ADR file lives at
-  [`../../clarion/adr/ADR-005-clarion-dir-tracking.md`](../../clarion/adr/) and is
+  [`../../loomweave/adr/ADR-005-loomweave-dir-tracking.md`](../../loomweave/adr/) and is
   moved from backlog to Accepted in the ADR index.
 
 ## 8. Exit criteria
@@ -495,7 +495,7 @@ WP1 is done for Sprint 1 when **all** of the following hold:
 - `cargo deny check` passes (ADR-023 gate; license allowlist + advisories + bans + sources all green).
 - `cargo doc --no-deps --all-features` builds without warnings (ADR-023 gate).
 - **GitHub Actions CI green** on the WP1 PR across all five jobs (fmt, clippy, nextest, doc, deny) (ADR-023 gate).
-- `clarion install && clarion analyze .` in a fresh tempdir produces the expected
+- `loomweave install && loomweave analyze .` in a fresh tempdir produces the expected
   `skipped_no_plugins` run row with zero entities.
 - L1 (full schema migration `0001`), L2 (`entity_id()` implementation), L3
   (WriterCmd + per-N-batch writer-actor) are each covered by at least one test.

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Guard ADR-024's in-place migration retirement trigger.
 
-Before the first external published build, Clarion may edit migration 0001 in
+Before the first external published build, Loomweave may edit migration 0001 in
 place. After that trigger fires, add:
 
-    crates/clarion-storage/migrations/published_build.txt
+    crates/loomweave-storage/migrations/published_build.txt
 
 with the git ref of the first published build whose 0001 migration must stay
 stable. Once the marker exists, this guard fails if the working tree's 0001
@@ -19,8 +19,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-MIGRATION_PATH = Path("crates/clarion-storage/migrations/0001_initial_schema.sql")
-MARKER_PATH = Path("crates/clarion-storage/migrations/published_build.txt")
+MIGRATION_PATH = Path("crates/loomweave-storage/migrations/0001_initial_schema.sql")
+MARKER_PATH = Path("crates/loomweave-storage/migrations/published_build.txt")
 
 
 class CheckError(Exception):
@@ -96,8 +96,8 @@ def run_self_test() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         git_ok(root, "init", "-q")
-        git_ok(root, "config", "user.email", "clarion-test@example.invalid")
-        git_ok(root, "config", "user.name", "Clarion Test")
+        git_ok(root, "config", "user.email", "loomweave-test@example.invalid")
+        git_ok(root, "config", "user.name", "Loomweave Test")
 
         write(root / MIGRATION_PATH, "initial migration\n")
         git_ok(root, "add", MIGRATION_PATH.as_posix())

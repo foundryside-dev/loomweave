@@ -1,18 +1,18 @@
 {
   "_meta": {
-    "contract": "clarion-http-read-api",
+    "contract": "loomweave-http-read-api",
     "endpoint": "POST /api/v1/files/batch",
     "api_version": 1,
     "fixture_version": 1,
     "stability": "normative",
-    "authority": "Clarion ADR-014 federation registry-backend contract (CONTRACT-1)",
-    "verification": "cargo test -p clarion-cli --test serve",
+    "authority": "Loomweave ADR-014 federation registry-backend contract (CONTRACT-1)",
+    "verification": "cargo test -p loomweave-cli --test serve",
     "normative": true,
     "updated": "2026-05-19",
-    "description": "Contract examples for Clarion bulk file identity resolution consumed by Filigree registry backends. The batch endpoint runs all lookups inside a single ReaderPool checkout; ETag is intentionally not applied; auth (CONTRACT-2) applies."
+    "description": "Contract examples for Loomweave bulk file identity resolution consumed by Filigree registry backends. The batch endpoint runs all lookups inside a single ReaderPool checkout; ETag is intentionally not applied; auth (CONTRACT-2) applies."
   },
   "shape_decl": {
-    "kind": "clarion-http-fixture-shapes",
+    "kind": "loomweave-http-fixture-shapes",
     "shapes": {
       "batch_resolution": {
         "status": 200,

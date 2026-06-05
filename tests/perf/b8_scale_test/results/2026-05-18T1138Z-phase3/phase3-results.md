@@ -2,7 +2,7 @@
 
 Date: 2026-05-18
 
-Corpus: `/tmp/clarion-b8-elspeth-full-20260518T0016Z`
+Corpus: `/tmp/loomweave-b8-elspeth-full-20260518T0016Z`
 
 Reproducibility status: directional historical measurement. The temporary
 corpus path is not committed; see `corpus-provenance.md` and
@@ -14,11 +14,11 @@ Command:
 ```bash
 corpus_dir=$(bash tests/perf/b8_scale_test/derive-elspeth-corpus.sh \
   /path/to/elspeth \
-  /tmp/clarion-b8-elspeth-corpus-$(date -u +%Y%m%dT%H%M%SZ))
-target/release/clarion install --force --path "$corpus_dir"
+  /tmp/loomweave-b8-elspeth-corpus-$(date -u +%Y%m%dT%H%M%SZ))
+target/release/loomweave install --force --path "$corpus_dir"
 python3 tests/perf/b8_scale_test/results/2026-05-18T0114Z/analyze-with-rss.py \
   tests/perf/b8_scale_test/results/2026-05-18T1138Z-phase3/analyze-metrics.json \
-  /home/john/clarion/target/release/clarion analyze \
+  /home/john/loomweave/target/release/loomweave analyze \
   "$corpus_dir"
 ```
 
@@ -44,6 +44,6 @@ Acceptance:
 - RSS overhead: PASS. Whole-run peak RSS is +9.399 MiB relative to the B.8
   baseline, below the 500 MiB limit.
 
-The run emitted `CLA-FACT-CLUSTERING-WEAK-MODULARITY` because the full elspeth
+The run emitted `LMWV-FACT-CLUSTERING-WEAK-MODULARITY` because the full elspeth
 graph modularity score was 0.020884003737243844, below the v0.1 threshold of
 0.3.

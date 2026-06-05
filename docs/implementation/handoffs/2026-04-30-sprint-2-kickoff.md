@@ -1,4 +1,4 @@
-# Clarion Sprint 2 — kickoff handoff
+# Loomweave Sprint 2 — kickoff handoff
 
 This file is the starting prompt for the next Claude Code session that
 opens Sprint 2. Paste it as the user's first message; it is
@@ -11,7 +11,7 @@ continuation of an in-flight branch.
 
 ---
 
-# Begin Clarion Sprint 2 — Tier B (catalog-emitting) + carryover
+# Begin Loomweave Sprint 2 — Tier B (catalog-emitting) + carryover
 
 Sprint 1's walking-skeleton tagged at `v0.1-sprint-1` on 2026-04-28.
 Tier A is fully ticked; nine lock-ins (L1–L9) are ratified. Sprint 2's
@@ -26,7 +26,7 @@ that supersedes the relevant Accepted one rather than editing in place.
 
 ## Working directory + branch
 
-- Directory: `/home/john/clarion`
+- Directory: `/home/john/loomweave`
 - Branch: start a new branch off `main` for Sprint 2 work, e.g.
   `sprint-2/wp4-pipeline` or per-WP branches as you go. The
   `sprint-1/wp2-plugin-host` branch is deleted both locally and on
@@ -36,10 +36,10 @@ that supersedes the relevant Accepted one rather than editing in place.
 
 ## Sprint 1 in one paragraph (so this handoff is self-contained)
 
-`clarion analyze` against a fixture project with a single
+`loomweave analyze` against a fixture project with a single
 `def hello(): ...` Python file persists exactly one entity row,
 `python:function:demo.hello`, with `kind="function"`, into
-`.clarion/clarion.db`. The pipeline is: Rust plugin host (WP2) discovers
+`.loomweave/loomweave.db`. The pipeline is: Rust plugin host (WP2) discovers
 the editable Python plugin (WP3) on `$PATH`, spawns it, completes a
 JSON-RPC handshake, sends one `analyze_file` request, receives one
 entity, and writes it through the writer-actor (WP1). Every stage has
@@ -60,10 +60,10 @@ Mapping to v0.1-plan.md WPs:
 | B.1 — Phase 0 (discovery): multi-file dispatch | WP4 | Pipeline walks the source tree and dispatches one `analyze_file` per matching file per plugin. |
 | B.2 — Python plugin emits classes + module entities | WP3-feature-complete | Extractor lifts beyond functions; ontology manifest updated. |
 | B.3 — Python plugin emits `contains` edges | WP3-feature-complete | Module → function, class → method `contains` relationships emitted. |
-| B.4 — `catalog.json` rendered after analyze | WP4 | File materialised under `.clarion/`; schema per `detailed-design.md` §3. |
-| B.5 — Per-subsystem markdown files | WP4 | Rendered to `.clarion/`; subsystem detection may be naive (single flat subsystem) for Tier B; clustering proper is WP4 Phase 3. |
+| B.4 — `catalog.json` rendered after analyze | WP4 | File materialised under `.loomweave/`; schema per `detailed-design.md` §3. |
+| B.5 — Per-subsystem markdown files | WP4 | Rendered to `.loomweave/`; subsystem detection may be naive (single flat subsystem) for Tier B; clustering proper is WP4 Phase 3. |
 | B.6 — Demo against elspeth-slice fixture | sprint demo | `catalog.json` lists ≥95% of visible Python classes/functions. |
-| B.7 — No Filigree/Wardline changes | invariant | Same rule as Sprint 1; this is still Clarion-internal work. |
+| B.7 — No Filigree/Wardline changes | invariant | Same rule as Sprint 1; this is still Loomweave-internal work. |
 
 **Recommended sequencing** (no flag-day refactors; each step lands a
 working DB row):
@@ -75,7 +75,7 @@ working DB row):
    `plugin.toml` since the entity-kind set changes — bumping is the
    ADR-007 cache-key signal that downstream caches must invalidate.
 3. WP3-feature-complete: `contains` edges (B.3). This is the first
-   edge type Clarion has ever persisted; the writer-actor (WP1) wrote
+   edge type Loomweave has ever persisted; the writer-actor (WP1) wrote
    the schema for it but never exercised it. Watch for L3 surprises.
 4. WP4 Phase 0 + Phase 1: multi-file walk + per-file dispatch (B.1).
    The CLI's `analyze.rs` already does a basic walk — extend it to
@@ -94,10 +94,10 @@ backlog.
 
 `clarion-889200006a` — L7 qualname divergence with Wardline's
 `FingerprintEntry` storage. Wardline stores `(module, qualified_name)`
-as separate fields; Clarion's L7 emits the combined dotted string.
+as separate fields; Loomweave's L7 emits the combined dotted string.
 
-When this fires: WP9 (Loom integrations) attempts the first
-cross-product join. If Sprint 2 stays Clarion-internal (Tier B), this
+When this fires: WP9 (Weft integrations) attempts the first
+cross-product join. If Sprint 2 stays Loomweave-internal (Tier B), this
 ticket can stay deferred — but it's the natural pre-emptive read for
 anyone touching WP9 plans.
 
@@ -107,7 +107,7 @@ Small, well-scoped, in code you've already touched:
 
 - `clarion-5e03cfdd21` — `read_applied_versions` uses `.ok()` and
   swallows DB-locked / corrupt errors. Surface them as `Err`.
-- `clarion-ed5017139f` — `clarion install` leaves a partial `.clarion/`
+- `clarion-ed5017139f` — `loomweave install` leaves a partial `.loomweave/`
   on failure, blocking re-install. Add cleanup or atomic move.
 - `clarion-b5b1029f5a` — `reader_pool` test uses a 100ms sleep to
   assert a second reader is blocked — flaky under load. Replace with a
@@ -151,7 +151,7 @@ locked at `v0.1-sprint-1`. If you want one to change, write an ADR.
 
 ### From WP2 (locked on 2026-04-24)
 
-- **Wire entity shape** (`crates/clarion-core/src/plugin/host.rs:132-154`):
+- **Wire entity shape** (`crates/loomweave-core/src/plugin/host.rs:132-154`):
   ```json
   {
     "id": "...",
@@ -172,7 +172,7 @@ locked at `v0.1-sprint-1`. If you want one to change, write an ADR.
   discovered binary; `[capabilities.runtime].reads_outside_project_root`
   must be `false` (true is rejected at handshake);
   `[ontology].entity_kinds` is the allowlist for emitted entity
-  kinds (host drops unknown kinds with `CLA-INFRA-PLUGIN-UNDECLARED-KIND`).
+  kinds (host drops unknown kinds with `LMWV-INFRA-PLUGIN-UNDECLARED-KIND`).
   When B.2 adds `class` and `module` kinds, both
   `plugin.toml::[ontology].entity_kinds` and the extractor must change
   in lockstep.
@@ -216,7 +216,7 @@ locked at `v0.1-sprint-1`. If you want one to change, write an ADR.
 - **Five Rust gates** on every commit: fmt, clippy `-D warnings`
   (pedantic), nextest, doc `-D warnings`, deny.
   **Critical addition (CI-only)**: `cargo build --workspace --bins`
-  must run before `cargo nextest run` so `clarion-plugin-fixture` is
+  must run before `cargo nextest run` so `loomweave-plugin-fixture` is
   on disk for `wp2_e2e` integration tests (commit `be7fa60`).
 - **Four Python gates**: ruff check, ruff format check,
   `mypy --strict`, pytest. ruff config has pragmatic excludes for
@@ -231,7 +231,7 @@ locked at `v0.1-sprint-1`. If you want one to change, write an ADR.
   `ruff-pre-commit@v0.15.11` and `mirrors-mypy@v1.20.2`.
 - **CI walking-skeleton job** runs
   `tests/e2e/sprint_1_walking_skeleton.sh`. Test scripts that need
-  `clarion analyze` to succeed must scrub `$PATH` (the runner has
+  `loomweave analyze` to succeed must scrub `$PATH` (the runner has
   world-writable dirs that trip WP2's discovery refusal — see commits
   `7c0e396` for the refusal and `be7fa60` for the test-side fix).
 

@@ -2,7 +2,7 @@
 
 ## Security Posture Summary
 
-Clarion has a credible local-first security posture: it treats plugins as
+Loomweave has a credible local-first security posture: it treats plugins as
 untrusted subprocesses, scans source before LLM exposure, constrains HTTP read
 access, and keeps sibling products optional. The main security risks are local
 implementation choices that need discipline: hand-rolled HMAC, unauthenticated
@@ -13,8 +13,8 @@ inherent in canonicalization-based path jails.
 
 | Boundary | Control |
 |---|---|
-| Target repository to Clarion | Secret scanning before ingest; path normalization; ignore handling; briefing-blocked file semantics. |
-| Clarion host to plugin subprocess | Content-Length JSON-RPC; manifest validation; executable basename validation; frame caps; path jail; field caps; Linux process limits. |
+| Target repository to Loomweave | Secret scanning before ingest; path normalization; ignore handling; briefing-blocked file semantics. |
+| Loomweave host to plugin subprocess | Content-Length JSON-RPC; manifest validation; executable basename validation; frame caps; path jail; field caps; Linux process limits. |
 | Plugin output to storage | Entity/edge validation; reserved core ontology enforcement; malformed outputs become findings or breaker conditions. |
 | Storage to MCP/HTTP | Typed query helpers; closed envelopes; traversal/path protections; briefing-blocked non-disclosure. |
 | MCP to external LLM provider | Live-provider opt-in; source-hash checks; excerpt/range limiting; token budget; cache accounting. |
@@ -36,7 +36,7 @@ inherent in canonicalization-based path jails.
 
 ### Hand-Rolled HTTP HMAC
 
-`crates/clarion-cli/src/http_read.rs` implements HMAC behavior locally with
+`crates/loomweave-cli/src/http_read.rs` implements HMAC behavior locally with
 `sha2`. This increases review burden. The length-mismatch fast return in
 constant-time comparison is probably not catastrophic if request parsing and
 exact-length signatures are enforced, but the code should be treated as
@@ -67,7 +67,7 @@ The path jail relies on canonicalization. The source explicitly acknowledges a
 race between proof and later open.
 
 **Recommendation:** acceptable for local-first RC1 if documented, but revisit
-if Clarion is ever exposed to hostile multi-user repositories or remote read
+if Loomweave is ever exposed to hostile multi-user repositories or remote read
 surfaces.
 
 ### LLM Empty Excerpt Behavior

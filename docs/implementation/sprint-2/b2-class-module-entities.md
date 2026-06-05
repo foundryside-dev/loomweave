@@ -1,8 +1,8 @@
 # B.2 — Python plugin: class + module entity emission (Sprint 2 / WP3 feature-complete subset)
 
 **Status**: DRAFT — Sprint 2 Tier-B B.2 work-package design
-**Anchoring design**: [detailed-design.md §1 (Plugin implementation — Python specifics)](../../clarion/v0.1/detailed-design.md#1-plugin-implementation-detail), [system-design.md §6 (Guidance composition; clustering)](../../clarion/v0.1/system-design.md#6-guidance-system)
-**Accepted ADRs**: [ADR-007](../../clarion/adr/ADR-007-summary-cache-key.md), [ADR-018](../../clarion/adr/ADR-018-identity-reconciliation.md), [ADR-021](../../clarion/adr/ADR-021-plugin-authority-hybrid.md), [ADR-022](../../clarion/adr/ADR-022-core-plugin-ontology.md), [ADR-023](../../clarion/adr/ADR-023-tooling-baseline.md)
+**Anchoring design**: [detailed-design.md §1 (Plugin implementation — Python specifics)](../../loomweave/v0.1/detailed-design.md#1-plugin-implementation-detail), [system-design.md §6 (Guidance composition; clustering)](../../loomweave/v0.1/system-design.md#6-guidance-system)
+**Accepted ADRs**: [ADR-007](../../loomweave/adr/ADR-007-summary-cache-key.md), [ADR-018](../../loomweave/adr/ADR-018-identity-reconciliation.md), [ADR-021](../../loomweave/adr/ADR-021-plugin-authority-hybrid.md), [ADR-022](../../loomweave/adr/ADR-022-core-plugin-ontology.md), [ADR-023](../../loomweave/adr/ADR-023-tooling-baseline.md)
 **Predecessor**: [WP3 Sprint-1 baseline](../sprint-1/wp3-python-plugin.md) (function-only extraction)
 **Successor**: B.3 — `contains` edges (planned)
 **Sprint-2 kickoff handoff**: [`docs/superpowers/handoffs/2026-04-30-sprint-2-kickoff.md`](../handoffs/2026-04-30-sprint-2-kickoff.md) §"What's in scope for Sprint 2" Tier B row B.2
@@ -23,20 +23,20 @@ B.2 extends the Python plugin to emit two additional entity kinds beyond Sprint 
 - Imports, calls, decorated_by, inherits_from edges (later WP3-feature-complete sprints).
 - `package` entity kind (later — requires multi-file context the per-file `analyze_file` RPC doesn't carry).
 - `decorator`, `global`, `protocol`, `enum`, `typed_dict`, `type_alias` entity kinds (later).
-- All `CLA-PY-*` findings including `CLA-PY-SYNTAX-ERROR` (the `parse_status` property is set on the module entity; the matching finding emission lands when WP4's finding pipeline activates).
+- All `LMWV-PY-*` findings including `LMWV-PY-SYNTAX-ERROR` (the `parse_status` property is set on the module entity; the matching finding emission lands when WP4's finding pipeline activates).
 
 ## 2. Locked surfaces from Sprint 1 (B.2 reads and writes against these)
 
 These are caller-observable surfaces locked at `v0.1-sprint-1` close. B.2 must not change them; if a change is genuinely needed, write an ADR amendment per the kickoff-handoff convention.
 
-- **Wire shape** (`crates/clarion-core/src/plugin/host.rs:132-154`): `RawEntity { id, kind, qualified_name, source: RawSource, extra }` with `#[serde(flatten)] extra`. `RawSource { file_path, extra }` likewise. New top-level fields ride through `extra` non-breakingly.
+- **Wire shape** (`crates/loomweave-core/src/plugin/host.rs:132-154`): `RawEntity { id, kind, qualified_name, source: RawSource, extra }` with `#[serde(flatten)] extra`. `RawSource { file_path, extra }` likewise. New top-level fields ride through `extra` non-breakingly.
 - **L7 qualname format**: `{dotted_module}.{__qualname__}`. `<locals>` marker only at function-parent boundaries. `module_dotted_name` strips `src/` prefix, drops `.py`, collapses `pkg/__init__.py` → `pkg`.
 - **L4 JSON-RPC method set**: `initialize`, `initialized`, `analyze_file`, `shutdown`, `exit`. B.2 changes none of these.
 - **L5 manifest schema**: B.2 amends only `[ontology].entity_kinds` (adds `"class"`, `"module"`) and `[ontology].ontology_version` (`0.1.0` → `0.2.0`). No structural change.
 - **L8 Wardline pin**: unchanged.
 - **`extract()` signature** (`extractor.py:86-99`): `extract(source: str, file_path: str, *, module_prefix_path: str | None = None) -> list[dict[str, Any]]`. B.2 keeps the signature; the return-type annotation tightens to a `TypedDict` form (see §4).
 - **`ServerState`** (`server.py:60-66`): unchanged.
-- **`ONTOLOGY_VERSION` constant** in `server.py`: bumps `0.1.0` → `0.2.0` in lockstep with `plugin.toml::ontology_version`. The bump is the L5 handshake-validation signal that the entity-kind set has shifted; **note that ADR-007's summary-cache key is the 5-tuple `(entity_id, content_hash, prompt_template_id, model_tier, guidance_fingerprint)` and `ontology_version` is NOT a cache-key component** (this corrects an imprecise framing in the kickoff handoff — verified at `docs/clarion/adr/ADR-007-summary-cache-key.md:10`). Cache invalidation when the kind set expands happens organically: new module/class entity_ids miss the cache by component-1 of the 5-tuple.
+- **`ONTOLOGY_VERSION` constant** in `server.py`: bumps `0.1.0` → `0.2.0` in lockstep with `plugin.toml::ontology_version`. The bump is the L5 handshake-validation signal that the entity-kind set has shifted; **note that ADR-007's summary-cache key is the 5-tuple `(entity_id, content_hash, prompt_template_id, model_tier, guidance_fingerprint)` and `ontology_version` is NOT a cache-key component** (this corrects an imprecise framing in the kickoff handoff — verified at `docs/loomweave/adr/ADR-007-summary-cache-key.md:10`). Cache invalidation when the kind set expands happens organically: new module/class entity_ids miss the cache by component-1 of the 5-tuple.
 
 ## 3. Design decisions (Q1–Q4 panel-resolved)
 
@@ -50,7 +50,7 @@ Each design decision below was taken to a five-reviewer panel (systems thinker, 
 - Module is `leaf: false` in the kind catalogue (`detailed-design.md:74`) — a structural container tied to *files*, not content. Suppressing module entities for empty / broken files would break referential integrity for B.3's `contains` edges (every function/class entity must contain into a module entity that exists) and force B.4 catalog rendering and B.5 per-subsystem markdown to write defensive null-parent guards.
 - An empty `__init__.py` is a load-bearing Python semantic artifact (package marker). Omitting it from the catalog passes verification but fails validation (the user asks "what packages exist?" and gets a wrong answer).
 - Syntax-error files are exactly what an archaeologist most needs to see ("why is this file broken?"). The `parse_status` property keeps the truth honest without dropping the entity.
-- Top-level `__init__.py` would crash the entity-ID assembler (`crates/clarion-core/src/entity_id.rs:97-101` rejects empty `canonical_qualified_name`). Skipping with a stderr line matches the existing syntax-error posture (`extractor.py:103-106`).
+- Top-level `__init__.py` would crash the entity-ID assembler (`crates/loomweave-core/src/entity_id.rs:97-101` rejects empty `canonical_qualified_name`). Skipping with a stderr line matches the existing syntax-error posture (`extractor.py:103-106`).
 
 **Supersedes**: UQ-WP3-11 (`wp3-python-plugin.md:322-327` — "empty `.py` file → empty entities array"). UQ-WP3-11 was scoped to *function* extraction at Sprint-1 close. B.2 introduces module as a new kind; for module entities specifically, the always-emit policy applies. The function-extraction part of UQ-WP3-11 still holds: an empty file produces zero *function* entities.
 
@@ -143,8 +143,8 @@ In a single commit:
 | File | Change |
 |---|---|
 | `plugins/python/plugin.toml` | `[ontology].entity_kinds = ["function", "class", "module"]`; `[ontology].ontology_version = "0.2.0"` |
-| `plugins/python/src/clarion_plugin_python/server.py` | `ONTOLOGY_VERSION = "0.2.0"` |
-| `plugins/python/src/clarion_plugin_python/__init__.py` | bump `__version__` (the package version) — separate decision; see §10 |
+| `plugins/python/src/loomweave_plugin_python/server.py` | `ONTOLOGY_VERSION = "0.2.0"` |
+| `plugins/python/src/loomweave_plugin_python/__init__.py` | bump `__version__` (the package version) — separate decision; see §10 |
 
 **Lint guard suggestion** (from Python-engineer review): a small shell assertion in the CI `python-plugin` job that greps `[ontology].ontology_version` from `plugin.toml` and `ONTOLOGY_VERSION = "..."` from `server.py` and fails if they disagree. Out of scope for B.2 itself but worth filing as a follow-up.
 
@@ -180,7 +180,7 @@ New test in `test_extractor.py` for the helper:
 
 ### Integration tests
 
-- `crates/clarion-core/tests/wp2_e2e_*.rs` — host-side: a fixture file with `def hello():` and `class Foo:` produces three entities (one module, one function, one class) with the right kinds and IDs. The existing `wp2_e2e_smoke_fixture_plugin_round_trip` test will need updating; the test should assert on entity-kinds-set rather than exact count.
+- `crates/loomweave-core/tests/wp2_e2e_*.rs` — host-side: a fixture file with `def hello():` and `class Foo:` produces three entities (one module, one function, one class) with the right kinds and IDs. The existing `wp2_e2e_smoke_fixture_plugin_round_trip` test will need updating; the test should assert on entity-kinds-set rather than exact count.
 
 ### End-to-end
 
@@ -196,7 +196,7 @@ Grow with module + class rows for byte-for-byte parity:
 - `python:class:pkg.mod.Foo.Bar` (nested class).
 - `python:class:pkg.mod.f.<locals>.C` (class-in-function).
 
-Both `crates/clarion-core/src/entity_id.rs::tests::shared_fixture_byte_for_byte_parity` and `plugins/python/tests/test_entity_id.py::test_matches_shared_fixture` consume the same file; divergence fails CI on both sides.
+Both `crates/loomweave-core/src/entity_id.rs::tests::shared_fixture_byte_for_byte_parity` and `plugins/python/tests/test_entity_id.py::test_matches_shared_fixture` consume the same file; divergence fails CI on both sides.
 
 ### Round-trip self-test
 
@@ -210,7 +210,7 @@ class_entities = [e for e in entities if e["kind"] == "class"]
 # Invariants — no exact totals (those become merge-conflict generators).
 assert len(module_entities) == 1, "exactly one module entity per analyzed file"
 assert all(e["source"]["file_path"] == str(target) for e in entities)
-assert any(e["qualified_name"] == "clarion_plugin_python.extractor.extract" for e in function_entities)
+assert any(e["qualified_name"] == "loomweave_plugin_python.extractor.extract" for e in function_entities)
 ```
 
 ## 7. Implementation task ledger
@@ -218,7 +218,7 @@ assert any(e["qualified_name"] == "clarion_plugin_python.extractor.extract" for 
 ### Task 1 — TypedDict shapes for `RawEntity` + `_build_module_entity`
 
 Files:
-- Modify `plugins/python/src/clarion_plugin_python/extractor.py` — add TypedDict imports, define `SourceRange`/`EntitySource`/`RawEntity`, change `extract` return annotation, add `_module_source_range` helper, add `_build_module_entity`.
+- Modify `plugins/python/src/loomweave_plugin_python/extractor.py` — add TypedDict imports, define `SourceRange`/`EntitySource`/`RawEntity`, change `extract` return annotation, add `_module_source_range` helper, add `_build_module_entity`.
 
 Steps:
 - Failing test: `test_module_source_range_no_trailing_newline`.
@@ -235,7 +235,7 @@ Steps:
 ### Task 2 — Per-kind builder split + `_build_class_entity`
 
 Files:
-- Modify `plugins/python/src/clarion_plugin_python/extractor.py` — rename `_build_entity` → `_build_function_entity`; add `_build_class_entity`; switch `_walk` to `match` dispatch; remove `_KIND` module-level constant.
+- Modify `plugins/python/src/loomweave_plugin_python/extractor.py` — rename `_build_entity` → `_build_function_entity`; add `_build_class_entity`; switch `_walk` to `match` dispatch; remove `_KIND` module-level constant.
 
 Steps:
 - Failing test: `test_class_entity_simple`.
@@ -251,7 +251,7 @@ Steps:
 
 Files:
 - Modify `plugins/python/plugin.toml`.
-- Modify `plugins/python/src/clarion_plugin_python/server.py`.
+- Modify `plugins/python/src/loomweave_plugin_python/server.py`.
 
 Steps:
 - Update `plugin.toml::[ontology].entity_kinds` to `["function", "class", "module"]`; `ontology_version` to `"0.2.0"`.
@@ -266,7 +266,7 @@ Files:
 
 Steps:
 - Add module + class fixture rows.
-- Run `cargo nextest run -p clarion-core entity_id::tests::shared_fixture_byte_for_byte_parity`.
+- Run `cargo nextest run -p loomweave-core entity_id::tests::shared_fixture_byte_for_byte_parity`.
 - Run `pytest plugins/python/tests/test_entity_id.py::test_matches_shared_fixture`.
 - Both green.
 - Commit: `test(wp3): cross-language fixture parity for class + module entities (B.2)`.
@@ -329,8 +329,8 @@ B.2 is done for Sprint 2 when all of:
 
 ## 10. Implementation-phase decisions (resolved post-spec-review)
 
-- **`__version__` package bump**: `clarion_plugin_python.__version__` moves from `0.1.0` to `0.1.1` (patch). The package version tracks code releases; the ontology version tracks declared kind set. They are different concepts — no breaking API change ships in B.2, so the patch bump is correct.
-- **Top-level `__init__.py` skip — stderr line wording**: `clarion-plugin-python: skipping <path>: top-level __init__.py has no package name\n`. Matches the existing syntax-error skip convention at `extractor.py:103-106` (`clarion-plugin-python: skipping <path>: <reason>\n`).
+- **`__version__` package bump**: `loomweave_plugin_python.__version__` moves from `0.1.0` to `0.1.1` (patch). The package version tracks code releases; the ontology version tracks declared kind set. They are different concepts — no breaking API change ships in B.2, so the patch bump is correct.
+- **Top-level `__init__.py` skip — stderr line wording**: `loomweave-plugin-python: skipping <path>: top-level __init__.py has no package name\n`. Matches the existing syntax-error skip convention at `extractor.py:103-106` (`loomweave-plugin-python: skipping <path>: <reason>\n`).
 - **Lint guard for ontology-version drift**: deferred as a follow-up — filigree [`clarion-8befae708b`](../../../.filigree/) (P3 task; not blocking B.2). B.2 ships with the two values agreeing by inspection; the lint guard is risk insurance against future drift.
 
 ## 11. Panel-review record

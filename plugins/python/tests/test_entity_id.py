@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from clarion_plugin_python.entity_id import (
+from loomweave_plugin_python.entity_id import (
     EmptySegmentError,
     GrammarViolationError,
     SegmentContainsColonError,
@@ -101,7 +101,7 @@ def test_matches_shared_fixture() -> None:
     """UQ-WP3-08: byte-for-byte L2 parity with the Rust assembler.
 
     The same ``fixtures/entity_id.json`` is consumed by
-    ``crates/clarion-core/src/entity_id.rs::tests::shared_fixture_byte_for_byte_parity``.
+    ``crates/loomweave-core/src/entity_id.rs::tests::shared_fixture_byte_for_byte_parity``.
     If this test or the Rust test disagrees on any row, the ID scheme has
     drifted between languages — the cross-product identity join (ADR-018)
     would break silently. CI fails both sides in lockstep.

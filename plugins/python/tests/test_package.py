@@ -6,8 +6,8 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-import clarion_plugin_python
-from clarion_plugin_python.wardline_descriptor import EXPECTED_DESCRIPTOR_VERSION
+import loomweave_plugin_python
+from loomweave_plugin_python.wardline_descriptor import EXPECTED_DESCRIPTOR_VERSION
 
 _PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 
@@ -17,7 +17,7 @@ def _read_toml(path: Path) -> dict[str, Any]:
 
 
 def test_package_version_matches_pyproject() -> None:
-    assert clarion_plugin_python.__version__ == "1.3.0"
+    assert loomweave_plugin_python.__version__ == "1.0.0"
 
 
 def test_plugin_version_lockstep_across_pyproject_manifest_and_module() -> None:
@@ -31,7 +31,7 @@ def test_plugin_version_lockstep_across_pyproject_manifest_and_module() -> None:
 
     pyproject_version = pyproject["project"]["version"]
     manifest_version = manifest["plugin"]["version"]
-    module_version = clarion_plugin_python.__version__
+    module_version = loomweave_plugin_python.__version__
 
     assert pyproject_version == manifest_version == module_version, (
         f"version drift: pyproject={pyproject_version!r}, "
@@ -42,7 +42,7 @@ def test_plugin_version_lockstep_across_pyproject_manifest_and_module() -> None:
 def test_manifest_declares_current_v1_ontology_only() -> None:
     manifest = _read_toml(_PLUGIN_ROOT / "plugin.toml")
 
-    assert manifest["plugin"]["version"] == "1.3.0"
+    assert manifest["plugin"]["version"] == "1.0.0"
     assert manifest["capabilities"]["runtime"]["wardline_aware"] is True
     assert manifest["integrations"]["wardline"]["expected_descriptor_version"] == (
         EXPECTED_DESCRIPTOR_VERSION

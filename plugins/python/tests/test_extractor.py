@@ -11,8 +11,8 @@ from typing import TYPE_CHECKING, Literal, cast
 
 import pytest
 
-from clarion_plugin_python.call_resolver import CallResolutionResult
-from clarion_plugin_python.extractor import (
+from loomweave_plugin_python.call_resolver import CallResolutionResult
+from loomweave_plugin_python.extractor import (
     ExtractResult,
     ImportsEdgeProperties,
     RawEdge,
@@ -21,9 +21,9 @@ from clarion_plugin_python.extractor import (
     extract_with_stats,
     module_dotted_name,
 )
-from clarion_plugin_python.pyright_session import PyrightSession
-from clarion_plugin_python.reference_resolver import ReferenceResolutionResult, ReferenceSite
-from clarion_plugin_python.wardline_descriptor import DescriptorEntry, WardlineVocabulary
+from loomweave_plugin_python.pyright_session import PyrightSession
+from loomweave_plugin_python.reference_resolver import ReferenceResolutionResult, ReferenceSite
+from loomweave_plugin_python.wardline_descriptor import DescriptorEntry, WardlineVocabulary
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -94,7 +94,7 @@ def pyright_langserver() -> str:
     if resolved is None:
         pytest.fail(
             "pyright-langserver not found on PATH or in the active virtualenv. "
-            "It is a hard runtime dependency of clarion-plugin-python "
+            "It is a hard runtime dependency of loomweave-plugin-python "
             "(pyproject.toml `dependencies`); a missing executable means the "
             "install is broken. Skipping these tests would mask a regression.",
         )
@@ -1021,13 +1021,13 @@ def _wardline_vocabulary(
 
 def test_wardline_vocabulary_attaches_decorator_metadata_and_tags() -> None:
     source = """\
-from loom_markers import external_boundary, trust_boundary, trusted
+from weft_markers import external_boundary, trust_boundary, trusted
 
 @external_boundary
 def read_body():
     return ""
 
-@loom_markers.trust_boundary(to_level="ASSURED")
+@weft_markers.trust_boundary(to_level="ASSURED")
 @trusted(level="INTEGRAL")
 class Sanitizer:
     pass
@@ -1057,7 +1057,7 @@ class Sanitizer:
     assert sanitizer["wardline"]["decorators"] == [
         {
             "canonical_name": "trust_boundary",
-            "qualified_name": "loom_markers.trust_boundary",
+            "qualified_name": "weft_markers.trust_boundary",
             "group": 1,
             "attrs": {"_wardline_to_level": "TaintState"},
             "line": 7,
@@ -1200,7 +1200,7 @@ def test_top_level_init_py_skipped_with_stderr(
 
     `module_dotted_name("__init__.py")` returns "" (the empty stem case).
     Emitting an entity with empty qualified_name would crash the entity-ID
-    assembler at crates/clarion-core/src/entity_id.rs:97-101.
+    assembler at crates/loomweave-core/src/entity_id.rs:97-101.
     """
     entities, _ = extract("def helper():\n    pass\n", "__init__.py")
     assert entities == []

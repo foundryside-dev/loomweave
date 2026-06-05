@@ -1,9 +1,9 @@
-# Clarion Comprehensive Read-Only Audit
+# Loomweave Comprehensive Read-Only Audit
 
 Date: 2026-06-04
-Repository: `/home/john/clarion`
+Repository: `/home/john/loomweave`
 Branch observed: `ws6-guidance-maturity` ahead of `origin/ws6-guidance-maturity` by 2
-Dirty state observed: untracked `.clarion/clarion.lock`
+Dirty state observed: untracked `.loomweave/loomweave.lock`
 
 ## Method
 
@@ -43,9 +43,9 @@ None found in the completed read-only audit.
 Severity: High
 
 Locations:
-- [host.rs](/home/john/clarion/crates/clarion-core/src/plugin/host.rs:978), lines 978-1087
-- [limits.rs](/home/john/clarion/crates/clarion-core/src/plugin/limits.rs:109), lines 109-130
-- [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:3478), lines 3478-3569
+- [host.rs](/home/john/loomweave/crates/loomweave-core/src/plugin/host.rs:978), lines 978-1087
+- [limits.rs](/home/john/loomweave/crates/loomweave-core/src/plugin/limits.rs:109), lines 109-130
+- [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:3478), lines 3478-3569
 
 Evidence: `EntityCountCap` documents ADR-021 as a combined cap for entities,
 edges, and findings. The host calls `try_admit(1)` only in the entity loop, then
@@ -69,16 +69,16 @@ persisting the excess items.
 Severity: High
 
 Locations:
-- [host.rs](/home/john/clarion/crates/clarion-core/src/plugin/host.rs:48), lines 48-59
-- [host.rs](/home/john/clarion/crates/clarion-core/src/plugin/host.rs:594), lines 594-610
-- [limits.rs](/home/john/clarion/crates/clarion-core/src/plugin/limits.rs:301), lines 301-326
+- [host.rs](/home/john/loomweave/crates/loomweave-core/src/plugin/host.rs:48), lines 48-59
+- [host.rs](/home/john/loomweave/crates/loomweave-core/src/plugin/host.rs:594), lines 594-610
+- [limits.rs](/home/john/loomweave/crates/loomweave-core/src/plugin/limits.rs:301), lines 301-326
 
 Evidence: The `pre_exec` block is compiled for Linux or macOS, but `host.rs`
 imports several limit symbols only on Linux and `effective_max_nproc` is compiled
 only for Linux/tests. The macOS path therefore appears to reference symbols that
 are not imported or defined.
 
-Impact: Clarion can fail to compile on macOS targets despite macOS being named
+Impact: Loomweave can fail to compile on macOS targets despite macOS being named
 in the resource-limit path and release governance history.
 
 Remediation: Align cfgs. Either make the `pre_exec` block Linux-only or import
@@ -86,16 +86,16 @@ and define macOS-safe helpers, splitting Linux-only `nproc` behavior from the
 portable address-space/file-descriptor limits.
 
 Acceptance test: Run `cargo check --workspace --all-targets --target x86_64-apple-darwin`
-or restore an equivalent macOS CI leg and prove `clarion-core` builds.
+or restore an equivalent macOS CI leg and prove `loomweave-core` builds.
 
 ### H3. File entities are not yet the canonical graph/source anchor
 
 Severity: High
 
 Locations:
-- [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:3514), lines 3514-3540
-- [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:3853), lines 3853-3933
-- [writer.rs](/home/john/clarion/crates/clarion-storage/src/writer.rs:571), lines 571-573
+- [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:3514), lines 3514-3540
+- [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:3853), lines 3853-3933
+- [writer.rs](/home/john/loomweave/crates/loomweave-storage/src/writer.rs:571), lines 571-573
 
 Evidence: Analyze now creates `core:file:*` records, but plugin entities still
 derive `source_file_id` from the module entity. Storage still permits both
@@ -117,9 +117,9 @@ the module parent is the file, the function parent chain resolves to the file,
 Severity: High
 
 Locations:
-- [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:321), lines 321-328
-- [commands.rs](/home/john/clarion/crates/clarion-storage/src/commands.rs:157), lines 157-164
-- [writer.rs](/home/john/clarion/crates/clarion-storage/src/writer.rs:439), lines 439-447
+- [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:321), lines 321-328
+- [commands.rs](/home/john/loomweave/crates/loomweave-storage/src/commands.rs:157), lines 157-164
+- [writer.rs](/home/john/loomweave/crates/loomweave-storage/src/writer.rs:439), lines 439-447
 
 Evidence: Storage comments state `--resume` is a re-emit-without-flip path, not
 incremental checkpoint recovery. No durable phase/file checkpoint path was found.
@@ -139,10 +139,10 @@ completed phases/files and provider calls are not repeated.
 Severity: High
 
 Locations:
-- [requirements.md](/home/john/clarion/docs/clarion/1.0/requirements.md:548), lines 548-554
-- [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:668), lines 668-700
-- [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:785), lines 785-884
-- [writer.rs](/home/john/clarion/crates/clarion-storage/src/writer.rs:974), lines 974-989
+- [requirements.md](/home/john/loomweave/docs/loomweave/1.0/requirements.md:548), lines 548-554
+- [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:668), lines 668-700
+- [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:785), lines 785-884
+- [writer.rs](/home/john/loomweave/crates/loomweave-storage/src/writer.rs:974), lines 974-989
 
 Evidence: Requirements describe streaming so the core can commit entities
 incrementally. Implementation runs blocking plugin work, collects all entities,
@@ -164,11 +164,11 @@ earlier batches are durable, the run records failure, and memory stays bounded.
 Severity: High
 
 Locations:
-- [plugin.toml](/home/john/clarion/plugins/python/plugin.toml:22), lines 22-40
-- [wardline_probe.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/wardline_probe.py:38), lines 38-84
-- [server.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/server.py:144), lines 144-155
-- [extractor.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/extractor.py:179), lines 179-194
-- [extractor.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/extractor.py:903), lines 903-930
+- [plugin.toml](/home/john/loomweave/plugins/python/plugin.toml:22), lines 22-40
+- [wardline_probe.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/wardline_probe.py:38), lines 38-84
+- [server.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/server.py:144), lines 144-155
+- [extractor.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/extractor.py:179), lines 179-194
+- [extractor.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/extractor.py:903), lines 903-930
 
 Evidence: The manifest sets `wardline_aware = true`, but the ontology exposes
 only `function`, `class`, `module` and `contains`, `calls`, `references`,
@@ -192,10 +192,10 @@ vocabulary is unavailable.
 Severity: High
 
 Locations:
-- [analyze_runs.rs](/home/john/clarion/crates/clarion-mcp/src/analyze_runs.rs:11), lines 11-16
-- [analyze_runs.rs](/home/john/clarion/crates/clarion-mcp/src/analyze_runs.rs:166), lines 166-202
-- [lib.rs](/home/john/clarion/crates/clarion-mcp/src/lib.rs:2005), lines 2005-2028
-- [writer.rs](/home/john/clarion/crates/clarion-storage/src/writer.rs:344), lines 344-363
+- [analyze_runs.rs](/home/john/loomweave/crates/loomweave-mcp/src/analyze_runs.rs:11), lines 11-16
+- [analyze_runs.rs](/home/john/loomweave/crates/loomweave-mcp/src/analyze_runs.rs:166), lines 166-202
+- [lib.rs](/home/john/loomweave/crates/loomweave-mcp/src/lib.rs:2005), lines 2005-2028
+- [writer.rs](/home/john/loomweave/crates/loomweave-storage/src/writer.rs:344), lines 344-363
 
 Evidence: MCP cancel explicitly defers supervising-process crash reconciliation
 to future `owner_pid`/`heartbeat_at` work. `project_status` reports the latest
@@ -218,12 +218,12 @@ terminal state and update the row.
 Severity: High
 
 Locations:
-- [ADR-007-summary-cache-key.md](/home/john/clarion/docs/clarion/adr/ADR-007-summary-cache-key.md:28), lines 28-40
-- [ADR-030-on-demand-summary-scope.md](/home/john/clarion/docs/clarion/adr/ADR-030-on-demand-summary-scope.md:58), lines 58-63
-- [summary.rs](/home/john/clarion/crates/clarion-mcp/src/tools/summary.rs:425), lines 425-454
-- [summary.rs](/home/john/clarion/crates/clarion-mcp/src/tools/summary.rs:510), lines 510-532
-- [guidance.rs](/home/john/clarion/crates/clarion-storage/src/guidance.rs:443), lines 443-452
-- [guidance.rs](/home/john/clarion/crates/clarion-cli/src/guidance.rs:272), lines 272-282
+- [ADR-007-summary-cache-key.md](/home/john/loomweave/docs/loomweave/adr/ADR-007-summary-cache-key.md:28), lines 28-40
+- [ADR-030-on-demand-summary-scope.md](/home/john/loomweave/docs/loomweave/adr/ADR-030-on-demand-summary-scope.md:58), lines 58-63
+- [summary.rs](/home/john/loomweave/crates/loomweave-mcp/src/tools/summary.rs:425), lines 425-454
+- [summary.rs](/home/john/loomweave/crates/loomweave-mcp/src/tools/summary.rs:510), lines 510-532
+- [guidance.rs](/home/john/loomweave/crates/loomweave-storage/src/guidance.rs:443), lines 443-452
+- [guidance.rs](/home/john/loomweave/crates/loomweave-cli/src/guidance.rs:272), lines 272-282
 
 Evidence: ADRs require `guidance_fingerprint` because summaries are
 guidance-conditioned. The summary read path hard-codes `guidance-empty`, and the
@@ -246,9 +246,9 @@ miss with a changed fingerprint and guidance content in the prompt.
 Severity: High
 
 Locations:
-- [extractor.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/extractor.py:454), lines 454-526
-- [shortcuts.rs](/home/john/clarion/crates/clarion-mcp/src/catalogue/shortcuts.rs:104), lines 104-132
-- [requirements.md](/home/john/clarion/docs/clarion/1.0/requirements.md:564), lines 564-569
+- [extractor.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/extractor.py:454), lines 454-526
+- [shortcuts.rs](/home/john/loomweave/crates/loomweave-mcp/src/catalogue/shortcuts.rs:104), lines 104-132
+- [requirements.md](/home/john/loomweave/docs/loomweave/1.0/requirements.md:564), lines 564-569
 
 Evidence: `_ImportEdgeCollector` visits the whole AST and emits every import as
 a module-level resolved `imports` edge. It does not track `if TYPE_CHECKING`,
@@ -270,9 +270,9 @@ Acceptance test: A fixture where `b.py` imports `a.py` only under
 Severity: High
 
 Locations:
-- [pyright_session.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/pyright_session.py:432), lines 432-448
-- [shortcuts.rs](/home/john/clarion/crates/clarion-mcp/src/catalogue/shortcuts.rs:324), lines 324-331
-- [shortcuts.rs](/home/john/clarion/crates/clarion-mcp/src/catalogue/shortcuts.rs:738), lines 738-757
+- [pyright_session.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/pyright_session.py:432), lines 432-448
+- [shortcuts.rs](/home/john/loomweave/crates/loomweave-mcp/src/catalogue/shortcuts.rs:324), lines 324-331
+- [shortcuts.rs](/home/john/loomweave/crates/loomweave-mcp/src/catalogue/shortcuts.rs:738), lines 738-757
 
 Evidence: Ambiguous calls store only `candidate_ids[0]` in `to_id`; the full set
 is stored in `properties.candidates`. Dead-code reachability selects only
@@ -292,10 +292,10 @@ both must be excluded from `entity_dead_list`.
 Severity: High
 
 Locations:
-- [extractor.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/extractor.py:356), lines 356-365
-- [extractor.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/extractor.py:861), lines 861-889
-- [pyright_session.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/pyright_session.py:970), lines 970-982
-- [pyright_session.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/pyright_session.py:1008), lines 1008-1038
+- [extractor.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/extractor.py:356), lines 356-365
+- [extractor.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/extractor.py:861), lines 861-889
+- [pyright_session.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/pyright_session.py:970), lines 970-982
+- [pyright_session.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/pyright_session.py:1008), lines 1008-1038
 
 Evidence: Entity extraction first-wins duplicate definitions and suppresses
 dropped duplicate bodies. Pyright indexing separately collects all definitions
@@ -317,11 +317,11 @@ Acceptance test: Two same-name functions where only the dropped duplicate calls
 Severity: High
 
 Locations:
-- [pyright_session.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/pyright_session.py:247), lines 247-276
-- [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:4141), lines 4141-4164
-- [unresolved.rs](/home/john/clarion/crates/clarion-storage/src/unresolved.rs:20), lines 20-29
-- [query.rs](/home/john/clarion/crates/clarion-storage/src/query.rs:961), lines 961-975
-- [summary.rs](/home/john/clarion/crates/clarion-mcp/src/tools/summary.rs:188), lines 188-199
+- [pyright_session.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/pyright_session.py:247), lines 247-276
+- [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:4141), lines 4141-4164
+- [unresolved.rs](/home/john/loomweave/crates/loomweave-storage/src/unresolved.rs:20), lines 20-29
+- [query.rs](/home/john/loomweave/crates/loomweave-storage/src/query.rs:961), lines 961-975
+- [summary.rs](/home/john/loomweave/crates/loomweave-mcp/src/tools/summary.rs:188), lines 188-199
 
 Evidence: On Pyright unavailable/timeout/crash, `resolve_calls` reports
 unresolved totals but returns an empty unresolved-site list. The analyzer only
@@ -346,9 +346,9 @@ on or materialize the stale site.
 Severity: High
 
 Locations:
-- [ci.yml](/home/john/clarion/.github/workflows/ci.yml:48), lines 48-74
-- [release.yml](/home/john/clarion/.github/workflows/release.yml:26), lines 26-29
-- [release.yml](/home/john/clarion/.github/workflows/release.yml:62), lines 62-117
+- [ci.yml](/home/john/loomweave/.github/workflows/ci.yml:48), lines 48-74
+- [release.yml](/home/john/loomweave/.github/workflows/release.yml:26), lines 26-29
+- [release.yml](/home/john/loomweave/.github/workflows/release.yml:62), lines 62-117
 
 Evidence: `release.yml` says the verify job must mirror CI. CI includes release
 governance static guard, pyright pin lockstep, Wardline version bounds, and
@@ -370,9 +370,9 @@ lockstep; both CI and release verify should fail before artifact build/publish.
 Severity: Medium
 
 Locations:
-- [pyright_session.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/pyright_session.py:370), lines 370-463
-- [pyright_session.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/pyright_session.py:1202), lines 1202-1218
-- [pyright_session.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/pyright_session.py:1384), lines 1384-1389
+- [pyright_session.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/pyright_session.py:370), lines 370-463
+- [pyright_session.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/pyright_session.py:1202), lines 1202-1218
+- [pyright_session.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/pyright_session.py:1384), lines 1384-1389
 
 Evidence: AST `col_offset`/`end_col_offset` are byte offsets. LSP ranges are
 UTF-16 character offsets. The code compares and converts these as if they were
@@ -393,8 +393,8 @@ call resolves and the byte span slices exactly to the callee expression.
 Severity: Medium
 
 Locations:
-- [extractor.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/extractor.py:632), lines 632-668
-- [pyright_session.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/pyright_session.py:602), lines 602-624
+- [extractor.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/extractor.py:632), lines 632-668
+- [pyright_session.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/pyright_session.py:602), lines 602-624
 
 Evidence: The reference collector suppresses only names bound in the current
 scope. Names bound in an enclosing function can be collected in an inner
@@ -416,9 +416,9 @@ local, assert no `references` edge targets the module for `token`.
 Severity: Medium
 
 Locations:
-- [lib.rs](/home/john/clarion/crates/clarion-mcp/src/lib.rs:345), lines 345-347
-- [inspection.rs](/home/john/clarion/crates/clarion-mcp/src/catalogue/inspection.rs:30), lines 30-31
-- [inspection.rs](/home/john/clarion/crates/clarion-mcp/src/catalogue/inspection.rs:179), lines 179-235
+- [lib.rs](/home/john/loomweave/crates/loomweave-mcp/src/lib.rs:345), lines 345-347
+- [inspection.rs](/home/john/loomweave/crates/loomweave-mcp/src/catalogue/inspection.rs:30), lines 30-31
+- [inspection.rs](/home/john/loomweave/crates/loomweave-mcp/src/catalogue/inspection.rs:179), lines 179-235
 
 Evidence: `entity_finding_list` fetches `LIMIT 5000`, then checks whether the
 already-capped vector reached 5,000. The 5,001st row is never fetched, so
@@ -439,10 +439,10 @@ truncation.
 Severity: Medium
 
 Locations:
-- [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:3484), lines 3484-3494
-- [lib.rs](/home/john/clarion/crates/clarion-mcp/src/lib.rs:2796), lines 2796-2798
-- [lib.rs](/home/john/clarion/crates/clarion-mcp/src/lib.rs:2846), lines 2846-2850
-- [analyze.rs](/home/john/clarion/crates/clarion-mcp/src/tools/analyze.rs:136), lines 136-160
+- [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:3484), lines 3484-3494
+- [lib.rs](/home/john/loomweave/crates/loomweave-mcp/src/lib.rs:2796), lines 2796-2798
+- [lib.rs](/home/john/loomweave/crates/loomweave-mcp/src/lib.rs:2846), lines 2846-2850
+- [analyze.rs](/home/john/loomweave/crates/loomweave-mcp/src/tools/analyze.rs:136), lines 136-160
 
 Evidence: Progress heartbeat is written at phase/file boundaries, but not while
 `host.analyze_file(file)` is in flight. MCP treats heartbeat age over 30 seconds
@@ -464,8 +464,8 @@ work.
 Severity: Medium
 
 Locations:
-- [contracts.md](/home/john/clarion/docs/federation/contracts.md:236), lines 236-310
-- [serve.rs](/home/john/clarion/crates/clarion-cli/tests/serve.rs:195), lines 195-234
+- [contracts.md](/home/john/loomweave/docs/federation/contracts.md:236), lines 236-310
+- [serve.rs](/home/john/loomweave/crates/loomweave-cli/tests/serve.rs:195), lines 195-234
 
 Evidence: The contract marks `fixtures/post-api-v1-files-batch.json` as
 normative. The conformance test loads other fixtures but not that batch fixture.
@@ -483,8 +483,8 @@ fixture-conformance test should fail.
 Severity: Medium
 
 Locations:
-- [contracts.md](/home/john/clarion/docs/federation/contracts.md:791), lines 791-805
-- [wardline_taint.rs](/home/john/clarion/crates/clarion-storage/src/wardline_taint.rs:346), lines 346-377
+- [contracts.md](/home/john/loomweave/docs/federation/contracts.md:791), lines 791-805
+- [wardline_taint.rs](/home/john/loomweave/crates/loomweave-storage/src/wardline_taint.rs:346), lines 346-377
 
 Evidence: The test states expected values were copied from
 `wardline-qualname-normalization.json`, then hard-codes them. New fixture
@@ -503,8 +503,8 @@ implementation supports it.
 Severity: Medium
 
 Locations:
-- [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:3908), lines 3908-3933
-- [writer.rs](/home/john/clarion/crates/clarion-storage/src/writer.rs:487), lines 487-528
+- [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:3908), lines 3908-3933
+- [writer.rs](/home/john/loomweave/crates/loomweave-storage/src/writer.rs:487), lines 487-528
 
 Evidence: Core file records set `first_seen_commit` and `last_seen_commit` to
 `None`, and the writer preserves incoming values rather than repairing them.
@@ -523,7 +523,7 @@ entities have correct first/last commit values.
 Severity: Medium
 
 Location:
-- [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:4270), lines 4270-4321
+- [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:4270), lines 4270-4321
 
 Evidence: `collect_source_files` warns and increments a local skipped counter
 for walk errors, but the return value is only a file list. The skipped count and
@@ -542,8 +542,8 @@ durable stats/findings report the skipped source-walk failure.
 Severity: Medium
 
 Locations:
-- [auth.rs](/home/john/clarion/crates/clarion-cli/src/http_read/auth.rs:71), lines 71-110
-- [auth.rs](/home/john/clarion/crates/clarion-cli/src/http_read/auth.rs:122), lines 122-185
+- [auth.rs](/home/john/loomweave/crates/loomweave-cli/src/http_read/auth.rs:71), lines 71-110
+- [auth.rs](/home/john/loomweave/crates/loomweave-cli/src/http_read/auth.rs:122), lines 122-185
 
 Evidence: HMAC-SHA256 and constant-time comparison are implemented locally. The
 canonical message signs method, path/query, and body hash only; it has no
@@ -565,8 +565,8 @@ class. Replaying the same signed request/nonce should fail.
 Severity: Medium
 
 Locations:
-- [plugin.toml](/home/john/clarion/plugins/python/plugin.toml:31), lines 31-47
-- [requirements.md](/home/john/clarion/docs/clarion/1.0/requirements.md:556), lines 556-577
+- [plugin.toml](/home/john/loomweave/plugins/python/plugin.toml:31), lines 31-47
+- [requirements.md](/home/john/loomweave/docs/loomweave/1.0/requirements.md:556), lines 556-577
 
 Evidence: Requirements name protocols, globals, modules, packages, and edges
 such as `inherits_from`, `decorated_by`, `uses_type`, and `alias_of`. The live
@@ -590,8 +590,8 @@ documented shapes or return explicit missing-signal notes.
 Severity: Low
 
 Locations:
-- [host.rs](/home/john/clarion/crates/clarion-core/src/plugin/host.rs:656), lines 656-666
-- [host_subprocess.rs](/home/john/clarion/crates/clarion-core/tests/host_subprocess.rs:185), lines 185-233
+- [host.rs](/home/john/loomweave/crates/loomweave-core/src/plugin/host.rs:656), lines 656-666
+- [host_subprocess.rs](/home/john/loomweave/crates/loomweave-core/tests/host_subprocess.rs:185), lines 185-233
 
 Evidence: Production code kills/waits on handshake failure, but the test comment
 states it verifies only prompt error return and non-hanging behavior, not zombie
@@ -608,8 +608,8 @@ fail the new test.
 Severity: Low
 
 Locations:
-- [server.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/server.py:74), lines 74-117
-- [server.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/server.py:294), lines 294-300
+- [server.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/server.py:74), lines 74-117
+- [server.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/server.py:294), lines 294-300
 
 Evidence: `read_frame` decodes headers with `line.decode("ascii")`; a
 non-ASCII byte raises `UnicodeDecodeError`, while `main` catches only
@@ -626,8 +626,8 @@ assert it returns the protocol-error exit path without corrupting stdout.
 Severity: Low
 
 Locations:
-- [guidance.rs](/home/john/clarion/crates/clarion-cli/src/guidance.rs:228), lines 228-234
-- [guidance.rs](/home/john/clarion/crates/clarion-storage/src/guidance.rs:156), lines 156-204
+- [guidance.rs](/home/john/loomweave/crates/loomweave-cli/src/guidance.rs:228), lines 228-234
+- [guidance.rs](/home/john/loomweave/crates/loomweave-storage/src/guidance.rs:156), lines 156-204
 
 Evidence: CLI create performs a non-atomic existence check before a low-level
 upsert. The source comment acknowledges a concurrent create can overwrite the
@@ -644,8 +644,8 @@ the other fails without modifying the first row.
 Severity: Low
 
 Locations:
-- [shortcuts.rs](/home/john/clarion/crates/clarion-mcp/src/catalogue/shortcuts.rs:104), lines 104-119
-- [shortcuts.rs](/home/john/clarion/crates/clarion-mcp/src/catalogue/shortcuts.rs:741), lines 741-744
+- [shortcuts.rs](/home/john/loomweave/crates/loomweave-mcp/src/catalogue/shortcuts.rs:104), lines 104-119
+- [shortcuts.rs](/home/john/loomweave/crates/loomweave-mcp/src/catalogue/shortcuts.rs:741), lines 741-744
 
 Evidence: Circular-import and dead-code adjacency scans use `LIMIT ?1` without
 `ORDER BY`.
@@ -662,19 +662,19 @@ assert repeated runs return identical truncated output.
 Severity: Low
 
 Locations:
-- [lib.rs](/home/john/clarion/crates/clarion-mcp/src/lib.rs:149), lines 149-490
-- [lib.rs](/home/john/clarion/crates/clarion-mcp/src/lib.rs:648), lines 648-970
-- [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:38), lines 38-44
+- [lib.rs](/home/john/loomweave/crates/loomweave-mcp/src/lib.rs:149), lines 149-490
+- [lib.rs](/home/john/loomweave/crates/loomweave-mcp/src/lib.rs:648), lines 648-970
+- [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:38), lines 38-44
 
-Evidence: `clarion-mcp` carries tool registry, server state, dispatch, resources,
+Evidence: `loomweave-mcp` carries tool registry, server state, dispatch, resources,
 diagnostics, analyze registry, and utility clients; CLI analyze imports helpers
-from `clarion_mcp`.
+from `loomweave_mcp`.
 
 Remediation: Move shared federation/config/scan-result helpers to a narrower
 crate or CLI-owned module and split MCP registry/state/dispatch/resource code
 into focused modules.
 
-Acceptance test: CLI analyze no longer depends on `clarion_mcp` for non-MCP
+Acceptance test: CLI analyze no longer depends on `loomweave_mcp` for non-MCP
 helpers, and MCP dispatch delegates to focused modules with behavior preserved.
 
 ## Recommended Remediation Order
@@ -723,55 +723,55 @@ regressions and broad gates run afterward.
 
 | Finding | Status | Primary implementation points | Regression evidence |
 | --- | --- | --- | --- |
-| H1 | Resolved | Combined entity, edge, and finding admission is enforced in [host.rs](/home/john/clarion/crates/clarion-core/src/plugin/host.rs:982) and [host.rs](/home/john/clarion/crates/clarion-core/src/plugin/host.rs:1174); cap semantics remain documented in [limits.rs](/home/john/clarion/crates/clarion-core/src/plugin/limits.rs:128). | Host cap tests in [host.rs](/home/john/clarion/crates/clarion-core/src/plugin/host.rs:2440) and [host.rs](/home/john/clarion/crates/clarion-core/src/plugin/host.rs:2524). |
-| H2 | Resolved | macOS/Linux resource-limit cfgs now align in [host.rs](/home/john/clarion/crates/clarion-core/src/plugin/host.rs:52), [host.rs](/home/john/clarion/crates/clarion-core/src/plugin/host.rs:107), [limits.rs](/home/john/clarion/crates/clarion-core/src/plugin/limits.rs:301), and [limits.rs](/home/john/clarion/crates/clarion-core/src/plugin/limits.rs:320). | Workspace check/build/clippy gates below compile the local targets; macOS target CI remains the stronger remote proof. |
-| H3 | Resolved | Analyze maps plugin output to canonical `core:file:*` anchors in [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:4137) and [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:4395); storage rejects module/function anchors in [writer.rs](/home/john/clarion/crates/clarion-storage/src/writer.rs:590). | Anchor tests in [writer_actor.rs](/home/john/clarion/crates/clarion-storage/tests/writer_actor.rs:1324) and [writer_actor.rs](/home/john/clarion/crates/clarion-storage/tests/writer_actor.rs:1374). |
-| H4 | Resolved by contract reconciliation | ADR-041 makes v1.x resume an idempotent re-emit rather than checkpoint recovery in [ADR-041-resume-is-idempotent-reemit.md](/home/john/clarion/docs/clarion/adr/ADR-041-resume-is-idempotent-reemit.md:12), and amends ADR-005/ADR-011 status lines. | Resume behavior test in [analyze.rs](/home/john/clarion/crates/clarion-cli/tests/analyze.rs:2261). |
-| H5 | Resolved | Plugin file output streams through a bounded channel in [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:765), [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:776), and [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:3673); cross-file edges are queued until both endpoints are inserted in [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:797) and [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:3593). | Failure-mode coverage in [analyze_failure_modes.rs](/home/john/clarion/crates/clarion-cli/tests/analyze_failure_modes.rs:439), plus full workspace and Phase 3 e2e tests. |
-| H6 | Resolved by honest capability contract | Python Wardline capability claims and v1 ontology docs were reconciled in [plugin.toml](/home/john/clarion/plugins/python/plugin.toml:1), [requirements.md](/home/john/clarion/docs/clarion/1.0/requirements.md:1), [system-design.md](/home/john/clarion/docs/clarion/1.0/system-design.md:1), and [detailed-design.md](/home/john/clarion/docs/clarion/1.0/detailed-design.md:1). | Ontology test in [test_package.py](/home/john/clarion/plugins/python/tests/test_package.py:1). |
-| H7 | Resolved | Runs now persist `owner_pid` and `heartbeat_at`; stale running rows are repaired by [runs.rs](/home/john/clarion/crates/clarion-storage/src/runs.rs:15), analyze startup in [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:371), MCP status in [status.rs](/home/john/clarion/crates/clarion-mcp/src/tools/status.rs:184), and analyze status in [analyze.rs](/home/john/clarion/crates/clarion-mcp/src/tools/analyze.rs:261). | Tests in [storage_tools.rs](/home/john/clarion/crates/clarion-mcp/tests/storage_tools.rs:4292) and [analyze_lifecycle.rs](/home/john/clarion/crates/clarion-mcp/tests/analyze_lifecycle.rs:265). |
-| H8 | Resolved | Summary inputs compose applicable guidance and hash it into the cache key in [summary.rs](/home/john/clarion/crates/clarion-mcp/src/tools/summary.rs:39), [summary.rs](/home/john/clarion/crates/clarion-mcp/src/tools/summary.rs:77), and [summary.rs](/home/john/clarion/crates/clarion-mcp/src/tools/summary.rs:500). | Prompt/cache regression in [storage_tools.rs](/home/john/clarion/crates/clarion-mcp/tests/storage_tools.rs:1421). |
-| H9 | Resolved | Python import extraction now records `type_only` and `scope`, and MCP runtime import algorithms filter them in [extractor.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/extractor.py:456), [extractor.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/extractor.py:550), and [shortcuts.rs](/home/john/clarion/crates/clarion-mcp/src/catalogue/shortcuts.rs:60). | Python package tests plus MCP shortcut tests. |
-| H10 | Resolved | Dead-code reachability expands ambiguous call candidates from edge properties in [shortcuts.rs](/home/john/clarion/crates/clarion-mcp/src/catalogue/shortcuts.rs:823) and [shortcuts.rs](/home/john/clarion/crates/clarion-mcp/src/catalogue/shortcuts.rs:829). | Ambiguous candidate tests in [catalogue_tools.rs](/home/john/clarion/crates/clarion-mcp/tests/catalogue_tools.rs:1205). |
-| H11 | Resolved | Duplicate-definition disposition now suppresses dropped duplicate bodies before call/reference collection in [extractor.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/extractor.py:896). | Regression in [test_extractor.py](/home/john/clarion/plugins/python/tests/test_extractor.py:565). |
-| H12 | Resolved | Unresolved-call reads require current caller content hashes in [query.rs](/home/john/clarion/crates/clarion-storage/src/query.rs:961) and [query.rs](/home/john/clarion/crates/clarion-storage/src/query.rs:984); analyze writes hash-scoped replacements in [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:4419). | Tests in [query_helpers.rs](/home/john/clarion/crates/clarion-storage/tests/query_helpers.rs:438) and [storage_tools.rs](/home/john/clarion/crates/clarion-mcp/tests/storage_tools.rs:3132). |
-| H13 | Resolved | Release verify now mirrors CI static guards in [release.yml](/home/john/clarion/.github/workflows/release.yml:70), [release.yml](/home/john/clarion/.github/workflows/release.yml:78), [release.yml](/home/john/clarion/.github/workflows/release.yml:85), and [release.yml](/home/john/clarion/.github/workflows/release.yml:88). | Guard scripts are covered by self-tests in the release verify job and cargo deny/build gates below. |
-| M1 | Resolved | Pyright/LSP matching now converts AST byte columns and LSP UTF-16 positions explicitly in [pyright_session.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/pyright_session.py:1451), [pyright_session.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/pyright_session.py:1461), and [pyright_session.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/pyright_session.py:1471). | Regression in [test_pyright_session.py](/home/john/clarion/plugins/python/tests/test_pyright_session.py:180). |
-| M2 | Resolved | Reference collection tracks enclosing local bindings in [extractor.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/extractor.py:650) and [extractor.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/extractor.py:717). | Python extractor tests. |
-| M3 | Resolved | Finding filters and pagination are pushed into SQL before the cap in [inspection.rs](/home/john/clarion/crates/clarion-mcp/src/catalogue/inspection.rs:200) and [inspection.rs](/home/john/clarion/crates/clarion-mcp/src/catalogue/inspection.rs:216). | Regression in [catalogue_tools.rs](/home/john/clarion/crates/clarion-mcp/tests/catalogue_tools.rs:315). |
-| M4 | Resolved | Analyze progress refreshes `heartbeat_at` through live progress snapshots and writer heartbeats in [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:126), [writer.rs](/home/john/clarion/crates/clarion-storage/src/writer.rs:1013), and [analyze.rs](/home/john/clarion/crates/clarion-mcp/src/tools/analyze.rs:147). | Analyze status and stale-run tests listed under H7. |
-| M5 | Resolved | The normative batch fixture is exercised by [serve.rs](/home/john/clarion/crates/clarion-cli/tests/serve.rs:1). | `cargo test -p clarion-cli --test serve serve_http_responses_match_federation_fixture_contracts -- --nocapture`. |
-| M6 | Resolved | Wardline qualname fixture vectors are loaded directly by storage/Python tests in [wardline_taint.rs](/home/john/clarion/crates/clarion-storage/src/wardline_taint.rs:1). | Full storage and Python gates. |
-| M7 | Resolved | Analyze stamps entity git provenance in [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:3540), with writer preserving first-seen and refreshing last-seen in [writer.rs](/home/john/clarion/crates/clarion-storage/src/writer.rs:501). | Regression in [analyze.rs](/home/john/clarion/crates/clarion-cli/tests/analyze.rs:3100). |
-| M8 | Resolved | Source-walk failures now persist stats/findings in [analyze.rs](/home/john/clarion/crates/clarion-cli/src/analyze.rs:4270). | `cargo test -p clarion-cli analyze::tests::source_walk -- --nocapture`. |
-| M9 | Resolved | Federation auth uses `hmac`/`subtle` plus timestamp and nonce replay checks in [auth.rs](/home/john/clarion/crates/clarion-cli/src/http_read/auth.rs:1), with ADR-042 documenting the contract. | `cargo test -p clarion-cli http_read::auth::tests::hmac -- --nocapture` and `cargo test -p clarion-cli --test serve hmac_identity -- --nocapture`. |
-| M10 | Resolved by contract reconciliation | v1.0 Python ontology now explicitly limits emitted kinds/edges and defers the absent ontology in [requirements.md](/home/john/clarion/docs/clarion/1.0/requirements.md:1), [system-design.md](/home/john/clarion/docs/clarion/1.0/system-design.md:1), and [detailed-design.md](/home/john/clarion/docs/clarion/1.0/detailed-design.md:1). | [test_package.py](/home/john/clarion/plugins/python/tests/test_package.py:1). |
-| L1 | Resolved | Handshake-failure zombie reaping is asserted on Linux in [host_subprocess.rs](/home/john/clarion/crates/clarion-core/tests/host_subprocess.rs:1). | `cargo test -p clarion-core --test host_subprocess t9 -- --nocapture`. |
-| L2 | Resolved | Python protocol header decoding converts non-ASCII malformed headers to `ProtocolError` in [server.py](/home/john/clarion/plugins/python/src/clarion_plugin_python/server.py:1). | [test_server.py](/home/john/clarion/plugins/python/tests/test_server.py:1). |
-| L3 | Resolved | Guidance create is now insert-only and atomic in [guidance.rs](/home/john/clarion/crates/clarion-storage/src/guidance.rs:1) and [guidance.rs](/home/john/clarion/crates/clarion-cli/src/guidance.rs:1). | [guidance_write.rs](/home/john/clarion/crates/clarion-storage/tests/guidance_write.rs:1). |
-| L4 | Resolved | Capped graph scans use deterministic ordering before `LIMIT` in [shortcuts.rs](/home/john/clarion/crates/clarion-mcp/src/catalogue/shortcuts.rs:1). | `cargo test -p clarion-mcp scan_truncates -- --nocapture`. |
-| L5 | Resolved | Shared federation/config/scan-result helpers moved to [crates/clarion-federation](/home/john/clarion/crates/clarion-federation/src/lib.rs:1), with MCP retaining re-export shims and CLI importing the narrower crate. | `cargo check -p clarion-federation --all-targets`, `cargo check -p clarion-cli --all-targets`, and no remaining CLI references to `clarion_mcp::config`, `clarion_mcp::filigree`, `clarion_mcp::filigree_url`, or `clarion_mcp::scan_results`. |
+| H1 | Resolved | Combined entity, edge, and finding admission is enforced in [host.rs](/home/john/loomweave/crates/loomweave-core/src/plugin/host.rs:982) and [host.rs](/home/john/loomweave/crates/loomweave-core/src/plugin/host.rs:1174); cap semantics remain documented in [limits.rs](/home/john/loomweave/crates/loomweave-core/src/plugin/limits.rs:128). | Host cap tests in [host.rs](/home/john/loomweave/crates/loomweave-core/src/plugin/host.rs:2440) and [host.rs](/home/john/loomweave/crates/loomweave-core/src/plugin/host.rs:2524). |
+| H2 | Resolved | macOS/Linux resource-limit cfgs now align in [host.rs](/home/john/loomweave/crates/loomweave-core/src/plugin/host.rs:52), [host.rs](/home/john/loomweave/crates/loomweave-core/src/plugin/host.rs:107), [limits.rs](/home/john/loomweave/crates/loomweave-core/src/plugin/limits.rs:301), and [limits.rs](/home/john/loomweave/crates/loomweave-core/src/plugin/limits.rs:320). | Workspace check/build/clippy gates below compile the local targets; macOS target CI remains the stronger remote proof. |
+| H3 | Resolved | Analyze maps plugin output to canonical `core:file:*` anchors in [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:4137) and [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:4395); storage rejects module/function anchors in [writer.rs](/home/john/loomweave/crates/loomweave-storage/src/writer.rs:590). | Anchor tests in [writer_actor.rs](/home/john/loomweave/crates/loomweave-storage/tests/writer_actor.rs:1324) and [writer_actor.rs](/home/john/loomweave/crates/loomweave-storage/tests/writer_actor.rs:1374). |
+| H4 | Resolved by contract reconciliation | ADR-041 makes v1.x resume an idempotent re-emit rather than checkpoint recovery in [ADR-041-resume-is-idempotent-reemit.md](/home/john/loomweave/docs/loomweave/adr/ADR-041-resume-is-idempotent-reemit.md:12), and amends ADR-005/ADR-011 status lines. | Resume behavior test in [analyze.rs](/home/john/loomweave/crates/loomweave-cli/tests/analyze.rs:2261). |
+| H5 | Resolved | Plugin file output streams through a bounded channel in [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:765), [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:776), and [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:3673); cross-file edges are queued until both endpoints are inserted in [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:797) and [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:3593). | Failure-mode coverage in [analyze_failure_modes.rs](/home/john/loomweave/crates/loomweave-cli/tests/analyze_failure_modes.rs:439), plus full workspace and Phase 3 e2e tests. |
+| H6 | Resolved by honest capability contract | Python Wardline capability claims and v1 ontology docs were reconciled in [plugin.toml](/home/john/loomweave/plugins/python/plugin.toml:1), [requirements.md](/home/john/loomweave/docs/loomweave/1.0/requirements.md:1), [system-design.md](/home/john/loomweave/docs/loomweave/1.0/system-design.md:1), and [detailed-design.md](/home/john/loomweave/docs/loomweave/1.0/detailed-design.md:1). | Ontology test in [test_package.py](/home/john/loomweave/plugins/python/tests/test_package.py:1). |
+| H7 | Resolved | Runs now persist `owner_pid` and `heartbeat_at`; stale running rows are repaired by [runs.rs](/home/john/loomweave/crates/loomweave-storage/src/runs.rs:15), analyze startup in [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:371), MCP status in [status.rs](/home/john/loomweave/crates/loomweave-mcp/src/tools/status.rs:184), and analyze status in [analyze.rs](/home/john/loomweave/crates/loomweave-mcp/src/tools/analyze.rs:261). | Tests in [storage_tools.rs](/home/john/loomweave/crates/loomweave-mcp/tests/storage_tools.rs:4292) and [analyze_lifecycle.rs](/home/john/loomweave/crates/loomweave-mcp/tests/analyze_lifecycle.rs:265). |
+| H8 | Resolved | Summary inputs compose applicable guidance and hash it into the cache key in [summary.rs](/home/john/loomweave/crates/loomweave-mcp/src/tools/summary.rs:39), [summary.rs](/home/john/loomweave/crates/loomweave-mcp/src/tools/summary.rs:77), and [summary.rs](/home/john/loomweave/crates/loomweave-mcp/src/tools/summary.rs:500). | Prompt/cache regression in [storage_tools.rs](/home/john/loomweave/crates/loomweave-mcp/tests/storage_tools.rs:1421). |
+| H9 | Resolved | Python import extraction now records `type_only` and `scope`, and MCP runtime import algorithms filter them in [extractor.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/extractor.py:456), [extractor.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/extractor.py:550), and [shortcuts.rs](/home/john/loomweave/crates/loomweave-mcp/src/catalogue/shortcuts.rs:60). | Python package tests plus MCP shortcut tests. |
+| H10 | Resolved | Dead-code reachability expands ambiguous call candidates from edge properties in [shortcuts.rs](/home/john/loomweave/crates/loomweave-mcp/src/catalogue/shortcuts.rs:823) and [shortcuts.rs](/home/john/loomweave/crates/loomweave-mcp/src/catalogue/shortcuts.rs:829). | Ambiguous candidate tests in [catalogue_tools.rs](/home/john/loomweave/crates/loomweave-mcp/tests/catalogue_tools.rs:1205). |
+| H11 | Resolved | Duplicate-definition disposition now suppresses dropped duplicate bodies before call/reference collection in [extractor.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/extractor.py:896). | Regression in [test_extractor.py](/home/john/loomweave/plugins/python/tests/test_extractor.py:565). |
+| H12 | Resolved | Unresolved-call reads require current caller content hashes in [query.rs](/home/john/loomweave/crates/loomweave-storage/src/query.rs:961) and [query.rs](/home/john/loomweave/crates/loomweave-storage/src/query.rs:984); analyze writes hash-scoped replacements in [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:4419). | Tests in [query_helpers.rs](/home/john/loomweave/crates/loomweave-storage/tests/query_helpers.rs:438) and [storage_tools.rs](/home/john/loomweave/crates/loomweave-mcp/tests/storage_tools.rs:3132). |
+| H13 | Resolved | Release verify now mirrors CI static guards in [release.yml](/home/john/loomweave/.github/workflows/release.yml:70), [release.yml](/home/john/loomweave/.github/workflows/release.yml:78), [release.yml](/home/john/loomweave/.github/workflows/release.yml:85), and [release.yml](/home/john/loomweave/.github/workflows/release.yml:88). | Guard scripts are covered by self-tests in the release verify job and cargo deny/build gates below. |
+| M1 | Resolved | Pyright/LSP matching now converts AST byte columns and LSP UTF-16 positions explicitly in [pyright_session.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/pyright_session.py:1451), [pyright_session.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/pyright_session.py:1461), and [pyright_session.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/pyright_session.py:1471). | Regression in [test_pyright_session.py](/home/john/loomweave/plugins/python/tests/test_pyright_session.py:180). |
+| M2 | Resolved | Reference collection tracks enclosing local bindings in [extractor.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/extractor.py:650) and [extractor.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/extractor.py:717). | Python extractor tests. |
+| M3 | Resolved | Finding filters and pagination are pushed into SQL before the cap in [inspection.rs](/home/john/loomweave/crates/loomweave-mcp/src/catalogue/inspection.rs:200) and [inspection.rs](/home/john/loomweave/crates/loomweave-mcp/src/catalogue/inspection.rs:216). | Regression in [catalogue_tools.rs](/home/john/loomweave/crates/loomweave-mcp/tests/catalogue_tools.rs:315). |
+| M4 | Resolved | Analyze progress refreshes `heartbeat_at` through live progress snapshots and writer heartbeats in [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:126), [writer.rs](/home/john/loomweave/crates/loomweave-storage/src/writer.rs:1013), and [analyze.rs](/home/john/loomweave/crates/loomweave-mcp/src/tools/analyze.rs:147). | Analyze status and stale-run tests listed under H7. |
+| M5 | Resolved | The normative batch fixture is exercised by [serve.rs](/home/john/loomweave/crates/loomweave-cli/tests/serve.rs:1). | `cargo test -p loomweave-cli --test serve serve_http_responses_match_federation_fixture_contracts -- --nocapture`. |
+| M6 | Resolved | Wardline qualname fixture vectors are loaded directly by storage/Python tests in [wardline_taint.rs](/home/john/loomweave/crates/loomweave-storage/src/wardline_taint.rs:1). | Full storage and Python gates. |
+| M7 | Resolved | Analyze stamps entity git provenance in [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:3540), with writer preserving first-seen and refreshing last-seen in [writer.rs](/home/john/loomweave/crates/loomweave-storage/src/writer.rs:501). | Regression in [analyze.rs](/home/john/loomweave/crates/loomweave-cli/tests/analyze.rs:3100). |
+| M8 | Resolved | Source-walk failures now persist stats/findings in [analyze.rs](/home/john/loomweave/crates/loomweave-cli/src/analyze.rs:4270). | `cargo test -p loomweave-cli analyze::tests::source_walk -- --nocapture`. |
+| M9 | Resolved | Federation auth uses `hmac`/`subtle` plus timestamp and nonce replay checks in [auth.rs](/home/john/loomweave/crates/loomweave-cli/src/http_read/auth.rs:1), with ADR-042 documenting the contract. | `cargo test -p loomweave-cli http_read::auth::tests::hmac -- --nocapture` and `cargo test -p loomweave-cli --test serve hmac_identity -- --nocapture`. |
+| M10 | Resolved by contract reconciliation | v1.0 Python ontology now explicitly limits emitted kinds/edges and defers the absent ontology in [requirements.md](/home/john/loomweave/docs/loomweave/1.0/requirements.md:1), [system-design.md](/home/john/loomweave/docs/loomweave/1.0/system-design.md:1), and [detailed-design.md](/home/john/loomweave/docs/loomweave/1.0/detailed-design.md:1). | [test_package.py](/home/john/loomweave/plugins/python/tests/test_package.py:1). |
+| L1 | Resolved | Handshake-failure zombie reaping is asserted on Linux in [host_subprocess.rs](/home/john/loomweave/crates/loomweave-core/tests/host_subprocess.rs:1). | `cargo test -p loomweave-core --test host_subprocess t9 -- --nocapture`. |
+| L2 | Resolved | Python protocol header decoding converts non-ASCII malformed headers to `ProtocolError` in [server.py](/home/john/loomweave/plugins/python/src/loomweave_plugin_python/server.py:1). | [test_server.py](/home/john/loomweave/plugins/python/tests/test_server.py:1). |
+| L3 | Resolved | Guidance create is now insert-only and atomic in [guidance.rs](/home/john/loomweave/crates/loomweave-storage/src/guidance.rs:1) and [guidance.rs](/home/john/loomweave/crates/loomweave-cli/src/guidance.rs:1). | [guidance_write.rs](/home/john/loomweave/crates/loomweave-storage/tests/guidance_write.rs:1). |
+| L4 | Resolved | Capped graph scans use deterministic ordering before `LIMIT` in [shortcuts.rs](/home/john/loomweave/crates/loomweave-mcp/src/catalogue/shortcuts.rs:1). | `cargo test -p loomweave-mcp scan_truncates -- --nocapture`. |
+| L5 | Resolved | Shared federation/config/scan-result helpers moved to [crates/loomweave-federation](/home/john/loomweave/crates/loomweave-federation/src/lib.rs:1), with MCP retaining re-export shims and CLI importing the narrower crate. | `cargo check -p loomweave-federation --all-targets`, `cargo check -p loomweave-cli --all-targets`, and no remaining CLI references to `loomweave_mcp::config`, `loomweave_mcp::filigree`, `loomweave_mcp::filigree_url`, or `loomweave_mcp::scan_results`. |
 
 ### Verification Run
 
 Focused regression checks:
 
-- `cargo test -p clarion-core --test host_subprocess t9 -- --nocapture`
-- `cargo test -p clarion-storage --test guidance_write insert_guidance_sheet_rejects_existing_id_without_overwrite -- --nocapture`
-- `cargo test -p clarion-mcp scan_truncates -- --nocapture`
-- `cargo test -p clarion-federation -- --nocapture`
-- `cargo test -p clarion-cli http_read::auth::tests::hmac -- --nocapture`
-- `cargo test -p clarion-cli http_read::tests -- --nocapture`
-- `cargo test -p clarion-cli http_read::wardline::tests -- --nocapture`
-- `cargo test -p clarion-cli http_read::linkages::tests -- --nocapture`
-- `cargo test -p clarion-cli --test serve hmac_identity -- --nocapture`
-- `cargo test -p clarion-cli --test serve serve_http_responses_match_federation_fixture_contracts -- --nocapture`
-- `cargo test -p clarion-cli --test analyze analyze_stamps_entities_with_git_head_commit -- --nocapture`
-- `cargo test -p clarion-cli analyze::tests::source_walk -- --nocapture`
-- `cargo test -p clarion-cli --test analyze analyze_migrates_a_stale_db_instead_of_failing -- --nocapture`
-- `cargo test -p clarion-cli --test install install_applies_each_migration_exactly_once -- --nocapture`
-- `cargo test -p clarion-cli --test wp1_e2e wp1_walking_skeleton_end_to_end -- --nocapture`
-- `cargo test -p clarion-cli --test analyze_failure_modes analyze_defers_cross_file_edges_until_target_entity_batch_arrives -- --nocapture`
+- `cargo test -p loomweave-core --test host_subprocess t9 -- --nocapture`
+- `cargo test -p loomweave-storage --test guidance_write insert_guidance_sheet_rejects_existing_id_without_overwrite -- --nocapture`
+- `cargo test -p loomweave-mcp scan_truncates -- --nocapture`
+- `cargo test -p loomweave-federation -- --nocapture`
+- `cargo test -p loomweave-cli http_read::auth::tests::hmac -- --nocapture`
+- `cargo test -p loomweave-cli http_read::tests -- --nocapture`
+- `cargo test -p loomweave-cli http_read::wardline::tests -- --nocapture`
+- `cargo test -p loomweave-cli http_read::linkages::tests -- --nocapture`
+- `cargo test -p loomweave-cli --test serve hmac_identity -- --nocapture`
+- `cargo test -p loomweave-cli --test serve serve_http_responses_match_federation_fixture_contracts -- --nocapture`
+- `cargo test -p loomweave-cli --test analyze analyze_stamps_entities_with_git_head_commit -- --nocapture`
+- `cargo test -p loomweave-cli analyze::tests::source_walk -- --nocapture`
+- `cargo test -p loomweave-cli --test analyze analyze_migrates_a_stale_db_instead_of_failing -- --nocapture`
+- `cargo test -p loomweave-cli --test install install_applies_each_migration_exactly_once -- --nocapture`
+- `cargo test -p loomweave-cli --test wp1_e2e wp1_walking_skeleton_end_to_end -- --nocapture`
+- `cargo test -p loomweave-cli --test analyze_failure_modes analyze_defers_cross_file_edges_until_target_entity_batch_arrives -- --nocapture`
 - `plugins/python/.venv/bin/pytest plugins/python/tests/test_package.py -q`
 - `plugins/python/.venv/bin/pytest plugins/python/tests/test_server.py::test_malformed_non_ascii_header_uses_protocol_error_exit_path -q`
 

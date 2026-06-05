@@ -20,11 +20,11 @@ Files this plan touches:
 
 | File | Role | Tasks |
 |---|---|---|
-| `plugins/python/src/clarion_plugin_python/extractor.py` | Add TypedDict shapes; add `_build_module_entity`, `_build_class_entity`; rename `_build_entity` → `_build_function_entity`; switch `_walk` to `match` dispatch; emit module entity (prepended); skip top-level `__init__.py` | 1, 2 |
+| `plugins/python/src/loomweave_plugin_python/extractor.py` | Add TypedDict shapes; add `_build_module_entity`, `_build_class_entity`; rename `_build_entity` → `_build_function_entity`; switch `_walk` to `match` dispatch; emit module entity (prepended); skip top-level `__init__.py` | 1, 2 |
 | `plugins/python/tests/test_extractor.py` | Add 11+ new tests for module / class / source-range / __init__.py-skip; rename two empty-file tests | 1, 2, 7 |
 | `plugins/python/plugin.toml` | Add `class`, `module` to `entity_kinds`; bump `ontology_version` to 0.2.0 | 3 |
-| `plugins/python/src/clarion_plugin_python/server.py` | Bump `ONTOLOGY_VERSION` constant to 0.2.0 | 3 |
-| `plugins/python/src/clarion_plugin_python/__init__.py` | Bump package `__version__` to 0.1.1 (patch — different concept from ontology_version) | 3 |
+| `plugins/python/src/loomweave_plugin_python/server.py` | Bump `ONTOLOGY_VERSION` constant to 0.2.0 | 3 |
+| `plugins/python/src/loomweave_plugin_python/__init__.py` | Bump package `__version__` to 0.1.1 (patch — different concept from ontology_version) | 3 |
 | `fixtures/entity_id.json` | Add 5 new rows: 2 module + 3 class | 4 |
 | `plugins/python/tests/test_round_trip.py` | Replace exact-total assertions with by-kind invariants | 5 |
 | `tests/e2e/sprint_1_walking_skeleton.sh` | Update entity-count assertion: 1 → 2 (now includes module entity) | 6 |
@@ -35,7 +35,7 @@ Files this plan touches:
 ## Task 1: TypedDict shapes + module entity emission + SyntaxError + top-level `__init__.py` skip
 
 **Files:**
-- Modify: `plugins/python/src/clarion_plugin_python/extractor.py`
+- Modify: `plugins/python/src/loomweave_plugin_python/extractor.py`
 - Modify: `plugins/python/tests/test_extractor.py`
 
 This is the meatiest task. It introduces the TypedDict wire-shape, the `_module_source_range` helper, the `_build_module_entity` builder, the SyntaxError-degraded-emission branch, and the top-level `__init__.py` skip — all behind failing tests written first. The `_walk` loop is left function-only here; class emission lands in Task 2.
@@ -50,7 +50,7 @@ def test_module_source_range_no_trailing_newline() -> None:
 
     `"a\\nb"` has one newline → end_line = 2.
     """
-    from clarion_plugin_python.extractor import _module_source_range
+    from loomweave_plugin_python.extractor import _module_source_range
 
     rng = _module_source_range("a\nb")
     assert rng == {"start_line": 1, "start_col": 0, "end_line": 2, "end_col": 0}
@@ -58,7 +58,7 @@ def test_module_source_range_no_trailing_newline() -> None:
 
 def test_module_source_range_crlf() -> None:
     """CRLF-terminated file produces same end_line as LF (count('\\n') handles both)."""
-    from clarion_plugin_python.extractor import _module_source_range
+    from loomweave_plugin_python.extractor import _module_source_range
 
     rng = _module_source_range("a\r\nb\r\n")
     # Two `\n`s → end_line = 3 (one past the last terminator).
@@ -67,7 +67,7 @@ def test_module_source_range_crlf() -> None:
 
 def test_module_source_range_empty_string() -> None:
     """Empty source → end_line = 1 (count is 0; +1)."""
-    from clarion_plugin_python.extractor import _module_source_range
+    from loomweave_plugin_python.extractor import _module_source_range
 
     rng = _module_source_range("")
     assert rng == {"start_line": 1, "start_col": 0, "end_line": 1, "end_col": 0}
@@ -81,7 +81,7 @@ Expected: FAIL with `ImportError: cannot import name '_module_source_range'`.
 
 - [ ] **Step 1.3: Add TypedDict imports + `_module_source_range` helper to extractor.py**
 
-In `plugins/python/src/clarion_plugin_python/extractor.py`, replace the imports block (lines 45-53) and append the new TypedDicts + helper. The replacement block:
+In `plugins/python/src/loomweave_plugin_python/extractor.py`, replace the imports block (lines 45-53) and append the new TypedDicts + helper. The replacement block:
 
 ```python
 from __future__ import annotations
@@ -91,8 +91,8 @@ import sys
 from pathlib import PurePosixPath
 from typing import Any, Literal, NotRequired, TypedDict
 
-from clarion_plugin_python.entity_id import entity_id
-from clarion_plugin_python.qualname import reconstruct_qualname
+from loomweave_plugin_python.entity_id import entity_id
+from loomweave_plugin_python.qualname import reconstruct_qualname
 
 _PLUGIN_ID = "python"
 
@@ -286,10 +286,10 @@ def extract(
     dotted_module = module_dotted_name(prefix_source)
 
     # Top-level __init__.py would resolve to "" — entity_id() rejects that
-    # (crates/clarion-core/src/entity_id.rs:97-101). Skip with stderr.
+    # (crates/loomweave-core/src/entity_id.rs:97-101). Skip with stderr.
     if not dotted_module:
         sys.stderr.write(
-            f"clarion-plugin-python: skipping {file_path}: "
+            f"loomweave-plugin-python: skipping {file_path}: "
             f"top-level __init__.py has no package name\n",
         )
         return []
@@ -298,7 +298,7 @@ def extract(
         tree = ast.parse(source)
     except SyntaxError as exc:
         sys.stderr.write(
-            f"clarion-plugin-python: skipping {file_path}: syntax error at "
+            f"loomweave-plugin-python: skipping {file_path}: syntax error at "
             f"line {exc.lineno}: {exc.msg}\n",
         )
         return [_build_module_entity(source, dotted_module, file_path, "syntax_error")]
@@ -403,7 +403,7 @@ def test_top_level_init_py_skipped_with_stderr(
 
     `module_dotted_name("__init__.py")` returns "" (the empty stem case).
     Emitting an entity with empty qualified_name would crash the entity-ID
-    assembler at crates/clarion-core/src/entity_id.rs:97-101.
+    assembler at crates/loomweave-core/src/entity_id.rs:97-101.
     """
     entities = extract("def helper():\n    pass\n", "__init__.py")
     assert entities == []
@@ -499,7 +499,7 @@ Expected: all PASS. If ruff format complains, run `ruff format plugins/python` t
 - [ ] **Step 1.21: Commit**
 
 ```bash
-git add plugins/python/src/clarion_plugin_python/extractor.py plugins/python/tests/test_extractor.py
+git add plugins/python/src/loomweave_plugin_python/extractor.py plugins/python/tests/test_extractor.py
 git commit -m "$(cat <<'EOF'
 feat(wp3): module entity emission with parse_status (B.2 Q1)
 
@@ -526,7 +526,7 @@ EOF
 ## Task 2: Per-kind builder split + `_build_class_entity`
 
 **Files:**
-- Modify: `plugins/python/src/clarion_plugin_python/extractor.py`
+- Modify: `plugins/python/src/loomweave_plugin_python/extractor.py`
 - Modify: `plugins/python/tests/test_extractor.py`
 
 Refactor the dispatcher and add class entity emission. After this task, all three kinds (function, class, module) ship.
@@ -715,7 +715,7 @@ Expected: all PASS.
 - [ ] **Step 2.9: Commit**
 
 ```bash
-git add plugins/python/src/clarion_plugin_python/extractor.py plugins/python/tests/test_extractor.py
+git add plugins/python/src/loomweave_plugin_python/extractor.py plugins/python/tests/test_extractor.py
 git commit -m "$(cat <<'EOF'
 feat(wp3): class entity emission + per-kind builders (B.2 Q3)
 
@@ -736,8 +736,8 @@ EOF
 
 **Files:**
 - Modify: `plugins/python/plugin.toml`
-- Modify: `plugins/python/src/clarion_plugin_python/server.py`
-- Modify: `plugins/python/src/clarion_plugin_python/__init__.py`
+- Modify: `plugins/python/src/loomweave_plugin_python/server.py`
+- Modify: `plugins/python/src/loomweave_plugin_python/__init__.py`
 
 §10 resolution: package `__version__` → `0.1.1` (patch); ontology_version → `0.2.0` (matches the kind-set expansion). The two are different concepts.
 
@@ -752,9 +752,9 @@ Old:
 # decorators are WP3-feature-complete kinds.
 entity_kinds = ["function"]
 edge_kinds = []
-# Per ADR-022: uppercase `CLA-{PLUGIN_ID_UPPER}-`. Reserved at parse
-# against the CLA-INFRA-* and CLA-FACT-* namespaces.
-rule_id_prefix = "CLA-PY-"
+# Per ADR-022: uppercase `LMWV-{PLUGIN_ID_UPPER}-`. Reserved at parse
+# against the LMWV-INFRA-* and LMWV-FACT-* namespaces.
+rule_id_prefix = "LMWV-PY-"
 # Feeds ADR-007 cache keying; bump when the entity/edge/rule set shifts.
 ontology_version = "0.1.0"
 ```
@@ -766,9 +766,9 @@ New:
 # imports, calls remain WP3-feature-complete (later Sprint 2+).
 entity_kinds = ["function", "class", "module"]
 edge_kinds = []
-# Per ADR-022: uppercase `CLA-{PLUGIN_ID_UPPER}-`. Reserved at parse
-# against the CLA-INFRA-* and CLA-FACT-* namespaces.
-rule_id_prefix = "CLA-PY-"
+# Per ADR-022: uppercase `LMWV-{PLUGIN_ID_UPPER}-`. Reserved at parse
+# against the LMWV-INFRA-* and LMWV-FACT-* namespaces.
+rule_id_prefix = "LMWV-PY-"
 # Bumps when the entity/edge/rule set shifts. NOTE: ADR-007's summary-cache
 # key is the 5-tuple (entity_id, content_hash, prompt_template_id,
 # model_tier, guidance_fingerprint) — ontology_version is handshake-validation,
@@ -779,7 +779,7 @@ ontology_version = "0.2.0"
 
 - [ ] **Step 3.2: Update `server.py` constant**
 
-In `plugins/python/src/clarion_plugin_python/server.py:35`:
+In `plugins/python/src/loomweave_plugin_python/server.py:35`:
 
 Old: `ONTOLOGY_VERSION = "0.1.0"`
 
@@ -787,7 +787,7 @@ New: `ONTOLOGY_VERSION = "0.2.0"`
 
 - [ ] **Step 3.3: Update package `__version__`**
 
-In `plugins/python/src/clarion_plugin_python/__init__.py`:
+In `plugins/python/src/loomweave_plugin_python/__init__.py`:
 
 Old: `__version__ = "0.1.0"`
 
@@ -821,7 +821,7 @@ Expected: all PASS.
 - [ ] **Step 3.6: Commit**
 
 ```bash
-git add plugins/python/plugin.toml plugins/python/src/clarion_plugin_python/server.py plugins/python/src/clarion_plugin_python/__init__.py
+git add plugins/python/plugin.toml plugins/python/src/loomweave_plugin_python/server.py plugins/python/src/loomweave_plugin_python/__init__.py
 git commit -m "$(cat <<'EOF'
 feat(wp3): ontology v0.2.0 — entity_kinds += class, module (B.2)
 
@@ -903,7 +903,7 @@ Mind JSON commas — the existing module row currently ends with a comma before 
 
 - [ ] **Step 4.3: Validate JSON syntax**
 
-Run: `python3 -c 'import json; json.load(open("/home/john/clarion/fixtures/entity_id.json"))'`
+Run: `python3 -c 'import json; json.load(open("/home/john/loomweave/fixtures/entity_id.json"))'`
 
 Expected: no output (valid JSON).
 
@@ -911,7 +911,7 @@ Expected: no output (valid JSON).
 
 Run:
 ```bash
-cargo nextest run -p clarion-core entity_id::tests::shared_fixture_byte_for_byte_parity
+cargo nextest run -p loomweave-core entity_id::tests::shared_fixture_byte_for_byte_parity
 plugins/python/.venv/bin/pytest plugins/python/tests/test_entity_id.py::test_matches_shared_fixture -v
 ```
 
@@ -929,7 +929,7 @@ simple class, nested class, class-in-function. The existing
 `pkg.submodule` module row's "future" annotation is updated since B.2
 makes module a real Python-plugin kind.
 
-Both crates/clarion-core/src/entity_id.rs::tests::shared_fixture_byte_for_byte_parity
+Both crates/loomweave-core/src/entity_id.rs::tests::shared_fixture_byte_for_byte_parity
 and plugins/python/tests/test_entity_id.py::test_matches_shared_fixture
 consume this file; divergence fails CI on both sides.
 
@@ -956,11 +956,11 @@ Old (lines ~115-129):
         entities = response["result"]["entities"]
         ids = {e["id"] for e in entities}
         # Public extractor API must be present.
-        assert "python:function:clarion_plugin_python.extractor.module_dotted_name" in ids
-        assert "python:function:clarion_plugin_python.extractor.extract" in ids
+        assert "python:function:loomweave_plugin_python.extractor.module_dotted_name" in ids
+        assert "python:function:loomweave_plugin_python.extractor.extract" in ids
         # Private walker is a FunctionDef too, so it emits.
-        assert "python:function:clarion_plugin_python.extractor._walk" in ids
-        assert "python:function:clarion_plugin_python.extractor._build_entity" in ids
+        assert "python:function:loomweave_plugin_python.extractor._walk" in ids
+        assert "python:function:loomweave_plugin_python.extractor._build_entity" in ids
 
         # Every entity should carry kind="function" and the absolute
         # source.file_path we sent (project_root relativisation only affects
@@ -981,19 +981,19 @@ New:
         # Invariants — no exact totals (those become merge-conflict generators
         # the moment someone adds a private helper to extractor.py).
         assert len(module_entities) == 1, "exactly one module entity per analyzed file"
-        assert module_entities[0]["id"] == "python:module:clarion_plugin_python.extractor"
+        assert module_entities[0]["id"] == "python:module:loomweave_plugin_python.extractor"
         assert module_entities[0].get("parse_status") == "ok"
 
         # Public extractor API must be present.
-        assert "python:function:clarion_plugin_python.extractor.module_dotted_name" in function_ids
-        assert "python:function:clarion_plugin_python.extractor.extract" in function_ids
+        assert "python:function:loomweave_plugin_python.extractor.module_dotted_name" in function_ids
+        assert "python:function:loomweave_plugin_python.extractor.extract" in function_ids
         # Private walker is a FunctionDef too, so it emits.
-        assert "python:function:clarion_plugin_python.extractor._walk" in function_ids
+        assert "python:function:loomweave_plugin_python.extractor._walk" in function_ids
         # B.2 renamed `_build_entity` → `_build_function_entity` and added
         # `_build_class_entity` + `_build_module_entity` (and `_module_source_range`).
-        assert "python:function:clarion_plugin_python.extractor._build_function_entity" in function_ids
-        assert "python:function:clarion_plugin_python.extractor._build_class_entity" in function_ids
-        assert "python:function:clarion_plugin_python.extractor._build_module_entity" in function_ids
+        assert "python:function:loomweave_plugin_python.extractor._build_function_entity" in function_ids
+        assert "python:function:loomweave_plugin_python.extractor._build_class_entity" in function_ids
+        assert "python:function:loomweave_plugin_python.extractor._build_module_entity" in function_ids
 
         # Extractor has no top-level classes (module-level functions only),
         # so class_entities should be empty for this specific target.
@@ -1007,7 +1007,7 @@ New:
 
 - [ ] **Step 5.2: Reinstall plugin so the binary picks up Task 1+2 changes**
 
-The round-trip test invokes the *installed* `clarion-plugin-python` binary. Editable install (`pip install -e`) makes the *source* changes take effect immediately, but verify:
+The round-trip test invokes the *installed* `loomweave-plugin-python` binary. Editable install (`pip install -e`) makes the *source* changes take effect immediately, but verify:
 
 Run: `plugins/python/.venv/bin/pip install -e plugins/python[dev]` (idempotent reinstall — no-op if up to date).
 
@@ -1017,7 +1017,7 @@ Run: `plugins/python/.venv/bin/pytest plugins/python/tests/test_round_trip.py -v
 
 Expected: PASS.
 
-If FAIL with "binary not found," check `which clarion-plugin-python` from the venv. If FAIL with mismatched IDs, the rename in Task 2 (`_build_entity` → `_build_function_entity`) wasn't applied or didn't reach the installed binary; reinstall and re-run.
+If FAIL with "binary not found," check `which loomweave-plugin-python` from the venv. If FAIL with mismatched IDs, the rename in Task 2 (`_build_entity` → `_build_function_entity`) wasn't applied or didn't reach the installed binary; reinstall and re-run.
 
 - [ ] **Step 5.4: Commit**
 
@@ -1053,12 +1053,12 @@ In `tests/e2e/sprint_1_walking_skeleton.sh`, replace lines 71-78 (the `RESULT=$(
 
 Old:
 ```bash
-RESULT=$(sqlite3 "$DEMO_DIR/.clarion/clarion.db" "select id, kind from entities order by id;")
+RESULT=$(sqlite3 "$DEMO_DIR/.loomweave/loomweave.db" "select id, kind from entities order by id;")
 EXPECTED="python:function:demo.hello|function"
 
 if [ "$RESULT" != "$EXPECTED" ]; then
     log "DB contents:"
-    sqlite3 "$DEMO_DIR/.clarion/clarion.db" "select * from entities;" >&2 || true
+    sqlite3 "$DEMO_DIR/.loomweave/loomweave.db" "select * from entities;" >&2 || true
     fail "expected exactly '$EXPECTED', got '$RESULT'"
 fi
 
@@ -1067,7 +1067,7 @@ log "PASS: walking skeleton persisted $RESULT"
 
 New:
 ```bash
-RESULT=$(sqlite3 "$DEMO_DIR/.clarion/clarion.db" "select id, kind from entities order by id;")
+RESULT=$(sqlite3 "$DEMO_DIR/.loomweave/loomweave.db" "select id, kind from entities order by id;")
 # B.2 (Sprint 2): every analyzed file emits a module entity in addition to
 # its function/class entities. The demo file `def hello(): return "world"`
 # produces exactly two rows.
@@ -1076,7 +1076,7 @@ python:module:demo|module"
 
 if [ "$RESULT" != "$EXPECTED" ]; then
     log "DB contents:"
-    sqlite3 "$DEMO_DIR/.clarion/clarion.db" "select * from entities;" >&2 || true
+    sqlite3 "$DEMO_DIR/.loomweave/loomweave.db" "select * from entities;" >&2 || true
     fail "expected exactly:\n$EXPECTED\ngot:\n$RESULT"
 fi
 
@@ -1085,7 +1085,7 @@ log "PASS: walking skeleton persisted module + function entities"
 
 The newline inside `EXPECTED` matches sqlite3's default output format (one row per line, alphabetic order: `python:function:demo.hello` < `python:module:demo`).
 
-- [ ] **Step 6.2: Build a fresh clarion binary so the script picks up nothing of Rust changes (none in this plan, but the venv has the new Python plugin)**
+- [ ] **Step 6.2: Build a fresh loomweave binary so the script picks up nothing of Rust changes (none in this plan, but the venv has the new Python plugin)**
 
 The script does `cargo build --workspace --release` itself; ensure the editable plugin install in the venv reflects Task 1+2:
 
@@ -1144,7 +1144,7 @@ Skip — the work is already in Task 1's commit.
 
 - [ ] **Step 8.1: Verify forward-pointer exists in the Sprint-1 WP3 doc**
 
-Run: `grep -n "B.2" /home/john/clarion/docs/implementation/sprint-1/wp3-python-plugin.md | head -5`
+Run: `grep -n "B.2" /home/john/loomweave/docs/implementation/sprint-1/wp3-python-plugin.md | head -5`
 
 Expected: at least one match referencing `b2-class-module-entities.md` or "Sprint 2 / B.2". If none, append the forward-pointer near §1 "out of scope":
 

@@ -1,4 +1,4 @@
-# Clarion Sprint 2 — Resume Handoff (post-amendment)
+# Loomweave Sprint 2 — Resume Handoff (post-amendment)
 
 This file is the starting prompt for the next Claude Code session that
 opens the resumed Sprint 2. Paste it as the user's first message; it is
@@ -10,7 +10,7 @@ record of what Sprint 2 was originally scoped to do.
 
 ---
 
-# Begin Clarion Sprint 2 (resumed under scope amendment 2026-05-16)
+# Begin Loomweave Sprint 2 (resumed under scope amendment 2026-05-16)
 
 Sprint 2 was opened 2026-04-30 with seven Tier B boxes (B.1–B.7) plus
 warmup carryover. Two boxes shipped (B.2 class+module entities, one
@@ -31,9 +31,9 @@ protocol changes — that's the proof). Forward on the existing work.
 
 1. **The scope amendment** — [`docs/implementation/sprint-2/scope-amendment-2026-05.md`](../../implementation/sprint-2/scope-amendment-2026-05.md). This is the source of truth for what Sprint 2 ships now. Read it cover-to-cover before doing anything else.
 2. **The three new ADRs** —
-   - [ADR-028 — Edge confidence tiers](../../clarion/adr/ADR-028-edge-confidence-tiers.md)
-   - [ADR-029 — Entity associations binding](../../clarion/adr/ADR-029-entity-associations-binding.md)
-   - [ADR-030 — On-demand summary scope](../../clarion/adr/ADR-030-on-demand-summary-scope.md)
+   - [ADR-028 — Edge confidence tiers](../../loomweave/adr/ADR-028-edge-confidence-tiers.md)
+   - [ADR-029 — Entity associations binding](../../loomweave/adr/ADR-029-entity-associations-binding.md)
+   - [ADR-030 — On-demand summary scope](../../loomweave/adr/ADR-030-on-demand-summary-scope.md)
 3. **The original Sprint 2 kickoff** — [`2026-04-30-sprint-2-kickoff.md`](./2026-04-30-sprint-2-kickoff.md). Read sections "Sprint 1 in one paragraph" (so this handoff stays self-contained on the walking-skeleton contract) and "Carryover" (unfixed warmup bugs are still ready work).
 4. **The B.3 design** — [`docs/implementation/sprint-2/b3-contains-edges.md`](../../implementation/sprint-2/b3-contains-edges.md). Implementation pending; this is the next thing to actually code.
 
@@ -44,17 +44,17 @@ Skim only:
 
 ## Working directory + branch
 
-- Directory: `/home/john/clarion`
+- Directory: `/home/john/loomweave`
 - Branch: continue on `sprint-2/b3-design` (the in-flight branch). The scope-amendment artifacts (ADRs 028/029/030, scope memo, plan + ADR-README updates) were authored under a `worktree-sprint-2+mvp-reset-additions` worktree; merge that into `sprint-2/b3-design` before starting implementation work, or rebase the amendments on top of B.3 impl as you go.
 - Latest commit on `sprint-2/b3-design`: `5c510f1` (B.3 design doc).
 - The `sprint-2/b2-design` branch is closed; B.2 work merged.
 
 ## Sprint 1 in one paragraph (so this handoff is self-contained)
 
-`clarion analyze` against a fixture project with a single
+`loomweave analyze` against a fixture project with a single
 `def hello(): ...` Python file persists exactly one entity row,
 `python:function:demo.hello`, with `kind="function"`, into
-`.clarion/clarion.db`. The pipeline is: Rust plugin host discovers
+`.loomweave/loomweave.db`. The pipeline is: Rust plugin host discovers
 the editable Python plugin on `$PATH`, spawns it, completes a
 JSON-RPC handshake, sends one `analyze_file` request, receives one
 entity, and writes it through the writer-actor. Every stage has both
@@ -93,7 +93,7 @@ warmup (optional) → B.3 impl → B.4* → B.5*       B.7 (parallel)
 Pick one of the unfixed warmup bugs. Both are P2, small, in code you
 will touch later, and will get you back into the Rust workspace:
 
-- `clarion-ed5017139f` — `clarion install` leaves partial `.clarion/` on failure. Fix: cleanup or atomic move.
+- `clarion-ed5017139f` — `loomweave install` leaves partial `.loomweave/` on failure. Fix: cleanup or atomic move.
 - `clarion-b5b1029f5a` — `reader_pool` flaky 100ms sleep. Fix: replace with deterministic synchronisation primitive.
 
 Skip if you want to dive into B.3.
@@ -103,7 +103,7 @@ Skip if you want to dive into B.3.
 Design is committed at [`docs/implementation/sprint-2/b3-contains-edges.md`](../../implementation/sprint-2/b3-contains-edges.md). Implementation follows the §"Locked surfaces" and §"Design decisions Q1–Q6" sections directly. Key shape:
 
 - Python plugin emits `contains` edges + adds `parent_id` field to `RawEntity` (dual encoding per Q2).
-- Writer-actor enforces the parent_id ↔ contains-edge consistency invariant (`CLA-INFRA-PARENT-CONTAINS-MISMATCH`).
+- Writer-actor enforces the parent_id ↔ contains-edge consistency invariant (`LMWV-INFRA-PARENT-CONTAINS-MISMATCH`).
 - Schema migration drops `edges.id`, promotes `(kind, from_id, to_id)` to natural PK (ADR-026 + ADR-024 edit-in-place policy).
 - Ontology version bumps `0.2.0 → 0.3.0` (MINOR per ADR-027).
 
@@ -129,7 +129,7 @@ This gate's purpose is to discover scale-bound design problems in week 2, not we
 
 **Decision C — storage layout for inferred edges.** Same `edges` table with `confidence='inferred'` rows, or separate `inferred_edges_cache` table? ADR-028 §"Alternative 4" defers this to B.4* implementation. Pick during implementation; document in the B.4* design doc.
 
-The schema migration for `confidence` column lands under ADR-024's edit-in-place policy (no consumer has read an edge row yet; Clarion is unpublished).
+The schema migration for `confidence` column lands under ADR-024's edit-in-place policy (no consumer has read an edge row yet; Loomweave is unpublished).
 
 ### Step 3 — B.5* references (`clarion-b0cedfd2bb`)
 
@@ -145,9 +145,9 @@ Can start in parallel with B.4*/B.5* — different repo (Filigree), different co
 - Target Filigree release: 2.1.0 (Filigree is currently at `release/2.0.1`).
 - Coordinate with the Filigree-side release plan; this is one PR on the Filigree repo.
 
-**Clarion-side**:
+**Loomweave-side**:
 - HTTP client for Filigree's existing API (use `reqwest`; auth per ADR-012 / Filigree's existing UDS+token scheme).
-- New MCP tool: `issues_for(entity_id, include_contained=true)` — implementation in the new `clarion-mcp` crate (see B.6 below).
+- New MCP tool: `issues_for(entity_id, include_contained=true)` — implementation in the new `loomweave-mcp` crate (see B.6 below).
 
 Federation §5 audit is in ADR-029; cite it if any reviewer questions the cross-product coupling.
 
@@ -155,7 +155,7 @@ Federation §5 audit is in ADR-029; cite it if any reviewer questions the cross-
 
 ### Step 5 — B.6 WP8 MCP surface (`clarion-e2a3672cc9`)
 
-New crate: `clarion-mcp`. Use `rmcp` (the Rust MCP SDK) or whatever the Rust ecosystem has settled on by the time this work starts.
+New crate: `loomweave-mcp`. Use `rmcp` (the Rust MCP SDK) or whatever the Rust ecosystem has settled on by the time this work starts.
 
 Seven tools (per ADR-028 §"Decision 2" + ADR-029 §"Decision 2" + ADR-030 §"Decision 1"):
 - `entity_at(file, line)` — innermost containing entity (uses `ix_entities_source_file` + line-range query)
@@ -171,8 +171,8 @@ MCP auth: UDS default per ADR-012; falls back to TCP+token. Same discipline as t
 ### Step 6 — B.8 elspeth scale-test (`clarion-6222134e0d`)
 
 Sprint 2 closes when B.8 ships. Scope per scope-amendment §3:
-- `clarion analyze` runs end-to-end against elspeth-slice (~50 files initially; full ~425k LOC if feasible).
-- `clarion serve` exposes the seven MCP tools.
+- `loomweave analyze` runs end-to-end against elspeth-slice (~50 files initially; full ~425k LOC if feasible).
+- `loomweave serve` exposes the seven MCP tools.
 - Consult-mode agent navigates the corpus via the MCP server.
 - Measure: cost per `summary(id)` call, latency per MCP query, cache hit rate on second-pass.
 - Re-scoped WP11 spike: per-query cost (the honest metric for on-demand) rather than per-run cost.
@@ -214,7 +214,7 @@ The current Sprint 2 ready landscape (as of 2026-05-16):
 - `clarion-2d2d1d27b5` (B.4*) — pending, blocked by B.3
 - `clarion-b0cedfd2bb` (B.5*) — pending, blocked by B.4*
 - `clarion-e2a3672cc9` (B.6) — pending, blocked by B.4*
-- `clarion-73ab0da435` (B.7) — pending, no clarion-side blocker; coordinates with Filigree-side release
+- `clarion-73ab0da435` (B.7) — pending, no loomweave-side blocker; coordinates with Filigree-side release
 - `clarion-6222134e0d` (B.8) — pending, blocked by B.6 + B.7
 - Open warmups: `clarion-ed5017139f`, `clarion-b5b1029f5a`
 - Triage backlog (don't let it grow further): `clarion-fbe50aa6e1`, `clarion-523b2eebad` (P2 audit findings)

@@ -3,7 +3,7 @@
 **/*.rs.bk
 Cargo.lock.bak
 
-# SQLite working files (project-level .clarion/ is tracked per ADR-005)
+# SQLite working files (project-level .loomweave/ is tracked per ADR-005)
 *.db-journal
 *.db-wal
 
@@ -27,15 +27,15 @@ htmlcov/
 # Smoke-test result artifacts (per-run; archived separately at tag-cut)
 tests/e2e/external-operator-smoke-results-*.md
 
-# Generated skill fingerprint (rewritten by `clarion install --skills`).
-.agents/skills/clarion-workflow/.fingerprint
+# Generated skill fingerprint (rewritten by `loomweave install --skills`).
+.agents/skills/loomweave-workflow/.fingerprint
 
-# Clarion runtime artifacts — the index DB, per-project instance fingerprint,
+# Loomweave runtime artifacts — the index DB, per-project instance fingerprint,
 # and analyze lock change on every run, so they are not tracked
-# (see .clarion/.gitignore).
-.clarion/clarion.db
-.clarion/instance_id
-.clarion/clarion.lock
+# (see .loomweave/.gitignore).
+.loomweave/loomweave.db
+.loomweave/instance_id
+.loomweave/loomweave.lock
 
 # Documentation site build output (mkdocs `site_dir`, web/mkdocs.yml).
 /site-build/

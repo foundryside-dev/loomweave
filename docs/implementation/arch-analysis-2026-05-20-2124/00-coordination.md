@@ -2,7 +2,7 @@
 
 ## Configuration
 
-- **Scope**: Full RC1 branch at `/home/john/clarion`, including Rust workspace crates, Python plugin, tests/perf/e2e harnesses, federation fixtures, release/CI scripts, and governing docs.
+- **Scope**: Full RC1 branch at `/home/john/loomweave`, including Rust workspace crates, Python plugin, tests/perf/e2e harnesses, federation fixtures, release/CI scripts, and governing docs.
 - **Branch / commit**: `RC1` at `286d92d` (`RC1...origin/RC1 [ahead 1]`).
 - **Deliverables selected**: **Option G — Comprehensive**.
   - Rationale: user requested a fresh "root and branch" analysis after deleting the old analysis.
@@ -15,12 +15,12 @@
 
 ## Subsystem Candidates
 
-1. `clarion-core` — domain primitives, plugin protocol/host, entity IDs, LLM provider contracts.
-2. `clarion-storage` — SQLite schema, writer actor, reader pool, query/cache helpers.
-3. `clarion-cli` — `clarion` binary, install/analyze/serve, HTTP read API, secret-scan glue, clustering.
-4. `clarion-mcp` — consult-mode MCP read surface, summary/inferred dispatch, Filigree enrichment.
-5. `clarion-scanner` — pre-ingest secret scanning engine and baseline policy.
-6. `clarion-plugin-fixture` — protocol-compatible fixture plugin and host integration support.
+1. `loomweave-core` — domain primitives, plugin protocol/host, entity IDs, LLM provider contracts.
+2. `loomweave-storage` — SQLite schema, writer actor, reader pool, query/cache helpers.
+3. `loomweave-cli` — `loomweave` binary, install/analyze/serve, HTTP read API, secret-scan glue, clustering.
+4. `loomweave-mcp` — consult-mode MCP read surface, summary/inferred dispatch, Filigree enrichment.
+5. `loomweave-scanner` — pre-ingest secret scanning engine and baseline policy.
+6. `loomweave-plugin-fixture` — protocol-compatible fixture plugin and host integration support.
 7. `plugins/python` — Python AST/pyright language plugin and Wardline probe.
 8. `tests`, `scripts`, `.github`, and docs/fixtures — release, federation, quality, and validation infrastructure.
 
@@ -45,7 +45,7 @@
 - 2026-05-20 21:24 — Ran `git status --short --branch`; branch is `RC1...origin/RC1 [ahead 1]`.
 - 2026-05-20 21:24 — Removed old analysis directory `docs/implementation/arch-analysis-2026-05-18-1244/` at user request.
 - 2026-05-20 21:24 — Created fresh workspace `docs/implementation/arch-analysis-2026-05-20-2124/temp`.
-- 2026-05-20 21:24 — Confirmed Rust workspace metadata has six crates: `clarion-core`, `clarion-storage`, `clarion-cli`, `clarion-mcp`, `clarion-scanner`, and `clarion-plugin-fixture`.
+- 2026-05-20 21:24 — Confirmed Rust workspace metadata has six crates: `loomweave-core`, `loomweave-storage`, `loomweave-cli`, `loomweave-mcp`, `loomweave-scanner`, and `loomweave-plugin-fixture`.
 - 2026-05-20 21:25 — Started six focused subsystem exploration agents: core/fixture, storage, CLI/scanner, MCP, Python plugin, and release/federation/docs.
 - 2026-05-20 21:31 — Integrated all six exploration reports into the root-and-branch synthesis.
 - 2026-05-20 21:36 — Created Option G deliverables: discovery, catalog, diagrams, final report, quality, security, release readiness, test infrastructure, dependency analysis, and architect handover.
@@ -55,9 +55,9 @@
 
 | Agent | Scope | Result |
 |---|---|---|
-| Aristotle | `clarion-core` and `clarion-plugin-fixture` | Complete; high confidence. |
-| Poincare | `clarion-storage` | Complete; high confidence. |
-| Halley | `clarion-cli` and `clarion-scanner` | Complete; high confidence. |
-| James | `clarion-mcp` | Complete; high confidence. |
+| Aristotle | `loomweave-core` and `loomweave-plugin-fixture` | Complete; high confidence. |
+| Poincare | `loomweave-storage` | Complete; high confidence. |
+| Halley | `loomweave-cli` and `loomweave-scanner` | Complete; high confidence. |
+| James | `loomweave-mcp` | Complete; high confidence. |
 | Pascal | `plugins/python` | Complete; high confidence for source shape, medium for live runtime health because tests were not executed in the exploration pass. |
 | Mill | Release, federation, governance, docs, workflows | Complete; high confidence for doc/workflow shape, with live GitHub policy still unverified in this pass. |

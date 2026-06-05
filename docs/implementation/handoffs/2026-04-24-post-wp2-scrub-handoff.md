@@ -1,4 +1,4 @@
-# Clarion Sprint 1 — post-WP2-scrub handoff
+# Loomweave Sprint 1 — post-WP2-scrub handoff
 
 This file is the starting prompt for the next Claude Code session after
 the WP2 phase-3 scrub closed out on 2026-04-24. Paste it as the user's
@@ -10,7 +10,7 @@ all legitimately FILE-ONLY with documented deferral rationale.
 
 ---
 
-# Continue Clarion Sprint 1 — WP2 signoff close + WP3 kickoff
+# Continue Loomweave Sprint 1 — WP2 signoff close + WP3 kickoff
 
 WP2 is code-complete and ready to tick. WP3 (Python plugin) is the
 next work package. This session's job is the human-gated A.2 signoff
@@ -23,7 +23,7 @@ perspective on WP3 will inevitably surface things WP2 missed.
 
 ## Working directory + branch
 
-- Directory: `/home/john/clarion`
+- Directory: `/home/john/loomweave`
 - Branch: `sprint-1/wp2-plugin-host`
 - Current HEAD: `7c0e396` (last WP2 scrub commit — world-writable dir
   refusal)
@@ -168,7 +168,7 @@ This is the bigger slice. WP3 builds an editable Python package at
 lock-ins:
 
 - **L7**: qualname reconstruction per
-  `docs/clarion/1.0/detailed-design.md §§4–5` (module-level, nested,
+  `docs/loomweave/1.0/detailed-design.md §§4–5` (module-level, nested,
   class, async, nested-class). Shared test fixture at
   `/fixtures/entity_id.json` must pass byte-for-byte in both Rust and
   Python — this is the L2+L7 alignment proof (A.3.4).
@@ -189,7 +189,7 @@ The scrub changed several surfaces that WP3 will touch:
    a third argument (the discovered binary path). Manifest's
    `plugin.executable` must be a bare basename that matches the
    discovered filename, or `HostError::Spawn` fires before exec. WP3's
-   Python plugin must declare `executable = "clarion-plugin-python"`
+   Python plugin must declare `executable = "loomweave-plugin-python"`
    — no paths.
 
 2. **Plugin's stderr is piped, not inherited.** The Python plugin's
@@ -214,7 +214,7 @@ The scrub changed several surfaces that WP3 will touch:
 5. **Resource limits on the plugin child**: `RLIMIT_AS` from manifest's
    `expected_max_rss_mb` (min of that and 2 GiB default), plus fixed
    `RLIMIT_NOFILE = 256`, `RLIMIT_NPROC = 32`. The Python plugin boot
-   path (`python3 -m clarion_plugin_python`) must fit — CPython alone
+   path (`python3 -m loomweave_plugin_python`) must fit — CPython alone
    takes ~30 MiB, plus imports. Realistic RSS ceiling for the Python
    plugin is 256 MiB+ (set in `plugin.toml`).
 
@@ -237,22 +237,22 @@ The scrub changed several surfaces that WP3 will touch:
 
 ### WP2 (what's in place, don't edit unless fixing a bug)
 
-- `crates/clarion-core/src/plugin/host.rs` (~2400 lines; T1–T11 tests
+- `crates/loomweave-core/src/plugin/host.rs` (~2400 lines; T1–T11 tests
   plus 4 new coverage-gap tests)
-- `crates/clarion-core/src/plugin/protocol.rs` (ProtocolError has
+- `crates/loomweave-core/src/plugin/protocol.rs` (ProtocolError has
   custom Deserialize now; `AnalyzeFileResult` is typed)
-- `crates/clarion-core/src/plugin/discovery.rs` (world-writable check,
+- `crates/loomweave-core/src/plugin/discovery.rs` (world-writable check,
   size caps)
-- `crates/clarion-core/src/plugin/manifest.rs` (integrations cap)
-- `crates/clarion-core/src/plugin/limits.rs` (NOFILE/NPROC)
-- `crates/clarion-cli/src/analyze.rs` (JoinError handled;
+- `crates/loomweave-core/src/plugin/manifest.rs` (integrations cap)
+- `crates/loomweave-core/src/plugin/limits.rs` (NOFILE/NPROC)
+- `crates/loomweave-cli/src/analyze.rs` (JoinError handled;
   `DiscoveredPlugin.executable` threaded into spawn)
 
 ### WP3 (what you'll create)
 
 - `plugins/python/` — editable Python package; `pyproject.toml` with
   `ruff`, `mypy`, `pytest` configured per ADR-023
-- `plugins/python/clarion_plugin_python/` — the module
+- `plugins/python/loomweave_plugin_python/` — the module
 - `plugins/python/tests/` — `test_qualname.py`,
   `test_wardline_probe.py`, `test_server.py`, `test_round_trip.py`
 - Shared fixture used by both Rust and Python:
@@ -263,14 +263,14 @@ The scrub changed several surfaces that WP3 will touch:
 - `docs/implementation/sprint-1/wp3-python-plugin.md` — the WP doc
 - `docs/implementation/sprint-1/signoffs.md §A.3` — the gate
 - `docs/implementation/sprint-1/README.md §4` — lock-in table
-- `docs/clarion/adr/ADR-001-language-plugin-boundary.md`
-- `docs/clarion/adr/ADR-002-crash-loop-breaker.md`
-- `docs/clarion/adr/ADR-003-entity-id-format.md`
-- `docs/clarion/adr/ADR-007-summary-cache-keying.md` — you'll produce
+- `docs/loomweave/adr/ADR-001-language-plugin-boundary.md`
+- `docs/loomweave/adr/ADR-002-crash-loop-breaker.md`
+- `docs/loomweave/adr/ADR-003-entity-id-format.md`
+- `docs/loomweave/adr/ADR-007-summary-cache-keying.md` — you'll produce
   `ontology_version` but not consume it yet
-- `docs/clarion/adr/ADR-023-tooling-baseline.md` — Python tooling gates
-- `docs/clarion/1.0/detailed-design.md §§4–5` — qualname rules
-- `docs/clarion/1.0/requirements.md` — REQ-/NFR- IDs WP3 addresses
+- `docs/loomweave/adr/ADR-023-tooling-baseline.md` — Python tooling gates
+- `docs/loomweave/1.0/detailed-design.md §§4–5` — qualname rules
+- `docs/loomweave/1.0/requirements.md` — REQ-/NFR- IDs WP3 addresses
 
 ## Methodology
 

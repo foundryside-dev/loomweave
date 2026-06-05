@@ -18,7 +18,7 @@ Implementation mitigation included in this run:
 ### Corpus Results
 
 - corpus: `elspeth_mini`
-- corpus_root: `/home/john/clarion/tests/perf/elspeth_mini`
+- corpus_root: `/home/john/loomweave/tests/perf/elspeth_mini`
 - file_count: 80
 - function_count: 828
 - reference_sites_total: 6186
@@ -55,7 +55,7 @@ Implementation mitigation included in this run:
 - outcome: GREEN
 - calibration_machine: Linux 6.8.0-110-generic x86_64; Python 3.12.3
 - pyright_pin: 1.1.409
-- clarion_commit_at_measurement: `098d61829eb59462596809205dc068b0282a8852` plus the B.5 review-follow-up working-tree patch
+- loomweave_commit_at_measurement: `098d61829eb59462596809205dc068b0282a8852` plus the B.5 review-follow-up working-tree patch
 
 ### Decision
 

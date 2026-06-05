@@ -1,18 +1,18 @@
 {
   "_meta": {
-    "contract": "clarion-http-read-api",
+    "contract": "loomweave-http-read-api",
     "endpoint": "GET /api/v1/_capabilities",
     "api_version": 1,
     "fixture_version": 5,
     "stability": "normative",
-    "authority": "Clarion ADR-014 federation registry-backend contract; Wave 0 / WS2 linkages; Wave 1 / WS1 SEI (ADR-038); T3.4 taint-store read-by-SEI",
-    "verification": "cargo test -p clarion-cli --test serve",
+    "authority": "Loomweave ADR-014 federation registry-backend contract; Wave 0 / WS2 linkages; Wave 1 / WS1 SEI (ADR-038); T3.4 taint-store read-by-SEI",
+    "verification": "cargo test -p loomweave-cli --test serve",
     "normative": true,
     "updated": "2026-06-02",
-    "description": "Contract example for Clarion registry-backend capability discovery (advertising the WS2 call-graph linkage routes, the WS1 SEI identity capability, and the T3.4 taint-store read-by-SEI route)."
+    "description": "Contract example for Loomweave registry-backend capability discovery (advertising the WS2 call-graph linkage routes, the WS1 SEI identity capability, and the T3.4 taint-store read-by-SEI route)."
   },
   "shape_decl": {
-    "kind": "clarion-http-fixture-shapes",
+    "kind": "loomweave-http-fixture-shapes",
     "shapes": {
       "capabilities_response": {
         "status": 200,

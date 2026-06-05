@@ -1,12 +1,12 @@
 # Clustering Operator Notes
 
-Clarion Phase 3 runs after plugin entity and edge extraction. It reads the
+Loomweave Phase 3 runs after plugin entity and edge extraction. It reads the
 persisted module dependency graph, clusters modules, and writes subsystem
-entities plus `in_subsystem` edges back into `.clarion/clarion.db`.
+entities plus `in_subsystem` edges back into `.loomweave/loomweave.db`.
 
 ## Configuration
 
-`clarion analyze` snapshots the resolved config into `runs.config`.
+`loomweave analyze` snapshots the resolved config into `runs.config`.
 
 ```yaml
 analysis:
@@ -28,7 +28,7 @@ weight is at least the graph's average positive edge weight; it is deterministic
 and does not perform Louvain modularity optimisation. `edge_types` may include
 `imports`, `calls`, or both. `weight_by` is currently `reference_count`.
 
-When `algorithm: leiden` produces zero or one community, Clarion computes the
+When `algorithm: leiden` produces zero or one community, Loomweave computes the
 local `weighted_components` fallback and uses it only if it produces more
 communities than Leiden. Stored subsystem properties and
 `runs.stats.clustering.algorithm` record the algorithm actually used, while
@@ -74,8 +74,8 @@ not call the LLM provider in v0.1.
 
 ## Weak Modularity
 
-Clarion emits a fact finding with rule
-`CLA-FACT-CLUSTERING-WEAK-MODULARITY` when clustering succeeds but the
+Loomweave emits a fact finding with rule
+`LMWV-FACT-CLUSTERING-WEAK-MODULARITY` when clustering succeeds but the
 modularity score is below `analysis.clustering.weak_modularity_threshold`
 (default `0.3`; set `0.0` to disable the finding). This means the graph did not
 separate cleanly into strong communities. Treat it as operator guidance, not a
@@ -84,7 +84,7 @@ different config, graph pruning, or an ADR amendment.
 
 ## Empty Inputs
 
-If no module dependency edges exist, Clarion emits no subsystems and records:
+If no module dependency edges exist, Loomweave emits no subsystems and records:
 
 ```json
 {

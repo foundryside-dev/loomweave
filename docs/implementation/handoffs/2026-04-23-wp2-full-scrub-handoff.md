@@ -1,4 +1,4 @@
-# Clarion Sprint 1 WP2 — Full Scrub Before WP3 (handoff prompt)
+# Loomweave Sprint 1 WP2 — Full Scrub Before WP3 (handoff prompt)
 
 This file is the starting prompt for a fresh Claude Code session that will
 do a **second full scrub of WP2** before the project moves on to WP3
@@ -11,7 +11,7 @@ answers is *"is it actually ready to sign off A.2 and move to WP3?"*
 
 ---
 
-# Continue Clarion Sprint 1 WP2 — full review + fix pass
+# Continue Loomweave Sprint 1 WP2 — full review + fix pass
 
 You are picking up WP2 (plugin protocol + hybrid authority) **after code
 is in place and two review passes have already landed fixes**. The sprint
@@ -26,7 +26,7 @@ third perspective usually turns up real issues the first two missed.
 
 ## Working directory + branch
 
-- Directory: `/home/john/clarion`
+- Directory: `/home/john/loomweave`
 - Branch: `sprint-1/wp2-plugin-host`
 - Current HEAD: `a1cc3be` (after the four P1 review-2 bugs landed)
 - Merge base with `main`: `ad8d4ce` (WP1 merge commit)
@@ -43,13 +43,13 @@ the four P1 review-2 bugs closed on 2026-04-23:
 |---|---|---|
 | `5c5c3ee` | clarion-b6d7e077fd | RawEntity string fields bounded to 4 KiB (host RAM DoS) |
 | `0fcc57f` | clarion-64b53d174e | Reap child on `PluginHost::spawn` handshake failure (no zombies) |
-| `37b56d9` | clarion-f56dc6ee43 | `clarion analyze` exits non-zero on FailRun |
+| `37b56d9` | clarion-f56dc6ee43 | `loomweave analyze` exits non-zero on FailRun |
 | `a1cc3be` | clarion-978c8d6f15 | CrashLoopBreaker wired into analyze.rs + one-plugin-crash no longer tanks run |
 
 The last one introduced a behavioural change worth flagging to reviewers:
 `RunOutcome::SoftFailed` (plugin crashed, other plugins' entities still
 commit) vs `RunOutcome::HardFailed` (writer-actor error, rollback). See
-`crates/clarion-cli/src/analyze.rs` §run-outcome. This split is new and
+`crates/loomweave-cli/src/analyze.rs` §run-outcome. This split is new and
 warrants scrutiny — it widens the CommitRun/FailRun semantics and
 implicitly extends the L3 writer-actor contract.
 
@@ -58,9 +58,9 @@ implicitly extends the L3 writer-actor contract.
 WP2 covers:
 
 - **L4** — JSON-RPC transport (Content-Length framing, typed protocol),
-  `crates/clarion-core/src/plugin/transport.rs` + `protocol.rs`
+  `crates/loomweave-core/src/plugin/transport.rs` + `protocol.rs`
 - **L5** — `plugin.toml` manifest parser/validator per ADR-022,
-  `crates/clarion-core/src/plugin/manifest.rs`
+  `crates/loomweave-core/src/plugin/manifest.rs`
 - **L6** — Core-enforced minimums per ADR-021 §Layer 2 (path jail,
   Content-Length ceiling, entity cap, `RLIMIT_AS`),
   `jail.rs` + `limits.rs`
@@ -71,18 +71,18 @@ WP2 covers:
 - **Crash-loop breaker** — ADR-002 + UQ-WP2-10 (>3 crashes/60s),
   `breaker.rs`
 - **Analyze CLI wiring** — discover → walk → per-plugin spawn →
-  writer-actor, `crates/clarion-cli/src/analyze.rs`
+  writer-actor, `crates/loomweave-cli/src/analyze.rs`
 
 Anchoring documents to read-with:
 - `docs/implementation/sprint-1/wp2-plugin-host.md` — the WP doc
 - `docs/implementation/sprint-1/signoffs.md` §A.2 — the gate
-- `docs/clarion/adr/ADR-002-crash-loop-breaker.md`
-- `docs/clarion/adr/ADR-021-plugin-authority-hybrid.md`
-- `docs/clarion/adr/ADR-022-core-plugin-ontology.md`
-- `docs/clarion/adr/ADR-023-tooling-baseline.md`
-- `docs/clarion/1.0/requirements.md` — REQ / NFR / CON IDs WP2 addresses
-- `docs/clarion/1.0/system-design.md` §§4–6 (host, plugin protocol, limits)
-- `docs/clarion/1.0/detailed-design.md` §§4–5 (wire schemas, rule catalogues)
+- `docs/loomweave/adr/ADR-002-crash-loop-breaker.md`
+- `docs/loomweave/adr/ADR-021-plugin-authority-hybrid.md`
+- `docs/loomweave/adr/ADR-022-core-plugin-ontology.md`
+- `docs/loomweave/adr/ADR-023-tooling-baseline.md`
+- `docs/loomweave/1.0/requirements.md` — REQ / NFR / CON IDs WP2 addresses
+- `docs/loomweave/1.0/system-design.md` §§4–6 (host, plugin protocol, limits)
+- `docs/loomweave/1.0/detailed-design.md` §§4–5 (wire schemas, rule catalogues)
 
 ## Open WP2 review-2 tail at session start
 
@@ -132,7 +132,7 @@ the same code but from different angles, and finding overlap is signal.
 
 1. **`axiom-rust-engineering:rust-code-reviewer`** on the four WP2
    source modules: `plugin/host.rs`, `plugin/transport.rs`,
-   `plugin/jail.rs`, `plugin/limits.rs`. Also `crates/clarion-cli/src/analyze.rs`.
+   `plugin/jail.rs`, `plugin/limits.rs`. Also `crates/loomweave-cli/src/analyze.rs`.
    Ask specifically about: error handling integrity, API surface, async
    correctness, lifetime soundness. *Do not* ask for style nits —
    clippy pedantic already caught those.
@@ -151,9 +151,9 @@ the same code but from different angles, and finding overlap is signal.
    across the fork/exec boundary.
 
 4. **`ordis-quality-engineering:test-suite-reviewer`** on
-   `crates/clarion-core/src/plugin/*/tests` and
-   `crates/clarion-core/tests/host_subprocess.rs` +
-   `crates/clarion-cli/tests/wp2_e2e.rs` + `.../analyze.rs`. Look for:
+   `crates/loomweave-core/src/plugin/*/tests` and
+   `crates/loomweave-core/tests/host_subprocess.rs` +
+   `crates/loomweave-cli/tests/wp2_e2e.rs` + `.../analyze.rs`. Look for:
    sleepy assertions, test interdependence, brittle ordering, tests
    that prove the mock rather than the code under test.
 
@@ -229,10 +229,10 @@ Not a requirements list — pointers based on what I know is thin:
   cost of serde_json parsing a 6 MiB pathological payload?
 
 - **Discovery dedup + symlink semantics.** `discover()` finds
-  `clarion-plugin-*` binaries on PATH. If two PATH entries resolve to
+  `loomweave-plugin-*` binaries on PATH. If two PATH entries resolve to
   the same canonical file, what happens? If a symlink changes between
   discovery and spawn, what happens? If a PATH entry is a world-
-  writable directory, can an attacker inject a `clarion-plugin-*` and
+  writable directory, can an attacker inject a `loomweave-plugin-*` and
   have it picked up?
 
 - **Writer-actor contract.** The Reading-A′ change uses

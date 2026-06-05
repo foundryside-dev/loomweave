@@ -30,23 +30,23 @@ Filigree state.
 
 ## Architecture Assessment
 
-Clarion remains aligned with its local-first mission. It can install, analyze,
+Loomweave remains aligned with its local-first mission. It can install, analyze,
 store, and serve without mandatory sibling runtime. Federation integrations are
 read/enrichment paths, not semantic dependencies.
 
 The crate/plugin split is sensible:
 
-- Core contracts and plugin host concerns live in `clarion-core`.
-- Durable graph storage lives in `clarion-storage`.
-- Operator commands and federation HTTP live in `clarion-cli`.
-- Consult-mode MCP lives in `clarion-mcp`.
-- Pre-ingest secret detection lives in `clarion-scanner`.
+- Core contracts and plugin host concerns live in `loomweave-core`.
+- Durable graph storage lives in `loomweave-storage`.
+- Operator commands and federation HTTP live in `loomweave-cli`.
+- Consult-mode MCP lives in `loomweave-mcp`.
+- Pre-ingest secret detection lives in `loomweave-scanner`.
 - Python language semantics live in `plugins/python`.
 
 The main maintainability pressure comes from large files that carry many
 responsibilities inside otherwise sound crate boundaries. `analyze.rs`,
 `http_read.rs`, `plugin/host.rs`, `llm_provider.rs`, and
-`clarion-mcp/src/lib.rs` should be treated as "touch with tests and local
+`loomweave-mcp/src/lib.rs` should be treated as "touch with tests and local
 factoring" files.
 
 ## Strengths
@@ -124,7 +124,7 @@ release or explicitly remove it from the release-ready checklist.
 ## Architectural Decisions To Preserve
 
 - Keep federation enrich-only. Do not add a shared runtime, shared registry, or
-  cross-product mediator to simplify Clarion.
+  cross-product mediator to simplify Loomweave.
 - Keep plugin subprocesses untrusted.
 - Keep scanner-before-LLM as a hard ordering constraint.
 - Keep storage mutation serialized through the writer actor.

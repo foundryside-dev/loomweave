@@ -1,6 +1,6 @@
-# Clarion v0.1 Design Review
+# Loomweave v0.1 Design Review
 
-**Original reviewed document (pre-restructure)**: `2026-04-17-clarion-v0.1-design.md`
+**Original reviewed document (pre-restructure)**: `2026-04-17-loomweave-v0.1-design.md`
 **Historical note**: this review evaluates the pre-restructure single-file design. The current canonical docset lives in [../README.md](../README.md), with the resulting implementation-level reference in [../detailed-design.md](../detailed-design.md). This file is retained as supporting context, not as normative guidance.
 **Review date**: 2026-04-17
 **Review method**: Eight parallel specialist reviews across solution architecture, systems dynamics, Python engineering, Rust engineering, security, integration architecture, reality check (symbol/path/API verification), and architecture-decision rigor.
@@ -16,13 +16,13 @@ These are not design opinions; they are claims in the document that do not match
 
 The design uses "SARIF-lite" throughout (§Abstract line 25, §Principle 4 line 68, §9) as if Filigree's intake is SARIF-shaped. It is not. Filigree's actual intake at `src/filigree/dashboard_routes/files.py:294` takes a flat custom JSON format keyed on `scan_source` + a `findings` array of `{path, rule_id, message, severity, ...}`. Real SARIF uses `runs[].results[].locations[].physicalLocation` with driver/tool objects and fingerprints. Wardline separately emits genuine SARIF v2.1.0, but that is not what Filigree ingests.
 
-**Consequence**: the suite's "shared finding-exchange protocol" as described does not exist. A Clarion-to-Filigree adapter has to translate between them. The design must either (a) state that Clarion emits Filigree's native intake schema and drop the "SARIF-lite" framing, (b) propose a SARIF-compatible extension to Filigree's intake endpoint as a prerequisite, or (c) position Clarion as emitting SARIF upstream of a suite-internal translator. Pick one and say it.
+**Consequence**: the suite's "shared finding-exchange protocol" as described does not exist. A Loomweave-to-Filigree adapter has to translate between them. The design must either (a) state that Loomweave emits Filigree's native intake schema and drop the "SARIF-lite" framing, (b) propose a SARIF-compatible extension to Filigree's intake endpoint as a prerequisite, or (c) position Loomweave as emitting SARIF upstream of a suite-internal translator. Pick one and say it.
 
 ### 1.2 Anthropic model IDs use a notation not found in any real code in this workspace
 
 The config example in §5 uses hyphen-separated version numbers: `claude-haiku-4-5`, `claude-sonnet-4-6`, `claude-opus-4-7`. Real code in adjacent projects (Wardline fixtures, elspeth, Filigree tests) uses dot notation: `claude-sonnet-4.5`, `claude-opus-4.6`. `claude-opus-4-7` specifically has no evidence anywhere in the workspace.
 
-**Consequence**: either the hyphen form is a future API change that hasn't landed yet, or the config example is wrong. This must be pinned against the actual Anthropic SDK version the implementation will use. Shipping with wrong model IDs means `clarion analyze` fails on every LLM call.
+**Consequence**: either the hyphen form is a future API change that hasn't landed yet, or the config example is wrong. This must be pinned against the actual Anthropic SDK version the implementation will use. Shipping with wrong model IDs means `loomweave analyze` fails on every LLM call.
 
 ### 1.3 Plugin manifest silently omits Wardline groups 9, 12, 13
 
@@ -42,7 +42,7 @@ These are design decisions that, if shipped as currently written, will cause vis
 
 **Corroboration**: Architecture, Python, Integration, ADR reviews.
 
-§3 specifies entity IDs as `{plugin_id}:{kind}:{file_path}::{qualified_name}` and explicitly defers rename tracking (`EntityAlias`) to v0.2. The design's own stated differentiator is the cross-tool graph — Filigree issues reference Clarion entity IDs, Wardline declarations reference them, guidance sheets match against them. Every file move, class rename, or `__init__.py` re-export resolution change silently detaches every reference.
+§3 specifies entity IDs as `{plugin_id}:{kind}:{file_path}::{qualified_name}` and explicitly defers rename tracking (`EntityAlias`) to v0.2. The design's own stated differentiator is the cross-tool graph — Filigree issues reference Loomweave entity IDs, Wardline declarations reference them, guidance sheets match against them. Every file move, class rename, or `__init__.py` re-export resolution change silently detaches every reference.
 
 In a 425k-LOC Python codebase that is the validating first customer, renames and moves are weekly events. Python-side specifically: `from auth import TokenManager` where `TokenManager` is defined in `src/auth/tokens.py` and re-exported from `src/auth/__init__.py` — the naive resolver creates two IDs for the same entity. Hundreds of affected entities in a well-structured package.
 
@@ -57,10 +57,10 @@ Option 1 is the cheapest and most defensible. Option 3 should not be chosen sile
 
 **Corroboration**: Architecture, Rust reviews.
 
-§4 claims WAL mode "supports concurrent reads during writes" and says `clarion analyze` "holds the writer lock for the duration of the batch." The example run in §6 shows a 38-minute batch. These are incompatible:
+§4 claims WAL mode "supports concurrent reads during writes" and says `loomweave analyze` "holds the writer lock for the duration of the batch." The example run in §6 shows a 38-minute batch. These are incompatible:
 
 - WAL grows unboundedly during a long writer; checkpointing cannot complete while readers pinned to the pre-analyze snapshot hold the old page.
-- `clarion serve` writes to the summary cache during live consult sessions (§5) — these writes will block or timeout.
+- `loomweave serve` writes to the summary cache during live consult sessions (§5) — these writes will block or timeout.
 - Multiple writer sources are unacknowledged: analyze ingesting entities/edges, serve writing summary-cache on consult misses, serve writing session state.
 
 **Mitigation**: specify a writer-actor model (single tokio task owning the write connection, bounded mpsc inbox), short per-N-files transactions rather than a single batch transaction, and explicit `busy_timeout` + checkpoint strategy. Alternative: analyze writes to a shadow DB and atomic-swaps on completion — simpler, and acceptable for single-user local-first deployments.
@@ -88,7 +88,7 @@ Two related threats with severity 9/9 in the security analysis:
 - **Secrets exfiltration**: The design sends file content to Anthropic for summarization (§5, §6) with no pre-ingest secret scanner, no redaction pass, no per-file allow/deny beyond include/exclude globs. Any `.env`, test fixture, or committed API key enters Anthropic's API and persists in the summary cache and `runs/<run_id>/log.jsonl` (which the design keeps "for audit").
 - **Prompt injection**: Adversarial docstrings/comments in source become attacker-controlled field values in the structured briefing schema. Schema validation doesn't help — the schema validates shape, not semantic content. An LLM-proposed guidance sheet (auto-promoted via the `propose_guidance` capability) then persists attacker text into every future prompt (prompt-cache poisoning).
 
-**Mitigation**: a pre-ingest secret-scanner pass (`detect-secrets` or equivalent) with findings blocking LLM dispatch on unredacted hits, and explicit prompt-injection handling (untrusted-content delimiters, or an "untrusted" role boundary in the prompt structure). Both belong in v0.1, not deferred — the first real user running `clarion analyze` on a repo with a committed `.env` leaks to Anthropic silently.
+**Mitigation**: a pre-ingest secret-scanner pass (`detect-secrets` or equivalent) with findings blocking LLM dispatch on unredacted hits, and explicit prompt-injection handling (untrusted-content delimiters, or an "untrusted" role boundary in the prompt structure). Both belong in v0.1, not deferred — the first real user running `loomweave analyze` on a repo with a committed `.env` leaks to Anthropic silently.
 
 ### 2.5 Provider abstraction is at the wrong layer (HIGH)
 
@@ -102,11 +102,11 @@ Two related threats with severity 9/9 in the security analysis:
 
 **Corroboration**: Security, Integration reviews.
 
-§9 binds the HTTP read API to loopback with no auth by default. §1 says Wardline "runs at commit cadence, pulling current entity state and declared topology from Clarion's HTTP read API." If Wardline runs in CI (the typical commit-cadence posture), loopback-only doesn't fit. The token-auth path is marked "opt-in" but not designed — no format, no rotation, no scoping.
+§9 binds the HTTP read API to loopback with no auth by default. §1 says Wardline "runs at commit cadence, pulling current entity state and declared topology from Loomweave's HTTP read API." If Wardline runs in CI (the typical commit-cadence posture), loopback-only doesn't fit. The token-auth path is marked "opt-in" but not designed — no format, no rotation, no scoping.
 
 Additionally, loopback is not a security boundary on modern dev hosts: shared Docker host networks, devcontainers, browser DNS-rebinding against a fixed port, and compromised IDE extensions all reach 127.0.0.1. Treating it as secure is a category error.
 
-**Mitigation**: design token auth in v0.1 even if opt-in remains the default. Specify the token format, where it's stored (OS keychain preferred, `.clarion/token` with `0600` mode as fallback), and how Wardline picks it up in CI.
+**Mitigation**: design token auth in v0.1 even if opt-in remains the default. Specify the token format, where it's stored (OS keychain preferred, `.loomweave/token` with `0600` mode as fallback), and how Wardline picks it up in CI.
 
 ---
 
@@ -120,7 +120,7 @@ These decisions are currently buried in prose or presented as foregone. They are
 | ADR-002 | Plugin transport: LSP-style subprocess JSON-RPC | Invoked by analogy to LSP/tree-sitter; Wasm, dylib, embedded-Python not considered | Becomes the third-party plugin contract | P0 |
 | ADR-003 | Entity ID scheme + rename handling | Path-embedded, `EntityAlias` deferred | Cross-tool identity depends on it; see §2.1 above | P0 |
 | ADR-004 | SARIF-lite vs SARIF vs native | Named; doesn't match Filigree reality | Cross-tool interop; see §1.1 | P0 |
-| ADR-005 | `.clarion/` git-committable including SQLite DB | Stated as feature; conflict with LLM-derived secrets in DB unaddressed | Operational; affects every user | P1 |
+| ADR-005 | `.loomweave/` git-committable including SQLite DB | Stated as feature; conflict with LLM-derived secrets in DB unaddressed | Operational; affects every user | P1 |
 | ADR-006 | Clustering algorithm (Leiden/Louvain specifically) | Named without comparison | Expensive LLM synthesis (Phase 6 Opus calls) rides on cluster quality | P1 |
 | ADR-007 | Summary cache key design and invalidation | Specified but alternatives not considered | Guidance edits invalidate broad cache swathes; cost impact | P1 |
 | ADR-008 | Filigree file-registry displacement | In a table, not called out as breaking change | Cross-product coordination; affects existing integrations | P1 |
@@ -152,13 +152,13 @@ Manual-authored and LLM-proposed guidance sheets have no lifecycle coupling to t
 
 ### 4.3 Finding stock has no drain
 
-Every `clarion analyze` run emits findings. There is no feedback from Filigree's triage state back to Clarion's emission policy. A rule that produces 500 suppressed findings with no promotions in 90 days is noise for this project, but Clarion's next run emits the same rule at the same priority.
+Every `loomweave analyze` run emits findings. There is no feedback from Filigree's triage state back to Loomweave's emission policy. A rule that produces 500 suppressed findings with no promotions in 90 days is noise for this project, but Loomweave's next run emits the same rule at the same priority.
 
-**Mitigation**: Filigree triage outcomes flow back as a per-rule priority modifier. Simple: if rule suppression rate > N% over M days, emit `CLA-INFRA-RULE-LOW-VALUE` and suggest a configuration change.
+**Mitigation**: Filigree triage outcomes flow back as a per-rule priority modifier. Simple: if rule suppression rate > N% over M days, emit `LMWV-INFRA-RULE-LOW-VALUE` and suggest a configuration change.
 
 ### 4.4 Exploration elimination may induce LLM capability atrophy
 
-The stated goal of Principle 2 is to pre-compute structural answers so agents don't have to spawn explore subagents. The second-order risk is that agents trained (by usage pattern) to trust Clarion never develop exploration strategies for cases where the catalog is wrong or incomplete — e.g., latent race conditions visible in runtime traces but invisible to static analysis.
+The stated goal of Principle 2 is to pre-compute structural answers so agents don't have to spawn explore subagents. The second-order risk is that agents trained (by usage pattern) to trust Loomweave never develop exploration strategies for cases where the catalog is wrong or incomplete — e.g., latent race conditions visible in runtime traces but invisible to static analysis.
 
 **Mitigation**: the briefing schema should include a `knowledge_basis` field marking each briefing with the class of evidence it rests on (`static_only`, `runtime_informed`, `human_verified`). LLMs consuming the briefing can use this to decide whether to look further. Single-field schema addition with significant downstream calibration value.
 
@@ -171,8 +171,8 @@ From the Python engineering review. These are plugin-side concerns that compound
 1. **Parser dispatch (tree-sitter vs LibCST) is undefined.** Which parser owns which task? LibCST parse failures — what's the fallback? Use `libcst.native` (Rust backend) if LibCST is in the hot path.
 2. **Decorator-as-DSL detection is naive.** Direct name match only works for the simple case. Decorator factories (`@app.route("/health")`), stacked decorators (order matters for Wardline semantics), class decorators, and aliases (`validates = validates_shape`) need explicit policy.
 3. **Call graph precision is overstated.** AST-only analysis produces reliable `calls` edges for direct same-scope calls, approximate (name-match) for method calls, and nothing for dynamic dispatch. The manifest's `calls: true` capability should carry a `confidence_basis: "ast_match"` qualifier.
-4. **`TYPE_CHECKING` block imports are unmentioned.** Treating them as runtime `imports` edges produces false `CLA-PY-STRUCTURE-001` circular-import findings in any typed codebase.
-5. **Plugin packaging and interpreter isolation.** `pip install clarion-plugin-python` into an unknown environment risks dependency conflicts with the analyzed project. Recommend `pipx` for isolation; define `plugins.toml` schema (`executable`, `python_version`).
+4. **`TYPE_CHECKING` block imports are unmentioned.** Treating them as runtime `imports` edges produces false `LMWV-PY-STRUCTURE-001` circular-import findings in any typed codebase.
+5. **Plugin packaging and interpreter isolation.** `pip install loomweave-plugin-python` into an unknown environment risks dependency conflicts with the analyzed project. Recommend `pipx` for isolation; define `plugins.toml` schema (`executable`, `python_version`).
 6. **Serial-or-parallel posture.** "May thread internally" is not a posture. Commit to serial for v0.1 (defensible) or specify the parallelism mechanism (partitioned `analyze_file_batch` RPC, or `multiprocessing.Pool` inside the plugin).
 
 ---
@@ -196,22 +196,22 @@ From the Rust engineering review. These are implementation-stack choices that be
 Not everything in the spec needs to change. The following are load-bearing strengths worth protecting during revision:
 
 - **Principle 3 (plugin-owns-ontology, core-owns-algorithms)** is the most important structural decision in the document. Any pressure to add language-specific logic to the core for convenience should be resisted.
-- **Principle 5 (observe vs enforce) is a strict boundary** that keeps Clarion and Wardline from merging into one bloated tool. Protect it — and see §8 below for one place it already leaks.
+- **Principle 5 (observe vs enforce) is a strict boundary** that keeps Loomweave and Wardline from merging into one bloated tool. Protect it — and see §8 below for one place it already leaks.
 - **Structured briefings with a fixed schema** (§3) is the right LLM-consumption shape. Prose summaries would lose the entire composability story.
 - **Guidance fingerprint as cache key** invalidates exactly the affected summaries when guidance changes — non-obvious and correct.
 - **No-silent-fallback posture** in the failure model (§6): every failure emits a finding. This is rare in tools of this class.
 - **Explicit non-goals list** (§10) is defensible and scopes the tool appropriately.
 - **Pre-computed exploration-query MCP tools** (§8): `find_entry_points`, `find_http_routes`, `find_data_models` family operationalize Principle 2 in a way agents can actually use.
-- **Entity-ID-on-Filigree-issues boundary**: the decision that Clarion owns file/entity identity and Filigree owns workflow/lifecycle is a real architectural commitment, not a compromise — which is exactly why §2.1 (ID stability) matters so much.
+- **Entity-ID-on-Filigree-issues boundary**: the decision that Loomweave owns file/entity identity and Filigree owns workflow/lifecycle is a real architectural commitment, not a compromise — which is exactly why §2.1 (ID stability) matters so much.
 - **Blake3 for fingerprints, provenance columns on every summary, RecordingProvider for tests**: all correct implementation-level bets.
 
 ---
 
 ## 8. Observe-vs-Enforce Boundary Leak
 
-Principle 5 states that Clarion's plugin detects *that* an annotation is present; Wardline determines *whether* the annotated code satisfies its declared semantic. The plugin manifest in §2 hardcodes Wardline's annotation names (`@validates_shape`, `@integral_writer`, etc.) and group numbering. This couples Clarion's release cadence to Wardline's vocabulary: adding a new Wardline annotation requires a Clarion plugin release.
+Principle 5 states that Loomweave's plugin detects *that* an annotation is present; Wardline determines *whether* the annotated code satisfies its declared semantic. The plugin manifest in §2 hardcodes Wardline's annotation names (`@validates_shape`, `@integral_writer`, etc.) and group numbering. This couples Loomweave's release cadence to Wardline's vocabulary: adding a new Wardline annotation requires a Loomweave plugin release.
 
-**Mitigation**: Wardline ships an annotation-descriptor file (JSON/YAML) that Clarion plugins consume. Clarion detects "the annotation Wardline cares about is present" without hardcoding which ones those are. Preserves Principle 5 and inverts the vocabulary coupling so the faster-shipping tool (Clarion) isn't gated by the slower one (Wardline).
+**Mitigation**: Wardline ships an annotation-descriptor file (JSON/YAML) that Loomweave plugins consume. Loomweave detects "the annotation Wardline cares about is present" without hardcoding which ones those are. Preserves Principle 5 and inverts the vocabulary coupling so the faster-shipping tool (Loomweave) isn't gated by the slower one (Wardline).
 
 ---
 
@@ -220,10 +220,10 @@ Principle 5 states that Clarion's plugin detects *that* an annotation is present
 In order:
 
 1. **Correct factual errors** (§1 above). One pass through the document; small edits.
-2. **Resolve the SARIF-lite confusion** — either translate at the Clarion/Filigree boundary and drop the SARIF framing, or propose a SARIF extension to Filigree's intake. This is a decision, not an edit.
+2. **Resolve the SARIF-lite confusion** — either translate at the Loomweave/Filigree boundary and drop the SARIF framing, or propose a SARIF extension to Filigree's intake. This is a decision, not an edit.
 3. **Decide the entity ID scheme** — either content-addressed + symbolic, or promote `EntityAlias` into v0.1. This is the single decision most likely to prevent downstream rework.
 4. **Author ADR-001 (core language) and ADR-002 (plugin transport)**. Even if the answers don't change, the act of comparing alternatives exposes blind spots. Do this before the implementation plan.
-5. **Add a `Security` section** covering secret-scanning pre-ingest, prompt-injection handling, `.clarion/` commit posture, HTTP auth for Wardline, API-key file-mode requirements.
+5. **Add a `Security` section** covering secret-scanning pre-ingest, prompt-injection handling, `.loomweave/` commit posture, HTTP auth for Wardline, API-key file-mode requirements.
 6. **Decide the SQLite concurrency model** (writer-actor vs shadow-DB-swap) and document it in §4.
 7. **Fill in the Python plugin gaps**: import resolution mechanism, parser dispatch, `TYPE_CHECKING` handling, parallelism posture.
 8. **Write the "Rust stack" addendum** (one page) naming the crate choices so implementation doesn't re-derive them.

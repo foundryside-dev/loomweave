@@ -1,8 +1,8 @@
 # WP2 — Plugin Host and Hybrid Authority (Sprint 1)
 
 **Status**: DRAFT — blocked-by WP1
-**Anchoring design**: [system-design.md §2 (Core/Plugin Architecture)](../../clarion/v0.1/system-design.md#2-core--plugin-architecture), [detailed-design.md §1 (Plugin implementation detail)](../../clarion/v0.1/detailed-design.md#1-plugin-implementation-detail)
-**Accepted ADRs**: [ADR-002](../../clarion/adr/ADR-002-plugin-transport-json-rpc.md), [ADR-021](../../clarion/adr/ADR-021-plugin-authority-hybrid.md), [ADR-022](../../clarion/adr/ADR-022-core-plugin-ontology.md)
+**Anchoring design**: [system-design.md §2 (Core/Plugin Architecture)](../../loomweave/v0.1/system-design.md#2-core--plugin-architecture), [detailed-design.md §1 (Plugin implementation detail)](../../loomweave/v0.1/detailed-design.md#1-plugin-implementation-detail)
+**Accepted ADRs**: [ADR-002](../../loomweave/adr/ADR-002-plugin-transport-json-rpc.md), [ADR-021](../../loomweave/adr/ADR-021-plugin-authority-hybrid.md), [ADR-022](../../loomweave/adr/ADR-022-core-plugin-ontology.md)
 **Predecessor**: [WP1](./wp1-scaffold.md).
 **Blocks**: WP3.
 
@@ -39,7 +39,7 @@ enforcement points are what lock L6 and determine the plugin API contract.
   proves the breaker trips. Respawn logic is implemented but the walking-skeleton demo
   does not exercise it (one analyze run = one spawn).
 - In-process mock plugin used by tests.
-- Wiring WP1's `clarion analyze` to discover and spawn plugins.
+- Wiring WP1's `loomweave analyze` to discover and spawn plugins.
 
 **Explicitly out of scope for Sprint 1:**
 
@@ -54,8 +54,8 @@ enforcement points are what lock L6 and determine the plugin API contract.
 ### L4 — JSON-RPC method set + Content-Length framing
 
 **What locks**: the over-the-wire protocol between core and any plugin, per
-[ADR-002](../../clarion/adr/ADR-002-plugin-transport-json-rpc.md) and
-[detailed-design.md §1](../../clarion/v0.1/detailed-design.md#1-plugin-implementation-detail).
+[ADR-002](../../loomweave/adr/ADR-002-plugin-transport-json-rpc.md) and
+[detailed-design.md §1](../../loomweave/v0.1/detailed-design.md#1-plugin-implementation-detail).
 
 **Sprint 1 method set** (minimum viable for walking skeleton):
 
@@ -83,23 +83,23 @@ Changing framing later = breaking every plugin implementation.
 **Downstream impact**:
 - WP3 implements the plugin side against this spec.
 - `↗` No direct cross-product touch in Sprint 1, but if Wardline ever becomes a
-  Clarion plugin (not planned for v0.1), it inherits this protocol.
+  Loomweave plugin (not planned for v0.1), it inherits this protocol.
 
 ### L5 — `plugin.toml` manifest schema
 
 **What locks**: the schema of the manifest file every plugin must provide, per
-[ADR-022](../../clarion/adr/ADR-022-core-plugin-ontology.md). WP2 ships the Rust
+[ADR-022](../../loomweave/adr/ADR-022-core-plugin-ontology.md). WP2 ships the Rust
 parser + validator; WP3 ships the first real manifest.
 
 **Schema (Sprint 1)**:
 
 ```toml
 [plugin]
-name = "clarion-plugin-python"           # package name; informational (hyphens OK, human-readable)
+name = "loomweave-plugin-python"           # package name; informational (hyphens OK, human-readable)
 plugin_id = "python"                      # identifier fed to entity_id(); must match [a-z][a-z0-9_]* (ADR-022)
 version = "0.1.0"                         # semver
 protocol_version = "1.0"                  # matches ADR-002 version
-executable = "clarion-plugin-python"      # command on PATH (see L9)
+executable = "loomweave-plugin-python"      # command on PATH (see L9)
 language = "python"                       # informational tag
 extensions = ["py"]                       # file extensions this plugin claims
 
@@ -110,14 +110,14 @@ extensions = ["py"]                       # file extensions this plugin claims
 # minimums (Content-Length ceiling, entity-count cap, RSS limit, path jail)
 # are core-enforced with fixed defaults a plugin cannot raise — see §L6.
 expected_max_rss_mb = 512                 # plugin's own RSS estimate; effective prlimit = min(this, core default 2 GiB)
-expected_entities_per_file = 5000         # triggers CLA-INFRA-PLUGIN-ENTITY-OVERRUN-WARNING well before the 500k hard cap (warning impl deferred — see Task 4)
+expected_entities_per_file = 5000         # triggers LMWV-INFRA-PLUGIN-ENTITY-OVERRUN-WARNING well before the 500k hard cap (warning impl deferred — see Task 4)
 wardline_aware = true                     # plugin reads wardline.core.registry.REGISTRY (WP3 L8)
 reads_outside_project_root = false        # opt-out declaration; v0.1 refuses `true` at initialize (see Task 1 + Task 6)
 
 [ontology]
 entity_kinds = ["function", "class", "module", "decorator"]
 edge_kinds = ["imports", "calls", "decorates", "contains"]
-rule_id_prefix = "CLA-PY-"                # every emitted rule-ID must start with this; must match ADR-022 grammar (see Task 1)
+rule_id_prefix = "LMWV-PY-"                # every emitted rule-ID must start with this; must match ADR-022 grammar (see Task 1)
 ontology_version = "0.1.0"                # bump when entity/edge/rule set changes
 ```
 
@@ -130,31 +130,31 @@ per-edge-kind semantic annotations, so this compliance is automatic —
 a manifest listing `contains` in `edge_kinds` parses successfully (Task 1
 test).
 
-**Rule-ID namespace**. Per ADR-022, `CLA-INFRA-*` is core-only (pipeline
-findings), `CLA-FACT-*` is shared (any plugin or the core), and
-`CLA-{PLUGIN_ID_UPPERCASE}-*` is reserved to that plugin. A manifest
-declaring `rule_id_prefix = "CLA-INFRA-"` or `"CLA-FACT-"` is rejected at
+**Rule-ID namespace**. Per ADR-022, `LMWV-INFRA-*` is core-only (pipeline
+findings), `LMWV-FACT-*` is shared (any plugin or the core), and
+`LMWV-{PLUGIN_ID_UPPERCASE}-*` is reserved to that plugin. A manifest
+declaring `rule_id_prefix = "LMWV-INFRA-"` or `"LMWV-FACT-"` is rejected at
 parse (Task 1); emission-time enforcement of off-namespace rule IDs
-(`CLA-INFRA-RULE-ID-NAMESPACE`) is deferred to the findings-emitting Tier B
+(`LMWV-INFRA-RULE-ID-NAMESPACE`) is deferred to the findings-emitting Tier B
 sprint — Sprint 1's walking skeleton emits no findings, so the RPC-time
 check has nothing to fire against.
 
 **Manifest-validation finding codes surfaced by this WP**:
 
-- `CLA-INFRA-MANIFEST-MALFORMED` — kind strings or `rule_id_prefix` fail
+- `LMWV-INFRA-MANIFEST-MALFORMED` — kind strings or `rule_id_prefix` fail
   ADR-022's identifier grammar (`[a-z][a-z0-9_]*` for kinds,
-  `CLA-[A-Z]+(-[A-Z0-9]+)+` for rule-ID prefixes). Rejected at `initialize`;
+  `LMWV-[A-Z]+(-[A-Z0-9]+)+` for rule-ID prefixes). Rejected at `initialize`;
   plugin fails to start.
-- `CLA-INFRA-MANIFEST-RESERVED-KIND` — manifest declares `file`, `subsystem`,
+- `LMWV-INFRA-MANIFEST-RESERVED-KIND` — manifest declares `file`, `subsystem`,
   or `guidance` in `entity_kinds`. Rejected at `initialize`.
-- `CLA-INFRA-MANIFEST-UNSUPPORTED-CAPABILITY` — manifest declares
+- `LMWV-INFRA-MANIFEST-UNSUPPORTED-CAPABILITY` — manifest declares
   `reads_outside_project_root = true`; v0.1 has no mechanism to allow it.
   Rejected at `initialize`.
-- `CLA-INFRA-RULE-ID-NAMESPACE` — manifest declares a reserved
-  `rule_id_prefix` (`CLA-INFRA-` or `CLA-FACT-`). Rejected at parse.
+- `LMWV-INFRA-RULE-ID-NAMESPACE` — manifest declares a reserved
+  `rule_id_prefix` (`LMWV-INFRA-` or `LMWV-FACT-`). Rejected at parse.
   *Emission-time* enforcement (plugin emits a rule ID outside its namespace)
   is deferred to the findings-emitting Tier B sprint.
-- `CLA-INFRA-PLUGIN-ENTITY-OVERRUN-WARNING` — per-file entity count exceeds
+- `LMWV-INFRA-PLUGIN-ENTITY-OVERRUN-WARNING` — per-file entity count exceeds
   `expected_entities_per_file`. Implementation deferred to the
   catalog-emitting Tier B sprint (Sprint 1 is one file per invocation; the
   warning has no useful surface area yet).
@@ -181,14 +181,14 @@ manifests against it, schema changes become breaking.
 Plugins cannot opt out; plugin authors rely on these running for every run.
 
 **Enforcement points** (defaults and subcodes per
-[ADR-021](../../clarion/adr/ADR-021-plugin-authority-hybrid.md) §2):
+[ADR-021](../../loomweave/adr/ADR-021-plugin-authority-hybrid.md) §2):
 
 | Minimum | Where enforced | Default | Behaviour on violation |
 |---|---|---|---|
-| Path jail (ADR-021 §2a) | Every path the plugin returns on `analyze_file` responses (file_path in source range, evidence anchors) | canonicalise via `std::fs::canonicalize`, reject if outside `project_root` | **Drop** the offending entity/edge/finding on **first offense** (do NOT kill plugin — path escape is more often a correctness bug than a live attack). Emit `CLA-INFRA-PLUGIN-PATH-ESCAPE` with `metadata.clarion.offending_path`. A dedicated sub-breaker counts repeats: **>10 path-escapes in 60s → plugin killed**, `CLA-INFRA-PLUGIN-DISABLED-PATH-ESCAPE`. |
-| Content-Length ceiling (ADR-021 §2b) | Every inbound JSON-RPC frame from the plugin | **8 MiB** per frame (floor 1 MiB) | Framing parser refuses the frame before deserialising; plugin killed (SIGTERM → SIGKILL if non-responsive); emit `CLA-INFRA-PLUGIN-FRAME-OVERSIZE` with observed vs ceiling bytes. Crash-loop counter increments. |
-| Entity-count cap (ADR-021 §2c) | Cumulative across all plugin-emitted `entity + edge + finding` records within one run | **500,000** combined records (floor 10,000) | In-flight batch flushed; plugin killed; run enters partial-results state; emit `CLA-INFRA-PLUGIN-ENTITY-CAP`. |
-| Per-plugin RSS limit (ADR-021 §2d) | On spawn | **2 GiB** virtual-memory cap (`RLIMIT_AS`, floor 512 MiB) | `prlimit(RLIMIT_AS)` on Linux / `setrlimit` on macOS applied via `pre_exec`. Process killed by OS on exceed; core detects `WIFSIGNALED && WTERMSIG == 9` and emits `CLA-INFRA-PLUGIN-OOM-KILLED`. |
+| Path jail (ADR-021 §2a) | Every path the plugin returns on `analyze_file` responses (file_path in source range, evidence anchors) | canonicalise via `std::fs::canonicalize`, reject if outside `project_root` | **Drop** the offending entity/edge/finding on **first offense** (do NOT kill plugin — path escape is more often a correctness bug than a live attack). Emit `LMWV-INFRA-PLUGIN-PATH-ESCAPE` with `metadata.loomweave.offending_path`. A dedicated sub-breaker counts repeats: **>10 path-escapes in 60s → plugin killed**, `LMWV-INFRA-PLUGIN-DISABLED-PATH-ESCAPE`. |
+| Content-Length ceiling (ADR-021 §2b) | Every inbound JSON-RPC frame from the plugin | **8 MiB** per frame (floor 1 MiB) | Framing parser refuses the frame before deserialising; plugin killed (SIGTERM → SIGKILL if non-responsive); emit `LMWV-INFRA-PLUGIN-FRAME-OVERSIZE` with observed vs ceiling bytes. Crash-loop counter increments. |
+| Entity-count cap (ADR-021 §2c) | Cumulative across all plugin-emitted `entity + edge + finding` records within one run | **500,000** combined records (floor 10,000) | In-flight batch flushed; plugin killed; run enters partial-results state; emit `LMWV-INFRA-PLUGIN-ENTITY-CAP`. |
+| Per-plugin RSS limit (ADR-021 §2d) | On spawn | **2 GiB** virtual-memory cap (`RLIMIT_AS`, floor 512 MiB) | `prlimit(RLIMIT_AS)` on Linux / `setrlimit` on macOS applied via `pre_exec`. Process killed by OS on exceed; core detects `WIFSIGNALED && WTERMSIG == 9` and emits `LMWV-INFRA-PLUGIN-OOM-KILLED`. |
 
 **Sprint 1 scope note — `file_list` deferred**. ADR-021 §2a also specifies
 path-jail enforcement on `file_list` RPC returns. Sprint 1's walking skeleton
@@ -202,7 +202,7 @@ Task 4 is reused; no re-design.
 **Ceilings hierarchy**: the manifest's `capabilities` values are upper bounds
 *the plugin declares for itself*. The core applies ADR-021's absolute
 ceilings independently; the effective ceiling is `min(manifest, core)`.
-Core ceiling config keys live under `clarion.yaml:plugin_limits.*` but
+Core ceiling config keys live under `loomweave.yaml:plugin_limits.*` but
 Sprint 1 hard-codes the ADR-021 defaults above (config surface deferred to
 WP6).
 
@@ -218,21 +218,21 @@ against the new behaviour.
 
 ### L9 — Plugin discovery convention
 
-**What locks**: how the core finds plugin binaries at `clarion analyze` time.
+**What locks**: how the core finds plugin binaries at `loomweave analyze` time.
 
 **Three candidate conventions** (UQ-WP2-01 resolves this):
 
 - **A. PATH-based**: look up `executable` from manifest on `$PATH` (like `git`
   finds `git-foo` subcommands). Pro: zero configuration, distro-native. Con:
   installation is user-dependent.
-- **B. Explicit plugin dir**: a `~/.config/clarion/plugins/<plugin-name>/plugin.toml`
+- **B. Explicit plugin dir**: a `~/.config/loomweave/plugins/<plugin-name>/plugin.toml`
   layout. Pro: explicit, discoverable. Con: bespoke install step.
-- **C. Config-listed paths**: `clarion.yaml` has `[[plugins]] manifest = "path"`.
+- **C. Config-listed paths**: `loomweave.yaml` has `[[plugins]] manifest = "path"`.
   Pro: project-local plugin overrides. Con: requires config before `analyze`.
 
-**Proposal**: **A with a fallback to B**. `clarion analyze` discovers plugins by
-scanning `$PATH` for executables matching `clarion-plugin-*`, then loading each
-one's `plugin.toml` from `<install-prefix>/share/clarion/plugins/<plugin-name>/plugin.toml`
+**Proposal**: **A with a fallback to B**. `loomweave analyze` discovers plugins by
+scanning `$PATH` for executables matching `loomweave-plugin-*`, then loading each
+one's `plugin.toml` from `<install-prefix>/share/loomweave/plugins/<plugin-name>/plugin.toml`
 (or next to the binary, whichever is found first). This matches the `git`
 subcommand idiom and is the lowest-friction path for the WP3 Python plugin which
 is pip-installable.
@@ -247,10 +247,10 @@ the convention later breaks installation docs and packaging.
 
 ## 3. File decomposition
 
-Within `clarion-core` (new modules):
+Within `loomweave-core` (new modules):
 
 ```
-/crates/clarion-core/src/
+/crates/loomweave-core/src/
   plugin/
     mod.rs                 # re-exports; the plugin-host facade
     transport.rs           # Content-Length framing; JSON-RPC frame encode/decode
@@ -264,14 +264,14 @@ Within `clarion-core` (new modules):
     mock.rs                # in-process mock plugin (test-only; `#[cfg(test)]`)
 ```
 
-The decision to put plugin support in `clarion-core` (rather than a new crate) keeps
+The decision to put plugin support in `loomweave-core` (rather than a new crate) keeps
 the plugin types close to the domain types they produce. If that becomes unwieldy
-later, splitting to `clarion-plugin-host` is a mechanical refactor.
+later, splitting to `loomweave-plugin-host` is a mechanical refactor.
 
-`clarion-cli` gets a small update:
+`loomweave-cli` gets a small update:
 
 ```
-/crates/clarion-cli/src/
+/crates/loomweave-cli/src/
   analyze.rs               # modified: discover plugins, spawn, iterate files, persist entities
 ```
 
@@ -294,7 +294,7 @@ New workspace dependencies introduced by WP2:
 - **UQ-WP2-01** — **Plugin discovery convention (L9)**: ~~open~~ —
   **resolved as PATH + neighbouring `plugin.toml`** per the §2 L9 proposal.
   `discovery::discover_plugins` scans `$PATH` entries for
-  `clarion-plugin-*` basenames and loads `plugin.toml` from next to the
+  `loomweave-plugin-*` basenames and loads `plugin.toml` from next to the
   binary (install-prefix fallback deferred — WP3's `pip install -e` places
   both binary and manifest in the same venv `bin/` directory, so the
   fallback path has no Sprint-1 surface). World-writable `$PATH` entries
@@ -321,18 +321,18 @@ New workspace dependencies introduced by WP2:
   `plugin::jail`.
 - **UQ-WP2-04** — **Content-Length ceiling default**: ~~open~~ —
   **resolved by ADR-021 §2b**. Default ceiling is **8 MiB** per frame,
-  floor 1 MiB, config key `clarion.yaml:plugin_limits.max_frame_bytes`
+  floor 1 MiB, config key `loomweave.yaml:plugin_limits.max_frame_bytes`
   (config surface deferred to WP6; Sprint 1 hard-codes the 8 MiB default).
   On exceed, the framing parser refuses the frame before deserialising,
   the plugin is killed (SIGTERM → SIGKILL if non-responsive), and
-  `CLA-INFRA-PLUGIN-FRAME-OVERSIZE` is emitted. **Resolved**: Task 4.
+  `LMWV-INFRA-PLUGIN-FRAME-OVERSIZE` is emitted. **Resolved**: Task 4.
 - **UQ-WP2-05** — **Entity-count cap: cap per file or per run?** ~~open~~ —
   **resolved by ADR-021 §2c**. Per-run cumulative cap on
   `entity + edge + finding` notifications combined. Default **500,000**,
-  floor 10,000, config key `clarion.yaml:plugin_limits.max_records_per_run`
+  floor 10,000, config key `loomweave.yaml:plugin_limits.max_records_per_run`
   (config surface deferred to WP6; Sprint 1 hard-codes the 500k default).
   On exceed: current in-flight batch flushed, plugin killed, run enters
-  partial-results state, `CLA-INFRA-PLUGIN-ENTITY-CAP` emitted.
+  partial-results state, `LMWV-INFRA-PLUGIN-ENTITY-CAP` emitted.
   **Resolved**: Task 4.
 - **UQ-WP2-06** — **prlimit on non-Linux**: ~~open~~ —
   **resolved as `#[cfg(target_os = "linux")]`-gated enforcement**.
@@ -365,22 +365,22 @@ New workspace dependencies introduced by WP2:
   enforcement); deferred to WP3 for the Python plugin's stdout swap.
 - **UQ-WP2-09** — **Manifest hot-reload**: ~~open~~ —
   **resolved as always-reload in Sprint 1**. `discovery::discover_plugins`
-  is invoked once per `clarion analyze` run and re-reads every
+  is invoked once per `loomweave analyze` run and re-reads every
   `plugin.toml` from disk; no in-memory manifest cache is carried across
   runs. Manifest cache-across-`serve`-sessions is a WP8 concern. **Resolved**:
   Task 2 / Task 5 (`plugin::{manifest, discovery}`).
 - **UQ-WP2-10** — **Crash-loop breaker parameters**: ~~open~~ —
   **resolved by ADR-002 + ADR-021 §Layer 3**. General breaker:
-  **>3 crashes in 60s** → plugin disabled, `CLA-INFRA-PLUGIN-DISABLED-CRASH-LOOP`.
+  **>3 crashes in 60s** → plugin disabled, `LMWV-INFRA-PLUGIN-DISABLED-CRASH-LOOP`.
   Path-escape sub-breaker (ADR-021 §2a): **>10 escapes in 60s** → plugin
-  killed, `CLA-INFRA-PLUGIN-DISABLED-PATH-ESCAPE`. Sprint 1 hard-codes both
+  killed, `LMWV-INFRA-PLUGIN-DISABLED-PATH-ESCAPE`. Sprint 1 hard-codes both
   thresholds; config surface deferred to WP6. **Resolved**: Task 7.
 - **UQ-WP2-11** — **Plugin-returned `id` vs 3-segment L2 format**: ~~open~~ —
   **resolved by identity check in `plugin::host` (T4)** per the §UQ-WP2-11
   proposal. On every `analyze_file` response, the host reconstructs the
   expected `EntityId` from `(plugin_id, kind, qualified_name)` and compares
   against the returned `id`; on mismatch the entity is dropped and
-  `CLA-INFRA-PLUGIN-ENTITY-ID-MISMATCH` is emitted. This extends ADR-022
+  `LMWV-INFRA-PLUGIN-ENTITY-ID-MISMATCH` is emitted. This extends ADR-022
   ontology-boundary enforcement to the ADR-003 identity format. The
   host-level T4 test plus `cross_plugin_plugin_id_spoof_is_rejected`
   (scrub commit `89b2da0`) cover both the shape-mismatch and cross-plugin
@@ -392,9 +392,9 @@ New workspace dependencies introduced by WP2:
 ### Task 1 — Manifest parser (L5)
 
 **Files**:
-- Create `/crates/clarion-core/src/plugin/mod.rs`
-- Create `/crates/clarion-core/src/plugin/manifest.rs`
-- Modify `/crates/clarion-core/src/lib.rs` to `pub mod plugin;`
+- Create `/crates/loomweave-core/src/plugin/mod.rs`
+- Create `/crates/loomweave-core/src/plugin/manifest.rs`
+- Modify `/crates/loomweave-core/src/lib.rs` to `pub mod plugin;`
 
 Steps:
 
@@ -405,22 +405,22 @@ Steps:
   - Negative: missing `[plugin].name` returns a clear error.
   - Negative: `expected_max_rss_mb = 0` rejected (must be > 0).
   - Negative: `entity_kinds = []` rejected (must declare at least one).
-  - Negative (ADR-022 identifier grammar): an entity kind not matching `[a-z][a-z0-9_]*` (e.g. `Function`, `func-tion`, `1function`) is rejected with `CLA-INFRA-MANIFEST-MALFORMED`.
-  - Negative (ADR-022 identifier grammar): a `rule_id_prefix` not matching `CLA-[A-Z]+(-[A-Z0-9]+)+` (e.g. `PY-`, `cla-py-`, `CLA-py-`) is rejected with `CLA-INFRA-MANIFEST-MALFORMED`.
-  - Negative (ADR-022 reserved kinds): a manifest declaring `file`, `subsystem`, or `guidance` in `entity_kinds` is rejected with `CLA-INFRA-MANIFEST-RESERVED-KIND`.
-  - Negative (ADR-022 namespace registry): `rule_id_prefix = "CLA-INFRA-"` rejected with `CLA-INFRA-RULE-ID-NAMESPACE` (core-only namespace).
-  - Negative (ADR-022 namespace registry): `rule_id_prefix = "CLA-FACT-"` rejected with `CLA-INFRA-RULE-ID-NAMESPACE` (shared namespace; plugins must use their own).
-  - Negative (ADR-021 §Layer 1): a manifest declaring `reads_outside_project_root = true` produces a validator result that the supervisor (Task 6) surfaces at `initialize` as `CLA-INFRA-MANIFEST-UNSUPPORTED-CAPABILITY`. Task 1's test asserts the validator flags the manifest; Task 6's test asserts the handshake rejection path.
+  - Negative (ADR-022 identifier grammar): an entity kind not matching `[a-z][a-z0-9_]*` (e.g. `Function`, `func-tion`, `1function`) is rejected with `LMWV-INFRA-MANIFEST-MALFORMED`.
+  - Negative (ADR-022 identifier grammar): a `rule_id_prefix` not matching `LMWV-[A-Z]+(-[A-Z0-9]+)+` (e.g. `PY-`, `lmwv-py-`, `LMWV-py-`) is rejected with `LMWV-INFRA-MANIFEST-MALFORMED`.
+  - Negative (ADR-022 reserved kinds): a manifest declaring `file`, `subsystem`, or `guidance` in `entity_kinds` is rejected with `LMWV-INFRA-MANIFEST-RESERVED-KIND`.
+  - Negative (ADR-022 namespace registry): `rule_id_prefix = "LMWV-INFRA-"` rejected with `LMWV-INFRA-RULE-ID-NAMESPACE` (core-only namespace).
+  - Negative (ADR-022 namespace registry): `rule_id_prefix = "LMWV-FACT-"` rejected with `LMWV-INFRA-RULE-ID-NAMESPACE` (shared namespace; plugins must use their own).
+  - Negative (ADR-021 §Layer 1): a manifest declaring `reads_outside_project_root = true` produces a validator result that the supervisor (Task 6) surfaces at `initialize` as `LMWV-INFRA-MANIFEST-UNSUPPORTED-CAPABILITY`. Task 1's test asserts the validator flags the manifest; Task 6's test asserts the handshake rejection path.
 - [ ] Run tests; expect failures.
-- [ ] Implement `pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, ManifestError>`. Include the two ADR-022 grammar regexes, the reserved-entity-kind list (`file`, `subsystem`, `guidance`), and the reserved-prefix list (`CLA-INFRA-`, `CLA-FACT-`).
+- [ ] Implement `pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, ManifestError>`. Include the two ADR-022 grammar regexes, the reserved-entity-kind list (`file`, `subsystem`, `guidance`), and the reserved-prefix list (`LMWV-INFRA-`, `LMWV-FACT-`).
 - [ ] Run tests; expect pass.
 - [ ] Commit: `feat(wp2): L5 plugin manifest parser and validator (ADR-021 §Layer 1 + ADR-022 grammar)`.
 
 ### Task 2 — JSON-RPC transport (L4)
 
 **Files**:
-- Create `/crates/clarion-core/src/plugin/transport.rs`
-- Create `/crates/clarion-core/src/plugin/protocol.rs`
+- Create `/crates/loomweave-core/src/plugin/transport.rs`
+- Create `/crates/loomweave-core/src/plugin/protocol.rs`
 
 Steps:
 
@@ -436,7 +436,7 @@ Steps:
 ### Task 3 — In-process mock plugin (test harness)
 
 **Files**:
-- Create `/crates/clarion-core/src/plugin/mock.rs`
+- Create `/crates/loomweave-core/src/plugin/mock.rs`
 
 Steps:
 
@@ -447,8 +447,8 @@ Steps:
 ### Task 4 — Core-enforced minimums (L6)
 
 **Files**:
-- Create `/crates/clarion-core/src/plugin/jail.rs`
-- Create `/crates/clarion-core/src/plugin/limits.rs`
+- Create `/crates/loomweave-core/src/plugin/jail.rs`
+- Create `/crates/loomweave-core/src/plugin/limits.rs`
 
 Steps:
 
@@ -460,44 +460,44 @@ Steps:
   - `EntityCountCap` with **500,000 default** per ADR-021 §2c; `try_admit(delta: usize) -> Result<(), CapExceeded>` tracks cumulative `entity + edge + finding` across the run.
   - `PathEscapeBreaker` with ADR-021 §2a threshold (**>10 escapes in 60s**) — rolling counter consumed by Task 6's host when a `JailError::EscapedRoot` is observed on a plugin response.
   - `apply_prlimit_as(max_rss_mib: u64)` using `nix::sys::resource::setrlimit` inside `CommandExt::pre_exec` (pre-exec fork path) — applies `RLIMIT_AS` per ADR-021 §2d with **2 GiB default**. Effective limit = `min(manifest.capabilities.runtime.expected_max_rss_mb, core_default)`. `#[cfg(target_os = "linux")]`-gated (UQ-WP2-06); on non-Linux, log-once warning.
-  - **Deferred**: `CLA-INFRA-PLUGIN-ENTITY-OVERRUN-WARNING` (ADR-021 §Consequences/Negative) — the per-file sanity warning fired when a plugin exceeds its declared `capabilities.runtime.expected_entities_per_file`. Sprint 1's walking skeleton is one file per invocation, so the warning has no useful surface area; implementation lands in the catalog-emitting Tier B sprint alongside multi-file discovery. Documented here so the subcode and declaration field stay wired end-to-end.
+  - **Deferred**: `LMWV-INFRA-PLUGIN-ENTITY-OVERRUN-WARNING` (ADR-021 §Consequences/Negative) — the per-file sanity warning fired when a plugin exceeds its declared `capabilities.runtime.expected_entities_per_file`. Sprint 1's walking skeleton is one file per invocation, so the warning has no useful surface area; implementation lands in the catalog-emitting Tier B sprint alongside multi-file discovery. Documented here so the subcode and declaration field stay wired end-to-end.
 - [ ] Tests for each; commit.
 - [ ] Commit: `feat(wp2): L6 core-enforced minimums — path jail, ceilings, prlimit (ADR-021 defaults)`.
 
 ### Task 5 — Plugin discovery (L9)
 
 **Files**:
-- Create `/crates/clarion-core/src/plugin/discovery.rs`
+- Create `/crates/loomweave-core/src/plugin/discovery.rs`
 
 Steps:
 
-- [ ] Write failing test: discovery finds a mock `clarion-plugin-*` binary on a test `$PATH` and loads its manifest from the expected location beside it.
-- [ ] Implement: scan `$PATH` for entries matching `clarion-plugin-*`; for each, look for `plugin.toml` next to the binary first, fall back to `<install-prefix>/share/clarion/plugins/<name>/plugin.toml`.
+- [ ] Write failing test: discovery finds a mock `loomweave-plugin-*` binary on a test `$PATH` and loads its manifest from the expected location beside it.
+- [ ] Implement: scan `$PATH` for entries matching `loomweave-plugin-*`; for each, look for `plugin.toml` next to the binary first, fall back to `<install-prefix>/share/loomweave/plugins/<name>/plugin.toml`.
 - [ ] Run; expect pass.
 - [ ] Commit: `feat(wp2): L9 plugin discovery convention (PATH + neighboring manifest)`.
 
 ### Task 6 — Plugin-host supervisor
 
 **Files**:
-- Create `/crates/clarion-core/src/plugin/host.rs`
+- Create `/crates/loomweave-core/src/plugin/host.rs`
 
 Steps:
 
 - [ ] Failing integration test: using a real subprocess (a tiny Rust binary in `tests/fixtures/` that speaks the protocol), `PluginHost::spawn(manifest, root)` completes a handshake, issues one `analyze_file` for a fixture, receives entities, and shuts down cleanly. Assert plugin exit code 0.
-- [ ] Failing test (ADR-021 §Layer 1): a plugin whose manifest declares `capabilities.runtime.reads_outside_project_root = true` is refused at `initialize`; the host emits `CLA-INFRA-MANIFEST-UNSUPPORTED-CAPABILITY` and the plugin process is terminated before any `analyze_file` is issued. v0.1 has no mechanism to allow this capability.
-- [ ] Failing test: ontology-boundary enforcement (ADR-022) — the fixture plugin emits an entity with `kind: "unknown"` not in the manifest; host drops it and emits `CLA-INFRA-PLUGIN-UNDECLARED-KIND`.
+- [ ] Failing test (ADR-021 §Layer 1): a plugin whose manifest declares `capabilities.runtime.reads_outside_project_root = true` is refused at `initialize`; the host emits `LMWV-INFRA-MANIFEST-UNSUPPORTED-CAPABILITY` and the plugin process is terminated before any `analyze_file` is issued. v0.1 has no mechanism to allow this capability.
+- [ ] Failing test: ontology-boundary enforcement (ADR-022) — the fixture plugin emits an entity with `kind: "unknown"` not in the manifest; host drops it and emits `LMWV-INFRA-PLUGIN-UNDECLARED-KIND`.
 - [ ] Failing test: identity-mismatch rejection (UQ-WP2-11) — fixture plugin emits an entity whose `id` doesn't match `entity_id(plugin_id, kind, qualified_name)`; host drops it.
-- [ ] Failing test: path-jail drop-not-kill (ADR-021 §2a) — fixture plugin emits an `analyze_file` response with a `source.file_path` that canonicalises outside `project_root`. Host drops the entity, emits `CLA-INFRA-PLUGIN-PATH-ESCAPE`, and the plugin remains alive for the next request.
-- [ ] Failing test: path-escape sub-breaker (ADR-021 §2a) — fixture plugin emits 11 escaping paths within 60s; on the 11th, the host kills the plugin and emits `CLA-INFRA-PLUGIN-DISABLED-PATH-ESCAPE`.
+- [ ] Failing test: path-jail drop-not-kill (ADR-021 §2a) — fixture plugin emits an `analyze_file` response with a `source.file_path` that canonicalises outside `project_root`. Host drops the entity, emits `LMWV-INFRA-PLUGIN-PATH-ESCAPE`, and the plugin remains alive for the next request.
+- [ ] Failing test: path-escape sub-breaker (ADR-021 §2a) — fixture plugin emits 11 escaping paths within 60s; on the 11th, the host kills the plugin and emits `LMWV-INFRA-PLUGIN-DISABLED-PATH-ESCAPE`.
 - [ ] Implement `host.rs`:
   - Spawn subprocess with `std::process::Command`, stdin/stdout piped.
   - Apply `apply_prlimit_as` (from Task 4) inside `CommandExt::pre_exec` before `exec`, using `min(manifest.capabilities.runtime.expected_max_rss_mb, core_default = 2 GiB)`.
   - Perform handshake: send `initialize`, await response; send `initialized` notification.
-  - **Before** sending `initialized`: if `manifest.capabilities.runtime.reads_outside_project_root == true`, emit `CLA-INFRA-MANIFEST-UNSUPPORTED-CAPABILITY`, send `shutdown` + `exit`, and return a host error to the caller. Do not dispatch any `analyze_file` requests. (ADR-021 §Layer 1: v0.1 has no mechanism to allow this capability.)
+  - **Before** sending `initialized`: if `manifest.capabilities.runtime.reads_outside_project_root == true`, emit `LMWV-INFRA-MANIFEST-UNSUPPORTED-CAPABILITY`, send `shutdown` + `exit`, and return a host error to the caller. Do not dispatch any `analyze_file` requests. (ADR-021 §Layer 1: v0.1 has no mechanism to allow this capability.)
   - Provide `PluginHost::analyze_file(path: &Path) -> Result<Vec<Entity>>` that:
     - Runs the request-side path through the jail (jail error on request = host error returned to caller; no plugin involvement).
     - Sends request, awaits response.
-    - For each returned entity/edge/finding: run its `source.file_path` and evidence-anchor paths through the jail. On `EscapedRoot`, drop the record, emit `CLA-INFRA-PLUGIN-PATH-ESCAPE`, and tick the `PathEscapeBreaker` counter. If the breaker trips, kill the plugin and emit `CLA-INFRA-PLUGIN-DISABLED-PATH-ESCAPE`.
+    - For each returned entity/edge/finding: run its `source.file_path` and evidence-anchor paths through the jail. On `EscapedRoot`, drop the record, emit `LMWV-INFRA-PLUGIN-PATH-ESCAPE`, and tick the `PathEscapeBreaker` counter. If the breaker trips, kill the plugin and emit `LMWV-INFRA-PLUGIN-DISABLED-PATH-ESCAPE`.
     - Validate each surviving entity: ontology kind (ADR-022), `EntityId` reconstruction match.
     - Returns surviving entities.
   - On drop, send `shutdown` + `exit` + wait (with timeout).
@@ -507,7 +507,7 @@ Steps:
 ### Task 7 — Crash-loop breaker
 
 **Files**:
-- Create `/crates/clarion-core/src/plugin/breaker.rs`
+- Create `/crates/loomweave-core/src/plugin/breaker.rs`
 
 Steps:
 
@@ -516,30 +516,30 @@ Steps:
 - [ ] Run; expect pass.
 - [ ] Commit: `feat(wp2): crash-loop breaker`.
 
-### Task 8 — Wire `clarion analyze` to use the plugin host
+### Task 8 — Wire `loomweave analyze` to use the plugin host
 
 **Files**:
-- Modify `/crates/clarion-cli/src/analyze.rs`
+- Modify `/crates/loomweave-cli/src/analyze.rs`
 
 Steps:
 
-- [ ] Modify `clarion analyze`:
+- [ ] Modify `loomweave analyze`:
   - On start: discover plugins (Task 5).
   - For each discovered plugin, spawn (Task 6), iterate the source tree, call `analyze_file` per matching file (match against the manifest's `[plugin].extensions` field).
   - Persist returned entities via the writer-actor (WP1 Task 6).
   - On plugin error or cap hit, mark run as failed with diagnostic.
-- [ ] Failing integration test: using the mock plugin fixture, `clarion analyze fixtures/demo.py` produces a run with `entity_count > 0`.
+- [ ] Failing integration test: using the mock plugin fixture, `loomweave analyze fixtures/demo.py` produces a run with `entity_count > 0`.
 - [ ] Run; expect pass.
-- [ ] Commit: `feat(wp2): wire clarion analyze to plugin host`.
+- [ ] Commit: `feat(wp2): wire loomweave analyze to plugin host`.
 
 ### Task 9 — WP2 end-to-end smoke test
 
 **Files**:
-- Create `/crates/clarion-cli/tests/wp2_e2e.rs`
+- Create `/crates/loomweave-cli/tests/wp2_e2e.rs`
 
 Steps:
 
-- [ ] Integration test using the fixture mock-plugin binary: `clarion install` + `clarion analyze fixture_dir/` produces a completed run with the mock's expected entity persisted.
+- [ ] Integration test using the fixture mock-plugin binary: `loomweave install` + `loomweave analyze fixture_dir/` produces a completed run with the mock's expected entity persisted.
 - [ ] Commit: `test(wp2): end-to-end smoke with mock plugin`.
 
 ## 7. ADR triggers
@@ -553,7 +553,7 @@ WP2 is done for Sprint 1 when all of:
 - L4 (JSON-RPC method set + transport), L5 (manifest parser), L6 (each of the four
   minimums), L9 (discovery) each have ≥1 passing positive test and ≥1 passing
   negative test.
-- `clarion analyze` with the mock plugin on a fixture produces persisted entities
+- `loomweave analyze` with the mock plugin on a fixture produces persisted entities
   in the DB.
 - Every UQ-WP2-* is marked resolved in this doc's §5.
 - `cargo test --workspace` passes.

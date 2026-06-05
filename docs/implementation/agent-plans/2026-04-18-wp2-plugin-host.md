@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship the Sprint 1 walking-skeleton plugin host — JSON-RPC over Content-Length framed stdio (L4), `plugin.toml` manifest parser (L5), core-enforced minimums (L6, all four controls per ADR-021 §2), plugin discovery (L9), crash-loop breaker, and wired `clarion analyze` that spawns a mock plugin and persists entities through the WP1 writer-actor.
+**Goal:** Ship the Sprint 1 walking-skeleton plugin host — JSON-RPC over Content-Length framed stdio (L4), `plugin.toml` manifest parser (L5), core-enforced minimums (L6, all four controls per ADR-021 §2), plugin discovery (L9), crash-loop breaker, and wired `loomweave analyze` that spawns a mock plugin and persists entities through the WP1 writer-actor.
 
-**Architecture:** Plugin host lives inside `clarion-core` under a new `plugin/` module (per WP2 §3). Subprocesses are managed via `tokio::process::Command` with piped stdio; framing is hand-rolled LSP-style Content-Length on top of `tokio::io::AsyncRead`/`AsyncWrite` (UQ-WP2-02 resolution). ADR-021 §2d's `RLIMIT_AS` is applied inside `CommandExt::pre_exec` — the only unsafe call site in the workspace, gated by `#[allow(unsafe_code)]` with a safety comment. A fresh workspace crate `clarion-mock-plugin` supplies the fixture binary that the integration-test subprocess spawns.
+**Architecture:** Plugin host lives inside `loomweave-core` under a new `plugin/` module (per WP2 §3). Subprocesses are managed via `tokio::process::Command` with piped stdio; framing is hand-rolled LSP-style Content-Length on top of `tokio::io::AsyncRead`/`AsyncWrite` (UQ-WP2-02 resolution). ADR-021 §2d's `RLIMIT_AS` is applied inside `CommandExt::pre_exec` — the only unsafe call site in the workspace, gated by `#[allow(unsafe_code)]` with a safety comment. A fresh workspace crate `loomweave-mock-plugin` supplies the fixture binary that the integration-test subprocess spawns.
 
-**Tech Stack:** Additions to the WP1 floor — `toml = "0.8"` (manifest parsing); `nix = { version = "0.28", features = ["resource"] }` (`setrlimit(RLIMIT_AS)`); `tokio` features expanded with `"process"` + `"io-util"`; `tokio-util = { version = "0.7", features = ["codec"] }` is **not** adopted (hand-rolled framing keeps the dependency surface small per UQ-WP2-02). New workspace member `crates/clarion-mock-plugin/` (test fixture binary). All ADR-023 gates (fmt / pedantic clippy / nextest / doc / deny / build dev + release) remain green on every commit.
+**Tech Stack:** Additions to the WP1 floor — `toml = "0.8"` (manifest parsing); `nix = { version = "0.28", features = ["resource"] }` (`setrlimit(RLIMIT_AS)`); `tokio` features expanded with `"process"` + `"io-util"`; `tokio-util = { version = "0.7", features = ["codec"] }` is **not** adopted (hand-rolled framing keeps the dependency surface small per UQ-WP2-02). New workspace member `crates/loomweave-mock-plugin/` (test fixture binary). All ADR-023 gates (fmt / pedantic clippy / nextest / doc / deny / build dev + release) remain green on every commit.
 
 **Source spec:** `docs/implementation/sprint-1/wp2-plugin-host.md`. If this plan and the spec disagree, the spec is authoritative on *what* to build; this plan is authoritative on *how* to build it step-by-step.
 
@@ -14,17 +14,17 @@
 
 **Resolved UQs before starting:**
 
-- **UQ-WP2-01** — Plugin discovery: PATH scan for `clarion-plugin-*` binaries + neighboring `plugin.toml` fallback to `<install-prefix>/share/clarion/plugins/<name>/plugin.toml`. Sprint 1 hard-codes no env var overrides; `clarion.yaml` discovery config surface is WP6. **Resolved by Task 5.**
+- **UQ-WP2-01** — Plugin discovery: PATH scan for `loomweave-plugin-*` binaries + neighboring `plugin.toml` fallback to `<install-prefix>/share/loomweave/plugins/<name>/plugin.toml`. Sprint 1 hard-codes no env var overrides; `loomweave.yaml` discovery config surface is WP6. **Resolved by Task 5.**
 - **UQ-WP2-02** — JSON-RPC library: hand-rolled over `serde_json`. Walking skeleton is unidirectional unary; framing is Content-Length + `\r\n\r\n` + body; one request → one response. **Resolved by Task 2.**
 - **UQ-WP2-03** — Path jail symlink semantics: canonicalise via `std::fs::canonicalize` which follows symlinks. A symlink inside the root that resolves outside is rejected. **Resolved by Task 4.**
-- **UQ-WP2-04** — Content-Length ceiling: **8 MiB** per frame (ADR-021 §2b default; floor 1 MiB). Transport parser refuses the frame before body deserialisation; host kills plugin with SIGTERM → SIGKILL; emits `CLA-INFRA-PLUGIN-FRAME-OVERSIZE`. **Resolved by Task 4.**
-- **UQ-WP2-05** — Entity-count cap: **500,000** combined `entity + edge + finding` records per run (ADR-021 §2c default; floor 10,000). On trip: in-flight batch flushed, plugin killed, run enters partial-results; `CLA-INFRA-PLUGIN-ENTITY-CAP` emitted. Sprint 1 emits only entity notifications; the cap counts them and leaves the edge/finding path ready for WP3+. **Resolved by Task 4.**
+- **UQ-WP2-04** — Content-Length ceiling: **8 MiB** per frame (ADR-021 §2b default; floor 1 MiB). Transport parser refuses the frame before body deserialisation; host kills plugin with SIGTERM → SIGKILL; emits `LMWV-INFRA-PLUGIN-FRAME-OVERSIZE`. **Resolved by Task 4.**
+- **UQ-WP2-05** — Entity-count cap: **500,000** combined `entity + edge + finding` records per run (ADR-021 §2c default; floor 10,000). On trip: in-flight batch flushed, plugin killed, run enters partial-results; `LMWV-INFRA-PLUGIN-ENTITY-CAP` emitted. Sprint 1 emits only entity notifications; the cap counts them and leaves the edge/finding path ready for WP3+. **Resolved by Task 4.**
 - **UQ-WP2-06** — prlimit on non-Linux: `#[cfg(target_os = "linux")]`-gate the `setrlimit` pre_exec; on other targets, log a one-shot tracing warning and proceed without the limit. Sprint 1 scope is Linux per WP1 §1; macOS path (ADR-021 §2d names `setrlimit(RLIMIT_AS)` on POSIX) lands with whichever sprint first adds macOS CI. **Resolved by Task 4.**
 - **UQ-WP2-07** — Plugin non-entity output: stderr is free-form and forwarded line-by-line to `tracing::info!` target `plugin::<plugin_id>`. Stdout is JSON-RPC only. Progress notifications are deferred. **Resolved by Task 3.**
 - **UQ-WP2-08** — Plugin stdout discipline: documented in the plugin-author guide (WP3 scope); host does not enforce. A stray `print()` in a Python plugin corrupts framing → transport parse error → plugin killed → crash-loop counter ticks. **Resolved by Task 3** (doc note in module rustdoc).
-- **UQ-WP2-09** — Manifest hot-reload: Sprint 1 always re-reads on `clarion analyze`. Caching belongs to WP8 `serve`. **Resolved by Task 2** (manifest is re-parsed on every `PluginHost::spawn`).
-- **UQ-WP2-10** — Crash-loop breaker parameters: **>3 crashes in 60s** → plugin disabled for the run (`CLA-INFRA-PLUGIN-DISABLED-CRASH-LOOP`, per ADR-002 + ADR-021 Layer 3). Path-escape sub-breaker: **>10 escapes in 60s** → plugin killed (`CLA-INFRA-PLUGIN-DISABLED-PATH-ESCAPE`, per ADR-021 §2a). Both hard-coded in Sprint 1; config surface deferred to WP6. **Resolved by Task 7.**
-- **UQ-WP2-11** — Identity-mismatch rejection: host reconstructs `entity_id(plugin_id, kind, qualified_name)` and compares byte-for-byte against the plugin's returned `id`. Mismatch → drop entity, emit `CLA-INFRA-PLUGIN-ENTITY-ID-MISMATCH`, plugin stays alive. **Resolved by Task 6.**
+- **UQ-WP2-09** — Manifest hot-reload: Sprint 1 always re-reads on `loomweave analyze`. Caching belongs to WP8 `serve`. **Resolved by Task 2** (manifest is re-parsed on every `PluginHost::spawn`).
+- **UQ-WP2-10** — Crash-loop breaker parameters: **>3 crashes in 60s** → plugin disabled for the run (`LMWV-INFRA-PLUGIN-DISABLED-CRASH-LOOP`, per ADR-002 + ADR-021 Layer 3). Path-escape sub-breaker: **>10 escapes in 60s** → plugin killed (`LMWV-INFRA-PLUGIN-DISABLED-PATH-ESCAPE`, per ADR-021 §2a). Both hard-coded in Sprint 1; config surface deferred to WP6. **Resolved by Task 7.**
+- **UQ-WP2-11** — Identity-mismatch rejection: host reconstructs `entity_id(plugin_id, kind, qualified_name)` and compares byte-for-byte against the plugin's returned `id`. Mismatch → drop entity, emit `LMWV-INFRA-PLUGIN-ENTITY-ID-MISMATCH`, plugin stays alive. **Resolved by Task 6.**
 
 **Scope note on "unsafe_code = forbid":** WP1's workspace `[lints.rust]` sets `unsafe_code = "forbid"`. ADR-021 §2d's enforcement point is `CommandExt::pre_exec` — an unsafe API because the closure runs in the fork'd child before exec. Task 4 relaxes the workspace-level lint from `"forbid"` to `"deny"` and places a narrow `#[allow(unsafe_code)]` at the single pre_exec call site in `plugin/limits.rs` with a safety-justifying comment. No other unsafe is introduced. The workspace guarantee becomes: "unsafe is denied except at one audited call site that is the only way to express the ADR-021 §2d enforcement."
 
@@ -32,35 +32,35 @@
 
 | Rule ID | Trigger |
 |---|---|
-| `CLA-INFRA-PLUGIN-PATH-ESCAPE` | Plugin-returned path canonicalises outside `project_root`; entity dropped, plugin alive. |
-| `CLA-INFRA-PLUGIN-DISABLED-PATH-ESCAPE` | >10 path-escapes in 60s; plugin killed. |
-| `CLA-INFRA-PLUGIN-FRAME-OVERSIZE` | Inbound Content-Length header above the 8 MiB ceiling; plugin killed. |
-| `CLA-INFRA-PLUGIN-ENTITY-CAP` | Per-run cumulative record count exceeds 500k; plugin killed, run partial. |
-| `CLA-INFRA-PLUGIN-OOM-KILLED` | Plugin exit was `WIFSIGNALED && WTERMSIG == 9` after `RLIMIT_AS` hit. |
-| `CLA-INFRA-PLUGIN-DISABLED-CRASH-LOOP` | >3 crashes in 60s; plugin disabled for the run. |
-| `CLA-INFRA-PLUGIN-UNDECLARED-KIND` | Entity emitted with `kind` not in manifest's `[ontology].entity_kinds`. |
-| `CLA-INFRA-PLUGIN-ENTITY-ID-MISMATCH` | Entity's `id` does not match `entity_id(plugin_id, kind, qualified_name)`. |
-| `CLA-INFRA-MANIFEST-MALFORMED` | Manifest fails grammar or required-field validation at `initialize`. |
-| `CLA-INFRA-MANIFEST-RESERVED-KIND` | Manifest declares a core-reserved kind (`file`, `subsystem`, `guidance`). |
+| `LMWV-INFRA-PLUGIN-PATH-ESCAPE` | Plugin-returned path canonicalises outside `project_root`; entity dropped, plugin alive. |
+| `LMWV-INFRA-PLUGIN-DISABLED-PATH-ESCAPE` | >10 path-escapes in 60s; plugin killed. |
+| `LMWV-INFRA-PLUGIN-FRAME-OVERSIZE` | Inbound Content-Length header above the 8 MiB ceiling; plugin killed. |
+| `LMWV-INFRA-PLUGIN-ENTITY-CAP` | Per-run cumulative record count exceeds 500k; plugin killed, run partial. |
+| `LMWV-INFRA-PLUGIN-OOM-KILLED` | Plugin exit was `WIFSIGNALED && WTERMSIG == 9` after `RLIMIT_AS` hit. |
+| `LMWV-INFRA-PLUGIN-DISABLED-CRASH-LOOP` | >3 crashes in 60s; plugin disabled for the run. |
+| `LMWV-INFRA-PLUGIN-UNDECLARED-KIND` | Entity emitted with `kind` not in manifest's `[ontology].entity_kinds`. |
+| `LMWV-INFRA-PLUGIN-ENTITY-ID-MISMATCH` | Entity's `id` does not match `entity_id(plugin_id, kind, qualified_name)`. |
+| `LMWV-INFRA-MANIFEST-MALFORMED` | Manifest fails grammar or required-field validation at `initialize`. |
+| `LMWV-INFRA-MANIFEST-RESERVED-KIND` | Manifest declares a core-reserved kind (`file`, `subsystem`, `guidance`). |
 
-**Sprint 1 scope on findings emission:** Sprint 1 does NOT create a `findings` table row for these rule IDs — that path is ADR-013's scanner-ingest API and arrives in WP6. For Sprint 1, each trigger logs via `tracing::warn!(rule_id = "CLA-INFRA-...", ...)` with the offending context as fields. The strings are still authoritative — WP6 reads them when wiring the `Finding` record emission. Tests assert on the log lines via `tracing-test` or captured output, not on DB rows.
+**Sprint 1 scope on findings emission:** Sprint 1 does NOT create a `findings` table row for these rule IDs — that path is ADR-013's scanner-ingest API and arrives in WP6. For Sprint 1, each trigger logs via `tracing::warn!(rule_id = "LMWV-INFRA-...", ...)` with the offending context as fields. The strings are still authoritative — WP6 reads them when wiring the `Finding` record emission. Tests assert on the log lines via `tracing-test` or captured output, not on DB rows.
 
 ---
 
 ## Task 1: Workspace prep + L5 manifest parser
 
 **Files:**
-- Modify: `/home/john/clarion/Cargo.toml` (workspace deps: add `toml`, extend `tokio` features)
-- Modify: `/home/john/clarion/crates/clarion-core/Cargo.toml` (add `toml`, `serde`, `thiserror`)
-- Create: `/home/john/clarion/crates/clarion-core/src/plugin/mod.rs`
-- Create: `/home/john/clarion/crates/clarion-core/src/plugin/manifest.rs`
-- Modify: `/home/john/clarion/crates/clarion-core/src/lib.rs` (add `pub mod plugin;` re-exports)
-- Create: `/home/john/clarion/crates/clarion-core/tests/fixtures/manifest_valid.toml`
-- Create: `/home/john/clarion/crates/clarion-core/tests/fixtures/manifest_missing_name.toml`
+- Modify: `/home/john/loomweave/Cargo.toml` (workspace deps: add `toml`, extend `tokio` features)
+- Modify: `/home/john/loomweave/crates/loomweave-core/Cargo.toml` (add `toml`, `serde`, `thiserror`)
+- Create: `/home/john/loomweave/crates/loomweave-core/src/plugin/mod.rs`
+- Create: `/home/john/loomweave/crates/loomweave-core/src/plugin/manifest.rs`
+- Modify: `/home/john/loomweave/crates/loomweave-core/src/lib.rs` (add `pub mod plugin;` re-exports)
+- Create: `/home/john/loomweave/crates/loomweave-core/tests/fixtures/manifest_valid.toml`
+- Create: `/home/john/loomweave/crates/loomweave-core/tests/fixtures/manifest_missing_name.toml`
 
 - [ ] **Step 1: Extend workspace dependencies**
 
-Modify the top `[workspace.dependencies]` block in `/home/john/clarion/Cargo.toml` — **add** two entries, **modify** the `tokio` line to include `"process"` and `"io-util"` features:
+Modify the top `[workspace.dependencies]` block in `/home/john/loomweave/Cargo.toml` — **add** two entries, **modify** the `tokio` line to include `"process"` and `"io-util"` features:
 
 ```toml
 # Replace the existing tokio line with:
@@ -72,9 +72,9 @@ toml = "0.8"
 
 Do NOT add `nix` here — that arrives in Task 4 where it's first used.
 
-- [ ] **Step 2: Extend `clarion-core`'s Cargo.toml**
+- [ ] **Step 2: Extend `loomweave-core`'s Cargo.toml**
 
-Modify `/home/john/clarion/crates/clarion-core/Cargo.toml` — add `toml`, `serde`, and `thiserror` to `[dependencies]`. They may already be present from WP1 (entity_id uses serde + thiserror); add only what's missing. The end state is:
+Modify `/home/john/loomweave/crates/loomweave-core/Cargo.toml` — add `toml`, `serde`, and `thiserror` to `[dependencies]`. They may already be present from WP1 (entity_id uses serde + thiserror); add only what's missing. The end state is:
 
 ```toml
 [dependencies]
@@ -88,7 +88,7 @@ toml.workspace = true
 
 - [ ] **Step 3: Write the module skeleton**
 
-Create `/home/john/clarion/crates/clarion-core/src/plugin/mod.rs`:
+Create `/home/john/loomweave/crates/loomweave-core/src/plugin/mod.rs`:
 
 ```rust
 //! Plugin host — subprocess supervision, JSON-RPC transport, manifest
@@ -96,12 +96,12 @@ Create `/home/john/clarion/crates/clarion-core/src/plugin/mod.rs`:
 //!
 //! # Scope
 //!
-//! This module is the Clarion-side end of the plugin transport defined in
-//! [ADR-002](../../clarion/adr/ADR-002-plugin-transport-json-rpc.md)
+//! This module is the Loomweave-side end of the plugin transport defined in
+//! [ADR-002](../../loomweave/adr/ADR-002-plugin-transport-json-rpc.md)
 //! and the enforcement surface for
-//! [ADR-021](../../clarion/adr/ADR-021-plugin-authority-hybrid.md)
+//! [ADR-021](../../loomweave/adr/ADR-021-plugin-authority-hybrid.md)
 //! §2a-d. The ontology boundary rules from
-//! [ADR-022](../../clarion/adr/ADR-022-core-plugin-ontology.md)
+//! [ADR-022](../../loomweave/adr/ADR-022-core-plugin-ontology.md)
 //! are enforced by [`host`] against the manifest parsed by [`manifest`].
 //!
 //! # Sub-modules
@@ -119,10 +119,10 @@ pub use manifest::{
 
 - [ ] **Step 4: Export from `lib.rs`**
 
-Modify `/home/john/clarion/crates/clarion-core/src/lib.rs` to declare the new module. The final file body:
+Modify `/home/john/loomweave/crates/loomweave-core/src/lib.rs` to declare the new module. The final file body:
 
 ```rust
-//! clarion-core — domain types, identifiers, provider traits, and plugin host.
+//! loomweave-core — domain types, identifiers, provider traits, and plugin host.
 //!
 //! WP2 introduces the `plugin` module which drives subprocess plugins
 //! via `JSON-RPC` over Content-Length framed stdio. The module's public
@@ -138,14 +138,14 @@ pub use llm_provider::{LlmProvider, NoopProvider};
 
 - [ ] **Step 5: Add the valid-manifest fixture**
 
-Create `/home/john/clarion/crates/clarion-core/tests/fixtures/manifest_valid.toml`:
+Create `/home/john/loomweave/crates/loomweave-core/tests/fixtures/manifest_valid.toml`:
 
 ```toml
 [plugin]
-name = "clarion-plugin-python"
+name = "loomweave-plugin-python"
 version = "0.1.0"
 protocol_version = "1.0"
-executable = "clarion-plugin-python"
+executable = "loomweave-plugin-python"
 language = "python"
 extensions = ["py"]
 
@@ -158,19 +158,19 @@ max_entities_per_run = 100000
 [ontology]
 entity_kinds = ["function", "class", "module", "decorator"]
 edge_kinds = ["imports", "calls", "decorates", "contains"]
-rule_id_prefix = "CLA-PY-"
+rule_id_prefix = "LMWV-PY-"
 ontology_version = "0.1.0"
 ```
 
 - [ ] **Step 6: Add the missing-name fixture**
 
-Create `/home/john/clarion/crates/clarion-core/tests/fixtures/manifest_missing_name.toml`:
+Create `/home/john/loomweave/crates/loomweave-core/tests/fixtures/manifest_missing_name.toml`:
 
 ```toml
 [plugin]
 version = "0.1.0"
 protocol_version = "1.0"
-executable = "clarion-plugin-python"
+executable = "loomweave-plugin-python"
 language = "python"
 extensions = ["py"]
 
@@ -183,22 +183,22 @@ max_entities_per_run = 100000
 [ontology]
 entity_kinds = ["function"]
 edge_kinds = ["imports"]
-rule_id_prefix = "CLA-PY-"
+rule_id_prefix = "LMWV-PY-"
 ontology_version = "0.1.0"
 ```
 
 - [ ] **Step 7: Write the failing tests**
 
-Create `/home/john/clarion/crates/clarion-core/src/plugin/manifest.rs` with the test skeleton first (TDD — tests before implementation):
+Create `/home/john/loomweave/crates/loomweave-core/src/plugin/manifest.rs` with the test skeleton first (TDD — tests before implementation):
 
 ```rust
 //! `plugin.toml` parser + validator (L5).
 //!
 //! Parses the manifest shape locked by WP2 §L5 and validates against
-//! [ADR-022](../../clarion/adr/ADR-022-core-plugin-ontology.md):
+//! [ADR-022](../../loomweave/adr/ADR-022-core-plugin-ontology.md):
 //! plugin `name` must match the identifier grammar; entity kinds cannot
 //! shadow the core-reserved set (`file`, `subsystem`, `guidance`); rule-ID
-//! prefix must be `CLA-<PLUGIN_ID_UPPERCASE>-` and end with `-`.
+//! prefix must be `LMWV-<PLUGIN_ID_UPPERCASE>-` and end with `-`.
 //!
 //! # Sprint 1 scope note
 //!
@@ -221,10 +221,10 @@ mod tests {
     #[test]
     fn parses_valid_manifest() {
         let m = parse_manifest(VALID).expect("valid fixture must parse");
-        assert_eq!(m.plugin.name, "clarion-plugin-python");
+        assert_eq!(m.plugin.name, "loomweave-plugin-python");
         assert_eq!(m.plugin.version, "0.1.0");
         assert_eq!(m.plugin.protocol_version, "1.0");
-        assert_eq!(m.plugin.executable, "clarion-plugin-python");
+        assert_eq!(m.plugin.executable, "loomweave-plugin-python");
         assert_eq!(m.plugin.language, "python");
         assert_eq!(m.plugin.extensions, vec!["py".to_string()]);
         assert_eq!(m.capabilities.max_rss_mb, 512);
@@ -239,7 +239,7 @@ mod tests {
             m.ontology.edge_kinds,
             vec!["imports", "calls", "decorates", "contains"]
         );
-        assert_eq!(m.ontology.rule_id_prefix, "CLA-PY-");
+        assert_eq!(m.ontology.rule_id_prefix, "LMWV-PY-");
         assert_eq!(m.ontology.ontology_version, "0.1.0");
     }
 
@@ -256,10 +256,10 @@ mod tests {
     fn rejects_zero_rss() {
         let input = br#"
 [plugin]
-name = "clarion-plugin-x"
+name = "loomweave-plugin-x"
 version = "0.1.0"
 protocol_version = "1.0"
-executable = "clarion-plugin-x"
+executable = "loomweave-plugin-x"
 language = "x"
 extensions = ["x"]
 
@@ -272,7 +272,7 @@ max_entities_per_run = 100000
 [ontology]
 entity_kinds = ["function"]
 edge_kinds = ["imports"]
-rule_id_prefix = "CLA-X-"
+rule_id_prefix = "LMWV-X-"
 ontology_version = "0.1.0"
 "#;
         let err = parse_manifest(input).expect_err("zero RSS must fail");
@@ -286,10 +286,10 @@ ontology_version = "0.1.0"
     fn rejects_empty_entity_kinds() {
         let input = br#"
 [plugin]
-name = "clarion-plugin-x"
+name = "loomweave-plugin-x"
 version = "0.1.0"
 protocol_version = "1.0"
-executable = "clarion-plugin-x"
+executable = "loomweave-plugin-x"
 language = "x"
 extensions = ["x"]
 
@@ -302,7 +302,7 @@ max_entities_per_run = 100000
 [ontology]
 entity_kinds = []
 edge_kinds = ["imports"]
-rule_id_prefix = "CLA-X-"
+rule_id_prefix = "LMWV-X-"
 ontology_version = "0.1.0"
 "#;
         let err = parse_manifest(input).expect_err("empty entity_kinds must fail");
@@ -316,10 +316,10 @@ ontology_version = "0.1.0"
     fn rejects_rule_id_prefix_without_trailing_dash() {
         let input = br#"
 [plugin]
-name = "clarion-plugin-x"
+name = "loomweave-plugin-x"
 version = "0.1.0"
 protocol_version = "1.0"
-executable = "clarion-plugin-x"
+executable = "loomweave-plugin-x"
 language = "x"
 extensions = ["x"]
 
@@ -332,7 +332,7 @@ max_entities_per_run = 100000
 [ontology]
 entity_kinds = ["function"]
 edge_kinds = ["imports"]
-rule_id_prefix = "CLA-X"
+rule_id_prefix = "LMWV-X"
 ontology_version = "0.1.0"
 "#;
         let err = parse_manifest(input).expect_err("prefix without '-' must fail");
@@ -346,10 +346,10 @@ ontology_version = "0.1.0"
     fn rejects_reserved_entity_kind_file() {
         let input = br#"
 [plugin]
-name = "clarion-plugin-x"
+name = "loomweave-plugin-x"
 version = "0.1.0"
 protocol_version = "1.0"
-executable = "clarion-plugin-x"
+executable = "loomweave-plugin-x"
 language = "x"
 extensions = ["x"]
 
@@ -362,7 +362,7 @@ max_entities_per_run = 100000
 [ontology]
 entity_kinds = ["function", "file"]
 edge_kinds = ["imports"]
-rule_id_prefix = "CLA-X-"
+rule_id_prefix = "LMWV-X-"
 ontology_version = "0.1.0"
 "#;
         let err = parse_manifest(input).expect_err("reserved kind must fail");
@@ -376,10 +376,10 @@ ontology_version = "0.1.0"
     fn rejects_plugin_name_uppercase() {
         let input = br#"
 [plugin]
-name = "Clarion-Plugin-X"
+name = "Loomweave-Plugin-X"
 version = "0.1.0"
 protocol_version = "1.0"
-executable = "clarion-plugin-x"
+executable = "loomweave-plugin-x"
 language = "x"
 extensions = ["x"]
 
@@ -392,7 +392,7 @@ max_entities_per_run = 100000
 [ontology]
 entity_kinds = ["function"]
 edge_kinds = ["imports"]
-rule_id_prefix = "CLA-X-"
+rule_id_prefix = "LMWV-X-"
 ontology_version = "0.1.0"
 "#;
         let err = parse_manifest(input).expect_err("uppercase name must fail");
@@ -406,10 +406,10 @@ ontology_version = "0.1.0"
     fn rejects_empty_extensions() {
         let input = br#"
 [plugin]
-name = "clarion-plugin-x"
+name = "loomweave-plugin-x"
 version = "0.1.0"
 protocol_version = "1.0"
-executable = "clarion-plugin-x"
+executable = "loomweave-plugin-x"
 language = "x"
 extensions = []
 
@@ -422,7 +422,7 @@ max_entities_per_run = 100000
 [ontology]
 entity_kinds = ["function"]
 edge_kinds = ["imports"]
-rule_id_prefix = "CLA-X-"
+rule_id_prefix = "LMWV-X-"
 ontology_version = "0.1.0"
 "#;
         let err = parse_manifest(input).expect_err("empty extensions must fail");
@@ -437,7 +437,7 @@ ontology_version = "0.1.0"
 - [ ] **Step 8: Run tests; expect failure (no types defined)**
 
 ```bash
-cd /home/john/clarion && cargo nextest run -p clarion-core manifest --no-tests=pass 2>&1 | head -40
+cd /home/john/loomweave && cargo nextest run -p loomweave-core manifest --no-tests=pass 2>&1 | head -40
 ```
 
 Expected: compile error `cannot find type 'Manifest'` (and several similar). That's the "red" state.
@@ -497,7 +497,7 @@ pub enum ManifestError {
 
     #[error(
         "[plugin].name {value:?} violates ADR-022 grammar \
-         (identifier `[a-z][a-z0-9_-]*`, must start with `clarion-plugin-`)"
+         (identifier `[a-z][a-z0-9_-]*`, must start with `loomweave-plugin-`)"
     )]
     InvalidPluginName { value: String },
 
@@ -514,7 +514,7 @@ pub enum ManifestError {
     EmptyOntologyField { field: &'static str },
 
     #[error(
-        "[ontology].rule_id_prefix {value:?} must start with `CLA-` and end \
+        "[ontology].rule_id_prefix {value:?} must start with `LMWV-` and end \
          with `-` (ADR-022 rule-ID namespace contract)"
     )]
     RuleIdPrefixFormat { value: String },
@@ -527,7 +527,7 @@ pub enum ManifestError {
 }
 
 /// Core-reserved entity kinds per
-/// [ADR-022](../../clarion/adr/ADR-022-core-plugin-ontology.md).
+/// [ADR-022](../../loomweave/adr/ADR-022-core-plugin-ontology.md).
 /// These are produced by core-owned algorithms (file-discovery, Leiden
 /// clustering, guidance composition). A plugin declaring any of them in
 /// its `entity_kinds` list is rejected at manifest parse.
@@ -584,7 +584,7 @@ fn validate(m: &Manifest) -> Result<(), ManifestError> {
 
 fn validate_plugin_name(name: &str) -> Result<(), ManifestError> {
     // ADR-022 grammar for plugin identifiers is `[a-z][a-z0-9_]*`. WP2 §L9
-    // requires PATH-installable binaries prefixed `clarion-plugin-`, which
+    // requires PATH-installable binaries prefixed `loomweave-plugin-`, which
     // broadens the grammar to include `-`. We accept the broader form for
     // the manifest `name` (which is also the binary name) and narrow it
     // back to `[a-z][a-z0-9_]*` when deriving `plugin_id` for `EntityId`
@@ -608,7 +608,7 @@ fn validate_plugin_name(name: &str) -> Result<(), ManifestError> {
             });
         }
     }
-    if !name.starts_with("clarion-plugin-") {
+    if !name.starts_with("loomweave-plugin-") {
         return Err(ManifestError::InvalidPluginName {
             value: name.to_owned(),
         });
@@ -624,7 +624,7 @@ fn validate_capability(field: &'static str, value: u64) -> Result<(), ManifestEr
 }
 
 fn validate_rule_id_prefix(value: &str) -> Result<(), ManifestError> {
-    if !value.starts_with("CLA-") || !value.ends_with('-') || value.len() < 6 {
+    if !value.starts_with("LMWV-") || !value.ends_with('-') || value.len() < 6 {
         return Err(ManifestError::RuleIdPrefixFormat {
             value: value.to_owned(),
         });
@@ -636,7 +636,7 @@ fn validate_rule_id_prefix(value: &str) -> Result<(), ManifestError> {
 - [ ] **Step 10: Run tests; expect pass**
 
 ```bash
-cd /home/john/clarion && cargo nextest run -p clarion-core manifest --no-tests=pass
+cd /home/john/loomweave && cargo nextest run -p loomweave-core manifest --no-tests=pass
 ```
 
 Expected: 8 tests pass (`parses_valid_manifest`, `rejects_missing_name`, `rejects_zero_rss`, `rejects_empty_entity_kinds`, `rejects_rule_id_prefix_without_trailing_dash`, `rejects_reserved_entity_kind_file`, `rejects_plugin_name_uppercase`, `rejects_empty_extensions`).
@@ -644,11 +644,11 @@ Expected: 8 tests pass (`parses_valid_manifest`, `rejects_missing_name`, `reject
 - [ ] **Step 11: Full ADR-023 gate sweep**
 
 ```bash
-cd /home/john/clarion && cargo fmt --all -- --check
-cd /home/john/clarion && cargo clippy --workspace --all-targets --all-features -- -D warnings
-cd /home/john/clarion && cargo nextest run --workspace --all-features --no-tests=pass
-cd /home/john/clarion && cargo doc --workspace --no-deps --all-features
-cd /home/john/clarion && cargo deny check
+cd /home/john/loomweave && cargo fmt --all -- --check
+cd /home/john/loomweave && cargo clippy --workspace --all-targets --all-features -- -D warnings
+cd /home/john/loomweave && cargo nextest run --workspace --all-features --no-tests=pass
+cd /home/john/loomweave && cargo doc --workspace --no-deps --all-features
+cd /home/john/loomweave && cargo deny check
 ```
 
 All five must exit 0. Pedantic expectations: `doc_markdown` may flag bare `TOML` / `JSON-RPC` tokens — backtick them (`` `TOML` ``, `` `JSON-RPC` ``) in the doc comments above before re-running clippy.
@@ -656,19 +656,19 @@ All five must exit 0. Pedantic expectations: `doc_markdown` may flag bare `TOML`
 - [ ] **Step 12: Commit**
 
 ```bash
-cd /home/john/clarion && git add Cargo.toml crates/clarion-core/ && git commit -m "$(cat <<'EOF'
+cd /home/john/loomweave && git add Cargo.toml crates/loomweave-core/ && git commit -m "$(cat <<'EOF'
 feat(wp2): L5 plugin.toml manifest parser and validator
 
-Adds clarion-core::plugin::{manifest,mod} with parse_manifest(&[u8]) ->
+Adds loomweave-core::plugin::{manifest,mod} with parse_manifest(&[u8]) ->
 Result<Manifest, ManifestError>. Validates against ADR-022: plugin name
-grammar [a-z][a-z0-9_-]* with required `clarion-plugin-` prefix; rule-ID
-prefix must be CLA-<UPPER>- and end with `-`; entity_kinds cannot shadow
+grammar [a-z][a-z0-9_-]* with required `loomweave-plugin-` prefix; rule-ID
+prefix must be LMWV-<UPPER>- and end with `-`; entity_kinds cannot shadow
 the core-reserved set (file, subsystem, guidance); required fields present;
 capabilities strictly positive.
 
 Workspace: toml = "0.8" added; tokio features extended with "process" +
 "io-util" (no runtime effect until Task 2). Fixtures live under
-crates/clarion-core/tests/fixtures/ and are include_bytes!-loaded into the
+crates/loomweave-core/tests/fixtures/ and are include_bytes!-loaded into the
 unit tests to keep the positive-path assertion a single source of truth.
 
 8 tests: positive, 7 negatives covering every ManifestError variant.
@@ -681,9 +681,9 @@ EOF
 ## Task 2: L4 JSON-RPC Content-Length transport
 
 **Files:**
-- Create: `/home/john/clarion/crates/clarion-core/src/plugin/transport.rs`
-- Create: `/home/john/clarion/crates/clarion-core/src/plugin/protocol.rs`
-- Modify: `/home/john/clarion/crates/clarion-core/src/plugin/mod.rs` (add module decls + re-exports)
+- Create: `/home/john/loomweave/crates/loomweave-core/src/plugin/transport.rs`
+- Create: `/home/john/loomweave/crates/loomweave-core/src/plugin/protocol.rs`
+- Modify: `/home/john/loomweave/crates/loomweave-core/src/plugin/mod.rs` (add module decls + re-exports)
 
 - [ ] **Step 1: Extend `plugin/mod.rs`**
 
@@ -716,7 +716,7 @@ pub use transport::{Frame, TransportError, read_frame, write_frame};
 
 - [ ] **Step 2: Write `protocol.rs`**
 
-Create `/home/john/clarion/crates/clarion-core/src/plugin/protocol.rs`:
+Create `/home/john/loomweave/crates/loomweave-core/src/plugin/protocol.rs`:
 
 ```rust
 //! Typed `JSON-RPC` 2.0 shapes for the L4 method set.
@@ -731,7 +731,7 @@ Create `/home/john/clarion/crates/clarion-core/src/plugin/protocol.rs`:
 //! | `shutdown`     | Core → plugin        | Graceful stop                            |
 //! | `exit`         | Core → plugin (note) | Forceful termination notification        |
 //!
-//! Error codes follow the JSON-RPC 2.0 spec plus Clarion-reserved
+//! Error codes follow the JSON-RPC 2.0 spec plus Loomweave-reserved
 //! [-32000, -32099] range for transport/host-side violations.
 
 use serde::{Deserialize, Serialize};
@@ -791,7 +791,7 @@ pub struct JsonRpcError {
     pub data: Option<Value>,
 }
 
-/// Error codes used by the Clarion host/plugin protocol. The standard
+/// Error codes used by the Loomweave host/plugin protocol. The standard
 /// `JSON-RPC` 2.0 codes are included for completeness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -801,9 +801,9 @@ pub enum JsonRpcErrorCode {
     MethodNotFound = -32_601,
     InvalidParams = -32_602,
     InternalError = -32_603,
-    /// Clarion-reserved: plugin refused the manifest handshake.
+    /// Loomweave-reserved: plugin refused the manifest handshake.
     ManifestRejected = -32_000,
-    /// Clarion-reserved: plugin reports an analysis-level error.
+    /// Loomweave-reserved: plugin reports an analysis-level error.
     AnalyzeFailed = -32_001,
 }
 
@@ -870,7 +870,7 @@ pub struct AnalyzeFileResult {
 pub struct ShutdownParams {}
 
 /// Entity as emitted by the plugin. The host validates this shape before
-/// translating it into [`clarion_storage::EntityRecord`]:
+/// translating it into [`loomweave_storage::EntityRecord`]:
 ///
 /// - `id` must equal `entity_id(plugin_id, kind, qualified_name)` (ADR-003
 ///   + ADR-022; enforced by [`super::host`] per UQ-WP2-11).
@@ -907,7 +907,7 @@ pub struct PluginSource {
 
 - [ ] **Step 3: Write `transport.rs` — tests first**
 
-Create `/home/john/clarion/crates/clarion-core/src/plugin/transport.rs`:
+Create `/home/john/loomweave/crates/loomweave-core/src/plugin/transport.rs`:
 
 ```rust
 //! Content-Length framed `JSON-RPC` codec (L4).
@@ -961,7 +961,7 @@ pub enum TransportError {
 
     #[error(
         "frame size {observed} exceeds ADR-021 §2b ceiling {ceiling} \
-         (rule-id CLA-INFRA-PLUGIN-FRAME-OVERSIZE)"
+         (rule-id LMWV-INFRA-PLUGIN-FRAME-OVERSIZE)"
     )]
     FrameTooLarge { observed: usize, ceiling: usize },
 }
@@ -1178,9 +1178,9 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: Add `tokio/macros` + `tokio/io-util` to `clarion-core`'s dev-dependencies**
+- [ ] **Step 4: Add `tokio/macros` + `tokio/io-util` to `loomweave-core`'s dev-dependencies**
 
-Modify `/home/john/clarion/crates/clarion-core/Cargo.toml` to ensure `tokio` (with `macros`, `io-util`, `rt`) is available under `[dev-dependencies]` for the `#[tokio::test]` attribute used above:
+Modify `/home/john/loomweave/crates/loomweave-core/Cargo.toml` to ensure `tokio` (with `macros`, `io-util`, `rt`) is available under `[dev-dependencies]` for the `#[tokio::test]` attribute used above:
 
 ```toml
 [dev-dependencies]
@@ -1192,7 +1192,7 @@ tokio = { workspace = true, features = ["macros", "io-util", "rt", "rt-multi-thr
 - [ ] **Step 5: Run the transport tests**
 
 ```bash
-cd /home/john/clarion && cargo nextest run -p clarion-core transport --no-tests=pass
+cd /home/john/loomweave && cargo nextest run -p loomweave-core transport --no-tests=pass
 ```
 
 Expected: 7 tests pass. If any fail with `doc_markdown`-style clippy complaints during compile, backtick `LSP` / `JSON-RPC` / `Content-Length` / `UTF-8` tokens in the module-level doc comments.
@@ -1200,17 +1200,17 @@ Expected: 7 tests pass. If any fail with `doc_markdown`-style clippy complaints 
 - [ ] **Step 6: Full ADR-023 gate sweep**
 
 ```bash
-cd /home/john/clarion && cargo fmt --all -- --check
-cd /home/john/clarion && cargo clippy --workspace --all-targets --all-features -- -D warnings
-cd /home/john/clarion && cargo nextest run --workspace --all-features --no-tests=pass
-cd /home/john/clarion && cargo doc --workspace --no-deps --all-features
-cd /home/john/clarion && cargo deny check
+cd /home/john/loomweave && cargo fmt --all -- --check
+cd /home/john/loomweave && cargo clippy --workspace --all-targets --all-features -- -D warnings
+cd /home/john/loomweave && cargo nextest run --workspace --all-features --no-tests=pass
+cd /home/john/loomweave && cargo doc --workspace --no-deps --all-features
+cd /home/john/loomweave && cargo deny check
 ```
 
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /home/john/clarion && git add crates/clarion-core/ && git commit -m "$(cat <<'EOF'
+cd /home/john/loomweave && git add crates/loomweave-core/ && git commit -m "$(cat <<'EOF'
 feat(wp2): L4 JSON-RPC Content-Length transport + typed protocol shapes
 
 plugin/transport.rs implements read_frame/write_frame over any
@@ -1222,7 +1222,7 @@ consuming the payload (ADR-021 §2b enforcement point).
 plugin/protocol.rs defines the JSON-RPC 2.0 envelope plus typed params
 and results for every L4 method: initialize, initialized, analyze_file,
 shutdown, exit. PluginEntity carries the on-wire shape the host
-validates before translating to clarion_storage::EntityRecord in Task 6.
+validates before translating to loomweave_storage::EntityRecord in Task 6.
 
 7 transport tests: round-trip empty object, round-trip real JSON-RPC
 request, two frames back-to-back, ceiling refused before body, missing
@@ -1237,8 +1237,8 @@ EOF
 ## Task 3: In-process mock plugin test harness
 
 **Files:**
-- Create: `/home/john/clarion/crates/clarion-core/src/plugin/mock.rs`
-- Modify: `/home/john/clarion/crates/clarion-core/src/plugin/mod.rs` (add `mock` module, re-export `MockPlugin` + variant enum under `#[cfg(any(test, feature = "mock"))]` — Sprint 1 uses plain `#[cfg(test)]`)
+- Create: `/home/john/loomweave/crates/loomweave-core/src/plugin/mock.rs`
+- Modify: `/home/john/loomweave/crates/loomweave-core/src/plugin/mod.rs` (add `mock` module, re-export `MockPlugin` + variant enum under `#[cfg(any(test, feature = "mock"))]` — Sprint 1 uses plain `#[cfg(test)]`)
 
 - [ ] **Step 1: Extend `plugin/mod.rs`**
 
@@ -1268,7 +1268,7 @@ pub use transport::{Frame, TransportError, read_frame, write_frame};
 
 - [ ] **Step 2: Write the mock module**
 
-Create `/home/john/clarion/crates/clarion-core/src/plugin/mock.rs`:
+Create `/home/john/loomweave/crates/loomweave-core/src/plugin/mock.rs`:
 
 ```rust
 //! In-process mock plugin for unit tests.
@@ -1279,7 +1279,7 @@ Create `/home/john/clarion/crates/clarion-core/src/plugin/mock.rs`:
 //! handshake logic without a real subprocess.
 //!
 //! Task 6's integration tests use a real subprocess fixture
-//! (`clarion-mock-plugin` crate). This module is for unit-level coverage.
+//! (`loomweave-mock-plugin` crate). This module is for unit-level coverage.
 //!
 //! # UQ-WP2-07 note
 //!
@@ -1490,7 +1490,7 @@ mod tests {
             Method::Initialize,
             &InitializeParams {
                 protocol_version: "1.0".to_owned(),
-                plugin_name: "clarion-plugin-mock".to_owned(),
+                plugin_name: "loomweave-plugin-mock".to_owned(),
                 plugin_version: "0.1.0".to_owned(),
                 project_root: "/tmp".to_owned(),
             },
@@ -1547,7 +1547,7 @@ Note the minor type-level annoyance: we `use super::super::protocol::{Initialize
 - [ ] **Step 3: Run the mock test**
 
 ```bash
-cd /home/john/clarion && cargo nextest run -p clarion-core mock --no-tests=pass
+cd /home/john/loomweave && cargo nextest run -p loomweave-core mock --no-tests=pass
 ```
 
 Expected: 1 test (`compliant_mock_completes_handshake`) passes.
@@ -1555,13 +1555,13 @@ Expected: 1 test (`compliant_mock_completes_handshake`) passes.
 - [ ] **Step 4: Full ADR-023 gate sweep + flake-check**
 
 ```bash
-cd /home/john/clarion && cargo fmt --all -- --check
-cd /home/john/clarion && cargo clippy --workspace --all-targets --all-features -- -D warnings
-cd /home/john/clarion && cargo nextest run --workspace --all-features --no-tests=pass
-cd /home/john/clarion && cargo nextest run --workspace --all-features --no-tests=pass
-cd /home/john/clarion && cargo nextest run --workspace --all-features --no-tests=pass
-cd /home/john/clarion && cargo doc --workspace --no-deps --all-features
-cd /home/john/clarion && cargo deny check
+cd /home/john/loomweave && cargo fmt --all -- --check
+cd /home/john/loomweave && cargo clippy --workspace --all-targets --all-features -- -D warnings
+cd /home/john/loomweave && cargo nextest run --workspace --all-features --no-tests=pass
+cd /home/john/loomweave && cargo nextest run --workspace --all-features --no-tests=pass
+cd /home/john/loomweave && cargo nextest run --workspace --all-features --no-tests=pass
+cd /home/john/loomweave && cargo doc --workspace --no-deps --all-features
+cd /home/john/loomweave && cargo deny check
 ```
 
 Three nextest runs in a row verify the async mock doesn't flake (timing-dependent tests are a WP2 hotspot). If any run hangs beyond 30s, kill it and investigate — the duplex-drop ordering is the usual suspect.
@@ -1569,7 +1569,7 @@ Three nextest runs in a row verify the async mock doesn't flake (timing-dependen
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/john/clarion && git add crates/clarion-core/ && git commit -m "$(cat <<'EOF'
+cd /home/john/loomweave && git add crates/loomweave-core/ && git commit -m "$(cat <<'EOF'
 feat(wp2): in-process mock plugin test harness
 
 plugin/mock.rs provides MockPlugin::spawn(variant) over tokio::io::duplex
@@ -1578,7 +1578,7 @@ CrashingAfterHandshake (drops pipes post-handshake), Oversize (writes a
 1024-byte frame so tests with ceiling=128 trip FrameTooLarge).
 
 Unit-level coverage: Task 6's real-subprocess integration tests use the
-separate clarion-mock-plugin crate spawned via assert_cmd::cargo_bin.
+separate loomweave-mock-plugin crate spawned via assert_cmd::cargo_bin.
 
 1 test asserts the compliant variant's full handshake + analyze_file
 round trip. Module is #[cfg(test)] pub(crate) — no runtime impact on
@@ -1592,15 +1592,15 @@ EOF
 ## Task 4: L6 core-enforced minimums — jail, limits, prlimit
 
 **Files:**
-- Modify: `/home/john/clarion/Cargo.toml` (add `nix` workspace dep; relax `unsafe_code` from `"forbid"` to `"deny"`)
-- Modify: `/home/john/clarion/crates/clarion-core/Cargo.toml` (add `nix` as a `[target.'cfg(target_os = "linux")'.dependencies]` entry; add `tracing`)
-- Create: `/home/john/clarion/crates/clarion-core/src/plugin/jail.rs`
-- Create: `/home/john/clarion/crates/clarion-core/src/plugin/limits.rs`
-- Modify: `/home/john/clarion/crates/clarion-core/src/plugin/mod.rs` (declare `jail` + `limits`; add re-exports)
+- Modify: `/home/john/loomweave/Cargo.toml` (add `nix` workspace dep; relax `unsafe_code` from `"forbid"` to `"deny"`)
+- Modify: `/home/john/loomweave/crates/loomweave-core/Cargo.toml` (add `nix` as a `[target.'cfg(target_os = "linux")'.dependencies]` entry; add `tracing`)
+- Create: `/home/john/loomweave/crates/loomweave-core/src/plugin/jail.rs`
+- Create: `/home/john/loomweave/crates/loomweave-core/src/plugin/limits.rs`
+- Modify: `/home/john/loomweave/crates/loomweave-core/src/plugin/mod.rs` (declare `jail` + `limits`; add re-exports)
 
 - [ ] **Step 1: Relax workspace `unsafe_code` lint**
 
-In `/home/john/clarion/Cargo.toml`, change the `[workspace.lints.rust]` block from:
+In `/home/john/loomweave/Cargo.toml`, change the `[workspace.lints.rust]` block from:
 
 ```toml
 [workspace.lints.rust]
@@ -1614,14 +1614,14 @@ to:
 # ADR-021 §2d enforcement requires CommandExt::pre_exec (unsafe because the
 # closure runs in the fork'd child before exec). Relaxed from "forbid" to
 # "deny" so the single audited call site in
-# crates/clarion-core/src/plugin/limits.rs can use `#[allow(unsafe_code)]`
+# crates/loomweave-core/src/plugin/limits.rs can use `#[allow(unsafe_code)]`
 # with a safety-justifying comment. No other unsafe is permitted.
 unsafe_code = "deny"
 ```
 
 - [ ] **Step 2: Add `nix` workspace dep**
 
-Append to `[workspace.dependencies]` in `/home/john/clarion/Cargo.toml`:
+Append to `[workspace.dependencies]` in `/home/john/loomweave/Cargo.toml`:
 
 ```toml
 nix = { version = "0.28", default-features = false, features = ["resource"] }
@@ -1630,9 +1630,9 @@ tracing-test = "0.2"
 
 `tracing-test` is a dev-only helper that captures `tracing` events for assertion; we pin it at workspace level for reuse across crates.
 
-- [ ] **Step 3: Extend `clarion-core/Cargo.toml`**
+- [ ] **Step 3: Extend `loomweave-core/Cargo.toml`**
 
-Modify `/home/john/clarion/crates/clarion-core/Cargo.toml` to add `tracing` + the target-scoped `nix`:
+Modify `/home/john/loomweave/crates/loomweave-core/Cargo.toml` to add `tracing` + the target-scoped `nix`:
 
 ```toml
 [dependencies]
@@ -1656,7 +1656,7 @@ tracing-test.workspace = true
 
 - [ ] **Step 4: Write `jail.rs` tests first**
 
-Create `/home/john/clarion/crates/clarion-core/src/plugin/jail.rs`:
+Create `/home/john/loomweave/crates/loomweave-core/src/plugin/jail.rs`:
 
 ```rust
 //! Path-jail helper — ADR-021 §2a enforcement primitive.
@@ -1684,7 +1684,7 @@ pub enum JailError {
 
     #[error(
         "{candidate:?} canonicalises outside project root {root:?} \
-         (rule-id CLA-INFRA-PLUGIN-PATH-ESCAPE)"
+         (rule-id LMWV-INFRA-PLUGIN-PATH-ESCAPE)"
     )]
     EscapedRoot { candidate: PathBuf, root: PathBuf },
 }
@@ -1784,7 +1784,7 @@ mod tests {
 
 - [ ] **Step 5: Write `limits.rs` tests first**
 
-Create `/home/john/clarion/crates/clarion-core/src/plugin/limits.rs`:
+Create `/home/john/loomweave/crates/loomweave-core/src/plugin/limits.rs`:
 
 ```rust
 //! Core-enforced ceilings + rolling breakers — ADR-021 §2b/§2c/§2d +
@@ -1859,7 +1859,7 @@ pub const ENTITY_COUNT_CAP_FLOOR: u64 = 10_000;
 #[derive(Debug, Error)]
 #[error(
     "per-run entity-count cap exceeded: {observed} > {cap} \
-     (rule-id CLA-INFRA-PLUGIN-ENTITY-CAP)"
+     (rule-id LMWV-INFRA-PLUGIN-ENTITY-CAP)"
 )]
 pub struct CapExceeded {
     pub observed: u64,
@@ -2176,8 +2176,8 @@ pub use transport::{Frame, TransportError, read_frame, write_frame};
 - [ ] **Step 7: Run the jail + limits tests**
 
 ```bash
-cd /home/john/clarion && cargo nextest run -p clarion-core jail --no-tests=pass
-cd /home/john/clarion && cargo nextest run -p clarion-core limits --no-tests=pass
+cd /home/john/loomweave && cargo nextest run -p loomweave-core jail --no-tests=pass
+cd /home/john/loomweave && cargo nextest run -p loomweave-core limits --no-tests=pass
 ```
 
 Expected: 5 jail tests pass, 8 limits tests pass (one of which is Linux-gated).
@@ -2185,13 +2185,13 @@ Expected: 5 jail tests pass, 8 limits tests pass (one of which is Linux-gated).
 - [ ] **Step 8: Full ADR-023 gate sweep + breaker flake-check**
 
 ```bash
-cd /home/john/clarion && cargo fmt --all -- --check
-cd /home/john/clarion && cargo clippy --workspace --all-targets --all-features -- -D warnings
-cd /home/john/clarion && cargo nextest run --workspace --all-features --no-tests=pass
-cd /home/john/clarion && cargo nextest run --workspace --all-features --no-tests=pass
-cd /home/john/clarion && cargo nextest run --workspace --all-features --no-tests=pass
-cd /home/john/clarion && cargo doc --workspace --no-deps --all-features
-cd /home/john/clarion && cargo deny check
+cd /home/john/loomweave && cargo fmt --all -- --check
+cd /home/john/loomweave && cargo clippy --workspace --all-targets --all-features -- -D warnings
+cd /home/john/loomweave && cargo nextest run --workspace --all-features --no-tests=pass
+cd /home/john/loomweave && cargo nextest run --workspace --all-features --no-tests=pass
+cd /home/john/loomweave && cargo nextest run --workspace --all-features --no-tests=pass
+cd /home/john/loomweave && cargo doc --workspace --no-deps --all-features
+cd /home/john/loomweave && cargo deny check
 ```
 
 Three nextest runs because the breaker tests are timing-adjacent (they use synthetic `Instant`s — should be deterministic — but the triple run catches any accidental `Instant::now()` slippage).
@@ -2201,7 +2201,7 @@ If `cargo deny check` complains about `nix`'s license or dependencies, add the s
 - [ ] **Step 9: Commit**
 
 ```bash
-cd /home/john/clarion && git add Cargo.toml crates/clarion-core/ && git commit -m "$(cat <<'EOF'
+cd /home/john/loomweave && git add Cargo.toml crates/loomweave-core/ && git commit -m "$(cat <<'EOF'
 feat(wp2): L6 core-enforced minimums — path jail, ceilings, prlimit (ADR-021 defaults)
 
 plugin/jail.rs — `jail(root, candidate) -> Result<PathBuf, JailError>`
@@ -2239,8 +2239,8 @@ EOF
 ## Task 5: L9 plugin discovery
 
 **Files:**
-- Create: `/home/john/clarion/crates/clarion-core/src/plugin/discovery.rs`
-- Modify: `/home/john/clarion/crates/clarion-core/src/plugin/mod.rs` (declare + re-export)
+- Create: `/home/john/loomweave/crates/loomweave-core/src/plugin/discovery.rs`
+- Modify: `/home/john/loomweave/crates/loomweave-core/src/plugin/mod.rs` (declare + re-export)
 
 - [ ] **Step 1: Extend `plugin/mod.rs`**
 
@@ -2258,15 +2258,15 @@ pub use discovery::{DiscoveredPlugin, DiscoveryError, discover, discover_with_pa
 
 - [ ] **Step 2: Write `discovery.rs` with tests first**
 
-Create `/home/john/clarion/crates/clarion-core/src/plugin/discovery.rs`:
+Create `/home/john/loomweave/crates/loomweave-core/src/plugin/discovery.rs`:
 
 ```rust
 //! Plugin discovery (L9).
 //!
 //! Convention: the core scans `$PATH` for executable files whose basename
-//! matches `clarion-plugin-*`. For each candidate binary, it looks for a
+//! matches `loomweave-plugin-*`. For each candidate binary, it looks for a
 //! `plugin.toml` alongside it; if absent, it falls back to
-//! `<parent-dir>/../share/clarion/plugins/<binary-basename>/plugin.toml`.
+//! `<parent-dir>/../share/loomweave/plugins/<binary-basename>/plugin.toml`.
 //!
 //! UQ-WP2-01 proposal: PATH-based with neighboring-manifest fallback.
 //! Resolved here.
@@ -2277,7 +2277,7 @@ Create `/home/john/clarion/crates/clarion-core/src/plugin/discovery.rs`:
 //! - First-match-wins on duplicate basenames (stable PATH order).
 //! - A candidate with no resolvable `plugin.toml` is silently skipped and
 //!   logged at `tracing::debug!`. It is not an error — the user may have
-//!   a `clarion-plugin-*` binary on PATH that isn't a Clarion plugin.
+//!   a `loomweave-plugin-*` binary on PATH that isn't a Loomweave plugin.
 
 use std::path::{Path, PathBuf};
 
@@ -2326,7 +2326,7 @@ pub fn discover_with_path(path: &str) -> Vec<DiscoveredPlugin> {
             let Some(name_str) = file_name.to_str() else {
                 continue;
             };
-            if !name_str.starts_with("clarion-plugin-") {
+            if !name_str.starts_with("loomweave-plugin-") {
                 continue;
             }
             if seen.iter().any(|s| s == name_str) {
@@ -2348,7 +2348,7 @@ pub fn discover_with_path(path: &str) -> Vec<DiscoveredPlugin> {
                 None => {
                     tracing::debug!(
                         executable = %exec_path.display(),
-                        "clarion-plugin-* candidate has no resolvable plugin.toml; skipping"
+                        "loomweave-plugin-* candidate has no resolvable plugin.toml; skipping"
                     );
                 }
             }
@@ -2375,11 +2375,11 @@ fn locate_manifest(exec: &Path, binary_name: &str) -> Option<(PathBuf, Manifest)
         if let Some(manifest) = read_and_parse(&candidate) {
             return Some((candidate, manifest));
         }
-        // Fallback: <parent>/../share/clarion/plugins/<name>/plugin.toml
+        // Fallback: <parent>/../share/loomweave/plugins/<name>/plugin.toml
         let candidate = parent
             .join("..")
             .join("share")
-            .join("clarion")
+            .join("loomweave")
             .join("plugins")
             .join(binary_name)
             .join("plugin.toml");
@@ -2430,33 +2430,33 @@ mod tests {
     #[test]
     fn finds_plugin_with_neighboring_manifest() {
         let tmp = tempfile::tempdir().unwrap();
-        let bin = mk_exec(tmp.path(), "clarion-plugin-python");
+        let bin = mk_exec(tmp.path(), "loomweave-plugin-python");
         fs::write(tmp.path().join("plugin.toml"), VALID).unwrap();
         let path = tmp.path().to_string_lossy().into_owned();
 
         let plugins = discover_with_path(&path);
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].executable, bin);
-        assert_eq!(plugins[0].manifest.plugin.name, "clarion-plugin-python");
+        assert_eq!(plugins[0].manifest.plugin.name, "loomweave-plugin-python");
     }
 
     #[test]
     fn finds_plugin_via_share_fallback() {
         let tmp = tempfile::tempdir().unwrap();
         // Simulated install layout:
-        //   <tmp>/bin/clarion-plugin-python
-        //   <tmp>/share/clarion/plugins/clarion-plugin-python/plugin.toml
+        //   <tmp>/bin/loomweave-plugin-python
+        //   <tmp>/share/loomweave/plugins/loomweave-plugin-python/plugin.toml
         let bin_dir = tmp.path().join("bin");
         fs::create_dir(&bin_dir).unwrap();
         let share_dir = tmp
             .path()
             .join("share")
-            .join("clarion")
+            .join("loomweave")
             .join("plugins")
-            .join("clarion-plugin-python");
+            .join("loomweave-plugin-python");
         fs::create_dir_all(&share_dir).unwrap();
         fs::write(share_dir.join("plugin.toml"), VALID).unwrap();
-        let bin = mk_exec(&bin_dir, "clarion-plugin-python");
+        let bin = mk_exec(&bin_dir, "loomweave-plugin-python");
         let path = bin_dir.to_string_lossy().into_owned();
 
         let plugins = discover_with_path(&path);
@@ -2465,7 +2465,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_non_clarion_prefixed_binaries() {
+    fn skips_non_loomweave_prefixed_binaries() {
         let tmp = tempfile::tempdir().unwrap();
         mk_exec(tmp.path(), "some-other-binary");
         fs::write(tmp.path().join("plugin.toml"), VALID).unwrap();
@@ -2474,17 +2474,17 @@ mod tests {
     }
 
     #[test]
-    fn skips_clarion_candidate_without_manifest() {
+    fn skips_loomweave_candidate_without_manifest() {
         let tmp = tempfile::tempdir().unwrap();
-        mk_exec(tmp.path(), "clarion-plugin-python");
+        mk_exec(tmp.path(), "loomweave-plugin-python");
         let path = tmp.path().to_string_lossy().into_owned();
         assert!(discover_with_path(&path).is_empty());
     }
 
     #[test]
-    fn skips_non_executable_clarion_file() {
+    fn skips_non_executable_loomweave_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let p = tmp.path().join("clarion-plugin-python");
+        let p = tmp.path().join("loomweave-plugin-python");
         fs::write(&p, b"not executable").unwrap();
         let mut perm = fs::metadata(&p).unwrap().permissions();
         perm.set_mode(0o644);
@@ -2498,9 +2498,9 @@ mod tests {
     fn duplicate_basename_first_wins() {
         let tmp1 = tempfile::tempdir().unwrap();
         let tmp2 = tempfile::tempdir().unwrap();
-        mk_exec(tmp1.path(), "clarion-plugin-python");
+        mk_exec(tmp1.path(), "loomweave-plugin-python");
         fs::write(tmp1.path().join("plugin.toml"), VALID).unwrap();
-        mk_exec(tmp2.path(), "clarion-plugin-python");
+        mk_exec(tmp2.path(), "loomweave-plugin-python");
         fs::write(tmp2.path().join("plugin.toml"), VALID).unwrap();
         let path = format!(
             "{}:{}",
@@ -2517,7 +2517,7 @@ mod tests {
 - [ ] **Step 3: Run discovery tests**
 
 ```bash
-cd /home/john/clarion && cargo nextest run -p clarion-core discovery --no-tests=pass
+cd /home/john/loomweave && cargo nextest run -p loomweave-core discovery --no-tests=pass
 ```
 
 Expected: 6 tests pass.
@@ -2525,27 +2525,27 @@ Expected: 6 tests pass.
 - [ ] **Step 4: Full ADR-023 gate sweep**
 
 ```bash
-cd /home/john/clarion && cargo fmt --all -- --check
-cd /home/john/clarion && cargo clippy --workspace --all-targets --all-features -- -D warnings
-cd /home/john/clarion && cargo nextest run --workspace --all-features --no-tests=pass
-cd /home/john/clarion && cargo doc --workspace --no-deps --all-features
-cd /home/john/clarion && cargo deny check
+cd /home/john/loomweave && cargo fmt --all -- --check
+cd /home/john/loomweave && cargo clippy --workspace --all-targets --all-features -- -D warnings
+cd /home/john/loomweave && cargo nextest run --workspace --all-features --no-tests=pass
+cd /home/john/loomweave && cargo doc --workspace --no-deps --all-features
+cd /home/john/loomweave && cargo deny check
 ```
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/john/clarion && git add crates/clarion-core/ && git commit -m "$(cat <<'EOF'
+cd /home/john/loomweave && git add crates/loomweave-core/ && git commit -m "$(cat <<'EOF'
 feat(wp2): L9 plugin discovery convention (PATH + neighboring manifest)
 
 plugin/discovery.rs scans $PATH for executable files prefixed
-`clarion-plugin-`. For each, it looks for plugin.toml beside the binary
-first, then falls back to <parent>/../share/clarion/plugins/<name>/
+`loomweave-plugin-`. For each, it looks for plugin.toml beside the binary
+first, then falls back to <parent>/../share/loomweave/plugins/<name>/
 plugin.toml. Non-matching names are skipped; candidates without a
 resolvable manifest are skipped with a debug trace; duplicate basenames
 across PATH entries keep the first-found wins.
 
-6 tests: neighboring manifest, share-fallback manifest, non-clarion prefix
+6 tests: neighboring manifest, share-fallback manifest, non-loomweave prefix
 skipped, missing-manifest skipped, non-executable file skipped, PATH-order
 deduplication.
 EOF
@@ -2554,27 +2554,27 @@ EOF
 
 ---
 
-## Task 6: Plugin-host supervisor + `clarion-mock-plugin` fixture
+## Task 6: Plugin-host supervisor + `loomweave-mock-plugin` fixture
 
 **Files:**
-- Create: `/home/john/clarion/crates/clarion-mock-plugin/` (new workspace crate)
-- Create: `/home/john/clarion/crates/clarion-mock-plugin/Cargo.toml`
-- Create: `/home/john/clarion/crates/clarion-mock-plugin/src/main.rs`
-- Create: `/home/john/clarion/crates/clarion-mock-plugin/fixtures/plugin.toml`
-- Modify: `/home/john/clarion/Cargo.toml` (add `clarion-mock-plugin` to `members`)
-- Create: `/home/john/clarion/crates/clarion-core/src/plugin/host.rs`
-- Modify: `/home/john/clarion/crates/clarion-core/src/plugin/mod.rs` (declare + re-export `host`)
-- Create: `/home/john/clarion/crates/clarion-core/tests/host_integration.rs`
+- Create: `/home/john/loomweave/crates/loomweave-mock-plugin/` (new workspace crate)
+- Create: `/home/john/loomweave/crates/loomweave-mock-plugin/Cargo.toml`
+- Create: `/home/john/loomweave/crates/loomweave-mock-plugin/src/main.rs`
+- Create: `/home/john/loomweave/crates/loomweave-mock-plugin/fixtures/plugin.toml`
+- Modify: `/home/john/loomweave/Cargo.toml` (add `loomweave-mock-plugin` to `members`)
+- Create: `/home/john/loomweave/crates/loomweave-core/src/plugin/host.rs`
+- Modify: `/home/john/loomweave/crates/loomweave-core/src/plugin/mod.rs` (declare + re-export `host`)
+- Create: `/home/john/loomweave/crates/loomweave-core/tests/host_integration.rs`
 
 - [ ] **Step 1: Create the fixture crate's manifest**
 
-Add `"crates/clarion-mock-plugin"` to the `members` array in the root `Cargo.toml`.
+Add `"crates/loomweave-mock-plugin"` to the `members` array in the root `Cargo.toml`.
 
-Create `/home/john/clarion/crates/clarion-mock-plugin/Cargo.toml`:
+Create `/home/john/loomweave/crates/loomweave-mock-plugin/Cargo.toml`:
 
 ```toml
 [package]
-name = "clarion-mock-plugin"
+name = "loomweave-mock-plugin"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -2585,12 +2585,12 @@ rust-version.workspace = true
 workspace = true
 
 [[bin]]
-name = "clarion-mock-plugin"
+name = "loomweave-mock-plugin"
 path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-clarion-core = { path = "../clarion-core", version = "0.1.0-dev" }
+loomweave-core = { path = "../loomweave-core", version = "0.1.0-dev" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "io-std"] }
 ```
@@ -2601,11 +2601,11 @@ Note: we need tokio's `io-std` feature for `tokio::io::{stdin, stdout}`. The fea
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "io-std"] }
 ```
 
-(Update the workspace `tokio` line in `/home/john/clarion/Cargo.toml` accordingly.)
+(Update the workspace `tokio` line in `/home/john/loomweave/Cargo.toml` accordingly.)
 
 - [ ] **Step 2: Write the fixture plugin binary**
 
-Create `/home/john/clarion/crates/clarion-mock-plugin/src/main.rs`:
+Create `/home/john/loomweave/crates/loomweave-mock-plugin/src/main.rs`:
 
 ```rust
 //! Fixture binary for WP2 host integration tests.
@@ -2613,23 +2613,23 @@ Create `/home/john/clarion/crates/clarion-mock-plugin/src/main.rs`:
 //! Behaviour is driven by a single CLI mode argument:
 //!
 //! ```text
-//! clarion-mock-plugin compliant         # handshake + 1 valid entity per analyze_file
-//! clarion-mock-plugin undeclared-kind   # emits an entity with kind="widget"
-//! clarion-mock-plugin id-mismatch       # emits an entity whose `id` != entity_id(...)
-//! clarion-mock-plugin path-escape       # emits an entity with file_path outside project_root
-//! clarion-mock-plugin repeat-path-escape <n>  # emits n escape entities across one analyze_file
-//! clarion-mock-plugin crash             # crashes immediately after handshake
+//! loomweave-mock-plugin compliant         # handshake + 1 valid entity per analyze_file
+//! loomweave-mock-plugin undeclared-kind   # emits an entity with kind="widget"
+//! loomweave-mock-plugin id-mismatch       # emits an entity whose `id` != entity_id(...)
+//! loomweave-mock-plugin path-escape       # emits an entity with file_path outside project_root
+//! loomweave-mock-plugin repeat-path-escape <n>  # emits n escape entities across one analyze_file
+//! loomweave-mock-plugin crash             # crashes immediately after handshake
 //! ```
 //!
 //! Reads `JSON-RPC` frames from stdin, writes frames to stdout, logs
 //! free-form text to stderr (host forwards to `tracing::info!`).
 
 use anyhow::{Context, Result};
-use clarion_core::plugin::protocol::{
+use loomweave_core::plugin::protocol::{
     AnalyzeFileParams, AnalyzeFileResult, InitializeParams, InitializeResult, JsonRpcRequest,
     JsonRpcResponse, Method, PluginEntity, PluginSource,
 };
-use clarion_core::plugin::transport::{read_frame, write_frame};
+use loomweave_core::plugin::transport::{read_frame, write_frame};
 use tokio::io::{stdin, stdout};
 
 const CEILING: usize = 8 * 1024 * 1024;
@@ -2671,7 +2671,7 @@ async fn main() -> Result<()> {
 
     let mut stdin = stdin();
     let mut stdout = stdout();
-    eprintln!("clarion-mock-plugin: started in mode {mode:?}");
+    eprintln!("loomweave-mock-plugin: started in mode {mode:?}");
 
     // initialize
     let frame = read_frame(&mut stdin, CEILING).await?;
@@ -2694,7 +2694,7 @@ async fn main() -> Result<()> {
     let _ = read_frame(&mut stdin, CEILING).await?;
 
     if matches!(mode, Mode::Crash) {
-        eprintln!("clarion-mock-plugin: crash mode — exit 1");
+        eprintln!("loomweave-mock-plugin: crash mode — exit 1");
         std::process::exit(1);
     }
 
@@ -2788,14 +2788,14 @@ fn build_response(mode: Mode, path: &str) -> AnalyzeFileResult {
 
 - [ ] **Step 3: Create the fixture manifest**
 
-Create `/home/john/clarion/crates/clarion-mock-plugin/fixtures/plugin.toml`:
+Create `/home/john/loomweave/crates/loomweave-mock-plugin/fixtures/plugin.toml`:
 
 ```toml
 [plugin]
-name = "clarion-plugin-mock"
+name = "loomweave-plugin-mock"
 version = "0.1.0"
 protocol_version = "1.0"
-executable = "clarion-mock-plugin"
+executable = "loomweave-mock-plugin"
 language = "mock"
 extensions = ["mock"]
 
@@ -2808,18 +2808,18 @@ max_entities_per_run = 100000
 [ontology]
 entity_kinds = ["function"]
 edge_kinds = ["calls"]
-rule_id_prefix = "CLA-MOCK-"
+rule_id_prefix = "LMWV-MOCK-"
 ontology_version = "0.1.0"
 ```
 
 - [ ] **Step 4: Write the host module with integration tests first (TDD)**
 
-Create `/home/john/clarion/crates/clarion-core/tests/host_integration.rs`. Tests here are red until Step 5 lands the implementation.
+Create `/home/john/loomweave/crates/loomweave-core/tests/host_integration.rs`. Tests here are red until Step 5 lands the implementation.
 
 ```rust
 //! WP2 Task 6 host-supervisor integration tests.
 //!
-//! Uses the `clarion-mock-plugin` fixture binary spawned via cargo-bin.
+//! Uses the `loomweave-mock-plugin` fixture binary spawned via cargo-bin.
 //!
 //! Asserts:
 //! - handshake + analyze_file round-trip + clean shutdown (happy path)
@@ -2830,16 +2830,16 @@ Create `/home/john/clarion/crates/clarion-core/tests/host_integration.rs`. Tests
 
 use std::path::PathBuf;
 
-use clarion_core::plugin::host::{HostError, PluginHost};
-use clarion_core::plugin::manifest::parse_manifest;
+use loomweave_core::plugin::host::{HostError, PluginHost};
+use loomweave_core::plugin::manifest::parse_manifest;
 
 fn mock_plugin_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_clarion-mock-plugin"))
+    PathBuf::from(env!("CARGO_BIN_EXE_loomweave-mock-plugin"))
 }
 
-fn mock_manifest() -> clarion_core::plugin::Manifest {
+fn mock_manifest() -> loomweave_core::plugin::Manifest {
     let bytes = std::fs::read(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../clarion-mock-plugin/fixtures/plugin.toml"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../loomweave-mock-plugin/fixtures/plugin.toml"),
     )
     .expect("read fixture manifest");
     parse_manifest(&bytes).expect("fixture manifest must parse")
@@ -2932,7 +2932,7 @@ Note on fixture spawn args: `PluginHost::spawn` takes `Vec<String>` extra args. 
 
 - [ ] **Step 5: Write `plugin/host.rs`**
 
-Create `/home/john/clarion/crates/clarion-core/src/plugin/host.rs`:
+Create `/home/john/loomweave/crates/loomweave-core/src/plugin/host.rs`:
 
 ```rust
 //! Plugin-host supervisor (WP2 Task 6).
@@ -2991,7 +2991,7 @@ pub enum HostError {
 
     #[error(
         "plugin path-escape sub-breaker tripped after {count} escapes — \
-         plugin killed (rule-id CLA-INFRA-PLUGIN-DISABLED-PATH-ESCAPE)"
+         plugin killed (rule-id LMWV-INFRA-PLUGIN-DISABLED-PATH-ESCAPE)"
     )]
     PathEscapeBreakerTripped { count: usize },
 
@@ -3019,9 +3019,9 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A validated entity ready for persistence. `source_file_id` /
 /// `content_hash` carry through from the plugin; translating to
-/// `clarion_storage::EntityRecord` is the caller's concern (Task 8) —
+/// `loomweave_storage::EntityRecord` is the caller's concern (Task 8) —
 /// this struct deliberately mirrors the plugin shape so the host
-/// doesn't need a direct dependency on `clarion-storage`.
+/// doesn't need a direct dependency on `loomweave-storage`.
 #[derive(Debug, Clone)]
 pub struct ValidatedEntity {
     pub id: String,
@@ -3199,7 +3199,7 @@ impl PluginHost {
             .any(|k| k == &e.kind)
         {
             tracing::warn!(
-                rule_id = "CLA-INFRA-PLUGIN-UNDECLARED-KIND",
+                rule_id = "LMWV-INFRA-PLUGIN-UNDECLARED-KIND",
                 plugin = %self.manifest.plugin.name,
                 kind = %e.kind,
                 entity_id = %e.id,
@@ -3209,7 +3209,7 @@ impl PluginHost {
         }
 
         // ADR-003 + UQ-WP2-11: id must match entity_id(plugin_id, kind, qualified_name).
-        // plugin_id narrows `clarion-plugin-<suffix>` to `<suffix>` with dashes
+        // plugin_id narrows `loomweave-plugin-<suffix>` to `<suffix>` with dashes
         // replaced by underscores — the grammar in ADR-022 forbids dashes in
         // plugin_id.
         let derived_plugin_id = derive_plugin_id(&self.manifest.plugin.name);
@@ -3217,7 +3217,7 @@ impl PluginHost {
             Ok(id) => id,
             Err(err) => {
                 tracing::warn!(
-                    rule_id = "CLA-INFRA-PLUGIN-ENTITY-ID-MISMATCH",
+                    rule_id = "LMWV-INFRA-PLUGIN-ENTITY-ID-MISMATCH",
                     plugin = %self.manifest.plugin.name,
                     entity_id = %e.id,
                     error = %err,
@@ -3228,7 +3228,7 @@ impl PluginHost {
         };
         if expected_id.as_str() != e.id || e.plugin_id != derived_plugin_id {
             tracing::warn!(
-                rule_id = "CLA-INFRA-PLUGIN-ENTITY-ID-MISMATCH",
+                rule_id = "LMWV-INFRA-PLUGIN-ENTITY-ID-MISMATCH",
                 plugin = %self.manifest.plugin.name,
                 expected = %expected_id,
                 observed = %e.id,
@@ -3264,7 +3264,7 @@ impl PluginHost {
             }
             Err(JailError::EscapedRoot { candidate, .. }) => {
                 tracing::warn!(
-                    rule_id = "CLA-INFRA-PLUGIN-PATH-ESCAPE",
+                    rule_id = "LMWV-INFRA-PLUGIN-PATH-ESCAPE",
                     plugin = %self.manifest.plugin.name,
                     offending_path = %candidate.display(),
                     "dropping entity whose source path escapes project_root"
@@ -3272,7 +3272,7 @@ impl PluginHost {
                 if self.escape_breaker.record_escape() == BreakerState::Tripped {
                     let count = self.escape_breaker.events_in_window();
                     tracing::warn!(
-                        rule_id = "CLA-INFRA-PLUGIN-DISABLED-PATH-ESCAPE",
+                        rule_id = "LMWV-INFRA-PLUGIN-DISABLED-PATH-ESCAPE",
                         plugin = %self.manifest.plugin.name,
                         count = count,
                         "path-escape sub-breaker tripped; killing plugin"
@@ -3312,11 +3312,11 @@ impl PluginHost {
 }
 
 /// Derive the ADR-022-compliant plugin_id from the manifest name.
-/// `clarion-plugin-python` → `python`. Dashes are replaced with
+/// `loomweave-plugin-python` → `python`. Dashes are replaced with
 /// underscores so the grammar `[a-z][a-z0-9_]*` is satisfied.
 fn derive_plugin_id(manifest_name: &str) -> String {
     manifest_name
-        .strip_prefix("clarion-plugin-")
+        .strip_prefix("loomweave-plugin-")
         .unwrap_or(manifest_name)
         .replace('-', "_")
 }
@@ -3327,8 +3327,8 @@ mod tests {
 
     #[test]
     fn derive_plugin_id_strips_prefix() {
-        assert_eq!(derive_plugin_id("clarion-plugin-python"), "python");
-        assert_eq!(derive_plugin_id("clarion-plugin-foo-bar"), "foo_bar");
+        assert_eq!(derive_plugin_id("loomweave-plugin-python"), "python");
+        assert_eq!(derive_plugin_id("loomweave-plugin-foo-bar"), "foo_bar");
     }
 }
 
@@ -3352,7 +3352,7 @@ pub use host::{HostError, PluginHost, ValidatedEntity};
 - [ ] **Step 7: Run host integration tests**
 
 ```bash
-cd /home/john/clarion && cargo nextest run -p clarion-core --test host_integration --no-tests=pass
+cd /home/john/loomweave && cargo nextest run -p loomweave-core --test host_integration --no-tests=pass
 ```
 
 Expected: 5 tests pass (`happy_path_handshake_and_analyze_file`, `undeclared_kind_entity_dropped`, `id_mismatch_entity_dropped`, `path_escape_drops_entity_plugin_stays_alive`, `eleven_escapes_trip_sub_breaker_and_kill`).
@@ -3364,19 +3364,19 @@ If the last test flakes, it's usually one of:
 - [ ] **Step 8: Full ADR-023 gate sweep + flake-check x3**
 
 ```bash
-cd /home/john/clarion && cargo fmt --all -- --check
-cd /home/john/clarion && cargo clippy --workspace --all-targets --all-features -- -D warnings
-cd /home/john/clarion && cargo nextest run --workspace --all-features --no-tests=pass
-cd /home/john/clarion && cargo nextest run --workspace --all-features --no-tests=pass
-cd /home/john/clarion && cargo nextest run --workspace --all-features --no-tests=pass
-cd /home/john/clarion && cargo doc --workspace --no-deps --all-features
-cd /home/john/clarion && cargo deny check
+cd /home/john/loomweave && cargo fmt --all -- --check
+cd /home/john/loomweave && cargo clippy --workspace --all-targets --all-features -- -D warnings
+cd /home/john/loomweave && cargo nextest run --workspace --all-features --no-tests=pass
+cd /home/john/loomweave && cargo nextest run --workspace --all-features --no-tests=pass
+cd /home/john/loomweave && cargo nextest run --workspace --all-features --no-tests=pass
+cd /home/john/loomweave && cargo doc --workspace --no-deps --all-features
+cd /home/john/loomweave && cargo deny check
 ```
 
 - [ ] **Step 9: Commit**
 
 ```bash
-cd /home/john/clarion && git add Cargo.toml crates/ && git commit -m "$(cat <<'EOF'
+cd /home/john/loomweave && git add Cargo.toml crates/ && git commit -m "$(cat <<'EOF'
 feat(wp2): plugin-host supervisor with ADR-021 enforcement + ADR-022 ontology
 
 plugin/host.rs — PluginHost::spawn(executable, args, manifest, project_root)
@@ -3385,11 +3385,11 @@ exposes analyze_file + shutdown.
 
 Per-entity validation on each analyze_file response:
   * ADR-022: kind must be in manifest.ontology.entity_kinds (drop + log
-    CLA-INFRA-PLUGIN-UNDECLARED-KIND).
+    LMWV-INFRA-PLUGIN-UNDECLARED-KIND).
   * UQ-WP2-11: id must equal entity_id(plugin_id, kind, qualified_name)
-    (drop + log CLA-INFRA-PLUGIN-ENTITY-ID-MISMATCH).
+    (drop + log LMWV-INFRA-PLUGIN-ENTITY-ID-MISMATCH).
   * ADR-021 §2a: source.file_path must canonicalise inside project_root
-    (drop + log CLA-INFRA-PLUGIN-PATH-ESCAPE + tick sub-breaker; trip on
+    (drop + log LMWV-INFRA-PLUGIN-PATH-ESCAPE + tick sub-breaker; trip on
     11th escape kills the plugin + returns HostError).
   * ADR-021 §2c: per-run entity-count cap consulted after each batch.
 
@@ -3397,10 +3397,10 @@ stderr is forwarded line-by-line to tracing::info! target plugin::stderr
 (UQ-WP2-07 resolution). shutdown consumes self, sends shutdown+exit, waits
 with a 5s timeout, SIGKILLs on timeout.
 
-crates/clarion-mock-plugin — new workspace fixture binary. Modes: compliant,
+crates/loomweave-mock-plugin — new workspace fixture binary. Modes: compliant,
 undeclared-kind, id-mismatch, path-escape, repeat-path-escape <n>, crash.
 Each writes JSON-RPC frames on stdout, reads from stdin, logs free-form to
-stderr. Host integration tests drive it via CARGO_BIN_EXE_clarion-mock-plugin.
+stderr. Host integration tests drive it via CARGO_BIN_EXE_loomweave-mock-plugin.
 
 5 host integration tests: happy path, undeclared kind dropped, id mismatch
 dropped, single escape dropped + plugin alive, 11 escapes trip the
@@ -3414,8 +3414,8 @@ EOF
 ## Task 7: Crash-loop breaker
 
 **Files:**
-- Create: `/home/john/clarion/crates/clarion-core/src/plugin/breaker.rs`
-- Modify: `/home/john/clarion/crates/clarion-core/src/plugin/mod.rs` (declare + re-export)
+- Create: `/home/john/loomweave/crates/loomweave-core/src/plugin/breaker.rs`
+- Modify: `/home/john/loomweave/crates/loomweave-core/src/plugin/mod.rs` (declare + re-export)
 
 - [ ] **Step 1: Extend `plugin/mod.rs`**
 
@@ -3428,14 +3428,14 @@ pub use breaker::{CrashLoopBreaker, CrashLoopState, DEFAULT_CRASH_LIMIT, DEFAULT
 
 - [ ] **Step 2: Write `breaker.rs` tests first**
 
-Create `/home/john/clarion/crates/clarion-core/src/plugin/breaker.rs`:
+Create `/home/john/loomweave/crates/loomweave-core/src/plugin/breaker.rs`:
 
 ```rust
 //! Per-plugin crash-loop breaker (ADR-002 + ADR-021 Layer 3).
 //!
 //! Default: >3 crashes in 60s trips the breaker and disables the plugin
 //! for the run. Sprint 1 hard-codes these values (UQ-WP2-10); config
-//! surface lives in `clarion.yaml:plugin_limits.*` from WP6 onwards.
+//! surface lives in `loomweave.yaml:plugin_limits.*` from WP6 onwards.
 //!
 //! The breaker's only job is to answer "can I spawn this plugin right
 //! now?" and "record that this plugin just crashed". Actual spawn,
@@ -3564,19 +3564,19 @@ mod tests {
 - [ ] **Step 3: Run breaker tests; expect pass**
 
 ```bash
-cd /home/john/clarion && cargo nextest run -p clarion-core breaker --no-tests=pass
+cd /home/john/loomweave && cargo nextest run -p loomweave-core breaker --no-tests=pass
 ```
 
 Expected: 3 tests pass.
 
 - [ ] **Step 4: Add an integration test using the crashing mock fixture**
 
-Append to `/home/john/clarion/crates/clarion-core/tests/host_integration.rs`:
+Append to `/home/john/loomweave/crates/loomweave-core/tests/host_integration.rs`:
 
 ```rust
 #[tokio::test]
 async fn crashing_plugin_trips_breaker_across_spawns() {
-    use clarion_core::plugin::breaker::{CrashLoopBreaker, CrashLoopState};
+    use loomweave_core::plugin::breaker::{CrashLoopBreaker, CrashLoopState};
     use std::time::Duration;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -3603,9 +3603,9 @@ Note: the `crash` mode in the fixture exits 1 immediately after handshake, so `s
 - [ ] **Step 5: Run the updated integration test**
 
 ```bash
-cd /home/john/clarion && cargo nextest run -p clarion-core --test host_integration --no-tests=pass
-cd /home/john/clarion && cargo nextest run -p clarion-core --test host_integration --no-tests=pass
-cd /home/john/clarion && cargo nextest run -p clarion-core --test host_integration --no-tests=pass
+cd /home/john/loomweave && cargo nextest run -p loomweave-core --test host_integration --no-tests=pass
+cd /home/john/loomweave && cargo nextest run -p loomweave-core --test host_integration --no-tests=pass
+cd /home/john/loomweave && cargo nextest run -p loomweave-core --test host_integration --no-tests=pass
 ```
 
 Three runs for timing flake check. All 6 integration tests should pass each run.
@@ -3613,17 +3613,17 @@ Three runs for timing flake check. All 6 integration tests should pass each run.
 - [ ] **Step 6: Full ADR-023 gate sweep**
 
 ```bash
-cd /home/john/clarion && cargo fmt --all -- --check
-cd /home/john/clarion && cargo clippy --workspace --all-targets --all-features -- -D warnings
-cd /home/john/clarion && cargo nextest run --workspace --all-features --no-tests=pass
-cd /home/john/clarion && cargo doc --workspace --no-deps --all-features
-cd /home/john/clarion && cargo deny check
+cd /home/john/loomweave && cargo fmt --all -- --check
+cd /home/john/loomweave && cargo clippy --workspace --all-targets --all-features -- -D warnings
+cd /home/john/loomweave && cargo nextest run --workspace --all-features --no-tests=pass
+cd /home/john/loomweave && cargo doc --workspace --no-deps --all-features
+cd /home/john/loomweave && cargo deny check
 ```
 
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /home/john/clarion && git add crates/clarion-core/ && git commit -m "$(cat <<'EOF'
+cd /home/john/loomweave && git add crates/loomweave-core/ && git commit -m "$(cat <<'EOF'
 feat(wp2): crash-loop breaker
 
 plugin/breaker.rs — CrashLoopBreaker with ADR-002 / ADR-021 Layer 3
@@ -3643,13 +3643,13 @@ EOF
 
 ---
 
-## Task 8: Wire `clarion analyze` to use the plugin host
+## Task 8: Wire `loomweave analyze` to use the plugin host
 
 **Files:**
-- Modify: `/home/john/clarion/crates/clarion-cli/Cargo.toml` (add `clarion-core` plugin surface, `walkdir`)
-- Modify: `/home/john/clarion/crates/clarion-cli/src/analyze.rs` (replace Sprint-1 stub)
-- Modify: `/home/john/clarion/Cargo.toml` (add `walkdir` workspace dep)
-- Create: `/home/john/clarion/crates/clarion-cli/tests/analyze_with_plugin.rs`
+- Modify: `/home/john/loomweave/crates/loomweave-cli/Cargo.toml` (add `loomweave-core` plugin surface, `walkdir`)
+- Modify: `/home/john/loomweave/crates/loomweave-cli/src/analyze.rs` (replace Sprint-1 stub)
+- Modify: `/home/john/loomweave/Cargo.toml` (add `walkdir` workspace dep)
+- Create: `/home/john/loomweave/crates/loomweave-cli/tests/analyze_with_plugin.rs`
 
 - [ ] **Step 1: Add `walkdir` workspace dep**
 
@@ -3659,7 +3659,7 @@ Append to `[workspace.dependencies]`:
 walkdir = "2"
 ```
 
-- [ ] **Step 2: Extend `clarion-cli/Cargo.toml`**
+- [ ] **Step 2: Extend `loomweave-cli/Cargo.toml`**
 
 Add to `[dependencies]`:
 
@@ -3667,16 +3667,16 @@ Add to `[dependencies]`:
 walkdir.workspace = true
 ```
 
-Nothing else needs adding — `clarion-core` is already a path dependency and the plugin module is exposed at the crate root through the re-exports in `plugin/mod.rs`.
+Nothing else needs adding — `loomweave-core` is already a path dependency and the plugin module is exposed at the crate root through the re-exports in `plugin/mod.rs`.
 
 - [ ] **Step 3: Rewrite `analyze.rs` to use the plugin host**
 
-Replace `/home/john/clarion/crates/clarion-cli/src/analyze.rs` (keep the helpers `iso8601_now` + `civil_from_unix_secs` from Sprint 1 — they're still needed for timestamps):
+Replace `/home/john/loomweave/crates/loomweave-cli/src/analyze.rs` (keep the helpers `iso8601_now` + `civil_from_unix_secs` from Sprint 1 — they're still needed for timestamps):
 
 ```rust
-//! `clarion analyze` — WP2-wired walking skeleton.
+//! `loomweave analyze` — WP2-wired walking skeleton.
 //!
-//! Discovers plugins via [`clarion_core::plugin::discover`], spawns each,
+//! Discovers plugins via [`loomweave_core::plugin::discover`], spawns each,
 //! walks the project tree, calls `analyze_file` per matching file, and
 //! persists returned entities through the WP1 writer-actor.
 
@@ -3686,9 +3686,9 @@ use anyhow::{Context, Result, bail};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-use clarion_core::plugin::host::{PluginHost, ValidatedEntity};
-use clarion_core::plugin::{discovery, manifest::Manifest};
-use clarion_storage::{
+use loomweave_core::plugin::host::{PluginHost, ValidatedEntity};
+use loomweave_core::plugin::{discovery, manifest::Manifest};
+use loomweave_storage::{
     DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, EntityRecord, RunStatus, Writer,
     commands::WriterCmd,
 };
@@ -3698,7 +3698,7 @@ use clarion_storage::{
 /// # Errors
 ///
 /// Returns an error if the target directory does not exist, has no
-/// `.clarion/` directory, or if any subsystem (discovery, spawn,
+/// `.loomweave/` directory, or if any subsystem (discovery, spawn,
 /// writer-actor) fails fatally.
 pub async fn run(project_path: PathBuf) -> Result<()> {
     if !project_path.exists() {
@@ -3710,14 +3710,14 @@ pub async fn run(project_path: PathBuf) -> Result<()> {
     let project_root = project_path
         .canonicalize()
         .with_context(|| format!("cannot canonicalise path {}", project_path.display()))?;
-    let clarion_dir = project_root.join(".clarion");
-    if !clarion_dir.exists() {
+    let loomweave_dir = project_root.join(".loomweave");
+    if !loomweave_dir.exists() {
         bail!(
-            "{} has no .clarion/ directory. Run `clarion install` first.",
+            "{} has no .loomweave/ directory. Run `loomweave install` first.",
             project_root.display()
         );
     }
-    let db_path = clarion_dir.join("clarion.db");
+    let db_path = loomweave_dir.join("loomweave.db");
 
     let plugins = discovery::discover().context("plugin discovery")?;
 
@@ -3861,8 +3861,8 @@ fn walk_files(project_root: &Path, manifest: &Manifest) -> Vec<PathBuf> {
                 None
             }
         })
-        // Skip anything inside the .clarion/ state directory.
-        .filter(|p| !p.components().any(|c| c.as_os_str() == ".clarion"))
+        // Skip anything inside the .loomweave/ state directory.
+        .filter(|p| !p.components().any(|c| c.as_os_str() == ".loomweave"))
         .collect()
 }
 
@@ -3935,14 +3935,14 @@ fn civil_from_unix_secs(mut secs: u64) -> (u32, u32, u32, u32, u32, u32) {
 
 - [ ] **Step 4: Write the plugin-wired integration test**
 
-Create `/home/john/clarion/crates/clarion-cli/tests/analyze_with_plugin.rs`:
+Create `/home/john/loomweave/crates/loomweave-cli/tests/analyze_with_plugin.rs`:
 
 ```rust
-//! `clarion analyze` with a mock plugin on PATH produces persisted entities.
+//! `loomweave analyze` with a mock plugin on PATH produces persisted entities.
 //!
-//! Assembles a temporary `$PATH` containing the `clarion-mock-plugin`
-//! fixture binary and a neighboring `plugin.toml`. Runs `clarion install`
-//! then `clarion analyze` and asserts the DB row shape.
+//! Assembles a temporary `$PATH` containing the `loomweave-mock-plugin`
+//! fixture binary and a neighboring `plugin.toml`. Runs `loomweave install`
+//! then `loomweave analyze` and asserts the DB row shape.
 
 use std::fs;
 use std::path::PathBuf;
@@ -3950,18 +3950,18 @@ use std::path::PathBuf;
 use assert_cmd::Command;
 use rusqlite::Connection;
 
-fn clarion_bin() -> Command {
-    Command::cargo_bin("clarion").expect("clarion binary")
+fn loomweave_bin() -> Command {
+    Command::cargo_bin("loomweave").expect("loomweave binary")
 }
 
 fn mock_plugin_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_clarion-mock-plugin"))
+    PathBuf::from(env!("CARGO_BIN_EXE_loomweave-mock-plugin"))
 }
 
 fn mock_manifest_bytes() -> Vec<u8> {
     let fixture = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../clarion-mock-plugin/fixtures/plugin.toml"
+        "/../loomweave-mock-plugin/fixtures/plugin.toml"
     );
     std::fs::read(fixture).expect("read mock manifest fixture")
 }
@@ -3972,7 +3972,7 @@ fn analyze_with_mock_plugin_persists_entities() {
     let bin_dir = tempfile::tempdir().unwrap();
 
     // Symlink the real mock-plugin binary into bin_dir under the expected name.
-    let symlinked = bin_dir.path().join("clarion-plugin-mock");
+    let symlinked = bin_dir.path().join("loomweave-plugin-mock");
     #[cfg(unix)]
     std::os::unix::fs::symlink(mock_plugin_bin(), &symlinked).unwrap();
     #[cfg(not(unix))]
@@ -3984,15 +3984,15 @@ fn analyze_with_mock_plugin_persists_entities() {
     // One `.mock` file for the plugin to pick up.
     fs::write(project_dir.path().join("demo.mock"), b"sample\n").unwrap();
 
-    // clarion install
-    clarion_bin()
+    // loomweave install
+    loomweave_bin()
         .args(["install", "--path"])
         .arg(project_dir.path())
         .assert()
         .success();
 
-    // clarion analyze with our custom PATH
-    clarion_bin()
+    // loomweave analyze with our custom PATH
+    loomweave_bin()
         .env("PATH", bin_dir.path())
         .args(["analyze"])
         .arg(project_dir.path())
@@ -4000,7 +4000,7 @@ fn analyze_with_mock_plugin_persists_entities() {
         .success();
 
     // Assert the DB row shape.
-    let db = project_dir.path().join(".clarion").join("clarion.db");
+    let db = project_dir.path().join(".loomweave").join("loomweave.db");
     let conn = Connection::open(&db).unwrap();
     let (count, status): (i64, String) = conn
         .query_row(
@@ -4027,14 +4027,14 @@ fn analyze_with_mock_plugin_persists_entities() {
 }
 ```
 
-**Integration-test machinery caveat:** `Command::cargo_bin("clarion")` requires the `clarion` binary to exist in a known location. `CARGO_BIN_EXE_clarion-mock-plugin` is set automatically because `clarion-cli` depends on `clarion-mock-plugin` via its dev-dependencies only if declared. Add the fixture as a dev-dependency of `clarion-cli` so the env var is populated:
+**Integration-test machinery caveat:** `Command::cargo_bin("loomweave")` requires the `loomweave` binary to exist in a known location. `CARGO_BIN_EXE_loomweave-mock-plugin` is set automatically because `loomweave-cli` depends on `loomweave-mock-plugin` via its dev-dependencies only if declared. Add the fixture as a dev-dependency of `loomweave-cli` so the env var is populated:
 
-Modify `/home/john/clarion/crates/clarion-cli/Cargo.toml` `[dev-dependencies]`:
+Modify `/home/john/loomweave/crates/loomweave-cli/Cargo.toml` `[dev-dependencies]`:
 
 ```toml
 [dev-dependencies]
 assert_cmd.workspace = true
-clarion-mock-plugin = { path = "../clarion-mock-plugin", version = "0.1.0-dev" }
+loomweave-mock-plugin = { path = "../loomweave-mock-plugin", version = "0.1.0-dev" }
 rusqlite.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
@@ -4043,31 +4043,31 @@ tempfile.workspace = true
 - [ ] **Step 5: Run the analyze tests**
 
 ```bash
-cd /home/john/clarion && cargo nextest run -p clarion-cli --no-tests=pass
+cd /home/john/loomweave && cargo nextest run -p loomweave-cli --no-tests=pass
 ```
 
-Expected: all `clarion-cli` tests pass, including the new `analyze_with_mock_plugin_persists_entities` (plus WP1's pre-existing install + analyze tests).
+Expected: all `loomweave-cli` tests pass, including the new `analyze_with_mock_plugin_persists_entities` (plus WP1's pre-existing install + analyze tests).
 
 - [ ] **Step 6: Full ADR-023 gate sweep**
 
 ```bash
-cd /home/john/clarion && cargo fmt --all -- --check
-cd /home/john/clarion && cargo clippy --workspace --all-targets --all-features -- -D warnings
-cd /home/john/clarion && cargo nextest run --workspace --all-features --no-tests=pass
-cd /home/john/clarion && cargo nextest run --workspace --all-features --no-tests=pass
-cd /home/john/clarion && cargo nextest run --workspace --all-features --no-tests=pass
-cd /home/john/clarion && cargo doc --workspace --no-deps --all-features
-cd /home/john/clarion && cargo deny check
+cd /home/john/loomweave && cargo fmt --all -- --check
+cd /home/john/loomweave && cargo clippy --workspace --all-targets --all-features -- -D warnings
+cd /home/john/loomweave && cargo nextest run --workspace --all-features --no-tests=pass
+cd /home/john/loomweave && cargo nextest run --workspace --all-features --no-tests=pass
+cd /home/john/loomweave && cargo nextest run --workspace --all-features --no-tests=pass
+cd /home/john/loomweave && cargo doc --workspace --no-deps --all-features
+cd /home/john/loomweave && cargo deny check
 ```
 
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /home/john/clarion && git add Cargo.toml crates/ && git commit -m "$(cat <<'EOF'
-feat(wp2): wire clarion analyze to plugin host
+cd /home/john/loomweave && git add Cargo.toml crates/ && git commit -m "$(cat <<'EOF'
+feat(wp2): wire loomweave analyze to plugin host
 
 analyze.rs — replaces the Sprint-1 skipped_no_plugins stub. Discovers
-plugins via clarion_core::plugin::discover, spawns each PluginHost, walks
+plugins via loomweave_core::plugin::discover, spawns each PluginHost, walks
 the project tree filtering by the manifest's [plugin].extensions, calls
 analyze_file per file, and persists each ValidatedEntity via the WP1
 writer-actor InsertEntity path. Per-plugin shutdown is clean (shutdown +
@@ -4079,12 +4079,12 @@ Run status wiring:
   * Failed when any plugin errored fatally (the other plugins still run;
     this matches "partial-results" framing from ADR-021 §2c).
 
-walkdir = "2" added as a workspace dep. clarion-mock-plugin added as a
-dev-dependency of clarion-cli so integration tests get the fixture's
+walkdir = "2" added as a workspace dep. loomweave-mock-plugin added as a
+dev-dependency of loomweave-cli so integration tests get the fixture's
 CARGO_BIN_EXE_ env var.
 
 1 new integration test assembles a temp PATH dir with a symlinked
-clarion-mock-plugin + neighboring plugin.toml, runs clarion install +
+loomweave-mock-plugin + neighboring plugin.toml, runs loomweave install +
 analyze, and asserts status=completed + entities >= 1 + id prefix
 "mock:function:".
 EOF
@@ -4096,11 +4096,11 @@ EOF
 ## Task 9: WP2 end-to-end smoke test
 
 **Files:**
-- Create: `/home/john/clarion/crates/clarion-cli/tests/wp2_e2e.rs`
+- Create: `/home/john/loomweave/crates/loomweave-cli/tests/wp2_e2e.rs`
 
 - [ ] **Step 1: Write the E2E smoke test**
 
-Create `/home/john/clarion/crates/clarion-cli/tests/wp2_e2e.rs`:
+Create `/home/john/loomweave/crates/loomweave-cli/tests/wp2_e2e.rs`:
 
 ```rust
 //! WP2 end-to-end smoke test — mirrors the README §3 demo script at WP2
@@ -4112,18 +4112,18 @@ use std::path::PathBuf;
 use assert_cmd::Command;
 use rusqlite::Connection;
 
-fn clarion_bin() -> Command {
-    Command::cargo_bin("clarion").expect("clarion binary")
+fn loomweave_bin() -> Command {
+    Command::cargo_bin("loomweave").expect("loomweave binary")
 }
 
 fn mock_plugin_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_clarion-mock-plugin"))
+    PathBuf::from(env!("CARGO_BIN_EXE_loomweave-mock-plugin"))
 }
 
 fn mock_manifest_bytes() -> Vec<u8> {
     std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../clarion-mock-plugin/fixtures/plugin.toml"
+        "/../loomweave-mock-plugin/fixtures/plugin.toml"
     ))
     .expect("read mock manifest")
 }
@@ -4143,33 +4143,33 @@ fn wp2_walking_skeleton_end_to_end() {
     #[cfg(unix)]
     std::os::unix::fs::symlink(
         mock_plugin_bin(),
-        path_dir.path().join("clarion-plugin-mock"),
+        path_dir.path().join("loomweave-plugin-mock"),
     )
     .unwrap();
     fs::write(path_dir.path().join("plugin.toml"), mock_manifest_bytes()).unwrap();
 
-    // clarion install
-    clarion_bin()
+    // loomweave install
+    loomweave_bin()
         .args(["install", "--path"])
         .arg(project.path())
         .assert()
         .success();
 
-    let clarion_dir = project.path().join(".clarion");
-    assert!(clarion_dir.join("clarion.db").exists());
-    assert!(clarion_dir.join("config.json").exists());
-    assert!(clarion_dir.join(".gitignore").exists());
-    assert!(project.path().join("clarion.yaml").exists());
+    let loomweave_dir = project.path().join(".loomweave");
+    assert!(loomweave_dir.join("loomweave.db").exists());
+    assert!(loomweave_dir.join("config.json").exists());
+    assert!(loomweave_dir.join(".gitignore").exists());
+    assert!(project.path().join("loomweave.yaml").exists());
 
-    // clarion analyze with the mock plugin on PATH
-    clarion_bin()
+    // loomweave analyze with the mock plugin on PATH
+    loomweave_bin()
         .env("PATH", path_dir.path())
         .args(["analyze"])
         .arg(project.path())
         .assert()
         .success();
 
-    let conn = Connection::open(clarion_dir.join("clarion.db")).unwrap();
+    let conn = Connection::open(loomweave_dir.join("loomweave.db")).unwrap();
 
     let migration_version: i64 = conn
         .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
@@ -4211,15 +4211,15 @@ fn wp2_walking_skeleton_end_to_end() {
 - [ ] **Step 2: Run the E2E test three times (flake check)**
 
 ```bash
-cd /home/john/clarion && cargo nextest run -p clarion-cli --test wp2_e2e --no-tests=pass
-cd /home/john/clarion && cargo nextest run -p clarion-cli --test wp2_e2e --no-tests=pass
-cd /home/john/clarion && cargo nextest run -p clarion-cli --test wp2_e2e --no-tests=pass
+cd /home/john/loomweave && cargo nextest run -p loomweave-cli --test wp2_e2e --no-tests=pass
+cd /home/john/loomweave && cargo nextest run -p loomweave-cli --test wp2_e2e --no-tests=pass
+cd /home/john/loomweave && cargo nextest run -p loomweave-cli --test wp2_e2e --no-tests=pass
 ```
 
 - [ ] **Step 3: Release-profile build**
 
 ```bash
-cd /home/john/clarion && cargo build --workspace --release
+cd /home/john/loomweave && cargo build --workspace --release
 ```
 
 Any warning-as-error surfacing here must be fixed in-code, not by loosening lints.
@@ -4227,13 +4227,13 @@ Any warning-as-error surfacing here must be fixed in-code, not by loosening lint
 - [ ] **Step 4: Final ADR-023 gate sweep (all 7 gates)**
 
 ```bash
-cd /home/john/clarion && cargo fmt --all -- --check
-cd /home/john/clarion && cargo clippy --workspace --all-targets --all-features -- -D warnings
-cd /home/john/clarion && cargo nextest run --workspace --all-features --no-tests=pass
-cd /home/john/clarion && cargo doc --workspace --no-deps --all-features
-cd /home/john/clarion && cargo deny check
-cd /home/john/clarion && cargo build --workspace
-cd /home/john/clarion && cargo build --workspace --release
+cd /home/john/loomweave && cargo fmt --all -- --check
+cd /home/john/loomweave && cargo clippy --workspace --all-targets --all-features -- -D warnings
+cd /home/john/loomweave && cargo nextest run --workspace --all-features --no-tests=pass
+cd /home/john/loomweave && cargo doc --workspace --no-deps --all-features
+cd /home/john/loomweave && cargo deny check
+cd /home/john/loomweave && cargo build --workspace
+cd /home/john/loomweave && cargo build --workspace --release
 ```
 
 All 7 exit 0. This is the WP2 closing-commit gate; CI runs the same set.
@@ -4241,12 +4241,12 @@ All 7 exit 0. This is the WP2 closing-commit gate; CI runs the same set.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/john/clarion && git add crates/clarion-cli/ && git commit -m "$(cat <<'EOF'
+cd /home/john/loomweave && git add crates/loomweave-cli/ && git commit -m "$(cat <<'EOF'
 test(wp2): end-to-end smoke with mock plugin
 
-wp2_e2e.rs runs the README §3 demo script at WP2 scope: clarion install
-+ clarion analyze against a project containing 2 .mock files, with the
-clarion-plugin-mock fixture on a synthetic PATH + neighboring plugin.toml.
+wp2_e2e.rs runs the README §3 demo script at WP2 scope: loomweave install
++ loomweave analyze against a project containing 2 .mock files, with the
+loomweave-plugin-mock fixture on a synthetic PATH + neighboring plugin.toml.
 Asserts runs.status = 'completed', entity_count = 2, all IDs are the
 3-segment form `mock:function:<qualified>` per L2.
 
@@ -4261,9 +4261,9 @@ EOF
 ## Task 10: Sign-off ladder + lock-in stamps + UQ resolutions
 
 **Files:**
-- Modify: `/home/john/clarion/docs/implementation/sprint-1/signoffs.md`
-- Modify: `/home/john/clarion/docs/implementation/sprint-1/README.md`
-- Modify: `/home/john/clarion/docs/implementation/sprint-1/wp2-plugin-host.md`
+- Modify: `/home/john/loomweave/docs/implementation/sprint-1/signoffs.md`
+- Modify: `/home/john/loomweave/docs/implementation/sprint-1/README.md`
+- Modify: `/home/john/loomweave/docs/implementation/sprint-1/wp2-plugin-host.md`
 
 - [ ] **Step 1: Tick Tier A.2 boxes in `signoffs.md`**
 
@@ -4273,7 +4273,7 @@ Do NOT tick A.3 / A.4 / A.5 / A.6 — those belong to WP3 / sprint-close.
 
 - [ ] **Step 2: Stamp lock-in dates in `README.md` §4**
 
-In `/home/john/clarion/docs/implementation/sprint-1/README.md` §4 "Lock-in summary", annotate L4, L5, L6, L9 with the same `locked on <date>` stamp used in signoffs.md.
+In `/home/john/loomweave/docs/implementation/sprint-1/README.md` §4 "Lock-in summary", annotate L4, L5, L6, L9 with the same `locked on <date>` stamp used in signoffs.md.
 
 - [ ] **Step 3: Mark UQ-WP2-* resolved in `wp2-plugin-host.md §5`**
 
@@ -4289,12 +4289,12 @@ For each UQ-WP2-01 through UQ-WP2-11, append a `**Resolved**: <task + outcome>` 
 - UQ-WP2-08 — resolved in Task 3 (docs): plugin-author discipline; documented in the mock plugin's module rustdoc and inherited by WP3's plugin-author guide.
 - UQ-WP2-09 — resolved in Task 6: manifest is re-parsed on every `PluginHost::spawn`. Caching is a `serve` concern (WP8).
 - UQ-WP2-10 — resolved in Task 7: >3 crashes/60s crash-loop breaker + >10 escapes/60s path-escape sub-breaker hard-coded; config surface deferred to WP6.
-- UQ-WP2-11 — resolved in Task 6: host reconstructs `entity_id(derived_plugin_id, kind, qualified_name)` and compares against the returned `id`; mismatch drops the entity, logs `CLA-INFRA-PLUGIN-ENTITY-ID-MISMATCH`, plugin stays alive.
+- UQ-WP2-11 — resolved in Task 6: host reconstructs `entity_id(derived_plugin_id, kind, qualified_name)` and compares against the returned `id`; mismatch drops the entity, logs `LMWV-INFRA-PLUGIN-ENTITY-ID-MISMATCH`, plugin stays alive.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/john/clarion && git add docs/implementation/sprint-1/ && git commit -m "$(cat <<'EOF'
+cd /home/john/loomweave && git add docs/implementation/sprint-1/ && git commit -m "$(cat <<'EOF'
 docs(sprint-1): tick WP2 sign-off and stamp L4/L5/L6/L9 lock-ins
 
 Tier A.2 boxes ticked in signoffs.md with the WP2 closing-commit date.
@@ -4321,7 +4321,7 @@ EOF
 | §6.Task 5 Plugin discovery (L9) | Task 5 | ✓ |
 | §6.Task 6 Plugin-host supervisor | Task 6 | ✓ |
 | §6.Task 7 Crash-loop breaker | Task 7 | ✓ |
-| §6.Task 8 Wire `clarion analyze` | Task 8 | ✓ |
+| §6.Task 8 Wire `loomweave analyze` | Task 8 | ✓ |
 | §6.Task 9 E2E smoke | Task 9 | ✓ |
 | §8 Exit criteria sign-off | Task 10 | ✓ |
 
@@ -4333,7 +4333,7 @@ Every lock-in (L4/L5/L6/L9) has a dedicated Task that lands it. Every UQ-WP2-* h
 - `ValidatedEntity` shape identical between Task 6 emission and Task 8 `EntityRecord` translation (Task 8's `persist_entity` maps field-for-field).
 - `ContentLengthCeiling::default()` = 8 MiB; `read_frame(reader, ceiling.bytes())` called with the struct's `bytes()` accessor — no `usize` literal drift.
 - `EntityCountCap::new(DEFAULT_ENTITY_COUNT_CAP)` uses the same const in Task 4 and Task 6.
-- `entity_id()` (WP1 Task 2) and Task 6's `derive_plugin_id` produce a plugin_id satisfying ADR-022 grammar; Task 6 tests explicitly exercise `clarion-plugin-foo-bar` → `foo_bar`.
+- `entity_id()` (WP1 Task 2) and Task 6's `derive_plugin_id` produce a plugin_id satisfying ADR-022 grammar; Task 6 tests explicitly exercise `loomweave-plugin-foo-bar` → `foo_bar`.
 - `Method::{Initialize, Initialized, AnalyzeFile, Shutdown, Exit}` — same five variants in `protocol.rs` (Task 2), `mock.rs` (Task 3), `host.rs` (Task 6), and the fixture binary's `main.rs` (Task 6).
 - `WriterCmd::InsertEntity { entity: Box<EntityRecord>, ack }` — Task 8's `persist_entity` wraps the record in `Box::new(record)` per WP1's L3 locked shape.
 
@@ -4346,15 +4346,15 @@ Every lock-in (L4/L5/L6/L9) has a dedicated Task that lands it. Every UQ-WP2-* h
    - The safety comment addresses fork-safety (post-fork, pre-exec, async-signal-safe only).
    - `setrlimit` is on the POSIX.1-2017 §2.4.3 AS-safe list.
 
-2. **`plugin_id` derivation narrowing**. Manifest `plugin.name` uses grammar `[a-z][a-z0-9_-]*` (dashes permitted) because it doubles as the PATH binary name. ADR-022's EntityId grammar for the `plugin_id` segment is stricter: `[a-z][a-z0-9_]*`. The host derives `plugin_id = manifest.name.strip_prefix("clarion-plugin-").replace('-', '_')`. This is a WP2 convention not stated verbatim in ADR-022; Task 6's commit message cites the derivation, and Task 10 should mention it in the UQ-WP2-11 resolution line.
+2. **`plugin_id` derivation narrowing**. Manifest `plugin.name` uses grammar `[a-z][a-z0-9_-]*` (dashes permitted) because it doubles as the PATH binary name. ADR-022's EntityId grammar for the `plugin_id` segment is stricter: `[a-z][a-z0-9_]*`. The host derives `plugin_id = manifest.name.strip_prefix("loomweave-plugin-").replace('-', '_')`. This is a WP2 convention not stated verbatim in ADR-022; Task 6's commit message cites the derivation, and Task 10 should mention it in the UQ-WP2-11 resolution line.
 
 3. **`source_file_id` carries the canonical file path string, not a file-entity ID**. WP1's `EntityRecord.source_file_id: Option<String>` is a foreign-key placeholder. Task 8's `persist_entity` puts the canonical file path string into it. WP4/WP5's file-discovery pass will replace that placeholder with the real core-minted file-entity ID; the schema column is permissive (TEXT). Flag to the design-doc author post-Sprint-1 if a stricter foreign-key constraint is wanted.
 
-4. **Sprint 1 findings are log-only**. The `CLA-INFRA-PLUGIN-*` rule IDs are emitted via `tracing::warn!(rule_id = "...", ...)` rather than as DB `findings` rows. WP6's scanner-ingest API (ADR-013) and the `POST /api/v1/scan-results` Filigree endpoint are where these logs become persisted findings. The rule IDs and field names locked in Task 6 are the forward-compatible contract.
+4. **Sprint 1 findings are log-only**. The `LMWV-INFRA-PLUGIN-*` rule IDs are emitted via `tracing::warn!(rule_id = "...", ...)` rather than as DB `findings` rows. WP6's scanner-ingest API (ADR-013) and the `POST /api/v1/scan-results` Filigree endpoint are where these logs become persisted findings. The rule IDs and field names locked in Task 6 are the forward-compatible contract.
 
 5. **`nix = "0.28"` with `features = ["resource"]` + `default-features = false`** — minimises the dependency surface. Older nix versions had a different `setrlimit` signature; the plan pins 0.28 exactly. If a reviewer bumps this, re-verify the pre_exec closure compiles.
 
-6. **Fixture binary lives under `crates/clarion-mock-plugin/`** as a full workspace member, not an example. Reason: `assert_cmd::Command::cargo_bin` requires a real bin target, and `CARGO_BIN_EXE_clarion-mock-plugin` is only set when the consuming crate declares it as a dev-dependency. Tasks 6 + 8 both declare it.
+6. **Fixture binary lives under `crates/loomweave-mock-plugin/`** as a full workspace member, not an example. Reason: `assert_cmd::Command::cargo_bin` requires a real bin target, and `CARGO_BIN_EXE_loomweave-mock-plugin` is only set when the consuming crate declares it as a dev-dependency. Tasks 6 + 8 both declare it.
 
 ---
 

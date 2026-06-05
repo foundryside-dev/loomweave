@@ -1,11 +1,11 @@
 # Execution prompts
 
-Drop-in agent prompts for executing the waves of the Clarion "road to first-class" program.
+Drop-in agent prompts for executing the waves of the Loomweave "road to first-class" program.
 Each prompt is self-contained: paste the fenced block into an agent running in this repo.
 
-**Program context:** [`../specs/2026-06-02-clarion-first-class-program-design.md`](../specs/2026-06-02-clarion-first-class-program-design.md)
+**Program context:** [`../specs/2026-06-02-loomweave-first-class-program-design.md`](../specs/2026-06-02-loomweave-first-class-program-design.md)
 (workstreams, dependency graph, wave sequencing §4).
-**Task source:** [`../plans/2026-06-02-clarion-integrated-delivery-plan.md`](../plans/2026-06-02-clarion-integrated-delivery-plan.md).
+**Task source:** [`../plans/2026-06-02-loomweave-integrated-delivery-plan.md`](../plans/2026-06-02-loomweave-integrated-delivery-plan.md).
 
 **Wave numbers are committed dispatch slots — once a wave is dispatched, its number is fixed and
 never re-used or renumbered.** Waves 0–3 are spent (Wave 0 executing; Wave 3 executed). The
@@ -30,7 +30,7 @@ dependency order.)
 
 1. **Wave 0** — autonomous, executing now. Completing it lets SEI lock.
 2. **Wave 1** — gated on Wave 0 + SEI lock; the prompt forces a confirm-or-stop gate check.
-3. **Wave 2** — closes the dossier (core paradise); gated only on Clarion's own WS1 + WS2.
+3. **Wave 2** — closes the dossier (core paradise); gated only on Loomweave's own WS1 + WS2.
 4. **Wave 3 (WS9)** — governed paradise; gated on Wave 2 + `legis` *existing*; forward-staged.
 5. **Waves 4–8 (standalone first-class)** — ungated, concurrent with the suite waves, committed
    order: WS5 → WS5b → WS6 → WS7 → WS8. **WS5b is Wave 5** — a committed slot, not "someday."

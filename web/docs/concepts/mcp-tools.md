@@ -1,16 +1,16 @@
 # MCP consult tools
 
-Clarion is a **consult-mode** tool. It does not write your code or run your
+Loomweave is a **consult-mode** tool. It does not write your code or run your
 tests; it answers questions about the codebase so a coding agent doesn't have to
-re-derive the same structural facts on every turn. `clarion serve` exposes those
+re-derive the same structural facts on every turn. `loomweave serve` exposes those
 answers as MCP tools.
 
 ## The consult loop
 
-Without Clarion, an agent answering "who calls this, and what does it touch?"
+Without Loomweave, an agent answering "who calls this, and what does it touch?"
 greps the tree, opens files, and reconstructs the call graph from scratch —
-every time, burning context. With Clarion, the same question is a couple of tool
-calls against a graph that was already built once by `clarion analyze`:
+every time, burning context. With Loomweave, the same question is a couple of tool
+calls against a graph that was already built once by `loomweave analyze`:
 
 ```text
 agent ──▶ entity_at(file, line)        ──▶ "which entity is here?"
@@ -25,7 +25,7 @@ trust it.
 
 ## Core tool families
 
-Clarion exposes a 39-tool MCP surface. Start with the navigation and briefing
+Loomweave exposes a 39-tool MCP surface. Start with the navigation and briefing
 tools, then reach for catalogue shortcuts when you need a targeted structural
 query:
 
@@ -52,13 +52,13 @@ shape of each response.
 The running server also exposes analyze lifecycle tools, freshness checks,
 faceted search, guidance/finding inspection, source/call-site evidence, and
 exploration-elimination shortcuts. Connect an MCP client to a live
-`clarion serve` to see the full, current `tools/list`.
+`loomweave serve` to see the full, current `tools/list`.
 
 ## Enrich-only by design
 
-`issues_for(id)` reaches into Filigree, a sibling Loom product, to attach issues
+`issues_for(id)` reaches into Filigree, a sibling Weft product, to attach issues
 to an entity. That binding is strictly **enrich-only**: if Filigree is
 unavailable, the tool returns an `unavailable` envelope instead of failing the
-call, and Clarion's own answers never depend on it. This is the Loom federation
-axiom in practice — a sibling may *add* information to Clarion's view, but is
-never *required* for Clarion to make sense.
+call, and Loomweave's own answers never depend on it. This is the Weft federation
+axiom in practice — a sibling may *add* information to Loomweave's view, but is
+never *required* for Loomweave to make sense.

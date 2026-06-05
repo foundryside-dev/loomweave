@@ -1,7 +1,7 @@
 {
   "generated_from": "targeted post-run raw MCP probe",
-  "project": "/tmp/clarion-b8-elspeth-tests-20260517T2156Z",
-  "config": "/tmp/clarion-b8-elspeth-tests-20260517T2156Z/clarion-b8-live.yaml",
+  "project": "/tmp/loomweave-b8-elspeth-tests-20260517T2156Z",
+  "config": "/tmp/loomweave-b8-elspeth-tests-20260517T2156Z/loomweave-b8-live.yaml",
   "summary_probe": {
     "latency_ms": 12213.408,
     "response": {

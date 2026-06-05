@@ -1,32 +1,32 @@
-# Clarion Federation Contracts
+# Loomweave Federation Contracts
 
-This file pins Clarion's federation contracts in both directions: the surface
-Clarion *exposes* to sibling products, and the conventions and routes Clarion
+This file pins Loomweave's federation contracts in both directions: the surface
+Loomweave *exposes* to sibling products, and the conventions and routes Loomweave
 *consumes* from Filigree. The exposed surface was historically read-only — the
-file-resolution read API consumed by Filigree's `ClarionRegistry` (ADR-014). At
+file-resolution read API consumed by Filigree's `LoomweaveRegistry` (ADR-014). At
 release:1.1 it also includes one **write** surface: the Wardline taint-fact store
 (ADR-036), a disabled-by-default `/api/wardline/*` sub-router that lets Wardline
-persist per-entity taint facts into Clarion's catalog so briefings can carry them.
-That write surface is enrich-only in the loom.md §5 sense — it is off unless
-explicitly enabled, Clarion never requires Wardline to be present, and Clarion's
+persist per-entity taint facts into Loomweave's catalog so briefings can carry them.
+That write surface is enrich-only in the weft.md §5 sense — it is off unless
+explicitly enabled, Loomweave never requires Wardline to be present, and Loomweave's
 own semantics never depend on a taint fact existing. Every consume-side coupling
-here is likewise enrich-only and fail-soft — Clarion stays solo-useful when
-Filigree is absent (loom.md §5).
+here is likewise enrich-only and fail-soft — Loomweave stays solo-useful when
+Filigree is absent (weft.md §5).
 
 > **Federation-pattern sources (pointers).** The federation axiom and composition
-> law cited as `loom.md §5` throughout this document are now authoritative at the
+> law cited as `weft.md §5` throughout this document are now authoritative at the
 > federation hub: `~/loom/doctrine.md` §5
-> (as of 2026-06-05; `loom.md` is now a pointer stub that preserves the original
-> section numbers, so `loom.md §5` resolves there). The cross-product **contract
+> (as of 2026-06-05; `weft.md` is now a pointer stub that preserves the original
+> section numbers, so `weft.md §5` resolves there). The cross-product **contract
 > index** — the suite-level list of every live cross-product contract and its
 > owning authority — lives at
 > `~/loom/contracts-index.md`. The
-> endpoint specs below are **Clarion-owned and authoritative**; the hub indexes
+> endpoint specs below are **Loomweave-owned and authoritative**; the hub indexes
 > them, it does not restate them.
 
 ## HTTP Read API
 
-`clarion serve` can expose the HTTP read API when enabled in `clarion.yaml`:
+`loomweave serve` can expose the HTTP read API when enabled in `loomweave.yaml`:
 
 ```yaml
 serve:
@@ -34,26 +34,26 @@ serve:
     enabled: true
     bind: 127.0.0.1:9111
     # Preferred 1.0 identity mode. Optional on loopback, required for
-    # authenticated Loom component requests.
-    identity_token_env: CLARION_LOOM_IDENTITY_SECRET
+    # authenticated Weft component requests.
+    identity_token_env: WEFT_IDENTITY_SECRET
     # Name of the env var holding the inbound bearer token. Optional on a
     # loopback bind, accepted for compatibility on non-loopback binds. Default
-    # `CLARION_LOOM_TOKEN` matches Filigree's pinned client default.
-    token_env: CLARION_LOOM_TOKEN
+    # `WEFT_TOKEN` matches Filigree's pinned client default.
+    token_env: WEFT_TOKEN
 ```
 
 The MCP stdio server remains available on stdin/stdout. The `/api/v1/*` read API
-is read-only and uses Clarion's existing SQLite reader pool. The `/api/wardline/*`
+is read-only and uses Loomweave's existing SQLite reader pool. The `/api/wardline/*`
 sub-router (see [Wardline taint-fact store](#wardline-taint-fact-store-sp9)) adds
 one write path — `POST /api/wardline/taint-facts` — which is disabled by default
-and, when enabled, routes through Clarion's writer-actor rather than the reader
+and, when enabled, routes through Loomweave's writer-actor rather than the reader
 pool; its read paths still use the reader pool.
 
 ### Authentication
 
 The `/api/v1/files`-family endpoints require
-`X-Loom-Component: clarion:<hmac>`, `X-Loom-Timestamp: <unix-seconds>`, and
-`X-Loom-Nonce: <opaque-nonce>` when Clarion has resolved
+`X-Weft-Component: loomweave:<hmac>`, `X-Weft-Timestamp: <unix-seconds>`, and
+`X-Weft-Nonce: <opaque-nonce>` when Loomweave has resolved
 `serve.http.identity_token_env` at startup. The HMAC is lowercase hex
 HMAC-SHA256 over the canonical message:
 
@@ -61,19 +61,19 @@ HMAC-SHA256 over the canonical message:
 <METHOD>
 <PATH_AND_QUERY>
 <SHA256_HEX_OF_REQUEST_BODY>
-<X_LOOM_TIMESTAMP>
-<X_LOOM_NONCE>
+<X_WEFT_TIMESTAMP>
+<X_WEFT_NONCE>
 ```
 
-Clarion accepts timestamps within a five-minute skew window and rejects nonce
-reuse inside that same process-local window. Nonces are scoped to one Clarion
+Loomweave accepts timestamps within a five-minute skew window and rejects nonce
+reuse inside that same process-local window. Nonces are scoped to one Loomweave
 server process and one shared secret; clients should use high-entropy unique
 nonces for every signed request. Replays, stale timestamps, missing freshness
 headers, malformed freshness headers, and wrong signatures all return the same
 `401 UNAUTHENTICATED` envelope.
 
 `/api/v1/_capabilities` is **always** unauthenticated so siblings can probe the
-API surface pre-auth. Clarion still accepts the older
+API surface pre-auth. Loomweave still accepts the older
 `Authorization: Bearer <token>` path when `token_env` resolves and
 `identity_token_env` is not configured.
 
@@ -84,10 +84,10 @@ startup, before binding):
 |---|---|---|---|
 | Loopback | unset | unset | Unauthenticated; allow all requests. |
 | Loopback | set | any | HMAC required on protected routes; capabilities always allowed. |
-| Loopback | configured but env missing | any | **Refuse to start** with `CLA-CONFIG-HTTP-IDENTITY-MISSING`. |
+| Loopback | configured but env missing | any | **Refuse to start** with `LMWV-CONFIG-HTTP-IDENTITY-MISSING`. |
 | Non-loopback | set | any | HMAC required on protected routes. |
 | Non-loopback | unset | set | Bearer required on protected routes. |
-| Non-loopback | unset | unset | **Refuse to start** with `CLA-CONFIG-HTTP-NO-AUTH`. |
+| Non-loopback | unset | unset | **Refuse to start** with `LMWV-CONFIG-HTTP-NO-AUTH`. |
 
 Authentication rejection (header absent, wrong scheme/prefix, wrong token or
 signature, blank token or signature, stale timestamp, or reused nonce) returns:
@@ -108,7 +108,7 @@ All non-2xx responses use this closed JSON error envelope:
 
 ```json
 {
-  "error": "path does not resolve to a Clarion file entity",
+  "error": "path does not resolve to a Loomweave file entity",
   "code": "NOT_FOUND"
 }
 ```
@@ -124,21 +124,21 @@ is emitted by `POST /api/v1/files/batch` (as `400`) and by the `/api/wardline/*`
 batch routes (as `413`) — the same `code` carries a **different HTTP status by
 endpoint**, so a client must route on `code`, not on status.
 
-> The `code` enum is defined canonically in Rust as `clarion_core::errors::HttpErrorCode`
+> The `code` enum is defined canonically in Rust as `loomweave_core::errors::HttpErrorCode`
 > (single source of truth shared with the MCP tool-error vocabulary; see ADR-037).
 > The wire spelling on this surface is unchanged.
 
 ### `GET /api/v1/files?path=&language=`
 
-Resolves a project-relative or absolute file path to the Clarion file identity
-Filigree stores as `file_records.id` when `registry_backend: clarion` is active.
+Resolves a project-relative or absolute file path to the Loomweave file identity
+Filigree stores as `file_records.id` when `registry_backend: loomweave` is active.
 
 Query parameters:
 
 | Name | Required | Meaning |
 |---|---:|---|
-| `path` | yes | File path under the Clarion project root. |
-| `language` | no | Caller-supplied language hint. If absent, Clarion infers from the source entity or file extension. |
+| `path` | yes | File path under the Loomweave project root. |
+| `language` | no | Caller-supplied language hint. If absent, Loomweave infers from the source entity or file extension. |
 
 Successful response:
 
@@ -156,17 +156,17 @@ Semantics:
 - `entity_id` is opaque to Filigree and follows ADR-003's file-kind shape
   `core:file:{qualified_name}`.
 - `content_hash` is the drift signal Filigree stores with the resolved row.
-- `canonical_path` is Clarion's project-relative canonical path: no leading
+- `canonical_path` is Loomweave's project-relative canonical path: no leading
   `/`, no leading `./`, no trailing `/`, and `/` as the separator on every
   platform.
-- `language` is the normalized language value Clarion used for the resolution.
+- `language` is the normalized language value Loomweave used for the resolution.
 - Unknown or outside-project paths return a non-2xx JSON error instead of
   guessing.
-- If no file-kind entity row exists for the path, Clarion returns
+- If no file-kind entity row exists for the path, Loomweave returns
   `404` with `code: "NOT_FOUND"` instead of synthesizing a file ID.
 - If the file-kind entity row carries a `briefing_blocked` property (set
   by the pre-ingest secret scanner or the unscanned-source defense-in-
-  depth path), Clarion returns `403` with
+  depth path), Loomweave returns `403` with
   `code: "BRIEFING_BLOCKED"` and the response body
   `{"error": "entity is briefing-blocked and cannot be exposed",
   "code": "BRIEFING_BLOCKED"}`. The response does not include the
@@ -220,7 +220,7 @@ Successful response (`200 OK`):
       "response": {
         "status": "not_found",
         "body": {
-          "error": "file is not known to Clarion",
+          "error": "file is not known to Loomweave",
           "code": "NOT_FOUND"
         }
       }
@@ -257,7 +257,7 @@ is normative for this section.
 ### `POST /api/v1/files/batch`
 
 Resolves up to **256** file paths in a single request. Filigree's
-`ClarionRegistry` uses this for cold-start hydration so that one rehydration
+`LoomweaveRegistry` uses this for cold-start hydration so that one rehydration
 costs one round-trip and one pooled-connection checkout, rather than N of each.
 
 Request body (`application/json`, max 16 KiB):
@@ -333,7 +333,7 @@ is normative for this section.
 ## Call-graph linkages
 
 Structural call-graph adjacency over HTTP (Wave 0 / WS2). These routes wrap
-Clarion's stored `calls` edges so a sibling (notably the dossier assembler) can
+Loomweave's stored `calls` edges so a sibling (notably the dossier assembler) can
 fetch a function's callers and callees without an MCP session. They are thin
 read wrappers — no inference is run at request time (see the confidence note).
 
@@ -344,7 +344,7 @@ by `linkages.http: true` in `/api/v1/_capabilities`.
 ### `GET /api/v1/entities/:entity_id/callers` and `…/callees`
 
 `callers` returns the entities that call `entity_id`; `callees` returns the
-entities `entity_id` calls. `:entity_id` is a full Clarion entity id
+entities `entity_id` calls. `:entity_id` is a full Loomweave entity id
 (`{plugin}:{kind}:{qualname}`, e.g. `python:function:auth.tokens.refresh`) in
 the path segment; percent-encode any reserved characters. In practice the
 call-graph subject is a function/method (dotted qualnames carry no `/`).
@@ -456,7 +456,7 @@ Envelope-level failures:
 
 ### `GET /api/v1/_capabilities`
 
-Reports whether this Clarion instance can serve the registry-backend read
+Reports whether this Loomweave instance can serve the registry-backend read
 contract.
 
 Successful response:
@@ -487,8 +487,8 @@ Filigree should treat `registry_backend: true` as the flag that the
 (see [§SEI identity resolution](#sei-identity-resolution)); `sei.version` is the
 SEI wire/format version (`1`). A consumer **must** gate its use of SEIs on this
 flag and **degrade gracefully** when it is absent or `supported: false` — that
-is a pre-SEI or non-conformant Clarion, and the consumer keeps working on
-locators (per ADR-038 / the Loom SEI standard §4).
+is a pre-SEI or non-conformant Loomweave, and the consumer keeps working on
+locators (per ADR-038 / the Weft SEI standard §4).
 
 `linkages.http: true` advertises the call-graph linkage routes
 (`GET /api/v1/entities/:id/callers|callees` and their `:batch-get` variants —
@@ -499,18 +499,18 @@ than probing the routes directly.
 `taint_store.read_by_sei: true` advertises the rename-stable taint read route
 ([`POST /api/wardline/taint-facts/by-sei`](#post-apiwardlinetaint-factsby-sei-read-batch-by-sei),
 T3.4). It is **discrete from `sei.supported`** deliberately: an older SEI-capable
-Clarion sets `sei.supported: true` but predates this route, so a consumer must
+Loomweave sets `sei.supported: true` but predates this route, so a consumer must
 gate the by-SEI taint read on **this** flag and fall back to the locator-keyed
 read when it is absent.
 
-`api_version` is the HTTP read API wire-contract version, not Clarion product
+`api_version` is the HTTP read API wire-contract version, not Loomweave product
 semver. It increments only for incompatible changes to the wire contract
 consumed by existing Filigree clients.
 
-`instance_id` is the stable per-project Clarion instance fingerprint persisted
-in `.clarion/instance_id`. Filigree should treat a changed `instance_id` for a
+`instance_id` is the stable per-project Loomweave instance fingerprint persisted
+in `.loomweave/instance_id`. Filigree should treat a changed `instance_id` for a
 previously known endpoint as evidence that it is now talking to a different
-Clarion project instance.
+Loomweave project instance.
 
 The contract fixture at
 [`fixtures/get-api-v1-capabilities.json`](./fixtures/get-api-v1-capabilities.json)
@@ -520,14 +520,14 @@ asserts that `instance_id` is a UUID; the example uses a seeded stable ID.
 ## SEI identity resolution
 
 Stable Entity Identity (SEI) resolution over HTTP (Wave 1 / WS1, ADR-038; the
-suite-wide standard is the Loom SEI conformance spec). The **SEI** is a durable,
+suite-wide standard is the Weft SEI conformance spec). The **SEI** is a durable,
 opaque surrogate identity that survives rename and move; the
 `{plugin}:{kind}:{qualname}` entity id is demoted to a mutable **locator**
 (address). Cross-tool bindings (Filigree associations, Wardline taint facts,
 `legis` attestations) **must** key on the SEI, never the locator.
 
 These routes are HMAC-gated exactly like `/api/v1/files`. Identity is read from
-Clarion's `sei_bindings` store (the source of truth). SEIs are **opaque on the
+Loomweave's `sei_bindings` store (the source of truth). SEIs are **opaque on the
 wire** — consumers MUST NOT parse them.
 
 ### `POST /api/v1/identity/resolve`
@@ -537,7 +537,7 @@ Resolve a locator to its alive SEI. Request: `{ "locator": "python:function:auth
 Successful response (`200 OK`):
 
 ```json
-{ "sei": "clarion:eid:<hex>", "current_locator": "python:function:auth.tokens.refresh", "content_hash": "<blake3>", "alive": true }
+{ "sei": "loomweave:eid:<hex>", "current_locator": "python:function:auth.tokens.refresh", "content_hash": "<blake3>", "alive": true }
 ```
 
 When the locator resolves to nothing alive: `{ "alive": false }` (still `200`).
@@ -545,7 +545,7 @@ When the locator resolves to nothing alive: `{ "alive": false }` (still `200`).
 **Fail-closed input validation (REQ-F-02).** `resolve` **rejects** any input that
 is not a locator — including an already-migrated, **SEI-shaped** string — with
 `400` and `code: "INVALID_PATH"` (`"not a valid locator…"`), **never** a silent
-mis-resolution. The rejection keys on the reserved **`clarion:eid:` prefix**, not
+mis-resolution. The rejection keys on the reserved **`loomweave:eid:` prefix**, not
 a colon count (an SEI carries the same two colons a locator does). This contract
 is what makes the idempotent, resumable cross-tool backfill safe — see
 [`sei-migration-playbook.md`](./sei-migration-playbook.md).
@@ -557,8 +557,8 @@ Resolve up to **256** locators in one request. Request:
 
 ```json
 {
-  "resolved": { "python:function:a.b": { "sei": "clarion:eid:<hex>", "current_locator": "python:function:a.b", "content_hash": "<blake3>", "alive": true } },
-  "invalid": ["clarion:eid:…", "malformed"],
+  "resolved": { "python:function:a.b": { "sei": "loomweave:eid:<hex>", "current_locator": "python:function:a.b", "content_hash": "<blake3>", "alive": true } },
+  "invalid": ["loomweave:eid:…", "malformed"],
   "not_found": ["python:function:gone"]
 }
 ```
@@ -581,29 +581,29 @@ The ordered append-only lineage event list for an SEI:
 
 ### Conformance
 
-Clarion's SEI behaviour is proven by the shared **SEI conformance oracle** (the
-Loom SEI standard §8): identity round-trip + opacity, rename (`locator_changed`),
+Loomweave's SEI behaviour is proven by the shared **SEI conformance oracle** (the
+Weft SEI standard §8): identity round-trip + opacity, rename (`locator_changed`),
 move (`moved`), ambiguous (fail-closed mint + orphan), delete (orphan +
 `alive: false`), and capability-absent (graceful degrade). The normative scenario
 definitions live at
 [`fixtures/sei-conformance-oracle.json`](./fixtures/sei-conformance-oracle.json)
-and Clarion's pass is enforced by
-`cargo test -p clarion-storage --test sei_conformance_oracle`.
+and Loomweave's pass is enforced by
+`cargo test -p loomweave-storage --test sei_conformance_oracle`.
 
 ## Dossier participation surface
 
-Wave 2 / WS4. Clarion does **not** assemble the cross-tool entity dossier — the
+Wave 2 / WS4. Loomweave does **not** assemble the cross-tool entity dossier — the
 *assembler* (Wardline; see its entity-dossier design at
-`wardline/docs/superpowers/specs/2026-06-01-wardline-loom-entity-dossier-design.md`
+`wardline/docs/superpowers/specs/2026-06-01-wardline-weft-entity-dossier-design.md`
 in the sibling repo, not vendored here) composes it. This section pins the exact
-Clarion HTTP slices the assembler reads,
+Loomweave HTTP slices the assembler reads,
 so the contract is explicit and the assembler can build a complete,
 freshness-stamped, SEI-keyed view of an entity **that stays correct after a
 rename**. The participation contract is specified in full at
-[`docs/superpowers/specs/2026-06-02-clarion-dossier-participation.md`](../superpowers/specs/2026-06-02-clarion-dossier-participation.md).
+[`docs/superpowers/specs/2026-06-02-loomweave-dossier-participation.md`](../superpowers/specs/2026-06-02-loomweave-dossier-participation.md).
 Every slice is an existing pinned endpoint — WS4 adds **no new endpoint**:
 
-| Dossier slice | Clarion endpoint | Pinned at |
+| Dossier slice | Loomweave endpoint | Pinned at |
 |---|---|---|
 | Identity + **content-axis** freshness | `POST /api/v1/identity/resolve` → `{ sei, content_hash, alive }` | [§SEI identity resolution](#post-apiv1identityresolve) |
 | **Identity-axis** freshness (alive/orphaned + rename lineage) | `GET /api/v1/identity/sei/:sei`, `GET /api/v1/identity/lineage/:sei` | [§SEI identity resolution](#get-apiv1identityseisei) |
@@ -617,12 +617,12 @@ stored fact against it → FRESH/STALE). The *identity axis* is `resolve_sei`'s
 alive — never silently orphaned). A rename therefore surfaces on the identity
 axis while content freshness is judged independently.
 
-**Filigree associations are NOT a Clarion surface.** The dossier's `work` section
+**Filigree associations are NOT a Loomweave surface.** The dossier's `work` section
 reads Filigree's own `GET /api/entity-associations?entity_id=…` (ADR-029)
-**directly**; Clarion is not a proxy or aggregator for it. Clarion contributes
+**directly**; Loomweave is not a proxy or aggregator for it. Loomweave contributes
 only the **join key** — the SEI from `resolve` — which both Filigree associations
-and Wardline taint facts key on. Routing Filigree data through Clarion would
-violate the enrich-only axiom (`loom.md` §5: Clarion serves slices, it does not
+and Wardline taint facts key on. Routing Filigree data through Loomweave would
+violate the enrich-only axiom (`weft.md` §5: Loomweave serves slices, it does not
 assemble or aggregate sibling data). This is a deliberate decision, not a gap.
 
 **Wardline's taint axis stays rename-correct via the SEI, not the locator.** A
@@ -634,7 +634,7 @@ rest of the dossier joins on, so a rename surfaces on the identity axis while th
 taint fact remains reachable. Gate on `taint_store.read_by_sei`.
 
 **`scc_peers` is not directly HTTP-reachable.** The dossier envelope lists
-`scc_peers[]`; Clarion exposes subsystem *clustering*
+`scc_peers[]`; Loomweave exposes subsystem *clustering*
 (`subsystem_members`/`subsystem_of`, MCP-only), which is **not** the same as
 strongly-connected-component peers — serving it under that name would be a
 semantic mismatch. The dossier degrades gracefully on partial linkages
@@ -645,13 +645,13 @@ here, not silently dropped.
 
 The composition is proven end-to-end against a renamed-function fixture by
 `serve_http_dossier_participation_surface_serves_a_renamed_function`
-(`crates/clarion-cli/tests/serve.rs`).
+(`crates/loomweave-cli/tests/serve.rs`).
 
 ## Governed paradise: `legis` governance consumption (WS9)
 
 Wave 3 / WS9 closes **governed paradise**: `legis` adds IRAP-grade governance
-(attestations, sign-offs, custody, audit lineage) keyed to Clarion's stable
-identity, as an **opt-in** layer a solo project never sees. Clarion is *already*
+(attestations, sign-offs, custody, audit lineage) keyed to Loomweave's stable
+identity, as an **opt-in** layer a solo project never sees. Loomweave is *already*
 the identity authority (Wave 1) — WS9 exposes existing surfaces and swaps one
 provider; it adds **no** new identity surface and **no** trust adjudication.
 Governed paradise does **not** gate core paradise (Wave 2); core paradise stands
@@ -659,10 +659,10 @@ on its own.
 
 ### Audit-spine consumption (read-only, existing surface)
 
-`legis` reads Clarion's **existing** Wave-1 identity surface as its audit spine —
-no new endpoint, **no Clarion-side integrity machinery**:
+`legis` reads Loomweave's **existing** Wave-1 identity surface as its audit spine —
+no new endpoint, **no Loomweave-side integrity machinery**:
 
-| `legis` need | Clarion endpoint | Maps to |
+| `legis` need | Loomweave endpoint | Maps to |
 |---|---|---|
 | Attestation join key (SEI for a code entity) | `POST /api/v1/identity/resolve` → `{ sei, content_hash, alive }` | [§SEI identity resolution](#post-apiv1identityresolve) |
 | Orphan → governance gap (attestation in limbo) | `GET /api/v1/identity/sei/:sei` → `{ alive: false, lineage }` | [§SEI identity resolution](#get-apiv1identityseisei) |
@@ -675,11 +675,11 @@ discharged **entirely** against these three routes. `legis` polls (pull-only);
 no push surface is required for v1 (it is informational future work per `legis`'s
 own conformance notes).
 
-**Integrity is `legis`'s boundary, not Clarion's (REQ-L-01).** The SEI standard
+**Integrity is `legis`'s boundary, not Loomweave's (REQ-L-01).** The SEI standard
 leaves lineage tamper-evidence to a named decision; `legis` accepts **Option 3** —
 each consumer establishes its own integrity layer over polled snapshots (`legis`
 stores a snapshot hash of the lineage at each governance decision and detects
-divergence on re-read). Clarion therefore ships **no** lineage hash-chain or
+divergence on re-read). Loomweave therefore ships **no** lineage hash-chain or
 signature in v1; the append-only `sei_lineage` log (INSERT-only, no UPDATE path)
 plus transport is the custody substrate `legis` verifies against. A signed
 lineage is North-Star, not a v1 requirement. This is the custody axiom: integrity
@@ -690,7 +690,7 @@ is re-established at the governance boundary, never assumed from the store.
 The SEI matcher consumes a typed, locator-level git-rename signal behind the
 `GitRenameSource` trait (SEI spec §6). `legis` owns the git interface, so it is
 the intended external supplier: `LegisGitRenameSource`
-(`crates/clarion-cli/src/sei_git.rs`) reads `legis`'s
+(`crates/loomweave-cli/src/sei_git.rs`) reads `legis`'s
 `GET /git/renames?rev_range=…` and feeds the **same** file→locator translation as
 the v1 `ShellGitRenameSource`, behind the same trait — no matcher change.
 Selection is enrich-only and **capability-aware** (`select_git_rename_source`):
@@ -699,7 +699,7 @@ when configured (`--legis-url`) **and** reachable. Unset/unreachable `legis`
 issues no HTTP and leaves behaviour byte-identical to pre-WS9.
 
 **Two windows, unioned (gap closed via option 2).** The two suppliers observe
-**different rename windows**: Clarion's working-tree-vs-HEAD window (uncommitted
+**different rename windows**: Loomweave's working-tree-vs-HEAD window (uncommitted
 renames — the "rename a file, re-analyze before commit" flow, shell `git diff -M
 HEAD`) and `legis`'s committed window over a rev-range (`git log -M`, which cannot
 see the working tree). A naive *swap* of one for the other would drop uncommitted
@@ -713,7 +713,7 @@ renames, so `analyze` now **unions** both each run (`gather_git_renames`):
   `0007`) and reads the *prior* run's commit (`prior_analyzed_commit`, excluding
   the current run) to form the range. So `legis` is now **operatively consulted**
   for renames committed between runs — the gap formerly disclosed here is closed
-  by option 2 (Clarion drives a committed rev-range). Option 1 (a `legis`
+  by option 2 (Loomweave drives a committed rev-range). Option 1 (a `legis`
   working-tree surface) remains unnecessary.
 
 Enrich-only and never a regression: with `legis` unset, or no prior commit, only
@@ -724,18 +724,18 @@ union can only *miss* a carry, never cause a false one. Proven by
 (working-tree rename survives a reachable-but-empty `legis`) and
 `gather_unions_committed_legis_and_working_tree_shell_renames` (committed `legis`
 rename and uncommitted shell rename both appear) in
-`crates/clarion-cli/src/sei_git.rs`.
+`crates/loomweave-cli/src/sei_git.rs`.
 
 ### Trust vocabulary — carried verbatim, never adjudicated
 
-Clarion does **not** adjudicate trust. One judge: **Wardline analyses, `legis`
-governs.** Clarion adds **no** policy / attestation engine — attestations live in
-`legis`, keyed on Clarion's SEI. The trust vocabulary (`declared_tier`,
+Loomweave does **not** adjudicate trust. One judge: **Wardline analyses, `legis`
+governs.** Loomweave adds **no** policy / attestation engine — attestations live in
+`legis`, keyed on Loomweave's SEI. The trust vocabulary (`declared_tier`,
 `wardline_groups`/`declared_groups`, boundary contracts) is carried **exactly as
-Wardline emits it**; Clarion participates in, never leads, any suite
+Wardline emits it**; Loomweave participates in, never leads, any suite
 trust-vocabulary convergence.
 
-What Clarion carries from Wardline **today** is the taint-fact store and
+What Loomweave carries from Wardline **today** is the taint-fact store and
 qualname-reconciled findings (see [§Wardline taint-fact store](#wardline-taint-fact-store-sp9)
 and [§Wardline qualname normalization](#wardline-qualname-normalization-entity-reconciliation)) —
 verbatim, no re-judgement. The `WardlineMeta` entity-property carriage of
@@ -753,26 +753,26 @@ input-path shape:
   configured project root with the requested path (or treats an absolute
   path as-is when it falls under the project root), then folds `.` /
   `..` lexically. The path **does not need to exist on disk** at lookup
-  time — Clarion resolves against its entity catalog
+  time — Loomweave resolves against its entity catalog
   (`entities.source_file_path`), not against `stat(2)`. This is important
   for replay scenarios where the catalog row outlives the file.
 - **Forward-slash separators only**. Both project-relative paths
   (`src/foo.py`) and project-root-anchored absolute paths
-  (`/var/run/clarion-corpus/src/foo.py`) are accepted; backslash
+  (`/var/run/loomweave-corpus/src/foo.py`) are accepted; backslash
   separators are not.
 - **Project-relative or absolute under the project root**. A request
   whose normalized form escapes the project root returns 400
   `PATH_OUTSIDE_PROJECT` (single-file) or surfaces as an
   `errors[].code = "PATH_OUTSIDE_PROJECT"` entry (batch).
 - **Symlink-resolved equivalents are not reconciled**. If your project
-  contains symlinks, both Clarion and Filigree must agree on the same
+  contains symlinks, both Loomweave and Filigree must agree on the same
   canonical form for the same logical file (typically the lexically-
-  joined form). Clarion does **not** call `canonicalize()` on the
+  joined form). Loomweave does **not** call `canonicalize()` on the
   request path; the catalog row carries the canonical form chosen at
   ingest.
 
-Reference implementation: `clarion-storage::query::normalize_lookup_path`
-(file path: [`crates/clarion-storage/src/query.rs`](../../crates/clarion-storage/src/query.rs)).
+Reference implementation: `loomweave-storage::query::normalize_lookup_path`
+(file path: [`crates/loomweave-storage/src/query.rs`](../../crates/loomweave-storage/src/query.rs)).
 The function signature is stable for the lifetime of `api_version: 1`;
 the *implementation* is free to change as long as the lexical /
 no-disk-touch / forward-slash / under-root contract holds.
@@ -781,30 +781,30 @@ no-disk-touch / forward-slash / under-root contract holds.
 
 This contract governs how a sibling that emits Findings against Python code
 (Wardline's native Filigree emitter, per ADR-018's 2026-05-29 amendment and the
-2026-05-29 integration brief §4.A) must spell the entity it references so Clarion
-can reconcile it. It is *enrich-only*: when the contract is honored, Clarion
-attaches the entity's structural context to the Finding; when it is not, Clarion
+2026-05-29 integration brief §4.A) must spell the entity it references so Loomweave
+can reconcile it. It is *enrich-only*: when the contract is honored, Loomweave
+attaches the entity's structural context to the Finding; when it is not, Loomweave
 degrades to `resolution_confidence: heuristic|none` — there is no error and no
 broken state, only a worse match. Filigree's own ticket lifecycle is unaffected
-either way (loom.md §5).
+either way (weft.md §5).
 
 **The composed form.** A Finding carries `metadata.wardline.qualname` as the
-**pre-composed** dotted name (Clarion's L7 `canonical_qualified_name`), not a
+**pre-composed** dotted name (Loomweave's L7 `canonical_qualified_name`), not a
 `(file, bare-qualname)` pair. The composition is two parts:
 
 ```text
 metadata.wardline.qualname = module_dotted_name(file_path) + "." + __qualname__
 ```
 
-- `module_dotted_name(file_path)` is Clarion's module-prefix rule. Its canonical
+- `module_dotted_name(file_path)` is Loomweave's module-prefix rule. Its canonical
   implementation and tests are
-  [`module_dotted_name`](../../plugins/python/src/clarion_plugin_python/extractor.py)
+  [`module_dotted_name`](../../plugins/python/src/loomweave_plugin_python/extractor.py)
   and `test_module_dotted_name_helper` in
   [`test_extractor.py`](../../plugins/python/tests/test_extractor.py). The rule:
   strip a leading `src/` **only at position 0**; drop the `.py` suffix; collapse
   an `__init__` filename to its package; join the rest with `.`. No other root
   marker (`lib/`, `app/`, the project name, …) is stripped, and a top-level
-  `__init__.py` normalizes to the empty string and is **not emitted** (Clarion
+  `__init__.py` normalizes to the empty string and is **not emitted** (Loomweave
   rejects an empty qualified name).
 - `__qualname__` is copied **verbatim** — `<locals>` closure markers and dotted
   nested-class chains are preserved, never rewritten.
@@ -824,7 +824,7 @@ top-level `__init__.py`). A conformant emitter reproduces every vector exactly.
 named in ADR-018 as the eventual conformance surface but is **not implemented at
 release:1.1**. Until it ships, the fixture above is the contract: validate against
 it offline. Building the endpoint ahead of a shipped Wardline consumer would be
-speculative forward-work (loom.md §5 — Clarion translates qualnames because it owns
+speculative forward-work (weft.md §5 — Loomweave translates qualnames because it owns
 the catalog, but only when a consumer needs it). What *did* ship is the narrower,
 exact-tier `POST /api/wardline/resolve` (see
 [Wardline taint-fact store](#wardline-taint-fact-store-sp9)), which takes
@@ -835,29 +835,29 @@ extends the same resolver rather than reimplementing it.
 
 ## Wardline taint-fact store (SP9)
 
-This pins the `/api/wardline/*` sub-router Clarion *exposes* to Wardline (ADR-036;
+This pins the `/api/wardline/*` sub-router Loomweave *exposes* to Wardline (ADR-036;
 design spec
-[`2026-05-30-clarion-wardline-taint-store-design.md`](../superpowers/specs/2026-05-30-clarion-wardline-taint-store-design.md)).
-Wardline computes per-entity taint facts and persists them into Clarion's catalog
-so Clarion can fold them into briefings; Clarion treats every fact's payload as an
+[`2026-05-30-loomweave-wardline-taint-store-design.md`](../superpowers/specs/2026-05-30-loomweave-wardline-taint-store-design.md)).
+Wardline computes per-entity taint facts and persists them into Loomweave's catalog
+so Loomweave can fold them into briefings; Loomweave treats every fact's payload as an
 **opaque blob** and never asserts whether it is fresh. This is enrich-only and
-disabled-by-default (loom.md §5): the write path is off unless explicitly enabled,
-and Clarion's own semantics never depend on a stored fact.
+disabled-by-default (weft.md §5): the write path is off unless explicitly enabled,
+and Loomweave's own semantics never depend on a stored fact.
 
-**Per-project isolation.** One `clarion serve` process serves exactly one project
-(the `.clarion/` store under that project root). The `project` request field is a
+**Per-project isolation.** One `loomweave serve` process serves exactly one project
+(the `.loomweave/` store under that project root). The `project` request field is a
 **guard, not a selector** — it does not choose among projects; it only lets a
 client assert which project it believes it is talking to. The handle is the
 project-root directory name. An **empty** `project` is always accepted (no
 assertion); a **non-empty** value that does not match the served project's
 directory name returns `403` with `code: "PROJECT_MISMATCH"`. (Reference:
 `AppState::reject_project_mismatch` in
-[`http_read.rs`](../../crates/clarion-cli/src/http_read.rs).)
+[`http_read.rs`](../../crates/loomweave-cli/src/http_read.rs).)
 
 ### Sub-router framing, auth, and limits
 
 The `/api/wardline/*` routes sit behind the **same identity middleware** as the
-protected `/api/v1/*` routes (HMAC `X-Loom-Component: clarion:<hmac>` plus
+protected `/api/v1/*` routes (HMAC `X-Weft-Component: loomweave:<hmac>` plus
 timestamp/nonce freshness preferred per ADR-034/ADR-042, legacy
 `Authorization: Bearer` accepted as fallback, loopback-unauth allowed; see
 [Authentication](#authentication)). The only difference is the body
@@ -889,18 +889,18 @@ capabilities.
 
 ### `POST /api/wardline/resolve`
 
-Exact-tier resolution of **pre-composed** dotted qualnames to Clarion entity IDs.
+Exact-tier resolution of **pre-composed** dotted qualnames to Loomweave entity IDs.
 No `&file=` disambiguator and no normalization: Wardline has already shaped each
-qualname to byte-match Clarion's `canonical_qualified_name`, and Clarion does a
+qualname to byte-match Loomweave's `canonical_qualified_name`, and Loomweave does a
 direct existence lookup of the candidate `python:function:<qualname>` (taint facts
-are function/method-scoped; methods are `python:function:` in Clarion's ontology
+are function/method-scoped; methods are `python:function:` in Loomweave's ontology
 per ADR-022).
 
 Request body (`application/json`, max 4 MiB):
 
 ```json
 {
-  "project": "clarion",
+  "project": "loomweave",
   "qualnames": ["auth.tokens.refresh", "auth.sessions.SessionStore.load"]
 }
 ```
@@ -947,7 +947,7 @@ parsing the body. Request body (`application/json`, max 4 MiB):
 
 ```json
 {
-  "project": "clarion",
+  "project": "loomweave",
   "scan_id": "wardline-scan-2026-05-30",
   "facts": [
     {
@@ -960,18 +960,18 @@ parsing the body. Request body (`application/json`, max 4 MiB):
 }
 ```
 
-- `wardline_json` is **opaque** to Clarion (see [Opacity contract](#opacity-contract)).
+- `wardline_json` is **opaque** to Loomweave (see [Opacity contract](#opacity-contract)).
 - `scan_id` and `content_hash_at_compute` are accepted as **top-level fields**
-  (queryable columns); Clarion does **not** parse them out of the blob. The
+  (queryable columns); Loomweave does **not** parse them out of the blob. The
   per-fact `scan_id` falls back to the batch-level `scan_id` when absent. Both are
   optional.
 - `sei` (optional, per fact) is the fact's **Stable Entity Identity** — a second,
   rename-stable lookup key (see
   [`POST /api/wardline/taint-facts/by-sei`](#post-apiwardlinetaint-factsby-sei-read-batch-by-sei)).
-  When **omitted**, Clarion resolves it server-side from the alive `sei_bindings`
+  When **omitted**, Loomweave resolves it server-side from the alive `sei_bindings`
   row for the fact's resolved locator (batched, one query for the whole request);
   when **present**, the caller-supplied value wins and is stored **verbatim**
-  (opaque — Clarion never parses `clarion:eid:<hex>`). A fact written on a pre-SEI
+  (opaque — Loomweave never parses `loomweave:eid:<hex>`). A fact written on a pre-SEI
   database / unbound locator stores `sei = null` and is reachable by locator only.
 
 Successful response (`200 OK`):
@@ -1060,7 +1060,7 @@ The view has **exactly four fields**:
 Note what is **not** echoed: the write-time `scan_id` and `content_hash_at_compute`
 columns are **never returned by the read**. Wardline reads its own
 `content_hash_at_compute` from *inside* the opaque `wardline_json` blob, not from a
-Clarion-returned field (see the freshness contract).
+Loomweave-returned field (see the freshness contract).
 
 Failure modes:
 
@@ -1084,7 +1084,7 @@ HMAC-gated like the rest of the `/api/wardline/*` group.
 
 Gate on the discrete capability flag
 [`taint_store.read_by_sei`](#get-apiv1_capabilities), **not** on `sei.supported`:
-an older SEI-capable Clarion advertises `sei.supported: true` yet predates this
+an older SEI-capable Loomweave advertises `sei.supported: true` yet predates this
 route.
 
 Request body (`application/json`, max 4 MiB): `{ "project"?, "seis": [..] }`.
@@ -1096,12 +1096,12 @@ objects, **one per input SEI, in input order**:
 ```json
 [
   {
-    "sei": "clarion:eid:9f2c…",
+    "sei": "loomweave:eid:9f2c…",
     "wardline_json": {"taint": "tainted"},
     "current_content_hash": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9",
     "exists": true
   },
-  {"sei": "clarion:eid:deadbeef", "exists": false}
+  {"sei": "loomweave:eid:deadbeef", "exists": false}
 ]
 ```
 
@@ -1129,7 +1129,7 @@ pre-rescan fact in the window before it.
 it is stranded under both the dead locator (resolution now points elsewhere) and
 this route (no SEI tag) until Wardline recomputes — the freshness gate surfaces it
 as stale, Wardline rewrites it, and the `sei` is populated. This is self-healing
-by design; Clarion does **not** backfill historical rows.
+by design; Loomweave does **not** backfill historical rows.
 
 Failure modes:
 
@@ -1159,23 +1159,23 @@ definition is pinned exactly:
   `current_content_hash` is **omitted** (field absent). `exists` still reflects the
   stored fact (it can be `true` with no `current_content_hash`).
 
-  Reference: `clarion_storage::current_file_hash` in
-  [`query.rs`](../../crates/clarion-storage/src/query.rs).
+  Reference: `loomweave_storage::current_file_hash` in
+  [`query.rs`](../../crates/loomweave-storage/src/query.rs).
 
 **Who decides freshness.** Wardline stamps `content_hash_at_compute` *inside* the
 opaque `wardline_json` blob when it computes a fact, then on read compares that
-stamp to Clarion's returned `current_content_hash`: equal ⇒ the fact is fresh;
+stamp to Loomweave's returned `current_content_hash`: equal ⇒ the fact is fresh;
 mismatch, or `exists: false`, or `current_content_hash` absent ⇒ Wardline
-recomputes. **Wardline owns the fresh/stale decision; Clarion never asserts a
+recomputes. **Wardline owns the fresh/stale decision; Loomweave never asserts a
 freshness verdict** — it only reports the live hash and lets Wardline compare.
 
 ### Opacity contract
 
-`wardline_json` is stored and returned **byte-verbatim**. Clarion holds it as a
+`wardline_json` is stored and returned **byte-verbatim**. Loomweave holds it as a
 serde_json `RawValue` on both the write and read paths, so object key order and
 whitespace are preserved exactly — `{"b":2,"a":1}` is *not* re-emitted as
-`{"a":1,"b":2}`. Clarion **never parses or validates** the blob's contents. The
-only fields Clarion reads structurally are the top-level `scan_id` /
+`{"a":1,"b":2}`. Loomweave **never parses or validates** the blob's contents. The
+only fields Loomweave reads structurally are the top-level `scan_id` /
 `content_hash_at_compute` accompanying a write (stored as queryable columns) — they
 are taken from the request envelope, **not** parsed out of the blob.
 
@@ -1189,31 +1189,31 @@ for these routes (the prose shapes here are the contract).
   (see [Wardline qualname normalization](#wardline-qualname-normalization-entity-reconciliation));
   `resolve_wardline_qualnames` is exercised against its vectors by
   `resolves_fixture_vectors_exact` in
-  [`wardline_taint.rs`](../../crates/clarion-storage/src/wardline_taint.rs).
+  [`wardline_taint.rs`](../../crates/loomweave-storage/src/wardline_taint.rs).
 - The **whole-file-vs-span freshness** definition is pinned by the
   `current_file_hash` tests in
-  [`query.rs`](../../crates/clarion-storage/src/query.rs) (asserting whole-file
+  [`query.rs`](../../crates/loomweave-storage/src/query.rs) (asserting whole-file
   blake3, not the span-scoped LF-normalized hash).
 - The **route behaviour** — exact resolve + unresolved, project-guard mismatch,
   `WRITE_DISABLED`, per-entity replace, byte-verbatim storage, the live whole-file
   hash, deleted-file ⇒ absent hash, the bare-array batch read, and the over-cap
   `413` — is pinned by the `wardline_*` async handler tests in
-  [`http_read.rs`](../../crates/clarion-cli/src/http_read.rs).
+  [`http_read.rs`](../../crates/loomweave-cli/src/http_read.rs).
 
 ## Consumed Filigree convention: ephemeral-port endpoint discovery
 
-The contracts above pin the surface Clarion *exposes*. This section and the ones
-that follow pin what Clarion *consumes*. Endpoint discovery comes first because
-it is the prerequisite for every consumed route below: before Clarion can call
+The contracts above pin the surface Loomweave *exposes*. This section and the ones
+that follow pin what Loomweave *consumes*. Endpoint discovery comes first because
+it is the prerequisite for every consumed route below: before Loomweave can call
 `issues_for`'s issue-detail read, the scan-results intake, or the clean-stale
 sweep, it must resolve *where* Filigree is actually listening.
 
-`clarion serve` and `clarion analyze` resolve that base URL through
-[`clarion_mcp::filigree_url::resolve_filigree_url`](../../crates/clarion-mcp/src/filigree_url.rs)
+`loomweave serve` and `loomweave analyze` resolve that base URL through
+[`loomweave_mcp::filigree_url::resolve_filigree_url`](../../crates/loomweave-mcp/src/filigree_url.rs)
 (added with clarion-084e82250c). It is strictly *enrich-only*: discovery only ever
 *upgrades* the statically configured `integrations.filigree.base_url`; it never
-gates Clarion's own semantics. Clarion stays solo-useful with Filigree absent
-(loom.md §5).
+gates Loomweave's own semantics. Loomweave stays solo-useful with Filigree absent
+(weft.md §5).
 
 **The convention.** Filigree's dashboard, when running in its default *ethereal*
 mode, publishes its live listen port to `<project_root>/.filigree/ephemeral.port`
@@ -1232,12 +1232,12 @@ read, never computed**. This mirrors the Filigree sources
 | Valid `<root>/.filigree/ephemeral.port` present | configured URL with its **port** overridden by the live port (scheme, host, path preserved) | `.filigree/ephemeral.port` |
 | No / unreadable port file | configured URL unchanged | `config` |
 
-**The negative contract (the load-bearing part).** What Clarion *refuses* to do is
-the loom-§5 safety argument:
+**The negative contract (the load-bearing part).** What Loomweave *refuses* to do is
+the weft-§5 safety argument:
 
 - It **reads** the published port; it never **computes** Filigree's port itself
   (no reimplementation of the `8400 + sha256 % 1000` rule).
-- When no live port file is present, it falls back to Clarion's **own** configured
+- When no live port file is present, it falls back to Loomweave's **own** configured
   `base_url`, **never** to a Filigree-internal default. Copying Filigree's
   `DEFAULT_PORT` would be a silent cross-product coupling that breaks the moment
   Filigree changes its default.
@@ -1249,7 +1249,7 @@ the loom-§5 safety argument:
 **Server-mode gap (named limitation).** Filigree also supports a *server* mode that
 publishes its endpoint through a home-directory global
 (`~/.config/filigree/server.json`) rather than the per-project `ephemeral.port`
-file. Clarion does **not** read `server.json` at release:1.1 — under Filigree
+file. Loomweave does **not** read `server.json` at release:1.1 — under Filigree
 server mode, discovery finds no `ephemeral.port` and degrades to the configured
 `base_url` (`source = config`), which is correct but does not auto-track a
 server-mode port. Closing this gap (reading the server-mode global) is tracked as
@@ -1277,53 +1277,53 @@ only when the integration is disabled.
 connection discovery resolves a single scalar (a port), not a wire document, so a
 fixture is not warranted; the shapes above are the contract. The executable check
 is the test module in
-[`filigree_url.rs`](../../crates/clarion-mcp/src/filigree_url.rs): it pins the
+[`filigree_url.rs`](../../crates/loomweave-mcp/src/filigree_url.rs): it pins the
 live-port override, the no-file and disabled fall-throughs, and the fail-soft
 folding of corrupt / zero ports to the configured URL. Because the port file is a
 *read* of a Filigree-owned convention, a change on Filigree's side (path or
-format) would be caught by re-reading its `ephemeral.py`, not by Clarion CI.
+format) would be caught by re-reading its `ephemeral.py`, not by Loomweave CI.
 
 ## Consumed Filigree route: entity associations
 
-This pins the Filigree reverse-association route Clarion consumes for
+This pins the Filigree reverse-association route Loomweave consumes for
 `issues_for` / `entity_issue_list`:
 
 ```text
 GET {filigree_base}/api/entity-associations?entity_id={association_key}
 ```
 
-`association_key` is opaque to Filigree. Clarion sends exactly **one** key per
-entity: the entity's SEI (`clarion:eid:*`) when the served index has one, and
+`association_key` is opaque to Filigree. Loomweave sends exactly **one** key per
+entity: the entity's SEI (`loomweave:eid:*`) when the served index has one, and
 the mutable locator (`{plugin}:{kind}:{qualname}`) only for entities with no SEI
 (pre-SEI or unbound indexes). There is no per-row fallback: once an entity has a
-SEI, Clarion queries by SEI alone, so a *legacy locator-keyed* Filigree row for
+SEI, Loomweave queries by SEI alone, so a *legacy locator-keyed* Filigree row for
 that same entity is **not** resolved until the SEI migration re-keys it onto the
 SEI (per [`sei-migration-playbook.md`](./sei-migration-playbook.md); bindings
 "must key on the SEI" — see [§SEI identity resolution](#sei-identity-resolution)).
 The locator query path therefore applies solely to entities that never had a SEI.
 
-The response field remains `clarion_entity_id` for wire compatibility; a SEI
-query echoes the SEI key, a locator query echoes the locator. Clarion maps a
+The response field remains `loomweave_entity_id` for wire compatibility; a SEI
+query echoes the SEI key, a locator query echoes the locator. Loomweave maps a
 returned SEI key back to the current locator before comparing
 `content_hash_at_attach` against the current entity content hash.
 
 ## Consumed Filigree route: issue detail (enrichment)
 
-This pins the single Filigree route Clarion *consumes* (against the endpoint
+This pins the single Filigree route Loomweave *consumes* (against the endpoint
 resolved above) to enrich an entity-association match — the read behind
 `issues_for`'s per-match `issue` block (clarion-51a2868c86). It is
 strictly *enrich-only*: if the route is absent or unreachable, the match still
-resolves with `issue: null`, and Clarion's semantics are unaffected (loom.md §5).
+resolves with `issue: null`, and Loomweave's semantics are unaffected (weft.md §5).
 
 ```text
-GET {filigree_base}/api/loom/issues/{issue_id}
+GET {filigree_base}/api/weft/issues/{issue_id}
 ```
 
 - `{issue_id}` is percent-encoded as a path-segment value.
 - **Request headers:** `accept: application/json`; `x-filigree-actor: <actor>`
   when an actor is configured; `Authorization: Bearer <token>` when a bearer
   token is configured. (HMAC is not used on this *outbound* read; it is an
-  inbound-auth mechanism on Clarion's own exposed routes.)
+  inbound-auth mechanism on Loomweave's own exposed routes.)
 - **`200` response body** — only these fields are read; **unknown fields are
   ignored** so Filigree may grow the route without breaking the consumer:
 
@@ -1331,7 +1331,7 @@ GET {filigree_base}/api/loom/issues/{issue_id}
   { "title": "string", "status": "string", "priority": 0 }
   ```
 
-  `priority` is an integer (Clarion's `IssueDetail.priority: i64`).
+  `priority` is an integer (Loomweave's `IssueDetail.priority: i64`).
 - **`404`** — the issue, or the whole route, is absent. Treated as the enrich-only
   degrade signal (`Ok(None)` → `issue: null`), **not** an error.
 - **Any other non-`2xx`** — surfaced as a client error; the enrichment for that
@@ -1339,34 +1339,34 @@ GET {filigree_base}/api/loom/issues/{issue_id}
 
 There is no normative fixture for this route yet; the shape above is the
 contract. The `parse_issue_detail_response` shape test in
-[`filigree.rs`](../../crates/clarion-mcp/src/filigree.rs) is the executable
+[`filigree.rs`](../../crates/loomweave-mcp/src/filigree.rs) is the executable
 check.
 
 ## Consumed Filigree routes: Wardline findings (Flow B read-time reconciliation)
 
 Flow B (read-time Wardline finding reconciliation) consumes two existing Filigree
-*loom* read routes — no new route is requested. Both are enrich-only: if either
+*weft* read routes — no new route is requested. Both are enrich-only: if either
 is unreachable the `wardline_findings` section degrades to
-`result_kind: "unavailable"` and the tool returns normally (loom.md §5).
+`result_kind: "unavailable"` and the tool returns normally (weft.md §5).
 
-1. `GET {filigree_base}/api/loom/files?scan_source=wardline&path_prefix=<rel-path>` →
-   a list envelope `{items, has_more}`. Clarion takes the item whose `path` is
-   byte-exact (the filter is a prefix query; Clarion performs the exact-match
+1. `GET {filigree_base}/api/weft/files?scan_source=wardline&path_prefix=<rel-path>` →
+   a list envelope `{items, has_more}`. Loomweave takes the item whose `path` is
+   byte-exact (the filter is a prefix query; Loomweave performs the exact-match
    itself to get Filigree's `file_id`).
-2. `GET {filigree_base}/api/loom/findings?scan_source=wardline&file_id=<file_id>` →
-   a list envelope `{items, has_more}`. Clarion reads `rule_id`, `message`,
+2. `GET {filigree_base}/api/weft/findings?scan_source=wardline&file_id=<file_id>` →
+   a list envelope `{items, has_more}`. Loomweave reads `rule_id`, `message`,
    `severity`, `status`, `line_start`/`line_end`, `fingerprint`, and `metadata`
    (the reconciliation key is `metadata.wardline.qualname`). Unknown fields are
    ignored so Filigree may grow the row without breaking this consumer.
 
-Clarion reads only the first page of each list response (it does not follow
+Loomweave reads only the first page of each list response (it does not follow
 `has_more`); for a single source file the expected file/finding volume fits one
 Filigree page. Multi-page following is a documented v1 limitation. **In both
 hops, a truncated first page fails closed rather than returning a partial
 view:**
 
 - Hop-1: if the prefix query returns a page that does not contain the
-  exact-path match **and** `has_more` is true, Clarion cannot conclude the file
+  exact-path match **and** `has_more` is true, Loomweave cannot conclude the file
   is absent — the match may be on a later page.
 - Hop-2: if the findings page for the resolved `file_id` reports `has_more`,
   the first page is an incomplete enumeration of the file's findings.
@@ -1384,8 +1384,8 @@ non-matching qualname is not surfaced (dropped); findings carrying no
 `metadata.wardline.qualname` are counted in `omitted_no_qualname`. `heuristic`
 is reserved but never returned in v1.1 (`wardline_reconcile.rs`).
 
-Flow B does not use `POST /api/v1/files:resolve`; it uses the two `loom` GET
-routes above (`POST /api/v1/files:resolve` is a route Clarion *exposes*, not
+Flow B does not use `POST /api/v1/files:resolve`; it uses the two `weft` GET
+routes above (`POST /api/v1/files:resolve` is a route Loomweave *exposes*, not
 one it consumes — see [`POST /api/v1/files:resolve`](#post-apiv1filesresolve)).
 
 The section is surfaced under `result.wardline_findings` in `issues_for` and as
@@ -1394,29 +1394,29 @@ a top-level field of the orientation pack.
 **Verification scope.** There is no normative wire fixture for these routes —
 the prose above is the contract. Executable checks:
 
-- `loom_files_url` / `loom_findings_url` / `parse_wardline_findings_response`
+- `weft_files_url` / `weft_findings_url` / `parse_wardline_findings_response`
   / `wardline_findings_for_path_does_two_hops_and_exact_path_filter` in
-  [`filigree.rs`](../../crates/clarion-mcp/src/filigree.rs) pin the URL shape,
+  [`filigree.rs`](../../crates/loomweave-mcp/src/filigree.rs) pin the URL shape,
   response parsing, and exact-path-filter logic.
 - `reconcile_for_entity` tests in
-  [`wardline_reconcile.rs`](../../crates/clarion-mcp/src/wardline_reconcile.rs)
+  [`wardline_reconcile.rs`](../../crates/loomweave-mcp/src/wardline_reconcile.rs)
   pin the exact-tier match and the omitted-no-qualname count.
 - `issues_for_attaches_exact_wardline_findings` and
   `orientation_pack_includes_wardline_findings` in
-  [`storage_tools.rs`](../../crates/clarion-mcp/tests/storage_tools.rs) pin
+  [`storage_tools.rs`](../../crates/loomweave-mcp/tests/storage_tools.rs) pin
   the end-to-end section attachment and the `result_kind: "unavailable"` degrade.
 
 ## Consumed Filigree route: scan-results intake (finding emission)
 
-This pins the Filigree route Clarion *consumes* to emit findings — WP9-B,
-REQ-FINDING-03, ADR-004. `clarion analyze` Phase 8 POSTs this run's persisted
+This pins the Filigree route Loomweave *consumes* to emit findings — WP9-B,
+REQ-FINDING-03, ADR-004. `loomweave analyze` Phase 8 POSTs this run's persisted
 findings on completion via
-[`FiligreeHttpClient::post_scan_results`](../../crates/clarion-mcp/src/filigree.rs).
+[`FiligreeHttpClient::post_scan_results`](../../crates/loomweave-mcp/src/filigree.rs).
 It is *enrich-only*: emission is gated behind
 `integrations.filigree.{enabled,emit_findings}` (both default `false`), and any
 failure — Filigree down, transport error, build error — is recorded in
-`stats.json` and logged as `CLA-INFRA-FILIGREE-UNREACHABLE`, never propagated.
-The analyze run never fails because a sibling is unreachable (loom.md §5).
+`stats.json` and logged as `LMWV-INFRA-FILIGREE-UNREACHABLE`, never propagated.
+The analyze run never fails because a sibling is unreachable (weft.md §5).
 
 ```text
 POST {filigree_base}/api/v1/scan-results
@@ -1424,16 +1424,16 @@ POST {filigree_base}/api/v1/scan-results
 
 - **Request headers:** `content-type: application/json`;
   `x-filigree-actor: <actor>` when configured; `Authorization: Bearer <token>`
-  when a bearer token is configured. (HMAC is inbound-only, on Clarion's own
+  when a bearer token is configured. (HMAC is inbound-only, on Loomweave's own
   exposed routes; this outbound POST uses bearer.)
 - **Request body** — only the keys below are sent. Filigree silently drops any
-  top-level finding key outside its enumerated set, so Clarion's richer fields
-  nest under `metadata` and the Clarion-owned `metadata.clarion.*` slot (ADR-004,
+  top-level finding key outside its enumerated set, so Loomweave's richer fields
+  nest under `metadata` and the Loomweave-owned `metadata.loomweave.*` slot (ADR-004,
   detailed-design §7) where verbatim preservation is verified:
 
   ```json
   {
-    "scan_source": "clarion",
+    "scan_source": "loomweave",
     "scan_run_id": "<run_id>",
     "mark_unseen": true,
     "create_observations": false,
@@ -1441,7 +1441,7 @@ POST {filigree_base}/api/v1/scan-results
     "findings": [
       {
         "path": "src/auth/tokens.py",
-        "rule_id": "CLA-PY-STRUCTURE-001",
+        "rule_id": "LMWV-PY-STRUCTURE-001",
         "message": "Circular import detected",
         "severity": "medium",
         "line_start": 12,
@@ -1450,7 +1450,7 @@ POST {filigree_base}/api/v1/scan-results
           "kind": "defect",
           "confidence": 0.95,
           "confidence_basis": "ast_match",
-          "clarion": {
+          "loomweave": {
             "entity_id": "python:class:auth.tokens::TokenManager",
             "related_entities": ["python:class:auth.sessions::SessionStore"],
             "supports": [],
@@ -1464,9 +1464,9 @@ POST {filigree_base}/api/v1/scan-results
   }
   ```
 
-  - `scan_source` is always `"clarion"`; it is part of Filigree's dedup key, so
+  - `scan_source` is always `"loomweave"`; it is part of Filigree's dedup key, so
     it is stable across runs.
-  - `scan_run_id` carries Clarion's `run_id`. It is omitted entirely when unset;
+  - `scan_run_id` carries Loomweave's `run_id`. It is omitted entirely when unset;
     an unknown id is tolerated by Filigree (it ingests the findings and
     reconstructs the run in history), which is how REQ-FINDING-05's wire shape
     ships without a pre-create handshake. **This tolerate-unknown behavior is
@@ -1474,17 +1474,17 @@ POST {filigree_base}/api/v1/scan-results
     recorded in Filigree's `docs/federation/contracts.md` §F6 and pinned by
     `tests/api/test_files_api.py::TestUnknownScanRunIdContract`). There is no
     `POST /api/.../scan-runs` create endpoint — only read-only
-    `GET /api/scan-runs` history — and Clarion emits no Phase-0 create call.
-    Three intake obligations Clarion honors against this contract:
-    (1) `run_id` is globally unique across producers — Clarion defaults it to a
-    UUIDv4 (`clarion-cli` `analyze.rs`), since Filigree keys on the id alone and
+    `GET /api/scan-runs` history — and Loomweave emits no Phase-0 create call.
+    Three intake obligations Loomweave honors against this contract:
+    (1) `run_id` is globally unique across producers — Loomweave defaults it to a
+    UUIDv4 (`loomweave-cli` `analyze.rs`), since Filigree keys on the id alone and
     a collision either rejects (`VALIDATION`, different `scan_source`) or
     silently misattributes (same `scan_source`); (2) `scan_source` stays stable
-    across a run (always `"clarion"`, per the bullet above), since history
+    across a run (always `"loomweave"`, per the bullet above), since history
     groups on `(scan_run_id, scan_source)`; (3) with `complete_scan_run=true`
     an unknown run cannot be marked completed, so the response `warnings[]`
     carries a benign `"Scan run <id> status not updated to 'completed': …"` —
-    Clarion switches on HTTP status + stats counts and never treats a populated
+    Loomweave switches on HTTP status + stats counts and never treats a populated
     `warnings[]` as failure.
   - `mark_unseen` is `true` for a normal full run (old-position findings for the
     same rule/file transition to `unseen_in_latest`); a `--resume RUN_ID` run
@@ -1510,13 +1510,13 @@ POST {filigree_base}/api/v1/scan-results
     meaningful only after normal `mark_unseen=true` runs. The emitted
     `mark_unseen` value is recorded in the run's `stats.json` `filigree_emission`
     block.
-  - `create_observations` is always `false` — Clarion emits findings, not
+  - `create_observations` is always `false` — Loomweave emits findings, not
     observations.
-  - `severity` is the **wire** vocabulary, mapped from Clarion's internal value:
+  - `severity` is the **wire** vocabulary, mapped from Loomweave's internal value:
     `CRITICAL→critical`, `ERROR→high`, `WARN→medium`, everything else
     (`INFO`, `NONE`, unknown) `→info`. This mirrors Filigree's own server-side
     coercion but is done client-side so the original survives under
-    `metadata.clarion.internal_severity`.
+    `metadata.loomweave.internal_severity`.
   - `line_start` / `line_end` are omitted when the anchor entity has no line
     range. A finding whose anchor entity has **no `path`** is skipped (and
     counted in `stats.json` as `skipped_no_path`); Filigree rejects path-less
@@ -1525,10 +1525,10 @@ POST {filigree_base}/api/v1/scan-results
     batch (above) carries tier facts anchored to a synthetic subsystem entity,
     which has no `source_file_path`. Rather than dropping them, that pass anchors
     them to the **project-root** `path` (the same stand-in the `core:project:*`
-    `CLA-INFRA-*` findings use) and sets `metadata.clarion.synthetic_anchor=true`;
+    `LMWV-INFRA-*` findings use) and sets `metadata.loomweave.synthetic_anchor=true`;
     such findings carry no `line_start`/`line_end`. A consumer must treat the
     `path` of a `synthetic_anchor` finding as a placeholder for a non-file entity
-    (the real subject is `metadata.clarion.entity_id`), never as a source
+    (the real subject is `metadata.loomweave.entity_id`), never as a source
     location. The during-run Phase-8 batch supplies no fallback, so a path-less
     during-run finding (e.g. the weak-modularity subsystem fact) is still skipped.
   - **briefing-blocked exclusion:** findings anchored to a `briefing_blocked`
@@ -1555,18 +1555,18 @@ POST {filigree_base}/api/v1/scan-results
   ```
 
 - **Any non-`2xx`** — surfaced as a transport/HTTP error, folded into the
-  `filigree_emission` stats blob and the `CLA-INFRA-FILIGREE-UNREACHABLE` log;
+  `filigree_emission` stats blob and the `LMWV-INFRA-FILIGREE-UNREACHABLE` log;
   the analyze run still completes successfully.
 
 There is no normative fixture for this route yet; the shapes above are the
 contract. The `request_serializes_to_filigree_wire_shape` and
 `parses_live_response_shape` tests in
-[`scan_results.rs`](../../crates/clarion-mcp/src/scan_results.rs) — the latter
+[`scan_results.rs`](../../crates/loomweave-mcp/src/scan_results.rs) — the latter
 pinned to a real captured Filigree response — are the executable checks.
 
 **Verification scope.** CI exercises the emitter against a *mock* HTTP server
 (`post_scan_results_sends_batch_and_parses_response` in
-[`filigree.rs`](../../crates/clarion-mcp/src/filigree.rs)), and the
+[`filigree.rs`](../../crates/loomweave-mcp/src/filigree.rs)), and the
 `analyze`-level test asserts the enrich-only degrade when Filigree is
 unreachable. The wire shapes pinned above were captured from a **one-time live
 probe** against a running Filigree intake (the source of the `severity`
@@ -1577,12 +1577,12 @@ changes.
 
 ## Consumed Filigree route: clean-stale retention (`--prune-unseen`)
 
-`clarion analyze --prune-unseen` asks Filigree to run a retention sweep over its
-own findings (REQ-FINDING-06). This is a **loom-generation** route, distinct
+`loomweave analyze --prune-unseen` asks Filigree to run a retention sweep over its
+own findings (REQ-FINDING-06). This is a **weft-generation** route, distinct
 from the classic `/api/v1/scan-results` emission intake.
 
 ```
-POST {filigree_base}/api/loom/findings/clean-stale
+POST {filigree_base}/api/weft/findings/clean-stale
 ```
 
 - **Headers** — `accept: application/json`, optional `x-filigree-actor` and
@@ -1592,20 +1592,20 @@ POST {filigree_base}/api/loom/findings/clean-stale
 
   ```json
   {
-    "scan_source": "clarion",
+    "scan_source": "loomweave",
     "older_than_days": 30,
-    "actor": "clarion-mcp"
+    "actor": "loomweave-mcp"
   }
   ```
 
   - `scan_source` is **required** server-side as an accident-guard (Filigree's
     core treats absent as "all sources", which the route refuses to expose).
-    Clarion always sends `"clarion"`, so the sweep can only touch Clarion's
+    Loomweave always sends `"loomweave"`, so the sweep can only touch Loomweave's
     findings — it can never affect Wardline's or any other tool's.
   - `older_than_days` comes from `integrations.filigree.prune_unseen_days`
     (default 30); a non-negative integer. `0` sweeps the whole current unseen
     backlog.
-  - `actor` is Clarion's configured actor, for Filigree's audit trail.
+  - `actor` is Loomweave's configured actor, for Filigree's audit trail.
 
 - **Semantics — soft-archive, not delete.** Filigree moves its
   `unseen_in_latest` findings older than the threshold to `fixed` status
@@ -1618,22 +1618,22 @@ POST {filigree_base}/api/loom/findings/clean-stale
   defaulted:
 
   ```json
-  { "findings_fixed": 4, "scan_source": "clarion", "older_than_days": 30 }
+  { "findings_fixed": 4, "scan_source": "loomweave", "older_than_days": 30 }
   ```
 
 - **Enrich-only.** The sweep runs after emission (Phase 8b) for the same
   non-hard-failed outcomes. A Filigree outage, a non-`2xx`, or the integration
   being disabled is recorded in the `filigree_prune` stats blob (status
-  `unreachable` / `skipped`) and the `CLA-INFRA-FILIGREE-UNREACHABLE` log — the
+  `unreachable` / `skipped`) and the `LMWV-INFRA-FILIGREE-UNREACHABLE` log — the
   analyze run still completes successfully. Prune keys on `unseen_in_latest`,
   which only `mark_unseen=true` (normal) runs create; a `--resume`
   (`mark_unseen=false`) run produces no unseen state for prune to sweep.
 
 **Verification scope.** Same posture as the emission intake: the wire shape is
 checked by `clean_stale_*` unit tests in
-[`scan_results.rs`](../../crates/clarion-mcp/src/scan_results.rs) and exercised
+[`scan_results.rs`](../../crates/loomweave-mcp/src/scan_results.rs) and exercised
 end-to-end against a *mock* Filigree (`analyze_prune_unseen_*` in
-[`analyze.rs`](../../crates/clarion-cli/tests/analyze.rs), covering the
+[`analyze.rs`](../../crates/loomweave-cli/tests/analyze.rs), covering the
 post-after-emission path, the unreachable degrade, and the disabled no-op). The
 route shape was read from Filigree's own handler + API tests; there is **no
 recurring end-to-end test against a live Filigree**.

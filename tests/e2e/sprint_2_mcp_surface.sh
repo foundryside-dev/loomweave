@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Sprint 2 B.6 MCP-surface end-to-end test.
 #
-# Builds a real demo Clarion database through `clarion analyze`, starts
-# `clarion serve`, and sends Content-Length framed MCP JSON-RPC requests for
+# Builds a real demo Loomweave database through `loomweave analyze`, starts
+# `loomweave serve`, and sends Content-Length framed MCP JSON-RPC requests for
 # the MCP navigation tools. Filigree is represented by a local HTTP
 # server that implements the B.7 reverse entity-association route.
 
@@ -18,22 +18,22 @@ fail() { printf '[mcp-surface] FAIL: %s\n' "$*" >&2; exit 1; }
 cd "$REPO_ROOT"
 
 if [ "$CARGO_BUILD" = "1" ]; then
-    log "building clarion (release) ..."
+    log "building loomweave (release) ..."
     cargo build --workspace --release
 fi
-CLARION_BIN="$REPO_ROOT/target/release/clarion"
-[ -x "$CLARION_BIN" ] || fail "clarion binary missing at $CLARION_BIN"
+LOOMWEAVE_BIN="$REPO_ROOT/target/release/loomweave"
+[ -x "$LOOMWEAVE_BIN" ] || fail "loomweave binary missing at $LOOMWEAVE_BIN"
 
 if [ ! -d "$VENV" ]; then
     log "creating venv at $VENV ..."
     python3 -m venv "$VENV"
 fi
-log "installing clarion-plugin-python (editable) ..."
+log "installing loomweave-plugin-python (editable) ..."
 "$VENV/bin/pip" install --quiet -e "$REPO_ROOT/plugins/python[dev]"
-PLUGIN_BIN="$VENV/bin/clarion-plugin-python"
-[ -x "$PLUGIN_BIN" ] || fail "clarion-plugin-python missing at $PLUGIN_BIN"
+PLUGIN_BIN="$VENV/bin/loomweave-plugin-python"
+[ -x "$PLUGIN_BIN" ] || fail "loomweave-plugin-python missing at $PLUGIN_BIN"
 
-DEMO_DIR="$(mktemp -d -t clarion-mcp-demo-XXXXXX)"
+DEMO_DIR="$(mktemp -d -t loomweave-mcp-demo-XXXXXX)"
 trap 'rm -rf "$DEMO_DIR"' EXIT
 log "scratch project: $DEMO_DIR"
 cd "$DEMO_DIR"
@@ -63,15 +63,15 @@ PY
 
 export PATH="$REPO_ROOT/target/release:$VENV/bin:$PATH"
 
-log "running: clarion install"
-clarion install
-[ -f "$DEMO_DIR/.clarion/clarion.db" ] || fail ".clarion/clarion.db not created"
+log "running: loomweave install"
+loomweave install
+[ -f "$DEMO_DIR/.loomweave/loomweave.db" ] || fail ".loomweave/loomweave.db not created"
 
-log "running: clarion analyze ."
-clarion analyze .
+log "running: loomweave analyze ."
+loomweave analyze .
 
 log "driving MCP stdio requests ..."
-python3 - "$CLARION_BIN" "$DEMO_DIR" <<'PY'
+python3 - "$LOOMWEAVE_BIN" "$DEMO_DIR" <<'PY'
 import json
 import sqlite3
 import subprocess
@@ -81,7 +81,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-clarion_bin = Path(sys.argv[1])
+loomweave_bin = Path(sys.argv[1])
 project_dir = Path(sys.argv[2])
 
 
@@ -119,7 +119,7 @@ def assert_tool_ok(response: dict[str, object]) -> dict[str, object]:
     return envelope
 
 
-conn = sqlite3.connect(project_dir / ".clarion" / "clarion.db")
+conn = sqlite3.connect(project_dir / ".loomweave" / "loomweave.db")
 world_hash = conn.execute(
     "SELECT content_hash FROM entities WHERE id = ?",
     ("python:function:demo.world",),
@@ -145,7 +145,7 @@ world_source = Path(world_entity[3]).read_text(encoding="utf-8")
 world_lines = world_source.splitlines(keepends=True)
 world_excerpt = "".join(world_lines[int(world_entity[4]) - 1 : int(world_entity[5])])
 world_prompt = (
-    "You are summarising one Clarion entity at leaf scope only.\n"
+    "You are summarising one Loomweave entity at leaf scope only.\n"
     f"Entity id: {world_entity[0]}\n"
     f"Kind: {world_entity[1]}\n"
     f"Name: {world_entity[2]}\n"
@@ -180,7 +180,7 @@ recording_fixture = [
         },
     }
 ]
-(project_dir / ".clarion" / "openrouter-recording.json").write_text(
+(project_dir / ".loomweave" / "openrouter-recording.json").write_text(
     json.dumps(recording_fixture, separators=(",", ":")),
     encoding="utf-8",
 )
@@ -199,7 +199,7 @@ class FiligreeHandler(BaseHTTPRequestHandler):
                 associations.append(
                     {
                         "issue_id": "filigree-world",
-                        "clarion_entity_id": entity_id,
+                        "loomweave_entity_id": entity_id,
                         "content_hash_at_attach": world_hash,
                         "attached_at": "2026-05-17T00:00:00.000Z",
                         "attached_by": "codex",
@@ -209,14 +209,14 @@ class FiligreeHandler(BaseHTTPRequestHandler):
                 associations.append(
                     {
                         "issue_id": "filigree-hello-drifted",
-                        "clarion_entity_id": entity_id,
+                        "loomweave_entity_id": entity_id,
                         "content_hash_at_attach": "old-hash",
                         "attached_at": "2026-05-17T00:00:00.000Z",
                         "attached_by": "codex",
                     }
                 )
             body = json.dumps({"associations": associations}).encode("utf-8")
-        elif parsed.path == "/api/loom/files":
+        elif parsed.path == "/api/weft/files":
             path_prefix = query.get("path_prefix", [""])[0]
             items = []
             if query.get("scan_source", [""])[0] == "wardline" and path_prefix == "demo.py":
@@ -229,7 +229,7 @@ class FiligreeHandler(BaseHTTPRequestHandler):
                     }
                 ]
             body = json.dumps({"items": items, "has_more": False}).encode("utf-8")
-        elif parsed.path == "/api/loom/findings":
+        elif parsed.path == "/api/weft/findings":
             body = json.dumps({"items": [], "has_more": False}).encode("utf-8")
         else:
             self.send_error(404)
@@ -247,7 +247,7 @@ class FiligreeHandler(BaseHTTPRequestHandler):
 filigree_server = ThreadingHTTPServer(("127.0.0.1", 0), FiligreeHandler)
 filigree_thread = threading.Thread(target=filigree_server.serve_forever, daemon=True)
 filigree_thread.start()
-(project_dir / "clarion.yaml").write_text(
+(project_dir / "loomweave.yaml").write_text(
     f"""
 version: 1
 llm_policy:
@@ -255,7 +255,7 @@ llm_policy:
   provider: recording
   model_id: anthropic/claude-sonnet-4.6
   session_token_ceiling: 1000000
-  recording_fixture_path: .clarion/openrouter-recording.json
+  recording_fixture_path: .loomweave/openrouter-recording.json
 serve:
   mcp:
     enable_write_tools: true
@@ -263,7 +263,7 @@ integrations:
   filigree:
     enabled: true
     base_url: http://127.0.0.1:{filigree_server.server_port}
-    actor: clarion-e2e
+    actor: loomweave-e2e
     token_env: FILIGREE_API_TOKEN
     timeout_seconds: 2
 """.lstrip(),
@@ -271,7 +271,7 @@ integrations:
 )
 
 proc = subprocess.Popen(
-    [str(clarion_bin), "serve", "--path", str(project_dir)],
+    [str(loomweave_bin), "serve", "--path", str(project_dir)],
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
@@ -290,7 +290,7 @@ requests: list[tuple[str, dict[str, object]]] = [
             "params": {
                 "protocolVersion": "2025-11-25",
                 "capabilities": {},
-                "clientInfo": {"name": "clarion-e2e", "version": "0.0.0"},
+                "clientInfo": {"name": "loomweave-e2e", "version": "0.0.0"},
             },
         },
     ),
@@ -418,7 +418,7 @@ requests: list[tuple[str, dict[str, object]]] = [
             "jsonrpc": "2.0",
             "id": "context",
             "method": "resources/read",
-            "params": {"uri": "clarion://context"},
+            "params": {"uri": "loomweave://context"},
         },
     ),
 ]
@@ -436,11 +436,11 @@ finally:
     stderr = proc.stderr.read().decode("utf-8", "replace")
     filigree_server.shutdown()
     filigree_server.server_close()
-    assert status == 0, f"clarion serve exited {status}; stderr={stderr}"
+    assert status == 0, f"loomweave serve exited {status}; stderr={stderr}"
 
 assert responses["initialize"]["result"]["protocolVersion"] == "2025-11-25"
 init_result = responses["initialize"]["result"]
-assert "clarion-workflow" in init_result["instructions"], init_result.get("instructions")
+assert "loomweave-workflow" in init_result["instructions"], init_result.get("instructions")
 assert isinstance(init_result["capabilities"]["resources"], dict), init_result["capabilities"]
 assert isinstance(init_result["capabilities"]["prompts"], dict), init_result["capabilities"]
 tools = responses["tools"]["result"]["tools"]
