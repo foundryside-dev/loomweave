@@ -244,7 +244,16 @@ where
         .map(|raw| raw.trim().to_owned())
         .filter(|trimmed| !trimmed.is_empty())
         .map(Arc::new);
-    let bind = config.bind;
+    // ADR-044: an unset bind means auto-select a per-project deterministic
+    // read-API port. An explicit bind is honored verbatim. (Task 3 adds the
+    // ephemeral fallback + published-file lifecycle.)
+    let auto_port = config.bind.is_none();
+    let bind = config.bind.unwrap_or_else(|| {
+        std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            loomweave_federation::loomweave_port::deterministic_port(&project_root),
+        ))
+    });
     let warn_unauthenticated_non_loopback = config.allow_non_loopback
         && !config.is_loopback_bind()
         && auth_token.is_none()
@@ -272,6 +281,7 @@ where
                 auth_token_thread,
                 identity_secret_thread,
                 bind,
+                auto_port,
                 shutdown_rx,
                 ready_tx,
             );
@@ -327,6 +337,8 @@ fn run_http_read_server(
     auth_token: Option<Arc<String>>,
     identity_secret: Option<Arc<String>>,
     bind: std::net::SocketAddr,
+    // ADR-044 Task 3 will consume this to drive the ephemeral fallback + publish.
+    _auto_port: bool,
     shutdown_rx: oneshot::Receiver<()>,
     ready_tx: mpsc::Sender<Result<HttpReadReady>>,
 ) -> Result<()> {
@@ -836,7 +848,7 @@ mod tests {
 
             let config = HttpReadConfig {
                 enabled: true,
-                bind,
+                bind: Some(bind),
                 allow_non_loopback: false,
                 token_env: "LOOMWEAVE_LOOPBACK_NO_TOKEN_TEST_UNSET".to_owned(),
                 identity_token_env: None,
@@ -907,7 +919,7 @@ mod tests {
 
         let config = HttpReadConfig {
             enabled: true,
-            bind,
+            bind: Some(bind),
             allow_non_loopback: false,
             wardline_taint_write: true,
             ..HttpReadConfig::default()
@@ -963,7 +975,7 @@ mod tests {
 
         let config = HttpReadConfig {
             enabled: true,
-            bind,
+            bind: Some(bind),
             allow_non_loopback: false,
             ..HttpReadConfig::default()
         };

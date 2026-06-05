@@ -295,8 +295,8 @@ pub struct McpServeConfig {
 #[serde(default)]
 pub struct HttpReadConfig {
     pub enabled: bool,
-    #[serde(deserialize_with = "deserialize_socket_addr")]
-    pub bind: SocketAddr,
+    #[serde(default, deserialize_with = "deserialize_optional_socket_addr")]
+    pub bind: Option<SocketAddr>,
     pub allow_non_loopback: bool,
     /// Name of the env var holding the inbound bearer token. When the env
     /// var is set, every `/api/v1/files`-family request must carry
@@ -323,7 +323,7 @@ impl Default for HttpReadConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            bind: SocketAddr::from(([127, 0, 0, 1], 9111)),
+            bind: None,
             allow_non_loopback: false,
             token_env: "WEFT_TOKEN".to_owned(),
             identity_token_env: None,
@@ -333,11 +333,19 @@ impl Default for HttpReadConfig {
 }
 
 impl HttpReadConfig {
+    /// # Panics
+    ///
+    /// This function cannot panic in practice: the `.expect` is only reached
+    /// when `is_loopback_bind()` is `false`, which only occurs when
+    /// `self.bind` is `Some(non-loopback addr)`.
     pub fn validate_loopback_trust(&self) -> Result<(), ConfigError> {
         if self.enabled && !self.allow_non_loopback && !self.is_loopback_bind() {
             return Err(ConfigError::NonLoopbackHttpBind {
                 code: "LMWV-CONFIG-HTTP-NON-LOOPBACK",
-                bind: self.bind,
+                // Safe: is_loopback_bind() is false only when bind is Some(non-loopback).
+                bind: self
+                    .bind
+                    .expect("non-loopback bind implies an explicit address"),
             });
         }
         Ok(())
@@ -347,6 +355,12 @@ impl HttpReadConfig {
     /// token env var is unset. Loopback binds with the env var unset stay
     /// unauthenticated (v0.1 trust matrix); the failure case is the explicit
     /// `allow_non_loopback: true` opt-in plus an unset `token_env`.
+    ///
+    /// # Panics
+    ///
+    /// This function cannot panic in practice: the `.expect` is only reached
+    /// when `is_loopback_bind()` is `false`, which only occurs when
+    /// `self.bind` is `Some(non-loopback addr)`.
     pub fn validate_auth_trust<F>(&self, env_lookup: F) -> Result<(), ConfigError>
     where
         F: Fn(&str) -> Option<String>,
@@ -383,24 +397,31 @@ impl HttpReadConfig {
         }
         Err(ConfigError::NonLoopbackHttpNoAuth {
             code: "LMWV-CONFIG-HTTP-NO-AUTH",
-            bind: self.bind,
+            bind: self
+                .bind
+                .expect("non-loopback bind implies an explicit address"),
             token_env: self.token_env.clone(),
         })
     }
 
+    /// `None` (auto-select) always binds `127.0.0.1`, so it is loopback.
     #[must_use]
     pub fn is_loopback_bind(&self) -> bool {
-        self.bind.ip().is_loopback()
+        self.bind.is_none_or(|addr| addr.ip().is_loopback())
     }
 }
 
-fn deserialize_socket_addr<'de, D>(deserializer: D) -> Result<SocketAddr, D::Error>
+fn deserialize_optional_socket_addr<'de, D>(deserializer: D) -> Result<Option<SocketAddr>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let raw = String::deserialize(deserializer)?;
-    raw.parse()
-        .map_err(|err| serde::de::Error::custom(format!("invalid serve.http.bind {raw:?}: {err}")))
+    let raw = Option::<String>::deserialize(deserializer)?;
+    match raw {
+        None => Ok(None),
+        Some(raw) => raw.parse().map(Some).map_err(|err| {
+            serde::de::Error::custom(format!("invalid serve.http.bind {raw:?}: {err}"))
+        }),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -899,7 +920,10 @@ serve:
         )
         .expect("parse HTTP bind");
 
-        assert_eq!(cfg.serve.http.bind, SocketAddr::from(([127, 0, 0, 1], 0)));
+        assert_eq!(
+            cfg.serve.http.bind,
+            Some(SocketAddr::from(([127, 0, 0, 1], 0)))
+        );
     }
 
     #[test]
@@ -1064,6 +1088,38 @@ serve:
         assert!(
             err.to_string().contains("invalid serve.http.bind"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn http_bind_defaults_to_none_auto_select() {
+        // ADR-044: the installer no longer pins a port; an unset bind means
+        // "auto-select a per-project deterministic port and publish it".
+        assert_eq!(HttpReadConfig::default().bind, None);
+    }
+
+    #[test]
+    fn http_bind_none_is_treated_as_loopback() {
+        // Auto-select always binds 127.0.0.1, so an absent bind is loopback and
+        // must satisfy the loopback-trust gate without allow_non_loopback.
+        let cfg = HttpReadConfig {
+            enabled: true,
+            bind: None,
+            ..HttpReadConfig::default()
+        };
+        assert!(cfg.is_loopback_bind());
+        assert!(cfg.validate_loopback_trust().is_ok());
+    }
+
+    #[test]
+    fn http_explicit_bind_still_parses() {
+        let cfg = McpConfig::from_yaml_str(
+            "serve:\n  http:\n    enabled: true\n    bind: \"127.0.0.1:9412\"\n",
+        )
+        .expect("parse explicit bind");
+        assert_eq!(
+            cfg.serve.http.bind,
+            Some(SocketAddr::from(([127, 0, 0, 1], 9412)))
         );
     }
 
