@@ -45,12 +45,71 @@ struct DirtyEntry {
     rel_path: String,
 }
 
+/// Build a constrained `git` invocation for read-only freshness checks.
+///
+/// `index_diff` may be pointed at arbitrary project directories. Even without
+/// a shell, Git honors repository-local configuration; notably, `git status`
+/// can execute a `core.fsmonitor` helper from `.git/config`. Override that
+/// execution-capable knob on every invocation so a freshness query remains
+/// read-only for attacker-prepared worktrees.
+fn git_command(project_root: &Path) -> Command {
+    let mut command = Command::new("git");
+    sanitize_git_environment(&mut command);
+    command
+        .arg("-C")
+        .arg(project_root)
+        .args(["-c", "core.fsmonitor=false"])
+        .args(["-c", "core.untrackedCache=false"]);
+    command
+}
+
+fn sanitize_git_environment(command: &mut Command) {
+    const GIT_ENV_KEYS: &[&str] = &[
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_WORK_TREE",
+    ];
+
+    for key in GIT_ENV_KEYS {
+        command.env_remove(key);
+    }
+    for (key, _) in std::env::vars_os() {
+        let key = key.to_string_lossy();
+        if key.starts_with("GIT_CONFIG_KEY_") || key.starts_with("GIT_CONFIG_VALUE_") {
+            command.env_remove(key.as_ref());
+        }
+    }
+
+    // Keep system/global config out of this read-only probe. Repository-local
+    // config is still loaded by Git, so the command-line overrides above remain
+    // the critical protection against `.git/config` fsmonitor helpers.
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null_device())
+        .env("GIT_CONFIG_SYSTEM", null_device());
+}
+
+#[cfg(not(windows))]
+fn null_device() -> &'static str {
+    "/dev/null"
+}
+
+#[cfg(windows)]
+fn null_device() -> &'static str {
+    "NUL"
+}
+
 /// Run `git` read-only against `project_root` and collect HEAD + dirty-tree
 /// facts. Blocking; call from a `spawn_blocking` context.
 pub(crate) fn gather_git_facts(project_root: &Path) -> GitFacts {
-    let inside = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
+    let inside = git_command(project_root)
         .args(["rev-parse", "--is-inside-work-tree"])
         .output();
     let (available, is_repo, reason) = match inside {
@@ -74,12 +133,7 @@ pub(crate) fn gather_git_facts(project_root: &Path) -> GitFacts {
     }
 
     let run = |args: &[&str]| -> Option<String> {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(project_root)
-            .args(args)
-            .output()
-            .ok()?;
+        let out = git_command(project_root).args(args).output().ok()?;
         out.status
             .success()
             .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
@@ -92,9 +146,7 @@ pub(crate) fn gather_git_facts(project_root: &Path) -> GitFacts {
     // Read status raw: porcelain's leading X-column space is significant, so it
     // must NOT be trimmed off the front (the `run` closure trims the whole
     // blob, which would shift every column left and corrupt the path).
-    let dirty = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
+    let dirty = git_command(project_root)
         .args(["status", "--porcelain=v1"])
         .output()
         .ok()
@@ -595,6 +647,66 @@ mod tests {
             }],
             plugin_stats: json!({}),
         }
+    }
+
+    #[cfg(unix)]
+    fn git_ok(project_root: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(project_root)
+            .args(args)
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gather_git_facts_disables_repo_configured_fsmonitor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        if !git_ok(dir.path(), &["init"]) {
+            eprintln!("skipping fsmonitor regression: git init failed");
+            return;
+        }
+
+        let marker = dir.path().join("fsmonitor.marker");
+        let hook = dir.path().join("fsmonitor-poc.sh");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\nprintf executed > {}\n", marker.display()),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&hook).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook, perms).unwrap();
+        assert!(git_ok(
+            dir.path(),
+            &["config", "core.fsmonitor", hook.to_str().unwrap()]
+        ));
+
+        // Prove this Git build/repo setup would execute the configured helper
+        // without the production mitigation, then assert `gather_git_facts` does
+        // not execute it. Older Git builds that do not invoke fsmonitor here are
+        // not useful for this regression and are treated as a no-op environment.
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["status", "--porcelain=v1"])
+            .output();
+        if !marker.exists() {
+            eprintln!("skipping fsmonitor regression: git status did not invoke fsmonitor");
+            return;
+        }
+        std::fs::remove_file(&marker).unwrap();
+
+        let facts = gather_git_facts(dir.path());
+        assert!(facts.available);
+        assert!(facts.is_repo);
+        assert!(
+            !marker.exists(),
+            "gather_git_facts must not execute repo-configured core.fsmonitor"
+        );
     }
 
     #[test]
