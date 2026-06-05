@@ -21,7 +21,6 @@
 //! gate. Only a genuinely broken state — an unparseable config file, or a
 //! `--fix` repair that errors or does not converge — is a problem.
 
-use std::env;
 use std::fs;
 use std::path::Path;
 
@@ -174,7 +173,9 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
             "mcp.registration" | "integration.bindings" => "Run `clarion doctor --fix`.".to_owned(),
             "index.freshness" => "Run `clarion analyze <project>` to refresh the index.".to_owned(),
             "plugin.availability" => {
-                "Install or expose Clarion language plugins on PATH.".to_owned()
+                "Install a Clarion language plugin (the Python plugin ships with `pip install \
+                 clarion`)."
+                    .to_owned()
             }
             _ => format!("Review doctor check `{}`.", check.id),
         })
@@ -220,30 +221,40 @@ fn check_index_freshness_json(project_root: &Path) -> DoctorJsonCheck {
 }
 
 fn check_plugin_availability_json() -> DoctorJsonCheck {
-    let Some(path) = env::var_os("PATH") else {
-        return DoctorJsonCheck::warning("plugin.availability", "PATH is unset");
-    };
-    for dir in env::split_paths(&path) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("clarion-plugin-")
-            {
-                return DoctorJsonCheck::ok(
-                    "plugin.availability",
-                    "at least one clarion-plugin-* executable is visible on PATH",
-                );
-            }
+    // Use the same discovery path as `clarion analyze` (`$PATH` *and* the running
+    // binary's directory), so doctor agrees with analyze about which plugins are
+    // visible. A manual `$PATH`-only scan here would report a co-located
+    // PyPI/venv-installed plugin as missing even though analyze can drive it.
+    let mut ids = Vec::new();
+    let mut errs = Vec::new();
+    for result in clarion_core::plugin::discover() {
+        match result {
+            Ok(plugin) => ids.push(plugin.manifest.plugin.plugin_id),
+            Err(err) => errs.push(err.to_string()),
         }
     }
-    DoctorJsonCheck::warning(
-        "plugin.availability",
-        "no clarion-plugin-* executable is visible on PATH",
-    )
+
+    if !ids.is_empty() {
+        let plural = if ids.len() == 1 { "" } else { "s" };
+        DoctorJsonCheck::ok(
+            "plugin.availability",
+            format!(
+                "{} language plugin{plural} discovered: {}",
+                ids.len(),
+                ids.join(", ")
+            ),
+        )
+    } else if !errs.is_empty() {
+        DoctorJsonCheck::warning(
+            "plugin.availability",
+            format!("plugin discovery reported errors: {}", errs.join("; ")),
+        )
+    } else {
+        DoctorJsonCheck::warning(
+            "plugin.availability",
+            "no clarion language plugin discovered (on PATH or alongside the clarion binary)",
+        )
+    }
 }
 
 fn check_skill_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
