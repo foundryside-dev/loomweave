@@ -539,6 +539,13 @@ def check_release_workflow_governance_gate(repo_root: Path) -> list[str]:
     failures: list[str] = []
     if "release-governance" not in jobs:
         failures.append(f"{workflow}: missing release-governance job")
+    else:
+        governance_needs = release_workflow_needs(jobs["release-governance"])
+        if "verify" not in governance_needs:
+            failures.append(
+                f"{workflow}: release-governance must need verify "
+                "before using release governance secrets"
+            )
 
     for job_name in ("build-rust", "build-plugin"):
         if job_name not in jobs:
@@ -821,6 +828,7 @@ def run_self_test() -> None:
         except CheckError as exc:
             assert "build-rust" in str(exc)
             assert "release-governance" in str(exc)
+            assert "must need verify" in str(exc)
         else:
             raise AssertionError("ungated release-build fixture should fail")
 
@@ -829,6 +837,7 @@ def run_self_test() -> None:
             "  verify:\n"
             "    steps: []\n"
             "  release-governance:\n"
+            "    needs: [verify]\n"
             "    steps: []\n"
             "  build-rust:\n"
             "    needs: [verify, release-governance]\n"

@@ -164,6 +164,7 @@ jobs:
 
   release-governance:
     name: GitHub release governance
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read
