@@ -14,6 +14,13 @@ use serde_json::{Map, Value, json};
 
 const DEFAULT_FILIGREE_BASE_URL: &str = "http://127.0.0.1:8766";
 
+/// ADR-044 migration: older `install --all` runs unconditionally stamped a fixed
+/// `serve.http.bind: 127.0.0.1:9111`. The deterministic read-API band is
+/// `9400–10399`, so this exact literal can only be the old auto-default, never a
+/// deterministic value. We strip it on repair so auto-port + ephemeral fallback
+/// can engage; any other (operator-chosen) bind is left intact.
+const STALE_DEFAULT_BIND: &str = "127.0.0.1:9111";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingState {
     Present,
@@ -124,6 +131,7 @@ fn loomweave_yaml_ok(project_root: &Path, desired: &DesiredBindings) -> Result<b
             .is_some_and(|http| {
                 http.get("enabled").and_then(Value::as_bool) == Some(true)
                     && http.get("wardline_taint_write").and_then(Value::as_bool) == Some(true)
+                    && http.get("bind").and_then(Value::as_str) != Some(STALE_DEFAULT_BIND)
             }))
 }
 
@@ -188,6 +196,12 @@ fn install_loomweave_yaml(project_root: &Path, desired: &DesiredBindings) -> Res
 
     let serve = ensure_object(root, "serve")?;
     let http = ensure_object(serve, "http")?;
+    // ADR-044 migration: strip exactly the old auto-stamped `bind: 127.0.0.1:9111`
+    // so auto-port + ephemeral fallback can engage. A deliberately operator-chosen
+    // bind (any other value) is left intact.
+    if http.get("bind").and_then(Value::as_str) == Some(STALE_DEFAULT_BIND) {
+        http.remove("bind");
+    }
     http.insert("enabled".to_owned(), json!(true));
     http.insert("wardline_taint_write".to_owned(), json!(true));
     write_yaml_if_changed(&path, &value)

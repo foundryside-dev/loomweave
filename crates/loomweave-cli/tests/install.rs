@@ -127,6 +127,49 @@ fn install_all_wires_three_way_integration_bindings() {
     );
 }
 
+/// ADR-044 migration: a project whose `loomweave.yaml` still carries the old
+/// auto-stamped `serve.http.bind: 127.0.0.1:9111` has that exact literal stripped
+/// on re-install, so auto-port + ephemeral fallback engages. A deliberately
+/// operator-chosen bind (any other value) is preserved verbatim.
+#[test]
+fn install_all_strips_stale_default_bind_but_keeps_custom_bind() {
+    // Case 1: the stale auto-default is stripped.
+    let stale = tempfile::tempdir().unwrap();
+    fs::write(
+        stale.path().join("loomweave.yaml"),
+        "version: 1\nserve:\n  http:\n    enabled: true\n    bind: 127.0.0.1:9111\n    wardline_taint_write: true\n",
+    )
+    .unwrap();
+    loomweave_bin()
+        .args(["install", "--all", "--path"])
+        .arg(stale.path())
+        .assert()
+        .success();
+    let stale_yaml = read_yaml(&stale.path().join("loomweave.yaml"));
+    assert!(
+        stale_yaml["serve"]["http"].get("bind").is_none(),
+        "stale 127.0.0.1:9111 bind must be stripped on re-install: {stale_yaml}"
+    );
+
+    // Case 2: a deliberately custom bind is preserved.
+    let custom = tempfile::tempdir().unwrap();
+    fs::write(
+        custom.path().join("loomweave.yaml"),
+        "version: 1\nserve:\n  http:\n    enabled: true\n    bind: 127.0.0.1:9999\n    wardline_taint_write: true\n",
+    )
+    .unwrap();
+    loomweave_bin()
+        .args(["install", "--all", "--path"])
+        .arg(custom.path())
+        .assert()
+        .success();
+    let custom_yaml = read_yaml(&custom.path().join("loomweave.yaml"));
+    assert_eq!(
+        custom_yaml["serve"]["http"]["bind"], "127.0.0.1:9999",
+        "an operator-chosen bind must be preserved: {custom_yaml}"
+    );
+}
+
 #[test]
 fn install_applies_each_migration_exactly_once() {
     let dir = tempfile::tempdir().unwrap();
