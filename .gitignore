@@ -40,6 +40,9 @@ tests/e2e/external-operator-smoke-results-*.md
 # Documentation site build output (mkdocs `site_dir`, web/mkdocs.yml).
 /site-build/
 
+# Wardline scan output written by `wardline scan` (raw, regenerated per run).
+/findings.jsonl
+
 # Filigree-managed docs — a running filigree process rewrites its managed
 # instruction blocks in these every session; untracked to avoid diff churn
 # (filigree regenerates them on demand).

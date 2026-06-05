@@ -36,7 +36,7 @@ llm_policy:
   session_token_ceiling: 1000000
 serve:
   http:
-    bind: 127.0.0.1:9111
+    bind: 127.0.0.1:9112
     enabled: true
     wardline_taint_write: true
 version: 1
