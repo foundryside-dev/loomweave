@@ -1307,6 +1307,85 @@ fn import_ignores_non_json_files() {
 }
 
 #[test]
+fn import_rejects_guidance_id_with_path_separator() {
+    let dst = tempfile::tempdir().unwrap();
+    seed_db(dst.path());
+
+    let import_dir = tempfile::tempdir().unwrap();
+    let malicious = serde_json::json!({
+        "id": "core:guidance:../escaped",
+        "name": "../escaped",
+        "properties": {
+            "content": "escape", "scope_level": "module", "match_rules": [],
+            "authored_at": "2026-01-01T00:00:00.000Z",
+        },
+    });
+    std::fs::write(
+        import_dir.path().join("traverse.json"),
+        serde_json::to_string_pretty(&malicious).unwrap(),
+    )
+    .unwrap();
+
+    let assert = clarion_bin()
+        .args(["guidance", "import"])
+        .args(["--path"])
+        .arg(dst.path())
+        .arg(import_dir.path())
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("traverse.json"),
+        "names the bad file: {stderr}"
+    );
+    assert!(
+        stderr.contains("invalid characters"),
+        "explains the bad id grammar: {stderr}"
+    );
+    assert!(
+        sheet_fields(dst.path(), "core:guidance:../escaped").is_none(),
+        "invalid guidance id is not imported"
+    );
+}
+
+#[test]
+fn export_flattens_legacy_guidance_id_path_separators() {
+    let src = tempfile::tempdir().unwrap();
+    seed_db(src.path());
+    let db_path = src.path().join(".clarion").join("clarion.db");
+    let conn = Connection::open(&db_path).expect("open db");
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
+         created_at, updated_at) VALUES \
+         (?1, 'core', 'guidance', ?2, ?2, ?3, \
+          strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        rusqlite::params![
+            "core:guidance:../escaped",
+            "../escaped",
+            serde_json::json!({
+                "content": "legacy", "scope_level": "module", "match_rules": [],
+                "authored_at": "2026-01-01T00:00:00.000Z",
+            })
+            .to_string()
+        ],
+    )
+    .expect("seed legacy malformed guidance id");
+
+    let parent = tempfile::tempdir().unwrap();
+    let safe_dir = parent.path().join("safe");
+    export_to(src.path(), &safe_dir);
+
+    assert!(
+        safe_dir.join("core__guidance__.._escaped.json").is_file(),
+        "legacy malformed ids are flattened into the requested export directory"
+    );
+    assert!(
+        !parent.path().join("escaped.json").exists(),
+        "export must not traverse to the parent directory"
+    );
+}
+
+#[test]
 fn import_is_partial_but_safe_when_a_later_file_is_malformed() {
     // Import is not atomic across the file set (each upsert is its own txn, files
     // processed in sorted name order). A malformed file aborts loudly, but any

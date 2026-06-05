@@ -347,10 +347,24 @@ pub fn slugify_guidance_name(input: &str) -> String {
 }
 
 fn validate_guidance_id(id: &str) -> Result<()> {
-    if !id.starts_with(GUIDANCE_ID_PREFIX) {
+    let Some(name) = id.strip_prefix(GUIDANCE_ID_PREFIX) else {
         return Err(StorageError::InvalidQuery(format!(
             "guidance sheet id '{id}' is not a guidance id (must start with `{GUIDANCE_ID_PREFIX}`); \
              refusing to write — this would corrupt the entity it names"
+        )));
+    };
+    if name.is_empty() {
+        return Err(StorageError::InvalidQuery(format!(
+            "guidance sheet id '{id}' is missing the guidance name after `{GUIDANCE_ID_PREFIX}`"
+        )));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    {
+        return Err(StorageError::InvalidQuery(format!(
+            "guidance sheet id '{id}' contains invalid characters; guidance names may only contain \
+             ASCII letters, numbers, '.', '-', and '_'"
         )));
     }
     Ok(())
@@ -607,6 +621,8 @@ impl PortableSheet {
                 "guidance sheet {source}: missing or empty `name`"
             )));
         }
+        validate_guidance_id(&sheet.id)
+            .map_err(|e| StorageError::InvalidQuery(format!("guidance sheet {source}: {e}")))?;
         Ok(sheet)
     }
 
@@ -620,10 +636,23 @@ impl PortableSheet {
     /// exactly three colon-joined segments and the segments never contain a bare
     /// colon by construction), so distinct ids never collide after substitution.
     /// We do not need to reverse the filename — the authoritative id lives inside
-    /// the file — so the encoding only has to be injective, not invertible.
+    /// the file — so the encoding only has to be injective for valid guidance ids,
+    /// not invertible. Any unexpected legacy/hand-written separator byte is
+    /// flattened defensively so export can never traverse out of the target
+    /// directory.
     #[must_use]
     pub fn file_name(&self) -> String {
-        format!("{}.json", self.id.replace(':', "__"))
+        let mut stem = String::with_capacity(self.id.len());
+        for byte in self.id.bytes() {
+            match byte {
+                b':' => stem.push_str("__"),
+                b if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_') => {
+                    stem.push(char::from(b));
+                }
+                _ => stem.push('_'),
+            }
+        }
+        format!("{stem}.json")
     }
 }
 
@@ -1158,6 +1187,12 @@ mod tests {
     }
 
     #[test]
+    fn file_name_flattens_legacy_path_separators() {
+        let p = portable_with("core:guidance:../escaped", "../escaped", json!({}));
+        assert_eq!(p.file_name(), "core__guidance__.._escaped.json");
+    }
+
+    #[test]
     fn short_name_is_display_tail() {
         let p = portable_with("core:guidance:a.b.c", "a.b.c", json!({}));
         assert_eq!(p.short_name(), "c");
@@ -1181,5 +1216,29 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("empty.json"), "{err}");
+    }
+
+    #[test]
+    fn from_canonical_json_rejects_non_guidance_id() {
+        let err = PortableSheet::from_canonical_json(
+            "evil.json",
+            r#"{"id":"python:function:auth.tokens.refresh","name":"auth.tokens.refresh","properties":{}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("evil.json"), "{err}");
+        assert!(err.contains("core:guidance:"), "{err}");
+    }
+
+    #[test]
+    fn from_canonical_json_rejects_path_separator_in_id() {
+        let err = PortableSheet::from_canonical_json(
+            "traverse.json",
+            r#"{"id":"core:guidance:../escaped","name":"../escaped","properties":{}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("traverse.json"), "{err}");
+        assert!(err.contains("invalid characters"), "{err}");
     }
 }
