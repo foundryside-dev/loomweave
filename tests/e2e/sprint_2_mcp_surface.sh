@@ -124,6 +124,14 @@ world_hash = conn.execute(
     "SELECT content_hash FROM entities WHERE id = ?",
     ("python:function:demo.world",),
 ).fetchone()[0]
+world_sei = conn.execute(
+    "SELECT sei FROM sei_bindings WHERE current_locator = ? AND status = 'alive'",
+    ("python:function:demo.world",),
+).fetchone()[0]
+hello_sei = conn.execute(
+    "SELECT sei FROM sei_bindings WHERE current_locator = ? AND status = 'alive'",
+    ("python:function:demo.hello",),
+).fetchone()[0]
 world_entity = conn.execute(
     """
     SELECT id, kind, name, source_file_path, source_line_start, source_line_end
@@ -182,33 +190,50 @@ filigree_requests: list[str] = []
 class FiligreeHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path != "/api/entity-associations":
+        query = urllib.parse.parse_qs(parsed.query)
+        if parsed.path == "/api/entity-associations":
+            entity_id = query.get("entity_id", [""])[0]
+            filigree_requests.append(entity_id)
+            associations: list[dict[str, str]] = []
+            if entity_id in {"python:function:demo.world", world_sei}:
+                associations.append(
+                    {
+                        "issue_id": "filigree-world",
+                        "clarion_entity_id": entity_id,
+                        "content_hash_at_attach": world_hash,
+                        "attached_at": "2026-05-17T00:00:00.000Z",
+                        "attached_by": "codex",
+                    }
+                )
+            elif entity_id in {"python:function:demo.hello", hello_sei}:
+                associations.append(
+                    {
+                        "issue_id": "filigree-hello-drifted",
+                        "clarion_entity_id": entity_id,
+                        "content_hash_at_attach": "old-hash",
+                        "attached_at": "2026-05-17T00:00:00.000Z",
+                        "attached_by": "codex",
+                    }
+                )
+            body = json.dumps({"associations": associations}).encode("utf-8")
+        elif parsed.path == "/api/loom/files":
+            path_prefix = query.get("path_prefix", [""])[0]
+            items = []
+            if query.get("scan_source", [""])[0] == "wardline" and path_prefix == "demo.py":
+                items = [
+                    {
+                        "file_id": "wardline-demo-py",
+                        "path": "demo.py",
+                        "language": "python",
+                        "file_type": "source",
+                    }
+                ]
+            body = json.dumps({"items": items, "has_more": False}).encode("utf-8")
+        elif parsed.path == "/api/loom/findings":
+            body = json.dumps({"items": [], "has_more": False}).encode("utf-8")
+        else:
             self.send_error(404)
             return
-        entity_id = urllib.parse.parse_qs(parsed.query).get("entity_id", [""])[0]
-        filigree_requests.append(entity_id)
-        associations: list[dict[str, str]] = []
-        if entity_id == "python:function:demo.world":
-            associations.append(
-                {
-                    "issue_id": "filigree-world",
-                    "clarion_entity_id": entity_id,
-                    "content_hash_at_attach": world_hash,
-                    "attached_at": "2026-05-17T00:00:00.000Z",
-                    "attached_by": "codex",
-                }
-            )
-        elif entity_id == "python:function:demo.hello":
-            associations.append(
-                {
-                    "issue_id": "filigree-hello-drifted",
-                    "clarion_entity_id": entity_id,
-                    "content_hash_at_attach": "old-hash",
-                    "attached_at": "2026-05-17T00:00:00.000Z",
-                    "attached_by": "codex",
-                }
-            )
-        body = json.dumps({"associations": associations}).encode("utf-8")
         self.send_response(200)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(body)))
@@ -231,6 +256,9 @@ llm_policy:
   model_id: anthropic/claude-sonnet-4.6
   session_token_ceiling: 1000000
   recording_fixture_path: .clarion/openrouter-recording.json
+serve:
+  mcp:
+    enable_write_tools: true
 integrations:
   filigree:
     enabled: true
@@ -543,8 +571,9 @@ assert issues["result"]["result_kind"] == "matched", issues
 assert issues["result"]["filigree_endpoint"]["enabled"] is True, issues
 assert issues["result"]["filigree_endpoint"]["resolved_url"], issues
 assert issues["stats_delta"]["filigree_requests_total"] >= 2, issues
-assert "python:function:demo.world" in filigree_requests, filigree_requests
-assert "python:function:demo.hello" in filigree_requests, filigree_requests
+assert world_sei in filigree_requests, filigree_requests
+assert hello_sei in filigree_requests, filigree_requests
+assert issues["result"]["wardline_findings"]["result_kind"] == "no_matches", issues
 
 context = responses["context"]["result"]
 ctx_text = context["contents"][0]["text"]
