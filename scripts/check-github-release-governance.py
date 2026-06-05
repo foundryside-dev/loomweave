@@ -41,6 +41,8 @@ class UsageError(Exception):
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 USES_RE = re.compile(r"^\s*(?:-\s*)?uses:\s*(?P<target>\S+)\s*$")
 JOB_RE = re.compile(r"^  (?P<name>[A-Za-z0-9_-]+):\s*(?:#.*)?$")
+JOB_NEEDS_RE = re.compile(r"^    needs:\s*(?P<value>.*)$")
+JOB_NEEDS_ITEM_RE = re.compile(r"^      -\s*(?P<value>[^#]+?)(?:\s*#.*)?$")
 REQUIRED_STATUS_CHECKS = frozenset(
     {
         "Rust",
@@ -510,10 +512,10 @@ def release_workflow_needs(job_lines: list[str]) -> set[str]:
     needs: set[str] = set()
     in_needs_block = False
     for line in job_lines:
-        stripped = line.strip()
-        if stripped.startswith("needs:"):
+        match = JOB_NEEDS_RE.match(line)
+        if match is not None:
             in_needs_block = True
-            value = stripped.split(":", maxsplit=1)[1].strip()
+            value = match.group("value").strip()
             if value.startswith("[") and value.endswith("]"):
                 needs.update(
                     item.strip(" '\"") for item in value[1:-1].split(",") if item.strip()
@@ -521,12 +523,17 @@ def release_workflow_needs(job_lines: list[str]) -> set[str]:
             elif value:
                 needs.add(value.strip(" '\""))
             continue
-        if in_needs_block:
-            if stripped.startswith("- "):
-                needs.add(stripped[2:].strip(" '\""))
-                continue
-            if line.startswith("    ") and not line.startswith("      "):
-                in_needs_block = False
+
+        if not in_needs_block:
+            continue
+
+        item_match = JOB_NEEDS_ITEM_RE.match(line)
+        if item_match is not None:
+            needs.add(item_match.group("value").strip(" '\""))
+            continue
+
+        if line.startswith("    ") and not line.startswith("      "):
+            in_needs_block = False
     return needs
 
 
@@ -823,6 +830,36 @@ def run_self_test() -> None:
             assert "release-governance" in str(exc)
         else:
             raise AssertionError("ungated release-build fixture should fail")
+
+        release_workflow.write_text(
+            "jobs:\n"
+            "  verify:\n"
+            "    steps: []\n"
+            "  release-governance:\n"
+            "    steps: []\n"
+            "  build-rust:\n"
+            "    needs: [verify]\n"
+            "    steps:\n"
+            "      - name: decoy env\n"
+            "        env:\n"
+            "          needs: release-governance\n"
+            "        run: echo decoy\n"
+            "  build-plugin:\n"
+            "    needs: [verify]\n"
+            "    steps:\n"
+            "      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\n"
+            "        with:\n"
+            "          needs: release-governance\n",
+            encoding="utf-8",
+        )
+        try:
+            check_release_workflow_governance_gate(root)
+        except CheckError as exc:
+            assert "build-rust" in str(exc)
+            assert "build-plugin" in str(exc)
+            assert "release-governance" in str(exc)
+        else:
+            raise AssertionError("nested decoy needs fixture should fail")
 
         release_workflow.write_text(
             "jobs:\n"
