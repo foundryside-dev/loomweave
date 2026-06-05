@@ -1,3 +1,7 @@
 ## 2026-06-04 - Borrowing strings during clustering graph traversal
 **Learning:** In `crates/clarion-analysis/src/lib.rs`, the fallback algorithm `local_weighted_components` cloned module string IDs deeply while populating neighbor lists (`neighbors`), seen sets (`seen`), and graph traversal stacks (`stack`). For a typical graph with hundreds or thousands of nodes, this causes extensive unnecessary memory allocations and CPU overhead during clustering.
 **Action:** Replace `String` with `&str` references inside internal clustering structures. Rust's borrow checker can perfectly track the lifetimes bound to the original `ModuleGraph`, and `.to_owned()` only needs to be called when pushing a module into the final partitioned `Vec<String>` results. This dramatically reduces heap allocations.
+
+## 2026-06-05 - Avoid redundant Regex compilation in repeated function calls
+**Learning:** `Regex::new` is an expensive operation that compiles regexes into DFA/NFA representations. In `crates/clarion-scanner/src/patterns.rs`, `Scanner::new()` was compiling the default rule floor regexes every time it was called. Rust's `Regex` and `RegexSet` objects from the `regex` crate wrap their compiled state in an `Arc`, meaning they are very cheap to clone.
+**Action:** Use `std::sync::OnceLock` to statically cache expensive struct instances that hold `Regex` fields (or the `Regex` fields themselves) if they only depend on static configurations. You can safely and efficiently `.clone()` the cached structures for subsequent calls.

@@ -14,14 +14,14 @@ pub struct PatternMeta {
     capture_group: Option<usize>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CompiledPattern {
     meta: PatternMeta,
     regex: Regex,
 }
 
 /// Rust-native port of the ADR-013 v0.1 secret rule floor.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Scanner {
     patterns: RegexSet,
     pattern_meta: Vec<PatternMeta>,
@@ -46,28 +46,34 @@ impl Scanner {
     /// Panics only if one of the compiled-in regular expressions is invalid.
     #[must_use]
     pub fn new() -> Self {
-        let pattern_meta = default_pattern_meta();
-        let patterns = RegexSet::new(pattern_meta.iter().map(|meta| meta.pattern))
-            .expect("default secret patterns compile");
-        let compiled_patterns = pattern_meta
-            .iter()
-            .cloned()
-            .map(|meta| CompiledPattern {
-                regex: Regex::new(meta.pattern).expect("default secret pattern compiles"),
-                meta,
-            })
-            .collect();
-        Self {
-            patterns,
-            pattern_meta,
-            compiled_patterns,
-            entropy_b64: EntropyTuning::BASE64,
-            entropy_hex: EntropyTuning::HEX,
-            entropy_b64_re: Regex::new(r"[A-Za-z0-9+/]{20,}={0,2}")
-                .expect("base64 candidate regex compiles"),
-            entropy_hex_re: Regex::new(r"\b[a-fA-F0-9]{40,}\b")
-                .expect("hex candidate regex compiles"),
-        }
+        // Cache compiled Regexes and Scanner instance behind a OnceLock.
+        // Cloning a `Regex` or `RegexSet` is extremely cheap (just bumping an Arc),
+        // preventing redundant compilation overhead whenever a Scanner is instantiated.
+        static DEFAULTS: std::sync::OnceLock<Scanner> = std::sync::OnceLock::new();
+        DEFAULTS.get_or_init(|| {
+            let pattern_meta = default_pattern_meta();
+            let patterns = RegexSet::new(pattern_meta.iter().map(|meta| meta.pattern))
+                .expect("default secret patterns compile");
+            let compiled_patterns = pattern_meta
+                .iter()
+                .cloned()
+                .map(|meta| CompiledPattern {
+                    regex: Regex::new(meta.pattern).expect("default secret pattern compiles"),
+                    meta,
+                })
+                .collect();
+            Self {
+                patterns,
+                pattern_meta,
+                compiled_patterns,
+                entropy_b64: EntropyTuning::BASE64,
+                entropy_hex: EntropyTuning::HEX,
+                entropy_b64_re: Regex::new(r"[A-Za-z0-9+/]{20,}={0,2}")
+                    .expect("base64 candidate regex compiles"),
+                entropy_hex_re: Regex::new(r"\b[a-fA-F0-9]{40,}\b")
+                    .expect("hex candidate regex compiles"),
+            }
+        }).clone()
     }
 
     #[must_use]
