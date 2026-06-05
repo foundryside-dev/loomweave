@@ -41,7 +41,13 @@ pattern publishes the live port at runtime rather than assigning it at install.
 ## Decision
 
 Mirror Filigree's endpoint-discovery convention symmetrically for loomweave's
-own read API.
+own read API. The **interop surface is the file**, not loomweave's resolver:
+the resolver below is loomweave's own conforming reader, but the contract that
+binds siblings is `.loomweave/ephemeral.port` itself. Cross-product consumers
+(notably Wardline, which is Python and cannot call a Rust resolver) implement
+their own reader against the file contract — the same "this is the contract,
+consumers conform" posture as the SEI token (ADR-038). The normative file
+contract and resolution semantics are pinned below.
 
 1. **Deterministic per-project port, ephemeral fallback.** `serve` binds a
    per-project deterministic port derived from the canonical project path, in a
@@ -51,23 +57,79 @@ own read API.
    bind-and-discover primitive already exists in test form at
    `crates/loomweave-cli/src/http_read.rs` and is generalized to the production
    serve path.
-2. **Publish the live port.** On successful bind, write the *actual* bound port
-   to `<project>/.loomweave/ephemeral.port` (plain integer, atomic write,
-   removed on clean shutdown, present only while serving) — the loomweave twin of
-   `.filigree/ephemeral.port`.
+2. **Publish the live port** to `<project>/.loomweave/ephemeral.port` per the
+   file contract below — the loomweave twin of `.filigree/ephemeral.port`.
 3. **Loomweave-side resolver.** Add a resolver in `loomweave-federation` (the
-   twin of `resolve_filigree_url`) that prefers `.loomweave/ephemeral.port` over
-   static config and fails soft when the file is missing/corrupt. Consumers use
-   it: wardline's `loomweave.url`, and loomweave's own `doctor` /
-   `project_status_get` (which report the resolved source, mirroring how
-   `project_status` reports the Filigree resolution).
+   twin of `resolve_filigree_url`) implementing the resolution semantics below.
+   Loomweave's own consumers use it (`doctor`, `project_status_get`, which report
+   the resolved source). It is *one* conforming reader, not the interop surface.
 4. **Installer stops pinning a port.** `install` no longer stamps a fixed
    `serve.http.bind: 127.0.0.1:9111`. The `loomweave.yaml` stub documents that
    the read-API port is auto-selected and published; an explicit `bind` override
    remains honored for operators who need a fixed port.
 
-`.loomweave/ephemeral.port` is a runtime artifact and is git-ignored, consistent
-with ADR-005's treatment of run-time-only state.
+## File contract (normative)
+
+`.loomweave/ephemeral.port` is the cross-product interop surface. Producers
+(loomweave `serve`) and every consumer (loomweave, Wardline, future siblings)
+conform to exactly this:
+
+- **Path:** `<project_root>/.loomweave/ephemeral.port`, where `<project_root>`
+  is the directory the consumer is scanning/serving (the same anchor as
+  `.filigree/ephemeral.port`).
+- **Content:** a single plain-ASCII integer — the **TCP port only**. No host, no
+  scheme, no key. An optional single trailing `\n` is permitted and ignored. No
+  other bytes.
+- **Host/scheme are implied, not stored:** `127.0.0.1` and `http`. This is sound
+  *only* because publication is loopback-only (next bullet); a consumer composes
+  `http://127.0.0.1:<port>`.
+- **Loopback-only publication.** The file is written **only when `serve` binds a
+  loopback address**. If an operator opts into a non-loopback bind
+  (`allow_non_loopback`, ADR-034), `serve` does **not** publish the file — that
+  deployment is explicit-config territory and consumers fall back to their
+  configured URL (where the operator set the reachable host). This keeps the
+  port-only format unambiguous and prevents a port-only reader from mis-targeting
+  a non-loopback host.
+- **Atomic write:** write to a temp file in `.loomweave/` and `rename(2)` into
+  place, so a reader never observes a partial/torn value.
+- **Lifecycle:** created/refreshed on successful loopback bind; removed on clean
+  shutdown. Present-only-while-serving is best-effort, not guaranteed — a crash
+  leaves a stale file, which resolution semantics handle (below).
+- **Git-ignored** runtime artifact, consistent with ADR-005's treatment of
+  run-time-only state.
+
+## Resolution semantics (normative)
+
+Every consumer resolves **at consume time** (each scan / read), never caches the
+resolution at install time — a port resolved once and reused goes stale exactly
+when another project rebinds. Wardline's filigree leg, which resolves at install
+time today, is the cautionary case (see related follow-up).
+
+**Precedence (highest wins):**
+
+1. An **explicit, deliberate target** — `--loomweave-url` flag or environment
+   override — always wins. The published port must never override a target the
+   operator set on purpose (remote loomweave, debugging a specific instance).
+2. The **published port file** `.loomweave/ephemeral.port` (composed to
+   `http://127.0.0.1:<port>`). This **beats a stale/default configured URL** so
+   resolution self-heals without a config edit.
+3. The **configured URL** (e.g. `wardline.yaml: loomweave.url`).
+4. **None** — federation is simply absent for this read; degrade, do not error.
+
+**Fail-soft is mandatory at every step:**
+
+- The port value MUST be validated to `1..=65535`. Missing, non-integer,
+  out-of-range, or otherwise malformed content → fall through to the next
+  precedence level (it is not an error).
+- A **resolved-but-refused** connection (file present, but the port is closed —
+  crashed serve / stale file) MUST be treated as soft: fall through to configured
+  URL or none. This — not malformed content — is the case a live consumer hits
+  most, and it must never surface as a hard error.
+- The instance-ID guard (ADR-034) is the **correctness backstop** that lets the
+  reader be simple rather than perfect: even if a stale file points at a port now
+  owned by *another* project's serve, the write is rejected `PROJECT_MISMATCH`,
+  fail-soft — a stale file degrades, never corrupts. Consumers rely on this; they
+  do not need to verify project identity before connecting.
 
 ## Consequences
 
@@ -76,14 +138,15 @@ with ADR-005's treatment of run-time-only state.
   consumer resolves *its own* project's live port.
 - The read-API port becomes a *read-this-file*, never a *compute-or-configure*,
   fact — matching the discipline loomweave already imposes on consuming
-  Filigree. "Read, never compute" is the load-bearing rule: nothing should hard
-  code or re-derive the band formula to guess a peer's port.
+  Filigree. "Read, never compute" is the load-bearing rule: nothing hard codes or
+  re-derives the band formula to guess a peer's port.
 - Consumers pinned to a literal `:9111` (e.g. existing `wardline.yaml` files)
-  must migrate to the resolver. Until they do, they fail soft to the configured
-  URL — degraded, not broken.
+  self-heal once they prefer the published file over config (precedence 2 > 3) —
+  no user edit required. Until a consumer adopts the resolver it fails soft to the
+  configured URL — degraded, not broken.
 - Federation stays enrich-only and solo-useful: a project with no published port
-  file (serve not running, or feature disabled) degrades to the configured
-  `base_url`, never to a sibling-internal default.
+  file (serve not running, feature disabled, or non-loopback bind) degrades to
+  the configured `base_url`, never to a sibling-internal default.
 
 ## Verification
 
@@ -92,10 +155,23 @@ with ADR-005's treatment of run-time-only state.
 - A deterministic-port collision forces the ephemeral-`0` fallback, and the
   published file reflects the *actually* bound port (not the deterministic
   guess).
-- The resolver prefers the published port over stale config and fails soft on
-  missing/corrupt/out-of-range content (twin of the `filigree_url` resolver
-  tests).
-- The published file is removed on clean shutdown; a consumer reading a stale
-  file degrades rather than erroring.
+- File contract: published content is a bare port (optional trailing newline),
+  written via temp + rename; a non-loopback bind publishes **no** file.
+- Precedence: an explicit `--loomweave-url`/env target overrides the published
+  file; the published file overrides a stale/default configured URL; absent file
+  falls through to config, then none.
+- Fail-soft: missing / non-integer / out-of-range (`0`, `>65535`) content, and a
+  **resolved-but-refused** connection (stale file, closed port), each degrade to
+  the next precedence level rather than erroring.
+- The published file is removed on clean shutdown.
 - A wardline scan against a project whose loomweave serve is running on a
   non-9111 port resolves and writes taint successfully (no `PROJECT_MISMATCH`).
+
+## Related follow-up (not blocking this ADR)
+
+Consume-time live-port resolution should apply to **both** sibling directions.
+Wardline reads `.filigree/ephemeral.port` only at install time and uses the
+static config URL at scan time, so its filigree leg carries the same latent
+staleness this ADR removes for the loomweave leg. Unifying both consumers on
+consume-time resolution is Wardline-side work, tracked separately; flagged here
+so the two legs are not designed divergently.
