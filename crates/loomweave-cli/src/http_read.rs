@@ -1181,6 +1181,46 @@ mod tests {
         );
     }
 
+    /// The headline ADR-044 behavior: when the AUTO-selected deterministic port
+    /// is already taken, serve falls back to an OS-assigned ephemeral port and
+    /// publishes the *actually* bound port (not the deterministic guess).
+    #[test]
+    fn auto_port_falls_back_to_ephemeral_when_deterministic_taken() {
+        use loomweave_federation::config::HttpReadConfig;
+        use loomweave_federation::loomweave_port::{deterministic_port, read_published_port};
+        use loomweave_storage::ReaderPool;
+        use std::net::TcpListener;
+
+        let _guard = http_runtime_test_guard();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Occupy this project's deterministic port so the auto bind must fall back.
+        let det = deterministic_port(dir.path());
+        let _held = TcpListener::bind(("127.0.0.1", det)).expect("hold deterministic port");
+
+        let db = dir.path().join("loomweave.db");
+        let readers = ReaderPool::open(&db, 4).expect("reader pool");
+        let cfg = HttpReadConfig {
+            enabled: true,
+            bind: None,
+            ..HttpReadConfig::default()
+        };
+        let iid =
+            crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-0000000000a5")
+                .expect("iid");
+
+        let server = spawn(dir.path().to_path_buf(), db, readers, iid, &cfg)
+            .expect("spawn must succeed via ephemeral fallback")
+            .expect("enabled => Some");
+
+        let published = read_published_port(dir.path()).expect("published a port");
+        assert_ne!(
+            published, det,
+            "fallback must publish the ephemeral port actually bound, not the taken deterministic one"
+        );
+        server.shutdown().expect("shutdown");
+    }
+
     // ----------------------------------------------------------------------
     // W.3 taint-fact READ endpoints (GET + :batch-get).
     // ----------------------------------------------------------------------
