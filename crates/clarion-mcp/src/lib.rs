@@ -3770,18 +3770,12 @@ fn build_call_sites(
 
     let (resolved, unbound) = collect_call_sites(conn, &entity, role, kind, confidence)?;
 
-    // Resolve each site's owning file + briefing-blocked state once, mapping
-    // the byte anchor to a line. A blocked owner's bytes are never read.
-    let mut owner_meta: HashMap<String, (Option<String>, bool)> = HashMap::new();
-    let mut file_content: HashMap<String, Option<String>> = HashMap::new();
-    // The queried entity's own path + block state are known without a lookup.
-    owner_meta.insert(
-        entity.id.clone(),
-        (
-            entity.source_file_path.clone(),
-            briefing_block_reason(&entity).is_some(),
-        ),
-    );
+    // Resolve each site's owning file + disclosure state once, mapping the byte
+    // anchor to a line only after scanner and drift guards pass.
+    let mut owner_meta: HashMap<String, OwnerMeta> = HashMap::new();
+    let mut file_content: HashMap<String, Option<Vec<u8>>> = HashMap::new();
+    // The queried entity is known without a lookup.
+    owner_meta.insert(entity.id.clone(), OwnerMeta::from_entity(entity.clone()));
 
     let mut site_values = Vec::new();
     let mut truncated = false;
@@ -3790,25 +3784,22 @@ fn build_call_sites(
             truncated = true;
             break;
         }
-        let (path_str, blocked) = resolve_owner(conn, &mut owner_meta, &site.owner_id)?;
-        if !path.admits(path_str.as_deref()) {
+        let owner = resolve_owner(conn, &mut owner_meta, &site.owner_id)?;
+        if !path.admits(owner.path.as_deref()) {
             continue;
         }
-        // Never read a briefing-blocked owner's file; redact line_text.
-        let (line, column, line_text) = if blocked {
-            (Value::Null, Value::Null, String::new())
-        } else {
-            anchor_line(&mut file_content, path_str.as_deref(), site.byte_start)
-        };
+        let anchor = anchor_line(&mut file_content, owner, site.byte_start);
         site_values.push(json!({
             "edge_kind": site.edge_kind,
             "other_id": site.other_id,
             "confidence": site.confidence.as_str(),
-            "file": path_str,
-            "line": line,
-            "column": column,
-            "line_text": line_text,
-            "briefing_blocked": blocked,
+            "file": owner.path,
+            "line": anchor.line,
+            "column": anchor.column,
+            "line_text": anchor.line_text,
+            "source_status": anchor.source_status,
+            "briefing_blocked": anchor.briefing_blocked,
+            "drift": anchor.drift,
             "byte_start": site.byte_start,
             "byte_end": site.byte_end
         }));
@@ -3820,27 +3811,20 @@ fn build_call_sites(
             truncated = true;
             break;
         }
-        let (path_str, blocked) = resolve_owner(conn, &mut owner_meta, &site.owner_id)?;
-        if !path.admits(path_str.as_deref()) {
+        let owner = resolve_owner(conn, &mut owner_meta, &site.owner_id)?;
+        if !path.admits(owner.path.as_deref()) {
             continue;
         }
-        // Never read a briefing-blocked owner's file; redact line_text.
-        let (line, column, line_text) = if blocked {
-            (Value::Null, Value::Null, String::new())
-        } else {
-            anchor_line(
-                &mut file_content,
-                path_str.as_deref(),
-                Some(site.byte_start),
-            )
-        };
+        let anchor = anchor_line(&mut file_content, owner, Some(site.byte_start));
         unresolved_values.push(json!({
             "callee_expr": site.callee_expr,
-            "file": path_str,
-            "line": line,
-            "column": column,
-            "line_text": line_text,
-            "briefing_blocked": blocked,
+            "file": owner.path,
+            "line": anchor.line,
+            "column": anchor.column,
+            "line_text": anchor.line_text,
+            "source_status": anchor.source_status,
+            "briefing_blocked": anchor.briefing_blocked,
+            "drift": anchor.drift,
             "byte_start": site.byte_start,
             "byte_end": site.byte_end
         }));
@@ -3869,49 +3853,132 @@ fn build_call_sites(
     })))
 }
 
-/// Memoized lookup of an owner entity's `(source_file_path, briefing_blocked)`.
-/// A briefing-blocked owner's source bytes must never be read — the pre-ingest
-/// scanner withholds them — so `call_sites` redacts `line_text` for such owners
-/// rather than disclosing the file content behind an edge.
-fn resolve_owner(
-    conn: &rusqlite::Connection,
-    cache: &mut HashMap<String, (Option<String>, bool)>,
-    owner_id: &str,
-) -> Result<(Option<String>, bool), StorageError> {
-    if let Some(meta) = cache.get(owner_id) {
-        return Ok(meta.clone());
-    }
-    let meta = match entity_by_id(conn, owner_id)? {
-        Some(entity) => (
-            entity.source_file_path.clone(),
-            briefing_block_reason(&entity).is_some(),
-        ),
-        None => (None, false),
-    };
-    cache.insert(owner_id.to_owned(), meta.clone());
-    Ok(meta)
+#[derive(Clone)]
+struct OwnerMeta {
+    entity: Option<EntityRow>,
+    path: Option<String>,
+    briefing_blocked: bool,
 }
 
-/// Map a byte anchor to (line, column, `line_text`), reading + caching the file.
+impl OwnerMeta {
+    fn from_entity(entity: EntityRow) -> Self {
+        let briefing_blocked = briefing_block_reason(&entity).is_some();
+        let path = entity.source_file_path.clone();
+        Self {
+            entity: Some(entity),
+            path,
+            briefing_blocked,
+        }
+    }
+
+    fn missing() -> Self {
+        Self {
+            entity: None,
+            path: None,
+            briefing_blocked: false,
+        }
+    }
+}
+
+struct AnchorLine {
+    line: Value,
+    column: Value,
+    line_text: String,
+    source_status: &'static str,
+    briefing_blocked: bool,
+    drift: Value,
+}
+
+impl AnchorLine {
+    fn redacted(source_status: &'static str, briefing_blocked: bool, drift: Value) -> Self {
+        Self {
+            line: Value::Null,
+            column: Value::Null,
+            line_text: String::new(),
+            source_status,
+            briefing_blocked,
+            drift,
+        }
+    }
+
+    fn ok(line: i64, column: i64, line_text: String) -> Self {
+        Self {
+            line: json!(line),
+            column: json!(column),
+            line_text,
+            source_status: "ok",
+            briefing_blocked: false,
+            drift: Value::Null,
+        }
+    }
+}
+
+/// Memoized lookup of an owner entity's disclosure metadata. A
+/// briefing-blocked owner's source bytes must never be read — the pre-ingest
+/// scanner withholds them — so `call_sites` redacts `line_text` for such owners
+/// rather than disclosing the file content behind an edge.
+fn resolve_owner<'a>(
+    conn: &rusqlite::Connection,
+    cache: &'a mut HashMap<String, OwnerMeta>,
+    owner_id: &str,
+) -> Result<&'a OwnerMeta, StorageError> {
+    if !cache.contains_key(owner_id) {
+        let meta = match entity_by_id(conn, owner_id)? {
+            Some(entity) => OwnerMeta::from_entity(entity),
+            None => OwnerMeta::missing(),
+        };
+        cache.insert(owner_id.to_owned(), meta);
+    }
+    Ok(cache
+        .get(owner_id)
+        .expect("owner metadata inserted before lookup"))
+}
+
+/// Map a byte anchor to line evidence after enforcing source disclosure guards.
 /// Any piece that can't be resolved degrades to JSON null / empty rather than
 /// failing the whole query.
 fn anchor_line(
-    file_content: &mut HashMap<String, Option<String>>,
-    path: Option<&str>,
+    file_content: &mut HashMap<String, Option<Vec<u8>>>,
+    owner: &OwnerMeta,
     byte_start: Option<i64>,
-) -> (Value, Value, String) {
-    let (Some(path), Some(byte_start)) = (path, byte_start) else {
-        return (Value::Null, Value::Null, String::new());
+) -> AnchorLine {
+    if owner.briefing_blocked {
+        return AnchorLine::redacted("briefing_blocked", true, Value::Null);
+    }
+    let (Some(entity), Some(path), Some(byte_start)) =
+        (owner.entity.as_ref(), owner.path.as_deref(), byte_start)
+    else {
+        return AnchorLine::redacted("unavailable", false, Value::Null);
     };
-    let content = file_content
+
+    let bytes = file_content
         .entry(path.to_owned())
-        .or_insert_with(|| std::fs::read_to_string(path).ok());
-    let Some(content) = content.as_deref() else {
-        return (Value::Null, Value::Null, String::new());
+        .or_insert_with(|| std::fs::read(path).ok());
+    let Some(bytes) = bytes.as_deref() else {
+        return AnchorLine::redacted("missing", false, Value::Null);
     };
-    match byte_line_col(content, byte_start) {
-        Some((line, column)) => (json!(line), json!(column), line_text_at(content, line)),
-        None => (Value::Null, Value::Null, String::new()),
+    let Ok(content) = String::from_utf8(bytes.to_vec()) else {
+        return AnchorLine::redacted("binary", false, Value::Null);
+    };
+
+    if let (Some(stored), Some(current)) = (
+        entity.content_hash.as_deref(),
+        current_source_content_hash(entity, bytes, Some(&content)),
+    ) && stored != current
+    {
+        return AnchorLine::redacted(
+            "drifted",
+            false,
+            json!({
+                "stored_content_hash": stored,
+                "current_content_hash": current
+            }),
+        );
+    }
+
+    match byte_line_col(&content, byte_start) {
+        Some((line, column)) => AnchorLine::ok(line, column, line_text_at(&content, line)),
+        None => AnchorLine::redacted("unavailable", false, Value::Null),
     }
 }
 

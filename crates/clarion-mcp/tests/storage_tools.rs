@@ -3077,6 +3077,68 @@ async fn call_sites_redacts_line_text_for_briefing_blocked_owner() {
         !blob.contains("return target"),
         "leaked blocked source: {blob}"
     );
+
+    let callee_resp = call_tool(
+        &state,
+        "call_sites",
+        json!({"id": "python:function:demo.mid", "role": "callee", "kind": "calls"}),
+    )
+    .await;
+    assert_eq!(callee_resp["ok"], true, "{callee_resp:?}");
+    let callee_sites = callee_resp["result"]["sites"]
+        .as_array()
+        .expect("callee sites array");
+    assert!(!callee_sites.is_empty(), "{callee_resp:?}");
+    for site in callee_sites {
+        assert_eq!(site["line_text"], "", "{site:?}");
+        assert_eq!(site["briefing_blocked"], true, "{site:?}");
+        assert_eq!(site["source_status"], "briefing_blocked", "{site:?}");
+    }
+}
+
+#[tokio::test]
+async fn call_sites_redacts_line_text_for_drifted_owner() {
+    // call_sites reads the site owner's source file to populate line_text. If
+    // that file no longer matches the indexed content_hash, it must not return
+    // newly modified, unscanned source content through either caller or callee
+    // queries.
+    let (project, db_path) = open_project();
+    let secret_line = "def entry():  # DRIFT_ONLY_SECRET=sk-validation-12345\n";
+    std::fs::write(
+        project.path().join("demo.py"),
+        format!(
+            "{secret_line}    return mid()\n\ndef mid():\n    return target()\n\ndef target():\n    return 1\n"
+        ),
+    )
+    .expect("rewrite source after indexing");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "call_sites",
+        json!({"id": "python:function:demo.mid", "role": "callee", "kind": "calls"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp:?}");
+    let sites = resp["result"]["sites"].as_array().expect("sites array");
+    assert!(!sites.is_empty(), "{resp:?}");
+    for site in sites {
+        assert_eq!(
+            site["line_text"], "",
+            "drifted owner leaked source: {site:?}"
+        );
+        assert_eq!(site["source_status"], "drifted", "{site:?}");
+        assert!(site["drift"]["stored_content_hash"].is_string(), "{site:?}");
+        assert!(
+            site["drift"]["current_content_hash"].is_string(),
+            "{site:?}"
+        );
+    }
+    let blob = resp.to_string();
+    assert!(
+        !blob.contains("DRIFT_ONLY_SECRET"),
+        "leaked drifted source: {blob}"
+    );
 }
 
 #[tokio::test]
