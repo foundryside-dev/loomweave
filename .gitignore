@@ -36,6 +36,7 @@ tests/e2e/external-operator-smoke-results-*.md
 .loomweave/loomweave.db
 .loomweave/instance_id
 .loomweave/loomweave.lock
+.loomweave/ephemeral.port
 
 # Documentation site build output (mkdocs `site_dir`, web/mkdocs.yml).
 /site-build/

@@ -9,6 +9,10 @@ loomweave.db
 instance_id
 loomweave.lock
 
+# Read-API live port discovery file (ADR-044): present only while serve runs,
+# rewritten per bind, loopback-only — a runtime artifact, never committed.
+ephemeral.port
+
 # SQLite write-ahead files never belong in the repo.
 *-wal
 *-shm

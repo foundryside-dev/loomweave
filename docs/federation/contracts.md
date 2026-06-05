@@ -32,7 +32,10 @@ Filigree is absent (weft.md §5).
 serve:
   http:
     enabled: true
-    bind: 127.0.0.1:9111
+    # The read-API port is auto-selected per project — a deterministic port in
+    # Loomweave's band (9400–10399, disjoint from Filigree's 8400–9399) with an
+    # ephemeral fallback — and published to .loomweave/ephemeral.port while
+    # serve runs. Set `bind:` explicitly only to pin a fixed port (ADR-044).
     # Preferred 1.0 identity mode. Optional on loopback, required for
     # authenticated Weft component requests.
     identity_token_env: WEFT_IDENTITY_SECRET

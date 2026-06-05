@@ -17,9 +17,13 @@ environment variable that contains the shared Weft component secret:
 serve:
   http:
     enabled: true
-    bind: 127.0.0.1:9111
     identity_token_env: WEFT_IDENTITY_SECRET
 ```
+
+The read-API port is auto-selected per project — a deterministic port in
+Loomweave's band (`9400–10399`, disjoint from Filigree's `8400–9399`) with an
+ephemeral fallback — and published to `.loomweave/ephemeral.port` while `serve`
+runs. Set `serve.http.bind` explicitly only to pin a fixed port (ADR-044).
 
 When `identity_token_env` is configured, Loomweave refuses to start unless the env
 var is present and non-empty. Protected `/api/v1/files` routes then require
@@ -65,7 +69,8 @@ catalog, or unavailable because of storage errors.
 When both `serve.http.token_env` (legacy bearer) and
 `serve.http.identity_token_env` (HMAC, preferred per
 [ADR-034](../loomweave/adr/ADR-034-federation-http-read-api-hardening.md)) are unset and the
-bind is loopback (default: `127.0.0.1:9111`), the HTTP read API serves
+bind is loopback (the auto-selected per-project port, or an explicit loopback
+`serve.http.bind`; see ADR-044), the HTTP read API serves
 unauthenticated. This is the intended single-user developer-workstation
 trust model — the loopback socket is reachable only from processes on the
 same host, and Loomweave's catalogue is no more sensitive than the project

@@ -1,9 +1,16 @@
 # ADR-044: Read-API Ephemeral Port Publication
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-06-06
 **Relates to**: [ADR-034](./ADR-034-federation-http-read-api-hardening.md)
 **Tracking**: clarion-7f574bc34f
+
+> **Accepted** on branch `feat/serve-no-index-chirp` (deterministic band
+> `9400–10399`). Acceptance evidence: the cross-product-visible
+> `.loomweave/ephemeral.port` term carries a **managed-clash** verdict in
+> [`docs/suite/glossary.md`](../../suite/glossary.md), with the explicit
+> `.filigree/ephemeral.port` ↔ `.loomweave/ephemeral.port` mapping table below
+> (per the README acceptance criteria, model ADR-017).
 
 ## Context
 
@@ -97,6 +104,26 @@ conform to exactly this:
   leaves a stale file, which resolution semantics handle (below).
 - **Git-ignored** runtime artifact, consistent with ADR-005's treatment of
   run-time-only state.
+
+## Managed-clash verdict
+
+`ephemeral.port` is a cross-product-visible term: Filigree owns the original
+`.filigree/ephemeral.port` endpoint-discovery convention, and this ADR adopts the
+same filename for Loomweave's own read API. Per the ADR-acceptance criteria
+(`docs/loomweave/adr/README.md`), this is a **managed clash** — the same term is
+used by a sibling, governed here by an explicit mapping table (model: ADR-017).
+The verdict is recorded in [`docs/suite/glossary.md`](../../suite/glossary.md).
+
+| Product | Path | Format | Publication | Band (internal, not contract) |
+|---|---|---|---|---|
+| Filigree | `.filigree/ephemeral.port` | single plain-ASCII TCP port, optional trailing `\n`, atomic temp+rename | loopback-only, present only while running | `8400–9399` |
+| Loomweave | `.loomweave/ephemeral.port` | identical | identical | `9400–10399` (disjoint) |
+
+The clash is *managed*, not *renamed*: the shared filename is deliberate (one
+convention siblings recognize), the paths are distinct per product, the wire
+format is identical, and the deterministic bands are disjoint so the two products
+never contend for the same port. The band is never part of the file contract —
+consumers read the published file, never recompute a peer's port.
 
 ## Resolution semantics (normative)
 

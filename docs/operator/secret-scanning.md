@@ -93,7 +93,8 @@ without authentication: **loopback bind with no token configured.**
 
 When both `serve.http.token_env` (legacy bearer) and `serve.http.identity_token_env`
 (HMAC, preferred per [ADR-034](../loomweave/adr/ADR-034-federation-http-read-api-hardening.md))
-are unset and the bind is loopback (default: `127.0.0.1:9111`), the HTTP read
+are unset and the bind is loopback (the auto-selected per-project read-API port,
+or an explicit loopback `serve.http.bind`; see ADR-044), the HTTP read
 API serves unauthenticated. On a single-user developer workstation this is
 the intended trust model: the loopback socket is reachable only from
 processes on that host, and Loomweave's catalogue is no more sensitive than

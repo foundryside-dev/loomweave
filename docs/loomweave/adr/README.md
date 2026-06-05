@@ -44,7 +44,7 @@ This folder is the canonical home for authored Loomweave architecture decision r
 | [ADR-041](./ADR-041-resume-is-idempotent-reemit.md) | Analyze resume is idempotent re-emit, not checkpoint recovery; amends ADR-005/ADR-011 resume language | Accepted |
 | [ADR-042](./ADR-042-hmac-freshness-and-replay-window.md) | HMAC freshness and replay window — timestamp + nonce headers, crate-backed HMAC, process-local replay cache | Accepted |
 | [ADR-043](./ADR-043-edge-reanalysis-replacement.md) | Edge reanalysis replacement — per-source-file anchored-edge replacement and edge metadata upsert; amends ADR-026 | Accepted |
-| [ADR-044](./ADR-044-read-api-ephemeral-port-publication.md) | Read-API ephemeral port publication — `.loomweave/ephemeral.port` as a normative cross-product file contract (loopback-only, port-only, atomic) + consume-time resolution precedence (explicit > file > config > none), per-project deterministic port, installer stops pinning 9111; relates to ADR-034 | Proposed |
+| [ADR-044](./ADR-044-read-api-ephemeral-port-publication.md) | Read-API ephemeral port publication — `.loomweave/ephemeral.port` as a normative cross-product file contract (loopback-only, port-only, atomic) + consume-time resolution precedence (explicit > file > config > none), per-project deterministic port, installer stops pinning 9111; relates to ADR-034 | Accepted |
 
 ## Backlog still tracked in the detailed design
 
