@@ -8,9 +8,8 @@
 //! touch only the `mcpServers.clarion` key, and preserve every other server
 //! (e.g. a sibling `filigree` entry) and top-level key. A fresh entry uses the
 //! bare `clarion` command (PATH-resolved, same convention as the `SessionStart`
-//! hook); an existing entry keeps its `command` verbatim and only has its
-//! `args` corrected to point at this project — never clobbering a deliberately
-//! customised binary path.
+//! hook). Existing entries are normalized to that command instead of preserving
+//! a repository-provided executable path.
 
 use std::fs;
 use std::path::Path;
@@ -45,19 +44,19 @@ fn desired_args(project_root: &Path) -> Value {
     json!(["serve", "--path", canonical.display().to_string()])
 }
 
-/// True if `entry.args` runs `serve` with `--path <this project>`.
+/// The full safe `clarion` entry `doctor` should report as healthy and install.
+fn desired_entry(project_root: &Path) -> Value {
+    json!({
+        "type": "stdio",
+        "command": "clarion",
+        "args": desired_args(project_root),
+        "env": {},
+    })
+}
+
+/// True if `entry` is the safe Clarion stdio invocation for this project.
 fn entry_targets_project(entry: &Value, project_root: &Path) -> bool {
-    let canonical = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
-    let want = canonical.display().to_string();
-    let Some(args) = entry.get("args").and_then(Value::as_array) else {
-        return false;
-    };
-    let strs: Vec<&str> = args.iter().filter_map(Value::as_str).collect();
-    let has_serve = strs.contains(&"serve");
-    let path_ok = strs.windows(2).any(|w| w[0] == "--path" && w[1] == want);
-    has_serve && path_ok
+    entry == &desired_entry(project_root)
 }
 
 /// Classify the `.mcp.json` Clarion entry without writing anything.
@@ -94,10 +93,9 @@ pub fn mcp_entry_state(project_root: &Path) -> McpState {
 /// Clarion's `serve` entry, and write it back pretty-printed. Returns `true`
 /// if the file changed.
 ///
-/// Never-clobber: an existing `clarion` object entry keeps its `command`,
-/// `type`, and `env`; only `args` are corrected. A fresh entry is written with
-/// the bare `clarion` command. All other servers and top-level keys are
-/// preserved.
+/// Never-clobber: all other servers and top-level keys are preserved, but the
+/// owned `mcpServers.clarion` entry is normalized to the safe bare `clarion`
+/// command.
 ///
 /// # Errors
 ///
@@ -137,38 +135,18 @@ pub fn install_mcp_entry(project_root: &Path) -> Result<bool> {
         );
     }
 
-    let want_args = desired_args(project_root);
+    let want_entry = desired_entry(project_root);
     let obj = root.as_object_mut().expect("root is object");
     let servers = obj
         .entry("mcpServers")
         .or_insert_with(|| Value::Object(Map::new()));
     let servers = servers.as_object_mut().expect("mcpServers is object");
 
-    let changed = match servers.get_mut(SERVER_KEY) {
-        // Existing object entry: preserve command/type/env, correct args only.
-        Some(entry) if entry.is_object() => {
-            let entry = entry.as_object_mut().expect("entry is object");
-            if entry.get("args") == Some(&want_args) {
-                false
-            } else {
-                entry.insert("args".to_string(), want_args);
-                true
-            }
-        }
-        // No entry (or a malformed non-object one we own): write a fresh entry
-        // with the bare PATH-resolved command.
-        _ => {
-            servers.insert(
-                SERVER_KEY.to_string(),
-                json!({
-                    "type": "stdio",
-                    "command": "clarion",
-                    "args": want_args,
-                    "env": {},
-                }),
-            );
-            true
-        }
+    let changed = if servers.get(SERVER_KEY) == Some(&want_entry) {
+        false
+    } else {
+        servers.insert(SERVER_KEY.to_string(), want_entry);
+        true
     };
 
     if !changed {
@@ -234,10 +212,40 @@ mod tests {
     }
 
     #[test]
-    fn install_preserves_other_servers_and_keeps_custom_command() {
+    fn state_rejects_matching_args_with_untrusted_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let canon = dir.path().canonicalize().unwrap().display().to_string();
+        fs::write(
+            dir.path().join(".mcp.json"),
+            format!(
+                r#"{{
+  "mcpServers": {{
+    "clarion": {{"type": "stdio", "command": "./evil-mcp.sh", "args": ["serve", "--path", {canon:?}], "env": {{}}}}
+  }}
+}}"#
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            mcp_entry_state(dir.path()),
+            McpState::Stale,
+            "matching args must not make an untrusted command healthy"
+        );
+        assert!(install_mcp_entry(dir.path()).unwrap());
+
+        let v: Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join(".mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(v["mcpServers"]["clarion"]["command"], "clarion");
+        assert_eq!(mcp_entry_state(dir.path()), McpState::Present);
+    }
+
+    #[test]
+    fn install_preserves_other_servers_and_normalizes_clarion_entry() {
         let dir = tempfile::tempdir().unwrap();
         // Pre-existing file with a sibling server and a clarion entry that has a
-        // deliberately customised command but a WRONG --path.
+        // deliberately customised command and a WRONG --path.
         fs::write(
             dir.path().join(".mcp.json"),
             r#"{
@@ -261,11 +269,13 @@ mod tests {
                 .unwrap();
         // Sibling untouched.
         assert_eq!(v["mcpServers"]["filigree"]["command"], "/opt/filigree-mcp");
-        // Custom command PRESERVED, args corrected to this project.
+        // The owned Clarion entry is normalized to the safe PATH-resolved command.
         assert_eq!(
-            v["mcpServers"]["clarion"]["command"], "/custom/bin/clarion",
-            "a customised command must be preserved, not clobbered"
+            v["mcpServers"]["clarion"]["command"], "clarion",
+            "a customised command must be replaced, not trusted"
         );
+        assert_eq!(v["mcpServers"]["clarion"]["type"], "stdio");
+        assert_eq!(v["mcpServers"]["clarion"]["env"], serde_json::json!({}));
         let canon = dir.path().canonicalize().unwrap().display().to_string();
         assert_eq!(
             v["mcpServers"]["clarion"]["args"],

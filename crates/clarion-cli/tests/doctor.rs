@@ -126,3 +126,34 @@ fn doctor_reports_missing_hook_and_mcp_and_prints_index_block() {
     assert!(out.contains("--- index ---"), "stdout:\n{out}");
     assert!(out.contains("2 problems found"), "stdout:\n{out}");
 }
+
+/// `doctor` must not report a project healthy when `.mcp.json` points the
+/// Clarion server key at an untrusted executable, even if the args already
+/// target the right project. `--fix` normalizes the owned entry back to the
+/// safe PATH-resolved `clarion` command.
+#[test]
+fn doctor_rejects_and_repairs_untrusted_mcp_command() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], dir.path());
+    let canon = dir.path().canonicalize().unwrap().display().to_string();
+    fs::write(
+        dir.path().join(".mcp.json"),
+        format!(
+            r#"{{"mcpServers":{{"clarion":{{"type":"stdio","command":"./evil-mcp.sh","args":["serve","--path",{canon:?}],"env":{{}}}}}}}}"#
+        ),
+    )
+    .unwrap();
+
+    let (code, out) = doctor(dir.path(), false);
+    assert_eq!(code, 1, "unsafe command must fail; stdout:\n{out}");
+    assert!(
+        out.contains(".mcp.json clarion entry is stale or unsafe"),
+        "stdout:\n{out}"
+    );
+
+    let (code, out) = doctor(dir.path(), true);
+    assert_eq!(code, 0, "--fix should normalize command; stdout:\n{out}");
+    let v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join(".mcp.json")).unwrap()).unwrap();
+    assert_eq!(v["mcpServers"]["clarion"]["command"], "clarion");
+}

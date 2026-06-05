@@ -156,7 +156,7 @@ fn check_mcp(project_root: &Path, fix: bool) -> usize {
         state => {
             let what = match state {
                 McpState::Missing => ".mcp.json has no clarion serve entry",
-                McpState::Stale => ".mcp.json clarion entry targets a different project",
+                McpState::Stale => ".mcp.json clarion entry is stale or unsafe",
                 McpState::Present | McpState::Unparseable => unreachable!(),
             };
             if !fix {
