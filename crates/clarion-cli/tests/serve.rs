@@ -4,7 +4,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Child, Command as StdCommand, Stdio};
-use std::sync::mpsc;
+use std::sync::{LazyLock, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,11 +15,14 @@ use clarion_core::{
 };
 use hmac::{Hmac, Mac};
 use rusqlite::{Connection, params};
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const STABLE_INSTANCE_ID: &str = "9bd7234e-6d44-4a38-9ae4-76f912a10221";
+static RESERVED_LOOPBACK_BINDS: LazyLock<Mutex<Vec<(String, TcpListener)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 
 #[derive(Debug)]
 struct HttpJsonResponse {
@@ -2579,7 +2582,51 @@ fn seed_storage_failure_file_entity(project_root: &Path) {
 
 fn free_loopback_bind() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind free loopback port");
-    listener.local_addr().expect("local addr").to_string()
+    let bind = listener.local_addr().expect("local addr").to_string();
+    RESERVED_LOOPBACK_BINDS
+        .lock()
+        .expect("reserved loopback bind lock")
+        .push((bind.clone(), listener));
+    bind
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ServeTestConfig {
+    serve: ServeTestSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ServeTestSection {
+    http: ServeHttpTestSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ServeHttpTestSection {
+    bind: Option<String>,
+}
+
+fn release_reserved_loopback_bind(project_root: &Path) {
+    let Some(bind) = configured_http_bind(project_root) else {
+        return;
+    };
+    let mut reserved = RESERVED_LOOPBACK_BINDS
+        .lock()
+        .expect("reserved loopback bind lock");
+    if let Some(index) = reserved
+        .iter()
+        .position(|(reserved_bind, _)| reserved_bind == &bind)
+    {
+        reserved.swap_remove(index);
+    }
+}
+
+fn configured_http_bind(project_root: &Path) -> Option<String> {
+    let raw = fs::read_to_string(project_root.join("clarion.yaml")).ok()?;
+    let parsed: ServeTestConfig = serde_norway::from_str(&raw).ok()?;
+    parsed.serve.http.bind
 }
 
 fn write_stdio_config(project_root: &Path) {
@@ -2735,6 +2782,7 @@ fn spawn_serve(project_root: &Path) -> ServeChild {
 }
 
 fn spawn_serve_with_env(project_root: &Path, env: &[(&str, &str)]) -> ServeChild {
+    release_reserved_loopback_bind(project_root);
     let mut command = StdCommand::new(assert_cmd::cargo::cargo_bin("clarion"));
     command
         .args(["serve", "--path"])

@@ -9,10 +9,17 @@
 //! The repair for each is that module's idempotent installer, so
 //! `doctor --fix` and `clarion install` converge to the same state.
 //!
-//! Output is a per-surface ✓/✗ report followed by the index snapshot (reused
+//! Output is a per-surface ✓/⚠/✗ report followed by the index snapshot (reused
 //! verbatim from the session-start hook). [`run`] returns whether every surface
 //! is healthy *after* any repairs; the caller maps an unhealthy result to a
 //! non-zero exit so `doctor` is usable as a CI / pre-commit gate.
+//!
+//! Severity is deliberate. The Loom three-way integration bindings are an
+//! *enrich-only* surface (per `docs/suite/loom.md` §5): a Clarion-solo or
+//! Clarion+Filigree-only project is first-class, so their absence is a
+//! **warning** (surfaced, suggests `--fix`) and never a problem that fails the
+//! gate. Only a genuinely broken state — an unparseable config file, or a
+//! `--fix` repair that errors or does not converge — is a problem.
 
 use std::env;
 use std::fs;
@@ -56,29 +63,36 @@ pub fn run(path: &Path, fix: bool, json_output: bool) -> Result<bool> {
 
     println!("clarion doctor{}", if fix { " --fix" } else { "" });
 
-    let mut problems = 0usize;
-    problems += check_skill(&project_root, fix);
-    problems += check_hook(&project_root, fix);
-    problems += check_mcp(&project_root, fix);
-    problems += check_integration_bindings(&project_root, fix);
+    let mut tally = Tally::default();
+    tally += check_skill(&project_root, fix);
+    tally += check_hook(&project_root, fix);
+    tally += check_mcp(&project_root, fix);
+    tally += check_integration_bindings(&project_root, fix);
 
     println!("--- index ---");
     for line in hook::snapshot_report(&project_root) {
         println!("{line}");
     }
 
-    if problems == 0 {
+    if tally.problems == 0 && tally.warnings == 0 {
         println!("All orientation surfaces healthy.");
+    } else if tally.problems == 0 {
+        let plural = if tally.warnings == 1 { "" } else { "s" };
+        println!(
+            "{} warning{plural}; no problems (run with --fix to wire optional surfaces).",
+            tally.warnings
+        );
     } else {
         let suffix = if fix {
             "."
         } else {
             " (run with --fix to repair)."
         };
-        let plural = if problems == 1 { "" } else { "s" };
-        println!("{problems} problem{plural} found{suffix}");
+        let plural = if tally.problems == 1 { "" } else { "s" };
+        println!("{} problem{plural} found{suffix}", tally.problems);
     }
-    Ok(problems == 0)
+    // Only problems fail the gate; warnings are advisory (enrich-only surfaces).
+    Ok(tally.problems == 0)
 }
 
 #[derive(Debug, Serialize)]
@@ -459,7 +473,8 @@ fn check_integration_bindings_json(project_root: &Path, fix: bool) -> DoctorJson
         BindingState::MissingOrStale => {
             let what = "three-way integration bindings missing or stale";
             if !fix {
-                return DoctorJsonCheck::problem("integration.bindings", what);
+                // Enrich-only surface: absence is a warning, not a gate failure.
+                return DoctorJsonCheck::warning("integration.bindings", what);
             }
             match integration_bindings::install_bindings(project_root) {
                 Ok(_)
@@ -486,22 +501,53 @@ fn read_clarion_yaml(project_root: &Path) -> Option<Value> {
     serde_norway::from_str(&raw).ok()
 }
 
-/// Print one healthy line and return 0.
-fn ok(line: &str) -> usize {
-    println!("  ✓ {line}");
-    0
+/// Per-check severity tally for the text report. Only `problems` fail the gate;
+/// `warnings` are surfaced but advisory (enrich-only / optional surfaces).
+#[derive(Default)]
+struct Tally {
+    problems: usize,
+    warnings: usize,
 }
 
-/// Print one problem line (plus an optional fix hint) and return 1.
-fn problem(line: &str, fix_hint: Option<&str>) -> usize {
+impl std::ops::AddAssign for Tally {
+    fn add_assign(&mut self, rhs: Self) {
+        self.problems += rhs.problems;
+        self.warnings += rhs.warnings;
+    }
+}
+
+/// Print one healthy line; contributes nothing to the tally.
+fn ok(line: &str) -> Tally {
+    println!("  ✓ {line}");
+    Tally::default()
+}
+
+/// Print one warning line (plus an optional fix hint). Surfaced but advisory —
+/// does not fail the gate.
+fn warn(line: &str, fix_hint: Option<&str>) -> Tally {
+    println!("  ⚠ {line}");
+    if let Some(hint) = fix_hint {
+        println!("      fix: {hint}");
+    }
+    Tally {
+        problems: 0,
+        warnings: 1,
+    }
+}
+
+/// Print one problem line (plus an optional fix hint). Fails the gate.
+fn problem(line: &str, fix_hint: Option<&str>) -> Tally {
     println!("  ✗ {line}");
     if let Some(hint) = fix_hint {
         println!("      fix: {hint}");
     }
-    1
+    Tally {
+        problems: 1,
+        warnings: 0,
+    }
 }
 
-fn check_skill(project_root: &Path, fix: bool) -> usize {
+fn check_skill(project_root: &Path, fix: bool) -> Tally {
     match skill_pack::skill_pack_state(project_root) {
         SkillPackState::UpToDate => ok("skill pack up to date (.claude + .agents)"),
         state => {
@@ -532,7 +578,7 @@ fn check_skill(project_root: &Path, fix: bool) -> usize {
     }
 }
 
-fn check_hook(project_root: &Path, fix: bool) -> usize {
+fn check_hook(project_root: &Path, fix: bool) -> Tally {
     match hooks_settings::session_start_hook_state(project_root) {
         HookState::Present => ok("SessionStart hook present (.claude/settings.json)"),
         // An unparseable settings.json is never auto-repaired — the merge
@@ -565,7 +611,7 @@ fn check_hook(project_root: &Path, fix: bool) -> usize {
     }
 }
 
-fn check_mcp(project_root: &Path, fix: bool) -> usize {
+fn check_mcp(project_root: &Path, fix: bool) -> Tally {
     match mcp_registration::mcp_entry_state(project_root) {
         McpState::Present => ok(".mcp.json clarion serve entry present"),
         McpState::Unparseable => problem(
@@ -595,7 +641,7 @@ fn check_mcp(project_root: &Path, fix: bool) -> usize {
     }
 }
 
-fn check_integration_bindings(project_root: &Path, fix: bool) -> usize {
+fn check_integration_bindings(project_root: &Path, fix: bool) -> Tally {
     match integration_bindings::binding_state(project_root) {
         BindingState::Present => {
             ok("three-way integration bindings present (Clarion + Filigree + Wardline)")
@@ -607,7 +653,8 @@ fn check_integration_bindings(project_root: &Path, fix: bool) -> usize {
         BindingState::MissingOrStale => {
             let what = "three-way integration bindings missing or stale";
             if !fix {
-                return problem(what, Some("clarion doctor --fix"));
+                // Enrich-only surface: absence is a warning, not a gate failure.
+                return warn(what, Some("clarion doctor --fix"));
             }
             match integration_bindings::install_bindings(project_root) {
                 Ok(_)

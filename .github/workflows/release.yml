@@ -30,7 +30,7 @@ jobs:
     name: Verify (pre-release gates)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           fetch-depth: 0
 
@@ -66,11 +66,6 @@ jobs:
         run: |
           python scripts/check-migration-retirement.py --self-test
           python scripts/check-migration-retirement.py
-
-      - name: release governance static guard
-        run: |
-          python scripts/check-github-release-governance.py --self-test
-          python scripts/check-github-release-governance.py --static-only
 
       - name: cross-workspace version lockstep
         run: python scripts/check-workspace-version-lockstep.py
@@ -162,25 +157,8 @@ jobs:
       - name: Phase 3 subsystems
         run: CARGO_BUILD=0 bash tests/e2e/phase3_subsystems.sh
 
-  release-governance:
-    name: GitHub release governance
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-
-      - name: enforce repository release controls
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_GOVERNANCE_TOKEN }}
-        run: |
-          set -euo pipefail
-          python scripts/check-github-release-governance.py \
-            --repository "${GITHUB_REPOSITORY}" \
-            --branch main
-
   build-rust:
-    needs: [verify, release-governance]
+    needs: [verify]
     name: Build clarion (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -196,7 +174,7 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-14
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
@@ -246,11 +224,11 @@ jobs:
           retention-days: 7
 
   build-plugin:
-    needs: [verify, release-governance]
+    needs: [verify]
     name: Build Python plugin sdist
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
@@ -318,7 +296,7 @@ jobs:
       contents: write
       id-token: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           fetch-depth: 0
 
@@ -335,7 +313,7 @@ jobs:
           ls -la release/
 
       - name: install cosign
-        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
 
       - name: sign release archives
         run: |
@@ -421,7 +399,7 @@ jobs:
           echo "notes-file=NOTES.md" >> "$GITHUB_OUTPUT"
 
       - name: create release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda
         with:
           tag_name: ${{ github.ref_name }}
           name: Clarion ${{ github.ref_name }}
@@ -447,7 +425,7 @@ jobs:
       contents: read
     steps:
       - name: install cosign
-        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
 
       - name: download published assets
         env:

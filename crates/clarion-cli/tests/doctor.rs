@@ -175,12 +175,17 @@ fn doctor_fix_repairs_missing_three_way_integration_bindings() {
 
     let (code, out) = doctor(dir.path(), false);
     assert_eq!(
-        code, 1,
-        "missing integration bindings should be unhealthy:\n{out}"
+        code, 0,
+        "missing enrich-only integration bindings must NOT fail the gate (federation axiom: \
+         Wardline is enrich-only, a Clarion-solo/Filigree-only project is first-class):\n{out}"
     );
     assert!(
-        out.contains("three-way integration bindings missing or stale"),
-        "stdout:\n{out}"
+        out.contains("⚠ three-way integration bindings missing or stale"),
+        "missing bindings should surface as a warning, not a problem:\n{out}"
+    );
+    assert!(
+        out.contains("1 warning; no problems"),
+        "summary should report the warning without claiming a problem:\n{out}"
     );
 
     let (code, out) = doctor(dir.path(), true);
@@ -298,8 +303,9 @@ fn doctor_fix_json_reports_fixed_config_bindings() {
 }
 
 /// With only the skill installed (no hook, no mcp, no integration bindings),
-/// `doctor` reports the missing surfaces and exits 1; the index snapshot block
-/// is still printed.
+/// `doctor` exits 1 on the genuine problems (missing hook + mcp) while the
+/// enrich-only integration bindings surface only as a warning; the index
+/// snapshot block is still printed.
 #[test]
 fn doctor_reports_missing_hook_and_mcp_and_prints_index_block() {
     let dir = tempfile::tempdir().unwrap();
@@ -314,9 +320,10 @@ fn doctor_reports_missing_hook_and_mcp_and_prints_index_block() {
         "stdout:\n{out}"
     );
     assert!(
-        out.contains("three-way integration bindings missing or stale"),
-        "stdout:\n{out}"
+        out.contains("⚠ three-way integration bindings missing or stale"),
+        "enrich-only bindings should be a warning, not a problem:\n{out}"
     );
     assert!(out.contains("--- index ---"), "stdout:\n{out}");
-    assert!(out.contains("3 problems found"), "stdout:\n{out}");
+    // Only the hook and mcp surfaces are genuine problems; bindings is a warning.
+    assert!(out.contains("2 problems found"), "stdout:\n{out}");
 }

@@ -475,14 +475,13 @@ impl ServerState {
             };
             requests_total += 1;
             accumulator.add_response(response);
+            // Stop if this response itself overflowed the issue cap, or if we've
+            // hit the cap and there are still entities left to query.
             if accumulator.issue_cap_truncated {
                 break;
             }
             if accumulator.emitted >= 100 && idx + 1 < read.entities.len() {
                 accumulator.issue_cap_truncated = true;
-                break;
-            }
-            if accumulator.issue_cap_truncated {
                 break;
             }
         }

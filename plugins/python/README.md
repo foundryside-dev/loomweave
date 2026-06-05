@@ -6,8 +6,10 @@ JSON-RPC protocol defined in [WP2 L4](../../docs/implementation/sprint-1/wp2-plu
 
 **Status**: Python structural extractor. It emits modules, classes, functions,
 `contains`, `calls`, `references`, `imports`, and versioned entity signatures
-for Stable Entity Identity (SEI) matching. Wardline semantic enrichment is not
-advertised until the plugin emits real Wardline-derived signals.
+for Stable Entity Identity (SEI) matching. It also reads Wardline's NG-25
+trust-vocabulary descriptor without importing Wardline and emits source-observed
+Wardline decorator metadata/tags on decorated entities when a descriptor is
+available.
 
 ## Install (development)
 

@@ -13,6 +13,17 @@ own semantics never depend on a taint fact existing. Every consume-side coupling
 here is likewise enrich-only and fail-soft — Clarion stays solo-useful when
 Filigree is absent (loom.md §5).
 
+> **Federation-pattern sources (pointers).** The federation axiom and composition
+> law cited as `loom.md §5` throughout this document are now authoritative at the
+> federation hub: `~/loom/doctrine.md` §5
+> (as of 2026-06-05; `loom.md` is now a pointer stub that preserves the original
+> section numbers, so `loom.md §5` resolves there). The cross-product **contract
+> index** — the suite-level list of every live cross-product contract and its
+> owning authority — lives at
+> `~/loom/contracts-index.md`. The
+> endpoint specs below are **Clarion-owned and authoritative**; the hub indexes
+> them, it does not restate them.
+
 ## HTTP Read API
 
 `clarion serve` can expose the HTTP read API when enabled in `clarion.yaml`:
@@ -1281,12 +1292,19 @@ This pins the Filigree reverse-association route Clarion consumes for
 GET {filigree_base}/api/entity-associations?entity_id={association_key}
 ```
 
-`association_key` is opaque to Filigree. Current Clarion callers use the
-entity's SEI (`clarion:eid:*`) when the served index has one, and fall back to
-the mutable locator (`{plugin}:{kind}:{qualname}`) only for pre-SEI or unbound
-indexes. The response field remains `clarion_entity_id` for wire compatibility;
-new rows normally echo the SEI key, while legacy rows may echo a locator.
-Clarion maps a returned SEI key back to the current locator before comparing
+`association_key` is opaque to Filigree. Clarion sends exactly **one** key per
+entity: the entity's SEI (`clarion:eid:*`) when the served index has one, and
+the mutable locator (`{plugin}:{kind}:{qualname}`) only for entities with no SEI
+(pre-SEI or unbound indexes). There is no per-row fallback: once an entity has a
+SEI, Clarion queries by SEI alone, so a *legacy locator-keyed* Filigree row for
+that same entity is **not** resolved until the SEI migration re-keys it onto the
+SEI (per [`sei-migration-playbook.md`](./sei-migration-playbook.md); bindings
+"must key on the SEI" — see [§SEI identity resolution](#sei-identity-resolution)).
+The locator query path therefore applies solely to entities that never had a SEI.
+
+The response field remains `clarion_entity_id` for wire compatibility; a SEI
+query echoes the SEI key, a locator query echoes the locator. Clarion maps a
+returned SEI key back to the current locator before comparing
 `content_hash_at_attach` against the current entity content hash.
 
 ## Consumed Filigree route: issue detail (enrichment)

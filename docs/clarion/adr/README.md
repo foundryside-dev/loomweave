@@ -20,7 +20,7 @@ This folder is the canonical home for authored Clarion architecture decision rec
 | [ADR-015](./ADR-015-wardline-filigree-emission.md) | Wardline→Filigree emission ownership — Clarion-side SARIF translator (v0.1), native Wardline emitter (v0.2) | Accepted |
 | [ADR-016](./ADR-016-observation-transport.md) | Observation transport — MCP-spawn (v0.1), Filigree HTTP endpoint (v0.2) | Accepted |
 | [ADR-017](./ADR-017-severity-and-dedup.md) | Severity mapping, rule-ID round-trip, and dedup policy | Accepted |
-| [ADR-018](./ADR-018-identity-reconciliation.md) | Identity reconciliation — Clarion translates; Wardline owns its qualnames; direct REGISTRY import with version pinning | Accepted |
+| [ADR-018](./ADR-018-identity-reconciliation.md) | Identity reconciliation — Clarion translates; Wardline owns its qualnames; descriptor read (direct REGISTRY import retired, Rev 3) | Accepted |
 | [ADR-021](./ADR-021-plugin-authority-hybrid.md) | Plugin authority model: hybrid (declared capabilities + core-enforced minimums) | Accepted |
 | [ADR-022](./ADR-022-core-plugin-ontology.md) | Core/plugin ontology ownership boundary | Accepted |
 | [ADR-023](./ADR-023-tooling-baseline.md) | Rust + Python tooling baseline (edition 2024, pedantic, cargo-deny, nextest, CI; ruff + mypy-strict + pre-commit) | Accepted |

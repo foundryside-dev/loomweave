@@ -16,8 +16,8 @@ Practical notes for configuring and running Clarion.
 - [Guidance](./guidance.md) — authoring guidance sheets with the `clarion
   guidance` CLI, `--match`/`--scope-level`/`--expires` semantics, staleness
   findings, and the export/import team-sharing workflow.
-- [Release governance](./v1.0-release-governance.md) — maintainer steps
-  for GitHub branch/ruleset enforcement, Actions policy, release dry run, and
-  final tag gating.
+- [Release handoff](./release-handoff.md) — retired
+  Clarion-owned GitHub ruleset enforcement and current standalone release
+  sequence.
 - [Federation contracts](../federation/contracts.md) — read-side HTTP
   contracts consumed by sibling products such as Filigree.

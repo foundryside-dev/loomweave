@@ -19,7 +19,7 @@ jobs:
     name: Rust
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           # Full history so the ADR-024 migration-retirement guard can resolve
           # the published_build.txt ref via `git show <ref>:0001` (the marker
@@ -34,10 +34,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
 
-      # Python is used by the migration-retirement guard and the
-      # workspace-version-lockstep guard below. Pin >= 3.11 explicitly so the
-      # stdlib `tomllib` is available regardless of which Python the runner
-      # image happens to preinstall.
+      # Python is used by the migration-retirement guard and lockstep guards
+      # below. Pin >= 3.11 explicitly so the stdlib `tomllib` is available
+      # regardless of which Python the runner image happens to preinstall.
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version: "3.11"
@@ -49,11 +48,6 @@ jobs:
         run: |
           python scripts/check-migration-retirement.py --self-test
           python scripts/check-migration-retirement.py
-
-      - name: release governance static guard
-        run: |
-          python scripts/check-github-release-governance.py --self-test
-          python scripts/check-github-release-governance.py --static-only
 
       - name: cross-workspace version lockstep
         run: python scripts/check-workspace-version-lockstep.py
@@ -123,7 +117,7 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-14
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
@@ -144,7 +138,7 @@ jobs:
     name: Python plugin
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
@@ -197,7 +191,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [rust, python-plugin]
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:

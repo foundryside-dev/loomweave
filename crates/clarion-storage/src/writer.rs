@@ -12,6 +12,7 @@
 //! present in release builds as a no-op counter; no `#[cfg(test)]` gating
 //! is used.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -71,10 +72,18 @@ impl Writer {
     /// Returns [`StorageError::Sqlite`] if the `rusqlite::Connection` cannot
     /// be opened, or [`StorageError::PragmaInvariant`] if write PRAGMAs fail.
     pub fn spawn(
-        db_path: std::path::PathBuf,
+        db_path: impl AsRef<Path>,
         batch_size: usize,
         channel_capacity: usize,
     ) -> Result<(Self, JoinHandle<Result<()>>)> {
+        let mut conn = Connection::open(db_path.as_ref())?;
+        pragma::apply_write_pragmas(&conn)?;
+        // STO-02: refuse a database whose `user_version` is strictly greater
+        // than CURRENT_SCHEMA_VERSION. Equal/less are normal — equal is the
+        // already-migrated steady state, less is handled by the migration
+        // runner (which `install` calls before the writer ever spawns).
+        schema::verify_user_version(&conn)?;
+
         let (tx, rx) = mpsc::channel(channel_capacity);
         let commits_observed = Arc::new(AtomicUsize::new(0));
         let dropped_edges_total = Arc::new(AtomicUsize::new(0));
@@ -83,13 +92,6 @@ impl Writer {
         let dropped_for_actor = dropped_edges_total.clone();
         let ambiguous_for_actor = ambiguous_edges_total.clone();
         let handle = tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut conn = Connection::open(&db_path)?;
-            pragma::apply_write_pragmas(&conn)?;
-            // STO-02: refuse a database whose `user_version` is strictly greater
-            // than CURRENT_SCHEMA_VERSION. Equal/less are normal — equal is the
-            // already-migrated steady state, less is handled by the migration
-            // runner (which `install` calls before the writer ever spawns).
-            schema::verify_user_version(&conn)?;
             run_actor(
                 rx,
                 &mut conn,

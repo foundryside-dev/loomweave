@@ -86,11 +86,14 @@ def test_initialize_roundtrip() -> None:
         assert response["id"] == 1
         result = response["result"]
         assert result["name"] == "clarion-plugin-python"
-        assert result["version"] == "1.2.0"
-        assert result["ontology_version"] == "0.6.0"
-        # Wardline is not advertised until the plugin emits real Wardline
-        # semantic signals.
-        assert result["capabilities"] == {}
+        assert result["version"] == "1.3.0"
+        assert result["ontology_version"] == "0.7.0"
+        assert set(result["capabilities"]) == {"wardline"}
+        assert result["capabilities"]["wardline"]["status"] in {
+            "absent",
+            "enabled",
+            "version_skew",
+        }
 
         # Graceful shutdown: shutdown → ack `{}`, then exit notification.
         proc.stdin.write(
@@ -243,6 +246,90 @@ def test_analyze_file_returns_extracted_entities(tmp_path: Path) -> None:
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=2)
+
+
+def test_initialize_project_descriptor_reports_wardline_enabled(tmp_path: Path) -> None:
+    descriptor = tmp_path / ".wardline" / "vocabulary.yaml"
+    descriptor.parent.mkdir()
+    descriptor.write_text(
+        """\
+version: wardline-generic-2
+entries:
+- canonical_name: trusted
+  group: 1
+  attrs:
+    _wardline_level: TaintState
+""",
+        encoding="utf-8",
+    )
+    state = server_module.ServerState()
+
+    response = server_module.handle_initialize(
+        {"protocol_version": "1.0", "project_root": str(tmp_path)},
+        state,
+    )
+
+    assert response["capabilities"]["wardline"] == {
+        "status": "enabled",
+        "descriptor_version": "wardline-generic-2",
+        "source": "project",
+    }
+    assert state.wardline_vocabulary is not None
+
+
+def test_analyze_file_threads_wardline_vocabulary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePyrightSession:
+        def __init__(self, project_root: Path, **_kwargs: Any) -> None:
+            self.project_root = project_root
+
+        def resolve_calls(
+            self,
+            file_path: str,
+            function_ids: list[str],
+        ) -> CallResolutionResult:
+            _ = (file_path, function_ids)
+            return CallResolutionResult()
+
+        def resolve_references(
+            self,
+            file_path: str,
+            sites: Sequence[ReferenceSite],
+        ) -> ReferenceResolutionResult:
+            _ = (file_path, sites)
+            return ReferenceResolutionResult()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(server_module, "PyrightSession", FakePyrightSession, raising=False)
+    descriptor = tmp_path / ".wardline" / "vocabulary.yaml"
+    descriptor.parent.mkdir()
+    descriptor.write_text(
+        """\
+version: wardline-generic-2
+entries:
+- canonical_name: trusted
+  group: 1
+  attrs:
+    _wardline_level: TaintState
+""",
+        encoding="utf-8",
+    )
+    demo = tmp_path / "demo.py"
+    demo.write_text("@trusted\ndef compute():\n    return 1\n", encoding="utf-8")
+    state = server_module.ServerState(initialized=True)
+    server_module.handle_initialize(
+        {"protocol_version": "1.0", "project_root": str(tmp_path)}, state
+    )
+
+    response = server_module.handle_analyze_file({"file_path": str(demo)}, state)
+
+    compute = next(e for e in response["entities"] if e["id"] == "python:function:demo.compute")
+    assert compute["wardline"]["decorators"][0]["canonical_name"] == "trusted"
+    assert "wardline:trusted" in compute["tags"]
 
 
 def test_method_not_found_returns_error() -> None:

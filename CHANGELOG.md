@@ -12,14 +12,90 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-06-05
+
+### Added
+
+- **Python plugin consumes Wardline's NG-25 trust-vocabulary descriptor
+  (ADR-018 Revision 3).** The Python plugin now reads Wardline's descriptor from
+  `.wardline/vocabulary.yaml` or the installed `wardline/core/vocabulary.yaml`
+  data file **without importing Wardline**. Functions and classes decorated with
+  Wardline trust decorators (`external_boundary` / `trust_boundary` / `trusted`)
+  receive `wardline` entity metadata and `wardline:*` tags when the descriptor is
+  available; a missing, invalid, or version-skewed descriptor degrades honestly to
+  normal structural extraction. This **fully retires** the Clarion-side
+  `wardline.core.registry` startup coupling (federation asterisk 2, registered at
+  `~/loom/asterisk-register.md`): plugin startup performs zero in-process Wardline import, so the
+  plugin no longer requires a co-installed Wardline and is robust to Wardline's
+  upcoming native core. Plugin-only change (no Rust-core / protocol / ontology
+  change); tracked at `clarion-881e9834bc`.
+
 ### Changed
 
-- Refreshed release-facing README/index documentation for the current 1.2.0
-  release line, including the 39-tool MCP surface, current install artifact
-  names, fixed ADR/docset links, current web/operator quick starts, and the full
-  end-to-end verification list.
+- **Filigree issue lookups key by Stable Entity Identity (SEI).** The MCP
+  `entity_issue_list` path and the federation Filigree client resolve issues by
+  SEI rather than source locator, aligning issue enrichment with Clarion's stable
+  identity (one key per entity — SEI xor locator, no per-row fallback).
+- Refreshed release-facing README / index documentation for the 1.3.0 release
+  line, including the 39-tool MCP surface, current install artifact names, fixed
+  ADR/docset links, current web/operator quick starts, and the full end-to-end
+  verification list.
 - Archived tracked architecture-analysis working notes out of live `temp/`
   directories under `docs/archive/working-notes/`.
+
+### Removed
+
+- **Release-governance gate script (`scripts/check-github-release-governance.py`).**
+  Release-governance enforcement is handed off to Legis; `release.yml` no longer
+  invokes the script and the standalone check is removed from the tree.
+- **In-repo agent-instruction files (`CLAUDE.md`, `AGENTS.md`).** Agent
+  conventions now derive from the `~/loom` federation hub plus local untracked
+  copies; both files are removed from the tracked tree and gitignored.
+- **Bundled Filigree-workflow skill (`.agents/skills/filigree-workflow/SKILL.md`).**
+  Removed from the tracked tree alongside the agent-instruction files.
+
+### Fixed
+
+- **`clarion doctor` reports enrich-only integration bindings as a warning, not a
+  gate failure (federation-axiom compliance).** A missing or stale
+  Clarion+Filigree+Wardline binding previously mapped to `problem` (exit 1),
+  which made an enrich-only sibling effectively required — contradicting
+  `loom.md` §5. Both the JSON and text doctor paths now report `warning` for
+  missing/stale bindings; unparseable bindings and `--fix` repair failures remain
+  `problem`. A bare `clarion doctor` on a no-bindings (Clarion-solo or
+  Clarion+Filigree-only) project now exits 0 with the warning surfaced.
+
+### Security
+
+- **Closed a config-driven command-execution path from untrusted repository
+  contents (`clarion-4b5a8aff54`).** `clarion analyze` (the SEI git-rename
+  signal) and `clarion serve` (the `index_diff_get` freshness/drift report)
+  shelled `git` inside the analyzed repository with repo-local configuration and
+  Git attributes enabled, so a malicious repository could execute arbitrary
+  commands as the local user during an ordinary analyze/serve — via
+  `core.fsmonitor`, an external diff/textconv driver, or a `filter.<name>.clean`
+  selected by a `filter` attribute. All corpus-facing `git` calls now route
+  through a single hardened helper (`clarion_core::hardened_git_command`) that
+  ignores operator/global/system config, strips config/exec-injecting environment
+  variables, overrides the program-naming repo-local keys via highest-precedence
+  `-c` flags (including `core.fsmonitor=false` and `core.attributesFile=`), and
+  neutralizes the attribute sources it can — the in-tree `.gitattributes` via
+  `--attr-source=<empty-tree>` and the system file via `GIT_ATTR_NOSYSTEM`. The
+  one source no config flag can disable, `$GIT_DIR/info/attributes`, only triggers
+  a filter when Git hashes working-tree content, so the call sites no longer do
+  that on an untrusted corpus: the rename signal uses `git diff --cached`
+  (index-vs-HEAD; still catches staged `git mv` renames) and the freshness probe
+  replaces `git status` with `git diff --cached` plus the existing stat-based
+  per-file drift check. **Behavior change:** `index_diff`'s `dirty_files` now
+  lists staged changes only — unstaged working-tree modifications and untracked
+  files are no longer enumerated there (unstaged edits to indexed files still
+  surface in `modified_since_analyze`). Signals remain best-effort and
+  enrich-only. The `--attr-source` belt-and-suspenders is applied only when a
+  one-time probe confirms Git >= 2.40; older Git omits it and stays both safe (the
+  `--cached` call sites carry the actual protection) and fully functional, so no
+  minimum-Git floor is introduced. Reported externally and re-verified with
+  working PoCs across all attribute sources; relates to the untrusted-corpus
+  posture of ADR-021.
 
 ## [1.2.0] — 2026-06-03
 
@@ -466,7 +542,8 @@ normative.
 - Operator guides under [`docs/operator/`](docs/operator/) — getting-started,
   OpenRouter setup, HTTP read API.
 
-[Unreleased]: https://github.com/tachyon-beep/clarion/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/tachyon-beep/clarion/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/tachyon-beep/clarion/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/tachyon-beep/clarion/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/tachyon-beep/clarion/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/tachyon-beep/clarion/compare/v1.0.0...v1.0.1

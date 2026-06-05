@@ -9,6 +9,7 @@
 pub mod embedding_provider;
 pub mod entity_id;
 pub mod errors;
+pub mod hardened_git;
 pub mod llm_provider;
 pub mod plugin;
 
@@ -18,6 +19,7 @@ pub use embedding_provider::{
 };
 pub use entity_id::{EntityId, EntityIdError, entity_id};
 pub use errors::{HttpErrorCode, McpErrorCode};
+pub use hardened_git::hardened_git_command;
 pub use llm_provider::{
     CachingModel, ClaudeCliProvider, ClaudeCliProviderConfig, CodexCliProvider,
     CodexCliProviderConfig, INFERRED_CALLS_PROMPT_VERSION, InferredCallsPromptInput,

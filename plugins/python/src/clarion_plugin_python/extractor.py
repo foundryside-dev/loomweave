@@ -60,7 +60,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
-from typing import Literal, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 
 from clarion_plugin_python.call_resolver import (
     CallResolutionResult,
@@ -79,6 +79,9 @@ from clarion_plugin_python.reference_resolver import (
     ReferencesEdgeProperties,
     ReferenceSite,
 )
+
+if TYPE_CHECKING:
+    from clarion_plugin_python.wardline_descriptor import WardlineVocabulary
 
 _PLUGIN_ID = "python"
 _NOOP_CALL_RESOLVER = NoOpCallResolver()
@@ -145,6 +148,20 @@ class ClassSignature(TypedDict):
     bases: list[str]
 
 
+class WardlineDecoratorMetadata(TypedDict):
+    canonical_name: str
+    qualified_name: str
+    group: int
+    attrs: dict[str, str]
+    line: int
+
+
+class WardlineEntityMetadata(TypedDict):
+    descriptor_version: str
+    confidence_basis: Literal["descriptor", "descriptor_version_skew"]
+    decorators: list[WardlineDecoratorMetadata]
+
+
 class RawEntity(TypedDict):
     """Wire shape matching the Rust host's RawEntity contract.
 
@@ -179,6 +196,9 @@ class RawEntity(TypedDict):
     tags: NotRequired[list[str]]
     # Short natural-language text used by analyze-time semantic embeddings.
     docstring: NotRequired[str]
+    # Wardline descriptor-backed source-observed decorator facts. Wardline owns
+    # the vocabulary; Clarion stores only the annotation facts seen on entities.
+    wardline: NotRequired[WardlineEntityMetadata]
 
 
 class RawEdge(TypedDict):
@@ -321,13 +341,14 @@ def _build_module_entity(
     return entity
 
 
-def extract(
+def extract(  # noqa: PLR0913 - resolver seams + optional Wardline vocabulary are caller-owned.
     source: str,
     file_path: str,
     *,
     module_prefix_path: str | None = None,
     call_resolver: CallResolver = _NOOP_CALL_RESOLVER,
     reference_resolver: ReferenceResolver = _NOOP_REFERENCE_RESOLVER,
+    wardline_vocabulary: WardlineVocabulary | None = None,
 ) -> tuple[list[RawEntity], list[RawEdge]]:
     result = extract_with_stats(
         source,
@@ -335,17 +356,19 @@ def extract(
         module_prefix_path=module_prefix_path,
         call_resolver=call_resolver,
         reference_resolver=reference_resolver,
+        wardline_vocabulary=wardline_vocabulary,
     )
     return result.entities, result.edges
 
 
-def extract_with_stats(
+def extract_with_stats(  # noqa: PLR0913 - resolver seams + optional Wardline vocabulary are caller-owned.
     source: str,
     file_path: str,
     *,
     module_prefix_path: str | None = None,
     call_resolver: CallResolver = _NOOP_CALL_RESOLVER,
     reference_resolver: ReferenceResolver = _NOOP_REFERENCE_RESOLVER,
+    wardline_vocabulary: WardlineVocabulary | None = None,
 ) -> ExtractResult:
     """Return extracted entities/edges plus resolver observability stats.
 
@@ -413,6 +436,7 @@ def extract_with_stats(
         seen_ids={module_entity["id"]},
         file_path=file_path,
         exported_names=_module_export_names(tree),
+        wardline_vocabulary=wardline_vocabulary,
     )
     _walk(
         tree,
@@ -863,6 +887,7 @@ class _WalkState:
 
     seen_ids: set[str]
     file_path: str
+    wardline_vocabulary: WardlineVocabulary | None = None
     exported_names: set[str] = field(default_factory=set)
     duplicate_entities_dropped: int = 0
 
@@ -1045,6 +1070,40 @@ def _attach_optional_entity_metadata(
         entity["tags"] = sorted(tags)
 
 
+def _attach_wardline_entity_metadata(
+    entity: RawEntity,
+    node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+    tags: set[str],
+    vocabulary: WardlineVocabulary | None,
+) -> None:
+    if vocabulary is None:
+        return
+    decorators: list[WardlineDecoratorMetadata] = []
+    for decorator in node.decorator_list:
+        qualified_name = _expr_qualified_name(decorator)
+        if qualified_name is None:
+            continue
+        entry = vocabulary.entry_for_decorator(qualified_name)
+        if entry is None:
+            continue
+        decorators.append(
+            {
+                "canonical_name": entry.canonical_name,
+                "qualified_name": qualified_name,
+                "group": entry.group,
+                "attrs": dict(entry.attrs),
+                "line": decorator.lineno,
+            },
+        )
+        tags.update({"wardline", f"wardline:{entry.canonical_name}"})
+    if decorators:
+        entity["wardline"] = {
+            "descriptor_version": vocabulary.version,
+            "confidence_basis": vocabulary.confidence_basis,
+            "decorators": decorators,
+        }
+
+
 def _module_export_names(tree: ast.Module) -> set[str]:
     exported: set[str] = set()
     for statement in tree.body:
@@ -1196,10 +1255,12 @@ def _build_function_entity(
         "definition": definition,
         "signature": _function_signature(node),
     }
+    tags = _function_tags(node, parents, state.exported_names)
+    _attach_wardline_entity_metadata(entity, node, tags, state.wardline_vocabulary)
     _attach_optional_entity_metadata(
         entity,
         docstring=ast.get_docstring(node),
-        tags=_function_tags(node, parents, state.exported_names),
+        tags=tags,
     )
     return entity, child_id
 
@@ -1241,9 +1302,11 @@ def _build_class_entity(
         "definition": definition,
         "signature": _class_signature(node),
     }
+    tags = _class_tags(node, parents, state.exported_names)
+    _attach_wardline_entity_metadata(entity, node, tags, state.wardline_vocabulary)
     _attach_optional_entity_metadata(
         entity,
         docstring=ast.get_docstring(node),
-        tags=_class_tags(node, parents, state.exported_names),
+        tags=tags,
     )
     return entity, child_id

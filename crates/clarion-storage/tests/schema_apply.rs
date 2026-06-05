@@ -1196,6 +1196,47 @@ fn open_refuses_db_from_future_user_version() {
 }
 
 #[test]
+fn writer_spawn_refuses_future_user_version_before_returning_sender() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("future-sync.db");
+    {
+        let mut conn = Connection::open(&path).unwrap();
+        pragma::apply_write_pragmas(&conn).unwrap();
+        schema::apply_migrations(&mut conn).unwrap();
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA user_version = {};",
+            schema::CURRENT_SCHEMA_VERSION + 1
+        ))
+        .expect("bump user_version");
+    }
+
+    let expected_found = schema::CURRENT_SCHEMA_VERSION + 1;
+    let expected_current = schema::CURRENT_SCHEMA_VERSION;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async move {
+        match Writer::spawn(path, 50, 256) {
+            Err(StorageError::FutureUserVersion { found, current }) => {
+                assert_eq!(found, expected_found);
+                assert_eq!(current, expected_current);
+            }
+            Err(err) => panic!("expected FutureUserVersion, got {err:?}"),
+            Ok((writer, handle)) => {
+                drop(writer);
+                handle.abort();
+                panic!("Writer::spawn returned a sender for a future-versioned database");
+            }
+        }
+    });
+}
+
+#[test]
 fn open_sets_application_id_on_legacy_db() {
     let tempdir = tempfile::tempdir().unwrap();
     let path = tempdir.path().join("legacy.db");

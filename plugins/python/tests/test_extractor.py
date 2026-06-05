@@ -7,7 +7,7 @@ import shutil
 import sys
 import textwrap
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import pytest
 
@@ -23,6 +23,7 @@ from clarion_plugin_python.extractor import (
 )
 from clarion_plugin_python.pyright_session import PyrightSession
 from clarion_plugin_python.reference_resolver import ReferenceResolutionResult, ReferenceSite
+from clarion_plugin_python.wardline_descriptor import DescriptorEntry, WardlineVocabulary
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -988,6 +989,120 @@ class Config:
     assert "entry-point" in main["tags"]
     assert "test" in test["tags"]
     assert "data-model" in config["tags"]
+
+
+def _wardline_vocabulary(
+    *,
+    confidence_basis: Literal["descriptor", "descriptor_version_skew"] = "descriptor",
+) -> WardlineVocabulary:
+    return WardlineVocabulary(
+        version="wardline-generic-2",
+        source="project",
+        confidence_basis=confidence_basis,
+        entries_by_name={
+            "external_boundary": DescriptorEntry(
+                canonical_name="external_boundary",
+                group=1,
+                attrs={},
+            ),
+            "trust_boundary": DescriptorEntry(
+                canonical_name="trust_boundary",
+                group=1,
+                attrs={"_wardline_to_level": "TaintState"},
+            ),
+            "trusted": DescriptorEntry(
+                canonical_name="trusted",
+                group=1,
+                attrs={"_wardline_level": "TaintState"},
+            ),
+        },
+    )
+
+
+def test_wardline_vocabulary_attaches_decorator_metadata_and_tags() -> None:
+    source = """\
+from loom_markers import external_boundary, trust_boundary, trusted
+
+@external_boundary
+def read_body():
+    return ""
+
+@loom_markers.trust_boundary(to_level="ASSURED")
+@trusted(level="INTEGRAL")
+class Sanitizer:
+    pass
+"""
+
+    entities, _ = extract(source, "service.py", wardline_vocabulary=_wardline_vocabulary())
+
+    read_body = next(e for e in entities if e["id"] == "python:function:service.read_body")
+    sanitizer = next(e for e in entities if e["id"] == "python:class:service.Sanitizer")
+
+    assert read_body["wardline"] == {
+        "descriptor_version": "wardline-generic-2",
+        "confidence_basis": "descriptor",
+        "decorators": [
+            {
+                "canonical_name": "external_boundary",
+                "qualified_name": "external_boundary",
+                "group": 1,
+                "attrs": {},
+                "line": 3,
+            },
+        ],
+    }
+    assert "wardline" in read_body["tags"]
+    assert "wardline:external_boundary" in read_body["tags"]
+
+    assert sanitizer["wardline"]["decorators"] == [
+        {
+            "canonical_name": "trust_boundary",
+            "qualified_name": "loom_markers.trust_boundary",
+            "group": 1,
+            "attrs": {"_wardline_to_level": "TaintState"},
+            "line": 7,
+        },
+        {
+            "canonical_name": "trusted",
+            "qualified_name": "trusted",
+            "group": 1,
+            "attrs": {"_wardline_level": "TaintState"},
+            "line": 8,
+        },
+    ]
+    assert "wardline:trust_boundary" in sanitizer["tags"]
+    assert "wardline:trusted" in sanitizer["tags"]
+
+
+def test_wardline_absent_preserves_plain_extraction_without_metadata() -> None:
+    source = """\
+@trusted
+def compute():
+    return 1
+"""
+
+    entities, _ = extract(source, "service.py", wardline_vocabulary=None)
+
+    compute = next(e for e in entities if e["id"] == "python:function:service.compute")
+    assert "wardline" not in compute
+    assert "tags" not in compute or "wardline" not in compute["tags"]
+
+
+def test_wardline_version_skew_marks_degraded_confidence() -> None:
+    source = """\
+@trusted
+def compute():
+    return 1
+"""
+
+    entities, _ = extract(
+        source,
+        "service.py",
+        wardline_vocabulary=_wardline_vocabulary(confidence_basis="descriptor_version_skew"),
+    )
+
+    compute = next(e for e in entities if e["id"] == "python:function:service.compute")
+    assert compute["wardline"]["confidence_basis"] == "descriptor_version_skew"
 
 
 def test_module_source_range_no_trailing_newline() -> None:
