@@ -12,7 +12,7 @@ Rename the product **Clarion → Loomweave** and the framework/suite **Loom → 
 
 ## READ FIRST (authoritative detail)
 - `docs/implementation/2026-06-05-loomweave-1.0-rename-and-pypi-plan.md` — **Phase B** is your spec (workstreams WS1–WS9, the reference-triage recipe, the do-not-rename list, the execution strategy, and the verification gate). Phases C/D are NOT yours (PyPI packaging + infra come later).
-- Skim `docs/superpowers/specs/2026-06-05-clarion-pypi-distribution-design.md` for context only.
+- Skim `docs/superpowers/specs/2026-06-05-loomweave-pypi-distribution-design.md` for context only.
 
 ## Naming hierarchy (the target end state)
 **Weft** framework (was "Loom") › **Loomweave** (flagship, was "Clarion"), **Filigree**, **Wardline**, **Legis** (+ **Shuttle** planned).

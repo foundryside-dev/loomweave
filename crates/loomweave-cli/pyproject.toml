@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "loomweave"
+version = "1.0.0"
+description = "Loomweave — graph-aware code archaeology (Rust core)"
+readme = "../../README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "John Morrissey", email = "qacona@gmail.com" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+]
+dependencies = ["loomweave-plugin-python==1.0.0"]
+
+[project.urls]
+Repository = "https://github.com/foundryside-dev/loomweave"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "Cargo.toml"
+bins = ["loomweave"]
+strip = true
