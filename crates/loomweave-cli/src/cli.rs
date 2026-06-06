@@ -3,7 +3,21 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(name = "loomweave", version, about = "Loomweave code-archaeology tool")]
+#[command(
+    name = "loomweave",
+    version,
+    about = "Loomweave code-archaeology tool",
+    long_about = "Loomweave extracts a queryable graph from a codebase and serves it to \
+consult-mode agents over MCP.\n\n\
+Typical flow: `loomweave install` (set up .loomweave/ + agent assets), `loomweave \
+analyze` (build the index), `loomweave serve` (run the MCP server).\n\n\
+LLM-backed entity summaries are OFF by default. To enable them set \
+`llm_policy.enabled: true` + `allow_live_provider: true` in loomweave.yaml and supply \
+the provider credential (e.g. OPENROUTER_API_KEY), or point at a coding-agent CLI \
+(claude_cli / codex_cli). Run `loomweave config example` to print an annotated config \
+and `loomweave config check` to see the effective LLM state; `loomweave doctor` \
+validates the install and the config."
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -66,8 +80,9 @@ pub enum Command {
     /// Run an analysis pass: walk the source tree, dispatch discovered plugins
     /// to extract entities/edges, and persist results to `.loomweave/loomweave.db`.
     /// Re-runs are idempotent (UPSERT on `entities.id`). If no plugins are on
-    /// `$PATH`, exits 0 with a WARN and status `skipped_no_plugins` — see
-    /// `docs/operator/getting-started.md` Troubleshooting.
+    /// `$PATH`, exits 0 with a WARN and status `skipped_no_plugins` — see the
+    /// Troubleshooting guide at
+    /// <https://github.com/foundryside-dev/loomweave/blob/main/docs/operator/getting-started.md>.
     ///
     /// To commit the index as a versioned artifact while `serve` may be running,
     /// take a consistent online copy with `loomweave db backup` rather than
@@ -148,6 +163,17 @@ pub enum Command {
     },
 
     /// Run the MCP stdio server.
+    ///
+    /// Serves the code graph to MCP clients. The entity_summary_get tool needs a
+    /// live LLM provider, which is OFF by default: set `llm_policy.enabled: true`
+    /// and `allow_live_provider: true` in loomweave.yaml and supply the provider
+    /// credential (OPENROUTER_API_KEY for the default openrouter provider), or
+    /// switch `llm_policy.provider` to claude_cli / codex_cli for a locally
+    /// authenticated coding-agent CLI. Without that, summaries are cache-only.
+    /// Write-capable tools (entity_summary_get, analyze_start, analyze_cancel,
+    /// propose_guidance, promote_guidance) require `serve.mcp.enable_write_tools:
+    /// true`. The effective LLM posture is logged to stderr at startup; run
+    /// `loomweave config check` to inspect it ahead of time.
     Serve {
         /// Project directory containing .loomweave/loomweave.db.
         #[arg(long, default_value = ".")]
@@ -176,6 +202,15 @@ pub enum Command {
     Guidance {
         #[command(subcommand)]
         command: GuidanceCommand,
+    },
+
+    /// Inspect `loomweave.yaml`: print an annotated example, or validate the
+    /// file and report the effective LLM provider state. The installed binary
+    /// ships no docs, so this is the in-tool way to discover the config schema
+    /// and see why live summaries are (or are not) enabled.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
     },
 
     /// Verify (and optionally repair) the installed agent-orientation surfaces:
@@ -228,6 +263,34 @@ pub enum DbCommand {
         /// Overwrite the output file if it already exists.
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigCommand {
+    /// Print an annotated example `loomweave.yaml` to stdout — the same content
+    /// `loomweave install` writes, generated so it always matches the current
+    /// config schema. Redirect it to `loomweave.yaml` and edit.
+    Example {
+        /// Pre-select the active LLM provider block in the example
+        /// (`openrouter`, `codex_cli`, or `claude_cli`). Defaults to the stub's
+        /// `openrouter`.
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Option<String>,
+    },
+
+    /// Parse and validate `loomweave.yaml`, then print the effective LLM state
+    /// (provider, enabled, live, model) and any warnings — the in-tool answer to
+    /// "why are my summaries cache-only?". Exits non-zero if the file fails to
+    /// parse or validate, so it works as a CI / pre-commit gate.
+    Check {
+        /// Project directory containing loomweave.yaml (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Path to loomweave.yaml (default: <path>/loomweave.yaml if present).
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 }
 

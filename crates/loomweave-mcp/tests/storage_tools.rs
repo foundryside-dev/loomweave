@@ -1208,6 +1208,7 @@ async fn issues_for_reports_resolved_endpoint_and_result_kind() {
     let diagnostics = DiagnosticsContext {
         llm: LlmDiagnostics {
             provider: "disabled".to_owned(),
+            enabled: false,
             live: false,
             allow_live_provider: false,
             cache_max_age_days: 180,
@@ -2422,6 +2423,50 @@ async fn summary_preview_cost_disabled_llm_is_distinct_from_miss() {
         envelope["result"]["live_spend_would_occur"], false,
         "a miss with no live provider must not be flagged as spending: {envelope:?}"
     );
+}
+
+#[tokio::test]
+async fn status_surfaces_agree_on_allow_live_provider_when_half_configured() {
+    // agent-first-feedback §2.2: project_status_get and summary_preview_cost must
+    // report the SAME allow_live_provider for a half-configured state — a provider
+    // permitted by config (allow_live_provider: true) but with enabled=false, so
+    // no live provider is wired. Previously the two read paths disagreed (status
+    // read raw config → true; preview read the unwired provider → false).
+    let (project, db_path) = open_project();
+    let diagnostics = DiagnosticsContext {
+        llm: LlmDiagnostics {
+            provider: "disabled".to_owned(),
+            enabled: false,
+            live: false,
+            allow_live_provider: true, // configured-but-inert
+            cache_max_age_days: 180,
+        },
+        filigree: resolve_filigree_url(&FiligreeConfig::default(), project.path()),
+    };
+    let state = state_for(project.path(), &db_path).with_diagnostics(diagnostics);
+
+    let status = call_tool(&state, "project_status", json!({})).await;
+    let preview = call_tool(
+        &state,
+        "summary_preview_cost",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(status["result"]["llm"]["allow_live_provider"], true);
+    assert_eq!(
+        status["result"]["llm"]["allow_live_provider"],
+        preview["result"]["policy"]["allow_live_provider"],
+        "status surfaces disagree on allow_live_provider: status={status:?} preview={preview:?}"
+    );
+    // Both must also agree the live path is off, so a miss would not spend.
+    assert_eq!(status["result"]["llm"]["enabled"], false);
+    assert_eq!(preview["result"]["policy"]["enabled"], false);
+    assert_eq!(
+        status["result"]["llm"]["live"],
+        preview["result"]["policy"]["live"]
+    );
+    assert_eq!(preview["result"]["live_spend_would_occur"], false);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5060,6 +5105,7 @@ async fn project_status_resolves_live_filigree_endpoint() {
     let diagnostics = DiagnosticsContext {
         llm: LlmDiagnostics {
             provider: "disabled".to_owned(),
+            enabled: false,
             live: false,
             allow_live_provider: false,
             cache_max_age_days: 180,
@@ -5091,6 +5137,7 @@ async fn project_status_filigree_falls_back_to_config_without_port_file() {
     let diagnostics = DiagnosticsContext {
         llm: LlmDiagnostics {
             provider: "openrouter".to_owned(),
+            enabled: true,
             live: true,
             allow_live_provider: true,
             cache_max_age_days: 7,

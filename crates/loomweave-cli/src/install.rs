@@ -27,58 +27,10 @@ const CONFIG_JSON_STUB: &str = r#"{
 }
 "#;
 
-// NOTE: Do not use `\` line-continuation here — Rust strips both the newline
-// AND all leading whitespace on the continuation line, producing flat (and
-// therefore broken) YAML. Use raw newlines + explicit indentation.
-const LOOMWEAVE_YAML_STUB: &str = "# loomweave.yaml — user-edited config.
-# Do not delete this file: loomweave serve reads MCP, LLM, and integration
-# settings from here when present.
-version: 1
-llm_policy:
-  enabled: false
-  provider: openrouter
-  allow_live_provider: false
-  openrouter:
-    endpoint_url: https://openrouter.ai/api/v1
-    api_key_env: OPENROUTER_API_KEY
-    attribution:
-      referer: https://github.com/foundryside-dev/loomweave
-      title: Loomweave
-  codex_cli:
-    executable: codex
-    model: null
-    profile: null
-    sandbox: read-only
-    timeout_seconds: 300
-  claude_cli:
-    executable: claude
-    model: null
-    permission_mode: plan
-    tools: []
-    timeout_seconds: 300
-    max_turns: 2
-    no_session_persistence: true
-    exclude_dynamic_system_prompt_sections: true
-  model_id: anthropic/claude-sonnet-4.6
-  session_token_ceiling: 1000000
-  max_inferred_edges_per_caller: 8
-  cache_max_age_days: 180
-integrations:
-  filigree:
-    enabled: false
-    base_url: http://127.0.0.1:8766
-    actor: loomweave-mcp
-    token_env: FILIGREE_API_TOKEN
-    timeout_seconds: 5
-serve:
-  mcp:
-    enable_write_tools: false
-  http:
-    enabled: false
-    # The read-API port is auto-selected per project (deterministic, with an
-    # ephemeral fallback) and published to .loomweave/ephemeral.port while
-    # serving. Set `bind:` explicitly only to pin a fixed port (ADR-044).
-";
+// The default `loomweave.yaml` lives in `crate::config` so `loomweave install`
+// and `loomweave config example` emit byte-identical content from a single
+// source of truth (it can never drift from what install writes).
+use crate::config::LOOMWEAVE_YAML_STUB;
 
 const GITIGNORE_CONTENTS: &str = "\
 # Loomweave .gitignore — ADR-005 tracked-vs-excluded list.

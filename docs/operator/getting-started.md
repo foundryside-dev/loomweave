@@ -249,6 +249,11 @@ prerequisites section above. Skip this block if you don't have a key; the
 other seventeen tools still work, only `summary` will return an "LLM disabled"
 envelope.
 
+Run `loomweave config check` after editing to confirm the effective state
+(provider, enabled, live, model) before starting `serve` — it flags the common
+mistakes (a provider left `enabled: false`, a missing key, or a misplaced key,
+which is now a hard parse error rather than a silent drop).
+
 ### The MCP tools
 
 The MCP surface exposes eighteen tools: the seventeen in the table below, plus

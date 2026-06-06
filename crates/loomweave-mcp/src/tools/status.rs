@@ -81,22 +81,38 @@ impl ServerState {
             return Ok(summary_read_error(read));
         };
 
-        // LLM policy posture (no provider call). `live` means a provider is
-        // wired AND config permits it; that is what makes a miss spend. A
-        // disabled/unconfigured LLM is therefore distinct from a cache miss.
-        let llm_enabled = self
-            .summary_llm
-            .as_ref()
-            .is_some_and(|llm| llm.config.enabled);
-        let live = self.summary_llm.is_some() && llm_enabled;
-        let allow_live_provider = self
-            .summary_llm
-            .as_ref()
-            .is_some_and(|llm| llm.config.allow_live_provider);
-        let provider = self.diagnostics.as_ref().map_or_else(
-            || if live { "configured" } else { "disabled" }.to_owned(),
-            |diag| diag.llm.provider.clone(),
-        );
+        // LLM policy posture (no provider call). Report `enabled` and
+        // `allow_live_provider` as the *configured* values from the diagnostics
+        // snapshot — the same source `project_status_get` reads — so the two
+        // tools never disagree (agent-first-feedback §2.2). `live` is the
+        // *effective* state: a live provider is wired and a miss would actually
+        // spend. When there is no diagnostics snapshot (a bare test harness),
+        // fall back to the wired provider's own config.
+        let (llm_enabled, allow_live_provider, live, provider) = match self.diagnostics.as_ref() {
+            Some(diag) => (
+                diag.llm.enabled,
+                diag.llm.allow_live_provider,
+                diag.llm.live,
+                diag.llm.provider.clone(),
+            ),
+            None => {
+                let enabled = self
+                    .summary_llm
+                    .as_ref()
+                    .is_some_and(|llm| llm.config.enabled);
+                let allow = self
+                    .summary_llm
+                    .as_ref()
+                    .is_some_and(|llm| llm.config.allow_live_provider);
+                let live = self.summary_llm.is_some() && enabled;
+                (
+                    enabled,
+                    allow,
+                    live,
+                    if live { "configured" } else { "disabled" }.to_owned(),
+                )
+            }
+        };
 
         // Cache status without spending: a fresh row is a hit; a present-but-
         // expired row would be re-billed; absence is a miss.
@@ -357,12 +373,29 @@ impl ServerState {
 
     pub(crate) fn llm_diagnostics_json(&self) -> Value {
         match &self.diagnostics {
-            Some(diag) => json!({
-                "provider": diag.llm.provider,
-                "live": diag.llm.live,
-                "allow_live_provider": diag.llm.allow_live_provider,
-                "cache_max_age_days": diag.llm.cache_max_age_days,
-            }),
+            Some(diag) => {
+                // Make a disabled provider self-healing (agent-first-feedback
+                // §3.11): carry the exact fix instead of a status code the agent
+                // must interpret. Null when already live.
+                let next_action = if diag.llm.live {
+                    Value::Null
+                } else {
+                    json!(
+                        "Live summaries are off; entity_summary_get is cache-only. Set \
+                         llm_policy.enabled: true + allow_live_provider: true and supply the \
+                         provider credential (e.g. OPENROUTER_API_KEY), then restart serve. Run \
+                         `loomweave config check` to verify."
+                    )
+                };
+                json!({
+                    "provider": diag.llm.provider,
+                    "enabled": diag.llm.enabled,
+                    "live": diag.llm.live,
+                    "allow_live_provider": diag.llm.allow_live_provider,
+                    "cache_max_age_days": diag.llm.cache_max_age_days,
+                    "next_action": next_action,
+                })
+            }
             None => Value::Null,
         }
     }

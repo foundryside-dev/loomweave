@@ -4,14 +4,34 @@ use std::{fs, net::SocketAddr};
 use serde::Deserialize;
 use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct McpConfig {
+    /// Config schema version marker. Accepted and currently informational; it
+    /// exists so a versioned `loomweave.yaml` (the install stub writes
+    /// `version: 1`) still parses under `deny_unknown_fields`.
+    pub version: u32,
     #[serde(alias = "llm_policy")]
     pub llm: LlmConfig,
     pub semantic_search: SemanticSearchConfig,
     pub integrations: IntegrationsConfig,
     pub serve: ServeConfig,
+}
+
+fn default_config_version() -> u32 {
+    1
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            version: default_config_version(),
+            llm: LlmConfig::default(),
+            semantic_search: SemanticSearchConfig::default(),
+            integrations: IntegrationsConfig::default(),
+            serve: ServeConfig::default(),
+        }
+    }
 }
 
 impl McpConfig {
@@ -35,13 +55,6 @@ impl McpConfig {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.llm.provider == LlmProviderKind::Anthropic
-            || self.llm.anthropic_api_key_env.is_some()
-        {
-            return Err(ConfigError::DeprecatedProvider {
-                code: "LMWV-CONFIG-DEPRECATED-PROVIDER",
-            });
-        }
         if self.integrations.filigree.enabled && self.integrations.filigree.actor.trim().is_empty()
         {
             return Err(ConfigError::InvalidFiligreeActor {
@@ -51,10 +64,60 @@ impl McpConfig {
         self.serve.http.validate_loopback_trust()?;
         Ok(())
     }
+
+    /// Non-fatal diagnostics about the *effective* LLM state, for surfacing at
+    /// `serve` startup, in `loomweave doctor`, and in `loomweave config check`.
+    ///
+    /// These never fail config load — `enabled: false` is the legitimate
+    /// safe default — they only explain why a configured provider may be inert,
+    /// so a misconfiguration announces itself instead of silently disabling
+    /// summaries (the agent-first-feedback §2.1 failure mode).
+    #[must_use]
+    pub fn llm_warnings(&self) -> Vec<String> {
+        let llm = &self.llm;
+        let provider = llm.provider.as_str();
+        let mut warnings = Vec::new();
+        if !llm.enabled {
+            if llm.allow_live_provider {
+                warnings.push(format!(
+                    "llm_policy.provider={provider} with allow_live_provider=true but \
+                     enabled=false → live summaries are off and entity_summary_get is \
+                     cache-only. Set llm_policy.enabled: true to enable."
+                ));
+            }
+        } else if !llm.allow_live_provider {
+            warnings.push(format!(
+                "llm_policy.enabled=true with provider={provider} but \
+                 allow_live_provider=false → live summaries are off (unless \
+                 LOOMWEAVE_LLM_LIVE=1 is set); entity_summary_get is cache-only. Set \
+                 llm_policy.allow_live_provider: true to enable live calls."
+            ));
+        } else {
+            // Live path is on: warn about an unpinned coding-agent model, which
+            // inherits the local CLI default and can be an expensive tier
+            // (agent-first-feedback §2.6).
+            match llm.provider {
+                LlmProviderKind::ClaudeCli if llm.claude_cli.model.is_none() => warnings.push(
+                    "llm_policy.claude_cli.model is unset → summaries inherit the local \
+                     `claude` CLI default model, which may be an expensive tier. Pin \
+                     llm_policy.claude_cli.model to control per-summary cost."
+                        .to_owned(),
+                ),
+                LlmProviderKind::CodexCli if llm.codex_cli.model.is_none() => warnings.push(
+                    "llm_policy.codex_cli.model is unset → summaries inherit the local \
+                     `codex` CLI default model. Pin llm_policy.codex_cli.model to control \
+                     per-summary cost."
+                        .to_owned(),
+                ),
+                _ => {}
+            }
+        }
+        warnings
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LlmConfig {
     pub enabled: bool,
     pub provider: LlmProviderKind,
@@ -67,7 +130,6 @@ pub struct LlmConfig {
     pub recording_fixture_path: Option<String>,
     pub max_inferred_edges_per_caller: u32,
     pub cache_max_age_days: u32,
-    pub anthropic_api_key_env: Option<String>,
 }
 
 impl Default for LlmConfig {
@@ -84,7 +146,30 @@ impl Default for LlmConfig {
             recording_fixture_path: None,
             max_inferred_edges_per_caller: 8,
             cache_max_age_days: 180,
-            anthropic_api_key_env: None,
+        }
+    }
+}
+
+impl LlmConfig {
+    /// Human-readable label for the model summaries will actually use, for
+    /// diagnostics (`serve` startup, `doctor`, `config check`). A coding-agent
+    /// CLI with an unpinned `model` inherits the local CLI's default, which this
+    /// names explicitly rather than rendering as a bare null.
+    #[must_use]
+    pub fn effective_model_label(&self) -> String {
+        match self.provider {
+            LlmProviderKind::OpenRouter => self.model_id.clone(),
+            LlmProviderKind::ClaudeCli => self
+                .claude_cli
+                .model
+                .clone()
+                .unwrap_or_else(|| "(local claude CLI default)".to_owned()),
+            LlmProviderKind::CodexCli => self
+                .codex_cli
+                .model
+                .clone()
+                .unwrap_or_else(|| "(local codex CLI default)".to_owned()),
+            LlmProviderKind::Recording => "(recording fixture)".to_owned(),
         }
     }
 }
@@ -94,7 +179,7 @@ impl Default for LlmConfig {
 /// nothing here makes a hosted embedding service required. When `enabled` is
 /// false the `search_semantic` tool degrades honestly to "not enabled".
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SemanticSearchConfig {
     pub enabled: bool,
     /// Explicit opt-in to the live API provider (in addition to `enabled`).
@@ -136,12 +221,23 @@ pub enum LlmProviderKind {
     CodexCli,
     #[serde(rename = "claude_cli", alias = "claude_code")]
     ClaudeCli,
-    Anthropic,
     Recording,
 }
 
+impl LlmProviderKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "openrouter",
+            Self::CodexCli => "codex_cli",
+            Self::ClaudeCli => "claude_cli",
+            Self::Recording => "recording",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct OpenRouterConfig {
     pub endpoint_url: String,
     pub api_key_env: String,
@@ -161,7 +257,7 @@ impl Default for OpenRouterConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct OpenRouterAttributionConfig {
     pub referer: String,
     pub title: String,
@@ -177,7 +273,7 @@ impl Default for OpenRouterAttributionConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CodexCliConfig {
     pub executable: String,
     pub model: Option<String>,
@@ -218,7 +314,7 @@ impl CodexSandboxMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ClaudeCliConfig {
     pub executable: String,
     pub model: Option<String>,
@@ -270,20 +366,20 @@ impl ClaudePermissionMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct IntegrationsConfig {
     pub filigree: FiligreeConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServeConfig {
     pub mcp: McpServeConfig,
     pub http: HttpReadConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct McpServeConfig {
     /// Enable MCP tools that can mutate state, spawn processes, or call an LLM.
     /// Default false: `loomweave serve` exposes consult-mode read tools unless an
@@ -292,7 +388,7 @@ pub struct McpServeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct HttpReadConfig {
     pub enabled: bool,
     /// Bind address for the HTTP read API. `None` (the default) auto-selects a
@@ -419,7 +515,7 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FiligreeConfig {
     pub enabled: bool,
     pub base_url: String,
@@ -479,9 +575,6 @@ where
 
     match config.llm.provider {
         LlmProviderKind::Recording => Ok(ProviderSelection::Recording),
-        LlmProviderKind::Anthropic => Err(ConfigError::DeprecatedProvider {
-            code: "LMWV-CONFIG-DEPRECATED-PROVIDER",
-        }),
         LlmProviderKind::OpenRouter => {
             let live_env_opt_in = env_lookup("LOOMWEAVE_LLM_LIVE").as_deref() == Some("1");
             if !config.llm.allow_live_provider && !live_env_opt_in {
@@ -531,11 +624,6 @@ pub enum ConfigError {
 
     #[error("live OpenRouter provider selected but API key env var {env_var} is missing")]
     MissingOpenRouterApiKey { env_var: String },
-
-    #[error(
-        "{code}: llm.provider=anthropic is deprecated; use llm_policy.provider: openrouter with llm_policy.openrouter.api_key_env and llm_policy.model_id"
-    )]
-    DeprecatedProvider { code: &'static str },
 
     #[error("{code}: integrations.filigree.actor must not be blank when Filigree is enabled")]
     InvalidFiligreeActor { code: &'static str },
@@ -738,9 +826,7 @@ llm_policy:
                 provider: LlmProviderKind::OpenRouter,
                 ..LlmConfig::default()
             },
-            semantic_search: SemanticSearchConfig::default(),
-            integrations: IntegrationsConfig::default(),
-            serve: ServeConfig::default(),
+            ..McpConfig::default()
         };
 
         let selected = select_provider_with_env(&cfg, |name| {
@@ -760,9 +846,7 @@ llm_policy:
                 allow_live_provider: true,
                 ..LlmConfig::default()
             },
-            semantic_search: SemanticSearchConfig::default(),
-            integrations: IntegrationsConfig::default(),
-            serve: ServeConfig::default(),
+            ..McpConfig::default()
         };
 
         let missing = select_provider_with_env(&cfg, |_| None).expect_err("missing key");
@@ -823,9 +907,7 @@ llm_policy:
                 provider: LlmProviderKind::CodexCli,
                 ..LlmConfig::default()
             },
-            semantic_search: SemanticSearchConfig::default(),
-            integrations: IntegrationsConfig::default(),
-            serve: ServeConfig::default(),
+            ..McpConfig::default()
         };
 
         let selected = select_provider_with_env(&cfg, |_| None).expect("provider selection");
@@ -887,9 +969,7 @@ llm_policy:
                 provider: LlmProviderKind::ClaudeCli,
                 ..LlmConfig::default()
             },
-            semantic_search: SemanticSearchConfig::default(),
-            integrations: IntegrationsConfig::default(),
-            serve: ServeConfig::default(),
+            ..McpConfig::default()
         };
 
         let selected = select_provider_with_env(&cfg, |_| None).expect("provider selection");
@@ -1135,23 +1215,6 @@ serve:
     }
 
     #[test]
-    fn old_anthropic_provider_shape_reports_deprecated_provider() {
-        let err = McpConfig::from_yaml_str(
-            r"
-llm:
-  enabled: true
-  provider: anthropic
-  anthropic_api_key_env: ANTHROPIC_API_KEY
-",
-        )
-        .expect_err("old provider shape should be rejected");
-
-        assert!(matches!(err, ConfigError::DeprecatedProvider { .. }));
-        assert!(err.to_string().contains("LMWV-CONFIG-DEPRECATED-PROVIDER"));
-        assert!(err.to_string().contains("provider: openrouter"));
-    }
-
-    #[test]
     fn enabled_filigree_integration_rejects_blank_actor() {
         let err = McpConfig::from_yaml_str(
             r#"
@@ -1164,5 +1227,121 @@ integrations:
         .expect_err("blank Filigree actor should be rejected");
 
         assert!(err.to_string().contains("LMWV-CONFIG-FILIGREE-ACTOR-BLANK"));
+    }
+
+    #[test]
+    fn version_marker_is_accepted() {
+        let cfg = McpConfig::from_yaml_str("version: 1\n").expect("version marker should parse");
+        assert_eq!(cfg.version, 1);
+        // Omitting it falls back to the default schema version.
+        assert_eq!(McpConfig::default().version, 1);
+    }
+
+    #[test]
+    fn unknown_top_level_key_is_rejected() {
+        let err = McpConfig::from_yaml_str("not_a_real_section: true\n")
+            .expect_err("unknown top-level key should be rejected");
+        let msg = err.to_string();
+        assert!(matches!(err, ConfigError::Yaml(_)), "got: {msg}");
+        assert!(msg.contains("not_a_real_section"), "got: {msg}");
+    }
+
+    #[test]
+    fn unknown_nested_key_under_claude_cli_is_rejected() {
+        // The exact agent-first-feedback §2.1 bug: `model_id` placed inside
+        // claude_cli (whose field is `model`) was silently dropped. With
+        // deny_unknown_fields it must now fail loudly, naming the key.
+        let err = McpConfig::from_yaml_str(
+            r"
+llm_policy:
+  enabled: true
+  provider: claude_cli
+  allow_live_provider: true
+  claude_cli:
+    model_id: claude-sonnet-4-6
+",
+        )
+        .expect_err("misplaced key under claude_cli should be rejected");
+        let msg = err.to_string();
+        assert!(matches!(err, ConfigError::Yaml(_)), "got: {msg}");
+        assert!(msg.contains("model_id"), "got: {msg}");
+    }
+
+    #[test]
+    fn fully_specified_live_provider_behind_disabled_emits_warning() {
+        // enabled omitted (defaults false) but allow_live_provider set: a config
+        // that looks live but is inert. Must load (disabled is a legitimate
+        // default) AND warn.
+        let cfg = McpConfig::from_yaml_str(
+            r"
+llm_policy:
+  provider: claude_cli
+  allow_live_provider: true
+",
+        )
+        .expect("configured-but-disabled provider should still load");
+        assert!(!cfg.llm.enabled);
+        let warnings = cfg.llm_warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains("enabled=false")),
+            "expected an enabled=false warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn enabled_without_allow_live_provider_emits_warning() {
+        let cfg = McpConfig::from_yaml_str(
+            r"
+llm_policy:
+  enabled: true
+  provider: claude_cli
+",
+        )
+        .expect("enabled-without-opt-in should load");
+        let warnings = cfg.llm_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("allow_live_provider=false")),
+            "expected an allow_live_provider=false warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn unpinned_claude_cli_model_on_live_path_warns_about_cost() {
+        let cfg = McpConfig::from_yaml_str(
+            r"
+llm_policy:
+  enabled: true
+  provider: claude_cli
+  allow_live_provider: true
+",
+        )
+        .expect("live claude_cli without a pinned model should load");
+        let warnings = cfg.llm_warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains("claude_cli.model")),
+            "expected an unpinned-model cost warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn healthy_live_config_emits_no_warnings() {
+        let cfg = McpConfig::from_yaml_str(
+            r"
+llm_policy:
+  enabled: true
+  provider: claude_cli
+  allow_live_provider: true
+  claude_cli:
+    model: claude-sonnet-4-6
+",
+        )
+        .expect("healthy live config should load");
+        assert!(
+            cfg.llm_warnings().is_empty(),
+            "expected no warnings, got: {:?}",
+            cfg.llm_warnings()
+        );
     }
 }

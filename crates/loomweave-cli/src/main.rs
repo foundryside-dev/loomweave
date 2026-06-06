@@ -125,6 +125,7 @@ fn main() -> Result<()> {
             } => db::backup(&path, &output, force),
         },
         cli::Command::Guidance { command } => guidance::run(command),
+        cli::Command::Config { command } => config::run(command),
         cli::Command::Doctor { path, fix, format } => {
             // doctor prints its own report; map an unhealthy result to a
             // non-zero exit so it can gate CI / pre-commit. The Result<()> arm

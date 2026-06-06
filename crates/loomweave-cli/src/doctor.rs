@@ -26,6 +26,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use loomweave_federation::config::{McpConfig, ProviderSelection, select_provider_with_env};
 use rusqlite::Connection;
 use serde::Serialize;
 use serde_json::Value;
@@ -72,6 +73,8 @@ pub fn run(path: &Path, fix: bool, json_output: bool) -> Result<bool> {
     tally += check_mcp(&project_root, fix);
     tally += check_instructions(&project_root, fix);
     tally += check_integration_bindings(&project_root, fix);
+    println!("--- llm ---");
+    tally += check_llm_provider(&project_root);
 
     println!("--- index ---");
     for line in hook::snapshot_report(&project_root) {
@@ -163,6 +166,7 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
         check_instructions_json(project_root, fix),
         check_http_config_json(project_root),
         check_filigree_url_json(project_root),
+        check_llm_provider_json(project_root),
         check_sei_population_json(project_root),
         check_wardline_taint_capability_json(project_root),
         check_mcp_hygiene_json(),
@@ -186,6 +190,13 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
             }
             "index.freshness" => {
                 "Run `loomweave analyze <project>` to refresh the index.".to_owned()
+            }
+            "llm.provider" => {
+                "Run `loomweave config check` to see the effective LLM state; to enable live \
+                 summaries set llm_policy.enabled: true + allow_live_provider: true and supply the \
+                 provider credential. See \
+                 https://github.com/foundryside-dev/loomweave/blob/main/docs/operator/openrouter.md."
+                    .to_owned()
             }
             "plugin.availability" => {
                 "Install a Loomweave language plugin (the Python plugin ships with `pip install \
@@ -473,6 +484,74 @@ fn check_filigree_url_json(project_root: &Path) -> DoctorJsonCheck {
     }
 }
 
+/// Severity classes for the LLM-config check, shared by the text and JSON
+/// paths so they never diverge.
+enum LlmPosture {
+    /// loomweave.yaml failed to parse/validate — serve would refuse to start.
+    Broken(String),
+    /// A live provider is configured but unusable (e.g. missing API key).
+    Unusable(String),
+    /// Healthy: a concise effective-state line, plus any advisory warnings.
+    Ok {
+        summary: String,
+        warnings: Vec<String>,
+    },
+}
+
+/// Load loomweave.yaml *typed* (so deny_unknown_fields + validate() run), resolve
+/// the effective provider, and classify the posture. This is the file most
+/// likely to be hand-edited wrong (agent-first-feedback §2.4); an absent file is
+/// fine (built-in defaults → LLM disabled).
+fn llm_posture(project_root: &Path) -> LlmPosture {
+    let config_path = project_root.join("loomweave.yaml");
+    let config = if config_path.exists() {
+        match McpConfig::from_path(&config_path) {
+            Ok(config) => config,
+            Err(err) => return LlmPosture::Broken(format!("loomweave.yaml: {err}")),
+        }
+    } else {
+        McpConfig::default()
+    };
+
+    let warnings = config.llm_warnings();
+    let provider = config.llm.provider.as_str();
+    match select_provider_with_env(&config, |name| std::env::var(name).ok()) {
+        Err(err) => LlmPosture::Unusable(format!("live provider selected but unusable: {err}")),
+        Ok(sel) => {
+            let live = matches!(
+                sel,
+                ProviderSelection::OpenRouter { .. }
+                    | ProviderSelection::CodexCli
+                    | ProviderSelection::ClaudeCli
+            );
+            let summary = if live {
+                format!(
+                    "LLM live: provider={provider}, model={}",
+                    config.llm.effective_model_label()
+                )
+            } else {
+                format!("LLM not live (provider={provider}); entity_summary_get is cache-only")
+            };
+            LlmPosture::Ok { summary, warnings }
+        }
+    }
+}
+
+fn check_llm_provider_json(project_root: &Path) -> DoctorJsonCheck {
+    match llm_posture(project_root) {
+        LlmPosture::Broken(msg) | LlmPosture::Unusable(msg) => {
+            DoctorJsonCheck::problem("llm.provider", msg)
+        }
+        LlmPosture::Ok { summary, warnings } if warnings.is_empty() => {
+            DoctorJsonCheck::ok("llm.provider", summary)
+        }
+        LlmPosture::Ok { summary, warnings } => DoctorJsonCheck::warning(
+            "llm.provider",
+            format!("{summary}; {}", warnings.join("; ")),
+        ),
+    }
+}
+
 fn check_sei_population_json(project_root: &Path) -> DoctorJsonCheck {
     let db = project_root.join(".loomweave/loomweave.db");
     let Ok(conn) = Connection::open(&db) else {
@@ -660,6 +739,33 @@ fn problem(line: &str, fix_hint: Option<&str>) -> Tally {
     Tally {
         problems: 1,
         warnings: 0,
+    }
+}
+
+/// Text-path twin of [`check_llm_provider_json`]: report the effective LLM
+/// state so a human running `loomweave doctor` sees why summaries are (or are
+/// not) live, instead of having to read source (agent-first-feedback §2.4).
+fn check_llm_provider(project_root: &Path) -> Tally {
+    match llm_posture(project_root) {
+        LlmPosture::Broken(msg) | LlmPosture::Unusable(msg) => problem(
+            &msg,
+            Some(
+                "loomweave config check  (docs: \
+                 https://github.com/foundryside-dev/loomweave/blob/main/docs/operator/openrouter.md)",
+            ),
+        ),
+        LlmPosture::Ok { summary, warnings } => {
+            let tally = ok(&summary);
+            if warnings.is_empty() {
+                tally
+            } else {
+                let mut tally = tally;
+                for warning in &warnings {
+                    tally += warn(warning, Some("loomweave config check"));
+                }
+                tally
+            }
+        }
     }
 }
 

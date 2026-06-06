@@ -42,6 +42,24 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
     };
     let provider_selection = select_provider_with_env(&config, |name| std::env::var(name).ok())?;
     let llm_diagnostics = llm_diagnostics(&provider_selection, &config.llm);
+    // Announce the *effective* LLM posture on stderr so a misconfigured provider
+    // is never silently disabled (agent-first-feedback §2.1/§2.6). stdout is the
+    // JSON-RPC channel, so diagnostics must not go there.
+    if llm_diagnostics.live {
+        tracing::info!(
+            provider = %llm_diagnostics.provider,
+            model = %config.llm.effective_model_label(),
+            "LLM live: entity_summary_get will dispatch to the provider"
+        );
+    } else {
+        tracing::info!(
+            provider = %llm_diagnostics.provider,
+            "LLM not live: entity_summary_get is cache-only"
+        );
+    }
+    for warning in config.llm_warnings() {
+        tracing::warn!("loomweave.yaml: {warning}");
+    }
     let llm_provider = build_llm_provider(&config, provider_selection, &project_root)?;
     let embedding_provider =
         build_embedding_provider(&config.semantic_search, |name| std::env::var(name).ok())?;
@@ -145,6 +163,7 @@ fn llm_diagnostics(
     };
     loomweave_mcp::LlmDiagnostics {
         provider: provider.to_owned(),
+        enabled: llm.enabled,
         live,
         allow_live_provider: llm.allow_live_provider,
         cache_max_age_days: llm.cache_max_age_days,

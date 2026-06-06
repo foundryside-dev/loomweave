@@ -16,4 +16,8 @@ verbatim into the next tool.
 Index freshness and counts: `project_status_get` (or the `loomweave://context`
 resource). If the index is stale, run `loomweave analyze <path>`.
 
+LLM summaries (`entity_summary_get`) are off by default and need a configured live
+provider; `project_status_get` reports the posture and `loomweave config check`
+explains how to enable it.
+
 Full workflow: the `loomweave-workflow` skill.

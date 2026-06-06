@@ -60,16 +60,28 @@ pub const LOOMWEAVE_WORKFLOW_SKILL: &str =
     include_str!("../assets/skills/loomweave-workflow/SKILL.md");
 
 /// Orientation text returned in the MCP `initialize` result's `instructions`
-/// field. The `Tools:` enumeration is derived from [`list_tools`] (the single
-/// source of truth) so it can never drift from the advertised tool set as tools
-/// are added or removed; the surrounding prose is static. Kept consistent with
-/// the loomweave-workflow skill.
-fn server_instructions() -> String {
-    let tool_names = list_tools()
+/// field. The `Tools:` enumeration is derived from [`list_tools_for_policy`]
+/// under the *active* policy (the single source of truth) so it can never
+/// advertise a tool the server will not actually register — the
+/// agent-first-feedback §2.5 bug, where the write tools were listed but absent
+/// from `tools/list` unless `serve.mcp.enable_write_tools: true`. When write
+/// tools are gated off, a note names them and how to enable them. Kept
+/// consistent with the loomweave-workflow skill.
+fn server_instructions(policy: McpToolPolicy) -> String {
+    let tool_names = list_tools_for_policy(policy)
         .iter()
         .map(|tool| tool.name)
         .collect::<Vec<_>>()
         .join(", ");
+    let write_tools_note = if policy.enable_write_tools {
+        String::new()
+    } else {
+        "\n\nNot listed above (write-gated): `entity_summary_get`, `analyze_start`, \
+`analyze_cancel`, `propose_guidance`, `promote_guidance`. These require \
+`serve.mcp.enable_write_tools: true` in loomweave.yaml; until then they are not \
+registered and calling one returns a tool-disabled error."
+            .to_owned()
+    };
     format!(
         "Loomweave is a code-archaeology server: it has pre-extracted this project \
 into a queryable map of entities (functions, classes, modules, files), the call \
@@ -84,7 +96,7 @@ verbatim into the next tool.
 Tools: {tool_names}. `entity_callers_list` / `entity_neighborhood_get` / `entity_execution_path_list` \
 take a `confidence` tier (resolved | ambiguous | inferred; default resolved). \
 `project_status_get` reports index freshness, counts, LLM policy, and the resolved \
-Filigree endpoint.
+Filigree endpoint.{write_tools_note}
 
 For the full workflow see the loomweave-workflow skill (installed by \
 `loomweave install --skills`), or read the `loomweave-workflow` prompt. Live \
@@ -789,7 +801,7 @@ pub fn handle_json_rpc(request: &Value) -> Option<Value> {
     };
 
     Some(match method {
-        "initialize" => result_response(&id, &initialize_result(false)),
+        "initialize" => result_response(&id, &initialize_result(false, McpToolPolicy::default())),
         "tools/list" => result_response(
             &id,
             &json!({"tools": list_tools_for_policy(McpToolPolicy::default())}),
@@ -927,9 +939,12 @@ pub struct LlmDiagnostics {
     /// Provider label, e.g. `"openrouter"`, `"codex_cli"`, `"recording"`, or
     /// `"disabled"` when no provider is wired.
     pub provider: String,
-    /// A live provider is wired and summaries will dispatch to it.
+    /// Whether LLM summaries are enabled at all (`llm.enabled`, configured).
+    pub enabled: bool,
+    /// A live provider is wired and summaries will dispatch to it (effective).
     pub live: bool,
-    /// Whether config permits a live provider at all (`llm.allow_live_provider`).
+    /// Whether config permits a live provider at all (`llm.allow_live_provider`,
+    /// configured).
     pub allow_live_provider: bool,
     /// Summary-cache freshness horizon in days (`llm.cache_max_age_days`).
     pub cache_max_age_days: u32,
@@ -1086,7 +1101,7 @@ impl ServerState {
 
         let dispatch = async {
             match method {
-                "initialize" => result_response(&id, &initialize_result(true)),
+                "initialize" => result_response(&id, &initialize_result(true, self.tool_policy)),
                 "tools/list" => result_response(
                     &id,
                     &json!({"tools": list_tools_for_policy(self.tool_policy)}),
@@ -2515,7 +2530,7 @@ fn should_spawn_stateful_stdio_request(request: &Value) -> bool {
 /// so it passes `stateful = false`; [`ServerState::handle_json_rpc`] serves the
 /// full surface and passes `stateful = true`. The `instructions` field is static
 /// orientation guidance (not a capability) and is included in both.
-fn initialize_result(stateful: bool) -> Value {
+fn initialize_result(stateful: bool, policy: McpToolPolicy) -> Value {
     let capabilities = if stateful {
         json!({ "tools": {}, "prompts": {}, "resources": {} })
     } else {
@@ -2528,7 +2543,7 @@ fn initialize_result(stateful: bool) -> Value {
             "name": "loomweave",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": server_instructions()
+        "instructions": server_instructions(policy)
     })
 }
 
@@ -5049,17 +5064,40 @@ mod tests {
     #[test]
     fn server_instructions_enumerate_every_tool() {
         // Single-source guard (clarion-71f0d6c3dd): the `instructions` tool list
-        // is derived from list_tools(), so every advertised tool must appear in
-        // it. If a tool is added/removed and this drifts, the instructions would
-        // otherwise silently misdescribe the surface.
-        let instructions = super::server_instructions();
-        for tool in super::list_tools() {
+        // is derived from list_tools_for_policy under the active policy, so every
+        // tool the server actually registers must appear in it — and a write-gated
+        // tool must NOT appear when the gate is off (agent-first-feedback §2.5).
+        use super::McpToolPolicy;
+
+        // With write tools enabled, every tool is advertised.
+        let all = super::server_instructions(McpToolPolicy::allow_write_tools());
+        for tool in super::list_tools_for_policy(McpToolPolicy::allow_write_tools()) {
             assert!(
-                instructions.contains(tool.name),
-                "instructions omit tool {:?}; instructions were:\n{instructions}",
+                all.contains(tool.name),
+                "instructions omit registered tool {:?}; instructions were:\n{all}",
                 tool.name
             );
         }
+
+        // Under the default read-only policy, the advertised list matches the
+        // registered list exactly — gated write tools are absent from the list
+        // but named in the gate note.
+        let read_only = super::server_instructions(McpToolPolicy::default());
+        let registered = super::list_tools_for_policy(McpToolPolicy::default());
+        for tool in &registered {
+            assert!(
+                read_only.contains(tool.name),
+                "instructions omit registered tool {:?}; instructions were:\n{read_only}",
+                tool.name
+            );
+        }
+        assert!(
+            registered.len() < super::list_tools().len(),
+            "default policy should gate at least one write tool"
+        );
+        // The gate note names the write tools and how to enable them.
+        assert!(read_only.contains("enable_write_tools"), "{read_only}");
+        assert!(read_only.contains("entity_summary_get"), "{read_only}");
     }
 
     #[test]
