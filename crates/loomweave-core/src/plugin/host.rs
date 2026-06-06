@@ -102,23 +102,31 @@ pub const MAX_FINDING_SEVERITY_BYTES: usize = 32;
 /// payload is <2 KiB) while rejecting payload floods.
 pub const MAX_ENTITY_EXTRA_BYTES: usize = 64 * 1024;
 
-/// Pyright's Node-based language server spawns helper threads/processes and
-/// inherits the plugin child's `RLIMIT_NPROC`. On Linux that limit is checked
-/// against all processes/threads for the user, not just descendants of the
-/// plugin, so the Sprint-1 single-plugin ceiling is too low for B.4* call
-/// resolution on ordinary developer workstations.
+/// The `RLIMIT_NPROC` ceiling to apply to a plugin child, or `None` to leave
+/// `RLIMIT_NPROC` uncapped.
+///
+/// Plugins that declare the `pyright` runtime capability spawn a Node-based
+/// language server, which itself spawns many helper threads/processes that
+/// inherit the plugin child's `RLIMIT_NPROC`. On Linux that limit is checked
+/// against **all** processes/threads for the real UID — not just descendants of
+/// the plugin — so it cannot bound a single plugin without being tripped by the
+/// user's unrelated processes (an interactive session, other Weft daemons, …).
+/// Any fixed ceiling low enough to stop a fork-bomb is therefore also low enough
+/// to fail a legitimate `fork(2)` with `EAGAIN` on a busy workstation. We leave
+/// `RLIMIT_NPROC` uncapped for language-server plugins and rely on `RLIMIT_AS`
+/// plus the host's crash-loop supervision instead. cgroups v2 `pids.max` is the
+/// correct tool for a true per-plugin process ceiling (future work).
+///
+/// Non-pyright plugins keep the [`DEFAULT_MAX_NPROC`] fork-bomb guard.
 // Used only from the Linux pre_exec limit path and from unit tests; gate
 // to match so other release builds don't see it as dead code under
 // `-D warnings`.
 #[cfg(any(target_os = "linux", test))]
-const PYRIGHT_MAX_NPROC: u64 = 4096;
-
-#[cfg(any(target_os = "linux", test))]
-fn effective_max_nproc(manifest: &Manifest) -> u64 {
+fn effective_max_nproc(manifest: &Manifest) -> Option<u64> {
     if manifest.capabilities.runtime.pyright.is_some() {
-        PYRIGHT_MAX_NPROC
+        None
     } else {
-        DEFAULT_MAX_NPROC
+        Some(DEFAULT_MAX_NPROC)
     }
 }
 
@@ -1561,12 +1569,15 @@ ontology_version = "0.1.0"
     }
 
     #[test]
-    fn pyright_runtime_raises_process_ceiling_for_language_server() {
+    fn pyright_runtime_leaves_process_ceiling_uncapped_for_language_server() {
+        // Non-pyright plugins keep the fork-bomb guard.
         assert_eq!(
             effective_max_nproc(&compliant_manifest()),
-            DEFAULT_MAX_NPROC
+            Some(DEFAULT_MAX_NPROC)
         );
-        assert_eq!(effective_max_nproc(&pyright_manifest()), PYRIGHT_MAX_NPROC);
+        // Pyright plugins run with no RLIMIT_NPROC cap: the per-UID-global limit
+        // is the wrong tool for a language-server plugin (see effective_max_nproc).
+        assert_eq!(effective_max_nproc(&pyright_manifest()), None);
     }
 
     // ── Full end-to-end helper ────────────────────────────────────────────────

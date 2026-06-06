@@ -25,6 +25,11 @@ wardline_aware = true
 # v0.1 rejects `true` at initialize with LMWV-INFRA-MANIFEST-UNSUPPORTED-CAPABILITY.
 reads_outside_project_root = false
 
+# Declaring this sub-table marks the plugin as a language-server host: it spawns
+# pyright-langserver (Node). The host detects this and leaves RLIMIT_NPROC
+# uncapped for the plugin — RLIMIT_NPROC is per-UID-global and would otherwise
+# fail pyright's fork() with EAGAIN on a busy workstation (see ADR-021,
+# "process-count control", and host::effective_max_nproc).
 [capabilities.runtime.pyright]
 pin = "1.1.409"
 

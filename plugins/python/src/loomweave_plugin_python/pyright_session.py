@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import ctypes
 import ctypes.util
+import errno
 import json
 import math
 import os
@@ -41,6 +42,8 @@ FINDING_PYRIGHT_POISON_FRAME = "LMWV-PY-PYRIGHT-POISON-FRAME"
 FINDING_PYRIGHT_INIT_TIMEOUT = "LMWV-PY-PYRIGHT-INIT-TIMEOUT"
 FINDING_PYRIGHT_UNAVAILABLE = "LMWV-PY-PYRIGHT-UNAVAILABLE"
 FINDING_PYRIGHT_INSTALL_FAILURE = "LMWV-PY-PYRIGHT-INSTALL-FAILURE"
+FINDING_PYRIGHT_SPAWN_DEFERRED = "LMWV-PY-PYRIGHT-SPAWN-DEFERRED"
+FINDING_PYRIGHT_RESOURCE_EXHAUSTED = "LMWV-PY-PYRIGHT-RESOURCE-EXHAUSTED"
 FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT = "LMWV-PY-CALL-RESOLUTION-TIMEOUT"
 FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT = "LMWV-PY-REFERENCE-RESOLUTION-TIMEOUT"
 FINDING_PYRIGHT_REFERENCE_SITE_CAP = "LMWV-PY-REFERENCE-SITE-CAP"
@@ -56,14 +59,32 @@ class PyrightRunState:
     consume ``ceil(N/25) * 3`` restarts instead of 3 for an entire analysis
     run. Pass the same ``PyrightRunState`` instance to every successive
     ``PyrightSession`` so the budget is enforced across the full run.
+
+    ``consecutive_spawn_deferrals`` tracks transient (resource-pressure) spawn
+    failures separately from the ``restart_count`` crash budget: it is reset to
+    zero on every successful spawn, so intermittent pressure never poisons the
+    run, while a sustained run of deferrals still terminates pyright once it
+    exceeds ``MAX_CONSECUTIVE_SPAWN_DEFERRALS``.
     """
 
     restart_count: int = 0
     disabled: bool = False
+    consecutive_spawn_deferrals: int = 0
 
 
 MAX_UNRESOLVED_CALLEE_EXPR_BYTES = 512
 MAX_PYRIGHT_RESTARTS_PER_RUN = 3
+# A spawn that fails with one of these errnos is a *transient* resource-pressure
+# condition (the host is momentarily out of process slots / memory), not a broken
+# install. EAGAIN in particular is what a busy workstation returns from fork(2)
+# when the per-UID RLIMIT_NPROC is hit. These are deferred-and-retried rather
+# than treated as a permanent install failure.
+_TRANSIENT_SPAWN_ERRNOS = frozenset({errno.EAGAIN, errno.ENOMEM, errno.EMFILE, errno.ENFILE})
+# Upper bound on *consecutive* transient spawn deferrals before pyright is
+# disabled for the run. Reset to zero on any successful spawn, so this only
+# fires under sustained pressure, never on an intermittent blip. A failed fork
+# costs microseconds, so retrying once per file across a large run is cheap.
+MAX_CONSECUTIVE_SPAWN_DEFERRALS = 50
 MAX_REFERENCE_SITES_PER_FILE = 2000
 PYRIGHT_INIT_TIMEOUT_SECS = 30.0
 PYRIGHT_CALL_TIMEOUT_SECS = 5.0
@@ -711,14 +732,7 @@ class PyrightSession:
                 preexec_fn=preexec_fn,  # noqa: PLW1509
             )
         except OSError as exc:
-            self._run_state.disabled = True
-            self._record_finding(
-                FINDING_PYRIGHT_INSTALL_FAILURE,
-                "pyright-langserver failed to start",
-                executable=executable,
-                error=str(exc),
-            )
-            return False
+            return self._handle_spawn_oserror(exc, executable)
 
         self._process = process
         self._start_stderr_drain(process)
@@ -745,7 +759,56 @@ class PyrightSession:
                 process.kill()
                 process.wait(timeout=2)
             return False
+        # A clean spawn + handshake clears any accumulated transient-deferral
+        # pressure: the per-UID resource squeeze that caused earlier EAGAINs has
+        # eased, so the run is healthy again.
+        self._run_state.consecutive_spawn_deferrals = 0
         return True
+
+    def _handle_spawn_oserror(self, exc: OSError, executable: str) -> bool:
+        """Triage a ``subprocess.Popen`` failure into transient vs. permanent.
+
+        ``EAGAIN``/``ENOMEM``/``EMFILE``/``ENFILE`` are *transient*
+        resource-pressure errors: a busy host momentarily out of process slots,
+        memory, or file descriptors. The spawn is deferred — ``self._process``
+        stays ``None`` and ``disabled`` is left unset, so the next file retries a
+        fresh spawn — and only a sustained run of deferrals
+        (``MAX_CONSECUTIVE_SPAWN_DEFERRALS``) gives up. Any other errno (notably
+        ``ENOENT``/``EACCES``) is a genuine, permanent install defect and
+        disables pyright for the rest of the run.
+        """
+        if exc.errno in _TRANSIENT_SPAWN_ERRNOS:
+            self._run_state.consecutive_spawn_deferrals += 1
+            if self._run_state.consecutive_spawn_deferrals > MAX_CONSECUTIVE_SPAWN_DEFERRALS:
+                self._run_state.disabled = True
+                self._record_finding(
+                    FINDING_PYRIGHT_RESOURCE_EXHAUSTED,
+                    "pyright-langserver persistently unavailable under resource "
+                    "pressure; skipping call resolution",
+                    executable=executable,
+                    consecutive_spawn_deferrals=self._run_state.consecutive_spawn_deferrals,
+                    error=str(exc),
+                )
+                return False
+            # Emit one finding per pressure *episode* (the 0 -> 1 transition),
+            # not one per deferred file, so a busy run is not buried in findings.
+            if self._run_state.consecutive_spawn_deferrals == 1:
+                self._record_finding(
+                    FINDING_PYRIGHT_SPAWN_DEFERRED,
+                    "pyright-langserver spawn deferred under resource pressure; "
+                    "will retry on subsequent files",
+                    executable=executable,
+                    error=str(exc),
+                )
+            return False
+        self._run_state.disabled = True
+        self._record_finding(
+            FINDING_PYRIGHT_INSTALL_FAILURE,
+            "pyright-langserver failed to start",
+            executable=executable,
+            error=str(exc),
+        )
+        return False
 
     def _initialize(self) -> None:
         result = self._request(
