@@ -304,7 +304,13 @@ impl FiligreeHttpClient {
             .timeout(Duration::from_secs(config.timeout_seconds.max(1)))
             .build()
             .map_err(FiligreeClientError::Build)?;
-        let token = env_lookup(&config.token_env).filter(|value| !value.trim().is_empty());
+        // Resolve the configured env var (default `WEFT_FEDERATION_TOKEN`) first;
+        // fall back to the legacy `FILIGREE_API_TOKEN` name so a pre-rename global
+        // export keeps working during the transition. Deprecated — remove the
+        // fallback once operators have migrated to the Weft-prefixed name.
+        let token = env_lookup(&config.token_env)
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| env_lookup("FILIGREE_API_TOKEN").filter(|value| !value.trim().is_empty()));
         Ok(Some(Self {
             base_url: config.base_url.clone(),
             actor: config.actor.clone(),
@@ -852,6 +858,76 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    /// Minimal enabled config; `from_config` does not connect until a request is
+    /// issued, so no server is needed to exercise token resolution.
+    fn token_resolution_config() -> FiligreeConfig {
+        FiligreeConfig {
+            enabled: true,
+            base_url: "http://127.0.0.1:1".to_owned(),
+            actor: "loomweave-test".to_owned(),
+            token_env: "WEFT_FEDERATION_TOKEN".to_owned(),
+            timeout_seconds: 1,
+            emit_findings: false,
+            prune_unseen_days: 30,
+        }
+    }
+
+    fn resolved_token(env: &[(&str, &str)]) -> Option<String> {
+        let config = token_resolution_config();
+        FiligreeHttpClient::from_config(&config, |name| {
+            env.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        })
+        .expect("build client")
+        .expect("enabled client")
+        .token
+    }
+
+    #[test]
+    fn token_resolution_prefers_configured_env_var() {
+        assert_eq!(
+            resolved_token(&[("WEFT_FEDERATION_TOKEN", "new-secret")]),
+            Some("new-secret".to_owned()),
+        );
+    }
+
+    #[test]
+    fn token_resolution_falls_back_to_legacy_filigree_api_token() {
+        // Pre-rename global export still works during the transition.
+        assert_eq!(
+            resolved_token(&[("FILIGREE_API_TOKEN", "legacy-secret")]),
+            Some("legacy-secret".to_owned()),
+        );
+    }
+
+    #[test]
+    fn token_resolution_configured_var_wins_over_legacy_fallback() {
+        assert_eq!(
+            resolved_token(&[
+                ("WEFT_FEDERATION_TOKEN", "new-secret"),
+                ("FILIGREE_API_TOKEN", "legacy-secret"),
+            ]),
+            Some("new-secret".to_owned()),
+        );
+    }
+
+    #[test]
+    fn token_resolution_empty_configured_var_falls_through_to_legacy() {
+        assert_eq!(
+            resolved_token(&[
+                ("WEFT_FEDERATION_TOKEN", "   "),
+                ("FILIGREE_API_TOKEN", "legacy-secret"),
+            ]),
+            Some("legacy-secret".to_owned()),
+        );
+    }
+
+    #[test]
+    fn token_resolution_none_when_neither_set() {
+        assert_eq!(resolved_token(&[]), None);
+    }
 
     #[test]
     fn parses_reverse_entity_association_response_shape() {

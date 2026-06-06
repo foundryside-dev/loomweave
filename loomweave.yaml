@@ -4,7 +4,7 @@ integrations:
     base_url: http://127.0.0.1:8542
     enabled: true
     timeout_seconds: 5
-    token_env: FILIGREE_API_TOKEN
+    token_env: WEFT_FEDERATION_TOKEN
 llm_policy:
   allow_live_provider: false
   cache_max_age_days: 180

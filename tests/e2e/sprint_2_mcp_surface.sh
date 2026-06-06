@@ -264,7 +264,7 @@ integrations:
     enabled: true
     base_url: http://127.0.0.1:{filigree_server.server_port}
     actor: loomweave-e2e
-    token_env: FILIGREE_API_TOKEN
+    token_env: WEFT_FEDERATION_TOKEN
     timeout_seconds: 2
 """.lstrip(),
     encoding="utf-8",

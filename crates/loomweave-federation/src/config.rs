@@ -520,6 +520,10 @@ pub struct FiligreeConfig {
     pub enabled: bool,
     pub base_url: String,
     pub actor: String,
+    /// Name of the environment variable holding the Filigree bearer token.
+    /// Defaults to `WEFT_FEDERATION_TOKEN` (Weft-suite federation plumbing).
+    /// The legacy `FILIGREE_API_TOKEN` name is still honoured as a deprecated
+    /// fallback at token-resolution time — see `FiligreeHttpClient::from_config`.
     pub token_env: String,
     pub timeout_seconds: u64,
     /// Whether `loomweave analyze` POSTs its findings to Filigree's
@@ -545,7 +549,7 @@ impl Default for FiligreeConfig {
             enabled: false,
             base_url: "http://127.0.0.1:8766".to_owned(),
             actor: "loomweave-mcp".to_owned(),
-            token_env: "FILIGREE_API_TOKEN".to_owned(),
+            token_env: "WEFT_FEDERATION_TOKEN".to_owned(),
             timeout_seconds: 5,
             emit_findings: false,
             prune_unseen_days: 30,

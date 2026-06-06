@@ -61,7 +61,7 @@ integrations:
     enabled: false
     base_url: http://127.0.0.1:8766
     actor: loomweave-mcp
-    token_env: FILIGREE_API_TOKEN
+    token_env: WEFT_FEDERATION_TOKEN
     timeout_seconds: 5
 serve:
   mcp:

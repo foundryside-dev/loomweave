@@ -12,6 +12,17 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+### Changed
+
+- **Filigree federation token env var renamed to `WEFT_FEDERATION_TOKEN`.** The
+  `integrations.filigree.token_env` default (and the name stamped into
+  `loomweave.yaml` by `loomweave install`) is now `WEFT_FEDERATION_TOKEN` —
+  Weft-suite federation plumbing is named by the suite, not by the sibling
+  member. The legacy `FILIGREE_API_TOKEN` name is still honoured as a deprecated
+  fallback at token-resolution time, so an existing global export keeps working
+  during the transition. This does not affect `serve.http.token_env`
+  (inbound HTTP read-API bearer auth, default `WEFT_TOKEN`).
+
 ## [1.1.0rc3] — 2026-06-06
 
 Third 1.1 release candidate. Hardens the Python plugin's pyright spawn path

@@ -189,7 +189,7 @@ fn install_loomweave_yaml(project_root: &Path, desired: &DesiredBindings) -> Res
     filigree.insert("enabled".to_owned(), json!(true));
     filigree.insert("base_url".to_owned(), json!(desired.filigree_base_url));
     ensure_string(filigree, "actor", "loomweave-mcp");
-    ensure_string(filigree, "token_env", "FILIGREE_API_TOKEN");
+    ensure_string(filigree, "token_env", "WEFT_FEDERATION_TOKEN");
     filigree
         .entry("timeout_seconds".to_owned())
         .or_insert(json!(5));
