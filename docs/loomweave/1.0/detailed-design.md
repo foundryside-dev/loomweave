@@ -739,25 +739,25 @@ CREATE TABLE runs (
     analyzed_at_commit TEXT   -- git HEAD analyzed against (WS9 / SEI §6, migration 0007); NULL off-git
 );
 
--- FTS5 for text search
+-- FTS5 for text search. (0001 also declared a `content_text` column reserved
+-- for an on-demand source projection; it was never populated and was dropped in
+-- migration 0009 — content search is served by the ADR-040 embeddings sidecar.)
 CREATE VIRTUAL TABLE entity_fts USING fts5(
     entity_id UNINDEXED,
-    name, short_name, summary_text, content_text,
+    name, short_name, summary_text,
     tokenize = 'porter unicode61'
 );
 
 -- FTS5 triggers keep entity_fts synchronised with entities.
 -- summary_text is derived from the briefing's purpose + patterns + risks
--- (short textual projection); content_text is populated on demand by the
--- plugin during Phase 1 via the `file_analyzed` message.
+-- (short textual projection).
 CREATE TRIGGER entities_ai AFTER INSERT ON entities BEGIN
-    INSERT INTO entity_fts (entity_id, name, short_name, summary_text, content_text)
+    INSERT INTO entity_fts (entity_id, name, short_name, summary_text)
     VALUES (
         new.id,
         new.name,
         new.short_name,
-        COALESCE(json_extract(new.summary, '$.briefing.purpose'), ''),
-        ''
+        COALESCE(json_extract(new.summary, '$.briefing.purpose'), '')
     );
 END;
 CREATE TRIGGER entities_au AFTER UPDATE ON entities BEGIN
