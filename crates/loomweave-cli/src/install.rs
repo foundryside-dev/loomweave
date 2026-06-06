@@ -131,6 +131,7 @@ pub enum InstallComponent {
     Skills,
     CodexSkills,
     Hooks,
+    Instructions,
 }
 
 /// What `loomweave install` should do, resolved from the CLI flags.
@@ -155,6 +156,7 @@ pub enum InstallPlan {
         skills: bool,
         codex_skills: bool,
         hooks: bool,
+        instructions: bool,
     },
     /// No flags or `--all`: initialise `.loomweave/` + every integration.
     All,
@@ -176,6 +178,7 @@ impl InstallPlan {
                 skills: components.contains(&InstallComponent::Skills),
                 codex_skills: components.contains(&InstallComponent::CodexSkills),
                 hooks: components.contains(&InstallComponent::Hooks),
+                instructions: components.contains(&InstallComponent::Instructions),
             }
         }
     }
@@ -228,6 +231,20 @@ impl InstallPlan {
     #[must_use]
     pub fn hooks(self) -> bool {
         matches!(self, Self::All | Self::Components { hooks: true, .. })
+    }
+
+    /// Whether to inject the agent-orientation block into `CLAUDE.md` /
+    /// `AGENTS.md`.
+    #[must_use]
+    pub fn instructions(self) -> bool {
+        matches!(
+            self,
+            Self::All
+                | Self::Components {
+                    instructions: true,
+                    ..
+                }
+        )
     }
 }
 
@@ -283,6 +300,10 @@ pub fn run(
         install_hooks(&project_root)?;
     }
 
+    if plan.instructions() {
+        install_instruction_blocks(&project_root)?;
+    }
+
     if matches!(plan, InstallPlan::All) {
         install_integration_bindings(&project_root)?;
     }
@@ -300,10 +321,11 @@ fn validate_plan(plan: InstallPlan) -> Result<()> {
         && !plan.skills()
         && !plan.codex_skills()
         && !plan.hooks()
+        && !plan.instructions()
     {
         bail!(
             "nothing to install: pass --claude-code, --codex, --skills, \
-             --codex-skills, --hooks, --all, \
+             --codex-skills, --hooks, --instructions, --all, \
              or run bare `loomweave install` to do everything."
         );
     }
@@ -445,6 +467,20 @@ fn install_hooks(project_root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn install_instruction_blocks(project_root: &Path) -> Result<()> {
+    let report = crate::instructions::install_instructions(project_root)
+        .context("inject loomweave instructions into CLAUDE.md / AGENTS.md")?;
+    if report.changed {
+        println!(
+            "Injected loomweave instructions block into {}/{{CLAUDE,AGENTS}}.md",
+            project_root.display()
+        );
+    } else {
+        println!("loomweave instructions block already up to date");
+    }
+    Ok(())
+}
+
 fn install_integration_bindings(project_root: &Path) -> Result<()> {
     let changed = crate::integration_bindings::install_bindings(project_root)
         .context("install local Loomweave/Filigree/Wardline integration bindings")?;
@@ -504,6 +540,7 @@ mod tests {
         assert!(naked.skills());
         assert!(naked.codex_skills());
         assert!(naked.hooks());
+        assert!(naked.instructions());
 
         // --skills: skills only, no init.
         let skills = InstallPlan::from_components(false, &[InstallComponent::Skills]);
@@ -514,7 +551,8 @@ mod tests {
                 codex: false,
                 skills: true,
                 codex_skills: false,
-                hooks: false
+                hooks: false,
+                instructions: false
             }
         );
         assert!(!skills.init_loomweave());
@@ -523,6 +561,24 @@ mod tests {
         assert!(skills.skills());
         assert!(!skills.codex_skills());
         assert!(!skills.hooks());
+        assert!(!skills.instructions());
+
+        // --instructions: instruction blocks only, no init.
+        let instr = InstallPlan::from_components(false, &[InstallComponent::Instructions]);
+        assert_eq!(
+            instr,
+            InstallPlan::Components {
+                claude_code: false,
+                codex: false,
+                skills: false,
+                codex_skills: false,
+                hooks: false,
+                instructions: true
+            }
+        );
+        assert!(!instr.init_loomweave());
+        assert!(instr.instructions());
+        assert!(!instr.skills());
 
         // --hooks: hooks only, no init.
         let hooks = InstallPlan::from_components(false, &[InstallComponent::Hooks]);
@@ -533,7 +589,8 @@ mod tests {
                 codex: false,
                 skills: false,
                 codex_skills: false,
-                hooks: true
+                hooks: true,
+                instructions: false
             }
         );
         assert!(!hooks.init_loomweave());
@@ -552,6 +609,7 @@ mod tests {
         assert!(all.skills());
         assert!(all.codex_skills());
         assert!(all.hooks());
+        assert!(all.instructions());
 
         // Multiple component flags: selected components only, still no init.
         let both = InstallPlan::from_components(
@@ -562,6 +620,7 @@ mod tests {
                 InstallComponent::Skills,
                 InstallComponent::CodexSkills,
                 InstallComponent::Hooks,
+                InstallComponent::Instructions,
             ],
         );
         assert_eq!(
@@ -571,7 +630,8 @@ mod tests {
                 codex: true,
                 skills: true,
                 codex_skills: true,
-                hooks: true
+                hooks: true,
+                instructions: true
             }
         );
         assert!(!both.init_loomweave());
@@ -580,6 +640,7 @@ mod tests {
         assert!(both.skills());
         assert!(both.codex_skills());
         assert!(both.hooks());
+        assert!(both.instructions());
     }
 
     #[test]
@@ -595,12 +656,14 @@ mod tests {
             &[InstallComponent::Skills],
             &[InstallComponent::CodexSkills],
             &[InstallComponent::Hooks],
+            &[InstallComponent::Instructions],
             &[
                 InstallComponent::ClaudeCode,
                 InstallComponent::Codex,
                 InstallComponent::Skills,
                 InstallComponent::CodexSkills,
                 InstallComponent::Hooks,
+                InstallComponent::Instructions,
             ],
         ];
         for all in [false, true] {
@@ -612,7 +675,8 @@ mod tests {
                         || plan.codex()
                         || plan.skills()
                         || plan.codex_skills()
-                        || plan.hooks(),
+                        || plan.hooks()
+                        || plan.instructions(),
                     "from_components({all}, {components:?}) produced a do-nothing plan: {plan:?}"
                 );
             }

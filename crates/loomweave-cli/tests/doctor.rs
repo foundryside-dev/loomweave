@@ -169,6 +169,7 @@ fn doctor_fix_repairs_missing_three_way_integration_bindings() {
             "--codex-skills",
             "--hooks",
             "--claude-code",
+            "--instructions",
         ],
         dir.path(),
     );
@@ -390,6 +391,174 @@ fn doctor_flags_untrusted_mcp_command_without_clobbering_it() {
         report["ok"], false,
         "an untrusted command makes the run not ok"
     );
+}
+
+/// Instructions severity model (plan decision #2, the product-judgment veto
+/// point): `Missing` is a non-gating **warning** — the same guidance ships via
+/// the MCP preamble and the loomweave-workflow skill, so a project that omits
+/// the always-loaded block is still first-class. A fresh `--all` install holds
+/// the block; deleting it from one target file drives the aggregate to Missing,
+/// which must surface as a warning and still exit 0.
+#[test]
+fn doctor_reports_missing_instructions_block_as_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], dir.path());
+    // Drop the Loomweave block from one target file -> aggregate is Missing.
+    fs::write(dir.path().join("AGENTS.md"), "# just notes\n").unwrap();
+
+    let (code, out) = doctor(dir.path(), false);
+    assert_eq!(
+        code, 0,
+        "a missing instructions block is an optional surface; must NOT fail the gate:\n{out}"
+    );
+    assert!(
+        out.contains("⚠ agent-orientation block missing from CLAUDE.md / AGENTS.md"),
+        "missing block should surface as a warning:\n{out}"
+    );
+
+    // --fix re-injects the block; a plain re-run is then clean.
+    let (code, out) = doctor(dir.path(), true);
+    assert_eq!(code, 0, "--fix should repair and exit 0:\n{out}");
+    assert!(
+        out.contains("agent-orientation block missing from CLAUDE.md / AGENTS.md — fixed"),
+        "stdout:\n{out}"
+    );
+    let (code, _) = doctor(dir.path(), false);
+    assert_eq!(code, 0, "repaired project must be healthy on re-run");
+}
+
+/// `Drifted` -> **problem**: a stale block body fails the gate without `--fix`
+/// and is auto-repaired with `--fix`. This pins the one branch that actually
+/// gates the doctor exit code; a refactor flipping Drifted to a warning would
+/// otherwise pass the suite undetected.
+#[test]
+fn doctor_reports_drifted_instructions_block_as_gating_problem() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], dir.path());
+    // Hand-edit the body inside the Loomweave span -> Drifted.
+    let claude = dir.path().join("CLAUDE.md");
+    let content = fs::read_to_string(&claude).unwrap();
+    let drifted = content.replace("code archaeology", "DRIFTED HEADER");
+    assert_ne!(drifted, content, "test setup: substitution must apply");
+    fs::write(&claude, &drifted).unwrap();
+
+    let (code, out) = doctor(dir.path(), false);
+    assert_eq!(
+        code, 1,
+        "a drifted instructions block must FAIL the doctor gate without --fix:\n{out}"
+    );
+    assert!(
+        out.contains("agent-orientation block drifted from the bundled copy"),
+        "stdout:\n{out}"
+    );
+
+    let (code, out) = doctor(dir.path(), true);
+    assert_eq!(code, 0, "--fix should repair drift and exit 0:\n{out}");
+    assert!(
+        out.contains("agent-orientation block drifted from the bundled copy — fixed"),
+        "stdout:\n{out}"
+    );
+    let (code, _) = doctor(dir.path(), false);
+    assert_eq!(code, 0, "repaired project must be healthy on re-run");
+}
+
+/// `Malformed` -> **problem**: a dangling Loomweave start marker (no following
+/// end marker) fails the gate without `--fix`, and `--fix` repairs it without
+/// truncating to EOF.
+#[test]
+fn doctor_reports_malformed_instructions_block_as_gating_problem() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], dir.path());
+    // Replace one target file's block with a dangling start marker.
+    fs::write(
+        dir.path().join("CLAUDE.md"),
+        "# notes\n<!-- loomweave:instructions:v0:deadbeef -->\norphan body, no end marker\n",
+    )
+    .unwrap();
+
+    let (code, out) = doctor(dir.path(), false);
+    assert_eq!(
+        code, 1,
+        "a malformed instructions block must FAIL the doctor gate without --fix:\n{out}"
+    );
+    assert!(
+        out.contains("agent-orientation block malformed (dangling loomweave marker)"),
+        "stdout:\n{out}"
+    );
+
+    let (code, out) = doctor(dir.path(), true);
+    assert_eq!(
+        code, 0,
+        "--fix should repair the malformed block and exit 0:\n{out}"
+    );
+    let fixed = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
+    assert!(
+        fixed.contains("# notes"),
+        "leading content must survive the repair:\n{fixed}"
+    );
+    assert!(
+        fixed.contains("orphan body, no end marker"),
+        "orphaned body must survive as loose prose:\n{fixed}"
+    );
+    let (code, _) = doctor(dir.path(), false);
+    assert_eq!(code, 0, "repaired project must be healthy on re-run");
+}
+
+/// JSON surface: pin the `instructions.block` check shape. Healthy install ->
+/// status `ok`, `fixed: false`; a drifted block -> status `problem` and the run
+/// aggregates to `ok: false`. The healthy-install json shape test omits this
+/// check, leaving the status string and `fixed` flag unverified.
+#[test]
+fn doctor_json_reports_instructions_block_check_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], dir.path());
+
+    // Healthy: instructions.block is ok, not fixed.
+    let (code, json) = doctor_json(dir.path(), false);
+    assert_eq!(code, 0, "healthy install should exit 0: {json}");
+    let check = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "instructions.block")
+        .expect("instructions.block check present");
+    assert_eq!(check["status"], "ok");
+    assert_eq!(check["fixed"], serde_json::json!(false));
+
+    // Drift the block -> the json check becomes a problem and ok aggregates to false.
+    let claude = dir.path().join("CLAUDE.md");
+    let content = fs::read_to_string(&claude).unwrap();
+    fs::write(
+        &claude,
+        content.replace("code archaeology", "DRIFTED HEADER"),
+    )
+    .unwrap();
+
+    let (code, json) = doctor_json(dir.path(), false);
+    assert_eq!(code, 1, "a drifted block must fail the json gate: {json}");
+    assert_eq!(
+        json["ok"], false,
+        "an instructions-driven problem must make the run not ok: {json}"
+    );
+    let check = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "instructions.block")
+        .expect("instructions.block check present");
+    assert_eq!(check["status"], "problem");
+
+    // --fix repairs it: status becomes fixed.
+    let (code, json) = doctor_json(dir.path(), true);
+    assert_eq!(code, 0, "--fix json should repair and exit 0: {json}");
+    let check = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "instructions.block")
+        .expect("instructions.block check present");
+    assert_eq!(check["status"], "fixed");
+    assert_eq!(check["fixed"], serde_json::json!(true));
 }
 
 #[test]

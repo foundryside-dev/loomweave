@@ -52,7 +52,13 @@ pub enum Command {
         #[arg(long)]
         hooks: bool,
 
-        /// Do everything: .loomweave/ init + MCP config + skills + hooks.
+        /// Inject the Loomweave agent-orientation block into CLAUDE.md and
+        /// AGENTS.md (touching only Loomweave's own marker span).
+        #[arg(long)]
+        instructions: bool,
+
+        /// Do everything: .loomweave/ init + MCP config + skills + hooks +
+        /// instructions.
         #[arg(long)]
         all: bool,
     },

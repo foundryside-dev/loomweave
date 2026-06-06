@@ -1,10 +1,11 @@
 //! `loomweave doctor [--fix]` — verify (and optionally repair) the installed
 //! agent-orientation surfaces.
 //!
-//! Three surfaces are checked, each owned by an existing installer module:
+//! Several surfaces are checked, each owned by an existing installer module:
 //! the `loomweave-workflow` skill pack ([`crate::skill_pack`]), the `SessionStart`
-//! hook ([`crate::hooks_settings`]), and the Claude Code `.mcp.json` MCP
-//! registration ([`crate::mcp_registration`]), plus the local
+//! hook ([`crate::hooks_settings`]), the Claude Code `.mcp.json` MCP
+//! registration ([`crate::mcp_registration`]), the `CLAUDE.md` / `AGENTS.md`
+//! agent-orientation block ([`crate::instructions`]), and the local
 //! Loomweave/Filigree/Wardline binding files ([`crate::integration_bindings`]).
 //! The repair for each is that module's idempotent installer, so
 //! `doctor --fix` and `loomweave install` converge to the same state.
@@ -30,10 +31,13 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::hooks_settings::HookState;
+use crate::instructions::InstructionsState;
 use crate::integration_bindings::BindingState;
 use crate::mcp_registration::McpState;
 use crate::skill_pack::SkillPackState;
-use crate::{hook, hooks_settings, integration_bindings, mcp_registration, skill_pack};
+use crate::{
+    hook, hooks_settings, instructions, integration_bindings, mcp_registration, skill_pack,
+};
 
 /// Run `loomweave doctor`. Returns `Ok(true)` iff every orientation surface is
 /// healthy after any requested repairs.
@@ -66,6 +70,7 @@ pub fn run(path: &Path, fix: bool, json_output: bool) -> Result<bool> {
     tally += check_skill(&project_root, fix);
     tally += check_hook(&project_root, fix);
     tally += check_mcp(&project_root, fix);
+    tally += check_instructions(&project_root, fix);
     tally += check_integration_bindings(&project_root, fix);
 
     println!("--- index ---");
@@ -155,6 +160,7 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
         check_skill_json(project_root, fix),
         check_hook_json(project_root, fix),
         check_mcp_json(project_root, fix),
+        check_instructions_json(project_root, fix),
         check_http_config_json(project_root),
         check_filigree_url_json(project_root),
         check_sei_population_json(project_root),
@@ -171,6 +177,9 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
             }
             "hook.session_start" => {
                 "Run `loomweave doctor --fix` or `loomweave install --hooks`.".to_owned()
+            }
+            "instructions.block" => {
+                "Run `loomweave doctor --fix` or `loomweave install --instructions`.".to_owned()
             }
             "mcp.registration" | "integration.bindings" => {
                 "Run `loomweave doctor --fix`.".to_owned()
@@ -519,6 +528,54 @@ fn check_mcp_hygiene_json() -> DoctorJsonCheck {
     )
 }
 
+fn check_instructions_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
+    match instructions::instructions_state(project_root) {
+        InstructionsState::UpToDate => DoctorJsonCheck::ok(
+            "instructions.block",
+            "agent-orientation block present in CLAUDE.md + AGENTS.md",
+        ),
+        InstructionsState::Missing => {
+            let what = "agent-orientation block missing from CLAUDE.md / AGENTS.md";
+            if !fix {
+                // Optional surface: absence is a warning, not a gate failure.
+                return DoctorJsonCheck::warning("instructions.block", what);
+            }
+            repair_instructions_json(project_root, what)
+        }
+        state => {
+            let what = match state {
+                InstructionsState::Drifted => {
+                    "agent-orientation block drifted from the bundled copy"
+                }
+                InstructionsState::Malformed => {
+                    "agent-orientation block malformed (dangling loomweave marker)"
+                }
+                InstructionsState::UpToDate | InstructionsState::Missing => unreachable!(),
+            };
+            if !fix {
+                return DoctorJsonCheck::problem("instructions.block", what);
+            }
+            repair_instructions_json(project_root, what)
+        }
+    }
+}
+
+fn repair_instructions_json(project_root: &Path, what: &str) -> DoctorJsonCheck {
+    match instructions::install_instructions(project_root) {
+        Ok(_) if instructions::instructions_state(project_root) == InstructionsState::UpToDate => {
+            DoctorJsonCheck::fixed("instructions.block", format!("{what}; fixed"))
+        }
+        Ok(_) => DoctorJsonCheck::problem(
+            "instructions.block",
+            format!("{what}; repair did not converge"),
+        ),
+        Err(err) => DoctorJsonCheck::problem(
+            "instructions.block",
+            format!("{what}; repair failed: {err}"),
+        ),
+    }
+}
+
 fn check_integration_bindings_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
     match integration_bindings::binding_state(project_root) {
         BindingState::Present => DoctorJsonCheck::ok(
@@ -724,6 +781,54 @@ fn check_mcp(project_root: &Path, fix: bool) -> Tally {
                 Err(err) => problem(&format!("{what} — repair failed: {err}"), None),
             }
         }
+    }
+}
+
+fn check_instructions(project_root: &Path, fix: bool) -> Tally {
+    match instructions::instructions_state(project_root) {
+        InstructionsState::UpToDate => {
+            ok("agent-orientation block present in CLAUDE.md + AGENTS.md")
+        }
+        // Optional surface: the same guidance ships via the MCP preamble and the
+        // loomweave-workflow skill, so a missing block is advisory — never a gate
+        // failure. Mirrors the integration-bindings severity model.
+        InstructionsState::Missing => {
+            let what = "agent-orientation block missing from CLAUDE.md / AGENTS.md";
+            if !fix {
+                return warn(what, Some("loomweave install --instructions"));
+            }
+            repair_instructions(project_root, what)
+        }
+        // Drifted / Malformed fail the gate: a stale or dangling block is a
+        // genuinely broken state. The repair is safe because it rewrites only
+        // Loomweave's own marker span.
+        state => {
+            let what = match state {
+                InstructionsState::Drifted => {
+                    "agent-orientation block drifted from the bundled copy"
+                }
+                InstructionsState::Malformed => {
+                    "agent-orientation block malformed (dangling loomweave marker)"
+                }
+                InstructionsState::UpToDate | InstructionsState::Missing => unreachable!(),
+            };
+            if !fix {
+                return problem(what, Some("loomweave doctor --fix"));
+            }
+            repair_instructions(project_root, what)
+        }
+    }
+}
+
+/// Shared `--fix` repair for the instructions block: re-inject, then re-classify
+/// to confirm convergence.
+fn repair_instructions(project_root: &Path, what: &str) -> Tally {
+    match instructions::install_instructions(project_root) {
+        Ok(_) if instructions::instructions_state(project_root) == InstructionsState::UpToDate => {
+            ok(&format!("{what} — fixed"))
+        }
+        Ok(_) => problem(&format!("{what} — repair did not converge"), None),
+        Err(err) => problem(&format!("{what} — repair failed: {err}"), None),
     }
 }
 

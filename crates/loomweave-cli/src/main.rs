@@ -10,6 +10,7 @@ mod hooks_settings;
 mod http_read;
 mod install;
 mod instance;
+mod instructions;
 mod integration_bindings;
 mod mcp_registration;
 mod run_lifecycle;
@@ -42,6 +43,7 @@ fn main() -> Result<()> {
             skills,
             codex_skills,
             hooks,
+            instructions,
             all,
         } => {
             let mut components = Vec::new();
@@ -59,6 +61,9 @@ fn main() -> Result<()> {
             }
             if hooks {
                 components.push(install::InstallComponent::Hooks);
+            }
+            if instructions {
+                components.push(install::InstallComponent::Instructions);
             }
             install::run(
                 &path,
