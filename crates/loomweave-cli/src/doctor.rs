@@ -498,8 +498,8 @@ enum LlmPosture {
     },
 }
 
-/// Load loomweave.yaml *typed* (so deny_unknown_fields + validate() run), resolve
-/// the effective provider, and classify the posture. This is the file most
+/// Load loomweave.yaml *typed* (so `deny_unknown_fields` + `validate()` run),
+/// resolve the effective provider, and classify the posture. This is the file most
 /// likely to be hand-edited wrong (agent-first-feedback §2.4); an absent file is
 /// fine (built-in defaults → LLM disabled).
 fn llm_posture(project_root: &Path) -> LlmPosture {

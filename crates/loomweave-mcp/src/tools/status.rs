@@ -88,14 +88,15 @@ impl ServerState {
         // *effective* state: a live provider is wired and a miss would actually
         // spend. When there is no diagnostics snapshot (a bare test harness),
         // fall back to the wired provider's own config.
-        let (llm_enabled, allow_live_provider, live, provider) = match self.diagnostics.as_ref() {
-            Some(diag) => (
-                diag.llm.enabled,
-                diag.llm.allow_live_provider,
-                diag.llm.live,
-                diag.llm.provider.clone(),
-            ),
-            None => {
+        let (llm_enabled, allow_live_provider, live, provider) =
+            if let Some(diag) = self.diagnostics.as_ref() {
+                (
+                    diag.llm.enabled,
+                    diag.llm.allow_live_provider,
+                    diag.llm.live,
+                    diag.llm.provider.clone(),
+                )
+            } else {
                 let enabled = self
                     .summary_llm
                     .as_ref()
@@ -111,8 +112,7 @@ impl ServerState {
                     live,
                     if live { "configured" } else { "disabled" }.to_owned(),
                 )
-            }
-        };
+            };
 
         // Cache status without spending: a fresh row is a hit; a present-but-
         // expired row would be re-billed; absence is a miss.

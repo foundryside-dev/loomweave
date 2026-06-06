@@ -164,16 +164,17 @@ pub enum Command {
 
     /// Run the MCP stdio server.
     ///
-    /// Serves the code graph to MCP clients. The entity_summary_get tool needs a
-    /// live LLM provider, which is OFF by default: set `llm_policy.enabled: true`
+    /// Serves the code graph to MCP clients. The `entity_summary_get` tool needs
+    /// a live LLM provider, which is OFF by default: set `llm_policy.enabled: true`
     /// and `allow_live_provider: true` in loomweave.yaml and supply the provider
-    /// credential (OPENROUTER_API_KEY for the default openrouter provider), or
-    /// switch `llm_policy.provider` to claude_cli / codex_cli for a locally
+    /// credential (`OPENROUTER_API_KEY` for the default `openrouter` provider), or
+    /// switch `llm_policy.provider` to `claude_cli` / `codex_cli` for a locally
     /// authenticated coding-agent CLI. Without that, summaries are cache-only.
-    /// Write-capable tools (entity_summary_get, analyze_start, analyze_cancel,
-    /// propose_guidance, promote_guidance) require `serve.mcp.enable_write_tools:
-    /// true`. The effective LLM posture is logged to stderr at startup; run
-    /// `loomweave config check` to inspect it ahead of time.
+    /// Write-capable tools (`entity_summary_get`, `analyze_start`,
+    /// `analyze_cancel`, `propose_guidance`, `promote_guidance`) require
+    /// `serve.mcp.enable_write_tools: true`. The effective LLM posture is logged
+    /// to stderr at startup; run `loomweave config check` to inspect it ahead of
+    /// time.
     Serve {
         /// Project directory containing .loomweave/loomweave.db.
         #[arg(long, default_value = ".")]
@@ -288,7 +289,7 @@ pub enum ConfigCommand {
         #[arg(long, default_value = ".")]
         path: PathBuf,
 
-        /// Path to loomweave.yaml (default: <path>/loomweave.yaml if present).
+        /// Path to loomweave.yaml (default: `<path>/loomweave.yaml` if present).
         #[arg(long)]
         config: Option<PathBuf>,
     },
