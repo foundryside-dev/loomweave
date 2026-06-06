@@ -12,6 +12,53 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+## [1.1.0rc2] — 2026-06-06
+
+Second 1.1 release candidate, rolling up dogfood-friction fixes and deferred
+v1.1 engineering items on top of rc1. No package is published for release
+candidates. (Cargo SemVer `1.1.0-rc2`; Python wheels normalise to PEP 440
+`1.1.0rc2`.)
+
+### Added
+
+- **Worktree-aware staleness (ADR-045).** `project_status_get`, the
+  `loomweave://context` resource, and the session-start banner now surface
+  `indexed_at_commit` + `worktree_dirty`, and a new `Staleness::StaleWorktree`
+  verdict fires when an otherwise-fresh index has untracked source on disk.
+  Detection uses a hardened, hash-free `git ls-files --others` scoped to ingested
+  source extensions (false-positive guard), proven filter-safe by test — closes
+  the "fresh lies about uncommitted code" friction (clarion-26c7e52027,
+  clarion-d9cf8bcfa9).
+
+### Changed
+
+- **`.loomweave/.gitignore` (ADR-005)** now also excludes `instance_id` and
+  `*.lock`, so `git add -A` no longer stages the per-project serve fingerprint or
+  the analyze advisory lock; ADR-005 documents the live-index commit hazard and
+  points at `loomweave db backup` (clarion-7381e6382d).
+- **WAL hygiene.** The storage writer-actor runs `PRAGMA wal_checkpoint(TRUNCATE)`
+  after each committed run, so the on-disk `loomweave.db` reflects committed state
+  while `serve` is alive instead of lagging behind a multi-MB WAL sidecar
+  (clarion-cdee445ed8).
+- **Release CI parity.** `release.yml` gains a macOS aarch64 `verify-macos` gate
+  (mirroring `ci.yml`) wired into the build/publish `needs` chain, closing the
+  gap where a macOS-only lint/test regression could reach the build jobs
+  (clarion-47d395e03c).
+
+### Removed
+
+- **Dead `entity_fts.content_text` column** dropped via migration 0009 — it was
+  never populated and never read (content search is served by the ADR-040
+  embeddings sidecar). `CURRENT_SCHEMA_VERSION` is now 9 (clarion-716449c371).
+
+### Docs
+
+- macOS Gatekeeper quarantine workaround added to `getting-started.md`
+  Troubleshooting (clarion-03dfa1f94d).
+- ADR-024 in-place migration-retirement guard activated: `published_build.txt`
+  backfilled to `v1.0.0` (first published build; 0001 byte-identical since), so
+  later schema changes must be additive migrations (clarion-b20448b3ac).
+
 ## [1.1.0rc1] — 2026-06-06
 
 First 1.1 release candidate. No package is published for release candidates —
