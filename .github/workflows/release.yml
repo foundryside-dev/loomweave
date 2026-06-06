@@ -175,8 +175,42 @@ jobs:
       - name: Phase 3 subsystems
         run: CARGO_BUILD=0 bash tests/e2e/phase3_subsystems.sh
 
+  # macOS (aarch64) pre-release gate — mirrors ci.yml's rust-macos job so a
+  # macOS-only clippy/--all-targets regression cannot reach the build/publish
+  # jobs. ci.yml gates every PR, but release.yml's Linux-only `verify` left a
+  # gap for a macOS-only test/all-targets lint issue that does not break the
+  # --bin build (clarion-47d395e03c). build-rust already uses macos-14, so no
+  # new runner dependency. Restore the x86_64 (macos-13) leg here alongside the
+  # build matrix when those runners recover (clarion-ec389a8e72).
+  verify-macos:
+    name: Verify macOS (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+          components: clippy
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          key: release-verify-${{ matrix.target }}
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: build workspace bins
+        run: cargo build --workspace --bins
+
   build-rust:
-    needs: [verify]
+    needs: [verify, verify-macos]
     name: Build loomweave (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -242,7 +276,7 @@ jobs:
           retention-days: 7
 
   build-wheels:
-    needs: [verify]
+    needs: [verify, verify-macos]
     name: Build loomweave wheel (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     # maturin bin-wheels for PyPI. Matrix mirrors `build-rust` (Linux x86_64 +
@@ -293,7 +327,7 @@ jobs:
           retention-days: 7
 
   build-plugin:
-    needs: [verify]
+    needs: [verify, verify-macos]
     name: Build Python plugin sdist
     runs-on: ubuntu-latest
     steps:
