@@ -337,6 +337,16 @@ fn run_actor(
                     &stats_json,
                     commits_observed,
                 );
+                // A committed run is the "snapshot" boundary: TRUNCATE-checkpoint
+                // so the on-disk loomweave.db is a whole, committable artifact
+                // (ADR-005 tracks it) without waiting for the process to exit.
+                // Only `CommitRun` (end of an analyze run) reaches here — never the
+                // serve summary-write path — so there is no per-write checkpoint
+                // cost. Best-effort and run before the ack so a caller that reads
+                // the file right after sees the truncated WAL (clarion-cdee445ed8).
+                if res.is_ok() {
+                    checkpoint_truncate(conn);
+                }
                 reply(ack, res);
             }
             WriterCmd::FailRun {
@@ -371,6 +381,22 @@ fn cleanup_after_channel_close(conn: &mut Connection, state: &mut ActorState) {
                 owner_pid = NULL \
               WHERE id = ?2",
             params![stats_json, run_id],
+        );
+    }
+}
+
+/// Issue `PRAGMA wal_checkpoint(TRUNCATE)` on the writer's own connection,
+/// best-effort. A concurrent reader (a live `serve` reader-pool connection) can
+/// hold the checkpoint back from resetting the WAL — that returns a "busy" row,
+/// not an error, and is harmless: the committed frames are already durable and
+/// stay applied. A genuine failure is logged, never propagated, so a checkpoint
+/// hiccup can never fail an otherwise-successful run commit (clarion-cdee445ed8).
+fn checkpoint_truncate(conn: &Connection) {
+    if let Err(err) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+        tracing::warn!(
+            error = %err,
+            "loomweave writer: post-commit WAL checkpoint(TRUNCATE) failed (harmless; \
+             committed frames remain durable)"
         );
     }
 }

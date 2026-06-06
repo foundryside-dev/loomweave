@@ -3270,3 +3270,56 @@ async fn channel_close_with_open_run_self_heals_to_failed() {
         "pending insert must be rolled back when channel closes"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_run_truncates_wal_while_writer_still_alive() {
+    // clarion-cdee445ed8: ADR-005 commits `.loomweave/loomweave.db`, so a finished
+    // analyze must leave the on-disk file a whole, committable snapshot WITHOUT
+    // waiting for the process to exit. `CommitRun` now issues an explicit
+    // `wal_checkpoint(TRUNCATE)`. We assert the WAL is reset to 0 bytes with the
+    // writer STILL ALIVE — proving it is the post-commit checkpoint, not SQLite's
+    // last-connection-close cleanup (which would only fire after the drop below).
+    //
+    // Scope note: `CommitRun` is reached only at the end of an analyze run, never
+    // by serve's summary-write path, so there is no per-write checkpoint cost. And
+    // while a long-lived serve holds reader connections open the TRUNCATE is
+    // best-effort (a reader can hold it back, harmlessly); `loomweave db backup`
+    // remains the way to capture a consistent committable copy mid-serve.
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let wal_path = dir.path().join("loomweave.db-wal");
+
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+    begin_demo_run(&tx, "run-wal").await;
+    seed_module_and_functions(&tx).await;
+    seed_contains_edges_for_demo_functions(&tx).await;
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-wal".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    // Writer is STILL ALIVE here (tx/writer not dropped): the only thing that
+    // could have emptied the WAL is the explicit post-CommitRun checkpoint.
+    let wal_after_commit = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
+    assert_eq!(
+        wal_after_commit, 0,
+        "CommitRun must TRUNCATE-checkpoint the WAL to 0 bytes while the writer is \
+         still alive, so the committed loomweave.db is whole on disk; got {wal_after_commit}"
+    );
+
+    // Clean shutdown still succeeds (and the actor task joins without error).
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+    let wal_after_shutdown = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
+    assert_eq!(
+        wal_after_shutdown, 0,
+        "WAL must remain truncated after shutdown; got {wal_after_shutdown}"
+    );
+}

@@ -62,6 +62,10 @@ pub enum Command {
     /// Re-runs are idempotent (UPSERT on `entities.id`). If no plugins are on
     /// `$PATH`, exits 0 with a WARN and status `skipped_no_plugins` — see
     /// `docs/operator/getting-started.md` Troubleshooting.
+    ///
+    /// To commit the index as a versioned artifact while `serve` may be running,
+    /// take a consistent online copy with `loomweave db backup` rather than
+    /// `git add`-ing the live file (whose pending WAL is not committable).
     Analyze {
         /// Path to analyse (default: current directory).
         #[arg(default_value = ".")]
