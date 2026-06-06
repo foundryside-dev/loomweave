@@ -12,6 +12,42 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+## [1.1.0rc1] — 2026-06-06
+
+First 1.1 release candidate. No package is published for release candidates —
+the `1.1.0` package ships only at the final tag. (Cargo SemVer `1.1.0-rc1`;
+the Python wheels normalise to PEP 440 `1.1.0rc1`.)
+
+### Added
+
+- **Read-API ephemeral port publication (ADR-044).** `loomweave serve` binds a
+  per-project **deterministic** read-API port (blake3 over the canonical project
+  path, band `9400–10399`, disjoint from Filigree's `8400–9399`) with an
+  OS-assigned **ephemeral fallback** when that port is taken, and publishes the
+  *actually bound* port to `.loomweave/ephemeral.port` — a normative cross-product
+  file contract (port-only ASCII + optional trailing newline, atomic temp+rename,
+  **loopback-only**, removed on clean shutdown). This resolves the cross-project
+  `127.0.0.1:9111` bind collision so multiple projects can `serve` concurrently
+  without mis-targeting one another. New consume-time resolver
+  `resolve_loomweave_url` (precedence: explicit target > published file >
+  configured URL > none) is the reference reader; `doctor` and
+  `project_status_get` report the live published endpoint. The published file is
+  git-ignored.
+- **No-index degraded MCP mode.** `serve` on a project with no index no longer
+  exits 1 — it serves a degraded MCP stdio session that answers `initialize` and
+  chirps to run `loomweave install` + `loomweave analyze` from every tool call,
+  so the MCP client connects and is told how to recover.
+
+### Changed
+
+- **`serve.http.bind` is now optional** (`Option<SocketAddr>`). Unset — the new
+  default — auto-selects and publishes the per-project deterministic port; an
+  explicit value is honoured verbatim (no fallback). The installer no longer
+  stamps `serve.http.bind: 127.0.0.1:9111`, the integration bindings write the
+  per-project deterministic loomweave URL, and `install`/`doctor --fix` self-heal
+  the stale hard-coded `9111` stamp on existing projects.
+- Version bumped to `1.1.0rc1` across the Rust workspace and the Python plugin.
+
 ## [1.0.0] — Loomweave — 2026-06-05
 
 **This release renames the product and re-baselines its version.** What shipped
