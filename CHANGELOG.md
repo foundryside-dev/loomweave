@@ -12,6 +12,37 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+## [1.1.0rc3] — 2026-06-06
+
+Third 1.1 release candidate. Hardens the Python plugin's pyright spawn path
+against transient resource pressure and corrects the plugin process-limit
+sandbox. No package is published for release candidates. (Cargo SemVer
+`1.1.0-rc3`; Python wheels normalise to PEP 440 `1.1.0rc3`.)
+
+### Fixed
+
+- **Transient pyright spawn failures no longer disable analysis for the whole
+  run.** A `subprocess.Popen` failure with a transient errno
+  (`EAGAIN`/`ENOMEM`/`EMFILE`/`ENFILE`) now skips only the current file and
+  retries a fresh spawn on the next one, instead of being treated as a permanent
+  install failure. A new `LMWV-PY-PYRIGHT-SPAWN-DEFERRED` finding is emitted once
+  per pressure episode, and a resettable soft-cap emits
+  `LMWV-PY-PYRIGHT-RESOURCE-EXHAUSTED` (giving up only under *sustained*
+  pressure); genuine defects (`ENOENT`/`EACCES`) still disable as before. Closes
+  the `[Errno 11] Resource temporarily unavailable` →
+  `LMWV-PY-PYRIGHT-INSTALL-FAILURE` failure seen analysing large projects.
+
+### Changed
+
+- **`RLIMIT_NPROC` is no longer applied to language-server plugins.** Because
+  `RLIMIT_NPROC` is enforced per real UID system-wide — not per plugin subtree —
+  any fixed ceiling is tripped by the operator's unrelated processes and
+  intermittently fails `pyright-langserver`'s `fork(2)` with `EAGAIN`. The host
+  now leaves `RLIMIT_NPROC` uncapped for plugins declaring the `pyright` runtime
+  capability (relying on `RLIMIT_AS` + crash-loop supervision) and retires the
+  `PYRIGHT_MAX_NPROC = 4096` constant. cgroup v2 `pids.max` is documented as the
+  future tool for true per-plugin process bounds (ADR-021, ADR-035).
+
 ## [1.1.0rc2] — 2026-06-06
 
 Second 1.1 release candidate, rolling up dogfood-friction fixes and deferred

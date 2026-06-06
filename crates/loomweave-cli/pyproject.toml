@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "loomweave"
-version = "1.1.0rc2"
+version = "1.1.0rc3"
 description = "Loomweave — graph-aware code archaeology (Rust core)"
 readme = "../../README.md"
 requires-python = ">=3.11"
@@ -15,7 +15,7 @@ classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
 ]
-dependencies = ["loomweave-plugin-python==1.1.0rc2"]
+dependencies = ["loomweave-plugin-python==1.1.0rc3"]
 
 [project.urls]
 Repository = "https://github.com/foundryside-dev/loomweave"

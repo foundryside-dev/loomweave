@@ -17,7 +17,7 @@ def _read_toml(path: Path) -> dict[str, Any]:
 
 
 def test_package_version_matches_pyproject() -> None:
-    assert loomweave_plugin_python.__version__ == "1.1.0rc2"
+    assert loomweave_plugin_python.__version__ == "1.1.0rc3"
 
 
 def test_plugin_version_lockstep_across_pyproject_manifest_and_module() -> None:
@@ -42,7 +42,7 @@ def test_plugin_version_lockstep_across_pyproject_manifest_and_module() -> None:
 def test_manifest_declares_current_v1_ontology_only() -> None:
     manifest = _read_toml(_PLUGIN_ROOT / "plugin.toml")
 
-    assert manifest["plugin"]["version"] == "1.1.0rc2"
+    assert manifest["plugin"]["version"] == "1.1.0rc3"
     assert manifest["capabilities"]["runtime"]["wardline_aware"] is True
     assert manifest["integrations"]["wardline"]["expected_descriptor_version"] == (
         EXPECTED_DESCRIPTOR_VERSION
