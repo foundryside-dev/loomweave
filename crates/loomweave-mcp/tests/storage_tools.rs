@@ -4829,6 +4829,122 @@ async fn project_status_reports_counts_latest_run_and_plugins() {
 }
 
 #[tokio::test]
+async fn project_status_fresh_carries_staleness_note_caveat() {
+    // The named tool an agent reads directly must disclose what "fresh" omits —
+    // not only the session-start banner (clarion-26c7e52027). The seeded demo.py
+    // is older than a far-future run, so the verdict is Fresh.
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    insert_run(
+        &conn,
+        "run-fresh",
+        "2099-01-01T00:00:00.000Z",
+        "completed",
+        Some("2099-01-01T00:00:00.000Z"),
+    );
+    drop(conn);
+
+    let state = state_for(project.path(), &db_path);
+    let result = call_tool(&state, "project_status", json!({})).await["result"].clone();
+    assert_eq!(
+        result["staleness"], "fresh",
+        "fixture must be fresh: {result}"
+    );
+    let note = result["staleness_note"]
+        .as_str()
+        .expect("a fresh verdict must carry a staleness_note");
+    assert!(
+        note.contains("loomweave analyze") && note.contains("not-yet-indexed"),
+        "staleness_note must disclose the not-yet-indexed gap and the re-analyze \
+         remedy: {note}"
+    );
+}
+
+#[tokio::test]
+async fn project_status_non_fresh_has_null_staleness_note() {
+    // A non-fresh verdict has no "fresh" claim to qualify, so the note is omitted.
+    // The seeded demo.py was just written (mtime ~now), so a past-dated run makes
+    // the source newer than the run → Stale, deterministically.
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    insert_run(
+        &conn,
+        "run-1",
+        "2026-02-02T00:00:00.000Z",
+        "completed",
+        Some("2026-02-02T00:00:00.000Z"),
+    );
+    drop(conn);
+
+    let state = state_for(project.path(), &db_path);
+    let result = call_tool(&state, "project_status", json!({})).await["result"].clone();
+    assert_ne!(
+        result["staleness"], "fresh",
+        "fixture must NOT be fresh: {result}"
+    );
+    assert_eq!(
+        result["staleness_note"],
+        Value::Null,
+        "a non-fresh verdict must omit the staleness_note: {result}"
+    );
+}
+
+#[tokio::test]
+async fn project_status_reports_stale_worktree_for_untracked_source() {
+    // The exact tool the dogfood report quoted (clarion-26c7e52027, ADR-045): a
+    // mtime-fresh index in a git work tree that has a brand-new untracked module.
+    // project_status_get must report staleness="stale_worktree" + worktree_dirty
+    // = true, not a misleading bare "fresh".
+    let (project, db_path) = open_project();
+
+    // Make the project a git repo and commit everything seeded so far, so only
+    // the new module below is untracked. Skip cleanly if git is unavailable.
+    let git = |args: &[&str]| -> bool {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(project.path())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    if !git(&["init", "-q"]) {
+        return;
+    }
+    let _ = git(&["config", "user.email", "t@t"]);
+    let _ = git(&["config", "user.name", "t"]);
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    insert_run(
+        &conn,
+        "run-fresh",
+        "2099-01-01T00:00:00.000Z",
+        "completed",
+        Some("2099-01-01T00:00:00.000Z"),
+    );
+    drop(conn);
+    // Brand-new untracked Python module the index never saw.
+    std::fs::write(project.path().join("hub.py"), "y = 2\n").expect("write untracked module");
+
+    let state = state_for(project.path(), &db_path);
+    let result = call_tool(&state, "project_status", json!({})).await["result"].clone();
+    assert_eq!(
+        result["staleness"], "stale_worktree",
+        "untracked source must yield stale_worktree: {result}"
+    );
+    assert_eq!(
+        result["worktree_dirty"], true,
+        "worktree_dirty must be true: {result}"
+    );
+    assert!(
+        result["staleness_note"]
+            .as_str()
+            .is_some_and(|n| n.contains("loomweave analyze")),
+        "stale_worktree must carry a re-analyze note: {result}"
+    );
+}
+
+#[tokio::test]
 async fn project_status_marks_skipped_no_plugins_run() {
     // AC#2: a skipped_no_plugins run is unmistakable as no index refresh.
     let (project, db_path) = open_project();

@@ -92,8 +92,10 @@ impl ServerState {
                     "degraded": snapshot.degraded(),
                     "scan_truncated": snapshot.scan_truncated(),
                 });
-                let staleness_stale =
-                    matches!(snapshot.staleness(), crate::snapshot::Staleness::Stale);
+                let staleness_stale = matches!(
+                    snapshot.staleness(),
+                    crate::snapshot::Staleness::Stale | crate::snapshot::Staleness::StaleWorktree
+                );
                 // Whether this index has any alive SEI bindings (REQ-C-04 /
                 // ADR-038). Degrades to `false` on a pre-SEI database.
                 let sei_populated = has_any_alive_binding(conn).unwrap_or(false);

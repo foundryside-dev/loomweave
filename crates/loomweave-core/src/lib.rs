@@ -19,7 +19,7 @@ pub use embedding_provider::{
 };
 pub use entity_id::{EntityId, EntityIdError, entity_id};
 pub use errors::{HttpErrorCode, McpErrorCode};
-pub use hardened_git::hardened_git_command;
+pub use hardened_git::{hardened_git_command, list_untracked_files};
 pub use llm_provider::{
     CachingModel, ClaudeCliProvider, ClaudeCliProviderConfig, CodexCliProvider,
     CodexCliProviderConfig, INFERRED_CALLS_PROMPT_VERSION, InferredCallsPromptInput,

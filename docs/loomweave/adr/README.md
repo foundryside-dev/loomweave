@@ -45,6 +45,7 @@ This folder is the canonical home for authored Loomweave architecture decision r
 | [ADR-042](./ADR-042-hmac-freshness-and-replay-window.md) | HMAC freshness and replay window — timestamp + nonce headers, crate-backed HMAC, process-local replay cache | Accepted |
 | [ADR-043](./ADR-043-edge-reanalysis-replacement.md) | Edge reanalysis replacement — per-source-file anchored-edge replacement and edge metadata upsert; amends ADR-026 | Accepted |
 | [ADR-044](./ADR-044-read-api-ephemeral-port-publication.md) | Read-API ephemeral port publication — `.loomweave/ephemeral.port` as a normative cross-product file contract (loopback-only, port-only, atomic) + consume-time resolution precedence (explicit > file > config > none), per-project deterministic port, installer stops pinning 9111; relates to ADR-034 | Accepted |
+| [ADR-045](./ADR-045-worktree-source-staleness.md) | Worktree-source staleness — `Staleness::StaleWorktree` + `worktree_dirty` via hardened, hash-free `git ls-files --others` scoped to ingested extensions; closes the unwatched-top-level-dir blind spot without `git status`'s filter-RCE vector; builds on ADR-013/021 untrusted-corpus posture | Accepted |
 
 ## Backlog still tracked in the detailed design
 

@@ -252,6 +252,28 @@ impl ServerState {
             );
         }
 
+        // Disclose what a `fresh` verdict does NOT cover, on the named tool an
+        // agent reads directly — not just in the session-start banner
+        // (clarion-26c7e52027). `fresh` compares already-indexed files' mtimes; a
+        // brand-new module in a not-yet-indexed top-level directory, or any
+        // uncommitted addition (undetectable on an untrusted corpus), can sit
+        // unseen behind it. `index_diff_get` reports committed/staged drift in
+        // detail (it shares the untracked blind spot); re-analyze is the remedy.
+        let staleness_note = match snapshot.staleness() {
+            crate::snapshot::Staleness::Fresh => Some(
+                "\"fresh\" reflects already-indexed source files only; it does NOT detect \
+                 brand-new modules in a not-yet-indexed directory, nor uncommitted \
+                 additions. If source was added or moved since the last analyze, re-run \
+                 `loomweave analyze`. Use index_diff_get for committed/staged drift detail.",
+            ),
+            crate::snapshot::Staleness::StaleWorktree => Some(
+                "the working tree has untracked source files of already-indexed types that \
+                 the index has not seen (new modules not yet analyzed; see worktree_dirty). \
+                 Re-run `loomweave analyze` before relying on graph answers.",
+            ),
+            _ => None,
+        };
+
         let result = json!({
             "project_root": root_display,
             "db_path": db_path.display().to_string(),
@@ -269,6 +291,8 @@ impl ServerState {
                 "briefing_blocked": briefing_blocked,
             },
             "staleness": serde_json::to_value(snapshot.staleness()).unwrap_or(Value::Null),
+            "staleness_note": staleness_note,
+            "worktree_dirty": snapshot.worktree_dirty(),
             "scan_truncated": snapshot.scan_truncated(),
             "last_analyzed_at": snapshot.last_analyzed_at(),
             "git_sha": analyzed_git_sha,

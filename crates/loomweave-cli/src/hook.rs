@@ -154,16 +154,49 @@ fn snapshot_outcome_lines(project_root: &Path, outcome: &SnapshotOutcome) -> Vec
     }
     match snapshot.staleness() {
         Staleness::Fresh => {
+            // Surface the analyzed commit (when the run recorded one) so the
+            // "fresh" claim names the commit it reflects — short form for the
+            // banner; project_status_get carries the full `git_sha`.
+            let at_commit = snapshot
+                .indexed_at_commit()
+                .map(|c| format!(", commit {}", c.chars().take(12).collect::<String>()))
+                .unwrap_or_default();
             lines.push(format!(
-                "Index is fresh (last analyzed {}). Ask Loomweave before re-exploring \
+                "Index is fresh (last analyzed {}{}). Ask Loomweave before re-exploring \
                  the tree; see the loomweave-workflow skill.",
-                snapshot.last_analyzed_at().unwrap_or("unknown")
+                snapshot.last_analyzed_at().unwrap_or("unknown"),
+                at_commit
             ));
+            // Honest caveat (clarion-26c7e52027): freshness compares the mtimes of
+            // *already-indexed* source files, so brand-new files in a not-yet-
+            // indexed top-level directory — or any uncommitted additions, which the
+            // untrusted-corpus git posture cannot safely detect — can sit unseen
+            // behind a "fresh" verdict. Re-analyze is the remedy.
+            lines.push(
+                "Caveat: \"fresh\" reflects already-indexed files only; it will NOT \
+                 detect brand-new modules in a not-yet-indexed directory. If you just \
+                 added or moved source, run `loomweave analyze` before relying on \
+                 graph answers (e.g. \"what calls X\")."
+                    .to_string(),
+            );
         }
         Staleness::Stale => {
             lines.push(format!(
                 "Index may be stale: source files changed since the last run. \
                  Run `loomweave analyze {}` to refresh.",
+                project_root.display()
+            ));
+        }
+        Staleness::StaleWorktree => {
+            // The ingested files are individually fresh, but the working tree has
+            // untracked source of an already-indexed type the index has not seen
+            // (the new-top-level-dir blind spot the mtime passes can't reach;
+            // clarion-26c7e52027). Concrete, not a caveat — name the remedy.
+            lines.push(format!(
+                "Index does NOT reflect the working tree: untracked source files of \
+                 already-indexed types are present (new modules not yet analyzed). \
+                 Run `loomweave analyze {}` before relying on graph answers \
+                 (e.g. \"what calls X\").",
                 project_root.display()
             ));
         }
@@ -190,4 +223,158 @@ fn snapshot_outcome_lines(project_root: &Path, outcome: &SnapshotOutcome) -> Vec
         }
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use rusqlite::Connection;
+
+    use loomweave_storage::{pragma, schema};
+
+    /// Build a `Fresh` snapshot for `project_root`: one ingested source file that
+    /// exists and is older than a completed run. `commit` populates
+    /// `runs.analyzed_at_commit` (or leaves it NULL). Mirrors the snapshot
+    /// module's own fixtures; the `TempDir` holding the db is returned so the
+    /// caller keeps it alive.
+    fn fresh_snapshot(
+        project_root: &Path,
+        commit: Option<&str>,
+    ) -> (tempfile::TempDir, ProjectSnapshot) {
+        std::fs::write(project_root.join("a.py"), "x = 1\n").unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut conn = Connection::open(db_dir.path().join("loomweave.db")).unwrap();
+        pragma::apply_write_pragmas(&conn).unwrap();
+        schema::apply_migrations(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO entities \
+             (id, plugin_id, kind, name, short_name, properties, source_file_path, created_at, updated_at) \
+             VALUES ('python:module:a', 'python', 'module', 'a', 'a', '{}', 'a.py', \
+                     '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status, analyzed_at_commit) \
+             VALUES ('r', '2099-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z', '{}', '{}', 'completed', ?1)",
+            rusqlite::params![commit],
+        )
+        .unwrap();
+        let snapshot = project_snapshot(&conn, project_root);
+        assert_eq!(
+            snapshot.staleness(),
+            Staleness::Fresh,
+            "fixture must be Fresh: {snapshot:?}"
+        );
+        (db_dir, snapshot)
+    }
+
+    #[test]
+    fn fresh_banner_carries_honest_caveat_and_commit() {
+        // The bare "fresh ... ask Loomweave before re-exploring" line lied about
+        // brand-new uncommitted modules (clarion-26c7e52027). The Fresh arm must
+        // now (a) name the indexed commit and (b) carry the re-analyze caveat.
+        let root = tempfile::tempdir().unwrap();
+        let (_db, snapshot) = fresh_snapshot(root.path(), Some("abc123def4567890"));
+        let lines = snapshot_outcome_lines(root.path(), &SnapshotOutcome::Ready(snapshot));
+        let banner = lines.join("\n");
+
+        assert!(
+            banner.contains("Index is fresh"),
+            "missing fresh line: {banner}"
+        );
+        // Short commit form is surfaced (12 chars), not the full 16-char fixture.
+        assert!(
+            banner.contains("commit abc123def456"),
+            "missing indexed commit: {banner}"
+        );
+        assert!(
+            banner.contains("loomweave analyze") && banner.contains("brand-new"),
+            "Fresh banner must disclose the not-yet-indexed blind spot and point at \
+             re-analyze: {banner}"
+        );
+    }
+
+    #[test]
+    fn fresh_banner_omits_commit_clause_when_run_recorded_none() {
+        // A run analyzed outside a git repo has NULL analyzed_at_commit: the banner
+        // must not invent a commit clause, but still carries the caveat.
+        let root = tempfile::tempdir().unwrap();
+        let (_db, snapshot) = fresh_snapshot(root.path(), None);
+        let lines = snapshot_outcome_lines(root.path(), &SnapshotOutcome::Ready(snapshot));
+        let banner = lines.join("\n");
+
+        assert!(
+            banner.contains("Index is fresh"),
+            "missing fresh line: {banner}"
+        );
+        assert!(
+            !banner.contains(", commit "),
+            "must not fabricate a commit: {banner}"
+        );
+        assert!(
+            banner.contains("brand-new"),
+            "caveat must still be present: {banner}"
+        );
+    }
+
+    #[test]
+    fn stale_worktree_banner_names_untracked_source_and_remedy() {
+        // In a git work tree, a mtime-fresh index with an untracked module yields
+        // StaleWorktree (clarion-26c7e52027, ADR-045); the banner must say so
+        // concretely and point at re-analyze, not the soft Fresh caveat.
+        use std::process::Command;
+        let root = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| -> bool {
+            Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        if !git(&["init", "-q"]) {
+            return; // git unavailable → skip
+        }
+        let _ = git(&["config", "user.email", "t@t"]);
+        let _ = git(&["config", "user.name", "t"]);
+        std::fs::write(root.path().join("a.py"), "x = 1\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut conn = Connection::open(db_dir.path().join("loomweave.db")).unwrap();
+        pragma::apply_write_pragmas(&conn).unwrap();
+        schema::apply_migrations(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO entities \
+             (id, plugin_id, kind, name, short_name, properties, source_file_path, created_at, updated_at) \
+             VALUES ('python:module:a', 'python', 'module', 'a', 'a', '{}', 'a.py', \
+                     '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+             VALUES ('r', '2099-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z', '{}', '{}', 'completed')",
+            [],
+        )
+        .unwrap();
+        // Brand-new untracked module the index never saw.
+        std::fs::write(root.path().join("hub.py"), "y = 2\n").unwrap();
+
+        let snapshot = project_snapshot(&conn, root.path());
+        assert_eq!(
+            snapshot.staleness(),
+            Staleness::StaleWorktree,
+            "fixture must be StaleWorktree: {snapshot:?}"
+        );
+        let lines = snapshot_outcome_lines(root.path(), &SnapshotOutcome::Ready(snapshot));
+        let banner = lines.join("\n");
+        assert!(
+            banner.contains("does NOT reflect the working tree")
+                && banner.contains("loomweave analyze"),
+            "StaleWorktree banner must name the gap and the re-analyze remedy: {banner}"
+        );
+    }
 }
