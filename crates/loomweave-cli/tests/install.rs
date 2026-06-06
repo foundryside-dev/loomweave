@@ -59,6 +59,11 @@ fn install_creates_loomweave_dir_with_expected_contents() {
         "*-wal",
         "*-shm",
         "ephemeral.port",
+        // Per-project fingerprint + analyze advisory lock are runtime artifacts,
+        // never durable — the shipped ignore must list them or `git add -A`
+        // stages a live lock / instance id (clarion-7381e6382d).
+        "instance_id",
+        "*.lock",
     ] {
         assert!(
             gitignore.contains(rule),

@@ -40,16 +40,22 @@ and every developer's install produces their own variant `.gitignore` by acciden
 ## Decision
 
 `loomweave install` writes `.loomweave/.gitignore` with the following contents
-(verbatim — the literal file lives at
-`crates/loomweave-cli/src/install.rs` and ships as the v0.1 baseline):
+(the literal file lives at `crates/loomweave-cli/src/install.rs` —
+`GITIGNORE_CONTENTS` — which is the source of truth; the v0.1 baseline has since
+grown the `ephemeral.port` (ADR-044), `embeddings.db` (ADR-040), `instance_id`,
+and `*.lock` entries):
 
 ```
+ephemeral.port
 *-wal
 *-shm
 *.db-wal
 *.db-shm
 *.shadow.db
 *.db.new
+embeddings.db
+instance_id
+*.lock
 tmp/
 logs/
 runs/*/log.jsonl
@@ -59,7 +65,13 @@ runs/*/log.jsonl
 
 - `.loomweave/loomweave.db` — the main analysis store. SQLite diffs poorly; the
   `loomweave db export --textual` + `loomweave db merge-helper` pattern (detailed
-  design §3 File layout) handles the team case.
+  design §3 File layout) handles the team case. **Committing a live index:** while
+  `loomweave serve` is running, the on-disk `loomweave.db` lags by its pending WAL
+  (the `-wal` sidecar is `.gitignore`d), so `git add loomweave.db` mid-serve can
+  stage an incomplete database. To commit a consistent point-in-time index, take
+  an online WAL-safe copy with `loomweave db backup` and commit that, or stop
+  `serve` first (SQLite checkpoints the WAL away on last-connection close) —
+  clarion-cdee445ed8.
 - `.loomweave/config.json` — small, human-readable internal state (schema
   version, last run IDs).
 - `.loomweave/.gitignore` itself — this file.
@@ -75,6 +87,12 @@ runs/*/log.jsonl
 - All shadow-DB intermediates.
 - `tmp/` and `logs/` (volatile scratch).
 - `runs/*/log.jsonl` (raw LLM bodies — audit-local, not commit-appropriate).
+- `ephemeral.port` (ADR-044) — the read-API live port discovery file, present
+  only while `serve` runs and rewritten per bind.
+- `embeddings.db` (ADR-040) — the semantic-search sidecar; large and rebuildable.
+- `instance_id` and `*.lock` — the per-project `serve` fingerprint and the
+  analyze advisory lock (`loomweave.lock`, fs2). Both are process-/machine-local
+  runtime state, never durable (clarion-7381e6382d).
 
 ### Out of scope for `.loomweave/.gitignore`
 

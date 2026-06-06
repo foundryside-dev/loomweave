@@ -84,11 +84,20 @@ const GITIGNORE_CONTENTS: &str = "\
 # Loomweave .gitignore — ADR-005 tracked-vs-excluded list.
 # Tracked (committed): loomweave.db, config.json, .gitignore itself.
 # Excluded (ignored): WAL sidecars, shadow DB, per-run logs, tmp scratch,
-#   the read-API live port discovery file.
+#   the read-API live port discovery file, the per-project instance id, and
+#   the analyze advisory lock.
 
 # Read-API live port discovery file (ADR-044): present only while serve runs,
 # rewritten per bind, loopback-only — a runtime artifact, never committed.
 ephemeral.port
+
+# Per-project instance fingerprint (loomweave serve) and the analyze advisory
+# lock (loomweave.lock, fs2). Both are process-/machine-local runtime state,
+# never durable: committing them stages a live lock + instance id, and the lock
+# is meaningless on another checkout (clarion-7381e6382d). `*.lock` also covers
+# any future lock sidecar.
+instance_id
+*.lock
 
 # SQLite write-ahead files never belong in the repo.
 *-wal
