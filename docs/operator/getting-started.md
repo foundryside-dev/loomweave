@@ -364,6 +364,22 @@ signals. A `loomweave doctor` subcommand that surfaces discovery state at exit
 is on the v2.0 roadmap; for v1.0 the diagnostic is the WARN line plus the
 `which loomweave-plugin-*` check above.
 
+### macOS: "loomweave cannot be opened because the developer cannot be verified"
+
+The release archives are not notarized (ADR-033 ships unsigned binaries), so
+macOS Gatekeeper quarantines the downloaded `loomweave` binary and refuses the
+first launch with a developer-verification error. Clear the quarantine
+attribute on the extracted binary before installing it:
+
+```bash
+xattr -d com.apple.quarantine ./loomweave-aarch64-apple-darwin/loomweave
+```
+
+Alternatively, approve it once from the GUI — attempt to run it, then
+**System Settings → Privacy & Security → "Open Anyway"**. Either is a one-time
+step per downloaded binary; a source build (the fallback under [§1](#1-install))
+is never quarantined. Notarized release artifacts are on the post-1.0 roadmap.
+
 ### "secret_present" block fires on a real file
 
 Add the file to `.loomweave/secrets-baseline.yaml` with a written justification
