@@ -33,11 +33,20 @@ const CONFIG_JSON_STUB: &str = r#"{
 use crate::config::LOOMWEAVE_YAML_STUB;
 
 const GITIGNORE_CONTENTS: &str = "\
-# Loomweave .gitignore — ADR-005 tracked-vs-excluded list.
-# Tracked (committed): loomweave.db, config.json, .gitignore itself.
-# Excluded (ignored): WAL sidecars, shadow DB, per-run logs, tmp scratch,
-#   the read-API live port discovery file, the per-project instance id, and
-#   the analyze advisory lock.
+# Loomweave .gitignore — ADR-005 tracked-vs-excluded list
+# (the loomweave.db posture was reversed by C1 / weft-d822a7de2d).
+# Tracked (committed): config.json, .gitignore itself.
+# Excluded (ignored): the index DB itself, WAL sidecars, shadow DB, per-run
+#   logs, tmp scratch, the read-API live port discovery file, the per-project
+#   instance id, and the analyze advisory lock.
+
+# The index DB is a regenerable orientation CACHE, not committed analysis state
+# (ADR-005, reversed by C1 / weft-d822a7de2d). `loomweave analyze` rebuilds the
+# structural graph with no LLM calls, so it is cheap to regenerate; only the lazy
+# summary cache costs anything, and that is machine-local. Tracking it dirtied the
+# working tree on every analyze/scan and blocked legis signing of the project.
+# (Sharing summaries across a team is a future opt-in, not the default.)
+loomweave.db
 
 # Read-API live port discovery file (ADR-044): present only while serve runs,
 # rewritten per bind, loopback-only — a runtime artifact, never committed.

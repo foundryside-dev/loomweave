@@ -1,11 +1,28 @@
 # ADR-005: `.loomweave/` Directory Git-Tracking Policy
 
-**Status**: Accepted; amended by ADR-041, ADR-046
+**Status**: Accepted; amended by ADR-041, ADR-046; **`loomweave.db` tracking
+reversed by C1 (weft-d822a7de2d), 2026-06-08**
+
+> **C1 reversal (weft-d822a7de2d), 2026-06-08:** `loomweave.db` is **no longer
+> committed by default — it is `.gitignore`d.** The original decision (below)
+> committed the DB so small teams could share briefings/guidance. Two facts that
+> postdate it overturn that default: (1) tracking a file that mutates on every
+> `analyze`/`scan` leaves a permanently dirty working tree, which **blocks legis
+> from signing** the project (legis refuses to sign a dirty tree); and (2) the DB
+> is a *regenerable orientation cache* — `loomweave analyze` rebuilds the
+> structural graph with **no LLM calls**, so the expensive part is only the lazy
+> summary cache, which is acceptably machine-local. Sharing summaries across a
+> team becomes a future **opt-in** (`storage.commit_db: true`, the inverse of the
+> old opt-out), not the default. The `GITIGNORE_CONTENTS` template in
+> `crates/loomweave-cli/src/install.rs` remains the source of truth and now lists
+> `loomweave.db`. The rest of the tracked/excluded split is unchanged. Sections
+> below are kept for the historical decision and read with this reversal applied.
 
 > **ADR-046 amendment:** the directory tracked by this policy moved from
 > `.loomweave/` to `.weft/loomweave/` (Weft store consolidation, clean break).
 > The tracked-vs-ignored split below is unchanged — only the parent path. Read
 > every `.loomweave/` path below as `.weft/loomweave/`.
+
 **Date**: 2026-04-18
 **Deciders**: qacona@gmail.com
 **Context**: `loomweave install` must write a `.gitignore` inside `.loomweave/` that
@@ -15,11 +32,13 @@ in `docs/implementation/sprint-1/wp1-scaffold.md §UQ-WP1-04`.
 
 ## Summary
 
-`.loomweave/loomweave.db` and `.loomweave/config.json` are committed. WAL sidecars,
-the shadow-DB intermediate, `tmp/`, `logs/`, and per-run raw LLM request/response
-logs (`runs/*/log.jsonl`) are `.gitignore`d. `loomweave.yaml` lives at the project
-root and is tracked under the user's existing repo-root `.gitignore`, not under
-`.loomweave/.gitignore` (it's a user-edited config, not analysis state).
+`.loomweave/config.json` is committed. `.loomweave/loomweave.db` is **`.gitignore`d**
+(C1 reversal — a regenerable cache that would otherwise dirty the tree on every
+run). WAL sidecars, the shadow-DB intermediate, `tmp/`, `logs/`, and per-run raw
+LLM request/response logs (`runs/*/log.jsonl`) are `.gitignore`d. `loomweave.yaml`
+lives at the project root and is tracked under the user's existing repo-root
+`.gitignore`, not under `.loomweave/.gitignore` (it's a user-edited config, not
+analysis state).
 
 ## Context
 
@@ -51,6 +70,7 @@ grown the `ephemeral.port` (ADR-044), `embeddings.db` (ADR-040), `instance_id`,
 and `*.lock` entries):
 
 ```
+loomweave.db
 ephemeral.port
 *-wal
 *-shm
@@ -68,15 +88,9 @@ runs/*/log.jsonl
 
 ### Tracked
 
-- `.loomweave/loomweave.db` — the main analysis store. SQLite diffs poorly; the
-  `loomweave db export --textual` + `loomweave db merge-helper` pattern (detailed
-  design §3 File layout) handles the team case. **Committing a live index:** while
-  `loomweave serve` is running, the on-disk `loomweave.db` lags by its pending WAL
-  (the `-wal` sidecar is `.gitignore`d), so `git add loomweave.db` mid-serve can
-  stage an incomplete database. To commit a consistent point-in-time index, take
-  an online WAL-safe copy with `loomweave db backup` and commit that, or stop
-  `serve` first (SQLite checkpoints the WAL away on last-connection close) —
-  clarion-cdee445ed8.
+- ~~`.loomweave/loomweave.db`~~ — **reversed by C1 (weft-d822a7de2d): now
+  Excluded** (see below). The DB is a regenerable orientation cache, and tracking
+  a file that mutates every run dirtied the tree and blocked legis signing.
 - `.loomweave/config.json` — small, human-readable internal state (schema
   version, last run IDs).
 - `.loomweave/.gitignore` itself — this file.
@@ -88,6 +102,13 @@ runs/*/log.jsonl
 
 ### Excluded
 
+- `loomweave.db` (C1 reversal, weft-d822a7de2d) — the index DB. A regenerable
+  orientation cache: `loomweave analyze` rebuilds the structural graph with no
+  LLM calls, and the only expensive content (the lazy summary cache) is
+  acceptably machine-local. Committing it left a permanently dirty tree (it
+  mutates on every `analyze`/`scan`), which blocked legis from signing the
+  project. Teams that want to share briefings opt **in** via
+  `storage.commit_db: true` (see the opt-in note below).
 - All SQLite WAL + SHM sidecars.
 - All shadow-DB intermediates.
 - `tmp/` and `logs/` (volatile scratch).
@@ -105,13 +126,15 @@ runs/*/log.jsonl
   inside `.loomweave/`. Its tracking is governed by the project's own repo-root
   `.gitignore`, which is the user's concern. Default posture: tracked.
 
-### Opt-out for users who don't want the DB committed
+### Opt-in for teams who *do* want the DB committed (C1 reversal)
 
-`loomweave.yaml:storage.commit_db: false` (post-Sprint-1 knob; WP6 authors the
-full `loomweave.yaml` schema). When false, Loomweave writes an additional
-`.loomweave/.gitignore` line excluding `loomweave.db`, and emits
-`loomweave db sync push/pull` commands. Not implemented in Sprint 1; the knob
-is documented here so the future change has a home.
+Post-C1 the default is **ignored**, so the knob inverts: `loomweave.yaml:
+storage.commit_db: true` is the opt-**in** for teams that want briefings/guidance
+versioned alongside the code. When true, Loomweave omits the `loomweave.db` line
+from the generated `.gitignore` (and the team accepts the dirty-tree / legis
+consequence, or commits via a checkpointed snapshot). Still unimplemented — the
+knob is documented here so the future change has a home. (Before C1 this was the
+inverse `commit_db: false` opt-*out*; the commit-the-DB posture was the default.)
 
 ## Alternatives Considered
 
@@ -133,9 +156,17 @@ committed is unbounded.
 are derived outputs that are expensive to rebuild. Small teams especially
 benefit from having them versioned alongside the code.
 
-**Why rejected**: the "enterprise rigor at lack of scale" posture favours
-committing analytic state for small-team workflows. Users who want machine-local
-analysis only opt out via `storage.commit_db: false`.
+**Why rejected** (originally): the "enterprise rigor at lack of scale" posture
+favoured committing analytic state for small-team workflows. Users who wanted
+machine-local analysis only opted out via `storage.commit_db: false`.
+
+> **Superseded for `loomweave.db` by C1 (weft-d822a7de2d):** this alternative is
+> now the chosen posture *for the DB* — it is machine-local by default. The
+> "expensive to rebuild" con is narrower than it read in 2026-04: the structural
+> graph regenerates from `loomweave analyze` with no LLM calls, and only the lazy
+> summary cache carries real cost. The decisive new factor (not in view at the
+> original decision) is that a committed, ever-mutating DB blocks legis signing.
+> `config.json` and the `runs/` provenance metadata remain tracked.
 
 ### Alternative 3: commit the DB but use git-lfs by default
 
@@ -161,9 +192,10 @@ path works; LFS is a v0.2+ knob.
 
 ### Negative
 
-- Committed SQLite DBs diff poorly by default. Mitigation: the
-  `loomweave db export --textual` / merge-helper path (detailed-design §3) is
-  the documented escape hatch.
+- ~~Committed SQLite DBs diff poorly by default.~~ Moot post-C1: the DB is no
+  longer committed by default. A fresh checkout has no index until `loomweave
+  install`/`analyze` rebuilds it (cheap — no LLM calls); the lazy summary cache
+  is re-paid per machine unless a team opts into `commit_db: true`.
 - Adding a new excluded pattern requires either a Loomweave release or a
   user-side `.loomweave/.gitignore` edit. The post-v0.1 plan is to keep this
   file tool-owned; users adding their own ignores put them in the repo-root
@@ -171,16 +203,19 @@ path works; LFS is a v0.2+ knob.
 
 ### Neutral
 
-- `storage.commit_db: false` is a defined but unimplemented opt-out. Sprint 1
-  ships with the commit-the-DB default only.
+- `storage.commit_db` is a defined but unimplemented knob. Post-C1 its sense is
+  inverted: `true` is the opt-**in** to commit the DB; the default (DB ignored)
+  needs no knob.
 
 ## Related Decisions
 
 - [ADR-011](./ADR-011-writer-actor-concurrency.md) — names the shadow-DB
   intermediate; this ADR excludes it from git.
 - [ADR-014](./ADR-014-filigree-registry-backend.md) — cross-tool references
-  rely on `loomweave.db` being available to readers (Filigree, Wardline); the
-  commit-by-default posture keeps those references resolvable across machines.
+  rely on `loomweave.db` being available to readers (Filigree, Wardline). Post-C1
+  the DB is no longer committed, so a reader on a fresh checkout resolves
+  references against a locally-rebuilt index (`loomweave analyze`) rather than a
+  pulled one; the structural graph it depends on regenerates with no LLM calls.
 
 ## References
 

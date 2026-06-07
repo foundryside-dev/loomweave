@@ -5,7 +5,9 @@
 **/*.rs.bk
 Cargo.lock.bak
 
-# SQLite working files (project-level .weft/loomweave/ is tracked per ADR-005/046)
+# SQLite working files (project-level .weft/loomweave/ is a regenerable cache,
+# ignored — ADR-005 as reversed by C1/weft-d822a7de2d; see the .weft/loomweave/
+# entries below and the blanket .weft/ rule)
 *.db-journal
 *.db-wal
 

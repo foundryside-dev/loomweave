@@ -915,6 +915,8 @@ CREATE INDEX ix_sei_lineage_sei ON sei_lineage(sei);
     defaults.yaml           # default policy overrides
 ```
 
+> **Reversed by C1 (weft-d822a7de2d), 2026-06-08 — see [ADR-005](../adr/ADR-005-loomweave-dir-tracking.md).** `loomweave.db` is **no longer committed by default**; it is `.gitignore`d as a regenerable orientation cache (a committed, ever-mutating DB dirtied the tree and blocked legis signing). The committed-DB machinery described in the rest of this subsection (textual export, merge-helper, merge-driver registration, commit caveats) now applies **only** under the `storage.commit_db: true` opt-in, not the default. `config.json` and `runs/` provenance metadata remain tracked.
+
 `.weft/loomweave/` is checked into git (consistent with Filigree's pattern and with the "shared analysis state" principle). SQLite files can diff poorly, so v0.1 ships **two features** for multi-developer teams to handle the committed DB:
 
 - `loomweave db export --textual <out_dir>` — emits a deterministic JSON tree: `entities.jsonl` (one entity per line, sorted by id), `edges.jsonl` (sorted by `(kind, from_id, to_id)`), `guidance.jsonl` (sorted by id), `findings.jsonl` (sorted by id). Summary cache is **excluded** (re-derivable on next run, and JSON-diffing thousands of LLM-generated briefings is not useful). Output is git-friendly: a one-entity change produces a one-line diff.
