@@ -1,9 +1,9 @@
 {
   "mcpServers": {
     "filigree": {
-      "args": [],
+      "type": "stdio",
       "command": "/home/john/.local/bin/filigree-mcp",
-      "type": "stdio"
+      "args": []
     },
     "loomweave": {
       "args": [
