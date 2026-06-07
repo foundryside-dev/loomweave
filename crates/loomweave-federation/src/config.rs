@@ -16,6 +16,17 @@ pub struct McpConfig {
     pub semantic_search: SemanticSearchConfig,
     pub integrations: IntegrationsConfig,
     pub serve: ServeConfig,
+    /// Tolerated-and-ignored sibling section. The same `loomweave.yaml` is
+    /// parsed by two structs: `AnalyzeConfig` (loomweave-cli) owns the top-level
+    /// `analysis:` clustering block, while `McpConfig` owns `integrations` and is
+    /// consulted at finding-emission time. Because `McpConfig` is
+    /// `deny_unknown_fields` (so typos in the fields it *does* own fail loudly —
+    /// agent-first-feedback §2), it must still declare `analysis` or it rejects
+    /// any config carrying that documented section, silently disabling Filigree
+    /// emission via `load_mcp_config`'s default-on-error fallback. Captured as an
+    /// opaque value and never read here; `AnalyzeConfig` is the typed owner.
+    #[serde(default)]
+    pub analysis: serde_norway::Value,
 }
 
 fn default_config_version() -> u32 {
@@ -30,6 +41,7 @@ impl Default for McpConfig {
             semantic_search: SemanticSearchConfig::default(),
             integrations: IntegrationsConfig::default(),
             serve: ServeConfig::default(),
+            analysis: serde_norway::Value::Null,
         }
     }
 }
@@ -1248,6 +1260,38 @@ integrations:
         let msg = err.to_string();
         assert!(matches!(err, ConfigError::Yaml(_)), "got: {msg}");
         assert!(msg.contains("not_a_real_section"), "got: {msg}");
+    }
+
+    #[test]
+    fn tolerates_analysis_section_without_disabling_filigree_emission() {
+        // clarion-1d405be546: the same loomweave.yaml is parsed by AnalyzeConfig
+        // (which owns the top-level `analysis:` clustering block) and by McpConfig
+        // (which owns `integrations.filigree`, consulted at emission time). Under
+        // deny_unknown_fields, McpConfig must still PARSE a config that carries a
+        // sibling `analysis:` section — otherwise load_mcp_config's
+        // default-on-error fallback silently sets filigree.enabled = false and
+        // emission is skipped with no surfaced error.
+        let cfg = McpConfig::from_yaml_str(
+            r"
+analysis:
+  clustering:
+    min_cluster_size: 2
+integrations:
+  filigree:
+    enabled: true
+    emit_findings: true
+    actor: loomweave-test
+",
+        )
+        .expect("config carrying both analysis: and integrations.filigree: must load");
+        assert!(
+            cfg.integrations.filigree.enabled,
+            "a sibling analysis: section must not disable Filigree"
+        );
+        assert!(
+            cfg.integrations.filigree.emit_findings,
+            "a sibling analysis: section must not disable finding emission"
+        );
     }
 
     #[test]
