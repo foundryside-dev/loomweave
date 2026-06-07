@@ -19,6 +19,24 @@ use crate::{
     timestamp_day_index, tool_error_envelope, verified_source_excerpt,
 };
 
+/// Consumer-visible scope note for `worktree_dirty`, emitted on every path (N5).
+/// `worktree_dirty` measures UN-INDEXED UNTRACKED source, not the git
+/// working-tree state, so a bare `false`/`null` must not be read as "git clean".
+/// It is deliberately scoped to untracked source: a MODIFIED already-tracked
+/// source file does not set it — broadening detection would require working-tree
+/// hashing, which the untrusted-corpus posture forbids (see
+/// `loomweave_core::list_untracked_files` / `hardened_git`). Such edits surface
+/// via `staleness` (→ `stale`) instead, so a freshness/signing gate must require
+/// `staleness == fresh`, not `worktree_dirty == false` alone.
+const WORKTREE_DIRTY_NOTE: &str = "`worktree_dirty` reports UN-INDEXED UNTRACKED source files (an ignore-aware \
+     `git ls-files --others` scoped to ingested extensions), NOT the git working-tree \
+     state: a `false`/`null` value does NOT mean the git tree is clean. It is scoped to \
+     UNTRACKED source only — a MODIFIED already-tracked source file does not set this flag \
+     (broadening it would require working-tree hashing, declined under the untrusted-corpus \
+     posture); such edits surface via `staleness` (→ `stale`) instead. A freshness or \
+     signing gate must require `staleness == fresh`, not `worktree_dirty == false` alone. \
+     `null` = not a git work tree, git unavailable, or nothing ingested to scope against.";
+
 impl ServerState {
     pub(crate) async fn tool_source_for_entity(
         &self,
@@ -309,6 +327,11 @@ impl ServerState {
             "staleness": serde_json::to_value(snapshot.staleness()).unwrap_or(Value::Null),
             "staleness_note": staleness_note,
             "worktree_dirty": snapshot.worktree_dirty(),
+            // N5: `worktree_dirty` is a bare boolean a consumer (and legis, which
+            // gates signing on it) can misread as "git clean" on the false/null
+            // path. Disclose its scope on EVERY path — true, false, and null — so
+            // the meaning is readable without reading loomweave source.
+            "worktree_dirty_note": WORKTREE_DIRTY_NOTE,
             "scan_truncated": snapshot.scan_truncated(),
             "last_analyzed_at": snapshot.last_analyzed_at(),
             "git_sha": analyzed_git_sha,

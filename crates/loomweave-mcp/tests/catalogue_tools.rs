@@ -373,6 +373,139 @@ async fn findings_for_empty_entity_is_not_an_error() {
     assert!(env["result"]["findings"].as_array().unwrap().is_empty());
 }
 
+// ---- project_finding_list (L1: whole-project finding browser) -----------
+
+#[tokio::test]
+async fn project_finding_list_total_reconciles_with_project_status_finding_count() {
+    // The L1 acceptance: an agent must be able to go from project_status's
+    // `findings: N` straight to the N findings — so the project-wide list's
+    // page.total must reconcile with project_status_get's finding count.
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    insert_entity(&conn, "python:function:b", "function", "b.py", Some((3, 4)));
+    insert_finding(&conn, "f-1", "python:function:a", "defect", "WARN", "open");
+    insert_finding(&conn, "f-2", "python:function:a", "defect", "ERROR", "open");
+    insert_finding(&conn, "f-3", "python:function:b", "fact", "INFO", "open");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let status = call_tool(&state, "project_status", json!({})).await;
+    let count = status["result"]["counts"]["findings"].as_i64().unwrap();
+    assert_eq!(count, 3, "{status}");
+
+    let env = call_tool(&state, "project_finding_list", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(
+        env["result"]["page"]["total"].as_i64().unwrap(),
+        count,
+        "project_finding_list total must reconcile with project_status finding count: {env}"
+    );
+    assert_eq!(
+        env["result"]["findings"].as_array().unwrap().len(),
+        3,
+        "{env}"
+    );
+}
+
+#[tokio::test]
+async fn project_finding_list_honest_empty_when_no_findings() {
+    // Honest-empty: a project with 0 findings returns an empty list, not an error.
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "project_finding_list", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 0, "{env}");
+    assert!(
+        env["result"]["findings"].as_array().unwrap().is_empty(),
+        "{env}"
+    );
+}
+
+#[tokio::test]
+async fn project_finding_list_rows_carry_entity_sei_file_line_severity_rule() {
+    // Each finding carries its anchoring entity SEI + file:line + severity/rule —
+    // with no entity id supplied by the caller.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((4, 9)),
+    );
+    insert_alive_sei(&conn, "loomweave:eid:abc123", "python:function:m.f");
+    insert_finding(
+        &conn,
+        "f-1",
+        "python:function:m.f",
+        "defect",
+        "WARN",
+        "open",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "project_finding_list", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let row = &env["result"]["findings"][0];
+    assert_eq!(row["rule_id"], "R1", "{env}");
+    assert_eq!(row["severity"], "WARN", "{env}");
+    assert_eq!(row["entity"]["id"], "python:function:m.f", "{env}");
+    assert_eq!(row["entity"]["sei"], "loomweave:eid:abc123", "{env}");
+    assert_eq!(row["entity"]["file"], "m.py", "{env}");
+    assert_eq!(row["entity"]["line"], 4, "{env}");
+}
+
+#[tokio::test]
+async fn project_finding_list_filters_and_paginates() {
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    for i in 0..5 {
+        insert_finding(
+            &conn,
+            &format!("f-{i}"),
+            "python:function:a",
+            "defect",
+            "WARN",
+            "open",
+        );
+    }
+    insert_finding(
+        &conn,
+        "z-crit",
+        "python:function:a",
+        "defect",
+        "CRITICAL",
+        "open",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    // Filter: only the CRITICAL one.
+    let env = call_tool(
+        &state,
+        "project_finding_list",
+        json!({"filter": {"severity": "CRITICAL"}}),
+    )
+    .await;
+    assert_eq!(env["result"]["page"]["total"], 1, "{env}");
+    assert_eq!(env["result"]["findings"][0]["id"], "z-crit", "{env}");
+
+    // Paginate over the full set (6 findings).
+    let env = call_tool(
+        &state,
+        "project_finding_list",
+        json!({"limit": 2, "offset": 0}),
+    )
+    .await;
+    assert_eq!(env["result"]["page"]["total"], 6, "{env}");
+    assert_eq!(env["result"]["page"]["returned"], 2, "{env}");
+    assert_eq!(env["result"]["page"]["truncated"], true, "{env}");
+}
+
 // ---- guidance_for -------------------------------------------------------
 
 #[tokio::test]
@@ -730,6 +863,52 @@ async fn find_by_wardline_honest_empty_when_no_facts() {
     assert_eq!(env["ok"], true, "{env}");
     assert_eq!(env["result"]["page"]["total"], 0);
     assert_eq!(env["result"]["signal"]["available"], false);
+}
+
+#[tokio::test]
+async fn find_by_wardline_has_findings_filter_restricts_to_fact_carrying_entities() {
+    // L1 complement: page only the wardline entities that actually carry
+    // findings, instead of every taint-fact-bearing entity.
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    insert_entity(&conn, "python:function:b", "function", "b.py", Some((1, 2)));
+    insert_taint_fact(&conn, "python:function:a", r#"{"tier":"exact"}"#);
+    insert_taint_fact(&conn, "python:function:b", r#"{"tier":"exact"}"#);
+    // Only `a` carries a finding.
+    insert_finding(&conn, "f-1", "python:function:a", "defect", "WARN", "open");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    // Unfiltered: both taint-fact entities.
+    let env = call_tool(&state, "find_by_wardline", json!({})).await;
+    assert_eq!(env["result"]["page"]["total"], 2, "{env}");
+
+    // has_findings: true → only `a`.
+    let env = call_tool(&state, "find_by_wardline", json!({"has_findings": true})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 1, "{env}");
+    assert_eq!(
+        env["result"]["entities"][0]["id"], "python:function:a",
+        "{env}"
+    );
+    assert_eq!(env["result"]["facet"]["has_findings"], true, "{env}");
+}
+
+#[test]
+fn entity_wardline_list_schema_declares_has_findings() {
+    // additionalProperties:false on the advertised schema would reject an
+    // undeclared param, so has_findings must be declared for clients to send it.
+    let tools = list_tools();
+    let tool = tools
+        .iter()
+        .find(|t| t.name == "entity_wardline_list")
+        .expect("entity_wardline_list tool definition");
+    assert_eq!(
+        tool.input_schema["properties"]["has_findings"],
+        json!({"type": "boolean"}),
+        "{:#}",
+        tool.input_schema
+    );
 }
 
 // ---- graph shortcuts ----------------------------------------------------

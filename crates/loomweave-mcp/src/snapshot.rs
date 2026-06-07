@@ -128,6 +128,17 @@ pub struct ProjectSnapshot {
     /// extensions, so an untracked non-source file (a scratch `notes.txt`) never
     /// flags it, and the untrusted-corpus posture is preserved (no working-tree
     /// hashing — see [`loomweave_core::list_untracked_files`]).
+    ///
+    /// **Scope (N5): UNTRACKED source only.** This flag deliberately does NOT
+    /// cover a MODIFIED already-tracked source file. Detecting modified-tracked
+    /// state (`git diff` / `git status --porcelain`) hashes working-tree content,
+    /// reintroducing exactly the corpus-controlled code-exec vector the hardening
+    /// avoids by using `ls-files --others` (which only lists paths) — so it is
+    /// declined. A modified *indexed* file is already caught by the mtime
+    /// modification scan ([`Staleness::Stale`]), so the staleness verdict reflects
+    /// mid-dev edits even though this boolean does not. The consumer-facing
+    /// `project_status_get.worktree_dirty_note` states this so a signing/freshness
+    /// gate keys on `staleness`, not on this flag alone.
     worktree_dirty: Option<bool>,
     /// `true` when this snapshot was produced from a *failure* rather than a
     /// healthy read: at least one backing SQL query failed unexpectedly and was

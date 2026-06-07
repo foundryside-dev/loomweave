@@ -255,6 +255,101 @@ impl ServerState {
         Ok(flatten_storage_envelope_result(result))
     }
 
+    /// `project_finding_list(filter?)` — every finding across the WHOLE project,
+    /// no entity id required, so an agent can go from `project_status`'s
+    /// `findings: N` count straight to the N findings (L1). Each row carries its
+    /// anchoring entity (id, `sei`, file, line) plus the finding's
+    /// `tool/rule_id/kind/severity/status/message/confidence/created_at`. Optionally
+    /// filtered by `filter.kind`/`severity`/`status` (same vocabulary as
+    /// `findings_for`). Bounded (limit/offset, total/truncated). With no filter
+    /// the page `total` reconciles with `project_status`'s finding count: it is
+    /// computed from the bare `findings` table (byte-identical to that count's
+    /// query), the entity join only enriches the returned rows. Honest-empty:
+    /// a project with no findings returns an empty list, not an error. Stateless.
+    pub(crate) async fn tool_project_findings(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let filter = FindingFilter::parse(arguments)?;
+        let page = Page::parse(arguments, FINDINGS_PAGE_DEFAULT, FINDINGS_PAGE_MAX)?;
+        let result = self
+            .readers
+            .with_reader(move |conn| {
+                let kind = filter.kind.as_deref();
+                let severity = filter.severity.as_deref();
+                let status = filter.status.as_deref();
+
+                // Reconciliation contract (L1 acceptance #2): count off the bare
+                // `findings` table with the SAME predicate the snapshot's
+                // `finding_count()` uses, so an unfiltered total equals
+                // project_status's finding count. The entity join below only
+                // enriches the page rows — it never drives the total.
+                let total: usize = conn.query_row(
+                    "SELECT COUNT(*) \
+                       FROM findings \
+                      WHERE (?1 IS NULL OR kind = ?1) \
+                        AND (?2 IS NULL OR severity = ?2) \
+                        AND (?3 IS NULL OR status = ?3)",
+                    rusqlite::params![kind, severity, status],
+                    |row| {
+                        let count: i64 = row.get(0)?;
+                        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+                    },
+                )?;
+
+                // Page rows, joined to the anchoring entity for file:line. The FK
+                // (`findings.entity_id REFERENCES entities(id) ON DELETE CASCADE`)
+                // guarantees every finding has a live anchor, so this inner join
+                // never drops a counted row.
+                let mut stmt = conn.prepare(
+                    "SELECT f.id, f.tool, f.rule_id, f.kind, f.severity, f.status, \
+                            f.message, f.confidence, f.created_at, \
+                            f.entity_id, e.source_file_path, e.source_line_start \
+                       FROM findings f \
+                       JOIN entities e ON e.id = f.entity_id \
+                      WHERE (?1 IS NULL OR f.kind = ?1) \
+                        AND (?2 IS NULL OR f.severity = ?2) \
+                        AND (?3 IS NULL OR f.status = ?3) \
+                      ORDER BY f.created_at DESC, f.id \
+                      LIMIT ?4 OFFSET ?5",
+                )?;
+                let limit = i64::try_from(page.limit).unwrap_or(i64::MAX);
+                let offset = i64::try_from(page.offset).unwrap_or(i64::MAX);
+                let mut rows =
+                    stmt.query(rusqlite::params![kind, severity, status, limit, offset])?;
+                let mut page_rows: Vec<ProjectFindingRow> = Vec::new();
+                while let Some(row) = rows.next()? {
+                    page_rows.push(ProjectFindingRow::from_row(row)?);
+                }
+
+                let returned = page_rows.len();
+                // Resolve each anchor's SEI while a reader connection is in scope.
+                let findings: Vec<Value> = page_rows
+                    .iter()
+                    .map(|row| {
+                        let sei = sei_for_locator(conn, &row.entity_id).ok().flatten();
+                        row.to_json(sei.as_deref())
+                    })
+                    .collect();
+                let meta = json!({
+                    "total": total,
+                    "offset": page.offset,
+                    "limit": page.limit,
+                    "returned": returned,
+                    "truncated": page.offset.saturating_add(returned) < total,
+                });
+
+                Ok(success_envelope(json!({
+                    "findings": findings,
+                    "filter": filter.to_json(),
+                    "page": meta,
+                    "scan_truncated": false,
+                })))
+            })
+            .await;
+        Ok(flatten_storage_envelope_result(result))
+    }
+
     /// `wardline_for(entity_id)` — the Wardline metadata recorded for the entity
     /// (declared tier, groups, boundary contracts), returned **verbatim**: the
     /// `wardline_json` blob is opaque to Loomweave (federation opacity contract).
@@ -478,6 +573,65 @@ impl FindingRow {
             "related_entities": related,
             "confidence": self.confidence,
             "created_at": self.created_at,
+        })
+    }
+}
+
+/// A finding row for the project-wide list, carrying its anchoring entity's
+/// locator + `file:line` (the SEI is resolved at render time). No `related_entities`
+/// — the project list answers "where are the N findings", and each row's primary
+/// anchor is the entity it hangs on.
+#[derive(Clone)]
+struct ProjectFindingRow {
+    id: String,
+    tool: Option<String>,
+    rule_id: Option<String>,
+    kind: String,
+    severity: String,
+    status: String,
+    message: Option<String>,
+    confidence: Option<f64>,
+    created_at: Option<String>,
+    entity_id: String,
+    entity_file: Option<String>,
+    entity_line: Option<i64>,
+}
+
+impl ProjectFindingRow {
+    fn from_row(row: &rusqlite::Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            tool: row.get(1)?,
+            rule_id: row.get(2)?,
+            kind: row.get(3)?,
+            severity: row.get(4)?,
+            status: row.get(5)?,
+            message: row.get(6)?,
+            confidence: row.get(7)?,
+            created_at: row.get(8)?,
+            entity_id: row.get(9)?,
+            entity_file: row.get(10)?,
+            entity_line: row.get(11)?,
+        })
+    }
+
+    fn to_json(&self, sei: Option<&str>) -> Value {
+        json!({
+            "id": self.id,
+            "tool": self.tool,
+            "rule_id": self.rule_id,
+            "kind": self.kind,
+            "severity": self.severity,
+            "status": self.status,
+            "message": self.message,
+            "confidence": self.confidence,
+            "created_at": self.created_at,
+            "entity": {
+                "id": self.entity_id,
+                "sei": sei,
+                "file": self.entity_file,
+                "line": self.entity_line,
+            },
         })
     }
 }

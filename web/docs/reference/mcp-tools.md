@@ -1,7 +1,7 @@
 # MCP tool reference
 
 The tools below are the core consult tools served by `loomweave serve` over the
-MCP stdio transport. The live 1.2.x surface exposes 39 tools, including
+MCP stdio transport. The live 1.2.x surface exposes 40 tools, including
 navigation, briefing, source inspection, guidance/finding enrichment, analyze
 lifecycle, freshness, faceted search, and structural shortcuts. Connect an MCP
 client and read `tools/list` for the complete, current catalogue.
@@ -94,10 +94,16 @@ Use `tools/list` for exact schemas. The remaining tool families include:
 - Source and orientation: `source_for_entity`, `call_sites`,
   `orientation_pack`, `project_status`, `summary_preview_cost`.
 - Guidance and findings: `guidance_for`, `propose_guidance`,
-  `promote_guidance`, `findings_for`, `wardline_for`.
+  `promote_guidance`, `findings_for`, `wardline_for`, and
+  `project_finding_list` — the whole-project finding browser: every finding
+  across the project (no entity id required), each carrying its anchoring entity
+  SEI + `file:line` + severity/rule, paginated. Its unfiltered `page.total`
+  reconciles with `project_status`'s finding count.
 - Analyze and freshness: `analyze_start`, `analyze_status`,
   `analyze_cancel`, `index_diff`.
-- Facets and shortcuts: `find_by_tag`, `find_by_kind`, `find_by_wardline`,
+- Facets and shortcuts: `find_by_tag`, `find_by_kind`, `find_by_wardline`
+  (accepts `has_findings: true` to page only the taint-fact entities that also
+  carry a finding),
   `find_circular_imports`, `find_coupling_hotspots`, `find_entry_points`,
   `find_http_routes`, `find_data_models`, `find_tests`, `find_deprecations`,
   `find_todos`, `what_tests_this`, `high_churn`, `recently_changed`,

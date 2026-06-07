@@ -4874,6 +4874,34 @@ async fn project_status_reports_counts_latest_run_and_plugins() {
 }
 
 #[tokio::test]
+async fn project_status_emits_worktree_dirty_scope_note_on_every_path() {
+    // N5: `worktree_dirty` is a bare boolean an agent (and legis, which gates
+    // signing on it) reads as "git clean" on the false/null path. Emit a
+    // consumer-visible scope note on EVERY path so the field's meaning —
+    // un-indexed UNTRACKED source, not the git working-tree state — is readable
+    // WITHOUT reading loomweave source. Here the project is not a git work tree,
+    // so worktree_dirty is null, the path the note must still cover.
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(&state, "project_status", json!({})).await;
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    let note = envelope["result"]["worktree_dirty_note"]
+        .as_str()
+        .expect("worktree_dirty_note must be present on the null/false path");
+    // The note must disclose that the field is NOT the git working-tree state and
+    // that it is scoped to untracked source (modified tracked source surfaces via
+    // staleness), so a signing gate doesn't read false as "git clean".
+    let lower = note.to_lowercase();
+    assert!(lower.contains("untracked"), "note: {note}");
+    assert!(lower.contains("staleness"), "note: {note}");
+    assert!(
+        lower.contains("not"),
+        "note must disclose it's not git-clean: {note}"
+    );
+}
+
+#[tokio::test]
 async fn project_status_fresh_carries_staleness_note_caveat() {
     // The named tool an agent reads directly must disclose what "fresh" omits —
     // not only the session-start banner (clarion-26c7e52027). The seeded demo.py

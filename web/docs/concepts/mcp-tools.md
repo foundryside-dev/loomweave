@@ -25,7 +25,7 @@ trust it.
 
 ## Core tool families
 
-Loomweave exposes a 39-tool MCP surface. Start with the navigation and briefing
+Loomweave exposes a 40-tool MCP surface. Start with the navigation and briefing
 tools, then reach for catalogue shortcuts when you need a targeted structural
 query:
 
@@ -42,6 +42,7 @@ query:
 | `source_for_entity(id)` | "Show the indexed source span and context." |
 | `orientation_pack(id or file/line)` | "Give me the entity, context, neighbors, paths, issues, and freshness in one packet." |
 | `guidance_for(id)` | "Which guidance sheets apply to this entity?" |
+| `project_finding_list(filter?)` | "List every finding across the project (no entity id), each with its anchoring entity + file:line." |
 | `find_dead_code(scope?)` / `search_semantic(query)` | "Run advanced reachability or semantic-search queries when their inputs are available." |
 
 See the [MCP tool reference](../reference/mcp-tools.md) for parameters and the

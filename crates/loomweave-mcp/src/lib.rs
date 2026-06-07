@@ -567,8 +567,8 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_wardline_list",
-            description: "Return entities carrying a Wardline taint fact, optionally filtered by `tier` and/or `group`, within an optional `scope` (entity id → descendants, OR path glob; omitted → whole project). The Wardline blob is opaque to Loomweave: tier/group filtering is best-effort against a top-level field on the blob and honest-empty when absent. Each entity carries its `wardline` blob verbatim plus its `sei`. Bounded (limit/offset, page.total/truncated). Facts are populated via Filigree Flow-B. No LLM call.",
-            input_schema: scope_facet_schema(&[("tier", false), ("group", false)]),
+            description: "Return entities carrying a Wardline taint fact, optionally filtered by `tier` and/or `group`, within an optional `scope` (entity id → descendants, OR path glob; omitted → whole project). Pass `has_findings: true` to return only entities that ALSO carry at least one finding — page just the fact-carrying-and-flawed entities instead of every taint-fact blob. The Wardline blob is opaque to Loomweave: tier/group filtering is best-effort against a top-level field on the blob and honest-empty when absent. Each entity carries its `wardline` blob verbatim plus its `sei`. Bounded (limit/offset, page.total/truncated). Facts are populated via Filigree Flow-B. No LLM call.",
+            input_schema: wardline_facet_schema(),
         },
         ToolDefinition {
             name: "module_circular_import_list",
@@ -672,6 +672,27 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "additionalProperties": false
             }),
         },
+        ToolDefinition {
+            name: "project_finding_list",
+            description: "List findings across the WHOLE project — NO entity id required — so an agent can go from project_status_get's `findings: N` count straight to the N findings (the count-without-list gap). Each row carries its anchoring entity { id, sei, file, line } plus the finding's tool/rule_id/kind/severity/status/message/confidence/created_at. Optionally filtered by `filter.kind` (defect/fact/classification/metric/suggestion), `filter.severity` (INFO/WARN/ERROR/CRITICAL/NONE), and `filter.status` (open/acknowledged/suppressed/promoted_to_issue). Bounded (limit default 50, max 200; page.total/returned/truncated). With NO filter, page.total reconciles with project_status_get's finding count (both count the bare findings table). A project with no findings returns an empty list, not an error. No LLM call.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "filter": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string"},
+                            "severity": {"type": "string"},
+                            "status": {"type": "string"}
+                        },
+                        "additionalProperties": false
+                    },
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                    "offset": {"type": "integer", "minimum": 0}
+                },
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -750,6 +771,17 @@ fn scope_facet_schema(facets: &[(&str, bool)]) -> Value {
         "required": required,
         "additionalProperties": false
     })
+}
+
+/// Input schema for `entity_wardline_list`: the faceted tier/group schema plus a
+/// `has_findings` boolean. Declared explicitly because the base schema sets
+/// `additionalProperties: false`, which would otherwise reject the param.
+fn wardline_facet_schema() -> Value {
+    let mut schema = scope_facet_schema(&[("tier", false), ("group", false)]);
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.insert("has_findings".to_owned(), json!({"type": "boolean"}));
+    }
+    schema
 }
 
 fn confidence_schema() -> Value {
@@ -1383,6 +1415,10 @@ impl ServerState {
                 Err(response) => return response.to_json_rpc(id),
             },
             "entity_semantic_search_list" => match self.tool_search_semantic(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "project_finding_list" => match self.tool_project_findings(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
@@ -4951,7 +4987,7 @@ mod tests {
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 39);
+        assert_eq!(tools.len(), 40);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
@@ -5059,6 +5095,7 @@ mod tests {
         assert_eq!(tools[36].name, "entity_recent_change_list");
         assert_eq!(tools[37].name, "entity_dead_list");
         assert_eq!(tools[38].name, "entity_semantic_search_list");
+        assert_eq!(tools[39].name, "project_finding_list");
     }
 
     #[test]

@@ -136,6 +136,7 @@ impl ServerState {
     ) -> std::result::Result<Value, ParamError> {
         let tier = optional_facet(arguments, "tier")?;
         let group = optional_facet(arguments, "group")?;
+        let has_findings = optional_bool(arguments, "has_findings")?;
         let scope = RawScope::parse(arguments)?;
         let page = Page::parse(arguments, FACET_PAGE_DEFAULT, FACET_PAGE_MAX)?;
         let project_root = self.project_root.clone();
@@ -146,12 +147,32 @@ impl ServerState {
                 let (candidates, scan_truncated) =
                     entities_with_wardline_facts(conn, FACET_SCAN_CAP)?;
 
+                // When `has_findings` is set, restrict to entities that carry at
+                // least one finding — so an agent pages the fact-carrying-AND-flawed
+                // entities, not every taint-fact blob (L1 complement). One bounded
+                // query builds the set; absent the flag the filter is a no-op.
+                let finding_anchor_ids: Option<std::collections::HashSet<String>> = if has_findings
+                {
+                    let mut set = std::collections::HashSet::new();
+                    let mut stmt = conn.prepare("SELECT DISTINCT entity_id FROM findings")?;
+                    let mut rows = stmt.query([])?;
+                    while let Some(row) = rows.next()? {
+                        set.insert(row.get::<_, String>(0)?);
+                    }
+                    Some(set)
+                } else {
+                    None
+                };
+
                 // Scope-filter first, then fetch the (opaque) blobs only for the
                 // survivors — a narrow scope avoids reading every candidate blob.
                 let in_scope: Vec<EntityRow> = candidates
                     .into_iter()
                     .filter(|e| {
                         filter.contains(&e.id, e.source_file_path.as_deref(), &project_root)
+                            && finding_anchor_ids
+                                .as_ref()
+                                .is_none_or(|ids| ids.contains(&e.id))
                     })
                     .collect();
                 let ids: Vec<String> = in_scope.iter().map(|e| e.id.clone()).collect();
@@ -200,7 +221,7 @@ impl ServerState {
 
                 let mut response = json!({
                     "entities": entities,
-                    "facet": { "tier": tier, "group": group },
+                    "facet": { "tier": tier, "group": group, "has_findings": has_findings },
                     "page": {
                         "total": total,
                         "offset": page.offset,
@@ -256,6 +277,18 @@ fn optional_facet(
         Some(_) => Err(ParamError::new(&format!(
             "{field} must be a string or number"
         ))),
+    }
+}
+
+/// Parse an optional boolean argument (`has_findings`). Absent / null → `false`.
+fn optional_bool(
+    arguments: &serde_json::Map<String, Value>,
+    field: &str,
+) -> std::result::Result<bool, ParamError> {
+    match arguments.get(field) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(ParamError::new(&format!("{field} must be a boolean"))),
     }
 }
 
