@@ -5,12 +5,12 @@ use std::path::Path;
 use loomweave_core::EdgeConfidence;
 use loomweave_storage::{
     ModuleDependencyEdge, ReferenceDirection, SubsystemMember, call_edges_from,
-    call_edges_targeting, child_entity_ids, contained_entity_ids, containing_module_id,
-    entity_at_line, entity_briefing_block_reason, entity_by_id, find_entities, findings_for_emit,
-    module_dependency_edges, module_reference_rollup, normalize_source_path, pragma,
-    reference_edges_for_entity, resolve_file, resolve_file_catalog_entry, schema,
-    subsystem_for_member, subsystem_members, subsystem_of_entity, unresolved_call_sites_for_caller,
-    unresolved_callers_for_target,
+    call_edges_targeting, child_entity_ids, contained_entity_ids, containing_module_id, edge_total,
+    entity_at_line, entity_briefing_block_reason, entity_by_id, entity_total, find_entities,
+    findings_for_emit, module_dependency_edges, module_reference_rollup, normalize_source_path,
+    pragma, reference_edges_for_entity, resolve_file, resolve_file_catalog_entry, schema,
+    subsystem_for_member, subsystem_members, subsystem_of_entity, subsystem_total,
+    unresolved_call_sites_for_caller, unresolved_callers_for_target,
 };
 use rusqlite::{Connection, params};
 
@@ -1705,4 +1705,23 @@ fn containing_module_id_walks_up_to_the_nearest_module() {
         containing_module_id(&conn, "python:function:orphan").expect("query"),
         None,
     );
+}
+
+#[test]
+fn graph_totals_count_all_entities_subsystems_and_edges() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let conn = open_fresh(&dir);
+
+    // Three entities — one of which is a subsystem — and two edges.
+    insert_entity(&conn, "python:module:a", "module");
+    insert_entity(&conn, "python:function:a.f", "function");
+    insert_entity(&conn, "core:subsystem:abcd", "subsystem");
+    insert_contains_edge(&conn, "python:module:a", "python:function:a.f");
+    insert_contains_edge(&conn, "python:module:a", "core:subsystem:abcd");
+
+    // entity_total counts every kind, INCLUDING the subsystem (matching the
+    // `project_status` convention); subsystem_total is the subset.
+    assert_eq!(entity_total(&conn).expect("entity_total"), 3);
+    assert_eq!(subsystem_total(&conn).expect("subsystem_total"), 1);
+    assert_eq!(edge_total(&conn).expect("edge_total"), 2);
 }

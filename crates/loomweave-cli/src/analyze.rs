@@ -1513,10 +1513,39 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         bail!("analyze run {run_id} failed — {reason}");
     }
 
-    println!(
-        "analyze complete: run {run_id} completed \
-         ({total_entity_count} entities, {total_edge_count} edges)"
-    );
+    // Report the WHOLE-GRAPH totals (the same numbers `project_status` and the
+    // session-start hook show), not this run's insert delta. The delta is
+    // misleadingly small on incremental runs that skip unchanged files — it
+    // counts only the phase3 subsystems re-emitted — so an operator could read
+    // it as the graph having shrunk. Fall back to the run delta only if the
+    // post-commit count read fails, so a cosmetic hiccup never masks a
+    // successful run.
+    let run_delta_summary = || {
+        format!(
+            "analyze complete: run {run_id} completed \
+             ({total_entity_count} entities, {total_edge_count} edges)"
+        )
+    };
+    let summary = match Connection::open(&db_path) {
+        Ok(conn) => match (
+            loomweave_storage::entity_total(&conn),
+            loomweave_storage::subsystem_total(&conn),
+            loomweave_storage::edge_total(&conn),
+        ) {
+            (Ok(entities), Ok(subsystems), Ok(edges)) => {
+                format_analyze_complete(&run_id, entities, subsystems, edges, skipped_files_total)
+            }
+            _ => run_delta_summary(),
+        },
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "analyze complete: graph-total read failed; reporting run delta"
+            );
+            run_delta_summary()
+        }
+    };
+    println!("{summary}");
     Ok(())
 }
 
@@ -1545,6 +1574,33 @@ struct PlannedSeiWrite {
 /// there and violate the `ux_sei_alive_locator` partial unique index. The
 /// `BTreeMap` also yields the deterministic, locator-sorted processing order the
 /// cross-entity carry dedup in [`run_sei_mint_pass`] relies on.
+/// Render the operator-facing `analyze complete` summary line.
+///
+/// Reports the **whole-graph** totals (entities incl. subsystems, edges) — the
+/// same numbers `project_status` and the session-start hook show — rather than
+/// the per-run insert delta, which is misleadingly small on incremental runs
+/// that skip unchanged files. When unchanged files were skipped, the line is
+/// annotated so an operator does not mistake a fast incremental pass for a graph
+/// that shrank.
+fn format_analyze_complete(
+    run_id: &str,
+    entities: i64,
+    subsystems: i64,
+    edges: i64,
+    skipped_files: u64,
+) -> String {
+    let incremental = if skipped_files > 0 {
+        let noun = if skipped_files == 1 { "file" } else { "files" };
+        format!("; incremental: {skipped_files} unchanged {noun} skipped")
+    } else {
+        String::new()
+    };
+    format!(
+        "analyze complete: run {run_id} completed \
+         (graph: {entities} entities incl. {subsystems} subsystems, {edges} edges{incremental})"
+    )
+}
+
 fn dedup_descriptors_by_locator(descriptors: Vec<NewEntityDescriptor>) -> Vec<NewEntityDescriptor> {
     descriptors
         .into_iter()
@@ -5265,6 +5321,42 @@ mod tests {
             .unwrap();
         assert_eq!(f.body_hash.as_deref(), Some("last"));
         assert_eq!(f.signature.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn analyze_complete_full_run_reports_whole_graph_totals() {
+        // A full run (no unchanged files skipped) reports the graph totals with
+        // the subsystem breakdown, matching `project_status` phrasing.
+        let line = format_analyze_complete("run-1", 263, 5, 496, 0);
+        assert_eq!(
+            line,
+            "analyze complete: run run-1 completed \
+             (graph: 263 entities incl. 5 subsystems, 496 edges)"
+        );
+    }
+
+    #[test]
+    fn analyze_complete_incremental_run_annotates_skipped_files() {
+        // An incremental run that skipped unchanged files reports the SAME graph
+        // totals (not the tiny insert delta) plus an explicit incremental marker.
+        let line = format_analyze_complete("run-2", 263, 5, 496, 29);
+        assert_eq!(
+            line,
+            "analyze complete: run run-2 completed \
+             (graph: 263 entities incl. 5 subsystems, 496 edges; \
+             incremental: 29 unchanged files skipped)"
+        );
+    }
+
+    #[test]
+    fn analyze_complete_incremental_singular_file_uses_singular_noun() {
+        let line = format_analyze_complete("run-3", 10, 0, 4, 1);
+        assert_eq!(
+            line,
+            "analyze complete: run run-3 completed \
+             (graph: 10 entities incl. 0 subsystems, 4 edges; \
+             incremental: 1 unchanged file skipped)"
+        );
     }
 
     #[test]

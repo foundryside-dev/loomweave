@@ -296,6 +296,32 @@ pub fn entity_by_id(conn: &Connection, entity_id: &str) -> Result<Option<EntityR
         .map_err(StorageError::from)
 }
 
+/// Total number of entity rows in the graph — every kind, **including**
+/// subsystems. Uses the same `SELECT COUNT(*) FROM entities` the MCP snapshot
+/// (`project_status`) reports, so the two surfaces always agree.
+pub fn entity_total(conn: &Connection) -> Result<i64> {
+    conn.query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))
+        .map_err(StorageError::from)
+}
+
+/// Number of subsystem entities (`kind = 'subsystem'`) — the breakdown
+/// `project_status` annotates alongside the entity total.
+pub fn subsystem_total(conn: &Connection) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM entities WHERE kind = 'subsystem'",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(StorageError::from)
+}
+
+/// Total number of edge rows in the graph, matching `project_status`'s
+/// `SELECT COUNT(*) FROM edges`.
+pub fn edge_total(conn: &Connection) -> Result<i64> {
+    conn.query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))
+        .map_err(StorageError::from)
+}
+
 pub fn resolve_file(
     conn: &Connection,
     project_root: &Path,
