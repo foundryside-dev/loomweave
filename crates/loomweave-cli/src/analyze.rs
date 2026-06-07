@@ -1956,11 +1956,11 @@ async fn emit_deletion_findings(
 }
 
 /// Build a `LMWV-FACT-ENTITY-DELETED` finding anchored to the deleted entity's own
-/// (never-pruned) row. The id is deterministic and run-scoped so a `--resume`
+/// (never-pruned) row. The id is deterministic and content-keyed so re-analysis (and `--resume`)
 /// re-walk regenerates the same id and `InsertFinding`'s upsert is idempotent.
 fn entity_deleted_finding(entity_id: &str, run_id: &str, now: &str) -> FindingRecord {
     FindingRecord {
-        id: format!("core:finding:{run_id}:entity-deleted:{entity_id}"),
+        id: format!("core:finding:entity-deleted:{entity_id}"),
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -1990,7 +1990,7 @@ fn guidance_orphan_finding(
     now: &str,
 ) -> FindingRecord {
     FindingRecord {
-        id: format!("core:finding:{run_id}:guidance-orphan:{guidance_id}:{deleted_entity_id}"),
+        id: format!("core:finding:guidance-orphan:{guidance_id}:{deleted_entity_id}"),
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -2208,7 +2208,7 @@ async fn emit_guidance_staleness_findings(
 /// Run-scoped, deterministic id; INFO, confidence 1.0.
 fn guidance_expired_finding(guidance_id: &str, run_id: &str, now: &str) -> FindingRecord {
     FindingRecord {
-        id: format!("core:finding:{run_id}:guidance-expired:{guidance_id}"),
+        id: format!("core:finding:guidance-expired:{guidance_id}"),
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -2237,7 +2237,7 @@ fn guidance_stale_finding(
     now: &str,
 ) -> FindingRecord {
     FindingRecord {
-        id: format!("core:finding:{run_id}:guidance-stale:{guidance_id}"),
+        id: format!("core:finding:guidance-stale:{guidance_id}"),
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -2277,7 +2277,7 @@ fn guidance_churn_stale_finding(
     now: &str,
 ) -> FindingRecord {
     FindingRecord {
-        id: format!("core:finding:{run_id}:guidance-churn-stale:{guidance_id}"),
+        id: format!("core:finding:guidance-churn-stale:{guidance_id}"),
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -2409,7 +2409,7 @@ async fn emit_tier_subsystem_findings(
 
 /// Build a `LMWV-FACT-TIER-SUBSYSTEM-MIXING` finding anchored to the subsystem,
 /// carrying its tier-bearing members as related ids and the tier distribution as
-/// evidence. Members are pre-sorted by the caller; the id is run-scoped.
+/// evidence. Members are pre-sorted by the caller; the id is content-keyed.
 fn tier_mixing_finding(
     subsystem_id: &str,
     members: &[(String, String)],
@@ -2423,7 +2423,7 @@ fn tier_mixing_finding(
         *tier_counts.entry(tier.as_str()).or_default() += 1;
     }
     FindingRecord {
-        id: format!("core:finding:{run_id}:tier-mixing:{subsystem_id}"),
+        id: format!("core:finding:tier-mixing:{subsystem_id}"),
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -2459,7 +2459,7 @@ fn tier_unanimous_finding(
 ) -> FindingRecord {
     let member_ids: Vec<&str> = members.iter().map(|(id, _)| id.as_str()).collect();
     FindingRecord {
-        id: format!("core:finding:{run_id}:tier-unanimous:{subsystem_id}"),
+        id: format!("core:finding:tier-unanimous:{subsystem_id}"),
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -2816,7 +2816,7 @@ async fn insert_weak_modularity_finding(
         .map(|subsystem| subsystem.id.clone())
         .collect::<Vec<_>>();
     let now = iso8601_now();
-    let finding_id = format!("core:finding:{run_id}:weak-modularity");
+    let finding_id = "core:finding:weak-modularity".to_owned();
     let related_entities_json = serde_json::to_string(&subsystem_ids)
         .context("serialize weak modularity related_entities")?;
     writer
@@ -2866,7 +2866,7 @@ async fn insert_weak_modularity_finding(
 /// The finding anchors to the degraded entity itself (the plugin still emits one
 /// manifest-declared degraded-syntax entity for a syntax-failed file), so no
 /// synthetic anchor is needed.
-/// The id is deterministic and run-scoped so a `--resume` re-walk regenerates the
+/// The id is deterministic and content-keyed so re-analysis (and `--resume`) re-walk regenerates the
 /// same id and `InsertFinding`'s upsert is idempotent (REQ-FINDING-05).
 fn syntax_error_finding(
     record: &EntityRecord,
@@ -2886,7 +2886,7 @@ fn syntax_error_finding(
         return None;
     }
     Some(FindingRecord {
-        id: format!("core:finding:{run_id}:syntax-error:{}", record.id),
+        id: format!("core:finding:syntax-error:{}", record.id),
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -3041,7 +3041,7 @@ fn host_finding_to_record(
     })
     .to_string();
     FindingRecord {
-        id: format!("core:finding:{run_id}:infra:{discriminator}"),
+        id: format!("core:finding:infra:{discriminator}"),
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -3108,7 +3108,7 @@ fn crash_finding_record(
 ) -> FindingRecord {
     let discriminator = blake3::hash(format!("{plugin_id}\u{0}{reason}").as_bytes()).to_hex();
     FindingRecord {
-        id: format!("core:finding:{run_id}:crash:{discriminator}"),
+        id: format!("core:finding:crash:{discriminator}"),
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -3142,7 +3142,7 @@ fn source_walk_finding_record(
         blake3::hash(format!("{}\u{0}{skipped_entries}", project_root.display()).as_bytes())
             .to_hex();
     FindingRecord {
-        id: format!("core:finding:{run_id}:source-walk:{discriminator}"),
+        id: format!("core:finding:source-walk:{discriminator}"),
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -5707,10 +5707,10 @@ mod tests {
         assert_eq!(finding.kind, "defect");
         assert_eq!(finding.severity, "WARN");
         assert_eq!(finding.tool, "loomweave");
-        // Deterministic, run-scoped id keeps InsertFinding idempotent on resume.
+        // Deterministic, content-keyed id keeps InsertFinding idempotent across runs.
         assert_eq!(
             finding.id,
-            "core:finding:run-1:syntax-error:python:module:pkg.broken"
+            "core:finding:syntax-error:python:module:pkg.broken"
         );
     }
 
@@ -5746,10 +5746,10 @@ mod tests {
         assert_eq!(finding.severity, "INFO");
         // Anchors to the deleted entity's own (never-pruned) row.
         assert_eq!(finding.entity_id, "python:function:pkg.gone");
-        // Deterministic, run-scoped id keeps InsertFinding idempotent on resume.
+        // Deterministic, content-keyed id keeps InsertFinding idempotent across runs.
         assert_eq!(
             finding.id,
-            "core:finding:run-1:entity-deleted:python:function:pkg.gone"
+            "core:finding:entity-deleted:python:function:pkg.gone"
         );
     }
 
@@ -5782,10 +5782,7 @@ mod tests {
         assert_eq!(finding.kind, "fact");
         assert_eq!(finding.severity, "WARN");
         assert_eq!(finding.entity_id, "core:subsystem:abc");
-        assert_eq!(
-            finding.id,
-            "core:finding:run-1:tier-mixing:core:subsystem:abc"
-        );
+        assert_eq!(finding.id, "core:finding:tier-mixing:core:subsystem:abc");
         let evidence: serde_json::Value = serde_json::from_str(&finding.evidence_json).unwrap();
         assert_eq!(evidence["tier_distribution"]["public"], 1);
         assert_eq!(evidence["tier_distribution"]["internal"], 1);
@@ -5825,7 +5822,7 @@ mod tests {
         assert_eq!(related, serde_json::json!(["python:function:pkg.gone"]));
         assert_eq!(
             finding.id,
-            "core:finding:run-1:guidance-orphan:core:guidance:g1:python:function:pkg.gone"
+            "core:finding:guidance-orphan:core:guidance:g1:python:function:pkg.gone"
         );
     }
 

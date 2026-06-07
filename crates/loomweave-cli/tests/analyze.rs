@@ -1219,6 +1219,46 @@ fn analyze_phase3_emits_weak_modularity_fact_when_below_threshold() {
     );
 }
 
+/// L1 / ADR-047 regression: re-analyzing an UNCHANGED tree must not accumulate
+/// duplicate finding rows. Finding ids are content-keyed (`core:finding:<disc>`),
+/// not run-scoped, so the `ON CONFLICT(id)` upsert de-dupes across fresh runs;
+/// before the fix every re-analyze minted new run-scoped rows and the count grew
+/// (the dogfood `255 -> 259 -> 263` symptom).
+#[cfg(unix)]
+#[test]
+fn analyze_findings_do_not_accumulate_across_reruns() {
+    let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["weak_a", "weak_b"]);
+    let db = project_dir.path().join(".weft/loomweave/loomweave.db");
+    let count = || -> i64 {
+        Connection::open(&db)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM findings", [], |row| row.get(0))
+            .unwrap()
+    };
+
+    let after_first = count();
+    assert!(
+        after_first > 0,
+        "fixture should produce at least one finding to make the test meaningful"
+    );
+
+    // Re-analyze the UNCHANGED tree twice more (same source, new run_id each time).
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let config = std::path::PathBuf::from(&config_path);
+    run_phase3_analyze(project_dir.path(), &config, &plugin_path);
+    let after_second = count();
+    run_phase3_analyze(project_dir.path(), &config, &plugin_path);
+    let after_third = count();
+
+    assert_eq!(
+        (after_second, after_third),
+        (after_first, after_first),
+        "finding count must be stable across re-analyses of an unchanged tree \
+         (got {after_first} -> {after_second} -> {after_third})"
+    );
+}
+
 /// Set up a phase3 project + plugin and run analyze once. Returns BOTH tempdirs
 /// (project, plugin) so the caller can keep the plugin on `PATH` and re-run
 /// `analyze` after mutating the source tree — `run_phase3_fixture` drops the

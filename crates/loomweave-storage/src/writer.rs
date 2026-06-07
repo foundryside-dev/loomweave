@@ -883,16 +883,20 @@ fn insert_finding(
 /// path (REQ-ANALYZE-04 deletion findings, emitted after `CommitRun` via
 /// `query_time_write`) share this so the SQL has a single home.
 fn write_finding_row(conn: &Connection, finding: &FindingRecord) -> Result<()> {
-    // ON CONFLICT(id) DO UPDATE makes the finding path idempotent under
-    // `--resume`: a finding id embeds its run_id (`core:finding:{run_id}:…`),
-    // so cross-run ids never collide and a fresh run only ever INSERTs. A
-    // resume re-walks under the *same* run_id and re-generates the same ids;
-    // without the upsert it would fail on `UNIQUE constraint: findings.id`.
-    // The conflict clause refreshes analysis-derived columns from the re-walk
-    // but PRESERVES the lifecycle columns (`status`, `suppression_reason`,
-    // `filigree_issue_id`) and `created_at` — the same first-seen-preserving
-    // discipline `insert_entity` applies. (These lifecycle columns are never
-    // mutated locally today; preserving them keeps that invariant if they are.)
+    // ON CONFLICT(id) DO UPDATE makes the finding path idempotent across BOTH a
+    // `--resume` re-walk and a fresh re-analyze. A finding id is keyed on its
+    // CONTENT (`core:finding:<discriminator>`, e.g. the anchor entity + rule +
+    // evidence hash) and NOT on run_id (L1 fix, clarion-772ff358da / ADR-047):
+    // the same logical finding regenerates the same id every run, so the upsert
+    // refreshes it in place instead of inserting a duplicate. The run_id *column*
+    // updates to the latest run (`run_id = excluded.run_id`), so `findings_for_emit`
+    // (WHERE run_id = current) still returns exactly the reproduced set. The
+    // conflict clause refreshes analysis-derived columns from the re-walk but
+    // PRESERVES the lifecycle columns (`status`, `suppression_reason`,
+    // `filigree_issue_id`) and `created_at` — so a finding's Filigree linkage and
+    // suppression now SURVIVE re-analysis (a run_id-scoped id used to orphan them
+    // by minting a fresh row each run). Same first-seen-preserving discipline
+    // `insert_entity` applies.
     conn.execute(
         "INSERT INTO findings ( \
             id, tool, tool_version, run_id, rule_id, kind, severity, confidence, \

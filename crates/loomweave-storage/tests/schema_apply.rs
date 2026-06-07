@@ -842,7 +842,7 @@ fn migrations_are_idempotent() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut conn = open_fresh(&tempdir);
     schema::apply_migrations(&mut conn).expect("second apply should be a no-op");
-    assert_eq!(schema::applied_count(&conn).unwrap(), 9);
+    assert_eq!(schema::applied_count(&conn).unwrap(), 10);
     let tables_after = table_names(&conn);
     assert!(tables_after.contains(&"entities".to_owned()));
 }
@@ -856,7 +856,7 @@ fn schema_migrations_records_each_applied_migration() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(count, 9);
+    assert_eq!(count, 10);
     let names: Vec<String> = {
         let mut stmt = conn
             .prepare("SELECT name FROM schema_migrations ORDER BY version")
@@ -876,6 +876,7 @@ fn schema_migrations_records_each_applied_migration() {
             "0007_run_analyzed_commit",
             "0008_run_owner_heartbeat",
             "0009_drop_fts_content_text",
+            "0010_dedupe_findings_drop_run_scoped_ids",
         ]
     );
 }

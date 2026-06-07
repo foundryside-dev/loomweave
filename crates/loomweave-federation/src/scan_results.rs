@@ -315,7 +315,7 @@ mod tests {
 
     fn defect_row() -> FindingForEmit {
         FindingForEmit {
-            id: "core:finding:run-1:circular".to_owned(),
+            id: "core:finding:circular".to_owned(),
             rule_id: "LMWV-PY-STRUCTURE-001".to_owned(),
             kind: "defect".to_owned(),
             severity: "WARN".to_owned(),
@@ -463,7 +463,7 @@ mod tests {
     fn prepare_batch_counts_emitted_and_skipped() {
         let emitted = defect_row();
         let mut skipped = defect_row();
-        skipped.id = "core:finding:run-1:weak-modularity".to_owned();
+        skipped.id = "core:finding:weak-modularity".to_owned();
         skipped.entity_id = "core:subsystem:abcd".to_owned();
         skipped.source_file_path = None;
 

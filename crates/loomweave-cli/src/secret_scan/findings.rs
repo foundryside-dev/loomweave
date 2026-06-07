@@ -114,12 +114,13 @@ pub(crate) async fn emit_findings(
             finding_entity_id(&pending.file_path, entity_anchors).with_context(|| {
                 format!("anchor secret finding for {}", pending.file_path.display())
             })?;
-        // Deterministic, run-scoped id so a `--resume` re-walk regenerates the
-        // SAME id and `InsertFinding`'s upsert is idempotent (REQ-FINDING-05).
-        // A random UUID would instead create a duplicate finding row on every
-        // resume (the id never collides, so the upsert never fires). The digest
-        // covers the anchor entity, rule, and evidence (file + line + hashed
-        // secret), which uniquely identify a detection within a run.
+        // Deterministic, content-keyed id so re-analysis (and a `--resume`
+        // re-walk) regenerates the SAME id and `InsertFinding`'s upsert is
+        // idempotent across runs (REQ-FINDING-05; L1 / ADR-047). A random UUID
+        // would instead create a duplicate finding row on every run (the id never
+        // collides, so the upsert never fires). The digest covers the anchor
+        // entity, rule, and evidence (file + line + hashed secret), which
+        // uniquely identify a detection independent of which run observed it.
         let discriminator = blake3::hash(
             format!(
                 "{entity_id}\u{0}{}\u{0}{}",
@@ -128,7 +129,7 @@ pub(crate) async fn emit_findings(
             .as_bytes(),
         )
         .to_hex();
-        let finding_id = format!("core:finding:{run_id}:secret:{discriminator}");
+        let finding_id = format!("core:finding:secret:{discriminator}");
         writer
             .send_wait(|ack| WriterCmd::InsertFinding {
                 finding: Box::new(FindingRecord {

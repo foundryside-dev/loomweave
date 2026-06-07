@@ -1185,7 +1185,7 @@ mod tests {
         .expect("enabled client");
 
         let row = crate::scan_results::FindingForEmit {
-            id: "core:finding:run-1:circular".to_owned(),
+            id: "core:finding:circular".to_owned(),
             rule_id: "LMWV-PY-STRUCTURE-001".to_owned(),
             kind: "defect".to_owned(),
             severity: "WARN".to_owned(),
