@@ -26,7 +26,7 @@ calls this?" without reading a single file.
 - You need a function's neighborhood, execution paths, or which subsystem it belongs to.
 
 **Not for:** editing code, reading exact implementation bodies (use `summary` or
-read the file once you have its path), or codebases with no `.loomweave/` index.
+read the file once you have its path), or codebases with no `.weft/loomweave/` index.
 
 ## Entity IDs — the model
 
@@ -161,7 +161,7 @@ honest-empty unless a plugin emits those tags. Likewise `high_churn` and
 
 `search_semantic` is also in the catalogue. It is opt-in under
 `semantic_search:`; when enabled, `loomweave analyze` populates the git-ignored
-`.loomweave/embeddings.db` sidecar and the query path filters stale vectors by
+`.weft/loomweave/embeddings.db` sidecar and the query path filters stale vectors by
 content hash.
 
 > Not in this catalogue: `emit_observation` as a general-purpose write surface.
@@ -202,7 +202,7 @@ and are composed into `summary` prompts with a real guidance fingerprint.
 
 ## Launch
 
-`loomweave serve --path <dir>` where `<dir>` contains `.loomweave/loomweave.db`
+`loomweave serve --path <dir>` where `<dir>` contains `.weft/loomweave/loomweave.db`
 (built by `loomweave analyze <dir>`). In an MCP client the tools appear as
 `mcp__loomweave__find_entity`, etc.
 
