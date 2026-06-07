@@ -1,11 +1,23 @@
 //! Resolve the live Filigree API base URL.
 //!
 //! Mirrors Filigree's ethereal endpoint-discovery convention: the dashboard
-//! publishes its live port to `<project>/.filigree/ephemeral.port` (a plain
+//! publishes its live port to a per-project `ephemeral.port` file (a plain
 //! integer, written atomically, present only while the dashboard runs) and
 //! serves the read API on that port. The port is chosen deterministically but
 //! unpredictably (`8400 + sha256(path) % 1000` with fallback), so it must be
-//! *read*, never computed. This mirrors the Filigree sources:
+//! *read*, never computed.
+//!
+//! **Location (Weft store consolidation, ADR-046):** Filigree publishes its
+//! runtime state under the shared `.weft/<member>/` dotdir, so the port file
+//! lives at `<project>/.weft/filigree/ephemeral.port` — the single location this
+//! resolver reads. There is **no** fallback to the pre-consolidation
+//! `.filigree/` path: after the coordinated cutover every sibling is at `.weft/`
+//! by construction, so a port file found only on the legacy path means a
+//! mis-sequenced cutover, and resolving it would silently bind to a stale dir
+//! (the lacuna-401 failure mode). Instead the resolver folds to the configured
+//! URL (`source = "config"`), and the wire-facing `source` label reports that —
+//! a loud, visible signal rather than a quiet stale resolve.
+//! This mirrors the Filigree sources:
 //!   - `filigree/src/filigree/ephemeral.py::{write,read}_port_file`
 //!   - `filigree/src/filigree/scanner_callback.py::resolve_scanner_api_url_with_source`
 //!
@@ -32,8 +44,9 @@ use crate::config::FiligreeConfig;
 /// by `project_status` (and, per clarion-318f1254eb, `issues_for`) so an agent
 /// can tell *where* the URL came from without shelling out to probe ports.
 pub const SOURCE_DISABLED: &str = "disabled";
-/// The live ethereal port published by Filigree's running dashboard.
-pub const SOURCE_EPHEMERAL_PORT: &str = ".filigree/ephemeral.port";
+/// The live ethereal port published by Filigree's running dashboard at the
+/// consolidated `.weft/filigree/` location — the only location read (ADR-046).
+pub const SOURCE_EPHEMERAL_PORT: &str = ".weft/filigree/ephemeral.port";
 /// Loomweave's own configured `integrations.filigree.base_url`.
 pub const SOURCE_CONFIG: &str = "config";
 
@@ -53,9 +66,12 @@ pub struct FiligreeUrlResolution {
 /// Resolve the Filigree read-API base URL, preferring the live ethereal port.
 ///
 /// - Disabled → no resolved URL, `source = "disabled"`.
-/// - A valid `<project_root>/.filigree/ephemeral.port` → the configured URL
-///   with its port overridden by the live port, `source = ".filigree/ephemeral.port"`.
-/// - Otherwise → the configured URL unchanged, `source = "config"`.
+/// - A valid `<project_root>/.weft/filigree/ephemeral.port` → the configured URL
+///   with its port overridden by the live port,
+///   `source = ".weft/filigree/ephemeral.port"`.
+/// - Otherwise → the configured URL unchanged, `source = "config"`. A port file
+///   present only at the pre-consolidation `.filigree/` path is **not** read; it
+///   folds here, so a mis-sequenced cutover is visible (not a stale resolve).
 #[must_use]
 pub fn resolve_filigree_url(config: &FiligreeConfig, project_root: &Path) -> FiligreeUrlResolution {
     let configured_url = config.base_url.clone();
@@ -68,13 +84,13 @@ pub fn resolve_filigree_url(config: &FiligreeConfig, project_root: &Path) -> Fil
         };
     }
     match read_ephemeral_port(project_root) {
-        Some(port) => {
+        Some((port, source)) => {
             let resolved = override_port(&configured_url, port);
             FiligreeUrlResolution {
                 enabled: true,
                 configured_url,
                 resolved_url: Some(resolved),
-                source: SOURCE_EPHEMERAL_PORT,
+                source,
             }
         }
         None => FiligreeUrlResolution {
@@ -86,14 +102,31 @@ pub fn resolve_filigree_url(config: &FiligreeConfig, project_root: &Path) -> Fil
     }
 }
 
-/// Read `<project_root>/.filigree/ephemeral.port` as a TCP port.
+/// Filigree's live published ephemeral port at the consolidated
+/// `.weft/filigree/` location. `None` when it does not resolve (fail-soft). Use
+/// this instead of reading the port file directly so the canonical-location
+/// policy stays in one place.
+#[must_use]
+pub fn read_filigree_ephemeral_port(project_root: &Path) -> Option<u16> {
+    read_ephemeral_port(project_root).map(|(port, _source)| port)
+}
+
+/// Read Filigree's published ephemeral port from the consolidated
+/// `.weft/filigree/ephemeral.port` location (ADR-046). Returns the port and the
+/// `SOURCE_EPHEMERAL_PORT` label.
 ///
 /// Mirrors Filigree's `read_port_file`: a plain trimmed integer. Any
-/// missing/corrupt/out-of-range/zero content folds to `None` (fail-soft).
-fn read_ephemeral_port(project_root: &Path) -> Option<u16> {
-    let path = project_root.join(".filigree").join("ephemeral.port");
+/// missing/corrupt/out-of-range/zero content folds to `None` (fail-soft). The
+/// pre-consolidation `.filigree/` path is deliberately not consulted — see the
+/// module docs.
+fn read_ephemeral_port(project_root: &Path) -> Option<(u16, &'static str)> {
+    let path = project_root
+        .join(".weft")
+        .join("filigree")
+        .join("ephemeral.port");
     let raw = std::fs::read_to_string(&path).ok()?;
-    raw.trim().parse::<u16>().ok().filter(|port| *port != 0)
+    let port = raw.trim().parse::<u16>().ok().filter(|port| *port != 0)?;
+    Some((port, SOURCE_EPHEMERAL_PORT))
 }
 
 /// Replace the port in a `scheme://host[:port][/path]` URL, preserving the
@@ -132,7 +165,13 @@ mod tests {
         }
     }
 
-    fn write_port_file(root: &Path, contents: &str) {
+    fn write_weft_port_file(root: &Path, contents: &str) {
+        let dir = root.join(".weft").join("filigree");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ephemeral.port"), contents).unwrap();
+    }
+
+    fn write_legacy_port_file(root: &Path, contents: &str) {
         let dir = root.join(".filigree");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("ephemeral.port"), contents).unwrap();
@@ -152,15 +191,29 @@ mod tests {
     #[test]
     fn live_ephemeral_port_overrides_the_stale_configured_port() {
         // The dogfood bug: configured 8766 is dead; the live dashboard is on
-        // 8542 per .filigree/ephemeral.port.
+        // 8542 per the consolidated .weft/filigree/ephemeral.port.
         let dir = tempfile::tempdir().unwrap();
-        write_port_file(dir.path(), "8542\n");
+        write_weft_port_file(dir.path(), "8542\n");
         let res = resolve_filigree_url(&enabled_config(), dir.path());
         assert!(res.enabled);
         assert_eq!(res.resolved_url.as_deref(), Some("http://127.0.0.1:8542"));
         assert_eq!(res.source, SOURCE_EPHEMERAL_PORT);
         // The configured URL is still reported verbatim alongside the resolved one.
         assert_eq!(res.configured_url, "http://127.0.0.1:8766");
+    }
+
+    #[test]
+    fn legacy_filigree_port_is_not_resolved_after_clean_break() {
+        // ADR-046 clean break: a sibling still on the pre-consolidation
+        // `.filigree/` path is NOT read. The live legacy port is ignored and the
+        // resolver folds to the configured URL, so `source == "config"` surfaces
+        // the mis-sequenced cutover loudly instead of silently binding the stale
+        // dir (the lacuna-401 wrong-but-quiet-resolve failure mode).
+        let dir = tempfile::tempdir().unwrap();
+        write_legacy_port_file(dir.path(), "8542\n");
+        let res = resolve_filigree_url(&enabled_config(), dir.path());
+        assert_eq!(res.source, SOURCE_CONFIG);
+        assert_eq!(res.resolved_url.as_deref(), Some("http://127.0.0.1:8766"));
     }
 
     #[test]
@@ -175,7 +228,7 @@ mod tests {
     #[test]
     fn corrupt_port_file_folds_to_configured_url() {
         let dir = tempfile::tempdir().unwrap();
-        write_port_file(dir.path(), "not-a-port");
+        write_weft_port_file(dir.path(), "not-a-port");
         let res = resolve_filigree_url(&enabled_config(), dir.path());
         assert_eq!(res.source, SOURCE_CONFIG);
         assert_eq!(res.resolved_url.as_deref(), Some("http://127.0.0.1:8766"));
@@ -184,7 +237,7 @@ mod tests {
     #[test]
     fn zero_port_is_rejected_as_corrupt() {
         let dir = tempfile::tempdir().unwrap();
-        write_port_file(dir.path(), "0");
+        write_weft_port_file(dir.path(), "0");
         let res = resolve_filigree_url(&enabled_config(), dir.path());
         assert_eq!(res.source, SOURCE_CONFIG);
     }

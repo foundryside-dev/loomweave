@@ -3273,7 +3273,7 @@ async fn channel_close_with_open_run_self_heals_to_failed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_run_truncates_wal_while_writer_still_alive() {
-    // clarion-cdee445ed8: ADR-005 commits `.loomweave/loomweave.db`, so a finished
+    // clarion-cdee445ed8: ADR-005 commits `.weft/loomweave/loomweave.db`, so a finished
     // analyze must leave the on-disk file a whole, committable snapshot WITHOUT
     // waiting for the process to exit. `CommitRun` now issues an explicit
     // `wal_checkpoint(TRUNCATE)`. We assert the WAL is reset to 0 bytes with the

@@ -34,7 +34,7 @@ serve:
     enabled: true
     # The read-API port is auto-selected per project — a deterministic port in
     # Loomweave's band (9400–10399, disjoint from Filigree's 8400–9399) with an
-    # ephemeral fallback — and published to .loomweave/ephemeral.port while
+    # ephemeral fallback — and published to .weft/loomweave/ephemeral.port while
     # serve runs. Set `bind:` explicitly only to pin a fixed port (ADR-044).
     # Preferred 1.0 identity mode. Optional on loopback, required for
     # authenticated Weft component requests.
@@ -511,7 +511,7 @@ semver. It increments only for incompatible changes to the wire contract
 consumed by existing Filigree clients.
 
 `instance_id` is the stable per-project Loomweave instance fingerprint persisted
-in `.loomweave/instance_id`. Filigree should treat a changed `instance_id` for a
+in `.weft/loomweave/instance_id`. Filigree should treat a changed `instance_id` for a
 previously known endpoint as evidence that it is now talking to a different
 Loomweave project instance.
 
@@ -848,7 +848,7 @@ disabled-by-default (weft.md §5): the write path is off unless explicitly enabl
 and Loomweave's own semantics never depend on a stored fact.
 
 **Per-project isolation.** One `loomweave serve` process serves exactly one project
-(the `.loomweave/` store under that project root). The `project` request field is a
+(the `.weft/loomweave/` store under that project root). The `project` request field is a
 **guard, not a selector** — it does not choose among projects; it only lets a
 client assert which project it believes it is talking to. The handle is the
 project-root directory name. An **empty** `project` is always accepted (no
@@ -1219,9 +1219,10 @@ gates Loomweave's own semantics. Loomweave stays solo-useful with Filigree absen
 (weft.md §5).
 
 **The convention.** Filigree's dashboard, when running in its default *ethereal*
-mode, publishes its live listen port to `<project_root>/.filigree/ephemeral.port`
-— a plain trimmed integer, written atomically, present only while the dashboard
-is up. The port is chosen deterministically but unpredictably
+mode, publishes its live listen port to
+`<project_root>/.weft/filigree/ephemeral.port` (the consolidated Weft store
+location, ADR-046) — a plain trimmed integer, written atomically, present only
+while the dashboard is up. The port is chosen deterministically but unpredictably
 (`8400 + sha256(project_path) % 1000`, with collision fallback), so it **must be
 read, never computed**. This mirrors the Filigree sources
 `filigree/src/filigree/ephemeral.py::{write,read}_port_file` and
@@ -1232,8 +1233,12 @@ read, never computed**. This mirrors the Filigree sources
 | Condition | Resolved URL | `source` label |
 |---|---|---|
 | Integration disabled | none (`null`) | `disabled` |
-| Valid `<root>/.filigree/ephemeral.port` present | configured URL with its **port** overridden by the live port (scheme, host, path preserved) | `.filigree/ephemeral.port` |
+| Valid `<root>/.weft/filigree/ephemeral.port` present | configured URL with its **port** overridden by the live port (scheme, host, path preserved) | `.weft/filigree/ephemeral.port` |
 | No / unreadable port file | configured URL unchanged | `config` |
+
+A port file present only at the pre-consolidation `<root>/.filigree/` path is
+**not** read (ADR-046 clean break): resolution folds to `config`, so a
+mis-sequenced cutover is visible rather than a silent stale resolve.
 
 **The negative contract (the load-bearing part).** What Loomweave *refuses* to do is
 the weft-§5 safety argument:
@@ -1267,14 +1272,14 @@ agent can tell *where* the URL came from without probing ports:
     "enabled": true,
     "configured_url": "http://127.0.0.1:8766",
     "resolved_url": "http://127.0.0.1:8542",
-    "resolution_source": ".filigree/ephemeral.port"
+    "resolution_source": ".weft/filigree/ephemeral.port"
   }
 }
 ```
 
 `resolution_source` is exactly one of the three `source` labels above
-(`disabled` / `.filigree/ephemeral.port` / `config`); `resolved_url` is `null`
-only when the integration is disabled.
+(`disabled` / `.weft/filigree/ephemeral.port` / `config`); `resolved_url` is
+`null` only when the integration is disabled.
 
 **Verification scope.** There is no normative fixture for this convention —
 connection discovery resolves a single scalar (a port), not a wire document, so a

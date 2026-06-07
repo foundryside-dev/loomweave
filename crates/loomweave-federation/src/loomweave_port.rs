@@ -1,9 +1,9 @@
 //! Loomweave read-API ephemeral-port contract (ADR-044).
 //!
-//! The twin of Filigree's `.filigree/ephemeral.port` convention, applied to
+//! The twin of Filigree's ephemeral-port convention, applied to
 //! Loomweave's own federation HTTP read API. `serve` binds a per-project
 //! deterministic port (ephemeral `:0` fallback) and publishes the *actually
-//! bound* port to `<project_root>/.loomweave/ephemeral.port`. Cross-product
+//! bound* port to `<project_root>/.weft/loomweave/ephemeral.port`. Cross-product
 //! consumers (notably Wardline, which is Python) read this file; nobody
 //! recomputes a peer's port. The deterministic band here is an implementation
 //! detail, never part of the file contract.
@@ -26,7 +26,7 @@ pub const PORT_BAND_SPAN: u16 = 1000;
 /// Canonical path of the published port file for a project root.
 #[must_use]
 pub fn published_port_path(project_root: &Path) -> PathBuf {
-    project_root.join(".loomweave").join("ephemeral.port")
+    loomweave_core::store::store_dir(project_root).join("ephemeral.port")
 }
 
 /// Deterministic-but-unpredictable read-API port for a project, derived from
@@ -68,17 +68,17 @@ pub fn read_published_port(project_root: &Path) -> Option<u16> {
     raw.trim().parse::<u16>().ok().filter(|port| *port != 0)
 }
 
-/// Atomically publish `port` to `<project_root>/.loomweave/ephemeral.port`.
+/// Atomically publish `port` to `<project_root>/.weft/loomweave/ephemeral.port`.
 /// Writes a temp file in the same directory and `rename(2)`s it into place, so
-/// a concurrent reader never observes a torn value. Creates `.loomweave/` if
-/// absent. The caller is responsible for the loopback-only invariant (only call
-/// this when the bound address is loopback).
+/// a concurrent reader never observes a torn value. Creates `.weft/loomweave/`
+/// if absent. The caller is responsible for the loopback-only invariant (only
+/// call this when the bound address is loopback).
 ///
 /// # Errors
 /// Returns the underlying I/O error if the directory cannot be created or the
 /// temp file cannot be written/renamed.
 pub fn publish_port(project_root: &Path, port: u16) -> std::io::Result<()> {
-    let dir = project_root.join(".loomweave");
+    let dir = loomweave_core::store::store_dir(project_root);
     std::fs::create_dir_all(&dir)?;
     // One `serve` per process publishes, so the PID makes the temp name unique
     // within this directory without needing a random suffix.
@@ -148,18 +148,18 @@ mod tests {
     }
 
     #[test]
-    fn publish_creates_loomweave_dir_if_absent() {
+    fn publish_creates_store_dir_if_absent() {
         let dir = tempfile::tempdir().unwrap();
-        // No .loomweave/ yet.
-        assert!(!dir.path().join(".loomweave").exists());
-        publish_port(dir.path(), 10000).expect("publish creates .loomweave/");
+        // No .weft/loomweave/ yet.
+        assert!(!loomweave_core::store::store_dir(dir.path()).exists());
+        publish_port(dir.path(), 10000).expect("publish creates .weft/loomweave/");
         assert_eq!(read_published_port(dir.path()), Some(10000));
     }
 
     #[test]
     fn read_tolerates_trailing_whitespace_and_newline() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".loomweave")).unwrap();
+        std::fs::create_dir_all(loomweave_core::store::store_dir(dir.path())).unwrap();
         std::fs::write(published_port_path(dir.path()), "  9500  \n").unwrap();
         assert_eq!(read_published_port(dir.path()), Some(9500));
     }
@@ -167,7 +167,7 @@ mod tests {
     #[test]
     fn read_rejects_malformed_zero_and_out_of_range() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".loomweave")).unwrap();
+        std::fs::create_dir_all(loomweave_core::store::store_dir(dir.path())).unwrap();
         for bad in ["", "not-a-port", "0", "65536", "70000", "-1", "12.5"] {
             std::fs::write(published_port_path(dir.path()), bad).unwrap();
             assert_eq!(

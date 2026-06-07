@@ -12,6 +12,7 @@ pub mod errors;
 pub mod hardened_git;
 pub mod llm_provider;
 pub mod plugin;
+pub mod store;
 
 pub use embedding_provider::{
     ApiEmbeddingProvider, ApiEmbeddingProviderConfig, EmbeddingProvider, EmbeddingProviderError,

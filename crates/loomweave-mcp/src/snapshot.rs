@@ -15,7 +15,7 @@ use std::time::SystemTime;
 use rusqlite::Connection;
 use serde::Serialize;
 
-/// Freshness of the `.loomweave/` index relative to the source files Loomweave
+/// Freshness of the `.weft/loomweave/` index relative to the source files Loomweave
 /// ingested. See the plan's Decision Point (b) for the algorithm.
 ///
 /// Freshness combines two passes over the files recorded in
@@ -31,7 +31,7 @@ use serde::Serialize;
 ///    when no tracked source actually changed. The watch set is the *direct
 ///    parents* of ingested files, so an addition/removal in any directory that
 ///    is not such a parent goes undetected — always including the project root
-///    itself, which is deliberately never watched (`analyze` writes `.loomweave/`
+///    itself, which is deliberately never watched (`analyze` writes `.weft/loomweave/`
 ///    under it, which would otherwise wedge every check to a permanent Stale).
 /// 2. **In-place modification** — an ingested file edited since the run. This
 ///    needs one `stat` per file and is bounded by `MAX_MODIFICATION_STAT_FILES`
@@ -154,7 +154,7 @@ pub struct ProjectSnapshot {
 }
 
 impl ProjectSnapshot {
-    /// Whether a readable `.loomweave/loomweave.db` was found. When `false`, every
+    /// Whether a readable `.weft/loomweave/loomweave.db` was found. When `false`, every
     /// count is `0` and `staleness` is [`Staleness::NeverAnalyzed`].
     #[must_use]
     pub fn db_present(&self) -> bool {
@@ -475,7 +475,7 @@ fn compute_staleness(
 /// Resolve every distinct ingested `source_file_path` to an absolute path, and
 /// collect the distinct parent directories to watch for structural drift. The
 /// project root itself is deliberately excluded from the watch set: `analyze`
-/// writes `.loomweave/loomweave.db` under it, so the root's mtime is always newer
+/// writes `.weft/loomweave/loomweave.db` under it, so the root's mtime is always newer
 /// than the run and would wedge every check to a permanent false [`Stale`]
 /// (the footgun the type-level note records). Returns `None` only on a
 /// query/prepare failure, having set `*degraded`.

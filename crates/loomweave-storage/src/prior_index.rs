@@ -154,7 +154,7 @@ pub fn prior_locators_by_file(conn: &Connection) -> Result<HashMap<String, Vec<S
 }
 
 /// Empty the prior-index snapshot. Used inside [`replace_prior_index`] and as
-/// the explicit-reset primitive (a full `.loomweave/` wipe via `install --force`
+/// the explicit-reset primitive (a full `.weft/loomweave/` wipe via `install --force`
 /// removes the DB entirely, so this is for in-place resets).
 ///
 /// # Errors

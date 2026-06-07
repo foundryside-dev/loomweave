@@ -1,6 +1,6 @@
 # Runtime Topology
 
-Loomweave stores project state in `.loomweave/loomweave.db`. The current v0.1 CLI
+Loomweave stores project state in `.weft/loomweave/loomweave.db`. The current v0.1 CLI
 uses SQLite WAL mode with a 5 second `busy_timeout` on writer and reader
 connections. `loomweave analyze` opens one writer actor for ingest. `loomweave
 serve` always opens a reader pool, and opens its own writer actor only when LLM
@@ -18,7 +18,7 @@ These storage settings are implementation constants today, not configurable
 ## Supported
 
 One `loomweave analyze` process and one `loomweave serve` process may run against
-the same `.loomweave/loomweave.db`. `serve` reads use committed SQLite snapshots:
+the same `.weft/loomweave/loomweave.db`. `serve` reads use committed SQLite snapshots:
 in-flight analyze writes are invisible until their transaction commits and a
 later read checks out a connection. If LLM-backed `serve` writes race with
 analyze ingest, SQLite serialises the writers and waits up to 5 seconds before
@@ -39,16 +39,16 @@ snapshot for a review session.
 ## Unsupported
 
 Do not run multiple `loomweave analyze` processes against the same
-`.loomweave/loomweave.db`. Loomweave has one writer actor per process, not one global
+`.weft/loomweave/loomweave.db`. Loomweave has one writer actor per process, not one global
 writer across processes, so two analyze runs can contend at SQLite's single
 writer boundary and produce interleaved run state.
 
 Do not run `loomweave install --force` while either `loomweave analyze` or
-`loomweave serve` is using the same project. `--force` replaces `.loomweave/`, so it
+`loomweave serve` is using the same project. `--force` replaces `.weft/loomweave/`, so it
 is an offline maintenance operation.
 
-Do not delete SQLite sidecar files, copy `.loomweave/loomweave.db` without its WAL
-sidecars, or edit `.loomweave/` files while Loomweave is running. Stop the processes
+Do not delete SQLite sidecar files, copy `.weft/loomweave/loomweave.db` without its WAL
+sidecars, or edit `.weft/loomweave/` files while Loomweave is running. Stop the processes
 first, then copy or repair the store.
 
 ## Not Yet Shipped

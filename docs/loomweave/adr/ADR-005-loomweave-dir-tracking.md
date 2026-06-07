@@ -1,6 +1,11 @@
 # ADR-005: `.loomweave/` Directory Git-Tracking Policy
 
-**Status**: Accepted; amended by ADR-041
+**Status**: Accepted; amended by ADR-041, ADR-046
+
+> **ADR-046 amendment:** the directory tracked by this policy moved from
+> `.loomweave/` to `.weft/loomweave/` (Weft store consolidation, clean break).
+> The tracked-vs-ignored split below is unchanged — only the parent path. Read
+> every `.loomweave/` path below as `.weft/loomweave/`.
 **Date**: 2026-04-18
 **Deciders**: qacona@gmail.com
 **Context**: `loomweave install` must write a `.gitignore` inside `.loomweave/` that

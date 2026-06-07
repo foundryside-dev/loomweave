@@ -20,8 +20,8 @@ use serde_json::{Value, json};
 
 fn open_project() -> (tempfile::TempDir, PathBuf) {
     let project = tempfile::tempdir().expect("temp project");
-    let loomweave_dir = project.path().join(".loomweave");
-    std::fs::create_dir(&loomweave_dir).expect("create .loomweave");
+    let loomweave_dir = project.path().join(".weft/loomweave");
+    std::fs::create_dir_all(&loomweave_dir).expect("create .loomweave");
     let db_path = loomweave_dir.join("loomweave.db");
     let mut conn = Connection::open(&db_path).expect("open sqlite");
     pragma::apply_write_pragmas(&conn).expect("write pragmas");

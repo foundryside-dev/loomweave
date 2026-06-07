@@ -8,7 +8,7 @@ use ignore::{DirEntry, WalkBuilder};
 use super::canonical_or_original;
 
 const SKIP_DIRS: &[&str] = &[
-    ".loomweave",
+    ".weft",
     ".git",
     ".hg",
     ".svn",
@@ -113,7 +113,7 @@ mod tests {
         write(root.join("nested/service.env"), "TOKEN=four\n");
         write(root.join("nested/.env"), "TOKEN=five\n");
         write(root.join("nested/not-env.txt"), "TOKEN=six\n");
-        write(root.join(".loomweave/.env"), "TOKEN=skip\n");
+        write(root.join(".weft/loomweave/.env"), "TOKEN=skip\n");
         write(root.join("node_modules/.env"), "TOKEN=skip\n");
 
         let files = collect_scan_files(root, &[root.join("src/app.py")]);
@@ -126,7 +126,7 @@ mod tests {
         assert!(rel.contains(&"nested/.env".to_owned()));
         assert!(rel.contains(&"src/app.py".to_owned()));
         assert!(!rel.contains(&"nested/not-env.txt".to_owned()));
-        assert!(!rel.contains(&".loomweave/.env".to_owned()));
+        assert!(!rel.contains(&".weft/loomweave/.env".to_owned()));
         assert!(!rel.contains(&"node_modules/.env".to_owned()));
     }
 

@@ -1,6 +1,6 @@
 //! `loomweave guidance` authoring CLI integration tests (WS6 / REQ-GUIDANCE-03).
 //!
-//! Drives the real binary end-to-end against a seeded `.loomweave/loomweave.db`:
+//! Drives the real binary end-to-end against a seeded `.weft/loomweave/loomweave.db`:
 //! create (via `--content`), show, list (incl. `--for-entity`), edit (via a
 //! fake `$EDITOR`), and delete. Verifies the written `properties` JSON matches
 //! the shape the MCP read path consumes.
@@ -23,10 +23,10 @@ fn loomweave_bin() -> Command {
     cmd
 }
 
-/// Seed a real `.loomweave/loomweave.db` with the schema and one code entity (so
+/// Seed a real `.weft/loomweave/loomweave.db` with the schema and one code entity (so
 /// `--for-entity` has a target to match).
 fn seed_db(root: &std::path::Path) {
-    let loomweave_dir = root.join(".loomweave");
+    let loomweave_dir = root.join(".weft/loomweave");
     std::fs::create_dir_all(&loomweave_dir).expect("mkdir .loomweave");
     let db_path = loomweave_dir.join("loomweave.db");
     let mut conn = Connection::open(&db_path).expect("open db");
@@ -59,7 +59,7 @@ fn seed_db(root: &std::path::Path) {
 }
 
 fn properties(root: &std::path::Path, id: &str) -> Value {
-    let db_path = root.join(".loomweave").join("loomweave.db");
+    let db_path = root.join(".weft/loomweave").join("loomweave.db");
     let conn = Connection::open(&db_path).expect("reopen db");
     let raw: String = conn
         .query_row(
@@ -76,7 +76,7 @@ fn properties(root: &std::path::Path, id: &str) -> Value {
 /// for the `--expired` / `--stale` filter tests). Bypasses the CLI `create` path
 /// deliberately — these tests exercise `list`, not authoring.
 fn seed_sheet(root: &std::path::Path, slug: &str, properties: &Value) {
-    let db_path = root.join(".loomweave").join("loomweave.db");
+    let db_path = root.join(".weft/loomweave").join("loomweave.db");
     let conn = Connection::open(&db_path).expect("open db for seed_sheet");
     let id = format!("core:guidance:{slug}");
     conn.execute(
@@ -555,7 +555,7 @@ fn create_normalizes_and_validates_expires() {
 
     // Proxy the read path: a future expiry must NOT be lexically < now, i.e. the
     // sheet is not treated as already expired.
-    let db_path = dir.path().join(".loomweave").join("loomweave.db");
+    let db_path = dir.path().join(".weft/loomweave").join("loomweave.db");
     let conn = Connection::open(&db_path).unwrap();
     let now: String = conn
         .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| {
@@ -737,7 +737,7 @@ fn edit_without_editor_set_fails_cleanly() {
 /// Seed one `summary_cache` row for the given entity (the column shape
 /// `analyze` and the cache writer use).
 fn seed_summary_cache(root: &std::path::Path, entity_id: &str) {
-    let db_path = root.join(".loomweave").join("loomweave.db");
+    let db_path = root.join(".weft/loomweave").join("loomweave.db");
     let conn = Connection::open(&db_path).expect("open db");
     conn.execute(
         "INSERT INTO summary_cache \
@@ -752,7 +752,7 @@ fn seed_summary_cache(root: &std::path::Path, entity_id: &str) {
 }
 
 fn summary_cache_count(root: &std::path::Path, entity_id: &str) -> i64 {
-    let db_path = root.join(".loomweave").join("loomweave.db");
+    let db_path = root.join(".weft/loomweave").join("loomweave.db");
     let conn = Connection::open(&db_path).expect("open db");
     conn.query_row(
         "SELECT COUNT(*) FROM summary_cache WHERE entity_id = ?1",
@@ -942,7 +942,7 @@ fn import_from(root: &std::path::Path, from_dir: &std::path::Path) {
 
 /// Fetch a guidance sheet's (name, properties) tuple, or None if absent.
 fn sheet_fields(root: &std::path::Path, id: &str) -> Option<(String, Value)> {
-    let db_path = root.join(".loomweave").join("loomweave.db");
+    let db_path = root.join(".weft/loomweave").join("loomweave.db");
     let conn = Connection::open(&db_path).expect("reopen db");
     conn.query_row(
         "SELECT name, properties FROM entities WHERE id = ?1 AND kind = 'guidance'",
@@ -1105,7 +1105,7 @@ fn import_is_idempotent() {
     assert_eq!(first, second, "re-import is a content no-op");
 
     // Exactly one sheet, not duplicated.
-    let db_path = dst.path().join(".loomweave").join("loomweave.db");
+    let db_path = dst.path().join(".weft/loomweave").join("loomweave.db");
     let conn = Connection::open(&db_path).unwrap();
     let count: i64 = conn
         .query_row(
@@ -1222,7 +1222,7 @@ fn import_rejects_code_entity_id_and_leaves_entity_intact() {
 /// Fetch the raw (name, kind, `plugin_id`, properties) tuple for ANY entity (not
 /// just guidance), or None.
 fn sheet_props_raw(root: &std::path::Path, id: &str) -> Option<(String, String, String, String)> {
-    let db_path = root.join(".loomweave").join("loomweave.db");
+    let db_path = root.join(".weft/loomweave").join("loomweave.db");
     let conn = Connection::open(&db_path).expect("reopen db");
     conn.query_row(
         "SELECT name, kind, plugin_id, properties FROM entities WHERE id = ?1",
@@ -1244,7 +1244,7 @@ fn import_invalidates_union_of_old_and_new_matches() {
 
     // Seed a `class` entity too, so an OLD `kind:class` rule has a target.
     {
-        let db_path = dst.path().join(".loomweave").join("loomweave.db");
+        let db_path = dst.path().join(".weft/loomweave").join("loomweave.db");
         let conn = Connection::open(&db_path).unwrap();
         conn.execute(
             "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
@@ -1328,7 +1328,7 @@ fn delete_invalidates_guides_edge_target() {
     // Manually wire a `guides` edge (no authoring path creates one today) and a
     // cache row on the target.
     {
-        let db_path = dir.path().join(".loomweave").join("loomweave.db");
+        let db_path = dir.path().join(".weft/loomweave").join("loomweave.db");
         let conn = Connection::open(&db_path).unwrap();
         conn.execute(
             "INSERT INTO edges (kind, from_id, to_id, confidence) VALUES \
@@ -1432,7 +1432,7 @@ fn import_rejects_guidance_id_with_path_separator() {
 fn export_flattens_legacy_guidance_id_path_separators() {
     let src = tempfile::tempdir().unwrap();
     seed_db(src.path());
-    let db_path = src.path().join(".loomweave").join("loomweave.db");
+    let db_path = src.path().join(".weft/loomweave").join("loomweave.db");
     let conn = Connection::open(&db_path).expect("open db");
     conn.execute(
         "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \

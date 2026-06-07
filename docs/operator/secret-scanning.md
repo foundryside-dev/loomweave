@@ -10,7 +10,7 @@ Plugin source files and `.env` sidecars are scanned. If a plugin reports an enti
 
 ## Whitelist A False Positive
 
-Add `.loomweave/secrets-baseline.yaml` and commit it with the source change:
+Add `.weft/loomweave/secrets-baseline.yaml` and commit it with the source change:
 
 ```yaml
 version: "1.0"
@@ -125,7 +125,7 @@ are marked by writing `briefing_blocked: <reason>` into the file entity's
 `properties` JSON column. v1.1 will promote `briefing_blocked` to a typed
 column on `entities`; v1.0 carries it as a JSON property.
 
-**A v1.0 binary opening a `.loomweave/loomweave.db` produced by a pre-WP5
+**A v1.0 binary opening a `.weft/loomweave/loomweave.db` produced by a pre-WP5
 Loomweave binary will find no `briefing_blocked` properties on any row.**
 Pre-WP5 binaries never ran the scanner and never wrote the property; the
 1.0 binary cannot retroactively discover which files contained secrets at

@@ -145,7 +145,7 @@ fn plugin_path(plugin_dir: &std::path::Path) -> std::ffi::OsString {
 }
 
 fn conn(project: &std::path::Path) -> Connection {
-    Connection::open(project.join(".loomweave/loomweave.db")).expect("open loomweave db")
+    Connection::open(project.join(".weft/loomweave/loomweave.db")).expect("open loomweave db")
 }
 
 fn sha1_hex(bytes: &[u8]) -> String {
@@ -417,7 +417,7 @@ fn baseline_suppresses_secret_and_emits_audit_match() {
     .unwrap();
     let hashed_secret = sha1_hex(b"AKIAIOSFODNN7EXAMPLE");
     std::fs::write(
-        project.path().join(".loomweave/secrets-baseline.yaml"),
+        project.path().join(".weft/loomweave/secrets-baseline.yaml"),
         format!(
             r#"
 version: "1.0"
@@ -480,7 +480,7 @@ fn missing_baseline_justification_degrades_to_finding() {
     .unwrap();
     let hashed_secret = sha1_hex(b"AKIAIOSFODNN7EXAMPLE");
     std::fs::write(
-        project.path().join(".loomweave/secrets-baseline.yaml"),
+        project.path().join(".weft/loomweave/secrets-baseline.yaml"),
         format!(
             r#"
 version: "1.0"
@@ -672,7 +672,7 @@ fn baseline_suppression_and_override_admission_are_audited_together() {
     .unwrap();
     let hashed_secret = sha1_hex(b"AKIAIOSFODNN7EXAMPLE");
     std::fs::write(
-        project.path().join(".loomweave/secrets-baseline.yaml"),
+        project.path().join(".weft/loomweave/secrets-baseline.yaml"),
         format!(
             r#"
 version: "1.0"
@@ -748,7 +748,7 @@ fn assert_invalid_baseline_aborts(raw_baseline: &str, expected_stderr: &str) {
     install_project(project.path());
     std::fs::write(project.path().join("leaky.sec"), b"nothing to see\n").unwrap();
     std::fs::write(
-        project.path().join(".loomweave/secrets-baseline.yaml"),
+        project.path().join(".weft/loomweave/secrets-baseline.yaml"),
         raw_baseline,
     )
     .unwrap();

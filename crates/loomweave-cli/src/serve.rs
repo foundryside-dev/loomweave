@@ -18,7 +18,7 @@ use loomweave_federation::filigree::FiligreeHttpClient;
 use loomweave_storage::{DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, ReaderPool, Writer};
 
 pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
-    let db_path = path.join(".loomweave").join("loomweave.db");
+    let db_path = loomweave_core::store::db_path(path);
     if !db_path.exists() {
         // No index yet. Rather than exiting 1 — which leaves the MCP client
         // staring at a server that died at startup with the reason buried in
@@ -65,8 +65,8 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
         build_embedding_provider(&config.semantic_search, |name| std::env::var(name).ok())?;
 
     // Resolve where Filigree actually listens — prefer the live ethereal port
-    // published in `.filigree/ephemeral.port` over the static configured port
-    // (which goes stale, the dogfood bug) — then build the client against the
+    // published in `.weft/filigree/ephemeral.port` over the static configured
+    // port (which goes stale, the dogfood bug) — then build the client against the
     // resolved URL so `issues_for` reaches the running dashboard. The same
     // resolution is surfaced by `project_status`.
     let filigree_resolution = loomweave_federation::filigree_url::resolve_filigree_url(

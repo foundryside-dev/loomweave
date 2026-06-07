@@ -1,9 +1,10 @@
 .filigree/
+.weft/filigree/
 /target
 **/*.rs.bk
 Cargo.lock.bak
 
-# SQLite working files (project-level .loomweave/ is tracked per ADR-005)
+# SQLite working files (project-level .weft/loomweave/ is tracked per ADR-005/046)
 *.db-journal
 *.db-wal
 
@@ -32,11 +33,11 @@ tests/e2e/external-operator-smoke-results-*.md
 
 # Loomweave runtime artifacts — the index DB, per-project instance fingerprint,
 # and analyze lock change on every run, so they are not tracked
-# (see .loomweave/.gitignore).
-.loomweave/loomweave.db
-.loomweave/instance_id
-.loomweave/loomweave.lock
-.loomweave/ephemeral.port
+# (see .weft/loomweave/.gitignore).
+.weft/loomweave/loomweave.db
+.weft/loomweave/instance_id
+.weft/loomweave/loomweave.lock
+.weft/loomweave/ephemeral.port
 
 # Documentation site build output (mkdocs `site_dir`, web/mkdocs.yml).
 /site-build/

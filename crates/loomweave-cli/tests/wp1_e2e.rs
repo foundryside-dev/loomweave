@@ -38,7 +38,7 @@ fn wp1_walking_skeleton_end_to_end() {
         .assert()
         .success();
 
-    let loomweave_dir = dir.path().join(".loomweave");
+    let loomweave_dir = dir.path().join(".weft/loomweave");
     assert!(loomweave_dir.join("loomweave.db").exists());
     assert!(loomweave_dir.join("config.json").exists());
     assert!(loomweave_dir.join(".gitignore").exists());

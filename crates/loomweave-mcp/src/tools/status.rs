@@ -190,7 +190,7 @@ impl ServerState {
         &self,
         _arguments: &serde_json::Map<String, Value>,
     ) -> std::result::Result<Value, ParamError> {
-        let db_path = self.project_root.join(".loomweave").join("loomweave.db");
+        let db_path = loomweave_core::store::db_path(&self.project_root);
         let root_display = self.project_root.display().to_string();
 
         let project_root = self.project_root.clone();
@@ -413,7 +413,7 @@ impl ServerState {
     }
 
     /// ADR-044: report the live read-API endpoint resolved from
-    /// `.loomweave/ephemeral.port` (the reference reader; `doctor` reports the
+    /// `.weft/loomweave/ephemeral.port` (the reference reader; `doctor` reports the
     /// same). Pass `None` config — `project_status` has no static loomweave URL
     /// of its own; this surfaces whether serve is currently publishing.
     pub(crate) fn loomweave_read_api_json(&self) -> Value {

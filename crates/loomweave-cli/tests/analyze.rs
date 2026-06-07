@@ -16,7 +16,7 @@ fn loomweave_bin() -> Command {
 }
 
 fn latest_run_config(project_root: &std::path::Path) -> serde_json::Value {
-    let conn = Connection::open(project_root.join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_root.join(".weft/loomweave/loomweave.db")).unwrap();
     let config_raw: String = conn
         .query_row(
             "SELECT config FROM runs ORDER BY started_at DESC LIMIT 1",
@@ -28,7 +28,7 @@ fn latest_run_config(project_root: &std::path::Path) -> serde_json::Value {
 }
 
 fn latest_run_stats(project_root: &std::path::Path) -> serde_json::Value {
-    let conn = Connection::open(project_root.join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_root.join(".weft/loomweave/loomweave.db")).unwrap();
     let stats_raw: String = conn
         .query_row(
             "SELECT stats FROM runs ORDER BY started_at DESC LIMIT 1",
@@ -839,7 +839,7 @@ semantic_search:
         requests[0]
     );
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let tag_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM entity_tags \
@@ -852,7 +852,7 @@ semantic_search:
         .expect("query persisted tags");
     assert_eq!(tag_count, 1, "plugin-emitted tags must be persisted");
 
-    let sidecar = project_dir.path().join(".loomweave/embeddings.db");
+    let sidecar = project_dir.path().join(".weft/loomweave/embeddings.db");
     assert!(sidecar.exists(), "analyze should create embeddings sidecar");
     let sidecar_conn = Connection::open(sidecar).unwrap();
     let embedding_count: i64 = sidecar_conn
@@ -893,7 +893,7 @@ fn analyze_without_plugins_writes_skipped_run_row() {
         .assert()
         .success();
 
-    let conn = Connection::open(dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let (count, status): (i64, String) = conn
         .query_row(
             "SELECT COUNT(*), COALESCE(MAX(status), '') FROM runs",
@@ -926,7 +926,7 @@ fn analyze_migrates_a_stale_db_instead_of_failing() {
         .assert()
         .success();
 
-    let db = dir.path().join(".loomweave/loomweave.db");
+    let db = dir.path().join(".weft/loomweave/loomweave.db");
     // Rewind to the pre-0007 (v6) shape: no `analyzed_at_commit`, no v7 ledger
     // row, user_version back to 6 — exactly an upgraded-binary-vs-old-DB state.
     {
@@ -1082,7 +1082,7 @@ analysis:
         "stderr should identify invalid clustering algorithm; got: {stderr}"
     );
 
-    let conn = Connection::open(dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let run_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
         .expect("query run count");
@@ -1096,7 +1096,7 @@ fn analyze_phase3_emits_subsystem_entities_and_edges() {
         &["auth_a", "auth_b", "billing_a", "billing_b"],
         &phase3_config(2),
     );
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
 
     let subsystem_count: i64 = conn
         .query_row(
@@ -1138,7 +1138,7 @@ fn analyze_phase3_emits_subsystem_entities_and_edges() {
 #[test]
 fn analyze_phase3_is_deterministic_across_two_runs() {
     fn signature(project_root: &std::path::Path) -> Vec<(String, String)> {
-        let conn = Connection::open(project_root.join(".loomweave/loomweave.db")).unwrap();
+        let conn = Connection::open(project_root.join(".weft/loomweave/loomweave.db")).unwrap();
         conn.prepare("SELECT id, properties FROM entities WHERE kind = 'subsystem' ORDER BY id")
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -1158,7 +1158,7 @@ fn analyze_phase3_is_deterministic_across_two_runs() {
 #[test]
 fn analyze_phase3_skips_empty_graph_with_stats() {
     let project_dir = run_phase3_fixture(&["solo"], &phase3_config(2));
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let subsystem_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM entities WHERE kind = 'subsystem'",
@@ -1186,7 +1186,7 @@ fn analyze_phase3_skips_empty_graph_with_stats() {
 #[test]
 fn analyze_phase3_emits_weak_modularity_fact_when_below_threshold() {
     let project_dir = run_phase3_fixture(&["weak_a", "weak_b"], &phase3_config(2));
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let row: (String, String, String, String, String) = conn
         .query_row(
             "SELECT rule_id, kind, severity, status, properties \
@@ -1385,7 +1385,8 @@ fn analyze_emits_post_commit_tier_finding_to_filigree_at_project_anchor() {
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
 
     {
-        let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+        let conn =
+            Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
         // Two subsystems → two tier findings, both anchored to the project root.
         // auth disagrees (MIXING); billing agrees (UNANIMOUS). They share
         // (rule-family, path, null line) but carry subsystem-distinct messages —
@@ -1464,7 +1465,7 @@ fn analyze_emits_entity_deleted_finding_when_file_removed() {
         &plugin_path,
     );
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     // The plugin's `module` entity carries the canonical finding shape.
     let (kind, severity, status): (String, String, String) = conn
         .query_row(
@@ -1510,7 +1511,7 @@ fn analyze_emits_guidance_orphan_and_invalidates_summary_cache_on_deletion() {
         phase3_project_for_rerun(&["auth_a", "auth_b", "billing_a", "billing_b"]);
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
     let target = "phase3fixture:module:billing_a";
 
     // Inject a guidance sheet that `guides` the soon-to-be-deleted entity, plus a
@@ -1590,7 +1591,7 @@ fn analyze_emits_guidance_orphan_for_match_rule_entity_and_dedupes() {
         phase3_project_for_rerun(&["auth_a", "auth_b", "billing_a", "billing_b"]);
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
     let target = "phase3fixture:module:billing_a";
 
     {
@@ -1670,7 +1671,7 @@ fn analyze_emits_guidance_expired_for_past_expiry_only() {
     let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["auth_a", "auth_b"]);
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
 
     {
         let conn = Connection::open(&db_path).unwrap();
@@ -1730,7 +1731,7 @@ fn analyze_emits_guidance_expired_under_no_sei() {
     let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["auth_a", "auth_b"]);
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
 
     {
         let conn = Connection::open(&db_path).unwrap();
@@ -1778,7 +1779,7 @@ fn analyze_emits_guidance_churn_stale_with_asymmetric_pinned_threshold() {
     let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["auth_a", "auth_b"]);
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
 
     // Seed git_churn_count on the matched module via properties JSON (the analyze
     // pipeline does not populate it). A `kind:module` match_rule selects both
@@ -1866,7 +1867,7 @@ fn analyze_guidance_churn_stale_is_honest_empty_without_churn() {
     let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["auth_a", "auth_b"]);
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
 
     {
         let conn = Connection::open(&db_path).unwrap();
@@ -2030,7 +2031,7 @@ fn analyze_generates_pinned_wardline_derived_guidance() {
         phase3_project_for_rerun(&["auth_a", "auth_b", "billing_a"]);
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
     write_wardline_manifest(project_dir.path(), "Keep integral code isolated.");
 
     run_phase3_analyze(
@@ -2094,7 +2095,7 @@ fn analyze_accepts_real_wardline_output_bundle() {
     let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["seed"]);
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
     write_real_wardline_output_fixture(project_dir.path());
 
     run_phase3_analyze(
@@ -2200,7 +2201,7 @@ fn analyze_preserves_wardline_override_and_emits_guidance_stale() {
         phase3_project_for_rerun(&["auth_a", "auth_b", "billing_a"]);
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
     write_wardline_manifest(project_dir.path(), "Initial Wardline guidance.");
     run_phase3_analyze(
         project_dir.path(),
@@ -2311,7 +2312,7 @@ fn analyze_emits_tier_mixing_and_unanimous_findings() {
         phase3_project_for_rerun(&["auth_a", "auth_b", "billing_a", "billing_b"]);
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
 
     {
         let conn = Connection::open(&db_path).unwrap();
@@ -2371,7 +2372,7 @@ fn analyze_resolves_function_tier_through_contains_chain_to_subsystem() {
     let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["auth_a", "auth_b"]);
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
     let func = "phase3fixture:function:auth_a.handler";
 
     {
@@ -2432,7 +2433,7 @@ analysis:
     weak_modularity_threshold: 0.0
 ",
     );
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let finding_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM findings \
@@ -2461,7 +2462,7 @@ fn analyze_phase3_does_not_emit_weak_modularity_fact_when_threshold_is_met() {
         &["auth_a", "auth_b", "billing_a", "billing_b"],
         &phase3_config(2),
     );
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let finding_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM findings \
@@ -2492,7 +2493,7 @@ fn analyze_phase3_min_cluster_size_drops_undersized_weighted_components() {
         &["auth_a", "auth_b", "billing_a", "billing_b"],
         &phase3_weighted_components_config(3),
     );
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let subsystem_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM entities WHERE kind = 'subsystem'",
@@ -2529,7 +2530,7 @@ fn analyze_phase3_persists_weighted_components_algorithm_when_selected() {
         &["auth_a", "auth_b", "billing_a", "billing_b"],
         &phase3_weighted_components_config(2),
     );
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let properties_json: String = conn
         .query_row(
             "SELECT properties FROM entities \
@@ -2591,7 +2592,7 @@ fn analyze_stats_reports_ambiguous_edges_total() {
         .assert()
         .success();
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let stats_raw: String = conn
         .query_row("SELECT stats FROM runs LIMIT 1", [], |row| row.get(0))
         .expect("query runs.stats");
@@ -2688,7 +2689,7 @@ fn analyze_mints_core_file_entity_for_registry_resolution() {
         .assert()
         .success();
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let resolved = loomweave_storage::resolve_file(&conn, project_dir.path(), "demo.call", "")
         .expect("resolve_file should not error")
         .expect("analyzed ordinary source file should resolve as a core file entity");
@@ -2734,7 +2735,7 @@ fn analyze_filters_external_import_edges_before_writer_insert() {
         .assert()
         .success();
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let import_edges: Vec<(String, String)> = conn
         .prepare("SELECT from_id, to_id FROM edges WHERE kind = 'imports' ORDER BY from_id, to_id")
         .unwrap()
@@ -2820,7 +2821,7 @@ fn analyze_failrun_exits_nonzero_with_run_row_marked_failed() {
     // The run row must still be marked `failed` — the FailRun WriterCmd
     // runs before the bail, so the DB state is consistent with the exit
     // code.
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let status: String = conn
         .query_row(
             "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1",
@@ -2875,7 +2876,7 @@ fn analyze_finding_emission_is_best_effort_when_filigree_unreachable() {
 
     // run_phase3_fixture already asserted the analyze invocation `.success()`;
     // confirm the run row landed `completed` despite the emission failure.
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let status: String = conn
         .query_row(
             "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1",
@@ -3037,7 +3038,8 @@ fn analyze_resume_reuses_run_row_and_emits_mark_unseen_false() {
 
     // Capture the fresh run's id, then resume it (POST 2).
     let run_id: String = {
-        let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+        let conn =
+            Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
         conn.query_row(
             "SELECT id FROM runs ORDER BY started_at DESC LIMIT 1",
             [],
@@ -3067,7 +3069,7 @@ fn analyze_resume_reuses_run_row_and_emits_mark_unseen_false() {
     );
 
     // Resume reused the run row — exactly one row in `runs`, finalized.
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let run_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
         .unwrap();
@@ -3221,7 +3223,7 @@ fn analyze_prune_unseen_is_best_effort_when_filigree_unreachable() {
         .assert()
         .success();
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let run_status: String = conn
         .query_row(
             "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1",
@@ -3361,7 +3363,7 @@ fn analyze_prune_unseen_is_best_effort_on_non_2xx() {
     server.join().expect("mock server thread");
 
     // A non-2xx clean-stale response must never fail the run.
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let run_status: String = conn
         .query_row(
             "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1",
@@ -3443,7 +3445,7 @@ fn analyze_rewrites_prior_index_to_current_run_entity_set() {
     use std::collections::BTreeSet;
 
     fn prior_index_locators(project_root: &std::path::Path) -> BTreeSet<String> {
-        let conn = Connection::open(project_root.join(".loomweave/loomweave.db")).unwrap();
+        let conn = Connection::open(project_root.join(".weft/loomweave/loomweave.db")).unwrap();
         conn.prepare("SELECT locator FROM sei_prior_index")
             .unwrap()
             .query_map([], |row| row.get::<_, String>(0))
@@ -3508,7 +3510,7 @@ fn analyze_rewrites_prior_index_to_current_run_entity_set() {
 
     // Column contract: body_hash populated (NOT NULL), recorded_at stamped, and
     // signature still NULL in Wave 0 (the WS1 matcher fills it later).
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let (body_hash, recorded_at, signature): (String, String, Option<String>) = conn
         .query_row(
             "SELECT body_hash, recorded_at, signature FROM sei_prior_index WHERE locator = ?1",
@@ -3528,7 +3530,7 @@ fn analyze_rewrites_prior_index_to_current_run_entity_set() {
 fn alive_sei_bindings(
     project_root: &std::path::Path,
 ) -> std::collections::BTreeMap<String, String> {
-    let conn = Connection::open(project_root.join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_root.join(".weft/loomweave/loomweave.db")).unwrap();
     conn.prepare(
         "SELECT current_locator, sei FROM sei_bindings \
          WHERE status = 'alive' AND current_locator IS NOT NULL",
@@ -3543,7 +3545,7 @@ fn alive_sei_bindings(
 }
 
 fn all_entity_ids(project_root: &std::path::Path) -> std::collections::BTreeSet<String> {
-    let conn = Connection::open(project_root.join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_root.join(".weft/loomweave/loomweave.db")).unwrap();
     conn.prepare("SELECT id FROM entities")
         .unwrap()
         .query_map([], |row| row.get::<_, String>(0))
@@ -3709,7 +3711,7 @@ fn analyze_orphans_deleted_entity_bindings_through_the_real_pipeline() {
     std::fs::remove_file(project_dir.path().join("sei_drop.p3")).unwrap();
     analyze();
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     // The dropped entity's binding is now orphaned (by SEI — its row persists).
     let dropped_status: String = conn
         .query_row(
@@ -3816,7 +3818,7 @@ fn analyze_stamps_entities_with_git_head_commit() {
         .assert()
         .success();
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     for entity_id in ["core:file:demo.p3", "phase3fixture:module:demo"] {
         let (first_seen, last_seen): (Option<String>, Option<String>) = conn
             .query_row(
@@ -3903,7 +3905,7 @@ fn analyze_incremental_skip_does_not_orphan_unchanged_file_entities() {
     );
     // And the binding's status is literally alive (belt-and-braces: alive_sei_bindings
     // already filters status='alive', but assert no orphaned lineage was recorded).
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let orphaned_for_stable: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sei_lineage WHERE sei = ?1 AND event = 'orphaned'",
@@ -4138,7 +4140,7 @@ fn analyze_persists_syntax_error_finding_for_unparseable_file() {
         .assert()
         .success();
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let (count, anchor): (i64, String) = conn
         .query_row(
             "SELECT COUNT(*), COALESCE(MIN(entity_id), '') FROM findings \
@@ -4293,7 +4295,7 @@ fn analyze_persists_crash_finding_anchored_to_project() {
         .assert()
         .failure();
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let (count, anchor): (i64, String) = conn
         .query_row(
             "SELECT COUNT(*), COALESCE(MIN(entity_id), '') FROM findings \
@@ -4466,7 +4468,7 @@ fn analyze_persists_timeout_finding_for_hanging_plugin() {
         .assert()
         .failure();
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let (timeout_count, anchor): (i64, String) = conn
         .query_row(
             "SELECT COUNT(*), COALESCE(MIN(entity_id), '') FROM findings \

@@ -749,11 +749,11 @@ fn render_sheet(sheet: &GuidanceSheet) -> String {
 
 // ── I/O helpers ───────────────────────────────────────────────────────────────
 
-/// Open a read-write connection to `.loomweave/loomweave.db` with a generous busy
+/// Open a read-write connection to `.weft/loomweave/loomweave.db` with a generous busy
 /// timeout so a concurrently-running `serve` writer does not cause an immediate
 /// lock error.
 fn open_db(project_root: &Path) -> Result<Connection> {
-    let db_path = project_root.join(".loomweave").join("loomweave.db");
+    let db_path = loomweave_core::store::db_path(project_root);
     if !db_path.exists() {
         bail!(
             "Loomweave database not found at {}; run `loomweave analyze` first",

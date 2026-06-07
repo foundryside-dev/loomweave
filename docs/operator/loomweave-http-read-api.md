@@ -22,7 +22,7 @@ serve:
 
 The read-API port is auto-selected per project — a deterministic port in
 Loomweave's band (`9400–10399`, disjoint from Filigree's `8400–9399`) with an
-ephemeral fallback — and published to `.loomweave/ephemeral.port` while `serve`
+ephemeral fallback — and published to `.weft/loomweave/ephemeral.port` while `serve`
 runs. Set `serve.http.bind` explicitly only to pin a fixed port (ADR-044).
 
 When `identity_token_env` is configured, Loomweave refuses to start unless the env

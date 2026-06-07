@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand, ValueEnum};
     about = "Loomweave code-archaeology tool",
     long_about = "Loomweave extracts a queryable graph from a codebase and serves it to \
 consult-mode agents over MCP.\n\n\
-Typical flow: `loomweave install` (set up .loomweave/ + agent assets), `loomweave \
+Typical flow: `loomweave install` (set up .weft/loomweave/ + agent assets), `loomweave \
 analyze` (build the index), `loomweave serve` (run the MCP server).\n\n\
 LLM-backed entity summaries are OFF by default. To enable them set \
 `llm_policy.enabled: true` + `allow_live_provider: true` in loomweave.yaml and supply \
@@ -25,15 +25,15 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Initialise .loomweave/ and install agent-orientation assets.
+    /// Initialise .weft/loomweave/ and install agent-orientation assets.
     ///
-    /// Bare `loomweave install` does everything: .loomweave/ init, Claude Code MCP,
-    /// Codex MCP, Claude/Codex skills, and hooks. If .loomweave/ already exists,
+    /// Bare `loomweave install` does everything: .weft/loomweave/ init, Claude Code MCP,
+    /// Codex MCP, Claude/Codex skills, and hooks. If .weft/loomweave/ already exists,
     /// init is skipped and the other components are applied idempotently.
     /// Component flags install only the named components without touching
-    /// .loomweave/. `--all` is equivalent to a bare install.
+    /// .weft/loomweave/. `--all` is equivalent to a bare install.
     Install {
-        /// Overwrite an existing .loomweave/ directory.
+        /// Overwrite an existing .weft/loomweave/ directory.
         #[arg(long)]
         force: bool,
 
@@ -71,14 +71,14 @@ pub enum Command {
         #[arg(long)]
         instructions: bool,
 
-        /// Do everything: .loomweave/ init + MCP config + skills + hooks +
+        /// Do everything: .weft/loomweave/ init + MCP config + skills + hooks +
         /// instructions.
         #[arg(long)]
         all: bool,
     },
 
     /// Run an analysis pass: walk the source tree, dispatch discovered plugins
-    /// to extract entities/edges, and persist results to `.loomweave/loomweave.db`.
+    /// to extract entities/edges, and persist results to `.weft/loomweave/loomweave.db`.
     /// Re-runs are idempotent (UPSERT on `entities.id`). If no plugins are on
     /// `$PATH`, exits 0 with a WARN and status `skipped_no_plugins` — see the
     /// Troubleshooting guide at
@@ -176,7 +176,7 @@ pub enum Command {
     /// to stderr at startup; run `loomweave config check` to inspect it ahead of
     /// time.
     Serve {
-        /// Project directory containing .loomweave/loomweave.db.
+        /// Project directory containing .weft/loomweave/loomweave.db.
         #[arg(long, default_value = ".")]
         path: PathBuf,
 
@@ -249,7 +249,7 @@ pub enum DoctorOutputFormat {
 
 #[derive(Subcommand)]
 pub enum DbCommand {
-    /// Take a consistent, WAL-safe online backup of `.loomweave/loomweave.db`.
+    /// Take a consistent, WAL-safe online backup of `.weft/loomweave/loomweave.db`.
     ///
     /// Unlike `cp`, this captures outstanding WAL frames into a standalone
     /// single-file copy, so it is safe to run during a live `loomweave analyze`.
@@ -257,7 +257,7 @@ pub enum DbCommand {
         /// Destination file for the backup copy.
         output: PathBuf,
 
-        /// Project directory containing .loomweave/loomweave.db (default: current).
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
 
@@ -304,7 +304,7 @@ pub enum GuidanceCommand {
     /// `entity:<entity-id>`. Content comes from `--content`, else stdin (when
     /// piped) or `$EDITOR`/`$VISUAL`.
     Create {
-        /// Project directory containing .loomweave/loomweave.db (default: current).
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
 
@@ -341,7 +341,7 @@ pub enum GuidanceCommand {
     /// Edit a sheet's content in `$EDITOR`/`$VISUAL` (other properties, including
     /// `authored_at` and provenance, are preserved).
     Edit {
-        /// Project directory containing .loomweave/loomweave.db (default: current).
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
         /// The guidance sheet id (`core:guidance:<slug>`).
@@ -350,7 +350,7 @@ pub enum GuidanceCommand {
 
     /// Print a guidance sheet (human-readable).
     Show {
-        /// Project directory containing .loomweave/loomweave.db (default: current).
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
         /// The guidance sheet id.
@@ -364,7 +364,7 @@ pub enum GuidanceCommand {
     /// filter (including `--for-entity`). Without any of them, behaves as the
     /// plain list.
     List {
-        /// Project directory containing .loomweave/loomweave.db (default: current).
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
         /// Only list sheets whose `match_rules` apply to this entity id.
@@ -387,7 +387,7 @@ pub enum GuidanceCommand {
 
     /// Delete a guidance sheet.
     Delete {
-        /// Project directory containing .loomweave/loomweave.db (default: current).
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
         /// The guidance sheet id.
@@ -398,7 +398,7 @@ pub enum GuidanceCommand {
     /// guidance sheet. The observation must have been produced by MCP
     /// `propose_guidance`; arbitrary observations are rejected.
     Promote {
-        /// Project directory containing .loomweave/loomweave.db (default: current).
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
         /// Path to loomweave.yaml (default: project-root/loomweave.yaml if present).
@@ -413,7 +413,7 @@ pub enum GuidanceCommand {
     /// (REQ-GUIDANCE-06). Output is byte-stable across runs on identical DB
     /// state. The target directory is created if absent.
     Export {
-        /// Project directory containing .loomweave/loomweave.db (default: current).
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
         /// Directory to write the exported sheet files into. Export does NOT
@@ -430,7 +430,7 @@ pub enum GuidanceCommand {
     /// untouched (never a destructive mirror). A malformed `*.json` aborts the
     /// import naming the offending file (a dropped sheet is silent data loss).
     Import {
-        /// Project directory containing .loomweave/loomweave.db (default: current).
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
         /// Directory of exported sheet files to import.
@@ -442,7 +442,7 @@ pub enum GuidanceCommand {
 pub enum HookCommand {
     /// Print a project snapshot and re-sync the skill pack on drift.
     SessionStart {
-        /// Project directory containing .loomweave/loomweave.db.
+        /// Project directory containing .weft/loomweave/loomweave.db.
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
@@ -460,7 +460,7 @@ pub enum SarifCommand {
         #[arg(long)]
         scan_source: Option<String>,
 
-        /// Project directory containing .loomweave/loomweave.db (default: current).
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },

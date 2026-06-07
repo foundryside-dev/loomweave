@@ -16,7 +16,7 @@ fn loomweave_bin() -> Command {
 
 #[test]
 fn hook_session_start_exits_zero_without_loomweave_db() {
-    // Fail-soft: no .loomweave/ at all must still exit 0 and nudge.
+    // Fail-soft: no .weft/loomweave/ at all must still exit 0 and nudge.
     let dir = tempfile::tempdir().unwrap();
     let assert = loomweave_bin()
         .args(["hook", "session-start", "--path"])
@@ -64,10 +64,10 @@ fn hook_session_start_prints_counts_for_installed_project() {
 #[test]
 fn hook_session_start_exits_zero_with_corrupt_db() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(dir.path().join(".loomweave")).unwrap();
+    std::fs::create_dir_all(dir.path().join(".weft/loomweave")).unwrap();
     // Garbage where loomweave.db should be — not a valid SQLite file.
     std::fs::write(
-        dir.path().join(".loomweave/loomweave.db"),
+        dir.path().join(".weft/loomweave/loomweave.db"),
         b"NOT A SQLITE DB",
     )
     .unwrap();

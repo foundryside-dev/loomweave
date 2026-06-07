@@ -477,7 +477,7 @@ results:
 #[test]
 fn absent_baseline_file_is_empty() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let baseline = load_baseline(&dir.path().join(".loomweave/secrets-baseline.yaml"))
+    let baseline = load_baseline(&dir.path().join(".weft/loomweave/secrets-baseline.yaml"))
         .expect("missing baseline is accepted");
     assert!(baseline.entries().is_empty());
 }

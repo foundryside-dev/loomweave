@@ -15,10 +15,10 @@ fn loomweave_bin() -> Command {
     cmd
 }
 
-/// Seed a real `.loomweave/loomweave.db` under `root` with one identifiable row,
+/// Seed a real `.weft/loomweave/loomweave.db` under `root` with one identifiable row,
 /// left in WAL mode (the state a live analyze leaves behind).
 fn seed_db(root: &std::path::Path) {
-    let loomweave_dir = root.join(".loomweave");
+    let loomweave_dir = root.join(".weft/loomweave");
     std::fs::create_dir_all(&loomweave_dir).expect("mkdir .loomweave");
     let db_path = loomweave_dir.join("loomweave.db");
     let mut conn = Connection::open(&db_path).expect("open db");
@@ -122,7 +122,7 @@ fn backup_refuses_to_clobber_without_force() {
 #[test]
 fn backup_rejects_missing_source_db() {
     let dir = tempfile::tempdir().unwrap();
-    // No seed_db: .loomweave/loomweave.db does not exist.
+    // No seed_db: .weft/loomweave/loomweave.db does not exist.
     let output = dir.path().join("snapshot.db");
 
     loomweave_bin()

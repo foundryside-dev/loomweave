@@ -659,7 +659,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_semantic_search_list",
-            description: "Rank entities by semantic (embedding cosine) similarity to a `query` string, within an optional `scope`. OPT-IN: semantic search is OFF by default; when disabled or no embedding provider is configured the tool returns result_kind=`not_enabled` with a missing-signal note (never a faked or empty-as-complete result). When enabled it embeds the query and runs a bounded exact cosine scan over the git-ignored `.loomweave/embeddings.db` sidecar (built at analyze time), considering only embeddings whose content_hash matches the entity's current hash (stale vectors never surface). Bounded (limit default 20, max 100; page.total/truncated). Each result carries its `sei` and a `score`.",
+            description: "Rank entities by semantic (embedding cosine) similarity to a `query` string, within an optional `scope`. OPT-IN: semantic search is OFF by default; when disabled or no embedding provider is configured the tool returns result_kind=`not_enabled` with a missing-signal note (never a faked or empty-as-complete result). When enabled it embeds the query and runs a bounded exact cosine scan over the git-ignored `.weft/loomweave/embeddings.db` sidecar (built at analyze time), considering only embeddings whose content_hash matches the entity's current hash (stale vectors never surface). Bounded (limit default 20, max 100; page.total/truncated). Each result carries its `sei` and a `score`.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -824,7 +824,7 @@ fn no_index_message(project_root: &Path) -> String {
     let root = project_root.display();
     format!(
         "Loomweave has no index for this project yet \
-({root}/.loomweave/loomweave.db is missing), so the structural graph has not been \
+({root}/.weft/loomweave/loomweave.db is missing), so the structural graph has not been \
 built and every Loomweave tool is unavailable. Run `loomweave install --path {root}` \
 then `loomweave analyze {root}` in a terminal to extract the entity / edge graph, \
 then reconnect this MCP server."
@@ -861,7 +861,7 @@ fn initialize_result_no_index(project_root: &Path) -> Value {
 }
 
 /// JSON-RPC dispatch for the degraded "no index" stdio server: the project has
-/// no `.loomweave/loomweave.db`, so there is no graph to query. `initialize`
+/// no `.weft/loomweave/loomweave.db`, so there is no graph to query. `initialize`
 /// succeeds (the client connects cleanly rather than seeing the server die) and
 /// `tools/call` returns the actionable chirp as a tool result with
 /// `isError: true` — the load-bearing channel, since not every client surfaces
@@ -902,7 +902,7 @@ pub fn handle_json_rpc_no_index(request: &Value, project_root: &Path) -> Option<
 /// Serve a degraded MCP stdio session for a project with no index. Mirrors
 /// [`serve_stdio`] (synchronous — there are no storage-backed async tools to
 /// drive) but routes every request through [`handle_json_rpc_no_index`]. Used by
-/// `loomweave serve` when `.loomweave/loomweave.db` is absent, so the client
+/// `loomweave serve` when `.weft/loomweave/loomweave.db` is absent, so the client
 /// connects and is told to run analyze rather than watching the server exit.
 pub fn serve_stdio_no_index(
     project_root: &Path,
@@ -1627,7 +1627,7 @@ impl ServerState {
             }
         };
 
-        let db_path = self.project_root.join(".loomweave").join("loomweave.db");
+        let db_path = loomweave_core::store::db_path(&self.project_root);
         let project_root = self.project_root.clone();
         let sheet_id = promoted.id.clone();
         let write_result =
@@ -3325,7 +3325,7 @@ fn summary_briefing_blocked(entity_json: &Value, reason: &str) -> Value {
     let remediation = if reason == "unscanned_source" {
         "Entity source file was not covered by the pre-ingest secret scan. Re-run with scanner coverage for that path or fix the plugin source path before requesting a summary."
     } else {
-        "File flagged by pre-ingest secret scan. Fix the secret or whitelist via .loomweave/secrets-baseline.yaml. See ADR-013."
+        "File flagged by pre-ingest secret scan. Fix the secret or whitelist via .weft/loomweave/secrets-baseline.yaml. See ADR-013."
     };
     let entity_id = entity_json
         .get("id")

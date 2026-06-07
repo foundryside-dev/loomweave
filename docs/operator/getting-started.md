@@ -128,10 +128,10 @@ loomweave install
 loomweave analyze
 ```
 
-A bare `loomweave install` does everything: it initialises `.loomweave/`, installs
+A bare `loomweave install` does everything: it initialises `.weft/loomweave/`, installs
 the agent-orientation assets, writes Claude Code MCP config, and upserts the
 Codex MCP config (see [§3](#agent-orientation-installed-by-default)). If
-`.loomweave/` already exists, init is skipped and the other components are applied
+`.weft/loomweave/` already exists, init is skipped and the other components are applied
 idempotently; pass `--force` to wipe and reinitialise the index.
 
 Expected output (abridged):
@@ -149,7 +149,7 @@ analyze complete: run <uuid> ok (entities=NNN, edges=MMM)
 ```
 
 The first run on a tree of this size completes in well under a minute on
-typical hardware. The result lives at `.loomweave/loomweave.db` (a single SQLite
+typical hardware. The result lives at `.weft/loomweave/loomweave.db` (a single SQLite
 file) and is safe to commit to git — see
 [ADR-005](../loomweave/adr/ADR-005-loomweave-dir-tracking.md).
 
@@ -193,7 +193,7 @@ Pick whichever you have; the questions in step 4 are client-agnostic.
 
 A bare `loomweave install` already bundles these for consult-mode agents. The
 component flags exist for explicit partial installs (e.g. adding the skill to a
-project whose `.loomweave/` you do not want re-touched):
+project whose `.weft/loomweave/` you do not want re-touched):
 
 ```bash
 loomweave install --claude-code --path /tmp/requests-2.32.4  # Claude Code MCP only
@@ -329,7 +329,7 @@ Expected behaviour:
 - `loomweave analyze` exits **0** with run status `completed`.
 - A `LMWV-SEC-SECRET-DETECTED` finding lands in `findings` with the message
   `AwsAccessKeyId detected in /tmp/requests-2.32.4/.env:1`. Inspect with
-  `sqlite3 .loomweave/loomweave.db "SELECT rule_id, message FROM findings
+  `sqlite3 .weft/loomweave/loomweave.db "SELECT rule_id, message FROM findings
   WHERE rule_id LIKE 'LMWV-SEC%';"`.
 - The `.env` file itself has no language entities (it's not Python), so
   the finding is anchored to the core-minted file entity rather than a
@@ -387,7 +387,7 @@ is never quarantined. Notarized release artifacts are on the post-1.0 roadmap.
 
 ### "secret_present" block fires on a real file
 
-Add the file to `.loomweave/secrets-baseline.yaml` with a written justification
+Add the file to `.weft/loomweave/secrets-baseline.yaml` with a written justification
 (the schema requires it). Full procedure: [secret-scanning.md](./secret-scanning.md).
 
 ### `summary` returns an error citing budget or LLM provider

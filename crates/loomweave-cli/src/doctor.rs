@@ -217,20 +217,23 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
 }
 
 fn check_loomweave_dir_json(project_root: &Path) -> DoctorJsonCheck {
-    let loomweave_dir = project_root.join(".loomweave");
+    let loomweave_dir = loomweave_core::store::store_dir(project_root);
     let db = loomweave_dir.join("loomweave.db");
     if loomweave_dir.is_dir() && db.is_file() {
         DoctorJsonCheck::ok(
-            ".loomweave.schema",
-            ".loomweave directory and database are present",
+            ".weft/loomweave.schema",
+            ".weft/loomweave store directory and database are present",
         )
     } else if loomweave_dir.is_dir() {
         DoctorJsonCheck::warning(
-            ".loomweave.schema",
-            ".loomweave directory exists but loomweave.db is absent",
+            ".weft/loomweave.schema",
+            ".weft/loomweave store directory exists but loomweave.db is absent",
         )
     } else {
-        DoctorJsonCheck::warning(".loomweave.schema", ".loomweave directory is absent")
+        DoctorJsonCheck::warning(
+            ".weft/loomweave.schema",
+            ".weft/loomweave store directory is absent",
+        )
     }
 }
 
@@ -431,7 +434,7 @@ fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
         );
     }
     // ADR-044: prefer the live published port over the (now usually absent)
-    // static bind. A running serve publishes .loomweave/ephemeral.port.
+    // static bind. A running serve publishes .weft/loomweave/ephemeral.port.
     let resolution = loomweave_federation::loomweave_url::resolve_loomweave_url(None, project_root);
     if let Some(url) = resolution.resolved_url {
         return DoctorJsonCheck::ok(
@@ -448,7 +451,7 @@ fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
     if bind.trim().is_empty() {
         DoctorJsonCheck::ok(
             "http.config",
-            "HTTP enabled; read-API port auto-selected and published to .loomweave/ephemeral.port while serving",
+            "HTTP enabled; read-API port auto-selected and published to .weft/loomweave/ephemeral.port while serving",
         )
     } else {
         DoctorJsonCheck::ok(
@@ -553,7 +556,7 @@ fn check_llm_provider_json(project_root: &Path) -> DoctorJsonCheck {
 }
 
 fn check_sei_population_json(project_root: &Path) -> DoctorJsonCheck {
-    let db = project_root.join(".loomweave/loomweave.db");
+    let db = loomweave_core::store::db_path(project_root);
     let Ok(conn) = Connection::open(&db) else {
         return DoctorJsonCheck::warning("sei.population", "loomweave.db is absent or unreadable");
     };

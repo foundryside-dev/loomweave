@@ -65,7 +65,7 @@ export PATH="$REPO_ROOT/target/release:$VENV/bin:$PATH"
 
 log "running: loomweave install"
 loomweave install
-[ -f "$DEMO_DIR/.loomweave/loomweave.db" ] || fail ".loomweave/loomweave.db not created"
+[ -f "$DEMO_DIR/.weft/loomweave/loomweave.db" ] || fail ".weft/loomweave/loomweave.db not created"
 
 log "running: loomweave analyze ."
 loomweave analyze .
@@ -119,7 +119,7 @@ def assert_tool_ok(response: dict[str, object]) -> dict[str, object]:
     return envelope
 
 
-conn = sqlite3.connect(project_dir / ".loomweave" / "loomweave.db")
+conn = sqlite3.connect(project_dir / ".weft" / "loomweave" / "loomweave.db")
 world_hash = conn.execute(
     "SELECT content_hash FROM entities WHERE id = ?",
     ("python:function:demo.world",),
@@ -180,7 +180,7 @@ recording_fixture = [
         },
     }
 ]
-(project_dir / ".loomweave" / "openrouter-recording.json").write_text(
+(project_dir / ".weft" / "openrouter-recording.json").write_text(
     json.dumps(recording_fixture, separators=(",", ":")),
     encoding="utf-8",
 )
@@ -255,7 +255,7 @@ llm_policy:
   provider: recording
   model_id: anthropic/claude-sonnet-4.6
   session_token_ceiling: 1000000
-  recording_fixture_path: .loomweave/openrouter-recording.json
+  recording_fixture_path: .weft/loomweave/openrouter-recording.json
 serve:
   mcp:
     enable_write_tools: true

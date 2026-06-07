@@ -1,7 +1,7 @@
 //! `loomweave db` maintenance subcommands.
 //!
 //! Currently a single verb: `backup`, an online, WAL-safe copy of
-//! `.loomweave/loomweave.db` (gap-register STO-04 / clarion-6d433b61ba).
+//! `.weft/loomweave/loomweave.db` (gap-register STO-04 / clarion-6d433b61ba).
 //!
 //! Why an online backup rather than `cp`: the live database runs in WAL mode,
 //! so committed pages live in `loomweave.db-wal` separately from the main file.
@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use rusqlite::{Connection, OpenFlags};
 
-/// Back up the project's `.loomweave/loomweave.db` to `output`.
+/// Back up the project's `.weft/loomweave/loomweave.db` to `output`.
 ///
 /// The copy is taken with `rusqlite::backup::Backup` (a consistent online
 /// snapshot) and staged into a sibling temp file that is renamed over `output`
@@ -30,7 +30,7 @@ use rusqlite::{Connection, OpenFlags};
 /// exists and `force` is not set, if `output` resolves to the source database
 /// itself, or if the backup / integrity check fails.
 pub fn backup(project_root: &Path, output: &Path, force: bool) -> Result<()> {
-    let db_path = project_root.join(".loomweave").join("loomweave.db");
+    let db_path = loomweave_core::store::db_path(project_root);
     ensure!(
         db_path.exists(),
         "Loomweave database not found at {}; run `loomweave analyze` first",

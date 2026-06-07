@@ -14,6 +14,33 @@ only when an incompatible change is made to that surface. See
 
 ### Changed
 
+- **Project store moved `.loomweave/` → `.weft/loomweave/` (Weft store
+  consolidation, clean break; ADR-046).** All machine-written state — the index
+  DB, `config.json`, `.gitignore`, `embeddings.db`, `ephemeral.port`,
+  `instance_id`, locks, and per-run dirs — now lives under the shared
+  `.weft/<member>/` dotdir, routed through a single `loomweave_core::store`
+  helper. There is **no fallback read** of the old location: existing projects
+  must re-init (`loomweave install` then `loomweave analyze`) and may delete the
+  orphaned `.loomweave/`. An operator may relocate the store with a
+  member-private `[loomweave].store_dir` key in a project-root `weft.toml`
+  (read-only to Loomweave; a missing or malformed file falls back silently to
+  the default). Sibling resolution reads the consolidated `.weft/<sibling>/`
+  location **only** — Filigree's live port at `.weft/filigree/ephemeral.port`,
+  Wardline's trust-vocabulary descriptor at `.weft/wardline/vocabulary.yaml` —
+  with no fallback to the pre-consolidation `.<sibling>/` path. A sibling found
+  only on the legacy path folds to the fail-soft default (`source = "config"`
+  for Filigree, an absent descriptor for Wardline), making a mis-sequenced
+  cutover visible rather than a silent stale resolve. **Cutover ordering:**
+  Filigree migrates to `.weft/filigree/` → this build installs → downstream
+  re-init.
+
+- **`cargo nextest run --workspace` now always completes instead of hanging.** A
+  `slow-timeout` cap in `.config/nextest.toml` terminates any test that runs past
+  the bound and reports it as a timeout failure, so the literal CI test command
+  runs clean to a verdict even while the pre-existing emission tests
+  (clarion-1d405be546) hang. The cap does not fix that bug — it makes the suite
+  honestly red and fast rather than green-via-family-exclusion.
+
 - **Filigree federation token env var renamed to `WEFT_FEDERATION_TOKEN`.** The
   `integrations.filigree.token_env` default (and the name stamped into
   `loomweave.yaml` by `loomweave install`) is now `WEFT_FEDERATION_TOKEN` —

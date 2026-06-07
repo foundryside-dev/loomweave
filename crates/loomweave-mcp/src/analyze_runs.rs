@@ -120,7 +120,7 @@ pub(crate) fn kill_run(handle: &mut RunHandle) {
 
 /// Best-effort delete a finished run's progress file as its handle is evicted
 /// from the registry. A missing file is success — a run may exit before writing
-/// one. Keeps `.loomweave/runs/*.progress.json` from accumulating across a
+/// one. Keeps `.weft/loomweave/runs/*.progress.json` from accumulating across a
 /// long-lived `loomweave serve` (clarion-7e0c21558a).
 pub(crate) fn reap_progress_file(path: &std::path::Path) {
     match std::fs::remove_file(path) {

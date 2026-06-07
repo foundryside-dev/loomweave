@@ -14,8 +14,8 @@ use serde_json::{Value, json};
 
 fn open_project() -> (tempfile::TempDir, std::path::PathBuf, Connection) {
     let project = tempfile::tempdir().expect("temp project");
-    let loomweave_dir = project.path().join(".loomweave");
-    std::fs::create_dir(&loomweave_dir).expect("create .loomweave");
+    let loomweave_dir = project.path().join(".weft/loomweave");
+    std::fs::create_dir_all(&loomweave_dir).expect("create .loomweave");
     let db_path = loomweave_dir.join("loomweave.db");
     let mut conn = Connection::open(&db_path).expect("open sqlite");
     pragma::apply_write_pragmas(&conn).expect("write pragmas");
@@ -1434,7 +1434,7 @@ async fn search_semantic_ranks_by_cosine_similarity() {
     drop(conn);
 
     let now = "2026-01-01T00:00:00.000Z";
-    let store = EmbeddingStore::open_in_loomweave_dir(project.path()).expect("open sidecar");
+    let store = EmbeddingStore::open_in_store_dir(project.path()).expect("open sidecar");
     let mk = |id: &str, hash: &str| EmbeddingKey {
         entity_id: id.to_owned(),
         content_hash: hash.to_owned(),

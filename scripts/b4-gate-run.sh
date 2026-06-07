@@ -130,7 +130,7 @@ def run_cli(repo_root: Path, venv: Path, corpus_root: Path) -> tuple[int, dict[s
         subprocess.run(["loomweave", "install"], cwd=project, env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         subprocess.run(["loomweave", "analyze", "."], cwd=project, env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         wall_ms = int(round((time.perf_counter() - started) * 1000))
-        db_path = project / ".loomweave" / "loomweave.db"
+        db_path = project / ".weft" / "loomweave" / "loomweave.db"
         with sqlite3.connect(db_path) as conn:
             row = conn.execute("select stats from runs where status = 'completed' order by started_at desc limit 1").fetchone()
         if row is None:

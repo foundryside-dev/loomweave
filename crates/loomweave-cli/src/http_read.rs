@@ -55,7 +55,7 @@ static HTTP_ERROR_DISPATCH: LazyLock<tracing::Dispatch> = LazyLock::new(|| {
     tracing::Dispatch::new(subscriber)
 });
 
-/// Removes the published `.loomweave/ephemeral.port` on drop — covering
+/// Removes the published `.weft/loomweave/ephemeral.port` on drop — covering
 /// graceful shutdown, error return, and panic-unwind in one place. Only
 /// SIGKILL can strand a stale file, which the read-side validation and the
 /// ADR-034 instance-ID guard tolerate (a stale file degrades, never corrupts).
@@ -404,7 +404,7 @@ fn run_http_read_server(
                 tracing::warn!(
                     error = %err,
                     port = local_addr.port(),
-                    "failed to publish .loomweave/ephemeral.port; consumers will fall back to configured URL"
+                    "failed to publish .weft/loomweave/ephemeral.port; consumers will fall back to configured URL"
                 );
                 None
             } else {
@@ -1072,7 +1072,7 @@ mod tests {
 
     /// ADR-044: with `bind: None`, two serves on distinct project paths each
     /// bind their own deterministic port and publish their own
-    /// `.loomweave/ephemeral.port`. Neither fails to bind.
+    /// `.weft/loomweave/ephemeral.port`. Neither fails to bind.
     #[test]
     fn auto_port_publishes_distinct_ports_per_project() {
         use loomweave_federation::config::HttpReadConfig;

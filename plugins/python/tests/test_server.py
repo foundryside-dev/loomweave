@@ -249,8 +249,8 @@ def test_analyze_file_returns_extracted_entities(tmp_path: Path) -> None:
 
 
 def test_initialize_project_descriptor_reports_wardline_enabled(tmp_path: Path) -> None:
-    descriptor = tmp_path / ".wardline" / "vocabulary.yaml"
-    descriptor.parent.mkdir()
+    descriptor = tmp_path / ".weft" / "wardline" / "vocabulary.yaml"
+    descriptor.parent.mkdir(parents=True)
     descriptor.write_text(
         """\
 version: wardline-generic-2
@@ -305,8 +305,8 @@ def test_analyze_file_threads_wardline_vocabulary(
             pass
 
     monkeypatch.setattr(server_module, "PyrightSession", FakePyrightSession, raising=False)
-    descriptor = tmp_path / ".wardline" / "vocabulary.yaml"
-    descriptor.parent.mkdir()
+    descriptor = tmp_path / ".weft" / "wardline" / "vocabulary.yaml"
+    descriptor.parent.mkdir(parents=True)
     descriptor.write_text(
         """\
 version: wardline-generic-2

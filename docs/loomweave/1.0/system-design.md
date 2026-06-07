@@ -84,7 +84,7 @@ flowchart TB
         PyPlugin["loomweave-plugin-python<br/><i>LSP-style JSON-RPC</i>"]
     end
 
-    Store[("`.loomweave/loomweave.db`<br/>SQLite WAL<br/><i>committed to git</i>")]
+    Store[("`.weft/loomweave/loomweave.db`<br/>SQLite WAL<br/><i>committed to git</i>")]
 
     Analyze -.->|"spawn per run"| PyPlugin
     Serve -.->|"spawn on demand<br/>for consult queries"| PyPlugin
@@ -100,7 +100,7 @@ flowchart TB
 | Mode | Surface | Purpose | v0.1 status |
 |---|---|---|---|
 | MCP-for-LLM | `loomweave serve` over stdio | First-class product surface — consult-mode agents hold a cursor, navigate the graph, emit observations to Filigree | Primary |
-| Catalog artefacts | `loomweave analyze` writes `.loomweave/catalog.json` + per-subsystem markdown | "I want to read the output" cases | v1.1 (deferred — Sprint 2 amendment §3 removed boxes B.4/B.5; see [REQ-ARTEFACT-01](requirements.md#req-artefact-01--json-catalog-output) / [REQ-ARTEFACT-02](requirements.md#req-artefact-02--per-subsystem-markdown--top-level-index)) |
+| Catalog artefacts | `loomweave analyze` writes `.weft/loomweave/catalog.json` + per-subsystem markdown | "I want to read the output" cases | v1.1 (deferred — Sprint 2 amendment §3 removed boxes B.4/B.5; see [REQ-ARTEFACT-01](requirements.md#req-artefact-01--json-catalog-output) / [REQ-ARTEFACT-02](requirements.md#req-artefact-02--per-subsystem-markdown--top-level-index)) |
 | Semi-dynamic wiki | HTML served by `loomweave serve` | Live finding list, in-browser guidance editing, consult entry points | v1.1 (deferred — NG-13) |
 
 ### Boundary contracts with the Weft siblings
@@ -425,20 +425,20 @@ flowchart LR
 
 **Why not a single giant transaction**: Long transactions pin the WAL, prevent checkpoints from completing, and produce unbounded WAL growth. Per-batch transactions are the industry-standard posture for this workload.
 
-**Writer-actor vs. shadow-DB**. The writer-actor model is the v0.1 default. A shadow-DB alternative (`loomweave analyze --shadow-db` writes to `.loomweave/loomweave.db.new`, atomic-renames on completion) is available for users wanting zero-stale reads from a concurrent `loomweave serve` during long analyze runs. See ADR-011.
+**Writer-actor vs. shadow-DB**. The writer-actor model is the v0.1 default. A shadow-DB alternative (`loomweave analyze --shadow-db` writes to `.weft/loomweave/loomweave.db.new`, atomic-renames on completion) is available for users wanting zero-stale reads from a concurrent `loomweave serve` during long analyze runs. See ADR-011.
 
 ### Crash safety
 
 SQLite WAL + writer-actor transactions + explicit `PRAGMA synchronous=NORMAL`
 give crash-safe storage semantics: a SIGKILL during analyze must not corrupt
-`.loomweave/loomweave.db`, and committed rows survive. Per ADR-041, v1.x
+`.weft/loomweave/loomweave.db`, and committed rows survive. Per ADR-041, v1.x
 `loomweave analyze --resume <run_id>` reopens the existing run id and re-walks
 idempotently; it does not read `checkpoints.jsonl` or continue from a phase/file
 checkpoint.
 
 ### Git-friendly storage
 
-`.loomweave/loomweave.db` is committable to git (NFR-OPS-03). SQLite files diff poorly — Loomweave ships two features to handle this:
+`.weft/loomweave/loomweave.db` is committable to git (NFR-OPS-03). SQLite files diff poorly — Loomweave ships two features to handle this:
 
 1. **Textual export**: `loomweave db export --textual <out_dir>` produces deterministic JSON-lines dumps of entities, edges, guidance, findings. Sorted by id / (kind, from, to) so a one-entity change produces a one-line diff. Summary cache is excluded (rebuilds cheaply on next run).
 
@@ -447,7 +447,7 @@ checkpoint.
 ### File layout
 
 ```
-<project>/.loomweave/
+<project>/.weft/loomweave/
     loomweave.db              # main store (plus WAL files beside it)
     config.json             # schema version, last run IDs
     loomweave.log             # process log
@@ -841,7 +841,7 @@ Write-effect tools (`emit_observation`, `promote_observation`, `propose_guidance
 
 - Created on MCP `initialize` (≤100ms, NFR-PERF-02).
 - Default idle timeout: 1 hour.
-- State persisted to `.loomweave/sessions/<id>.json` for reconnection.
+- State persisted to `.weft/loomweave/sessions/<id>.json` for reconnection.
 - Admin surface: `loomweave sessions list` / `loomweave sessions close <id>`.
 
 ---
@@ -1077,7 +1077,7 @@ Security is a first-class concern in v0.1 because Loomweave sends source code to
 | Prompt injection via source | Critical | Adversarial docstrings / comments → briefing field values → future-prompt poisoning via cache | Schema validation + untrusted-content delimiters + `knowledge_basis: static_only` |
 | Guidance poisoning via LLM-proposed sheets | High | `propose_guidance` MCP tool promotes attacker text into prompts | Manual promotion gate — proposals create observations, not sheets |
 | HTTP API reachable by other local processes | Medium | `loomweave serve` on shared dev host / container | ADR-014 registry-backend API is unauthenticated but loopback-only by default; non-loopback binds are refused unless explicitly allowed and protected by operator-managed access control. |
-| DB tampering via committed `.loomweave/loomweave.db` | Medium | Bad actor edits DB, commits, poisons teammate briefings | Content-hash cross-check on load (v0.2); `loomweave db verify` CLI |
+| DB tampering via committed `.weft/loomweave/loomweave.db` | Medium | Bad actor edits DB, commits, poisons teammate briefings | Content-hash cross-check on load (v0.2); `loomweave db verify` CLI |
 | LLM audit-log leakage via git | Medium | `runs/<run_id>/log.jsonl` contains request/response bodies | Default-excluded from git |
 | Personal API key charged when committing team DB | Medium (operator) | Developer commits DB generated with personal key | Operator guidance; `--audit-key` hint |
 | Plugin subprocess compromise | Medium | Malicious third-party plugin reads source or exhausts host resources | Hybrid authority per ADR-021: path jail, Content-Length ceiling, entity-count cap, per-plugin `prlimit` RSS. Full syscall sandbox + plugin hash-pinning deferred to v0.2 (NG-16) |
@@ -1090,7 +1090,7 @@ Before any file content reaches the LLM (Phases 4, 5, 6), Loomweave runs a pre-i
 - **Scope**: every file in `analysis.include` is scanned; exclusion globs apply *after* scanning (excluded files never reach the LLM regardless).
 - **Policy on finding**:
   - Unredacted secret → `LMWV-SEC-SECRET-DETECTED` (severity: ERROR) + **block LLM dispatch for that file**. Entities in the file still land in the store with summaries marked `briefing_blocked: secret_present`.
-  - False-positive whitelist: `.loomweave/secrets-baseline.yaml` (same format as `detect-secrets`' baseline; committable and reviewable).
+  - False-positive whitelist: `.weft/loomweave/secrets-baseline.yaml` (same format as `detect-secrets`' baseline; committable and reviewable).
   - Override: `loomweave analyze --allow-unredacted-secrets` requires explicit confirmation prompt and records the override in `stats.json`.
 - **Coverage**: high-entropy strings, common API key patterns (AWS, GitHub, Anthropic, Stripe, etc.), RSA private key headers, JWT-looking tokens.
 
@@ -1138,9 +1138,9 @@ Findings feed Filigree via the normal exchange. Security-focused operators can `
 
 Some risks sit outside Loomweave's code but inside the operator's responsibility:
 
-- **Use project-scoped API keys, not personal ones, when committing the DB**. Briefings in `.loomweave/loomweave.db` were paid for by whoever ran analyze; a teammate pulling your committed DB benefits from calls your personal key paid for. Use an Anthropic project key, not your personal key.
+- **Use project-scoped API keys, not personal ones, when committing the DB**. Briefings in `.weft/loomweave/loomweave.db` were paid for by whoever ran analyze; a teammate pulling your committed DB benefits from calls your personal key paid for. Use an Anthropic project key, not your personal key.
 - **Rotate tokens when a committed DB exposes a stale model's output**. If the DB was generated with a leaked or exposed API key, the token is already used; briefings aren't themselves secret but the key's usage fingerprint is.
-- **Review `.loomweave/.gitignore` before first commit**. Default excludes `runs/*/log.jsonl` (raw LLM request/response bodies); opting in to commit logs ships source excerpts to the repo — a choice, not an oversight.
+- **Review `.weft/loomweave/.gitignore` before first commit**. Default excludes `runs/*/log.jsonl` (raw LLM request/response bodies); opting in to commit logs ships source excerpts to the repo — a choice, not an oversight.
 
 Operator-guidance documentation lives in the detailed-design §10 for procedural depth.
 
@@ -1225,7 +1225,7 @@ The parallel listing in [detailed-design.md §11](./detailed-design.md#11-archit
 | ADR-002 | Plugin transport: Content-Length framed JSON-RPC 2.0 subprocess | Accepted | P0 | Binary-safe framing, resumability after crash, alignment with LSP patterns. Alternatives: newline-delimited JSON (unsafe for content with embedded newlines), Wasm (too early for plugin authoring ergonomics), embedded Python (couples core to Python runtime). |
 | ADR-003 | Entity ID scheme: symbolic canonical-name; file path as property; EntityAlias v0.2 | Accepted | P0 | Cross-tool identity must survive file moves. Path-embedded IDs silently detach every reference; symbolic IDs survive 80% case (file move without rename). Rename tracking via EntityAlias deferred; manual `--repair-aliases` workaround in v0.1. |
 | ADR-004 | Finding-exchange format: Filigree-native intake; `metadata.loomweave.*` nesting | Accepted | P0 | Filigree's `POST /api/v1/scan-results` is production path; SARIF requires either translation or Filigree-side work. Nesting convention under `metadata` dict (verified verbatim preservation) avoids silent drops of extension fields. |
-| ADR-005 | `.loomweave/` git-committable by default; DB included, run logs excluded | To author | P1 | Shared-analysis-state story benefits small teams; run logs may contain source excerpts appropriate to Anthropic but not git. Default-exclude run logs via `.gitignore`; opt-in to commit. |
+| ADR-005 | `.weft/loomweave/` git-committable by default; DB included, run logs excluded | To author | P1 | Shared-analysis-state story benefits small teams; run logs may contain source excerpts appropriate to Anthropic but not git. Default-exclude run logs via `.gitignore`; opt-in to commit. |
 | [ADR-006](../adr/ADR-006-clustering-algorithm.md), [ADR-032](../adr/ADR-032-weighted-components-clustering-fallback.md) | Clustering algorithm: Leiden (with weighted-components fallback) on imports + calls subgraph | Accepted | P0 | Leiden's connected-community guarantee fixes disconnected-cluster defects. Directed, weighted (reference_count); module-level. `weighted_components` is the deterministic fallback selectable via config when a local component cut is preferred. Modularity score recorded, not enforced (v0.1); weak threshold is reported via finding. |
 | [ADR-007](../adr/ADR-007-summary-cache-key.md) | Summary cache key design: `(entity_id, content_hash, prompt_template_id, model_tier, guidance_fingerprint)` + TTL backstop + churn-eager invalidation | Accepted | P0 | Full 5-part key captures all syntactic staleness paths; TTL backstop (180d default) bounds semantic staleness the key alone doesn't see; churn-eager invalidation on `LMWV-FACT-GUIDANCE-CHURN-STALE` makes stale-guidance pressure visible via cost. Neighborhood-drift flag (`stale_semantic: true`) rather than forced miss preserves NFR-COST-02's 95% hit-rate target. Block C1 spike validates the assumption. |
 | ADR-008 | (Superseded by ADR-014.) | Superseded | — | Initial Filigree file-registry displacement design was "feature flag"; recon showed it's schema surgery. See ADR-014. |
@@ -1233,7 +1233,7 @@ The parallel listing in [detailed-design.md §11](./detailed-design.md#11-archit
 | ADR-010 | MCP as first-class surface — lock-in cost vs ecosystem reach | To author | P2 | Anthropic's MCP standard is the ecosystem's current centre of gravity for LLM tool integrations; lock-in cost is acknowledged but the ecosystem reach outweighs it for v0.1. Strategic review at v0.3+. |
 | [ADR-011](../adr/ADR-011-writer-actor-concurrency.md) | Writer-actor concurrency model (vs shadow-DB swap) | Accepted | P0 | Single writer actor + per-N-files transactions (default N=50) is the committed shape; `--shadow-db` opt-in for zero-stale-read scenarios. Design-review §2.2 CRITICAL flag retires. SQLite-concurrency-under-load assumption named as v0.2 validation task (`NG-28` proposed). |
 | [ADR-012](../adr/ADR-012-http-auth-default.md) | Historical HTTP read-API auth proposal: UDS default with TCP+token fallback | Superseded for ADR-014 registry-backend API | P0 | ADR-014 now owns the registry-backend HTTP read API posture: unauthenticated loopback-only by default, non-loopback refused unless explicitly allowed and protected externally. ADR-012 remains context for the earlier broad HTTP API proposal. |
-| [ADR-013](../adr/ADR-013-pre-ingest-secret-scanner.md) | Pre-ingest secret scanner with LLM-dispatch block | Accepted | P0 | Rust-native port of detect-secrets rule set (preserves NFR-OPS-04 single-binary). File-level block on detection; structural extraction preserved; briefings marked `briefing_blocked: secret_present`. `.loomweave/secrets-baseline.yaml` for false-positives. `--allow-unredacted-secrets` requires TTY confirm OR explicit `--confirm-allow-unredacted-secrets=yes-i-understand` in CI. |
+| [ADR-013](../adr/ADR-013-pre-ingest-secret-scanner.md) | Pre-ingest secret scanner with LLM-dispatch block | Accepted | P0 | Rust-native port of detect-secrets rule set (preserves NFR-OPS-04 single-binary). File-level block on detection; structural extraction preserved; briefings marked `briefing_blocked: secret_present`. `.weft/loomweave/secrets-baseline.yaml` for false-positives. `--allow-unredacted-secrets` requires TTY confirm OR explicit `--confirm-allow-unredacted-secrets=yes-i-understand` in CI. |
 | [ADR-014](../adr/ADR-014-filigree-registry-backend.md) | Filigree `registry_backend` flag + pluggable `RegistryProtocol` — schema surgery, not config flip | Accepted | P0 | Four NOT-NULL foreign keys on `file_records(id)` + three auto-create paths require a real interface, not a flag. Loomweave's shadow-registry fallback preserves v0.1 shipability when Filigree hasn't landed the surgery. |
 | [ADR-015](../adr/ADR-015-wardline-filigree-emission.md) | Wardline→Filigree emission ownership: Loomweave-side SARIF translator (v0.1), native Wardline POST (v0.2) | Accepted | P0 | Wardline has no HTTP client today (`integration-recon:339`); adding one is a refactor not on the v0.1 timeline. Loomweave-side translator ships independently; translator stays permanent for Semgrep / CodeQL / etc. `weft.md` §5 asterisk 1 retires when native emitter lands. Revision trigger: Block C2 spike showing emitter is ≤1 day of work promotes to v0.1. |
 | [ADR-016](../adr/ADR-016-observation-transport.md) | Observation transport: `filigree mcp` subprocess spawn (v0.1); `POST /api/v1/observations` HTTP (v0.2) | Accepted | P0 | Per Q1 scope commitment, observation HTTP transport deferred to v0.2. v0.1 emits via Loomweave spawning `filigree mcp` subprocess and calling existing `create_observation` MCP tool over stdio. v0.2 HTTP endpoint is the retirement trigger; capability probe detects via `HEAD /api/v1/observations`. |

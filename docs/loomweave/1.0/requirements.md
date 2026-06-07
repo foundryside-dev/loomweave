@@ -452,7 +452,7 @@ Write-effect tools (`emit_observation`, `promote_observation`, `propose_guidance
 
 > **Deferred to v1.1** per the [Sprint 2 scope amendment §3 (Box B.6)](../../implementation/sprint-2/scope-amendment-2026-05.md). Session persistence is the cursor-based Navigation model deferred with [REQ-MCP-01](#req-mcp-01--cursor-based-session-model); v1.0 tools take explicit `id` arguments per-call and hold no per-session state beyond the request scope.
 
-Sessions are created on MCP `initialize`, idle-timeout after 1 hour (configurable), and persist to `.loomweave/sessions/<id>.json` for reconnection. `loomweave sessions list` and `loomweave sessions close <id>` provide admin surfaces.
+Sessions are created on MCP `initialize`, idle-timeout after 1 hour (configurable), and persist to `.weft/loomweave/sessions/<id>.json` for reconnection. `loomweave sessions list` and `loomweave sessions close <id>` provide admin surfaces.
 
 **Rationale**: Agents reconnecting after a transport interruption expect their cursor and breadcrumbs to survive; losing session state mid-investigation is hostile to the workflow.
 **Verification**: Open a session, populate cursor, disconnect, reconnect, assert state restored.
@@ -468,7 +468,7 @@ Human-readable outputs from `loomweave analyze`.
 
 > **Deferred to v1.1** per the [Sprint 2 scope amendment §3 (Box B.4 removed)](../../implementation/sprint-2/scope-amendment-2026-05.md). The `catalog.json` artefact has no consumer in the v1.0 MVP MCP surface; the MCP tools query the SQLite store directly.
 
-`loomweave analyze` emits `.loomweave/catalog.json` — a deterministic, stable-shape dump of the entity catalog, edges, subsystems, and findings at run completion.
+`loomweave analyze` emits `.weft/loomweave/catalog.json` — a deterministic, stable-shape dump of the entity catalog, edges, subsystems, and findings at run completion.
 
 **Rationale**: JSON is the universal interchange format; downstream consumers (dashboards, bespoke scripts, CI gates) can read the catalog without speaking SQLite. Deterministic output means git diffs reflect real changes, not run-to-run noise.
 **Verification**: Two consecutive runs produce byte-identical `catalog.json`; schema conforms to a versioned JSON schema.
@@ -478,7 +478,7 @@ Human-readable outputs from `loomweave analyze`.
 
 > **Deferred to v1.1** per the [Sprint 2 scope amendment §3 (Box B.5 removed)](../../implementation/sprint-2/scope-amendment-2026-05.md). Subsystem rendering lands with WP4 in v1.1.
 
-`loomweave analyze` emits `.loomweave/catalog/<subsystem>.md` (one markdown file per subsystem) plus `.loomweave/catalog/index.md` (top-level navigation). Markdown is generated from the store, not authored.
+`loomweave analyze` emits `.weft/loomweave/catalog/<subsystem>.md` (one markdown file per subsystem) plus `.weft/loomweave/catalog/index.md` (top-level navigation). Markdown is generated from the store, not authored.
 
 **Rationale**: Markdown is the human-reading surface for cases where a human (reviewer, new team member) wants to read the catalog without running `loomweave serve` or speaking MCP. Subsystem granularity matches how humans think about large codebases; the index makes discovery cheap.
 **Verification**: For each subsystem entity, a corresponding markdown file exists and renders cleanly; index lists all subsystems.
@@ -836,7 +836,7 @@ Loomweave v0.1 is validated against `elspeth` (~425k LOC Python, ~1,100 files). 
 
 #### NFR-SCALE-02 — DB size bound
 
-The `.loomweave/loomweave.db` store for an elspeth-scale project fits within 2GB. Larger projects degrade gracefully — no hard cap, but cost of commit-the-DB grows.
+The `.weft/loomweave/loomweave.db` store for an elspeth-scale project fits within 2GB. Larger projects degrade gracefully — no hard cap, but cost of commit-the-DB grows.
 
 **Rationale**: Committed DBs live in git; a 2GB DB is uncomfortable but workable, 10GB is pathological. Matching elspeth to 500MB-2GB keeps the commit-DB story honest.
 **Verification**: Elspeth run produces a DB within the bound; DB growth linear with entity count.
@@ -856,7 +856,7 @@ The `.loomweave/loomweave.db` store for an elspeth-scale project fits within 2GB
 
 #### NFR-SEC-01 — Pre-ingest secret scanning
 
-Before any file content reaches the LLM provider, Loomweave runs a pre-ingest secret scanner (bundled `detect-secrets` or equivalent) on the file buffer. Unredacted secrets emit `LMWV-SEC-SECRET-DETECTED` and **block LLM dispatch for that file**. False-positive whitelist at `.loomweave/secrets-baseline.yaml`.
+Before any file content reaches the LLM provider, Loomweave runs a pre-ingest secret scanner (bundled `detect-secrets` or equivalent) on the file buffer. Unredacted secrets emit `LMWV-SEC-SECRET-DETECTED` and **block LLM dispatch for that file**. False-positive whitelist at `.weft/loomweave/secrets-baseline.yaml`.
 
 **Rationale**: The first real user running `loomweave analyze` on a repo with a committed `.env` would otherwise silently leak to Anthropic. Pre-ingest redaction is a hard dependency for v0.1; retrofitting it after a leak is too late.
 **Verification**: Fixture with a deliberately-committed test secret blocks LLM dispatch; baseline whitelist suppresses the block for approved false positives.
@@ -916,10 +916,10 @@ Every security-relevant event (`LMWV-SEC-SECRET-DETECTED`, `LMWV-SEC-UNREDACTED-
 
 #### NFR-SEC-05 — Run log exclusion from git by default
 
-`runs/<run_id>/log.jsonl` (raw LLM request/response bodies) is git-excluded by default via `.loomweave/.gitignore` (`runs/*/log.jsonl`). Operators opt-in to committing explicitly.
+`runs/<run_id>/log.jsonl` (raw LLM request/response bodies) is git-excluded by default via `.weft/loomweave/.gitignore` (`runs/*/log.jsonl`). Operators opt-in to committing explicitly.
 
 **Rationale**: Run logs may contain source excerpts appropriate to ship to Anthropic but not appropriate to commit to a public repo. Default-exclude prevents accidental exposure; explicit opt-in forces the operator to own the choice.
-**Verification**: Fresh install produces `.loomweave/.gitignore` with the rule; log files not tracked in the next `git status`.
+**Verification**: Fresh install produces `.weft/loomweave/.gitignore` with the rule; log files not tracked in the next `git status`.
 **See**: System Design §4 (Storage, Commit posture), §10 (Security, Operator guidance).
 
 ---
@@ -942,9 +942,9 @@ Loomweave runs entirely locally. The only required network egress is the LLM pro
 **Verification**: Network egress audit during `loomweave analyze`: only Anthropic endpoints in the packet capture.
 **See**: System Design §1 (Context & Boundaries).
 
-#### NFR-OPS-03 — `.loomweave/` git-committable
+#### NFR-OPS-03 — `.weft/loomweave/` git-committable
 
-The `.loomweave/` directory (including `loomweave.db` by default) is safe to commit to git. Textual DB export (`loomweave db export --textual`) and a merge helper (`loomweave db merge-helper`) handle multi-developer conflicts.
+The `.weft/loomweave/` directory (including `loomweave.db` by default) is safe to commit to git. Textual DB export (`loomweave db export --textual`) and a merge helper (`loomweave db merge-helper`) handle multi-developer conflicts.
 
 **Rationale**: Shared analysis state benefits small teams (one developer pays the LLM cost; the team sees the briefings). Commit-by-default matches Filigree's and Wardline's storage patterns. Textual export makes git diffs meaningful.
 **Verification**: `git add .loomweave && git commit` succeeds on a populated store; two developers' simultaneous runs produce a DB that the merge helper resolves deterministically.
@@ -964,7 +964,7 @@ The Python plugin installs via `pipx install loomweave-plugin-python` into its o
 
 #### NFR-OBSERV-01 — Structured JSON logs
 
-Loomweave emits structured JSON-line logs via the `tracing` crate. Logs rotate at 100MB with 5 files kept. Per-run log at `.loomweave/runs/<run_id>/log.jsonl`; per-process log at `.loomweave/loomweave.log`.
+Loomweave emits structured JSON-line logs via the `tracing` crate. Logs rotate at 100MB with 5 files kept. Per-run log at `.weft/loomweave/runs/<run_id>/log.jsonl`; per-process log at `.weft/loomweave/loomweave.log`.
 
 **Rationale**: Structured logs are machine-parseable; text logs aren't. Downstream log aggregation (if operators route Loomweave's output into Vector / Loki / Splunk) works by default.
 **Verification**: Log entries parse as JSON; rotation verified; log levels respected.
@@ -1032,7 +1032,7 @@ The dry-run cost estimate is within ±50% of actual spend on representative proj
 
 #### NFR-RELIABILITY-01 — Crash-surviving store
 
-> **v1.x status amended by ADR-041.** `.loomweave/loomweave.db` must survive
+> **v1.x status amended by ADR-041.** `.weft/loomweave/loomweave.db` must survive
 > unclean shutdown (SIGKILL during analyze) without corruption. Subsequent
 > `loomweave analyze --resume <run_id>` safely reopens and re-walks the same run
 > id; it does not continue from a phase/file checkpoint.

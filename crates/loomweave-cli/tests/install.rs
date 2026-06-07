@@ -30,7 +30,7 @@ fn install_creates_loomweave_dir_with_expected_contents() {
         .assert()
         .success();
 
-    let loomweave = dir.path().join(".loomweave");
+    let loomweave = dir.path().join(".weft/loomweave");
     assert!(
         loomweave.join("loomweave.db").exists(),
         "loomweave.db missing"
@@ -75,7 +75,7 @@ fn install_creates_loomweave_dir_with_expected_contents() {
 #[test]
 fn install_all_wires_three_way_integration_bindings() {
     let dir = tempfile::tempdir().unwrap();
-    let filigree_dir = dir.path().join(".filigree");
+    let filigree_dir = dir.path().join(".weft").join("filigree");
     fs::create_dir_all(&filigree_dir).unwrap();
     fs::write(filigree_dir.join("ephemeral.port"), "8749\n").unwrap();
 
@@ -185,7 +185,7 @@ fn install_applies_each_migration_exactly_once() {
         .assert()
         .success();
 
-    let conn = Connection::open(dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
             row.get(0)
@@ -212,10 +212,11 @@ fn install_all_rejects_non_directory_loomweave() {
     // Bug (PR#21 review #6): when `.loomweave` already exists as a regular file
     // and `--all` (a non-bare init) is run without `--force`, install treated
     // it as "already initialised" and skipped DB creation, then proceeded to
-    // install skills/hooks atop a project with no usable `.loomweave/loomweave.db`.
+    // install skills/hooks atop a project with no usable `.weft/loomweave/loomweave.db`.
     // It must instead refuse with a clear non-directory error.
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(".loomweave"), "i am a file, not a dir").unwrap();
+    std::fs::create_dir_all(dir.path().join(".weft")).unwrap();
+    std::fs::write(dir.path().join(".weft/loomweave"), "i am a file, not a dir").unwrap();
 
     let out = loomweave_bin()
         .args(["install", "--all", "--path"])
@@ -233,10 +234,11 @@ fn install_all_rejects_non_directory_loomweave() {
 #[test]
 fn install_force_rejects_non_directory_loomweave() {
     // The --force overwrite path has its own non-directory guard (distinct from
-    // the --all skip-init guard): it can only remove an existing .loomweave/
+    // the --all skip-init guard): it can only remove an existing .weft/loomweave/
     // *directory*, never a regular file masquerading as one.
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(".loomweave"), "i am a file, not a dir").unwrap();
+    std::fs::create_dir_all(dir.path().join(".weft")).unwrap();
+    std::fs::write(dir.path().join(".weft/loomweave"), "i am a file, not a dir").unwrap();
 
     let out = loomweave_bin()
         .args(["install", "--force", "--path"])
@@ -246,7 +248,7 @@ fn install_force_rejects_non_directory_loomweave() {
         .failure();
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     assert!(
-        stderr.contains("can only overwrite an existing .loomweave/ directory"),
+        stderr.contains("can only overwrite an existing .weft/loomweave/ directory"),
         "error did not mention the --force non-directory guard: {stderr}"
     );
 }
@@ -260,7 +262,7 @@ fn install_skips_loomweave_init_when_dir_already_exists() {
         .assert()
         .success();
 
-    // Second bare install must succeed: skip .loomweave/ init but still apply
+    // Second bare install must succeed: skip .weft/loomweave/ init but still apply
     // skills/hooks idempotently and report "already initialised".
     let out = loomweave_bin()
         .args(["install", "--path"])
@@ -283,7 +285,7 @@ fn install_force_replaces_existing_loomweave_dir_without_overwriting_yaml() {
         .assert()
         .success();
 
-    let loomweave = dir.path().join(".loomweave");
+    let loomweave = dir.path().join(".weft/loomweave");
     fs::write(loomweave.join("stale.tmp"), "stale").unwrap();
     fs::write(
         dir.path().join("loomweave.yaml"),
@@ -299,7 +301,7 @@ fn install_force_replaces_existing_loomweave_dir_without_overwriting_yaml() {
 
     assert!(
         !loomweave.join("stale.tmp").exists(),
-        "--force should remove stale .loomweave/ contents"
+        "--force should remove stale .weft/loomweave/ contents"
     );
     assert!(
         loomweave.join("loomweave.db").exists(),
@@ -316,14 +318,14 @@ fn install_force_replaces_existing_loomweave_dir_without_overwriting_yaml() {
 #[cfg(unix)]
 #[test]
 fn install_cleans_up_loomweave_dir_when_post_mkdir_step_fails() {
-    // Bug clarion-ed5017139f: `loomweave install` left .loomweave/ partially
+    // Bug clarion-ed5017139f: `loomweave install` left .weft/loomweave/ partially
     // populated on failure, blocking re-install without manual rm -rf.
     //
     // Reproducer: pre-create loomweave.yaml as a *broken symlink* whose target
     // sits under a non-existent parent dir. Install's `yaml_path.exists()`
     // check follows symlinks → returns false → install attempts `fs::write`,
     // which follows the symlink → tries to open a path under a non-existent
-    // dir → ENOENT. By that point .loomweave/ has been mkdir'd and populated;
+    // dir → ENOENT. By that point .weft/loomweave/ has been mkdir'd and populated;
     // the bug was leaving it on disk.
     use std::os::unix::fs::symlink;
 
@@ -341,10 +343,10 @@ fn install_cleans_up_loomweave_dir_when_post_mkdir_step_fails() {
         .assert()
         .failure();
 
-    let loomweave = dir.path().join(".loomweave");
+    let loomweave = dir.path().join(".weft/loomweave");
     assert!(
         !loomweave.exists(),
-        ".loomweave/ should have been cleaned up after install failed, \
+        ".weft/loomweave/ should have been cleaned up after install failed, \
          but it still exists at {}",
         loomweave.display()
     );
@@ -385,8 +387,8 @@ fn install_claude_code_writes_mcp_json_without_initialising_loomweave_dir() {
         .success();
 
     assert!(
-        !dir.path().join(".loomweave").exists(),
-        "--claude-code should not create .loomweave/"
+        !dir.path().join(".weft/loomweave").exists(),
+        "--claude-code should not create .weft/loomweave/"
     );
     let raw = fs::read_to_string(dir.path().join(".mcp.json")).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -417,8 +419,8 @@ fn install_codex_writes_requested_config_without_initialising_loomweave_dir() {
         .success();
 
     assert!(
-        !dir.path().join(".loomweave").exists(),
-        "--codex should not create .loomweave/"
+        !dir.path().join(".weft/loomweave").exists(),
+        "--codex should not create .weft/loomweave/"
     );
     let raw = fs::read_to_string(&codex_config).unwrap();
     assert!(

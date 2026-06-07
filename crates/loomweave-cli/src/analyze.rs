@@ -333,7 +333,7 @@ pub(crate) struct AnalyzeOptions {
 ///
 /// # Errors
 ///
-/// Returns an error if the target directory does not exist, has no `.loomweave/`
+/// Returns an error if the target directory does not exist, has no `.weft/loomweave/`
 /// directory, if analyze config is invalid, or if the writer actor fails to
 /// start or process commands.
 #[allow(clippy::too_many_lines)]
@@ -347,10 +347,10 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let project_root = project_path
         .canonicalize()
         .with_context(|| format!("cannot canonicalise path {}", project_path.display()))?;
-    let loomweave_dir = project_root.join(".loomweave");
+    let loomweave_dir = loomweave_core::store::store_dir(&project_root);
     if !loomweave_dir.exists() {
         bail!(
-            "{} has no .loomweave/ directory. Run `loomweave install` first.",
+            "{} has no .weft/loomweave/ store. Run `loomweave install` first.",
             project_root.display()
         );
     }
@@ -3171,7 +3171,7 @@ async fn populate_semantic_embeddings(
 
     let conn = Connection::open(db_path)
         .with_context(|| format!("open Loomweave database {}", db_path.display()))?;
-    let store = EmbeddingStore::open_in_loomweave_dir(project_root)
+    let store = EmbeddingStore::open_in_store_dir(project_root)
         .map_err(|err| anyhow::anyhow!("{err}"))
         .context("open semantic embedding sidecar")?;
     let pending = semantic_embedding_candidates(&conn, &store, &model_id, &mut stats)?;
@@ -5101,10 +5101,10 @@ fn unresolved_call_site_key(
 
 /// Skip-list for directory names during the source walk.
 ///
-/// Sprint 1 conservative set: VCS directories, loomweave's own state, and
+/// Sprint 1 conservative set: VCS directories, the shared .weft/ runtime state, and
 /// common virtual-environment directories.
 const SKIP_DIRS: &[&str] = &[
-    ".loomweave",
+    ".weft",
     ".git",
     ".hg",
     ".svn",
@@ -6134,8 +6134,8 @@ mod tests {
         use loomweave_storage::{EmbeddingKey, EmbeddingStore, pragma, schema};
 
         let project = tempfile::tempdir().unwrap();
-        std::fs::create_dir(project.path().join(".loomweave")).unwrap();
-        let db_path = project.path().join(".loomweave/loomweave.db");
+        std::fs::create_dir_all(loomweave_core::store::store_dir(project.path())).unwrap();
+        let db_path = loomweave_core::store::db_path(project.path());
         let mut conn = rusqlite::Connection::open(&db_path).unwrap();
         pragma::apply_write_pragmas(&conn).unwrap();
         schema::apply_migrations(&mut conn).unwrap();
@@ -6150,7 +6150,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let store = EmbeddingStore::open_in_loomweave_dir(project.path()).unwrap();
+        let store = EmbeddingStore::open_in_store_dir(project.path()).unwrap();
         store
             .upsert(
                 &EmbeddingKey {
@@ -6203,8 +6203,8 @@ mod tests {
         use loomweave_storage::{pragma, schema};
 
         let project = tempfile::tempdir().unwrap();
-        std::fs::create_dir(project.path().join(".loomweave")).unwrap();
-        let db_path = project.path().join(".loomweave/loomweave.db");
+        std::fs::create_dir_all(loomweave_core::store::store_dir(project.path())).unwrap();
+        let db_path = loomweave_core::store::db_path(project.path());
         let mut conn = rusqlite::Connection::open(&db_path).unwrap();
         pragma::apply_write_pragmas(&conn).unwrap();
         schema::apply_migrations(&mut conn).unwrap();

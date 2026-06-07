@@ -158,7 +158,7 @@ fn doctor_fix_preserves_sibling_mcp_server() {
 #[test]
 fn doctor_fix_repairs_missing_three_way_integration_bindings() {
     let dir = tempfile::tempdir().unwrap();
-    let filigree_dir = dir.path().join(".filigree");
+    let filigree_dir = dir.path().join(".weft").join("filigree");
     fs::create_dir_all(&filigree_dir).unwrap();
     fs::write(filigree_dir.join("ephemeral.port"), "8749\n").unwrap();
 
@@ -270,7 +270,7 @@ fn doctor_json_reports_stable_check_shape_for_healthy_install() {
 #[test]
 fn doctor_fix_json_reports_fixed_config_bindings() {
     let dir = tempfile::tempdir().unwrap();
-    let filigree_dir = dir.path().join(".filigree");
+    let filigree_dir = dir.path().join(".weft").join("filigree");
     fs::create_dir_all(&filigree_dir).unwrap();
     fs::write(filigree_dir.join("ephemeral.port"), "8749\n").unwrap();
     install(
@@ -315,7 +315,7 @@ fn doctor_fix_json_reports_fixed_config_bindings() {
 #[test]
 fn doctor_reports_missing_hook_and_mcp_and_prints_index_block() {
     let dir = tempfile::tempdir().unwrap();
-    // Skill flags install ONLY the skill packs (no .loomweave/, no hook, no mcp).
+    // Skill flags install ONLY the skill packs (no .weft/loomweave/, no hook, no mcp).
     install(&["install", "--skills", "--codex-skills"], dir.path());
 
     let (code, out) = doctor(dir.path(), false);
@@ -566,7 +566,7 @@ fn doctor_reports_published_ephemeral_port() {
     let dir = tempfile::tempdir().unwrap();
     install(&["install", "--all"], dir.path());
     // Simulate a live serve having published its port.
-    let loomweave_dir = dir.path().join(".loomweave");
+    let loomweave_dir = dir.path().join(".weft/loomweave");
     std::fs::create_dir_all(&loomweave_dir).unwrap();
     std::fs::write(loomweave_dir.join("ephemeral.port"), "9876\n").unwrap();
 

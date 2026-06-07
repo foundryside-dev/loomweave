@@ -69,7 +69,7 @@ serve:
   http:
     enabled: false
     # The read-API port is auto-selected per project (deterministic, with an
-    # ephemeral fallback) and published to .loomweave/ephemeral.port while
+    # ephemeral fallback) and published to .weft/loomweave/ephemeral.port while
     # serving. Set `bind:` explicitly only to pin a fixed port (ADR-044).
 ";
 

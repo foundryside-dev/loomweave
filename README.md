@@ -81,7 +81,7 @@ loomweave analyze
 loomweave serve
 ```
 
-`loomweave install` is the one-step agent setup path: it initialises `.loomweave/`,
+`loomweave install` is the one-step agent setup path: it initialises `.weft/loomweave/`,
 installs the `loomweave-workflow` skill for Claude Code and Codex, writes Claude
 Code MCP config, upserts Codex MCP config, and installs the SessionStart hook.
 Use component flags such as `--claude-code`, `--codex`, `--skills`,
@@ -118,7 +118,7 @@ federation doctrine that anchors every cross-product decision is in
 
 ## Storage and operations
 
-Loomweave keeps project state in a local `.loomweave/` directory.
+Loomweave keeps project state in a local `.weft/loomweave/` directory.
 The local-first storage model, the no-NFS constraint, the no-double-analyze
 constraint (fs2 advisory lock), and the backup/restore procedure are
 documented in

@@ -880,7 +880,7 @@ CREATE INDEX ix_sei_lineage_sei ON sei_lineage(sei);
 - **Consult-mode writes** (summary cache, session state) during `loomweave serve` are dispatched on the same writer actor; they interleave with analyze-time writes if a user starts `loomweave analyze` against a running `loomweave serve` (not recommended but survivable). Writes are applied in arrival order; no starvation because consult writes are tiny and sparse.
 - **Readers** (plugin processes, MCP tool calls, HTTP API handlers, the markdown renderer) open read-only `rusqlite` connections from a `deadpool-sqlite` pool (configurable max: default 16). WAL lets them read against the committed snapshot without blocking writers.
 - **Checkpointing**: truncate-mode checkpoint issued after each 10 analyze-transactions or after `loomweave analyze` completes, whichever comes first.
-- **Operational posture (v0.1)**: running `loomweave analyze` and `loomweave serve` against the same `.loomweave/loomweave.db` simultaneously is supported but `loomweave serve` will observe stale read-snapshots until the analyze finishes and checkpoint completes. `loomweave serve` emits a `LMWV-INFRA-STALE-SNAPSHOT` finding when this is detected. Users wanting zero-stale reads during long analyze runs should prefer the "shadow DB + atomic swap" pattern (analyze writes to `.loomweave/loomweave.db.new`, atomic rename on completion) — available via `loomweave analyze --shadow-db` flag.
+- **Operational posture (v0.1)**: running `loomweave analyze` and `loomweave serve` against the same `.weft/loomweave/loomweave.db` simultaneously is supported but `loomweave serve` will observe stale read-snapshots until the analyze finishes and checkpoint completes. `loomweave serve` emits a `LMWV-INFRA-STALE-SNAPSHOT` finding when this is detected. Users wanting zero-stale reads during long analyze runs should prefer the "shadow DB + atomic swap" pattern (analyze writes to `.weft/loomweave/loomweave.db.new`, atomic rename on completion) — available via `loomweave analyze --shadow-db` flag.
 
 **Why not a single write transaction for the whole batch**: long transactions pin the WAL and prevent checkpoint; WAL growth is unbounded; readers pinned to the pre-analyse snapshot can't advance; SQLite `database is locked` errors surface to consult-mode writes. Per-batch transactions are the industry-standard posture for this workload.
 
@@ -898,7 +898,7 @@ CREATE INDEX ix_sei_lineage_sei ON sei_lineage(sei);
 ### File layout
 
 ```
-<project>/.loomweave/
+<project>/.weft/loomweave/
     loomweave.db              # main store (WAL files beside it)
     config.json             # internal state: schema version, last run IDs
     loomweave.log             # structured log
@@ -915,7 +915,7 @@ CREATE INDEX ix_sei_lineage_sei ON sei_lineage(sei);
     defaults.yaml           # default policy overrides
 ```
 
-`.loomweave/` is checked into git (consistent with Filigree's pattern and with the "shared analysis state" principle). SQLite files can diff poorly, so v0.1 ships **two features** for multi-developer teams to handle the committed DB:
+`.weft/loomweave/` is checked into git (consistent with Filigree's pattern and with the "shared analysis state" principle). SQLite files can diff poorly, so v0.1 ships **two features** for multi-developer teams to handle the committed DB:
 
 - `loomweave db export --textual <out_dir>` — emits a deterministic JSON tree: `entities.jsonl` (one entity per line, sorted by id), `edges.jsonl` (sorted by `(kind, from_id, to_id)`), `guidance.jsonl` (sorted by id), `findings.jsonl` (sorted by id). Summary cache is **excluded** (re-derivable on next run, and JSON-diffing thousands of LLM-generated briefings is not useful). Output is git-friendly: a one-entity change produces a one-line diff.
 - `loomweave db merge-helper <ours.db> <theirs.db> <base.db?> --output merged.db` — applied as a Git merge driver or manually during conflict resolution. Strategy: textual export of each side, deterministic union of entities/edges (last-writer-wins on conflicts keyed by `updated_at`), guidance-sheet conflict surfaced with a `CONFLICT` marker per affected sheet (human must resolve), summary cache cleared (will rebuild).
@@ -926,7 +926,7 @@ Users can opt out entirely: `loomweave.yaml:storage.commit_db: false` excludes t
 
 ```
 # .gitattributes
-.loomweave/loomweave.db merge=loomweave-db
+.weft/loomweave/loomweave.db merge=loomweave-db
 
 # .git/config (or per-developer)
 [merge "loomweave-db"]
@@ -936,10 +936,10 @@ Users can opt out entirely: `loomweave.yaml:storage.commit_db: false` excludes t
 
 With the driver registered, conflicting runs from two developers produce a deterministic merged DB at commit time; without it, operators resolve manually via `loomweave db export --textual` on both sides plus `loomweave db import --textual <merged_dir>`.
 
-**Git-commit caveats for `.loomweave/loomweave.db`**:
+**Git-commit caveats for `.weft/loomweave/loomweave.db`**:
 
 - LLM-derived content (briefings, guidance body text) lives in the DB and is therefore committed. Content derived from source files redacted by the pre-ingest secret scanner never reaches the LLM in the first place, so briefings don't contain secret material. Briefings that *describe* security-sensitive code (e.g., "this module is the JWT verifier") are fine to commit — they're public documentation.
-- `runs/<run_id>/log.jsonl` records raw LLM request/response bodies for audit. This log is **excluded** from git by default via `.loomweave/.gitignore` (`runs/*/log.jsonl`) because those bodies may contain source excerpts that are fine to ship to Anthropic but not appropriate to commit to a public repo. Users opting in to commit run logs must accept that posture explicitly.
+- `runs/<run_id>/log.jsonl` records raw LLM request/response bodies for audit. This log is **excluded** from git by default via `.weft/loomweave/.gitignore` (`runs/*/log.jsonl`) because those bodies may contain source excerpts that are fine to ship to Anthropic but not appropriate to commit to a public repo. Users opting in to commit run logs must accept that posture explicitly.
 - Operational rollouts where the DB is private-not-shared (single-developer experiments, pre-publication audits) can set `loomweave.yaml:storage.commit_db: false` and the DB is `.gitignore`'d instead.
 
 ### Migration strategy
@@ -1124,7 +1124,7 @@ These core-emitted rules are the ADR-013 audit surface. ADR-013 remains canonica
 
 | Rule | Severity | Category | Description | Remediation | ADR |
 |---|---|---|---|---|---|
-| `LMWV-SEC-SECRET-DETECTED` | ERROR | security | Pre-ingest secret scanner detected a credential pattern in a file slated for LLM dispatch. | Remove the secret, rotate the credential, or whitelist via `.loomweave/secrets-baseline.yaml` with a justification. | [ADR-013](../adr/ADR-013-pre-ingest-secret-scanner.md) |
+| `LMWV-SEC-SECRET-DETECTED` | ERROR | security | Pre-ingest secret scanner detected a credential pattern in a file slated for LLM dispatch. | Remove the secret, rotate the credential, or whitelist via `.weft/loomweave/secrets-baseline.yaml` with a justification. | [ADR-013](../adr/ADR-013-pre-ingest-secret-scanner.md) |
 | `LMWV-SEC-UNREDACTED-SECRETS-ALLOWED` | ERROR | security | Operator invoked `--allow-unredacted-secrets`; file content reached the LLM provider with secrets intact. | Audit override usage via `filigree list --rule-id=LMWV-SEC-UNREDACTED-SECRETS-ALLOWED --since 30d`. | [ADR-013](../adr/ADR-013-pre-ingest-secret-scanner.md) |
 | `LMWV-INFRA-SECRET-BASELINE-NO-JUSTIFICATION` | ERROR | infra | Baseline entry missing required `justification` field; entry not honoured. | Add a `justification` string explaining why the match is safe. | [ADR-013](../adr/ADR-013-pre-ingest-secret-scanner.md) |
 | `LMWV-INFRA-SECRET-BASELINE-MATCH` | INFO | infra | Baseline entry suppressed a scanner detection as an audit event. | None; informational and retained for `NFR-SEC-04` audit. | [ADR-013](../adr/ADR-013-pre-ingest-secret-scanner.md) |
@@ -1175,8 +1175,8 @@ $ loomweave analyze /home/john/elspeth
   Phase 6: subsystem (opus)          [████████████████]     43/43     0:06:18  $4.91
   Phase 7: cross-cutting (wardline ingest) ✓ (0.4s)
   Phase 8: emission
-    Catalog: .loomweave/catalog.json (4.1 MB)
-    Markdown: .loomweave/catalog/*.md (51 files)
+    Catalog: .weft/loomweave/catalog.json (4.1 MB)
+    Markdown: .weft/loomweave/catalog/*.md (51 files)
     Findings: 137 (127 facts, 10 defects)
     Filigree observations pushed: 2
   Done in 0:38:12, total cost $11.37
@@ -1452,11 +1452,11 @@ not the implementation contract for `/api/v1/_capabilities` or
 
 Some risks sit outside Loomweave's code but inside the operator's responsibility. These belong in the team's onboarding doc, not in the tool's runtime defences:
 
-- **Use project-scoped API keys, not personal ones, when `storage.commit_db: true`.** Briefings in `.loomweave/loomweave.db` were paid for by whoever ran `loomweave analyze`. A teammate pulling your committed DB benefits from LLM calls your personal key paid for. Use an Anthropic project / org key, not your personal key, when committing the DB.
+- **Use project-scoped API keys, not personal ones, when `storage.commit_db: true`.** Briefings in `.weft/loomweave/loomweave.db` were paid for by whoever ran `loomweave analyze`. A teammate pulling your committed DB benefits from LLM calls your personal key paid for. Use an Anthropic project / org key, not your personal key, when committing the DB.
 - **Protect non-loopback HTTP exposure outside Loomweave.** If operators bind the
   ADR-014 HTTP read API outside loopback, place an authenticated reverse proxy
   or equivalent access-control layer in front of it.
-- **Review `.loomweave/.gitignore` before first commit.** The default excludes `runs/*/log.jsonl` (raw LLM request/response bodies); if operators opt into committing run logs for audit, they accept that source excerpts sent to Anthropic ship to the repo. That's a choice, not an oversight — but it must be a deliberate one.
+- **Review `.weft/loomweave/.gitignore` before first commit.** The default excludes `runs/*/log.jsonl` (raw LLM request/response bodies); if operators opt into committing run logs for audit, they accept that source excerpts sent to Anthropic ship to the repo. That's a choice, not an oversight — but it must be a deliberate one.
 
 ### Audit-surface finding IDs
 
@@ -1609,7 +1609,7 @@ Every failure produces either a finding or a run-stats entry. Rule-ID namespacin
 1. Single-binary: Linux (x86_64, ARM64), macOS (x86_64, ARM64), Windows (x86_64); no dynamic linking beyond libc.
 2. Python plugin: `pip install loomweave-plugin-python`; Python 3.11+.
 3. Store survives unclean shutdown (SIGKILL during analysis).
-4. `.loomweave/loomweave.db` is git-committable and round-trips across machines.
+4. `.weft/loomweave/loomweave.db` is git-committable and round-trips across machines.
 
 **Ecosystem**:
 
@@ -1649,7 +1649,7 @@ The table below is a navigation aid for implementers: it maps each ADR to the se
 | ADR-002 | Plugin transport: Content-Length framed JSON-RPC 2.0 subprocess | §1 |
 | ADR-003 | Entity ID scheme: symbolic canonical-name; file path as property; EntityAlias v0.2 | §2 |
 | ADR-004 | Finding-exchange format: Filigree-native intake; `metadata.loomweave.*` nesting | §2, §7 |
-| ADR-005 | `.loomweave/` git-committable by default | §3 |
+| ADR-005 | `.weft/loomweave/` git-committable by default | §3 |
 | [ADR-006](../adr/ADR-006-clustering-algorithm.md), [ADR-032](../adr/ADR-032-weighted-components-clustering-fallback.md) | Clustering algorithm: Leiden with weighted-components fallback | §4, §5 |
 | [ADR-007](../adr/ADR-007-summary-cache-key.md) | Summary cache key design and invalidation | §4 |
 | ADR-008 | Superseded by ADR-014 | §7, §9 |
@@ -1732,7 +1732,7 @@ For v0.1 through at least v0.3, each tool's store remains its own concern. Revis
 | **Knowledge basis** | EntityBriefing field indicating the evidence class a briefing rests on: `static_only`, `runtime_informed`, or `human_verified`. |
 | **Content-Length framing** | JSON-RPC message framing used by the plugin protocol — the same mechanism LSP uses. `Content-Length: <n>\r\n\r\n<json>`. Required for binary-safe streams and crash-resumability. See §1. |
 | **Canonical qualified name** | Plugin-language-native fully-qualified identifier used in entity IDs. Python example: `auth.tokens.TokenManager` (with `src/` prefix stripped), not `src/auth/tokens.py::TokenManager`. |
-| **Shadow DB** | Operational posture where `loomweave analyze` writes to `.loomweave/loomweave.db.new` and atomic-renames on completion; zero impact on read-snapshot of an already-running `loomweave serve`. Available via `loomweave analyze --shadow-db`. |
+| **Shadow DB** | Operational posture where `loomweave analyze` writes to `.weft/loomweave/loomweave.db.new` and atomic-renames on completion; zero impact on read-snapshot of an already-running `loomweave serve`. Available via `loomweave analyze --shadow-db`. |
 | **Pre-ingest redaction** | Secret-scanner pass (`detect-secrets` or equivalent) executed before any file content reaches the LLM provider; unredacted hits block LLM dispatch for that file. See §8, System-design §10. |
 | **Suite bootstrap** | The set of Filigree-side and Wardline-side changes Loomweave v0.1 requires as prerequisites. Not "integration with existing capabilities" but "new features in sibling tools." Documented in §9. |
 | **`metadata` extension slot** | Filigree's scan-result ingest preserves a per-finding `metadata` dict verbatim. Loomweave's extension fields (`kind`, `confidence`, `related_entities`, internal-severity preservation, etc.) nest under `metadata.loomweave.*`; Wardline's SARIF property-bag keys nest under `metadata.wardline_properties.*`. Top-level unknown keys are silently dropped by Filigree. |
@@ -1744,7 +1744,7 @@ For v0.1 through at least v0.3, each tool's store remains its own concern. Revis
 | **Entity-resolve endpoint** | `GET /api/v1/entities/resolve?scheme=&value=` — exposes Loomweave's identity-translation layer as a public API so sibling tools can look up Loomweave entity IDs from their native schemes without embedding Loomweave's ID format. See §7. |
 | **Capability probe / compat report** | At `loomweave analyze` startup, Loomweave probes Filigree and Wardline capabilities and emits one `LMWV-INFRA-SUITE-COMPAT-REPORT` finding summarising what's present and what's degraded. See System-design §11. |
 | **Textual DB export** | `loomweave db export --textual` — deterministic JSON-lines dump of entities, edges, guidance, findings (summary cache excluded). Enables git-friendly diffs and multi-developer merge resolution on the committed SQLite database. See §3. |
-| **DB merge-helper** | `loomweave db merge-helper` — Git merge driver that resolves `.loomweave/loomweave.db` conflicts deterministically: union entities/edges, last-writer-wins by `updated_at`, guidance conflicts surfaced for manual resolution, cache cleared. See §3. |
+| **DB merge-helper** | `loomweave db merge-helper` — Git merge driver that resolves `.weft/loomweave/loomweave.db` conflicts deterministically: union entities/edges, last-writer-wins by `updated_at`, guidance conflicts surfaced for manual resolution, cache cleared. See §3. |
 | **Triage-state feedback** | Mechanism by which Filigree's suppression and acknowledgement reasons surface inside Loomweave briefings as operator-acknowledged evidence or synthetic risk entries. Read-only on Loomweave's side. |
 | **`first_seen_commit` / `last_seen_commit`** | Entity-level provenance: the git SHA of the first run to observe an entity and of the most recent run to still observe it. Enables point-in-time queries without re-running analysis. |
 
@@ -1843,7 +1843,7 @@ Revision 5 (2026-04-17) restructures the single design document into a three-lay
 |---|---|---|
 | Gap 1: Triage state has no path back into briefings | Read-only feedback loop in briefing composition; operator-acknowledged evidence / synthetic risk entries; `guidance_fingerprint` includes acknowledged finding IDs | System-design §7 Composition, System-design §3 EntityBriefing |
 | Gap 2: Degraded-mode matrix incomplete (combinations & version skew) | Capability-negotiation probe at `loomweave analyze` startup; single `LMWV-INFRA-SUITE-COMPAT-REPORT` finding summarising all probe results; per-component fallback table covers pre-flag Filigree, REGISTRY additive skew, SARIF property-bag removal | System-design §11 |
-| Gap 3: SQLite merge conflicts on committed `.loomweave/loomweave.db` | Promoted `loomweave db export --textual` to v0.1; added `loomweave db merge-helper` with git-merge-driver integration | §3 |
+| Gap 3: SQLite merge conflicts on committed `.weft/loomweave/loomweave.db` | Promoted `loomweave db export --textual` to v0.1; added `loomweave db merge-helper` with git-merge-driver integration | §3 |
 | Gap 4: No story for entity deletion between runs | `LMWV-FACT-ENTITY-DELETED` emitted at Phase 7 via entity-set diff; `LMWV-FACT-GUIDANCE-ORPHAN` for affected sheets; cache invalidation on deletion | §5, System-design §6 |
 | Leverage 1: Loomweave as cross-tool identity oracle | New `GET /api/v1/entities/resolve?scheme=&value=` endpoint; covers wardline_qualname, wardline_exception_location, file_path, sarif_logical_location | §7 |
 | Leverage 2: Subsystem-tier-mixing rule | `LMWV-FACT-TIER-SUBSYSTEM-MIXING` and `LMWV-FACT-SUBSYSTEM-TIER-UNANIMOUS` added to Phase 7; unique-to-Loomweave structural signal | §5 |

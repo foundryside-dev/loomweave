@@ -120,8 +120,8 @@ subsystem_signature() {
 run_analyze "$PROJECT_A"
 run_analyze "$PROJECT_B"
 
-DB_A="$PROJECT_A/.loomweave/loomweave.db"
-DB_B="$PROJECT_B/.loomweave/loomweave.db"
+DB_A="$PROJECT_A/.weft/loomweave/loomweave.db"
+DB_B="$PROJECT_B/.weft/loomweave/loomweave.db"
 
 log "verifying subsystem rows ..."
 SUBSYSTEM_COUNT=$(sqlite3 "$DB_A" "SELECT COUNT(*) FROM entities WHERE kind = 'subsystem';")
@@ -174,7 +174,7 @@ from pathlib import Path
 
 loomweave_bin = Path(sys.argv[1])
 project_dir = Path(sys.argv[2])
-conn = sqlite3.connect(project_dir / ".loomweave" / "loomweave.db")
+conn = sqlite3.connect(project_dir / ".weft" / "loomweave" / "loomweave.db")
 subsystem_id = conn.execute(
     "SELECT id FROM entities WHERE kind = 'subsystem' ORDER BY id LIMIT 1"
 ).fetchone()[0]

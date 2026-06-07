@@ -91,7 +91,7 @@ PYRIGHT_CALL_TIMEOUT_SECS = 5.0
 PYRIGHT_FILE_TIMEOUT_SECS = 3.0
 STDERR_TAIL_LIMIT = 65536
 PYRIGHT_EXCLUDE_PATTERNS = [
-    "**/.loomweave/**",
+    "**/.weft/**",
     "**/.git/**",
     "**/.hg/**",
     "**/.svn/**",
@@ -100,7 +100,7 @@ PYRIGHT_EXCLUDE_PATTERNS = [
     "**/__pycache__/**",
     "**/node_modules/**",
 ]
-PROJECT_LOCAL_EXTERNAL_DIRS = {".loomweave", ".git", ".hg", ".svn", ".jj", ".venv", "node_modules"}
+PROJECT_LOCAL_EXTERNAL_DIRS = {".weft", ".git", ".hg", ".svn", ".jj", ".venv", "node_modules"}
 
 
 if TYPE_CHECKING:

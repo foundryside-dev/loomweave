@@ -124,10 +124,10 @@ fi
 cd corpus
 
 if "$LOOMWEAVE_BIN" install >/dev/null 2>"$WORK_DIR/install.err"; then
-    if [ -f .loomweave/loomweave.db ]; then
-        record "3" "PASS" ".loomweave/loomweave.db created against psf/requests@$CORPUS_REF"
+    if [ -f .weft/loomweave/loomweave.db ]; then
+        record "3" "PASS" ".weft/loomweave/loomweave.db created against psf/requests@$CORPUS_REF"
     else
-        record "3" "FAIL" "install reported success but .loomweave/loomweave.db missing"
+        record "3" "FAIL" "install reported success but .weft/loomweave/loomweave.db missing"
     fi
 else
     record "3" "FAIL" "loomweave install exited non-zero: $(tr '\n' ' ' < "$WORK_DIR/install.err")"
@@ -137,8 +137,8 @@ fi
 
 log "running loomweave analyze ..."
 if "$LOOMWEAVE_BIN" analyze . >"$WORK_DIR/analyze1.out" 2>"$WORK_DIR/analyze1.err"; then
-    ENTITY_COUNT_1="$(sqlite3 .loomweave/loomweave.db 'SELECT COUNT(*) FROM entities WHERE kind != "subsystem"' || echo 0)"
-    EDGE_COUNT_1="$(sqlite3 .loomweave/loomweave.db 'SELECT COUNT(*) FROM edges' || echo 0)"
+    ENTITY_COUNT_1="$(sqlite3 .weft/loomweave/loomweave.db 'SELECT COUNT(*) FROM entities WHERE kind != "subsystem"' || echo 0)"
+    EDGE_COUNT_1="$(sqlite3 .weft/loomweave/loomweave.db 'SELECT COUNT(*) FROM edges' || echo 0)"
     if [ "$ENTITY_COUNT_1" -gt 0 ]; then
         record "4.1" "PASS" "analyze ok; entities=$ENTITY_COUNT_1 edges=$EDGE_COUNT_1"
     else
@@ -191,7 +191,7 @@ def tool_call(proc, rid, name, args):
     return read_frame(proc)
 
 # Pick a real entity from the analyzed corpus to test against.
-conn = sqlite3.connect(project_dir / ".loomweave" / "loomweave.db")
+conn = sqlite3.connect(project_dir / ".weft" / "loomweave" / "loomweave.db")
 ent = conn.execute("""
     SELECT id, kind, name FROM entities
     WHERE kind = 'function' AND name = 'get'
@@ -255,7 +255,7 @@ try:
                           if matches else f"FAIL: find_entity('{pattern}') returned empty (envelope: {fe_body})")
 
     # 4.3(b) callers_of — find a function with at least one caller.
-    conn2 = sqlite3.connect(project_dir / ".loomweave" / "loomweave.db")
+    conn2 = sqlite3.connect(project_dir / ".weft" / "loomweave" / "loomweave.db")
     row = conn2.execute("""
         SELECT e.id, COUNT(*) AS c FROM entities e
         JOIN edges ed ON ed.to_id = e.id
@@ -328,8 +328,8 @@ fi
 
 log "running loomweave analyze (re-run for idempotency) ..."
 if "$LOOMWEAVE_BIN" analyze . >"$WORK_DIR/analyze2.out" 2>"$WORK_DIR/analyze2.err"; then
-    ENTITY_COUNT_2="$(sqlite3 .loomweave/loomweave.db 'SELECT COUNT(*) FROM entities WHERE kind != "subsystem"')"
-    EDGE_COUNT_2="$(sqlite3 .loomweave/loomweave.db 'SELECT COUNT(*) FROM edges')"
+    ENTITY_COUNT_2="$(sqlite3 .weft/loomweave/loomweave.db 'SELECT COUNT(*) FROM entities WHERE kind != "subsystem"')"
+    EDGE_COUNT_2="$(sqlite3 .weft/loomweave/loomweave.db 'SELECT COUNT(*) FROM edges')"
     if [ "$ENTITY_COUNT_2" = "$ENTITY_COUNT_1" ] && [ "$EDGE_COUNT_2" = "$EDGE_COUNT_1" ]; then
         record "5" "PASS" "idempotent: entities=$ENTITY_COUNT_2 edges=$EDGE_COUNT_2 unchanged"
     else
@@ -351,8 +351,8 @@ ANALYZE_3_EXIT=0
 "$LOOMWEAVE_BIN" analyze . >"$WORK_DIR/analyze3.out" 2>"$WORK_DIR/analyze3.err" || ANALYZE_3_EXIT=$?
 
 # Expected: soft-failure (exit 78) or success with briefing_blocked recorded.
-BLOCKED_COUNT="$(sqlite3 .loomweave/loomweave.db "SELECT COUNT(*) FROM entities WHERE json_extract(properties, '\$.briefing_blocked') IS NOT NULL" 2>/dev/null || echo 0)"
-FINDING_COUNT="$(sqlite3 .loomweave/loomweave.db "SELECT COUNT(*) FROM findings WHERE rule_id = 'LMWV-SEC-SECRET-DETECTED'" 2>/dev/null || echo 0)"
+BLOCKED_COUNT="$(sqlite3 .weft/loomweave/loomweave.db "SELECT COUNT(*) FROM entities WHERE json_extract(properties, '\$.briefing_blocked') IS NOT NULL" 2>/dev/null || echo 0)"
+FINDING_COUNT="$(sqlite3 .weft/loomweave/loomweave.db "SELECT COUNT(*) FROM findings WHERE rule_id = 'LMWV-SEC-SECRET-DETECTED'" 2>/dev/null || echo 0)"
 
 if [ "$BLOCKED_COUNT" -gt 0 ] && [ "$FINDING_COUNT" -gt 0 ]; then
     record "6" "PASS" "post-plant: $BLOCKED_COUNT blocked entities, $FINDING_COUNT secret findings (analyze exit $ANALYZE_3_EXIT)"
@@ -368,7 +368,7 @@ fi
 
 if [ "$BLOCKED_COUNT" -gt 0 ]; then
     log "verifying blocked-entity summary refusal ..."
-    BLOCKED_ID="$(sqlite3 .loomweave/loomweave.db "SELECT id FROM entities WHERE json_extract(properties, '\$.briefing_blocked') IS NOT NULL LIMIT 1")"
+    BLOCKED_ID="$(sqlite3 .weft/loomweave/loomweave.db "SELECT id FROM entities WHERE json_extract(properties, '\$.briefing_blocked') IS NOT NULL LIMIT 1")"
     if [ -n "$BLOCKED_ID" ]; then
         set +e
         python3 - "$LOOMWEAVE_BIN" "$WORK_DIR/corpus" "$BLOCKED_ID" "$WORK_DIR/step7.json" <<'PY'

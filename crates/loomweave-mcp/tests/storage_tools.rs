@@ -38,8 +38,8 @@ use serde_json::{Value, json};
 
 fn open_project() -> (tempfile::TempDir, std::path::PathBuf) {
     let project = tempfile::tempdir().expect("temp project");
-    let loomweave_dir = project.path().join(".loomweave");
-    std::fs::create_dir(&loomweave_dir).expect("create .loomweave");
+    let loomweave_dir = project.path().join(".weft/loomweave");
+    std::fs::create_dir_all(&loomweave_dir).expect("create .loomweave");
     let db_path = loomweave_dir.join("loomweave.db");
     let mut conn = Connection::open(&db_path).expect("open sqlite");
     pragma::apply_write_pragmas(&conn).expect("write pragmas");
@@ -1198,7 +1198,7 @@ async fn issues_for_reports_resolved_endpoint_and_result_kind() {
     // endpoint, and distinguishes reachable-but-empty (no_matches) from a
     // populated result (matched) — without the agent curling ports by hand.
     let (project, db_path) = open_project();
-    let filigree_dir = project.path().join(".filigree");
+    let filigree_dir = project.path().join(".weft").join("filigree");
     fs::create_dir_all(&filigree_dir).unwrap();
     fs::write(filigree_dir.join("ephemeral.port"), "8542").unwrap();
     let config = FiligreeConfig {
@@ -4865,7 +4865,7 @@ async fn project_status_reports_counts_latest_run_and_plugins() {
         result["db_path"]
             .as_str()
             .unwrap()
-            .ends_with(".loomweave/loomweave.db")
+            .ends_with(".weft/loomweave/loomweave.db")
     );
     assert_eq!(result["git_sha"], "abc123status");
     // A bare ServerState carries no diagnostics context.
@@ -5091,10 +5091,10 @@ async fn project_status_skipped_run_keeps_prior_completed_index_visible() {
 
 #[tokio::test]
 async fn project_status_resolves_live_filigree_endpoint() {
-    // AC#3: the live ethereal port (.filigree/ephemeral.port) is reported as
+    // AC#3: the live ethereal port (.weft/filigree/ephemeral.port) is reported as
     // the resolution source, overriding the stale configured port.
     let (project, db_path) = open_project();
-    let filigree_dir = project.path().join(".filigree");
+    let filigree_dir = project.path().join(".weft").join("filigree");
     fs::create_dir_all(&filigree_dir).unwrap();
     fs::write(filigree_dir.join("ephemeral.port"), "8542").unwrap();
 
@@ -5155,7 +5155,7 @@ async fn project_status_filigree_falls_back_to_config_without_port_file() {
 #[tokio::test]
 async fn project_status_reports_loomweave_read_api_published_port() {
     // ADR-044: project_status surfaces the live read-API endpoint resolved from
-    // .loomweave/ephemeral.port (the second in-repo consumer of the resolver,
+    // .weft/loomweave/ephemeral.port (the second in-repo consumer of the resolver,
     // alongside doctor). No diagnostics context is needed — it resolves the
     // file at query time from the project root.
     let (project, db_path) = open_project();

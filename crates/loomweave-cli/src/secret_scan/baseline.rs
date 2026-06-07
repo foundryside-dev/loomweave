@@ -13,7 +13,7 @@ const BASELINE_NO_JUSTIFICATION: &str = "LMWV-INFRA-SECRET-BASELINE-NO-JUSTIFICA
 const BASELINE_MATCH: &str = "LMWV-INFRA-SECRET-BASELINE-MATCH";
 
 pub(super) fn load_for_scan(project_root: &Path) -> Result<(Baseline, Vec<PendingFinding>)> {
-    let path = project_root.join(".loomweave/secrets-baseline.yaml");
+    let path = loomweave_core::store::store_dir(project_root).join("secrets-baseline.yaml");
     match loomweave_scanner::load_baseline(&path) {
         Ok(baseline) => Ok((baseline, Vec::new())),
         Err(BaselineError::MissingJustifications { entries }) => Ok((

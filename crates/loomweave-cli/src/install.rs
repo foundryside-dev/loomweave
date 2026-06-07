@@ -1,16 +1,16 @@
-//! `loomweave install` — initialise .loomweave/ in the target directory.
+//! `loomweave install` — initialise .weft/loomweave/ in the target directory.
 //!
 //! Creates:
-//! - `.loomweave/loomweave.db`        (migrated)
-//! - `.loomweave/config.json`       (internal state stub)
-//! - `.loomweave/.gitignore`        (UQ-WP1-04 rules; ADR-005)
+//! - `.weft/loomweave/loomweave.db`        (migrated)
+//! - `.weft/loomweave/config.json`       (internal state stub)
+//! - `.weft/loomweave/.gitignore`        (UQ-WP1-04 rules; ADR-005)
 //! - `<path>/loomweave.yaml`        (user-edited config stub at project root;
 //!   see detailed-design.md §File layout)
 //!
 //! A bare `loomweave install` (no flags) does everything: init + MCP config +
-//! skills + hooks + local Weft integration bindings. If `.loomweave/` already
+//! skills + hooks + local Weft integration bindings. If `.weft/loomweave/` already
 //! exists, init is skipped and the idempotent components are still applied.
-//! Pass `--force` to wipe and reinitialise `.loomweave/`. Component flags and
+//! Pass `--force` to wipe and reinitialise `.weft/loomweave/`. Component flags and
 //! `--all` are still accepted for explicit partial installs.
 
 use std::fs;
@@ -100,7 +100,7 @@ pub enum InstallComponent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallPlan {
     /// Component flags without `--all`: apply the named components and do NOT
-    /// initialise `.loomweave/`. `from_components` only constructs this when at
+    /// initialise `.weft/loomweave/`. `from_components` only constructs this when at
     /// least one component is present.
     Components {
         claude_code: bool,
@@ -110,7 +110,7 @@ pub enum InstallPlan {
         hooks: bool,
         instructions: bool,
     },
-    /// No flags or `--all`: initialise `.loomweave/` + every integration.
+    /// No flags or `--all`: initialise `.weft/loomweave/` + every integration.
     All,
 }
 
@@ -135,7 +135,7 @@ impl InstallPlan {
         }
     }
 
-    /// Whether to initialise `.loomweave/` (the index). True for `All`.
+    /// Whether to initialise `.weft/loomweave/` (the index). True for `All`.
     #[must_use]
     pub fn init_loomweave(self) -> bool {
         matches!(self, Self::All)
@@ -204,7 +204,7 @@ impl InstallPlan {
 ///
 /// # Errors
 ///
-/// Returns an error if `.loomweave/` already exists without `--force`, if the
+/// Returns an error if `.weft/loomweave/` already exists without `--force`, if the
 /// target directory cannot be canonicalised, or if any filesystem or database
 /// operation fails.
 pub fn run(
@@ -285,23 +285,23 @@ fn validate_plan(plan: InstallPlan) -> Result<()> {
 }
 
 fn initialise_project(project_root: &Path, force: bool) -> Result<()> {
-    let loomweave_dir = project_root.join(".loomweave");
+    let loomweave_dir = loomweave_core::store::store_dir(project_root);
     let exists = loomweave_dir.exists();
-    // `All` (including naked install) treats an existing .loomweave/ as
+    // `All` (including naked install) treats an existing .weft/loomweave/ as
     // already-initialised and skips re-init, still applying the idempotent
-    // components. A non-directory .loomweave is not a usable index, so refuse
+    // components. A non-directory .weft/loomweave is not a usable index, so refuse
     // rather than "succeed" with skills/hooks atop a project with no loomweave.db.
     // Component-only installs skip this block.
     if exists && !force {
         if !loomweave_dir.is_dir() {
             bail!(
-                "found a non-directory at {}; expected an initialised .loomweave/ \
+                "found a non-directory at {}; expected an initialised .weft/loomweave/ \
                  directory. Remove it (or pass --force) and re-run.",
                 loomweave_dir.display()
             );
         }
         println!(
-            "{} already initialised; skipping .loomweave/ init (pass --force to recreate).",
+            "{} already initialised; skipping .weft/loomweave/ init (pass --force to recreate).",
             loomweave_dir.display()
         );
         return Ok(());
@@ -311,7 +311,7 @@ fn initialise_project(project_root: &Path, force: bool) -> Result<()> {
         // --force overwrite path.
         if !loomweave_dir.is_dir() {
             bail!(
-                "--force can only overwrite an existing .loomweave/ directory; \
+                "--force can only overwrite an existing .weft/loomweave/ directory; \
                  found non-directory at {}.",
                 loomweave_dir.display()
             );
@@ -323,7 +323,7 @@ fn initialise_project(project_root: &Path, force: bool) -> Result<()> {
     fs::create_dir_all(&loomweave_dir)
         .with_context(|| format!("mkdir {}", loomweave_dir.display()))?;
 
-    // Cleanup guard: if any post-mkdir step fails, remove .loomweave/ before
+    // Cleanup guard: if any post-mkdir step fails, remove .weft/loomweave/ before
     // bubbling the error so the next install attempt isn't blocked by the
     // "already exists" check (clarion-ed5017139f).
     if let Err(err) = populate_after_mkdir(&loomweave_dir, project_root) {
@@ -331,7 +331,7 @@ fn initialise_project(project_root: &Path, force: bool) -> Result<()> {
             tracing::warn!(
                 loomweave_dir = %loomweave_dir.display(),
                 error = %cleanup_err,
-                "install failed and cleanup of partial .loomweave/ also failed; \
+                "install failed and cleanup of partial .weft/loomweave/ also failed; \
                  manual rm -rf may be required"
             );
         }

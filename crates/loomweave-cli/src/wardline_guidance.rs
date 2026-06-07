@@ -371,7 +371,7 @@ fn collect_overlay_paths(dir: &Path, paths: &mut Vec<std::path::PathBuf>) -> Res
         if entry.file_type()?.is_dir() {
             if matches!(
                 file_name.as_ref(),
-                ".git" | ".loomweave" | ".venv" | "target" | "node_modules"
+                ".git" | ".weft" | ".venv" | "target" | "node_modules"
             ) {
                 continue;
             }

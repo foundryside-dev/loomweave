@@ -78,7 +78,7 @@ fn desired_bindings(project_root: &Path) -> DesiredBindings {
     );
     // ADR-044: seed the consumer's static target with this project's
     // deterministic read-API port. serve binds the same port (barring an
-    // ephemeral fallback), and the published .loomweave/ephemeral.port file
+    // ephemeral fallback), and the published .weft/loomweave/ephemeral.port file
     // overrides this at runtime once a consumer resolves consume-time.
     let port = loomweave_federation::loomweave_port::deterministic_port(project_root);
     let loomweave_url = format!("http://127.0.0.1:{port}");
@@ -90,8 +90,10 @@ fn desired_bindings(project_root: &Path) -> DesiredBindings {
 }
 
 fn live_filigree_base_url(project_root: &Path) -> Option<String> {
-    let raw = fs::read_to_string(project_root.join(".filigree/ephemeral.port")).ok()?;
-    let port: u16 = raw.trim().parse().ok()?;
+    // ADR-046: read Filigree's live port only from the consolidated
+    // `.weft/filigree/ephemeral.port` location, via the canonical resolver so the
+    // single-location policy stays in one place. No `.filigree/` legacy fallback.
+    let port = loomweave_federation::filigree_url::read_filigree_ephemeral_port(project_root)?;
     Some(format!("http://127.0.0.1:{port}"))
 }
 

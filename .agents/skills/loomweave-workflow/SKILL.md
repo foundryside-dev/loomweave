@@ -65,17 +65,26 @@ tell which case you're in.
 | `execution_paths_from` | bounded call paths out of an entity | `{"id": "<id>", "max_depth": 5}` |
 | `subsystem_members` | modules in a subsystem | `{"id": "core:subsystem:<hash>"}` |
 | `subsystem_of` | the subsystem an entity belongs to (reverse of `subsystem_members`) | `{"id": "<id>"}` |
-| `summary` | on-demand prose summary of one entity | `{"id": "<id>"}` |
+| `summary` † | on-demand prose summary of one entity | `{"id": "<id>"}` |
 | `summary_preview_cost` | preview a `summary` call's cache status / cost before spending | `{"id": "<id>"}` |
 | `issues_for` | Filigree issues attached to an entity | `{"id": "<id>"}` |
 | `source_for_entity` | an entity's exact indexed source span + bounded context | `{"id": "<id>", "context_lines": 10}` |
 | `call_sites` | the source line(s) behind a calls/references edge | `{"id": "<id>", "role": "caller"}` |
 | `orientation_pack` | one deterministic orientation packet for an entity or file:line (entity + context + neighbors + paths + issues + freshness) | `{"file": "rel/path.py", "line": 42}` |
 | `index_diff` | index freshness / drift vs. the current working tree | `{}` |
-| `analyze_start` | launch a background re-index, return its `run_id` | `{}` |
+| `analyze_start` † | launch a background re-index, return its `run_id` | `{}` |
 | `analyze_status` | poll a started analyze (queued/running/terminal + progress) | `{"run_id": "<id>"}` |
-| `analyze_cancel` | stop a running analyze (group-kills plugin + Pyright) | `{"run_id": "<id>"}` |
+| `analyze_cancel` † | stop a running analyze (group-kills plugin + Pyright) | `{"run_id": "<id>"}` |
 | `project_status` | index freshness, counts, LLM + Filigree status | `{}` |
+
+† **Write-gated.** `summary` (`entity_summary_get`), `analyze_start`,
+`analyze_cancel`, `propose_guidance`, and `promote_guidance` are registered only
+when `serve.mcp.enable_write_tools: true` is set in `loomweave.yaml` (default
+`false`). When the gate is off they do not appear in `tools/list` and a call
+returns a tool-disabled error — run `loomweave config check` to see the active
+policy. `summary` additionally requires the live LLM provider to be enabled
+(`llm_policy.enabled: true` + `allow_live_provider: true`), or it serves cache
+only.
 
 `callers_of` / `neighborhood` / `execution_paths_from` take a `confidence`
 tier — one of `"resolved"` (default; only high-confidence edges),
@@ -163,6 +172,7 @@ for team sharing). Agents may call `propose_guidance` to create a Filigree
 observation, but that proposal is inert until an operator promotes it through
 `promote_guidance` or the CLI. Promoted sheets reach you through `guidance_for`
 and are composed into `summary` prompts with a real guidance fingerprint.
+(`propose_guidance` and `promote_guidance` are write-gated — see the † note above.)
 
 ## Workflow: orient, then navigate
 

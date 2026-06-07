@@ -14,7 +14,7 @@ promoted sheets reach consult agents through the `guidance_for` MCP read tool
 and are also composed into auto-generated `summary` prompts with a real
 `guidance_fingerprint` cache key.
 
-All subcommands operate on `.loomweave/loomweave.db`, so **run `loomweave analyze`
+All subcommands operate on `.weft/loomweave/loomweave.db`, so **run `loomweave analyze`
 first** — the CLI errors if the database is absent.
 
 ## Authoring workflow (`REQ-GUIDANCE-03`)

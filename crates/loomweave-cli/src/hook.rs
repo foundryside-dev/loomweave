@@ -30,11 +30,11 @@ pub fn session_start(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What [`load_snapshot`] could establish about the `.loomweave/` index.
+/// What [`load_snapshot`] could establish about the `.weft/loomweave/` index.
 ///
 /// A *missing* db and a *present-but-unreadable* db are deliberately distinct:
 /// the missing case nudges toward `install` + `analyze`, but that advice is
-/// wrong for a present-but-corrupt/locked db (`install` refuses while `.loomweave/`
+/// wrong for a present-but-corrupt/locked db (`install` refuses while `.weft/loomweave/`
 /// exists; `analyze` cannot repair corruption). See [`print_snapshot`].
 enum SnapshotOutcome {
     /// Either the db file is absent (a `missing_db_snapshot()`) or it opened and
@@ -61,14 +61,14 @@ fn resync_skill_if_present(project_root: &Path) {
 }
 
 fn load_snapshot(project_root: &Path) -> SnapshotOutcome {
-    let db_path = project_root.join(".loomweave").join("loomweave.db");
+    let db_path = loomweave_core::store::db_path(project_root);
     if !db_path.exists() {
         return SnapshotOutcome::Ready(missing_db_snapshot());
     }
     let conn = match Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
         Ok(conn) => conn,
         Err(err) => {
-            tracing::warn!(error = %err, "open .loomweave/loomweave.db read-only failed");
+            tracing::warn!(error = %err, "open .weft/loomweave/loomweave.db read-only failed");
             return SnapshotOutcome::DbUnreadable;
         }
     };
@@ -78,7 +78,7 @@ fn load_snapshot(project_root: &Path) -> SnapshotOutcome {
     // db is classified as unreadable rather than silently reported as 0 counts
     // (which would otherwise print the wrong "no analysis yet" nudge).
     if let Err(err) = conn.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0)) {
-        tracing::warn!(error = %err, "probe read of .loomweave/loomweave.db failed");
+        tracing::warn!(error = %err, "probe read of .weft/loomweave/loomweave.db failed");
         return SnapshotOutcome::DbUnreadable;
     }
     let root = project_root
@@ -111,11 +111,11 @@ fn snapshot_outcome_lines(project_root: &Path, outcome: &SnapshotOutcome) -> Vec
     let snapshot = match outcome {
         SnapshotOutcome::Ready(snapshot) => snapshot,
         SnapshotOutcome::DbUnreadable => {
-            let db_path = project_root.join(".loomweave").join("loomweave.db");
+            let db_path = loomweave_core::store::db_path(project_root);
             lines.push(format!(
                 "Loomweave: an index exists at {} but could not be opened (it may be \
                  corrupt, locked by another process, or unreadable). Check permissions, \
-                 ensure no other loomweave process holds it, or remove .loomweave/ and re-run \
+                 ensure no other loomweave process holds it, or remove .weft/loomweave/ and re-run \
                  `loomweave install` + `loomweave analyze`. (Run with RUST_LOG=warn for the \
                  open error.)",
                 db_path.display()
@@ -125,7 +125,7 @@ fn snapshot_outcome_lines(project_root: &Path, outcome: &SnapshotOutcome) -> Vec
     };
     if !snapshot.db_present() {
         lines.push(format!(
-            "Loomweave: no index at {}/.loomweave/loomweave.db. \
+            "Loomweave: no index at {}/.weft/loomweave/loomweave.db. \
              Run `loomweave install --path {}` then `loomweave analyze {}`.",
             project_root.display(),
             project_root.display(),
