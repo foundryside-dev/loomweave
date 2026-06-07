@@ -1,4 +1,5 @@
 .filigree/
+.filigree.conf
 .weft/filigree/
 /target
 **/*.rs.bk
@@ -51,3 +52,6 @@ tests/e2e/external-operator-smoke-results-*.md
 AGENTS.md
 CLAUDE.md
 .agents/skills/filigree-workflow/SKILL.md
+
+# Filigree issue tracker
+.weft/
