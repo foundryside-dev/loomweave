@@ -265,6 +265,19 @@ pub enum DbCommand {
         #[arg(long)]
         force: bool,
     },
+
+    /// Checkpoint the WAL into `.weft/loomweave/loomweave.db` and truncate it,
+    /// so the on-disk file is a clean point-in-time artifact (Weft C-2).
+    ///
+    /// `analyze` already TRUNCATE-checkpoints at each committed run boundary;
+    /// this is the on-demand companion for after a `serve` session, whose
+    /// summary writes can grow the WAL between the PASSIVE `wal_autocheckpoint`
+    /// cadence and a backup / demo / snapshot.
+    Checkpoint {
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]

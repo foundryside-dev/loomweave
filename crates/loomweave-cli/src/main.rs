@@ -123,6 +123,7 @@ fn main() -> Result<()> {
                 path,
                 force,
             } => db::backup(&path, &output, force),
+            cli::DbCommand::Checkpoint { path } => db::checkpoint(&path),
         },
         cli::Command::Guidance { command } => guidance::run(command),
         cli::Command::Config { command } => config::run(command),
