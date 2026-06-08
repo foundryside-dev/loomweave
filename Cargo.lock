@@ -1174,6 +1174,7 @@ dependencies = [
  "loomweave-core",
  "proc-macro2",
  "quote",
+ "rusqlite",
  "serde_json",
  "syn",
  "tempfile",
