@@ -1,12 +1,23 @@
 //! Resolve the live Loomweave read-API base URL (ADR-044).
 //!
 //! The reference reader of the `.weft/loomweave/ephemeral.port` file contract and
-//! the twin of [`crate::filigree_url`]. Precedence (consumer-side): the
-//! published live port wins over a configured URL, which wins over nothing.
-//! (ADR-044's higher "explicit flag/env" precedence level is realized by each
-//! consumer's own CLI/env handling — e.g. Wardline's `--loomweave-url` — not by
-//! this library function.) Fail-soft throughout: a missing/corrupt file folds
-//! to the configured URL; absent both, `None` (federation simply degrades).
+//! the twin of [`crate::filigree_url`]. Resolution walks the C-9 §2.2
+//! precedence ladder (highest wins), reporting which rung produced the URL:
+//!   1. `WEFT_LOOMWEAVE_URL` env (a per-process operator override), verbatim;
+//!   2. `weft.toml [loomweave].url` (the operator's durable declaration),
+//!      verbatim — deliberately above on-disk discovery, since a remote
+//!      Loomweave has no local `ephemeral.port`;
+//!   3. the published `.weft/loomweave/ephemeral.port`;
+//!   4. the consumer's configured URL; else
+//!   5. nothing (`None`).
+//!
+//! This supersedes the earlier ADR-044 division of labour (where the explicit
+//! flag/env rung was each consumer's own job and this function read only the
+//! port file): the env + `weft.toml` rungs are now resolved here, with the env
+//! getter injected so the rung stays testable. A runtime flag (e.g. Wardline's
+//! `--loomweave-url`) still sits above all of these and is applied by the
+//! consumer before calling. Fail-soft throughout: a blank/absent/corrupt value
+//! at any rung falls through to the next (federation simply degrades).
 
 use std::path::Path;
 

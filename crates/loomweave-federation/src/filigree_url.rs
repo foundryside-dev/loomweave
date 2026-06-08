@@ -29,6 +29,13 @@
 //! file is fail-soft: any missing/corrupt/out-of-range content degrades to the
 //! configured URL.
 //!
+//! Precedence (C-9 §2.2, highest wins; see [`resolve_filigree_url`] for the
+//! full contract): `WEFT_FILIGREE_URL` env → `weft.toml [filigree].url` →
+//! `.weft/filigree/ephemeral.port` → configured `base_url`. The operator's
+//! durable env / `weft.toml` declarations (used verbatim) sit *above* on-disk
+//! port discovery — they name a Filigree that may be remote, with no local port
+//! file. Every rung is fail-soft.
+//!
 //! Scope: ethereal mode only. Filigree's `server` mode resolves through a
 //! home-directory global (`~/.config/filigree/server.json`); that path is not
 //! exercised here and is left as a known gap (clarion-318f1254eb tracks the

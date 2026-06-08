@@ -17,13 +17,27 @@
 //! member-private `[loomweave].store_dir` key (the canonical store-relocation key
 //! across the federation). `weft.toml` is **read-only** to Loomweave — install,
 //! doctor, and the CLI never write it (Gate `weft-eb3dee402f`: never add a writer
-//! to a shared multi-section file). Loomweave reads **only its own
-//! `[loomweave]` table**; every other top-level table (a sibling's section) is
+//! to a shared multi-section file). Loomweave reads its own `[loomweave]` table
+//! in full, plus the allowlisted cross-read `url` key from a sibling's table
+//! (see [`sibling_url`], C-9 §2.1); every other key in a sibling's section is
 //! ignored, so the file stays forward-compatible as siblings add their own keys.
 //!
 //! Resolution is fail-soft (C-9c, normative): a missing OR malformed `weft.toml`
 //! — parse error, wrong type, absent table/key, blank value — is treated as
 //! absent, and the built-in default applies. It is never a hard failure.
+//!
+//! ### Override location constraint (`store_dir`)
+//!
+//! The source-walk, secret-scan, and pyright skip-lists exclude the whole
+//! `.weft/` dotdir, so a store kept at the default (or any `store_dir` *inside*
+//! `.weft/`) is never walked, scanned, or type-checked as project source. A
+//! `store_dir` override is therefore **required to stay within `.weft/`, or else
+//! be placed entirely outside the analyzed project root.** An override pointing
+//! at a path *under the analyzed tree but outside `.weft/`* is a misconfiguration:
+//! `loomweave.db` and its WAL would be walked and secret-scanned as if they were
+//! source (clarion-6dd4b8bb85, ADR-046 Consequences). Auto-excluding an arbitrary
+//! override location was considered and rejected as not worth the coupling — the
+//! recommended override stays within `.weft/`.
 
 use std::path::{Path, PathBuf};
 
