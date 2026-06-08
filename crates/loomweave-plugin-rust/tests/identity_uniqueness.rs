@@ -24,6 +24,18 @@ fn corpus() -> Vec<(&'static str, &'static str, &'static str)> {
             "k.m",
             "#[cfg(unix)] fn f(){}\n#[cfg(windows)] fn f(){}\n",
         ),
+        // Two cfg-gated inherent impls of the SAME type defining the SAME
+        // method name. With all cfg variants visible (spec §5) both `go`
+        // methods are extracted; they stay distinct ONLY because the
+        // inherent-impl ordinal (`impl#<>#0` vs `impl#<>#1`) is in the key.
+        // Drop the ordinal and these two collapse to one locator — so this
+        // entry makes the ordinal discriminant a non-vacuous regression
+        // (the `fn a`/`fn b` entry above does not, since the names differ).
+        (
+            "k",
+            "k.m",
+            "struct Foo;\n#[cfg(unix)] impl Foo { fn go(&self){} }\n#[cfg(windows)] impl Foo { fn go(&self){} }\n",
+        ),
     ]
 }
 
@@ -60,6 +72,31 @@ fn duplicates(ids: &[String]) -> Vec<String> {
         .filter(|i| !seen.insert((*i).clone()))
         .cloned()
         .collect()
+}
+
+#[test]
+fn inherent_impl_ordinal_is_load_bearing() {
+    // Two cfg-gated inherent impls of `Foo`, each defining `go`. Both methods
+    // are extracted (all-cfg-visible); the ordinal in `impl#<>#N` is the only
+    // thing keeping their locators apart. Assert there are exactly two `go`
+    // methods and that they are distinct — a regression that goes red if the
+    // ordinal discriminant is ever removed.
+    let src = "struct Foo;\n#[cfg(unix)] impl Foo { fn go(&self){} }\n#[cfg(windows)] impl Foo { fn go(&self){} }\n";
+    let go_ids: Vec<String> = extract_file("k", "k.m", "/p/src/m.rs", src)
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["id"].as_str().map(ToOwned::to_owned))
+        .filter(|id| id.rsplit('.').next() == Some("go"))
+        .collect();
+    assert_eq!(
+        go_ids.len(),
+        2,
+        "expected both cfg-gated `go` methods, got {go_ids:?}"
+    );
+    assert_ne!(
+        go_ids[0], go_ids[1],
+        "ordinal discriminant collapsed two distinct methods to one locator"
+    );
 }
 
 #[test]
