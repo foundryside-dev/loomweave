@@ -424,6 +424,16 @@ fn two_no_cfg_inherent_impls_merge_to_one_entity_and_are_reorder_stable() {
 ```
 Add to `tests/identity_stability.rs`: reorder two same-signature inherent impls → **no** id (impl or method) changes. (This replaces the 1a `inherent_impl_ordinal_is_load_bearing` premise; under Option (b) the ordinal is gone, so update/remove that uniqueness-corpus entry and its `identity_uniqueness.rs` assertions — the cfg-twin `go` family stays, separated by `@cfg`.)
 
+Add to the `identity_uniqueness.rs` corpus a **cfg-gated trait-impl twin** family (latent 1a hole — the corpus never had it; becomes live data loss in 1b):
+```rust
+// Same trait, same type, mutually-exclusive cfgs — both `fmt` methods are
+// visible (spec §5). They stay distinct ONLY because the @cfg discriminant
+// applies to trait impls too (Task 5 dropped the `it.trait_.is_none()` guard).
+("k","k.m",
+ "struct Foo;\n#[cfg(unix)] impl std::fmt::Display for Foo { fn fmt(&self,_:&mut std::fmt::Formatter)->std::fmt::Result{Ok(())} }\n#[cfg(windows)] impl std::fmt::Display for Foo { fn fmt(&self,_:&mut std::fmt::Formatter)->std::fmt::Result{Ok(())} }\n"),
+```
+The existing `no_duplicate_ids_across_every_collision_family` test then locks it: both `impl` entities and both `fmt` methods must have distinct locators.
+
 - [ ] **Step 2: Run — expect FAIL** (`rust:impl:` entities absent; methods still parent to module).
 Run: `cargo nextest run -p loomweave-plugin-rust --test impl_entity`
 Expected: FAIL.
@@ -441,8 +451,14 @@ fn emit_impl(
     let type_q = format!("{module_path}.{}", self_ty_name(&it.self_ty));
     let disc = impl_disc_for(it);                       // ordinal-free (Option b)
     let mut impl_q = impl_qualname(&type_q, &disc);
-    if it.trait_.is_none() && impl_is_cfg_twin(&impl_q)
-        && let Some(pred) = cfg_predicate(&it.attrs) {
+    // cfg-twin discriminant applies to ANY cfg-gated twin impl, trait OR inherent.
+    // The 1a "trait path disambiguates" reasoning holds only for DIFFERENT traits;
+    // `#[cfg(unix)] impl Display for Foo` and `#[cfg(windows)] impl Display for Foo`
+    // share the path `Foo.impl[Display]` and would dedup to one entity, silently
+    // ON CONFLICT-dropping one `fmt`. `impl_is_cfg_twin` keys on the full `impl_q`
+    // (which includes `[Display]`), so it is correct for trait impls too — do NOT
+    // gate on `it.trait_.is_none()`.
+    if impl_is_cfg_twin(&impl_q) && let Some(pred) = cfg_predicate(&it.attrs) {
         impl_q.push_str(&cfg_discriminant(&pred));
     }
     let impl_id = build_id("impl", &impl_q)?;
@@ -516,10 +532,14 @@ fn resolves_unique_inproject_path_else_ambiguous_or_external() {
     // in-project trait -> Resolved (implements/imports share this)
     assert_eq!(r.resolve_trait_path("c_crate", "Tr"),
                Resolution::Resolved("rust:trait:c_crate.Tr".to_owned()));
-    // glob -> Ambiguous (never faked Resolved, H5)
-    assert_eq!(r.resolve_use_path("c_crate", "c_crate::a::*"), Resolution::Ambiguous);
+    // glob -> Ambiguous carrying the in-project module id (never faked Resolved, H5;
+    // never null — edges.to_id is NOT NULL, so Ambiguous MUST supply a real id)
+    assert_eq!(r.resolve_use_path("c_crate", "c_crate::a::*"),
+               Resolution::Ambiguous("rust:module:c_crate.a".to_owned()));
     // external -> External (Task 7/8 drop it per D1)
     assert_eq!(r.resolve_use_path("c_crate", "serde::Serialize"), Resolution::External);
+    // glob of an EXTERNAL module -> External (no in-project candidate to point at)
+    assert_eq!(r.resolve_use_path("c_crate", "serde::*"), Resolution::External);
 }
 ```
 
@@ -537,37 +557,56 @@ fn resolves_unique_inproject_path_else_ambiguous_or_external() {
 use crate::symbol_table::SymbolTable;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Resolution { Resolved(String), Ambiguous, External }
+pub enum Resolution {
+    Resolved(String),
+    /// Cannot be promoted to Resolved from syntax alone (glob / multi-kind), but
+    /// carries a REAL in-project candidate id — never null, because `edges.to_id`
+    /// is `NOT NULL`. A glob points at the in-project module; a multi-kind
+    /// collision points at the first id by sorted order (deterministic).
+    Ambiguous(String),
+    External,
+}
 
 pub struct Resolver<'t> { table: &'t SymbolTable }
 
 impl<'t> Resolver<'t> {
     #[must_use] pub fn new(table: &'t SymbolTable) -> Self { Self { table } }
 
-    /// Resolve a `use`/path string from `from_crate`. Glob/alias → Ambiguous;
-    /// a path whose leading segment names no in-project crate → External; a
-    /// path resolving to exactly one in-project id → Resolved.
+    /// Resolve a `use`/path string from `from_crate`. A glob over an in-project
+    /// module → Ambiguous(module id); a glob over an external module → External;
+    /// a path resolving to exactly one in-project id → Resolved; a same-qualname
+    /// multi-kind collision → Ambiguous(first id); otherwise External.
     #[must_use]
     pub fn resolve_use_path(&self, from_crate: &str, path: &str) -> Resolution {
-        if path.ends_with("::*") { return Resolution::Ambiguous; }
-        let dotted = normalize_path(from_crate, path);      // crate::/self::/super:: -> dotted crate-rooted
-        match self.table.ids_for_qualname(&dotted) {
-            []  => Resolution::External,
-            [one] => Resolution::Resolved(one.clone()),
-            _   => Resolution::Ambiguous,                    // same qualname, >1 kind
+        if let Some(prefix) = path.strip_suffix("::*") {
+            let dotted = normalize_path(from_crate, prefix);
+            // point a glob at its in-project module, if any; else it's external.
+            return self.table.ids_for_qualname(&dotted).iter()
+                .find(|id| id.starts_with("rust:module:"))
+                .map_or(Resolution::External, |m| Resolution::Ambiguous(m.clone()));
         }
+        let dotted = normalize_path(from_crate, path);      // crate::/self::/super:: -> dotted crate-rooted
+        resolve_ids(self.table.ids_for_qualname(&dotted), |_| true)
     }
     #[must_use]
     pub fn resolve_trait_path(&self, from_crate: &str, path: &str) -> Resolution {
         // trait paths resolve the same way but filter to rust:trait: ids.
         let dotted = normalize_path(from_crate, path);
-        let traits: Vec<&String> = self.table.ids_for_qualname(&dotted)
-            .iter().filter(|id| id.starts_with("rust:trait:")).collect();
-        match traits.as_slice() {
-            []  => Resolution::External,
-            [one] => Resolution::Resolved((*one).clone()),
-            _   => Resolution::Ambiguous,
-        }
+        resolve_ids(self.table.ids_for_qualname(&dotted), |id| id.starts_with("rust:trait:"))
+    }
+}
+
+/// Shared id-slice → Resolution: 0 → External, exactly 1 (after filter) →
+/// Resolved, >1 → Ambiguous(first by sorted order — deterministic for the
+/// golden snapshot). Inputs from `ids_for_qualname` are already sorted (BTreeMap
+/// value built in insert order; sort defensively).
+fn resolve_ids(ids: &[String], keep: impl Fn(&str) -> bool) -> Resolution {
+    let mut matched: Vec<&String> = ids.iter().filter(|id| keep(id)).collect();
+    matched.sort();
+    match matched.as_slice() {
+        [] => Resolution::External,
+        [one] => Resolution::Resolved((*one).clone()),
+        [first, ..] => Resolution::Ambiguous((*first).clone()),
     }
 }
 
@@ -619,7 +658,7 @@ The table is built at `initialize` then dropped (`main.rs:86-88` calls only `.le
 - [ ] **Step 2: Run — expect FAIL.** Run: `cargo nextest run -p loomweave-plugin-rust --test imports_edges`. Expected: FAIL.
 
 - [ ] **Step 3: Add an edges-aware extraction entry point.** Add `extract_file_with_edges(crate_name, module_path, file_path, src, resolver: &Resolver) -> Result<Extracted, syn::Error>` (the existing `extract_file_full` stays, calling the new one with a no-op resolver, so the identity/uniqueness/symbol-table callers are unaffected). In `walk_items`, collect `Item::Use` items, expand the use-tree to leaf paths, and for each call `resolver.resolve_use_path` → build an `imports` edge via `edges.rs` for `Resolved`/`Ambiguous`, drop `External`. The `imports` edge is **anchored** (carries the `use` statement's byte span) — capture `source_byte_start/end` from the `Item::Use` span (`source_range_of`).
-> `imports` confidence: `Resolved` carries the resolved `to_id`; `Ambiguous` carries a best-effort candidate `to_id` (a real in-project id — never null) per the existing Ambiguous contract. A glob with no single candidate but a resolvable module prefix points the Ambiguous edge at the module id.
+> `imports` confidence: `Resolved(id)` carries the resolved `to_id`; `Ambiguous(id)` carries the candidate id the resolver supplied (glob → module id; multi-kind → first by sorted order) — always a real in-project id, never null, satisfying `edges.to_id NOT NULL`. `External` → no edge.
 
 - [ ] **Step 4: Thread the table** in `main.rs`: keep the `SymbolTable` in an `Option<SymbolTable>` stashed at `initialize` (alongside `crate_roots`), and in `analyze_one_file` build a `Resolver::new(&table)` and call `extract_file_with_edges`. (`extract_file_degraded_aware` gains the resolver param too.)
 
@@ -645,6 +684,8 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Modify: `crates/loomweave-plugin-rust/plugin.toml` — add `implements` (and `imports`) to `edge_kinds` (atomic with the writer const — manifest-only → host silently drops with `undeclared_edge_kind`, `host.rs:1183`; writer-only → manifest validator rejects).
 - Modify: `crates/loomweave-plugin-rust/src/{extract,edges}.rs` — emit `implements` from `Item::Impl` with `it.trait_`.
 - Test: `crates/loomweave-plugin-rust/tests/implements_edges.rs`; extend `analyze_e2e.rs`.
+
+- [ ] **Step 0: Verify the core seams against current `loomweave-core` before writing.** This task's core line refs (`ANCHORED_EDGE_KINDS` at `writer.rs:699-705`, the imports-only external filter at `analyze.rs:4713`, the unconditional force-flush at `analyze.rs:879-882`, the absence of a CHECK on `edges.kind`) are survey-sourced — confirm each is current with `grep -n 'ANCHORED_EDGE_KINDS\|pending_plugin_edges\|undeclared_edge_kind' crates/loomweave-core/src/` and by reading the filter at the cited line. If a ref moved, update the steps below to the real location before editing. Do **not** trust the line numbers blindly.
 
 - [ ] **Step 1: Write the failing tests.** Unit: `impl Tr for Foo` where `Tr` is in-project → a `Resolved` `implements` edge `rust:impl:…Foo.impl[Tr]` → `rust:trait:…Tr`, carrying non-null `source_byte_start/end` (the trait-path span). `impl std::fmt::Display for Foo` → **no** edge (External, dropped). E2E: add a trait + an in-project impl of it to the fixture and assert the stored edge set includes the `implements` row and that an external-trait impl produces no edge and the run still **completes** (the seen-set gate dropped it, no FK-fail).
 
