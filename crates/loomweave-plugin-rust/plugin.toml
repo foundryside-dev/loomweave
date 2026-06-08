@@ -10,9 +10,13 @@ language = "rust"
 extensions = ["rs"]
 
 [capabilities.runtime]
-# Measured basis filled by Task 14 (ADR-035); placeholder envelope until then.
-expected_max_rss_mb = 1024
-expected_entities_per_file = 5000
+# Measured basis (ADR-035, Task 14 dogfood gate over this 8-crate workspace,
+# 2836 entities): peak RSS ~20 MB for the whole-workspace init-time symbol-table
+# build (the heaviest path — `analyze_file` parses a single file); max 288
+# entities in one file (loomweave-mcp/src/lib.rs). Envelopes carry headroom for
+# larger workspaces / files.
+expected_max_rss_mb = 128
+expected_entities_per_file = 512
 wardline_aware = false
 reads_outside_project_root = false
 

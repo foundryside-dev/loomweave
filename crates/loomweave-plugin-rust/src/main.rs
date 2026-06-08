@@ -132,7 +132,8 @@ fn main() {
 /// malformed/unreadable file still yields a degraded module rather than nothing.
 ///
 /// Returns `(entities, findings)` already shaped for the wire:
-/// degraded-parse `findings` from [`extract_file_degraded_aware`] are
+/// degraded-parse `findings` from
+/// [`extract_file_degraded_aware`](loomweave_plugin_rust::extract::extract_file_degraded_aware) are
 /// deserialised into [`AnalyzeFileFinding`]; any element that fails to
 /// deserialise is dropped rather than aborting the response.
 fn analyze_one_file(

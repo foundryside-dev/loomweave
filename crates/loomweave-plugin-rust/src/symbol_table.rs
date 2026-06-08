@@ -65,6 +65,26 @@ pub fn build_symbol_table(project_root: &Path) -> SymbolTable {
         let Some(src_root) = src_root_of(&roots, &file) else {
             continue;
         };
+        // Phase 1a scope: only files under the crate's `src/` tree are part of
+        // the library/binary crate the qualname scheme names. Integration tests
+        // (`tests/`), benches, examples, and `build.rs` are *separate* Rust
+        // compilation units — ADR-049 crate-root discovery does not name them,
+        // so folding them into this crate's namespace would mint colliding
+        // `rust:module:<crate>` locators (each one's bare-crate fallback). They
+        // are out of Phase 1a scope.
+        if !file.starts_with(&src_root) {
+            continue;
+        }
+        // When a crate ships both `src/lib.rs` and `src/main.rs` they are two
+        // distinct crates sharing a source root; both would resolve to the bare
+        // crate-root module path and collide on `rust:module:<crate>`. ADR-049
+        // makes `lib.rs` the canonical crate-root module, so when a sibling
+        // `lib.rs` exists the binary root (`main.rs`) is skipped in Phase 1a
+        // (its own crate root is not separately discovered). A crate with only
+        // `main.rs` (a pure binary) keeps it — it IS that crate's root.
+        if file_is_redundant_main(&src_root, &file) {
+            continue;
+        }
         let module_path = module_path_for(&crate_name, &src_root, &file);
         let Ok(src) = std::fs::read_to_string(&file) else {
             continue;
@@ -82,6 +102,15 @@ pub fn build_symbol_table(project_root: &Path) -> SymbolTable {
         }
     }
     SymbolTable { by_id, duplicates }
+}
+
+/// Whether `file` is a binary root (`<src_root>/main.rs`) that is redundant
+/// because the same crate also ships a library root (`<src_root>/lib.rs`). Such
+/// a `main.rs` is a separate binary crate; ADR-049 makes `lib.rs` the canonical
+/// crate-root module, so the redundant `main.rs` is skipped in Phase 1a to
+/// avoid colliding on the bare `rust:module:<crate>` locator.
+fn file_is_redundant_main(src_root: &Path, file: &Path) -> bool {
+    file == src_root.join("main.rs") && src_root.join("lib.rs").is_file()
 }
 
 /// The crate's source root directory (`<crate-dir>/src`) for `file`, or `None`
@@ -151,5 +180,66 @@ mod tests {
         assert!(table.contains_id("rust:struct:a_crate.X"));
         assert!(table.contains_id("rust:struct:b_crate.X"));
         assert_eq!(table.duplicate_ids(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn integration_tests_and_benches_are_out_of_scope_and_do_not_collide() {
+        // A crate's `tests/` and `benches/` files are separate compilation
+        // units; folding them into the library's namespace would mint a
+        // second `rust:module:<crate>` locator. The walk must skip them.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("c/src")).unwrap();
+        fs::create_dir_all(root.join("c/tests")).unwrap();
+        fs::create_dir_all(root.join("c/benches")).unwrap();
+        fs::write(root.join("c/Cargo.toml"), "[package]\nname=\"c_crate\"\n").unwrap();
+        fs::write(root.join("c/src/lib.rs"), "pub fn lib_fn() {}\n").unwrap();
+        fs::write(root.join("c/tests/it.rs"), "fn helper() {}\n").unwrap();
+        fs::write(root.join("c/benches/b.rs"), "fn bench_helper() {}\n").unwrap();
+
+        let table = build_symbol_table(root);
+        assert_eq!(table.duplicate_ids(), Vec::<String>::new());
+        // the lib's own module/function are present...
+        assert!(table.contains_id("rust:module:c_crate"));
+        assert!(table.contains_id("rust:function:c_crate.lib_fn"));
+        // ...but the test/bench helpers (which would have landed at the bare
+        // crate path) are NOT attributed to the library crate.
+        assert!(!table.contains_id("rust:function:c_crate.helper"));
+        assert!(!table.contains_id("rust:function:c_crate.bench_helper"));
+    }
+
+    #[test]
+    fn lib_and_main_in_one_crate_do_not_collide_on_the_crate_module() {
+        // A crate shipping both `src/lib.rs` and `src/main.rs` has two crate
+        // roots sharing a source dir; both would resolve to the bare crate
+        // module path. ADR-049 makes `lib.rs` canonical, so `main.rs` is skipped
+        // and `rust:module:<crate>` is emitted exactly once.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("c/src")).unwrap();
+        fs::write(root.join("c/Cargo.toml"), "[package]\nname=\"c_crate\"\n").unwrap();
+        fs::write(root.join("c/src/lib.rs"), "pub fn lib_fn() {}\n").unwrap();
+        fs::write(root.join("c/src/main.rs"), "fn main() {}\n").unwrap();
+
+        let table = build_symbol_table(root);
+        assert_eq!(table.duplicate_ids(), Vec::<String>::new());
+        assert!(table.contains_id("rust:module:c_crate"));
+        assert!(table.contains_id("rust:function:c_crate.lib_fn"));
+    }
+
+    #[test]
+    fn pure_binary_crate_keeps_its_main_root() {
+        // A crate with only `src/main.rs` (no lib) — `main.rs` IS its root and
+        // must be kept, not skipped by the redundant-main rule.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("c/src")).unwrap();
+        fs::write(root.join("c/Cargo.toml"), "[package]\nname=\"c_crate\"\n").unwrap();
+        fs::write(root.join("c/src/main.rs"), "fn run_it() {}\nfn main() {}\n").unwrap();
+
+        let table = build_symbol_table(root);
+        assert_eq!(table.duplicate_ids(), Vec::<String>::new());
+        assert!(table.contains_id("rust:module:c_crate"));
+        assert!(table.contains_id("rust:function:c_crate.run_it"));
     }
 }
