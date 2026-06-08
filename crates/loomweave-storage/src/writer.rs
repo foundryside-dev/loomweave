@@ -272,6 +272,15 @@ fn run_actor(
                 });
                 reply(ack, res);
             }
+            WriterCmd::SweepStaleFindings {
+                current_run_id,
+                ack,
+            } => {
+                let res = query_time_write(conn, &mut state, commits_observed, |conn| {
+                    crate::findings::sweep_stale_findings(conn, &current_run_id)
+                });
+                reply(ack, res);
+            }
             WriterCmd::UpsertSeiBinding { record, ack } => {
                 let res = query_time_write(conn, &mut state, commits_observed, |conn| {
                     crate::sei::upsert_sei_binding(conn, &record)

@@ -8,6 +8,7 @@ pub mod cache;
 pub mod commands;
 pub mod embeddings;
 pub mod error;
+pub mod findings;
 pub mod glob;
 pub mod guidance;
 pub mod pragma;
@@ -34,6 +35,7 @@ pub use commands::{
 };
 pub use embeddings::{EmbeddingKey, EmbeddingStore, StoredEmbedding, embeddings_db_path};
 pub use error::{Result, StorageError};
+pub use findings::sweep_stale_findings;
 pub use glob::glob_match;
 pub use guidance::{
     GUIDANCE_PROPOSAL_MARKER, GuidanceProposal, GuidanceSheet, GuidanceSheetInput, MatchFacts,

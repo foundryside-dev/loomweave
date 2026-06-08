@@ -1391,6 +1391,111 @@ async fn insert_finding_is_idempotent_on_resume() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sweep_stale_findings_retires_only_unreproduced_open_unlinked_rows() {
+    // ADR-048 / clarion-87c1eba2bd: the command round-trips through the
+    // query-time-write path (no active run) and returns the deleted count. Two
+    // findings are written under run-1; run-2 re-emits only one (so its run_id
+    // refreshes to run-2). Sweeping at run-2 must retire exactly the finding
+    // run-2 stopped reproducing and leave the reproduced one.
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    let finding = |id: &str, run_id: &str| FindingRecord {
+        id: id.to_owned(),
+        tool: "loomweave".to_owned(),
+        tool_version: "1.0.0".to_owned(),
+        run_id: run_id.to_owned(),
+        rule_id: "LMWV-TEST-RULE".to_owned(),
+        kind: "defect".to_owned(),
+        severity: "WARN".to_owned(),
+        confidence: None,
+        confidence_basis: None,
+        entity_id: "python:module:demo".to_owned(),
+        related_entities_json: "[]".to_owned(),
+        message: "m".to_owned(),
+        evidence_json: "[]".to_owned(),
+        properties_json: "{}".to_owned(),
+        supports_json: "[]".to_owned(),
+        supported_by_json: "[]".to_owned(),
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+
+    // run-1: both findings present.
+    begin_demo_run(&tx, "run-1").await;
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(make_module_entity("python:module:demo")),
+        ack,
+    })
+    .await
+    .unwrap();
+    for id in ["core:finding:reproduced", "core:finding:vanished"] {
+        send::<()>(&tx, |ack| WriterCmd::InsertFinding {
+            finding: Box::new(finding(id, "run-1")),
+            ack,
+        })
+        .await
+        .unwrap();
+    }
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-1".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    // run-2 (fresh): re-emit only `reproduced` — its run_id upserts to run-2.
+    begin_demo_run(&tx, "run-2").await;
+    send::<()>(&tx, |ack| WriterCmd::InsertFinding {
+        finding: Box::new(finding("core:finding:reproduced", "run-2")),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-2".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    // Sweep at run-2: query-time write, no active run.
+    let deleted = send::<usize>(&tx, |ack| WriterCmd::SweepStaleFindings {
+        current_run_id: "run-2".into(),
+        ack,
+    })
+    .await
+    .expect("sweep command must round-trip without an active run");
+    assert_eq!(deleted, 1, "exactly the un-reproduced finding is retired");
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let conn = Connection::open(path).unwrap();
+    let surviving: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT id FROM findings ORDER BY id").unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(
+        surviving,
+        ["core:finding:reproduced"],
+        "the reproduced finding survives; the vanished one is swept"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn entity_source_file_id_rejects_non_source_anchor_entity() {
     let dir = tempfile::tempdir().unwrap();
     let path = prepared_db(&dir);

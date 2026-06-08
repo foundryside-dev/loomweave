@@ -251,6 +251,21 @@ pub enum WriterCmd {
         recorded_at: String,
         ack: Ack<()>,
     },
+    /// Retire findings the current run no longer reproduces (clarion-87c1eba2bd /
+    /// ADR-048): DELETE every `open`, Filigree-unlinked finding whose `run_id` is
+    /// not `current_run_id`. Mirrors the prior-index diff for findings, using the
+    /// `run_id` signal ADR-047 established (a reproduced finding carries the current
+    /// `run_id`; a vanished one keeps its prior one). PRESERVES lifecycle —
+    /// `filigree_issue_id`-linked or non-`open` findings are operator decisions
+    /// owned by the Filigree unseen/soft-archive path, never this sweep. The
+    /// caller gates this to a clean full pass (Completed, non-resume, fully
+    /// walked, non-`--no-sei`). Query-time write: it runs after `CommitRun` (no
+    /// active run transaction), best-effort, and never gates the run's own
+    /// outcome. Returns the number of rows deleted.
+    SweepStaleFindings {
+        current_run_id: String,
+        ack: Ack<usize>,
+    },
     /// Upsert one SEI binding (mint or carry) — Wave 1 / WS1 (ADR-038). A carry
     /// REPLACEs the binding's own row by SEI PK, moving `current_locator` in
     /// place; it never creates a second alive row. Query-time write: the SEI

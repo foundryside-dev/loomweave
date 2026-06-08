@@ -1437,6 +1437,58 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 ),
                 _ => {}
             }
+            // Stale-finding sweep (clarion-87c1eba2bd / ADR-048): retire findings
+            // whose code no longer reproduces them. Runs LAST in the Completed arm
+            // — after every during-run `InsertFinding` AND every post-commit
+            // `PersistPostRunFinding` pass (SEI deletion, tier, guidance) — so a
+            // reproduced finding already carries the current run_id and only a
+            // genuinely-vanished finding keeps an older one. Gated to a CLEAN FULL
+            // PASS so `run_id <> current` unambiguously means "the current run
+            // walked this finding's file and stopped reproducing it":
+            //   • !resume               — a `--resume` run REUSES the prior run_id
+            //     (its not-yet-re-emitted findings already match current, so the
+            //     run_id signal can't distinguish them — never sweep on resume).
+            //   • skipped_files == 0    — an incremental run leaves unchanged
+            //     files' findings at their PRIOR run_id; sweeping them would
+            //     wrongly retire still-reproducing findings.
+            //   • source_walk_skipped_entries == 0 — a file/dir that ERRORED
+            //     during the source walk (IO / permission / path-jail) was never
+            //     read, so its findings were not re-emitted and keep a prior
+            //     run_id; the run still reaches `Completed`, so without this guard
+            //     a single walk error would retire a whole unwalked subtree's
+            //     still-reproducing findings ("never looked" ≠ "looked, fixed").
+            //   • !no_sei               — the SEI pass (entity-deleted /
+            //     guidance-orphan facts) was skipped, so those findings were NOT
+            //     refreshed this run and must not be mistaken for vanished.
+            // Best-effort + enrich-only like the SEI/tier/guidance passes above: a
+            // failure logs and never un-commits the already-durable graph. Findings
+            // linger until the next clean full analyze — accepted (findings are
+            // regenerable current-state, ADR-047).
+            if !resume
+                && skipped_files_total == 0
+                && source_walk_skipped_entries == 0
+                && !options.no_sei
+            {
+                match writer
+                    .send_wait(|ack| WriterCmd::SweepStaleFindings {
+                        current_run_id: run_id.clone(),
+                        ack,
+                    })
+                    .await
+                {
+                    Ok(retired) if retired > 0 => tracing::info!(
+                        run_id = %run_id,
+                        stale_findings_retired = retired,
+                        "stale-finding sweep retired findings whose code no longer reproduces"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        run_id = %run_id,
+                        error = %e,
+                        "stale-finding sweep skipped (run already committed successfully)"
+                    ),
+                }
+            }
         }
         RunOutcome::SoftFailed { reason } => {
             // Commit entities inserted by healthy plugins AND mark the run

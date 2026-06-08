@@ -4209,6 +4209,258 @@ fn analyze_persists_syntax_error_finding_for_unparseable_file() {
     assert_eq!(anchor_exists, 1, "finding anchor entity is present");
 }
 
+/// A `synfixture`-style plugin whose `parse_status` keys on file *content*
+/// (`BROKEN` substring), not the filename stem. This lets a test toggle a
+/// file-anchored `LMWV-PY-SYNTAX-ERROR` finding on and off by rewriting the SAME
+/// file's bytes — the module entity id is stable, so no entity-deleted noise — and
+/// makes content edits drive the incremental skip/walk decision. Used by the
+/// ADR-048 stale-finding-sweep gate tests.
+#[cfg(unix)]
+const SWEEP_PLUGIN_SCRIPT: &str = r#"#!/usr/bin/python3
+import json
+import pathlib
+import sys
+
+
+def read_frame():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if line in (b"", b"\r\n"):
+            break
+        name, value = line.decode("ascii").strip().split(":", 1)
+        headers[name.lower()] = value.strip()
+    length = int(headers["content-length"])
+    return json.loads(sys.stdin.buffer.read(length))
+
+
+def write_frame(message):
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n")
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+
+while True:
+    msg = read_frame()
+    method = msg.get("method")
+    if method == "initialized":
+        continue
+    if method == "exit":
+        raise SystemExit(0)
+    ident = msg["id"]
+    if method == "initialize":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "name": "loomweave-plugin-sweep",
+                "version": "0.1.0",
+                "ontology_version": "0.6.0",
+                "capabilities": {},
+            },
+        })
+    elif method == "analyze_file":
+        path = msg["params"]["file_path"]
+        stem = pathlib.Path(path).stem
+        try:
+            content = pathlib.Path(path).read_text()
+        except OSError:
+            content = ""
+        parse_status = "syntax_error" if "BROKEN" in content else "ok"
+        entity = {
+            "id": f"sweepfixture:module:{stem}",
+            "kind": "module",
+            "qualified_name": stem,
+            "source": {"file_path": path},
+            "parse_status": parse_status,
+        }
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {"entities": [entity], "edges": [], "stats": {}},
+        })
+    elif method == "shutdown":
+        write_frame({"jsonrpc": "2.0", "id": ident, "result": {}})
+    else:
+        raise SystemExit(1)
+"#;
+
+#[cfg(unix)]
+const SWEEP_PLUGIN_MANIFEST: &str = r#"
+[plugin]
+name = "loomweave-plugin-sweep"
+plugin_id = "sweepfixture"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "loomweave-plugin-sweep"
+language = "sweepfixture"
+extensions = ["swp"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 256
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+entity_kinds = ["module"]
+edge_kinds = []
+rule_id_prefix = "LMWV-SWP-"
+ontology_version = "0.6.0"
+
+[ontology.roles]
+file_scope = ["module"]
+syntax_degraded_module = ["module"]
+"#;
+
+#[cfg(unix)]
+fn write_sweep_plugin(plugin_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let plugin_script = plugin_dir.join("loomweave-plugin-sweep");
+    std::fs::write(&plugin_script, SWEEP_PLUGIN_SCRIPT).expect("write sweep plugin script");
+    let mut perms = std::fs::metadata(&plugin_script)
+        .expect("stat sweep plugin")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&plugin_script, perms).expect("chmod sweep plugin");
+
+    std::fs::write(plugin_dir.join("plugin.toml"), SWEEP_PLUGIN_MANIFEST)
+        .expect("write sweep plugin manifest");
+}
+
+/// Count the file-anchored syntax-error findings the sweep fixture produces.
+#[cfg(unix)]
+fn syntax_error_finding_count(project_root: &std::path::Path) -> i64 {
+    Connection::open(project_root.join(".weft/loomweave/loomweave.db"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'LMWV-PY-SYNTAX-ERROR'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// ADR-048 acceptance #1 + #3: a finding the current run no longer reproduces is
+/// retired by the stale-finding sweep, and the whole-project finding count drops.
+/// `mod_a.swp` carries a `BROKEN` marker (→ one `LMWV-PY-SYNTAX-ERROR` finding);
+/// fixing its content and re-running a clean full pass (`--no-incremental`, so the
+/// sweep gate's `skipped_files == 0` holds) must DELETE the now-unreproduced
+/// finding. This fails if the sweep is removed (the row would linger at the old
+/// `run_id`).
+#[cfg(unix)]
+#[test]
+fn analyze_stale_finding_sweep_retires_unreproduced_finding_on_full_run() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_sweep_plugin(plugin_dir.path());
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let analyze = |extra: &[&str]| {
+        let mut cmd = loomweave_bin();
+        cmd.arg("analyze");
+        for a in extra {
+            cmd.arg(a);
+        }
+        cmd.arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .assert()
+            .success();
+    };
+
+    // Run 1: mod_a is broken → one syntax-error finding (run_id R1).
+    std::fs::write(project_dir.path().join("mod_a.swp"), b"BROKEN\n").unwrap();
+    std::fs::write(project_dir.path().join("mod_b.swp"), b"ok\n").unwrap();
+    analyze(&[]);
+    assert_eq!(
+        syntax_error_finding_count(project_dir.path()),
+        1,
+        "run 1 must produce exactly one syntax-error finding for the broken file"
+    );
+    let total_after_run1: i64 =
+        Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM findings", [], |row| row.get(0))
+            .unwrap();
+
+    // Fix mod_a's content (byte change → re-walked) and re-run a clean FULL pass.
+    std::fs::write(project_dir.path().join("mod_a.swp"), b"ok\n").unwrap();
+    analyze(&["--no-incremental"]);
+
+    assert_eq!(
+        syntax_error_finding_count(project_dir.path()),
+        0,
+        "the fixed file's finding no longer reproduces and must be swept"
+    );
+    let total_after_run2: i64 =
+        Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM findings", [], |row| row.get(0))
+            .unwrap();
+    assert!(
+        total_after_run2 < total_after_run1,
+        "whole-project finding count must DROP after a fix (got {total_after_run1} -> {total_after_run2})"
+    );
+}
+
+/// ADR-048 gate (the incremental-skip clause): a finding in a file the run did
+/// NOT re-walk (incrementally skipped, so still-reproducing) must NOT be swept,
+/// even though its row keeps a prior `run_id`. Run 1 broke `mod_a`; run 2 touches
+/// only `mod_b`, so `mod_a` is skipped (`skipped_files > 0`) and its finding is
+/// not re-emitted — the gate must block the sweep so the still-valid finding
+/// survives. This fails if the `skipped_files == 0` gate clause is removed (the
+/// sweep would then delete the finding at run 2's `run_id`).
+#[cfg(unix)]
+#[test]
+fn analyze_stale_finding_sweep_skipped_on_incremental_run() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_sweep_plugin(plugin_dir.path());
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let analyze = || {
+        loomweave_bin()
+            .args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .assert()
+            .success();
+    };
+
+    // Run 1: mod_a broken → finding at R1; mod_b clean.
+    std::fs::write(project_dir.path().join("mod_a.swp"), b"BROKEN\n").unwrap();
+    std::fs::write(project_dir.path().join("mod_b.swp"), b"ok\n").unwrap();
+    analyze();
+    assert_eq!(syntax_error_finding_count(project_dir.path()), 1);
+
+    // Run 2: touch ONLY mod_b. mod_a is unchanged → incrementally skipped, so its
+    // still-valid finding is not re-emitted and keeps R1 while the run is R2.
+    std::fs::write(project_dir.path().join("mod_b.swp"), b"ok\n# touched\n").unwrap();
+    analyze();
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(1),
+        "mod_a must be incrementally skipped so the gate is exercised"
+    );
+    assert_eq!(
+        syntax_error_finding_count(project_dir.path()),
+        1,
+        "an incremental run must NOT sweep a still-reproducing finding in a skipped file"
+    );
+}
+
 /// A plugin that crashes mid-`analyze_file`. Initializes cleanly, then exits
 /// non-zero on the first analyze request — exercising the host's crash path.
 #[cfg(unix)]
