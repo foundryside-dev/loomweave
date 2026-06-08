@@ -8,11 +8,11 @@
 //! becomes an `impl` entity in Phase 1b (Phase 1a emits `module`/`struct`/
 //! `function`, where `function` includes methods).
 use serde_json::{Value, json};
-use syn::{ImplItem, Item, ItemFn, ItemImpl, ItemMod, ItemStruct};
+use syn::{ImplItem, Item, ItemFn, ItemImpl, ItemMod, ItemStruct, Meta};
 
 use crate::qualname::{
-    build_entity_id, free_item_qualname, impl_disc_for, impl_qualname, method_qualname,
-    self_ty_name,
+    build_entity_id, cfg_discriminant, free_item_qualname, impl_disc_for, impl_qualname,
+    method_qualname, self_ty_name,
 };
 use crate::signature::{function_signature, struct_signature};
 use crate::spans::{SourceRange, source_range_of};
@@ -129,11 +129,28 @@ fn walk_items(
     // impls (which carry no ordinal). Scoped to this item list.
     let mut inherent_ordinals: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
+    // Free-fn names that appear more than once in this item list are cfg twins
+    // (e.g. `#[cfg(unix)] fn f` / `#[cfg(windows)] fn f`): all cfg variants are
+    // visible (spec §5), so a bare path collides. Such siblings get a normalised
+    // `@cfg(...)` discriminant (ADR-049 §3). Names with a single free fn keep the
+    // bare path, so the common case is undisturbed.
+    let mut free_fn_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for item in items {
+        if let Item::Fn(ItemFn { sig, .. }) = item {
+            *free_fn_counts.entry(sig.ident.to_string()).or_insert(0) += 1;
+        }
+    }
     for item in items {
         match item {
-            Item::Fn(ItemFn { sig, .. }) => {
+            Item::Fn(ItemFn { sig, attrs, .. }) => {
                 let name = sig.ident.to_string();
-                let q = free_item_qualname(module_path, &name);
+                let mut q = free_item_qualname(module_path, &name);
+                if free_fn_counts.get(&name).copied().unwrap_or(0) > 1
+                    && let Some(pred) = cfg_predicate(attrs)
+                {
+                    q.push_str(&cfg_discriminant(&pred));
+                }
                 out.push(entity(
                     "function",
                     &q,
@@ -218,6 +235,23 @@ fn emit_impl_methods(
         }
     }
     Ok(())
+}
+
+/// Extract the predicate of the first `#[cfg(...)]` attribute on an item, if
+/// any. Returns the raw token text of the predicate (e.g. `"unix"`,
+/// `"any(unix, windows)"`); normalisation into a stable suffix is
+/// [`cfg_discriminant`]'s job. `#[cfg_attr(...)]` and other attributes are
+/// ignored — only a literal `cfg` list disambiguates a path-sharing twin.
+fn cfg_predicate(attrs: &[syn::Attribute]) -> Option<String> {
+    attrs.iter().find_map(|attr| {
+        if let Meta::List(list) = &attr.meta
+            && list.path.is_ident("cfg")
+        {
+            Some(list.tokens.to_string())
+        } else {
+            None
+        }
+    })
 }
 
 /// Build an entity id string, mapping the [`EntityIdError`] into a
