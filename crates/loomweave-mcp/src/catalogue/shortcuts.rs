@@ -36,6 +36,21 @@ const EDGE_SCAN_ORDER_BY: &str = "ORDER BY kind, from_id, to_id, confidence, \
 /// `find_dead_code` — entities "called from outside" the codebase. Tag-emitting
 /// plugins populate these; the empty-root guard protects indexes with no root
 /// tags from a flood of false positives.
+///
+/// The trailing `wardline:*` entries are Wardline-derived trust boundaries
+/// (clarion-bf496d55d1, §4.2): the Python plugin emits `wardline:external_boundary`
+/// / `wardline:trusted` from the on-disk Wardline vocabulary descriptor
+/// (`@external_boundary` / `@trusted` decorators) into `entity_tags` at analyze
+/// time — a developer-annotated, higher-confidence "called from outside the
+/// static graph" signal than the structural heuristics. They map onto the
+/// existing entry-point / exported-api root classes (`external_boundary` →
+/// entry point, `trusted` → exported API); for dead-code reachability only the
+/// union matters, so both simply join the root set, reading the same single
+/// `entity_tags` signal under the same host validation discipline as every
+/// other tag. Enrich-only: with no Wardline descriptor no `wardline:*` tag is
+/// emitted and the root set is byte-identical to before. Stale facts cannot
+/// resurrect a deleted entity as a root — `entity_tags` rows cascade-delete
+/// with their entity, and roots join only live `entities`.
 const DEAD_CODE_ROOT_TAGS: &[&str] = &[
     "entry-point",
     "http-route",
@@ -43,6 +58,8 @@ const DEAD_CODE_ROOT_TAGS: &[&str] = &[
     "data-model",
     "cli-command",
     "exported-api",
+    "wardline:external_boundary",
+    "wardline:trusted",
 ];
 
 /// Tags that force an entity to be treated as live regardless of static

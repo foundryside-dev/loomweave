@@ -1524,6 +1524,64 @@ async fn find_dead_code_flags_unreachable_and_spares_live() {
     );
 }
 
+// clarion-bf496d55d1 §4.2: a Wardline-derived trust-boundary tag
+// (`wardline:external_boundary` / `wardline:trusted`, emitted by the Python
+// plugin from the on-disk Wardline vocabulary descriptor) acts as a reachability
+// root, so a statically-unreached but human-annotated trust boundary is NOT
+// flagged dead, while an untagged unreached entity still is.
+#[tokio::test]
+async fn find_dead_code_treats_wardline_trust_boundaries_as_roots() {
+    let (project, db, conn) = open_project();
+    // An externally-invoked boundary: unreached over static edges, but annotated
+    // @external_boundary -> wardline:external_boundary. Must be a root, not dead.
+    insert_entity(
+        &conn,
+        "python:function:webhook",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    insert_tag(
+        &conn,
+        "python:function:webhook",
+        "wardline:external_boundary",
+    );
+    // A trusted producer: @trusted -> wardline:trusted. Also a root.
+    insert_entity(
+        &conn,
+        "python:function:mint_token",
+        "function",
+        "app.py",
+        Some((6, 10)),
+    );
+    insert_tag(&conn, "python:function:mint_token", "wardline:trusted");
+    // Genuinely dead leaf — unreached and untagged.
+    insert_entity(
+        &conn,
+        "python:function:orphan",
+        "function",
+        "app.py",
+        Some((11, 15)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        dead,
+        vec!["python:function:orphan".to_owned()],
+        "only the untagged unreached entity is dead; the Wardline trust \
+         boundaries are roots: {env}"
+    );
+}
+
 // Framework-magic entities (decorated handlers, plugin hooks) are excluded from
 // candidacy even when statically unreached.
 #[tokio::test]
