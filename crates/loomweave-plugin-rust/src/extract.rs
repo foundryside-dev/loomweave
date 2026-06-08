@@ -60,6 +60,63 @@ pub fn extract_file(
     Ok(out)
 }
 
+/// Extraction wrapper with degraded-parse fallback (review M3).
+///
+/// On a successful parse, returns the extracted entities and an empty finding
+/// list. On `syn::parse_file` failure (or a qualname/id-validation error from
+/// [`extract_file`]), returns **exactly one** `module` entity flagged
+/// `parse_status = "syntax_error"` plus a single Warning finding — never an
+/// empty list, never a panic. The manifest declares the `syntax_degraded_module`
+/// role on `module` for this case.
+///
+/// The returned finding `Value` carries the real [`AnalyzeFileFinding`] field
+/// names (`subcode`/`severity`/`message`/`metadata`) so `main.rs` can
+/// `serde_json::from_value` each one into the wire struct without remapping.
+///
+/// [`AnalyzeFileFinding`]: loomweave_core::plugin::AnalyzeFileFinding
+#[must_use]
+pub fn extract_file_degraded_aware(
+    crate_name: &str,
+    module_path: &str,
+    file_path: &str,
+    src: &str,
+) -> (Vec<Value>, Vec<Value>) {
+    match extract_file(crate_name, module_path, file_path, src) {
+        Ok(entities) => (entities, Vec::new()),
+        Err(e) => {
+            // Best-effort id; if the module path itself is unrepresentable the
+            // entity still carries the (empty) id and the qualified_name, which
+            // is enough for the host to record a degraded module.
+            let id = build_entity_id("module", module_path)
+                .map(|i| i.as_str().to_owned())
+                .unwrap_or_default();
+            let entity = json!({
+                "id": id,
+                "kind": "module",
+                "qualified_name": module_path,
+                "parse_status": "syntax_error",
+                "source": {
+                    "file_path": file_path,
+                    "source_byte_start": 0,
+                    "source_byte_end": 0,
+                    "source_range": { "start_line": 1, "end_line": 1 }
+                }
+            });
+            let mut metadata = serde_json::Map::new();
+            if !id.is_empty() {
+                metadata.insert("entity_id".to_owned(), json!(id));
+            }
+            let finding = json!({
+                "subcode": "LMWV-RUST-SYNTAX-ERROR",
+                "severity": "warning",
+                "message": format!("syn could not parse {file_path}: {e}"),
+                "metadata": metadata
+            });
+            (vec![entity], vec![finding])
+        }
+    }
+}
+
 fn walk_items(
     items: &[Item],
     module_path: &str,
@@ -246,5 +303,25 @@ mod tests {
         assert_eq!(f["source"]["file_path"], "/p/src/m.rs");
         assert!(f["source"]["source_byte_start"].as_i64().is_some());
         assert!(f["source"]["source_byte_end"].as_i64().unwrap() > 0);
+    }
+
+    #[test]
+    fn malformed_file_yields_one_degraded_module_and_a_warning() {
+        let src = "fn broken( {{{ this is not rust";
+        let (entities, findings) = extract_file_degraded_aware("k", "k.m", "/p/src/m.rs", src);
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0]["kind"], "module");
+        assert_eq!(entities[0]["id"], "rust:module:k.m");
+        assert_eq!(entities[0]["parse_status"], "syntax_error");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0]["severity"], "warning");
+    }
+
+    #[test]
+    fn valid_file_yields_entities_and_no_findings() {
+        let src = "pub fn a() {}\n";
+        let (entities, findings) = extract_file_degraded_aware("k", "k.m", "/p/src/m.rs", src);
+        assert!(findings.is_empty());
+        assert!(entities.iter().any(|e| e["kind"] == "function"));
     }
 }
