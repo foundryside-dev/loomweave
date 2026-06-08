@@ -148,7 +148,7 @@ pub fn verify_user_version(conn: &Connection) -> Result<()> {
 
 /// Reject an *unmigrated* database (`user_version = 0`) at read-open time.
 ///
-/// [`set_user_version`] / [`apply_migrations`] stamp
+/// [`apply_migrations`] stamps
 /// `user_version = CURRENT_SCHEMA_VERSION`, so a genuine Loomweave index — even
 /// one with zero entities (installed but not yet analyzed) — reads back a
 /// non-zero version. A `user_version` of 0 means no Loomweave schema was ever
