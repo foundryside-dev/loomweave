@@ -24,6 +24,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use loomweave_federation::config::{McpConfig, ProviderSelection, select_provider_with_env};
@@ -73,6 +74,7 @@ pub fn run(path: &Path, fix: bool, json_output: bool) -> Result<bool> {
     tally += check_mcp(&project_root, fix);
     tally += check_instructions(&project_root, fix);
     tally += check_integration_bindings(&project_root, fix);
+    tally += check_db_tracked(&project_root, fix);
     println!("--- llm ---");
     tally += check_llm_provider(&project_root);
 
@@ -171,6 +173,7 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
         check_wardline_taint_capability_json(project_root),
         check_mcp_hygiene_json(),
         check_integration_bindings_json(project_root, fix),
+        check_db_tracked_json(project_root, fix),
     ];
     let next_actions: Vec<String> = checks
         .iter()
@@ -187,6 +190,11 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
             }
             "mcp.registration" | "integration.bindings" => {
                 "Run `loomweave doctor --fix`.".to_owned()
+            }
+            "db.tracked" => {
+                "Run `loomweave doctor --fix` or `git rm --cached .weft/loomweave/loomweave.db` \
+                 to stop the regenerable index dirtying the tree."
+                    .to_owned()
             }
             "index.freshness" => {
                 "Run `loomweave analyze <project>` to refresh the index.".to_owned()
@@ -234,6 +242,100 @@ fn check_loomweave_dir_json(project_root: &Path) -> DoctorJsonCheck {
             ".weft/loomweave.schema",
             ".weft/loomweave store directory is absent",
         )
+    }
+}
+
+/// Whether the regenerable runtime DB is committed to git.
+///
+/// `loomweave.db` mutates on every `analyze`/`scan`; tracking it leaves a
+/// permanently-dirty work tree that blocks legis signing (C1 / weft-d822a7de2d).
+/// ADR-005 was reversed (`b7a1b30`) so a fresh `install` gitignores it, but a
+/// template change cannot untrack an already-committed db — this is the detector
+/// for that residual.
+#[derive(Debug, PartialEq, Eq)]
+enum DbTrackedState {
+    /// Healthy: the db is not in the git index (untracked, ignored, absent, the
+    /// store lives outside the repo, or this is not a git work tree).
+    Untracked,
+    /// The db is committed/staged — dirties the tree and blocks signing.
+    Tracked,
+}
+
+/// Ask git whether `<store_dir>/loomweave.db` is tracked. `ls-files
+/// --error-unmatch` exits 0 only when the pathspec matches a tracked file, so a
+/// non-success exit (untracked, ignored, absent, outside the repo, not a repo,
+/// or git missing) all fold to [`DbTrackedState::Untracked`] — nothing to fix.
+fn db_tracked_state(project_root: &Path) -> DbTrackedState {
+    let db = loomweave_core::store::db_path(project_root);
+    let Ok(rel) = db.strip_prefix(project_root) else {
+        // Store dir is outside the repo — this repo cannot be tracking it.
+        return DbTrackedState::Untracked;
+    };
+    let tracked = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(rel)
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if tracked {
+        DbTrackedState::Tracked
+    } else {
+        DbTrackedState::Untracked
+    }
+}
+
+/// `--fix` self-heal: `git rm --cached` the runtime db (and its WAL/SHM
+/// sidecars), removing them from the index while keeping the working-tree files.
+/// `--ignore-unmatch` makes the sidecars optional.
+fn git_untrack_db(project_root: &Path) -> Result<()> {
+    let store = loomweave_core::store::store_dir(project_root);
+    let rel = store
+        .strip_prefix(project_root)
+        .context("store dir is outside the project root; cannot git rm --cached")?;
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["rm", "--cached", "-q", "--ignore-unmatch", "--"])
+        .arg(rel.join("loomweave.db"))
+        .arg(rel.join("loomweave.db-wal"))
+        .arg(rel.join("loomweave.db-shm"))
+        .status()
+        .context("run git rm --cached")?;
+    if !status.success() {
+        bail!("git rm --cached exited with {status}");
+    }
+    Ok(())
+}
+
+/// JSON-path twin of [`check_db_tracked`].
+fn check_db_tracked_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
+    match db_tracked_state(project_root) {
+        DbTrackedState::Untracked => {
+            DoctorJsonCheck::ok("db.tracked", "runtime loomweave.db is not git-tracked")
+        }
+        DbTrackedState::Tracked => {
+            let what = "loomweave.db is git-tracked — it mutates on every analyze/scan, dirtying \
+                        the work tree and blocking legis signing (ADR-005 reversed)";
+            if !fix {
+                return DoctorJsonCheck::warning("db.tracked", what);
+            }
+            match git_untrack_db(project_root) {
+                Ok(()) if db_tracked_state(project_root) == DbTrackedState::Untracked => {
+                    DoctorJsonCheck::fixed(
+                        "db.tracked",
+                        format!("{what} — untracked (git rm --cached)"),
+                    )
+                }
+                Ok(()) => DoctorJsonCheck::problem(
+                    "db.tracked",
+                    format!("{what} — repair did not converge"),
+                ),
+                Err(err) => {
+                    DoctorJsonCheck::problem("db.tracked", format!("{what} — repair failed: {err}"))
+                }
+            }
+        }
     }
 }
 
@@ -941,6 +1043,34 @@ fn repair_instructions(project_root: &Path, what: &str) -> Tally {
     }
 }
 
+/// Text-path twin of [`check_db_tracked_json`]: surface a git-tracked runtime db
+/// (the C1 analyze→sign blocker) instead of greening over it, and self-heal it
+/// under `--fix`.
+fn check_db_tracked(project_root: &Path, fix: bool) -> Tally {
+    match db_tracked_state(project_root) {
+        DbTrackedState::Untracked => ok("runtime loomweave.db is not git-tracked"),
+        DbTrackedState::Tracked => {
+            let what = "loomweave.db is git-tracked — it mutates on every analyze/scan, dirtying \
+                        the work tree and blocking legis signing";
+            if !fix {
+                return warn(
+                    what,
+                    Some(
+                        "git rm --cached .weft/loomweave/loomweave.db  (or loomweave doctor --fix)",
+                    ),
+                );
+            }
+            match git_untrack_db(project_root) {
+                Ok(()) if db_tracked_state(project_root) == DbTrackedState::Untracked => {
+                    ok(&format!("{what} — fixed (git rm --cached)"))
+                }
+                Ok(()) => problem(&format!("{what} — repair did not converge"), None),
+                Err(err) => problem(&format!("{what} — repair failed: {err}"), None),
+            }
+        }
+    }
+}
+
 fn check_integration_bindings(project_root: &Path, fix: bool) -> Tally {
     match integration_bindings::binding_state(project_root) {
         BindingState::Present => {
@@ -967,5 +1097,82 @@ fn check_integration_bindings(project_root: &Path, fix: bool) -> Tally {
                 Err(err) => problem(&format!("{what} — repair failed: {err}"), None),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git runs")
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    fn init_repo(repo: &Path) {
+        run_git(repo, &["init", "-q"]);
+        run_git(repo, &["config", "user.email", "t@t"]);
+        run_git(repo, &["config", "user.name", "t"]);
+    }
+
+    /// Materialise the runtime DB at the canonical store path
+    /// (`<root>/.weft/loomweave/loomweave.db`).
+    fn write_db(root: &Path) -> std::path::PathBuf {
+        let db = loomweave_core::store::db_path(root);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, b"SQLite format 3\0").unwrap();
+        db
+    }
+
+    #[test]
+    fn db_tracked_state_is_untracked_when_db_is_not_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        write_db(root); // present on disk, never `git add`-ed
+        assert_eq!(db_tracked_state(root), DbTrackedState::Untracked);
+    }
+
+    #[test]
+    fn db_tracked_state_is_tracked_when_db_is_git_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        write_db(root);
+        run_git(root, &["add", "-f", ".weft/loomweave/loomweave.db"]);
+        assert_eq!(db_tracked_state(root), DbTrackedState::Tracked);
+    }
+
+    #[test]
+    fn db_tracked_state_is_untracked_outside_a_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        write_db(dir.path());
+        assert_eq!(db_tracked_state(dir.path()), DbTrackedState::Untracked);
+    }
+
+    #[test]
+    fn git_untrack_db_unstages_the_tracked_db_but_keeps_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let db = write_db(root);
+        run_git(root, &["add", "-f", ".weft/loomweave/loomweave.db"]);
+        assert_eq!(db_tracked_state(root), DbTrackedState::Tracked);
+
+        git_untrack_db(root).expect("untrack succeeds");
+
+        assert_eq!(db_tracked_state(root), DbTrackedState::Untracked);
+        assert!(
+            db.exists(),
+            "git rm --cached must keep the working-tree file"
+        );
     }
 }
