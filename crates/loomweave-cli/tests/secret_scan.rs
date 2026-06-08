@@ -310,6 +310,121 @@ fn resume_does_not_duplicate_secret_findings() {
 }
 
 #[test]
+fn still_secret_stays_blocked_across_reanalysis() {
+    // Regression for clarion-3b87a7b174: a file that STILL contains a secret
+    // must keep `briefing_blocked` across every re-analysis path. The flag has
+    // no durable storage — `entities.briefing_blocked` (migration 0002) is a
+    // VIRTUAL generated column over the mutable `properties` JSON, re-derived
+    // from the scanner each run (writer.rs upserts `properties = excluded.
+    // properties` wholesale). So the only thing keeping a secret entity withheld
+    // is that every producer re-asserts the block on every run. This locks the
+    // invariant `still-secret ⇒ every entity of the file stays briefing_blocked`
+    // across (1) a full re-analysis that rewrites properties (changed body),
+    // (2) an incremental skip (unchanged), and (3) `--resume`. A future producer
+    // that rewrites a secret file's properties without re-stamping the block
+    // would silently re-expose it to briefings/federation; this test fails first.
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    let leaky = project.path().join("leaky.sec");
+    std::fs::write(&leaky, b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n").unwrap();
+
+    let analyze = || {
+        loomweave_bin()
+            .arg("analyze")
+            .arg(project.path())
+            .env("PATH", plugin_path(plugin.path()))
+            .assert()
+            .success();
+    };
+
+    // (total entities for the file, of which how many are NOT blocked).
+    let census = || {
+        let db = conn(project.path());
+        let total: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE source_file_path LIKE '%leaky.sec'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let unblocked: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM entities \
+                   WHERE source_file_path LIKE '%leaky.sec' \
+                     AND json_extract(properties, '$.briefing_blocked') IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (total, unblocked)
+    };
+
+    // Run 1 — fresh analyze. The secret-bearing file is withheld.
+    analyze();
+    let (total, unblocked) = census();
+    assert!(
+        total >= 1,
+        "the secret file must produce at least one entity"
+    );
+    assert_eq!(
+        unblocked, 0,
+        "run 1: every entity of the secret file must be briefing_blocked",
+    );
+
+    // Run 2 — FULL re-analysis with a changed body that STILL contains the
+    // secret. The changed hash forces a non-skip, so the plugin re-runs and the
+    // writer rewrites `properties` wholesale: this is the exact properties-
+    // rewrite path the ticket worried about. The block must be re-asserted.
+    std::fs::write(
+        &leaky,
+        b"# key rotated, value unchanged\naws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n",
+    )
+    .unwrap();
+    analyze();
+    let (total, unblocked) = census();
+    assert!(total >= 1);
+    assert_eq!(
+        unblocked, 0,
+        "run 2 (full re-analysis, properties rewritten, secret remains): \
+         every entity must stay briefing_blocked",
+    );
+
+    // Run 3 — incremental skip (file unchanged since run 2). The rows are left
+    // untouched, so the block persists; lock it so a skip-path regression bites.
+    analyze();
+    let (_total, unblocked) = census();
+    assert_eq!(
+        unblocked, 0,
+        "run 3 (incremental skip, secret remains): block must persist",
+    );
+
+    // Run 4 — `--resume` the latest run. Resume re-runs the unconditional
+    // secret scan (it only changes finding `mark_unseen`), so the block must
+    // survive a resumed re-analysis too.
+    let run_id: String = conn(project.path())
+        .query_row(
+            "SELECT id FROM runs ORDER BY started_at DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    loomweave_bin()
+        .arg("analyze")
+        .args(["--resume", &run_id])
+        .arg(project.path())
+        .env("PATH", plugin_path(plugin.path()))
+        .assert()
+        .success();
+    let (_total, unblocked) = census();
+    assert_eq!(
+        unblocked, 0,
+        "run 4 (--resume, secret remains): block must survive a resumed re-analysis",
+    );
+}
+
+#[test]
 fn dotenv_sidecar_persists_finding_with_core_file_anchor() {
     let project = tempfile::tempdir().unwrap();
     let plugin = tempfile::tempdir().unwrap();
