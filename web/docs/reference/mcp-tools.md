@@ -27,11 +27,18 @@ a module reports `containing_range` — never a fabricated exact match.
 
 ## `find_entity(pattern, kind?)`
 
-Searches entities by id, name, short name, and stored summary text. Results are
-paginated and ranked by full-text match where possible. Does **not** traverse
-the graph and does **not** search on-demand `summary_cache` entries. Pass an
-optional `kind` (`subsystem`, `function`, `class`, `module`) to filter — the way
-to locate a subsystem without visually filtering results.
+Searches entities by id, name, short name, summary, and **docstring content**.
+Matching merges stemmed full-text ranking with grep-equivalent substring recall,
+so a concept word finds both entities whose docstring mentions it and identifiers
+that merely contain it (e.g. `library` finds the class `LibraryService`, which
+whole-token FTS alone misses). This is the always-on keyword-discovery path — no
+embeddings required (semantic ranking is the separate, opt-in
+`entity_semantic_search_list`). Results are paginated: full-text hits first, then
+substring-only hits. Docstrings withheld by the secret scanner (`briefing_blocked`)
+are never matched. Does **not** traverse the graph and does **not** search
+on-demand `summary_cache` entries. Pass an optional `kind` (`subsystem`,
+`function`, `class`, `module`) to filter — the way to locate a subsystem without
+visually filtering results.
 
 ## `callers_of(id)`
 

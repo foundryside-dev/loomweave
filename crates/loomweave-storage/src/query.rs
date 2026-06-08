@@ -738,54 +738,117 @@ pub fn find_entities(
         ));
     }
     let limit = limit.clamp(1, 100);
-    let limit_i64 = i64::try_from(limit)
-        .map_err(|_| StorageError::InvalidQuery("entity search limit is too large".to_owned()))?;
-    let offset_i64 = i64::try_from(offset)
-        .map_err(|_| StorageError::InvalidQuery("entity search offset is too large".to_owned()))?;
-    if is_fts_safe(pattern) {
-        let kind_clause = if kind.is_some() {
-            "AND e.kind = ?4 "
-        } else {
-            ""
-        };
-        let sql = format!(
-            "SELECT e.{columns} \
-             FROM entity_fts f \
-             JOIN entities e ON e.id = f.entity_id \
-             WHERE entity_fts MATCH ?1 {kind_clause}\
-             ORDER BY bm25(entity_fts), e.id \
-             LIMIT ?2 OFFSET ?3",
-            columns = ENTITY_COLUMNS.replace(", ", ", e.")
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = match kind {
-            Some(kind) => stmt.query_map(
-                params![pattern, limit_i64, offset_i64, kind],
-                map_entity_row,
-            )?,
-            None => stmt.query_map(params![pattern, limit_i64, offset_i64], map_entity_row)?,
-        };
-        return rows
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(StorageError::from);
-    }
+    // We materialise `offset + limit` rows from each recall path, merge them
+    // FTS-first, then page in Rust. `offset + limit` is the smallest prefix of
+    // the merged stream that can contain this page, so both sources fetch at
+    // OFFSET 0 up to this cap and pagination happens after the merge.
+    let fetch_cap = offset.saturating_add(limit);
 
+    // Two complementary recall paths, merged:
+    //
+    // 1. FTS (only when the pattern is FTS-safe): stemmed, bm25-ranked matches
+    //    over name / short_name / summary. Good ranking, but it matches whole
+    //    stemmed tokens, not substrings — so the query `library` never reaches
+    //    the class `LibraryService` (token `libraryservice`), and a concept word
+    //    that lives only in docstring prose is invisible.
+    // 2. LIKE substring over id / name / short_name / summary AND the
+    //    secret-guarded docstring. This is the grep-equivalent content recall the
+    //    discovery surface promises (weft-b7ce301e92): it catches identifier
+    //    substrings FTS cannot and surfaces concept words from docstring prose,
+    //    with no dependency on the opt-in embeddings sidecar (ADR-040).
+    //
+    // The merge keeps FTS hits first (preserving bm25 rank) and appends LIKE-only
+    // hits in id order, deduped by id. Each source is capped at `fetch_cap` and
+    // `limit` is clamped to <=100, so the merged prefix is bounded and exact for
+    // any page.
+    let fts_rows = if is_fts_safe(pattern) {
+        fts_match_entities(conn, pattern, fetch_cap, kind)?
+    } else {
+        Vec::new()
+    };
+    let like_rows = like_match_entities(conn, pattern, fetch_cap, kind)?;
+
+    let mut seen = std::collections::HashSet::with_capacity(fts_rows.len() + like_rows.len());
+    let mut merged = Vec::with_capacity(fts_rows.len() + like_rows.len());
+    for row in fts_rows.into_iter().chain(like_rows) {
+        if seen.insert(row.id.clone()) {
+            merged.push(row);
+        }
+    }
+    Ok(merged.into_iter().skip(offset).take(limit).collect())
+}
+
+/// FTS-safe, bm25-ranked matches over `name` / `short_name` / `summary_text`,
+/// capped at `fetch_cap` (always OFFSET 0 — [`find_entities`] pages after the
+/// merge). The caller guarantees `pattern` satisfies [`is_fts_safe`].
+fn fts_match_entities(
+    conn: &Connection,
+    pattern: &str,
+    fetch_cap: usize,
+    kind: Option<&str>,
+) -> Result<Vec<EntityRow>> {
+    let cap_i64 = i64::try_from(fetch_cap)
+        .map_err(|_| StorageError::InvalidQuery("entity search limit is too large".to_owned()))?;
+    let kind_clause = if kind.is_some() {
+        "AND e.kind = ?3 "
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT e.{columns} \
+         FROM entity_fts f \
+         JOIN entities e ON e.id = f.entity_id \
+         WHERE entity_fts MATCH ?1 {kind_clause}\
+         ORDER BY bm25(entity_fts), e.id \
+         LIMIT ?2",
+        columns = ENTITY_COLUMNS.replace(", ", ", e.")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = match kind {
+        Some(kind) => stmt.query_map(params![pattern, cap_i64, kind], map_entity_row)?,
+        None => stmt.query_map(params![pattern, cap_i64], map_entity_row)?,
+    };
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+/// Substring (LIKE) matches over `id` / `name` / `short_name` / `summary` plus
+/// the `briefing_blocked`-guarded docstring, capped at `fetch_cap` (OFFSET 0).
+///
+/// The docstring clause is gated on `briefing_blocked IS NULL`: a secret-bearing
+/// docstring withheld by the pre-ingest scanner (ADR-013) must never become
+/// matchable, or searching for a leaked secret would resurface the very entity
+/// the block exists to hide. (Identity exposure of blocked entities on these
+/// read surfaces is a separate, tracked gap — clarion-307668e2be; this content
+/// clause deliberately does not widen it. `id`/`name`/`short_name`/`summary`
+/// matching is unchanged from the prior behaviour.)
+fn like_match_entities(
+    conn: &Connection,
+    pattern: &str,
+    fetch_cap: usize,
+    kind: Option<&str>,
+) -> Result<Vec<EntityRow>> {
+    let cap_i64 = i64::try_from(fetch_cap)
+        .map_err(|_| StorageError::InvalidQuery("entity search limit is too large".to_owned()))?;
     let like = format!("%{}%", escape_like(pattern));
-    let kind_clause = if kind.is_some() { "AND kind = ?4 " } else { "" };
+    let kind_clause = if kind.is_some() { "AND kind = ?3 " } else { "" };
     let sql = format!(
         "SELECT {ENTITY_COLUMNS} \
          FROM entities \
          WHERE (id LIKE ?1 ESCAPE '\\' \
             OR name LIKE ?1 ESCAPE '\\' \
             OR short_name LIKE ?1 ESCAPE '\\' \
-            OR COALESCE(summary, '') LIKE ?1 ESCAPE '\\') {kind_clause}\
+            OR COALESCE(summary, '') LIKE ?1 ESCAPE '\\' \
+            OR (json_extract(properties, '$.briefing_blocked') IS NULL \
+                AND COALESCE(json_extract(properties, '$.docstring'), '') LIKE ?1 ESCAPE '\\')) \
+            {kind_clause}\
          ORDER BY id \
-         LIMIT ?2 OFFSET ?3"
+         LIMIT ?2"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = match kind {
-        Some(kind) => stmt.query_map(params![like, limit_i64, offset_i64, kind], map_entity_row)?,
-        None => stmt.query_map(params![like, limit_i64, offset_i64], map_entity_row)?,
+        Some(kind) => stmt.query_map(params![like, cap_i64, kind], map_entity_row)?,
+        None => stmt.query_map(params![like, cap_i64], map_entity_row)?,
     };
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(StorageError::from)

@@ -54,7 +54,9 @@ impl ServerState {
                 "signal": missing_signal(
                     "semantic_search",
                     "semantic search is not enabled (semantic_search.enabled=false) or no embedding \
-                     provider is configured; enable it and run analyze to build embeddings",
+                     provider is configured; enable it and run analyze to build embeddings. For \
+                     keyword discovery without embeddings, use entity_find — it matches name, \
+                     summary, and docstring content by substring (no opt-in required)",
                 ),
             })));
         };

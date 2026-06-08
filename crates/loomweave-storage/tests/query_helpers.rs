@@ -41,6 +41,26 @@ fn insert_entity_with_hash(conn: &Connection, id: &str, kind: &str, content_hash
     .expect("insert entity with hash");
 }
 
+fn insert_entity_with_properties(
+    conn: &Connection,
+    id: &str,
+    kind: &str,
+    short_name: &str,
+    properties_json: &str,
+) {
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, properties, created_at, updated_at
+         ) VALUES (
+            ?1, 'python', ?2, ?1, ?3, ?4,
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        params![id, kind, short_name, properties_json],
+    )
+    .expect("insert entity with properties");
+}
+
 fn insert_named_entity(
     conn: &Connection,
     id: &str,
@@ -995,6 +1015,84 @@ fn find_entities_kind_filter_applies_on_punctuation_like_path() {
         like_module.iter().any(|e| e.id == "python:module:pkg.svc"),
         "{like_module:?}"
     );
+}
+
+#[test]
+fn find_entities_matches_concept_word_in_docstring() {
+    // weft-b7ce301e92 (LW-1): a concept word that lives only in docstring prose
+    // — not in any entity name — must be discoverable. FTS over name/short_name
+    // alone returns empty here ("borrow" is no entity's name); the LIKE content
+    // path over the docstring is what makes discovery beat grep at the entry.
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity_with_properties(
+        &conn,
+        "python:class:loan.LoanPolicy",
+        "class",
+        "LoanPolicy",
+        r#"{"docstring": "Strategy interface: how many days a user may borrow a book."}"#,
+    );
+    // A decoy with no matching content.
+    insert_entity(&conn, "python:class:user.User", "class");
+
+    let hits = find_entities(&conn, "borrow", 20, 0, None).expect("docstring search");
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].id, "python:class:loan.LoanPolicy");
+}
+
+#[test]
+fn find_entities_matches_identifier_substring_fts_cannot() {
+    // weft-b7ce301e92 (LW-1): the marquee case. The concept word `library` is a
+    // substring of the CamelCase identifier `LibraryService`, but FTS matches
+    // whole stemmed tokens (`libraryservice`), so `MATCH 'library'` returns
+    // nothing. The LIKE substring path is what surfaces the class an agent is
+    // actually looking for.
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity_with_properties(
+        &conn,
+        "python:class:catalog.LibraryService",
+        "class",
+        "LibraryService",
+        "{}",
+    );
+
+    let hits = find_entities(&conn, "library", 20, 0, None).expect("identifier-substring search");
+    assert!(
+        hits.iter()
+            .any(|e| e.id == "python:class:catalog.LibraryService"),
+        "substring of a CamelCase identifier must be discoverable: {hits:?}"
+    );
+}
+
+#[test]
+fn find_entities_does_not_leak_briefing_blocked_docstring_content() {
+    // weft-b7ce301e92 secret-safety invariant (cf. clarion-307668e2be): a
+    // docstring withheld by the pre-ingest scanner (briefing_blocked set) must
+    // never become matchable via the new content path — otherwise searching for
+    // a leaked secret would resurface the very entity the block exists to hide.
+    // An identical docstring WITHOUT the block must match (proves the guard, not
+    // the absence of indexing, is what suppresses it).
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity_with_properties(
+        &conn,
+        "python:function:secrets.blocked",
+        "function",
+        "blocked",
+        r#"{"docstring": "uniquesecrettoken in here", "briefing_blocked": "secret_present"}"#,
+    );
+    insert_entity_with_properties(
+        &conn,
+        "python:function:secrets.visible",
+        "function",
+        "visible",
+        r#"{"docstring": "uniquesecrettoken in here"}"#,
+    );
+
+    let hits = find_entities(&conn, "uniquesecrettoken", 20, 0, None).expect("guarded search");
+    assert_eq!(hits.len(), 1, "blocked docstring must not match: {hits:?}");
+    assert_eq!(hits[0].id, "python:function:secrets.visible");
 }
 
 #[test]

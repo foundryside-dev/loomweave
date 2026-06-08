@@ -314,7 +314,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_find",
-            description: "Search Loomweave entities by id, name, short name, and summary text stored on entity rows. Results are paginated and ranked by FTS match where possible. This does not traverse the graph and does not search on-demand summary_cache entries. Pass an optional `kind` (e.g. \"subsystem\", \"function\", \"class\", \"module\") to return only entities of that kind — the way to locate a subsystem without visually filtering results.",
+            description: "Search Loomweave entities by id, name, short name, summary, and docstring content. Matching merges stemmed FTS ranking with grep-equivalent substring recall, so a concept word finds both entities whose docstring mentions it and identifiers that merely contain it (e.g. `library` finds the class `LibraryService`, which whole-token FTS alone misses). This is the always-on keyword-discovery path — no embeddings required (semantic ranking is the separate, opt-in `entity_semantic_search_list`). Results are paginated; FTS-ranked hits come first, then substring-only hits. Docstrings withheld by the secret scanner (briefing_blocked) are never matched. This does not traverse the graph and does not search on-demand summary_cache entries. Pass an optional `kind` (e.g. \"subsystem\", \"function\", \"class\", \"module\") to return only entities of that kind — the way to locate a subsystem without visually filtering results.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -5011,7 +5011,7 @@ mod tests {
         assert_eq!(tools[1].name, "entity_find");
         assert_eq!(
             tools[1].description,
-            "Search Loomweave entities by id, name, short name, and summary text stored on entity rows. Results are paginated and ranked by FTS match where possible. This does not traverse the graph and does not search on-demand summary_cache entries. Pass an optional `kind` (e.g. \"subsystem\", \"function\", \"class\", \"module\") to return only entities of that kind — the way to locate a subsystem without visually filtering results."
+            "Search Loomweave entities by id, name, short name, summary, and docstring content. Matching merges stemmed FTS ranking with grep-equivalent substring recall, so a concept word finds both entities whose docstring mentions it and identifiers that merely contain it (e.g. `library` finds the class `LibraryService`, which whole-token FTS alone misses). This is the always-on keyword-discovery path — no embeddings required (semantic ranking is the separate, opt-in `entity_semantic_search_list`). Results are paginated; FTS-ranked hits come first, then substring-only hits. Docstrings withheld by the secret scanner (briefing_blocked) are never matched. This does not traverse the graph and does not search on-demand summary_cache entries. Pass an optional `kind` (e.g. \"subsystem\", \"function\", \"class\", \"module\") to return only entities of that kind — the way to locate a subsystem without visually filtering results."
         );
         assert_eq!(tools[2].name, "entity_callers_list");
         assert_eq!(
