@@ -20,6 +20,19 @@ impl CrateRoots {
             .max_by_key(|(dir, _)| dir.as_os_str().len())
             .map(|(_, name)| name.clone())
     }
+
+    /// The crate root directory owning `file` (the dir holding `Cargo.toml` /
+    /// `src/`), by the same longest directory-prefix match as
+    /// [`Self::crate_name_for`]. Join `src` onto this to get the crate's source
+    /// root for [`crate::module_path::module_path_for`].
+    #[must_use]
+    pub fn crate_dir_for(&self, file: &Path) -> Option<PathBuf> {
+        self.roots
+            .iter()
+            .filter(|(dir, _)| file.starts_with(dir))
+            .max_by_key(|(dir, _)| dir.as_os_str().len())
+            .map(|(dir, _)| dir.clone())
+    }
 }
 
 /// Underscore a crate name the way Rust does (`a-b` → `a_b`).

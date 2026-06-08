@@ -69,8 +69,16 @@ fn main() {
                 if let Ok(params) = serde_json::from_value::<InitializeParams>(
                     raw.get("params").cloned().unwrap_or(serde_json::json!({})),
                 ) {
-                    // Task 7 builds the project symbol table from this root.
+                    // Build the project symbol table from this root (Task 7,
+                    // spec §2.3). Phase 1a does not consult it during
+                    // `analyze_file` yet — Phase 1b resolves cross-file edges
+                    // against it — but building it here proves the §2.3 walk
+                    // and powers the dogfood gate (Task 14).
                     project_root = params.project_root;
+                    let symbol_table = loomweave_plugin_rust::symbol_table::build_symbol_table(
+                        std::path::Path::new(&project_root),
+                    );
+                    let _ = symbol_table.len();
                 }
                 let _ = &project_root;
                 let result = InitializeResult {
