@@ -21,9 +21,12 @@ use loomweave_core::plugin::parse_manifest;
 const RUST_MANIFEST_BYTES: &[u8] = include_bytes!("../plugin.toml");
 
 /// A tiny, analysable Rust source file. Laid out under a temp crate's `src/`
-/// so crate-root discovery (ADR-049 §1) produces real crate-rooted ids.
-const SAMPLE_RS: &str =
-    "pub struct Gadget { pub n: i32 }\npub fn make() -> Gadget { Gadget { n: 0 } }\n";
+/// so crate-root discovery (ADR-049 §1) produces real crate-rooted ids. It
+/// includes an `impl` block so the impl method + its `contains` edge round-trip
+/// through the real host's `RawEdge` wire path (ADR-026 dual-encoding).
+const SAMPLE_RS: &str = "pub struct Gadget { pub n: i32 }\n\
+     pub fn make() -> Gadget { Gadget { n: 0 } }\n\
+     impl Gadget { pub fn bump(&mut self) { self.n += 1; } }\n";
 
 /// Locate the off-glob `loomweave-rust-plugin` binary in the Cargo target dir,
 /// building it on demand if missing.
@@ -174,6 +177,39 @@ fn handshake_analyze_shutdown_roundtrip() {
         ids.iter()
             .any(|id| id == "rust:function:sample_crate.sample.make"),
         "expected crate-rooted function id; got {ids:?}"
+    );
+    // The impl method round-trips, carrying its impl discriminator in the id.
+    let bump_id = ids
+        .iter()
+        .find(|id| id.contains("Gadget.impl") && id.rsplit('.').next() == Some("bump"))
+        .unwrap_or_else(|| panic!("expected the impl method id; got {ids:?}"));
+
+    // ADR-026 dual-encoding through the REAL host wire: every non-module entity
+    // with a parent_id has a matching `contains` edge — including the impl
+    // method (the bug this fix closes would have emitted parent_id with no edge,
+    // and the storage writer would FailRun). The host deserialised these edges
+    // into RawEdge, so this also proves the contains wire shape is accepted.
+    let contains: std::collections::BTreeSet<(String, String)> = outcome
+        .edges
+        .iter()
+        .filter(|e| e.kind == "contains")
+        .map(|e| (e.from_id.clone(), e.to_id.clone()))
+        .collect();
+    for e in &outcome.entities {
+        if e.kind == "module" {
+            continue; // file_scope: the core supplies the file->module edge
+        }
+        if let Some(parent) = e.raw.parent_id.as_deref() {
+            assert!(
+                contains.contains(&(parent.to_owned(), e.id.as_str().to_owned())),
+                "entity {} has parent_id={parent} but no contains edge; edges={contains:?}",
+                e.id.as_str(),
+            );
+        }
+    }
+    assert!(
+        contains.iter().any(|(_, to)| to == bump_id),
+        "expected a contains edge to the impl method {bump_id}; got {contains:?}"
     );
 
     host.shutdown().expect("shutdown must succeed");

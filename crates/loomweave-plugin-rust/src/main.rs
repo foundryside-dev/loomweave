@@ -106,11 +106,11 @@ fn main() {
                 .unwrap_or(AnalyzeFileParams {
                     file_path: String::new(),
                 });
-                let (entities, findings) =
+                let (entities, edges, findings) =
                     analyze_one_file(&params.file_path, crate_roots.as_ref());
                 let result = AnalyzeFileResult {
                     entities,
-                    edges: vec![],
+                    edges,
                     stats: AnalyzeFileStats::default(),
                     findings,
                 };
@@ -131,15 +131,16 @@ fn main() {
 /// known crate root, falls back to the file stem as the module path so a
 /// malformed/unreadable file still yields a degraded module rather than nothing.
 ///
-/// Returns `(entities, findings)` already shaped for the wire:
-/// degraded-parse `findings` from
+/// Returns `(entities, edges, findings)` already shaped for the wire: the
+/// structural `contains` edges (ADR-026 dual-encoding) accompany the entities,
+/// and degraded-parse `findings` from
 /// [`extract_file_degraded_aware`](loomweave_plugin_rust::extract::extract_file_degraded_aware) are
 /// deserialised into [`AnalyzeFileFinding`]; any element that fails to
 /// deserialise is dropped rather than aborting the response.
 fn analyze_one_file(
     file_path: &str,
     crate_roots: Option<&CrateRoots>,
-) -> (Vec<Value>, Vec<AnalyzeFileFinding>) {
+) -> (Vec<Value>, Vec<Value>, Vec<AnalyzeFileFinding>) {
     use loomweave_plugin_rust::extract::extract_file_degraded_aware;
     use loomweave_plugin_rust::module_path::module_path_for;
 
@@ -161,13 +162,13 @@ fn analyze_one_file(
     };
 
     let src = std::fs::read_to_string(file).unwrap_or_default();
-    let (entities, finding_values) =
+    let (entities, edges, finding_values) =
         extract_file_degraded_aware(&crate_name, &module_path, file_path, &src);
     let findings = finding_values
         .into_iter()
         .filter_map(|v| serde_json::from_value::<AnalyzeFileFinding>(v).ok())
         .collect();
-    (entities, findings)
+    (entities, edges, findings)
 }
 
 fn send_result(writer: &mut impl Write, id: i64, result: Value) {

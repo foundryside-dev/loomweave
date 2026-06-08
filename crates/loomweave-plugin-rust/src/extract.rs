@@ -1,12 +1,22 @@
 //! syn-based extraction of module/struct/function entities (Task 6).
-//! ADR-038 SEI signatures (Task 8).
+//! ADR-038 SEI signatures (Task 8). Structural `contains` edges (Phase 1a
+//! completion — ADR-026 dual-encoding).
 //!
 //! Parse one file with `syn`, walk top-level + inline-`mod` items, and emit
-//! entity JSON `Value`s matching the wire contract. The file-level `module`
-//! entity is `file_scope` (the core auto-emits its `contains` edge).
-//! Inherent/trait impl methods use the Task 4 qualnames; the impl block itself
-//! becomes an `impl` entity in Phase 1b (Phase 1a emits `module`/`struct`/
-//! `function`, where `function` includes methods).
+//! entity JSON `Value`s plus their `contains` edges, matching the wire
+//! contract.
+//!
+//! **Containment (ADR-026 dual-encoding — every `parent_id` MUST have a
+//! matching `contains` edge, or the storage writer fails the run):**
+//! - `module` entities are `file_scope`: the **core** re-parents them to the
+//!   file and emits the `file -> module` contains edge. The plugin must NOT
+//!   emit a contains edge for a module.
+//! - every non-`module` child (`struct`, free `function`, impl method) is
+//!   parented to its enclosing **module** and the plugin emits the matching
+//!   `module -> child` contains edge here. Methods parent to the module (always
+//!   emitted, always in-file) rather than the impl block — the impl `entity` is
+//!   Phase 1b, and the method's *locator* already carries the impl
+//!   discriminator, so Phase 1b can re-parent to the impl without churning id.
 use serde_json::{Value, json};
 use syn::{ImplItem, Item, ItemFn, ItemImpl, ItemMod, ItemStruct, Meta};
 
@@ -17,32 +27,41 @@ use crate::qualname::{
 use crate::signature::{function_signature, struct_signature};
 use crate::spans::{SourceRange, source_range_of};
 
-/// Extract entities from one file's source.
+/// Entities and their structural `contains` edges extracted from one file.
+pub struct Extracted {
+    /// Wire-shaped entity `Value`s: a `file_scope` `module` for the file, then
+    /// every top-level / inline-`mod` `struct`, free `function`, and impl method.
+    pub entities: Vec<Value>,
+    /// Wire-shaped `contains` edge `Value`s (`module -> non-module-child`).
+    /// `module` children are excluded — the core emits their `file -> module`
+    /// edge (see the module docs).
+    pub edges: Vec<Value>,
+}
+
+/// Extract entities **and** their `contains` edges from one file's source.
 ///
-/// `module_path` is the file-level dotted module (Task 2 output). Returns
-/// wire-shaped entity `Value`s: a `file_scope` `module` for the file itself,
-/// then every top-level / inline-`mod` `struct`, free `function`, and impl
-/// method.
+/// `module_path` is the file-level dotted module (Task 2 output).
 ///
 /// # Errors
 ///
 /// Returns the [`syn::Error`] from [`syn::parse_file`] when `src` is not valid
 /// Rust (the degraded-parse fallback wrapping this is Task 9). Also surfaces an
 /// [`syn::Error`] if an assembled qualname fails [`build_entity_id`] validation.
-pub fn extract_file(
+pub fn extract_file_full(
     crate_name: &str,
     module_path: &str,
     file_path: &str,
     src: &str,
-) -> Result<Vec<Value>, syn::Error> {
+) -> Result<Extracted, syn::Error> {
     // `crate_name` is already encoded into `module_path` (Task 2 builds the
     // dotted path crate-rooted). It stays in the public signature for Phase 1b
     // cross-crate edge resolution; extraction itself does not consult it.
     let _ = crate_name;
     let file = syn::parse_file(src)?;
-    let mut out = Vec::new();
-    // File-level module entity (file_scope; core emits its contains edge).
-    out.push(entity(
+    let mut entities = Vec::new();
+    let mut edges = Vec::new();
+    // File-level module entity (file_scope; core emits its file->module edge).
+    entities.push(entity(
         "module",
         module_path,
         file_path,
@@ -56,22 +75,46 @@ pub fn extract_file(
         None,
     )?);
     let module_id = build_id("module", module_path)?;
-    walk_items(&file.items, module_path, &module_id, file_path, &mut out)?;
-    Ok(out)
+    walk_items(
+        &file.items,
+        module_path,
+        &module_id,
+        file_path,
+        &mut entities,
+        &mut edges,
+    )?;
+    Ok(Extracted { entities, edges })
+}
+
+/// Entities-only extraction, for identity / uniqueness / symbol-table callers
+/// that do not need edges. See [`extract_file_full`].
+///
+/// # Errors
+///
+/// As [`extract_file_full`].
+pub fn extract_file(
+    crate_name: &str,
+    module_path: &str,
+    file_path: &str,
+    src: &str,
+) -> Result<Vec<Value>, syn::Error> {
+    extract_file_full(crate_name, module_path, file_path, src).map(|x| x.entities)
 }
 
 /// Extraction wrapper with degraded-parse fallback (review M3).
 ///
-/// On a successful parse, returns the extracted entities and an empty finding
-/// list. On `syn::parse_file` failure (or a qualname/id-validation error from
-/// [`extract_file`]), returns **exactly one** `module` entity flagged
-/// `parse_status = "syntax_error"` plus a single Warning finding — never an
-/// empty list, never a panic. The manifest declares the `syntax_degraded_module`
-/// role on `module` for this case.
+/// On a successful parse, returns the extracted entities, their `contains`
+/// edges, and an empty finding list. On `syn::parse_file` failure (or a
+/// qualname/id-validation error from [`extract_file_full`]), returns **exactly
+/// one** `module` entity flagged `parse_status = "syntax_error"`, **no** edges,
+/// plus a single Warning finding — never an empty entity list, never a panic.
+/// The manifest declares the `syntax_degraded_module` role on `module`.
 ///
 /// The returned finding `Value` carries the real [`AnalyzeFileFinding`] field
 /// names (`subcode`/`severity`/`message`/`metadata`) so `main.rs` can
 /// `serde_json::from_value` each one into the wire struct without remapping.
+///
+/// Returns `(entities, edges, findings)`.
 ///
 /// [`AnalyzeFileFinding`]: loomweave_core::plugin::AnalyzeFileFinding
 #[must_use]
@@ -80,9 +123,9 @@ pub fn extract_file_degraded_aware(
     module_path: &str,
     file_path: &str,
     src: &str,
-) -> (Vec<Value>, Vec<Value>) {
-    match extract_file(crate_name, module_path, file_path, src) {
-        Ok(entities) => (entities, Vec::new()),
+) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+    match extract_file_full(crate_name, module_path, file_path, src) {
+        Ok(Extracted { entities, edges }) => (entities, edges, Vec::new()),
         Err(e) => {
             // Best-effort id; if the module path itself is unrepresentable the
             // entity still carries the (empty) id and the qualified_name, which
@@ -112,7 +155,7 @@ pub fn extract_file_degraded_aware(
                 "message": format!("syn could not parse {file_path}: {e}"),
                 "metadata": metadata
             });
-            (vec![entity], vec![finding])
+            (vec![entity], Vec::new(), vec![finding])
         }
     }
 }
@@ -123,6 +166,7 @@ fn walk_items(
     parent_id: &str,
     file_path: &str,
     out: &mut Vec<Value>,
+    edges: &mut Vec<Value>,
 ) -> Result<(), syn::Error> {
     // Source-order ordinal for inherent impls of the same self-type, so
     // multiple inherent blocks get distinct keys without perturbing trait
@@ -151,45 +195,58 @@ fn walk_items(
                 {
                     q.push_str(&cfg_discriminant(&pred));
                 }
-                out.push(entity(
+                let child = entity(
                     "function",
                     &q,
                     file_path,
                     &source_range_of(item),
                     Some(parent_id),
                     Some(function_signature(sig)),
-                )?);
+                )?;
+                push_with_contains(parent_id, child, out, edges);
             }
             Item::Struct(ItemStruct { ident, fields, .. }) => {
                 let q = free_item_qualname(module_path, &ident.to_string());
-                out.push(entity(
+                let child = entity(
                     "struct",
                     &q,
                     file_path,
                     &source_range_of(item),
                     Some(parent_id),
                     Some(struct_signature(fields)),
-                )?);
+                )?;
+                push_with_contains(parent_id, child, out, edges);
             }
             Item::Impl(it) => {
-                emit_impl_methods(it, module_path, file_path, &mut inherent_ordinals, out)?;
+                emit_impl_methods(
+                    it,
+                    module_path,
+                    parent_id,
+                    file_path,
+                    &mut inherent_ordinals,
+                    out,
+                    edges,
+                )?;
             }
             Item::Mod(ItemMod {
                 ident,
                 content: Some((_, inner)),
                 ..
             }) => {
+                // A nested `module` is `file_scope`: the core re-parents it to
+                // the file and emits the `file -> module` contains edge, so the
+                // plugin emits neither a parent_id nor a contains edge for it.
                 let nested = format!("{module_path}.{ident}");
                 out.push(entity(
                     "module",
                     &nested,
                     file_path,
                     &source_range_of(item),
-                    Some(parent_id),
+                    None,
                     None,
                 )?);
                 let nested_id = build_id("module", &nested)?;
-                walk_items(inner, &nested, &nested_id, file_path, out)?;
+                walk_items(inner, &nested, &nested_id, file_path, out, edges)?;
             }
             _ => {} // const/static/enum/trait/etc. are Phase 1b
         }
@@ -200,9 +257,11 @@ fn walk_items(
 fn emit_impl_methods(
     it: &ItemImpl,
     module_path: &str,
+    module_id: &str,
     file_path: &str,
     inherent_ordinals: &mut std::collections::BTreeMap<String, usize>,
     out: &mut Vec<Value>,
+    edges: &mut Vec<Value>,
 ) -> Result<(), syn::Error> {
     // Type qualname for the impl's self type (simple path types in 1a; exotic
     // self types fall back to a textual rendering in `self_ty_name`).
@@ -219,22 +278,51 @@ fn emit_impl_methods(
         0
     };
     let disc = impl_disc_for(it, ordinal);
-    // The impl entity itself is Phase 1b; here it only parents its methods.
-    let impl_id = build_id("function", &impl_qualname(&type_q, &disc))?;
+    // The impl block's discriminator is folded into each method's locator (so
+    // `Display::fmt` and `Debug::fmt` stay distinct). The impl `entity` itself
+    // is Phase 1b; until it exists, methods parent to the enclosing **module**
+    // (always emitted, always in-file) so every `parent_id` has its matching
+    // `contains` edge — ADR-026 dual-encoding. `impl_qualname` proves the impl
+    // key assembles, but is not emitted as an entity yet.
+    let _ = impl_qualname(&type_q, &disc);
     for member in &it.items {
         if let ImplItem::Fn(m) = member {
             let q = method_qualname(&type_q, &disc, &m.sig.ident.to_string());
-            out.push(entity(
+            let child = entity(
                 "function",
                 &q,
                 file_path,
                 &source_range_of(member),
-                Some(impl_id.as_str()),
+                Some(module_id),
                 Some(function_signature(&m.sig)),
-            )?);
+            )?;
+            push_with_contains(module_id, child, out, edges);
         }
     }
     Ok(())
+}
+
+/// Push a non-`module` child entity and its matching `module -> child`
+/// `contains` edge (ADR-026 dual-encoding: a `parent_id` without a `contains`
+/// edge fails the storage writer's consistency check). `child` MUST already
+/// carry `parent_id == from_id`.
+fn push_with_contains(from_id: &str, child: Value, out: &mut Vec<Value>, edges: &mut Vec<Value>) {
+    if let Some(to_id) = child.get("id").and_then(Value::as_str) {
+        edges.push(contains_edge(from_id, to_id));
+    }
+    out.push(child);
+}
+
+/// A structural `contains` edge. Per ADR-026 decision 3 a structural edge
+/// carries NULL byte offsets (omitted here → wire default `None`); confidence
+/// is `resolved` (the relationship is syntactically certain).
+fn contains_edge(from_id: &str, to_id: &str) -> Value {
+    json!({
+        "kind": "contains",
+        "from_id": from_id,
+        "to_id": to_id,
+        "confidence": "resolved"
+    })
 }
 
 /// Extract the predicate of the first `#[cfg(...)]` attribute on an item, if
@@ -342,11 +430,13 @@ mod tests {
     #[test]
     fn malformed_file_yields_one_degraded_module_and_a_warning() {
         let src = "fn broken( {{{ this is not rust";
-        let (entities, findings) = extract_file_degraded_aware("k", "k.m", "/p/src/m.rs", src);
+        let (entities, edges, findings) =
+            extract_file_degraded_aware("k", "k.m", "/p/src/m.rs", src);
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0]["kind"], "module");
         assert_eq!(entities[0]["id"], "rust:module:k.m");
         assert_eq!(entities[0]["parse_status"], "syntax_error");
+        assert!(edges.is_empty());
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0]["severity"], "warning");
     }
@@ -354,8 +444,80 @@ mod tests {
     #[test]
     fn valid_file_yields_entities_and_no_findings() {
         let src = "pub fn a() {}\n";
-        let (entities, findings) = extract_file_degraded_aware("k", "k.m", "/p/src/m.rs", src);
+        let (entities, _edges, findings) =
+            extract_file_degraded_aware("k", "k.m", "/p/src/m.rs", src);
         assert!(findings.is_empty());
         assert!(entities.iter().any(|e| e["kind"] == "function"));
+    }
+
+    /// ADR-026 dual-encoding, mirroring the storage writer's two-direction
+    /// `parent_contains_mismatch` check (`writer.rs:1252`): emitting a
+    /// `parent_id` without a matching `contains` edge — the bug this fix closes
+    /// — would `FailRun`. Every non-`module` entity with a `parent_id` must have a
+    /// `contains` edge `(parent_id -> id)`, and every `contains` edge must have a
+    /// child whose `parent_id` equals its `from_id`. `module` entities are
+    /// excluded: they are `file_scope`, so the core supplies their
+    /// `file -> module` edge, not the plugin.
+    #[test]
+    fn parent_contains_dual_encoding_holds() {
+        let src = "pub struct Foo { a: i32 }\n\
+                   pub fn free() {}\n\
+                   impl Foo { pub fn make() -> Foo { Foo { a: 0 } } }\n\
+                   impl std::fmt::Display for Foo { fn fmt(&self, _f: &mut std::fmt::Formatter) -> std::fmt::Result { Ok(()) } }\n\
+                   pub mod inner { pub struct Bar; }\n";
+        let Extracted { entities, edges } =
+            extract_file_full("k", "k.m", "/p/src/m.rs", src).unwrap();
+
+        // Index the contains edges by (from, to).
+        let contains: std::collections::BTreeSet<(String, String)> = edges
+            .iter()
+            .filter(|e| e["kind"] == "contains")
+            .map(|e| {
+                (
+                    e["from_id"].as_str().unwrap().to_owned(),
+                    e["to_id"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        let id_to_parent: std::collections::BTreeMap<String, Option<String>> = entities
+            .iter()
+            .map(|e| {
+                (
+                    e["id"].as_str().unwrap().to_owned(),
+                    e.get("parent_id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                )
+            })
+            .collect();
+
+        // Direction 1: every non-module entity with a parent_id has a contains.
+        for e in &entities {
+            if e["kind"] == "module" {
+                continue;
+            }
+            if let Some(parent) = e.get("parent_id").and_then(Value::as_str) {
+                let id = e["id"].as_str().unwrap();
+                assert!(
+                    contains.contains(&(parent.to_owned(), id.to_owned())),
+                    "entity {id} has parent_id={parent} but no matching contains edge",
+                );
+            }
+        }
+        // Direction 2: every contains edge has a child whose parent_id == from.
+        for (from, to) in &contains {
+            assert_eq!(
+                id_to_parent.get(to).and_then(Option::as_deref),
+                Some(from.as_str()),
+                "contains ({from} -> {to}) has no matching child parent_id",
+            );
+        }
+        // And the fix is non-vacuous: the impl method is present and parented.
+        assert!(
+            entities.iter().any(|e| e["id"]
+                .as_str()
+                .is_some_and(|id| id.contains("Foo.impl") && id.ends_with("make"))),
+            "expected the impl method entity",
+        );
     }
 }
