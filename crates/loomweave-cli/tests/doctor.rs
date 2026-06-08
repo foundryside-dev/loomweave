@@ -9,6 +9,7 @@ use std::fs;
 use std::path::Path;
 
 use assert_cmd::Command;
+use rusqlite::Connection;
 
 fn loomweave_bin() -> Command {
     let mut cmd = Command::cargo_bin("loomweave").expect("loomweave binary");
@@ -33,6 +34,16 @@ fn install(args: &[&str], dir: &Path) {
 
 fn read_yaml(path: &Path) -> serde_json::Value {
     serde_norway::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// Materialise a minimal healthy `SQLite` DB at the canonical store path so
+/// `check_loomweave_dir` reports healthy (not the absent warning). A freshly
+/// opened `SQLite` file has `user_version = 0`, which is <= the current schema
+/// version and is therefore accepted.
+fn write_healthy_db(root: &Path) {
+    let db_path = root.join(".weft/loomweave/loomweave.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    Connection::open(&db_path).expect("create minimal SQLite DB");
 }
 
 /// Run `doctor` (optionally with `--fix`) and return `(exit_code, stdout)`.
@@ -96,6 +107,9 @@ fn doctor_fix_registers_mcp_then_reports_healthy() {
         &["install", "--skills", "--codex-skills", "--hooks"],
         dir.path(),
     );
+    // Materialise a healthy DB so the index health check reports ok rather than
+    // the absent-DB warning, which would prevent "All orientation surfaces healthy."
+    write_healthy_db(dir.path());
 
     let (code, out) = doctor(dir.path(), true);
     assert_eq!(code, 0, "--fix should repair and exit 0; stdout:\n{out}");
@@ -173,6 +187,10 @@ fn doctor_fix_repairs_missing_three_way_integration_bindings() {
         ],
         dir.path(),
     );
+    // Materialise a healthy DB so the index health check reports ok rather than
+    // the absent-DB warning; with the DB present, only the integration bindings
+    // surface warns, keeping the "1 warning" count stable.
+    write_healthy_db(dir.path());
 
     let (code, out) = doctor(dir.path(), false);
     assert_eq!(
@@ -582,5 +600,275 @@ fn doctor_reports_published_ephemeral_port() {
     assert!(
         http["message"].as_str().unwrap_or("").contains("9876"),
         "http.config should report the published live port: {http}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Index DB health check tests (.weft/loomweave.schema)
+// ---------------------------------------------------------------------------
+
+/// (a) Absent DB → `.weft/loomweave.schema` is a warning (ok=true), gate passes.
+///
+/// A missing DB is a legitimate intermediate state (install-before-analyze), so
+/// it must not fail the gate. The JSON path must set `ok: true`, and the text
+/// path must exit 0 (warnings only, no problems).
+#[test]
+fn doctor_index_health_absent_db_is_warning_gate_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], dir.path());
+    // `check_sei_population_json` opens the DB with `Connection::open` which
+    // creates it as a side-effect when absent. Remove any DB that install or a
+    // prior doctor run may have materialised so this test exercises the
+    // genuine absence path.
+    let db_path = dir.path().join(".weft/loomweave/loomweave.db");
+    if db_path.exists() {
+        fs::remove_file(&db_path).unwrap();
+    }
+
+    let (code, json) = doctor_json(dir.path(), false);
+    assert_eq!(
+        code, 0,
+        "absent index DB must not fail the gate (install-before-analyze is a \
+         legitimate intermediate state): {json}"
+    );
+    assert_eq!(
+        json["ok"], true,
+        "absent index DB must leave ok=true: {json}"
+    );
+    let check = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == ".weft/loomweave.schema")
+        .expect(".weft/loomweave.schema check must be present");
+    assert_eq!(
+        check["status"], "warning",
+        ".weft/loomweave.schema must be a warning when DB is absent: {check}"
+    );
+    assert!(
+        check["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("loomweave install"),
+        "warning message must suggest loomweave install + analyze: {check}"
+    );
+
+    // Text path: warnings-only → exit 0.
+    // Re-delete the DB: doctor_json may have recreated it as a side-effect
+    // of check_sei_population_json (which uses Connection::open, not read-only).
+    if db_path.exists() {
+        fs::remove_file(&db_path).unwrap();
+    }
+    let (code, out) = doctor(dir.path(), false);
+    assert_eq!(
+        code, 0,
+        "absent index DB must not fail the text-path gate: stdout:\n{out}"
+    );
+    assert!(
+        out.contains("⚠ no index"),
+        "absent DB must surface as a text-path warning: stdout:\n{out}"
+    );
+}
+
+/// (b) DB file present but not valid `SQLite` → `.weft/loomweave.schema` is a
+/// problem (ok=false), gate fails.
+///
+/// A corrupt or non-`SQLite` file in the DB position must be surfaced as a gate
+/// failure, not silently reported as healthy.
+#[test]
+fn doctor_index_health_corrupt_db_is_problem_gate_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], dir.path());
+    // Write a non-SQLite file at the DB path — must NOT be zero-length (a 0-byte
+    // file opens as a fresh db with user_version=0 and is healthy).
+    let db_path = dir.path().join(".weft/loomweave/loomweave.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    fs::write(&db_path, b"this is not a sqlite database").unwrap();
+
+    let (code, json) = doctor_json(dir.path(), false);
+    assert_eq!(code, 1, "a corrupt index DB must fail the gate: {json}");
+    assert_eq!(
+        json["ok"], false,
+        "a corrupt index DB must set ok=false: {json}"
+    );
+    let check = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == ".weft/loomweave.schema")
+        .expect(".weft/loomweave.schema check must be present");
+    assert_eq!(
+        check["status"], "problem",
+        ".weft/loomweave.schema must be a problem when DB is unreadable: {check}"
+    );
+    assert!(
+        check["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unreadable"),
+        "problem message must say the index is unreadable: {check}"
+    );
+
+    // Text path: problem → exit 1.
+    let (code, out) = doctor(dir.path(), false);
+    assert_eq!(
+        code, 1,
+        "a corrupt index DB must fail the text-path gate: stdout:\n{out}"
+    );
+    assert!(
+        out.contains("✗") && out.contains("unreadable"),
+        "corrupt DB must surface as a text-path problem: stdout:\n{out}"
+    );
+}
+
+/// (c) DB present, opens, but `user_version` > current → future-schema
+/// problem (ok=false), message names the version numbers.
+#[test]
+fn doctor_index_health_future_schema_is_problem_with_version_in_message() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], dir.path());
+    let db_path = dir.path().join(".weft/loomweave/loomweave.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    // Create a valid SQLite file with user_version stamped to current+1.
+    {
+        let conn = Connection::open(&db_path).expect("create DB");
+        // user_version is a 32-bit signed integer in SQLite; any value > current
+        // triggers the future-schema guard. We avoid hardcoding a literal so the
+        // test stays correct when CURRENT_SCHEMA_VERSION is bumped.
+        conn.execute_batch("PRAGMA user_version = 99999;")
+            .expect("set future user_version");
+    }
+
+    let (code, json) = doctor_json(dir.path(), false);
+    assert_eq!(code, 1, "a future-schema DB must fail the gate: {json}");
+    assert_eq!(
+        json["ok"], false,
+        "a future-schema DB must set ok=false: {json}"
+    );
+    let check = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == ".weft/loomweave.schema")
+        .expect(".weft/loomweave.schema check must be present");
+    assert_eq!(
+        check["status"], "problem",
+        ".weft/loomweave.schema must be a problem for a future-schema DB: {check}"
+    );
+    let msg = check["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("99999"),
+        "problem message must name the found schema version (99999): {check}"
+    );
+    assert!(
+        msg.contains("newer Loomweave build"),
+        "problem message must mention 'newer Loomweave build': {check}"
+    );
+
+    // Text path: problem → exit 1.
+    let (code, out) = doctor(dir.path(), false);
+    assert_eq!(
+        code, 1,
+        "a future-schema DB must fail the text-path gate: stdout:\n{out}"
+    );
+    assert!(
+        out.contains("99999"),
+        "text output must name the schema version (99999): stdout:\n{out}"
+    );
+}
+
+/// (d) DB present, opens, version <= current → `.weft/loomweave.schema` is ok.
+///
+/// The check's specific status is verified via the JSON surface so we don't
+/// couple to the global "All healthy" summary (which depends on plugin/llm state).
+#[test]
+fn doctor_index_health_healthy_db_is_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], dir.path());
+    // A freshly opened SQLite file has user_version=0, which is <= current and
+    // therefore accepted by verify_user_version.
+    write_healthy_db(dir.path());
+
+    let (code, json) = doctor_json(dir.path(), false);
+    assert_eq!(code, 0, "a healthy index DB must not fail the gate: {json}");
+    let check = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == ".weft/loomweave.schema")
+        .expect(".weft/loomweave.schema check must be present");
+    assert_eq!(
+        check["status"], "ok",
+        ".weft/loomweave.schema must be ok for a healthy DB: {check}"
+    );
+    assert_eq!(
+        check["fixed"],
+        serde_json::json!(false),
+        "a healthy check is never marked fixed: {check}"
+    );
+
+    // Text path: no warning or problem for the index check → does not
+    // contribute to exit-1.
+    let (code, out) = doctor(dir.path(), false);
+    assert_eq!(
+        code, 0,
+        "a healthy index DB must not fail the text-path gate: stdout:\n{out}"
+    );
+    assert!(
+        out.contains("✓") && out.contains("index DB present"),
+        "healthy DB must surface as a text-path ok line: stdout:\n{out}"
+    );
+}
+
+fn run_git(repo: &Path, args: &[&str]) {
+    let ok = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .expect("git runs")
+        .status
+        .success();
+    assert!(ok, "git {args:?} failed");
+}
+
+/// A git-tracked runtime DB is a gate-failing problem: it mutates on every
+/// analyze/scan, dirtying the work tree and blocking legis signing. `doctor`
+/// must exit non-zero; `--fix` untracks it via `git rm --cached` and the project
+/// is then healthy (exit 0), with the working-tree file preserved.
+#[test]
+fn doctor_flags_git_tracked_db_as_problem_and_fix_untracks_it() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], dir.path());
+    write_healthy_db(dir.path());
+    run_git(dir.path(), &["init", "-q"]);
+    run_git(dir.path(), &["config", "user.email", "t@t"]);
+    run_git(dir.path(), &["config", "user.name", "t"]);
+    // `-f` overrides the installed .gitignore — the real scenario is a db that
+    // was committed before ADR-005 was reversed.
+    run_git(dir.path(), &["add", "-f", ".weft/loomweave/loomweave.db"]);
+
+    let (code, out) = doctor(dir.path(), false);
+    assert_eq!(
+        code, 1,
+        "a git-tracked db must fail the gate; stdout:\n{out}"
+    );
+    assert!(
+        out.contains("loomweave.db is git-tracked"),
+        "the tracked-db problem must be named; stdout:\n{out}"
+    );
+
+    let (fix_code, fix_out) = doctor(dir.path(), true);
+    assert_eq!(
+        fix_code, 0,
+        "--fix untracks the db, then the project is healthy; stdout:\n{fix_out}"
+    );
+    assert!(
+        fix_out.contains("git rm --cached"),
+        "the --fix line must report the remedy; stdout:\n{fix_out}"
+    );
+    assert!(
+        dir.path().join(".weft/loomweave/loomweave.db").is_file(),
+        "git rm --cached must keep the working-tree db file"
     );
 }

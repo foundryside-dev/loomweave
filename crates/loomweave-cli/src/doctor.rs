@@ -19,8 +19,10 @@
 //! *enrich-only* surface (per `docs/suite/weft.md` §5): a Loomweave-solo or
 //! Loomweave+Filigree-only project is first-class, so their absence is a
 //! **warning** (surfaced, suggests `--fix`) and never a problem that fails the
-//! gate. Only a genuinely broken state — an unparseable config file, or a
-//! `--fix` repair that errors or does not converge — is a problem.
+//! gate. A genuinely broken state — an unparseable config file, a `--fix` repair
+//! that errors or does not converge, or a git-tracked runtime `loomweave.db`
+//! (which dirties the tree and blocks legis signing, C1 / weft-d822a7de2d) — is
+//! a problem that fails the gate.
 
 use std::fs;
 use std::path::Path;
@@ -31,6 +33,9 @@ use loomweave_federation::config::{McpConfig, ProviderSelection, select_provider
 use rusqlite::Connection;
 use serde::Serialize;
 use serde_json::Value;
+
+use loomweave_storage::StorageError;
+use loomweave_storage::schema::{CURRENT_SCHEMA_VERSION, verify_user_version};
 
 use crate::hooks_settings::HookState;
 use crate::instructions::InstructionsState;
@@ -75,6 +80,7 @@ pub fn run(path: &Path, fix: bool, json_output: bool) -> Result<bool> {
     tally += check_instructions(&project_root, fix);
     tally += check_integration_bindings(&project_root, fix);
     tally += check_db_tracked(&project_root, fix);
+    tally += check_loomweave_dir(&project_root);
     println!("--- llm ---");
     tally += check_llm_provider(&project_root);
 
@@ -196,6 +202,12 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
                  to stop the regenerable index dirtying the tree."
                     .to_owned()
             }
+            ".weft/loomweave.schema" => {
+                "Run `loomweave install` + `loomweave analyze <project>` to create or \
+                 rebuild the index. If the DB is corrupt, remove `.weft/loomweave/loomweave.db` \
+                 first."
+                    .to_owned()
+            }
             "index.freshness" => {
                 "Run `loomweave analyze <project>` to refresh the index.".to_owned()
             }
@@ -224,24 +236,100 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
     }
 }
 
+/// Classification of the tracked-index DB health, shared by the text and JSON
+/// renderers so they can never diverge.
+enum IndexDbHealth {
+    /// DB is absent (legitimate intermediate state: install-before-analyze).
+    Absent,
+    /// DB file is present but could not be opened or probed — corrupt, wrong
+    /// format, permission error, or locked.
+    Unreadable(String),
+    /// DB opens cleanly but its `user_version` is newer than this build.
+    FutureSchema { found: u32, current: u32 },
+    /// DB opens and its schema version is within range of this build.
+    Healthy,
+}
+
+/// Classify the index DB at the canonical store path into one of four states.
+/// Uses `Connection::open_with_flags` with `SQLITE_OPEN_READ_ONLY` so the
+/// check never creates or mutates the DB (unlike `Connection::open`, which
+/// creates the file on success).
+fn classify_index_db_health(project_root: &Path) -> IndexDbHealth {
+    let db_path = loomweave_core::store::db_path(project_root);
+    if !db_path.exists() {
+        return IndexDbHealth::Absent;
+    }
+    let conn =
+        match Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Ok(conn) => conn,
+            Err(err) => return IndexDbHealth::Unreadable(err.to_string()),
+        };
+    // `open_with_flags(READ_ONLY)` lazily succeeds even on a non-SQLite file
+    // ("NOT A SQLITE DB"); the corruption only surfaces at first read.
+    // `verify_user_version` issues `PRAGMA user_version` — a cheap single-page
+    // read that serves double duty as the corruption probe.
+    match verify_user_version(&conn) {
+        Ok(()) => IndexDbHealth::Healthy,
+        Err(StorageError::FutureUserVersion { found, current }) => {
+            IndexDbHealth::FutureSchema { found, current }
+        }
+        Err(err) => IndexDbHealth::Unreadable(err.to_string()),
+    }
+}
+
+/// JSON-path check for tracked-index DB health.  Expands the former
+/// existence-only check with four distinct states: absent (warning),
+/// unreadable (problem), future-schema (problem), healthy (ok).
 fn check_loomweave_dir_json(project_root: &Path) -> DoctorJsonCheck {
-    let loomweave_dir = loomweave_core::store::store_dir(project_root);
-    let db = loomweave_dir.join("loomweave.db");
-    if loomweave_dir.is_dir() && db.is_file() {
-        DoctorJsonCheck::ok(
+    match classify_index_db_health(project_root) {
+        IndexDbHealth::Healthy => DoctorJsonCheck::ok(
             ".weft/loomweave.schema",
-            ".weft/loomweave store directory and database are present",
-        )
-    } else if loomweave_dir.is_dir() {
-        DoctorJsonCheck::warning(
+            format!(
+                ".weft/loomweave store database is present and readable (schema v{CURRENT_SCHEMA_VERSION})"
+            ),
+        ),
+        IndexDbHealth::Absent => DoctorJsonCheck::warning(
             ".weft/loomweave.schema",
-            ".weft/loomweave store directory exists but loomweave.db is absent",
-        )
-    } else {
-        DoctorJsonCheck::warning(
+            "no index — run `loomweave install` + `loomweave analyze`",
+        ),
+        IndexDbHealth::Unreadable(detail) => DoctorJsonCheck::problem(
             ".weft/loomweave.schema",
-            ".weft/loomweave store directory is absent",
-        )
+            format!("index exists but is unreadable: {detail}"),
+        ),
+        IndexDbHealth::FutureSchema { found, current } => DoctorJsonCheck::problem(
+            ".weft/loomweave.schema",
+            format!(
+                "index schema v{found} is newer than this build (current v{current}); \
+                 the database was written by a newer Loomweave build"
+            ),
+        ),
+    }
+}
+
+/// Text-path twin of [`check_loomweave_dir_json`]: contributes to the `Tally`
+/// so problems fail the gate and warnings are surfaced.
+fn check_loomweave_dir(project_root: &Path) -> Tally {
+    match classify_index_db_health(project_root) {
+        IndexDbHealth::Healthy => ok(&format!(
+            "index DB present and readable (schema v{CURRENT_SCHEMA_VERSION})"
+        )),
+        IndexDbHealth::Absent => warn(
+            "no index — run `loomweave install` + `loomweave analyze`",
+            Some("loomweave install --path . && loomweave analyze ."),
+        ),
+        IndexDbHealth::Unreadable(detail) => problem(
+            &format!("index exists but is unreadable: {detail}"),
+            Some(
+                "check permissions; if corrupt, remove .weft/loomweave/loomweave.db and re-analyze",
+            ),
+        ),
+        IndexDbHealth::FutureSchema { found, current } => problem(
+            &format!(
+                "index schema v{found} is newer than this build (current v{current}); \
+                 the database was written by a newer Loomweave build"
+            ),
+            Some("upgrade loomweave to match or exceed the schema version of the database"),
+        ),
     }
 }
 
@@ -318,7 +406,7 @@ fn check_db_tracked_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
             let what = "loomweave.db is git-tracked — it mutates on every analyze/scan, dirtying \
                         the work tree and blocking legis signing (ADR-005 reversed)";
             if !fix {
-                return DoctorJsonCheck::warning("db.tracked", what);
+                return DoctorJsonCheck::problem("db.tracked", what);
             }
             match git_untrack_db(project_root) {
                 Ok(()) if db_tracked_state(project_root) == DbTrackedState::Untracked => {
@@ -1053,7 +1141,10 @@ fn check_db_tracked(project_root: &Path, fix: bool) -> Tally {
             let what = "loomweave.db is git-tracked — it mutates on every analyze/scan, dirtying \
                         the work tree and blocking legis signing";
             if !fix {
-                return warn(
+                // A tracked regenerable db blocks the analyze→govern→sign loop —
+                // a genuinely broken state, so it fails the gate (unlike the
+                // enrich-only binding/instruction warnings).
+                return problem(
                     what,
                     Some(
                         "git rm --cached .weft/loomweave/loomweave.db  (or loomweave doctor --fix)",

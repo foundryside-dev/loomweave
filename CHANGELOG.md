@@ -59,6 +59,19 @@ sandbox. No package is published for release candidates. (Cargo SemVer
 
 ### Fixed
 
+- **`loomweave doctor` now gates on tracked-index DB health (check
+  `.weft/loomweave.schema`).** The check previously only tested for file
+  existence; it now classifies four states: absent (warning — a legitimate
+  install-before-analyze intermediate, does not fail the gate); present but
+  unreadable / corrupt / wrong format (problem — fails the gate); present and
+  opens but `PRAGMA user_version` exceeds this build's schema version (problem —
+  reports the version numbers and names the newer-build cause); and healthy
+  (ok). Both the JSON and text paths report consistently so CI gates driven by
+  either surface see the same verdict. The check resolves the DB path via
+  `loomweave_core::store::db_path` so a `weft.toml` `[loomweave].store_dir`
+  override is honoured, and opens read-only so the health check never creates
+  or mutates the file.
+
 - **Transient pyright spawn failures no longer disable analysis for the whole
   run.** A `subprocess.Popen` failure with a transient errno
   (`EAGAIN`/`ENOMEM`/`EMFILE`/`ENFILE`) now skips only the current file and
