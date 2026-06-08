@@ -1173,6 +1173,7 @@ version = "1.1.0-rc3"
 dependencies = [
  "loomweave-core",
  "proc-macro2",
+ "quote",
  "serde_json",
  "syn",
  "tempfile",

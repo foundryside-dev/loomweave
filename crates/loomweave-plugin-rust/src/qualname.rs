@@ -4,6 +4,7 @@
 //! stable across benign edits.
 
 use loomweave_core::{EntityId, EntityIdError, entity_id};
+use syn::{GenericArgument, ItemImpl, PathArguments, Type};
 
 /// The plugin id that prefixes every entity id this plugin emits (ADR-049).
 pub const PLUGIN_ID: &str = "rust";
@@ -18,7 +19,7 @@ pub fn free_item_qualname(module_path: &str, item_name: &str) -> String {
 ///
 /// # Errors
 ///
-/// Propagates [`EntityIdError`] from [`entity_id`] when `kind` violates the
+/// Propagates [`EntityIdError`] from [`entity_id()`] when `kind` violates the
 /// ADR-022 grammar or `qualname` is empty / contains a reserved `:`.
 pub fn build_entity_id(kind: &str, qualname: &str) -> Result<EntityId, EntityIdError> {
     entity_id(PLUGIN_ID, kind, qualname)
@@ -106,6 +107,70 @@ pub fn impl_qualname(type_qualname: &str, disc: &ImplDisc) -> String {
 #[must_use]
 pub fn method_qualname(type_qualname: &str, disc: &ImplDisc, method: &str) -> String {
     format!("{type_qualname}.{}.{method}", disc.key())
+}
+
+/// Render the discriminator for a syn impl block (ADR-049 §2).
+///
+/// Trait impls become [`ImplDisc::trait_impl`] keyed by the trait path's last
+/// segment plus its concrete generic arguments (so `From<i32>` and `From<u32>`
+/// differ); inherent impls become [`ImplDisc::inherent`] keyed by the impl's
+/// declared generic-parameter count (positional, rename-stable) plus a
+/// caller-supplied source-order `ordinal` that disambiguates multiple inherent
+/// blocks for the same self type.
+#[must_use]
+pub fn impl_disc_for(it: &ItemImpl, ordinal: usize) -> ImplDisc {
+    if let Some((_, trait_path, _)) = &it.trait_
+        && let Some(last) = trait_path.segments.last()
+    {
+        let generic_args = trait_generic_args(&last.arguments);
+        return ImplDisc::trait_impl(&last.ident.to_string(), &generic_args);
+    }
+    let param_names: Vec<String> = it
+        .generics
+        .type_params()
+        .map(|p| p.ident.to_string())
+        .collect();
+    ImplDisc::inherent(&param_names, ordinal)
+}
+
+/// Concrete type/const generic arguments of a trait path's final segment,
+/// rendered textually. Lifetimes are skipped (not part of the locator).
+fn trait_generic_args(args: &PathArguments) -> Vec<String> {
+    let PathArguments::AngleBracketed(ab) = args else {
+        return Vec::new();
+    };
+    ab.args
+        .iter()
+        .filter_map(|a| match a {
+            GenericArgument::Type(ty) => Some(type_textual(ty)),
+            GenericArgument::Const(expr) => {
+                Some(quote::ToTokens::to_token_stream(expr).to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The locator-relevant name of an impl's self type: the last path segment for
+/// a simple path type (`Foo` in `crate::m::Foo`), else a whitespace-stripped
+/// textual rendering that is still deterministic for exotic self types.
+#[must_use]
+pub fn self_ty_name(ty: &Type) -> String {
+    if let Type::Path(p) = ty
+        && let Some(last) = p.path.segments.last()
+    {
+        return last.ident.to_string();
+    }
+    type_textual(ty)
+}
+
+/// Deterministic, whitespace-free textual rendering of a type.
+fn type_textual(ty: &Type) -> String {
+    quote::ToTokens::to_token_stream(ty)
+        .to_string()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
 }
 
 /// Normalise a `#[cfg(<predicate>)]` predicate to a stable `@cfg(...)` suffix:
@@ -224,5 +289,60 @@ mod cfg_tests {
         let unix = format!("{}{}", "m.f", cfg_discriminant("unix"));
         let win = format!("{}{}", "m.f", cfg_discriminant("windows"));
         assert_ne!(unix, win);
+    }
+}
+
+#[cfg(test)]
+mod syn_disc_tests {
+    use super::*;
+    use syn::parse_quote;
+
+    #[test]
+    fn self_ty_name_takes_the_last_path_segment() {
+        let it: syn::ItemImpl = parse_quote!(impl crate::m::Foo { fn x(&self) {} });
+        assert_eq!(self_ty_name(&it.self_ty), "Foo");
+    }
+
+    #[test]
+    fn impl_disc_for_inherent_renders_positional_generics_and_ordinal() {
+        let it: syn::ItemImpl = parse_quote!(
+            impl<T> Foo<T> {
+                fn m(&self) {}
+            }
+        );
+        let disc = impl_disc_for(&it, 0);
+        assert_eq!(disc.key(), "impl#<$0>#0");
+    }
+
+    #[test]
+    fn impl_disc_for_inherent_rename_is_stable_but_ordinal_distinguishes() {
+        let a: syn::ItemImpl = parse_quote!(
+            impl<T> Foo<T> {
+                fn m(&self) {}
+            }
+        );
+        let b: syn::ItemImpl = parse_quote!(
+            impl<U> Foo<U> {
+                fn m(&self) {}
+            }
+        );
+        // Rename T -> U is a no-op (positional); ordinal still separates blocks.
+        assert_eq!(impl_disc_for(&a, 0).key(), impl_disc_for(&b, 0).key());
+        assert_ne!(impl_disc_for(&a, 0).key(), impl_disc_for(&a, 1).key());
+    }
+
+    #[test]
+    fn impl_disc_for_trait_keeps_trait_name_and_concrete_generic_args() {
+        let display: syn::ItemImpl =
+            parse_quote!(impl std::fmt::Display for Foo { fn fmt(&self) {} });
+        assert_eq!(impl_disc_for(&display, 0).key(), "impl[Display]");
+
+        let from_signed: syn::ItemImpl = parse_quote!(impl From<i32> for Foo {});
+        assert_eq!(impl_disc_for(&from_signed, 0).key(), "impl[From<i32>]");
+        let from_unsigned: syn::ItemImpl = parse_quote!(impl From<u32> for Foo {});
+        assert_ne!(
+            impl_disc_for(&from_signed, 0).key(),
+            impl_disc_for(&from_unsigned, 0).key()
+        );
     }
 }

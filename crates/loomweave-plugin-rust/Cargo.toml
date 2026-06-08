@@ -26,6 +26,7 @@ loomweave-core = { path = "../loomweave-core", version = "1.1.0-rc3" }
 serde_json.workspace = true
 syn = { version = "2", features = ["full", "extra-traits", "visit"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
 toml = { workspace = true }
 
 [dev-dependencies]
