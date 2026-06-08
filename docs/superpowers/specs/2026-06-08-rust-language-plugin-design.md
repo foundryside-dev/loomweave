@@ -210,7 +210,7 @@ that is **unique within a run** and **stable across benign edits**:
 ```
 rust:struct:loomweave_core.config.Widget            # crate token closes cross-crate collisions
 rust:function:loomweave_core.config.helper
-rust:function:loomweave_core.config.Widget.impl#.render   # inherent method, carries its impl discriminator
+rust:function:loomweave_core.config.Widget.impl#<>#0.render   # inherent method, carries its impl discriminator
 ```
 
 - **Crate token (closes the cross-crate collision).** Leading segment is the
@@ -231,7 +231,7 @@ on the same type never collide:
 ```
 rust:impl:loomweave_core.config.Foo.impl[Display]      # trait impl — keyed by trait
 rust:impl:loomweave_core.config.Foo.impl[From<i32>]    # trait generic args ARE in the key
-rust:impl:loomweave_core.config.Foo.impl#<0>           # inherent impl, positional generics + ordinal
+rust:impl:loomweave_core.config.Foo.impl#<$0>#0        # inherent impl, positional generics + ordinal
 rust:function:loomweave_core.config.Foo.impl[Display].fmt   # Display::fmt, distinct from…
 rust:function:loomweave_core.config.Foo.impl[Debug].fmt     # …Debug::fmt
 ```
@@ -240,9 +240,10 @@ rust:function:loomweave_core.config.Foo.impl[Debug].fmt     # …Debug::fmt
   (`impl[From<i32>]` ≠ `impl[From<u32>]`).
 - **Inherent impls** key by a **positional, De Bruijn-style** generic signature
   so renaming `<T>`→`<U>` (a benign edit) does **not** churn the id; multiple
-  inherent impls that still tie get a stable **ordinal** (`#<0>`, `#<1>`) by
-  in-file source order (further disambiguated by the module-path prefix across
-  files).
+  inherent impls that still tie get a stable trailing **ordinal** (`#0`, `#1`,
+  rendered after the positional-generic block, e.g. `impl#<$0>#0`,
+  `impl#<$0>#1`) by in-file source order (further disambiguated by the
+  module-path prefix across files).
 - **`#[cfg]` twins:** because §5 keeps all cfg variants visible, two same-path
   items on mutually-exclusive cfgs would collide; each appends a normalized
   `@cfg(<predicate>)` discriminant. Items with a unique path or no cfg get no
