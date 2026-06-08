@@ -72,10 +72,16 @@ fn desired_bindings(project_root: &Path) -> DesiredBindings {
     let filigree_base_url = live_filigree_base_url(project_root)
         .or_else(|| configured_filigree_base_url(project_root))
         .unwrap_or_else(|| DEFAULT_FILIGREE_BASE_URL.to_owned());
-    let wardline_filigree_url = format!(
-        "{}/api/weft/scan-results",
-        filigree_base_url.trim_end_matches('/')
-    );
+    // Server-mode Filigree mounts the federation write router under
+    // `/api/p/{prefix}/…` and fail-closes an unscoped write (filigree N1), so the
+    // bridge URL must carry the project scope or every wardline scan 400s. A
+    // single-project (non-server) Filigree, or no Filigree at all, keeps the
+    // unscoped `/api/…` mount. (gap-analysis opp #2 / weft path-scope action.)
+    let base = filigree_base_url.trim_end_matches('/');
+    let wardline_filigree_url = match filigree_server_scope(project_root) {
+        Some(prefix) => format!("{base}/api/p/{prefix}/weft/scan-results"),
+        None => format!("{base}/api/weft/scan-results"),
+    };
     // ADR-044: seed the consumer's static target with this project's
     // deterministic read-API port. serve binds the same port (barring an
     // ephemeral fallback), and the published .weft/loomweave/ephemeral.port file
@@ -87,6 +93,30 @@ fn desired_bindings(project_root: &Path) -> DesiredBindings {
         wardline_filigree_url,
         loomweave_url,
     }
+}
+
+/// This project's Filigree routing key, but only when Filigree runs in *server*
+/// mode (the case that requires a project-scoped `/api/p/{prefix}/…` write).
+///
+/// Reads `.weft/filigree/config.json`; the URL-facing key is `prefix` (filigree
+/// routes `/api/p/{prefix}` on it; `name` is display-only, kept as a fallback).
+/// Fail-soft: returns `None` (→ unscoped path) when the config is absent,
+/// unparseable, not `mode: "server"`, or carries no usable key — so a
+/// Loomweave-solo or single-project layout is unchanged.
+fn filigree_server_scope(project_root: &Path) -> Option<String> {
+    let path = project_root.join(".weft/filigree/config.json");
+    let raw = fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    if value.get("mode").and_then(Value::as_str) != Some("server") {
+        return None;
+    }
+    value
+        .get("prefix")
+        .or_else(|| value.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
 }
 
 fn live_filigree_base_url(project_root: &Path) -> Option<String> {
@@ -362,4 +392,68 @@ fn write_text_if_changed(path: &Path, content: &str) -> Result<bool> {
     }
     fs::write(path, content).with_context(|| format!("write {}", path.display()))?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_filigree_config(root: &Path, body: &str) {
+        let dir = root.join(".weft/filigree");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("config.json"), body).unwrap();
+    }
+
+    /// Server-mode Filigree fail-closes an unscoped federation write, so the
+    /// bridge URL must carry the project scope `/api/p/{prefix}/…`.
+    #[test]
+    fn server_mode_filigree_yields_project_scoped_bridge_url() {
+        let dir = tempfile::tempdir().unwrap();
+        write_filigree_config(
+            dir.path(),
+            r#"{"prefix":"lacuna","name":"lacuna","mode":"server"}"#,
+        );
+        let desired = desired_bindings(dir.path());
+        assert!(
+            desired
+                .wardline_filigree_url
+                .ends_with("/api/p/lacuna/weft/scan-results"),
+            "server-mode Filigree must scope the bridge URL: {}",
+            desired.wardline_filigree_url
+        );
+    }
+
+    /// Single-project (non-server) Filigree serves the unscoped `/api/…` mount,
+    /// so the bridge URL stays unscoped.
+    #[test]
+    fn non_server_filigree_keeps_unscoped_bridge_url() {
+        let dir = tempfile::tempdir().unwrap();
+        write_filigree_config(
+            dir.path(),
+            r#"{"prefix":"lacuna","name":"lacuna","mode":"single"}"#,
+        );
+        let desired = desired_bindings(dir.path());
+        assert!(
+            desired
+                .wardline_filigree_url
+                .ends_with("/api/weft/scan-results")
+                && !desired.wardline_filigree_url.contains("/api/p/"),
+            "non-server Filigree keeps the unscoped path: {}",
+            desired.wardline_filigree_url
+        );
+    }
+
+    /// No Filigree config (Loomweave-solo, or pre-init) → unscoped, fail-soft.
+    #[test]
+    fn absent_filigree_config_keeps_unscoped_bridge_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let desired = desired_bindings(dir.path());
+        assert!(
+            desired
+                .wardline_filigree_url
+                .ends_with("/api/weft/scan-results"),
+            "absent Filigree config keeps the unscoped path: {}",
+            desired.wardline_filigree_url
+        );
+    }
 }
