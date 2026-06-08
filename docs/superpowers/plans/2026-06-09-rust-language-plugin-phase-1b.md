@@ -121,15 +121,18 @@ fn analyze_over_multifile_crate_completes_with_exact_id_set() {
         "rust:function:e2e_crate.make".to_owned(),
         "rust:function:e2e_crate.sub.helper".to_owned(),
         // Phase-1a ontology only: the impl method parents to the module here
-        // (the impl ENTITY is Task 5; this snapshot GROWS then).
-        "rust:function:e2e_crate.Widget.impl#<>.bump".to_owned(),
+        // (the impl ENTITY is Task 5; this snapshot GROWS then). The method
+        // locator carries the CURRENT source-order ordinal (`#0`) — the code
+        // still mints `impl#<>#0` until Task 5 drops it (Option b); this row
+        // is rewritten to `…impl#<>.bump` in Task 5 Step 6.
+        "rust:function:e2e_crate.Widget.impl#<>#0.bump".to_owned(),
     ];
     want.sort();
     assert_eq!(got, want,
         "out-of-src tests/build.rs must NOT mint colliding/extra ids");
 }
 ```
-> Note: the exact `outcome` accessor shape (reading `runs.status` + the `entities` table) follows however `wp2_e2e.rs` reads its result; reuse that helper. The `Widget.impl#<>.bump` locator assumes Option (b) (ordinal dropped); if Task 5 lands as Option (a) it is `…impl#<>#0.bump` and this `want` row updates in Task 5.
+> Note: the exact `outcome` accessor shape (reading `runs.status` + the `entities` table) follows however `wp2_e2e.rs` reads its result; reuse that helper. The `Widget.impl#<>#0.bump` locator is the **current** (pre-Task-5) shape — `qualname.rs:85` still mints the source-order ordinal `#0`. Task 5 Step 6 rewrites this row to `…impl#<>.bump` when Option (b) drops the ordinal (under Option (a) it stays `…impl#<>#0.bump` and no rewrite is needed). Using the current shape here keeps Task 1 → Task 2 a clean RED → GREEN: Task 2 fixes only the scope collision, not the ordinal, so the locator must match what today's code emits.
 
 - [ ] **Step 3: Run it — expect RED.** The plugin's `analyze_one_file` has no scope guard, so `tests/it.rs` and `build.rs` each mint a bare `rust:module:e2e_crate`; the writer's `ON CONFLICT(id) DO UPDATE` silently merges them and `test_only_helper`/`build.rs main` leak into the set.
 
@@ -484,7 +487,7 @@ Compute `impl_is_cfg_twin` once per item list (a closure over a `BTreeMap<String
 
 - [ ] **Step 5: Amend ADR-049 §1.** Replace the "ordinal … assigned by source order" paragraph: inherent impls of the same `(type, positional-generic-signature, cfg)` are **one** `impl` entity (`…impl#<sig>`); cfg-twin inherent impls are split by the `@cfg(...)` discriminant; there is no source-order ordinal, so the discriminator is genuinely source-order-independent.
 
-- [ ] **Step 6: Update the Task-1 E2E `want` set** — the impl method row stays `…Foo.impl#<>.bump`, and add `"rust:impl:e2e_crate.Widget.impl#<>"`.
+- [ ] **Step 6: Update the Task-1 E2E `want` set** — the impl method row **changes** from the current `…Widget.impl#<>#0.bump` to `…Widget.impl#<>.bump` (the ordinal `#0` is dropped under Option b), and add the new impl entity `"rust:impl:e2e_crate.Widget.impl#<>"`. (Under Option (a) the method row is unchanged — `#0` stays — and you only add the impl entity, which under (a) is `rust:impl:e2e_crate.Widget.impl#<>#0`.)
 
 - [ ] **Step 7: Run — expect GREEN** + full suite (esp. `identity_uniqueness`, `identity_stability`, `analyze_e2e`, `entity_id` parity fixture rows that mention the ordinal — update those fixture rows).
 Run: `cargo nextest run -p loomweave-plugin-rust`
