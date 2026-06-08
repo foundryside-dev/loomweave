@@ -58,7 +58,7 @@ tell which case you're in.
 
 | Tool | Use when | Args |
 |------|----------|------|
-| `find_entity` | locate an entity by name/text | `{"pattern": "<name>"}` |
+| `find_entity` | locate an entity by name, or by a concept word in its docstring/identifier (substring) | `{"pattern": "<name-or-word>"}` |
 | `entity_at` | what's at a file:line | `{"file": "rel/path.py", "line": 42}` |
 | `callers_of` | what calls this entity | `{"id": "<id>"}` |
 | `neighborhood` | one-hop callers+callees+container+contained+references+imports | `{"id": "<id>"}` |
@@ -106,6 +106,25 @@ node-id strings ranked longest-first. Resolve a path id against `nodes`, not by
 re-reading each path element. `truncated`/`truncation_reason` report `edge-cap`
 (traversal stopped early) or `path-cap` (ranked output trimmed for size).
 
+### How `find_entity` matches — the grep replacement for "find the thing that does Y"
+
+`find_entity` merges two recall paths so a concept word, not just an exact
+identifier, lands a hit:
+
+- **stemmed full-text ranking** over name / short name / summary, and
+- **grep-equivalent substring recall** over name / short name / summary **and the
+  entity's docstring**.
+
+So a word that is only a *substring* of a compound identifier is discoverable —
+`{"pattern": "library"}` finds the class `LibraryService`, which whole-token
+full-text alone never matches — and a concept that lives only in docstring prose
+(e.g. `borrow` mentioned in a `LoanPolicy` docstring) is found even when no
+entity is named after it. This is the **always-on keyword-discovery path: reach
+for `find_entity` before you grep.** It needs no embeddings — semantic *ranking*
+is the separate, opt-in `search_semantic` (below). Full-text hits rank first,
+then substring-only hits. Docstrings withheld by the secret scanner
+(`briefing_blocked`) are never matched.
+
 ## Catalogue tools — inspection · faceted search · shortcuts
 
 Beyond navigation, Loomweave serves a **stateless catalogue** of read tools. All
@@ -125,6 +144,7 @@ descendants) **or** a path glob (`"src/auth/**"`); omit it for the whole project
 |------|----------|------|
 | `guidance_for` | guidance sheets applicable to an entity, scope-ranked | `{"id": "<id>"}` |
 | `findings_for` | findings anchored to an entity (filter kind/severity/status) | `{"id": "<id>", "filter": {"status": "open"}}` |
+| `project_finding_list` | **every** finding across the project — no entity id needed; each row carries its anchoring entity `{id, sei, file, line}` + tool/rule/kind/severity/status | `{"filter": {"severity": "error"}}` |
 | `wardline_for` | the entity's Wardline metadata (verbatim, opaque) | `{"id": "<id>"}` |
 
 **Faceted search:**
@@ -133,7 +153,7 @@ descendants) **or** a path glob (`"src/auth/**"`); omit it for the whole project
 |------|----------|------|
 | `find_by_tag` | entities carrying a categorisation tag | `{"tag": "<tag>", "scope": "src/**"}` |
 | `find_by_kind` | entities of a kind (`function`/`class`/`module`/…) | `{"kind": "function"}` |
-| `find_by_wardline` | entities by Wardline tier/group (best-effort) | `{"tier": "exact"}` |
+| `find_by_wardline` | entities by Wardline tier/group (best-effort); pass `has_findings:true` to page only taint-fact entities that also carry a finding | `{"tier": "exact", "has_findings": true}` |
 
 **Exploration-elimination shortcuts** (on-demand graph/index queries — no
 analyze-time precompute):
@@ -159,10 +179,15 @@ honest-empty unless a plugin emits those tags. Likewise `high_churn` and
 `recently_changed` are honest-empty until churn/change signals are populated (use
 `index_diff` for repo-level freshness).
 
-`search_semantic` is also in the catalogue. It is opt-in under
-`semantic_search:`; when enabled, `loomweave analyze` populates the git-ignored
-`.weft/loomweave/embeddings.db` sidecar and the query path filters stale vectors by
-content hash.
+`search_semantic` is also in the catalogue — embedding-similarity *ranking* for a
+natural-language query. It is opt-in under `semantic_search:`; when enabled,
+`loomweave analyze` populates the git-ignored `.weft/loomweave/embeddings.db`
+sidecar and the query path filters stale vectors by content hash. When it is off
+(the default) it returns `result_kind: "not_enabled"` rather than a fabricated or
+empty-as-complete result — **that is not a dead end: `find_entity` already does
+keyword/substring/docstring discovery with no embeddings required** (see "How
+`find_entity` matches" above), so it is the right reach for "find the thing that
+does Y" out of the box.
 
 > Not in this catalogue: `emit_observation` as a general-purpose write surface.
 
@@ -197,8 +222,9 @@ and are composed into `summary` prompts with a real guidance fingerprint.
   `subsystem_of {"id": "<entity-id>"}` — it accepts any entity (a function/class
   resolves through its containing module) and returns the subsystem plus the
   module it resolved through. `subsystem_members` is the forward direction.
-- **`find_entity` is paginated** (~20/page, `next_cursor`); narrow the pattern
-  rather than paging if you can.
+- **`find_entity` is paginated** (~20/page, `next_cursor`); a broad concept word
+  now matches docstring/identifier substrings too, so it can return many hits —
+  narrow the pattern (or add a `kind` filter) rather than paging if you can.
 
 ## Launch
 
