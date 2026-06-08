@@ -132,7 +132,7 @@ kind proves arbitrary kinds are accepted.
 
 | Edge | Phase | Confidence | Notes |
 |------|-------|-----------|-------|
-| `contains` | 1b | Resolved | `mod`→item, `impl`→method, file-module→items. Purely structural — genuinely Resolved-by-construction. |
+| `contains` | **1a** | Resolved | `module`→item, `module`→method, file-module→items. Purely structural — genuinely Resolved-by-construction. **Moved into Phase 1a:** ADR-026 dual-encoding requires that every entity `parent_id` have a matching `contains` edge, or the storage writer (`parent_contains_mismatch`) hard-fails the run — so `parent_id` and `contains` ship together. In 1a, methods are parented to their enclosing **module** (the impl `entity` is 1b); Phase 1b re-parents methods to impl entities (non-churning — parent_id is not the locator). |
 | `imports` | 1b | Resolved (restricted) / Ambiguous | `use` statements. **Only the explicit, non-glob, uniquely-resolvable subset is Resolved** (`use a::b::C;` where `C` resolves to exactly one in-project entity via the §2.3 table). `use a::*;` globs, `pub use` re-exports, and aliases that syntax cannot uniquely resolve are emitted **Ambiguous**, never as a faked Resolved edge (H5). |
 | `implements` | 1b | Resolved (restricted) / Ambiguous | `impl Trait for Type` → trait. Highest-value Rust edge ("who implements X"). Resolved when the trait path resolves to exactly one in-project trait via §2.3; aliased/re-exported trait paths that don't uniquely resolve from syntax are Ambiguous (H5). External traits → external ref, not faked. |
 | `derives` | 1b | Resolved (in-project) / external-ref | `#[derive(...)]` → trait. Same resolution as `implements`. **Reality note (L4):** in practice nearly all `#[derive]` targets are `std`/external (`Debug`, `Clone`, `serde::*`) → external-ref or dropped; in-project resolved derives are rare. Captures the *invocation*, not the macro-generated impl body (§5). **Escape hatch:** if the external-target representation (open Q1) complicates it, `derives` slips to Phase 2 with no loss to the Phase-1a/1b dogfood win. |
@@ -268,7 +268,7 @@ breaks every cross-product binding on that type. Both invariants get dedicated
 regression tests over a corpus containing every collision pair ADR-049 enumerates
 (§7).
 
-### 4.4 SEI signatures (Phase 1b tail)
+### 4.4 SEI signatures (shipped in Phase 1a)
 
 Per ADR-038, function/struct/trait/impl entities emit a versioned `signature`
 object stored verbatim by core and compared by string equality as the
@@ -319,18 +319,26 @@ Each phase is independently useful and mergeable to the active rcN branch.
 cross-product SEI contract baked into `fixtures/entity_id.json`, so it must be
 proven collision-free *before* any edge keys on it.
 
-- **Phase 1a — identity foundation (the gate).** Crate-root discovery +
-  `mod`-tree traversal + the ADR-049 qualname scheme (crate token, impl/trait
-  method discriminator, positional generics, `@cfg` twins, inherent-impl
-  ordinal); the §2.3 init-time symbol table that the same walk feeds; a starter
-  entity set (`module`, `struct`, `function`); and the §4.3 **stability *and*
-  uniqueness** tests. **Exit gate: proven zero-collision over Loomweave's own
-  8-crate workspace.** Nothing keys on an unproven locator.
-- **Phase 1b — remaining entities + Resolved structural edges.** The other 7
-  entity kinds; `contains` (Resolved) + `imports`/`implements` (Resolved on the
-  uniquely-resolvable subset, else Ambiguous — §3.2 H5) + `derives`; SEI
-  signatures (§4.4). Loomweave indexes its own workspace end-to-end. No fuzzy
-  resolution beyond the declared Ambiguous envelope.
+- **Phase 1a — identity foundation (the gate). *(Implemented 2026-06-09.)***
+  Crate-root discovery + `mod`-tree traversal + the ADR-049 qualname scheme
+  (crate token, impl/trait method discriminator, positional generics, `@cfg`
+  twins, inherent-impl ordinal); the §2.3 init-time symbol table that the same
+  walk feeds; a starter entity set (`module`, `struct`, `function`); **the
+  `contains` edge** (pulled in from 1b — ADR-026 dual-encoding requires it to
+  accompany `parent_id`, else the storage writer fails the run; SEI signatures
+  also landed here); and the §4.3 **stability *and* uniqueness** tests. **Exit
+  gate: proven zero-collision over Loomweave's own workspace** (built: a
+  symbol-table uniqueness test over `crates/`, 2,836 entities). *Known residual:
+  a full `loomweave analyze` CLI→writer E2E awaits the install-path PATH staging
+  (a deferred cross-cutting follow-up); the writer's dual-encoding check is
+  guarded by a unit test mirroring it + a host-integration roundtrip.*
+- **Phase 1b — remaining entities + the resolving edges.** The other 7 entity
+  kinds + the `impl` entity (re-parenting methods off the module onto their
+  impl); `imports`/`implements` (Resolved on the uniquely-resolvable subset,
+  else Ambiguous — §3.2 H5) + `derives`; the full `loomweave analyze`→writer
+  E2E. (`contains` and SEI signatures already shipped in 1a.) Loomweave indexes
+  its own workspace end-to-end. No fuzzy resolution beyond the declared
+  Ambiguous envelope.
 - **Phase 2 — `calls` + `references`.** Same-name candidates as Ambiguous;
   unresolved sites reported to core via the existing `unresolved_call_sites`
   channel for query-time Inferred resolution. This is where the genuinely hard,
