@@ -108,6 +108,33 @@ pub fn method_qualname(type_qualname: &str, disc: &ImplDisc, method: &str) -> St
     format!("{type_qualname}.{}.{method}", disc.key())
 }
 
+/// Normalise a `#[cfg(<predicate>)]` predicate to a stable `@cfg(...)` suffix:
+/// whitespace stripped, nested predicate arguments sorted. Applied only to an
+/// item that shares a path with a sibling (extract.rs decides applicability),
+/// closing the otherwise-guaranteed cfg-twin collision (ADR-049 §3).
+#[must_use]
+pub fn cfg_discriminant(predicate: &str) -> String {
+    format!("@cfg({})", normalise_pred(predicate))
+}
+
+fn normalise_pred(p: &str) -> String {
+    let s: String = p.chars().filter(|c| !c.is_whitespace()).collect();
+    // Sort the args of any single `any(...)`/`all(...)` wrapper (1-level; the
+    // common twin case). Deeper nesting falls back to the stripped string,
+    // which is still deterministic.
+    if let Some(inner) = s.strip_prefix("any(").and_then(|r| r.strip_suffix(')')) {
+        let mut parts: Vec<&str> = inner.split(',').collect();
+        parts.sort_unstable();
+        return format!("any({})", parts.join(","));
+    }
+    if let Some(inner) = s.strip_prefix("all(").and_then(|r| r.strip_suffix(')')) {
+        let mut parts: Vec<&str> = inner.split(',').collect();
+        parts.sort_unstable();
+        return format!("all({})", parts.join(","));
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +202,27 @@ mod impl_tests {
         let a = ImplDisc::inherent(&[], 0).key_with_positional();
         let b = ImplDisc::inherent(&[], 1).key_with_positional();
         assert_ne!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod cfg_tests {
+    use super::*;
+
+    #[test]
+    fn normalises_a_cfg_predicate_deterministically() {
+        assert_eq!(cfg_discriminant("unix"), "@cfg(unix)");
+        // whitespace-stripped, args sorted
+        assert_eq!(
+            cfg_discriminant("any( windows , unix )"),
+            "@cfg(any(unix,windows))"
+        );
+    }
+
+    #[test]
+    fn cfg_twins_get_distinct_qualnames() {
+        let unix = format!("{}{}", "m.f", cfg_discriminant("unix"));
+        let win = format!("{}{}", "m.f", cfg_discriminant("windows"));
+        assert_ne!(unix, win);
     }
 }
