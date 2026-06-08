@@ -33,6 +33,14 @@ pub enum StorageError {
     )]
     FutureUserVersion { found: u32, current: u32 },
 
+    #[error(
+        "LMWV-INFRA-STORAGE-UNMIGRATED-DB: refusing to open an unmigrated SQLite \
+         file (user_version=0 — no Loomweave schema applied). This is an empty or \
+         externally-created file, not a Loomweave index. Run `loomweave install \
+         --path <project>` then `loomweave analyze <project>` to build the index"
+    )]
+    UnmigratedIndex,
+
     #[error("migration {version} failed: {source}")]
     Migration {
         version: u32,

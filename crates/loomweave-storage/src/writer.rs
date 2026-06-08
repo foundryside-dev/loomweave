@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -471,6 +471,40 @@ fn begin_run(
     started_at: &str,
     head_commit: Option<&str>,
 ) -> Result<()> {
+    begin_run_inner(
+        conn,
+        state,
+        run_id,
+        config_json,
+        started_at,
+        head_commit,
+        |_| {},
+        |_| {},
+    )
+}
+
+/// `begin_run` with two test seams.
+///
+/// `after_insert_committed` fires after the auto-committed `INSERT INTO runs`
+/// (which deliberately publishes the row as `running` so cross-process
+/// `analyze_status` pollers can see an in-progress run *before* the first batch
+/// commits) and before the write transaction is opened. `on_write_tx_failed`
+/// fires only when `begin_write_tx` returns `Err`, just before the cleanup
+/// `UPDATE`. Production passes no-ops; tests use them to drive the review-#4
+/// TOCTOU window deterministically (grab a competing write lock in the first
+/// seam so `begin_write_tx` fails, release it in the second so the best-effort
+/// cleanup can re-acquire the lock). This mirrors the `on_busy` seam discipline
+/// in `retry.rs`.
+fn begin_run_inner(
+    conn: &mut Connection,
+    state: &mut ActorState,
+    run_id: &str,
+    config_json: &str,
+    started_at: &str,
+    head_commit: Option<&str>,
+    mut after_insert_committed: impl FnMut(&Connection),
+    mut on_write_tx_failed: impl FnMut(&Connection),
+) -> Result<()> {
     if state.current_run.is_some() {
         return Err(StorageError::WriterProtocol(
             "BeginRun received while a run is already in progress".to_owned(),
@@ -483,7 +517,32 @@ fn begin_run(
          ) VALUES (?1, ?2, NULL, ?3, '{}', 'running', ?4, ?5, ?2)",
         params![run_id, started_at, config_json, head_commit, owner_pid()],
     )?;
-    begin_write_tx(conn, state)?;
+    after_insert_committed(conn);
+    if let Err(err) = begin_write_tx(conn, state) {
+        // TOCTOU repair (review #4). The INSERT above auto-committed the row as
+        // `running` (visible to analyze_status), but under sustained
+        // cross-process contention begin_write_tx can exhaust its retries here.
+        // Without repair the row is stranded `running` with `current_run`
+        // unset, so the actor's channel-close cleanup never marks it failed and
+        // analyze_status reports a phantom in-progress run. Re-mark it failed
+        // under a fresh implicit transaction (mirrors the CommitRun
+        // failure-remark idiom). The INSERT is deliberately NOT moved inside
+        // the tx (the ticket's literal suggestion) because that would hide the
+        // `running` row from cross-process analyze_status until the first batch
+        // COMMIT — the regression review #15 warns about. Best-effort: if the
+        // cleanup itself loses the still-contended lock, mark_stale_running_runs_failed
+        // sweeps the row on the next startup.
+        on_write_tx_failed(conn);
+        let _ = conn.execute(
+            "UPDATE runs \
+                SET status = 'failed', \
+                    completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
+                    owner_pid = NULL \
+              WHERE id = ?1",
+            params![run_id],
+        );
+        return Err(err);
+    }
     state.in_tx = true;
     state.writes_in_batch = 0;
     state.current_run = Some(run_id.to_owned());
@@ -500,11 +559,42 @@ fn begin_run(
 /// same durable graph as the original — `--resume` is a re-emit-without-flip
 /// path, not an incremental checkpoint-recovery one.
 fn resume_run(conn: &mut Connection, state: &mut ActorState, run_id: &str) -> Result<()> {
+    resume_run_inner(conn, state, run_id, |_| {}, |_| {})
+}
+
+/// `resume_run` with the same two test seams as [`begin_run_inner`].
+///
+/// Unlike `begin_run`, `resume_run` mutates a PRE-EXISTING row, so the
+/// failure path must *restore* the row's prior terminal state rather than mark
+/// it failed — leaving a previously-`completed` run flipped to `running` would
+/// mis-report it (review #15). The prior `(status, completed_at)` are captured
+/// before the flip and restored if `begin_write_tx` fails.
+fn resume_run_inner(
+    conn: &mut Connection,
+    state: &mut ActorState,
+    run_id: &str,
+    mut after_update_committed: impl FnMut(&Connection),
+    mut on_write_tx_failed: impl FnMut(&Connection),
+) -> Result<()> {
     if state.current_run.is_some() {
         return Err(StorageError::WriterProtocol(
             "ResumeRun received while a run is already in progress".to_owned(),
         ));
     }
+    // Capture the row's prior terminal state BEFORE flipping it to `running`,
+    // so it can be restored verbatim if we fail to open the write transaction.
+    let prior = conn
+        .query_row(
+            "SELECT status, completed_at FROM runs WHERE id = ?1",
+            params![run_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let Some((prior_status, prior_completed_at)) = prior else {
+        return Err(StorageError::WriterProtocol(format!(
+            "ResumeRun: no run with id {run_id} to resume"
+        )));
+    };
     let reopened = conn.execute(
         "UPDATE runs \
             SET status = 'running', \
@@ -515,11 +605,26 @@ fn resume_run(conn: &mut Connection, state: &mut ActorState, run_id: &str) -> Re
         params![owner_pid(), run_id],
     )?;
     if reopened == 0 {
+        // Raced away between the SELECT and the UPDATE — treat as not-found.
         return Err(StorageError::WriterProtocol(format!(
             "ResumeRun: no run with id {run_id} to resume"
         )));
     }
-    begin_write_tx(conn, state)?;
+    after_update_committed(conn);
+    if let Err(err) = begin_write_tx(conn, state) {
+        // The row pre-existed this resume, so restore its prior terminal state
+        // rather than leave it stranded `running` (review #15). Best-effort:
+        // mark_stale_running_runs_failed is the backstop if the restore also
+        // loses the still-contended lock.
+        on_write_tx_failed(conn);
+        let _ = conn.execute(
+            "UPDATE runs \
+                SET status = ?1, completed_at = ?2, owner_pid = NULL \
+              WHERE id = ?3",
+            params![prior_status, prior_completed_at, run_id],
+        );
+        return Err(err);
+    }
     state.in_tx = true;
     state.writes_in_batch = 0;
     state.current_run = Some(run_id.to_owned());
@@ -1366,5 +1471,170 @@ fn ensure_run_update_changed_one(changed: usize, run_id: &str) -> Result<()> {
         Err(StorageError::WriterProtocol(format!(
             "UPDATE runs affected {changed} rows for run_id={run_id}",
         )))
+    }
+}
+
+#[cfg(test)]
+mod run_lifecycle_failpoint_tests {
+    //! Deterministic, single-threaded coverage for the `begin_run` / `resume_run`
+    //! TOCTOU repair paths (reviews #4 / #15). The competing write lock is held
+    //! and released through `begin_run_inner` / `resume_run_inner`'s two test
+    //! seams, so the failure window is hit without threads or wall-clock races.
+
+    use std::time::Duration;
+
+    use rusqlite::Connection;
+
+    use super::{ActorState, begin_run_inner, resume_run_inner};
+    use crate::error::StorageError;
+    use crate::schema;
+
+    /// On-disk DB (BEGIN IMMEDIATE needs a real file to contend on) with the
+    /// busy handler disabled so contention surfaces as an immediate `SQLITE_BUSY`.
+    fn migrated_conn(path: &std::path::Path) -> Connection {
+        let mut conn = Connection::open(path).expect("open");
+        conn.busy_timeout(Duration::from_millis(0))
+            .expect("busy_timeout");
+        schema::apply_migrations(&mut conn).expect("apply_migrations");
+        conn
+    }
+
+    /// A writer state whose write-tx acquire fails fast (single attempt, no
+    /// backoff) so a held competing lock trips it immediately.
+    fn fastfail_state() -> ActorState {
+        let mut state = ActorState::new(50);
+        state.retry_policy = crate::retry::RetryPolicy {
+            max_attempts: 1,
+            initial_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+        };
+        state
+    }
+
+    fn run_status(conn: &Connection, run_id: &str) -> Option<String> {
+        conn.query_row("SELECT status FROM runs WHERE id = ?1", [run_id], |row| {
+            row.get::<_, String>(0)
+        })
+        .ok()
+    }
+
+    #[test]
+    fn begin_run_marks_row_failed_when_write_tx_cannot_be_acquired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idx.db");
+        let mut conn = migrated_conn(&path);
+        // Second connection to the same DB; grabs the write lock in the TOCTOU
+        // window so begin_write_tx busies out.
+        let competitor = migrated_conn(&path);
+        let mut state = fastfail_state();
+
+        let err = begin_run_inner(
+            &mut conn,
+            &mut state,
+            "run-toctou",
+            "{}",
+            "2026-01-01T00:00:00.000Z",
+            None,
+            // after_insert_committed: the `running` row is now durable; grab the
+            // write lock so the upcoming begin_write_tx fails.
+            |_| {
+                competitor
+                    .execute_batch("BEGIN IMMEDIATE")
+                    .expect("competitor takes the write lock");
+            },
+            // on_write_tx_failed: release the lock so the best-effort cleanup
+            // UPDATE can re-acquire it.
+            |_| {
+                competitor
+                    .execute_batch("COMMIT")
+                    .expect("competitor releases the write lock");
+            },
+        )
+        .expect_err("begin_write_tx must fail while the competitor holds the lock");
+
+        assert!(
+            matches!(err, StorageError::Sqlite(_)),
+            "expected a busy SQLite error, got {err:?}"
+        );
+        assert_eq!(
+            run_status(&conn, "run-toctou").as_deref(),
+            Some("failed"),
+            "a stranded 'running' row must be repaired to 'failed', not left phantom-running"
+        );
+        assert!(
+            state.current_run.is_none(),
+            "current_run must stay unset on the failure path"
+        );
+    }
+
+    #[test]
+    fn resume_run_restores_prior_status_when_write_tx_cannot_be_acquired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idx.db");
+        let mut conn = migrated_conn(&path);
+        // Pre-seed a previously-completed run.
+        conn.execute(
+            "INSERT INTO runs ( \
+                id, started_at, completed_at, config, stats, status, analyzed_at_commit, \
+                owner_pid, heartbeat_at \
+             ) VALUES (?1, ?2, ?3, '{}', '{}', 'completed', NULL, NULL, ?2)",
+            rusqlite::params![
+                "run-resume",
+                "2026-01-01T00:00:00.000Z",
+                "2026-01-01T00:05:00.000Z"
+            ],
+        )
+        .unwrap();
+
+        let competitor = migrated_conn(&path);
+        let mut state = fastfail_state();
+
+        let err = resume_run_inner(
+            &mut conn,
+            &mut state,
+            "run-resume",
+            |_| {
+                competitor
+                    .execute_batch("BEGIN IMMEDIATE")
+                    .expect("competitor takes the write lock");
+            },
+            |_| {
+                competitor
+                    .execute_batch("COMMIT")
+                    .expect("competitor releases the write lock");
+            },
+        )
+        .expect_err("begin_write_tx must fail while the competitor holds the lock");
+
+        assert!(
+            matches!(err, StorageError::Sqlite(_)),
+            "expected a busy SQLite error, got {err:?}"
+        );
+        let (status, completed_at): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, completed_at FROM runs WHERE id = ?1",
+                ["run-resume"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "completed",
+            "a pre-existing completed run must be restored, not left flipped to 'running'"
+        );
+        assert_eq!(
+            completed_at.as_deref(),
+            Some("2026-01-01T00:05:00.000Z"),
+            "completed_at must be restored to its prior value"
+        );
+        assert!(state.current_run.is_none());
+        // owner_pid sanity: restored row is unowned.
+        let owner: Option<i64> = conn
+            .query_row(
+                "SELECT owner_pid FROM runs WHERE id = ?1",
+                ["run-resume"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(owner.is_none(), "restored run must be unowned");
     }
 }

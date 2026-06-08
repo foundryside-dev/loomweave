@@ -1004,6 +1004,11 @@ pub struct ServerState {
     /// Launcher for `analyze_start` to spawn. `None` → `current_exe()`; tests
     /// inject a stub via [`ServerState::with_analyze_command`].
     analyze_program: Option<PathBuf>,
+    /// Config file the active `serve` was launched with, forwarded as
+    /// `--config` to an `analyze_start`-spawned analyze so the child parses the
+    /// same configuration (review #12). `None` → the child uses its default
+    /// config discovery (serve was started without an explicit `--config`).
+    analyze_config_path: Option<PathBuf>,
 }
 
 impl ServerState {
@@ -1027,6 +1032,7 @@ impl ServerState {
             cancelled_requests: Arc::new(AsyncMutex::new(BTreeSet::new())),
             cancellation_notify: Arc::new(Notify::new()),
             analyze_program: None,
+            analyze_config_path: None,
         }
     }
 
@@ -1036,6 +1042,15 @@ impl ServerState {
     #[must_use]
     pub fn with_analyze_command(mut self, program: PathBuf) -> Self {
         self.analyze_program = Some(program);
+        self
+    }
+
+    /// Forward `serve`'s `--config` path to `analyze_start`-spawned analyze runs
+    /// so the child parses the same configuration (review #12). Call only when
+    /// serve was launched with an explicit, on-disk config file.
+    #[must_use]
+    pub fn with_analyze_config(mut self, config_path: PathBuf) -> Self {
+        self.analyze_config_path = Some(config_path);
         self
     }
 

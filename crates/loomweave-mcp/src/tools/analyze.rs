@@ -79,6 +79,7 @@ impl ServerState {
             &self.project_root,
             &run_id,
             &progress_path,
+            self.analyze_config_path.as_deref(),
             started_at,
         ) {
             Ok(handle) => handle,

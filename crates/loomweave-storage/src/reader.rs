@@ -91,6 +91,19 @@ impl ReaderPool {
         conn.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))?;
         pragma::validate_application_id_for_read(&conn)?;
         crate::schema::verify_user_version(&conn)?;
+        // Reject an *unmigrated* file (review #8). A header-valid SQLite file
+        // can still be an empty/externally-created DB the read pool would
+        // otherwise auto-materialise and answer every query against with zero
+        // rows. `application_id` can't discriminate it (legacy Loomweave indexes
+        // carry application_id=0, which is accepted), so key on the schema
+        // version: an installed index is stamped at CURRENT_SCHEMA_VERSION by
+        // `apply_migrations`, whereas a fresh/empty file is user_version=0.
+        // NOTE: this checks the *schema*, never row counts — an installed but
+        // not-yet-analyzed index is user_version=CURRENT with zero entities and
+        // is a valid serve target. (A future-version DB is already rejected by
+        // verify_user_version above; 0 < v < CURRENT is left to migrate-on-open
+        // policy and is not refused here.)
+        crate::schema::reject_unmigrated_for_read(&conn)?;
         drop(conn);
         Self::open(db_path, max_size)
     }

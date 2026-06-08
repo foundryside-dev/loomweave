@@ -146,6 +146,33 @@ pub fn verify_user_version(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Reject an *unmigrated* database (`user_version = 0`) at read-open time.
+///
+/// [`set_user_version`] / [`apply_migrations`] stamp
+/// `user_version = CURRENT_SCHEMA_VERSION`, so a genuine Loomweave index — even
+/// one with zero entities (installed but not yet analyzed) — reads back a
+/// non-zero version. A `user_version` of 0 means no Loomweave schema was ever
+/// applied: an empty file the read pool would otherwise auto-create, or an
+/// externally-produced `SQLite` file. `serve` must refuse it rather than answer
+/// every query with zero rows (review #8).
+///
+/// This deliberately keys on the schema version, NOT on table row counts, so a
+/// migrated-but-empty index stays a valid serve target. A *future* version is
+/// handled by [`verify_user_version`]; `0 < user_version < CURRENT` is left to
+/// migrate-on-open policy and is not refused here.
+///
+/// # Errors
+///
+/// Returns [`StorageError::UnmigratedIndex`] when `PRAGMA user_version` is 0,
+/// or [`StorageError::Sqlite`] if the PRAGMA query fails.
+pub fn reject_unmigrated_for_read(conn: &Connection) -> Result<()> {
+    let raw: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if raw == 0 {
+        return Err(StorageError::UnmigratedIndex);
+    }
+    Ok(())
+}
+
 /// Write `PRAGMA user_version = CURRENT_SCHEMA_VERSION`. Idempotent — writing
 /// the same value is cheap (it touches the `SQLite` header page). Called after
 /// the migration runner has applied every pending migration.

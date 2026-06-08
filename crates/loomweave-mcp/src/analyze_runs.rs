@@ -49,11 +49,19 @@ pub(crate) type RunRegistry = Arc<Mutex<HashMap<String, RunHandle>>>;
 /// `program` is the launcher (`current_exe()` in production; a stub in tests).
 /// The run id and progress path are passed in so the caller can return the
 /// handle without racing the run's first DB write or progress write.
+///
+/// `config_path`, when `Some`, is forwarded as `--config <path>` so the spawned
+/// `analyze` parses the SAME configuration the active `serve` was launched with
+/// (review #12). Without it the child re-discovers config from the default
+/// search path, which can silently diverge from serve's `--config` (e.g.
+/// integrations.filigree emission settings), so a serve-triggered analyze would
+/// behave differently from the operator's configured run.
 pub(crate) fn spawn_analyze(
     program: &std::path::Path,
     project_root: &std::path::Path,
     run_id: &str,
     progress_path: &std::path::Path,
+    config_path: Option<&std::path::Path>,
     started_at: String,
 ) -> std::io::Result<RunHandle> {
     let mut command = std::process::Command::new(program);
@@ -63,7 +71,11 @@ pub(crate) fn spawn_analyze(
         .arg("--run-id")
         .arg(run_id)
         .arg("--progress-file")
-        .arg(progress_path)
+        .arg(progress_path);
+    if let Some(config_path) = config_path {
+        command.arg("--config").arg(config_path);
+    }
+    command
         // Isolate the child's stdio. When analyze_start is driven from the
         // stdio MCP server, the child would otherwise inherit the server's
         // stdout — and `loomweave analyze` initializes tracing at `info`, so its
@@ -241,6 +253,7 @@ mod tests {
             dir.path(),
             "run-x",
             &progress,
+            None,
             "2026-05-30T00:00:00Z".to_owned(),
         )
         .expect("spawn stub");
@@ -251,6 +264,73 @@ mod tests {
             where_fd1.trim(),
             "/dev/null",
             "child stdout was not isolated from the parent: {where_fd1:?}"
+        );
+    }
+
+    /// review #12: serve's `--config` must be forwarded to the spawned analyze.
+    #[test]
+    fn spawn_analyze_forwards_config_path_when_present_and_omits_when_absent() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("argv_stub.sh");
+        let argv_dump = dir.path().join("argv.txt");
+        let config = dir.path().join("loomweave.yaml");
+        std::fs::write(&config, "version: 1\n").unwrap();
+        // Dump the full argv (one arg per line) so the test can assert exactly
+        // which flags were forwarded. The progress-file path is argv-relative,
+        // so locate it from the run rather than hard-coding a positional index.
+        let mut file = std::fs::File::create(&script).unwrap();
+        writeln!(
+            file,
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"{}\"\n",
+            argv_dump.display()
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(file);
+
+        // With Some(config): argv must contain `--config <path>`.
+        let progress = dir.path().join("p1.txt");
+        let mut handle = spawn_analyze(
+            &script,
+            dir.path(),
+            "run-cfg",
+            &progress,
+            Some(config.as_path()),
+            "2026-05-30T00:00:00Z".to_owned(),
+        )
+        .expect("spawn stub");
+        handle.child.wait().expect("reap stub");
+        let argv = std::fs::read_to_string(&argv_dump).expect("stub wrote argv");
+        let forwarded: Vec<&str> = argv.lines().collect();
+        let cfg_pos = forwarded
+            .iter()
+            .position(|a| *a == "--config")
+            .expect("--config must be forwarded when Some");
+        assert_eq!(
+            forwarded.get(cfg_pos + 1).copied(),
+            Some(config.to_str().unwrap()),
+            "--config must be followed by the serve config path"
+        );
+
+        // With None: argv must NOT contain `--config`.
+        let progress2 = dir.path().join("p2.txt");
+        let mut handle2 = spawn_analyze(
+            &script,
+            dir.path(),
+            "run-nocfg",
+            &progress2,
+            None,
+            "2026-05-30T00:00:00Z".to_owned(),
+        )
+        .expect("spawn stub");
+        handle2.child.wait().expect("reap stub");
+        let argv2 = std::fs::read_to_string(&argv_dump).expect("stub wrote argv");
+        assert!(
+            !argv2.lines().any(|a| a == "--config"),
+            "--config must be omitted when None; got {argv2:?}"
         );
     }
 }

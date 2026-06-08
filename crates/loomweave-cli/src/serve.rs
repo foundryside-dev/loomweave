@@ -121,6 +121,9 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
         loomweave_mcp::McpToolPolicy {
             enable_write_tools: config.serve.mcp.enable_write_tools,
         },
+        // review #12: forward serve's resolved config to analyze_start, but only
+        // when it exists on disk (the McpConfig::default() fallback has no file).
+        config_path.exists().then(|| config_path.to_path_buf()),
     )?;
     supervise_stdio_with_http(stdio, http_server)
 }
@@ -188,6 +191,7 @@ fn spawn_mcp_stdio(
     filigree_client: Option<FiligreeHttpClient>,
     diagnostics: loomweave_mcp::DiagnosticsContext,
     tool_policy: loomweave_mcp::McpToolPolicy,
+    analyze_config_path: Option<PathBuf>,
 ) -> Result<StdioServe> {
     let (result_tx, result_rx) = mpsc::channel();
     let join = thread::Builder::new()
@@ -203,6 +207,7 @@ fn spawn_mcp_stdio(
                 filigree_client,
                 diagnostics,
                 tool_policy,
+                analyze_config_path,
             );
             let _ = result_tx.send(result);
         })
@@ -221,6 +226,7 @@ fn run_mcp_stdio(
     filigree_client: Option<FiligreeHttpClient>,
     diagnostics: loomweave_mcp::DiagnosticsContext,
     tool_policy: loomweave_mcp::McpToolPolicy,
+    analyze_config_path: Option<PathBuf>,
 ) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -233,6 +239,13 @@ fn run_mcp_stdio(
     let _runtime_guard = runtime.enter();
     let mut state =
         loomweave_mcp::ServerState::new(project_root, readers).with_tool_policy(tool_policy);
+    // Forward serve's config to an analyze_start-spawned analyze so the child
+    // parses the same configuration (review #12). Some only when serve was
+    // launched with an on-disk config — the McpConfig::default() fallback has
+    // no file to forward.
+    if let Some(analyze_config_path) = analyze_config_path {
+        state = state.with_analyze_config(analyze_config_path);
+    }
     let mut llm_writer = None;
     let mut llm_writer_join = None;
     if let Some(provider) = llm_provider {
