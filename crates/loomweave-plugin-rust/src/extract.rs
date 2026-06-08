@@ -173,24 +173,46 @@ fn walk_items(
     // impls (which carry no ordinal). Scoped to this item list.
     let mut inherent_ordinals: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
-    // Free-fn names that appear more than once in this item list are cfg twins
-    // (e.g. `#[cfg(unix)] fn f` / `#[cfg(windows)] fn f`): all cfg variants are
-    // visible (spec §5), so a bare path collides. Such siblings get a normalised
-    // `@cfg(...)` discriminant (ADR-049 §3). Names with a single free fn keep the
-    // bare path, so the common case is undisturbed.
-    let mut free_fn_counts: std::collections::BTreeMap<String, usize> =
+    // Named items sharing one (kind, name) in this item list are cfg twins
+    // (`#[cfg(unix)] fn f` / `#[cfg(windows)] fn f`, and the same for a `struct`
+    // or an inline `mod`): all cfg variants are visible (spec §5), so a bare path
+    // collides — silent intra-run data loss at the writer's
+    // `ON CONFLICT(id) DO UPDATE` (ADR-049 Context). Such siblings get a
+    // normalised `@cfg(...)` discriminant (ADR-049 §3). Counting is per-kind
+    // because the entity id's `kind` segment already separates `fn Foo` from
+    // `struct Foo`; a unique (kind, name) keeps the bare path, so the common case
+    // is undisturbed.
+    let mut twin_counts: std::collections::BTreeMap<(&'static str, String), usize> =
         std::collections::BTreeMap::new();
     for item in items {
-        if let Item::Fn(ItemFn { sig, .. }) = item {
-            *free_fn_counts.entry(sig.ident.to_string()).or_insert(0) += 1;
+        let key = match item {
+            Item::Fn(ItemFn { sig, .. }) => Some(("function", sig.ident.to_string())),
+            Item::Struct(ItemStruct { ident, .. }) => Some(("struct", ident.to_string())),
+            Item::Mod(ItemMod {
+                ident,
+                content: Some(_),
+                ..
+            }) => Some(("module", ident.to_string())),
+            _ => None,
+        };
+        if let Some(k) = key {
+            *twin_counts.entry(k).or_insert(0) += 1;
         }
     }
+    // True when a (kind, name) is shared by a cfg-gated sibling in this list.
+    let is_cfg_twin = |kind: &'static str, name: &str| {
+        twin_counts
+            .get(&(kind, name.to_owned()))
+            .copied()
+            .unwrap_or(0)
+            > 1
+    };
     for item in items {
         match item {
             Item::Fn(ItemFn { sig, attrs, .. }) => {
                 let name = sig.ident.to_string();
                 let mut q = free_item_qualname(module_path, &name);
-                if free_fn_counts.get(&name).copied().unwrap_or(0) > 1
+                if is_cfg_twin("function", &name)
                     && let Some(pred) = cfg_predicate(attrs)
                 {
                     q.push_str(&cfg_discriminant(&pred));
@@ -205,8 +227,19 @@ fn walk_items(
                 )?;
                 push_with_contains(parent_id, child, out, edges);
             }
-            Item::Struct(ItemStruct { ident, fields, .. }) => {
-                let q = free_item_qualname(module_path, &ident.to_string());
+            Item::Struct(ItemStruct {
+                ident,
+                fields,
+                attrs,
+                ..
+            }) => {
+                let name = ident.to_string();
+                let mut q = free_item_qualname(module_path, &name);
+                if is_cfg_twin("struct", &name)
+                    && let Some(pred) = cfg_predicate(attrs)
+                {
+                    q.push_str(&cfg_discriminant(&pred));
+                }
                 let child = entity(
                     "struct",
                     &q,
@@ -231,12 +264,18 @@ fn walk_items(
             Item::Mod(ItemMod {
                 ident,
                 content: Some((_, inner)),
+                attrs,
                 ..
             }) => {
                 // A nested `module` is `file_scope`: the core re-parents it to
                 // the file and emits the `file -> module` contains edge, so the
                 // plugin emits neither a parent_id nor a contains edge for it.
-                let nested = format!("{module_path}.{ident}");
+                let mut nested = format!("{module_path}.{ident}");
+                if is_cfg_twin("module", &ident.to_string())
+                    && let Some(pred) = cfg_predicate(attrs)
+                {
+                    nested.push_str(&cfg_discriminant(&pred));
+                }
                 out.push(entity(
                     "module",
                     &nested,

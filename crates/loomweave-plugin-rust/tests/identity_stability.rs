@@ -17,6 +17,29 @@ fn reordering_impl_blocks_does_not_change_method_ids() {
 }
 
 #[test]
+fn mutating_one_impls_method_set_does_not_churn_other_ids() {
+    // ADR-049 §4.3 benign-edit stability: adding/removing a method in one impl
+    // must not perturb any *other* entity's locator. `b` adds `fn n` alongside
+    // `m` in the same inherent block; every id from `a` must survive verbatim,
+    // and exactly one new id (the added method) appears.
+    let a = "struct Foo;\nimpl Foo { fn m(&self){} }\n";
+    let b = "struct Foo;\nimpl Foo { fn m(&self){} fn n(&self){} }\n";
+    let before = id_set(a);
+    let after = id_set(b);
+    assert!(
+        before.is_subset(&after),
+        "adding `fn n` churned a pre-existing id: {:?}",
+        &before - &after
+    );
+    assert_eq!(
+        (&after - &before).len(),
+        1,
+        "expected exactly the new method's id to be added, got {:?}",
+        &after - &before
+    );
+}
+
+#[test]
 fn renaming_a_generic_param_is_a_noop_for_inherent_impl_ids() {
     let t = "struct Foo<X>(X);\nimpl<T> Foo<T> { fn m(&self){} }\n";
     let u = "struct Foo<X>(X);\nimpl<U> Foo<U> { fn m(&self){} }\n";

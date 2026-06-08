@@ -198,11 +198,25 @@
       "expected_entity_id": "rust:function:k.m.Foo.impl#<$0>#0.m"
     },
     {
+      "description": "rust inherent-impl method second ordinal (multiple inherent blocks; ADR-049 §Consequences parity-fixture list)",
+      "plugin_id": "rust",
+      "kind": "function",
+      "canonical_qualified_name": "k.m.Foo.impl#<$0>#1.m",
+      "expected_entity_id": "rust:function:k.m.Foo.impl#<$0>#1.m"
+    },
+    {
       "description": "rust cfg twin discriminant",
       "plugin_id": "rust",
       "kind": "function",
       "canonical_qualified_name": "k.m.f@cfg(unix)",
       "expected_entity_id": "rust:function:k.m.f@cfg(unix)"
+    },
+    {
+      "description": "rust struct cfg twin discriminant (cfg policy is item-general, not functions-only; ADR-049 §3)",
+      "plugin_id": "rust",
+      "kind": "struct",
+      "canonical_qualified_name": "k.m.S@cfg(windows)",
+      "expected_entity_id": "rust:struct:k.m.S@cfg(windows)"
     }
   ],
   "contains_edges": [

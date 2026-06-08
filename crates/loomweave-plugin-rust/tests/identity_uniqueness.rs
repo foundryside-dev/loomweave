@@ -24,6 +24,21 @@ fn corpus() -> Vec<(&'static str, &'static str, &'static str)> {
             "k.m",
             "#[cfg(unix)] fn f(){}\n#[cfg(windows)] fn f(){}\n",
         ),
+        // The same cfg-twin collision for a `struct` and an inline `mod` — the
+        // `@cfg` discriminant is item-general (ADR-049 §3), not functions-only.
+        // Without it both `S`/`inner` variants emit one bare locator and the
+        // writer's ON CONFLICT silently drops one (the exact Phase-1a data-loss
+        // family the zero-collision gate exists to catch).
+        (
+            "k",
+            "k.m",
+            "#[cfg(unix)] struct S;\n#[cfg(windows)] struct S;\n",
+        ),
+        (
+            "k",
+            "k.m",
+            "#[cfg(unix)] mod inner { pub fn g(){} }\n#[cfg(windows)] mod inner { pub fn g(){} }\n",
+        ),
         // Two cfg-gated inherent impls of the SAME type defining the SAME
         // method name. With all cfg variants visible (spec §5) both `go`
         // methods are extracted; they stay distinct ONLY because the
