@@ -8,6 +8,7 @@ members = [
     "crates/loomweave-cli",
     "crates/loomweave-mcp",
     "crates/loomweave-plugin-fixture",
+    "crates/loomweave-plugin-rust",
     "crates/loomweave-scanner",
 ]
 

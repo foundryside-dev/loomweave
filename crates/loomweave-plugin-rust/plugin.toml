@@ -1,0 +1,41 @@
+[plugin]
+name = "loomweave-plugin-rust"
+plugin_id = "rust"
+version = "1.1.0rc3"
+protocol_version = "1.0"
+# Bare basename per ADR-021 — the host refuses any path component. This is the
+# DISCOVERY name; the cargo artifact is `loomweave-rust-plugin` (off-glob).
+executable = "loomweave-plugin-rust"
+language = "rust"
+extensions = ["rs"]
+
+[capabilities.runtime]
+# Measured basis filled by Task 14 (ADR-035); placeholder envelope until then.
+expected_max_rss_mb = 1024
+expected_entities_per_file = 5000
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+# Phase 1a starter kinds. Phase 1b adds the remaining 7 (ADR-027 MINOR bump).
+entity_kinds = ["module", "struct", "function"]
+# The core auto-emits the file->module `contains` edge for file_scope entities.
+edge_kinds = ["contains"]
+rule_id_prefix = "LMWV-RUST-"
+ontology_version = "0.1.0"
+
+[ontology.roles]
+file_scope = ["module"]
+callable = ["function"]
+syntax_degraded_module = ["module"]
+
+[signature]
+schema_version = 1
+
+[signature.schemas.function]
+v = 1
+fields = ["params", "return_ann", "generics"]
+
+[signature.schemas.struct]
+v = 1
+fields = ["fields"]
