@@ -440,8 +440,11 @@ impl ServerState {
     /// same). Pass `None` config — `project_status` has no static loomweave URL
     /// of its own; this surfaces whether serve is currently publishing.
     pub(crate) fn loomweave_read_api_json(&self) -> Value {
-        let resolution =
-            loomweave_federation::loomweave_url::resolve_loomweave_url(None, &self.project_root);
+        let resolution = loomweave_federation::loomweave_url::resolve_loomweave_url(
+            None,
+            &self.project_root,
+            |name| std::env::var(name).ok(),
+        );
         json!({
             "resolved_url": resolution.resolved_url,
             "resolution_source": resolution.source,

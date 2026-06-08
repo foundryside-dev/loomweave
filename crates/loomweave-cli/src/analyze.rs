@@ -3585,7 +3585,8 @@ async fn post_findings_batch(
 
     // Resolve the live Filigree URL (ephemeral port over stale config), the same
     // resolution `loomweave serve` and `project_status` use.
-    let resolution = resolve_filigree_url(filigree_cfg, project_root);
+    let resolution =
+        resolve_filigree_url(filigree_cfg, project_root, |name| std::env::var(name).ok());
     let mut resolved_cfg = filigree_cfg.clone();
     if let Some(url) = resolution.resolved_url {
         resolved_cfg.base_url = url;
@@ -3724,7 +3725,8 @@ async fn prune_unseen_findings_in_filigree(
 
     // Resolve the live Filigree URL (ephemeral port over stale config), the
     // same resolution emission uses.
-    let resolution = resolve_filigree_url(filigree_cfg, project_root);
+    let resolution =
+        resolve_filigree_url(filigree_cfg, project_root, |name| std::env::var(name).ok());
     let mut resolved_cfg = filigree_cfg.clone();
     if let Some(url) = resolution.resolved_url {
         resolved_cfg.base_url = url;

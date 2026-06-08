@@ -1213,7 +1213,7 @@ async fn issues_for_reports_resolved_endpoint_and_result_kind() {
             allow_live_provider: false,
             cache_max_age_days: 180,
         },
-        filigree: resolve_filigree_url(&config, project.path()),
+        filigree: resolve_filigree_url(&config, project.path(), |_| None),
     };
 
     // Reachable but no associations for this entity -> no_matches.
@@ -2441,7 +2441,7 @@ async fn status_surfaces_agree_on_allow_live_provider_when_half_configured() {
             allow_live_provider: true, // configured-but-inert
             cache_max_age_days: 180,
         },
-        filigree: resolve_filigree_url(&FiligreeConfig::default(), project.path()),
+        filigree: resolve_filigree_url(&FiligreeConfig::default(), project.path(), |_| None),
     };
     let state = state_for(project.path(), &db_path).with_diagnostics(diagnostics);
 
@@ -5138,7 +5138,7 @@ async fn project_status_resolves_live_filigree_endpoint() {
             allow_live_provider: false,
             cache_max_age_days: 180,
         },
-        filigree: resolve_filigree_url(&config, project.path()),
+        filigree: resolve_filigree_url(&config, project.path(), |_| None),
     };
     let state = state_for(project.path(), &db_path).with_diagnostics(diagnostics);
 
@@ -5170,7 +5170,7 @@ async fn project_status_filigree_falls_back_to_config_without_port_file() {
             allow_live_provider: true,
             cache_max_age_days: 7,
         },
-        filigree: resolve_filigree_url(&config, project.path()),
+        filigree: resolve_filigree_url(&config, project.path(), |_| None),
     };
     let state = state_for(project.path(), &db_path).with_diagnostics(diagnostics);
     let envelope = call_tool(&state, "project_status", json!({})).await;

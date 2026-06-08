@@ -625,7 +625,10 @@ fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
     }
     // ADR-044: prefer the live published port over the (now usually absent)
     // static bind. A running serve publishes .weft/loomweave/ephemeral.port.
-    let resolution = loomweave_federation::loomweave_url::resolve_loomweave_url(None, project_root);
+    let resolution =
+        loomweave_federation::loomweave_url::resolve_loomweave_url(None, project_root, |name| {
+            std::env::var(name).ok()
+        });
     if let Some(url) = resolution.resolved_url {
         return DoctorJsonCheck::ok(
             "http.config",

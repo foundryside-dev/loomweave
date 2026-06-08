@@ -44,6 +44,14 @@ use crate::config::FiligreeConfig;
 /// by `project_status` (and, per clarion-318f1254eb, `issues_for`) so an agent
 /// can tell *where* the URL came from without shelling out to probe ports.
 pub const SOURCE_DISABLED: &str = "disabled";
+/// The runtime environment override `WEFT_FILIGREE_URL` (the C-9 §2.2 rung-2
+/// `WEFT_<X>_URL` spelling) — a per-process operator declaration that outranks
+/// every durable/on-disk source.
+pub const SOURCE_ENV: &str = "env:WEFT_FILIGREE_URL";
+/// The operator-declared durable endpoint `weft.toml [filigree].url` (C-9 §2.2
+/// rung-3). Outranks on-disk port discovery: it is the operator's explicit
+/// "Filigree is here" (e.g. a remote host with no local `ephemeral.port`).
+pub const SOURCE_WEFT_TOML: &str = "weft.toml";
 /// The live ethereal port published by Filigree's running dashboard at the
 /// consolidated `.weft/filigree/` location — the only location read (ADR-046).
 pub const SOURCE_EPHEMERAL_PORT: &str = ".weft/filigree/ephemeral.port";
@@ -63,17 +71,35 @@ pub struct FiligreeUrlResolution {
     pub source: &'static str,
 }
 
-/// Resolve the Filigree read-API base URL, preferring the live ethereal port.
+/// Resolve the Filigree read-API base URL along the C-9 §2.2 precedence ladder.
 ///
-/// - Disabled → no resolved URL, `source = "disabled"`.
-/// - A valid `<project_root>/.weft/filigree/ephemeral.port` → the configured URL
-///   with its port overridden by the live port,
-///   `source = ".weft/filigree/ephemeral.port"`.
-/// - Otherwise → the configured URL unchanged, `source = "config"`. A port file
-///   present only at the pre-consolidation `.filigree/` path is **not** read; it
-///   folds here, so a mis-sequenced cutover is visible (not a stale resolve).
+/// Highest wins, after the enabled short-circuit:
+/// 1. `WEFT_FILIGREE_URL` env (`getenv`) → `source = "env:WEFT_FILIGREE_URL"`,
+///    used verbatim — a per-process operator override.
+/// 2. `weft.toml [filigree].url` → `source = "weft.toml"`, used verbatim — the
+///    operator's durable declaration (e.g. a remote Filigree with no local
+///    `ephemeral.port`). Outranks on-disk discovery by design (§2.2).
+/// 3. A valid `<project_root>/.weft/filigree/ephemeral.port` → the configured
+///    URL with its port overridden by the live port,
+///    `source = ".weft/filigree/ephemeral.port"`.
+/// 4. Otherwise → the configured URL unchanged, `source = "config"`. A port file
+///    present only at the pre-consolidation `.filigree/` path is **not** read;
+///    it folds here, so a mis-sequenced cutover is visible (not a stale
+///    resolve).
+///
+/// - Disabled → no resolved URL, `source = "disabled"` (the env/weft.toml rungs
+///   do not revive a disabled integration).
+///
+/// `getenv` is injected (rather than reading `std::env` directly) so the rung is
+/// testable without mutating process env; production passes
+/// `|name| std::env::var(name).ok()`. Both the env and `weft.toml` rungs are
+/// fail-soft: a blank/absent value falls through to the next rung.
 #[must_use]
-pub fn resolve_filigree_url(config: &FiligreeConfig, project_root: &Path) -> FiligreeUrlResolution {
+pub fn resolve_filigree_url(
+    config: &FiligreeConfig,
+    project_root: &Path,
+    getenv: impl Fn(&str) -> Option<String>,
+) -> FiligreeUrlResolution {
     let configured_url = config.base_url.clone();
     if !config.enabled {
         return FiligreeUrlResolution {
@@ -83,6 +109,25 @@ pub fn resolve_filigree_url(config: &FiligreeConfig, project_root: &Path) -> Fil
             source: SOURCE_DISABLED,
         };
     }
+    // Rung 1: WEFT_FILIGREE_URL env, used verbatim.
+    if let Some(url) = getenv("WEFT_FILIGREE_URL").filter(|u| !u.trim().is_empty()) {
+        return FiligreeUrlResolution {
+            enabled: true,
+            configured_url,
+            resolved_url: Some(url.trim().to_owned()),
+            source: SOURCE_ENV,
+        };
+    }
+    // Rung 2: weft.toml [filigree].url, used verbatim (outranks on-disk port).
+    if let Some(url) = loomweave_core::store::sibling_url(project_root, "filigree") {
+        return FiligreeUrlResolution {
+            enabled: true,
+            configured_url,
+            resolved_url: Some(url),
+            source: SOURCE_WEFT_TOML,
+        };
+    }
+    // Rung 3: live ethereal port overrides the configured URL's port.
     match read_ephemeral_port(project_root) {
         Some((port, source)) => {
             let resolved = override_port(&configured_url, port);
@@ -93,6 +138,7 @@ pub fn resolve_filigree_url(config: &FiligreeConfig, project_root: &Path) -> Fil
                 source,
             }
         }
+        // Rung 4: configured base_url unchanged.
         None => FiligreeUrlResolution {
             enabled: true,
             resolved_url: Some(configured_url.clone()),
@@ -181,7 +227,7 @@ mod tests {
     fn disabled_integration_resolves_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let config = FiligreeConfig::default(); // enabled: false
-        let res = resolve_filigree_url(&config, dir.path());
+        let res = resolve_filigree_url(&config, dir.path(), |_| None);
         assert!(!res.enabled);
         assert_eq!(res.resolved_url, None);
         assert_eq!(res.source, SOURCE_DISABLED);
@@ -194,7 +240,7 @@ mod tests {
         // 8542 per the consolidated .weft/filigree/ephemeral.port.
         let dir = tempfile::tempdir().unwrap();
         write_weft_port_file(dir.path(), "8542\n");
-        let res = resolve_filigree_url(&enabled_config(), dir.path());
+        let res = resolve_filigree_url(&enabled_config(), dir.path(), |_| None);
         assert!(res.enabled);
         assert_eq!(res.resolved_url.as_deref(), Some("http://127.0.0.1:8542"));
         assert_eq!(res.source, SOURCE_EPHEMERAL_PORT);
@@ -211,7 +257,7 @@ mod tests {
         // dir (the lacuna-401 wrong-but-quiet-resolve failure mode).
         let dir = tempfile::tempdir().unwrap();
         write_legacy_port_file(dir.path(), "8542\n");
-        let res = resolve_filigree_url(&enabled_config(), dir.path());
+        let res = resolve_filigree_url(&enabled_config(), dir.path(), |_| None);
         assert_eq!(res.source, SOURCE_CONFIG);
         assert_eq!(res.resolved_url.as_deref(), Some("http://127.0.0.1:8766"));
     }
@@ -219,7 +265,7 @@ mod tests {
     #[test]
     fn falls_back_to_configured_url_when_no_port_file() {
         let dir = tempfile::tempdir().unwrap();
-        let res = resolve_filigree_url(&enabled_config(), dir.path());
+        let res = resolve_filigree_url(&enabled_config(), dir.path(), |_| None);
         assert!(res.enabled);
         assert_eq!(res.resolved_url.as_deref(), Some("http://127.0.0.1:8766"));
         assert_eq!(res.source, SOURCE_CONFIG);
@@ -229,7 +275,7 @@ mod tests {
     fn corrupt_port_file_folds_to_configured_url() {
         let dir = tempfile::tempdir().unwrap();
         write_weft_port_file(dir.path(), "not-a-port");
-        let res = resolve_filigree_url(&enabled_config(), dir.path());
+        let res = resolve_filigree_url(&enabled_config(), dir.path(), |_| None);
         assert_eq!(res.source, SOURCE_CONFIG);
         assert_eq!(res.resolved_url.as_deref(), Some("http://127.0.0.1:8766"));
     }
@@ -238,7 +284,7 @@ mod tests {
     fn zero_port_is_rejected_as_corrupt() {
         let dir = tempfile::tempdir().unwrap();
         write_weft_port_file(dir.path(), "0");
-        let res = resolve_filigree_url(&enabled_config(), dir.path());
+        let res = resolve_filigree_url(&enabled_config(), dir.path(), |_| None);
         assert_eq!(res.source, SOURCE_CONFIG);
     }
 
@@ -261,5 +307,60 @@ mod tests {
     #[test]
     fn override_port_returns_input_without_scheme() {
         assert_eq!(override_port("127.0.0.1:8766", 8542), "127.0.0.1:8766");
+    }
+
+    fn write_weft_url(root: &Path, member: &str, url: &str) {
+        std::fs::write(
+            root.join("weft.toml"),
+            format!("[{member}]\nurl = \"{url}\"\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn env_url_wins_verbatim_over_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        // A live port AND a weft.toml url are present; the env override still wins.
+        write_weft_port_file(dir.path(), "8542\n");
+        write_weft_url(dir.path(), "filigree", "http://weft-host:1234");
+        let res = resolve_filigree_url(&enabled_config(), dir.path(), |name| {
+            (name == "WEFT_FILIGREE_URL").then(|| "http://env-host:9000".to_owned())
+        });
+        assert_eq!(res.resolved_url.as_deref(), Some("http://env-host:9000"));
+        assert_eq!(res.source, SOURCE_ENV);
+    }
+
+    #[test]
+    fn weft_toml_url_wins_verbatim_over_live_port() {
+        // The operator's durable declaration (e.g. a remote Filigree) outranks
+        // the on-disk live port (§2.2 rung-3 above rung-4).
+        let dir = tempfile::tempdir().unwrap();
+        write_weft_port_file(dir.path(), "8542\n");
+        write_weft_url(dir.path(), "filigree", "http://remote-host:8749");
+        let res = resolve_filigree_url(&enabled_config(), dir.path(), |_| None);
+        assert_eq!(res.resolved_url.as_deref(), Some("http://remote-host:8749"));
+        assert_eq!(res.source, SOURCE_WEFT_TOML);
+    }
+
+    #[test]
+    fn blank_env_falls_through_to_lower_rungs() {
+        let dir = tempfile::tempdir().unwrap();
+        write_weft_port_file(dir.path(), "8542\n");
+        let res = resolve_filigree_url(&enabled_config(), dir.path(), |_| Some("   ".to_owned()));
+        // Blank env is skipped; the live port resolves.
+        assert_eq!(res.resolved_url.as_deref(), Some("http://127.0.0.1:8542"));
+        assert_eq!(res.source, SOURCE_EPHEMERAL_PORT);
+    }
+
+    #[test]
+    fn disabled_is_not_revived_by_env_or_weft_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        write_weft_url(dir.path(), "filigree", "http://remote-host:8749");
+        let res = resolve_filigree_url(&FiligreeConfig::default(), dir.path(), |_| {
+            Some("http://env-host:9000".to_owned())
+        });
+        assert!(!res.enabled);
+        assert_eq!(res.resolved_url, None);
+        assert_eq!(res.source, SOURCE_DISABLED);
     }
 }

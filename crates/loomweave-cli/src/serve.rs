@@ -72,6 +72,7 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
     let filigree_resolution = loomweave_federation::filigree_url::resolve_filigree_url(
         &config.integrations.filigree,
         &project_root,
+        |name| std::env::var(name).ok(),
     );
     let mut filigree_config = config.integrations.filigree.clone();
     if let Some(resolved) = &filigree_resolution.resolved_url {
