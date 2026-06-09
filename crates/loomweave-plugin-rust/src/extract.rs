@@ -21,12 +21,14 @@
 //!   Same-`(type, generic-sig, cfg)` inherent impls MERGE to one `impl` entity
 //!   (no source-order ordinal — ADR-049 amend, Option b); cfg-twin impls
 //!   (inherent OR trait) are split by an `@cfg(...)` suffix.
+use loomweave_core::plugin::UnresolvedCallSite;
 use serde_json::{Value, json};
 use syn::{
     ImplItem, Item, ItemConst, ItemEnum, ItemFn, ItemImpl, ItemMacro, ItemMod, ItemStatic,
     ItemStruct, ItemTrait, ItemType, ItemUse, Meta, UseTree,
 };
 
+use crate::calls::walk_calls;
 use crate::edges::{implements_edge, imports_edge};
 use crate::qualname::{
     build_entity_id, cfg_discriminant, free_item_qualname, impl_disc_for, impl_qualname,
@@ -46,6 +48,11 @@ pub struct Extracted {
     /// `impl -> method`). `module` children are excluded — the core emits their
     /// `file -> module` edge (see the module docs).
     pub edges: Vec<Value>,
+    /// Call sites that produced NO `calls` edge — method calls, assoc/external
+    /// path calls, and non-path call forms (Phase 2). Empty when no resolver is
+    /// threaded (the [`extract_file_full`] contract), exactly as `edges` carries
+    /// no `imports`/`calls`/`implements` without a resolver.
+    pub unresolved_call_sites: Vec<UnresolvedCallSite>,
 }
 
 /// Extract entities **and** their `contains` edges from one file's source.
@@ -116,6 +123,7 @@ fn extract_file_inner(
     let file = syn::parse_file(src)?;
     let mut entities = Vec::new();
     let mut edges = Vec::new();
+    let mut unresolved_call_sites = Vec::new();
     // File-level module entity (file_scope; core emits its file->module edge).
     entities.push(entity(
         "module",
@@ -139,8 +147,13 @@ fn extract_file_inner(
         resolution,
         &mut entities,
         &mut edges,
+        &mut unresolved_call_sites,
     )?;
-    Ok(Extracted { entities, edges })
+    Ok(Extracted {
+        entities,
+        edges,
+        unresolved_call_sites,
+    })
 }
 
 /// Entities-only extraction, for identity / uniqueness / symbol-table callers
@@ -171,7 +184,9 @@ pub fn extract_file(
 /// names (`subcode`/`severity`/`message`/`metadata`) so `main.rs` can
 /// `serde_json::from_value` each one into the wire struct without remapping.
 ///
-/// Returns `(entities, edges, findings)`.
+/// Returns `(entities, edges, unresolved_call_sites, findings)`. The
+/// entities-only entry point never resolves anything, so its
+/// `unresolved_call_sites` is always empty (parity with its empty edges).
 ///
 /// [`AnalyzeFileFinding`]: loomweave_core::plugin::AnalyzeFileFinding
 #[must_use]
@@ -180,7 +195,7 @@ pub fn extract_file_degraded_aware(
     module_path: &str,
     file_path: &str,
     src: &str,
-) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+) -> (Vec<Value>, Vec<Value>, Vec<UnresolvedCallSite>, Vec<Value>) {
     degraded_aware(
         module_path,
         file_path,
@@ -194,7 +209,7 @@ pub fn extract_file_degraded_aware(
 /// plus a Warning finding, no edges — because an unparseable file has no `use`
 /// tree to resolve.
 ///
-/// Returns `(entities, edges, findings)`.
+/// Returns `(entities, edges, unresolved_call_sites, findings)`.
 #[must_use]
 pub fn extract_file_degraded_aware_with_edges(
     crate_name: &str,
@@ -202,7 +217,7 @@ pub fn extract_file_degraded_aware_with_edges(
     file_path: &str,
     src: &str,
     resolver: &Resolver,
-) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+) -> (Vec<Value>, Vec<Value>, Vec<UnresolvedCallSite>, Vec<Value>) {
     degraded_aware(
         module_path,
         file_path,
@@ -211,16 +226,20 @@ pub fn extract_file_degraded_aware_with_edges(
 }
 
 /// Shape an extraction `Result` into the degraded-aware
-/// `(entities, edges, findings)` triple: a clean parse passes through with no
+/// `(entities, edges, unresolved_call_sites, findings)` tuple: a clean parse passes through with no
 /// findings; a parse error collapses to a single `syntax_error` module entity
 /// plus one Warning finding and no edges.
 fn degraded_aware(
     module_path: &str,
     file_path: &str,
     extracted: Result<Extracted, syn::Error>,
-) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+) -> (Vec<Value>, Vec<Value>, Vec<UnresolvedCallSite>, Vec<Value>) {
     match extracted {
-        Ok(Extracted { entities, edges }) => (entities, edges, Vec::new()),
+        Ok(Extracted {
+            entities,
+            edges,
+            unresolved_call_sites,
+        }) => (entities, edges, unresolved_call_sites, Vec::new()),
         Err(e) => {
             // Best-effort id; if the module path itself is unrepresentable the
             // entity still carries the (empty) id and the qualified_name, which
@@ -250,7 +269,7 @@ fn degraded_aware(
                 "message": format!("syn could not parse {file_path}: {e}"),
                 "metadata": metadata
             });
-            (vec![entity], Vec::new(), vec![finding])
+            (vec![entity], Vec::new(), Vec::new(), vec![finding])
         }
     }
 }
@@ -267,6 +286,7 @@ fn walk_items(
     resolution: Option<(&str, &Resolver)>,
     out: &mut Vec<Value>,
     edges: &mut Vec<Value>,
+    sites: &mut Vec<UnresolvedCallSite>,
 ) -> Result<(), syn::Error> {
     // Impl entities already emitted in THIS item list, by full impl id. A
     // second source block with the same impl id (same type+sig+cfg) does NOT
@@ -335,7 +355,9 @@ fn walk_items(
     };
     for item in items {
         match item {
-            Item::Fn(ItemFn { sig, attrs, .. }) => {
+            Item::Fn(ItemFn {
+                sig, attrs, block, ..
+            }) => {
                 let name = sig.ident.to_string();
                 let mut q = free_item_qualname(module_path, &name);
                 if is_cfg_twin("function", &name)
@@ -351,7 +373,15 @@ fn walk_items(
                     Some(parent_id),
                     Some(function_signature(sig)),
                 )?;
+                let fn_id = build_id("function", &q)?;
                 push_with_contains(parent_id, child, out, edges);
+                // Phase 2: walk the body for call sites, ONLY with a resolver
+                // (the edges-aware entry point) — parity with `imports`. The
+                // caller is this free fn; closures / nested fns are walked but
+                // attributed to it (see `calls` module docs).
+                if let Some((from_crate, resolver)) = resolution {
+                    walk_calls(block, &fn_id, from_crate, resolver, edges, sites);
+                }
             }
             Item::Struct(ItemStruct {
                 ident,
@@ -387,6 +417,7 @@ fn walk_items(
                     resolution,
                     out,
                     edges,
+                    sites,
                 )?;
             }
             Item::Mod(ItemMod {
@@ -414,7 +445,7 @@ fn walk_items(
                 )?);
                 let nested_id = build_id("module", &nested)?;
                 walk_items(
-                    inner, &nested, &nested_id, file_path, resolution, out, edges,
+                    inner, &nested, &nested_id, file_path, resolution, out, edges, sites,
                 )?;
             }
             // Phase 1b leaf kinds: free items riding the same qualname + entity +
@@ -644,6 +675,7 @@ fn emit_impl(
     resolution: Option<(&str, &Resolver)>,
     out: &mut Vec<Value>,
     edges: &mut Vec<Value>,
+    sites: &mut Vec<UnresolvedCallSite>,
 ) -> Result<(), syn::Error> {
     // Type qualname for the impl's self type (simple path types in 1a; exotic
     // self types fall back to a textual rendering in `self_ty_name`).
@@ -722,7 +754,13 @@ fn emit_impl(
                 Some(&impl_id),
                 Some(function_signature(&m.sig)),
             )?;
+            let method_id = build_id("function", &q)?;
             push_with_contains(&impl_id, child, out, edges); // impl -> method
+            // Phase 2: walk the method body for call sites, ONLY with a resolver.
+            // The caller is this impl method id (NOT the impl or the module).
+            if let Some((from_crate, resolver)) = resolution {
+                walk_calls(&m.block, &method_id, from_crate, resolver, edges, sites);
+            }
         }
     }
     Ok(())
@@ -873,13 +911,14 @@ mod tests {
     #[test]
     fn malformed_file_yields_one_degraded_module_and_a_warning() {
         let src = "fn broken( {{{ this is not rust";
-        let (entities, edges, findings) =
+        let (entities, edges, sites, findings) =
             extract_file_degraded_aware("k", "k.m", "/p/src/m.rs", src);
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0]["kind"], "module");
         assert_eq!(entities[0]["id"], "rust:module:k.m");
         assert_eq!(entities[0]["parse_status"], "syntax_error");
         assert!(edges.is_empty());
+        assert!(sites.is_empty());
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0]["severity"], "warning");
     }
@@ -887,7 +926,7 @@ mod tests {
     #[test]
     fn valid_file_yields_entities_and_no_findings() {
         let src = "pub fn a() {}\n";
-        let (entities, _edges, findings) =
+        let (entities, _edges, _sites, findings) =
             extract_file_degraded_aware("k", "k.m", "/p/src/m.rs", src);
         assert!(findings.is_empty());
         assert!(entities.iter().any(|e| e["kind"] == "function"));
@@ -908,8 +947,9 @@ mod tests {
                    impl Foo { pub fn make() -> Foo { Foo { a: 0 } } }\n\
                    impl std::fmt::Display for Foo { fn fmt(&self, _f: &mut std::fmt::Formatter) -> std::fmt::Result { Ok(()) } }\n\
                    pub mod inner { pub struct Bar; }\n";
-        let Extracted { entities, edges } =
-            extract_file_full("k", "k.m", "/p/src/m.rs", src).unwrap();
+        let Extracted {
+            entities, edges, ..
+        } = extract_file_full("k", "k.m", "/p/src/m.rs", src).unwrap();
 
         // Index the contains edges by (from, to).
         let contains: std::collections::BTreeSet<(String, String)> = edges

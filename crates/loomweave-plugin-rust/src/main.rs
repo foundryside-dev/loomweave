@@ -21,6 +21,7 @@ use loomweave_core::plugin::transport::{Frame, read_frame, write_frame};
 use loomweave_core::plugin::{
     AnalyzeFileFinding, AnalyzeFileParams, AnalyzeFileResult, AnalyzeFileStats, InitializeParams,
     InitializeResult, JsonRpcVersion, ResponseEnvelope, ResponsePayload, ShutdownResult,
+    UnresolvedCallSite,
 };
 use loomweave_plugin_rust::crate_roots::CrateRoots;
 use loomweave_plugin_rust::symbol_table::SymbolTable;
@@ -113,7 +114,7 @@ fn main() {
                 .unwrap_or(AnalyzeFileParams {
                     file_path: String::new(),
                 });
-                let (entities, edges, findings) = analyze_one_file(
+                let (entities, edges, unresolved_call_sites, findings) = analyze_one_file(
                     &params.file_path,
                     crate_roots.as_ref(),
                     symbol_table.as_ref(),
@@ -121,7 +122,16 @@ fn main() {
                 let result = AnalyzeFileResult {
                     entities,
                     edges,
-                    stats: AnalyzeFileStats::default(),
+                    stats: AnalyzeFileStats {
+                        // Phase 2 calls stats. `*_total` is the count of sites
+                        // that produced no in-project `calls` edge; the list is
+                        // those sites verbatim for lazy query-time inference.
+                        // The reference_* / latency fields stay default (the
+                        // Rust plugin has no Pyright-style reference pass).
+                        unresolved_call_sites_total: unresolved_call_sites.len() as u64,
+                        unresolved_call_sites,
+                        ..Default::default()
+                    },
                     findings,
                 };
                 send_result(&mut writer, id, serde_json::to_value(result).unwrap());
@@ -156,7 +166,12 @@ fn analyze_one_file(
     file_path: &str,
     crate_roots: Option<&CrateRoots>,
     symbol_table: Option<&SymbolTable>,
-) -> (Vec<Value>, Vec<Value>, Vec<AnalyzeFileFinding>) {
+) -> (
+    Vec<Value>,
+    Vec<Value>,
+    Vec<UnresolvedCallSite>,
+    Vec<AnalyzeFileFinding>,
+) {
     use loomweave_plugin_rust::extract::{
         extract_file_degraded_aware, extract_file_degraded_aware_with_edges,
     };
@@ -170,7 +185,7 @@ fn analyze_one_file(
     let Some((crate_name, module_path)) =
         crate_roots.and_then(|roots| emittable_scope(roots, file))
     else {
-        return (Vec::new(), Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     };
 
     let src = std::fs::read_to_string(file).unwrap_or_default();
@@ -178,7 +193,7 @@ fn analyze_one_file(
     // in-project `use` paths into `imports` edges; without it (defensive — every
     // real `initialize` builds one) fall back to the entities/`contains`-only
     // path so analysis never silently aborts.
-    let (entities, edges, finding_values) = match symbol_table {
+    let (entities, edges, unresolved_call_sites, finding_values) = match symbol_table {
         Some(table) => {
             let resolver = Resolver::new(table);
             extract_file_degraded_aware_with_edges(
@@ -195,7 +210,7 @@ fn analyze_one_file(
         .into_iter()
         .filter_map(|v| serde_json::from_value::<AnalyzeFileFinding>(v).ok())
         .collect();
-    (entities, edges, findings)
+    (entities, edges, unresolved_call_sites, findings)
 }
 
 fn send_result(writer: &mut impl Write, id: i64, result: Value) {

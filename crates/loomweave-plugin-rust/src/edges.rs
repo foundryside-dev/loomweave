@@ -54,3 +54,26 @@ pub fn implements_edge(from_id: &str, to_id: &str, confidence: &str, span: &Sour
         "confidence": confidence,
     })
 }
+
+/// An anchored `calls` edge from the enclosing function entity (`from_id`) to the
+/// resolved callee function (`to_id`), carrying the call expression's byte span.
+///
+/// Like `imports`/`implements`, `calls` is anchored (ADR-026 decision 3): it
+/// carries non-null byte offsets and so may NOT be `inferred`. The resolver's
+/// outcome renders to the wire string — `"resolved"` for a unique in-project
+/// `function`, `"ambiguous"` for a multi-candidate collision. An `External`
+/// (or method / non-path) call yields NO edge (it is recorded as an
+/// `UnresolvedCallSite` instead), so this helper is never called for it. The
+/// candidate-properties list the Python plugin attaches is intentionally OMITTED
+/// for the MVP — the edge shape stays minimal, mirroring `imports_edge`.
+#[must_use]
+pub fn calls_edge(from_id: &str, to_id: &str, confidence: &str, span: &SourceRange) -> Value {
+    json!({
+        "kind": "calls",
+        "from_id": from_id,
+        "to_id": to_id,
+        "source_byte_start": span.byte_start,
+        "source_byte_end": span.byte_end,
+        "confidence": confidence,
+    })
+}
