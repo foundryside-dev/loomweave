@@ -83,6 +83,7 @@ Because this integration **passes** the failure test — rather than accepting a
 - The store is clobber-safe by construction: a dedicated `wardline_taint_facts` table is never touched by the `entities` UPSERT, so re-analyze does not wipe taint facts the way the schema-reserved `wardline` column would.
 - `scan_id` and `content_hash_at_compute` are real columns (not parsed out of the opaque blob), giving observability and an optional future prune-by-scan without ever requiring Loomweave to read `wardline_json`.
 - The federation boundary is structural, not merely documented: the `wardline`-named table and routes make "Wardline-specific, not a generic blob bus" a property of the schema, enforceable at review time against the §5 guard.
+- The exact-tier qualname resolver (`resolve_wardline_qualnames`) is reused, unchanged, by the MCP `entity_resolve` tool (`clarion-d76e7f7267`) — one resolution definition serves both the federation `/api/wardline/resolve` route and the consult-mode read surface; the MCP tool additionally projects each candidate through `entity_json` so it returns the SEI per candidate (ADR-038), whereas the federation route is locator-only.
 
 ### Negative / costs
 

@@ -485,6 +485,8 @@ assert tool_names == [
     "entity_recent_change_list",
     "entity_dead_list",
     "entity_semantic_search_list",
+    "project_finding_list",
+    "entity_resolve",
 ], tool_names
 # Single-source check (clarion-71f0d6c3dd): the initialize `instructions` tool
 # enumeration is derived from list_tools(), so every advertised tool must appear
