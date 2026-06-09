@@ -261,3 +261,77 @@ fn handshake_hang_times_out_run_terminal_child_reaped() {
     // (d) No plugin child outlives the run.
     assert_no_leaked_child(&marker_pair);
 }
+
+/// Task 5 (plan step 5.1): a plugin that goes silent at `shutdown` AFTER the
+/// work completed is killed by the shutdown deadline; the run still resolves
+/// `completed` (entities are durable — only exit etiquette failed, D7), a
+/// `LMWV-INFRA-PLUGIN-SHUTDOWN-TIMEOUT` warning finding is persisted, the
+/// crash-loop breaker does not tick, and no plugin child outlives the run.
+#[test]
+fn shutdown_hang_times_out_run_still_completes() {
+    let fixture_bin = fixture_binary_path();
+    let plugin_dir = setup_plugin_dir(&fixture_bin);
+    let (project_dir, new_path) = setup_project(&plugin_dir);
+    let (marker_key, marker_value, marker_pair) = unique_marker("shutdown-hang");
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &new_path)
+        .env(&marker_key, &marker_value)
+        .env("LOOMWEAVE_FIXTURE_HANG_AT_SHUTDOWN", "1")
+        .env("LOOMWEAVE_PLUGIN_SHUTDOWN_TIMEOUT_MS", "500")
+        .timeout(ANALYZE_BACKSTOP)
+        .assert()
+        .success();
+
+    let conn = open_db(&project_dir);
+
+    // Run outcome unchanged: completed, exit 0 (asserted above).
+    let (run_count, run_status, _) = run_record(&conn);
+    assert_eq!(run_count, 1, "exactly one run row");
+    assert_eq!(
+        run_status, "completed",
+        "a shutdown timeout must not fail a completed run (D7)"
+    );
+
+    // The work is durable: the fixture's entity persisted.
+    let entity_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE id = 'fixture:widget:demo.sample'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query fixture entity");
+    assert_eq!(entity_count, 1, "fixture entity must be persisted");
+
+    // The etiquette failure is visible as a WARN finding.
+    assert_eq!(
+        finding_count(&conn, "LMWV-INFRA-PLUGIN-SHUTDOWN-TIMEOUT"),
+        1,
+        "exactly one shutdown-timeout finding"
+    );
+    let severity: String = conn
+        .query_row(
+            "SELECT severity FROM findings WHERE rule_id = 'LMWV-INFRA-PLUGIN-SHUTDOWN-TIMEOUT'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query shutdown-timeout severity");
+    assert_eq!(
+        severity, "WARN",
+        "shutdown timeout is a warning, not an error"
+    );
+
+    // A shutdown timeout is not a per-file timeout and not a crash: no
+    // LMWV-PY-TIMEOUT, and the crash-loop breaker never ticked.
+    assert_eq!(finding_count(&conn, "LMWV-PY-TIMEOUT"), 0);
+    assert_eq!(finding_count(&conn, "LMWV-INFRA-PLUGIN-CRASH"), 0);
+    assert_eq!(
+        finding_count(&conn, "LMWV-INFRA-PLUGIN-DISABLED-CRASH-LOOP"),
+        0
+    );
+
+    // No plugin child outlives the run.
+    assert_no_leaked_child(&marker_pair);
+}

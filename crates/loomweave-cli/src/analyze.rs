@@ -708,6 +708,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     }
     let handshake_timeout = plugin_handshake_timeout();
     let file_timeout = plugin_file_timeout();
+    let shutdown_timeout = plugin_shutdown_timeout();
     let briefing_blocks = secret_scan_outcome.briefing_blocks_shared();
     let scanned_files = secret_scan_outcome.scanned_files_shared();
     'plugins: for plugin in plugins {
@@ -820,6 +821,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 &progress_clone,
                 handshake_timeout,
                 file_timeout,
+                shutdown_timeout,
                 &batch_tx,
             )
         });
@@ -3107,6 +3109,30 @@ fn plugin_handshake_timeout() -> std::time::Duration {
         )
 }
 
+/// Subcode for a plugin that went silent at `shutdown` after the work
+/// completed (ADR-050 D7). WARN, never ERROR: the entities are durable and
+/// the run outcome is unchanged — only the plugin's exit etiquette failed.
+const PLUGIN_SHUTDOWN_TIMEOUT_RULE_ID: &str = "LMWV-INFRA-PLUGIN-SHUTDOWN-TIMEOUT";
+
+/// Shutdown (`shutdown`/`exit`) deadline (ADR-050). ADR-035 tuning: basis —
+/// after the file loop there is no legitimate work left; shutdown is pure
+/// exit etiquette, and a healthy plugin acknowledges within milliseconds, so
+/// 10 s is generous for a loaded machine; override — env
+/// `LOOMWEAVE_PLUGIN_SHUTDOWN_TIMEOUT_MS`; retune — raise if a legitimate
+/// plugin needs longer to flush state at exit.
+const DEFAULT_PLUGIN_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Resolve the shutdown timeout, honouring the env override.
+fn plugin_shutdown_timeout() -> std::time::Duration {
+    std::env::var("LOOMWEAVE_PLUGIN_SHUTDOWN_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(
+            DEFAULT_PLUGIN_SHUTDOWN_TIMEOUT,
+            std::time::Duration::from_millis,
+        )
+}
+
 /// Map a host-layer subcode to an ADR-017 severity. Crash / kill / OOM / timeout
 /// are `ERROR` (the plugin or a file was lost); drop-and-continue diagnostics
 /// (malformed/undeclared/oversize) are `WARN`.
@@ -3117,6 +3143,9 @@ fn infra_severity(subcode: &str) -> &'static str {
         | FINDING_DISABLED_CRASH_LOOP
         | "LMWV-INFRA-PLUGIN-OOM-KILLED"
         | "LMWV-INFRA-PLUGIN-DISABLED-PATH-ESCAPE" => "ERROR",
+        // The default WARN arm deliberately covers
+        // `PLUGIN_SHUTDOWN_TIMEOUT_RULE_ID`: a shutdown timeout is exit
+        // etiquette, never lost work (ADR-050 D7).
         _ => "WARN",
     }
 }
@@ -4396,6 +4425,7 @@ fn run_plugin_blocking(
     progress: &ProgressReporter,
     handshake_timeout: std::time::Duration,
     file_timeout: std::time::Duration,
+    shutdown_timeout: std::time::Duration,
     batch_tx: &tokio::sync::mpsc::Sender<PluginBatchMessage>,
 ) -> Result<BatchResult, PluginRunError> {
     use loomweave_core::PluginHost;
@@ -4611,15 +4641,11 @@ fn run_plugin_blocking(
         Ok(())
     })();
 
-    // Stop and join the watchdog before reaping so it no longer holds the child
-    // handle (lets us reclaim the owned `Child` for the reap path).
-    watchdog.request_stop();
-    let _ = watchdog_handle.join();
+    // Read the file-loop verdict BEFORE arming the shutdown deadline: the
+    // watchdog records the FIRST expired phase, so a `Shutdown` record can
+    // only exist when no earlier phase fired (and shutdown only runs on the
+    // Ok path anyway).
     let timed_out = watchdog.timed_out_phase() == Some(WatchdogPhase::File);
-    let mut child = Arc::try_unwrap(child)
-        .unwrap_or_else(|_| unreachable!("watchdog joined; no other Arc holders remain"))
-        .into_inner()
-        .expect("child mutex poisoned");
 
     // A timeout forces the failure branch: the watchdog already killed the child,
     // so any in-flight read failed (or, in a near-deadline race, a stale Ok no
@@ -4633,23 +4659,42 @@ fn run_plugin_blocking(
         work_result
     };
 
-    // Try a graceful shutdown on the happy path; on error, skip straight to
-    // kill — the plugin's behaviour is already untrusted. `analyze_file`
-    // already issues `shutdown`/`exit` before returning PathEscapeBreaker or
-    // EntityCap errors, so calling `host.shutdown()` again there would write
-    // to a closed pipe; that's why we only call it on Ok.
+    // Try a graceful shutdown on the happy path, under its own wall-clock
+    // deadline (ADR-050 D7): the watchdog is still alive here, so a plugin
+    // that goes silent at `shutdown` is killed, the blocked read unblocks,
+    // and the etiquette failure surfaces as a WARN finding below — the run
+    // outcome is unchanged. On error, skip straight to kill — the plugin's
+    // behaviour is already untrusted. `analyze_file` already issues
+    // `shutdown`/`exit` before returning PathEscapeBreaker or EntityCap
+    // errors, so calling `host.shutdown()` again there would write to a
+    // closed pipe; that's why we only call it on Ok.
     if work_result.is_ok() {
-        if let Err(e) = host.shutdown() {
+        watchdog.arm(shutdown_timeout, WatchdogPhase::Shutdown);
+        let shutdown_result = host.shutdown();
+        watchdog.disarm();
+        if let Err(e) = shutdown_result {
             tracing::warn!(
                 plugin_id = %plugin_id,
                 error = %e,
                 "best-effort host shutdown failed; falling back to kill()",
             );
-            let _ = child.kill();
+            if let Ok(mut c) = child.lock() {
+                let _ = c.kill();
+            }
         }
-    } else {
-        let _ = child.kill();
+    } else if let Ok(mut c) = child.lock() {
+        let _ = c.kill();
     }
+
+    // Stop and join the watchdog before reaping so it no longer holds the child
+    // handle (lets us reclaim the owned `Child` for the reap path).
+    watchdog.request_stop();
+    let _ = watchdog_handle.join();
+    let shutdown_timed_out = watchdog.timed_out_phase() == Some(WatchdogPhase::Shutdown);
+    let mut child = Arc::try_unwrap(child)
+        .unwrap_or_else(|_| unreachable!("watchdog joined; no other Arc holders remain"))
+        .into_inner()
+        .expect("child mutex poisoned");
 
     let mut findings = host.take_findings();
     findings.extend(dispatch_findings);
@@ -4668,6 +4713,27 @@ fn run_plugin_blocking(
                 file_timeout.as_millis()
             ),
         ));
+    }
+
+    // ADR-050 D7: a shutdown timeout is visible (WARN) but does NOT touch
+    // `work_result` — the entities are durable, only exit etiquette failed.
+    // It rides the Ok path, so it never ticks the crash-loop breaker.
+    if shutdown_timed_out {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("plugin_id".to_owned(), plugin_id.to_owned());
+        metadata.insert(
+            "timeout_ms".to_owned(),
+            shutdown_timeout.as_millis().to_string(),
+        );
+        findings.push(HostFinding {
+            subcode: PLUGIN_SHUTDOWN_TIMEOUT_RULE_ID.to_owned(),
+            message: format!(
+                "plugin {plugin_id} exceeded the shutdown timeout ({} ms) and was killed; \
+                 analysis results are unaffected",
+                shutdown_timeout.as_millis()
+            ),
+            metadata,
+        });
     }
 
     // Reap unconditionally. `Child::Drop` does not wait on Unix.
@@ -6261,8 +6327,10 @@ mod tests {
             wd.deadline.lock().unwrap().is_none(),
             "disarm clears the deadline"
         );
-        // A timeout is an ERROR-severity loss of work.
+        // A timeout is an ERROR-severity loss of work; a shutdown timeout is
+        // exit etiquette only (ADR-050 D7) — WARN, never ERROR.
         assert_eq!(infra_severity(PLUGIN_TIMEOUT_RULE_ID), "ERROR");
+        assert_eq!(infra_severity(PLUGIN_SHUTDOWN_TIMEOUT_RULE_ID), "WARN");
     }
 
     #[test]
