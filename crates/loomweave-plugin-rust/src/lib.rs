@@ -3,6 +3,7 @@ pub mod crate_roots;
 pub mod extract;
 pub mod module_path;
 pub mod qualname;
+pub mod scope;
 pub mod signature;
 pub mod spans;
 pub mod symbol_table;

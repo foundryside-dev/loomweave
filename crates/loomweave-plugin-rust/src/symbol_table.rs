@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::crate_roots::discover_crate_roots;
 use crate::extract::extract_file;
-use crate::module_path::module_path_for;
+use crate::scope::emittable_scope;
 
 /// A project-wide map from every declared entity id to its qualified name,
 /// plus the ids that were seen more than once during the init-time walk.
@@ -59,33 +59,14 @@ pub fn build_symbol_table(project_root: &Path) -> SymbolTable {
     let mut by_id: BTreeMap<String, String> = BTreeMap::new();
     let mut duplicates = Vec::new();
     for file in walk_rs_files(project_root) {
-        let Some(crate_name) = roots.crate_name_for(&file) else {
+        // Crate-scope discipline (src/-only, redundant-main skip, module-path
+        // derivation) is shared with `analyze_one_file` via `scope::emittable_scope`:
+        // a file outside the library/binary crate the ADR-049 qualname scheme
+        // names contributes nothing rather than minting a colliding
+        // `rust:module:<crate>` locator.
+        let Some((crate_name, module_path)) = emittable_scope(&roots, &file) else {
             continue;
         };
-        let Some(src_root) = src_root_of(&roots, &file) else {
-            continue;
-        };
-        // Phase 1a scope: only files under the crate's `src/` tree are part of
-        // the library/binary crate the qualname scheme names. Integration tests
-        // (`tests/`), benches, examples, and `build.rs` are *separate* Rust
-        // compilation units — ADR-049 crate-root discovery does not name them,
-        // so folding them into this crate's namespace would mint colliding
-        // `rust:module:<crate>` locators (each one's bare-crate fallback). They
-        // are out of Phase 1a scope.
-        if !file.starts_with(&src_root) {
-            continue;
-        }
-        // When a crate ships both `src/lib.rs` and `src/main.rs` they are two
-        // distinct crates sharing a source root; both would resolve to the bare
-        // crate-root module path and collide on `rust:module:<crate>`. ADR-049
-        // makes `lib.rs` the canonical crate-root module, so when a sibling
-        // `lib.rs` exists the binary root (`main.rs`) is skipped in Phase 1a
-        // (its own crate root is not separately discovered). A crate with only
-        // `main.rs` (a pure binary) keeps it — it IS that crate's root.
-        if file_is_redundant_main(&src_root, &file) {
-            continue;
-        }
-        let module_path = module_path_for(&crate_name, &src_root, &file);
         let Ok(src) = std::fs::read_to_string(&file) else {
             continue;
         };
@@ -102,21 +83,6 @@ pub fn build_symbol_table(project_root: &Path) -> SymbolTable {
         }
     }
     SymbolTable { by_id, duplicates }
-}
-
-/// Whether `file` is a binary root (`<src_root>/main.rs`) that is redundant
-/// because the same crate also ships a library root (`<src_root>/lib.rs`). Such
-/// a `main.rs` is a separate binary crate; ADR-049 makes `lib.rs` the canonical
-/// crate-root module, so the redundant `main.rs` is skipped in Phase 1a to
-/// avoid colliding on the bare `rust:module:<crate>` locator.
-fn file_is_redundant_main(src_root: &Path, file: &Path) -> bool {
-    file == src_root.join("main.rs") && src_root.join("lib.rs").is_file()
-}
-
-/// The crate's source root directory (`<crate-dir>/src`) for `file`, or `None`
-/// when `file` belongs to no discovered crate.
-fn src_root_of(roots: &crate::crate_roots::CrateRoots, file: &Path) -> Option<PathBuf> {
-    roots.crate_dir_for(file).map(|dir| dir.join("src"))
 }
 
 /// Recursively collect every `.rs` file under `root`, skipping vendored /

@@ -125,11 +125,16 @@ fn main() {
     }
 }
 
-/// Read one source file, derive its crate name + dotted module path from the
-/// discovered crate roots (ADR-049 §1), and extract entities with the
-/// degraded-parse fallback (Task 9). On a read failure or a file outside any
-/// known crate root, falls back to the file stem as the module path so a
-/// malformed/unreadable file still yields a degraded module rather than nothing.
+/// Derive a file's crate name + dotted module path from the discovered crate
+/// roots via the shared [`emittable_scope`](loomweave_plugin_rust::scope::emittable_scope)
+/// guard, then extract entities with the degraded-parse fallback (Task 9). A
+/// file that resolves to no emittable crate scope — out of any crate's `src/`
+/// tree (`tests/`, `benches/`, `examples/`, `build.rs`), a redundant `main.rs`
+/// shadowing a sibling `lib.rs`, or outside any known crate root — emits
+/// NOTHING: minting a bare-crate `rust:module:<crate>` for it would collide with
+/// the real crate root and `FailRun` the storage writer
+/// (`LMWV-INFRA-PARENT-CONTAINS-MISMATCH`). The degraded-parse fallback still
+/// runs below for files that ARE in scope but fail to parse.
 ///
 /// Returns `(entities, edges, findings)` already shaped for the wire: the
 /// structural `contains` edges (ADR-026 dual-encoding) accompany the entities,
@@ -142,23 +147,16 @@ fn analyze_one_file(
     crate_roots: Option<&CrateRoots>,
 ) -> (Vec<Value>, Vec<Value>, Vec<AnalyzeFileFinding>) {
     use loomweave_plugin_rust::extract::extract_file_degraded_aware;
-    use loomweave_plugin_rust::module_path::module_path_for;
+    use loomweave_plugin_rust::scope::emittable_scope;
 
     let file = std::path::Path::new(file_path);
-    let stem = file
-        .file_stem()
-        .map_or_else(|| "module".to_owned(), |s| s.to_string_lossy().into_owned());
 
-    let (crate_name, module_path) = match crate_roots {
-        Some(roots) => match (roots.crate_name_for(file), roots.crate_dir_for(file)) {
-            (Some(name), Some(dir)) => {
-                let src_root = dir.join("src");
-                let module = module_path_for(&name, &src_root, file);
-                (name, module)
-            }
-            _ => (stem.clone(), stem),
-        },
-        None => (stem.clone(), stem),
+    // Out-of-scope files (out of any crate's `src/` tree, a redundant `main.rs`,
+    // or outside any known crate root) emit NOTHING — see the doc comment above.
+    let Some((crate_name, module_path)) =
+        crate_roots.and_then(|roots| emittable_scope(roots, file))
+    else {
+        return (Vec::new(), Vec::new(), Vec::new());
     };
 
     let src = std::fs::read_to_string(file).unwrap_or_default();
