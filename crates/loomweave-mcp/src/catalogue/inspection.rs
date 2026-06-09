@@ -405,6 +405,95 @@ impl ServerState {
             .await;
         Ok(flatten_storage_envelope_result(result))
     }
+
+    /// `entity_resolve` — batch-resolve dotted qualnames to entity ids + SEIs,
+    /// the inverse of the id-taking tools.
+    ///
+    /// Reuses the Wardline exact-tier resolver (`resolve_wardline_qualnames`,
+    /// ADR-036) and projects each hit through [`crate::entity_json`] so a
+    /// candidate carries its SEI (ADR-038, stable entity identity) and a
+    /// secret-scan-blocked entity collapses to the blocked stub — its id/sei are
+    /// withheld exactly as the federation read API withholds them (ADR-034).
+    /// Routing through `entity_json` (rather than hand-rolling the id+sei tuple)
+    /// is load-bearing: it stops the reverse-map from becoming a side channel
+    /// that discloses a blocked locator.
+    ///
+    /// Output is multi-candidate-shaped from day one (`result_kind` +
+    /// `candidates` list) even though the exact tier yields at most one
+    /// candidate — the reserved `Resolution::Heuristic` variant slots in without
+    /// a schema break.
+    pub(crate) async fn tool_entity_resolve(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        // Batch cap mirrors the federation `/api/wardline/resolve` surface
+        // (`WARDLINE_TAINT_BATCH_MAX = 2000`); kept local to avoid a dependency
+        // edge from loomweave-mcp onto loomweave-cli.
+        const ENTITY_RESOLVE_BATCH_MAX: usize = 2000;
+
+        let Some(raw) = arguments.get("qualnames").and_then(Value::as_array) else {
+            return Err(ParamError::new("qualnames must be a non-empty array"));
+        };
+        if raw.is_empty() {
+            return Err(ParamError::new("qualnames must be a non-empty array"));
+        }
+        if raw.len() > ENTITY_RESOLVE_BATCH_MAX {
+            return Err(ParamError::new(
+                "qualnames exceeds the 2000-entry batch cap",
+            ));
+        }
+        let mut qualnames = Vec::with_capacity(raw.len());
+        for item in raw {
+            let Some(qualname) = item.as_str() else {
+                return Err(ParamError::new("each qualname must be a string"));
+            };
+            if qualname.trim().is_empty() {
+                return Err(ParamError::new("qualnames must not contain a blank entry"));
+            }
+            qualnames.push(qualname.to_owned());
+        }
+        // `kind` is fixed-enum forward-room — resolution hardcodes
+        // `python:function:` today. Reject any value other than the default.
+        match arguments.get("kind") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(kind)) if kind == "function" => {}
+            Some(_) => return Err(ParamError::new("kind must be \"function\"")),
+        }
+
+        let result = self
+            .readers
+            .with_reader(move |conn| {
+                let resolved = resolve_wardline_qualnames(conn, &qualnames)?;
+                let mut results = Vec::with_capacity(resolved.len());
+                for (qualname, resolution) in resolved {
+                    let (candidates, result_kind) = match resolution {
+                        Resolution::Exact { entity_id } => {
+                            match entity_by_id(conn, &entity_id)? {
+                                // Project through entity_json: attaches the SEI and
+                                // collapses a briefing-blocked entity to the stub so
+                                // its id/sei are never disclosed here.
+                                Some(entity) => (vec![entity_json(conn, &entity)], "resolved"),
+                                // The candidate id resolved but its row vanished
+                                // (a torn read): treat as unresolved, never error.
+                                None => (Vec::new(), "unresolved"),
+                            }
+                        }
+                        Resolution::None => (Vec::new(), "unresolved"),
+                    };
+                    results.push(json!({
+                        "qualname": qualname,
+                        "candidates": candidates,
+                        "result_kind": result_kind,
+                    }));
+                }
+                Ok(success_envelope(json!({
+                    "results": results,
+                    "scope_excludes": ["heuristic-tier-not-implemented"],
+                })))
+            })
+            .await;
+        Ok(flatten_storage_envelope_result(result))
+    }
 }
 
 /// guidance sheet ids that explicitly `guides` the given entity.

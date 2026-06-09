@@ -694,6 +694,24 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "additionalProperties": false
             }),
         },
+        ToolDefinition {
+            name: "entity_resolve",
+            description: "Resolve dotted qualnames (e.g. `pkg.mod.func`) to entity ids + SEIs — the inverse of having an id already. Batch-only: pass `qualnames` (1..=2000) and get one `results` entry per input IN INPUT ORDER, each with `result_kind` (resolved | unresolved | ambiguous) and a `candidates` list. A `resolved` candidate carries { id, sei, kind }; an `unresolved` qualname returns an empty candidates list (NOT an error — honest-empty). `kind` is fixed to `function` today. Exact-tier resolution omits a confidence field. A candidate whose entity is secret-scan-blocked collapses to the blocked stub — its id/sei are withheld. No LLM call.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "qualnames": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "minItems": 1,
+                        "maxItems": 2000
+                    },
+                    "kind": {"type": "string", "enum": ["function"], "default": "function"}
+                },
+                "required": ["qualnames"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -1435,6 +1453,10 @@ impl ServerState {
                 Err(response) => return response.to_json_rpc(id),
             },
             "project_finding_list" => match self.tool_project_findings(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "entity_resolve" => match self.tool_entity_resolve(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
@@ -5136,7 +5158,7 @@ mod tests {
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 40);
+        assert_eq!(tools.len(), 41);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
@@ -5245,6 +5267,7 @@ mod tests {
         assert_eq!(tools[37].name, "entity_dead_list");
         assert_eq!(tools[38].name, "entity_semantic_search_list");
         assert_eq!(tools[39].name, "project_finding_list");
+        assert_eq!(tools[40].name, "entity_resolve");
     }
 
     #[test]

@@ -1953,3 +1953,174 @@ async fn find_by_wardline_redacts_blocked_entity_and_withholds_blob() {
         "blocked id leaked in find_by_wardline response: {env}"
     );
 }
+
+// ---- entity_resolve (Item 2, clarion-d76e7f7267) ------------------------
+
+#[tokio::test]
+async fn entity_resolve_resolves_qualname_to_id_and_sei() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:demo.entry",
+        "function",
+        "demo.py",
+        Some((1, 2)),
+    );
+    insert_alive_sei(
+        &conn,
+        "loomweave:eid:demo-entry",
+        "python:function:demo.entry",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["demo.entry"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["qualname"], "demo.entry");
+    assert_eq!(results[0]["result_kind"], "resolved");
+    let candidates = results[0]["candidates"].as_array().expect("candidates");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0]["id"], "python:function:demo.entry");
+    assert_eq!(candidates[0]["sei"], "loomweave:eid:demo-entry");
+    assert_eq!(candidates[0]["kind"], "function");
+}
+
+#[tokio::test]
+async fn entity_resolve_unknown_qualname_is_unresolved_not_error() {
+    let (project, db, _conn) = open_project();
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["no.such.thing"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "honest-empty, not an error: {env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["result_kind"], "unresolved");
+    assert_eq!(
+        results[0]["candidates"]
+            .as_array()
+            .expect("candidates")
+            .len(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_preserves_input_order_across_batch() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:a.one",
+        "function",
+        "a.py",
+        Some((1, 2)),
+    );
+    insert_entity(
+        &conn,
+        "python:function:b.two",
+        "function",
+        "b.py",
+        Some((1, 2)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    // Order: known, unknown, known — must echo back in exactly this order.
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["b.two", "missing.x", "a.one"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["qualname"], "b.two");
+    assert_eq!(results[0]["result_kind"], "resolved");
+    assert_eq!(results[1]["qualname"], "missing.x");
+    assert_eq!(results[1]["result_kind"], "unresolved");
+    assert_eq!(results[2]["qualname"], "a.one");
+    assert_eq!(results[2]["candidates"][0]["id"], "python:function:a.one");
+}
+
+#[tokio::test]
+async fn entity_resolve_over_cap_is_param_error() {
+    let (project, db, _conn) = open_project();
+    let state = state_for(project.path(), &db);
+
+    // A ParamError surfaces as a JSON-RPC error (-32602), not a tool envelope,
+    // so drive handle_json_rpc directly.
+    let qualnames: Vec<String> = (0..2001).map(|i| format!("q.{i}")).collect();
+    let response = state
+        .handle_json_rpc(&json!({
+            "jsonrpc": "2.0",
+            "id": "over-cap",
+            "method": "tools/call",
+            "params": {"name": "entity_resolve", "arguments": {"qualnames": qualnames}}
+        }))
+        .await
+        .expect("response");
+
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "over-cap must be a JSON-RPC param error: {response}"
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_collapses_briefing_blocked_candidate_to_stub() {
+    // Landmine #9: a blocked entity's candidate must collapse to the stub —
+    // routing through entity_json — so the reverse-map never discloses a
+    // secret-scan-blocked locator.
+    let (project, db, conn) = open_project();
+    insert_blocked_entity(
+        &conn,
+        "python:function:secret.handler",
+        "function",
+        "secret.py",
+        Some((1, 2)),
+        "secret_in_source",
+    );
+    insert_alive_sei(
+        &conn,
+        "loomweave:eid:secret",
+        "python:function:secret.handler",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["secret.handler"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results[0]["result_kind"], "resolved");
+    let candidate = &results[0]["candidates"][0];
+    assert_redacted_identity(candidate, "secret_in_source");
+    assert!(
+        !env.to_string().contains("python:function:secret.handler"),
+        "blocked locator leaked via entity_resolve: {env}"
+    );
+    assert!(
+        !env.to_string().contains("loomweave:eid:secret"),
+        "blocked SEI leaked via entity_resolve: {env}"
+    );
+}
