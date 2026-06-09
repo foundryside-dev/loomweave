@@ -17,9 +17,18 @@ use crate::scope::emittable_scope;
 pub struct SymbolTable {
     /// entity id -> qualified name (the resolution surface for Phase 1b edges).
     by_id: BTreeMap<String, String>,
+    /// qualified name -> the ids that share it (the REVERSE index Phase 1b's
+    /// resolver inverts). A `Vec` because one qualname can map to several kinds
+    /// (e.g. a `struct S` and a `fn S` share qualname `crate.mod.S` but differ
+    /// in kind, which lives in the id, not the qualname). Kept sorted so the
+    /// resolver's multi-kind "first by sorted order" tiebreak is deterministic.
+    by_qualname: BTreeMap<String, Vec<String>>,
     /// ids seen more than once during the walk (must be empty — the gate).
     duplicates: Vec<String>,
 }
+
+/// Empty id slice returned for a qualname absent from the reverse index.
+static EMPTY_IDS: &[String] = &[];
 
 impl SymbolTable {
     /// Whether an entity with this id was declared anywhere in the project.
@@ -33,6 +42,19 @@ impl SymbolTable {
     #[must_use]
     pub fn duplicate_ids(&self) -> Vec<String> {
         self.duplicates.clone()
+    }
+
+    /// The ids declared at this qualified name, sorted (empty slice if absent).
+    /// One qualname can map to several ids that differ only in kind; the
+    /// Phase 1b resolver inverts a `use`/trait path into this slice.
+    #[must_use]
+    pub fn ids_for_qualname(&self, q: &str) -> &[String] {
+        self.by_qualname.get(q).map_or(EMPTY_IDS, Vec::as_slice)
+    }
+
+    /// Every entity id in the table, in sorted order (Tasks 7/8 may iterate it).
+    pub fn iter_ids(&self) -> impl Iterator<Item = &str> {
+        self.by_id.keys().map(String::as_str)
     }
 
     /// Number of distinct entity ids in the table.
@@ -57,6 +79,7 @@ impl SymbolTable {
 pub fn build_symbol_table(project_root: &Path) -> SymbolTable {
     let roots = discover_crate_roots(project_root);
     let mut by_id: BTreeMap<String, String> = BTreeMap::new();
+    let mut by_qualname: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut duplicates = Vec::new();
     for file in walk_rs_files(project_root) {
         // Crate-scope discipline (src/-only, redundant-main skip, module-path
@@ -77,12 +100,26 @@ pub fn build_symbol_table(project_root: &Path) -> SymbolTable {
         for e in entities {
             let id = e["id"].as_str().unwrap_or_default().to_owned();
             let q = e["qualified_name"].as_str().unwrap_or_default().to_owned();
-            if by_id.insert(id.clone(), q).is_some() {
+            // Invert into the reverse index. Re-declared ids (collisions) are NOT
+            // double-counted here: a colliding id contributes its qualname once
+            // and is recorded in `duplicates` below for the gate.
+            if by_id.insert(id.clone(), q.clone()).is_some() {
                 duplicates.push(id);
+            } else {
+                by_qualname.entry(q).or_default().push(id);
             }
         }
     }
-    SymbolTable { by_id, duplicates }
+    // Determinism: the resolver's multi-kind "first by sorted order" tiebreak
+    // relies on each qualname's id vec being sorted.
+    for ids in by_qualname.values_mut() {
+        ids.sort();
+    }
+    SymbolTable {
+        by_id,
+        by_qualname,
+        duplicates,
+    }
 }
 
 /// Recursively collect every `.rs` file under `root`, skipping vendored /
