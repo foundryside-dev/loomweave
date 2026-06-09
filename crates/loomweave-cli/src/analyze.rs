@@ -4238,19 +4238,45 @@ struct PendingUnresolvedCallSites {
     sites: Vec<UnresolvedCallSiteRecord>,
 }
 
-/// Per-file analysis-timeout watchdog (REQ-ANALYZE-06, `LMWV-PY-TIMEOUT`).
+/// Plugin lifecycle phase a watchdog deadline guards.
 ///
-/// `analyze_file` blocks on a synchronous read of the plugin's stdout, which has
-/// no read deadline. The watchdog runs on its own thread holding a shared handle
-/// to the child process (the reader lives in the *host*, a separate value, so
-/// killing the child unblocks the read without touching the host). The main
-/// thread `arm`s before each `analyze_file` and `disarm`s after; if the deadline
-/// passes while armed, the watchdog kills the child and records the timeout.
+/// `Handshake` covers the blocking `initialize` exchange (a plugin may do
+/// whole-repo work there — the Rust plugin builds its symbol table inside
+/// `initialize`); `File` covers each `analyze_file`; `Shutdown` covers the
+/// best-effort `shutdown`/`exit` exchange after the file loop.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WatchdogPhase {
+    #[allow(
+        dead_code,
+        reason = "armed by the handshake deadline (hardening plan Task 4)"
+    )]
+    Handshake,
+    File,
+    #[allow(
+        dead_code,
+        reason = "armed by the shutdown deadline (hardening plan Task 5)"
+    )]
+    Shutdown,
+}
+
+/// Plugin lifecycle-timeout watchdog (REQ-ANALYZE-06, `LMWV-PY-TIMEOUT`).
+///
+/// Every plugin exchange blocks on a synchronous read of the plugin's stdout,
+/// which has no read deadline. The watchdog runs on its own thread holding a
+/// shared handle to the child process (the reader lives in the *host*, a
+/// separate value, so killing the child unblocks the read without touching the
+/// host). The main thread `arm`s before each blocking exchange — naming the
+/// lifecycle [`WatchdogPhase`] being guarded — and `disarm`s after; if the
+/// deadline passes while armed, the watchdog kills the child and records which
+/// phase timed out.
 struct PluginWatchdog {
-    /// Active deadline, or `None` when disarmed. Guarded so `disarm` and the
-    /// watchdog's fire-check observe a consistent value (no kill-after-disarm).
-    deadline: std::sync::Mutex<Option<std::time::Instant>>,
-    timed_out: std::sync::atomic::AtomicBool,
+    /// Active deadline plus the phase it guards, or `None` when disarmed.
+    /// Guarded so `disarm` and the watchdog's fire-check observe a consistent
+    /// value (no kill-after-disarm).
+    deadline: std::sync::Mutex<Option<(std::time::Instant, WatchdogPhase)>>,
+    /// First phase whose deadline expired, or `None` if no timeout fired.
+    /// First-wins: the first expiry is the one that broke the run.
+    timed_out: std::sync::Mutex<Option<WatchdogPhase>>,
     stop: std::sync::atomic::AtomicBool,
 }
 
@@ -4258,22 +4284,46 @@ impl PluginWatchdog {
     fn new() -> Self {
         Self {
             deadline: std::sync::Mutex::new(None),
-            timed_out: std::sync::atomic::AtomicBool::new(false),
+            timed_out: std::sync::Mutex::new(None),
             stop: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    fn arm(&self, timeout: std::time::Duration) {
+    fn arm(&self, timeout: std::time::Duration, phase: WatchdogPhase) {
         *self.deadline.lock().expect("watchdog deadline poisoned") =
-            Some(std::time::Instant::now() + timeout);
+            Some((std::time::Instant::now() + timeout, phase));
     }
 
     fn disarm(&self) {
         *self.deadline.lock().expect("watchdog deadline poisoned") = None;
     }
 
-    fn did_time_out(&self) -> bool {
-        self.timed_out.load(Ordering::SeqCst)
+    /// Phase whose deadline expired first, or `None` if no timeout fired.
+    fn timed_out_phase(&self) -> Option<WatchdogPhase> {
+        *self.timed_out.lock().expect("watchdog timed_out poisoned")
+    }
+
+    /// Fire-check: if the armed deadline has passed, disarm (kill at most
+    /// once per arm), record the phase (first expiry wins), and return the
+    /// phase so the watchdog thread kills the child.
+    fn expire_if_due(&self) -> Option<WatchdogPhase> {
+        let expired = {
+            let mut guard = self.deadline.lock().expect("watchdog deadline poisoned");
+            match *guard {
+                Some((deadline, phase)) if std::time::Instant::now() >= deadline => {
+                    *guard = None; // disarm so we kill at most once
+                    Some(phase)
+                }
+                _ => None,
+            }
+        };
+        if let Some(phase) = expired {
+            let mut recorded = self.timed_out.lock().expect("watchdog timed_out poisoned");
+            if recorded.is_none() {
+                *recorded = Some(phase);
+            }
+        }
+        expired
     }
 
     fn request_stop(&self) {
@@ -4281,9 +4331,10 @@ impl PluginWatchdog {
     }
 }
 
-/// Spawn the watchdog thread. It polls the shared deadline; on expiry it flips
-/// `timed_out`, clears the deadline (kill at most once), and kills the child.
-/// Returns the join handle so the caller can stop + join before reaping.
+/// Spawn the watchdog thread. It polls the shared deadline; on expiry it
+/// records the timed-out phase, clears the deadline (kill at most once), and
+/// kills the child. Returns the join handle so the caller can stop + join
+/// before reaping.
 fn spawn_plugin_watchdog(
     watchdog: Arc<PluginWatchdog>,
     child: Arc<std::sync::Mutex<std::process::Child>>,
@@ -4292,24 +4343,11 @@ fn spawn_plugin_watchdog(
     std::thread::spawn(move || {
         while !watchdog.stop.load(Ordering::SeqCst) {
             std::thread::sleep(PLUGIN_WATCHDOG_POLL_INTERVAL);
-            let expired = {
-                let mut guard = watchdog
-                    .deadline
-                    .lock()
-                    .expect("watchdog deadline poisoned");
-                match *guard {
-                    Some(deadline) if std::time::Instant::now() >= deadline => {
-                        *guard = None; // disarm so we kill at most once
-                        true
-                    }
-                    _ => false,
-                }
-            };
-            if expired {
-                watchdog.timed_out.store(true, Ordering::SeqCst);
+            if let Some(phase) = watchdog.expire_if_due() {
                 tracing::warn!(
                     plugin_id = %plugin_id,
-                    "plugin exceeded per-file analysis timeout; killing child",
+                    phase = ?phase,
+                    "plugin exceeded lifecycle deadline; killing child",
                 );
                 if let Ok(mut c) = child.lock() {
                     let _ = c.kill();
@@ -4398,7 +4436,7 @@ fn run_plugin_blocking(
                     continue;
                 }
             };
-            watchdog.arm(file_timeout);
+            watchdog.arm(file_timeout, WatchdogPhase::File);
             let analyze_outcome = host.analyze_file(&dispatch_file);
             watchdog.disarm();
             drop(heartbeat_guard);
@@ -4518,7 +4556,7 @@ fn run_plugin_blocking(
     // handle (lets us reclaim the owned `Child` for the reap path).
     watchdog.request_stop();
     let _ = watchdog_handle.join();
-    let timed_out = watchdog.did_time_out();
+    let timed_out = watchdog.timed_out_phase().is_some();
     let mut child = Arc::try_unwrap(child)
         .unwrap_or_else(|_| unreachable!("watchdog joined; no other Arc holders remain"))
         .into_inner()
@@ -6133,9 +6171,16 @@ mod tests {
     #[test]
     fn plugin_watchdog_arm_disarm_and_severity() {
         let wd = PluginWatchdog::new();
-        assert!(!wd.did_time_out(), "fresh watchdog has not fired");
-        wd.arm(std::time::Duration::from_secs(60));
+        assert!(
+            wd.timed_out_phase().is_none(),
+            "fresh watchdog has not fired"
+        );
+        wd.arm(std::time::Duration::from_secs(60), WatchdogPhase::File);
         assert!(wd.deadline.lock().unwrap().is_some(), "arm sets a deadline");
+        assert!(
+            wd.expire_if_due().is_none(),
+            "an unexpired deadline does not fire"
+        );
         wd.disarm();
         assert!(
             wd.deadline.lock().unwrap().is_none(),
@@ -6143,6 +6188,36 @@ mod tests {
         );
         // A timeout is an ERROR-severity loss of work.
         assert_eq!(infra_severity(PLUGIN_TIMEOUT_RULE_ID), "ERROR");
+    }
+
+    #[test]
+    fn plugin_watchdog_expiry_records_armed_phase() {
+        let wd = PluginWatchdog::new();
+        wd.arm(std::time::Duration::ZERO, WatchdogPhase::Handshake);
+        assert_eq!(
+            wd.expire_if_due(),
+            Some(WatchdogPhase::Handshake),
+            "an expired deadline fires with the armed phase"
+        );
+        assert_eq!(
+            wd.timed_out_phase(),
+            Some(WatchdogPhase::Handshake),
+            "the fired phase is recorded"
+        );
+        // Kill-at-most-once per arm: expiry disarms.
+        assert!(
+            wd.expire_if_due().is_none(),
+            "a fired deadline does not fire twice"
+        );
+        // A later expiry still triggers a kill, but the FIRST recorded phase
+        // wins — it names the phase that broke the run.
+        wd.arm(std::time::Duration::ZERO, WatchdogPhase::Shutdown);
+        assert_eq!(wd.expire_if_due(), Some(WatchdogPhase::Shutdown));
+        assert_eq!(
+            wd.timed_out_phase(),
+            Some(WatchdogPhase::Handshake),
+            "first recorded phase wins"
+        );
     }
 
     #[test]
