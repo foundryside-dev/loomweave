@@ -825,6 +825,9 @@ fn check_instructions_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
                 InstructionsState::Malformed => {
                     "agent-orientation block malformed (dangling loomweave marker)"
                 }
+                InstructionsState::Duplicated => {
+                    "agent-orientation block duplicated (stale split-brain copy)"
+                }
                 InstructionsState::UpToDate | InstructionsState::Missing => unreachable!(),
             };
             if !fix {
@@ -1112,6 +1115,9 @@ fn check_instructions(project_root: &Path, fix: bool) -> Tally {
                 InstructionsState::Malformed => {
                     "agent-orientation block malformed (dangling loomweave marker)"
                 }
+                InstructionsState::Duplicated => {
+                    "agent-orientation block duplicated (stale split-brain copy)"
+                }
                 InstructionsState::UpToDate | InstructionsState::Missing => unreachable!(),
             };
             if !fix {
@@ -1250,6 +1256,73 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_db(dir.path());
         assert_eq!(db_tracked_state(dir.path()), DbTrackedState::Untracked);
+    }
+
+    /// A representative co-resident Filigree block (shape taken from the repo's
+    /// own AGENTS.md) for the doctor-entry-point C-4 coverage.
+    const DOCTOR_FILIGREE_BLOCK: &str = "<!-- filigree:instructions:v3.0.0rc2:98d5c5f2 -->\n\
+## Filigree Issue Tracker\n\
+\n\
+filigree tracks tasks for this project.\n\
+<!-- /filigree:instructions -->\n";
+
+    /// C-4 (e) via the `doctor --fix` entry point: a stale duplicate own block
+    /// must be FLAGGED as a problem by `doctor` (no `--fix`) and COLLAPSED to one
+    /// by `doctor --fix`. Covers the doctor surface (`check_instructions`), the
+    /// twin of the `install --instructions` coverage in `instructions.rs`.
+    #[test]
+    fn doctor_flags_then_fixes_duplicate_own_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        instructions::install_instructions(root).unwrap(); // seed both files clean
+        let claude = root.join("CLAUDE.md");
+        let block = std::fs::read_to_string(&claude).unwrap();
+        // Two well-formed copies of the (already-current) block.
+        std::fs::write(&claude, format!("{block}\n{block}")).unwrap();
+
+        // doctor (diagnose only) must flag it as a problem, not green.
+        let diag = check_instructions(root, false);
+        assert_eq!(diag.problems, 1, "duplicate must be flagged as a problem");
+
+        // doctor --fix must repair it to a healthy single block.
+        let fixed = check_instructions(root, true);
+        assert_eq!(
+            fixed.problems, 0,
+            "doctor --fix must collapse the duplicate"
+        );
+        assert_eq!(
+            instructions::instructions_state(root),
+            InstructionsState::UpToDate
+        );
+    }
+
+    /// C-4 (c) via the `doctor --fix` entry point: a Filigree block sandwiched
+    /// between a stale Loomweave start and Loomweave's real end must survive the
+    /// repair (the foreign-fence-bounded rewrite never crosses it).
+    #[test]
+    fn doctor_fix_preserves_sandwiched_foreign_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        instructions::install_instructions(root).unwrap();
+        let claude = root.join("CLAUDE.md");
+        let sandwiched = format!(
+            "<!-- loomweave:instructions:v0:deadbeef -->\n\
+             stale loomweave body\n\
+             {DOCTOR_FILIGREE_BLOCK}\
+             <!-- /loomweave:instructions -->\n"
+        );
+        std::fs::write(&claude, &sandwiched).unwrap();
+
+        let fixed = check_instructions(root, true);
+        let after = std::fs::read_to_string(&claude).unwrap();
+        assert!(
+            after.contains(DOCTOR_FILIGREE_BLOCK),
+            "doctor --fix swallowed the sandwiched filigree block:\n{after}"
+        );
+        assert_eq!(
+            fixed.problems, 0,
+            "doctor --fix must converge on the sandwiched-foreign case"
+        );
     }
 
     #[test]

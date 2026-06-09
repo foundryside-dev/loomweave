@@ -102,10 +102,19 @@ pub enum InstructionsState {
     /// (auto-repaired with `--fix`).
     Drifted,
     /// At least one target file has a malformed block — a dangling start marker
-    /// with no following end marker, or an end marker preceding its start.
-    /// Doctor treats this as a **problem**; the repair is safe because it only
-    /// rewrites Loomweave's own span.
+    /// with no following end marker, an end marker preceding its start, or an own
+    /// close marker that lies *beyond* a co-resident foreign block (so a naive
+    /// open..close match would swallow the sibling). Doctor treats this as a
+    /// **problem**; the repair is safe because it only rewrites Loomweave's own
+    /// span, bounded at the first foreign fence.
     Malformed,
+    /// Every file is well-formed, but at least one carries a stale **duplicate**
+    /// own block — a second Loomweave block before any foreign fence, or one
+    /// shielded beyond a foreign block. A split-brain problem (the duplicate is
+    /// silent, conflicting guidance). Doctor treats this as a **problem**: the
+    /// canonicalisable case is auto-collapsed with `--fix`; a foreign-shielded
+    /// duplicate is surfaced for hand resolution (foreign-safety > own-dedup).
+    Duplicated,
 }
 
 /// Classify one file's Loomweave block without writing.
@@ -117,23 +126,28 @@ enum FileState {
     Current,
     /// Well-formed block whose body differs from the embedded bytes.
     Drifted,
-    /// Start marker present without a following end marker (or markers are
-    /// mis-ordered).
+    /// Start marker present without a following end marker, markers mis-ordered,
+    /// or the own close marker lies beyond a co-resident foreign block.
     Malformed,
+    /// Well-formed first own block, but a stale duplicate own block also exists
+    /// (canonicalisable before a foreign fence, or shielded beyond one).
+    Duplicated,
 }
 
 /// Aggregate per-file states into a single [`InstructionsState`].
 ///
 /// Precedence is **severity-ordered**, high → low: `Malformed` > `Drifted` >
-/// `Missing` > `UpToDate`. This deliberately differs from
+/// `Duplicated` > `Missing` > `UpToDate`. This deliberately differs from
 /// [`crate::skill_pack`]'s "Missing first" rule: here `Missing` is only a
-/// warning while `Drifted`/`Malformed` fail the gate, so a missing block must
-/// never mask a gate-failing drifted/malformed one.
+/// warning while `Drifted`/`Malformed`/`Duplicated` fail the gate, so a missing
+/// block must never mask a gate-failing one.
 fn aggregate(states: &[FileState]) -> InstructionsState {
     if states.iter().any(|s| matches!(s, FileState::Malformed)) {
         InstructionsState::Malformed
     } else if states.iter().any(|s| matches!(s, FileState::Drifted)) {
         InstructionsState::Drifted
+    } else if states.iter().any(|s| matches!(s, FileState::Duplicated)) {
+        InstructionsState::Duplicated
     } else if states.iter().any(|s| matches!(s, FileState::Absent)) {
         InstructionsState::Missing
     } else {
@@ -163,8 +177,19 @@ fn file_state(path: &Path) -> FileState {
     match locate_span(&content) {
         Span::Absent => FileState::Absent,
         Span::Malformed => FileState::Malformed,
-        Span::WellFormed { body, .. } => {
-            if body == canonical_body() {
+        Span::WellFormed { end, body } => {
+            // A stale duplicate own block — either canonicalisable (before any
+            // real foreign block) or shielded (beyond one) — is a split-brain
+            // problem, not health (C-4 (e)). Check before the drift compare so a
+            // body-current first block can never green over a duplicate.
+            let tail = &content[end..];
+            let foreign = first_real_foreign_block_pos(tail, 0);
+            let head = &tail[..foreign];
+            let canonicalisable_dup = remove_own_blocks(head).as_str() != head;
+            let shielded_dup = first_own_open_fence_pos(&tail[foreign..]).is_some();
+            if canonicalisable_dup || shielded_dup {
+                FileState::Duplicated
+            } else if body == canonical_body() {
                 FileState::Current
             } else {
                 FileState::Drifted
@@ -173,65 +198,207 @@ fn file_state(path: &Path) -> FileState {
     }
 }
 
+/// Loomweave's own vendor namespace, lower-cased for the case-insensitive
+/// fence comparison mandated by C-4 clause (h).
+const OWN_NS: &str = "loomweave";
+
 /// Where (and whether) a well-ordered Loomweave block sits in `content`.
 enum Span {
-    /// No start marker line present.
+    /// No own top-level start marker present.
     Absent,
-    /// Start marker present without a following end marker, or mis-ordered.
+    /// Start marker present without a following end marker, mis-ordered, or the
+    /// own close marker lies beyond a co-resident foreign block.
     Malformed,
-    /// A well-ordered block. `start` is the byte offset of the start-marker
-    /// line; `end` is the byte offset just past the end-marker line (including
-    /// its trailing newline if any). `body` is the extracted block body,
-    /// trailing-newline-trimmed, for the drift compare.
-    WellFormed {
-        start: usize,
-        end: usize,
-        body: String,
-    },
+    /// A well-ordered block whose close precedes any real foreign block. `end`
+    /// is the byte offset just past the end-marker line (including its trailing
+    /// newline if any). `body` is the extracted block body, trailing-newline-
+    /// trimmed, for the drift compare.
+    WellFormed { end: usize, body: String },
 }
 
-/// Locate Loomweave's block by scanning **whole lines** — never a bare `-->`
-/// substring scan, which could match Filigree's or Wardline's end marker. The
-/// start marker is the first line whose trimmed form starts with
-/// [`START_PREFIX`]; the end marker is the first line *strictly after* it whose
-/// trimmed form equals [`END_MARKER`].
-fn locate_span(content: &str) -> Span {
-    let mut start: Option<(usize, usize)> = None; // (line_start_byte, line_end_byte)
+/// A managed-block fence (open or close) recognised on its own line.
+struct Fence {
+    /// Lower-cased vendor namespace (C-4 (h): compared case-insensitively).
+    ns: String,
+    /// True for a close fence (`<!-- /<ns>:instructions … -->`).
+    is_close: bool,
+    /// Byte offset of the start of the line carrying the fence.
+    pos: usize,
+}
+
+/// Parse an already-trimmed line as a managed-block fence, returning its
+/// lower-cased namespace and whether it is a close fence. Recognises
+/// `<!-- [/]<ns>:instructions …`, namespace charset `[A-Za-z0-9_-]+` matched
+/// case-insensitively (C-4 clause (h)). This is the namespace-fence detector
+/// that lets foreign boundaries — including differently-cased siblings —
+/// register, and is the prerequisite primitive for bounded recovery (c) and
+/// own-duplicate canonicalisation (e).
+fn parse_fence(trimmed: &str) -> Option<(String, bool)> {
+    let rest = trimmed.strip_prefix("<!--")?.trim_start();
+    let (is_close, rest) = rest.strip_prefix('/').map_or((false, rest), |r| (true, r));
+    let ns_len = rest
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+        .count();
+    if ns_len == 0 || !rest[ns_len..].starts_with(":instructions") {
+        return None;
+    }
+    Some((rest[..ns_len].to_ascii_lowercase(), is_close))
+}
+
+/// Every managed-block fence in `content`, in document order, line-anchored —
+/// never a bare `-->` substring scan, which could match a sibling's marker
+/// mid-prose.
+fn fences(content: &str) -> Vec<Fence> {
+    let mut out = Vec::new();
     let mut offset = 0usize;
     for line in content.split_inclusive('\n') {
-        let trimmed = line.trim();
+        let line_start = offset;
+        offset += line.len();
+        if let Some((ns, is_close)) = parse_fence(line.trim()) {
+            out.push(Fence {
+                ns,
+                is_close,
+                pos: line_start,
+            });
+        }
+    }
+    out
+}
+
+/// Byte offset of the first *real* foreign block at/after `search_from`, else
+/// `content.len()` (bound at EOF). A real foreign block is a foreign-namespace
+/// OPEN fence with a matching foreign CLOSE fence after it — genuine co-resident
+/// sibling content we must never delete or split (C-4 (c)). A lone foreign open
+/// (a marker quoted in prose or inside our own body) and a stray foreign close
+/// are NOT boundaries: a well-formed own block whose body merely mentions a
+/// sibling's marker is replaced in place, not truncated at the quoted marker.
+/// Own-namespace fences are always absorbed, so duplicate/unclosed own blocks
+/// still collapse.
+fn first_real_foreign_block_pos(content: &str, search_from: usize) -> usize {
+    let all = fences(content);
+    let relevant: Vec<&Fence> = all.iter().filter(|f| f.pos >= search_from).collect();
+    for (i, f) in relevant.iter().enumerate() {
+        if f.ns == OWN_NS || f.is_close {
+            continue;
+        }
+        if relevant[i + 1..].iter().any(|n| n.ns == f.ns && n.is_close) {
+            return f.pos;
+        }
+    }
+    content.len()
+}
+
+/// Byte offset of Loomweave's own *top-level* open fence, or `None`. An own open
+/// marker quoted inside an (unclosed) foreign block is shielded — we decline to
+/// claim content we cannot prove is ours, and the caller falls back to an append
+/// (which deletes nothing). This is the foreign-safe anchor for the replace path.
+fn first_own_open_fence_pos(content: &str) -> Option<usize> {
+    let mut inside_foreign: Option<String> = None;
+    for f in fences(content) {
+        match &inside_foreign {
+            Some(ns) => {
+                if f.is_close && &f.ns == ns {
+                    inside_foreign = None;
+                }
+            }
+            None => {
+                if !f.is_close {
+                    if f.ns == OWN_NS {
+                        return Some(f.pos);
+                    }
+                    inside_foreign = Some(f.ns);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `(line_start, line_end)` of the first line strictly after `after` whose
+/// trimmed form equals [`END_MARKER`]; `None` if none follows. Whole-line
+/// matched so it never trips on a sibling's `-->`.
+fn own_end_line_pos(content: &str, after: usize) -> Option<(usize, usize)> {
+    let mut offset = 0usize;
+    for line in content.split_inclusive('\n') {
         let line_start = offset;
         let line_end = offset + line.len();
         offset = line_end;
-
-        match start {
-            // Still scanning for the start marker.
-            None => {
-                if trimmed.starts_with(START_PREFIX) {
-                    start = Some((line_start, line_end));
-                }
-            }
-            // Start marker already seen; the first matching end-marker line closes
-            // the span.
-            Some((span_start, body_start)) if trimmed == END_MARKER => {
-                // Body is everything between the start-marker line and the
-                // end-marker line; trim a single trailing newline so it round-trips
-                // against `canonical_body` (which has no trailing newline).
-                let raw_body = &content[body_start..line_start];
-                let body = raw_body.strip_suffix('\n').unwrap_or(raw_body).to_owned();
-                return Span::WellFormed {
-                    start: span_start,
-                    end: line_end,
-                    body,
-                };
-            }
-            Some(_) => {}
+        if line_start > after && line.trim() == END_MARKER {
+            return Some((line_start, line_end));
         }
     }
-    match start {
-        // Start marker found but never a following end marker → dangling.
-        Some(_) => Span::Malformed,
-        None => Span::Absent,
+    None
+}
+
+/// Remove every *complete* own block (own start line through its own end line,
+/// inclusive) from `text`, keeping all other bytes verbatim. A dangling own open
+/// with no following close is left in place (mirrors a non-greedy open..close
+/// substitution). Used to canonicalise duplicate own blocks in a region already
+/// known to be free of real foreign blocks.
+fn remove_own_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut buf = String::new();
+    let mut in_own = false;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if in_own {
+            buf.push_str(line);
+            if trimmed == END_MARKER {
+                in_own = false;
+                buf.clear(); // complete own block — drop it
+            }
+        } else if trimmed.starts_with(START_PREFIX) {
+            in_own = true;
+            buf.clear();
+            buf.push_str(line);
+        } else {
+            out.push_str(line);
+        }
+    }
+    out.push_str(&buf); // dangling own open with no close: keep verbatim
+    out
+}
+
+/// Collapse duplicate own blocks in `tail` that precede the first real foreign
+/// block, returning `(cleaned_tail, shielded_dup)` (C-4 (e)). Own blocks before
+/// that boundary are removed; everything from the foreign block onward is
+/// preserved verbatim — including any own duplicate beyond it, which
+/// foreign-safety forbids reaching across; the flag surfaces such a shielded
+/// duplicate.
+fn canonicalise_tail(tail: &str) -> (String, bool) {
+    let foreign = first_real_foreign_block_pos(tail, 0);
+    let (head, rest) = (&tail[..foreign], &tail[foreign..]);
+    let cleaned = remove_own_blocks(head);
+    let shielded = first_own_open_fence_pos(rest).is_some();
+    (format!("{cleaned}{rest}"), shielded)
+}
+
+/// Locate Loomweave's own block, **foreign-aware**. The start is the first
+/// top-level own open fence ([`first_own_open_fence_pos`], so an own marker
+/// shielded inside an unclosed foreign block is skipped). A block is
+/// [`Span::WellFormed`] only when its own end marker follows the start *and*
+/// precedes the first real foreign block; an own close that lies beyond a
+/// foreign block is [`Span::Malformed`] (a naive open..close match would swallow
+/// the sibling — bounded recovery is required).
+fn locate_span(content: &str) -> Span {
+    let Some(start) = first_own_open_fence_pos(content) else {
+        return Span::Absent;
+    };
+    let Some((own_end_start, own_end_after)) = own_end_line_pos(content, start) else {
+        return Span::Malformed;
+    };
+    if own_end_start >= first_real_foreign_block_pos(content, start) {
+        return Span::Malformed;
+    }
+    // Body is everything between the start-marker line and the end-marker line;
+    // trim a single trailing newline so it round-trips against `canonical_body`.
+    let body_start = start + content[start..].find('\n').map_or(0, |i| i + 1);
+    let raw_body = &content[body_start..own_end_start];
+    let body = raw_body.strip_suffix('\n').unwrap_or(raw_body).to_owned();
+    Span::WellFormed {
+        end: own_end_after,
+        body,
     }
 }
 
@@ -246,22 +413,28 @@ pub struct InstructionsInstallReport {
 /// Inject (or repair) the Loomweave block into both [`TARGET_FILES`] under
 /// `project_root`, idempotently. Doubles as the `doctor --fix` repair.
 ///
-/// Per-file behaviour, touching **only** Loomweave's own span:
+/// Per-file behaviour, touching **only** Loomweave's own span and obeying the
+/// weft C-4 multi-owner managed-block contract — a rewrite never crosses a
+/// co-resident foreign-namespace fence:
 ///
-/// - **Replace** when a well-ordered `START_PREFIX`…`END_MARKER` span exists:
-///   rewrite exactly that span, leaving every byte outside it (e.g. a
-///   coexisting Filigree block) untouched. A no-op when the body already
-///   matches.
-/// - **Append** when no start marker is present: append the block (separated by
-///   a blank line) to the file's existing content, which is left intact.
-/// - **Dangling start marker** (start present, no following end): do **not**
-///   truncate to EOF (that would eat a coexisting Filigree block). Strip only
-///   the orphaned start-marker line and append a fresh well-formed block; all
-///   other bytes — including the orphaned prose body, left as loose text —
-///   survive.
+/// - **Replace** when a well-ordered own block closes *before* any real foreign
+///   block: rewrite that span in place, then canonicalise any duplicate own
+///   blocks in the tail up to (never across) the first real foreign block
+///   (C-4 (c) replace path, (e) own-duplicate canonicalisation). A no-op when
+///   the result is byte-identical.
+/// - **Bounded recovery** when the own close lies *beyond* a real foreign block
+///   (so a naive open..close match would swallow the sibling): cut the rewrite
+///   at the foreign fence, never truncate across it (C-4 (c)).
+/// - **Append** when no claimable own start is present — none at all, or one
+///   shielded inside an unclosed foreign block: append the block to the file's
+///   existing content, which is left intact (C-4 (d)).
+/// - **Dangling start marker** (own start present, no following own end): strip
+///   the orphaned start-marker line(s) and append a fresh block; all other bytes
+///   survive. Never truncate to EOF.
 ///
 /// Writes are atomic (temp + rename in the same directory, preserving the
-/// existing file mode) and reject a symlinked target.
+/// existing file mode), reject a symlinked target, and refuse an empty payload
+/// (C-4 (g)).
 ///
 /// # Errors
 ///
@@ -289,26 +462,24 @@ fn install_into_file(path: &Path) -> Result<bool> {
     };
 
     let block = render_block();
-    let new_content = match existing.as_deref() {
-        None => format!("{block}\n"),
-        Some(content) => match locate_span(content) {
-            Span::WellFormed { start, end, body } => {
-                if body == canonical_body() {
-                    // Already current — no-op, even if the provenance marker
-                    // version differs (drift is body-only).
-                    return Ok(false);
-                }
-                splice_span(content, start, end, &block)
-            }
-            Span::Absent => append_block(content, &block),
-            Span::Malformed => {
-                // Dangling start marker: strip only the orphan start-marker
-                // line, then append a fresh block. Never truncate to EOF.
-                let stripped = strip_start_marker_line(content);
-                append_block(&stripped, &block)
-            }
-        },
+    let (new_content, shielded_dup) = match existing.as_deref() {
+        None => (format!("{block}\n"), false),
+        Some(content) => compute_injection(content, &block),
     };
+
+    if shielded_dup {
+        // A stale own duplicate survives beyond a foreign block because
+        // canonicalising it would mean reaching across a block we do not own. It
+        // is conflicting guidance, not a harmless copy — surface it rather than
+        // silently ship a split brain (foreign-safety wins over own-dedup, C-4
+        // (e)). To stderr, never stdout (operator-diagnostic hygiene).
+        eprintln!(
+            "loomweave: warning: {} carries a Loomweave instruction block beyond \
+             another tool's block that cannot be canonicalised without crossing it; \
+             the stale copy was left in place. Resolve it by hand.",
+            path.display()
+        );
+    }
 
     if existing.as_deref() == Some(new_content.as_str()) {
         return Ok(false);
@@ -317,24 +488,55 @@ fn install_into_file(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Replace `content[start..end]` with `block`, normalising so the replacement
-/// span ends in exactly one newline (the original end-marker line may or may
-/// not have carried one at EOF).
-fn splice_span(content: &str, start: usize, end: usize, block: &str) -> String {
-    let mut out = String::with_capacity(content.len());
-    out.push_str(&content[..start]);
-    out.push_str(block);
-    let tail = &content[end..];
-    // The located `end` is just past the end-marker line's trailing newline (if
-    // present). Preserve whatever followed it verbatim; guarantee a newline
-    // between our end marker and that tail when the tail is non-empty.
-    if tail.is_empty() {
-        out.push('\n');
+/// Compute the new file content for an existing file, foreign-fence-bounded.
+/// Returns `(new_content, shielded_dup)`; `shielded_dup` flags an own duplicate
+/// left in place because canonicalising it would cross a foreign block. Pure —
+/// all IO is in [`install_into_file`].
+fn compute_injection(content: &str, block: &str) -> (String, bool) {
+    let Some(start) = first_own_open_fence_pos(content) else {
+        // No own open we can claim (none, or shielded inside an unclosed foreign
+        // block). Append a fresh block, preserving all existing text (C-4 (d)).
+        // If a current block is already present-but-unreachable, appending each
+        // run would grow the file unboundedly — decline instead (read-only, so
+        // foreign-safety is untouched).
+        if content.contains(block) {
+            return (content.to_owned(), false);
+        }
+        return (append_block(content, block), false);
+    };
+
+    let Some((own_end_start, own_end_after)) = own_end_line_pos(content, start) else {
+        // Own open with no following end marker anywhere: dangling. Strip every
+        // orphan own start line (convergent + foreign-safe) and append a fresh
+        // block. Never truncate to EOF (C-4 (d)).
+        let stripped = strip_start_marker_line(content);
+        return (append_block(&stripped, block), false);
+    };
+
+    let foreign = first_real_foreign_block_pos(content, start);
+    if own_end_start < foreign {
+        // Well-formed own block closing before any real foreign block: replace it
+        // in place, then canonicalise duplicate own blocks in the tail up to (but
+        // never across) the first real foreign block (C-4 (c) replace path, (e)).
+        let (tail, shielded) = canonicalise_tail(&content[own_end_after..]);
+        (splice_block(content, start, block, &tail), shielded)
     } else {
-        out.push('\n');
-        out.push_str(tail);
+        // Bounded recovery (C-4 (c)): the own close lies beyond a real foreign
+        // block, so a naive open..close match would swallow the sibling. Cut at
+        // the foreign block (or EOF) instead, never across it.
+        let tail = &content[foreign..];
+        let shielded = first_own_open_fence_pos(tail).is_some();
+        (splice_block(content, start, block, tail), shielded)
     }
-    out
+}
+
+/// Splice `block` in at `start`, followed by `tail`, with exactly one newline
+/// between the block's end marker and the tail. When the in-place span is
+/// unchanged this reproduces `content` byte-for-byte (idempotency); when `tail`
+/// begins at a foreign fence it guarantees our close marker is never glued
+/// mid-line against that fence.
+fn splice_block(content: &str, start: usize, block: &str, tail: &str) -> String {
+    format!("{}{}\n{}", &content[..start], block, tail)
 }
 
 /// Append `block` to `content`, separated by a blank line, with a trailing
@@ -356,15 +558,15 @@ fn append_block(content: &str, block: &str) -> String {
 /// Remove **every** line whose trimmed form starts with [`START_PREFIX`].
 /// Every other byte — including any orphaned body that followed it — is kept.
 ///
-/// This is only reached from the [`Span::Malformed`] branch, where
-/// [`locate_span`] returned `Malformed` precisely because no end marker follows
-/// the first start marker — so *every* start marker in the file is orphaned by
-/// definition. Stripping only the first would leave a second dangling start
-/// behind; on the next install/doctor run [`locate_span`] would pair that
-/// leftover orphan with the freshly-appended block's end marker, forming a
-/// well-formed span that engulfs (and deletes) everything between — including a
-/// co-resident Filigree block. Removing all orphan starts converges in one pass
-/// and never eats a neighbouring tool's block.
+/// This is only reached from [`compute_injection`]'s dangling-own-open branch,
+/// where [`own_end_line_pos`] found no end marker following the first start
+/// marker — so *every* start marker in the file is orphaned by definition.
+/// Stripping only the first would leave a second dangling start behind; on the
+/// next install/doctor run that leftover orphan would pair with the
+/// freshly-appended block's end marker, forming a well-formed span that engulfs
+/// (and deletes) everything between — including a co-resident Filigree block.
+/// Removing all orphan starts converges in one pass and never eats a
+/// neighbouring tool's block.
 fn strip_start_marker_line(content: &str) -> String {
     let mut out = String::with_capacity(content.len());
     for line in content.split_inclusive('\n') {
@@ -396,6 +598,16 @@ fn reject_symlink(path: &Path) -> Result<()> {
 /// same directory (so `rename` stays on one filesystem), preserve the existing
 /// file mode when the target already exists, then `rename` over the target.
 fn atomic_write(path: &Path, content: &str) -> Result<()> {
+    // Refuse-to-empty guard (C-4 (g)). Every caller embeds the non-empty rendered
+    // block, so an empty / whitespace-only payload can only be corruption or a
+    // logic bug. The temp+rename below already makes truncating a populated file
+    // structurally impossible; this is belt-and-braces parity with the siblings —
+    // refuse loudly rather than rename an empty temp over a populated CLAUDE.md /
+    // AGENTS.md.
+    if content.trim().is_empty() {
+        bail!("refusing to write empty content to {}", path.display());
+    }
+
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
 
@@ -747,6 +959,174 @@ filigree tracks tasks for this project.\n\
             err.to_string().contains("symlink")
                 || err.chain().any(|c| c.to_string().contains("symlink")),
             "expected a symlink rejection, got: {err}"
+        );
+    }
+
+    /// A representative *uppercase*-namespaced sibling block. C-4 (h) requires
+    /// the foreign-fence detector to match the namespace case-insensitively, so
+    /// this must register as a boundary exactly like a lowercase sibling.
+    const FILIGREE_BLOCK_UPPER: &str = "<!-- FILIGREE:instructions:v3.0.0rc2:98d5c5f2 -->\n\
+## Filigree Issue Tracker\n\
+\n\
+filigree tracks tasks for this project.\n\
+<!-- /FILIGREE:instructions -->\n";
+
+    /// C-4 (c) — the headline data-loss vector. A stale Loomweave START marker,
+    /// then a *complete* Filigree block, then Loomweave's REAL end marker. The
+    /// pre-fix `locate_span` closes the own span on the first end-marker line
+    /// after the start — Loomweave's own close, which sits AFTER the Filigree
+    /// block — so the blind `splice_span` deletes the sibling (1 → 0). The fix
+    /// must bound the replaced span at the first foreign fence after the own
+    /// start. Demonstrably fails on the pre-change code.
+    #[test]
+    fn foreign_block_sandwiched_in_own_span_survives_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        install_instructions(dir.path()).unwrap(); // seed both files clean
+        let claude = dir.path().join("CLAUDE.md");
+        let sandwiched = format!(
+            "# notes\n\n\
+             <!-- loomweave:instructions:v0:deadbeef -->\n\
+             stale loomweave body\n\
+             {FILIGREE_BLOCK}\
+             <!-- /loomweave:instructions -->\n\
+             trailing prose\n"
+        );
+        std::fs::write(&claude, &sandwiched).unwrap();
+
+        install_instructions(dir.path()).unwrap();
+        let after = std::fs::read_to_string(&claude).unwrap();
+        assert!(
+            after.contains(FILIGREE_BLOCK),
+            "filigree block swallowed by unbounded own-span replace:\n{after}"
+        );
+        assert_eq!(
+            after.matches(START_PREFIX).count(),
+            1,
+            "exactly one loomweave start must remain:\n{after}"
+        );
+        // Foreign-untouched bytes plus convergence: a second pass is a no-op.
+        let second = install_instructions(dir.path()).unwrap();
+        assert!(
+            !second.changed,
+            "sandwiched-foreign repair must reach a fixed point:\n{}",
+            std::fs::read_to_string(&claude).unwrap()
+        );
+        assert!(
+            std::fs::read_to_string(&claude)
+                .unwrap()
+                .contains(FILIGREE_BLOCK),
+            "filigree block must survive the converged repair"
+        );
+    }
+
+    /// C-4 (h) — same sandwich as the headline vector, but the sibling uses an
+    /// UPPERCASE namespace. The case-insensitive fence detector must still treat
+    /// it as a foreign boundary and refuse to swallow it.
+    #[test]
+    fn uppercase_foreign_namespace_registers_as_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        install_instructions(dir.path()).unwrap();
+        let claude = dir.path().join("CLAUDE.md");
+        let sandwiched = format!(
+            "<!-- loomweave:instructions:v0:deadbeef -->\n\
+             stale\n\
+             {FILIGREE_BLOCK_UPPER}\
+             <!-- /loomweave:instructions -->\n"
+        );
+        std::fs::write(&claude, &sandwiched).unwrap();
+        install_instructions(dir.path()).unwrap();
+        let after = std::fs::read_to_string(&claude).unwrap();
+        assert!(
+            after.contains(FILIGREE_BLOCK_UPPER),
+            "uppercase-namespaced foreign block swallowed:\n{after}"
+        );
+    }
+
+    /// C-4 (e) — own-duplicate canonicalisation. Two well-formed, body-current
+    /// Loomweave blocks. Pre-fix: only the first is touched, the stale duplicate
+    /// persists, and `instructions_state` still reports `UpToDate` (doctor green
+    /// over a split brain). The fix must collapse to exactly one block and make
+    /// doctor flag the duplicate before repair. Demonstrably fails on pre-change
+    /// code (stays at two; reports `UpToDate`).
+    #[test]
+    fn duplicate_own_blocks_canonicalise_to_one() {
+        let dir = tempfile::tempdir().unwrap();
+        install_instructions(dir.path()).unwrap();
+        let claude = dir.path().join("CLAUDE.md");
+        let block = render_block();
+        let doubled = format!("# notes\n\n{block}\n\n{block}\n");
+        std::fs::write(&claude, &doubled).unwrap();
+
+        // doctor must FLAG it (not report green) before repair.
+        assert_ne!(
+            instructions_state(dir.path()),
+            InstructionsState::UpToDate,
+            "a stale own-duplicate must not read as healthy"
+        );
+
+        // --fix (== install) must collapse to exactly one canonical block.
+        install_instructions(dir.path()).unwrap();
+        let after = std::fs::read_to_string(&claude).unwrap();
+        assert_eq!(
+            after.matches(START_PREFIX).count(),
+            1,
+            "duplicate own block not collapsed:\n{after}"
+        );
+        assert_eq!(
+            after.matches(END_MARKER).count(),
+            1,
+            "duplicate end marker not collapsed:\n{after}"
+        );
+        assert!(after.contains("# notes"), "prior prose lost:\n{after}");
+        assert_eq!(instructions_state(dir.path()), InstructionsState::UpToDate);
+        // Idempotent thereafter.
+        assert!(!install_instructions(dir.path()).unwrap().changed);
+    }
+
+    /// C-4 (e) foreign-safety clause: an own duplicate that sits *beyond* a
+    /// foreign block must be left in place (canonicalising it would mean reaching
+    /// across a block we do not own) and surfaced, never relocated or deleted.
+    #[test]
+    fn own_duplicate_beyond_foreign_is_left_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        install_instructions(dir.path()).unwrap();
+        let claude = dir.path().join("CLAUDE.md");
+        let block = render_block();
+        let layout = format!("{block}\n\n{FILIGREE_BLOCK}\n{block}\n");
+        std::fs::write(&claude, &layout).unwrap();
+        install_instructions(dir.path()).unwrap();
+        let after = std::fs::read_to_string(&claude).unwrap();
+        assert!(
+            after.contains(FILIGREE_BLOCK),
+            "foreign block lost:\n{after}"
+        );
+        assert_eq!(
+            after.matches(START_PREFIX).count(),
+            2,
+            "an own duplicate beyond a foreign block must be left, not relocated:\n{after}"
+        );
+    }
+
+    /// C-4 (g) — refuse-to-empty guard. The atomic writer must refuse an
+    /// empty/whitespace-only payload and leave the populated target untouched.
+    /// Demonstrably fails on pre-change code (no explicit guard).
+    #[test]
+    fn atomic_write_refuses_empty_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        std::fs::write(&path, "populated content\n").unwrap();
+        let err = super::atomic_write(&path, "   \n\t\n").unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("empty")
+                || err
+                    .chain()
+                    .any(|c| c.to_string().to_lowercase().contains("empty")),
+            "expected a refuse-to-empty error, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "populated content\n",
+            "populated target must be untouched by a refused empty write"
         );
     }
 
