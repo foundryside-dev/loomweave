@@ -18,7 +18,10 @@
 //!   Phase 1b, and the method's *locator* already carries the impl
 //!   discriminator, so Phase 1b can re-parent to the impl without churning id.
 use serde_json::{Value, json};
-use syn::{ImplItem, Item, ItemFn, ItemImpl, ItemMod, ItemStruct, Meta};
+use syn::{
+    ImplItem, Item, ItemConst, ItemEnum, ItemFn, ItemImpl, ItemMacro, ItemMod, ItemStatic,
+    ItemStruct, ItemTrait, ItemType, Meta,
+};
 
 use crate::qualname::{
     build_entity_id, cfg_discriminant, free_item_qualname, impl_disc_for, impl_qualname,
@@ -160,6 +163,10 @@ pub fn extract_file_degraded_aware(
     }
 }
 
+// Length is arm count, not branching complexity: each leaf kind is one flat,
+// near-identical dispatch arm over the item enum. Splitting it would obscure the
+// one-arm-per-syn-Item structure the reader relies on.
+#[allow(clippy::too_many_lines)]
 fn walk_items(
     items: &[Item],
     module_path: &str,
@@ -193,6 +200,14 @@ fn walk_items(
                 content: Some(_),
                 ..
             }) => Some(("module", ident.to_string())),
+            Item::Enum(ItemEnum { ident, .. }) => Some(("enum", ident.to_string())),
+            Item::Trait(ItemTrait { ident, .. }) => Some(("trait", ident.to_string())),
+            Item::Type(ItemType { ident, .. }) => Some(("type_alias", ident.to_string())),
+            Item::Const(ItemConst { ident, .. }) => Some(("const", ident.to_string())),
+            Item::Static(ItemStatic { ident, .. }) => Some(("static", ident.to_string())),
+            Item::Macro(ItemMacro {
+                ident: Some(ident), ..
+            }) => Some(("macro", ident.to_string())),
             _ => None,
         };
         if let Some(k) = key {
@@ -287,7 +302,125 @@ fn walk_items(
                 let nested_id = build_id("module", &nested)?;
                 walk_items(inner, &nested, &nested_id, file_path, out, edges)?;
             }
-            _ => {} // const/static/enum/trait/etc. are Phase 1b
+            // Phase 1b leaf kinds: free items riding the same qualname + entity +
+            // contains pattern as `struct`/`function`, with `None` signature (no
+            // signature builder yet — trait/impl SEI signatures are a later task).
+            // Trait *bodies* are deliberately NOT walked here (matching 1a).
+            Item::Enum(ItemEnum { ident, attrs, .. }) => {
+                let name = ident.to_string();
+                let mut q = free_item_qualname(module_path, &name);
+                if is_cfg_twin("enum", &name)
+                    && let Some(pred) = cfg_predicate(attrs)
+                {
+                    q.push_str(&cfg_discriminant(&pred));
+                }
+                let child = entity(
+                    "enum",
+                    &q,
+                    file_path,
+                    &source_range_of(item),
+                    Some(parent_id),
+                    None,
+                )?;
+                push_with_contains(parent_id, child, out, edges);
+            }
+            Item::Trait(ItemTrait { ident, attrs, .. }) => {
+                let name = ident.to_string();
+                let mut q = free_item_qualname(module_path, &name);
+                if is_cfg_twin("trait", &name)
+                    && let Some(pred) = cfg_predicate(attrs)
+                {
+                    q.push_str(&cfg_discriminant(&pred));
+                }
+                let child = entity(
+                    "trait",
+                    &q,
+                    file_path,
+                    &source_range_of(item),
+                    Some(parent_id),
+                    None,
+                )?;
+                push_with_contains(parent_id, child, out, edges);
+            }
+            Item::Type(ItemType { ident, attrs, .. }) => {
+                let name = ident.to_string();
+                let mut q = free_item_qualname(module_path, &name);
+                if is_cfg_twin("type_alias", &name)
+                    && let Some(pred) = cfg_predicate(attrs)
+                {
+                    q.push_str(&cfg_discriminant(&pred));
+                }
+                let child = entity(
+                    "type_alias",
+                    &q,
+                    file_path,
+                    &source_range_of(item),
+                    Some(parent_id),
+                    None,
+                )?;
+                push_with_contains(parent_id, child, out, edges);
+            }
+            Item::Const(ItemConst { ident, attrs, .. }) => {
+                let name = ident.to_string();
+                let mut q = free_item_qualname(module_path, &name);
+                if is_cfg_twin("const", &name)
+                    && let Some(pred) = cfg_predicate(attrs)
+                {
+                    q.push_str(&cfg_discriminant(&pred));
+                }
+                let child = entity(
+                    "const",
+                    &q,
+                    file_path,
+                    &source_range_of(item),
+                    Some(parent_id),
+                    None,
+                )?;
+                push_with_contains(parent_id, child, out, edges);
+            }
+            Item::Static(ItemStatic { ident, attrs, .. }) => {
+                let name = ident.to_string();
+                let mut q = free_item_qualname(module_path, &name);
+                if is_cfg_twin("static", &name)
+                    && let Some(pred) = cfg_predicate(attrs)
+                {
+                    q.push_str(&cfg_discriminant(&pred));
+                }
+                let child = entity(
+                    "static",
+                    &q,
+                    file_path,
+                    &source_range_of(item),
+                    Some(parent_id),
+                    None,
+                )?;
+                push_with_contains(parent_id, child, out, edges);
+            }
+            Item::Macro(ItemMacro {
+                ident: Some(ident),
+                attrs,
+                ..
+            }) => {
+                // Only `macro_rules! name { .. }` (named) — bare macro
+                // *invocations* (`foo!();`) carry `ident: None` and fall through.
+                let name = ident.to_string();
+                let mut q = free_item_qualname(module_path, &name);
+                if is_cfg_twin("macro", &name)
+                    && let Some(pred) = cfg_predicate(attrs)
+                {
+                    q.push_str(&cfg_discriminant(&pred));
+                }
+                let child = entity(
+                    "macro",
+                    &q,
+                    file_path,
+                    &source_range_of(item),
+                    Some(parent_id),
+                    None,
+                )?;
+                push_with_contains(parent_id, child, out, edges);
+            }
+            _ => {} // `impl` entity is Task 5; macro invocations / use / extern etc. unmodelled.
         }
     }
     Ok(())

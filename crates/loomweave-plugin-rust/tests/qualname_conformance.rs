@@ -112,10 +112,23 @@ fn corpus_kinds_are_known() {
             kinds.insert(e["kind"].as_str().unwrap().to_owned());
         }
     }
-    let known: std::collections::BTreeSet<String> = ["module", "struct", "function"]
-        .into_iter()
-        .map(String::from)
-        .collect();
+    // The contract-vetted kind set: Phase 1a (module/struct/function) plus the
+    // Phase 1b leaf kinds (ADR-027 MINOR bump). Mirror plugin.toml `entity_kinds`
+    // minus `impl` (Task 5). A tenth, unvetted kind still trips the guard.
+    let known: std::collections::BTreeSet<String> = [
+        "module",
+        "struct",
+        "function",
+        "enum",
+        "trait",
+        "type_alias",
+        "const",
+        "static",
+        "macro",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
     assert!(
         kinds.is_subset(&known),
         "unhandled entity kinds in corpus: {:?}",

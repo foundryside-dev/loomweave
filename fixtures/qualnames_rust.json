@@ -211,10 +211,11 @@
       "name": "macro_invocation_generates_no_entity",
       "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
       "reproducibility": "slice-1",
-      "note": "AGREEMENT: a macro_rules! definition + invocation generates a `generated` fn at compile time, but neither engine sees it (syn does not expand; tree-sitter cannot). Only the file-scope module is emitted. Both engines must agree the generated item does not exist.",
+      "note": "AGREEMENT: the `macro_rules! make` DEFINITION is a `macro` entity (Phase 1b, ADR-027 MINOR ontology bump). The COMPILE-TIME-GENERATED `generated` fn that `make!()` would expand to is NOT seen by either engine (syn does not expand; tree-sitter cannot), and the bare `make!()` INVOCATION emits nothing. So the file emits exactly the file-scope module and the macro definition; both engines must agree the generated item does not exist.",
       "source": "macro_rules! make { () => { fn generated() {} } }\nmake!();\n",
       "expected": [
-        {"qualname": "demo.m", "kind": "module"}
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.make", "kind": "macro"}
       ]
     }
   ]
