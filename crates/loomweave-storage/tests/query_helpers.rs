@@ -6,11 +6,12 @@ use loomweave_core::EdgeConfidence;
 use loomweave_storage::{
     ModuleDependencyEdge, ReferenceDirection, SubsystemMember, call_edges_from,
     call_edges_targeting, child_entity_ids, contained_entity_ids, containing_module_id, edge_total,
-    entity_at_line, entity_briefing_block_reason, entity_by_id, entity_total, find_entities,
-    findings_for_emit, module_dependency_edges, module_reference_rollup, normalize_source_path,
-    pragma, reference_edges_for_entity, resolve_file, resolve_file_catalog_entry, schema,
-    subsystem_for_member, subsystem_members, subsystem_of_entity, subsystem_total,
-    unresolved_call_sites_for_caller, unresolved_callers_for_target,
+    entities_targeted_by_unresolved_call_sites, entity_at_line, entity_briefing_block_reason,
+    entity_by_id, entity_total, find_entities, findings_for_emit, module_dependency_edges,
+    module_reference_rollup, normalize_source_path, pragma, reference_edges_for_entity,
+    resolve_file, resolve_file_catalog_entry, schema, subsystem_for_member, subsystem_members,
+    subsystem_of_entity, subsystem_total, unresolved_call_sites_for_caller,
+    unresolved_callers_for_target,
 };
 use rusqlite::{Connection, params};
 
@@ -525,6 +526,94 @@ fn unresolved_callers_for_target_filters_stale_caller_content_hash_rows() {
     assert_eq!(sites.len(), 1);
     assert_eq!(sites[0].site_key, "current-site");
     assert_eq!(sites[0].caller_content_hash, "hash-current");
+}
+
+#[test]
+fn entities_targeted_by_unresolved_sites_matches_method_and_assoc_leaves() {
+    // The dead-code fail-toward-live input: an entity whose short_name matches
+    // the terminal identifier of an unresolved call site is a plausible target.
+    // Critically this must match the Rust associated-function `::` form
+    // (`Svc::make` -> `make`), which the `.`-only leaf extraction in
+    // `candidate_entities_for_expr` / `unresolved_callers_for_target` misses.
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity_with_hash(&conn, "rust:function:app.run", "function", "hc");
+    insert_named_entity(
+        &conn,
+        "rust:function:app.Svc.impl#<>.do_work",
+        "function",
+        "app.Svc.impl#<>.do_work",
+        "do_work",
+        None,
+    );
+    insert_named_entity(
+        &conn,
+        "rust:function:app.Svc.impl#<>.make",
+        "function",
+        "app.Svc.impl#<>.make",
+        "make",
+        None,
+    );
+    insert_named_entity(
+        &conn,
+        "rust:function:app.helper",
+        "function",
+        "app.helper",
+        "helper",
+        None,
+    );
+    insert_named_entity(
+        &conn,
+        "rust:function:app.orphan",
+        "function",
+        "app.orphan",
+        "orphan",
+        None,
+    );
+
+    // Method call `.do_work`; assoc path `Svc::make`; dotted path `m.helper`;
+    // a non-identifier form `<expr>()` (contributes no leaf).
+    insert_unresolved_call_site(&conn, "rust:function:app.run", "hc", "s0", ".do_work");
+    insert_unresolved_call_site(&conn, "rust:function:app.run", "hc", "s1", "Svc::make");
+    insert_unresolved_call_site(&conn, "rust:function:app.run", "hc", "s2", "m.helper");
+    insert_unresolved_call_site(&conn, "rust:function:app.run", "hc", "s3", "<expr>()");
+
+    let targeted = entities_targeted_by_unresolved_call_sites(&conn).unwrap();
+
+    assert!(
+        targeted.contains("rust:function:app.Svc.impl#<>.do_work"),
+        "method-call leaf `.do_work` must target `do_work`: {targeted:?}"
+    );
+    assert!(
+        targeted.contains("rust:function:app.Svc.impl#<>.make"),
+        "assoc-call leaf `Svc::make` must target `make` (the :: form the `.`-only \
+         matchers miss): {targeted:?}"
+    );
+    assert!(
+        targeted.contains("rust:function:app.helper"),
+        "dotted-path leaf `m.helper` must target `helper`: {targeted:?}"
+    );
+    assert!(
+        !targeted.contains("rust:function:app.orphan"),
+        "an entity matched by no call leaf must NOT be targeted: {targeted:?}"
+    );
+}
+
+#[test]
+fn entities_targeted_by_unresolved_sites_skips_stale_caller() {
+    // A site whose caller content-hash is stale must not target anything
+    // (same staleness filter as unresolved_callers_for_target).
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity_with_hash(&conn, "rust:function:app.run", "function", "hc");
+    insert_named_entity(&conn, "rust:function:app.t", "function", "app.t", "t", None);
+    insert_unresolved_call_site(&conn, "rust:function:app.run", "stale", "s0", ".t");
+
+    let targeted = entities_targeted_by_unresolved_call_sites(&conn).unwrap();
+    assert!(
+        targeted.is_empty(),
+        "a stale-caller site must not target anything: {targeted:?}"
+    );
 }
 
 #[test]

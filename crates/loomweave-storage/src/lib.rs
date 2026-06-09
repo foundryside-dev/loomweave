@@ -55,13 +55,13 @@ pub use query::{
     SubsystemMember, UnresolvedCallSiteRow, ancestor_chain, call_edges_from, call_edges_targeting,
     candidate_entities_for_unresolved_sites, child_entity_ids, contained_entity_ids,
     containing_module_id, current_file_hash, edge_total, entities_by_churn, entities_by_kind,
-    entities_by_tag, entities_containing_line, entities_with_wardline_facts, entity_at_line,
-    entity_briefing_block_reason, entity_by_id, entity_total, entity_visibility,
-    existing_entity_ids, find_entities, findings_for_emit, import_edges_for_entity,
-    module_dependency_edges, module_reference_rollup, normalize_source_path,
-    reference_edges_for_entity, resolve_entity_ref, resolve_file, resolve_file_catalog_entry,
-    subsystem_for_member, subsystem_members, subsystem_of_entity, subsystem_total,
-    unresolved_call_sites_for_caller, unresolved_callers_for_target,
+    entities_by_tag, entities_containing_line, entities_targeted_by_unresolved_call_sites,
+    entities_with_wardline_facts, entity_at_line, entity_briefing_block_reason, entity_by_id,
+    entity_total, entity_visibility, existing_entity_ids, find_entities, findings_for_emit,
+    import_edges_for_entity, module_dependency_edges, module_reference_rollup,
+    normalize_source_path, reference_edges_for_entity, resolve_entity_ref, resolve_file,
+    resolve_file_catalog_entry, subsystem_for_member, subsystem_members, subsystem_of_entity,
+    subsystem_total, unresolved_call_sites_for_caller, unresolved_callers_for_target,
 };
 pub use reader::ReaderPool;
 pub use retry::{RetryPolicy, begin_immediate};
