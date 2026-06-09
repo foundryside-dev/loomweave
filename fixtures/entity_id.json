@@ -191,18 +191,25 @@
       "expected_entity_id": "rust:function:loomweave_core.m.Foo.impl[Display].fmt"
     },
     {
-      "description": "rust inherent-impl method positional generics + ordinal",
+      "description": "rust inherent-impl method positional generics, no ordinal (ADR-049 amended 2026-06-09, Option b)",
       "plugin_id": "rust",
       "kind": "function",
-      "canonical_qualified_name": "k.m.Foo.impl#<$0>#0.m",
-      "expected_entity_id": "rust:function:k.m.Foo.impl#<$0>#0.m"
+      "canonical_qualified_name": "k.m.Foo.impl#<$0>.m",
+      "expected_entity_id": "rust:function:k.m.Foo.impl#<$0>.m"
     },
     {
-      "description": "rust inherent-impl method second ordinal (multiple inherent blocks; ADR-049 §Consequences parity-fixture list)",
+      "description": "rust inherent `impl` ENTITY locator (Task 5; the impl block is its own entity, its methods parent to it)",
+      "plugin_id": "rust",
+      "kind": "impl",
+      "canonical_qualified_name": "k.m.Foo.impl#<$0>",
+      "expected_entity_id": "rust:impl:k.m.Foo.impl#<$0>"
+    },
+    {
+      "description": "rust cfg-twin INHERENT-impl method: ordinal gone, distinct by @cfg suffix on the impl key (ADR-049 amended 2026-06-09, Option b)",
       "plugin_id": "rust",
       "kind": "function",
-      "canonical_qualified_name": "k.m.Foo.impl#<$0>#1.m",
-      "expected_entity_id": "rust:function:k.m.Foo.impl#<$0>#1.m"
+      "canonical_qualified_name": "k.m.Foo.impl#<>@cfg(windows).go",
+      "expected_entity_id": "rust:function:k.m.Foo.impl#<>@cfg(windows).go"
     },
     {
       "description": "rust cfg twin discriminant",

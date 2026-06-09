@@ -11,12 +11,16 @@
 //! - `module` entities are `file_scope`: the **core** re-parents them to the
 //!   file and emits the `file -> module` contains edge. The plugin must NOT
 //!   emit a contains edge for a module.
-//! - every non-`module` child (`struct`, free `function`, impl method) is
+//! - every non-`module` free child (`struct`, free `function`, leaf kinds) is
 //!   parented to its enclosing **module** and the plugin emits the matching
-//!   `module -> child` contains edge here. Methods parent to the module (always
-//!   emitted, always in-file) rather than the impl block — the impl `entity` is
-//!   Phase 1b, and the method's *locator* already carries the impl
-//!   discriminator, so Phase 1b can re-parent to the impl without churning id.
+//!   `module -> child` contains edge here.
+//! - an `impl` entity is parented to the enclosing **module** (`module -> impl`
+//!   contains), and each impl method is re-parented onto the **impl** entity
+//!   (`impl -> method` contains), NOT the module (Task 5). Its locator already
+//!   carries the impl discriminator, so the re-parent does not churn the id.
+//!   Same-`(type, generic-sig, cfg)` inherent impls MERGE to one `impl` entity
+//!   (no source-order ordinal — ADR-049 amend, Option b); cfg-twin impls
+//!   (inherent OR trait) are split by an `@cfg(...)` suffix.
 use serde_json::{Value, json};
 use syn::{
     ImplItem, Item, ItemConst, ItemEnum, ItemFn, ItemImpl, ItemMacro, ItemMod, ItemStatic,
@@ -25,19 +29,20 @@ use syn::{
 
 use crate::qualname::{
     build_entity_id, cfg_discriminant, free_item_qualname, impl_disc_for, impl_qualname,
-    method_qualname, self_ty_name,
+    self_ty_name,
 };
-use crate::signature::{function_signature, struct_signature};
+use crate::signature::{function_signature, impl_signature, struct_signature};
 use crate::spans::{SourceRange, source_range_of};
 
 /// Entities and their structural `contains` edges extracted from one file.
 pub struct Extracted {
     /// Wire-shaped entity `Value`s: a `file_scope` `module` for the file, then
-    /// every top-level / inline-`mod` `struct`, free `function`, and impl method.
+    /// every top-level / inline-`mod` `struct`, free `function`, leaf item,
+    /// `impl` entity, and impl method.
     pub entities: Vec<Value>,
-    /// Wire-shaped `contains` edge `Value`s (`module -> non-module-child`).
-    /// `module` children are excluded — the core emits their `file -> module`
-    /// edge (see the module docs).
+    /// Wire-shaped `contains` edge `Value`s (`module -> non-module-child` and
+    /// `impl -> method`). `module` children are excluded — the core emits their
+    /// `file -> module` edge (see the module docs).
     pub edges: Vec<Value>,
 }
 
@@ -175,11 +180,31 @@ fn walk_items(
     out: &mut Vec<Value>,
     edges: &mut Vec<Value>,
 ) -> Result<(), syn::Error> {
-    // Source-order ordinal for inherent impls of the same self-type, so
-    // multiple inherent blocks get distinct keys without perturbing trait
-    // impls (which carry no ordinal). Scoped to this item list.
-    let mut inherent_ordinals: std::collections::BTreeMap<String, usize> =
+    // Impl entities already emitted in THIS item list, by full impl id. A
+    // second source block with the same impl id (same type+sig+cfg) does NOT
+    // re-emit the entity — it only appends its methods (the merge, ADR-049
+    // amend, Option b). Scoped to this item list.
+    let mut seen_impl_ids: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    // cfg-twin counter for impls: keyed on the FULL pre-cfg impl qualname
+    // (incl. the trait `[Trait]` fragment), so it splits cfg-twin inherent AND
+    // trait impls (e.g. `#[cfg(unix)] impl Display for Foo` /
+    // `#[cfg(windows)] impl Display for Foo` both render `Foo.impl[Display]`
+    // and would dedup to one entity, silently dropping one `fmt`). `twin_counts`
+    // above is keyed `(kind, name)` and cannot see impl qualnames, so impls need
+    // their own pre-pass. Counting genuinely-same `(type, generic-sig)` blocks
+    // >1 marks a twin; the `@cfg` suffix then re-splits the cfg variants.
+    let mut impl_twin_counts: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
+    for item in items {
+        if let Item::Impl(it) = item {
+            let type_q = format!("{module_path}.{}", self_ty_name(&it.self_ty));
+            let impl_q = impl_qualname(&type_q, &impl_disc_for(it));
+            *impl_twin_counts.entry(impl_q).or_insert(0) += 1;
+        }
+    }
+    let impl_is_cfg_twin =
+        |impl_q: &str| impl_twin_counts.get(impl_q).copied().unwrap_or(0) > 1;
     // Named items sharing one (kind, name) in this item list are cfg twins
     // (`#[cfg(unix)] fn f` / `#[cfg(windows)] fn f`, and the same for a `struct`
     // or an inline `mod`): all cfg variants are visible (spec §5), so a bare path
@@ -266,12 +291,13 @@ fn walk_items(
                 push_with_contains(parent_id, child, out, edges);
             }
             Item::Impl(it) => {
-                emit_impl_methods(
+                emit_impl(
                     it,
                     module_path,
                     parent_id,
                     file_path,
-                    &mut inherent_ordinals,
+                    &impl_is_cfg_twin,
+                    &mut seen_impl_ids,
                     out,
                     edges,
                 )?;
@@ -426,49 +452,69 @@ fn walk_items(
     Ok(())
 }
 
-fn emit_impl_methods(
+// `impl_is_cfg_twin` is a borrowed closure (one per item list); `seen_impl_ids`
+// is threaded so a second same-id block merges (entity emitted once, methods
+// appended). Both are inherent to the merge contract.
+#[allow(clippy::too_many_arguments)]
+fn emit_impl(
     it: &ItemImpl,
     module_path: &str,
     module_id: &str,
     file_path: &str,
-    inherent_ordinals: &mut std::collections::BTreeMap<String, usize>,
+    impl_is_cfg_twin: &dyn Fn(&str) -> bool,
+    seen_impl_ids: &mut std::collections::BTreeSet<String>,
     out: &mut Vec<Value>,
     edges: &mut Vec<Value>,
 ) -> Result<(), syn::Error> {
     // Type qualname for the impl's self type (simple path types in 1a; exotic
     // self types fall back to a textual rendering in `self_ty_name`).
     let type_q = format!("{module_path}.{}", self_ty_name(&it.self_ty));
-    // Inherent impls take a per-self-type source-order ordinal; trait impls do
-    // not consume an ordinal (their trait path already disambiguates them), so
-    // reordering trait impls cannot perturb a later inherent ordinal.
-    let ordinal = if it.trait_.is_none() {
-        let slot = inherent_ordinals.entry(type_q.clone()).or_insert(0);
-        let current = *slot;
-        *slot += 1;
-        current
-    } else {
-        0
-    };
-    let disc = impl_disc_for(it, ordinal);
-    // The impl block's discriminator is folded into each method's locator (so
-    // `Display::fmt` and `Debug::fmt` stay distinct). The impl `entity` itself
-    // is Phase 1b; until it exists, methods parent to the enclosing **module**
-    // (always emitted, always in-file) so every `parent_id` has its matching
-    // `contains` edge — ADR-026 dual-encoding. `impl_qualname` proves the impl
-    // key assembles, but is not emitted as an entity yet.
-    let _ = impl_qualname(&type_q, &disc);
+    let disc = impl_disc_for(it); // ordinal-free (ADR-049 amend, Option b)
+    let mut impl_q = impl_qualname(&type_q, &disc);
+    // cfg-twin discriminant applies to ANY cfg-gated twin impl, trait OR
+    // inherent. `#[cfg(unix)] impl Display for Foo` and
+    // `#[cfg(windows)] impl Display for Foo` share `Foo.impl[Display]` and would
+    // dedup to one entity, silently dropping one `fmt`. `impl_is_cfg_twin` keys
+    // on the FULL pre-cfg `impl_q` (which includes `[Display]`), so it is
+    // correct for trait impls too — do NOT gate on `it.trait_.is_none()`.
+    if impl_is_cfg_twin(&impl_q)
+        && let Some(pred) = cfg_predicate(&it.attrs)
+    {
+        impl_q.push_str(&cfg_discriminant(&pred));
+    }
+    let impl_id = build_id("impl", &impl_q)?;
+    // First block with this id → emit the entity + the module->impl edge. A
+    // second same-id block (the merge) skips this and only appends methods.
+    if seen_impl_ids.insert(impl_id.clone()) {
+        let e = entity(
+            "impl",
+            &impl_q,
+            file_path,
+            &source_range_of(it),
+            Some(module_id),
+            Some(impl_signature(it)),
+        )?;
+        edges.push(contains_edge(module_id, &impl_id)); // module -> impl
+        out.push(e);
+    }
+    // Methods re-parent onto the impl entity (impl -> method), NOT the module.
+    // The method qualname is built from the cfg-AUGMENTED `impl_q` (not from
+    // `disc`, which no longer carries the cfg discriminant under Option (b)):
+    // for a cfg-twin inherent impl, `disc.key()` is identical across twins, so
+    // building from `disc` would collide both `go` methods on one locator. The
+    // `@cfg` suffix lives in `impl_q`, so the method must inherit it from there.
     for member in &it.items {
         if let ImplItem::Fn(m) = member {
-            let q = method_qualname(&type_q, &disc, &m.sig.ident.to_string());
+            let q = format!("{impl_q}.{}", m.sig.ident);
             let child = entity(
                 "function",
                 &q,
                 file_path,
                 &source_range_of(member),
-                Some(module_id),
+                Some(&impl_id),
                 Some(function_signature(&m.sig)),
             )?;
-            push_with_contains(module_id, child, out, edges);
+            push_with_contains(&impl_id, child, out, edges); // impl -> method
         }
     }
     Ok(())

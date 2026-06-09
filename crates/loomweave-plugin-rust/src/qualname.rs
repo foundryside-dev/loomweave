@@ -28,20 +28,23 @@ pub fn build_entity_id(kind: &str, qualname: &str) -> Result<EntityId, EntityIdE
 /// An impl block's stable discriminator (ADR-049 §2).
 ///
 /// Trait impls key by `impl[<TraitPath-with-concrete-generics>]`; inherent
-/// impls key by `impl#<positional-De-Bruijn-generic-signature>` plus a stable
-/// ordinal that disambiguates multiple inherent blocks for the same type.
+/// impls key by `impl#<positional-De-Bruijn-generic-signature>`. There is NO
+/// source-order ordinal (ADR-049 amend, Option b): same-`(type, generic-sig,
+/// cfg)` inherent impls share one key and are MERGED into one `impl` entity at
+/// the extraction layer, so the discriminator is genuinely
+/// source-order-independent (reorder-stable). cfg-twin inherent impls (same
+/// type+sig, mutually-exclusive cfgs) are split by an `@cfg(...)` suffix
+/// appended at the extraction layer, not by the discriminator.
 pub enum ImplDisc {
     /// `impl[<trait-with-generics>]`
     Trait {
         /// The rendered trait path with any concrete generic arguments.
         rendered: String,
     },
-    /// `impl#<positional-generics>` with a stable ordinal for ties.
+    /// `impl#<positional-generics>` (no ordinal — merged at the entity layer).
     Inherent {
         /// Positional, De Bruijn-style rendering of the impl's generic params.
         positional_generics: String,
-        /// Source-order ordinal disambiguating same-signature inherent blocks.
-        ordinal: usize,
     },
 }
 
@@ -61,15 +64,16 @@ impl ImplDisc {
 
     /// An inherent impl discriminator. `generic_param_names` are the impl's
     /// declared generic parameter names; they are rendered positionally
-    /// (De Bruijn) so a rename (`<T>` → `<U>`) does not churn the key.
+    /// (De Bruijn) so a rename (`<T>` → `<U>`) does not churn the key. There is
+    /// no ordinal — same-signature inherent impls share this key and merge to
+    /// one entity (ADR-049 amend, Option b).
     #[must_use]
-    pub fn inherent(generic_param_names: &[String], ordinal: usize) -> Self {
+    pub fn inherent(generic_param_names: &[String]) -> Self {
         let positional: Vec<String> = (0..generic_param_names.len())
             .map(|i| format!("${i}"))
             .collect();
         ImplDisc::Inherent {
             positional_generics: positional.join(","),
-            ordinal,
         }
     }
 
@@ -80,9 +84,8 @@ impl ImplDisc {
             ImplDisc::Trait { rendered } => format!("impl[{rendered}]"),
             ImplDisc::Inherent {
                 positional_generics,
-                ordinal,
             } => {
-                format!("impl#<{positional_generics}>#{ordinal}")
+                format!("impl#<{positional_generics}>")
             }
         }
     }
@@ -114,11 +117,12 @@ pub fn method_qualname(type_qualname: &str, disc: &ImplDisc, method: &str) -> St
 /// Trait impls become [`ImplDisc::trait_impl`] keyed by the trait path's last
 /// segment plus its concrete generic arguments (so `From<i32>` and `From<u32>`
 /// differ); inherent impls become [`ImplDisc::inherent`] keyed by the impl's
-/// declared generic-parameter count (positional, rename-stable) plus a
-/// caller-supplied source-order `ordinal` that disambiguates multiple inherent
-/// blocks for the same self type.
+/// declared generic-parameter count (positional, rename-stable). There is no
+/// ordinal (ADR-049 amend, Option b): same-signature inherent blocks share the
+/// key and merge to one entity; cfg-twins are split by an `@cfg(...)` suffix
+/// appended by the caller (extract.rs), not here.
 #[must_use]
-pub fn impl_disc_for(it: &ItemImpl, ordinal: usize) -> ImplDisc {
+pub fn impl_disc_for(it: &ItemImpl) -> ImplDisc {
     if let Some((_, trait_path, _)) = &it.trait_
         && let Some(last) = trait_path.segments.last()
     {
@@ -130,7 +134,7 @@ pub fn impl_disc_for(it: &ItemImpl, ordinal: usize) -> ImplDisc {
         .type_params()
         .map(|p| p.ident.to_string())
         .collect();
-    ImplDisc::inherent(&param_names, ordinal)
+    ImplDisc::inherent(&param_names)
 }
 
 /// Concrete type/const generic arguments of a trait path's final segment,
@@ -273,16 +277,20 @@ mod impl_tests {
     #[test]
     fn inherent_generic_param_rename_does_not_churn() {
         // impl<T> Foo<T> and impl<U> Foo<U> render identically (positional).
-        let t = ImplDisc::inherent(&["T".to_owned()], /*ordinal*/ 0).key_with_positional();
-        let u = ImplDisc::inherent(&["U".to_owned()], 0).key_with_positional();
+        let t = ImplDisc::inherent(&["T".to_owned()]).key_with_positional();
+        let u = ImplDisc::inherent(&["U".to_owned()]).key_with_positional();
         assert_eq!(t, u);
     }
 
     #[test]
-    fn multiple_inherent_impls_get_distinct_ordinals() {
-        let a = ImplDisc::inherent(&[], 0).key_with_positional();
-        let b = ImplDisc::inherent(&[], 1).key_with_positional();
-        assert_ne!(a, b);
+    fn same_signature_inherent_impls_share_one_key() {
+        // ADR-049 amend (Option b): no ordinal — two non-generic inherent
+        // blocks render the SAME key and are merged into one `impl` entity at
+        // the extraction layer (see tests/impl_entity.rs).
+        let a = ImplDisc::inherent(&[]).key_with_positional();
+        let b = ImplDisc::inherent(&[]).key_with_positional();
+        assert_eq!(a, b);
+        assert_eq!(a, "impl#<>");
     }
 }
 
@@ -320,18 +328,18 @@ mod syn_disc_tests {
     }
 
     #[test]
-    fn impl_disc_for_inherent_renders_positional_generics_and_ordinal() {
+    fn impl_disc_for_inherent_renders_positional_generics_no_ordinal() {
         let it: syn::ItemImpl = parse_quote!(
             impl<T> Foo<T> {
                 fn m(&self) {}
             }
         );
-        let disc = impl_disc_for(&it, 0);
-        assert_eq!(disc.key(), "impl#<$0>#0");
+        let disc = impl_disc_for(&it);
+        assert_eq!(disc.key(), "impl#<$0>");
     }
 
     #[test]
-    fn impl_disc_for_inherent_rename_is_stable_but_ordinal_distinguishes() {
+    fn impl_disc_for_inherent_rename_is_stable_and_same_signature_blocks_share_one_key() {
         let a: syn::ItemImpl = parse_quote!(
             impl<T> Foo<T> {
                 fn m(&self) {}
@@ -342,23 +350,25 @@ mod syn_disc_tests {
                 fn m(&self) {}
             }
         );
-        // Rename T -> U is a no-op (positional); ordinal still separates blocks.
-        assert_eq!(impl_disc_for(&a, 0).key(), impl_disc_for(&b, 0).key());
-        assert_ne!(impl_disc_for(&a, 0).key(), impl_disc_for(&a, 1).key());
+        // Rename T -> U is a no-op (positional). Under Option (b) there is no
+        // ordinal, so two same-signature inherent blocks share ONE key and are
+        // merged at the entity layer (see tests/impl_entity.rs).
+        assert_eq!(impl_disc_for(&a).key(), impl_disc_for(&b).key());
+        assert_eq!(impl_disc_for(&a).key(), "impl#<$0>");
     }
 
     #[test]
     fn impl_disc_for_trait_keeps_trait_name_and_concrete_generic_args() {
         let display: syn::ItemImpl =
             parse_quote!(impl std::fmt::Display for Foo { fn fmt(&self) {} });
-        assert_eq!(impl_disc_for(&display, 0).key(), "impl[Display]");
+        assert_eq!(impl_disc_for(&display).key(), "impl[Display]");
 
         let from_signed: syn::ItemImpl = parse_quote!(impl From<i32> for Foo {});
-        assert_eq!(impl_disc_for(&from_signed, 0).key(), "impl[From<i32>]");
+        assert_eq!(impl_disc_for(&from_signed).key(), "impl[From<i32>]");
         let from_unsigned: syn::ItemImpl = parse_quote!(impl From<u32> for Foo {});
         assert_ne!(
-            impl_disc_for(&from_signed, 0).key(),
-            impl_disc_for(&from_unsigned, 0).key()
+            impl_disc_for(&from_signed).key(),
+            impl_disc_for(&from_unsigned).key()
         );
     }
 }

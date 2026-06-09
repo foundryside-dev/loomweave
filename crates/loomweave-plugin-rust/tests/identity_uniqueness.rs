@@ -41,15 +41,29 @@ fn corpus() -> Vec<(&'static str, &'static str, &'static str)> {
         ),
         // Two cfg-gated inherent impls of the SAME type defining the SAME
         // method name. With all cfg variants visible (spec §5) both `go`
-        // methods are extracted; they stay distinct ONLY because the
-        // inherent-impl ordinal (`impl#<>#0` vs `impl#<>#1`) is in the key.
-        // Drop the ordinal and these two collapse to one locator — so this
-        // entry makes the ordinal discriminant a non-vacuous regression
-        // (the `fn a`/`fn b` entry above does not, since the names differ).
+        // methods are extracted; under Option (b) the source-order ordinal is
+        // GONE, so they stay distinct ONLY because the cfg-twin `@cfg`
+        // discriminant splits the two impl entities (`impl#<>@cfg(unix)` vs
+        // `impl#<>@cfg(windows)`) and the methods inherit it. Drop the cfg
+        // discriminant and both impls + both `go` methods collapse to one
+        // locator — so this entry makes the cfg discriminant a non-vacuous
+        // regression for cfg-twin INHERENT impls (the `fn a`/`fn b` entry above
+        // does not, since the names differ).
         (
             "k",
             "k.m",
             "struct Foo;\n#[cfg(unix)] impl Foo { fn go(&self){} }\n#[cfg(windows)] impl Foo { fn go(&self){} }\n",
+        ),
+        // A cfg-gated TRAIT-impl twin: same trait, same type, mutually-exclusive
+        // cfgs. Both `fmt` methods AND both `impl` entities share
+        // `Foo.impl[Display]` pre-cfg; the cfg discriminant must apply to TRAIT
+        // impls too (extract.rs does NOT gate the suffix on `it.trait_.is_none()`),
+        // else the two `impl[Display]` entities dedup to one and one `fmt` is
+        // silently dropped. Proves the dropped guard.
+        (
+            "k",
+            "k.m",
+            "struct Foo;\n#[cfg(unix)] impl std::fmt::Display for Foo { fn fmt(&self,_:&mut std::fmt::Formatter)->std::fmt::Result{Ok(())} }\n#[cfg(windows)] impl std::fmt::Display for Foo { fn fmt(&self,_:&mut std::fmt::Formatter)->std::fmt::Result{Ok(())} }\n",
         ),
     ]
 }
@@ -90,12 +104,14 @@ fn duplicates(ids: &[String]) -> Vec<String> {
 }
 
 #[test]
-fn inherent_impl_ordinal_is_load_bearing() {
+fn cfg_discriminant_is_load_bearing_for_cfg_twin_inherent_impls() {
     // Two cfg-gated inherent impls of `Foo`, each defining `go`. Both methods
-    // are extracted (all-cfg-visible); the ordinal in `impl#<>#N` is the only
-    // thing keeping their locators apart. Assert there are exactly two `go`
-    // methods and that they are distinct — a regression that goes red if the
-    // ordinal discriminant is ever removed.
+    // are extracted (all-cfg-visible). Under Option (b) the source-order ordinal
+    // is GONE; the `@cfg` discriminant on the impl entity (and inherited by the
+    // method) is now the only thing keeping their locators apart
+    // (`impl#<>@cfg(unix)` vs `impl#<>@cfg(windows)`). Assert there are exactly
+    // two `go` methods and that they are distinct — a regression that goes red
+    // if the cfg discriminant is ever dropped for cfg-twin inherent impls.
     let src = "struct Foo;\n#[cfg(unix)] impl Foo { fn go(&self){} }\n#[cfg(windows)] impl Foo { fn go(&self){} }\n";
     let go_ids: Vec<String> = extract_file("k", "k.m", "/p/src/m.rs", src)
         .unwrap()
@@ -110,7 +126,7 @@ fn inherent_impl_ordinal_is_load_bearing() {
     );
     assert_ne!(
         go_ids[0], go_ids[1],
-        "ordinal discriminant collapsed two distinct methods to one locator"
+        "cfg discriminant collapsed two distinct methods to one locator"
     );
 }
 

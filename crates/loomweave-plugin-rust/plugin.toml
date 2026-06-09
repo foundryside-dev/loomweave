@@ -21,8 +21,8 @@ wardline_aware = false
 reads_outside_project_root = false
 
 [ontology]
-# Phase 1a starter kinds + Phase 1b leaf kinds (ADR-027 MINOR bump). The `impl`
-# entity is the last remaining kind (Task 5).
+# Phase 1a starter kinds + Phase 1b leaf kinds + the `impl` entity (Task 5,
+# ADR-027 MINOR bump). The 10-kind set is complete.
 entity_kinds = [
     "module",
     "struct",
@@ -33,11 +33,12 @@ entity_kinds = [
     "const",
     "static",
     "macro",
+    "impl",
 ]
 # The core auto-emits the file->module `contains` edge for file_scope entities.
 edge_kinds = ["contains"]
 rule_id_prefix = "LMWV-RUST-"
-ontology_version = "0.2.0"
+ontology_version = "0.3.0"
 
 [ontology.roles]
 file_scope = ["module"]

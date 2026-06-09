@@ -202,17 +202,18 @@ fn analyze_e2e_stored_rust_entity_set_excludes_out_of_src_files() {
         .collect();
     got.sort();
 
-    // Expected (`want`) set — only the in-`src/` entities. The method locator
-    // carries the CURRENT source-order ordinal `impl#<>#0` (a later task drops
-    // it). The impl block is NOT yet its own entity, so `bump` parents to the
-    // module in the Phase-1a ontology.
+    // Expected (`want`) set — only the in-`src/` entities. The `impl Widget`
+    // block is its own `impl` entity (Task 5), and `bump` re-parents onto it.
+    // The method locator carries NO source-order ordinal (`impl#<>`, ADR-049
+    // amend, Option b).
     let mut want: Vec<String> = vec![
         "rust:module:e2e_crate".to_owned(),
         "rust:module:e2e_crate.sub".to_owned(),
         "rust:struct:e2e_crate.Widget".to_owned(),
         "rust:function:e2e_crate.make".to_owned(),
         "rust:function:e2e_crate.sub.helper".to_owned(),
-        "rust:function:e2e_crate.Widget.impl#<>#0.bump".to_owned(),
+        "rust:impl:e2e_crate.Widget.impl#<>".to_owned(),
+        "rust:function:e2e_crate.Widget.impl#<>.bump".to_owned(),
     ];
     want.sort();
 

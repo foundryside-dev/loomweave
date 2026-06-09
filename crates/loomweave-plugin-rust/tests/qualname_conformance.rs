@@ -113,8 +113,9 @@ fn corpus_kinds_are_known() {
         }
     }
     // The contract-vetted kind set: Phase 1a (module/struct/function) plus the
-    // Phase 1b leaf kinds (ADR-027 MINOR bump). Mirror plugin.toml `entity_kinds`
-    // minus `impl` (Task 5). A tenth, unvetted kind still trips the guard.
+    // Phase 1b leaf kinds and the `impl` entity (Task 5, ADR-027 MINOR bump).
+    // Mirrors plugin.toml `entity_kinds` exactly. An eleventh, unvetted kind
+    // still trips the guard.
     let known: std::collections::BTreeSet<String> = [
         "module",
         "struct",
@@ -125,6 +126,7 @@ fn corpus_kinds_are_known() {
         "const",
         "static",
         "macro",
+        "impl",
     ]
     .into_iter()
     .map(String::from)
