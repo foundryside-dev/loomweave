@@ -439,6 +439,48 @@ impl
         project_root: &Path,
         executable: &Path,
     ) -> Result<(Self, std::process::Child), HostError> {
+        let (mut host, mut child) = Self::spawn_unhandshaken(manifest, project_root, executable)?;
+
+        // Reap on handshake failure. `std::process::Child::Drop` does NOT
+        // waitpid on Unix, so returning Err while `child` goes out of scope
+        // leaves a zombie per failed spawn. Covers both handshake error
+        // paths (transport/protocol and manifest capability refusal); the
+        // capability path already ran `do_shutdown()` but that does not
+        // reap either. Errors from kill/wait are best-effort — by this
+        // point the child's state is already anomalous.
+        if let Err(e) = host.handshake() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+
+        Ok((host, child))
+    }
+
+    /// Launch the plugin subprocess (sandbox limits applied, stderr drain
+    /// attached) WITHOUT performing the `initialize` handshake.
+    ///
+    /// The caller MUST call [`handshake`](PluginHost::handshake) before any
+    /// request, and owns kill+reap on handshake failure
+    /// (`std::process::Child::Drop` does not reap on Unix). The split exists
+    /// so a caller can put its own wall-clock deadline around the handshake —
+    /// a plugin may do whole-repo work inside `initialize` (the Rust plugin
+    /// builds its symbol table there), and a hung handshake must be killable
+    /// by a watchdog that already holds the child handle.
+    ///
+    /// [`spawn`](PluginHost::spawn) is the convenience wrapper that performs
+    /// the handshake inline and reaps on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::Spawn`] under the same conditions as
+    /// [`spawn`](PluginHost::spawn) (bad executable, manifest/basename
+    /// mismatch, missing pipe handles).
+    pub fn spawn_unhandshaken(
+        manifest: Manifest,
+        project_root: &Path,
+        executable: &Path,
+    ) -> Result<(Self, std::process::Child), HostError> {
         let canonical_root = project_root
             .canonicalize()
             .map_err(|e| HostError::Spawn(format!("canonicalise project root: {e}")))?;
@@ -564,19 +606,6 @@ impl
         );
         host.stderr_tail = Some(stderr_tail);
         host.stderr_thread = Some(stderr_thread);
-
-        // Reap on handshake failure. `std::process::Child::Drop` does NOT
-        // waitpid on Unix, so returning Err while `child` goes out of scope
-        // leaves a zombie per failed spawn. Covers both handshake error
-        // paths (transport/protocol and manifest capability refusal); the
-        // capability path already ran `do_shutdown()` but that does not
-        // reap either. Errors from kill/wait are best-effort — by this
-        // point the child's state is already anomalous.
-        if let Err(e) = host.handshake() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e);
-        }
 
         Ok((host, child))
     }

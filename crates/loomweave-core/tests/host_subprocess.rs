@@ -210,6 +210,49 @@ fn t1_subprocess_happy_path() {
     );
 }
 
+/// `spawn_unhandshaken` launches the child but does NOT exchange `initialize`:
+/// the caller owns the handshake. Observable: `ontology_version()` is only
+/// populated by `handshake()`, so it must be `None` after the un-handshaken
+/// spawn and `Some` after the explicit handshake. The explicit
+/// handshake-then-shutdown round trip must succeed, proving the split spawn
+/// leaves the host fully usable.
+#[test]
+fn spawn_unhandshaken_defers_handshake_to_caller() {
+    let manifest =
+        parse_manifest(FIXTURE_MANIFEST_BYTES).expect("fixture plugin.toml must be valid");
+    let project_dir = tempfile::TempDir::new().expect("create tempdir");
+    let sample_path = project_dir.path().join("sample.mt");
+    std::fs::write(&sample_path, b"widget demo.sample {}\n").expect("write sample.mt");
+
+    let (_fixture_stage, exec) = staged_fixture();
+    let (mut host, mut child) = PluginHost::spawn_unhandshaken(manifest, project_dir.path(), &exec)
+        .expect("spawn_unhandshaken must succeed");
+
+    assert!(
+        host.ontology_version().is_none(),
+        "no initialize may be exchanged before the caller's explicit handshake()"
+    );
+
+    host.handshake().expect("explicit handshake must succeed");
+    assert!(
+        host.ontology_version().is_some(),
+        "handshake() must store the plugin's ontology_version"
+    );
+
+    // The host is fully usable after the deferred handshake.
+    let outcome = host
+        .analyze_file(&sample_path)
+        .expect("analyze_file must succeed after deferred handshake");
+    assert_eq!(outcome.entities.len(), 1);
+
+    host.shutdown().expect("shutdown must succeed");
+    let status = child.wait().expect("wait for child process");
+    assert!(
+        status.success(),
+        "fixture plugin must exit with code 0; got: {status:?}"
+    );
+}
+
 /// T9: handshake failure on a subprocess that exits before responding
 /// returns `Err` promptly — the host does not hang on a closed stdout.
 ///
