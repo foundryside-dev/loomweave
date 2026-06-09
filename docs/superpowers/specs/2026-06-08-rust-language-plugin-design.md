@@ -220,7 +220,9 @@ rust:function:loomweave_core.config.Widget.impl#<>#0.render   # inherent method,
   holding `src/lib.rs`/`src/main.rs`). Without it, `loomweave_core::config::X`
   and `loomweave_cli::config::X` both collapse to `config.X` and the second
   overwrites the first on the 8-crate dogfood target.
-- **Module path** honours `#[path=...]` and `mod foo;` file boundaries.
+- **Module path** follows `mod foo;` file boundaries. `#[path=...]` overrides are
+  **deferred** (0 uses in the dogfood corpus); a `#[path]`-relocated module is
+  treated by its default file path until implemented (per ADR-049).
 
 ### 4.2 `impl` blocks and member methods (closes intra-type collisions)
 
@@ -402,14 +404,33 @@ proven collision-free *before* any edge keys on it.
   now settled in **ADR-049** (`docs/loomweave/adr/ADR-049-rust-qualname-canonicalization.md`).
   §4 is normative-by-reference to it. This closes the prior open question.
 
+**Resolved during Phase 1b (2026-06-09; authoritative record is ADR-049 + the
+Phase-1b commits — noted here only to close the loop):**
+
+- **External-target representation (Q1) — drop-external (D1).** Out-of-project
+  `implements`/`imports` targets are dropped, not faked as external refs.
+- **Init-walk entity-set consistency (D2/D3) — host seen-entity-set gate.** The
+  host gates emitted entities against the seen-entity set rather than the plugin
+  re-deriving the file-discovery/skip-list logic.
+- **Inherent-impl ordinal — resolved by merge (Option (b)).** No source-order
+  ordinal; same-`(type, positional-generics, cfg)` inherent impls merge into one
+  `impl` entity (see the ADR-049 item-path discrimination section).
+
+**Deferred (NOT walked / NOT implemented in Phase 1b):**
+
+- **trait BODY items are NOT walked as entities.** Only the `trait` item itself
+  is emitted; trait methods and associated consts/types inside the trait body
+  are deferred (the trait-item walk discards the body).
+- **`#[path = "…"]` module-file overrides — deferred** (0 uses in the dogfood
+  corpus). Until implemented, module-path derivation treats a `#[path]`-relocated
+  module by its default file path (per §4.1 / ADR-049).
+- **Host `RLIMIT_STACK`/`RLIMIT_CPU` + `syn` recursion-depth hardening — tracked
+  SEPARATELY.** This is a host-hardening item protecting *all* plugins from
+  adversarial/pathological inputs, not Rust-specific, and is out of Phase 1b
+  scope.
+
 **Still open (settle in the Phase 1 plan):**
 
-- Exact external-target representation (drop vs. external-reference marker) for
-  out-of-project `implements`/`derives`/`imports` targets — it is the seam where
-  `derives` could slip to Phase 2.
-- Whether the init-time symbol-table walk should share the host's file-discovery
-  / skip-list logic or maintain its own (correctness is unaffected; consistency
-  of the *entity* set is the concern).
 - The Phase 1b cross-file-edge staleness mechanism (M5 in §2.3) — downgrade-to-
   Inferred vs. route-via-`unresolved_call_sites`.
 

@@ -13,10 +13,14 @@ workspace = true
 # (see loomweave-core/src/plugin/discovery.rs). A `cargo build --workspace
 # --bins` drops this binary into `target/<profile>/` next to `loomweave`; if it
 # matched the glob, current_exe()-relative discovery would find a manifest-less
-# "plugin" beside the running binary and fail the run. `loomweave install`
-# stages it under the discovery name `loomweave-plugin-rust` with a neighbour
-# `plugin.toml`; tests stage it the same way (see tests/host_integration.rs).
-# This mirrors loomweave-plugin-fixture's deliberate off-glob naming.
+# "plugin" beside the running binary and fail the run. To run it through the
+# host it must be staged under the discovery name `loomweave-plugin-rust` with a
+# neighbour `plugin.toml`. The automated tests (tests/host_integration.rs,
+# tests/analyze_e2e.rs) self-stage it that way (copy/symlink the binary under the
+# discovery name + copy the neighbour plugin.toml). LIVE `loomweave install`
+# plugin staging is a SEPARATE deferred follow-up — install.rs has no
+# plugin-staging code yet. This mirrors loomweave-plugin-fixture's deliberate
+# off-glob naming.
 [[bin]]
 name = "loomweave-rust-plugin"
 path = "src/main.rs"

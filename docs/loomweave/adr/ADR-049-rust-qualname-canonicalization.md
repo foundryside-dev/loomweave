@@ -48,7 +48,7 @@ A Rust entity's `canonical_qualified_name` is `<crate>.<module-path>.<item-path>
 
 **Crate token (closes B1).** The leading segment is the crate name (underscored, e.g. `loomweave_core`). Crate roots are discovered by reading each `Cargo.toml`'s `[package].name` **as text** within `project_root` (permitted — the hard constraint forbids running `cargo metadata`/registry resolution, not reading a manifest file), falling back to the directory containing `src/lib.rs` / `src/main.rs`. A virtual workspace with no member resolves crate-by-nearest-manifest.
 
-**Module path.** The `mod` tree from crate root to the item, honoring `#[path = "…"]` and file-module (`mod foo;` → `foo.rs`/`foo/mod.rs`) boundaries. Inline `mod` blocks nest normally.
+**Module path.** The `mod` tree from crate root to the item, following file-module (`mod foo;` → `foo.rs`/`foo/mod.rs`) boundaries. Inline `mod` blocks nest normally. **`#[path = "…"]` module-file overrides are deferred** (0 occurrences in the dogfood corpus); until implemented, the module-path derivation treats a `#[path]`-relocated module by its **default** file path.
 
 **Item path with impl discrimination (closes B2).**
 
