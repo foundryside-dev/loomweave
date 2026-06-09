@@ -164,13 +164,29 @@ pub fn self_ty_name(ty: &Type) -> String {
     type_textual(ty)
 }
 
-/// Deterministic, whitespace-free textual rendering of a type.
-fn type_textual(ty: &Type) -> String {
-    quote::ToTokens::to_token_stream(ty)
+/// Deterministic, whitespace-free textual rendering of any token-bearing node.
+/// `to_token_stream` renders paths/types spaced (`std :: fmt :: Debug`); stripping
+/// whitespace yields the conventional `std::fmt::Debug`. This is the crate's one
+/// path/type normaliser (the `signature::tidy` helper only handles `param: type`
+/// surfaces, not `::`).
+fn strip_ws<T: quote::ToTokens>(t: &T) -> String {
+    t.to_token_stream()
         .to_string()
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect()
+}
+
+/// Deterministic, whitespace-free textual rendering of a type.
+fn type_textual(ty: &Type) -> String {
+    strip_ws(ty)
+}
+
+/// Deterministic, whitespace-free textual rendering of a path (e.g. a supertrait
+/// or implemented-trait path for SEI signatures).
+#[must_use]
+pub fn path_textual(path: &syn::Path) -> String {
+    strip_ws(path)
 }
 
 /// Normalise a `#[cfg(<predicate>)]` predicate to a stable `@cfg(...)` suffix:

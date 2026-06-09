@@ -5,9 +5,10 @@
 //! compares by string equality, so they must be deterministic (stable field
 //! order, canonical rendering). Task 6 needs the builders so extraction can
 //! attach signatures; Task 8 expands and pins their exact rendering.
+use crate::qualname::{path_textual, self_ty_name};
 use quote::ToTokens;
 use serde_json::{Value, json};
-use syn::{Fields, Signature};
+use syn::{Fields, ItemImpl, ItemTrait, Signature, TypeParamBound};
 
 /// Canonicalise `proc-macro2`'s spaced token rendering so the stored signature
 /// is stable under ADR-038's string-equality comparison. `to_token_stream()`
@@ -62,6 +63,43 @@ pub fn struct_signature(fields: &Fields) -> Value {
         Fields::Unit => Vec::new(),
     };
     json!({ "v": 1, "fields": rendered })
+}
+
+/// Deterministic SEI signature object for a `trait` entity (spec §4.4).
+///
+/// `supertraits` is the trait-bound paths of `it.supertraits`, each rendered
+/// via [`path_textual`] (whitespace-stripped, matching the rest of the crate's
+/// path normalisation — `tidy()` only collapses `: ` / `, ` and would leave
+/// `std :: fmt :: Debug` unjoined). Lifetime and other non-trait bounds are
+/// skipped (supertraits are trait bounds). Sorted for determinism under
+/// ADR-038's string-equality comparison.
+#[must_use]
+pub fn trait_signature(it: &ItemTrait) -> Value {
+    let mut supertraits: Vec<String> = it
+        .supertraits
+        .iter()
+        .filter_map(|b| match b {
+            TypeParamBound::Trait(t) => Some(path_textual(&t.path)),
+            _ => None,
+        })
+        .collect();
+    supertraits.sort();
+    json!({ "v": 1, "supertraits": supertraits })
+}
+
+/// Deterministic SEI signature object for an `impl` entity (spec §4.4).
+///
+/// `target` is the self type's locator name via [`self_ty_name`]; `trait` is
+/// the implemented trait path rendered via [`path_textual`], or JSON `null`
+/// for an inherent impl.
+#[must_use]
+pub fn impl_signature(it: &ItemImpl) -> Value {
+    let target = self_ty_name(&it.self_ty);
+    let trait_ = match &it.trait_ {
+        Some((_, path, _)) => Value::String(path_textual(path)),
+        None => Value::Null,
+    };
+    json!({ "v": 1, "target": target, "trait": trait_ })
 }
 
 #[cfg(test)]
