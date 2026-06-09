@@ -562,6 +562,26 @@ mod syn_disc_tests {
     }
 
     #[test]
+    fn self_ty_locator_renders_nested_declared_param_literally_not_positionally() {
+        // A declared param NESTED inside another type arg (`Vec<T>`) is NOT
+        // positionally substituted: `self_ty_arg`'s bare-path guard requires
+        // `PathArguments::None`, which `Vec<T>` fails, so the whole arg falls to
+        // `type_textual` (literal `T`). The prefix is `Foo<Vec<T>>`, never the
+        // recursive `Foo<Vec<$0>>`. Pins the F2 nested-param rule (ADR-049 §2
+        // rename-stability limitation) at the rendering layer; the end-to-end
+        // cross-tool trip-wire is the `generic_self_nested_param` corpus row.
+        let it: syn::ItemImpl = parse_quote!(
+            impl<T> Foo<Vec<T>> {
+                fn get(&self) {}
+            }
+        );
+        assert_eq!(
+            self_ty_locator(&it.self_ty, &declared_type_params(&it)),
+            "Foo<Vec<T>>"
+        );
+    }
+
+    #[test]
     fn impl_disc_for_trait_keeps_trait_name_and_concrete_generic_args() {
         let display: syn::ItemImpl =
             parse_quote!(impl std::fmt::Display for Foo { fn fmt(&self) {} });

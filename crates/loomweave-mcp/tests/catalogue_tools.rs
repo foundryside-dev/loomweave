@@ -1421,6 +1421,110 @@ fn insert_ambiguous_calls_edge(conn: &Connection, from: &str, to: &str, candidat
     .expect("insert ambiguous calls edge");
 }
 
+/// Like [`insert_entity`] but with an explicit `short_name` (the terminal
+/// identifier). The dead-code unresolved-call-site shield matches a candidate's
+/// `short_name` against unresolved callee leaves, so realistic leaf names
+/// (`do_work`, not the full id) are required to exercise it.
+fn insert_entity_named(
+    conn: &Connection,
+    id: &str,
+    kind: &str,
+    source_path: &str,
+    range: Option<(i64, i64)>,
+    short_name: &str,
+) {
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, source_file_path, \
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at) \
+         VALUES (?1,'rust',?2,?1,?6,?3,?4,?5,'{}','hash','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')",
+        params![id, kind, source_path, range.map(|(s, _)| s), range.map(|(_, e)| e), short_name],
+    )
+    .expect("insert named entity");
+}
+
+/// Record an unresolved call site whose caller is content-current (hash `hash`,
+/// matching [`insert_entity`] / [`insert_entity_named`]), so the dead-code
+/// staleness join keeps it. `callee_expr` is the recorded form (`.foo` for a
+/// method call, `Type::assoc` for an associated call).
+fn insert_unresolved_site(conn: &Connection, caller_id: &str, site_key: &str, callee_expr: &str) {
+    conn.execute(
+        "INSERT INTO entity_unresolved_call_sites ( \
+            caller_entity_id, caller_content_hash, site_key, site_ordinal, \
+            source_byte_start, source_byte_end, callee_expr, created_at \
+         ) VALUES (?1, 'hash', ?2, 0, 10, 20, ?3, '2026-01-01T00:00:00.000Z')",
+        params![caller_id, site_key, callee_expr],
+    )
+    .expect("insert unresolved site");
+}
+
+// clarion-… consumer honesty: a function reached ONLY via an unresolved call
+// site (a method `x.do_work()` or associated `Svc::make()` call the Rust
+// resolver could not bind — no `calls` edge) has no incoming edge, so pure
+// static reachability would false-flag it dead. The dead-code tool must spare
+// it (fail toward live) and disclose the suppression count.
+#[tokio::test]
+async fn find_dead_code_spares_fn_reached_only_via_unresolved_call_site() {
+    let (project, db, conn) = open_project();
+    // Root so the reachability root set is non-empty (else signal-unavailable).
+    insert_entity(
+        &conn,
+        "rust:function:app.main",
+        "function",
+        "app.rs",
+        Some((1, 5)),
+    );
+    insert_tag(&conn, "rust:function:app.main", "entry-point");
+    // Reached ONLY via an unresolved method call `.do_work` — no edge.
+    insert_entity_named(
+        &conn,
+        "rust:function:app.Svc.impl.do_work",
+        "function",
+        "app.rs",
+        Some((6, 9)),
+        "do_work",
+    );
+    insert_unresolved_site(&conn, "rust:function:app.main", "s0", ".do_work");
+    // Reached ONLY via an unresolved associated call `Svc::make` — no edge.
+    insert_entity_named(
+        &conn,
+        "rust:function:app.Svc.impl.make",
+        "function",
+        "app.rs",
+        Some((10, 12)),
+        "make",
+    );
+    insert_unresolved_site(&conn, "rust:function:app.main", "s1", "Svc::make");
+    // Genuinely dead — no edge and no unresolved site names it.
+    insert_entity_named(
+        &conn,
+        "rust:function:app.orphan",
+        "function",
+        "app.rs",
+        Some((13, 15)),
+        "orphan",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        dead,
+        vec!["rust:function:app.orphan".to_owned()],
+        "method/assoc-only-called fns must be spared; only the true orphan is dead: {env}"
+    );
+    assert_eq!(
+        env["result"]["unresolved_call_site_suppressed"], 2,
+        "the two unresolved-call-site shields must be disclosed: {env}"
+    );
+}
+
 #[test]
 fn tools_list_includes_find_dead_code() {
     let names: Vec<&str> = list_tools().iter().map(|t| t.name).collect();

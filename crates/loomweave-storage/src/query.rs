@@ -1513,6 +1513,82 @@ pub fn candidate_entities_for_unresolved_sites(
     Ok(out)
 }
 
+/// The terminal identifier of an unresolved call site's `callee_expr`, or
+/// `None` if the expression has no usable name.
+///
+/// The Rust plugin records three `callee_expr` shapes (see
+/// `loomweave-plugin-rust/src/calls.rs`): a method call `x.foo()` stores
+/// `".foo"`, an unresolved path call `a::b::f()` / `Type::assoc()` stores the
+/// `::`-joined path (`"a::b::f"` / `"Type::assoc"`), and any other call form
+/// stores `"<expr>()"`. The leaf is the segment after the last `.` **or** `::`
+/// — `foo`, `f`, `assoc` respectively. Crucially this splits on `::` as well as
+/// `.`, so the Rust associated-function form (`Type::assoc`) yields `assoc`;
+/// the older `.`-only leaf extraction (`candidate_entities_for_expr`,
+/// `unresolved_callers_for_target`) misses it. A leaf that is not a bare
+/// identifier (`<expr>()`, empty) returns `None`.
+fn unresolved_callee_leaf(callee_expr: &str) -> Option<String> {
+    let leaf = callee_expr
+        .rsplit([':', '.'])
+        .next()
+        .unwrap_or(callee_expr)
+        .trim();
+    if leaf.is_empty() || !leaf.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(leaf.to_owned())
+}
+
+/// The set of entity ids that are a *plausible target* of at least one
+/// persisted unresolved call site — i.e. an entity whose `short_name` matches
+/// the terminal identifier of some unresolved `callee_expr`.
+///
+/// This is the dead-code consumer's fail-toward-live suppression input. The
+/// Rust call resolver cannot resolve method calls (`x.foo()`) or associated /
+/// constructor calls (`Type::assoc()`) without type inference, so a function
+/// reachable *only* through such a call has no incoming `calls` edge and would
+/// be flagged dead by pure static reachability — a false positive. Treating it
+/// as live when its name matches an unresolved site keeps the dead-code tool
+/// honest (it under-reports rather than over-reports). The match is coarse
+/// (terminal-name only, so an unrelated `x.foo()` shields a genuinely-dead
+/// `foo`) — but coarse in the safe direction.
+///
+/// Only sites whose caller is still content-current count (the same
+/// `caller.content_hash = u.caller_content_hash` staleness filter as
+/// [`unresolved_callers_for_target`]). Language-agnostic: a plugin whose
+/// resolver leaves no unresolved sites (e.g. the pyright-backed Python plugin)
+/// contributes an empty set and the suppression is a no-op.
+pub fn entities_targeted_by_unresolved_call_sites(conn: &Connection) -> Result<BTreeSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT u.callee_expr \
+         FROM entity_unresolved_call_sites u \
+         JOIN entities caller ON caller.id = u.caller_entity_id \
+         WHERE caller.content_hash = u.caller_content_hash",
+    )?;
+    let exprs = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut leaves: BTreeSet<String> = BTreeSet::new();
+    for expr in exprs {
+        if let Some(leaf) = unresolved_callee_leaf(&expr?) {
+            leaves.insert(leaf);
+        }
+    }
+    if leaves.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    let mut stmt = conn.prepare("SELECT id, short_name FROM entities")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut targeted: BTreeSet<String> = BTreeSet::new();
+    for row in rows {
+        let (id, short_name) = row?;
+        if leaves.contains(&short_name) {
+            targeted.insert(id);
+        }
+    }
+    Ok(targeted)
+}
+
 pub fn contained_entity_ids(
     conn: &Connection,
     root_id: &str,

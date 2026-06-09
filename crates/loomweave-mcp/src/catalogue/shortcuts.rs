@@ -16,7 +16,8 @@ use serde_json::{Value, json};
 
 use loomweave_core::{EdgeConfidence, McpErrorCode};
 use loomweave_storage::{
-    call_edges_targeting, entities_by_churn, entity_by_id, resolve_entity_ref,
+    call_edges_targeting, entities_by_churn, entities_targeted_by_unresolved_call_sites,
+    entity_by_id, resolve_entity_ref,
 };
 
 use crate::ParamError;
@@ -350,6 +351,14 @@ impl ServerState {
                 let reachable = forward_reachable(&adjacency, live);
 
                 let excluded = ids_with_any_tag(conn, DEAD_CODE_EXCLUDED_TAGS)?;
+                // Fail toward live: an entity whose name matches an unresolved
+                // call site is a plausible callee and must NOT be flagged dead.
+                // The Rust resolver emits no `calls` edge for `x.method()` /
+                // `Type::assoc()` (no type inference), so those callees are
+                // invisible to static reachability — without this they would be
+                // false-flagged dead. Language-agnostic: a fully-resolving
+                // plugin (pyright-backed Python) leaves this set empty.
+                let unresolved_targets = entities_targeted_by_unresolved_call_sites(conn)?;
                 let (all_ids, entity_scan_truncated) = all_entity_ids(conn)?;
 
                 let mut candidates: Vec<String> = all_ids
@@ -359,6 +368,14 @@ impl ServerState {
                     .filter(|id| in_scope.as_ref().is_none_or(|ids| ids.contains(id)))
                     .collect();
                 candidates.sort();
+
+                // Count the unresolved-call-site shield separately so the
+                // disclosure is exact, then remove the shielded candidates.
+                let unresolved_call_site_suppressed = candidates
+                    .iter()
+                    .filter(|id| unresolved_targets.contains(*id))
+                    .count();
+                candidates.retain(|id| !unresolved_targets.contains(id));
 
                 let total = candidates.len();
                 let returned: Vec<String> = candidates
@@ -400,6 +417,7 @@ impl ServerState {
                     },
                     "scope_truncated": scope_truncated,
                     "scan_truncated": scan_truncated || entity_scan_truncated,
+                    "unresolved_call_site_suppressed": unresolved_call_site_suppressed,
                 })))
             })
             .await;
