@@ -8,7 +8,7 @@
     "trait_impl_method": "<Type>.impl[<Trait-last-segment-with-concrete-generic-args>].<method>  e.g. Foo.impl[Display].fmt, Foo.impl[From<i32>].from. Lifetimes dropped; concrete type/const generic args KEPT (they are part of the key).",
     "inherent_impl_method": "<Type>.impl#<positional-generics>.<method>  e.g. Foo.impl#<>.bar, Foo.impl#<$0>.get. Generic params rendered POSITIONALLY ($0,$1,... De Bruijn) so a param rename does not churn. There is NO source-order ordinal (ADR-049 amend, Option b): same-(type, positional-generic-signature, cfg) inherent impls MERGE into ONE `impl` entity and their methods all hang off it, so the discriminator is genuinely source-order-independent (reorder-stable). cfg-twin inherent impls (same type+sig, mutually-exclusive cfgs) are split by an @cfg(...) suffix on the impl key (Foo.impl#<>@cfg(unix) vs Foo.impl#<>@cfg(windows)); their methods inherit it.",
     "impl_entity": "<Type>.impl[<Trait...>] (trait) or <Type>.impl#<positional-generics> (inherent), kind=impl. The impl block is its own entity, parented to the enclosing module (module->impl contains); each impl method is parented to the impl entity (impl->method contains), NOT the module. Same-(type,generic-sig,cfg) inherent impls collapse to ONE impl entity (the merge); cfg-twins split by @cfg.",
-    "cfg_twins": "an item whose bare path collides with a cfg-gated sibling (all cfg variants are visible) gets a normalised @cfg(<pred>) suffix: f@cfg(unix). Predicate whitespace-stripped, any()/all() args sorted. A unique-path item gets NO suffix.",
+    "cfg_twins": "an item whose bare path collides with a cfg-gated sibling (all cfg variants are visible) gets a normalised @cfg(<pred>) suffix: f@cfg(unix). Predicate whitespace-stripped, any()/all() args sorted. A unique-path item gets NO suffix. cfg-twin discrimination is item-general AND impl-general: free items (cfg_twin, struct_cfg_twin), INHERENT impls (inherent_impl_cfg_twin -> impl#<>@cfg(unix)) and TRAIT impls (trait_impl_cfg_twin -> impl[Display]@cfg(unix)) all carry it. For impls the @cfg suffix lands on the impl key (after impl#<sig> / after impl[Trait]) and each method inherits it; post-ordinal-drop it is the SOLE thing preventing cfg-twin impls from merging into one entity and silently dropping a method.",
     "async": "async fn renders IDENTICALLY to a sync fn (no suffix).",
     "kind": "the entity-ID kind segment is 'function' for EVERY Rust callable (free fn, inherent method, associated fn, trait method) and 'struct'/'module' for those. There is NO 'method' id-kind. A semantic function/method distinction, if a consumer needs it, must ride Entity metadata, not the locator.",
     "closures_and_nested_fns": "NOT emitted as entities. The extractor never descends into function bodies, so closures and nested `fn` items have no locator. A finding inside one must be attributed to the nearest enclosing named item. This deliberately avoids the positional {closure#N} churn that would destabilise the SEI locator.",
@@ -152,6 +152,36 @@
         {"qualname": "demo.m", "kind": "module"},
         {"qualname": "demo.m.S@cfg(unix)", "kind": "struct"},
         {"qualname": "demo.m.S@cfg(windows)", "kind": "struct"}
+      ]
+    },
+    {
+      "name": "inherent_impl_cfg_twin",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "cfg-twin INHERENT impls (same type, same positional-generic sig, mutually-exclusive cfgs). Post-ordinal-drop (ADR-049 amend, Option b) the @cfg(...) suffix on the impl KEY is the SOLE discriminant that stops these two blocks merging into one entity and silently dropping a method. The suffix lands ON the impl segment (impl#<>@cfg(unix)) and each block's method inherits it (impl#<>@cfg(unix).go). Without it both `go` methods collapse to demo.m.Foo.impl#<>.go and the writer's ON CONFLICT drops one — the exact data-loss family the @cfg discriminator exists to prevent. A Wardline impl-extractor that omits the @cfg impl suffix would silently merge these; this case is the conformance trip-wire.",
+      "source": "struct Foo;\n#[cfg(unix)] impl Foo { fn go(&self){} }\n#[cfg(windows)] impl Foo { fn go(&self){} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.Foo", "kind": "struct"},
+        {"qualname": "demo.m.Foo.impl#<>@cfg(unix)", "kind": "impl"},
+        {"qualname": "demo.m.Foo.impl#<>@cfg(unix).go", "kind": "function"},
+        {"qualname": "demo.m.Foo.impl#<>@cfg(windows)", "kind": "impl"},
+        {"qualname": "demo.m.Foo.impl#<>@cfg(windows).go", "kind": "function"}
+      ]
+    },
+    {
+      "name": "trait_impl_cfg_twin",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "cfg-twin TRAIT impls (same type, same trait+concrete-generics, mutually-exclusive cfgs). The @cfg(...) suffix sits AFTER the impl[Trait] bracket (impl[Display]@cfg(unix)) and the method inherits it (impl[Display]@cfg(unix).fmt). Without it both `fmt` methods collapse to demo.m.Foo.impl[Display].fmt and one is dropped. Trait-impl cfg-twins are split by @cfg exactly like inherent ones (ADR-049 §1, amended: cfg-twins now apply to trait impls too). Pins that a Wardline trait-impl extractor must render @cfg on the trait-impl key, not just the inherent one.",
+      "source": "struct Foo;\n#[cfg(unix)] impl std::fmt::Display for Foo { fn fmt(&self,_:&mut std::fmt::Formatter)->std::fmt::Result{Ok(())} }\n#[cfg(windows)] impl std::fmt::Display for Foo { fn fmt(&self,_:&mut std::fmt::Formatter)->std::fmt::Result{Ok(())} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.Foo", "kind": "struct"},
+        {"qualname": "demo.m.Foo.impl[Display]@cfg(unix)", "kind": "impl"},
+        {"qualname": "demo.m.Foo.impl[Display]@cfg(unix).fmt", "kind": "function"},
+        {"qualname": "demo.m.Foo.impl[Display]@cfg(windows)", "kind": "impl"},
+        {"qualname": "demo.m.Foo.impl[Display]@cfg(windows).fmt", "kind": "function"}
       ]
     },
     {
