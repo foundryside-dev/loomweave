@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CLI reference — Loomweave</title>
+<meta name="description" content="The loomweave binary's command set: install (with agent-setup component flags), analyze, serve, guidance, doctor, sarif import, and db backup. Run loomweave <command> --help for the authoritative, version-matched flags.">
+<link rel="preload" href="fonts/SpaceGrotesk-Variable.ttf" as="font" type="font/ttf" crossorigin>
+<link rel="preload" href="fonts/JetBrainsMono-Variable.ttf" as="font" type="font/ttf" crossorigin>
+<link rel="stylesheet" href="colors_and_type.css">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<a class="skip-link" href="#top">Skip to content</a>
+
+<header class="hub-header">
+  <a class="brand" href="index.html" aria-label="Loomweave — home">
+    <svg class="mark" width="26" height="26" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+      <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 5 V27"/><path d="M16 11 H24"/><path d="M16 21 H8"/></g>
+      <g fill="currentColor"><circle cx="16" cy="5" r="2.4"/><circle cx="24" cy="11" r="2.4"/><circle cx="8" cy="21" r="2.4"/><circle cx="16" cy="27" r="2.4"/></g>
+    </svg>
+    <span class="wordmark">Loomweave</span>
+    <span class="path-hint">~/loomweave</span>
+  </a>
+  <nav class="hub-nav" aria-label="Primary">
+    <a href="index.html">Overview</a>
+    <a href="getting-started.html">Getting started</a>
+    <a href="concepts.html">Concepts</a>
+    <a href="tools.html">MCP tools</a>
+    <a href="cli.html" aria-current="page">CLI</a>
+    <a class="ext" href="https://github.com/foundryside-dev/loomweave" target="_blank" rel="noopener">GitHub</a>
+    <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft hub</a>
+  </nav>
+</header>
+
+<main id="top">
+
+  <div class="page-head">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="index.html">Loomweave</a><span class="sep">/</span><span aria-current="page">CLI</span>
+    </nav>
+    <h1 class="page-title">CLI reference</h1>
+    <p class="page-lede">The <code class="t-inline-code">loomweave</code> binary has a small, focused command set. Run <code class="t-inline-code">loomweave &lt;command&gt; --help</code> for the authoritative, version-matched flags.</p>
+  </div>
+
+  <div class="docmain">
+
+    <div class="code">
+      <div class="code-head"><span class="code-lang">usage</span></div>
+<pre>loomweave &lt;command&gt; [options]</pre>
+    </div>
+
+    <div class="onpage" aria-label="On this page">
+      <div class="t-label onpage-label">Commands</div>
+      <ul>
+        <li><a href="#install">install</a></li>
+        <li><a href="#analyze">analyze</a></li>
+        <li><a href="#serve">serve</a></li>
+        <li><a href="#guidance">guidance</a></li>
+        <li><a href="#doctor">doctor</a></li>
+        <li><a href="#sarif">sarif import</a></li>
+        <li><a href="#db-backup">db backup</a></li>
+      </ul>
+    </div>
+
+    <section class="doc-section">
+      <h2 class="doc-h2" id="install"><code>loomweave install</code></h2>
+      <p class="doc-p">Initialise <code>.weft/loomweave/</code> and wire the agent. A bare <code>loomweave install</code> does everything: store init plus the MCP config, the <code>loomweave-workflow</code> skill pack, and the <code>SessionStart</code> hook. If <code>.weft/loomweave/</code> already exists, init is skipped and the agent surfaces are applied idempotently. Component flags give you partial installs.</p>
+      <div class="tbl-wrap">
+        <table class="ref">
+          <thead><tr><th>Flag</th><th class="wrap">Effect</th></tr></thead>
+          <tbody>
+            <tr><td><code>--path &lt;DIR&gt;</code></td><td class="wrap">Directory to install into (default: current directory)</td></tr>
+            <tr><td><code>--claude-code</code></td><td class="wrap">Write the Claude Code MCP config</td></tr>
+            <tr><td><code>--codex</code></td><td class="wrap">Upsert the Codex MCP config</td></tr>
+            <tr><td><code>--skills</code></td><td class="wrap">Install the bundled <code>loomweave-workflow</code> skill pack for Claude Code</td></tr>
+            <tr><td><code>--codex-skills</code></td><td class="wrap">Install the <code>loomweave-workflow</code> skill pack for Codex</td></tr>
+            <tr><td><code>--hooks</code></td><td class="wrap">Merge a <code>SessionStart</code> hook into <code>.claude/settings.json</code></td></tr>
+            <tr><td><code>--all</code></td><td class="wrap">Do everything (equivalent to a bare <code>install</code>)</td></tr>
+            <tr><td><code>--force</code></td><td class="wrap">Overwrite an existing <code>.weft/loomweave/</code> directory</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="doc-section">
+      <h2 class="doc-h2" id="analyze"><code>loomweave analyze</code></h2>
+      <p class="doc-p">Walk the source tree, dispatch discovered language plugins to extract entities/edges, and persist results to <code>.weft/loomweave/loomweave.db</code>. Re-runs are idempotent (UPSERT on the entity id) and incremental by default. If no plugins are on <code>$PATH</code>, exits <code>0</code> with a warning and status <code>skipped_no_plugins</code>. Needs no LLM credentials.</p>
+      <div class="tbl-wrap">
+        <table class="ref">
+          <thead><tr><th>Flag</th><th class="wrap">Effect</th></tr></thead>
+          <tbody>
+            <tr><td><code>[PATH]</code></td><td class="wrap">Path to analyse (default: current directory)</td></tr>
+            <tr><td><code>--config &lt;FILE&gt;</code></td><td class="wrap">Path to <code>loomweave.yaml</code> (default: project root if present)</td></tr>
+            <tr><td><code>--no-incremental</code></td><td class="wrap">Force a full re-index, disabling the unchanged-file skip</td></tr>
+            <tr><td><code>--resume &lt;RUN_ID&gt;</code></td><td class="wrap">Reuse a prior run id; re-emit findings without flipping a peer&rsquo;s prior findings to <code>unseen_in_latest</code></td></tr>
+            <tr><td><code>--prune-unseen</code></td><td class="wrap">Ask Filigree to soft-archive stale Loomweave findings (enrich-only)</td></tr>
+            <tr><td><code>--no-sei</code></td><td class="wrap">Skip the SEI mint pass (diagnostic escape hatch)</td></tr>
+            <tr><td><code>--allow-unredacted-secrets</code></td><td class="wrap">Allow analysis of files with unredacted secrets (requires confirmation)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note note-warn">
+        <div class="note-label">Warning · analyze writes to the project root</div>
+        <div class="note-body"><code>analyze</code> always persists to the project root&rsquo;s <code>.weft/loomweave/</code>, regardless of where <code>--path</code> pointed during <code>install</code>. Wipe a stale <code>.weft/loomweave/</code> before re-analysing the same corpus from scratch, or use <code>--no-incremental</code>.</div>
+      </div>
+    </section>
+
+    <section class="doc-section">
+      <h2 class="doc-h2" id="serve"><code>loomweave serve</code></h2>
+      <p class="doc-p">Run the MCP stdio server, exposing the consult tools over MCP. See the <a href="tools.html">MCP tool reference</a> for the surface.</p>
+      <div class="tbl-wrap">
+        <table class="ref">
+          <thead><tr><th>Flag</th><th class="wrap">Effect</th></tr></thead>
+          <tbody>
+            <tr><td><code>--path &lt;DIR&gt;</code></td><td class="wrap">Project directory containing <code>.weft/loomweave/loomweave.db</code> (default: current directory)</td></tr>
+            <tr><td><code>--config &lt;FILE&gt;</code></td><td class="wrap">Path to <code>loomweave.yaml</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="doc-section">
+      <h2 class="doc-h2" id="guidance"><code>loomweave guidance</code></h2>
+      <p class="doc-p">Author, import, export, and review operator guidance sheets — the curated advice consult agents read alongside the structural graph (and which invalidates the relevant summary cache when it changes). Authored guidance is available through the CLI and the MCP read path today; consult agents consume it via <code>entity_guidance_list</code>.</p>
+    </section>
+
+    <section class="doc-section">
+      <h2 class="doc-h2" id="doctor"><code>loomweave doctor</code></h2>
+      <p class="doc-p">Verify (and optionally repair) the installed agent-orientation surfaces: the <code>loomweave-workflow</code> skill pack, the <code>SessionStart</code> hook, and the <code>.mcp.json</code> MCP registration. Prints a per-surface report; exits non-zero if any problem remains, so it works as a CI or pre-commit gate.</p>
+      <div class="tbl-wrap">
+        <table class="ref">
+          <thead><tr><th>Flag</th><th class="wrap">Effect</th></tr></thead>
+          <tbody>
+            <tr><td><code>--path &lt;DIR&gt;</code></td><td class="wrap">Project directory to check (default: current directory)</td></tr>
+            <tr><td><code>--fix</code></td><td class="wrap">Repair problems in place (idempotent). Without it, doctor only reports</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="doc-section">
+      <h2 class="doc-h2" id="sarif"><code>loomweave sarif import</code></h2>
+      <p class="doc-p">Ingest external findings as SARIF, anchoring them to entities in the graph so they surface through <code>entity_finding_list</code> and <code>project_finding_list</code> over MCP. The bridge from any SARIF-emitting analyzer into Loomweave&rsquo;s entity-anchored finding browser.</p>
+    </section>
+
+    <section class="doc-section">
+      <h2 class="doc-h2" id="db-backup"><code>loomweave db backup</code></h2>
+      <p class="doc-p">Take a consistent, WAL-safe online backup of <code>.weft/loomweave/loomweave.db</code>. Unlike <code>cp</code>, this captures outstanding WAL frames into a standalone single-file copy, so it is safe to run during a live <code>loomweave analyze</code>.</p>
+      <div class="tbl-wrap">
+        <table class="ref">
+          <thead><tr><th>Flag</th><th class="wrap">Effect</th></tr></thead>
+          <tbody>
+            <tr><td><code>--output &lt;FILE&gt;</code></td><td class="wrap">Destination path for the backup copy</td></tr>
+            <tr><td><code>--force</code></td><td class="wrap">Overwrite an existing destination file</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <p class="doc-p t-meta">Flags here are documented to the current release line; <code>loomweave &lt;command&gt; --help</code> is the authoritative, version-matched reference.</p>
+
+  </div>
+</main>
+
+<footer class="hub-footer">
+  <svg class="mark" width="18" height="18" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+    <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 5 V27"/><path d="M16 11 H24"/><path d="M16 21 H8"/></g>
+    <g fill="currentColor"><circle cx="16" cy="5" r="2.4"/><circle cx="24" cy="11" r="2.4"/><circle cx="8" cy="21" r="2.4"/><circle cx="16" cy="27" r="2.4"/></g>
+  </svg>
+  <span class="foot-note">Loomweave is part of the <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft Federation</a> — the suite&rsquo;s code-structure surface and its SEI identity authority. Installable and runnable: a single Rust binary plus a Python language plugin.</span>
+  <nav class="foot-links" aria-label="Resources">
+    <a class="ext" href="https://github.com/foundryside-dev/loomweave" target="_blank" rel="noopener">Source</a>
+    <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft hub</a>
+    <a class="ext" href="https://github.com/foundryside-dev/weft/blob/main/sei-standard.md" target="_blank" rel="noopener">SEI standard</a>
+  </nav>
+  <a class="foot-org ext" href="https://foundryside.dev" target="_blank" rel="noopener" aria-label="part of Foundryside — foundryside.dev">
+    <svg class="mark" width="17" height="17" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+      <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 24 H27"/><path d="M11 24 V15"/><path d="M16 24 V10"/><path d="M21 24 V15"/></g>
+      <g fill="currentColor"><circle cx="11" cy="15" r="2.1"/><circle cx="16" cy="10" r="2.3"/><circle cx="21" cy="15" r="2.1"/></g>
+    </svg>
+    <span>part of Foundryside · foundryside.dev</span>
+  </a>
+  <span class="foot-meta">MIT · 2026</span>
+</footer>
+
+<script src="main.js"></script>
+</body>
+</html>

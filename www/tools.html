@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MCP tools — Loomweave</title>
+<meta name="description" content="Loomweave's ~40-tool consult-mode MCP surface, grouped by family: navigation and graph traversal; briefing and source inspection; guidance, findings and federation context; analyze lifecycle and freshness; faceted and shortcut queries.">
+<link rel="preload" href="fonts/SpaceGrotesk-Variable.ttf" as="font" type="font/ttf" crossorigin>
+<link rel="preload" href="fonts/JetBrainsMono-Variable.ttf" as="font" type="font/ttf" crossorigin>
+<link rel="stylesheet" href="colors_and_type.css">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<a class="skip-link" href="#top">Skip to content</a>
+
+<header class="hub-header">
+  <a class="brand" href="index.html" aria-label="Loomweave — home">
+    <svg class="mark" width="26" height="26" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+      <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 5 V27"/><path d="M16 11 H24"/><path d="M16 21 H8"/></g>
+      <g fill="currentColor"><circle cx="16" cy="5" r="2.4"/><circle cx="24" cy="11" r="2.4"/><circle cx="8" cy="21" r="2.4"/><circle cx="16" cy="27" r="2.4"/></g>
+    </svg>
+    <span class="wordmark">Loomweave</span>
+    <span class="path-hint">~/loomweave</span>
+  </a>
+  <nav class="hub-nav" aria-label="Primary">
+    <a href="index.html">Overview</a>
+    <a href="getting-started.html">Getting started</a>
+    <a href="concepts.html">Concepts</a>
+    <a href="tools.html" aria-current="page">MCP tools</a>
+    <a href="cli.html">CLI</a>
+    <a class="ext" href="https://github.com/foundryside-dev/loomweave" target="_blank" rel="noopener">GitHub</a>
+    <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft hub</a>
+  </nav>
+</header>
+
+<main id="top">
+
+  <div class="page-head">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="index.html">Loomweave</a><span class="sep">/</span><span aria-current="page">MCP tools</span>
+    </nav>
+    <h1 class="page-title">MCP tools</h1>
+    <p class="page-lede"><code class="t-inline-code">loomweave serve</code> exposes a <strong>~40-tool</strong> consult-mode MCP surface that an agent calls instead of grep-and-read. Grouped below by family. Connect an MCP client to a live <code class="t-inline-code">loomweave serve</code> and read <code class="t-inline-code">tools/list</code> for the exact, version-matched schemas.</p>
+  </div>
+
+  <div class="docmain">
+
+    <div class="note">
+      <div class="note-label">Note · default confidence is resolved</div>
+      <div class="note-body">Graph-traversal tools (<code>entity_callers_list</code>, <code>entity_neighborhood_get</code>, <code>entity_execution_path_list</code>) return only <strong>resolved</strong> edges by default. Ambiguous static candidates and LLM-inferred edges are opt-in. Results carry a <code>scope_excludes</code> block naming static blind spots, so an empty section is never read as a guaranteed true negative. See <a href="concepts.html#scope-excludes">Concepts → scope_excludes</a>.</div>
+    </div>
+
+    <div class="onpage" aria-label="On this page">
+      <div class="t-label onpage-label">Families</div>
+      <ul>
+        <li><a href="#navigation">Navigation &amp; graph traversal</a></li>
+        <li><a href="#briefing">Briefing &amp; source inspection</a></li>
+        <li><a href="#guidance">Guidance, findings &amp; federation context</a></li>
+        <li><a href="#analyze">Analyze lifecycle &amp; freshness</a></li>
+        <li><a href="#facets">Faceted &amp; shortcut queries</a></li>
+      </ul>
+    </div>
+
+    <section class="family doc-section" id="navigation">
+      <div class="family-head"><h2 class="family-name">Navigation &amp; graph traversal</h2></div>
+      <p class="family-desc">Locate an entity, then walk the graph around it — callers, callees, one-hop neighborhood, bounded call paths, call sites, and subsystem membership.</p>
+      <div class="tbl-wrap">
+        <table class="ref">
+          <thead><tr><th>Tool</th><th class="wrap">What it answers</th></tr></thead>
+          <tbody>
+            <tr><td><code>entity_at</code></td><td class="wrap">Which entity covers this <code>file:line</code>? Returns the innermost match plus a <code>match_reason</code> evidence block and index freshness.</td></tr>
+            <tr><td><code>entity_find</code></td><td class="wrap">Find entities by id, name, short name, summary, and docstring content (stemmed FTS + substring recall). Optional <code>kind</code> filter.</td></tr>
+            <tr><td><code>entity_callers_list</code></td><td class="wrap">Who calls this entity? <code>resolved</code> by default; carries <code>scope_excludes</code>.</td></tr>
+            <tr><td><code>entity_call_site_list</code></td><td class="wrap">The concrete call sites — where, in source, this entity is invoked.</td></tr>
+            <tr><td><code>entity_execution_path_list</code></td><td class="wrap">Bounded, calls-only execution paths from an entity, ranked longest-first, with truncation reporting.</td></tr>
+            <tr><td><code>entity_neighborhood_get</code></td><td class="wrap">The one-hop neighborhood: callers, callees, container, contained, references, and imports (<code>imports_in</code>/<code>imports_out</code>) in one call.</td></tr>
+            <tr><td><code>subsystem_member_list</code></td><td class="wrap">Which module entities belong to this subsystem?</td></tr>
+            <tr><td><code>entity_subsystem_get</code></td><td class="wrap">The reverse lookup — which subsystem does this entity belong to?</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="family doc-section" id="briefing">
+      <div class="family-head"><h2 class="family-name">Briefing &amp; source inspection</h2></div>
+      <p class="family-desc">Get a one-paragraph explanation (lazy LLM, cached), the indexed source span, a one-shot orientation packet, and project-level status. <code>summary</code> is the only path that makes a network call to a model provider.</p>
+      <div class="tbl-wrap">
+        <table class="ref">
+          <thead><tr><th>Tool</th><th class="wrap">What it answers</th></tr></thead>
+          <tbody>
+            <tr><td><code>entity_summary_get</code> <span class="t-meta">(<code>summary</code>)</span></td><td class="wrap">A cached one-paragraph summary for one entity, dispatching the LLM lazily. Degrades to a deterministic <code>structural-fallback</code> if the model returns non-JSON — and caches that, so a retry is a free hit.</td></tr>
+            <tr><td><code>entity_summary_preview_cost_get</code></td><td class="wrap">What would summarising this entity cost before you spend it?</td></tr>
+            <tr><td><code>entity_source_get</code></td><td class="wrap">The indexed source span and surrounding context for an entity.</td></tr>
+            <tr><td><code>entity_orientation_pack_get</code></td><td class="wrap">One packet ≈ find + at + source + neighborhood + issues + freshness — the fastest way for an agent to orient on a single entity.</td></tr>
+            <tr><td><code>project_status_get</code></td><td class="wrap">Project-level health: entity counts, index freshness, finding totals.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="family doc-section" id="guidance">
+      <div class="family-head"><h2 class="family-name">Guidance, findings &amp; federation context</h2></div>
+      <p class="family-desc">Operator-authored guidance sheets, scanner findings, and the enrich-only sibling reach into Filigree (issues) and Wardline (taint facts). Every federation binding degrades cleanly when the sibling is absent.</p>
+      <div class="tbl-wrap">
+        <table class="ref">
+          <thead><tr><th>Tool</th><th class="wrap">What it answers</th></tr></thead>
+          <tbody>
+            <tr><td><code>entity_guidance_list</code></td><td class="wrap">Which guidance sheets apply to this entity?</td></tr>
+            <tr><td><code>propose_guidance</code> / <code>promote_guidance</code></td><td class="wrap">Author and promote guidance through the MCP path (operators also use <code>loomweave guidance</code>).</td></tr>
+            <tr><td><code>entity_finding_list</code></td><td class="wrap">Scanner / imported findings anchored to this entity.</td></tr>
+            <tr><td><code>project_finding_list</code></td><td class="wrap">Every finding across the project (no entity id) — each carrying its anchoring entity SEI + <code>file:line</code> + severity/rule, paginated.</td></tr>
+            <tr><td><code>entity_issue_list</code> <span class="t-meta">(<code>issues_for</code>)</span></td><td class="wrap">Filigree issues attached to this entity, drift-aware. <strong>Enrich-only</strong>: returns an <code>unavailable</code> envelope if Filigree is down rather than failing.</td></tr>
+            <tr><td><code>entity_wardline_get</code> / <code>entity_wardline_list</code></td><td class="wrap">Wardline taint facts reconciled to the entity by qualname (Loomweave hosts the taint-fact store). Enrich-only.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="family doc-section" id="analyze">
+      <div class="family-head"><h2 class="family-name">Analyze lifecycle &amp; freshness</h2></div>
+      <p class="family-desc">Drive and observe the indexing pass, and diff the index against a prior run to see what moved.</p>
+      <div class="tbl-wrap">
+        <table class="ref">
+          <thead><tr><th>Tool</th><th class="wrap">What it answers</th></tr></thead>
+          <tbody>
+            <tr><td><code>analyze_start</code></td><td class="wrap">Kick off an indexing run over MCP.</td></tr>
+            <tr><td><code>analyze_status_get</code></td><td class="wrap">Progress and terminal status of the current / last run.</td></tr>
+            <tr><td><code>analyze_cancel</code></td><td class="wrap">Cancel an in-flight run.</td></tr>
+            <tr><td><code>index_diff_get</code></td><td class="wrap">What changed between this index and a prior one — added, removed, moved entities.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="family doc-section" id="facets">
+      <div class="family-head"><h2 class="family-name">Faceted &amp; shortcut queries</h2></div>
+      <p class="family-desc">Targeted structural queries that eliminate exploration — entry points, dead code, circular imports, coupling hotspots, churn, tests, routes, data models, deprecations, todos, and semantic search.</p>
+      <div class="tbl-wrap">
+        <table class="ref">
+          <thead><tr><th>Tool</th><th class="wrap">What it answers</th></tr></thead>
+          <tbody>
+            <tr><td><code>entity_kind_list</code> / <code>entity_tag_list</code></td><td class="wrap">Browse entities by kind or by tag (the way to locate a subsystem without visually filtering).</td></tr>
+            <tr><td><code>entity_entry_point_list</code></td><td class="wrap">Where does execution start? Entry points into the graph.</td></tr>
+            <tr><td><code>entity_dead_list</code></td><td class="wrap">Reachability shortcut — entities with no resolved callers (honest about unresolved call sites; fails toward live).</td></tr>
+            <tr><td><code>module_circular_import_list</code></td><td class="wrap">Import cycles between modules.</td></tr>
+            <tr><td><code>entity_coupling_hotspot_list</code></td><td class="wrap">The most-coupled entities — where change ripples.</td></tr>
+            <tr><td><code>entity_high_churn_list</code> / <code>entity_recent_change_list</code></td><td class="wrap">What changes a lot, and what changed recently.</td></tr>
+            <tr><td><code>entity_test_list</code> / <code>entity_test_caller_list</code></td><td class="wrap">The tests, and what tests a given entity.</td></tr>
+            <tr><td><code>entity_http_route_list</code> / <code>entity_data_model_list</code></td><td class="wrap">HTTP routes and data models surfaced as facets.</td></tr>
+            <tr><td><code>entity_deprecation_list</code> / <code>entity_todo_list</code></td><td class="wrap">Deprecations and in-source TODOs.</td></tr>
+            <tr><td><code>entity_semantic_search_list</code></td><td class="wrap">Embedding-ranked semantic search — opt-in, when embeddings are available (distinct from the always-on <code>entity_find</code>).</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <p class="doc-p t-meta">This page presents a curated, family-grouped view of the surface. The live server is the authority for the complete, current <code>tools/list</code> and the exact parameter schemas — and the surface grows. See also the <a href="cli.html">CLI reference</a>.</p>
+
+  </div>
+</main>
+
+<footer class="hub-footer">
+  <svg class="mark" width="18" height="18" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+    <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 5 V27"/><path d="M16 11 H24"/><path d="M16 21 H8"/></g>
+    <g fill="currentColor"><circle cx="16" cy="5" r="2.4"/><circle cx="24" cy="11" r="2.4"/><circle cx="8" cy="21" r="2.4"/><circle cx="16" cy="27" r="2.4"/></g>
+  </svg>
+  <span class="foot-note">Loomweave is part of the <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft Federation</a> — the suite&rsquo;s code-structure surface and its SEI identity authority. Installable and runnable: a single Rust binary plus a Python language plugin.</span>
+  <nav class="foot-links" aria-label="Resources">
+    <a class="ext" href="https://github.com/foundryside-dev/loomweave" target="_blank" rel="noopener">Source</a>
+    <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft hub</a>
+    <a class="ext" href="https://github.com/foundryside-dev/weft/blob/main/sei-standard.md" target="_blank" rel="noopener">SEI standard</a>
+  </nav>
+  <a class="foot-org ext" href="https://foundryside.dev" target="_blank" rel="noopener" aria-label="part of Foundryside — foundryside.dev">
+    <svg class="mark" width="17" height="17" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+      <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 24 H27"/><path d="M11 24 V15"/><path d="M16 24 V10"/><path d="M21 24 V15"/></g>
+      <g fill="currentColor"><circle cx="11" cy="15" r="2.1"/><circle cx="16" cy="10" r="2.3"/><circle cx="21" cy="15" r="2.1"/></g>
+    </svg>
+    <span>part of Foundryside · foundryside.dev</span>
+  </a>
+  <span class="foot-meta">MIT · 2026</span>
+</footer>
+
+<script src="main.js"></script>
+</body>
+</html>

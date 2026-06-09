@@ -1,0 +1,302 @@
+/* ============================================================================
+   WEFT DESIGN SYSTEM — colors_and_type.css
+   ----------------------------------------------------------------------------
+   The single source of low-level visual tokens for the Weft federation.
+
+   Weft is a family of agent-first, local-first developer tools. This is the
+   "Loom" revision of the palette: the system stops borrowing the generic
+   dark-teal-and-cool-blue dev-tool uniform and commits to its own metaphor —
+   a LOOM. The canonical (dark) theme is a warm crafted ink: an espresso-black
+   ground, dyed-amber accent, and the per-member "threads" treated as fiber
+   that can glow on a left-rule. The documented light theme is "Specimen" — a
+   warm-paper field-ledger / textile swatch book (oxblood ink rule, embroidery
+   -floss threads), so the two themes read as the same loom in two materials.
+
+   Nothing about the SEMANTICS changed: color is still rationed and always
+   means a status, a severity, or a member — never decoration. Only the
+   material moved (teal-clinical -> warm-crafted). Define new colors in `oklch`
+   from these anchors; don't invent.
+
+   Fonts: bundled locally in fonts/ as variable TTFs (OFL, open source) so the
+   system works fully offline. JetBrains Mono = product face; Space Grotesk =
+   brand/display face. See README "Visual Foundations".
+   ============================================================================ */
+
+/* JetBrains Mono — product face (UI, code, body, data). Variable weight. */
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('fonts/JetBrainsMono-Variable.ttf') format('truetype');
+  font-weight: 100 800; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('fonts/JetBrainsMono-Italic-Variable.ttf') format('truetype');
+  font-weight: 100 800; font-style: italic; font-display: swap;
+}
+/* Space Grotesk — brand / display face (wordmark, headlines). Variable weight. */
+@font-face {
+  font-family: 'Space Grotesk';
+  src: url('fonts/SpaceGrotesk-Variable.ttf') format('truetype');
+  font-weight: 300 700; font-style: normal; font-display: swap;
+}
+
+/* Brand default: every consumer paints in the product face from first frame,
+   so no page ever flashes a substitute system font before React/inline styles
+   apply. Display face is opted into via .t-display / --font-display. */
+html, body {
+  font-family: var(--font-mono);
+}
+
+:root {
+  /* ---- Surfaces — "Loom": warm espresso ink (dark is canonical / default) - */
+  --surface-base:    #14110D;  /* app background — warm espresso-black        */
+  --surface-raised:  #1E1A13;  /* cards, headers, panels                      */
+  --surface-overlay: #2A2319;  /* chips, inputs, secondary fills              */
+  --surface-hover:   #39301F;  /* hover fill for interactive surfaces         */
+
+  /* ---- Borders -------------------------------------------------------- */
+  --border-default:  #332A1F;  /* hairline dividers, card edges               */
+  --border-strong:   #4A3C2A;  /* inputs, buttons, emphasized edges           */
+
+  /* ---- Text — warm ivory ramp (softer than the old white-on-black) ---- */
+  --text-primary:    #F2E9D8;  /* headings, key values                       */
+  --text-secondary:  #B6A78E;  /* body, labels                               */
+  --text-muted:      #7F6F58;  /* metadata, timestamps, hints                */
+
+  /* ---- Accent (dyed amber — the suite's interactive thread) ----------- */
+  --accent:          #E9B04A;
+  --accent-hover:    #D69A33;
+  --accent-subtle:   rgba(233, 176, 74, 0.16);
+
+  /* ---- Status & semantic ---------------------------------------------- *
+   * wip stays a cool blue so "in progress" pops against the warm ground.   */
+  --status-open:     #8A7A64;  /* warm slate — untouched / backlog           */
+  --status-wip:      #56B7E2;  /* sky — in progress (cool pop)               */
+  --status-done:     #897C66;  /* warm steel — completed                     */
+  --ready:           #5FB98E;  /* warm emerald — no blockers, startable      */
+  --aging:           #E9B04A;  /* amber — WIP aging (>4h)                    */
+  --stale:           #E2604E;  /* warm red — WIP stale (>24h) / errors       */
+
+  /* ---- Priority ramp (P0 hottest -> P4 coolest) ----------------------- */
+  --prio-0: #E25C49;  --prio-1: #EC8A3C;  --prio-2: #8A7A64;
+  --prio-3: #C9BBA0;  --prio-4: #C9BBA0;
+
+  /* ---- Severity (scanner findings) ------------------------------------ */
+  --sev-critical: #E25C49;  --sev-high: #EC8A3C;  --sev-medium: #E0B23A;
+  --sev-low:      #56A0E2;  --sev-info: #8A7A64;
+
+  /* ---- The Weft thread palette — one accent per federation member ----- *
+   * Warmed to sit on the espresso ground; still distinct across the wheel  *
+   * and legible on --surface-base. Member identity: glyph color, left-rule *
+   * (which can carry --glow-thread), badge, header tab.                    */
+  --thread-loomweave:  #52C9B8;  /* aqua    — structure + identity spine     */
+  --thread-filigree: #56B7E2;  /* sky     — work state (canonical accent)  */
+  --thread-wardline: #F0875E;  /* coral   — trust boundary                 */
+  --thread-legis:    #B79BF2;  /* violet  — governance & law               */
+  --thread-charter:  #E9B04A;  /* gold    — requirements & verification    */
+  --thread-shuttle:  #8C7C68;  /* slate   — roadmap thought-bubble (dim)   */
+
+  /* ---- Lacuna — the demo suite (ADJACENT, not part of Weft) ----------- *
+   * Lacuna is NOT a member. It's the demonstration target. It inherits the *
+   * whole Weft system so it reads as the same world, then sets itself apart *
+   * three ways. The "Loom" revision REVERSES the temperature contrast: now  *
+   * that Weft is warm, Lacuna's off-palette goes COOL mauve-ink — still the  *
+   * "MissingNo" that appears in no member thread — plus its cooler specimen  *
+   * surface and the DASHED / ticketed border treatment (vs Weft's solid     *
+   * left-rules). Use it when linking OUT to Lacuna from a Weft surface.      */
+  --lacuna-accent:     #C77FA6;  /* dusty mauve — off the federation wheel   */
+  --lacuna-accent-dim: #8E5A77;  /* hovers, secondary marks                  */
+  --lacuna-surface:    #1E1922;  /* cool mauve-ink raised (vs warm --raised) */
+  --lacuna-overlay:    #29222F;  /* cool chip/input fill                     */
+  --lacuna-border:     #3D2F3F;  /* mauve-grey hairline                      */
+  --lacuna-flaw:       #E2604E;  /* a planted lacuna (reuses stale red)      */
+
+  /* ---- Radii ---------------------------------------------------------- */
+  --radius-sm: 3px;   /* chips, pills, scrollbar                           */
+  --radius:    6px;   /* buttons, inputs, cards (Tailwind "rounded")       */
+  --radius-lg: 8px;   /* popovers, dropdowns, modals (shadow-xl surfaces)  */
+  --radius-full: 9999px;
+
+  /* ---- Elevation ------------------------------------------------------ */
+  --shadow-pop: 0 10px 25px rgba(0, 0, 0, 0.50);     /* dropdowns/popovers */
+  --shadow-modal: 0 20px 50px rgba(0, 0, 0, 0.60);   /* modals             */
+  --glow-accent: 0 0 8px rgba(233, 176, 74, 0.45);   /* change-flash       */
+
+  /* ---- Loom signature (new in this revision) -------------------------- *
+   * --glow-thread : a soft fiber bloom for a member's left-rule. Set       *
+   *   --thread on the element (the .thread-* helpers do) and apply         *
+   *   box-shadow: var(--glow-thread). Falls back to the accent.            *
+   * --weave-warp  : a faint warp-thread texture for AMBIENT surfaces only  *
+   *   (hub hero, board background). Never on text or dense chrome — it's a  *
+   *   whisper, not a pattern. The light theme overrides this to ledger      *
+   *   ruling. Use as a background layer behind real content.               */
+  --glow-thread: 0 0 7px -1px var(--thread, var(--accent));
+  --weave-warp:  repeating-linear-gradient(90deg, rgba(233,176,74,0.05) 0 1px, transparent 1px 8px); /* @kind other */
+
+  /* ---- Semantic aliases (derived; promote repeated literals to tokens) *
+   * These name the recurring "computed" values the components reach for so *
+   * the literals live in exactly one place. New surfaces inherit them.     */
+  --text-on-accent:  #1A140A;                  /* ink on an amber-filled button */
+  --focus-ring:      0 0 0 2px var(--accent);  /* 2px accent keyboard ring   */
+  --ring-offset:     var(--surface-base);      /* ring sits on app bg        */
+  /* danger (destructive) — deep umber-maroon fill, warm coral ink */
+  --danger-fill:     rgba(120, 42, 32, 0.50);
+  --danger-fill-hi:  rgba(120, 42, 32, 0.85);
+  --danger-fg:       #F0917E;
+  --danger-border:   #7A2A20;
+  /* affirmative (ready / pass) — deep emerald fill, warm mint ink */
+  --ready-fill:      rgba(28, 74, 56, 0.50);
+  --ready-fg:        #6FCB9F;
+  --ready-border:    #2E7D52;
+
+  /* ---- Spacing scale (Tailwind-derived, 4px base) --------------------- */
+  --space-1: 4px;   --space-2: 8px;   --space-3: 12px;  --space-4: 16px;
+  --space-5: 20px;  --space-6: 24px;  --space-8: 32px;  --space-12: 48px;
+
+  /* ---- Type families -------------------------------------------------- *
+   * Two faces, one voice:                                                  *
+   *  --font-display : Space Grotesk — the BRAND layer. Wordmark, hub       *
+   *                   headlines, slide titles. Geometric, technical.       *
+   *  --font-mono    : JetBrains Mono — the PRODUCT layer. All UI, code,    *
+   *                   body, data. The terminal-grade signature.           *
+   * Product surfaces stay mono end-to-end; display is for brand moments.  */
+  --font-display: 'Space Grotesk', 'JetBrains Mono', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, 'SF Mono', Menlo, monospace;
+  --font-sans: 'JetBrains Mono', ui-monospace, monospace; /* product body stays mono */
+
+  /* ---- Motion --------------------------------------------------------- */
+  --ease: cubic-bezier(0.4, 0, 0.2, 1); /* @kind other */
+  --dur-fast: 0.15s;   /* @kind other */  /* card hover, button states     */
+  --dur:      0.2s;    /* @kind other */  /* panel slide, theme swap        */
+}
+
+/* ---- Light theme — "Specimen": warm-paper field-ledger ---------------- */
+[data-theme="light"] {
+  --surface-base:    #ECE3D1;  /* warm paper                                 */
+  --surface-raised:  #F8F1E3;  /* page / card stock                          */
+  --surface-overlay: #E2D7BF;  /* chips, inputs                              */
+  --surface-hover:   #D8CBB1;
+  --border-default:  #CDBE9F;
+  --border-strong:   #A8966F;
+  --text-primary:    #241E13;  /* dark ink                                   */
+  --text-secondary:  #5C5238;
+  --text-muted:      #897B5F;
+  --accent:          #A33B2C;  /* oxblood / madder — the ruling-red ink      */
+  --accent-hover:    #8A2F22;
+  --accent-subtle:   rgba(163, 59, 44, 0.12);
+  --status-open:     #897B5F;
+  --status-wip:      #1E7AB0;
+  --status-done:     #9A8C70;
+  --ready:           #2E7D52;
+  --aging:           #B8862A;
+  --stale:           #B23A28;
+  --prio-0: #B23A28;  --prio-1: #C26A1E;  --prio-2: #897B5F;
+  --prio-3: #A8966F;  --prio-4: #A8966F;
+  --sev-critical: #B23A28;  --sev-high: #C26A1E;  --sev-medium: #B8862A;
+  --sev-low:      #1E7AB0;  --sev-info: #897B5F;
+  /* embroidery-floss threads — deepened for legibility on paper */
+  --thread-loomweave: #118C7E;  --thread-filigree: #1E7AB0;  --thread-wardline: #CF5630;
+  --thread-legis:    #6E4FC0;  --thread-charter:  #A9791F;  --thread-shuttle:  #6E6450;
+  --lacuna-accent:     #A8527E;
+  --lacuna-accent-dim: #7E3F60;
+  --lacuna-surface:    #E7DCDE;
+  --lacuna-overlay:    #DCCED2;
+  --lacuna-border:     #C4A9B4;
+  --lacuna-flaw:       #B23A28;
+  --shadow-pop:   0 10px 25px rgba(60, 45, 25, 0.14);
+  --shadow-modal: 0 20px 50px rgba(60, 45, 25, 0.20);
+  --glow-accent:  0 0 0 rgba(0, 0, 0, 0);          /* paper doesn't glow      */
+  --glow-thread:  0 0 0 rgba(0, 0, 0, 0);
+  /* ledger ruling instead of warp threads */
+  --weave-warp:   repeating-linear-gradient(0deg, transparent 0 27px, rgba(36,30,19,0.045) 27px 28px); /* @kind other */
+  --text-on-accent: #F8F1E3;   /* paper-white ink on the oxblood button      */
+  --ring-offset:    var(--surface-base);
+  --danger-fill:    rgba(243, 220, 210, 0.90);
+  --danger-fill-hi: rgba(235, 200, 190, 0.95);
+  --danger-fg:      #9E2A1C;
+  --danger-border:  #D8A293;
+  --ready-fill:     rgba(214, 234, 222, 0.90);
+  --ready-fg:       #2E7D52;
+  --ready-border:   #9CC9AE;
+}
+
+/* ============================================================================
+   SEMANTIC TYPE SCALE
+   Mono-forward, tight, terminal-grade. Sizes are deliberately small and dense
+   — this is a developer tool, not a marketing page. The dashboard runs at
+   text-xs (12px) for chrome; these named roles cover documents + UI kits.
+   ============================================================================ */
+
+.weft-type { font-family: var(--font-mono); color: var(--text-primary);
+  -webkit-font-smoothing: antialiased; font-feature-settings: "liga" 1, "calt" 1; }
+
+/* Display — hub hero / portfolio headers / slide titles (BRAND face) */
+.t-display {
+  font-family: var(--font-display); font-weight: 700;
+  font-size: 46px; line-height: 1.02; letter-spacing: -0.02em;
+  color: var(--text-primary);
+}
+.t-h1 {
+  font-family: var(--font-display); font-weight: 600;
+  font-size: 30px; line-height: 1.12; letter-spacing: -0.015em;
+  color: var(--text-primary);
+}
+/* Brand wordmark helper */
+.t-wordmark {
+  font-family: var(--font-display); font-weight: 700;
+  letter-spacing: -0.02em; color: var(--text-primary);
+}
+.t-h2 {
+  font-family: var(--font-mono); font-weight: 600;
+  font-size: 20px; line-height: 1.25; color: var(--text-primary);
+}
+.t-h3 {
+  font-family: var(--font-mono); font-weight: 600;
+  font-size: 15px; line-height: 1.3; color: var(--text-primary);
+}
+/* Body */
+.t-body {
+  font-family: var(--font-mono); font-weight: 400;
+  font-size: 14px; line-height: 1.6; color: var(--text-secondary);
+  text-wrap: pretty;
+}
+.t-small {
+  font-family: var(--font-mono); font-weight: 400;
+  font-size: 12px; line-height: 1.5; color: var(--text-secondary);
+}
+/* Label — uppercase section/eyebrow with tracking */
+.t-label {
+  font-family: var(--font-mono); font-weight: 600;
+  font-size: 11px; line-height: 1.4; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--text-muted);
+}
+/* Mono inline — code, ids, tokens, CLI */
+.t-code {
+  font-family: var(--font-mono); font-weight: 500;
+  font-size: 13px; line-height: 1.5; color: var(--text-primary);
+}
+.t-meta {
+  font-family: var(--font-mono); font-weight: 400;
+  font-size: 11px; line-height: 1.4; color: var(--text-muted);
+}
+
+/* ---- Member identity helper: paints a strand by its thread color ------ */
+.thread-loomweave  { --thread: var(--thread-loomweave); }
+.thread-filigree { --thread: var(--thread-filigree); }
+.thread-wardline { --thread: var(--thread-wardline); }
+.thread-legis    { --thread: var(--thread-legis); }
+.thread-charter  { --thread: var(--thread-charter); }
+.thread-shuttle  { --thread: var(--thread-shuttle); }
+
+/* ---- Motion --------------------------------------------------------------
+   The system's only ambient motion is brief and never gates visibility. This
+   popover-entrance keyframe is deliberately safe: its first frame is already
+   legible (opacity 0.7, a 4px lift), so if a throttled/headless context pauses
+   the animation the menu still reads. Honour reduced-motion by skipping it. */
+@keyframes ddMenuIn {
+  from { opacity: 0.7; transform: translateY(-4px); }
+  to   { opacity: 1;   transform: translateY(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  @keyframes ddMenuIn { from { opacity: 1; } to { opacity: 1; } }
+}

@@ -1,18 +1,21 @@
 name: Docs
 
-# Build and deploy the Loomweave documentation site (web/) to GitHub Pages.
+# Publish the hand-rolled static Loomweave site (www/) to GitHub Pages.
 # The site is served at https://loomweave.foundryside.dev via the CNAME in
-# web/docs/CNAME. Deploys on push to main; PRs get a strict build check only.
+# www/CNAME. www/ is plain HTML/CSS/JS with no build step, so this workflow
+# just copies the directory onto the gh-pages branch (the same branch the
+# previous mkdocs deploy used — no Pages "source" setting change is needed).
+# Deploys on push to main; PRs get a link/asset sanity check only.
 
 on:
   push:
     branches: [main]
     paths:
-      - "web/**"
+      - "www/**"
       - ".github/workflows/docs.yml"
   pull_request:
     paths:
-      - "web/**"
+      - "www/**"
       - ".github/workflows/docs.yml"
 
 concurrency:
@@ -24,20 +27,57 @@ permissions:
 
 jobs:
   docs:
-    name: Build + deploy
+    name: Check + publish
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
-        with:
-          python-version: "3.13"
-          cache: pip
-          cache-dependency-path: web/requirements.txt
-      - run: pip install -r web/requirements.txt
-      - name: Build (strict)
-        run: mkdocs build --strict -f web/mkdocs.yml
-      - name: Deploy to gh-pages
+
+      # Cheap, dependency-free guard: every internal page link and local asset
+      # referenced by www/*.html must resolve to a file that exists on disk.
+      - name: Check links + assets resolve
+        run: |
+          python3 - <<'PY'
+          import re, sys, pathlib
+          root = pathlib.Path("www")
+          bad = []
+          for page in root.glob("*.html"):
+              html = page.read_text(encoding="utf-8")
+              for m in re.finditer(r'(?:href|src)="([^"#?]+)', html):
+                  ref = m.group(1)
+                  if ref.startswith(("http://", "https://", "mailto:", "//", "data:")):
+                      continue
+                  target = (root / ref).resolve()
+                  if not target.exists():
+                      bad.append(f"{page.name}: {ref}")
+          if bad:
+              print("Unresolved local references:")
+              print("\n".join(sorted(set(bad))))
+              sys.exit(1)
+          print("All local page links and assets resolve.")
+          PY
+
+      - name: Publish www/ to gh-pages
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: mkdocs gh-deploy --force -f web/mkdocs.yml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Stage the site into a clean orphan worktree on gh-pages.
+          work="$(mktemp -d)"
+          cp -a www/. "$work/"
+          touch "$work/.nojekyll"
+          git fetch origin gh-pages || true
+          rm -rf .git-pages && git worktree prune
+          git worktree add --orphan -B gh-pages .git-pages
+          # Replace the worktree contents wholesale with the new site.
+          find .git-pages -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+          cp -a "$work/." .git-pages/
+          ( cd .git-pages
+            git add -A
+            git commit -m "Deploy www/ @ ${GITHUB_SHA::8}" --allow-empty
+            git push --force origin gh-pages )
+          git worktree remove --force .git-pages

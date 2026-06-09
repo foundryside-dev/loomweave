@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Getting started — Loomweave</title>
+<meta name="description" content="From nothing to a running Loomweave MCP server a consult-mode agent can query: install the binary and Python plugin, initialise a project, build the graph, wire an MCP client, and enable optional summaries.">
+<link rel="preload" href="fonts/SpaceGrotesk-Variable.ttf" as="font" type="font/ttf" crossorigin>
+<link rel="preload" href="fonts/JetBrainsMono-Variable.ttf" as="font" type="font/ttf" crossorigin>
+<link rel="stylesheet" href="colors_and_type.css">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<a class="skip-link" href="#top">Skip to content</a>
+
+<header class="hub-header">
+  <a class="brand" href="index.html" aria-label="Loomweave — home">
+    <svg class="mark" width="26" height="26" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+      <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 5 V27"/><path d="M16 11 H24"/><path d="M16 21 H8"/></g>
+      <g fill="currentColor"><circle cx="16" cy="5" r="2.4"/><circle cx="24" cy="11" r="2.4"/><circle cx="8" cy="21" r="2.4"/><circle cx="16" cy="27" r="2.4"/></g>
+    </svg>
+    <span class="wordmark">Loomweave</span>
+    <span class="path-hint">~/loomweave</span>
+  </a>
+  <nav class="hub-nav" aria-label="Primary">
+    <a href="index.html">Overview</a>
+    <a href="getting-started.html" aria-current="page">Getting started</a>
+    <a href="concepts.html">Concepts</a>
+    <a href="tools.html">MCP tools</a>
+    <a href="cli.html">CLI</a>
+    <a class="ext" href="https://github.com/foundryside-dev/loomweave" target="_blank" rel="noopener">GitHub</a>
+    <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft hub</a>
+  </nav>
+</header>
+
+<main id="top">
+
+  <div class="page-head">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="index.html">Loomweave</a><span class="sep">/</span><span aria-current="page">Getting started</span>
+    </nav>
+    <h1 class="page-title">Getting started</h1>
+    <p class="page-lede">From nothing to a running Loomweave MCP server a consult-mode agent can query. Everything except <code class="t-inline-code">summary(id)</code> works with no LLM credentials.</p>
+  </div>
+
+  <div class="docmain">
+
+    <ol class="steps">
+
+      <li class="step">
+        <h2 class="step-title doc-h2" id="install">Install the binary and the Python plugin</h2>
+        <p class="doc-p">Loomweave is a single Rust binary; Python support ships as a separate language plugin. Pull both from the current GitHub Release.</p>
+        <div class="code">
+          <div class="code-head"><span class="code-lang">bash</span></div>
+<pre>TAG=v1.1.0
+curl -L -o loomweave.tar.gz \
+  "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave-x86_64-unknown-linux-gnu.tar.gz"
+tar xzf loomweave.tar.gz
+install loomweave-x86_64-unknown-linux-gnu/loomweave ~/.local/bin/
+
+pipx install \
+  "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave-plugin-python-1.1.0.tar.gz"</pre>
+        </div>
+        <p class="doc-p">Confirm the binary is on your <code>PATH</code>:</p>
+        <div class="code">
+          <div class="code-head"><span class="code-lang">bash</span></div>
+<pre>loomweave --version</pre>
+        </div>
+        <p class="doc-p">The Python plugin is discovered on <code>$PATH</code> at analyze time. If no plugin is found, <code>loomweave analyze</code> exits <code>0</code> with a warning and status <code>skipped_no_plugins</code> rather than failing.</p>
+      </li>
+
+      <li class="step">
+        <h2 class="step-title doc-h2" id="init">Initialise a project</h2>
+        <p class="doc-p">From inside the repository you want to map:</p>
+        <div class="code">
+          <div class="code-head"><span class="code-lang">bash</span></div>
+<pre>cd /path/to/your/python/repo
+loomweave install --path .</pre>
+        </div>
+        <p class="doc-p"><code>install</code> is the one-step agent setup path: it creates the project-local <code>.weft/loomweave/</code> store (the SQLite database lives at <code>.weft/loomweave/loomweave.db</code>), installs the <code>loomweave-workflow</code> skill for Claude Code and Codex, writes Claude Code MCP config, upserts Codex MCP config, and installs the <code>SessionStart</code> hook. Component flags give you partial installs:</p>
+        <ul class="doc-ul">
+          <li class="doc-li"><code>--claude-code</code> — write Claude Code MCP config only.</li>
+          <li class="doc-li"><code>--codex</code> — upsert Codex MCP config only.</li>
+          <li class="doc-li"><code>--skills</code> / <code>--codex-skills</code> — install the <code>loomweave-workflow</code> skill pack for Claude Code / Codex.</li>
+          <li class="doc-li"><code>--hooks</code> — merge a <code>SessionStart</code> hook into <code>.claude/settings.json</code>.</li>
+          <li class="doc-li"><code>--all</code> — do everything (equivalent to a bare <code>install</code>).</li>
+        </ul>
+        <div class="note">
+          <div class="note-label">Note · where state lives</div>
+          <div class="note-body"><code>loomweave analyze</code> always persists to the project root&rsquo;s <code>.weft/loomweave/</code>, not to wherever <code>--path</code> pointed at install time. To re-index a corpus cleanly, remove the stale <code>.weft/loomweave/</code> first (or pass <code>--no-incremental</code>).</div>
+        </div>
+      </li>
+
+      <li class="step">
+        <h2 class="step-title doc-h2" id="analyze">Build the graph</h2>
+        <div class="code">
+          <div class="code-head"><span class="code-lang">bash</span></div>
+<pre>loomweave analyze</pre>
+        </div>
+        <p class="doc-p"><code>analyze</code> walks the source tree, dispatches the discovered language plugin to extract entities and edges, and persists the result. Re-runs are idempotent (UPSERT on the entity id) and incremental by default — unchanged files are skipped. Pass <code>--no-incremental</code> to force a clean re-index.</p>
+        <p class="doc-p">This step needs <strong>no LLM credentials</strong>. It is the fastest way to verify the install end-to-end.</p>
+      </li>
+
+      <li class="step">
+        <h2 class="step-title doc-h2" id="serve">Serve the graph over MCP</h2>
+        <div class="code">
+          <div class="code-head"><span class="code-lang">bash</span></div>
+<pre>loomweave serve</pre>
+        </div>
+        <p class="doc-p">This starts the MCP stdio server. Point your MCP client at it — for Claude Code, register it in <code>.mcp.json</code> (a bare <code>loomweave install</code> writes this for you):</p>
+        <div class="code">
+          <div class="code-head"><span class="code-lang">json — .mcp.json</span></div>
+<pre>{
+  <span class="ky">"mcpServers"</span>: {
+    <span class="ky">"loomweave"</span>: {
+      <span class="ky">"command"</span>: <span class="st">"loomweave"</span>,
+      <span class="ky">"args"</span>: [<span class="st">"serve"</span>, <span class="st">"--path"</span>, <span class="st">"."</span>]
+    }
+  }
+}</pre>
+        </div>
+        <p class="doc-p">Your agent can now call Loomweave&rsquo;s consult tools instead of re-exploring the tree. See <a href="concepts.html#consult-loop">the consult loop</a> for the workflow and <a href="tools.html">the MCP tool reference</a> for the surface.</p>
+      </li>
+
+      <li class="step">
+        <h2 class="step-title doc-h2" id="summaries">(Optional) Enable on-demand summaries</h2>
+        <p class="doc-p"><code>summary(id)</code> dispatches an LLM lazily — one entity at a time, cached after the first call. The provider is OpenRouter or a local Claude/Codex CLI, configured in <code>loomweave.yaml</code> (<code>llm_policy</code>); for OpenRouter, set <code>OPENROUTER_API_KEY</code> in the environment (or a project <code>.env</code>) before calling it. Structural extraction never needs this; summarisation is the only path that makes network calls to a model provider.</p>
+        <div class="note">
+          <div class="note-label">Note · local-first</div>
+          <div class="note-body">There is no mandatory cloud component. The only required network egress is the LLM provider during <code>summary</code> calls. <code>analyze</code> runs with no credentials.</div>
+        </div>
+      </li>
+
+    </ol>
+
+    <section class="doc-section">
+      <h2 class="doc-h2" id="troubleshooting">Troubleshooting</h2>
+      <div class="tbl-wrap">
+        <table class="ref">
+          <thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead>
+          <tbody>
+            <tr><td><code>analyze</code> exits <code>skipped_no_plugins</code></td><td class="wrap">No language plugin on <code>$PATH</code></td><td class="wrap"><code>pipx install</code> the Python plugin (step 1)</td></tr>
+            <tr><td class="wrap">Stale entities after a big refactor</td><td class="wrap">Incremental skip kept old rows</td><td class="wrap"><code>loomweave analyze --no-incremental</code></td></tr>
+            <tr><td class="wrap">Agent can&rsquo;t reach the server</td><td class="wrap">MCP registration missing</td><td class="wrap"><code>loomweave doctor --fix</code></td></tr>
+            <tr><td class="wrap"><code>summary</code> fails with no provider</td><td class="wrap"><code>OPENROUTER_API_KEY</code> unset (and no local CLI provider)</td><td class="wrap">Set the key, or point <code>llm_policy</code> at a local Claude/Codex CLI</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="doc-p"><code>loomweave doctor</code> verifies the skill pack, the <code>SessionStart</code> hook, and the <code>.mcp.json</code> registration, and repairs them in place with <code>--fix</code>. See the <a href="cli.html#doctor">CLI reference</a> for every command and flag.</p>
+    </section>
+
+  </div>
+</main>
+
+<footer class="hub-footer">
+  <svg class="mark" width="18" height="18" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+    <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 5 V27"/><path d="M16 11 H24"/><path d="M16 21 H8"/></g>
+    <g fill="currentColor"><circle cx="16" cy="5" r="2.4"/><circle cx="24" cy="11" r="2.4"/><circle cx="8" cy="21" r="2.4"/><circle cx="16" cy="27" r="2.4"/></g>
+  </svg>
+  <span class="foot-note">Loomweave is part of the <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft Federation</a> — the suite&rsquo;s code-structure surface and its SEI identity authority. Installable and runnable: a single Rust binary plus a Python language plugin.</span>
+  <nav class="foot-links" aria-label="Resources">
+    <a class="ext" href="https://github.com/foundryside-dev/loomweave" target="_blank" rel="noopener">Source</a>
+    <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft hub</a>
+    <a class="ext" href="https://github.com/foundryside-dev/weft/blob/main/sei-standard.md" target="_blank" rel="noopener">SEI standard</a>
+  </nav>
+  <a class="foot-org ext" href="https://foundryside.dev" target="_blank" rel="noopener" aria-label="part of Foundryside — foundryside.dev">
+    <svg class="mark" width="17" height="17" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+      <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 24 H27"/><path d="M11 24 V15"/><path d="M16 24 V10"/><path d="M21 24 V15"/></g>
+      <g fill="currentColor"><circle cx="11" cy="15" r="2.1"/><circle cx="16" cy="10" r="2.3"/><circle cx="21" cy="15" r="2.1"/></g>
+    </svg>
+    <span>part of Foundryside · foundryside.dev</span>
+  </a>
+  <span class="foot-meta">MIT · 2026</span>
+</footer>
+
+<script src="main.js"></script>
+</body>
+</html>
