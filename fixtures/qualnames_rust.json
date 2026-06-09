@@ -176,6 +176,19 @@
       ]
     },
     {
+      "name": "generic_self_nested_param",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "F2 NESTED-PARAM trip-wire (ADR-049 §2 self-type-args amendment, rename-stability limitation). The impl's declared param T appears NESTED inside another type arg (Vec<T>), not at top level. A nested declared param is NOT positionally substituted: the whole self-type arg renders via type_textual (literal `T`), so the self-type prefix is Foo<Vec<T>>, NOT recursive Foo<Vec<$0>>. Contrast positional_generic_param, where the TOP-LEVEL declared param renders positionally ($0). The impl's own inherent signature still renders its declared param positionally (#<$0>). CROSS-TOOL CONTRACT: a second producer (Wardline) MUST mirror this type_textual rendering of nested params; implementing recursive positional substitution (Foo<Vec<$0>>) would diverge, and THIS row is the conformance trip-wire that catches it. KNOWN LIMITATION: nested-param rendering is therefore NOT rename-stable (impl<U> Foo<Vec<U>> renders the distinct key Foo<Vec<U>>) — strictly better than the pre-amendment behaviour (which silently dropped a method), but full recursive positional rendering is a deferred follow-up. See ADR-049 §2 and the federation change-set F2.",
+      "source": "struct Foo<T>(T);\nimpl<T> Foo<Vec<T>> { fn get(&self) {} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.Foo", "kind": "struct"},
+        {"qualname": "demo.m.Foo<Vec<T>>.impl#<$0>", "kind": "impl"},
+        {"qualname": "demo.m.Foo<Vec<T>>.impl#<$0>.get", "kind": "function"}
+      ]
+    },
+    {
       "name": "cfg_twin",
       "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
       "reproducibility": "slice-1",
