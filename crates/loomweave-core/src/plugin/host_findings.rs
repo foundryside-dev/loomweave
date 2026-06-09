@@ -79,6 +79,13 @@ pub const FINDING_MALFORMED_UNRESOLVED_CALL_SITE: &str =
 /// validation. The row is dropped and this infrastructure finding is retained.
 pub const FINDING_MALFORMED_FINDING: &str = "LMWV-INFRA-PLUGIN-MALFORMED-FINDING";
 
+/// Emitted when the plugin process terminates on SIGABRT (signal 6) — the
+/// signature of a stack overflow (Rust guard page → abort) or an explicit
+/// `abort()` (ADR-050). Distinct from
+/// [`FINDING_OOM_KILLED`](crate::plugin::limits::FINDING_OOM_KILLED), whose
+/// SIGKILL/SIGSEGV signature points at `RLIMIT_AS` enforcement instead.
+pub const FINDING_PLUGIN_ABORTED: &str = "LMWV-INFRA-PLUGIN-ABORTED";
+
 /// Informational diagnostic accumulated during a host's lifetime.
 ///
 /// Collected into `self.findings` on each enforcement action. Drained via
@@ -252,6 +259,25 @@ impl HostFinding {
             subcode: FINDING_ENTITY_FIELD_OVERSIZE.to_owned(),
             message: format!(
                 "entity field {field:?} is {actual_bytes} bytes, over the {limit_bytes}-byte limit"
+            ),
+            metadata,
+        }
+    }
+
+    /// Emitted by the CLI wrapper once the child has been reaped and its exit
+    /// status is SIGABRT (signal 6) — the signature of a stack overflow
+    /// (Rust guard page → abort) or an explicit `abort()` (ADR-050). Distinct
+    /// from [`oom_killed`](Self::oom_killed): an abort is the plugin's own
+    /// runtime giving up, not the kernel enforcing a memory ceiling.
+    pub fn aborted(plugin_id: &str, signal: i32) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("plugin_id".to_owned(), plugin_id.to_owned());
+        metadata.insert("signal".to_owned(), signal.to_string());
+        Self {
+            subcode: FINDING_PLUGIN_ABORTED.to_owned(),
+            message: format!(
+                "plugin {plugin_id} terminated abnormally (signal {signal}, SIGABRT — \
+                 consistent with a stack overflow or explicit abort)"
             ),
             metadata,
         }

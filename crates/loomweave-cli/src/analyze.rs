@@ -21,6 +21,7 @@ use rusqlite::Connection;
 use time::{OffsetDateTime, macros::format_description};
 use uuid::Uuid;
 
+use loomweave_core::plugin::host::FINDING_PLUGIN_ABORTED;
 use loomweave_core::{
     AcceptedEdge, AcceptedEntity, AnalyzeFileOutcome, CrashLoopBreaker, CrashLoopState,
     DiscoveredPlugin, EmbeddingProvider, FINDING_DISABLED_CRASH_LOOP, HostError, HostFinding,
@@ -3141,6 +3142,7 @@ fn infra_severity(subcode: &str) -> &'static str {
         INFRA_CRASH_RULE_ID
         | PLUGIN_TIMEOUT_RULE_ID
         | FINDING_DISABLED_CRASH_LOOP
+        | FINDING_PLUGIN_ABORTED
         | "LMWV-INFRA-PLUGIN-OOM-KILLED"
         | "LMWV-INFRA-PLUGIN-DISABLED-PATH-ESCAPE" => "ERROR",
         // The default WARN arm deliberately covers
@@ -4494,7 +4496,7 @@ fn run_plugin_blocking(
                 other => format!("plugin {plugin_id} spawn/handshake error: {other}"),
             }
         };
-        reap_and_classify_exit(&mut child, plugin_id, &mut findings);
+        reap_and_classify_exit(&mut child, plugin_id, &mut findings, handshake_timed_out);
         return Err(PluginRunError::with_findings(reason, findings));
     }
 
@@ -4736,8 +4738,15 @@ fn run_plugin_blocking(
         });
     }
 
-    // Reap unconditionally. `Child::Drop` does not wait on Unix.
-    reap_and_classify_exit(&mut child, plugin_id, &mut findings);
+    // Reap unconditionally. `Child::Drop` does not wait on Unix. When any
+    // lifecycle deadline fired, the SIGKILL in the exit status is the
+    // watchdog's own — suppress the OOM classification (ADR-050).
+    reap_and_classify_exit(
+        &mut child,
+        plugin_id,
+        &mut findings,
+        watchdog.timed_out_phase().is_some(),
+    );
 
     match work_result {
         Ok(()) => Ok(BatchResult { findings }),
@@ -4766,20 +4775,33 @@ fn plugin_timeout_finding(
     }
 }
 
-/// Wait on the child, inspect its exit status, and append an OOM finding if
-/// the signal is consistent with `RLIMIT_AS` enforcement (ADR-021 §2d).
+/// Wait on the child, inspect its exit status, and append a classification
+/// finding for abnormal terminations (ADR-050):
 ///
-/// Linux kernel behaviour on `RLIMIT_AS` violation varies: typical signatures
-/// are SIGKILL (OOM-killer path) and SIGSEGV (map/allocation failure that the
-/// plugin did not handle). Both are treated as likely memory-limit events.
+/// - SIGABRT (6) → [`HostFinding::aborted`] — the stack-overflow / explicit
+///   `abort()` signature; always reported.
+/// - SIGKILL (9) / SIGSEGV (11) → [`HostFinding::oom_killed`] — the observed
+///   `RLIMIT_AS` signatures (ADR-021 §2d; kernel behaviour varies between
+///   the OOM-killer path and an unhandled map failure) — UNLESS
+///   `suppress_kill_classification` is set: when the lifecycle watchdog
+///   already killed the child, the SIGKILL is the host's own and reporting
+///   it as an OOM event would double-report a single timeout.
+///
 /// Other signals or non-zero exit codes get a warn log but no finding — the
 /// cause is ambiguous without more bookkeeping.
 fn reap_and_classify_exit(
     child: &mut std::process::Child,
     plugin_id: &str,
     findings: &mut Vec<HostFinding>,
+    suppress_kill_classification: bool,
 ) {
-    reap_and_classify_exit_with_timeout(child, plugin_id, findings, PLUGIN_REAP_TIMEOUT);
+    reap_and_classify_exit_with_timeout(
+        child,
+        plugin_id,
+        findings,
+        PLUGIN_REAP_TIMEOUT,
+        suppress_kill_classification,
+    );
 }
 
 const PLUGIN_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -4790,9 +4812,12 @@ fn reap_and_classify_exit_with_timeout(
     plugin_id: &str,
     findings: &mut Vec<HostFinding>,
     timeout: std::time::Duration,
+    suppress_kill_classification: bool,
 ) {
     match wait_child_with_timeout(child, timeout) {
-        Ok(Some(status)) => classify_child_exit_status(status, plugin_id, findings),
+        Ok(Some(status)) => {
+            classify_child_exit_status(status, plugin_id, findings, suppress_kill_classification);
+        }
         Ok(None) => {
             tracing::warn!(
                 plugin_id = %plugin_id,
@@ -4850,6 +4875,7 @@ fn classify_child_exit_status(
     status: std::process::ExitStatus,
     plugin_id: &str,
     findings: &mut Vec<HostFinding>,
+    suppress_kill_classification: bool,
 ) {
     if status.success() {
         return;
@@ -4863,9 +4889,17 @@ fn classify_child_exit_status(
                 signal,
                 "plugin terminated by signal",
             );
+            // SIGABRT (6) is the stack-overflow / explicit-abort signature
+            // (ADR-050). Never suppressed: the watchdog kills with SIGKILL,
+            // so an abort is always the plugin's own.
+            if signal == 6 {
+                findings.push(HostFinding::aborted(plugin_id, signal));
+            }
             // SIGKILL (9) and SIGSEGV (11) are the observed signatures
-            // of an RLIMIT_AS kill in Sprint-1 testing.
-            if signal == 9 || signal == 11 {
+            // of an RLIMIT_AS kill in Sprint-1 testing — but when the
+            // lifecycle watchdog already killed this child, the SIGKILL is
+            // the host's own (the timeout finding is the root cause).
+            if (signal == 9 || signal == 11) && !suppress_kill_classification {
                 findings.push(HostFinding::oom_killed(plugin_id, signal));
             }
         } else if let Some(code) = status.code() {
@@ -6489,6 +6523,7 @@ mod tests {
             "stubborn",
             &mut findings,
             std::time::Duration::from_millis(50),
+            false,
         );
 
         assert!(
@@ -6503,6 +6538,68 @@ mod tests {
             findings.is_empty(),
             "timeout kill should not be misclassified as an OOM finding: {findings:?}"
         );
+    }
+
+    /// ADR-050: SIGABRT (signal 6) — the stack-overflow / explicit-abort
+    /// signature — is classified distinctly as `LMWV-INFRA-PLUGIN-ABORTED`,
+    /// never as an OOM kill, and is ERROR severity.
+    #[test]
+    #[cfg(unix)]
+    fn reap_classifies_sigabrt_as_aborted_finding() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "kill -ABRT $$"])
+            .spawn()
+            .expect("spawn self-aborting child");
+        let mut findings = Vec::new();
+
+        reap_and_classify_exit_with_timeout(
+            &mut child,
+            "abrt",
+            &mut findings,
+            std::time::Duration::from_secs(5),
+            false,
+        );
+
+        assert_eq!(findings.len(), 1, "exactly one finding: {findings:?}");
+        assert_eq!(findings[0].subcode, FINDING_PLUGIN_ABORTED);
+        assert_eq!(
+            findings[0].metadata.get("signal").map(String::as_str),
+            Some("6")
+        );
+        assert_eq!(infra_severity(FINDING_PLUGIN_ABORTED), "ERROR");
+    }
+
+    /// ADR-050 `timed_out` gate: when the lifecycle watchdog killed the child,
+    /// the resulting SIGKILL must not be double-reported as an OOM event —
+    /// but without suppression the SIGKILL classification is unchanged.
+    #[test]
+    #[cfg(unix)]
+    fn reap_suppresses_oom_classification_for_watchdog_kill() {
+        for (suppress, expected_oom) in [(true, 0_usize), (false, 1_usize)] {
+            let mut child = std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn sleeping child");
+            child.kill().expect("kill child (watchdog stand-in)");
+            let mut findings = Vec::new();
+
+            reap_and_classify_exit_with_timeout(
+                &mut child,
+                "killed",
+                &mut findings,
+                std::time::Duration::from_secs(5),
+                suppress,
+            );
+
+            let oom_count = findings
+                .iter()
+                .filter(|f| f.subcode == "LMWV-INFRA-PLUGIN-OOM-KILLED")
+                .count();
+            assert_eq!(
+                oom_count, expected_oom,
+                "suppress={suppress} must yield {expected_oom} OOM findings: {findings:?}"
+            );
+        }
     }
 
     #[test]

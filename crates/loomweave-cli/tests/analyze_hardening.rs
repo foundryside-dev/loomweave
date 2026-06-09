@@ -254,9 +254,13 @@ fn handshake_hang_times_out_run_terminal_child_reaped() {
         "no redundant LMWV-INFRA-PLUGIN-CRASH when the cause is a timeout"
     );
 
-    // (e) The watchdog's own SIGKILL must not be misreported as an OOM kill.
-    // Enabled by Task 6 (timed_out gate); red until then.
-    // assert_eq!(finding_count(&conn, "LMWV-INFRA-PLUGIN-OOM-KILLED"), 0);
+    // (e) The watchdog's own SIGKILL must not be misreported as an OOM kill
+    // (timed_out gate — Task 6).
+    assert_eq!(
+        finding_count(&conn, "LMWV-INFRA-PLUGIN-OOM-KILLED"),
+        0,
+        "watchdog kill must not double-report as OOM"
+    );
 
     // (d) No plugin child outlives the run.
     assert_no_leaked_child(&marker_pair);
@@ -332,6 +336,118 @@ fn shutdown_hang_times_out_run_still_completes() {
         0
     );
 
+    // The watchdog's own SIGKILL at shutdown must not be misreported as an
+    // OOM kill (timed_out gate — Task 6).
+    assert_eq!(
+        finding_count(&conn, "LMWV-INFRA-PLUGIN-OOM-KILLED"),
+        0,
+        "watchdog shutdown kill must not double-report as OOM"
+    );
+
     // No plugin child outlives the run.
+    assert_no_leaked_child(&marker_pair);
+}
+
+/// Task 6 (plan step 6.1): a CPU-spinning plugin is contained by the per-file
+/// watchdog (acceptance gate 3 — busy loops never allocate or crash, so the
+/// RLIMIT/breaker layers never fire); exactly one phase-tagged timeout
+/// finding, and the watchdog's own SIGKILL is NOT double-reported as an OOM
+/// kill.
+#[test]
+fn spin_at_analyze_contained_by_file_watchdog() {
+    let fixture_bin = fixture_binary_path();
+    let plugin_dir = setup_plugin_dir(&fixture_bin);
+    let (project_dir, new_path) = setup_project(&plugin_dir);
+    let (marker_key, marker_value, marker_pair) = unique_marker("spin-analyze");
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &new_path)
+        .env(&marker_key, &marker_value)
+        .env("LOOMWEAVE_FIXTURE_SPIN_AT_ANALYZE", "1")
+        .env("LOOMWEAVE_PLUGIN_FILE_TIMEOUT_MS", "500")
+        .timeout(ANALYZE_BACKSTOP)
+        .assert()
+        .failure();
+
+    let conn = open_db(&project_dir);
+
+    let (run_count, run_status, failure_reason) = run_record(&conn);
+    assert_eq!(run_count, 1, "exactly one run row");
+    assert_eq!(run_status, "failed", "run must resolve terminal-failed");
+    assert!(
+        failure_reason.contains("per-file analysis timeout"),
+        "failure_reason must name the per-file timeout; got {failure_reason:?}"
+    );
+
+    // Exactly one timeout finding, tagged with the file phase.
+    assert_eq!(
+        finding_count(&conn, "LMWV-PY-TIMEOUT"),
+        1,
+        "exactly one LMWV-PY-TIMEOUT finding"
+    );
+    let evidence = finding_evidence(&conn, "LMWV-PY-TIMEOUT");
+    assert!(
+        evidence.contains("\"phase\":\"file\""),
+        "timeout finding must carry phase=file metadata; got {evidence}"
+    );
+
+    // The timed_out gate: the watchdog's own SIGKILL is not an OOM event.
+    assert_eq!(
+        finding_count(&conn, "LMWV-INFRA-PLUGIN-OOM-KILLED"),
+        0,
+        "watchdog kill must not double-report as OOM"
+    );
+
+    assert_no_leaked_child(&marker_pair);
+}
+
+/// Task 6 (plan step 6.1): a plugin that SIGABRTs mid-analysis (the real
+/// stack-overflow signature: Rust guard page → abort → signal 6) resolves the
+/// run terminal-failed and is classified distinctly as
+/// `LMWV-INFRA-PLUGIN-ABORTED` — not as an OOM kill.
+#[test]
+fn abort_at_analyze_classified_and_terminal() {
+    let fixture_bin = fixture_binary_path();
+    let plugin_dir = setup_plugin_dir(&fixture_bin);
+    let (project_dir, new_path) = setup_project(&plugin_dir);
+    let (marker_key, marker_value, marker_pair) = unique_marker("abort-analyze");
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &new_path)
+        .env(&marker_key, &marker_value)
+        .env("LOOMWEAVE_FIXTURE_ABORT_AT_ANALYZE", "1")
+        .timeout(ANALYZE_BACKSTOP)
+        .assert()
+        .failure();
+
+    let conn = open_db(&project_dir);
+
+    let (run_count, run_status, _) = run_record(&conn);
+    assert_eq!(run_count, 1, "exactly one run row");
+    assert_eq!(run_status, "failed", "run must resolve terminal-failed");
+
+    // SIGABRT is classified distinctly, with the signal in evidence.
+    assert_eq!(
+        finding_count(&conn, "LMWV-INFRA-PLUGIN-ABORTED"),
+        1,
+        "exactly one LMWV-INFRA-PLUGIN-ABORTED finding"
+    );
+    let evidence = finding_evidence(&conn, "LMWV-INFRA-PLUGIN-ABORTED");
+    assert!(
+        evidence.contains("\"signal\":\"6\""),
+        "aborted finding must carry signal=6 metadata; got {evidence}"
+    );
+
+    // An abort is not an OOM kill (signal 6, not 9/11).
+    assert_eq!(
+        finding_count(&conn, "LMWV-INFRA-PLUGIN-OOM-KILLED"),
+        0,
+        "SIGABRT must not be classified as an OOM kill"
+    );
+
     assert_no_leaked_child(&marker_pair);
 }
