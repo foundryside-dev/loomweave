@@ -23,6 +23,7 @@ use loomweave_core::plugin::{
     InitializeResult, JsonRpcVersion, ResponseEnvelope, ResponsePayload, ShutdownResult,
 };
 use loomweave_plugin_rust::crate_roots::CrateRoots;
+use loomweave_plugin_rust::symbol_table::SymbolTable;
 use serde_json::Value;
 
 fn main() {
@@ -36,6 +37,10 @@ fn main() {
     // Discovered at `initialize`; consulted at `analyze_file` to derive each
     // file's crate name + dotted module path (ADR-049 §1, Task 2).
     let mut crate_roots: Option<CrateRoots> = None;
+    // Built at `initialize`; consulted at `analyze_file` to resolve each file's
+    // in-project `use` paths into `imports` edges (Task 7). Mirrors
+    // `crate_roots`: stashed here, threaded into `analyze_one_file`.
+    let mut symbol_table: Option<SymbolTable> = None;
 
     loop {
         let Ok(frame) = read_frame(&mut reader, ContentLengthCeiling::DEFAULT) else {
@@ -77,15 +82,14 @@ fn main() {
                     raw.get("params").cloned().unwrap_or(serde_json::json!({})),
                 ) {
                     // Build the project symbol table from this root (Task 7,
-                    // spec §2.3). Phase 1a does not consult it during
-                    // `analyze_file` yet — Phase 1b resolves cross-file edges
-                    // against it — but building it here proves the §2.3 walk
-                    // and powers the dogfood gate (Task 14).
+                    // spec §2.3) and STASH it: `analyze_file` builds a
+                    // `Resolver` over it to resolve each file's in-project `use`
+                    // paths into `imports` edges (Phase 1b). It also powers the
+                    // dogfood gate (Task 14).
                     project_root = params.project_root;
                     let root = std::path::Path::new(&project_root);
-                    let symbol_table =
-                        loomweave_plugin_rust::symbol_table::build_symbol_table(root);
-                    let _ = symbol_table.len();
+                    symbol_table =
+                        Some(loomweave_plugin_rust::symbol_table::build_symbol_table(root));
                     crate_roots = Some(loomweave_plugin_rust::crate_roots::discover_crate_roots(
                         root,
                     ));
@@ -108,8 +112,11 @@ fn main() {
                 .unwrap_or(AnalyzeFileParams {
                     file_path: String::new(),
                 });
-                let (entities, edges, findings) =
-                    analyze_one_file(&params.file_path, crate_roots.as_ref());
+                let (entities, edges, findings) = analyze_one_file(
+                    &params.file_path,
+                    crate_roots.as_ref(),
+                    symbol_table.as_ref(),
+                );
                 let result = AnalyzeFileResult {
                     entities,
                     edges,
@@ -147,8 +154,12 @@ fn main() {
 fn analyze_one_file(
     file_path: &str,
     crate_roots: Option<&CrateRoots>,
+    symbol_table: Option<&SymbolTable>,
 ) -> (Vec<Value>, Vec<Value>, Vec<AnalyzeFileFinding>) {
-    use loomweave_plugin_rust::extract::extract_file_degraded_aware;
+    use loomweave_plugin_rust::extract::{
+        extract_file_degraded_aware, extract_file_degraded_aware_with_edges,
+    };
+    use loomweave_plugin_rust::resolve::Resolver;
     use loomweave_plugin_rust::scope::emittable_scope;
 
     let file = std::path::Path::new(file_path);
@@ -162,8 +173,23 @@ fn analyze_one_file(
     };
 
     let src = std::fs::read_to_string(file).unwrap_or_default();
-    let (entities, edges, finding_values) =
-        extract_file_degraded_aware(&crate_name, &module_path, file_path, &src);
+    // With the project symbol table stashed at `initialize`, resolve this file's
+    // in-project `use` paths into `imports` edges; without it (defensive — every
+    // real `initialize` builds one) fall back to the entities/`contains`-only
+    // path so analysis never silently aborts.
+    let (entities, edges, finding_values) = match symbol_table {
+        Some(table) => {
+            let resolver = Resolver::new(table);
+            extract_file_degraded_aware_with_edges(
+                &crate_name,
+                &module_path,
+                file_path,
+                &src,
+                &resolver,
+            )
+        }
+        None => extract_file_degraded_aware(&crate_name, &module_path, file_path, &src),
+    };
     let findings = finding_values
         .into_iter()
         .filter_map(|v| serde_json::from_value::<AnalyzeFileFinding>(v).ok())

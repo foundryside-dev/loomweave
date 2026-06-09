@@ -24,13 +24,15 @@
 use serde_json::{Value, json};
 use syn::{
     ImplItem, Item, ItemConst, ItemEnum, ItemFn, ItemImpl, ItemMacro, ItemMod, ItemStatic,
-    ItemStruct, ItemTrait, ItemType, Meta,
+    ItemStruct, ItemTrait, ItemType, ItemUse, Meta, UseTree,
 };
 
+use crate::edges::imports_edge;
 use crate::qualname::{
     build_entity_id, cfg_discriminant, free_item_qualname, impl_disc_for, impl_qualname,
     self_ty_name,
 };
+use crate::resolve::{Resolution, Resolver};
 use crate::signature::{function_signature, impl_signature, struct_signature};
 use crate::spans::{SourceRange, source_range_of};
 
@@ -61,9 +63,55 @@ pub fn extract_file_full(
     file_path: &str,
     src: &str,
 ) -> Result<Extracted, syn::Error> {
+    // No resolver → no `imports` edges (entities + structural `contains` only).
+    // Keeps identity / uniqueness / symbol-table callers byte-identical.
+    extract_file_inner(crate_name, module_path, file_path, src, None)
+}
+
+/// Edges-aware extraction (Phase 1b, Task 7): everything [`extract_file_full`]
+/// emits, **plus** resolved `imports` edges. Each file-scope `use` leaf path is
+/// resolved against the project symbol table through `resolver`:
+/// - a unique in-project target → a `resolved` anchored `imports` edge,
+/// - a glob / multi-kind candidate → an `ambiguous` anchored `imports` edge,
+/// - an external (or unresolvable) path → NOTHING (D1: external dropped).
+///
+/// `crate_name` is the resolution origin (`from_crate`) — it is NOT the dotted
+/// `module_path` (which already bakes the crate in). The `imports` edge's
+/// `from_id` is the enclosing **module** entity (a file-scope `use` is a module
+/// property); its byte span anchors the `use` statement.
+///
+/// # Errors
+///
+/// As [`extract_file_full`].
+pub fn extract_file_with_edges(
+    crate_name: &str,
+    module_path: &str,
+    file_path: &str,
+    src: &str,
+    resolver: &Resolver,
+) -> Result<Extracted, syn::Error> {
+    extract_file_inner(
+        crate_name,
+        module_path,
+        file_path,
+        src,
+        Some((crate_name, resolver)),
+    )
+}
+
+/// Shared extraction core. `resolution = None` skips `use`-edge resolution
+/// entirely (the [`extract_file_full`] contract); `Some((from_crate, resolver))`
+/// resolves each `use` leaf into an anchored `imports` edge.
+fn extract_file_inner(
+    crate_name: &str,
+    module_path: &str,
+    file_path: &str,
+    src: &str,
+    resolution: Option<(&str, &Resolver)>,
+) -> Result<Extracted, syn::Error> {
     // `crate_name` is already encoded into `module_path` (Task 2 builds the
-    // dotted path crate-rooted). It stays in the public signature for Phase 1b
-    // cross-crate edge resolution; extraction itself does not consult it.
+    // dotted path crate-rooted). Extraction of entities does not consult it; the
+    // resolver path receives the origin crate via `resolution` instead.
     let _ = crate_name;
     let file = syn::parse_file(src)?;
     let mut entities = Vec::new();
@@ -88,6 +136,7 @@ pub fn extract_file_full(
         module_path,
         &module_id,
         file_path,
+        resolution,
         &mut entities,
         &mut edges,
     )?;
@@ -132,7 +181,45 @@ pub fn extract_file_degraded_aware(
     file_path: &str,
     src: &str,
 ) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
-    match extract_file_full(crate_name, module_path, file_path, src) {
+    degraded_aware(
+        module_path,
+        file_path,
+        extract_file_full(crate_name, module_path, file_path, src),
+    )
+}
+
+/// Edges-aware degraded wrapper (Task 7): like [`extract_file_degraded_aware`]
+/// but resolves `use` paths into `imports` edges via `resolver` on a clean
+/// parse. The degraded fallback is identical — a single `syntax_error` module
+/// plus a Warning finding, no edges — because an unparseable file has no `use`
+/// tree to resolve.
+///
+/// Returns `(entities, edges, findings)`.
+#[must_use]
+pub fn extract_file_degraded_aware_with_edges(
+    crate_name: &str,
+    module_path: &str,
+    file_path: &str,
+    src: &str,
+    resolver: &Resolver,
+) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+    degraded_aware(
+        module_path,
+        file_path,
+        extract_file_with_edges(crate_name, module_path, file_path, src, resolver),
+    )
+}
+
+/// Shape an extraction `Result` into the degraded-aware
+/// `(entities, edges, findings)` triple: a clean parse passes through with no
+/// findings; a parse error collapses to a single `syntax_error` module entity
+/// plus one Warning finding and no edges.
+fn degraded_aware(
+    module_path: &str,
+    file_path: &str,
+    extracted: Result<Extracted, syn::Error>,
+) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+    match extracted {
         Ok(Extracted { entities, edges }) => (entities, edges, Vec::new()),
         Err(e) => {
             // Best-effort id; if the module path itself is unrepresentable the
@@ -177,6 +264,7 @@ fn walk_items(
     module_path: &str,
     parent_id: &str,
     file_path: &str,
+    resolution: Option<(&str, &Resolver)>,
     out: &mut Vec<Value>,
     edges: &mut Vec<Value>,
 ) -> Result<(), syn::Error> {
@@ -326,7 +414,15 @@ fn walk_items(
                     None,
                 )?);
                 let nested_id = build_id("module", &nested)?;
-                walk_items(inner, &nested, &nested_id, file_path, out, edges)?;
+                walk_items(
+                    inner,
+                    &nested,
+                    &nested_id,
+                    file_path,
+                    resolution,
+                    out,
+                    edges,
+                )?;
             }
             // Phase 1b leaf kinds: free items riding the same qualname + entity +
             // contains pattern as `struct`/`function`, with `None` signature (no
@@ -446,10 +542,99 @@ fn walk_items(
                 )?;
                 push_with_contains(parent_id, child, out, edges);
             }
-            _ => {} // `impl` entity is Task 5; macro invocations / use / extern etc. unmodelled.
+            // `use` items resolve to anchored `imports` edges (Phase 1b, Task 7)
+            // — ONLY when a resolver is threaded (the edges-aware entry point).
+            // A `use` at item scope is a property of the enclosing module, so the
+            // edge's `from_id` is `parent_id` (the module/file entity, never
+            // `core:file:*`). The whole `use` statement's byte span anchors every
+            // leaf edge it expands to.
+            Item::Use(it) => {
+                if let Some((from_crate, resolver)) = resolution {
+                    emit_use_edges(it, from_crate, parent_id, resolver, edges);
+                }
+            }
+            _ => {} // macro invocations / extern / etc. unmodelled.
         }
     }
     Ok(())
+}
+
+/// Resolve one `use` item into zero or more anchored `imports` edges.
+///
+/// The `use` tree is expanded to leaf paths (`use a::{b, c::d};` → `a::b`,
+/// `a::c::d`; `use a::*;` → `a::*`; `use a::B as C;` → `a::B`, alias dropped),
+/// each resolved against the project symbol table:
+/// - [`Resolution::Resolved`] → a `resolved` `imports` edge to the unique id,
+/// - [`Resolution::Ambiguous`] → an `ambiguous` `imports` edge to the candidate,
+/// - [`Resolution::External`] → NOTHING (D1: external targets dropped).
+///
+/// Every emitted edge is anchored at the whole `use` statement's byte span
+/// (`from = module entity`, `to = resolved id`).
+fn emit_use_edges(
+    it: &ItemUse,
+    from_crate: &str,
+    from_id: &str,
+    resolver: &Resolver,
+    edges: &mut Vec<Value>,
+) {
+    let span = source_range_of(it);
+    let mut leaves = Vec::new();
+    collect_use_leaves(&it.tree, "", &mut leaves);
+    for leaf in leaves {
+        let (to_id, confidence) = match resolver.resolve_use_path(from_crate, &leaf) {
+            Resolution::Resolved(id) => (id, "resolved"),
+            Resolution::Ambiguous(id) => (id, "ambiguous"),
+            Resolution::External => continue,
+        };
+        edges.push(imports_edge(from_id, &to_id, confidence, &span));
+    }
+}
+
+/// Flatten a [`syn::UseTree`] into `::`-joined leaf paths.
+///
+/// `prefix` is the accumulated `::`-joined path from the ancestors. `Path`
+/// descends one segment; `Name`/`Rename` terminate a leaf (the rename alias is
+/// dropped — resolution keys on the REAL imported path, per the resolver
+/// contract); `Glob` terminates a `<prefix>::*` leaf (the resolver special-cases
+/// the `::*` suffix); `Group` fans out to each branch sharing `prefix`.
+///
+/// `self` as a group leaf (`use a::b::{self, Display};` — the very common
+/// "import the module itself plus some of its items" idiom) terminates the
+/// `prefix` path UNCHANGED (`a::b`), not `a::b::self`: `self` here names the
+/// enclosing module, and the resolver only special-cases a *leading* `self`.
+/// Appending the literal segment would miss the table and silently drop the
+/// module edge.
+fn collect_use_leaves(tree: &UseTree, prefix: &str, out: &mut Vec<String>) {
+    let joined = |seg: &str| {
+        if prefix.is_empty() {
+            seg.to_owned()
+        } else {
+            format!("{prefix}::{seg}")
+        }
+    };
+    match tree {
+        UseTree::Path(p) => {
+            collect_use_leaves(&p.tree, &joined(&p.ident.to_string()), out);
+        }
+        // A `self` leaf names the enclosing module: emit `prefix` as-is. (Only
+        // meaningful inside a `Group`; a bare `use self;` carries an empty
+        // prefix and contributes nothing, which is correct.)
+        UseTree::Name(n) if n.ident == "self" => {
+            if !prefix.is_empty() {
+                out.push(prefix.to_owned());
+            }
+        }
+        UseTree::Name(n) => out.push(joined(&n.ident.to_string())),
+        // `use a::B as C;` — resolve the REAL path `a::B`, ignore the alias `C`.
+        UseTree::Rename(r) => out.push(joined(&r.ident.to_string())),
+        // `use a::*;` — pass the `::*`-suffixed path; the resolver handles it.
+        UseTree::Glob(_) => out.push(joined("*")),
+        UseTree::Group(g) => {
+            for branch in &g.items {
+                collect_use_leaves(branch, prefix, out);
+            }
+        }
+    }
 }
 
 // `impl_is_cfg_twin` is a borrowed closure (one per item list); `seen_impl_ids`
