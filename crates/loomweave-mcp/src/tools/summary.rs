@@ -21,8 +21,8 @@ use loomweave_storage::{
     SummaryCacheEntry, SummaryCacheKey, WriterCmd, call_edges_from, call_edges_targeting,
     candidate_entities_for_unresolved_sites, entity_by_id, existing_entity_ids,
     guidance_sheet_is_expired, guidance_sheet_matches_entity, inferred_edge_cache_lookup,
-    list_guidance_sheets, summary_cache_lookup, unresolved_call_sites_for_caller,
-    unresolved_callers_for_target,
+    list_guidance_sheets, resolve_entity_ref, summary_cache_lookup,
+    unresolved_call_sites_for_caller, unresolved_callers_for_target,
 };
 
 use crate::{
@@ -136,6 +136,23 @@ impl ServerState {
         }
 
         Ok(self.refresh_summary(*ready, summary_llm, now).await)
+    }
+
+    /// Resolve an id-or-SEI to its canonical `entities.id` locator via a single
+    /// reader call. Returns `Ok(None)` when nothing alive resolves. Used to
+    /// canonicalize a raw arg ONCE at the top of the `ensure_inferred_*`
+    /// pre-gated tools so both the inference pass and the reader key on the real
+    /// locator rather than re-resolving a SEI each time (clarion-d76e7f7267).
+    pub(crate) async fn resolve_to_locator(
+        &self,
+        id_or_sei: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let id_or_sei = id_or_sei.to_owned();
+        self.readers
+            .with_reader(move |conn| {
+                Ok(resolve_entity_ref(conn, &id_or_sei)?.map(|entity| entity.id))
+            })
+            .await
     }
 
     pub(crate) async fn ensure_inferred_for_target(
@@ -482,7 +499,7 @@ impl ServerState {
         let project_root = self.project_root.clone();
         self.readers
             .with_reader(move |conn| {
-                let Some(entity) = entity_by_id(conn, &entity_id)? else {
+                let Some(entity) = resolve_entity_ref(conn, &entity_id)? else {
                     return Ok(SummaryRead::EntityNotFound(entity_id));
                 };
                 if entity.kind == "subsystem" {

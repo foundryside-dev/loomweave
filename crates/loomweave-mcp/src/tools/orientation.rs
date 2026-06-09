@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use loomweave_storage::{
     ReferenceDirection, StorageError, ancestor_chain, call_edges_from, call_edges_targeting,
     child_entity_ids, entities_containing_line, entity_by_id, has_any_alive_binding,
-    normalize_source_path,
+    normalize_source_path, resolve_entity_ref,
 };
 
 use crate::{
@@ -79,7 +79,7 @@ impl ServerState {
                     (candidates.first().cloned(), candidates)
                 } else {
                     let id = entity_id_arg.as_deref().unwrap_or_default();
-                    match entity_by_id(conn, id)? {
+                    match resolve_entity_ref(conn, id)? {
                         Some(entity) => (Some(entity.clone()), vec![entity]),
                         None => (None, Vec::new()),
                     }

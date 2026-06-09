@@ -231,6 +231,36 @@ async fn entity_sei_is_null_without_binding_and_populated_with_one() {
     );
 }
 
+#[tokio::test]
+async fn wardline_for_accepts_sei_and_resolves_to_same_entity_as_locator() {
+    // Item 1 (clarion-d76e7f7267): wardline_for accepts a SEI and resolves it to
+    // the same entity as the locator.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
+    insert_taint_fact(
+        &conn,
+        "python:function:m.f",
+        r#"{"taint":"tainted","sources":["request.body"]}"#,
+    );
+    insert_alive_sei(&conn, "loomweave:eid:mf", "python:function:m.f");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let by_locator = call_tool(&state, "wardline_for", json!({"id": "python:function:m.f"})).await;
+    let by_sei = call_tool(&state, "wardline_for", json!({"id": "loomweave:eid:mf"})).await;
+
+    assert_eq!(by_locator["ok"], true, "{by_locator}");
+    assert_eq!(by_sei["ok"], true, "SEI must resolve: {by_sei}");
+    assert_eq!(by_sei["result"]["result_kind"], "present");
+    assert_eq!(by_sei["result"], by_locator["result"]);
+}
+
 // ---- findings_for -------------------------------------------------------
 
 #[tokio::test]

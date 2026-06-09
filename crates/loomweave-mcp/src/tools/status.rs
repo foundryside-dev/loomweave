@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use loomweave_core::{LeafSummaryPromptInput, McpErrorCode, build_leaf_summary_prompt};
 use serde_json::{Value, json};
 
-use loomweave_storage::{StorageError, contained_entity_ids, entity_by_id, has_any_alive_binding};
+use loomweave_storage::{
+    StorageError, contained_entity_ids, entity_by_id, has_any_alive_binding, resolve_entity_ref,
+};
 
 use crate::{
     IssuesForRead, ParamError, SUMMARY_MAX_OUTPUT_TOKENS, ServerState, SummaryRead, entity_json,
@@ -53,7 +55,7 @@ impl ServerState {
         let payload = self
             .readers
             .with_reader(move |conn| {
-                let Some(entity) = entity_by_id(conn, &id_for_reader)? else {
+                let Some(entity) = resolve_entity_ref(conn, &id_for_reader)? else {
                     return Ok(None);
                 };
                 Ok(Some(source_for_entity_json(conn, &entity, context_lines)))
@@ -458,13 +460,13 @@ impl ServerState {
     ) -> Result<Option<IssuesForRead>, StorageError> {
         self.readers
             .with_reader(move |conn| {
-                let Some(root) = entity_by_id(conn, &entity_id)? else {
+                let Some(root) = resolve_entity_ref(conn, &entity_id)? else {
                     return Ok(None);
                 };
                 let mut ids = vec![root.id.clone()];
                 let mut entity_cap_truncated = false;
                 if include_contained {
-                    let contained = contained_entity_ids(conn, &entity_id, 1_000)?;
+                    let contained = contained_entity_ids(conn, &root.id, 1_000)?;
                     entity_cap_truncated = contained.truncated;
                     ids.extend(contained.entity_ids);
                 }

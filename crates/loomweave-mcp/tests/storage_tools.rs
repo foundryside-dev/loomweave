@@ -30,8 +30,8 @@ use loomweave_mcp::{
     list_tools,
 };
 use loomweave_storage::{
-    GuidanceSheetInput, ReaderPool, SummaryCacheEntry, SummaryCacheKey, Writer, pragma, schema,
-    upsert_guidance_sheet, upsert_summary_cache,
+    GuidanceProposal, GuidanceSheetInput, ReaderPool, SummaryCacheEntry, SummaryCacheKey, Writer,
+    pragma, schema, upsert_guidance_sheet, upsert_summary_cache,
 };
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -6058,4 +6058,306 @@ async fn issues_for_dotted_method_qualname_reconciles_end_to_end() {
     let items = section["items"].as_array().expect("items array");
     assert_eq!(items.len(), 1, "one matched finding: {section}");
     assert_eq!(items[0]["rule_id"], "WLN-X");
+}
+
+// ---------------------------------------------------------------------------
+// Item 1 (clarion-d76e7f7267): id-taking tools accept a SEI and resolve it to
+// the SAME entity as the locator. Each test seeds the alive binding
+// loomweave:eid:demo-entry -> python:function:demo.entry, then asserts a call
+// keyed by the SEI matches a call keyed by the locator.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn callers_of_accepts_sei_and_resolves_to_same_entity_as_locator() {
+    let (project, db_path) = open_project();
+    seed_alive_sei_binding(
+        &db_path,
+        "loomweave:eid:demo-entry",
+        "python:function:demo.mid",
+    );
+    let state = state_for(project.path(), &db_path);
+
+    let by_locator = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.mid"}),
+    )
+    .await;
+    let by_sei = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "loomweave:eid:demo-entry"}),
+    )
+    .await;
+
+    assert_eq!(by_locator["ok"], true, "{by_locator}");
+    assert_eq!(by_sei["ok"], true, "{by_sei}");
+    assert_eq!(
+        by_sei["result"]["callers"], by_locator["result"]["callers"],
+        "SEI-keyed callers must equal locator-keyed callers"
+    );
+    assert_eq!(
+        by_sei["result"]["callers"][0]["entity"]["id"],
+        "python:function:demo.entry"
+    );
+}
+
+#[tokio::test]
+async fn neighborhood_accepts_sei_and_resolves_to_same_entity_as_locator() {
+    let (project, db_path) = open_project();
+    seed_alive_sei_binding(
+        &db_path,
+        "loomweave:eid:demo-entry",
+        "python:function:demo.entry",
+    );
+    let state = state_for(project.path(), &db_path);
+
+    let by_locator = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    let by_sei = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "loomweave:eid:demo-entry"}),
+    )
+    .await;
+
+    assert_eq!(by_locator["ok"], true, "{by_locator}");
+    assert_eq!(by_sei["ok"], true, "{by_sei}");
+    assert_eq!(
+        by_sei["result"]["entity"]["id"],
+        "python:function:demo.entry"
+    );
+    assert_eq!(by_sei["result"]["callees"], by_locator["result"]["callees"]);
+}
+
+#[tokio::test]
+async fn summary_accepts_sei_and_resolves_to_same_entity_as_locator() {
+    let (project, db_path) = open_project();
+    seed_alive_sei_binding(
+        &db_path,
+        "loomweave:eid:demo-entry",
+        "python:function:demo.entry",
+    );
+    // No LLM configured: both resolve to the same entity and return the same
+    // llm-disabled envelope rather than EntityNotFound (the SEI was accepted).
+    let state =
+        state_for(project.path(), &db_path).with_tool_policy(McpToolPolicy::allow_write_tools());
+
+    let by_locator = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    let by_sei = call_tool(&state, "summary", json!({"id": "loomweave:eid:demo-entry"})).await;
+
+    assert_eq!(by_locator["error"]["code"], "llm-disabled", "{by_locator}");
+    assert_eq!(
+        by_sei["error"]["code"], "llm-disabled",
+        "a seeded SEI must resolve to the same llm-disabled outcome, not 404: {by_sei}"
+    );
+}
+
+#[tokio::test]
+async fn source_for_entity_accepts_sei_and_resolves_to_same_entity_as_locator() {
+    let (project, db_path) = open_project();
+    seed_alive_sei_binding(
+        &db_path,
+        "loomweave:eid:demo-entry",
+        "python:function:demo.entry",
+    );
+    let state = state_for(project.path(), &db_path);
+
+    let by_locator = call_tool(
+        &state,
+        "source_for_entity",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    let by_sei = call_tool(
+        &state,
+        "source_for_entity",
+        json!({"id": "loomweave:eid:demo-entry"}),
+    )
+    .await;
+
+    assert_eq!(by_locator["ok"], true, "{by_locator}");
+    assert_eq!(by_sei["ok"], true, "{by_sei}");
+    assert_eq!(by_sei["result"], by_locator["result"]);
+}
+
+#[tokio::test]
+async fn call_sites_accepts_sei_and_resolves_to_same_entity_as_locator() {
+    // The new existence gate (Landmine #3): call_sites had no gate, so a SEI
+    // would silently return empty. Assert SEI == locator here, and the
+    // orphan/unknown-SEI -> NotFound case in the dedicated test below.
+    let (project, db_path) = open_project();
+    seed_alive_sei_binding(
+        &db_path,
+        "loomweave:eid:demo-entry",
+        "python:function:demo.entry",
+    );
+    let state = state_for(project.path(), &db_path);
+
+    let by_locator = call_tool(
+        &state,
+        "call_sites",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    let by_sei = call_tool(
+        &state,
+        "call_sites",
+        json!({"id": "loomweave:eid:demo-entry"}),
+    )
+    .await;
+
+    assert_eq!(by_locator["ok"], true, "{by_locator}");
+    assert_eq!(
+        by_sei["ok"], true,
+        "SEI must resolve, not silent-empty: {by_sei}"
+    );
+    assert_eq!(by_sei["result"], by_locator["result"]);
+}
+
+#[tokio::test]
+async fn call_sites_unknown_sei_is_not_found_not_empty() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let env = call_tool(
+        &state,
+        "call_sites",
+        json!({"id": "loomweave:eid:does-not-exist"}),
+    )
+    .await;
+
+    assert_eq!(
+        env["ok"], false,
+        "unknown SEI must be an error, not empty: {env}"
+    );
+    assert_eq!(env["error"]["code"], "not-found");
+}
+
+#[tokio::test]
+async fn id_taking_tool_rejects_orphaned_sei_as_entity_not_found() {
+    // A SEI that resolves to NotAlive (no binding seeded) must fail closed:
+    // resolve_entity_ref returns None -> EntityNotFound.
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let env = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "loomweave:eid:orphaned-unknown"}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], false, "{env}");
+    assert_eq!(env["error"]["code"], "entity-not-found");
+    assert!(
+        env["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("loomweave:eid:orphaned-unknown"),
+        "EntityNotFound echoes the pasted SEI: {env}"
+    );
+}
+
+#[tokio::test]
+async fn find_entity_with_pasted_sei_returns_the_resolved_entity() {
+    // Item 1.E: a pasted SEI exact-resolves (was empty before — the SEI lives
+    // only in sei_bindings, never in any entities column).
+    let (project, db_path) = open_project();
+    seed_alive_sei_binding(
+        &db_path,
+        "loomweave:eid:demo-entry",
+        "python:function:demo.entry",
+    );
+    let state = state_for(project.path(), &db_path);
+
+    let env = call_tool(
+        &state,
+        "find_entity",
+        json!({"pattern": "loomweave:eid:demo-entry"}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let entities = env["result"]["entities"]
+        .as_array()
+        .expect("entities array");
+    assert_eq!(
+        entities.len(),
+        1,
+        "pasted SEI exact-resolves to one row: {env}"
+    );
+    assert_eq!(entities[0]["id"], "python:function:demo.entry");
+}
+
+#[tokio::test]
+async fn find_entity_with_unknown_sei_returns_empty_not_error() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let env = call_tool(
+        &state,
+        "find_entity",
+        json!({"pattern": "loomweave:eid:nope"}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(
+        env["result"]["entities"]
+            .as_array()
+            .expect("entities")
+            .len(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn propose_guidance_accepts_sei_but_stores_the_locator_in_match_rule() {
+    // Landmine #1: a SEI may be accepted, but the default match_rule and the
+    // proposal's entity_id MUST carry the resolved LOCATOR, not the raw SEI —
+    // otherwise the stored guidance silently becomes SEI-keyed.
+    let (project, db_path) = open_project();
+    seed_alive_sei_binding(
+        &db_path,
+        "loomweave:eid:demo-entry",
+        "python:function:demo.entry",
+    );
+    let client = Arc::new(FakeFiligreeClient::default());
+    let state = state_for_filigree(project.path(), &db_path, client.clone());
+
+    let proposed = call_tool(
+        &state,
+        "propose_guidance",
+        json!({
+            "entity_id": "loomweave:eid:demo-entry",
+            "content": "Locator-keyed guidance even when proposed by SEI.",
+            "scope_level": "function"
+        }),
+    )
+    .await;
+
+    assert_eq!(proposed["ok"], true, "{proposed}");
+    let created = client.created_observations();
+    assert_eq!(created.len(), 1);
+    let proposal =
+        GuidanceProposal::from_observation_detail(&created[0].detail).expect("parse proposal");
+    assert_eq!(
+        proposal.entity_id, "python:function:demo.entry",
+        "proposal entity_id must be the resolved locator, not the SEI"
+    );
+    assert_eq!(
+        proposal.match_rules[0]["id"], "python:function:demo.entry",
+        "default match_rule id must be the locator, not the SEI: {:?}",
+        proposal.match_rules
+    );
 }

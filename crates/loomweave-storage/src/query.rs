@@ -743,6 +743,21 @@ pub fn find_entities(
     offset: usize,
     kind: Option<&str>,
 ) -> Result<Vec<EntityRow>> {
+    // A pasted SEI (`loomweave:eid:...`) is exact-resolve, not fuzzy substring:
+    // the SEI lives only in `sei_bindings.sei`, never in any `entities` column,
+    // so the LIKE/FTS recall below would find NOTHING. Short-circuit to
+    // `resolve_entity_ref` so a pasted SEI resolves to its 1 alive entity row,
+    // honoring offset/limit paging so `tool_find_entity`'s cursor logic stays
+    // consistent. Strictly additive — no SEI ever matched the recall paths
+    // before (clarion-d76e7f7267). A partial SEI hex prefix is not a meaningful
+    // search, so only a fully-reserved token short-circuits.
+    if crate::sei::is_reserved_sei(pattern.trim()) {
+        return Ok(resolve_entity_ref(conn, pattern.trim())?
+            .into_iter()
+            .skip(offset)
+            .take(limit.clamp(1, 100))
+            .collect());
+    }
     if pattern.trim().is_empty() {
         return Err(StorageError::InvalidQuery(
             "entity search pattern must not be blank".to_owned(),

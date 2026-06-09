@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use loomweave_storage::{
     EntityVisibility, ReferenceDirection, StorageError, ancestor_chain, call_edges_from,
     call_edges_targeting, child_entity_ids, entities_containing_line, entity_by_id,
-    entity_visibility, find_entities, normalize_source_path, subsystem_members,
+    entity_visibility, find_entities, normalize_source_path, resolve_entity_ref, subsystem_members,
     subsystem_of_entity,
 };
 
@@ -23,13 +23,13 @@ use crate::filigree::IssueDetail;
 use crate::{
     CallSiteKind, CallSiteRole, InferredDispatchStats, IssuesForAccumulator, ParamError, PathScope,
     PathTraversal, ServerState, build_call_sites, call_graph_scope_excludes, callee_json,
-    caller_json, compact_execution_paths, entity_context_json, entity_json, entity_properties_json,
-    envelope_from_storage_result, flatten_storage_envelope_result, import_neighbors,
-    issues_unavailable, optional_bool, optional_confidence, optional_usize, path_truncation_reason,
-    reference_neighbors_for, required_i64, required_str, storage_retryable, success_envelope,
-    success_envelope_with_stats, success_envelope_with_truncation,
-    success_envelope_with_truncation_and_stats, tool_error_envelope, wardline_section_for_entity,
-    wardline_unavailable,
+    caller_json, compact_execution_paths, entity_context_json, entity_json,
+    entity_not_found_envelope, entity_properties_json, envelope_from_storage_result,
+    flatten_storage_envelope_result, import_neighbors, issues_unavailable, optional_bool,
+    optional_confidence, optional_usize, path_truncation_reason, reference_neighbors_for,
+    required_i64, required_str, storage_retryable, success_envelope, success_envelope_with_stats,
+    success_envelope_with_truncation, success_envelope_with_truncation_and_stats,
+    tool_error_envelope, wardline_section_for_entity, wardline_unavailable,
 };
 
 impl ServerState {
@@ -137,8 +137,22 @@ impl ServerState {
         &self,
         arguments: &serde_json::Map<String, Value>,
     ) -> std::result::Result<Value, ParamError> {
-        let entity_id = required_str(arguments, "id")?.to_owned();
+        let requested_id = required_str(arguments, "id")?.to_owned();
         let confidence = optional_confidence(arguments)?;
+        // Canonicalize the id-or-SEI to its locator ONCE, before the
+        // `ensure_inferred_*` pre-gate, so the inference pass and the reader both
+        // key on the real `entities.id` (clarion-d76e7f7267).
+        let entity_id = match self.resolve_to_locator(&requested_id).await {
+            Ok(Some(id)) => id,
+            Ok(None) => return Ok(entity_not_found_envelope(&requested_id)),
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::StorageError,
+                    &err.to_string(),
+                    storage_retryable(&err),
+                ));
+            }
+        };
         let stats_delta = if confidence == EdgeConfidence::Inferred {
             match self.ensure_inferred_for_target(&entity_id).await {
                 Ok(stats) => stats.to_json(),
@@ -150,13 +164,6 @@ impl ServerState {
         let result = self
             .readers
             .with_reader(move |conn| {
-                if entity_by_id(conn, &entity_id)?.is_none() {
-                    return Ok(tool_error_envelope(
-                        McpErrorCode::EntityNotFound,
-                        &format!("entity {entity_id} was not found"),
-                        false,
-                    ));
-                }
                 let callers = call_edges_targeting(conn, &entity_id, confidence)?
                     .into_iter()
                     .filter_map(|edge| caller_json(conn, &edge).transpose())
@@ -177,11 +184,25 @@ impl ServerState {
         &self,
         arguments: &serde_json::Map<String, Value>,
     ) -> std::result::Result<Value, ParamError> {
-        let entity_id = required_str(arguments, "id")?.to_owned();
+        let requested_id = required_str(arguments, "id")?.to_owned();
         let max_depth = optional_usize(arguments, "max_depth")?
             .unwrap_or(3)
             .clamp(1, 8);
         let confidence = optional_confidence(arguments)?;
+        // Canonicalize id-or-SEI to its locator ONCE, before the inferred-branch
+        // dispatch (which runs its own `ensure_inferred_*` pass) and the reader,
+        // so all downstream traversal keys on the real id (clarion-d76e7f7267).
+        let entity_id = match self.resolve_to_locator(&requested_id).await {
+            Ok(Some(id)) => id,
+            Ok(None) => return Ok(entity_not_found_envelope(&requested_id)),
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::StorageError,
+                    &err.to_string(),
+                    storage_retryable(&err),
+                ));
+            }
+        };
         if confidence == EdgeConfidence::Inferred {
             return Ok(self.inferred_execution_paths(entity_id, max_depth).await);
         }
@@ -190,13 +211,6 @@ impl ServerState {
         let result = self
             .readers
             .with_reader(move |conn| {
-                if entity_by_id(conn, &entity_id)?.is_none() {
-                    return Ok(tool_error_envelope(
-                        McpErrorCode::EntityNotFound,
-                        &format!("entity {entity_id} was not found"),
-                        false,
-                    ));
-                }
                 let mut traversal = PathTraversal::new(edge_cap);
                 let mut path = vec![entity_id.clone()];
                 traversal.walk(conn, &entity_id, &mut path, max_depth, confidence)?;
@@ -328,8 +342,21 @@ impl ServerState {
         &self,
         arguments: &serde_json::Map<String, Value>,
     ) -> std::result::Result<Value, ParamError> {
-        let entity_id = required_str(arguments, "id")?.to_owned();
+        let requested_id = required_str(arguments, "id")?.to_owned();
         let confidence = optional_confidence(arguments)?;
+        // Canonicalize id-or-SEI to its locator ONCE, before both
+        // `ensure_inferred_*` pre-gates and the reader (clarion-d76e7f7267).
+        let entity_id = match self.resolve_to_locator(&requested_id).await {
+            Ok(Some(id)) => id,
+            Ok(None) => return Ok(entity_not_found_envelope(&requested_id)),
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::StorageError,
+                    &err.to_string(),
+                    storage_retryable(&err),
+                ));
+            }
+        };
         if confidence == EdgeConfidence::Inferred {
             if let Err(err) = self.ensure_inferred_for_target(&entity_id).await {
                 return Ok(err.to_envelope());
@@ -563,7 +590,7 @@ impl ServerState {
         let result = self
             .readers
             .with_reader(move |conn| {
-                let Some(subsystem) = entity_by_id(conn, &subsystem_id)? else {
+                let Some(subsystem) = resolve_entity_ref(conn, &subsystem_id)? else {
                     return Ok(tool_error_envelope(
                         McpErrorCode::EntityNotFound,
                         &format!("entity {subsystem_id} was not found"),
@@ -625,7 +652,7 @@ impl ServerState {
         let result = self
             .readers
             .with_reader(move |conn| {
-                let Some(entity) = entity_by_id(conn, &entity_id)? else {
+                let Some(entity) = resolve_entity_ref(conn, &entity_id)? else {
                     return Ok(tool_error_envelope(
                         McpErrorCode::EntityNotFound,
                         &format!("entity {entity_id} was not found"),
@@ -691,7 +718,14 @@ impl ServerState {
         let result = self
             .readers
             .with_reader(move |conn| {
-                build_call_sites(conn, &entity_id, role, kind, confidence, path)
+                // ADD an existence gate (clarion-d76e7f7267): `build_call_sites`
+                // takes a raw locator with no gate, so a pasted SEI would silently
+                // return EMPTY instead of EntityNotFound. Resolve the id-or-SEI to
+                // its locator first, then thread the canonical id into the builder.
+                let Some(entity) = resolve_entity_ref(conn, &entity_id)? else {
+                    return Ok(None);
+                };
+                build_call_sites(conn, &entity.id, role, kind, confidence, path)
             })
             .await;
         match result {

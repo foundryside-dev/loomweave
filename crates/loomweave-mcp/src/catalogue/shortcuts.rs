@@ -15,7 +15,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use serde_json::{Value, json};
 
 use loomweave_core::{EdgeConfidence, McpErrorCode};
-use loomweave_storage::{call_edges_targeting, entities_by_churn, entity_by_id};
+use loomweave_storage::{
+    call_edges_targeting, entities_by_churn, entity_by_id, resolve_entity_ref,
+};
 
 use crate::ParamError;
 use crate::ServerState;
@@ -523,7 +525,7 @@ impl ServerState {
         let result = self
             .readers
             .with_reader(move |conn| {
-                let Some(entity) = entity_by_id(conn, &entity_id)? else {
+                let Some(entity) = resolve_entity_ref(conn, &entity_id)? else {
                     return Ok(tool_error_envelope(
                         McpErrorCode::EntityNotFound,
                         &format!("entity {entity_id} was not found"),

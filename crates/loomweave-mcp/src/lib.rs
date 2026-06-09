@@ -35,7 +35,8 @@ use loomweave_storage::{
     WriterCmd, call_edges_from, call_edges_targeting, containing_module_id,
     entity_briefing_block_reason, entity_by_id, import_edges_for_entity,
     inferred_edge_cache_key_id, module_reference_rollup, reference_edges_for_entity,
-    sei_for_locator, unresolved_call_sites_for_caller, unresolved_callers_for_target,
+    resolve_entity_ref, sei_for_locator, unresolved_call_sites_for_caller,
+    unresolved_callers_for_target,
 };
 
 use crate::config::{LlmConfig, SemanticSearchConfig};
@@ -1515,17 +1516,16 @@ impl ServerState {
             .get("expires")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
-        let match_rules = arguments
-            .get("match_rules")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_else(|| vec![json!({"type": "entity", "id": entity_id})]);
-
         let project_root = self.project_root.clone();
+        // Accept an id-or-SEI and resolve to the canonical locator FIRST
+        // (clarion-d76e7f7267). The default match_rule and the proposal's
+        // `entity_id` MUST carry the resolved `entity.id` (a locator), not the
+        // raw arg — otherwise a pasted SEI silently makes the stored guidance
+        // SEI-keyed instead of locator-keyed (a persisted-data-shape drift).
         let entity_lookup_id = entity_id.clone();
         let entity = match self
             .readers
-            .with_reader(move |conn| entity_by_id(conn, &entity_lookup_id))
+            .with_reader(move |conn| resolve_entity_ref(conn, &entity_lookup_id))
             .await
         {
             Ok(Some(entity)) => entity,
@@ -1545,8 +1545,15 @@ impl ServerState {
             }
         };
 
+        let resolved_id = entity.id.clone();
+        let match_rules = arguments
+            .get("match_rules")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| vec![json!({"type": "entity", "id": resolved_id})]);
+
         let proposal = GuidanceProposal {
-            entity_id: entity_id.clone(),
+            entity_id: entity.id.clone(),
             content,
             scope_level,
             match_rules,
@@ -2961,6 +2968,17 @@ fn success_envelope_with_stats(result: Value, stats_delta: Value) -> Value {
 
 fn tool_error_envelope(code: McpErrorCode, message: &str, retryable: bool) -> Value {
     tool_error_envelope_with_diagnostics(code, message, retryable, json!({}), Vec::new())
+}
+
+/// `EntityNotFound` envelope echoing the caller's original input string. Used by
+/// the id-or-SEI canonicalize-at-top path so an unresolvable SEI reports the
+/// exact token the caller pasted (clarion-d76e7f7267).
+fn entity_not_found_envelope(requested_id: &str) -> Value {
+    tool_error_envelope(
+        McpErrorCode::EntityNotFound,
+        &format!("entity {requested_id} was not found"),
+        false,
+    )
 }
 
 fn tool_error_envelope_with_diagnostics(

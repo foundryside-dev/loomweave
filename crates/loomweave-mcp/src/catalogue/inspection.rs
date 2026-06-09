@@ -11,7 +11,8 @@ use serde_json::{Value, json};
 
 use loomweave_core::McpErrorCode;
 use loomweave_storage::{
-    MatchFacts, RuleVerdict, entity_by_id, get_taint_facts, rule_match, sei_for_locator,
+    MatchFacts, Resolution, RuleVerdict, entity_by_id, get_taint_facts, resolve_entity_ref,
+    resolve_wardline_qualnames, rule_match, sei_for_locator,
 };
 
 use crate::ParamError;
@@ -54,7 +55,7 @@ impl ServerState {
         let result = self
             .readers
             .with_reader(move |conn| {
-                let Some(entity) = entity_by_id(conn, &entity_id)? else {
+                let Some(entity) = resolve_entity_ref(conn, &entity_id)? else {
                     return Ok(tool_error_envelope(
                         McpErrorCode::EntityNotFound,
                         &format!("entity {entity_id} was not found"),
@@ -188,7 +189,7 @@ impl ServerState {
         let result = self
             .readers
             .with_reader(move |conn| {
-                let Some(entity) = entity_by_id(conn, &entity_id)? else {
+                let Some(entity) = resolve_entity_ref(conn, &entity_id)? else {
                     return Ok(tool_error_envelope(
                         McpErrorCode::EntityNotFound,
                         &format!("entity {entity_id} was not found"),
@@ -365,7 +366,7 @@ impl ServerState {
         let result = self
             .readers
             .with_reader(move |conn| {
-                let Some(entity) = entity_by_id(conn, &entity_id)? else {
+                let Some(entity) = resolve_entity_ref(conn, &entity_id)? else {
                     return Ok(tool_error_envelope(
                         McpErrorCode::EntityNotFound,
                         &format!("entity {entity_id} was not found"),
