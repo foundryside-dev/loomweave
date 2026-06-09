@@ -118,7 +118,9 @@ fn install_all_wires_three_way_integration_bindings() {
         "install must not write a dead wardline.yaml that Wardline never reads"
     );
 
-    // The two peer URLs reach Wardline *only* via the `.mcp.json` launch flags.
+    // Loomweave registers the Wardline MCP server and owns only its OWN
+    // `--loomweave-url`. It cedes the emit URL (`--filigree-url`) to wardline's
+    // installer, so a fresh install writes none (weft emit incident 2026-06-10).
     let mcp: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dir.path().join(".mcp.json")).unwrap()).unwrap();
     assert_eq!(
@@ -128,9 +130,7 @@ fn install_all_wires_three_way_integration_bindings() {
             "--root",
             ".",
             "--loomweave-url",
-            expected_loomweave_url,
-            "--filigree-url",
-            "http://127.0.0.1:8749/api/weft/scan-results"
+            expected_loomweave_url
         ])
     );
 }

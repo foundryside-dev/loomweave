@@ -1,11 +1,18 @@
 //! Local three-way Loomweave/Filigree/Wardline dogfood bindings.
 //!
 //! These are intentionally configuration bindings, not a shared runtime:
-//! Loomweave enables its own optional HTTP and Filigree read surfaces, and the
-//! project-local `.mcp.json` launches Wardline with the two peer URLs as
-//! `--loomweave-url` / `--filigree-url` flags for MCP scans.
+//! Loomweave enables its own optional HTTP and Filigree read surfaces and, in
+//! the project-local `.mcp.json`, registers the Wardline MCP server and stamps
+//! **its own** `--loomweave-url` (the read-API Loomweave owns).
 //!
-//! Wardline receives those URLs *only* via the `.mcp.json` launch flags (its
+//! Loomweave does **not** own Wardline's emit URL (`--filigree-url`): that is
+//! project-scoped to the Filigree server-mode `/api/p/<prefix>/…` mount, which
+//! Loomweave cannot compute, and an unscoped write fail-closes with a silent
+//! 400 that drops every finding. So Loomweave carries an existing value forward
+//! verbatim and otherwise omits the flag; **wardline's own installer owns and
+//! scopes it** (ownership decision, weft emit incident 2026-06-10).
+//!
+//! Wardline receives URLs *only* via the `.mcp.json` launch flags (its
 //! `resolve_loomweave_url` / `resolve_filigree_url` precedence is
 //! flag > env > published `.weft/*/ephemeral.port`). It reads no URL from any
 //! `wardline.yaml` — that file is not in either resolver's chain — so Loomweave
@@ -35,12 +42,11 @@ pub enum BindingState {
     Unparseable,
 }
 
-// All three fields are URLs by nature; the `_url` suffix is the meaningful part
-// of each name, not redundant noise.
+// Both fields are URLs by nature; the `_url` suffix is the meaningful part of
+// each name, not redundant noise.
 #[allow(clippy::struct_field_names)]
 struct DesiredBindings {
     filigree_base_url: String,
-    wardline_filigree_url: String,
     loomweave_url: String,
 }
 
@@ -77,16 +83,12 @@ fn desired_bindings(project_root: &Path) -> DesiredBindings {
     let filigree_base_url = live_filigree_base_url(project_root)
         .or_else(|| configured_filigree_base_url(project_root))
         .unwrap_or_else(|| DEFAULT_FILIGREE_BASE_URL.to_owned());
-    // Server-mode Filigree mounts the federation write router under
-    // `/api/p/{prefix}/…` and fail-closes an unscoped write (filigree N1), so the
-    // bridge URL must carry the project scope or every wardline scan 400s. A
-    // single-project (non-server) Filigree, or no Filigree at all, keeps the
-    // unscoped `/api/…` mount. (gap-analysis opp #2 / weft path-scope action.)
-    let base = filigree_base_url.trim_end_matches('/');
-    let wardline_filigree_url = match filigree_server_scope(project_root) {
-        Some(prefix) => format!("{base}/api/p/{prefix}/weft/scan-results"),
-        None => format!("{base}/api/weft/scan-results"),
-    };
+    // NB: Loomweave no longer derives wardline's emit (`--filigree-url`) value —
+    // that is wardline's installer's job, project-scoped to the server-mode
+    // `/api/p/{prefix}/…` mount (ownership decision, weft emit incident
+    // 2026-06-10). `filigree_base_url` here is only for Loomweave's OWN Filigree
+    // *read* integration in loomweave.yaml, a separate path.
+    //
     // ADR-044: seed the consumer's static target with this project's
     // deterministic read-API port. serve binds the same port (barring an
     // ephemeral fallback), and the published .weft/loomweave/ephemeral.port file
@@ -95,33 +97,8 @@ fn desired_bindings(project_root: &Path) -> DesiredBindings {
     let loomweave_url = format!("http://127.0.0.1:{port}");
     DesiredBindings {
         filigree_base_url,
-        wardline_filigree_url,
         loomweave_url,
     }
-}
-
-/// This project's Filigree routing key, but only when Filigree runs in *server*
-/// mode (the case that requires a project-scoped `/api/p/{prefix}/…` write).
-///
-/// Reads `.weft/filigree/config.json`; the URL-facing key is `prefix` (filigree
-/// routes `/api/p/{prefix}` on it; `name` is display-only, kept as a fallback).
-/// Fail-soft: returns `None` (→ unscoped path) when the config is absent,
-/// unparseable, not `mode: "server"`, or carries no usable key — so a
-/// Loomweave-solo or single-project layout is unchanged.
-fn filigree_server_scope(project_root: &Path) -> Option<String> {
-    let path = project_root.join(".weft/filigree/config.json");
-    let raw = fs::read_to_string(path).ok()?;
-    let value: Value = serde_json::from_str(&raw).ok()?;
-    if value.get("mode").and_then(Value::as_str) != Some("server") {
-        return None;
-    }
-    value
-        .get("prefix")
-        .or_else(|| value.get("name"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .map(str::to_owned)
 }
 
 fn live_filigree_base_url(project_root: &Path) -> Option<String> {
@@ -195,12 +172,11 @@ fn wardline_mcp_ok(project_root: &Path, desired: &DesiredBindings) -> Result<boo
     let Some(entry) = servers.get("wardline") else {
         return Ok(false);
     };
-    // Compare against the *effective* args: a scoped emit URL already in place is
-    // not "stale" just because Loomweave would otherwise compute an unscoped one,
-    // so the no-clobber guard must not make doctor flap (check ↔ write parity).
+    // Loomweave cedes the emit URL: the expected args carry forward whatever
+    // wardline recorded, so this check validates Loomweave's own fields
+    // (command, --loomweave-url, structure) without judging wardline's emit URL.
     let existing = existing_wardline_filigree_url(&value);
-    let filigree_url = effective_wardline_filigree_url(desired, existing.as_deref());
-    Ok(entry.get("args") == Some(&desired_wardline_args(desired, &filigree_url)))
+    Ok(entry.get("args") == Some(&desired_wardline_args(desired, existing.as_deref())))
 }
 
 fn install_loomweave_yaml(project_root: &Path, desired: &DesiredBindings) -> Result<bool> {
@@ -257,10 +233,9 @@ fn install_wardline_mcp(project_root: &Path, desired: &DesiredBindings) -> Resul
             path.display()
         );
     }
-    // Read the existing emit URL *before* mutating, so the no-clobber guard can
-    // preserve a scoped value rather than downgrade it to the unscoped form.
+    // Read wardline's existing emit URL *before* mutating, so we carry it forward
+    // verbatim (Loomweave cedes ownership; it never synthesizes or downgrades it).
     let existing = existing_wardline_filigree_url(&root);
-    let filigree_url = effective_wardline_filigree_url(desired, existing.as_deref());
     let root_obj = root.as_object_mut().expect("root is object");
     let servers = root_obj
         .entry("mcpServers".to_owned())
@@ -269,7 +244,7 @@ fn install_wardline_mcp(project_root: &Path, desired: &DesiredBindings) -> Resul
     let desired_entry = json!({
         "type": "stdio",
         "command": wardline_command(),
-        "args": desired_wardline_args(desired, &filigree_url),
+        "args": desired_wardline_args(desired, existing.as_deref()),
     });
     if servers.get("wardline") == Some(&desired_entry) {
         return Ok(false);
@@ -278,28 +253,30 @@ fn install_wardline_mcp(project_root: &Path, desired: &DesiredBindings) -> Resul
     write_json_if_changed(&path, &root)
 }
 
-fn desired_wardline_args(desired: &DesiredBindings, filigree_url: &str) -> Value {
-    json!([
-        "mcp",
-        "--root",
-        ".",
-        "--loomweave-url",
-        desired.loomweave_url,
-        "--filigree-url",
-        filigree_url
-    ])
+/// Loomweave does **not** own wardline's emit URL — wardline's own installer
+/// writes and project-scopes `--filigree-url` (it knows its own Filigree prefix;
+/// the server-mode daemon fail-closes an unscoped write with a silent 400 that
+/// drops every finding). So Loomweave carries an existing value forward verbatim
+/// and otherwise **omits** the flag; it never synthesizes one. (Ownership
+/// decision, weft emit incident 2026-06-10: Loomweave cedes the emit URL to
+/// wardline; it cannot compute the `/api/p/<prefix>/` scope itself.)
+fn desired_wardline_args(desired: &DesiredBindings, filigree_url: Option<&str>) -> Value {
+    let mut args = vec![
+        json!("mcp"),
+        json!("--root"),
+        json!("."),
+        json!("--loomweave-url"),
+        json!(desired.loomweave_url),
+    ];
+    if let Some(url) = filigree_url {
+        args.push(json!("--filigree-url"));
+        args.push(json!(url));
+    }
+    Value::Array(args)
 }
 
-/// A scan-results URL is project-scoped when it carries the server-mode
-/// `/api/p/<project>/` mount. The shared `--server-mode` daemon **fail-closes an
-/// unscoped write with a 400 that looks like a successful POST**, silently
-/// dropping every finding (weft emit incident, 2026-06-10).
-fn is_scoped_scan_url(url: &str) -> bool {
-    url.contains("/api/p/")
-}
-
-/// The `--filigree-url` value currently recorded in the project's `.mcp.json`
-/// wardline entry, if any.
+/// The `--filigree-url` value wardline currently records in the project's
+/// `.mcp.json` entry, if any — carried forward verbatim (Loomweave never owns it).
 fn existing_wardline_filigree_url(root: &Value) -> Option<String> {
     let args = root
         .get("mcpServers")?
@@ -310,26 +287,6 @@ fn existing_wardline_filigree_url(root: &Value) -> Option<String> {
         .iter()
         .position(|arg| arg.as_str() == Some("--filigree-url"))?;
     args.get(flag + 1)?.as_str().map(str::to_owned)
-}
-
-/// No-clobber guard: Loomweave must never replace an existing **scoped** emit URL
-/// with its own **unscoped** computation. When Loomweave cannot itself determine
-/// the project scope — it has no server-mode marker to read yet (the per-store
-/// server-mode marker is a pending Filigree producer-side contract) —
-/// `desired.wardline_filigree_url` falls back to the unscoped form; writing that
-/// over a good scoped value is exactly what makes
-/// findings vanish. So if the desired value is unscoped and the project already
-/// carries a scoped one, keep theirs. (Wardline's own installer owns the scoped
-/// value; this guard just stops Loomweave from downgrading it.)
-fn effective_wardline_filigree_url(desired: &DesiredBindings, existing: Option<&str>) -> String {
-    match existing {
-        Some(url)
-            if !is_scoped_scan_url(&desired.wardline_filigree_url) && is_scoped_scan_url(url) =>
-        {
-            url.to_owned()
-        }
-        _ => desired.wardline_filigree_url.clone(),
-    }
 }
 
 fn wardline_command() -> String {
@@ -425,69 +382,10 @@ fn write_text_if_changed(path: &Path, content: &str) -> Result<bool> {
 mod tests {
     use super::*;
 
-    fn write_filigree_config(root: &Path, body: &str) {
-        let dir = root.join(".weft/filigree");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("config.json"), body).unwrap();
-    }
-
-    /// Server-mode Filigree fail-closes an unscoped federation write, so the
-    /// bridge URL must carry the project scope `/api/p/{prefix}/…`.
-    #[test]
-    fn server_mode_filigree_yields_project_scoped_bridge_url() {
-        let dir = tempfile::tempdir().unwrap();
-        write_filigree_config(
-            dir.path(),
-            r#"{"prefix":"lacuna","name":"lacuna","mode":"server"}"#,
-        );
-        let desired = desired_bindings(dir.path());
-        assert!(
-            desired
-                .wardline_filigree_url
-                .ends_with("/api/p/lacuna/weft/scan-results"),
-            "server-mode Filigree must scope the bridge URL: {}",
-            desired.wardline_filigree_url
-        );
-    }
-
-    /// Single-project (non-server) Filigree serves the unscoped `/api/…` mount,
-    /// so the bridge URL stays unscoped.
-    #[test]
-    fn non_server_filigree_keeps_unscoped_bridge_url() {
-        let dir = tempfile::tempdir().unwrap();
-        write_filigree_config(
-            dir.path(),
-            r#"{"prefix":"lacuna","name":"lacuna","mode":"single"}"#,
-        );
-        let desired = desired_bindings(dir.path());
-        assert!(
-            desired
-                .wardline_filigree_url
-                .ends_with("/api/weft/scan-results")
-                && !desired.wardline_filigree_url.contains("/api/p/"),
-            "non-server Filigree keeps the unscoped path: {}",
-            desired.wardline_filigree_url
-        );
-    }
-
-    /// No Filigree config (Loomweave-solo, or pre-init) → unscoped, fail-soft.
-    #[test]
-    fn absent_filigree_config_keeps_unscoped_bridge_url() {
-        let dir = tempfile::tempdir().unwrap();
-        let desired = desired_bindings(dir.path());
-        assert!(
-            desired
-                .wardline_filigree_url
-                .ends_with("/api/weft/scan-results"),
-            "absent Filigree config keeps the unscoped path: {}",
-            desired.wardline_filigree_url
-        );
-    }
-
-    /// A `.mcp.json` whose wardline entry matches what Loomweave would write
-    /// except for the emit URL — same resolved command, same loomweave-url — so
-    /// the emit URL is the only variable under test.
-    fn mcp_json_matching(desired: &DesiredBindings, filigree_url: &str) -> String {
+    /// A `.mcp.json` wardline entry as wardline's installer would write it —
+    /// resolved command, Loomweave's loomweave-url, and a wardline-owned scoped
+    /// `--filigree-url`.
+    fn wardline_entry_with_emit(desired: &DesiredBindings, filigree_url: &str) -> String {
         let command = wardline_command();
         let loomweave_url = &desired.loomweave_url;
         format!(
@@ -495,67 +393,86 @@ mod tests {
         )
     }
 
-    /// The no-clobber guard: when Loomweave cannot itself scope the emit URL (no
-    /// server-mode marker → `desired` is unscoped), it must NOT overwrite an
-    /// existing scoped `--filigree-url`. Downgrading it to the unscoped form is
-    /// what makes the server-mode daemon fail-close the write with a silent 400.
+    /// Cede: Loomweave carries wardline's existing scoped emit URL forward
+    /// verbatim and does not rewrite the entry (the server-mode daemon
+    /// fail-closes an unscoped write with a silent 400 — Loomweave must never
+    /// downgrade or clobber the value wardline owns).
     #[test]
-    fn install_preserves_existing_scoped_emit_url_when_unscoped_desired() {
+    fn install_carries_forward_existing_emit_url() {
         let dir = tempfile::tempdir().unwrap();
-        // No Filigree config → desired_bindings yields an UNSCOPED url.
         let desired = desired_bindings(dir.path());
-        assert!(
-            !is_scoped_scan_url(&desired.wardline_filigree_url),
-            "precondition: desired must be unscoped here"
-        );
         let scoped = "http://127.0.0.1:8749/api/p/lacuna/weft/scan-results";
         fs::write(
             dir.path().join(".mcp.json"),
-            mcp_json_matching(&desired, scoped),
+            wardline_entry_with_emit(&desired, scoped),
         )
         .unwrap();
 
-        // install must not change the file (scoped url preserved → entry identical).
         let changed = install_wardline_mcp(dir.path(), &desired).unwrap();
-        assert!(!changed, "scoped emit URL must be preserved, not rewritten");
+        assert!(
+            !changed,
+            "carried-forward emit URL must not rewrite the entry"
+        );
 
         let raw = fs::read_to_string(dir.path().join(".mcp.json")).unwrap();
         assert!(
             raw.contains(scoped) && !raw.contains("/api/weft/scan-results"),
-            "the scoped URL must survive; no unscoped downgrade:\n{raw}"
+            "wardline's scoped URL must survive verbatim; no downgrade:\n{raw}"
         );
         assert!(
             wardline_mcp_ok(dir.path(), &desired).unwrap(),
-            "check must agree with write (no doctor flap)"
+            "check agrees with write (no doctor flap)"
         );
     }
 
-    /// When Loomweave CAN scope (server-mode marker present → `desired` scoped),
-    /// its computed scoped value is authoritative and is written even over a
-    /// stale scoped value.
+    /// Cede: on a fresh project Loomweave registers the wardline MCP server but
+    /// writes NO `--filigree-url` — wardline's own installer owns and scopes that
+    /// value. Loomweave must not synthesize a (necessarily unscoped → 400) URL.
     #[test]
-    fn install_writes_scoped_when_desired_is_scoped() {
+    fn install_omits_emit_url_on_fresh_project() {
         let dir = tempfile::tempdir().unwrap();
-        write_filigree_config(
-            dir.path(),
-            r#"{"prefix":"lacuna","name":"lacuna","mode":"server"}"#,
-        );
         let desired = desired_bindings(dir.path());
-        assert!(is_scoped_scan_url(&desired.wardline_filigree_url));
-        // Pre-existing entry points at a *different* prefix; the scoped desired wins.
+        install_wardline_mcp(dir.path(), &desired).unwrap();
+
+        let value: Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join(".mcp.json")).unwrap())
+                .unwrap();
+        let args = value["mcpServers"]["wardline"]["args"]
+            .as_array()
+            .expect("wardline args present");
+        assert!(
+            args.iter().any(|a| a.as_str() == Some("--loomweave-url")),
+            "Loomweave still owns --loomweave-url"
+        );
+        assert!(
+            !args.iter().any(|a| a.as_str() == Some("--filigree-url")),
+            "Loomweave must NOT write a --filigree-url on a fresh project: {args:?}"
+        );
+        assert!(
+            wardline_mcp_ok(dir.path(), &desired).unwrap(),
+            "the emit-URL-less entry Loomweave just wrote is its own definition of ok"
+        );
+    }
+
+    /// Cede: Loomweave does not overwrite wardline's emit URL even when it
+    /// differs from anything Loomweave would pick — it has no opinion on the
+    /// value, only on its own fields.
+    #[test]
+    fn install_does_not_touch_wardline_emit_url_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let desired = desired_bindings(dir.path());
+        let arbitrary = "http://127.0.0.1:8749/api/p/some-other-prefix/weft/scan-results";
         fs::write(
             dir.path().join(".mcp.json"),
-            mcp_json_matching(
-                &desired,
-                "http://127.0.0.1:8749/api/p/stale/weft/scan-results",
-            ),
+            wardline_entry_with_emit(&desired, arbitrary),
         )
         .unwrap();
-        install_wardline_mcp(dir.path(), &desired).unwrap();
+        let changed = install_wardline_mcp(dir.path(), &desired).unwrap();
+        assert!(!changed);
         let raw = fs::read_to_string(dir.path().join(".mcp.json")).unwrap();
         assert!(
-            raw.contains("/api/p/lacuna/weft/scan-results") && !raw.contains("/api/p/stale/"),
-            "Loomweave's own scoped computation is authoritative:\n{raw}"
+            raw.contains(arbitrary),
+            "wardline's emit URL value is untouched by Loomweave:\n{raw}"
         );
     }
 }
