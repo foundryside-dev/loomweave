@@ -210,7 +210,7 @@ that is **unique within a run** and **stable across benign edits**:
 ```
 rust:struct:loomweave_core.config.Widget            # crate token closes cross-crate collisions
 rust:function:loomweave_core.config.helper
-rust:function:loomweave_core.config.Widget.impl#<>#0.render   # inherent method, carries its impl discriminator
+rust:function:loomweave_core.config.Widget.impl#<>.render   # inherent method, carries its impl discriminator
 ```
 
 - **Crate token (closes the cross-crate collision).** Leading segment is the
@@ -233,7 +233,7 @@ on the same type never collide:
 ```
 rust:impl:loomweave_core.config.Foo.impl[Display]      # trait impl — keyed by trait
 rust:impl:loomweave_core.config.Foo.impl[From<i32>]    # trait generic args ARE in the key
-rust:impl:loomweave_core.config.Foo.impl#<$0>#0        # inherent impl, positional generics + ordinal
+rust:impl:loomweave_core.config.Foo.impl#<$0>          # inherent impl, positional generics (no ordinal — same-key impls merge)
 rust:function:loomweave_core.config.Foo.impl[Display].fmt   # Display::fmt, distinct from…
 rust:function:loomweave_core.config.Foo.impl[Debug].fmt     # …Debug::fmt
 ```
@@ -241,11 +241,14 @@ rust:function:loomweave_core.config.Foo.impl[Debug].fmt     # …Debug::fmt
 - **Trait impls** key by the trait path **with its concrete generic arguments**
   (`impl[From<i32>]` ≠ `impl[From<u32>]`).
 - **Inherent impls** key by a **positional, De Bruijn-style** generic signature
-  so renaming `<T>`→`<U>` (a benign edit) does **not** churn the id; multiple
-  inherent impls that still tie get a stable trailing **ordinal** (`#0`, `#1`,
-  rendered after the positional-generic block, e.g. `impl#<$0>#0`,
-  `impl#<$0>#1`) by in-file source order (further disambiguated by the
-  module-path prefix across files).
+  so renaming `<T>`→`<U>` (a benign edit) does **not** churn the id. There is
+  **no source-order ordinal** (amended 2026-06-09, Option (b)): multiple inherent
+  impls of the same `(type, positional-generic-signature, cfg)` **merge** into one
+  `impl` entity — the union of their methods all hang off that single entity —
+  making the discriminator both reorder-stable and method-set-stable. Inherent
+  blocks for the same type in different files stay distinct because the defining
+  file's module-path prefix already discriminates them; cfg-twin inherent (and
+  trait) impls are split by the `@cfg(...)` discriminant below.
 - **`#[cfg]` twins:** because §5 keeps all cfg variants visible, two same-path
   items on mutually-exclusive cfgs would collide; each appends a normalized
   `@cfg(<predicate>)` discriminant. Items with a unique path or no cfg get no
@@ -324,7 +327,7 @@ proven collision-free *before* any edge keys on it.
 - **Phase 1a — identity foundation (the gate). *(Implemented 2026-06-09.)***
   Crate-root discovery + `mod`-tree traversal + the ADR-049 qualname scheme
   (crate token, impl/trait method discriminator, positional generics, `@cfg`
-  twins, inherent-impl ordinal); the §2.3 init-time symbol table that the same
+  twins, inherent-impl merge — Option (b), no ordinal); the §2.3 init-time symbol table that the same
   walk feeds; a starter entity set (`module`, `struct`, `function`); **the
   `contains` edge** (pulled in from 1b — ADR-026 dual-encoding requires it to
   accompany `parent_id`, else the storage writer fails the run; SEI signatures
@@ -365,7 +368,7 @@ proven collision-free *before* any edge keys on it.
 - **Entity-ID parity (non-vacuous — H1):** satisfy `fixtures/entity_id.json`
   byte-for-byte. The fixture is **extended before implementation** with rows
   exercising the crate token, trait-impl-method (`impl[Trait].m`),
-  inherent-impl-method, multiple-inherent-impl ordinal, positional-generic
+  inherent-impl-method, multiple-inherent-impl merge (Option (b)), positional-generic
   stability, and a `@cfg` twin — the language-neutral assembler makes the lone
   trivial row pass today, so it must grow to actually gate the ADR-049 scheme.
 - **Identity stability & uniqueness** (`crates/loomweave-plugin-rust/tests/identity_stability.rs`
