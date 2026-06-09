@@ -40,10 +40,23 @@ fn read_yaml(path: &Path) -> serde_json::Value {
 /// `check_loomweave_dir` reports healthy (not the absent warning). A freshly
 /// opened `SQLite` file has `user_version = 0`, which is <= the current schema
 /// version and is therefore accepted.
+///
+/// A real `.weft/loomweave/` (created by `install`) also carries the current
+/// `.gitignore`, so this completes the store with one too — otherwise the
+/// gitignore-drift check (`gitignore.current`) would add a spurious "missing"
+/// warning to tests that build the store dir by hand. The canonical bytes are
+/// generated from a throwaway real install rather than duplicated here (which
+/// would itself drift — the exact failure the new check guards against).
 fn write_healthy_db(root: &Path) {
-    let db_path = root.join(".weft/loomweave/loomweave.db");
-    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-    Connection::open(&db_path).expect("create minimal SQLite DB");
+    let store = root.join(".weft/loomweave");
+    fs::create_dir_all(&store).unwrap();
+    Connection::open(store.join("loomweave.db")).expect("create minimal SQLite DB");
+
+    let scratch = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], scratch.path());
+    let canonical = fs::read(scratch.path().join(".weft/loomweave/.gitignore"))
+        .expect("install writes a canonical .gitignore");
+    fs::write(store.join(".gitignore"), canonical).unwrap();
 }
 
 /// Run `doctor` (optionally with `--fix`) and return `(exit_code, stdout)`.

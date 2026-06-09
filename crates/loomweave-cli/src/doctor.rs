@@ -80,6 +80,7 @@ pub fn run(path: &Path, fix: bool, json_output: bool) -> Result<bool> {
     tally += check_instructions(&project_root, fix);
     tally += check_integration_bindings(&project_root, fix);
     tally += check_db_tracked(&project_root, fix);
+    tally += check_gitignore_current(&project_root, fix);
     tally += check_loomweave_dir(&project_root);
     println!("--- llm ---");
     tally += check_llm_provider(&project_root);
@@ -180,6 +181,7 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
         check_mcp_hygiene_json(),
         check_integration_bindings_json(project_root, fix),
         check_db_tracked_json(project_root, fix),
+        check_gitignore_current_json(project_root, fix),
     ];
     let next_actions: Vec<String> = checks
         .iter()
@@ -221,6 +223,11 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
             "plugin.availability" => {
                 "Install a Loomweave language plugin (the Python plugin ships with `pip install \
                  loomweave`)."
+                    .to_owned()
+            }
+            "gitignore.current" => {
+                "Run `loomweave doctor --fix` or `loomweave install` to rewrite \
+                 `.weft/loomweave/.gitignore` to the current template."
                     .to_owned()
             }
             _ => format!("Review doctor check `{}`.", check.id),
@@ -424,6 +431,88 @@ fn check_db_tracked_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
                 }
             }
         }
+    }
+}
+
+/// Health of the Loomweave-owned `.weft/loomweave/.gitignore` relative to the
+/// canonical template. When the template evolves (e.g. C1 reversed ADR-005 to
+/// *ignore* `loomweave.db`), a project initialised by an older binary keeps a
+/// stale file: `doctor --fix` must detect and rewrite it, not green over it.
+#[derive(Debug, PartialEq, Eq)]
+enum GitignoreState {
+    /// On-disk bytes match the current template (or there is no store dir to
+    /// manage — that gap is owned by `check_loomweave_dir`).
+    Current,
+    /// The store dir exists but `.gitignore` is absent.
+    Missing,
+    /// `.gitignore` exists but its bytes differ from the current template.
+    Stale,
+}
+
+/// Classify `<store_dir>/.gitignore` against [`crate::install::GITIGNORE_CONTENTS`].
+/// A full-file byte compare is correct because the file is wholly Loomweave-owned
+/// (written verbatim into the private store dir) — there is no user content to
+/// merge. When the store dir is absent there is nothing to manage (that gap is
+/// `check_loomweave_dir`'s), so report [`GitignoreState::Current`].
+fn gitignore_state(project_root: &Path) -> GitignoreState {
+    let store = loomweave_core::store::store_dir(project_root);
+    if !store.is_dir() {
+        return GitignoreState::Current;
+    }
+    match fs::read_to_string(store.join(".gitignore")) {
+        Ok(contents) if contents == crate::install::GITIGNORE_CONTENTS => GitignoreState::Current,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => GitignoreState::Missing,
+        // Drifted bytes, or unreadable for any other reason: rewrite under `--fix`.
+        Ok(_) | Err(_) => GitignoreState::Stale,
+    }
+}
+
+/// `--fix` repair: rewrite the Loomweave-owned `.gitignore` to the canonical
+/// template via the shared installer writer, so `install` and `doctor --fix`
+/// converge on byte-identical output.
+fn repair_gitignore(project_root: &Path) -> Result<()> {
+    crate::install::write_gitignore(&loomweave_core::store::store_dir(project_root))
+}
+
+/// JSON-path twin of [`check_gitignore_current`].
+fn check_gitignore_current_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
+    match gitignore_state(project_root) {
+        GitignoreState::Current => DoctorJsonCheck::ok(
+            "gitignore.current",
+            "loomweave .gitignore matches the current template",
+        ),
+        state => {
+            let what = gitignore_what(&state);
+            if !fix {
+                // Loomweave-owned regenerable file: drift is advisory, never a
+                // gate failure (mirrors the enrich-only surfaces).
+                return DoctorJsonCheck::warning("gitignore.current", what);
+            }
+            match repair_gitignore(project_root) {
+                Ok(()) if gitignore_state(project_root) == GitignoreState::Current => {
+                    DoctorJsonCheck::fixed("gitignore.current", format!("{what} — fixed"))
+                }
+                Ok(()) => DoctorJsonCheck::warning(
+                    "gitignore.current",
+                    format!("{what} — repair did not converge"),
+                ),
+                Err(err) => DoctorJsonCheck::warning(
+                    "gitignore.current",
+                    format!("{what} — repair failed: {err}"),
+                ),
+            }
+        }
+    }
+}
+
+/// Human-readable description of a non-`Current` gitignore state.
+fn gitignore_what(state: &GitignoreState) -> &'static str {
+    match state {
+        GitignoreState::Missing => "loomweave .gitignore is missing",
+        GitignoreState::Stale => {
+            "loomweave .gitignore is stale (does not match the current template)"
+        }
+        GitignoreState::Current => unreachable!("Current is handled before gitignore_what"),
     }
 }
 
@@ -1171,6 +1260,30 @@ fn check_db_tracked(project_root: &Path, fix: bool) -> Tally {
     }
 }
 
+/// Text-path twin of [`check_gitignore_current_json`]: warn (never gate-fail)
+/// when the Loomweave-owned `.gitignore` is stale or missing, and rewrite it to
+/// the canonical template under `--fix`.
+fn check_gitignore_current(project_root: &Path, fix: bool) -> Tally {
+    match gitignore_state(project_root) {
+        GitignoreState::Current => ok("loomweave .gitignore matches the current template"),
+        state => {
+            let what = gitignore_what(&state);
+            if !fix {
+                return warn(what, Some("loomweave doctor --fix (or loomweave install)"));
+            }
+            match repair_gitignore(project_root) {
+                Ok(()) if gitignore_state(project_root) == GitignoreState::Current => {
+                    ok(&format!("{what} — fixed"))
+                }
+                // Keep repair failures as warnings: a regenerable, Loomweave-owned
+                // file must never fail the gate. Surface the cause.
+                Ok(()) => warn(&format!("{what} — repair did not converge"), None),
+                Err(err) => warn(&format!("{what} — repair failed: {err}"), None),
+            }
+        }
+    }
+}
+
 fn check_integration_bindings(project_root: &Path, fix: bool) -> Tally {
     match integration_bindings::binding_state(project_root) {
         BindingState::Present => {
@@ -1256,6 +1369,108 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_db(dir.path());
         assert_eq!(db_tracked_state(dir.path()), DbTrackedState::Untracked);
+    }
+
+    /// Materialise `<root>/.weft/loomweave/.gitignore` with the given bytes,
+    /// returning its path.
+    fn write_gitignore_bytes(root: &Path, bytes: &str) -> std::path::PathBuf {
+        let store = loomweave_core::store::store_dir(root);
+        std::fs::create_dir_all(&store).unwrap();
+        let path = store.join(".gitignore");
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    /// The pre-C1 template header (ADR-005 tracked-db model) — representative of
+    /// the stale file a project initialised by an older binary still carries.
+    const STALE_GITIGNORE: &str =
+        "# Tracked (committed): loomweave.db, config.json\nephemeral.port\n";
+
+    #[test]
+    fn gitignore_state_current_when_bytes_match_template() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gitignore_bytes(dir.path(), crate::install::GITIGNORE_CONTENTS);
+        assert_eq!(gitignore_state(dir.path()), GitignoreState::Current);
+    }
+
+    #[test]
+    fn gitignore_state_stale_when_bytes_differ() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gitignore_bytes(dir.path(), STALE_GITIGNORE);
+        assert_eq!(gitignore_state(dir.path()), GitignoreState::Stale);
+    }
+
+    #[test]
+    fn gitignore_state_missing_when_store_exists_without_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Store dir present (e.g. via db init) but no .gitignore.
+        write_db(dir.path());
+        assert_eq!(gitignore_state(dir.path()), GitignoreState::Missing);
+    }
+
+    #[test]
+    fn doctor_warns_then_fixes_stale_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = write_gitignore_bytes(root, STALE_GITIGNORE);
+
+        // Plain doctor: surface the drift as a WARNING (never a gate failure).
+        let diag = check_gitignore_current(root, false);
+        assert_eq!(diag.warnings, 1, "stale .gitignore must warn");
+        assert_eq!(
+            diag.problems, 0,
+            ".gitignore drift must never fail the gate"
+        );
+
+        // doctor --fix: rewrite to exactly the template, then re-verify clean.
+        let fixed = check_gitignore_current(root, true);
+        assert_eq!(fixed.problems, 0);
+        assert_eq!(fixed.warnings, 0, "repaired .gitignore must verify clean");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            crate::install::GITIGNORE_CONTENTS,
+            ".gitignore not rewritten to the canonical template"
+        );
+        assert_eq!(gitignore_state(root), GitignoreState::Current);
+    }
+
+    #[test]
+    fn doctor_fix_repairs_missing_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_db(root); // store dir exists, no .gitignore
+        assert_eq!(gitignore_state(root), GitignoreState::Missing);
+
+        let fixed = check_gitignore_current(root, true);
+        assert_eq!(fixed.problems, 0);
+        assert_eq!(fixed.warnings, 0);
+        let written =
+            std::fs::read_to_string(loomweave_core::store::store_dir(root).join(".gitignore"))
+                .unwrap();
+        assert_eq!(written, crate::install::GITIGNORE_CONTENTS);
+    }
+
+    #[test]
+    fn doctor_fix_is_noop_on_current_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = write_gitignore_bytes(root, crate::install::GITIGNORE_CONTENTS);
+
+        // Pin an old mtime; a rewrite (temp+rename) would replace the inode and
+        // bump it, so an unchanged mtime proves the current file was not churned.
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let t = check_gitignore_current(root, true);
+        assert_eq!(t.problems, 0);
+        assert_eq!(t.warnings, 0);
+        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(after, old, "current .gitignore must not be rewritten");
     }
 
     /// A representative co-resident Filigree block (shape taken from the repo's

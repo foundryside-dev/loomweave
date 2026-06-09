@@ -32,7 +32,13 @@ const CONFIG_JSON_STUB: &str = r#"{
 // source of truth (it can never drift from what install writes).
 use crate::config::LOOMWEAVE_YAML_STUB;
 
-const GITIGNORE_CONTENTS: &str = "\
+/// Canonical contents of `.weft/loomweave/.gitignore`. The single source of
+/// truth: [`write_gitignore`] writes it verbatim on install, and
+/// `loomweave doctor --fix` compares the on-disk file against it and rewrites a
+/// stale/missing one to match — so the two paths provably converge. The file is
+/// wholly Loomweave-owned (private store dir), so a full-file compare + rewrite
+/// is correct; there is no user content to merge.
+pub(crate) const GITIGNORE_CONTENTS: &str = "\
 # Loomweave .gitignore — ADR-005 tracked-vs-excluded list
 # (the loomweave.db posture was reversed by C1 / weft-d822a7de2d).
 # Tracked (committed): config.json, .gitignore itself.
@@ -461,9 +467,7 @@ fn populate_after_mkdir(loomweave_dir: &Path, project_root: &Path) -> Result<()>
     fs::write(&config_path, CONFIG_JSON_STUB)
         .with_context(|| format!("write {}", config_path.display()))?;
 
-    let gitignore_path = loomweave_dir.join(".gitignore");
-    fs::write(&gitignore_path, GITIGNORE_CONTENTS)
-        .with_context(|| format!("write {}", gitignore_path.display()))?;
+    write_gitignore(loomweave_dir)?;
 
     let yaml_path = project_root.join("loomweave.yaml");
     if yaml_path.exists() {
@@ -474,6 +478,34 @@ fn populate_after_mkdir(loomweave_dir: &Path, project_root: &Path) -> Result<()>
     } else {
         fs::write(&yaml_path, LOOMWEAVE_YAML_STUB)
             .with_context(|| format!("write {}", yaml_path.display()))?;
+    }
+    Ok(())
+}
+
+/// Write `<store_dir>/.gitignore` with the canonical [`GITIGNORE_CONTENTS`],
+/// atomically (temp + rename in the same directory) so a concurrent reader never
+/// sees a half-written file and a crash never truncates it. Shared by
+/// `loomweave install` (fresh init) and `loomweave doctor --fix` (stale/missing
+/// repair) so the template lives in exactly one place and both paths converge on
+/// byte-identical output.
+///
+/// # Errors
+///
+/// Returns an error if the store directory cannot be created, or if the temp
+/// write or rename fails.
+pub(crate) fn write_gitignore(store_dir: &Path) -> Result<()> {
+    fs::create_dir_all(store_dir).with_context(|| format!("mkdir {}", store_dir.display()))?;
+    let target = store_dir.join(".gitignore");
+    let temp = store_dir.join(format!(".gitignore.loomweave.tmp-{}", std::process::id()));
+    if let Err(err) = fs::write(&temp, GITIGNORE_CONTENTS)
+        .with_context(|| format!("write {}", temp.display()))
+        .and_then(|()| {
+            fs::rename(&temp, &target)
+                .with_context(|| format!("rename {} -> {}", temp.display(), target.display()))
+        })
+    {
+        let _ = fs::remove_file(&temp);
+        return Err(err);
     }
     Ok(())
 }
