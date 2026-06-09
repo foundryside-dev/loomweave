@@ -1,0 +1,34 @@
+# Distribution crate for the `loomweave-plugin-rust` wheel (live activation).
+#
+# DELIBERATELY OUT OF THE WORKSPACE (see the repo-root Cargo.toml `[workspace]
+# exclude`): its `[[bin]]` is named `loomweave-plugin-rust` — ON the
+# `loomweave-plugin-*` discovery glob — which is exactly what must NOT exist in
+# `target/` during a normal `cargo build --workspace --bins` (a glob-named binary
+# next to `loomweave` would be false-discovered as a manifest-less plugin and
+# fail the run; see `loomweave-core/src/plugin/discovery.rs`). Excluding it keeps
+# the workspace build producing only the off-glob `loomweave-rust-plugin`, while
+# maturin builds THIS crate for the wheel. The bin is a one-line shim over the
+# shared library entry point so the two binaries cannot drift.
+#
+# Mirrors the out-of-workspace precedent of `plugins/python/`.
+# Its own (empty) workspace root: the crate lives physically under the loomweave
+# repo tree, so without this cargo walks up and binds it to the repo workspace.
+# An empty `[workspace]` stops that walk and builds it truly standalone — which
+# is what maturin needs and what keeps the glob-named bin out of the repo build.
+[workspace]
+
+[package]
+name = "loomweave-plugin-rust-dist"
+version = "1.1.0-rc4"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/foundryside-dev/loomweave"
+rust-version = "1.88"
+publish = false
+
+[[bin]]
+name = "loomweave-plugin-rust"
+path = "src/main.rs"
+
+[dependencies]
+loomweave-plugin-rust = { path = "../../crates/loomweave-plugin-rust", version = "1.1.0-rc4" }

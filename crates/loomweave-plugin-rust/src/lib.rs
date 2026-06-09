@@ -7,6 +7,7 @@ pub mod module_path;
 pub mod qualname;
 pub mod resolve;
 pub mod scope;
+pub mod serve;
 pub mod signature;
 pub mod spans;
 pub mod symbol_table;

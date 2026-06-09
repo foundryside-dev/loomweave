@@ -51,8 +51,52 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CARGO_TOML = REPO_ROOT / "Cargo.toml"
 PLUGIN_PYPROJECT_TOML = REPO_ROOT / "plugins/python/pyproject.toml"
 CLI_PYPROJECT_TOML = REPO_ROOT / "crates/loomweave-cli/pyproject.toml"
+RUST_PLUGIN_PYPROJECT_TOML = REPO_ROOT / "packaging/rust-plugin-dist/pyproject.toml"
 
 PLUGIN_PACKAGE = "loomweave-plugin-python"
+RUST_PLUGIN_PACKAGE = "loomweave-plugin-rust"
+
+
+def check_rust_wheel_lockstep(
+    cargo: dict[str, Any],
+    cli_pyproject: dict[str, Any],
+    rust_plugin_pyproject: dict[str, Any],
+) -> list[str]:
+    """Drift errors for the Rust plugin wheel (mirror of the Python checks).
+
+    The `loomweave` wheel pins `loomweave-plugin-rust==<v>`; if the Rust plugin
+    wheel's own version drifts from that pin (or the workspace), `pip install`
+    fails to resolve on first release — the same hazard this guard closes for
+    the Python plugin.
+    """
+    errors: list[str] = []
+    try:
+        rust_norm = _normalize(_dig(cargo, "workspace", "package", "version"))
+    except _Missing as missing:
+        return [f"Cargo.toml key {missing} not found"]
+
+    try:
+        wheel_version = _dig(rust_plugin_pyproject, "project", "version")
+        if _normalize(wheel_version) != rust_norm:
+            errors.append(
+                f"loomweave-plugin-rust wheel version {wheel_version!r} != "
+                f"workspace {rust_norm!r}"
+            )
+    except _Missing as missing:
+        errors.append(f"packaging/rust-plugin-dist/pyproject.toml key {missing} not found")
+
+    try:
+        pin = _pinned_version(_dig(cli_pyproject, "project", "dependencies"), RUST_PLUGIN_PACKAGE)
+        if pin is None:
+            errors.append(f"loomweave-cli pyproject does not pin {RUST_PLUGIN_PACKAGE}==<version>")
+        elif _normalize(pin) != rust_norm:
+            errors.append(
+                f"loomweave-cli pins {RUST_PLUGIN_PACKAGE}=={pin} != workspace {rust_norm!r}"
+            )
+    except _Missing as missing:
+        errors.append(f"crates/loomweave-cli/pyproject.toml key {missing} not found")
+
+    return errors
 
 
 class _Missing(Exception):
@@ -222,6 +266,42 @@ def _self_test() -> int:
         else:
             print(f"  self-test ok [{name}]")
 
+    # Rust wheel lockstep (separate function).
+    def rust_cli(deps: str) -> dict[str, Any]:
+        return tomllib.loads(f'[project]\nname = "loomweave"\n{deps}\n')
+
+    def rust_wheel(version: str) -> dict[str, Any]:
+        return tomllib.loads(
+            f'[project]\nname = "loomweave-plugin-rust"\nversion = "{version}"\n'
+        )
+
+    rc_both = (
+        'dependencies = ["loomweave-plugin-python==1.1.0rc1", '
+        '"loomweave-plugin-rust==1.1.0rc1"]'
+    )
+    rust_cases: list[tuple[str, dict[str, Any], dict[str, Any], dict[str, Any], bool]] = [
+        ("rust aligned", rc, rust_cli(rc_both), rust_wheel("1.1.0rc1"), True),
+        ("rust wheel drift", rc, rust_cli(rc_both), rust_wheel("1.1.0rc2"), False),
+        (
+            "rust pin absent",
+            rc,
+            rust_cli('dependencies = ["loomweave-plugin-python==1.1.0rc1"]'),
+            rust_wheel("1.1.0rc1"),
+            False,
+        ),
+    ]
+    for name, cargo, cli_py, rust_py, expect_ok in rust_cases:
+        errors = check_rust_wheel_lockstep(cargo, cli_py, rust_py)
+        actual_ok = not errors
+        if actual_ok != expect_ok:
+            failures += 1
+            print(
+                f"  SELF-TEST FAIL [{name}]: expected ok={expect_ok}, got {errors!r}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"  self-test ok [{name}]")
+
     if failures:
         print(
             f"check-workspace-version-lockstep: --self-test FAILED ({failures})",
@@ -239,8 +319,10 @@ def main(argv: list[str]) -> int:
     cargo = _read_toml(CARGO_TOML)
     plugin_pyproject = _read_toml(PLUGIN_PYPROJECT_TOML)
     cli_pyproject = _read_toml(CLI_PYPROJECT_TOML)
+    rust_plugin_pyproject = _read_toml(RUST_PLUGIN_PYPROJECT_TOML)
 
     errors = check_lockstep(cargo, plugin_pyproject, cli_pyproject)
+    errors += check_rust_wheel_lockstep(cargo, cli_pyproject, rust_plugin_pyproject)
     if errors:
         print("check-workspace-version-lockstep: drift detected", file=sys.stderr)
         for error in errors:
