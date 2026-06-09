@@ -168,3 +168,58 @@ fn implements_resolves_in_project_generic_trait_by_stripping_args() {
     );
     assert_eq!(implements[0]["confidence"], "resolved");
 }
+
+/// A NEGATIVE impl (`impl !MyTrait for Foo`) asserts NON-implementation, so it
+/// must NOT emit a (positive) `implements` edge — even though the trait resolves
+/// in-project. The `it.trait_` destructure carries an `Option<Bang>`; without the
+/// `bang.is_none()` guard a negative impl would emit a WRONG positive edge.
+///
+/// The trait MUST be in-project (`MyTrait`, not e.g. `Send`): an external trait
+/// resolves `External -> None` and yields no edge regardless of the guard, so
+/// the test would pass vacuously. With an in-project trait the test
+/// discriminates: no guard -> 1 edge (wrong), guard -> 0 edges (correct).
+#[test]
+fn negative_impl_emits_no_implements_edge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("c/src")).unwrap();
+    std::fs::write(root.join("c/Cargo.toml"), "[package]\nname=\"c_crate\"\n").unwrap();
+    std::fs::write(
+        root.join("c/src/lib.rs"),
+        "pub trait MyTrait {}\npub struct Foo;\n",
+    )
+    .unwrap();
+
+    let table = build_symbol_table(root);
+    let r = Resolver::new(&table);
+
+    // `impl !MyTrait for Foo {}` — nightly-gated syntax, but syn parses it.
+    let src = "pub trait MyTrait {}\n\
+               pub struct Foo;\n\
+               impl !MyTrait for Foo {}\n";
+    let extracted =
+        extract_file_with_edges("c_crate", "c_crate", "/p/c/src/lib.rs", src, &r).unwrap();
+
+    let implements: Vec<&Value> = extracted
+        .edges
+        .iter()
+        .filter(|e| e["kind"] == "implements")
+        .collect();
+
+    assert!(
+        implements.is_empty(),
+        "a negative impl (`impl !MyTrait for Foo`) must NOT emit a positive \
+         implements edge; got {implements:#?}",
+    );
+
+    // The impl ENTITY itself is still emitted (only the edge is suppressed).
+    assert!(
+        extracted
+            .entities
+            .iter()
+            .any(|e| e["id"] == "rust:impl:c_crate.Foo.impl[MyTrait]"),
+        "the negative-impl entity must still be emitted (only the implements \
+         edge is suppressed); got {:#?}",
+        extracted.entities,
+    );
+}

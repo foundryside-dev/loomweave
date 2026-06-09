@@ -272,8 +272,7 @@ fn walk_items(
     // second source block with the same impl id (same type+sig+cfg) does NOT
     // re-emit the entity — it only appends its methods (the merge, ADR-049
     // amend, Option b). Scoped to this item list.
-    let mut seen_impl_ids: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
+    let mut seen_impl_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     // cfg-twin counter for impls: keyed on the FULL pre-cfg impl qualname
     // (incl. the trait `[Trait]` fragment), so it splits cfg-twin inherent AND
     // trait impls (e.g. `#[cfg(unix)] impl Display for Foo` /
@@ -291,8 +290,7 @@ fn walk_items(
             *impl_twin_counts.entry(impl_q).or_insert(0) += 1;
         }
     }
-    let impl_is_cfg_twin =
-        |impl_q: &str| impl_twin_counts.get(impl_q).copied().unwrap_or(0) > 1;
+    let impl_is_cfg_twin = |impl_q: &str| impl_twin_counts.get(impl_q).copied().unwrap_or(0) > 1;
     // Named items sharing one (kind, name) in this item list are cfg twins
     // (`#[cfg(unix)] fn f` / `#[cfg(windows)] fn f`, and the same for a `struct`
     // or an inline `mod`): all cfg variants are visible (spec §5), so a bare path
@@ -416,13 +414,7 @@ fn walk_items(
                 )?);
                 let nested_id = build_id("module", &nested)?;
                 walk_items(
-                    inner,
-                    &nested,
-                    &nested_id,
-                    file_path,
-                    resolution,
-                    out,
-                    edges,
+                    inner, &nested, &nested_id, file_path, resolution, out, edges,
                 )?;
             }
             // Phase 1b leaf kinds: free items riding the same qualname + entity +
@@ -692,8 +684,16 @@ fn emit_impl(
         // seen-entity-set gate (Task 8) is the second. Emitted once per impl
         // entity (inside the seen-id guard): a merge twin shares the trait, so a
         // second edge would only redundantly upsert the same natural-PK row.
-        if let (Some((from_crate, resolver)), Some((_, trait_path, _))) =
+        //
+        // A NEGATIVE impl (`impl !Trait for Foo`) asserts NON-implementation, so
+        // it must NOT emit a (positive) `implements` edge. `it.trait_` is
+        // `Some((Option<Bang>, Path, For))`; the `Bang` is `Some` for a negative
+        // impl. Guard on `bang.is_none()` (the impl ENTITY + module->impl
+        // `contains` edge above are still emitted; only the `implements` edge is
+        // suppressed).
+        if let (Some((from_crate, resolver)), Some((bang, trait_path, _))) =
             (resolution, it.trait_.as_ref())
+            && bang.is_none()
             && let Some((to_id, confidence)) =
                 match resolver.resolve_trait_path(from_crate, &trait_path_for_lookup(trait_path)) {
                     Resolution::Resolved(id) => Some((id, "resolved")),

@@ -26,7 +26,10 @@ fn each_leaf_kind_is_emitted_with_its_kind_segment() {
         "rust:static:k.m.S",
         "rust:macro:k.m.mac",
     ] {
-        assert!(got.contains(&want.to_owned()), "missing {want}; got {got:?}");
+        assert!(
+            got.contains(&want.to_owned()),
+            "missing {want}; got {got:?}"
+        );
     }
 }
 

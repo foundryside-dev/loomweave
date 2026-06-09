@@ -88,8 +88,9 @@ fn main() {
                     // dogfood gate (Task 14).
                     project_root = params.project_root;
                     let root = std::path::Path::new(&project_root);
-                    symbol_table =
-                        Some(loomweave_plugin_rust::symbol_table::build_symbol_table(root));
+                    symbol_table = Some(loomweave_plugin_rust::symbol_table::build_symbol_table(
+                        root,
+                    ));
                     crate_roots = Some(loomweave_plugin_rust::crate_roots::discover_crate_roots(
                         root,
                     ));

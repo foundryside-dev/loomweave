@@ -113,9 +113,14 @@ fn group_self_resolves_the_module_and_rename_uses_the_real_path() {
     // `{self, S as Renamed}`: `self` -> the module `c_crate.a`; `S as Renamed`
     // -> resolve the real `S`, alias dropped.
     let src = "use c_crate::a::{self, S as Renamed};\n";
-    let extracted =
-        extract_file_with_edges("c_crate", "c_crate.consumer", "/p/c/src/consumer.rs", src, &r)
-            .unwrap();
+    let extracted = extract_file_with_edges(
+        "c_crate",
+        "c_crate.consumer",
+        "/p/c/src/consumer.rs",
+        src,
+        &r,
+    )
+    .unwrap();
 
     let to_ids: Vec<&str> = extracted
         .edges
@@ -131,5 +136,54 @@ fn group_self_resolves_the_module_and_rename_uses_the_real_path() {
     assert!(
         to_ids.contains(&"rust:struct:c_crate.a.S"),
         "`S as Renamed` must resolve on the real path to the struct id, got {to_ids:?}",
+    );
+}
+
+/// `use a::{b, c::d};` — a NESTED group: a bare leaf (`b`) AND a `Path`-inside-
+/// `Group` (`c::d`). Both leaves must fan out to their own `imports` edge. The
+/// expansion logic handles a `Path` branch inside a `Group`, but no prior test
+/// exercised that branch (the existing group test only has bare/`self`/renamed
+/// leaves). Here both `a::b` and `a::c::d` resolve in-project so both land as
+/// Resolved edges.
+#[test]
+fn nested_group_use_expands_both_leaves() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("c/src/a/c")).unwrap();
+    std::fs::write(root.join("c/Cargo.toml"), "[package]\nname=\"c_crate\"\n").unwrap();
+    std::fs::write(root.join("c/src/lib.rs"), "pub mod a;\n").unwrap();
+    // `a` is a module dir: `a/mod.rs` declares `struct b` and `pub mod c`,
+    // `a/c.rs` declares `struct d`. So `a::b` -> struct, `a::c::d` -> struct.
+    std::fs::write(root.join("c/src/a/mod.rs"), "pub struct b;\npub mod c;\n").unwrap();
+    std::fs::write(root.join("c/src/a/c.rs"), "pub struct d;\n").unwrap();
+
+    let table = build_symbol_table(root);
+    let r = Resolver::new(&table);
+
+    // The nested group: a bare leaf `b` and a `Path`-inside-`Group` leaf `c::d`.
+    let src = "use c_crate::a::{b, c::d};\n";
+    let extracted = extract_file_with_edges(
+        "c_crate",
+        "c_crate.consumer",
+        "/p/c/src/consumer.rs",
+        src,
+        &r,
+    )
+    .unwrap();
+
+    let to_ids: Vec<&str> = extracted
+        .edges
+        .iter()
+        .filter(|e| e["kind"] == "imports")
+        .filter_map(|e| e["to_id"].as_str())
+        .collect();
+
+    assert!(
+        to_ids.contains(&"rust:struct:c_crate.a.b"),
+        "the bare leaf `b` must expand to `a::b`, got {to_ids:?}",
+    );
+    assert!(
+        to_ids.contains(&"rust:struct:c_crate.a.c.d"),
+        "the `Path`-inside-`Group` leaf `c::d` must expand to `a::c::d`, got {to_ids:?}",
     );
 }

@@ -23,12 +23,7 @@ fn impl_entity_emitted_and_methods_reparent_to_it() {
         .edges
         .iter()
         .filter(|e| e["kind"] == "contains")
-        .map(|e| {
-            (
-                e["from_id"].as_str().unwrap(),
-                e["to_id"].as_str().unwrap(),
-            )
-        })
+        .map(|e| (e["from_id"].as_str().unwrap(), e["to_id"].as_str().unwrap()))
         .collect();
     assert!(edges.contains(&("rust:module:k.m", impl_id))); // module -> impl
     assert!(edges.contains(&(impl_id, method_id))); // impl -> method
@@ -92,12 +87,7 @@ fn two_no_cfg_inherent_impls_merge_to_one_entity_and_are_reorder_stable() {
         .edges
         .iter()
         .filter(|e| e["kind"] == "contains")
-        .map(|e| {
-            (
-                e["from_id"].as_str().unwrap(),
-                e["to_id"].as_str().unwrap(),
-            )
-        })
+        .map(|e| (e["from_id"].as_str().unwrap(), e["to_id"].as_str().unwrap()))
         .collect();
     assert!(edges.contains(&("rust:module:k.m", impl_id))); // module -> impl (emitted once)
     assert!(edges.contains(&(impl_id, "rust:function:k.m.Foo.impl#<>.a")));
@@ -108,7 +98,12 @@ fn two_no_cfg_inherent_impls_merge_to_one_entity_and_are_reorder_stable() {
     let module_to_impl = a
         .edges
         .iter()
-        .filter(|e| e["kind"] == "contains" && e["from_id"] == "rust:module:k.m" && e["to_id"] == impl_id)
+        .filter(|e| {
+            e["kind"] == "contains" && e["from_id"] == "rust:module:k.m" && e["to_id"] == impl_id
+        })
         .count();
-    assert_eq!(module_to_impl, 1, "module -> impl edge must be emitted once");
+    assert_eq!(
+        module_to_impl, 1,
+        "module -> impl edge must be emitted once"
+    );
 }
