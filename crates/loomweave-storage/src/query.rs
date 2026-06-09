@@ -296,6 +296,28 @@ pub fn entity_by_id(conn: &Connection, entity_id: &str) -> Result<Option<EntityR
         .map_err(StorageError::from)
 }
 
+/// Resolve an id-or-SEI to its entity row. A `loomweave:eid:`-prefixed input
+/// is routed through the SEI binding (SEI -> alive `current_locator` ->
+/// `entities.id`); anything else is a plain locator lookup. Returns `None` when
+/// the SEI is unknown/orphaned/superseded OR the locator has no entity row.
+///
+/// Mirrors [`entity_by_id`]'s signature exactly so a call site is a one-token
+/// swap. This is the single resolution definition shared by the MCP read tools
+/// that must accept either a raw locator or a Stable Entity Identity token.
+pub fn resolve_entity_ref(conn: &Connection, id_or_sei: &str) -> Result<Option<EntityRow>> {
+    if crate::sei::is_reserved_sei(id_or_sei) {
+        match crate::sei::resolve_sei(conn, id_or_sei)? {
+            crate::sei::SeiLookupResult::Alive(rec) => match rec.current_locator {
+                Some(locator) => entity_by_id(conn, &locator),
+                None => Ok(None),
+            },
+            crate::sei::SeiLookupResult::NotAlive { .. } => Ok(None),
+        }
+    } else {
+        entity_by_id(conn, id_or_sei)
+    }
+}
+
 /// Total number of entity rows in the graph — every kind, **including**
 /// subsystems. Uses the same `SELECT COUNT(*) FROM entities` the MCP snapshot
 /// (`project_status`) reports, so the two surfaces always agree.
