@@ -959,14 +959,16 @@ fn tools_list_includes_subsystem_members() {
 
     assert_eq!(
         tool.description,
-        "List module entities assigned to a subsystem entity."
+        "List module entities assigned to a subsystem entity. Bounded: `limit` (default 50, max 100) plus a numeric-offset `cursor`; the result carries `next_cursor` (null when exhausted) and an explicit `truncated` flag."
     );
     assert_eq!(
         tool.input_schema,
         json!({
             "type": "object",
             "properties": {
-                "id": {"type": "string", "minLength": 1}
+                "id": {"type": "string", "minLength": 1},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "cursor": {"type": ["string", "null"]}
             },
             "required": ["id"],
             "additionalProperties": false
@@ -6359,5 +6361,139 @@ async fn propose_guidance_accepts_sei_but_stores_the_locator_in_match_rule() {
         proposal.match_rules[0]["id"], "python:function:demo.entry",
         "default match_rule id must be the locator, not the SEI: {:?}",
         proposal.match_rules
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Item 3 (clarion-d76e7f7267): bounded graph relationship tools.
+//   * Single-relation (callers_of, subsystem_members): limit + cursor +
+//     next_cursor + explicit truncated.
+//   * Neighborhood: ONE per-bucket limit + a truncated MAP, NO cursor.
+// ---------------------------------------------------------------------------
+
+/// Seed `count` distinct functions that all call `python:function:demo.target`,
+/// so callers_of(demo.target) has a deterministic, paginable caller set.
+fn seed_extra_callers(db_path: &std::path::Path, count: usize) {
+    let conn = Connection::open(db_path).expect("open sqlite");
+    let source_path: String = conn
+        .query_row(
+            "SELECT source_file_path FROM entities WHERE id = 'python:function:demo.target'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("target source path");
+    for i in 0..count {
+        let id = format!("python:function:demo.caller{i}");
+        conn.execute(
+            "INSERT INTO entities (id, plugin_id, kind, name, short_name, source_file_path, \
+                source_line_start, source_line_end, properties, content_hash, created_at, updated_at) \
+             VALUES (?1,'python','function',?1,?1,?2,1,2,'{}','hash','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')",
+            params![id, source_path],
+        )
+        .expect("insert caller entity");
+        conn.execute(
+            "INSERT INTO edges (kind, from_id, to_id, confidence, source_byte_start, source_byte_end) \
+             VALUES ('calls', ?1, 'python:function:demo.target', 'resolved', 10, 20)",
+            params![id],
+        )
+        .expect("insert calls edge");
+    }
+}
+
+#[tokio::test]
+async fn callers_of_paginates_with_limit_cursor_and_truncated() {
+    let (project, db_path) = open_project();
+    // demo.mid already calls demo.target (resolved). Add 2 more -> 3 callers.
+    seed_extra_callers(&db_path, 2);
+    let state = state_for(project.path(), &db_path);
+
+    let first = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.target", "limit": 2}),
+    )
+    .await;
+    assert_eq!(first["ok"], true, "{first}");
+    assert_eq!(first["result"]["callers"].as_array().unwrap().len(), 2);
+    assert_eq!(first["result"]["next_cursor"], "2");
+    assert_eq!(
+        first["result"]["truncated"], true,
+        "first page of 3 with limit 2 must be truncated"
+    );
+
+    let second = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.target", "limit": 2, "cursor": "2"}),
+    )
+    .await;
+    assert_eq!(second["ok"], true, "{second}");
+    assert_eq!(second["result"]["callers"].as_array().unwrap().len(), 1);
+    assert_eq!(second["result"]["next_cursor"], Value::Null);
+    assert_eq!(second["result"]["truncated"], false);
+}
+
+#[tokio::test]
+async fn subsystem_members_paginates_with_limit_cursor_and_truncated() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    let subsystem_id = seed_subsystem(&conn, project.path()); // 2 members
+    drop(conn);
+    let state = state_for(project.path(), &db_path);
+
+    let first = call_tool(
+        &state,
+        "subsystem_members",
+        json!({"id": subsystem_id, "limit": 1}),
+    )
+    .await;
+    assert_eq!(first["ok"], true, "{first}");
+    assert_eq!(first["result"]["members"].as_array().unwrap().len(), 1);
+    assert_eq!(first["result"]["next_cursor"], "1");
+    assert_eq!(first["result"]["truncated"], true);
+
+    let second = call_tool(
+        &state,
+        "subsystem_members",
+        json!({"id": subsystem_id, "limit": 1, "cursor": "1"}),
+    )
+    .await;
+    assert_eq!(second["ok"], true, "{second}");
+    assert_eq!(second["result"]["members"].as_array().unwrap().len(), 1);
+    assert_eq!(second["result"]["next_cursor"], Value::Null);
+    assert_eq!(second["result"]["truncated"], false);
+}
+
+#[tokio::test]
+async fn neighborhood_caps_each_bucket_and_reports_a_truncated_map_with_no_cursor() {
+    let (project, db_path) = open_project();
+    // demo.target's callers: demo.mid plus 4 seeded -> 5 inbound callers.
+    seed_extra_callers(&db_path, 4);
+    let state = state_for(project.path(), &db_path);
+
+    let env = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:demo.target", "limit": 2}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    // The callers bucket is capped at the per-bucket limit and flagged truncated.
+    assert_eq!(
+        env["result"]["callers"].as_array().unwrap().len(),
+        2,
+        "callers bucket must be capped at limit: {env}"
+    );
+    assert_eq!(
+        env["result"]["truncated"]["callers"], true,
+        "the truncated MAP must flag the trimmed callers bucket: {env}"
+    );
+    // A bucket under the cap is NOT flagged truncated.
+    assert_eq!(env["result"]["truncated"]["imports_out"], false);
+    // The overview has NO cursor — one cursor cannot advance 7 buckets.
+    assert!(
+        env["result"].get("next_cursor").is_none(),
+        "neighborhood overview must NOT carry a cursor: {env}"
     );
 }

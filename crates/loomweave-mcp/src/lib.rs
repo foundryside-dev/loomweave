@@ -330,8 +330,8 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_callers_list",
-            description: "Return entities that call the given entity. Default confidence is resolved, so ambiguous static candidates and LLM-inferred edges are excluded unless explicitly requested. Ambiguous edges expand all candidates; inferred edges may trigger bounded LLM dispatch. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls) so an empty callers list is never read as a guaranteed true negative.",
-            input_schema: id_confidence_schema(),
+            description: "Return entities that call the given entity. Default confidence is resolved, so ambiguous static candidates and LLM-inferred edges are excluded unless explicitly requested. Ambiguous edges expand all candidates; inferred edges may trigger bounded LLM dispatch. Bounded: `limit` (default 50, max 100) plus a numeric-offset `cursor`; the result carries `next_cursor` (null when exhausted) and an explicit `truncated` flag. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls) so an empty callers list is never read as a guaranteed true negative.",
+            input_schema: id_confidence_cursor_schema(),
         },
         ToolDefinition {
             name: "entity_execution_path_list",
@@ -367,13 +367,13 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_neighborhood_get",
-            description: "Return the one-hop Loomweave neighborhood around an entity: callers, callees, container, contained entities, references, and imports (imports_in = who imports this module, imports_out = what it imports; module-to-module). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. On references_in each rolled-up neighbor also carries `importer_module` — the importing symbol's containing module — so reverse-import names importing modules, not just symbols. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls) so empty sections are never read as guaranteed true negatives.",
+            description: "Return the one-hop Loomweave neighborhood around an entity: callers, callees, container, contained entities, references, and imports (imports_in = who imports this module, imports_out = what it imports; module-to-module). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. On references_in each rolled-up neighbor also carries `importer_module` — the importing symbol's containing module — so reverse-import names importing modules, not just symbols. Each list bucket is bounded by a single per-bucket `limit` (default 50, max 100); a sibling `truncated` map flags which buckets were trimmed (callers/callees/contained/references_in/references_out/imports_in/imports_out). For the full cursor-paginated set of a trimmed bucket, use the dedicated single-relation tool (e.g. entity_callers_list). This overview has NO cursor — one cursor cannot coherently advance seven heterogeneous buckets. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls) so empty sections are never read as guaranteed true negatives.",
             input_schema: id_confidence_schema(),
         },
         ToolDefinition {
             name: "subsystem_member_list",
-            description: "List module entities assigned to a subsystem entity.",
-            input_schema: id_schema(),
+            description: "List module entities assigned to a subsystem entity. Bounded: `limit` (default 50, max 100) plus a numeric-offset `cursor`; the result carries `next_cursor` (null when exhausted) and an explicit `truncated` flag.",
+            input_schema: id_cursor_schema(),
         },
         ToolDefinition {
             name: "entity_subsystem_get",
@@ -822,12 +822,51 @@ fn id_schema() -> Value {
     })
 }
 
+/// `id` + `limit` + `cursor` — the single-relation bounded shape (id-only tools
+/// with no confidence param, e.g. `subsystem_member_list`). `cursor` is a
+/// numeric-offset string; null/absent starts at 0 (clarion-d76e7f7267).
+fn id_cursor_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "minLength": 1},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            "cursor": {"type": ["string", "null"]}
+        },
+        "required": ["id"],
+        "additionalProperties": false
+    })
+}
+
 fn id_confidence_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
             "id": {"type": "string", "minLength": 1},
-            "confidence": confidence_schema()
+            "confidence": confidence_schema(),
+            // For `entity_callers_list` this is a page size; for
+            // `entity_neighborhood_get` it is a PER-BUCKET cap (no cursor — see
+            // `id_confidence_cursor_schema` for the cursor-paginated single-
+            // relation variant). clarion-d76e7f7267.
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100}
+        },
+        "required": ["id"],
+        "additionalProperties": false
+    })
+}
+
+/// `id` + `confidence` + `limit` + `cursor` — the single-relation cursor-
+/// paginated shape for `entity_callers_list`. Distinct from the neighborhood
+/// overview, which takes a per-bucket `limit` but NO cursor (one cursor cannot
+/// coherently advance seven heterogeneous buckets). clarion-d76e7f7267.
+fn id_confidence_cursor_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "minLength": 1},
+            "confidence": confidence_schema(),
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            "cursor": {"type": ["string", "null"]}
         },
         "required": ["id"],
         "additionalProperties": false
@@ -2805,6 +2844,21 @@ fn optional_usize(
     usize::try_from(raw)
         .map(Some)
         .map_err(|_| ParamError::new(&format!("{field} is too large")))
+}
+
+/// Parse the numeric-offset `cursor` argument shared by the bounded single-
+/// relation tools (mirrors `tool_find_entity`'s cursor handling). Null/absent
+/// starts at offset 0; a non-numeric string is a param error (clarion-d76e7f7267).
+fn parse_cursor_offset(
+    arguments: &serde_json::Map<String, Value>,
+) -> std::result::Result<usize, ParamError> {
+    match arguments.get("cursor") {
+        None | Some(Value::Null) => Ok(0),
+        Some(Value::String(cursor)) => cursor
+            .parse::<usize>()
+            .map_err(|_| ParamError::new("cursor must be a numeric offset")),
+        _ => Err(ParamError::new("cursor must be a string or null")),
+    }
 }
 
 fn optional_bool(
@@ -5172,7 +5226,7 @@ mod tests {
         assert_eq!(tools[2].name, "entity_callers_list");
         assert_eq!(
             tools[2].description,
-            "Return entities that call the given entity. Default confidence is resolved, so ambiguous static candidates and LLM-inferred edges are excluded unless explicitly requested. Ambiguous edges expand all candidates; inferred edges may trigger bounded LLM dispatch. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls) so an empty callers list is never read as a guaranteed true negative."
+            "Return entities that call the given entity. Default confidence is resolved, so ambiguous static candidates and LLM-inferred edges are excluded unless explicitly requested. Ambiguous edges expand all candidates; inferred edges may trigger bounded LLM dispatch. Bounded: `limit` (default 50, max 100) plus a numeric-offset `cursor`; the result carries `next_cursor` (null when exhausted) and an explicit `truncated` flag. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls) so an empty callers list is never read as a guaranteed true negative."
         );
         assert_eq!(tools[3].name, "entity_execution_path_list");
         assert_eq!(
@@ -5192,12 +5246,12 @@ mod tests {
         assert_eq!(tools[6].name, "entity_neighborhood_get");
         assert_eq!(
             tools[6].description,
-            "Return the one-hop Loomweave neighborhood around an entity: callers, callees, container, contained entities, references, and imports (imports_in = who imports this module, imports_out = what it imports; module-to-module). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. On references_in each rolled-up neighbor also carries `importer_module` — the importing symbol's containing module — so reverse-import names importing modules, not just symbols. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls) so empty sections are never read as guaranteed true negatives."
+            "Return the one-hop Loomweave neighborhood around an entity: callers, callees, container, contained entities, references, and imports (imports_in = who imports this module, imports_out = what it imports; module-to-module). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. On references_in each rolled-up neighbor also carries `importer_module` — the importing symbol's containing module — so reverse-import names importing modules, not just symbols. Each list bucket is bounded by a single per-bucket `limit` (default 50, max 100); a sibling `truncated` map flags which buckets were trimmed (callers/callees/contained/references_in/references_out/imports_in/imports_out). For the full cursor-paginated set of a trimmed bucket, use the dedicated single-relation tool (e.g. entity_callers_list). This overview has NO cursor — one cursor cannot coherently advance seven heterogeneous buckets. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls) so empty sections are never read as guaranteed true negatives."
         );
         assert_eq!(tools[7].name, "subsystem_member_list");
         assert_eq!(
             tools[7].description,
-            "List module entities assigned to a subsystem entity."
+            "List module entities assigned to a subsystem entity. Bounded: `limit` (default 50, max 100) plus a numeric-offset `cursor`; the result carries `next_cursor` (null when exhausted) and an explicit `truncated` flag."
         );
         assert_eq!(tools[8].name, "entity_subsystem_get");
         assert_eq!(

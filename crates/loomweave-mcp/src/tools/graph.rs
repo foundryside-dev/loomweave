@@ -26,10 +26,11 @@ use crate::{
     caller_json, compact_execution_paths, entity_context_json, entity_json,
     entity_not_found_envelope, entity_properties_json, envelope_from_storage_result,
     flatten_storage_envelope_result, import_neighbors, issues_unavailable, optional_bool,
-    optional_confidence, optional_usize, path_truncation_reason, reference_neighbors_for,
-    required_i64, required_str, storage_retryable, success_envelope, success_envelope_with_stats,
-    success_envelope_with_truncation, success_envelope_with_truncation_and_stats,
-    tool_error_envelope, wardline_section_for_entity, wardline_unavailable,
+    optional_confidence, optional_usize, parse_cursor_offset, path_truncation_reason,
+    reference_neighbors_for, required_i64, required_str, storage_retryable, success_envelope,
+    success_envelope_with_stats, success_envelope_with_truncation,
+    success_envelope_with_truncation_and_stats, tool_error_envelope, wardline_section_for_entity,
+    wardline_unavailable,
 };
 
 impl ServerState {
@@ -139,6 +140,12 @@ impl ServerState {
     ) -> std::result::Result<Value, ParamError> {
         let requested_id = required_str(arguments, "id")?.to_owned();
         let confidence = optional_confidence(arguments)?;
+        // Bounded single-relation shape (clarion-d76e7f7267): limit (default 50,
+        // clamp 1..=100) + numeric-offset cursor; emit next_cursor + truncated.
+        let limit = optional_usize(arguments, "limit")?
+            .unwrap_or(50)
+            .clamp(1, 100);
+        let offset = parse_cursor_offset(arguments)?;
         // Canonicalize the id-or-SEI to its locator ONCE, before the
         // `ensure_inferred_*` pre-gate, so the inference pass and the reader both
         // key on the real `entities.id` (clarion-d76e7f7267).
@@ -164,13 +171,22 @@ impl ServerState {
         let result = self
             .readers
             .with_reader(move |conn| {
-                let callers = call_edges_targeting(conn, &entity_id, confidence)?
+                let mut callers = call_edges_targeting(conn, &entity_id, confidence)?
                     .into_iter()
                     .filter_map(|edge| caller_json(conn, &edge).transpose())
                     .collect::<Result<Vec<_>, StorageError>>()?;
+                // Slice the materialised Vec at the MCP layer (the storage helper
+                // takes no LIMIT/OFFSET). `offset` past the end yields an empty
+                // page; `has_more` drives next_cursor + the explicit truncated.
+                let total = callers.len();
+                let page: Vec<_> = callers.drain(..).skip(offset).take(limit).collect();
+                let has_more = offset.saturating_add(limit) < total;
+                let next_cursor = has_more.then(|| (offset + limit).to_string());
                 Ok(success_envelope_with_stats(
                     json!({
-                        "callers": callers,
+                        "callers": page,
+                        "next_cursor": next_cursor,
+                        "truncated": has_more,
                         "scope_excludes": call_graph_scope_excludes(confidence),
                     }),
                     stats_delta,
@@ -344,6 +360,13 @@ impl ServerState {
     ) -> std::result::Result<Value, ParamError> {
         let requested_id = required_str(arguments, "id")?.to_owned();
         let confidence = optional_confidence(arguments)?;
+        // Per-bucket cap (clarion-d76e7f7267): ONE `limit` (default 50, clamp
+        // 1..=100) bounds EACH of the seven list buckets independently. NO
+        // cursor — one cursor cannot coherently advance seven heterogeneous
+        // buckets; an agent paginates a specific relation via its dedicated tool.
+        let limit = optional_usize(arguments, "limit")?
+            .unwrap_or(50)
+            .clamp(1, 100);
         // Canonicalize id-or-SEI to its locator ONCE, before both
         // `ensure_inferred_*` pre-gates and the reader (clarion-d76e7f7267).
         let entity_id = match self.resolve_to_locator(&requested_id).await {
@@ -382,11 +405,11 @@ impl ServerState {
                 if let Some(reason) = crate::briefing_block_reason(&entity) {
                     return Ok(crate::blocked_entity_refusal(&reason));
                 }
-                let inbound_callers = call_edges_targeting(conn, &entity_id, confidence)?
+                let mut inbound_callers = call_edges_targeting(conn, &entity_id, confidence)?
                     .into_iter()
                     .filter_map(|edge| caller_json(conn, &edge).transpose())
                     .collect::<Result<Vec<_>, StorageError>>()?;
-                let outbound_calls = call_edges_from(conn, &entity_id, confidence)?
+                let mut outbound_calls = call_edges_from(conn, &entity_id, confidence)?
                     .into_iter()
                     .filter_map(|edge| callee_json(conn, &edge).transpose())
                     .collect::<Result<Vec<_>, StorageError>>()?;
@@ -397,18 +420,36 @@ impl ServerState {
                     .transpose()?
                     .as_ref()
                     .map(|e| entity_json(conn, e));
-                let contained_entities = child_entity_ids(conn, &entity_id)?
+                let mut contained_entities = child_entity_ids(conn, &entity_id)?
                     .iter()
                     .filter_map(|child_id| entity_by_id(conn, child_id).transpose())
                     .map(|row| row.map(|entity| entity_json(conn, &entity)))
                     .collect::<Result<Vec<_>, StorageError>>()?;
-                let (references_in, references_rolled_up) =
+                let (mut references_in, references_rolled_up) =
                     reference_neighbors_for(conn, &entity, ReferenceDirection::In)?;
-                let (references_out, _) =
+                let (mut references_out, _) =
                     reference_neighbors_for(conn, &entity, ReferenceDirection::Out)?;
-                let imports_in = import_neighbors(conn, &entity_id, ReferenceDirection::In)?;
-                let imports_out = import_neighbors(conn, &entity_id, ReferenceDirection::Out)?;
+                let mut imports_in = import_neighbors(conn, &entity_id, ReferenceDirection::In)?;
+                let mut imports_out = import_neighbors(conn, &entity_id, ReferenceDirection::Out)?;
                 let scope_excludes = call_graph_scope_excludes(confidence);
+                // Bound EACH bucket independently and record whether it was
+                // trimmed in the sibling `truncated` map. A trimmed bucket directs
+                // the agent to the dedicated single-relation tool for the full
+                // cursor-paginated set (clarion-d76e7f7267).
+                let truncate_bucket = |bucket: &mut Vec<Value>| -> bool {
+                    let trimmed = bucket.len() > limit;
+                    bucket.truncate(limit);
+                    trimmed
+                };
+                let truncated = json!({
+                    "callers": truncate_bucket(&mut inbound_callers),
+                    "callees": truncate_bucket(&mut outbound_calls),
+                    "contained": truncate_bucket(&mut contained_entities),
+                    "references_in": truncate_bucket(&mut references_in),
+                    "references_out": truncate_bucket(&mut references_out),
+                    "imports_in": truncate_bucket(&mut imports_in),
+                    "imports_out": truncate_bucket(&mut imports_out),
+                });
                 Ok(success_envelope(json!({
                     "entity": entity_json(conn, &entity),
                     "callers": inbound_callers,
@@ -424,6 +465,7 @@ impl ServerState {
                     "references_rolled_up": references_rolled_up,
                     "imports_in": imports_in,
                     "imports_out": imports_out,
+                    "truncated": truncated,
                     "scope_excludes": scope_excludes,
                 })))
             })
@@ -587,6 +629,12 @@ impl ServerState {
         arguments: &serde_json::Map<String, Value>,
     ) -> std::result::Result<Value, ParamError> {
         let subsystem_id = required_str(arguments, "id")?.to_owned();
+        // Bounded single-relation shape (clarion-d76e7f7267): a subsystem can
+        // hold hundreds of modules. limit (default 50, clamp 1..=100) + cursor.
+        let limit = optional_usize(arguments, "limit")?
+            .unwrap_or(50)
+            .clamp(1, 100);
+        let offset = parse_cursor_offset(arguments)?;
         let result = self
             .readers
             .with_reader(move |conn| {
@@ -604,13 +652,21 @@ impl ServerState {
                         false,
                     ));
                 }
+                // Slice the members Vec at the MCP layer (the storage helper takes
+                // no LIMIT/OFFSET) before projecting, so paging bounds the work.
+                let all_members = subsystem_members(conn, &subsystem.id)?;
+                let total = all_members.len();
+                let has_more = offset.saturating_add(limit) < total;
+                let next_cursor = has_more.then(|| (offset + limit).to_string());
                 // Members are projected with their own compact shape (not
                 // `entity_json`), so the briefing-blocked gate is applied here via
                 // `entity_visibility` — a blocked member module (its file carries a
                 // secret) is redacted to withhold its id/name/path
                 // (clarion-307668e2be).
-                let members = subsystem_members(conn, &subsystem.id)?
+                let members = all_members
                     .iter()
+                    .skip(offset)
+                    .take(limit)
                     .map(|member| {
                         if let EntityVisibility::Blocked(reason) =
                             entity_visibility(conn, &member.id)?
@@ -637,7 +693,9 @@ impl ServerState {
                         "short_name": subsystem.short_name,
                         "properties": entity_properties_json(&subsystem)
                     },
-                    "members": members
+                    "members": members,
+                    "next_cursor": next_cursor,
+                    "truncated": has_more
                 })))
             })
             .await;
