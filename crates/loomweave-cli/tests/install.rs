@@ -110,13 +110,15 @@ fn install_all_wires_three_way_integration_bindings() {
     );
     let expected_loomweave_url = format!("http://127.0.0.1:{expected_port}");
 
-    let wardline_yaml = read_yaml(&dir.path().join("wardline.yaml"));
-    assert_eq!(wardline_yaml["loomweave"]["url"], expected_loomweave_url);
-    assert_eq!(
-        wardline_yaml["filigree"]["url"],
-        "http://127.0.0.1:8749/api/weft/scan-results"
+    // Wardline reads no URL from any `wardline.yaml` (its resolvers are
+    // flag > env > published-port), so Loomweave writes none — the absence is
+    // deliberate, not an oversight.
+    assert!(
+        !dir.path().join("wardline.yaml").exists(),
+        "install must not write a dead wardline.yaml that Wardline never reads"
     );
 
+    // The two peer URLs reach Wardline *only* via the `.mcp.json` launch flags.
     let mcp: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dir.path().join(".mcp.json")).unwrap()).unwrap();
     assert_eq!(

@@ -32,7 +32,9 @@ pub const SOURCE_ENV: &str = "env:WEFT_LOOMWEAVE_URL";
 pub const SOURCE_WEFT_TOML: &str = "weft.toml";
 /// The live published port file `.weft/loomweave/ephemeral.port`.
 pub const SOURCE_EPHEMERAL_PORT: &str = ".weft/loomweave/ephemeral.port";
-/// A statically configured URL (e.g. `wardline.yaml: loomweave.url`).
+/// A statically configured URL from a consumer's own config (distinct from the
+/// `weft.toml` rung above). Note: Wardline does *not* use this rung for
+/// Loomweave — its `resolve_loomweave_url` reads no config-file URL key.
 pub const SOURCE_CONFIG: &str = "config";
 /// Neither a published file nor a configured URL — federation is absent.
 pub const SOURCE_NONE: &str = "none";

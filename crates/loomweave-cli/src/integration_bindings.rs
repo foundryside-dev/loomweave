@@ -1,9 +1,16 @@
 //! Local three-way Loomweave/Filigree/Wardline dogfood bindings.
 //!
 //! These are intentionally configuration bindings, not a shared runtime:
-//! Loomweave enables its own optional HTTP and Filigree read surfaces, Wardline
-//! receives the two peer URLs, and the project-local `.mcp.json` launches
-//! Wardline with the same URLs for MCP scans.
+//! Loomweave enables its own optional HTTP and Filigree read surfaces, and the
+//! project-local `.mcp.json` launches Wardline with the two peer URLs as
+//! `--loomweave-url` / `--filigree-url` flags for MCP scans.
+//!
+//! Wardline receives those URLs *only* via the `.mcp.json` launch flags (its
+//! `resolve_loomweave_url` / `resolve_filigree_url` precedence is
+//! flag > env > published `.weft/*/ephemeral.port`). It reads no URL from any
+//! `wardline.yaml` — that file is not in either resolver's chain — so Loomweave
+//! does not write one. (The separate, now-orphaned `wardline.yaml` *manifest*
+//! read on the analyze side is tracked in clarion-7c9336163e.)
 
 use std::env;
 use std::fs;
@@ -43,11 +50,10 @@ pub fn binding_state(project_root: &Path) -> BindingState {
     let desired = desired_bindings(project_root);
     match (
         loomweave_yaml_ok(project_root, &desired),
-        wardline_yaml_ok(project_root, &desired),
         wardline_mcp_ok(project_root, &desired),
     ) {
-        (Ok(true), Ok(true), Ok(true)) => BindingState::Present,
-        (Err(_), _, _) | (_, Err(_), _) | (_, _, Err(_)) => BindingState::Unparseable,
+        (Ok(true), Ok(true)) => BindingState::Present,
+        (Err(_), _) | (_, Err(_)) => BindingState::Unparseable,
         _ => BindingState::MissingOrStale,
     }
 }
@@ -63,7 +69,6 @@ pub fn install_bindings(project_root: &Path) -> Result<bool> {
     let desired = desired_bindings(project_root);
     let mut changed = false;
     changed |= install_loomweave_yaml(project_root, &desired)?;
-    changed |= install_wardline_yaml(project_root, &desired)?;
     changed |= install_wardline_mcp(project_root, &desired)?;
     Ok(changed)
 }
@@ -167,24 +172,6 @@ fn loomweave_yaml_ok(project_root: &Path, desired: &DesiredBindings) -> Result<b
             }))
 }
 
-fn wardline_yaml_ok(project_root: &Path, desired: &DesiredBindings) -> Result<bool> {
-    let path = project_root.join("wardline.yaml");
-    if !path.exists() {
-        return Ok(false);
-    }
-    let value = read_yaml_value(&path)?;
-    Ok(value
-        .get("loomweave")
-        .and_then(|loomweave| loomweave.get("url"))
-        .and_then(Value::as_str)
-        == Some(desired.loomweave_url.as_str())
-        && value
-            .get("filigree")
-            .and_then(|filigree| filigree.get("url"))
-            .and_then(Value::as_str)
-            == Some(desired.wardline_filigree_url.as_str()))
-}
-
 fn wardline_mcp_ok(project_root: &Path, desired: &DesiredBindings) -> Result<bool> {
     let path = project_root.join(".mcp.json");
     if !path.exists() {
@@ -236,17 +223,6 @@ fn install_loomweave_yaml(project_root: &Path, desired: &DesiredBindings) -> Res
     }
     http.insert("enabled".to_owned(), json!(true));
     http.insert("wardline_taint_write".to_owned(), json!(true));
-    write_yaml_if_changed(&path, &value)
-}
-
-fn install_wardline_yaml(project_root: &Path, desired: &DesiredBindings) -> Result<bool> {
-    let path = project_root.join("wardline.yaml");
-    let mut value = read_yaml_value_or_empty(&path)?;
-    let root = object_mut(&mut value, &path)?;
-    let loomweave = ensure_object(root, "loomweave")?;
-    loomweave.insert("url".to_owned(), json!(desired.loomweave_url));
-    let filigree = ensure_object(root, "filigree")?;
-    filigree.insert("url".to_owned(), json!(desired.wardline_filigree_url));
     write_yaml_if_changed(&path, &value)
 }
 

@@ -237,10 +237,10 @@ fn doctor_fix_repairs_missing_three_way_integration_bindings() {
         serde_json::json!(true)
     );
 
-    let wardline_yaml = read_yaml(&dir.path().join("wardline.yaml"));
-    assert_eq!(
-        wardline_yaml["filigree"]["url"],
-        "http://127.0.0.1:8749/api/weft/scan-results"
+    // Wardline reads no URL from any `wardline.yaml`, so --fix writes none.
+    assert!(
+        !dir.path().join("wardline.yaml").exists(),
+        "doctor --fix must not write a dead wardline.yaml that Wardline never reads"
     );
 
     let expected_port = loomweave_federation::loomweave_port::deterministic_port(
@@ -248,6 +248,7 @@ fn doctor_fix_repairs_missing_three_way_integration_bindings() {
     );
     let expected_loomweave_url = format!("http://127.0.0.1:{expected_port}");
 
+    // The two peer URLs reach Wardline only via the `.mcp.json` launch flags.
     let mcp: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dir.path().join(".mcp.json")).unwrap()).unwrap();
     assert_eq!(
