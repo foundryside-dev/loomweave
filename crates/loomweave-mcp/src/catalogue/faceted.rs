@@ -212,8 +212,16 @@ impl ServerState {
                     .iter()
                     .map(|(entity, blob)| {
                         let mut row = entity_json(conn, entity);
+                        // The Wardline taint blob carries qualnames, which would
+                        // survive the identity stub of a blocked entity — withhold
+                        // it too (clarion-307668e2be).
+                        let blob = if crate::briefing_block_reason(entity).is_some() {
+                            Value::Null
+                        } else {
+                            blob.clone()
+                        };
                         if let Some(object) = row.as_object_mut() {
-                            object.insert("wardline".to_owned(), blob.clone());
+                            object.insert("wardline".to_owned(), blob);
                         }
                         row
                     })

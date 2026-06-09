@@ -1734,3 +1734,192 @@ async fn search_semantic_ranks_by_cosine_similarity() {
         "login should outrank add: {env}"
     );
 }
+
+// ---- briefing_blocked identity gate (clarion-307668e2be) ----------------
+
+/// Like [`insert_entity`] but marks the row briefing-blocked. `content_hash` is
+/// kept identical to [`insert_entity`] ("hash") so embedding keys still match.
+fn insert_blocked_entity(
+    conn: &Connection,
+    id: &str,
+    kind: &str,
+    source_path: &str,
+    range: Option<(i64, i64)>,
+    reason: &str,
+) {
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, source_file_path, \
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at) \
+         VALUES (?1,'python',?2,?1,?1,?3,?4,?5,?6,'hash','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')",
+        params![
+            id,
+            kind,
+            source_path,
+            range.map(|(s, _)| s),
+            range.map(|(_, e)| e),
+            json!({"briefing_blocked": reason}).to_string(),
+        ],
+    )
+    .expect("insert blocked entity");
+}
+
+/// Assert an entity projection is a redacted stub: every identity field null,
+/// only the block reason present.
+fn assert_redacted_identity(entity: &Value, reason: &str) {
+    assert_eq!(entity["briefing_blocked"], reason, "stub reason: {entity}");
+    for field in [
+        "id",
+        "sei",
+        "kind",
+        "name",
+        "short_name",
+        "source_file_path",
+        "source_line_start",
+        "source_line_end",
+        "content_hash",
+    ] {
+        assert!(
+            entity.get(field).is_none_or(Value::is_null),
+            "identity field `{field}` must be withheld for a blocked entity: {entity}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn find_by_kind_redacts_briefing_blocked_identity() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:visible",
+        "function",
+        "a.py",
+        Some((1, 2)),
+    );
+    insert_blocked_entity(
+        &conn,
+        "python:function:leaky",
+        "function",
+        "b.py",
+        Some((3, 4)),
+        "secret_present",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_by_kind", json!({"kind": "function"})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    // Both functions counted; the blocked one is a stub, not omitted.
+    assert_eq!(env["result"]["page"]["total"], 2, "{env}");
+    let blocked = env["result"]["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["briefing_blocked"] == "secret_present")
+        .expect("blocked entity stub present");
+    assert_redacted_identity(blocked, "secret_present");
+    assert!(
+        !env.to_string().contains("python:function:leaky"),
+        "blocked id leaked in find_by_kind response: {env}"
+    );
+}
+
+#[tokio::test]
+async fn search_semantic_redacts_briefing_blocked_identity() {
+    let (project, db, conn) = open_project();
+    insert_blocked_entity(
+        &conn,
+        "python:function:login",
+        "function",
+        "auth.py",
+        Some((1, 2)),
+        "secret_present",
+    );
+    drop(conn);
+
+    let now = "2026-01-01T00:00:00.000Z";
+    let store = EmbeddingStore::open_in_store_dir(project.path()).expect("open sidecar");
+    let key = EmbeddingKey {
+        entity_id: "python:function:login".to_owned(),
+        content_hash: "hash".to_owned(),
+        model_id: "rec-model".to_owned(),
+    };
+    store
+        .upsert(&key, &[1.0, 0.0], 0.0, 1, now)
+        .expect("upsert login embedding");
+    drop(store);
+
+    let provider = Arc::new(RecordingEmbeddingProvider::from_recordings(
+        "rec-model",
+        2,
+        vec![EmbeddingRecording {
+            text: "authenticate user".to_owned(),
+            vector: vec![0.9, 0.1],
+        }],
+    ));
+    let config = SemanticSearchConfig {
+        enabled: true,
+        model_id: "rec-model".to_owned(),
+        dimensions: 2,
+        ..SemanticSearchConfig::default()
+    };
+    let state = state_for(project.path(), &db).with_semantic_search(config, provider);
+
+    let env = call_tool(
+        &state,
+        "search_semantic",
+        json!({"query": "authenticate user"}),
+    )
+    .await;
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1, "{env}");
+    assert_redacted_identity(&results[0]["entity"], "secret_present");
+    assert!(
+        !env.to_string().contains("python:function:login"),
+        "blocked id leaked in search_semantic response: {env}"
+    );
+}
+
+#[tokio::test]
+async fn find_by_wardline_redacts_blocked_entity_and_withholds_blob() {
+    let (project, db, conn) = open_project();
+    insert_blocked_entity(
+        &conn,
+        "python:function:tainted",
+        "function",
+        "t.py",
+        Some((1, 2)),
+        "secret_present",
+    );
+    // The Wardline taint blob embeds a qualname — which would survive the
+    // identity stub if attached.
+    insert_taint_fact(
+        &conn,
+        "python:function:tainted",
+        &json!({"qualname": "app.secrets.tainted", "tier": "high"}).to_string(),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_by_wardline", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let blocked = env["result"]["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["briefing_blocked"] == "secret_present")
+        .expect("blocked entity stub present");
+    assert_redacted_identity(blocked, "secret_present");
+    assert!(
+        blocked["wardline"].is_null(),
+        "wardline blob leaks identity for a blocked entity: {blocked}"
+    );
+    assert!(
+        !env.to_string().contains("app.secrets.tainted"),
+        "qualname leaked via the wardline blob: {env}"
+    );
+    assert!(
+        !env.to_string().contains("python:function:tainted"),
+        "blocked id leaked in find_by_wardline response: {env}"
+    );
+}

@@ -3373,11 +3373,7 @@ fn summary_scope_deferred(entity_json: &Value) -> Value {
 }
 
 fn summary_briefing_blocked(entity_json: &Value, reason: &str) -> Value {
-    let remediation = if reason == "unscanned_source" {
-        "Entity source file was not covered by the pre-ingest secret scan. Re-run with scanner coverage for that path or fix the plugin source path before requesting a summary."
-    } else {
-        "File flagged by pre-ingest secret scan. Fix the secret or whitelist via .weft/loomweave/secrets-baseline.yaml. See ADR-013."
-    };
+    let remediation = briefing_block_remediation(reason);
     let entity_id = entity_json
         .get("id")
         .and_then(Value::as_str)
@@ -3443,6 +3439,17 @@ fn entity_identity_json(entity: &EntityRow) -> Value {
 /// to JSON `null` on a pre-SEI database or an orphaned/unbound locator — the
 /// lookup must never fail the tool call.
 fn entity_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
+    // A secret-scan-blocked entity (ADR-013) must not have its identity disclosed
+    // by a discovery/structure MCP read — matching the federation read API, whose
+    // BRIEFING_BLOCKED response omits id/name/path/hash (ADR-034). This is the
+    // single choke point: every list/structure surface projects entities (and
+    // their caller/callee/reference/import neighbors) through here
+    // (clarion-307668e2be). The deliberate exception — `summary`, which echoes a
+    // caller-named entity's identity + remediation — builds identity via
+    // `entity_identity_json` instead, bypassing this gate.
+    if let Some(reason) = briefing_block_reason(entity) {
+        return blocked_entity_stub(&reason);
+    }
     let mut value = entity_identity_json(entity);
     if let Some(object) = value.as_object_mut() {
         object.insert(
@@ -3451,6 +3458,55 @@ fn entity_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
         );
     }
     value
+}
+
+/// The identity projection of a briefing-blocked entity (ADR-013 secret scan).
+///
+/// Every identity field is withheld — only the block reason remains — so a
+/// discovery/structure MCP read acknowledges the entity exists without
+/// disclosing its name, path, or line span. Mirrors the federation read API,
+/// whose `BRIEFING_BLOCKED` response omits the same fields (ADR-034). The
+/// qualname-bearing `id` is nulled too: the locator itself encodes the name.
+fn blocked_entity_stub(reason: &str) -> Value {
+    json!({
+        "id": Value::Null,
+        "sei": Value::Null,
+        "kind": Value::Null,
+        "name": Value::Null,
+        "short_name": Value::Null,
+        "source_file_path": Value::Null,
+        "source_line_start": Value::Null,
+        "source_line_end": Value::Null,
+        "content_hash": Value::Null,
+        "briefing_blocked": reason,
+    })
+}
+
+/// Placeholder substituted for a briefing-blocked entity's id in execution-path
+/// arrays. Distinct blocked nodes collapse to this one token (uncorrelatable by
+/// design — the accepted price of withholding identity, clarion-307668e2be).
+const BRIEFING_BLOCKED_PATH_SENTINEL: &str = "[briefing-blocked]";
+
+/// Operator-facing remediation for a briefing block, by reason. Shared by every
+/// refusal envelope (summary / neighborhood / orientation) so the "fix the
+/// secret" guidance stays consistent.
+fn briefing_block_remediation(reason: &str) -> &'static str {
+    if reason == "unscanned_source" {
+        "Entity source file was not covered by the pre-ingest secret scan. Re-run with scanner coverage for that path or fix the plugin source path before requesting a summary."
+    } else {
+        "File flagged by pre-ingest secret scan. Fix the secret or whitelist via .weft/loomweave/secrets-baseline.yaml. See ADR-013."
+    }
+}
+
+/// Refusal envelope for a structure-fan-out read (`neighborhood`,
+/// `orientation`) whose queried entity is itself briefing-blocked. Withholds the
+/// structure *around* the withheld entity (ADR-034) and discloses no identity.
+fn blocked_entity_refusal(reason: &str) -> Value {
+    success_envelope(json!({
+        "available": false,
+        "briefing_blocked": reason,
+        "remediation": briefing_block_remediation(reason),
+    }))
 }
 
 fn entity_properties_json(entity: &EntityRow) -> Value {
@@ -3533,6 +3589,21 @@ fn span_len(entity: &EntityRow) -> Option<i64> {
 /// Compact entity descriptor for the containing stack — enough to orient
 /// without the full `entity_json` payload.
 fn stack_entity_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
+    // A blocked entity in the containing stack (the matched node, or a blocked
+    // ancestor module) is redacted to a stub — same identity-withholding as
+    // `entity_json` (clarion-307668e2be).
+    if let Some(reason) = briefing_block_reason(entity) {
+        return json!({
+            "id": Value::Null,
+            "sei": Value::Null,
+            "kind": Value::Null,
+            "short_name": Value::Null,
+            "name": Value::Null,
+            "source_line_start": Value::Null,
+            "source_line_end": Value::Null,
+            "briefing_blocked": reason,
+        });
+    }
     // REQ-C-04: a containing-stack ancestor is sometimes the ONLY place an
     // entity appears in the response, so it carries its `sei` (the durable
     // binding key) — not just the mutable `id`/locator. Graceful-degrade null.
@@ -3586,15 +3657,29 @@ fn entity_context_json(
         .collect();
     containing_stack.push(stack_entity_json(conn, matched));
 
-    let def = DefinitionSpan::from_entity(matched);
-    let ranges = json!({
-        "source_line_start": matched.source_line_start,
-        "source_line_end": matched.source_line_end,
-        "decl_line": def.decl_line,
-        "body_line_start": def.body_line_start,
-        "decorator_line_start": def.decorator_line_start,
-        "decorator_line_end": def.decorator_line_end,
-    });
+    // A blocked matched entity withholds its line span too — the ranges block
+    // would otherwise disclose exactly what the block hides (clarion-307668e2be).
+    let ranges = if let Some(reason) = briefing_block_reason(matched) {
+        json!({
+            "source_line_start": Value::Null,
+            "source_line_end": Value::Null,
+            "decl_line": Value::Null,
+            "body_line_start": Value::Null,
+            "decorator_line_start": Value::Null,
+            "decorator_line_end": Value::Null,
+            "briefing_blocked": reason,
+        })
+    } else {
+        let def = DefinitionSpan::from_entity(matched);
+        json!({
+            "source_line_start": matched.source_line_start,
+            "source_line_end": matched.source_line_end,
+            "decl_line": def.decl_line,
+            "body_line_start": def.body_line_start,
+            "decorator_line_start": def.decorator_line_start,
+            "decorator_line_end": def.decorator_line_end,
+        })
+    };
 
     // Ambiguity: other candidates sharing the winner's span length are genuine
     // same-granularity overlaps. Strictly larger spans are the nesting stack
@@ -3661,6 +3746,10 @@ struct OrientationCore {
     sei_populated: bool,
     neighbors_omitted: serde_json::Map<String, Value>,
     paths_truncation_reason: Option<String>,
+    /// Set when the resolved primary entity is briefing-blocked: the pack is
+    /// refused (no identity, no surrounding structure) rather than built
+    /// (clarion-307668e2be).
+    briefing_blocked: Option<String>,
 }
 
 /// Sort a neighbor list by entity id (stable, deterministic) and cap it,
@@ -4745,12 +4834,19 @@ fn callee_json(
     edge: &CallEdgeMatch,
 ) -> Result<Option<Value>, StorageError> {
     Ok(entity_by_id(conn, &edge.to_id)?.map(|entity| {
+        // `stored_to_id` echoes the callee's raw id, which leaks the qualname of
+        // a blocked callee even when `entity_json` redacts it (clarion-307668e2be).
+        let stored_to_id = if briefing_block_reason(&entity).is_some() {
+            Value::Null
+        } else {
+            json!(edge.stored_to_id)
+        };
         json!({
             "entity": entity_json(conn, &entity),
             "edge_confidence": edge.confidence.as_str(),
             "source_byte_start": edge.source_byte_start,
             "source_byte_end": edge.source_byte_end,
-            "stored_to_id": edge.stored_to_id
+            "stored_to_id": stored_to_id
         })
     }))
 }
@@ -4784,11 +4880,31 @@ fn compact_execution_paths(
             node_ids.insert(id.clone());
         }
     }
-    let nodes = node_ids
-        .iter()
-        .filter_map(|id| entity_by_id(conn, id).transpose())
-        .map(|row| row.map(|entity| compact_node_json(conn, &entity)))
-        .collect::<Result<Vec<_>, StorageError>>()?;
+    // A briefing-blocked node is omitted from the node table (its id IS its
+    // qualname, so it cannot be projected) and its occurrences in the path
+    // arrays are replaced with a sentinel. The path keeps its shape — a flow
+    // *through* withheld territory — without disclosing which entity
+    // (clarion-307668e2be).
+    let mut blocked: BTreeSet<String> = BTreeSet::new();
+    let mut nodes = Vec::new();
+    for id in &node_ids {
+        if let Some(entity) = entity_by_id(conn, id)? {
+            if briefing_block_reason(&entity).is_some() {
+                blocked.insert(id.clone());
+            } else {
+                nodes.push(compact_node_json(conn, &entity));
+            }
+        }
+    }
+    if !blocked.is_empty() {
+        for path in &mut paths {
+            for id in path.iter_mut() {
+                if blocked.contains(id) {
+                    BRIEFING_BLOCKED_PATH_SENTINEL.clone_into(id);
+                }
+            }
+        }
+    }
     Ok(CompactPaths {
         nodes,
         paths,

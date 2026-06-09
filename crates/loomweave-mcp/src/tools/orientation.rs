@@ -18,7 +18,7 @@ use crate::{
     PathTraversal, ServerState, call_graph_scope_excludes, callee_json, caller_json,
     cap_neighbor_list, compact_execution_paths, entity_context_json, entity_json, import_neighbors,
     orientation_suggested_reads, path_truncation_reason, reference_neighbors_for, required_i64,
-    storage_retryable, success_envelope_with_truncation, tool_error_envelope,
+    storage_retryable, success_envelope, success_envelope_with_truncation, tool_error_envelope,
 };
 
 impl ServerState {
@@ -118,8 +118,28 @@ impl ServerState {
                         sei_populated,
                         neighbors_omitted: serde_json::Map::new(),
                         paths_truncation_reason: None,
+                        briefing_blocked: None,
                     });
                 };
+
+                // Refuse to build a pack for a briefing-blocked primary
+                // (clarion-307668e2be): no identity, no surrounding structure —
+                // mirroring the federation read API (ADR-034). Resolved here, in
+                // the reader closure, so the post-closure path can short-circuit.
+                if let Some(reason) = crate::briefing_block_reason(&entity) {
+                    return Ok(OrientationCore {
+                        primary_id: None,
+                        primary_kind: None,
+                        lookup_was_id: query_line.is_none(),
+                        packet: Value::Null,
+                        freshness,
+                        staleness_stale,
+                        sei_populated,
+                        neighbors_omitted: serde_json::Map::new(),
+                        paths_truncation_reason: None,
+                        briefing_blocked: Some(reason),
+                    });
+                }
 
                 let ancestors = ancestor_chain(conn, &entity.id)?;
                 let entity_context = entity_context_json(
@@ -250,6 +270,7 @@ impl ServerState {
                     sei_populated,
                     neighbors_omitted,
                     paths_truncation_reason: paths_truncation_reason.map(str::to_owned),
+                    briefing_blocked: None,
                 })
             })
             .await;
@@ -264,6 +285,18 @@ impl ServerState {
                 ));
             }
         };
+
+        // A briefing-blocked primary is refused before any structure is built —
+        // no identity, no neighbors, no paths (clarion-307668e2be). Checked ahead
+        // of the not-found branch: the blocked core carries `primary_id: None`.
+        if let Some(reason) = &core.briefing_blocked {
+            return Ok(success_envelope(json!({
+                "available": false,
+                "briefing_blocked": reason,
+                "remediation": crate::briefing_block_remediation(reason),
+                "primary_entity": Value::Null,
+            })));
+        }
 
         // An `entity`-id lookup that resolved to nothing is a hard error; a
         // file/line lookup that spans nothing degrades to a no_match packet.

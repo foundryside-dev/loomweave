@@ -12,9 +12,10 @@ use loomweave_core::{EdgeConfidence, McpErrorCode};
 use serde_json::{Value, json};
 
 use loomweave_storage::{
-    ReferenceDirection, StorageError, ancestor_chain, call_edges_from, call_edges_targeting,
-    child_entity_ids, entities_containing_line, entity_by_id, find_entities, normalize_source_path,
-    subsystem_members, subsystem_of_entity,
+    EntityVisibility, ReferenceDirection, StorageError, ancestor_chain, call_edges_from,
+    call_edges_targeting, child_entity_ids, entities_containing_line, entity_by_id,
+    entity_visibility, find_entities, normalize_source_path, subsystem_members,
+    subsystem_of_entity,
 };
 
 use crate::filigree::IssueDetail;
@@ -347,6 +348,13 @@ impl ServerState {
                         false,
                     ));
                 };
+                // Refuse to fan out structure around a briefing-blocked entity
+                // (clarion-307668e2be) — withholding the surrounding graph is the
+                // federation posture (ADR-034). A blocked entity that appears as a
+                // *neighbor* of a visible entity is stubbed, not refused.
+                if let Some(reason) = crate::briefing_block_reason(&entity) {
+                    return Ok(crate::blocked_entity_refusal(&reason));
+                }
                 let inbound_callers = call_edges_targeting(conn, &entity_id, confidence)?
                     .into_iter()
                     .filter_map(|edge| caller_json(conn, &edge).transpose())
@@ -569,16 +577,32 @@ impl ServerState {
                         false,
                     ));
                 }
+                // Members are projected with their own compact shape (not
+                // `entity_json`), so the briefing-blocked gate is applied here via
+                // `entity_visibility` — a blocked member module (its file carries a
+                // secret) is redacted to withhold its id/name/path
+                // (clarion-307668e2be).
                 let members = subsystem_members(conn, &subsystem.id)?
                     .iter()
                     .map(|member| {
-                        json!({
-                            "id": member.id,
-                            "name": member.name,
-                            "source_file_path": member.source_file_path
-                        })
+                        if let EntityVisibility::Blocked(reason) =
+                            entity_visibility(conn, &member.id)?
+                        {
+                            Ok(json!({
+                                "id": Value::Null,
+                                "name": Value::Null,
+                                "source_file_path": Value::Null,
+                                "briefing_blocked": reason
+                            }))
+                        } else {
+                            Ok(json!({
+                                "id": member.id,
+                                "name": member.name,
+                                "source_file_path": member.source_file_path
+                            }))
+                        }
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>, StorageError>>()?;
                 Ok(success_envelope(json!({
                     "subsystem": {
                         "id": subsystem.id,

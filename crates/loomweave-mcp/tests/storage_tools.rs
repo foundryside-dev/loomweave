@@ -1018,6 +1018,39 @@ async fn subsystem_members_returns_member_modules() {
 }
 
 #[tokio::test]
+async fn subsystem_members_redacts_briefing_blocked_member() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    let subsystem_id = seed_subsystem(&conn, project.path());
+    drop(conn);
+    // The pkg.auth module's file carries a secret → its module entity is blocked.
+    mark_blocked(&db_path, "python:module:pkg.auth", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(&state, "subsystem_members", json!({"id": subsystem_id})).await;
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    let members = envelope["result"]["members"].as_array().unwrap();
+    // Member count stays honest; the blocked module is a redacted stub.
+    assert_eq!(members.len(), 2, "{envelope}");
+    let blocked = members
+        .iter()
+        .find(|m| m["briefing_blocked"] == "secret_present")
+        .expect("blocked member present as a stub");
+    assert!(blocked["id"].is_null(), "{blocked}");
+    assert!(blocked["name"].is_null(), "{blocked}");
+    assert!(blocked["source_file_path"].is_null(), "{blocked}");
+    // The visible member is untouched; the blocked id never appears.
+    assert!(
+        members.iter().any(|m| m["id"] == "python:module:demo"),
+        "{envelope}"
+    );
+    assert!(
+        !envelope.to_string().contains("pkg.auth"),
+        "blocked member id leaked in subsystem_members: {envelope}"
+    );
+}
+
+#[tokio::test]
 async fn subsystem_members_rejects_non_subsystem_id() {
     let (project, db_path) = open_project();
     let state = state_for(project.path(), &db_path);
@@ -3557,6 +3590,279 @@ async fn find_entity_kind_filter_returns_only_that_kind() {
     assert!(
         blank["error"].is_object(),
         "blank kind should be a param error: {blank:?}"
+    );
+}
+
+// ---- briefing_blocked identity gate (clarion-307668e2be) ----------------
+//
+// A secret-scan-blocked entity's identity (id, name, source_file_path, line
+// span) must not be disclosed by any discovery/structure MCP read — matching
+// the federation read API (ADR-034). Discovery surfaces emit a *stub* that
+// acknowledges existence with only the block reason; structure-fan-out surfaces
+// (neighborhood / orientation) *refuse* when the queried entity itself is
+// blocked. The blocked entity's qualname-bearing id must appear NOWHERE in the
+// response (it leaks the name even when name/path are nulled).
+
+/// Mark an already-seeded entity briefing-blocked by rewriting its `properties`.
+fn mark_blocked(db_path: &std::path::Path, id: &str, reason: &str) {
+    let conn = Connection::open(db_path).expect("open sqlite");
+    conn.execute(
+        "UPDATE entities SET properties = ?1 WHERE id = ?2",
+        params![json!({"briefing_blocked": reason}).to_string(), id],
+    )
+    .expect("mark entity blocked");
+}
+
+/// Assert an entity projection is a redacted stub: every identity field null,
+/// only the block reason present.
+fn assert_redacted_identity(entity: &Value, reason: &str) {
+    assert_eq!(entity["briefing_blocked"], reason, "stub reason: {entity}");
+    for field in [
+        "id",
+        "sei",
+        "kind",
+        "name",
+        "short_name",
+        "source_file_path",
+        "source_line_start",
+        "source_line_end",
+        "content_hash",
+    ] {
+        assert!(
+            entity.get(field).is_none_or(Value::is_null),
+            "identity field `{field}` must be withheld for a blocked entity: {entity}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn find_entity_redacts_briefing_blocked_identity() {
+    let (project, db_path) = open_project();
+    mark_blocked(&db_path, "python:function:demo.mid", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    // `demo.mid` matches exactly one seeded id.
+    let resp = call_tool(
+        &state,
+        "find_entity",
+        json!({"pattern": "python:function:demo.mid", "limit": 10}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+
+    let entities = resp["result"]["entities"].as_array().unwrap();
+    let blocked: Vec<&Value> = entities
+        .iter()
+        .filter(|e| e["briefing_blocked"] == "secret_present")
+        .collect();
+    assert_eq!(blocked.len(), 1, "blocked entity still listed: {resp}");
+    assert_redacted_identity(blocked[0], "secret_present");
+    assert!(
+        !resp.to_string().contains("demo.mid"),
+        "blocked id leaked somewhere in find_entity response: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn entity_at_redacts_briefing_blocked_match_and_context() {
+    let (project, db_path) = open_project();
+    // demo.mid uniquely spans lines 4-5 (module also spans, but mid is innermost).
+    mark_blocked(&db_path, "python:function:demo.mid", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(&state, "entity_at", json!({"file": "demo.py", "line": 4})).await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    assert_redacted_identity(&resp["result"]["entity"], "secret_present");
+
+    // The matched node in the containing stack is redacted; its ranges nulled.
+    let stack = resp["result"]["entity_context"]["containing_stack"]
+        .as_array()
+        .unwrap();
+    let matched_node = stack.last().expect("matched node present");
+    assert_eq!(matched_node["briefing_blocked"], "secret_present", "{resp}");
+    assert!(matched_node["id"].is_null(), "{resp}");
+    assert!(
+        resp["result"]["entity_context"]["ranges"]["source_line_start"].is_null(),
+        "matched ranges leak the blocked line span: {resp}"
+    );
+    assert!(
+        !resp.to_string().contains("demo.mid"),
+        "blocked id leaked in entity_at response: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn entity_at_redacts_blocked_alternative() {
+    let (project, db_path) = open_project();
+    // demo.target and demo.alt_target both span lines 7-8 (same-granularity
+    // overlap). entity_at(line 7) matches alt_target (id-sorted first) and lists
+    // target as a same-granularity *alternative* — which must be redacted when
+    // blocked (the `alternatives` block is a third projection in entity_context).
+    mark_blocked(&db_path, "python:function:demo.target", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(&state, "entity_at", json!({"file": "demo.py", "line": 7})).await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let alternatives = resp["result"]["entity_context"]["alternatives"]
+        .as_array()
+        .unwrap();
+    let blocked = alternatives
+        .iter()
+        .find(|a| a["entity"]["briefing_blocked"] == "secret_present")
+        .expect("blocked alternative present as a stub");
+    assert_redacted_identity(&blocked["entity"], "secret_present");
+    assert!(
+        !resp.to_string().contains("demo.target"),
+        "blocked alternative id leaked in entity_at response: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn orientation_suggested_reads_omit_blocked_callee() {
+    let (project, db_path) = open_project();
+    // entry's first resolved callee is mid; block it. The suggested-reads drill
+    // into the first callee reads its id from the (now-redacted) packet, so the
+    // blocked id must not surface in suggested_next_reads.
+    mark_blocked(&db_path, "python:function:demo.mid", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    assert!(
+        !resp["result"]["suggested_next_reads"]
+            .to_string()
+            .contains("demo.mid"),
+        "blocked callee id leaked in suggested_next_reads: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn neighborhood_redacts_blocked_neighbor_including_stored_to_id() {
+    let (project, db_path) = open_project();
+    // demo.entry calls demo.mid (resolved). Block the callee.
+    mark_blocked(&db_path, "python:function:demo.mid", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+
+    let callees = resp["result"]["callees"].as_array().unwrap();
+    let blocked = callees
+        .iter()
+        .find(|c| c["entity"]["briefing_blocked"] == "secret_present")
+        .expect("blocked callee present as a stub");
+    assert_redacted_identity(&blocked["entity"], "secret_present");
+    assert!(
+        blocked["stored_to_id"].is_null(),
+        "stored_to_id leaks the blocked callee id: {blocked}"
+    );
+    assert!(
+        !resp.to_string().contains("demo.mid"),
+        "blocked id leaked in neighborhood response: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn neighborhood_refuses_structure_for_blocked_entity() {
+    let (project, db_path) = open_project();
+    mark_blocked(&db_path, "python:function:demo.mid", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:demo.mid"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    assert_eq!(resp["result"]["available"], false, "{resp}");
+    assert_eq!(
+        resp["result"]["briefing_blocked"], "secret_present",
+        "{resp}"
+    );
+    // No structure around the withheld entity, and its id never appears.
+    assert!(resp["result"]["callers"].is_null(), "{resp}");
+    assert!(resp["result"]["callees"].is_null(), "{resp}");
+    assert!(
+        !resp.to_string().contains("demo.mid"),
+        "blocked id leaked in neighborhood refusal: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn orientation_refuses_for_blocked_primary() {
+    let (project, db_path) = open_project();
+    mark_blocked(&db_path, "python:function:demo.entry", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    assert_eq!(resp["result"]["available"], false, "{resp}");
+    assert_eq!(
+        resp["result"]["briefing_blocked"], "secret_present",
+        "{resp}"
+    );
+    assert!(resp["result"]["primary_entity"].is_null(), "{resp}");
+    assert!(
+        !resp.to_string().contains("demo.entry"),
+        "blocked primary id leaked in orientation refusal: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn orientation_redacts_blocked_node_in_execution_paths() {
+    let (project, db_path) = open_project();
+    // demo.target is a leaf reached via entry -> mid -> target (resolved).
+    mark_blocked(&db_path, "python:function:demo.target", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+
+    // The blocked node is omitted from the node table...
+    let nodes = resp["result"]["execution_paths"]["nodes"]
+        .as_array()
+        .unwrap();
+    assert!(
+        nodes
+            .iter()
+            .all(|n| n["id"] != "python:function:demo.target"),
+        "blocked node leaked in execution_paths node table: {resp}"
+    );
+    // ...and replaced by the sentinel in the path arrays.
+    let paths = resp["result"]["execution_paths"]["paths"]
+        .as_array()
+        .unwrap();
+    let has_sentinel = paths.iter().any(|p| {
+        p.as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id == "[briefing-blocked]")
+    });
+    assert!(has_sentinel, "expected [briefing-blocked] sentinel: {resp}");
+    assert!(
+        !resp.to_string().contains("demo.target"),
+        "blocked id leaked somewhere in orientation pack: {resp}"
     );
 }
 

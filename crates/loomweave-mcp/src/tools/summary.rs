@@ -29,11 +29,11 @@ use crate::{
     BudgetReservation, EMPTY_GUIDANCE_FINGERPRINT, InferenceLlmState, InferredDispatchFailure,
     InferredDispatchOutcome, InferredDispatchStats, InferredInflightGuard, InferredRead,
     ParamError, ServerState, SummaryLlmState, SummaryRead, SummaryReady, briefing_block_reason,
-    entities_json, entity_json, inferred_records_from_result, inferred_usage_stats,
-    invoke_llm_provider, llm_usage_json, required_str, stale_semantic, storage_retryable,
-    structural_summary_json, summary_cache_expired, summary_read_error, summary_success_envelope,
-    summary_usage_stats, token_ceiling_envelope, tool_error_envelope, unresolved_sites_json,
-    verified_source_excerpt,
+    entities_json, entity_identity_json, entity_json, inferred_records_from_result,
+    inferred_usage_stats, invoke_llm_provider, llm_usage_json, required_str, stale_semantic,
+    storage_retryable, structural_summary_json, summary_cache_expired, summary_read_error,
+    summary_success_envelope, summary_usage_stats, token_ceiling_envelope, tool_error_envelope,
+    unresolved_sites_json, verified_source_excerpt,
 };
 
 fn composed_summary_guidance(
@@ -489,8 +489,13 @@ impl ServerState {
                     return Ok(SummaryRead::ScopeDeferred(entity_json(conn, &entity)));
                 }
                 if let Some(reason) = briefing_block_reason(&entity) {
+                    // Deliberate exception to the `entity_json` identity gate
+                    // (clarion-307668e2be): the caller named this exact id and
+                    // needs the remediation echo ("fix the secret at <path>"), so
+                    // build identity via the conn-free core that bypasses the
+                    // redaction. The caller cannot *discover* what it already named.
                     return Ok(SummaryRead::BriefingBlocked(
-                        entity_json(conn, &entity),
+                        entity_identity_json(&entity),
                         reason,
                     ));
                 }
