@@ -77,8 +77,14 @@ fn visit(dir: &Path, out: &mut BTreeMap<PathBuf, String>) {
         // symlinked dir is an out-of-tree escape (would read an outside
         // `Cargo.toml` and register an outside crate root) or a cycle (would
         // re-register an in-tree crate under an aliased path). `file_type()`
-        // reports the link itself; `Path::is_dir()` would follow it.
-        if entry.file_type().is_ok_and(|t| t.is_symlink()) {
+        // reports the link itself; `Path::is_dir()` would follow it. Skip the
+        // entry when it IS a symlink, AND when its type cannot be determined: on
+        // an `Err` we must not fall through to `Path::is_dir()`, which would
+        // follow a symlink we failed to classify. Can-not-determine => do-not-recurse.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
             continue;
         }
         let path = entry.path();

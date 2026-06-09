@@ -140,8 +140,14 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         // an out-of-tree escape (reads files outside the project) or a cycle
         // (re-collects in-tree files under an aliased path, double-minting ids).
         // `DirEntry::file_type()` reports the link itself (it does NOT traverse),
-        // unlike `Path::is_dir()` which follows the link.
-        if entry.file_type().is_ok_and(|t| t.is_symlink()) {
+        // unlike `Path::is_dir()` which follows the link. Skip the entry when it
+        // IS a symlink, AND when its type cannot be determined: on an `Err` we
+        // must not fall through to `Path::is_dir()`, which would follow a
+        // symlink we failed to classify. Treat can-not-determine as do-not-recurse.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
             continue;
         }
         let path = entry.path();
