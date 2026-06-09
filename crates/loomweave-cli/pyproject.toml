@@ -15,7 +15,16 @@ classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
 ]
-dependencies = ["loomweave-plugin-python==1.1.0rc4"]
+# Both language plugins are hard dependencies: a `pip install loomweave` lands
+# their console binaries in the same venv `bin/` as `loomweave`, where exe-dir
+# discovery finds them (each with its manifest under share/loomweave/plugins/).
+# This makes Rust analysis on-by-default, mirroring Python. To make Rust opt-in
+# instead, move loomweave-plugin-rust to an [project.optional-dependencies]
+# `rust` extra (installed via `loomweave[rust]`).
+dependencies = [
+    "loomweave-plugin-python==1.1.0rc4",
+    "loomweave-plugin-rust==1.1.0rc4",
+]
 
 [project.urls]
 Repository = "https://github.com/foundryside-dev/loomweave"

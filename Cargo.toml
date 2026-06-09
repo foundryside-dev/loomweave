@@ -11,6 +11,12 @@ members = [
     "crates/loomweave-plugin-rust",
     "crates/loomweave-scanner",
 ]
+# The Rust plugin's distribution crate is DELIBERATELY excluded: its bin is
+# named on the `loomweave-plugin-*` discovery glob (for the wheel), which must
+# never land in `target/` from a workspace build. maturin builds it standalone.
+exclude = [
+    "packaging/rust-plugin-dist",
+]
 
 [workspace.package]
 version = "1.1.0-rc4"
