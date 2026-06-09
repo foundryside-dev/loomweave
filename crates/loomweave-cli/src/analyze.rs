@@ -663,6 +663,13 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let mut references_skipped_external_total: u64 = 0;
     let mut references_skipped_cap_total: u64 = 0;
     let mut imports_skipped_external_total: u64 = 0;
+    // Anchored resolving edges (`imports`/`implements`) whose endpoints were
+    // never stored this run — dropped-and-counted by the seen-entity-set gate
+    // (D1 external / D2 gitignored-superset / D3 mid-run staleness). Flushing
+    // such an edge would FK-HardFail the whole run (`edges.to_id` is
+    // `NOT NULL REFERENCES entities(id)` with FKs on); the gate trades the edge
+    // for a counter so the run still completes.
+    let mut plugin_edges_dropped_unseen_total: u64 = 0;
     let mut unresolved_reference_sites_total: u64 = 0;
     let mut pyright_latency = P95Accumulator::default();
     let mut pyright_index_parse_latency = P95Accumulator::default();
@@ -876,21 +883,16 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     match persist_plugin_edges(&writer, ready_edges).await {
                         Ok(edge_count) => {
                             plugin_edge_count += edge_count;
-                            if !pending_plugin_edges.is_empty() {
-                                match persist_plugin_edges(
-                                    &writer,
-                                    std::mem::take(&mut pending_plugin_edges),
-                                )
-                                .await
-                                {
-                                    Ok(edge_count) => {
-                                        plugin_edge_count += edge_count;
-                                    }
-                                    Err(e) => {
-                                        insert_err = Some(e);
-                                    }
-                                }
-                            }
+                            // `DeferredImportEdges` is this plugin's LAST message
+                            // (`seen_plugin_entity_ids`/`pending_plugin_edges` are
+                            // re-initialised per plugin at the top of the `'plugins`
+                            // loop), so whatever is still pending after the final
+                            // drain has an endpoint the host never stored. Such an
+                            // edge cannot FK-resolve — flushing it would HardFail
+                            // the whole run. Drop it and COUNT it (never silently
+                            // lose, never downgrade-to-Inferred); the run completes.
+                            plugin_edges_dropped_unseen_total +=
+                                drop_unready_plugin_edges(&mut pending_plugin_edges);
                         }
                         Err(e) => {
                             insert_err = Some(e);
@@ -1199,6 +1201,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "references_skipped_external_total": references_skipped_external_total,
                 "references_skipped_cap_total": references_skipped_cap_total,
                 "imports_skipped_external_total": imports_skipped_external_total,
+                "plugin_edges_dropped_unseen_total": plugin_edges_dropped_unseen_total,
                 "source_walk_skipped_entries": source_walk_skipped_entries,
                 "source_walk_error_samples": source_walk_error_samples,
                 "source_walk_errors_omitted": source_walk_errors_omitted,
@@ -1506,6 +1509,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "references_skipped_external_total": references_skipped_external_total,
                 "references_skipped_cap_total": references_skipped_cap_total,
                 "imports_skipped_external_total": imports_skipped_external_total,
+                "plugin_edges_dropped_unseen_total": plugin_edges_dropped_unseen_total,
                 "source_walk_skipped_entries": source_walk_skipped_entries,
                 "source_walk_error_samples": source_walk_error_samples,
                 "source_walk_errors_omitted": source_walk_errors_omitted,
@@ -4171,6 +4175,23 @@ fn drain_ready_plugin_edges(
     ready
 }
 
+/// End-of-plugin reconciliation of the pending anchored-edge buffer: every edge
+/// still pending after the last [`drain_ready_plugin_edges`] call has a `from_id`
+/// or `to_id` the host never stored this run (external target, gitignored-file
+/// superset, or mid-run staleness — D1/D2/D3). Such an edge can NEVER FK-resolve:
+/// `edges.to_id`/`from_id` are `NOT NULL REFERENCES entities(id)` with FKs on, so
+/// an `INSERT` of it hard-fails the whole run. Drop the whole buffer and return
+/// the count (drop-AND-count — never silently lose; never downgrade to Inferred,
+/// which the writer rejects on anchored edges). Behaviour-preserving for the
+/// Python plugin: its surviving `imports` targets are plugin-emitted file-scope
+/// modules in `seen_plugin_entity_ids`, so they drain ready and the buffer is
+/// empty here (a no-op).
+fn drop_unready_plugin_edges(pending_edges: &mut Vec<DescribedEdgeRecord>) -> u64 {
+    let dropped = u64::try_from(pending_edges.len()).unwrap_or(u64::MAX);
+    pending_edges.clear();
+    dropped
+}
+
 #[derive(Debug, Default)]
 struct BatchStats {
     unresolved_call_sites_total: u64,
@@ -5624,6 +5645,68 @@ mod tests {
 
         assert_eq!(skipped, 1);
         assert!(edges.is_empty());
+    }
+
+    /// A minimal anchored resolving edge (`implements`) for the seen-set gate
+    /// tests: both endpoints supplied so membership is what decides readiness.
+    fn implements_edge_record(from_id: &str, to_id: &str) -> (String, EdgeRecord) {
+        (
+            format!("implements {from_id} -> {to_id}"),
+            EdgeRecord {
+                kind: "implements".to_owned(),
+                from_id: from_id.to_owned(),
+                to_id: to_id.to_owned(),
+                confidence: loomweave_core::EdgeConfidence::Resolved,
+                properties_json: None,
+                source_file_id: Some(from_id.to_owned()),
+                source_byte_start: Some(0),
+                source_byte_end: Some(4),
+            },
+        )
+    }
+
+    /// The seen-set gate's happy path: an edge whose BOTH endpoints are already
+    /// stored drains ready; one whose `to_id` is not yet seen stays pending (it
+    /// may become ready when a later batch stores the target — D3 reconciliation).
+    #[test]
+    fn drain_ready_plugin_edges_releases_only_fully_seen_endpoints() {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        seen.insert("rust:impl:c.Foo.impl[Tr]".to_owned());
+        seen.insert("rust:trait:c.Tr".to_owned());
+
+        let mut pending = vec![
+            // ready: both endpoints stored.
+            implements_edge_record("rust:impl:c.Foo.impl[Tr]", "rust:trait:c.Tr"),
+            // not ready: target not yet seen.
+            implements_edge_record("rust:impl:c.Foo.impl[Other]", "rust:trait:c.Other"),
+        ];
+
+        let ready = drain_ready_plugin_edges(&mut pending, &seen);
+
+        assert_eq!(ready.len(), 1, "only the fully-seen edge drains ready");
+        assert_eq!(ready[0].1.to_id, "rust:trait:c.Tr");
+        assert_eq!(pending.len(), 1, "the unseen-target edge stays pending");
+        assert_eq!(pending[0].1.to_id, "rust:trait:c.Other");
+    }
+
+    /// The seen-set gate's drop-and-count: anything STILL pending at end-of-plugin
+    /// has an endpoint the host never stored (D1 external / D2 gitignored-superset
+    /// / D3 stale). Flushing it would FK-HardFail the run, so the gate drops the
+    /// whole buffer and returns the count — never silently lost, never flushed.
+    #[test]
+    fn drop_unready_plugin_edges_drops_and_counts_never_flushes() {
+        let mut pending = vec![
+            implements_edge_record("rust:impl:c.Foo.impl[Ext]", "rust:trait:ext.Trait"),
+            implements_edge_record("rust:impl:c.Bar.impl[Gone]", "rust:trait:c.Gone"),
+        ];
+
+        let dropped = drop_unready_plugin_edges(&mut pending);
+
+        assert_eq!(dropped, 2, "both never-seen edges are counted as dropped");
+        assert!(
+            pending.is_empty(),
+            "the pending buffer is fully drained (dropped, not retained)"
+        );
     }
 
     #[test]

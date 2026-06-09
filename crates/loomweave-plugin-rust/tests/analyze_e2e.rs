@@ -214,6 +214,14 @@ fn analyze_e2e_stored_rust_entity_set_excludes_out_of_src_files() {
         "rust:function:e2e_crate.sub.helper".to_owned(),
         "rust:impl:e2e_crate.Widget.impl#<>".to_owned(),
         "rust:function:e2e_crate.Widget.impl#<>.bump".to_owned(),
+        // Task 8 fixture additions: an in-project trait + its impl on Widget, and
+        // an external-trait impl (`impl std::fmt::Display for Widget`). Each impl
+        // is its own entity with its method re-parented (Task 5).
+        "rust:trait:e2e_crate.Bumpable".to_owned(),
+        "rust:impl:e2e_crate.Widget.impl[Bumpable]".to_owned(),
+        "rust:function:e2e_crate.Widget.impl[Bumpable].bump_by".to_owned(),
+        "rust:impl:e2e_crate.Widget.impl[Display]".to_owned(),
+        "rust:function:e2e_crate.Widget.impl[Display].fmt".to_owned(),
     ];
     want.sort();
 
@@ -223,5 +231,39 @@ fn analyze_e2e_stored_rust_entity_set_excludes_out_of_src_files() {
          The out-of-src/ collision leaks tests/it.rs + build.rs items.\n\
            got:  {got:#?}\n\
            want: {want:#?}"
+    );
+
+    // ── Task 8: the `implements` edge + the seen-entity-set gate ──────────────
+    //
+    // The run COMPLETED (asserted above) even though the fixture carries an
+    // external-trait impl (`impl std::fmt::Display for Widget`): the plugin drops
+    // the External trait at emit, so no dangling `implements` edge reaches the
+    // host force-flush to FK-HardFail the run. (The host seen-set gate is the
+    // second line of defence for a Resolved-but-unstored target.)
+    let mut edge_stmt = conn
+        .prepare(
+            "SELECT from_id, to_id FROM edges \
+             WHERE kind = 'implements' ORDER BY from_id, to_id",
+        )
+        .expect("prepare implements-edge query");
+    let implements: Vec<(String, String)> = edge_stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("query implements edges")
+        .map(|r| r.expect("implements row"))
+        .collect();
+
+    // Exactly ONE `implements` edge: the in-project `impl Bumpable for Widget`.
+    // The external `impl std::fmt::Display for Widget` yields no edge.
+    assert_eq!(
+        implements,
+        vec![(
+            "rust:impl:e2e_crate.Widget.impl[Bumpable]".to_owned(),
+            "rust:trait:e2e_crate.Bumpable".to_owned(),
+        )],
+        "expected exactly one stored implements edge (impl Bumpable for Widget); \
+         the external Display impl must NOT yield one, and the run must still \
+         have completed. got: {implements:#?}"
     );
 }

@@ -27,7 +27,7 @@ use syn::{
     ItemStruct, ItemTrait, ItemType, ItemUse, Meta, UseTree,
 };
 
-use crate::edges::imports_edge;
+use crate::edges::{implements_edge, imports_edge};
 use crate::qualname::{
     build_entity_id, cfg_discriminant, free_item_qualname, impl_disc_for, impl_qualname,
     self_ty_name,
@@ -386,6 +386,7 @@ fn walk_items(
                     file_path,
                     &impl_is_cfg_twin,
                     &mut seen_impl_ids,
+                    resolution,
                     out,
                     edges,
                 )?;
@@ -648,6 +649,7 @@ fn emit_impl(
     file_path: &str,
     impl_is_cfg_twin: &dyn Fn(&str) -> bool,
     seen_impl_ids: &mut std::collections::BTreeSet<String>,
+    resolution: Option<(&str, &Resolver)>,
     out: &mut Vec<Value>,
     edges: &mut Vec<Value>,
 ) -> Result<(), syn::Error> {
@@ -681,6 +683,27 @@ fn emit_impl(
         )?;
         edges.push(contains_edge(module_id, &impl_id)); // module -> impl
         out.push(e);
+        // Anchored `implements` edge for a TRAIT impl (`impl Tr for Foo`), ONLY
+        // when a resolver is threaded (the edges-aware entry point) and the
+        // implemented trait resolves in-project. The edge anchors on the
+        // implemented-TRAIT-PATH's span (the `Tr`), not the whole `impl` block.
+        // `External` traits (`impl std::fmt::Display for Foo`) yield no edge —
+        // dropped here at emit, the resolver's first line of defence; the host
+        // seen-entity-set gate (Task 8) is the second. Emitted once per impl
+        // entity (inside the seen-id guard): a merge twin shares the trait, so a
+        // second edge would only redundantly upsert the same natural-PK row.
+        if let (Some((from_crate, resolver)), Some((_, trait_path, _))) =
+            (resolution, it.trait_.as_ref())
+            && let Some((to_id, confidence)) =
+                match resolver.resolve_trait_path(from_crate, &trait_path_for_lookup(trait_path)) {
+                    Resolution::Resolved(id) => Some((id, "resolved")),
+                    Resolution::Ambiguous(id) => Some((id, "ambiguous")),
+                    Resolution::External => None,
+                }
+        {
+            let span = source_range_of(trait_path);
+            edges.push(implements_edge(&impl_id, &to_id, confidence, &span));
+        }
     }
     // Methods re-parent onto the impl entity (impl -> method), NOT the module.
     // The method qualname is built from the cfg-AUGMENTED `impl_q` (not from
@@ -703,6 +726,23 @@ fn emit_impl(
         }
     }
     Ok(())
+}
+
+/// The `::`-joined trait-path string the resolver looks up, with generic
+/// arguments STRIPPED. The resolver lookup keys on the trait's qualname
+/// (`crate.module.MyTrait`), and an in-project `trait MyTrait<T>` entity is keyed
+/// on its bare ident (`impl_disc_for` takes `last.ident` and handles generic args
+/// separately) — so `impl MyTrait<i32> for Foo` MUST resolve as `MyTrait`, not
+/// `MyTrait<i32>` (which `normalize_path` would never match, silently dropping the
+/// edge for every in-project generic trait). Joining the segment idents drops the
+/// `<…>` arguments while preserving the `a::b::Tr` path shape. Leading
+/// `crate`/`self`/`super` segments are kept verbatim for `normalize_path` to map.
+fn trait_path_for_lookup(path: &syn::Path) -> String {
+    path.segments
+        .iter()
+        .map(|seg| seg.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::")
 }
 
 /// Push a non-`module` child entity and its matching `module -> child`

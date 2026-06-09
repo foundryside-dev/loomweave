@@ -700,6 +700,7 @@ const ANCHORED_EDGE_KINDS: &[&str] = &[
     "calls",
     "references",
     "imports",
+    "implements",
     "decorates",
     "inherits_from",
 ];

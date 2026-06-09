@@ -32,3 +32,25 @@ pub fn imports_edge(from_id: &str, to_id: &str, confidence: &str, span: &SourceR
         "confidence": confidence,
     })
 }
+
+/// An anchored `implements` edge from a trait-impl entity (`from_id`) to the
+/// resolved trait it implements (`to_id`), carrying the IMPLEMENTED-TRAIT PATH's
+/// byte span (NOT the whole `impl` block) so the anchor points precisely at the
+/// `Tr` in `impl Tr for Foo`.
+///
+/// Like `imports`, `implements` is anchored (ADR-026 decision 3): it carries
+/// non-null byte offsets and so may NOT be `inferred`. The resolver's outcome
+/// renders to the wire string — `"resolved"` for a unique in-project trait,
+/// `"ambiguous"` for a multi-kind candidate. An `External` trait yields NO edge
+/// (dropped at emit), so this helper is never called for it.
+#[must_use]
+pub fn implements_edge(from_id: &str, to_id: &str, confidence: &str, span: &SourceRange) -> Value {
+    json!({
+        "kind": "implements",
+        "from_id": from_id,
+        "to_id": to_id,
+        "source_byte_start": span.byte_start,
+        "source_byte_end": span.byte_end,
+        "confidence": confidence,
+    })
+}

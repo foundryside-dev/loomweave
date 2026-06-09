@@ -36,9 +36,14 @@ entity_kinds = [
     "impl",
 ]
 # The core auto-emits the file->module `contains` edge for file_scope entities.
-edge_kinds = ["contains"]
+# `imports` (Task 7) and `implements` (Task 8) are anchored resolving edges; a
+# manifest-only kind would be host-dropped (`undeclared_edge_kind`) and a
+# writer-only kind would be manifest-rejected, so both must be declared here.
+edge_kinds = ["contains", "imports", "implements"]
 rule_id_prefix = "LMWV-RUST-"
-ontology_version = "0.3.0"
+# 0.4.0: additive edge kinds `imports` + `implements` (ADR-027 MINOR). Lockstep
+# with the `main.rs` handshake constant.
+ontology_version = "0.4.0"
 
 [ontology.roles]
 file_scope = ["module"]
