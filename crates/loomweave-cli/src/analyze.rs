@@ -4330,6 +4330,10 @@ fn run_plugin_blocking(
     let mut dispatch_findings: Vec<HostFinding> = Vec::new();
     let work_result: Result<(), String> = (|| {
         let mut file_scope_entity_ids: BTreeSet<String> = BTreeSet::new();
+        // Every stored in-project entity id (any kind), accumulated across all
+        // files so the deferred import-filter can retain edges whose target is a
+        // non-module item — function / struct / const / trait (clarion-d1e3dc67dc).
+        let mut all_entity_ids: BTreeSet<String> = BTreeSet::new();
         let mut deferred_import_edges: Vec<(String, EdgeRecord)> = Vec::new();
         for file in files {
             let file_display = file.to_string_lossy().into_owned();
@@ -4416,6 +4420,7 @@ fn run_plugin_blocking(
                         core_file_contains_edge(&file_entity_id, entity.id.as_str()),
                     ));
                 }
+                all_entity_ids.insert(id_str.clone());
                 file_entities.push((id_str.clone(), record.clone()));
             }
             let unresolved_for_file = map_unresolved_call_sites_for_file(
@@ -4453,6 +4458,7 @@ fn run_plugin_blocking(
         }
         let imports_skipped_external = filter_external_import_edges_by_module_ids(
             &file_scope_entity_ids,
+            &all_entity_ids,
             &mut deferred_import_edges,
         );
         batch_tx
@@ -4695,19 +4701,23 @@ fn filter_external_import_edges(
         .filter(|(_, record)| kind_roles.is_file_scope(&record.kind))
         .map(|(id, _)| id.as_str())
         .collect();
-    filter_external_import_edges_by_module_refs(&module_entity_ids, edges)
+    let all_entity_ids: BTreeSet<&str> = entities.iter().map(|(id, _)| id.as_str()).collect();
+    filter_external_import_edges_by_module_refs(&module_entity_ids, &all_entity_ids, edges)
 }
 
 fn filter_external_import_edges_by_module_ids(
     module_entity_ids: &BTreeSet<String>,
+    all_entity_ids: &BTreeSet<String>,
     edges: &mut Vec<(String, EdgeRecord)>,
 ) -> u64 {
     let module_entity_ids: BTreeSet<&str> = module_entity_ids.iter().map(String::as_str).collect();
-    filter_external_import_edges_by_module_refs(&module_entity_ids, edges)
+    let all_entity_ids: BTreeSet<&str> = all_entity_ids.iter().map(String::as_str).collect();
+    filter_external_import_edges_by_module_refs(&module_entity_ids, &all_entity_ids, edges)
 }
 
 fn filter_external_import_edges_by_module_refs(
     module_entity_ids: &BTreeSet<&str>,
+    all_entity_ids: &BTreeSet<&str>,
     edges: &mut Vec<(String, EdgeRecord)>,
 ) -> u64 {
     let before = edges.len();
@@ -4715,13 +4725,24 @@ fn filter_external_import_edges_by_module_refs(
         if edge.kind != "imports" {
             return true;
         }
+        // The `from X import sub` → `X.sub` collapse stays MODULE-keyed: we only
+        // rewrite the target onto an absolute submodule when that submodule is
+        // itself a file-scope module. A Python `from pkg import func` therefore
+        // keeps pointing at the module `pkg`, never re-targeting onto the function
+        // `pkg.func` — preserving the established Python import shape
+        // (clarion-d1e3dc67dc).
         if let Some(local_submodule) =
             absolute_from_import_submodule_target(edge, module_entity_ids)
         {
             edge.to_id = local_submodule;
             return true;
         }
-        module_entity_ids.contains(edge.to_id.as_str())
+        // Retain any edge whose target is a stored in-project entity of ANY kind
+        // (module, function, struct, const, trait, …). The Rust resolver targets
+        // `use` paths at non-module items; the Python plugin only ever mints module
+        // targets, so this is a strict superset for Python (clarion-d1e3dc67dc).
+        // A target absent from the store is still genuinely external and dropped.
+        all_entity_ids.contains(edge.to_id.as_str())
     });
     u64::try_from(before - edges.len()).unwrap_or(u64::MAX)
 }
@@ -5629,6 +5650,50 @@ mod tests {
     }
 
     #[test]
+    fn filter_import_edges_retains_non_module_in_project_target() {
+        // clarion-d1e3dc67dc: the Rust resolver targets `use` paths at functions /
+        // structs / consts / traits, not just file-scope modules. Such an in-project,
+        // non-module target was dropped as "external" by the module-only gate even
+        // though its entity was stored. It must now survive.
+        let entities = vec![
+            module_record("rust:module:demo.sub"),
+            record_of_kind("rust:function:demo.sub.helper", "function"),
+        ];
+        let mut edges = vec![resolved_import_edge(
+            "rust:module:demo",
+            "rust:function:demo.sub.helper",
+        )];
+
+        // python_kind_roles has file_scope = {module}, so `function` is correctly
+        // NOT file-scope — exercising exactly the non-module-target path.
+        let skipped = filter_external_import_edges(&entities, &python_kind_roles(), &mut edges);
+
+        assert_eq!(skipped, 0, "an in-project function target is not external");
+        assert_eq!(
+            edges.len(),
+            1,
+            "the import edge to a function must be retained"
+        );
+        assert_eq!(edges[0].1.to_id, "rust:function:demo.sub.helper");
+    }
+
+    #[test]
+    fn filter_import_edges_still_drops_unstored_target() {
+        // The broadened fallback must not become a blanket keep: a target that is
+        // NOT a stored in-project entity (any kind) is still external and dropped.
+        let entities = vec![module_record("rust:module:demo")];
+        let mut edges = vec![resolved_import_edge(
+            "rust:module:demo",
+            "rust:function:other_crate.thing",
+        )];
+
+        let skipped = filter_external_import_edges(&entities, &python_kind_roles(), &mut edges);
+
+        assert_eq!(skipped, 1, "an unstored target is still external");
+        assert!(edges.is_empty());
+    }
+
+    #[test]
     fn subsystem_display_name_uses_common_module_prefix() {
         let (name, short_name) = subsystem_display_name(
             &[
@@ -5707,6 +5772,12 @@ mod tests {
                 updated_at: "2026-05-17T00:00:00.000Z".to_owned(),
             },
         )
+    }
+
+    fn record_of_kind(id: &str, kind: &str) -> (String, EntityRecord) {
+        let (_, mut record) = module_record(id);
+        record.kind = kind.to_owned();
+        (id.to_owned(), record)
     }
 
     fn entity_with_properties(id: &str, properties_json: &str) -> EntityRecord {
@@ -5975,6 +6046,24 @@ mod tests {
         assert_eq!(rec.severity, "ERROR");
         assert_eq!(rec.entity_id, "core:project:demo");
         assert!(rec.message.contains("boom"));
+    }
+
+    fn resolved_import_edge(from_id: &str, to_id: &str) -> (String, EdgeRecord) {
+        (
+            format!("imports {from_id} -> {to_id}"),
+            EdgeRecord {
+                kind: "imports".to_owned(),
+                from_id: from_id.to_owned(),
+                to_id: to_id.to_owned(),
+                confidence: loomweave_core::EdgeConfidence::Resolved,
+                properties_json: Some(
+                    serde_json::json!({ "import_style": "import", "level": 0 }).to_string(),
+                ),
+                source_file_id: Some(from_id.to_owned()),
+                source_byte_start: Some(0),
+                source_byte_end: Some(10),
+            },
+        )
     }
 
     fn from_import_edge(from_id: &str, to_id: &str, imported_name: &str) -> (String, EdgeRecord) {
