@@ -6372,7 +6372,7 @@ async fn propose_guidance_accepts_sei_but_stores_the_locator_in_match_rule() {
 // ---------------------------------------------------------------------------
 
 /// Seed `count` distinct functions that all call `python:function:demo.target`,
-/// so callers_of(demo.target) has a deterministic, paginable caller set.
+/// so `callers_of(demo.target)` has a deterministic, paginable caller set.
 fn seed_extra_callers(db_path: &std::path::Path, count: usize) {
     let conn = Connection::open(db_path).expect("open sqlite");
     let source_path: String = conn
