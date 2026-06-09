@@ -1,0 +1,1037 @@
+//! syn-based extraction of module/struct/function entities (Task 6).
+//! ADR-038 SEI signatures (Task 8). Structural `contains` edges (Phase 1a
+//! completion — ADR-026 dual-encoding).
+//!
+//! Parse one file with `syn`, walk top-level + inline-`mod` items, and emit
+//! entity JSON `Value`s plus their `contains` edges, matching the wire
+//! contract.
+//!
+//! **Containment (ADR-026 dual-encoding — every `parent_id` MUST have a
+//! matching `contains` edge, or the storage writer fails the run):**
+//! - `module` entities are `file_scope`: the **core** re-parents them to the
+//!   file and emits the `file -> module` contains edge. The plugin must NOT
+//!   emit a contains edge for a module.
+//! - every non-`module` free child (`struct`, free `function`, leaf kinds) is
+//!   parented to its enclosing **module** and the plugin emits the matching
+//!   `module -> child` contains edge here.
+//! - an `impl` entity is parented to the enclosing **module** (`module -> impl`
+//!   contains), and each impl method is re-parented onto the **impl** entity
+//!   (`impl -> method` contains), NOT the module (Task 5). Its locator already
+//!   carries the impl discriminator, so the re-parent does not churn the id.
+//!   Same-`(type, generic-sig, cfg)` inherent impls MERGE to one `impl` entity
+//!   (no source-order ordinal — ADR-049 amend, Option b); cfg-twin impls
+//!   (inherent OR trait) are split by an `@cfg(...)` suffix.
+use loomweave_core::plugin::UnresolvedCallSite;
+use serde_json::{Value, json};
+use syn::{
+    ImplItem, Item, ItemConst, ItemEnum, ItemFn, ItemImpl, ItemMacro, ItemMod, ItemStatic,
+    ItemStruct, ItemTrait, ItemType, ItemUse, Meta, UseTree,
+};
+
+use crate::calls::walk_calls;
+use crate::edges::{implements_edge, imports_edge};
+use crate::qualname::{
+    build_entity_id, cfg_discriminant, declared_type_params, free_item_qualname, impl_disc_for,
+    impl_qualname, self_ty_locator,
+};
+use crate::resolve::{Resolution, Resolver};
+use crate::signature::{function_signature, impl_signature, struct_signature};
+use crate::spans::{SourceRange, source_range_of};
+
+/// Entities and their structural `contains` edges extracted from one file.
+pub struct Extracted {
+    /// Wire-shaped entity `Value`s: a `file_scope` `module` for the file, then
+    /// every top-level / inline-`mod` `struct`, free `function`, leaf item,
+    /// `impl` entity, and impl method.
+    pub entities: Vec<Value>,
+    /// Wire-shaped `contains` edge `Value`s (`module -> non-module-child` and
+    /// `impl -> method`). `module` children are excluded — the core emits their
+    /// `file -> module` edge (see the module docs).
+    pub edges: Vec<Value>,
+    /// Call sites that produced NO `calls` edge — method calls, assoc/external
+    /// path calls, and non-path call forms (Phase 2). Empty when no resolver is
+    /// threaded (the [`extract_file_full`] contract), exactly as `edges` carries
+    /// no `imports`/`calls`/`implements` without a resolver.
+    pub unresolved_call_sites: Vec<UnresolvedCallSite>,
+}
+
+/// Extract entities **and** their `contains` edges from one file's source.
+///
+/// `module_path` is the file-level dotted module (Task 2 output).
+///
+/// # Errors
+///
+/// Returns the [`syn::Error`] from [`syn::parse_file`] when `src` is not valid
+/// Rust (the degraded-parse fallback wrapping this is Task 9). Also surfaces an
+/// [`syn::Error`] if an assembled qualname fails [`build_entity_id`] validation.
+pub fn extract_file_full(
+    crate_name: &str,
+    module_path: &str,
+    file_path: &str,
+    src: &str,
+) -> Result<Extracted, syn::Error> {
+    // No resolver → no `imports` edges (entities + structural `contains` only).
+    // Keeps identity / uniqueness / symbol-table callers byte-identical.
+    extract_file_inner(crate_name, module_path, file_path, src, None)
+}
+
+/// Edges-aware extraction (Phase 1b, Task 7): everything [`extract_file_full`]
+/// emits, **plus** resolved `imports` edges. Each file-scope `use` leaf path is
+/// resolved against the project symbol table through `resolver`:
+/// - a unique in-project target → a `resolved` anchored `imports` edge,
+/// - a glob / multi-kind candidate → an `ambiguous` anchored `imports` edge,
+/// - an external (or unresolvable) path → NOTHING (D1: external dropped).
+///
+/// `crate_name` is the resolution origin (`from_crate`) — it is NOT the dotted
+/// `module_path` (which already bakes the crate in). The `imports` edge's
+/// `from_id` is the enclosing **module** entity (a file-scope `use` is a module
+/// property); its byte span anchors the `use` statement.
+///
+/// # Errors
+///
+/// As [`extract_file_full`].
+pub fn extract_file_with_edges(
+    crate_name: &str,
+    module_path: &str,
+    file_path: &str,
+    src: &str,
+    resolver: &Resolver,
+) -> Result<Extracted, syn::Error> {
+    extract_file_inner(
+        crate_name,
+        module_path,
+        file_path,
+        src,
+        Some((crate_name, resolver)),
+    )
+}
+
+/// Shared extraction core. `resolution = None` skips `use`-edge resolution
+/// entirely (the [`extract_file_full`] contract); `Some((from_crate, resolver))`
+/// resolves each `use` leaf into an anchored `imports` edge.
+fn extract_file_inner(
+    crate_name: &str,
+    module_path: &str,
+    file_path: &str,
+    src: &str,
+    resolution: Option<(&str, &Resolver)>,
+) -> Result<Extracted, syn::Error> {
+    // `crate_name` is already encoded into `module_path` (Task 2 builds the
+    // dotted path crate-rooted). Extraction of entities does not consult it; the
+    // resolver path receives the origin crate via `resolution` instead.
+    let _ = crate_name;
+    let file = syn::parse_file(src)?;
+    let mut entities = Vec::new();
+    let mut edges = Vec::new();
+    let mut unresolved_call_sites = Vec::new();
+    // File-level module entity (file_scope; core emits its file->module edge).
+    entities.push(entity(
+        "module",
+        module_path,
+        file_path,
+        &SourceRange {
+            byte_start: 0,
+            byte_end: i64::try_from(src.len()).unwrap_or(0),
+            start_line: 1,
+            end_line: i64::try_from(src.lines().count()).unwrap_or(1),
+        },
+        None,
+        None,
+    )?);
+    let module_id = build_id("module", module_path)?;
+    walk_items(
+        &file.items,
+        module_path,
+        &module_id,
+        file_path,
+        resolution,
+        &mut entities,
+        &mut edges,
+        &mut unresolved_call_sites,
+    )?;
+    Ok(Extracted {
+        entities,
+        edges,
+        unresolved_call_sites,
+    })
+}
+
+/// Entities-only extraction, for identity / uniqueness / symbol-table callers
+/// that do not need edges. See [`extract_file_full`].
+///
+/// # Errors
+///
+/// As [`extract_file_full`].
+pub fn extract_file(
+    crate_name: &str,
+    module_path: &str,
+    file_path: &str,
+    src: &str,
+) -> Result<Vec<Value>, syn::Error> {
+    extract_file_full(crate_name, module_path, file_path, src).map(|x| x.entities)
+}
+
+/// Extraction wrapper with degraded-parse fallback (review M3).
+///
+/// On a successful parse, returns the extracted entities, their `contains`
+/// edges, and an empty finding list. On `syn::parse_file` failure (or a
+/// qualname/id-validation error from [`extract_file_full`]), returns **exactly
+/// one** `module` entity flagged `parse_status = "syntax_error"`, **no** edges,
+/// plus a single Warning finding — never an empty entity list, never a panic.
+/// The manifest declares the `syntax_degraded_module` role on `module`.
+///
+/// The returned finding `Value` carries the real [`AnalyzeFileFinding`] field
+/// names (`subcode`/`severity`/`message`/`metadata`) so `main.rs` can
+/// `serde_json::from_value` each one into the wire struct without remapping.
+///
+/// Returns `(entities, edges, unresolved_call_sites, findings)`. The
+/// entities-only entry point never resolves anything, so its
+/// `unresolved_call_sites` is always empty (parity with its empty edges).
+///
+/// [`AnalyzeFileFinding`]: loomweave_core::plugin::AnalyzeFileFinding
+#[must_use]
+pub fn extract_file_degraded_aware(
+    crate_name: &str,
+    module_path: &str,
+    file_path: &str,
+    src: &str,
+) -> (Vec<Value>, Vec<Value>, Vec<UnresolvedCallSite>, Vec<Value>) {
+    degraded_aware(
+        module_path,
+        file_path,
+        extract_file_full(crate_name, module_path, file_path, src),
+    )
+}
+
+/// Edges-aware degraded wrapper (Task 7): like [`extract_file_degraded_aware`]
+/// but resolves `use` paths into `imports` edges via `resolver` on a clean
+/// parse. The degraded fallback is identical — a single `syntax_error` module
+/// plus a Warning finding, no edges — because an unparseable file has no `use`
+/// tree to resolve.
+///
+/// Returns `(entities, edges, unresolved_call_sites, findings)`.
+#[must_use]
+pub fn extract_file_degraded_aware_with_edges(
+    crate_name: &str,
+    module_path: &str,
+    file_path: &str,
+    src: &str,
+    resolver: &Resolver,
+) -> (Vec<Value>, Vec<Value>, Vec<UnresolvedCallSite>, Vec<Value>) {
+    degraded_aware(
+        module_path,
+        file_path,
+        extract_file_with_edges(crate_name, module_path, file_path, src, resolver),
+    )
+}
+
+/// Shape an extraction `Result` into the degraded-aware
+/// `(entities, edges, unresolved_call_sites, findings)` tuple: a clean parse passes
+/// through with no findings; a parse error collapses to a single `syntax_error`
+/// module entity plus one Warning finding and no edges / no call sites.
+fn degraded_aware(
+    module_path: &str,
+    file_path: &str,
+    extracted: Result<Extracted, syn::Error>,
+) -> (Vec<Value>, Vec<Value>, Vec<UnresolvedCallSite>, Vec<Value>) {
+    match extracted {
+        Ok(Extracted {
+            entities,
+            edges,
+            unresolved_call_sites,
+        }) => (entities, edges, unresolved_call_sites, Vec::new()),
+        Err(e) => {
+            // Best-effort id; if the module path itself is unrepresentable the
+            // entity still carries the (empty) id and the qualified_name, which
+            // is enough for the host to record a degraded module.
+            let id = build_entity_id("module", module_path)
+                .map(|i| i.as_str().to_owned())
+                .unwrap_or_default();
+            let entity = json!({
+                "id": id,
+                "kind": "module",
+                "qualified_name": module_path,
+                "parse_status": "syntax_error",
+                "source": {
+                    "file_path": file_path,
+                    "source_byte_start": 0,
+                    "source_byte_end": 0,
+                    "source_range": { "start_line": 1, "end_line": 1 }
+                }
+            });
+            let mut metadata = serde_json::Map::new();
+            if !id.is_empty() {
+                metadata.insert("entity_id".to_owned(), json!(id));
+            }
+            let finding = json!({
+                "subcode": "LMWV-RUST-SYNTAX-ERROR",
+                "severity": "warning",
+                "message": format!("syn could not parse {file_path}: {e}"),
+                "metadata": metadata
+            });
+            (vec![entity], Vec::new(), Vec::new(), vec![finding])
+        }
+    }
+}
+
+// Length is arm count, not branching complexity: each leaf kind is one flat,
+// near-identical dispatch arm over the item enum. Splitting it would obscure the
+// one-arm-per-syn-Item structure the reader relies on.
+#[allow(clippy::too_many_lines)]
+fn walk_items(
+    items: &[Item],
+    module_path: &str,
+    parent_id: &str,
+    file_path: &str,
+    resolution: Option<(&str, &Resolver)>,
+    out: &mut Vec<Value>,
+    edges: &mut Vec<Value>,
+    sites: &mut Vec<UnresolvedCallSite>,
+) -> Result<(), syn::Error> {
+    // Impl entities already emitted in THIS item list, by full impl id. A
+    // second source block with the same impl id (same type+sig+cfg) does NOT
+    // re-emit the entity — it only appends its methods (the merge, ADR-049
+    // amend, Option b). Scoped to this item list.
+    let mut seen_impl_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // cfg-twin counter for impls: keyed on the FULL pre-cfg impl qualname
+    // (incl. the trait `[Trait]` fragment), so it splits cfg-twin inherent AND
+    // trait impls (e.g. `#[cfg(unix)] impl Display for Foo` /
+    // `#[cfg(windows)] impl Display for Foo` both render `Foo.impl[Display]`
+    // and would dedup to one entity, silently dropping one `fmt`). `twin_counts`
+    // above is keyed `(kind, name)` and cannot see impl qualnames, so impls need
+    // their own pre-pass. Counting genuinely-same `(type, generic-sig)` blocks
+    // >1 marks a twin; the `@cfg` suffix then re-splits the cfg variants.
+    let mut impl_twin_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for item in items {
+        if let Item::Impl(it) = item {
+            let type_q = format!(
+                "{module_path}.{}",
+                self_ty_locator(&it.self_ty, &declared_type_params(it))
+            );
+            let impl_q = impl_qualname(&type_q, &impl_disc_for(it));
+            *impl_twin_counts.entry(impl_q).or_insert(0) += 1;
+        }
+    }
+    let impl_is_cfg_twin = |impl_q: &str| impl_twin_counts.get(impl_q).copied().unwrap_or(0) > 1;
+    // Named items sharing one (kind, name) in this item list are cfg twins
+    // (`#[cfg(unix)] fn f` / `#[cfg(windows)] fn f`, and the same for a `struct`
+    // or an inline `mod`): all cfg variants are visible (spec §5), so a bare path
+    // collides — silent intra-run data loss at the writer's
+    // `ON CONFLICT(id) DO UPDATE` (ADR-049 Context). Such siblings get a
+    // normalised `@cfg(...)` discriminant (ADR-049 §3). Counting is per-kind
+    // because the entity id's `kind` segment already separates `fn Foo` from
+    // `struct Foo`; a unique (kind, name) keeps the bare path, so the common case
+    // is undisturbed.
+    let mut twin_counts: std::collections::BTreeMap<(&'static str, String), usize> =
+        std::collections::BTreeMap::new();
+    for item in items {
+        let key = match item {
+            Item::Fn(ItemFn { sig, .. }) => Some(("function", sig.ident.to_string())),
+            Item::Struct(ItemStruct { ident, .. }) => Some(("struct", ident.to_string())),
+            Item::Mod(ItemMod {
+                ident,
+                content: Some(_),
+                ..
+            }) => Some(("module", ident.to_string())),
+            Item::Enum(ItemEnum { ident, .. }) => Some(("enum", ident.to_string())),
+            Item::Trait(ItemTrait { ident, .. }) => Some(("trait", ident.to_string())),
+            Item::Type(ItemType { ident, .. }) => Some(("type_alias", ident.to_string())),
+            Item::Const(ItemConst { ident, .. }) => Some(("const", ident.to_string())),
+            Item::Static(ItemStatic { ident, .. }) => Some(("static", ident.to_string())),
+            Item::Macro(ItemMacro {
+                ident: Some(ident), ..
+            }) => Some(("macro", ident.to_string())),
+            _ => None,
+        };
+        if let Some(k) = key {
+            *twin_counts.entry(k).or_insert(0) += 1;
+        }
+    }
+    // True when a (kind, name) is shared by a cfg-gated sibling in this list.
+    let is_cfg_twin = |kind: &'static str, name: &str| {
+        twin_counts
+            .get(&(kind, name.to_owned()))
+            .copied()
+            .unwrap_or(0)
+            > 1
+    };
+    for item in items {
+        match item {
+            Item::Fn(ItemFn {
+                sig, attrs, block, ..
+            }) => {
+                let name = sig.ident.to_string();
+                let mut q = free_item_qualname(module_path, &name);
+                if is_cfg_twin("function", &name)
+                    && let Some(disc) = cfg_suffix(attrs)
+                {
+                    q.push_str(&disc);
+                }
+                let child = entity(
+                    "function",
+                    &q,
+                    file_path,
+                    &source_range_of(item),
+                    Some(parent_id),
+                    Some(function_signature(sig)),
+                )?;
+                let fn_id = build_id("function", &q)?;
+                push_with_contains(parent_id, child, out, edges);
+                // Phase 2: walk the body for call sites, ONLY with a resolver
+                // (the edges-aware entry point) — parity with `imports`. The
+                // caller is this free fn; closures / nested fns are walked but
+                // attributed to it (see `calls` module docs).
+                if let Some((from_crate, resolver)) = resolution {
+                    walk_calls(block, &fn_id, from_crate, resolver, edges, sites);
+                }
+            }
+            Item::Struct(ItemStruct {
+                ident,
+                fields,
+                attrs,
+                ..
+            }) => {
+                let name = ident.to_string();
+                let mut q = free_item_qualname(module_path, &name);
+                if is_cfg_twin("struct", &name)
+                    && let Some(disc) = cfg_suffix(attrs)
+                {
+                    q.push_str(&disc);
+                }
+                let child = entity(
+                    "struct",
+                    &q,
+                    file_path,
+                    &source_range_of(item),
+                    Some(parent_id),
+                    Some(struct_signature(fields)),
+                )?;
+                push_with_contains(parent_id, child, out, edges);
+            }
+            Item::Impl(it) => {
+                emit_impl(
+                    it,
+                    module_path,
+                    parent_id,
+                    file_path,
+                    &impl_is_cfg_twin,
+                    &mut seen_impl_ids,
+                    resolution,
+                    out,
+                    edges,
+                    sites,
+                )?;
+            }
+            Item::Mod(ItemMod {
+                ident,
+                content: Some((_, inner)),
+                attrs,
+                ..
+            }) => {
+                // A nested `module` is `file_scope`: the core re-parents it to
+                // the file and emits the `file -> module` contains edge, so the
+                // plugin emits neither a parent_id nor a contains edge for it.
+                let mut nested = format!("{module_path}.{ident}");
+                if is_cfg_twin("module", &ident.to_string())
+                    && let Some(disc) = cfg_suffix(attrs)
+                {
+                    nested.push_str(&disc);
+                }
+                out.push(entity(
+                    "module",
+                    &nested,
+                    file_path,
+                    &source_range_of(item),
+                    None,
+                    None,
+                )?);
+                let nested_id = build_id("module", &nested)?;
+                walk_items(
+                    inner, &nested, &nested_id, file_path, resolution, out, edges, sites,
+                )?;
+            }
+            // Phase 1b leaf kinds: free items riding the same qualname + entity +
+            // contains pattern as `struct`/`function`, with `None` signature (no
+            // signature builder yet — trait/impl SEI signatures are a later task).
+            // Trait *bodies* are deliberately NOT walked here (matching 1a).
+            Item::Enum(ItemEnum { ident, attrs, .. }) => {
+                let name = ident.to_string();
+                let mut q = free_item_qualname(module_path, &name);
+                if is_cfg_twin("enum", &name)
+                    && let Some(disc) = cfg_suffix(attrs)
+                {
+                    q.push_str(&disc);
+                }
+                let child = entity(
+                    "enum",
+                    &q,
+                    file_path,
+                    &source_range_of(item),
+                    Some(parent_id),
+                    None,
+                )?;
+                push_with_contains(parent_id, child, out, edges);
+            }
+            Item::Trait(ItemTrait { ident, attrs, .. }) => {
+                let name = ident.to_string();
+                let mut q = free_item_qualname(module_path, &name);
+                if is_cfg_twin("trait", &name)
+                    && let Some(disc) = cfg_suffix(attrs)
+                {
+                    q.push_str(&disc);
+                }
+                let child = entity(
+                    "trait",
+                    &q,
+                    file_path,
+                    &source_range_of(item),
+                    Some(parent_id),
+                    None,
+                )?;
+                push_with_contains(parent_id, child, out, edges);
+            }
+            Item::Type(ItemType { ident, attrs, .. }) => {
+                let name = ident.to_string();
+                let mut q = free_item_qualname(module_path, &name);
+                if is_cfg_twin("type_alias", &name)
+                    && let Some(disc) = cfg_suffix(attrs)
+                {
+                    q.push_str(&disc);
+                }
+                let child = entity(
+                    "type_alias",
+                    &q,
+                    file_path,
+                    &source_range_of(item),
+                    Some(parent_id),
+                    None,
+                )?;
+                push_with_contains(parent_id, child, out, edges);
+            }
+            Item::Const(ItemConst { ident, attrs, .. }) => {
+                let name = ident.to_string();
+                let mut q = free_item_qualname(module_path, &name);
+                if is_cfg_twin("const", &name)
+                    && let Some(disc) = cfg_suffix(attrs)
+                {
+                    q.push_str(&disc);
+                }
+                let child = entity(
+                    "const",
+                    &q,
+                    file_path,
+                    &source_range_of(item),
+                    Some(parent_id),
+                    None,
+                )?;
+                push_with_contains(parent_id, child, out, edges);
+            }
+            Item::Static(ItemStatic { ident, attrs, .. }) => {
+                let name = ident.to_string();
+                let mut q = free_item_qualname(module_path, &name);
+                if is_cfg_twin("static", &name)
+                    && let Some(disc) = cfg_suffix(attrs)
+                {
+                    q.push_str(&disc);
+                }
+                let child = entity(
+                    "static",
+                    &q,
+                    file_path,
+                    &source_range_of(item),
+                    Some(parent_id),
+                    None,
+                )?;
+                push_with_contains(parent_id, child, out, edges);
+            }
+            Item::Macro(ItemMacro {
+                ident: Some(ident),
+                attrs,
+                ..
+            }) => {
+                // Only `macro_rules! name { .. }` (named) — bare macro
+                // *invocations* (`foo!();`) carry `ident: None` and fall through.
+                let name = ident.to_string();
+                let mut q = free_item_qualname(module_path, &name);
+                if is_cfg_twin("macro", &name)
+                    && let Some(disc) = cfg_suffix(attrs)
+                {
+                    q.push_str(&disc);
+                }
+                let child = entity(
+                    "macro",
+                    &q,
+                    file_path,
+                    &source_range_of(item),
+                    Some(parent_id),
+                    None,
+                )?;
+                push_with_contains(parent_id, child, out, edges);
+            }
+            // `use` items resolve to anchored `imports` edges (Phase 1b, Task 7)
+            // — ONLY when a resolver is threaded (the edges-aware entry point).
+            // A `use` at item scope is a property of the enclosing module, so the
+            // edge's `from_id` is `parent_id` (the module/file entity, never
+            // `core:file:*`). The whole `use` statement's byte span anchors every
+            // leaf edge it expands to.
+            Item::Use(it) => {
+                if let Some((from_crate, resolver)) = resolution {
+                    emit_use_edges(it, from_crate, parent_id, resolver, edges);
+                }
+            }
+            _ => {} // macro invocations / extern / etc. unmodelled.
+        }
+    }
+    Ok(())
+}
+
+/// Resolve one `use` item into zero or more anchored `imports` edges.
+///
+/// The `use` tree is expanded to leaf paths (`use a::{b, c::d};` → `a::b`,
+/// `a::c::d`; `use a::*;` → `a::*`; `use a::B as C;` → `a::B`, alias dropped),
+/// each resolved against the project symbol table:
+/// - [`Resolution::Resolved`] → a `resolved` `imports` edge to the unique id,
+/// - [`Resolution::Ambiguous`] → an `ambiguous` `imports` edge to the candidate,
+/// - [`Resolution::External`] → NOTHING (D1: external targets dropped).
+///
+/// Every emitted edge is anchored at the whole `use` statement's byte span
+/// (`from = module entity`, `to = resolved id`).
+fn emit_use_edges(
+    it: &ItemUse,
+    from_crate: &str,
+    from_id: &str,
+    resolver: &Resolver,
+    edges: &mut Vec<Value>,
+) {
+    let span = source_range_of(it);
+    let mut leaves = Vec::new();
+    collect_use_leaves(&it.tree, "", &mut leaves);
+    for leaf in leaves {
+        let (to_id, confidence) = match resolver.resolve_use_path(from_crate, &leaf) {
+            Resolution::Resolved(id) => (id, "resolved"),
+            Resolution::Ambiguous(id) => (id, "ambiguous"),
+            Resolution::External => continue,
+        };
+        edges.push(imports_edge(from_id, &to_id, confidence, &span));
+    }
+}
+
+/// Flatten a [`syn::UseTree`] into `::`-joined leaf paths.
+///
+/// `prefix` is the accumulated `::`-joined path from the ancestors. `Path`
+/// descends one segment; `Name`/`Rename` terminate a leaf (the rename alias is
+/// dropped — resolution keys on the REAL imported path, per the resolver
+/// contract); `Glob` terminates a `<prefix>::*` leaf (the resolver special-cases
+/// the `::*` suffix); `Group` fans out to each branch sharing `prefix`.
+///
+/// `self` as a group leaf (`use a::b::{self, Display};` — the very common
+/// "import the module itself plus some of its items" idiom) terminates the
+/// `prefix` path UNCHANGED (`a::b`), not `a::b::self`: `self` here names the
+/// enclosing module, and the resolver only special-cases a *leading* `self`.
+/// Appending the literal segment would miss the table and silently drop the
+/// module edge.
+fn collect_use_leaves(tree: &UseTree, prefix: &str, out: &mut Vec<String>) {
+    let joined = |seg: &str| {
+        if prefix.is_empty() {
+            seg.to_owned()
+        } else {
+            format!("{prefix}::{seg}")
+        }
+    };
+    match tree {
+        UseTree::Path(p) => {
+            collect_use_leaves(&p.tree, &joined(&p.ident.to_string()), out);
+        }
+        // A `self` leaf names the enclosing module: emit `prefix` as-is. (Only
+        // meaningful inside a `Group`; a bare `use self;` carries an empty
+        // prefix and contributes nothing, which is correct.)
+        UseTree::Name(n) if n.ident == "self" => {
+            if !prefix.is_empty() {
+                out.push(prefix.to_owned());
+            }
+        }
+        UseTree::Name(n) => out.push(joined(&n.ident.to_string())),
+        // `use a::B as C;` — resolve the REAL path `a::B`, ignore the alias `C`.
+        UseTree::Rename(r) => out.push(joined(&r.ident.to_string())),
+        // `use a::*;` — pass the `::*`-suffixed path; the resolver handles it.
+        UseTree::Glob(_) => out.push(joined("*")),
+        UseTree::Group(g) => {
+            for branch in &g.items {
+                collect_use_leaves(branch, prefix, out);
+            }
+        }
+    }
+}
+
+// `impl_is_cfg_twin` is a borrowed closure (one per item list); `seen_impl_ids`
+// is threaded so a second same-id block merges (entity emitted once, methods
+// appended). Both are inherent to the merge contract.
+#[allow(clippy::too_many_arguments)]
+fn emit_impl(
+    it: &ItemImpl,
+    module_path: &str,
+    module_id: &str,
+    file_path: &str,
+    impl_is_cfg_twin: &dyn Fn(&str) -> bool,
+    seen_impl_ids: &mut std::collections::BTreeSet<String>,
+    resolution: Option<(&str, &Resolver)>,
+    out: &mut Vec<Value>,
+    edges: &mut Vec<Value>,
+    sites: &mut Vec<UnresolvedCallSite>,
+) -> Result<(), syn::Error> {
+    // Type qualname for the impl's self type, INCLUDING its concrete generic
+    // arguments (ADR-049 §2 self-type-args amendment): `impl Foo<i32>` →
+    // `…Foo<i32>` and `impl Foo<u32>` → `…Foo<u32>`, so the two impls get
+    // distinct keys and do NOT spuriously merge in `seen_impl_ids`. Declared
+    // impl type-params (`impl<T> Foo<T>`) render positionally (`$0`), staying
+    // rename-stable. Exotic self types fall back to a textual rendering.
+    let type_q = format!(
+        "{module_path}.{}",
+        self_ty_locator(&it.self_ty, &declared_type_params(it))
+    );
+    let disc = impl_disc_for(it); // ordinal-free (ADR-049 amend, Option b)
+    let mut impl_q = impl_qualname(&type_q, &disc);
+    // cfg-twin discriminant applies to ANY cfg-gated twin impl, trait OR
+    // inherent. `#[cfg(unix)] impl Display for Foo` and
+    // `#[cfg(windows)] impl Display for Foo` share `Foo.impl[Display]` and would
+    // dedup to one entity, silently dropping one `fmt`. `impl_is_cfg_twin` keys
+    // on the FULL pre-cfg `impl_q` (which includes `[Display]`), so it is
+    // correct for trait impls too — do NOT gate on `it.trait_.is_none()`.
+    if impl_is_cfg_twin(&impl_q)
+        && let Some(disc) = cfg_suffix(&it.attrs)
+    {
+        impl_q.push_str(&disc);
+    }
+    let impl_id = build_id("impl", &impl_q)?;
+    // First block with this id → emit the entity + the module->impl edge. A
+    // second same-id block (the merge) skips this and only appends methods.
+    if seen_impl_ids.insert(impl_id.clone()) {
+        let e = entity(
+            "impl",
+            &impl_q,
+            file_path,
+            &source_range_of(it),
+            Some(module_id),
+            Some(impl_signature(it)),
+        )?;
+        edges.push(contains_edge(module_id, &impl_id)); // module -> impl
+        out.push(e);
+        // Anchored `implements` edge for a TRAIT impl (`impl Tr for Foo`), ONLY
+        // when a resolver is threaded (the edges-aware entry point) and the
+        // implemented trait resolves in-project. The edge anchors on the
+        // implemented-TRAIT-PATH's span (the `Tr`), not the whole `impl` block.
+        // `External` traits (`impl std::fmt::Display for Foo`) yield no edge —
+        // dropped here at emit, the resolver's first line of defence; the host
+        // seen-entity-set gate (Task 8) is the second. Emitted once per impl
+        // entity (inside the seen-id guard): a merge twin shares the trait, so a
+        // second edge would only redundantly upsert the same natural-PK row.
+        //
+        // A NEGATIVE impl (`impl !Trait for Foo`) asserts NON-implementation, so
+        // it must NOT emit a (positive) `implements` edge. `it.trait_` is
+        // `Some((Option<Bang>, Path, For))`; the `Bang` is `Some` for a negative
+        // impl. Guard on `bang.is_none()` (the impl ENTITY + module->impl
+        // `contains` edge above are still emitted; only the `implements` edge is
+        // suppressed).
+        if let (Some((from_crate, resolver)), Some((bang, trait_path, _))) =
+            (resolution, it.trait_.as_ref())
+            && bang.is_none()
+            && let Some((to_id, confidence)) =
+                match resolver.resolve_trait_path(from_crate, &trait_path_for_lookup(trait_path)) {
+                    Resolution::Resolved(id) => Some((id, "resolved")),
+                    Resolution::Ambiguous(id) => Some((id, "ambiguous")),
+                    Resolution::External => None,
+                }
+        {
+            let span = source_range_of(trait_path);
+            edges.push(implements_edge(&impl_id, &to_id, confidence, &span));
+        }
+    }
+    // Methods re-parent onto the impl entity (impl -> method), NOT the module.
+    // The method qualname is built from the cfg-AUGMENTED `impl_q` (not from
+    // `disc`, which no longer carries the cfg discriminant under Option (b)):
+    // for a cfg-twin inherent impl, `disc.key()` is identical across twins, so
+    // building from `disc` would collide both `go` methods on one locator. The
+    // `@cfg` suffix lives in `impl_q`, so the method must inherit it from there.
+    for member in &it.items {
+        if let ImplItem::Fn(m) = member {
+            let q = format!("{impl_q}.{}", m.sig.ident);
+            let child = entity(
+                "function",
+                &q,
+                file_path,
+                &source_range_of(member),
+                Some(&impl_id),
+                Some(function_signature(&m.sig)),
+            )?;
+            let method_id = build_id("function", &q)?;
+            push_with_contains(&impl_id, child, out, edges); // impl -> method
+            // Phase 2: walk the method body for call sites, ONLY with a resolver.
+            // The caller is this impl method id (NOT the impl or the module).
+            if let Some((from_crate, resolver)) = resolution {
+                walk_calls(&m.block, &method_id, from_crate, resolver, edges, sites);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `::`-joined trait-path string the resolver looks up, with generic
+/// arguments STRIPPED. The resolver lookup keys on the trait's qualname
+/// (`crate.module.MyTrait`), and an in-project `trait MyTrait<T>` entity is keyed
+/// on its bare ident (`impl_disc_for` takes `last.ident` and handles generic args
+/// separately) — so `impl MyTrait<i32> for Foo` MUST resolve as `MyTrait`, not
+/// `MyTrait<i32>` (which `normalize_path` would never match, silently dropping the
+/// edge for every in-project generic trait). Joining the segment idents drops the
+/// `<…>` arguments while preserving the `a::b::Tr` path shape. Leading
+/// `crate`/`self`/`super` segments are kept verbatim for `normalize_path` to map.
+fn trait_path_for_lookup(path: &syn::Path) -> String {
+    path.segments
+        .iter()
+        .map(|seg| seg.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+/// Push a non-`module` child entity and its matching `module -> child`
+/// `contains` edge (ADR-026 dual-encoding: a `parent_id` without a `contains`
+/// edge fails the storage writer's consistency check). `child` MUST already
+/// carry `parent_id == from_id`.
+fn push_with_contains(from_id: &str, child: Value, out: &mut Vec<Value>, edges: &mut Vec<Value>) {
+    if let Some(to_id) = child.get("id").and_then(Value::as_str) {
+        edges.push(contains_edge(from_id, to_id));
+    }
+    out.push(child);
+}
+
+/// A structural `contains` edge. Per ADR-026 decision 3 a structural edge
+/// carries NULL byte offsets (omitted here → wire default `None`); confidence
+/// is `resolved` (the relationship is syntactically certain).
+fn contains_edge(from_id: &str, to_id: &str) -> Value {
+    json!({
+        "kind": "contains",
+        "from_id": from_id,
+        "to_id": to_id,
+        "confidence": "resolved"
+    })
+}
+
+/// Extract the predicate of EVERY `#[cfg(...)]` attribute on an item, in source
+/// order. Returns the raw token text of each predicate (e.g. `"unix"`,
+/// `"any(unix, windows)"`); normalisation + reserved-char escaping + folding
+/// into one stable suffix is [`cfg_discriminant`]'s job. `#[cfg_attr(...)]` and
+/// other attributes are ignored — only literal `cfg` lists disambiguate a
+/// path-sharing twin.
+///
+/// All cfgs are collected (not just the first): stacked twins like
+/// `#[cfg(unix)] #[cfg(feature="a")]` vs `#[cfg(unix)] #[cfg(feature="b")]`
+/// legally coexist and must get DISTINCT discriminants, so the whole set feeds
+/// the discriminant (FINDING #5).
+fn cfg_predicates(attrs: &[syn::Attribute]) -> Vec<String> {
+    attrs
+        .iter()
+        .filter_map(|attr| {
+            if let Meta::List(list) = &attr.meta
+                && list.path.is_ident("cfg")
+            {
+                Some(list.tokens.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// The folded `@cfg(...)` discriminant suffix for an item, or `None` when the
+/// item carries no `#[cfg(...)]`. Folds EVERY cfg (FINDING #5) and escapes
+/// reserved entity-id chars (FINDING #6) via [`cfg_discriminant`].
+fn cfg_suffix(attrs: &[syn::Attribute]) -> Option<String> {
+    let preds = cfg_predicates(attrs);
+    if preds.is_empty() {
+        None
+    } else {
+        Some(cfg_discriminant(&preds))
+    }
+}
+
+/// Build an entity id string, mapping the [`EntityIdError`] into a
+/// [`syn::Error`] so the extraction path has a single error type.
+///
+/// [`EntityIdError`]: loomweave_core::EntityIdError
+fn build_id(kind: &str, qualname: &str) -> Result<String, syn::Error> {
+    build_entity_id(kind, qualname)
+        .map(|id| id.as_str().to_owned())
+        .map_err(|e| syn::Error::new(proc_macro2::Span::call_site(), e.to_string()))
+}
+
+fn entity(
+    kind: &str,
+    qualname: &str,
+    file_path: &str,
+    range: &SourceRange,
+    parent_id: Option<&str>,
+    signature: Option<Value>,
+) -> Result<Value, syn::Error> {
+    let id = build_id(kind, qualname)?;
+    let mut e = json!({
+        "id": id.as_str(),
+        "kind": kind,
+        "qualified_name": qualname,
+        "source": {
+            "file_path": file_path,
+            "source_byte_start": range.byte_start,
+            "source_byte_end": range.byte_end,
+            "source_range": { "start_line": range.start_line, "end_line": range.end_line }
+        }
+    });
+    if let Some(p) = parent_id {
+        e["parent_id"] = json!(p);
+    }
+    if let Some(s) = signature {
+        e["signature"] = s;
+    }
+    Ok(e)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(entities: &[Value]) -> Vec<String> {
+        entities
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn extracts_module_struct_and_free_function() {
+        let src = "pub struct Widget { a: i32 }\npub fn helper(x: i32) -> bool { x > 0 }\n";
+        let out = extract_file(
+            "loomweave_core",
+            "loomweave_core.config",
+            "/p/src/config.rs",
+            src,
+        )
+        .unwrap();
+        let got = ids(&out);
+        assert!(got.contains(&"rust:module:loomweave_core.config".to_owned()));
+        assert!(got.contains(&"rust:struct:loomweave_core.config.Widget".to_owned()));
+        assert!(got.contains(&"rust:function:loomweave_core.config.helper".to_owned()));
+    }
+
+    #[test]
+    fn trait_and_inherent_methods_are_distinct_functions() {
+        let src = "struct Foo;\nimpl std::fmt::Display for Foo { fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { Ok(()) } }\nimpl std::fmt::Debug for Foo { fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { Ok(()) } }\n";
+        let out = extract_file("k", "k.m", "/p/src/m.rs", src).unwrap();
+        let got = ids(&out);
+        assert!(got.iter().any(|id| id.contains("Foo.impl[Display].fmt")));
+        assert!(got.iter().any(|id| id.contains("Foo.impl[Debug].fmt")));
+    }
+
+    #[test]
+    fn every_entity_carries_file_path_and_byte_range() {
+        let src = "pub fn a() {}\n";
+        let out = extract_file("k", "k.m", "/p/src/m.rs", src).unwrap();
+        let f = out.iter().find(|e| e["kind"] == "function").unwrap();
+        assert_eq!(f["source"]["file_path"], "/p/src/m.rs");
+        assert!(f["source"]["source_byte_start"].as_i64().is_some());
+        assert!(f["source"]["source_byte_end"].as_i64().unwrap() > 0);
+    }
+
+    #[test]
+    fn malformed_file_yields_one_degraded_module_and_a_warning() {
+        let src = "fn broken( {{{ this is not rust";
+        let (entities, edges, sites, findings) =
+            extract_file_degraded_aware("k", "k.m", "/p/src/m.rs", src);
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0]["kind"], "module");
+        assert_eq!(entities[0]["id"], "rust:module:k.m");
+        assert_eq!(entities[0]["parse_status"], "syntax_error");
+        assert!(edges.is_empty());
+        assert!(sites.is_empty());
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0]["severity"], "warning");
+    }
+
+    #[test]
+    fn valid_file_yields_entities_and_no_findings() {
+        let src = "pub fn a() {}\n";
+        let (entities, _edges, _sites, findings) =
+            extract_file_degraded_aware("k", "k.m", "/p/src/m.rs", src);
+        assert!(findings.is_empty());
+        assert!(entities.iter().any(|e| e["kind"] == "function"));
+    }
+
+    /// ADR-026 dual-encoding, mirroring the storage writer's two-direction
+    /// `parent_contains_mismatch` check (`writer.rs:1252`): emitting a
+    /// `parent_id` without a matching `contains` edge — the bug this fix closes
+    /// — would `FailRun`. Every non-`module` entity with a `parent_id` must have a
+    /// `contains` edge `(parent_id -> id)`, and every `contains` edge must have a
+    /// child whose `parent_id` equals its `from_id`. `module` entities are
+    /// excluded: they are `file_scope`, so the core supplies their
+    /// `file -> module` edge, not the plugin.
+    #[test]
+    fn parent_contains_dual_encoding_holds() {
+        let src = "pub struct Foo { a: i32 }\n\
+                   pub fn free() {}\n\
+                   impl Foo { pub fn make() -> Foo { Foo { a: 0 } } }\n\
+                   impl std::fmt::Display for Foo { fn fmt(&self, _f: &mut std::fmt::Formatter) -> std::fmt::Result { Ok(()) } }\n\
+                   pub mod inner { pub struct Bar; }\n";
+        let Extracted {
+            entities, edges, ..
+        } = extract_file_full("k", "k.m", "/p/src/m.rs", src).unwrap();
+
+        // Index the contains edges by (from, to).
+        let contains: std::collections::BTreeSet<(String, String)> = edges
+            .iter()
+            .filter(|e| e["kind"] == "contains")
+            .map(|e| {
+                (
+                    e["from_id"].as_str().unwrap().to_owned(),
+                    e["to_id"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        let id_to_parent: std::collections::BTreeMap<String, Option<String>> = entities
+            .iter()
+            .map(|e| {
+                (
+                    e["id"].as_str().unwrap().to_owned(),
+                    e.get("parent_id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                )
+            })
+            .collect();
+
+        // Direction 1: every non-module entity with a parent_id has a contains.
+        for e in &entities {
+            if e["kind"] == "module" {
+                continue;
+            }
+            if let Some(parent) = e.get("parent_id").and_then(Value::as_str) {
+                let id = e["id"].as_str().unwrap();
+                assert!(
+                    contains.contains(&(parent.to_owned(), id.to_owned())),
+                    "entity {id} has parent_id={parent} but no matching contains edge",
+                );
+            }
+        }
+        // Direction 2: every contains edge has a child whose parent_id == from.
+        for (from, to) in &contains {
+            assert_eq!(
+                id_to_parent.get(to).and_then(Option::as_deref),
+                Some(from.as_str()),
+                "contains ({from} -> {to}) has no matching child parent_id",
+            );
+        }
+        // And the fix is non-vacuous: the impl method is present and parented.
+        assert!(
+            entities.iter().any(|e| e["id"]
+                .as_str()
+                .is_some_and(|id| id.contains("Foo.impl") && id.ends_with("make"))),
+            "expected the impl method entity",
+        );
+    }
+}

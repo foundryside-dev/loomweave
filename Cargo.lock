@@ -1168,6 +1168,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "loomweave-plugin-rust"
+version = "1.1.0-rc3"
+dependencies = [
+ "loomweave-core",
+ "proc-macro2",
+ "quote",
+ "rusqlite",
+ "serde_json",
+ "syn",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "loomweave-scanner"
 version = "1.1.0-rc3"
 dependencies = [
