@@ -746,6 +746,22 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 secret_finding_files.contains(&crate::secret_scan::canonical_or_original(path))
                     || file_needs_reanalysis(&project_root, path, &prior_file_hashes)
             });
+        // Locators of THIS plugin's skipped-unchanged entities. These rows stay in
+        // the committed DB untouched this run (they are guarded against orphan
+        // deletion via `retained_locators` below — see the SEI matcher's
+        // current-locator union), so they are exactly the endpoints an anchored
+        // edge from a CHANGED file may resolve against even though the host never
+        // re-dispatched the file that owns them. Seeding them into
+        // `seen_plugin_entity_ids` (below) lets such an edge drain ready instead of
+        // being dropped-and-counted as if its endpoint were never stored. We seed
+        // ONLY skipped-file locators (never the full prior index): a CHANGED file
+        // that drops a symbol does NOT re-emit it this run, and — crucially —
+        // because it was re-dispatched its locator is absent from THIS set, so an
+        // edge into that now-dead symbol still drops. Seeding from the full prior
+        // index instead would mark the dropped symbol seen (its row lingers —
+        // `entities` is cumulative) and resurrect a stale edge to a symbol the
+        // source no longer defines.
+        let mut skipped_file_entity_ids: Vec<String> = Vec::new();
         for path in &skipped_files {
             skipped_files_total += 1;
             progress.file_skipped_unchanged(&plugin_id, &path.to_string_lossy());
@@ -756,6 +772,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     if let Some(entry) = prior_index_snapshot.get(&locator) {
                         prior_index_entries.push(entry.clone());
                     }
+                    skipped_file_entity_ids.push(locator.clone());
                     retained_locators.insert(locator);
                 }
             }
@@ -808,7 +825,13 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         let mut insert_err: Option<anyhow::Error> = None;
         let mut plugin_entity_count: u64 = 0;
         let mut plugin_edge_count: u64 = 0;
-        let mut seen_plugin_entity_ids: BTreeSet<String> = BTreeSet::new();
+        // Seed the seen-entity gate with this plugin's skipped-file entity ids: an
+        // anchored edge from a re-analyzed file into an UNCHANGED file's entity must
+        // drain ready (its endpoint exists in the committed DB and survives this
+        // run), not be dropped at end-of-plugin. Full runs have no skipped files, so
+        // this is empty and behaviour is unchanged.
+        let mut seen_plugin_entity_ids: BTreeSet<String> =
+            skipped_file_entity_ids.into_iter().collect();
         let mut pending_plugin_edges: Vec<DescribedEdgeRecord> = Vec::new();
         while let Some(message) = batch_rx.recv().await {
             if insert_err.is_some() {

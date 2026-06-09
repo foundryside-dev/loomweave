@@ -434,6 +434,200 @@ ontology_version = "0.6.0"
 file_scope = ["module"]
 "#;
 
+// ── Cross-file anchored-edge fixture ──────────────────────────────────────────
+//
+// A content-driven plugin for the incremental host-seam edge-retention tests. Each
+// `.cx` file is a tiny directive script the plugin reads line-by-line:
+//
+//   entity <name>          → emit a child function `crossfixture:function:<stem>.<name>`
+//                            (parented to the module, with a `contains` edge), so the
+//                            symbol can be DROPPED between runs by editing the file.
+//   impl <stem>.<name>     → emit an anchored `implements` edge from this module to
+//                            `crossfixture:function:<stem>.<name>` (a CROSS-FILE
+//                            endpoint into another file's entity — the case the
+//                            seen-entity gate must handle). `implements` is used
+//                            rather than `imports` because the host filters `imports`
+//                            targets down to file-scope modules; `implements` flows
+//                            through the seen-set gate to an arbitrary entity target.
+//
+// Every file always emits its module `crossfixture:module:<stem>`. Because the
+// emission is a pure function of the file's content, changing the content between
+// analyze runs deterministically changes which entities/edges the file produces —
+// which is exactly what the positive (target unchanged) and negative (target's
+// symbol dropped) incremental scenarios require.
+#[cfg(unix)]
+const CROSS_PLUGIN_SCRIPT: &str = r#"#!/usr/bin/python3
+import json
+import pathlib
+import sys
+
+
+def read_frame():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if line in (b"", b"\r\n"):
+            break
+        name, value = line.decode("ascii").strip().split(":", 1)
+        headers[name.lower()] = value.strip()
+    length = int(headers["content-length"])
+    return json.loads(sys.stdin.buffer.read(length))
+
+
+def write_frame(message):
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n")
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+
+while True:
+    msg = read_frame()
+    method = msg.get("method")
+    if method == "initialized":
+        continue
+    if method == "exit":
+        raise SystemExit(0)
+    ident = msg["id"]
+    if method == "initialize":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "name": "loomweave-plugin-cross",
+                "version": "0.1.0",
+                "ontology_version": "0.6.0",
+                "capabilities": {},
+            },
+        })
+    elif method == "analyze_file":
+        path = msg["params"]["file_path"]
+        stem = pathlib.Path(path).stem
+        module_id = f"crossfixture:module:{stem}"
+        entities = [
+            {
+                "id": module_id,
+                "kind": "module",
+                "qualified_name": stem,
+                "source": {"file_path": path},
+            },
+        ]
+        edges = []
+        with open(path, "r", encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+        for lineno, raw in enumerate(lines, start=1):
+            line = raw.strip()
+            if line.startswith("entity "):
+                name = line[len("entity "):].strip()
+                ent_id = f"crossfixture:function:{stem}.{name}"
+                entities.append({
+                    "id": ent_id,
+                    "kind": "function",
+                    "qualified_name": f"{stem}.{name}",
+                    "source": {
+                        "file_path": path,
+                        "source_range": {
+                            "start_line": lineno,
+                            "start_col": 0,
+                            "end_line": lineno,
+                            "end_col": len(raw),
+                        },
+                    },
+                    "parent_id": module_id,
+                })
+                edges.append({
+                    "kind": "contains",
+                    "from_id": module_id,
+                    "to_id": ent_id,
+                })
+            elif line.startswith("impl "):
+                target = line[len("impl "):].strip()
+                target_stem, _, sym = target.partition(".")
+                to_id = f"crossfixture:function:{target_stem}.{sym}"
+                edges.append({
+                    "kind": "implements",
+                    "from_id": module_id,
+                    "to_id": to_id,
+                    "source_byte_start": 0,
+                    "source_byte_end": 10,
+                    "confidence": "resolved",
+                })
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "entities": entities,
+                "edges": edges,
+                "stats": {},
+            },
+        })
+    elif method == "shutdown":
+        write_frame({"jsonrpc": "2.0", "id": ident, "result": {}})
+    else:
+        raise SystemExit(1)
+"#;
+
+#[cfg(unix)]
+const CROSS_PLUGIN_MANIFEST: &str = r#"
+[plugin]
+name = "loomweave-plugin-cross"
+plugin_id = "crossfixture"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "loomweave-plugin-cross"
+language = "crossfixture"
+extensions = ["cx"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 256
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+entity_kinds = ["module", "function"]
+edge_kinds = ["contains", "implements"]
+rule_id_prefix = "LMWV-CROSS-"
+ontology_version = "0.6.0"
+
+[ontology.roles]
+file_scope = ["module"]
+"#;
+
+#[cfg(unix)]
+fn write_cross_plugin(plugin_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let plugin_script = plugin_dir.join("loomweave-plugin-cross");
+    std::fs::write(&plugin_script, CROSS_PLUGIN_SCRIPT).expect("write cross plugin script");
+    let mut perms = std::fs::metadata(&plugin_script)
+        .expect("stat cross plugin")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&plugin_script, perms).expect("chmod cross plugin");
+
+    std::fs::write(plugin_dir.join("plugin.toml"), CROSS_PLUGIN_MANIFEST)
+        .expect("write cross plugin manifest");
+}
+
+/// Install Loomweave + the cross-file fixture plugin into a fresh project. Returns
+/// the project dir, the plugin dir (kept alive so the script stays on disk), and
+/// the `PATH` value that exposes the plugin to `loomweave analyze`.
+#[cfg(unix)]
+fn cross_env() -> (tempfile::TempDir, tempfile::TempDir, std::ffi::OsString) {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_cross_plugin(plugin_dir.path());
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    (project_dir, plugin_dir, plugin_path)
+}
+
 #[cfg(unix)]
 fn write_ambiguous_calls_plugin(plugin_dir: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -3956,6 +4150,191 @@ fn analyze_incremental_skip_does_not_orphan_unchanged_file_entities() {
     assert_eq!(
         orphaned_for_stable, 0,
         "no orphaned lineage event may be recorded for a skipped-unchanged entity"
+    );
+}
+
+/// POSITIVE host-seam edge retention (clarion incremental data-loss fix). An
+/// anchored `imports` edge from a CHANGED file into an UNCHANGED file's entity must
+/// PERSIST across an incremental run. The endpoint row still exists in the committed
+/// DB (its file was skipped, not re-analysed, not deleted), so the FK resolves — the
+/// edge must drain ready, not be dropped-and-counted as if the endpoint were absent.
+///
+/// Before the fix, `seen_plugin_entity_ids` started empty and was only extended with
+/// THIS run's re-analysed entities; the unchanged target's id was never present, so
+/// the edge stayed pending and was dropped at end-of-plugin.
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_retains_edge_into_unchanged_file_entity() {
+    let (project_dir, _plugin_dir, plugin_path) = cross_env();
+    let analyze = || {
+        loomweave_bin()
+            .args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .assert()
+            .success();
+    };
+
+    // File B defines `bar`; file A implements it. Run 1 stores both files' entities
+    // and the cross-file edge a -> b.bar.
+    let path_a = project_dir.path().join("a.cx");
+    let path_b = project_dir.path().join("b.cx");
+    std::fs::write(&path_b, b"entity bar\n").unwrap();
+    std::fs::write(&path_a, b"impl b.bar\n").unwrap();
+    analyze();
+
+    let edge_present = |conn: &Connection| -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM edges \
+             WHERE kind = 'implements' \
+               AND from_id = 'crossfixture:module:a' \
+               AND to_id = 'crossfixture:function:b.bar'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    };
+    {
+        let conn =
+            Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
+        assert!(
+            edge_present(&conn),
+            "run 1 (full) must store the cross-file implements edge"
+        );
+    }
+
+    // Run 2: change ONLY a.cx (still implementing b.bar); b.cx is byte-identical →
+    // skipped. The edge's target `crossfixture:function:b.bar` lives in the skipped
+    // file, so it is not re-emitted this run — the exact data-loss case the fix addresses.
+    std::fs::write(&path_a, b"impl b.bar\n# touched\n").unwrap();
+    analyze();
+
+    let stats = latest_run_stats(project_dir.path());
+    assert_eq!(
+        stats["skipped_files"].as_u64(),
+        Some(1),
+        "exactly b.cx must be skipped on the incremental re-run: {stats}"
+    );
+
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
+    assert!(
+        edge_present(&conn),
+        "the implements edge into the UNCHANGED file's entity must PERSIST across the \
+         incremental run (endpoint still in the committed DB), not be dropped: {stats}"
+    );
+    assert_eq!(
+        stats["plugin_edges_dropped_unseen_total"].as_u64(),
+        Some(0),
+        "no edge should be dropped-as-unseen when its endpoint survives in the DB: {stats}"
+    );
+}
+
+/// NEGATIVE / SAFETY host-seam guard (the test that prevents shipping the
+/// resurrection bug). A CHANGED file C drops a symbol `foo` (no longer emitted this
+/// run) while another CHANGED file A still references `C::foo`. The stale edge must
+/// be DROPPED-AND-COUNTED and the run must COMPLETE; no edge row to the now-dead
+/// symbol may be written.
+///
+/// This discriminates the SAFE fix (seed seen-set from SKIPPED files only) from the
+/// UNSAFE one (seed from the FULL prior index). Entities are cumulative, so c.foo's
+/// row lingers from run 1 — a full-index seed would mark it seen, drain the edge
+/// ready, and write a FK-valid-but-STALE edge to a symbol the source no longer
+/// defines (a zombie edge — wrong data, not a crash). The skipped-only seed never
+/// marks a re-analysed file's locator, so the edge stays pending and is dropped.
+/// With the bug (empty seed) the edge is also dropped, so this test passes on both
+/// the bug and the safe fix and FAILS only on the unsafe full-index seed — exactly
+/// the regression it must catch.
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_drops_edge_to_this_run_deleted_entity() {
+    let (project_dir, _plugin_dir, plugin_path) = cross_env();
+    let analyze = || {
+        let mut cmd = loomweave_bin();
+        cmd.args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path);
+        cmd
+    };
+
+    // Run 1: C defines `foo`; A implements it. Both stored, edge a -> c.foo present.
+    let path_a = project_dir.path().join("a.cx");
+    let path_c = project_dir.path().join("c.cx");
+    std::fs::write(&path_c, b"entity foo\n").unwrap();
+    std::fs::write(&path_a, b"impl c.foo\n").unwrap();
+    analyze().assert().success();
+
+    {
+        let conn =
+            Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
+        let edge1: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE kind = 'implements' \
+                   AND from_id = 'crossfixture:module:a' \
+                   AND to_id = 'crossfixture:function:c.foo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(edge1, 1, "run 1 must store the cross-file implements edge");
+    }
+
+    // Run 2: change BOTH files. C drops `foo` (entity deleted this run); A still
+    // implements c.foo but is also edited so it is re-analysed. Neither file is
+    // skipped, so the deleted `c.foo` is never re-seen and never resurrected.
+    std::fs::write(&path_c, b"entity other\n").unwrap();
+    std::fs::write(&path_a, b"impl c.foo\n# touched\n").unwrap();
+    // The run must COMPLETE — a resurrected endpoint would write a dangling FK and
+    // HardFail (non-zero exit) here.
+    analyze().assert().success();
+
+    let stats = latest_run_stats(project_dir.path());
+    assert_eq!(
+        stats["skipped_files"].as_u64(),
+        Some(0),
+        "both files changed, so nothing is skipped: {stats}"
+    );
+    assert_eq!(
+        stats["plugin_edges_dropped_unseen_total"].as_u64(),
+        Some(1),
+        "the edge to the this-run-deleted entity must be dropped-AND-COUNTED: {stats}"
+    );
+
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
+    // No dangling FK row: the edge to the now-deleted c.foo must NOT have been written.
+    let dangling: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges WHERE kind = 'implements' \
+               AND from_id = 'crossfixture:module:a' \
+               AND to_id = 'crossfixture:function:c.foo'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        dangling, 0,
+        "no dangling implements edge may persist to the this-run-deleted entity"
+    );
+    // Entities are CUMULATIVE (never pruned, no run-scoping — see the analyze
+    // pipeline's prior-index notes), so c.foo's row from run 1 survives even though
+    // the symbol no longer exists in the source. THAT is precisely why a naive
+    // "seed seen-set from the full prior index" fix is unsafe: c.foo's locator would
+    // still be in the prior index, the seed would mark it seen, the edge would drain
+    // ready, and the host would write a FK-valid-but-STALE edge to a symbol the
+    // source no longer defines. The skipped-only seed never marks a re-analysed
+    // file's locator, so the stale edge is correctly dropped above. This assertion
+    // documents the lingering row that makes the resurrection hazard real.
+    let foo_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE id = 'crossfixture:function:c.foo'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        foo_rows, 1,
+        "entities are cumulative: c.foo's row lingers — which is exactly why a \
+         full-index seed would resurrect a stale edge to it (the hazard this guards)"
     );
 }
 
