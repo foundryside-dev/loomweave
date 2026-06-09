@@ -73,6 +73,14 @@ fn visit(dir: &Path, out: &mut BTreeMap<PathBuf, String>) {
             .or_insert_with(|| normalise(base));
     }
     for entry in entries.flatten() {
+        // Do NOT follow symlinked directories (mirrors `symbol_table::walk`): a
+        // symlinked dir is an out-of-tree escape (would read an outside
+        // `Cargo.toml` and register an outside crate root) or a cycle (would
+        // re-register an in-tree crate under an aliased path). `file_type()`
+        // reports the link itself; `Path::is_dir()` would follow it.
+        if entry.file_type().is_ok_and(|t| t.is_symlink()) {
+            continue;
+        }
         let path = entry.path();
         if path.is_dir() && !is_ignored(&path) {
             visit(&path, out);
@@ -122,6 +130,49 @@ mod tests {
         assert_eq!(
             roots.crate_name_for(&root.join("crates/b/src/main.rs")),
             Some("loomweave_cli".to_owned())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn does_not_register_crate_roots_reached_through_symlinked_dirs() {
+        // Crate-root discovery must not follow directory symlinks: a symlinked
+        // dir is an out-of-tree escape (an outside crate's `Cargo.toml` would be
+        // read and registered as a root) or a cycle (an in-tree crate would be
+        // re-registered under an aliased path). Neither is a real crate in the
+        // project the host asked us to index.
+        use std::os::unix::fs::symlink;
+        let proj = tempfile::tempdir().unwrap();
+        let root = proj.path();
+        fs::create_dir_all(root.join("c/src")).unwrap();
+        fs::write(root.join("c/Cargo.toml"), "[package]\nname=\"c_crate\"\n").unwrap();
+        fs::write(root.join("c/src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+        // ESCAPE: a full outside crate symlinked into the tree.
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(outside.path().join("src")).unwrap();
+        fs::write(
+            outside.path().join("Cargo.toml"),
+            "[package]\nname=\"evil_crate\"\n",
+        )
+        .unwrap();
+        fs::write(outside.path().join("src/lib.rs"), "pub fn evil() {}\n").unwrap();
+        symlink(outside.path(), root.join("evil")).unwrap();
+
+        // CYCLE: must not blow the stack / re-register through the alias.
+        symlink(root, root.join("loop")).unwrap();
+
+        let roots = discover_crate_roots(root); // must RETURN
+        // The real crate is found...
+        assert_eq!(
+            roots.crate_name_for(&root.join("c/src/lib.rs")),
+            Some("c_crate".to_owned())
+        );
+        // ...but the symlinked-in outside crate is NOT registered.
+        assert_eq!(
+            roots.crate_name_for(&root.join("evil/src/lib.rs")),
+            None,
+            "out-of-tree crate reached via symlink must not be a registered root",
         );
     }
 

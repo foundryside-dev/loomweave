@@ -135,6 +135,15 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         return;
     };
     for entry in entries.flatten() {
+        // Do NOT follow symlinked directories. The host's path-jail covers
+        // `analyze_file` paths but not this init walk; a symlinked dir is either
+        // an out-of-tree escape (reads files outside the project) or a cycle
+        // (re-collects in-tree files under an aliased path, double-minting ids).
+        // `DirEntry::file_type()` reports the link itself (it does NOT traverse),
+        // unlike `Path::is_dir()` which follows the link.
+        if entry.file_type().is_ok_and(|t| t.is_symlink()) {
+            continue;
+        }
         let path = entry.path();
         if path.is_dir() {
             if !is_ignored(&path) {
@@ -244,5 +253,41 @@ mod tests {
         assert_eq!(table.duplicate_ids(), Vec::<String>::new());
         assert!(table.contains_id("rust:module:c_crate"));
         assert!(table.contains_id("rust:function:c_crate.run_it"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_symbol_table_does_not_follow_symlinked_dirs() {
+        // The init walk is load-bearing (Phase 1b resolves against it) and must
+        // not follow directory symlinks: a symlinked dir is either an out-of-tree
+        // ESCAPE (reads files the host's path-jail never sanctioned) or a CYCLE
+        // (re-collects in-tree files under an aliased path, double-minting ids and
+        // tripping the duplicates gate; on POSIX the kernel's ELOOP cap stops the
+        // recursion before a stack overflow, so the harm is collisions, not a crash).
+        use std::os::unix::fs::symlink;
+        let proj = tempfile::tempdir().unwrap();
+        let root = proj.path();
+        fs::create_dir_all(root.join("c/src")).unwrap();
+        fs::write(root.join("c/Cargo.toml"), "[package]\nname=\"c_crate\"\n").unwrap();
+        fs::write(root.join("c/src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+        // ESCAPE: an out-of-tree dir holding a `.rs` file, symlinked *inside* the
+        // crate's src so a naive walk would collect it as `c_crate.sub.evil`.
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("evil.rs"), "pub fn evil() {}\n").unwrap();
+        symlink(outside.path(), root.join("c/src/sub")).unwrap();
+
+        // CYCLE: root/loop -> root. A followed cycle re-collects c_crate's files
+        // under the aliased path and double-mints their ids.
+        symlink(root, root.join("loop")).unwrap();
+
+        let table = build_symbol_table(root); // must RETURN (no hang/overflow)
+
+        // CYCLE not followed: no id was minted twice.
+        assert_eq!(table.duplicate_ids(), Vec::<String>::new());
+        // ESCAPE not followed: nothing from the out-of-tree `evil.rs`.
+        assert!(table.iter_ids().all(|id| !id.contains("evil")));
+        // The real in-project fn IS present (the walk still works).
+        assert!(table.contains_id("rust:function:c_crate.f"));
     }
 }
