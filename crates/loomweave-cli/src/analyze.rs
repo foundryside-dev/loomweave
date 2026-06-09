@@ -706,6 +706,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             &started_at,
         ));
     }
+    let handshake_timeout = plugin_handshake_timeout();
     let file_timeout = plugin_file_timeout();
     let briefing_blocks = secret_scan_outcome.briefing_blocks_shared();
     let scanned_files = secret_scan_outcome.scanned_files_shared();
@@ -817,6 +818,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 &briefing_blocks_clone,
                 &scanned_files_clone,
                 &progress_clone,
+                handshake_timeout,
                 file_timeout,
                 &batch_tx,
             )
@@ -3086,6 +3088,25 @@ fn plugin_file_timeout() -> std::time::Duration {
         )
 }
 
+/// Handshake (`initialize`) deadline (ADR-050). ADR-035 tuning: basis — a
+/// plugin may legitimately do whole-repo work inside `initialize` (the Rust
+/// plugin builds its symbol table there; at syn's ~40 MB/s parse throughput,
+/// 300 s covers a ~10 M-LOC repo), so this budget scales with repo size, not
+/// per-file work; override — env `LOOMWEAVE_PLUGIN_HANDSHAKE_TIMEOUT_MS`;
+/// retune — raise if a legitimate repo trips it in practice.
+const DEFAULT_PLUGIN_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Resolve the handshake timeout, honouring the env override.
+fn plugin_handshake_timeout() -> std::time::Duration {
+    std::env::var("LOOMWEAVE_PLUGIN_HANDSHAKE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(
+            DEFAULT_PLUGIN_HANDSHAKE_TIMEOUT,
+            std::time::Duration::from_millis,
+        )
+}
+
 /// Map a host-layer subcode to an ADR-017 severity. Crash / kill / OOM / timeout
 /// are `ERROR` (the plugin or a file was lost); drop-and-continue diagnostics
 /// (malformed/undeclared/oversize) are `WARN`.
@@ -4246,10 +4267,6 @@ struct PendingUnresolvedCallSites {
 /// best-effort `shutdown`/`exit` exchange after the file loop.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum WatchdogPhase {
-    #[allow(
-        dead_code,
-        reason = "armed by the handshake deadline (hardening plan Task 4)"
-    )]
     Handshake,
     File,
     #[allow(
@@ -4377,6 +4394,7 @@ fn run_plugin_blocking(
     briefing_blocks: &Arc<BTreeMap<PathBuf, loomweave_core::BriefingBlockReason>>,
     scanned_source_files: &Arc<BTreeSet<PathBuf>>,
     progress: &ProgressReporter,
+    handshake_timeout: std::time::Duration,
     file_timeout: std::time::Duration,
     batch_tx: &tokio::sync::mpsc::Sender<PluginBatchMessage>,
 ) -> Result<BatchResult, PluginRunError> {
@@ -4384,23 +4402,22 @@ fn run_plugin_blocking(
 
     let manifest_language = manifest.plugin.language.clone();
     let kind_roles = PluginKindRoles::from_manifest(&manifest);
-    let (mut host, child) =
-        PluginHost::spawn(manifest, project_root, executable).map_err(|e| match e {
+    let (mut host, child) = PluginHost::spawn_unhandshaken(manifest, project_root, executable)
+        .map_err(|e| match e {
             HostError::Spawn(msg) => {
                 PluginRunError::new(format!("failed to spawn plugin {plugin_id}: {msg}"))
             }
-            HostError::Handshake(ref me) => {
-                PluginRunError::new(format!("plugin {plugin_id} refused handshake: {me}"))
-            }
-            other => {
-                PluginRunError::new(format!("plugin {plugin_id} spawn/handshake error: {other}"))
-            }
+            other => PluginRunError::new(format!("plugin {plugin_id} spawn error: {other}")),
         })?;
     host.set_briefing_blocks(Arc::clone(briefing_blocks));
     host.set_scanned_source_files(Arc::clone(scanned_source_files));
 
-    // Per-file analysis-timeout watchdog (REQ-ANALYZE-06). Shares the child
+    // Lifecycle-timeout watchdog (REQ-ANALYZE-06, ADR-050). Shares the child
     // handle so it can kill a hung plugin and unblock the synchronous read.
+    // Started BEFORE the handshake: a plugin may do whole-repo work inside
+    // `initialize` (the Rust plugin builds its symbol table there), and a
+    // hung handshake would otherwise wedge the run record and the analyze
+    // advisory lock forever.
     let child = Arc::new(std::sync::Mutex::new(child));
     let watchdog = Arc::new(PluginWatchdog::new());
     let watchdog_handle = spawn_plugin_watchdog(
@@ -4408,6 +4425,48 @@ fn run_plugin_blocking(
         Arc::clone(&child),
         plugin_id.to_owned(),
     );
+
+    // Handshake under its own wall-clock deadline. `spawn_unhandshaken`'s
+    // contract: the caller owns kill+reap on handshake failure (Child::Drop
+    // does not reap on Unix) — preserved here CLI-side via
+    // `reap_and_classify_exit`.
+    watchdog.arm(handshake_timeout, WatchdogPhase::Handshake);
+    let handshake_result = host.handshake();
+    watchdog.disarm();
+    if let Err(handshake_err) = handshake_result {
+        watchdog.request_stop();
+        let _ = watchdog_handle.join();
+        let handshake_timed_out = watchdog.timed_out_phase() == Some(WatchdogPhase::Handshake);
+        let mut child = Arc::try_unwrap(child)
+            .unwrap_or_else(|_| unreachable!("watchdog joined; no other Arc holders remain"))
+            .into_inner()
+            .expect("child mutex poisoned");
+        let _ = child.kill();
+        let mut findings = host.take_findings();
+        drop(host);
+        let reason = if handshake_timed_out {
+            let reason = format!(
+                "plugin {plugin_id} exceeded the handshake timeout ({} ms) and was killed",
+                handshake_timeout.as_millis()
+            );
+            findings.push(plugin_timeout_finding(
+                plugin_id,
+                "handshake",
+                handshake_timeout,
+                reason.clone(),
+            ));
+            reason
+        } else {
+            match handshake_err {
+                HostError::Handshake(ref me) => {
+                    format!("plugin {plugin_id} refused handshake: {me}")
+                }
+                other => format!("plugin {plugin_id} spawn/handshake error: {other}"),
+            }
+        };
+        reap_and_classify_exit(&mut child, plugin_id, &mut findings);
+        return Err(PluginRunError::with_findings(reason, findings));
+    }
 
     let mut dispatch_findings: Vec<HostFinding> = Vec::new();
     let work_result: Result<(), String> = (|| {
@@ -4556,7 +4615,7 @@ fn run_plugin_blocking(
     // handle (lets us reclaim the owned `Child` for the reap path).
     watchdog.request_stop();
     let _ = watchdog_handle.join();
-    let timed_out = watchdog.timed_out_phase().is_some();
+    let timed_out = watchdog.timed_out_phase() == Some(WatchdogPhase::File);
     let mut child = Arc::try_unwrap(child)
         .unwrap_or_else(|_| unreachable!("watchdog joined; no other Arc holders remain"))
         .into_inner()
@@ -4600,20 +4659,15 @@ fn run_plugin_blocking(
     // visible. Add a LMWV-PY-TIMEOUT host finding; it rides out through
     // PluginRunError.findings and is persisted by the run's crash path.
     if timed_out {
-        let mut metadata = BTreeMap::new();
-        metadata.insert("plugin_id".to_owned(), plugin_id.to_owned());
-        metadata.insert(
-            "timeout_ms".to_owned(),
-            file_timeout.as_millis().to_string(),
-        );
-        findings.push(HostFinding {
-            subcode: PLUGIN_TIMEOUT_RULE_ID.to_owned(),
-            message: format!(
+        findings.push(plugin_timeout_finding(
+            plugin_id,
+            "file",
+            file_timeout,
+            format!(
                 "plugin {plugin_id} exceeded the per-file analysis timeout ({} ms) and was killed",
                 file_timeout.as_millis()
             ),
-            metadata,
-        });
+        ));
     }
 
     // Reap unconditionally. `Child::Drop` does not wait on Unix.
@@ -4622,6 +4676,27 @@ fn run_plugin_blocking(
     match work_result {
         Ok(()) => Ok(BatchResult { findings }),
         Err(reason) => Err(PluginRunError::with_findings(reason, findings)),
+    }
+}
+
+/// Build the `LMWV-PY-TIMEOUT` host finding for a lifecycle-deadline kill
+/// (ADR-050). `phase` names the [`WatchdogPhase`] that fired (`"handshake"` /
+/// `"file"`) so a consumer can tell a hung `initialize` from a hung
+/// `analyze_file` without parsing the message.
+fn plugin_timeout_finding(
+    plugin_id: &str,
+    phase: &str,
+    timeout: std::time::Duration,
+    message: String,
+) -> HostFinding {
+    let mut metadata = BTreeMap::new();
+    metadata.insert("plugin_id".to_owned(), plugin_id.to_owned());
+    metadata.insert("phase".to_owned(), phase.to_owned());
+    metadata.insert("timeout_ms".to_owned(), timeout.as_millis().to_string());
+    HostFinding {
+        subcode: PLUGIN_TIMEOUT_RULE_ID.to_owned(),
+        message,
+        metadata,
     }
 }
 
