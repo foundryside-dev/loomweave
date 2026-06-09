@@ -27,6 +27,14 @@ pub fn build_entity_id(kind: &str, qualname: &str) -> Result<EntityId, EntityIdE
 
 /// An impl block's stable discriminator (ADR-049 §2).
 ///
+/// This is the `impl[...]` / `impl#<...>` *fragment only* — it discriminates the
+/// trait (with its concrete generics) and the inherent-impl declared-generic
+/// signature. The impl's **self-type concrete generic arguments** (what makes
+/// `Foo<i32>` and `Foo<u32>` distinct) are NOT here; they live in the type-name
+/// prefix composed by [`self_ty_locator`] (`Foo<i32>.impl#<>` vs
+/// `Foo<u32>.impl#<>`). The full impl locator is therefore
+/// `<self_ty_locator>.<ImplDisc::key>[@cfg(...)]`.
+///
 /// Trait impls key by `impl[<TraitPath-with-concrete-generics>]`; inherent
 /// impls key by `impl#<positional-De-Bruijn-generic-signature>`. There is NO
 /// source-order ordinal (ADR-049 amend, Option b): same-`(type, generic-sig,
@@ -129,12 +137,20 @@ pub fn impl_disc_for(it: &ItemImpl) -> ImplDisc {
         let generic_args = trait_generic_args(&last.arguments);
         return ImplDisc::trait_impl(&last.ident.to_string(), &generic_args);
     }
-    let param_names: Vec<String> = it
-        .generics
+    ImplDisc::inherent(&declared_type_params(it))
+}
+
+/// The impl's declared generic type-parameter names in source order
+/// (`impl<T, U> Foo<…>` → `["T", "U"]`). Lifetimes and const generics are
+/// excluded. Used both for the inherent `#<…>` signature and to recognise which
+/// self-type generic arguments are the impl's own parameters (rendered
+/// positionally by [`self_ty_locator`]) versus concrete instantiations.
+#[must_use]
+pub fn declared_type_params(it: &ItemImpl) -> Vec<String> {
+    it.generics
         .type_params()
         .map(|p| p.ident.to_string())
-        .collect();
-    ImplDisc::inherent(&param_names)
+        .collect()
 }
 
 /// Concrete type/const generic arguments of a trait path's final segment,
@@ -155,9 +171,11 @@ fn trait_generic_args(args: &PathArguments) -> Vec<String> {
         .collect()
 }
 
-/// The locator-relevant name of an impl's self type: the last path segment for
-/// a simple path type (`Foo` in `crate::m::Foo`), else a whitespace-stripped
-/// textual rendering that is still deterministic for exotic self types.
+/// The locator-relevant *bare* name of an impl's self type: the last path
+/// segment for a simple path type (`Foo` in `crate::m::Foo`), else a
+/// whitespace-stripped textual rendering that is still deterministic for exotic
+/// self types. This drops any self-type generic arguments — used for the SEI
+/// signature `target` field, NOT for the impl locator (see [`self_ty_locator`]).
 #[must_use]
 pub fn self_ty_name(ty: &Type) -> String {
     if let Type::Path(p) = ty
@@ -166,6 +184,70 @@ pub fn self_ty_name(ty: &Type) -> String {
         return last.ident.to_string();
     }
     type_textual(ty)
+}
+
+/// The locator-relevant name of an impl's self type **including its concrete
+/// generic arguments** (ADR-049 §2, self-type-generic-args amendment). This is
+/// what makes `impl Foo<i32>` and `impl Foo<u32>` distinct impl entities:
+/// without the self-type args both render bare `Foo`, so their impl keys
+/// (`Foo.impl#<>` / `Foo.impl[Display]`) collide and `seen_impl_ids` would
+/// spuriously merge them, silently overwriting a like-named method at the writer.
+///
+/// `declared_params` are the impl's own declared generic-parameter names
+/// (`impl<T> Foo<T>` → `["T"]`). A self-type arg that is exactly one of those is
+/// the impl's *own* type parameter, not a concrete instantiation, so it is
+/// rendered **positionally** (`$N`, matching the De Bruijn scheme of the inherent
+/// `#<…>` signature) to stay rename-stable: `impl<T> Foo<T>` and `impl<U> Foo<U>`
+/// both render `Foo<$0>`. Concrete args (`i32`, `String`, a const, a nested
+/// generic) render via `type_textual` (whitespace-free), so spacing matches
+/// the rest of the dialect. Lifetimes and associated-type bindings are dropped
+/// (not part of the locator). A non-`Type::Path` self type, or a path with no
+/// angle-bracketed args, renders exactly as [`self_ty_name`] (bare).
+#[must_use]
+pub fn self_ty_locator(ty: &Type, declared_params: &[String]) -> String {
+    let Type::Path(p) = ty else {
+        return type_textual(ty);
+    };
+    let Some(last) = p.path.segments.last() else {
+        return type_textual(ty);
+    };
+    let base = last.ident.to_string();
+    let PathArguments::AngleBracketed(ab) = &last.arguments else {
+        return base;
+    };
+    let rendered: Vec<String> = ab
+        .args
+        .iter()
+        .filter_map(|a| match a {
+            GenericArgument::Type(arg_ty) => Some(self_ty_arg(arg_ty, declared_params)),
+            GenericArgument::Const(expr) => {
+                Some(quote::ToTokens::to_token_stream(expr).to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    if rendered.is_empty() {
+        base
+    } else {
+        format!("{base}<{}>", rendered.join(","))
+    }
+}
+
+/// Render one self-type generic argument: a bare path matching a declared impl
+/// type-parameter becomes its positional `$N` token (rename-stable); anything
+/// else is rendered concretely and whitespace-free.
+fn self_ty_arg(arg_ty: &Type, declared_params: &[String]) -> String {
+    if let Type::Path(p) = arg_ty
+        && p.qself.is_none()
+        && p.path.segments.len() == 1
+        && matches!(p.path.segments[0].arguments, PathArguments::None)
+        && let Some(pos) = declared_params
+            .iter()
+            .position(|d| p.path.segments[0].ident == d.as_str())
+    {
+        return format!("${pos}");
+    }
+    type_textual(arg_ty)
 }
 
 /// Deterministic, whitespace-free textual rendering of any token-bearing node.
@@ -193,17 +275,50 @@ pub fn path_textual(path: &syn::Path) -> String {
     strip_ws(path)
 }
 
-/// Normalise a `#[cfg(<predicate>)]` predicate to a stable `@cfg(...)` suffix:
-/// whitespace stripped, nested predicate arguments sorted. Applied only to an
-/// item that shares a path with a sibling (extract.rs decides applicability),
-/// closing the otherwise-guaranteed cfg-twin collision (ADR-049 §3).
+/// Normalise the FULL set of `#[cfg(<predicate>)]` attributes on an item into a
+/// single stable `@cfg(...)` suffix: each predicate is individually
+/// whitespace-stripped, its nested arguments sorted, and EVERY reserved
+/// entity-id character escaped; the normalised predicates are then sorted and
+/// joined so the suffix is order-independent (ADR-049 §3).
+///
+/// Two reasons this folds *all* cfgs rather than just the first:
+///
+/// - **Stacked-cfg twins** like `#[cfg(unix)] #[cfg(feature="a")]` vs
+///   `#[cfg(unix)] #[cfg(feature="b")]` legally coexist; folding only the first
+///   `#[cfg]` would hand both the same `@cfg(unix)` discriminant and collide one
+///   away at the writer's `ON CONFLICT`. Folding every cfg keeps them distinct.
+/// - **Reserved-char safety**: a predicate such as `feature = "a:b"` carries the
+///   reserved `:` separator; flowed verbatim into a qualname it makes
+///   `build_entity_id` reject the id and collapse the whole clean-parse file to a
+///   single `syntax_error` module. `escape_reserved` guarantees the suffix can
+///   never contain a reserved entity-id char.
+///
+/// Applied only to an item that shares a path with a sibling (extract.rs decides
+/// applicability), closing the otherwise-guaranteed cfg-twin collision.
 #[must_use]
-pub fn cfg_discriminant(predicate: &str) -> String {
-    format!("@cfg({})", normalise_pred(predicate))
+pub fn cfg_discriminant(predicates: &[String]) -> String {
+    let mut norm: Vec<String> = predicates.iter().map(|p| normalise_pred(p)).collect();
+    norm.sort_unstable();
+    format!("@cfg({})", norm.join("&"))
+}
+
+/// Escape every reserved entity-id character so a cfg predicate can never make
+/// `build_entity_id` reject the assembled id (ADR-022 reserves exactly `:` in the
+/// canonical-qualified-name segment; see `loomweave_core::entity_id`).
+///
+/// The escape is injective so distinct predicates stay distinct: `%` is the
+/// escape introducer and is encoded FIRST (`%` → `%25`), then each reserved char
+/// (`:` → `%3A`). Without the leading `%` pass a literal `%3A` in source would
+/// alias a real escaped `:`; with it, `feature="a:b"` and the literal
+/// `feature="a%3Ab"` produce distinct discriminants.
+fn escape_reserved(s: &str) -> String {
+    // Order matters: encode the introducer before any char it could introduce.
+    s.replace('%', "%25").replace(':', "%3A")
 }
 
 fn normalise_pred(p: &str) -> String {
-    let s: String = p.chars().filter(|c| !c.is_whitespace()).collect();
+    let stripped: String = p.chars().filter(|c| !c.is_whitespace()).collect();
+    let s = escape_reserved(&stripped);
     // Sort the args of any single `any(...)`/`all(...)` wrapper (1-level; the
     // common twin case). Deeper nesting falls back to the stripped string,
     // which is still deterministic.
@@ -298,21 +413,49 @@ mod impl_tests {
 mod cfg_tests {
     use super::*;
 
+    fn disc(preds: &[&str]) -> String {
+        let owned: Vec<String> = preds.iter().map(|p| (*p).to_owned()).collect();
+        cfg_discriminant(&owned)
+    }
+
     #[test]
     fn normalises_a_cfg_predicate_deterministically() {
-        assert_eq!(cfg_discriminant("unix"), "@cfg(unix)");
+        assert_eq!(disc(&["unix"]), "@cfg(unix)");
         // whitespace-stripped, args sorted
-        assert_eq!(
-            cfg_discriminant("any( windows , unix )"),
-            "@cfg(any(unix,windows))"
-        );
+        assert_eq!(disc(&["any( windows , unix )"]), "@cfg(any(unix,windows))");
     }
 
     #[test]
     fn cfg_twins_get_distinct_qualnames() {
-        let unix = format!("{}{}", "m.f", cfg_discriminant("unix"));
-        let win = format!("{}{}", "m.f", cfg_discriminant("windows"));
+        let unix = format!("{}{}", "m.f", disc(&["unix"]));
+        let win = format!("{}{}", "m.f", disc(&["windows"]));
         assert_ne!(unix, win);
+    }
+
+    #[test]
+    fn stacked_cfgs_are_folded_order_independently() {
+        // FINDING #5: a stacked-cfg pair sharing a leading `#[cfg(unix)]` but
+        // differing on the second cfg must NOT collide. The whole set is folded,
+        // so the two discriminants differ.
+        let a = disc(&["unix", "feature=\"a\""]);
+        let b = disc(&["unix", "feature=\"b\""]);
+        assert_ne!(a, b);
+        // Order-independent: a source reorder yields the same discriminant.
+        assert_eq!(
+            disc(&["unix", "feature=\"a\""]),
+            disc(&["feature=\"a\"", "unix"])
+        );
+    }
+
+    #[test]
+    fn reserved_char_in_predicate_is_escaped_and_injective() {
+        // FINDING #6: a `:` in the predicate must be escaped so it never reaches
+        // build_entity_id as a reserved char.
+        let d = disc(&["feature=\"a:b\""]);
+        assert!(!d.contains(':'), "discriminant must not contain a raw ':'");
+        // Injective: `a:b` and a literal `a%3Ab` stay distinct (the escape
+        // introducer `%` is itself encoded, so no aliasing).
+        assert_ne!(disc(&["feature=\"a:b\""]), disc(&["feature=\"a%3Ab\""]));
     }
 }
 
@@ -355,6 +498,67 @@ mod syn_disc_tests {
         // merged at the entity layer (see tests/impl_entity.rs).
         assert_eq!(impl_disc_for(&a).key(), impl_disc_for(&b).key());
         assert_eq!(impl_disc_for(&a).key(), "impl#<$0>");
+    }
+
+    #[test]
+    fn self_ty_locator_folds_concrete_args_and_distinguishes_instantiations() {
+        let signed: syn::ItemImpl = parse_quote!(impl Foo<i32> { fn get(&self) {} });
+        let unsigned: syn::ItemImpl = parse_quote!(impl Foo<u32> { fn get(&self) {} });
+        let s = self_ty_locator(&signed.self_ty, &declared_type_params(&signed));
+        let u = self_ty_locator(&unsigned.self_ty, &declared_type_params(&unsigned));
+        assert_eq!(s, "Foo<i32>");
+        assert_eq!(u, "Foo<u32>");
+        assert_ne!(
+            s, u,
+            "distinct concrete self-type args must produce distinct keys"
+        );
+    }
+
+    #[test]
+    fn self_ty_locator_renders_declared_param_positionally_and_rename_stable() {
+        // The self-type arg here is the impl's OWN declared param `T`/`U`, so it
+        // renders positionally ($0) and a rename does not churn.
+        let t: syn::ItemImpl = parse_quote!(
+            impl<T> Foo<T> {
+                fn get(&self) {}
+            }
+        );
+        let u: syn::ItemImpl = parse_quote!(
+            impl<U> Foo<U> {
+                fn get(&self) {}
+            }
+        );
+        let lt = self_ty_locator(&t.self_ty, &declared_type_params(&t));
+        let lu = self_ty_locator(&u.self_ty, &declared_type_params(&u));
+        assert_eq!(lt, "Foo<$0>");
+        assert_eq!(
+            lt, lu,
+            "a generic-param rename must not churn the self-type locator"
+        );
+    }
+
+    #[test]
+    fn self_ty_locator_non_generic_self_renders_bare() {
+        let it: syn::ItemImpl = parse_quote!(impl crate::m::Foo { fn x(&self) {} });
+        assert_eq!(
+            self_ty_locator(&it.self_ty, &declared_type_params(&it)),
+            "Foo"
+        );
+    }
+
+    #[test]
+    fn self_ty_locator_mixes_declared_and_concrete_positionally() {
+        // `impl<T> Foo<T, i32>`: declared `T` -> $0, concrete `i32` kept; the
+        // positional rendering prevents collision with `impl Foo<i32>`.
+        let it: syn::ItemImpl = parse_quote!(
+            impl<T> Foo<T, i32> {
+                fn get(&self) {}
+            }
+        );
+        assert_eq!(
+            self_ty_locator(&it.self_ty, &declared_type_params(&it)),
+            "Foo<$0,i32>"
+        );
     }
 
     #[test]

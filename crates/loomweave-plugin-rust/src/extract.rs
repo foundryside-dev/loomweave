@@ -31,8 +31,8 @@ use syn::{
 use crate::calls::walk_calls;
 use crate::edges::{implements_edge, imports_edge};
 use crate::qualname::{
-    build_entity_id, cfg_discriminant, free_item_qualname, impl_disc_for, impl_qualname,
-    self_ty_name,
+    build_entity_id, cfg_discriminant, declared_type_params, free_item_qualname, impl_disc_for,
+    impl_qualname, self_ty_locator,
 };
 use crate::resolve::{Resolution, Resolver};
 use crate::signature::{function_signature, impl_signature, struct_signature};
@@ -226,9 +226,9 @@ pub fn extract_file_degraded_aware_with_edges(
 }
 
 /// Shape an extraction `Result` into the degraded-aware
-/// `(entities, edges, unresolved_call_sites, findings)` tuple: a clean parse passes through with no
-/// findings; a parse error collapses to a single `syntax_error` module entity
-/// plus one Warning finding and no edges.
+/// `(entities, edges, unresolved_call_sites, findings)` tuple: a clean parse passes
+/// through with no findings; a parse error collapses to a single `syntax_error`
+/// module entity plus one Warning finding and no edges / no call sites.
 fn degraded_aware(
     module_path: &str,
     file_path: &str,
@@ -305,7 +305,10 @@ fn walk_items(
         std::collections::BTreeMap::new();
     for item in items {
         if let Item::Impl(it) = item {
-            let type_q = format!("{module_path}.{}", self_ty_name(&it.self_ty));
+            let type_q = format!(
+                "{module_path}.{}",
+                self_ty_locator(&it.self_ty, &declared_type_params(it))
+            );
             let impl_q = impl_qualname(&type_q, &impl_disc_for(it));
             *impl_twin_counts.entry(impl_q).or_insert(0) += 1;
         }
@@ -361,9 +364,9 @@ fn walk_items(
                 let name = sig.ident.to_string();
                 let mut q = free_item_qualname(module_path, &name);
                 if is_cfg_twin("function", &name)
-                    && let Some(pred) = cfg_predicate(attrs)
+                    && let Some(disc) = cfg_suffix(attrs)
                 {
-                    q.push_str(&cfg_discriminant(&pred));
+                    q.push_str(&disc);
                 }
                 let child = entity(
                     "function",
@@ -392,9 +395,9 @@ fn walk_items(
                 let name = ident.to_string();
                 let mut q = free_item_qualname(module_path, &name);
                 if is_cfg_twin("struct", &name)
-                    && let Some(pred) = cfg_predicate(attrs)
+                    && let Some(disc) = cfg_suffix(attrs)
                 {
-                    q.push_str(&cfg_discriminant(&pred));
+                    q.push_str(&disc);
                 }
                 let child = entity(
                     "struct",
@@ -431,9 +434,9 @@ fn walk_items(
                 // plugin emits neither a parent_id nor a contains edge for it.
                 let mut nested = format!("{module_path}.{ident}");
                 if is_cfg_twin("module", &ident.to_string())
-                    && let Some(pred) = cfg_predicate(attrs)
+                    && let Some(disc) = cfg_suffix(attrs)
                 {
-                    nested.push_str(&cfg_discriminant(&pred));
+                    nested.push_str(&disc);
                 }
                 out.push(entity(
                     "module",
@@ -456,9 +459,9 @@ fn walk_items(
                 let name = ident.to_string();
                 let mut q = free_item_qualname(module_path, &name);
                 if is_cfg_twin("enum", &name)
-                    && let Some(pred) = cfg_predicate(attrs)
+                    && let Some(disc) = cfg_suffix(attrs)
                 {
-                    q.push_str(&cfg_discriminant(&pred));
+                    q.push_str(&disc);
                 }
                 let child = entity(
                     "enum",
@@ -474,9 +477,9 @@ fn walk_items(
                 let name = ident.to_string();
                 let mut q = free_item_qualname(module_path, &name);
                 if is_cfg_twin("trait", &name)
-                    && let Some(pred) = cfg_predicate(attrs)
+                    && let Some(disc) = cfg_suffix(attrs)
                 {
-                    q.push_str(&cfg_discriminant(&pred));
+                    q.push_str(&disc);
                 }
                 let child = entity(
                     "trait",
@@ -492,9 +495,9 @@ fn walk_items(
                 let name = ident.to_string();
                 let mut q = free_item_qualname(module_path, &name);
                 if is_cfg_twin("type_alias", &name)
-                    && let Some(pred) = cfg_predicate(attrs)
+                    && let Some(disc) = cfg_suffix(attrs)
                 {
-                    q.push_str(&cfg_discriminant(&pred));
+                    q.push_str(&disc);
                 }
                 let child = entity(
                     "type_alias",
@@ -510,9 +513,9 @@ fn walk_items(
                 let name = ident.to_string();
                 let mut q = free_item_qualname(module_path, &name);
                 if is_cfg_twin("const", &name)
-                    && let Some(pred) = cfg_predicate(attrs)
+                    && let Some(disc) = cfg_suffix(attrs)
                 {
-                    q.push_str(&cfg_discriminant(&pred));
+                    q.push_str(&disc);
                 }
                 let child = entity(
                     "const",
@@ -528,9 +531,9 @@ fn walk_items(
                 let name = ident.to_string();
                 let mut q = free_item_qualname(module_path, &name);
                 if is_cfg_twin("static", &name)
-                    && let Some(pred) = cfg_predicate(attrs)
+                    && let Some(disc) = cfg_suffix(attrs)
                 {
-                    q.push_str(&cfg_discriminant(&pred));
+                    q.push_str(&disc);
                 }
                 let child = entity(
                     "static",
@@ -552,9 +555,9 @@ fn walk_items(
                 let name = ident.to_string();
                 let mut q = free_item_qualname(module_path, &name);
                 if is_cfg_twin("macro", &name)
-                    && let Some(pred) = cfg_predicate(attrs)
+                    && let Some(disc) = cfg_suffix(attrs)
                 {
-                    q.push_str(&cfg_discriminant(&pred));
+                    q.push_str(&disc);
                 }
                 let child = entity(
                     "macro",
@@ -677,9 +680,16 @@ fn emit_impl(
     edges: &mut Vec<Value>,
     sites: &mut Vec<UnresolvedCallSite>,
 ) -> Result<(), syn::Error> {
-    // Type qualname for the impl's self type (simple path types in 1a; exotic
-    // self types fall back to a textual rendering in `self_ty_name`).
-    let type_q = format!("{module_path}.{}", self_ty_name(&it.self_ty));
+    // Type qualname for the impl's self type, INCLUDING its concrete generic
+    // arguments (ADR-049 §2 self-type-args amendment): `impl Foo<i32>` →
+    // `…Foo<i32>` and `impl Foo<u32>` → `…Foo<u32>`, so the two impls get
+    // distinct keys and do NOT spuriously merge in `seen_impl_ids`. Declared
+    // impl type-params (`impl<T> Foo<T>`) render positionally (`$0`), staying
+    // rename-stable. Exotic self types fall back to a textual rendering.
+    let type_q = format!(
+        "{module_path}.{}",
+        self_ty_locator(&it.self_ty, &declared_type_params(it))
+    );
     let disc = impl_disc_for(it); // ordinal-free (ADR-049 amend, Option b)
     let mut impl_q = impl_qualname(&type_q, &disc);
     // cfg-twin discriminant applies to ANY cfg-gated twin impl, trait OR
@@ -689,9 +699,9 @@ fn emit_impl(
     // on the FULL pre-cfg `impl_q` (which includes `[Display]`), so it is
     // correct for trait impls too — do NOT gate on `it.trait_.is_none()`.
     if impl_is_cfg_twin(&impl_q)
-        && let Some(pred) = cfg_predicate(&it.attrs)
+        && let Some(disc) = cfg_suffix(&it.attrs)
     {
-        impl_q.push_str(&cfg_discriminant(&pred));
+        impl_q.push_str(&disc);
     }
     let impl_id = build_id("impl", &impl_q)?;
     // First block with this id → emit the entity + the module->impl edge. A
@@ -806,21 +816,42 @@ fn contains_edge(from_id: &str, to_id: &str) -> Value {
     })
 }
 
-/// Extract the predicate of the first `#[cfg(...)]` attribute on an item, if
-/// any. Returns the raw token text of the predicate (e.g. `"unix"`,
-/// `"any(unix, windows)"`); normalisation into a stable suffix is
-/// [`cfg_discriminant`]'s job. `#[cfg_attr(...)]` and other attributes are
-/// ignored — only a literal `cfg` list disambiguates a path-sharing twin.
-fn cfg_predicate(attrs: &[syn::Attribute]) -> Option<String> {
-    attrs.iter().find_map(|attr| {
-        if let Meta::List(list) = &attr.meta
-            && list.path.is_ident("cfg")
-        {
-            Some(list.tokens.to_string())
-        } else {
-            None
-        }
-    })
+/// Extract the predicate of EVERY `#[cfg(...)]` attribute on an item, in source
+/// order. Returns the raw token text of each predicate (e.g. `"unix"`,
+/// `"any(unix, windows)"`); normalisation + reserved-char escaping + folding
+/// into one stable suffix is [`cfg_discriminant`]'s job. `#[cfg_attr(...)]` and
+/// other attributes are ignored — only literal `cfg` lists disambiguate a
+/// path-sharing twin.
+///
+/// All cfgs are collected (not just the first): stacked twins like
+/// `#[cfg(unix)] #[cfg(feature="a")]` vs `#[cfg(unix)] #[cfg(feature="b")]`
+/// legally coexist and must get DISTINCT discriminants, so the whole set feeds
+/// the discriminant (FINDING #5).
+fn cfg_predicates(attrs: &[syn::Attribute]) -> Vec<String> {
+    attrs
+        .iter()
+        .filter_map(|attr| {
+            if let Meta::List(list) = &attr.meta
+                && list.path.is_ident("cfg")
+            {
+                Some(list.tokens.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// The folded `@cfg(...)` discriminant suffix for an item, or `None` when the
+/// item carries no `#[cfg(...)]`. Folds EVERY cfg (FINDING #5) and escapes
+/// reserved entity-id chars (FINDING #6) via [`cfg_discriminant`].
+fn cfg_suffix(attrs: &[syn::Attribute]) -> Option<String> {
+    let preds = cfg_predicates(attrs);
+    if preds.is_empty() {
+        None
+    } else {
+        Some(cfg_discriminant(&preds))
+    }
 }
 
 /// Build an entity id string, mapping the [`EntityIdError`] into a

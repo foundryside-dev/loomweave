@@ -1,4 +1,4 @@
-use loomweave_plugin_rust::extract::extract_file;
+use loomweave_plugin_rust::extract::{extract_file, extract_file_degraded_aware};
 
 /// One source string per ADR-049 collision family, plus the cross-crate case.
 fn corpus() -> Vec<(&'static str, &'static str, &'static str)> {
@@ -153,4 +153,85 @@ fn cross_crate_same_item_distinct() {
     .map(|e| e["id"].as_str().unwrap().to_owned())
     .collect();
     assert!(a.iter().all(|id| !b.contains(id)));
+}
+
+#[test]
+fn stacked_cfg_twins_get_distinct_ids() {
+    // FINDING #5: legally-coexisting stacked-cfg twins share a leading
+    // `#[cfg(unix)]` but differ on a second `#[cfg(feature=...)]`. Folding only
+    // the FIRST cfg would hand both an identical `@cfg(unix)` discriminant and
+    // collide one away at the writer's ON CONFLICT. Folding ALL cfgs keeps the
+    // two `f` functions distinct.
+    let src = "#[cfg(unix)] #[cfg(feature=\"a\")] fn f(){}\n\
+               #[cfg(unix)] #[cfg(feature=\"b\")] fn f(){}\n";
+    let f_ids: Vec<String> = extract_file("k", "k.m", "/p/src/m.rs", src)
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["id"].as_str().map(ToOwned::to_owned))
+        .filter(|id| id.contains(":function:"))
+        .collect();
+    assert_eq!(
+        f_ids.len(),
+        2,
+        "expected both stacked-cfg-twin `f` functions, got {f_ids:?}"
+    );
+    assert_ne!(
+        f_ids[0], f_ids[1],
+        "stacked-cfg twins collapsed to one locator (only the first cfg folded)"
+    );
+}
+
+#[test]
+fn reserved_char_in_cfg_predicate_does_not_collapse_the_file() {
+    // FINDING #6: a cfg predicate carrying a reserved entity-id char (`:` in
+    // `feature = "a:b"`) must NOT flow verbatim into the qualname — that would
+    // make build_entity_id reject the id and, on the real ingest path, degrade
+    // the ENTIRE clean-parse file to a single `syntax_error` module, discarding
+    // every real entity. The cfg discriminant escapes the reserved char, so the
+    // file parses cleanly and the twins extract.
+    let src = "#[cfg(feature=\"a:b\")] fn f(){}\n\
+               #[cfg(feature=\"c:d\")] fn f(){}\n\
+               struct Keeper;\n";
+
+    // The degraded-aware path is the real ingest path that collapses on an
+    // id-validation error. Post-fix it must report NO findings and NOT collapse.
+    let (entities, _edges, _sites, findings) =
+        extract_file_degraded_aware("k", "k.m", "/p/src/m.rs", src);
+    assert!(
+        findings.is_empty(),
+        "exotic-but-legal cfg predicate produced a degraded-parse finding: {findings:?}"
+    );
+    let kinds: Vec<&str> = entities.iter().filter_map(|e| e["kind"].as_str()).collect();
+    assert!(
+        !kinds.contains(&"syntax_error"),
+        "exotic-but-legal cfg predicate collapsed the file to syntax_error: {kinds:?}"
+    );
+    // The unrelated real entity survived — the file did not collapse.
+    assert!(
+        entities
+            .iter()
+            .any(|e| e["id"].as_str().is_some_and(|id| id.ends_with(".Keeper"))),
+        "clean entity `Keeper` was discarded — file collapsed"
+    );
+    // Every emitted id is a valid 3-segment entity id (no raw `:` leaked into a
+    // qualname segment).
+    for e in &entities {
+        let id = e["id"].as_str().unwrap();
+        assert_eq!(
+            id.matches(':').count(),
+            2,
+            "id has a reserved-char leak in its qualname segment: {id}"
+        );
+    }
+    // The two reserved-char twins remain distinct.
+    let f_ids: Vec<String> = entities
+        .iter()
+        .filter_map(|e| e["id"].as_str().map(ToOwned::to_owned))
+        .filter(|id| id.contains(":function:"))
+        .collect();
+    assert_eq!(f_ids.len(), 2, "expected both `f` twins, got {f_ids:?}");
+    assert_ne!(
+        f_ids[0], f_ids[1],
+        "reserved-char cfg twins collapsed to one locator"
+    );
 }

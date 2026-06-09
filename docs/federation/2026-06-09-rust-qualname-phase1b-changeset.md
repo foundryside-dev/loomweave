@@ -5,6 +5,7 @@
 **Date:** 2026-06-09
 **Re:** Phase 1b changes to the Rust `qualified_name` dialect that Wardline's second-producer frontend (and its vendored corpus) must mirror.
 **Status:** **Change-set, action required.** The Phase 1b dialect amendments are landed and emitted today by `crates/loomweave-plugin-rust` on `feat/rust-plugin-spec`. The shared corpus `fixtures/qualnames_rust.json` and the byte-for-byte parity gate `tests/qualname_conformance.rs` are amended in lockstep. Wardline must update its tree-sitter engine and re-vendor the corpus.
+**Amendment (2026-06-09, self-type-args — THIRD dialect amendment):** the impl-key `<Type>` segment now carries the self type's **concrete generic arguments** (`impl Foo<i32>` → `…Foo<i32>`, `impl Foo<u32>` → `…Foo<u32>`), closing a second silent-data-loss family where `Foo<i32>` and `Foo<u32>` impls (and their trait twins) collided on a bare-`Foo` key and one like-named method was overwritten at the writer. The impl's **own** declared generic params render positionally (`…Foo<$0>`), preserving rename-stability and same-instantiation merging. This affects every impl-bearing corpus row (see new §3a and the amended `positional_generic_param`/`_renamed` rows + new `generic_self_*` rows). Wardline must re-vendor the corpus and update its frontend to fold concrete self-type args into the impl `<Type>`.
 **Supersedes:** the **inherent-impl-discriminator section** of `docs/federation/2026-06-09-rust-qualname-dialect-response.md` (decision 4b and the corresponding clause of its one-paragraph reply). That letter described an inherent-impl key of `Foo.impl#<positional>#<ordinal>` (a source-order ordinal). **Phase 1b drops the ordinal.** Everything else in the prior letter still stands; this document amends only what changed and adds the new surface (leaf kinds, the `impl` entity, edges).
 **Authority:** Loomweave remains the authoritative producer for the Rust dialect (**ADR-049**, amended 2026-06-09). The corpus `expected` values are generated from the live extractor, never hand-authored; where this document and your frontend diverge, **Loomweave's emitted form is normative and Wardline conforms**.
 **Version:** `ontology_version` bumped **0.1.0 → 0.4.0** (ADR-027 MINOR bumps: new entity kinds, then the `imports`/`implements` edge kinds). `plugin_id` is `rust`, so ids read `rust:<kind>:<qualname>` (e.g. `rust:macro:demo.m.make`, `rust:impl:demo.m.Foo.impl#<>`).
@@ -36,6 +37,7 @@ Why the ordinal drop: the prior scheme called its inherent discriminator "source
 | D | **Method re-parenting** | Containment is now `module → impl → method`. If you emit containment, parent impl methods to the `impl` entity, not the module. (Method **qualname** is unchanged — it already carried the impl discriminator.) |
 | E | **BREAKING — inherent-impl ordinal dropped** | Stop emitting the trailing `#<ordinal>`. Merge same-`(type, positional-generic-sig, cfg)` inherent impls into ONE entity; union their methods under it. See §3. |
 | F | **`@cfg` now splits impls** (inherent AND trait) | Render the `@cfg(<pred>)` suffix on cfg-twin impl keys (`impl#<>@cfg(unix)`, `impl[Display]@cfg(windows)`). This is the SOLE discriminant once the ordinal is gone. See §3, §7. |
+| F2 | **Self-type concrete generic args fold into `<Type>`** (self-type-args amendment) | Render the self type's concrete generic args in the impl `<Type>`: `impl Foo<i32>` → `…Foo<i32>`, `impl Foo<u32>` → `…Foo<u32>` (distinct impls + distinct methods). The impl's OWN declared params render positionally **only when the arg IS the param directly (top-level)**: `impl<T> Foo<T>` → `…Foo<$0>` (rename-stable). **A param NESTED inside another type arg is NOT positionally substituted** — `impl<T> Foo<Vec<T>>` → `…Foo<Vec<T>>`, `impl<T> Foo<&T>` → `…Foo<&T>` (rendered via `type_textual`, literal `T`, so a nested-param rename DOES churn). **Wardline MUST mirror this `type_textual` rendering of nested params — do NOT implement recursive positional substitution (`Foo<Vec<$0>>`)** or you diverge with no conformance row to catch it (a nested-param row is owed as follow-up). Concrete args whitespace-free; lifetimes/bindings dropped; non-generic self renders bare `Foo`. Same-instantiation blocks still merge. See §3a. |
 | G | **`imports` edge** (anchored) | If you emit edges: resolve `use` leaves via your symbol table → anchored `imports` edge; external/unresolvable dropped. See §6. |
 | H | **`implements` edge** (anchored) | Anchored edge from the trait-`impl` entity to the resolved trait; external trait dropped. See §6. |
 
@@ -79,12 +81,44 @@ If a Wardline impl-extractor omitted the `@cfg` impl suffix, the two cfg-twin bl
 
 ---
 
+## 3a. The self-type-args amendment (THIRD dialect amendment) — concrete self-type generics fold into `<Type>`
+
+**The bug (silent data loss).** The impl `<Type>` segment previously dropped the self type's generic arguments — only the bare last path-segment ident (`Foo`) was used. So `impl Foo<i32>` and `impl Foo<u32>` both rendered the bare key `…Foo.impl#<>`, and their trait twins `impl Display for Foo<i32>` / `…<u32>` both rendered `…Foo.impl[Display]`. The extraction layer's `seen_impl_ids` then **spuriously merged** the second impl into the first, re-parented both impls' methods under one id, and a like-named method (e.g. two `get`, two `fmt`) was **silently overwritten** at the writer's `ON CONFLICT(id) DO UPDATE` — the exact data-loss family this dialect exists to prevent.
+
+**The fix.** The self type's concrete generic arguments now fold into `<Type>`:
+
+| impl | `<Type>` segment | distinct? |
+|---|---|---|
+| `impl Foo<i32> { fn get }` | `Foo<i32>` → `…Foo<i32>.impl#<>.get` | ✅ vs `Foo<u32>` |
+| `impl Foo<u32> { fn get }` | `Foo<u32>` → `…Foo<u32>.impl#<>.get` | ✅ |
+| `impl Display for Foo<i32>` | `Foo<i32>` → `…Foo<i32>.impl[Display].fmt` | ✅ vs `Foo<u32>` |
+| `impl<T> Foo<T> { fn get }` | `Foo<$0>` → `…Foo<$0>.impl#<$0>.get` | rename-stable (T→U identical) |
+| `impl Foo { fn get }` (non-generic) | `Foo` → `…Foo.impl#<>.get` | bare, unchanged |
+
+**Rendering rules** (mirror the `@cfg`/positional conventions already in the dialect):
+
+- A self-type arg that is the impl's **own declared generic parameter** is rendered **positionally** (`$0`, `$1`, … the same De Bruijn scheme as the inherent `#<…>` signature), so an `impl<T> Foo<T>` → `impl<U> Foo<U>` rename does not churn. Note this changes the **prior** `positional_generic_param` corpus rows from `…Foo.impl#<$0>` to `…Foo<$0>.impl#<$0>` (the self-type prefix now also shows the `$0`).
+- A **concrete** arg (`i32`, `String`, a const, a nested generic) is rendered whitespace-free (the same `type_textual` normaliser used for trait generic args), e.g. `Foo<Vec<u8>>`.
+- Lifetimes and associated-type bindings are **dropped** (not part of the locator).
+- A non-generic self type renders the **bare** name (`Foo`), unchanged from before.
+- **Composition order:** `<self-type-with-args>.<impl#<sig>|impl[Trait]>[@cfg(...)]` — self-type args first, then the inherent/trait discriminant, then any cfg suffix.
+
+**Merge semantics now key on the self-type args too.** The merge triple is `(self-type-with-concrete-args, positional-generic-sig, cfg)`. Two blocks on the **same** instantiation still merge:
+
+- **`generic_self_same_concrete_two_blocks_merge`** (corpus, new): `impl Foo<i32> { fn a }` + `impl Foo<i32> { fn b }` → same triple → **ONE** entity `demo.m.Foo<i32>.impl#<>` carrying both `a` and `b`.
+- **`generic_self_inherent_concrete_args`** (corpus, new): `impl Foo<i32> { fn get }` + `impl Foo<u32> { fn get }` → self-type args differ → **TWO** entities, each with its own `get`. A frontend that dropped the self-type args would collapse these to one and silently drop one `get`.
+- **`generic_self_trait_concrete_args`** (corpus, new): the trait twin of the above.
+
+These three new rows plus the amended `positional_generic_param`/`positional_generic_param_renamed` rows are the conformance trip-wire for this amendment.
+
+---
+
 ## 4. The `impl` entity + method re-parenting
 
 **The `impl` block is now its own entity**, `kind=impl`, with these key forms:
 
-- **Trait impl:** `…<Type>.impl[<TraitPath-last-segment-with-concrete-generics>]` — e.g. `Foo.impl[Display]`, `Foo.impl[From<i32>]`. Lifetimes dropped; concrete type/const generic args **kept** (`From<i32>` ≠ `From<u32>`).
-- **Inherent impl:** `…<Type>.impl#<positional-generic-sig>` — e.g. `Foo.impl#<>`, `Foo.impl#<$0>`. No ordinal (§3).
+- **Trait impl:** `…<Type>.impl[<TraitPath-last-segment-with-concrete-generics>]` — e.g. `Foo.impl[Display]`, `Foo.impl[From<i32>]`, `Foo<i32>.impl[Display]`. Lifetimes dropped; concrete type/const generic args **kept** in BOTH the self-type prefix and the trait fragment (`From<i32>` ≠ `From<u32>`; `Foo<i32>` ≠ `Foo<u32>` — see §3a).
+- **Inherent impl:** `…<Type>.impl#<positional-generic-sig>` — e.g. `Foo.impl#<>`, `Foo.impl#<$0>`, `Foo<i32>.impl#<>`. No ordinal (§3); concrete self-type args fold into `<Type>` (§3a).
 
 **Containment is now `module → impl → method`** (was `module → method`):
 
