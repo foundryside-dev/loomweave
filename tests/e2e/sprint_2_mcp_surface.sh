@@ -180,7 +180,11 @@ recording_fixture = [
         },
     }
 ]
-(project_dir / ".weft" / "openrouter-recording.json").write_text(
+# Write the recording fixture to the path the serve config points at. The store
+# moved under .weft/loomweave/ (ADR-046) but this fixture write lagged behind in
+# .weft/, so serve could never find it and exited 1 before any tool assertion —
+# the same outside-the-blocking-floor drift that hid the stale tool list.
+(project_dir / ".weft" / "loomweave" / "openrouter-recording.json").write_text(
     json.dumps(recording_fixture, separators=(",", ":")),
     encoding="utf-8",
 )
