@@ -285,16 +285,42 @@ fn legis_renames_url(base_url: &str, base_commit: &str) -> String {
     )
 }
 
-/// Parse `legis`'s `GET /git/renames` JSON (`[{old_path, new_path, …}]`) into
-/// `(old_path, new_path)` pairs. Entries missing/empty in either path are
-/// skipped; a non-array or unparseable body yields an empty list (fail-soft).
-/// The shape mirrors `legis`'s `RenameEvidence` dataclass.
-fn parse_legis_rename_json(body: &str) -> Vec<(String, String)> {
+/// How a `legis` `GET /git/renames` body parsed — enough to tell an honest empty
+/// result (no renames in range) from a *silent under-carry* (the body had
+/// rename rows but our keys did not match, so every hint was dropped). The whole
+/// rename path is fail-soft / enrich-only and **never hard-fails**; the danger is
+/// therefore not a crash but silence — a producer key rename (`old_path` →
+/// something else) or an envelope migration (`[…]` → `{"renames":[…]}`) zeroes
+/// the rename signal with no error, orphaning renamed-with-edit entities under
+/// fresh SEIs. This classification lets [`parse_legis_rename_json`] *log* that
+/// drift instead of swallowing it. (G16 defensive half, clarion-73dff1d2d1; the
+/// durable fix is a shared two-way conformance vector — deferred, needs a vector
+/// home — that pins the canonical keys so drift trips a test, not production.)
+#[derive(Debug, PartialEq, Eq)]
+enum RenameParseOutcome {
+    /// Body was not JSON, or was a JSON scalar — fail-soft empty.
+    Unparseable,
+    /// Body was a JSON object, not the expected array: a likely envelope
+    /// migration that silently carries no renames.
+    NonArrayEnvelope,
+    /// Array of `items` rows yielded `pairs` extracted renames.
+    Array { items: usize, pairs: usize },
+}
+
+/// Core of [`parse_legis_rename_json`], split out so the silent-under-carry
+/// signature is unit-testable without capturing logs. Behaviour is byte-identical
+/// to the previous inline parser; only the diagnostic is new.
+fn classify_legis_rename_json(body: &str) -> (Vec<(String, String)>, RenameParseOutcome) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
-        return Vec::new();
+        return (Vec::new(), RenameParseOutcome::Unparseable);
     };
     let Some(arr) = value.as_array() else {
-        return Vec::new();
+        let outcome = if value.is_object() {
+            RenameParseOutcome::NonArrayEnvelope
+        } else {
+            RenameParseOutcome::Unparseable
+        };
+        return (Vec::new(), outcome);
     };
     let mut out = Vec::new();
     for item in arr {
@@ -307,7 +333,37 @@ fn parse_legis_rename_json(body: &str) -> Vec<(String, String)> {
             out.push((old.to_owned(), new.to_owned()));
         }
     }
-    out
+    let outcome = RenameParseOutcome::Array {
+        items: arr.len(),
+        pairs: out.len(),
+    };
+    (out, outcome)
+}
+
+/// Parse `legis`'s `GET /git/renames` JSON (`[{old_path, new_path, …}]`) into
+/// `(old_path, new_path)` pairs. Entries missing/empty in either path are
+/// skipped; a non-array or unparseable body yields an empty list (fail-soft).
+/// The shape mirrors `legis`'s `RenameEvidence` dataclass.
+///
+/// Fail-soft does not mean silent: a body that carried rename rows but produced
+/// zero pairs (a producer key rename) or an object envelope (a wire-shape change)
+/// is logged at `warn`, because either silently drops SEI rename hints. An honest
+/// empty range (`[]`) is not flagged.
+fn parse_legis_rename_json(body: &str) -> Vec<(String, String)> {
+    let (pairs, outcome) = classify_legis_rename_json(body);
+    match outcome {
+        RenameParseOutcome::NonArrayEnvelope => tracing::warn!(
+            "legis GET /git/renames returned a JSON object, not an array — likely a wire-shape \
+             change; no rename hints carried (renamed-with-edit entities may re-mint under new SEIs)"
+        ),
+        RenameParseOutcome::Array { items, pairs: 0 } if items > 0 => tracing::warn!(
+            items,
+            "legis GET /git/renames had {items} row(s) but yielded 0 rename pairs — likely a \
+             producer key rename of old_path/new_path; SEI rename hints silently dropped"
+        ),
+        _ => {}
+    }
+    pairs
 }
 
 /// True if `legis` answers a `GET {base_url}/health` with a 2xx inside the
@@ -570,6 +626,56 @@ mod tests {
     fn malformed_legis_body_yields_empty_pairs() {
         assert!(parse_legis_rename_json("not json").is_empty());
         assert!(parse_legis_rename_json(r#"{"not":"an array"}"#).is_empty());
+    }
+
+    // --- G16: silent-under-carry is detectable, not swallowed (clarion-73dff1d2d1) ---
+    // Defensive half: the parser still never hard-fails, but the cases that
+    // silently zero the rename signal are now classified so they can be logged.
+    // The durable fix (a shared two-way conformance vector pinning the canonical
+    // keys) is deferred — it needs an agreed vector home.
+
+    #[test]
+    fn classify_distinguishes_honest_empty_from_silent_under_carry() {
+        // Honest empty range: empty array → 0 items, 0 pairs (NOT flagged).
+        assert_eq!(
+            classify_legis_rename_json("[]"),
+            (vec![], RenameParseOutcome::Array { items: 0, pairs: 0 })
+        );
+        // Silent under-carry: rows present, but a producer key rename means none
+        // match `old_path`/`new_path` → 2 items, 0 pairs (this is the warn case).
+        let renamed_keys = r#"[{"from":"a.py","to":"b.py"},{"source":"c.py","dest":"d.py"}]"#;
+        let (pairs, outcome) = classify_legis_rename_json(renamed_keys);
+        assert!(pairs.is_empty());
+        assert_eq!(outcome, RenameParseOutcome::Array { items: 2, pairs: 0 });
+        // Envelope migration: object instead of array.
+        assert_eq!(
+            classify_legis_rename_json(r#"{"renames":[{"old_path":"a","new_path":"b"}]}"#),
+            (vec![], RenameParseOutcome::NonArrayEnvelope)
+        );
+        // Not JSON at all.
+        assert_eq!(
+            classify_legis_rename_json("not json"),
+            (vec![], RenameParseOutcome::Unparseable)
+        );
+    }
+
+    #[test]
+    fn classify_reports_pairs_on_happy_path_and_skips_empties() {
+        let body = r#"[
+          {"old_path":"auth.py","new_path":"authn.py","similarity":96},
+          {"old_path":"","new_path":"x.py"},
+          {"old_path":"pkg/old.py","new_path":"pkg/new.py"}
+        ]"#;
+        let (pairs, outcome) = classify_legis_rename_json(body);
+        assert_eq!(
+            pairs,
+            vec![
+                ("auth.py".to_owned(), "authn.py".to_owned()),
+                ("pkg/old.py".to_owned(), "pkg/new.py".to_owned()),
+            ]
+        );
+        // 3 rows in, 2 pairs out — a partial extraction is NOT under-carry (pairs > 0).
+        assert_eq!(outcome, RenameParseOutcome::Array { items: 3, pairs: 2 });
     }
 
     #[test]
