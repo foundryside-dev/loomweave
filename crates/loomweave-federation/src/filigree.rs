@@ -17,6 +17,9 @@ use crate::scan_results::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct EntityAssociationsResponse {
+    /// `default` so an absent/empty envelope key degrades to an empty list
+    /// (enrich-only) rather than hard-failing the whole entity issue-list read.
+    #[serde(default)]
     pub associations: Vec<EntityAssociation>,
 }
 
@@ -75,9 +78,24 @@ pub struct EntityAssociation {
     /// Opaque Loomweave association key as stored by Filigree. New bindings use
     /// the entity's SEI (`loomweave:eid:*`); legacy rows may still carry the
     /// mutable locator (`{plugin}:{kind}:{qualname}`).
+    ///
+    /// `alias = "clarion_entity_id"` tolerates the pre-v26 producer field name
+    /// (Filigree renamed `clarion_entity_id` → `loomweave_entity_id` in schema
+    /// v26 / 3.0.0 with no compat alias), so a pre-v26 server or JSONL export
+    /// still deserializes. We deliberately do NOT alias the co-emitted canonical
+    /// `entity_id`: the live producer emits BOTH keys with identical values, and
+    /// serde rejects the duplicate field slot — aliasing `entity_id` would
+    /// hard-fail against the current server. `clarion_entity_id` is safe because
+    /// it is never co-emitted alongside `loomweave_entity_id`.
+    #[serde(alias = "clarion_entity_id")]
     pub loomweave_entity_id: String,
     pub content_hash_at_attach: String,
+    /// `default`: display-only enrichment (never routing/drift logic), so its
+    /// absence degrades to an empty string instead of failing the read.
+    #[serde(default)]
     pub attached_at: String,
+    /// `default`: display-only actor identity; absence degrades, never fails.
+    #[serde(default)]
     pub attached_by: String,
 }
 
@@ -976,6 +994,109 @@ mod tests {
             parsed.associations[0].loomweave_entity_id,
             "loomweave:eid:0123456789abcdef0123456789abcdef"
         );
+    }
+
+    // --- G15: rename/drift-tolerant deserialization (clarion-18d0f42964) ---
+    // Defensive half only; the shared cross-member conformance vector is the
+    // deferred producer-coupled half. See `residual` note at the end.
+
+    /// The live Filigree v27 producer co-emits BOTH `entity_id` and
+    /// `loomweave_entity_id` (identical values) plus governance/computed/null
+    /// fields the consumer does not model. This MUST parse — and it is the
+    /// regression guard for the alias trap: serde rejects a duplicate field
+    /// slot, so if `loomweave_entity_id` ever gains `alias = "entity_id"` this
+    /// vector fails with `duplicate field`. `alias = "clarion_entity_id"` is
+    /// safe here because `clarion_entity_id` is absent.
+    #[test]
+    fn parses_live_v27_both_keys_and_governance_fields() {
+        let parsed = parse_entity_associations_response(
+            r#"{"associations":[{
+                "issue_id":"filigree-1234567890",
+                "entity_id":"loomweave:eid:0123456789abcdef0123456789abcdef",
+                "loomweave_entity_id":"loomweave:eid:0123456789abcdef0123456789abcdef",
+                "entity_kind":"function",
+                "content_hash_at_attach":"hash-a",
+                "attached_at":"2026-05-17T00:00:00.000Z",
+                "attached_by":"codex",
+                "migration_orphaned_at":null,
+                "orphan_status":"unknown",
+                "freshness_status":"unknown",
+                "signature":null,"signoff_seq":null,"signed_content_hash":null
+            }]}"#,
+        )
+        .expect("live v27 both-keys shape must parse (no duplicate-field trap)");
+        assert_eq!(parsed.associations.len(), 1);
+        assert_eq!(
+            parsed.associations[0].loomweave_entity_id,
+            "loomweave:eid:0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    /// A pre-v26 producer (or pre-v26 JSONL export) names the same value
+    /// `clarion_entity_id`; the alias routes it into the canonical slot.
+    #[test]
+    fn parses_pre_v26_clarion_entity_id_via_alias() {
+        let parsed = parse_entity_associations_response(
+            r#"{"associations":[{
+                "issue_id":"filigree-1234567890",
+                "clarion_entity_id":"python:function:demo.hello",
+                "content_hash_at_attach":"hash-a",
+                "attached_at":"2026-05-17T00:00:00.000Z",
+                "attached_by":"codex"
+            }]}"#,
+        )
+        .expect("pre-v26 clarion_entity_id must deserialize via alias");
+        assert_eq!(
+            parsed.associations[0].loomweave_entity_id,
+            "python:function:demo.hello"
+        );
+    }
+
+    /// Unknown/future producer fields are ignored (no `deny_unknown_fields`).
+    #[test]
+    fn ignores_unknown_producer_fields() {
+        let parsed = parse_entity_associations_response(
+            r#"{"associations":[{
+                "issue_id":"filigree-1",
+                "loomweave_entity_id":"python:function:demo.hello",
+                "content_hash_at_attach":"hash-a",
+                "attached_at":"2026-05-17T00:00:00.000Z",
+                "attached_by":"codex",
+                "some_future_field":{"nested":true}
+            }]}"#,
+        )
+        .expect("unknown fields must be ignored, not rejected");
+        assert_eq!(
+            parsed.associations[0].loomweave_entity_id,
+            "python:function:demo.hello"
+        );
+    }
+
+    /// Dropped display-only fields degrade to empty strings via `default`,
+    /// rather than hard-failing the whole read.
+    #[test]
+    fn defaults_absent_display_fields() {
+        let parsed = parse_entity_associations_response(
+            r#"{"associations":[{
+                "issue_id":"filigree-1",
+                "loomweave_entity_id":"python:function:demo.hello",
+                "content_hash_at_attach":"hash-a"
+            }]}"#,
+        )
+        .expect("absent attached_at/attached_by must default, not fail");
+        let row = &parsed.associations[0];
+        assert_eq!(row.attached_at, "");
+        assert_eq!(row.attached_by, "");
+        assert_eq!(row.content_hash_at_attach, "hash-a");
+    }
+
+    /// An absent top-level `associations` key degrades to an empty list
+    /// (enrich-only), rather than erroring `missing field associations`.
+    #[test]
+    fn defaults_absent_envelope_to_empty_list() {
+        let parsed = parse_entity_associations_response("{}")
+            .expect("absent envelope key must default to empty list");
+        assert!(parsed.associations.is_empty());
     }
 
     #[test]

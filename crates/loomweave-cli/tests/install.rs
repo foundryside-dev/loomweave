@@ -35,20 +35,18 @@ fn install_creates_loomweave_dir_with_expected_contents() {
         loomweave.join("loomweave.db").exists(),
         "loomweave.db missing"
     );
+    // No config.json stub is written: the dead `{schema_version, last_run_id}`
+    // marker nothing read was removed (weft emit incident 2026-06-10). The store
+    // dir stays committed via its tracked `.gitignore` instead.
     assert!(
-        loomweave.join("config.json").exists(),
-        "config.json missing"
+        !loomweave.join("config.json").exists(),
+        "config.json stub must no longer be written"
     );
     assert!(loomweave.join(".gitignore").exists(), ".gitignore missing");
     assert!(
         dir.path().join("loomweave.yaml").exists(),
         "loomweave.yaml not at project root"
     );
-
-    let config = fs::read_to_string(loomweave.join("config.json")).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
-    assert_eq!(parsed["schema_version"], 1);
-    assert!(parsed["last_run_id"].is_null());
 
     let gitignore = fs::read_to_string(loomweave.join(".gitignore")).unwrap();
     for rule in &[

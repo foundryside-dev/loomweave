@@ -4,7 +4,7 @@
     "delimiter": ".",
     "crate_rooted": "first segment is the crate name, '-' normalised to '_' (loomweave-cli -> loomweave_cli); discovered from Cargo.toml [package].name read as TEXT, longest-path-prefix match (crate_roots.rs). Falls back to the dir holding src/lib.rs|src/main.rs.",
     "module_route": "crate root + mod tree to the item; lib.rs/main.rs/mod.rs contribute NO segment; inline `mod foo {}` nests. #[path] is NOT yet honoured (KNOWN-GAP, sp2).",
-    "free_items": "<crate>.<mods>.<name> (function, struct; enum/trait/const/static/type_alias/macro are Phase 1b, not yet emitted).",
+    "free_items": "<crate>.<mods>.<name> for EVERY named free-item kind: function, struct, enum, trait, type_alias, const, static, macro (the macro_rules! definition). Trait BODIES are deliberately not walked: a trait definition emits only its own `trait` entity, never its method items.",
     "self_type_generic_args": "<Type> in every impl locator carries the self type's CONCRETE generic arguments (ADR-049 §2 amendment): impl Foo<i32> -> Foo<i32>, impl Foo<u32> -> Foo<u32>, so the two impls (and their like-named methods) get distinct ids instead of colliding on a bare `Foo` key and being spuriously merged (silent data loss at the writer's ON CONFLICT(id) DO UPDATE). A self-type arg that is the impl's OWN declared generic param renders POSITIONALLY ($0,$1,... De Bruijn) — impl<T> Foo<T> -> Foo<$0> — so a param rename does not churn; concrete args (i32, String, const, nested generics) render whitespace-free; lifetimes/associated-type bindings dropped. A non-generic self type (impl Foo) renders bare `Foo`. Composition order: <self_ty_locator>.<impl#<sig>|impl[Trait]>[@cfg(...)].",
     "trait_impl_method": "<Type-with-concrete-self-generics>.impl[<Trait-last-segment-with-concrete-generic-args>].<method>  e.g. Foo.impl[Display].fmt, Foo.impl[From<i32>].from, Foo<i32>.impl[Display].fmt. Lifetimes dropped; concrete type/const generic args KEPT in BOTH the self-type prefix and the trait fragment (they are part of the key).",
     "inherent_impl_method": "<Type-with-concrete-self-generics>.impl#<positional-generics>.<method>  e.g. Foo.impl#<>.bar, Foo.impl#<$0>.get, Foo<i32>.impl#<>.get. The self-type prefix carries concrete instantiation args (Foo<i32> vs Foo<u32> are distinct) with the impl's own declared params rendered positionally ($0). The trailing #<...> signature renders the impl's declared generic params POSITIONALLY ($0,$1,... De Bruijn) so a param rename does not churn. There is NO source-order ordinal (ADR-049 amend, Option b): same-(self-type-args, positional-generic-signature, cfg) inherent impls MERGE into ONE `impl` entity and their methods all hang off it, so the discriminator is genuinely source-order-independent (reorder-stable). DIFFERENT concrete self-type args (Foo<i32> vs Foo<u32>) do NOT merge. cfg-twin inherent impls (same type+args+sig, mutually-exclusive cfgs) are split by an @cfg(...) suffix on the impl key (Foo.impl#<>@cfg(unix) vs Foo.impl#<>@cfg(windows)); their methods inherit it.",
@@ -316,6 +316,84 @@
       "expected": [
         {"qualname": "demo.m", "kind": "module"},
         {"qualname": "demo.m.make", "kind": "macro"}
+      ]
+    },
+    {
+      "name": "leaf_item_kinds",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "Pins the five Phase 1b leaf kinds the corpus did not previously carry: enum, trait, type_alias, const, static (the macro_rules! definition is already pinned by macro_invocation_generates_no_entity). Each is a free item riding the same <module>.<name> qualname pattern as struct/function. The trait emits ONLY its own `trait` entity — trait bodies are deliberately not walked (extract.rs), so a trait method item would produce no entity.",
+      "source": "pub enum Color { Red }\npub trait Greet {}\npub type Alias = u8;\npub const LIMIT: u32 = 10;\npub static NAME: &str = \"x\";\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.Color", "kind": "enum"},
+        {"qualname": "demo.m.Greet", "kind": "trait"},
+        {"qualname": "demo.m.Alias", "kind": "type_alias"},
+        {"qualname": "demo.m.LIMIT", "kind": "const"},
+        {"qualname": "demo.m.NAME", "kind": "static"}
+      ]
+    },
+    {
+      "name": "stacked_cfg_twin",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "STACKED-cfg twins: two inherent impls of one type each carry TWO #[cfg] attributes, differing only in the first. cfg_discriminant folds EVERY predicate (each normalised, the set sorted, joined with `&`), so the discriminants stay distinct (@cfg(feature=\"a\"&unix) vs @cfg(feature=\"b\"&unix)). Folding only the FIRST #[cfg] would hand both blocks the same suffix and merge them at the writer's ON CONFLICT, silently dropping one `go`. The suffix is order-independent: the predicates are sorted AFTER normalisation, not in source order. Each block's method inherits its impl key.",
+      "source": "struct Foo;\n#[cfg(feature = \"a\")]\n#[cfg(unix)]\nimpl Foo { pub fn go(&self) {} }\n#[cfg(feature = \"b\")]\n#[cfg(unix)]\nimpl Foo { pub fn go(&self) {} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.Foo", "kind": "struct"},
+        {"qualname": "demo.m.Foo.impl#<>@cfg(feature=\"a\"&unix)", "kind": "impl"},
+        {"qualname": "demo.m.Foo.impl#<>@cfg(feature=\"a\"&unix).go", "kind": "function"},
+        {"qualname": "demo.m.Foo.impl#<>@cfg(feature=\"b\"&unix)", "kind": "impl"},
+        {"qualname": "demo.m.Foo.impl#<>@cfg(feature=\"b\"&unix).go", "kind": "function"}
+      ]
+    },
+    {
+      "name": "cfg_escape_reserved_char",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "Reserved-char ESCAPE in cfg predicates: `feature = \"a:b\"` carries the reserved entity-id separator `:`; flowed verbatim into a qualname it would make build_entity_id reject the id and degrade the whole file. escape_reserved encodes injectively — `%` first (% -> %25), then `:` -> %3A — so feature=\"a:b\" renders feature=\"a%3Ab\" and a literal source `%3A` cannot alias it. Escape runs on the whitespace-stripped predicate BEFORE any any()/all() arg sorting.",
+      "source": "#[cfg(feature = \"a:b\")]\npub fn f() {}\n#[cfg(feature = \"c\")]\npub fn f() {}\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.f@cfg(feature=\"a%3Ab\")", "kind": "function"},
+        {"qualname": "demo.m.f@cfg(feature=\"c\")", "kind": "function"}
+      ]
+    },
+    {
+      "name": "leaf_kind_cfg_twin",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "cfg-twin discrimination on a Phase 1b LEAF kind: the twin counter is per-(kind, name) across ALL nine named item kinds (extract.rs twin_counts), so two cfg-gated `const LIMIT` siblings get @cfg suffixes exactly like the function (cfg_twin) and struct (struct_cfg_twin) cases. Load-bearing for a second producer doing full-set comparison: a twin counter that only covers fn/struct would emit two colliding demo.m.LIMIT rows here.",
+      "source": "#[cfg(unix)]\npub const LIMIT: u32 = 1;\n#[cfg(windows)]\npub const LIMIT: u32 = 2;\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.LIMIT@cfg(unix)", "kind": "const"},
+        {"qualname": "demo.m.LIMIT@cfg(windows)", "kind": "const"}
+      ]
+    },
+    {
+      "name": "cfg_attr_comment_interposition",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "COMMENT INTERPOSITION between a #[cfg] attribute and its item: a `//` line comment (and, on the twin, a `///` doc comment) sits between the cfg and the fn. Comments are token-stream-invisible to syn — the cfg still attaches to the fn, so BOTH twins keep their @cfg discriminant. A `///` doc comment IS a syn attribute (#[doc = \"...\"], Meta::NameValue) but cfg_predicates filters Meta::List path=cfg only, so it contributes nothing. A producer whose attribute-to-item association resets on an interposed comment would emit a bare colliding `demo.m.f` here; this row is the conformance trip-wire.",
+      "source": "#[cfg(unix)]\n// platform note\npub fn f() {}\n#[cfg(windows)]\n/// doc comment\npub fn f() {}\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.f@cfg(unix)", "kind": "function"},
+        {"qualname": "demo.m.f@cfg(windows)", "kind": "function"}
+      ]
+    },
+    {
+      "name": "cfg_predicate_internal_comment",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "COMMENT INSIDE the cfg predicate: `any(unix, /* why */ windows)`. proc-macro2 token streams carry no comments, so cfg_predicates' tokens.to_string() never sees `/* why */`; normalise_pred then strips whitespace and sorts the any() args, yielding any(unix,windows). A producer that collects the predicate as raw source TEXT between the parens would smuggle the comment bytes into the discriminant and diverge; this row pins that the predicate is the TOKEN stream, not the source span.",
+      "source": "#[cfg(any(unix, /* why */ windows))]\npub fn g() {}\n#[cfg(target_os = \"macos\")]\npub fn g() {}\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.g@cfg(any(unix,windows))", "kind": "function"},
+        {"qualname": "demo.m.g@cfg(target_os=\"macos\")", "kind": "function"}
       ]
     }
   ]

@@ -2,8 +2,8 @@
 //!
 //! Creates:
 //! - `.weft/loomweave/loomweave.db`        (migrated)
-//! - `.weft/loomweave/config.json`       (internal state stub)
-//! - `.weft/loomweave/.gitignore`        (UQ-WP1-04 rules; ADR-005)
+//! - `.weft/loomweave/.gitignore`        (UQ-WP1-04 rules; ADR-005 — also the
+//!   store dir's tracked marker, so the dir stays committed)
 //! - `<path>/loomweave.yaml`        (user-edited config stub at project root;
 //!   see detailed-design.md §File layout)
 //!
@@ -21,12 +21,6 @@ use rusqlite::Connection;
 
 use loomweave_storage::{pragma, schema};
 
-const CONFIG_JSON_STUB: &str = r#"{
-    "schema_version": 1,
-    "last_run_id": null
-}
-"#;
-
 // The default `loomweave.yaml` lives in `crate::config` so `loomweave install`
 // and `loomweave config example` emit byte-identical content from a single
 // source of truth (it can never drift from what install writes).
@@ -41,7 +35,7 @@ use crate::config::LOOMWEAVE_YAML_STUB;
 pub(crate) const GITIGNORE_CONTENTS: &str = "\
 # Loomweave .gitignore — ADR-005 tracked-vs-excluded list
 # (the loomweave.db posture was reversed by C1 / weft-d822a7de2d).
-# Tracked (committed): config.json, .gitignore itself.
+# Tracked (committed): .gitignore itself (the store dir's only tracked marker).
 # Excluded (ignored): the index DB itself, WAL sidecars, shadow DB, per-run
 #   logs, tmp scratch, the read-API live port discovery file, the per-project
 #   instance id, and the analyze advisory lock.
@@ -463,10 +457,10 @@ fn populate_after_mkdir(loomweave_dir: &Path, project_root: &Path) -> Result<()>
     let db_path = loomweave_dir.join("loomweave.db");
     initialise_db(&db_path).context("initialise loomweave.db")?;
 
-    let config_path = loomweave_dir.join("config.json");
-    fs::write(&config_path, CONFIG_JSON_STUB)
-        .with_context(|| format!("write {}", config_path.display()))?;
-
+    // No `config.json` stub: it carried `{schema_version, last_run_id}` that
+    // nothing ever read (weft emit incident 2026-06-10 — finishing the dead-write
+    // cleanup begun for wardline.yaml). The store dir stays committed via its
+    // own tracked `.gitignore`, so no marker file is needed.
     write_gitignore(loomweave_dir)?;
 
     let yaml_path = project_root.join("loomweave.yaml");
