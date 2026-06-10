@@ -614,7 +614,10 @@ mod syn_disc_tests {
     #[test]
     fn path_typed_trait_generic_arg_escapes_reserved_colon() {
         let it: syn::ItemImpl = parse_quote!(impl From<std::io::Error> for Foo {});
-        assert_eq!(impl_disc_for(&it).key(), "impl[From<std%3A%3Aio%3A%3AError>]");
+        assert_eq!(
+            impl_disc_for(&it).key(),
+            "impl[From<std%3A%3Aio%3A%3AError>]"
+        );
     }
 
     #[test]

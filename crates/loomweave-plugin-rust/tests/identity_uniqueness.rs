@@ -156,7 +156,8 @@ fn cfg_discriminant_is_load_bearing_for_cfg_twin_methods_in_one_block() {
     // ADR-049 Amendment 5 (clarion-dfeb905f46): two cfg-gated `go` methods in
     // ONE impl block. The impl-level @cfg cannot split them (one impl key); a
     // method-level @cfg suffix must. Assert exactly two `go` methods, distinct.
-    let src = "struct Foo;\nimpl Foo { #[cfg(unix)] fn go(&self){} #[cfg(windows)] fn go(&self){} }\n";
+    let src =
+        "struct Foo;\nimpl Foo { #[cfg(unix)] fn go(&self){} #[cfg(windows)] fn go(&self){} }\n";
     // The method-level @cfg suffix lands AFTER the name: `…go@cfg(unix)`, so the
     // final `.`-segment starts with `go` rather than equalling it.
     let go_ids: Vec<String> = extract_file("k", "k.m", "/p/src/m.rs", src)
