@@ -165,11 +165,23 @@ class _FunctionIndex:
 
 @dataclass
 class _ReferenceEdgeAccumulator:
+    kind: Literal["references", "inherits_from", "decorates"]
     from_id: str
     to_id: str
     source_byte_start: int
     source_byte_end: int
     candidates: set[str]
+
+
+# Site kind → emitted edge kind (clarion-43416be550). `name`/`annotation`
+# sites keep producing `references`; the two relation kinds map onto the
+# ontology kinds that were previously declared-but-dead for Python.
+_EDGE_KIND_BY_SITE_KIND: dict[str, Literal["references", "inherits_from", "decorates"]] = {
+    "name": "references",
+    "annotation": "references",
+    "base": "inherits_from",
+    "decorator": "decorates",
+}
 
 
 class PyrightSession:
@@ -505,7 +517,7 @@ class PyrightSession:
             },
         )
         try:
-            accumulators: dict[tuple[str, str], _ReferenceEdgeAccumulator] = {}
+            accumulators: dict[tuple[str, str, str], _ReferenceEdgeAccumulator] = {}
             lookup_cache: dict[
                 tuple[str, str, str, int, int, int, int], tuple[list[str], bool]
             ] = {}
@@ -539,6 +551,7 @@ class PyrightSession:
                                 deadline=deadline,
                             )
                             saw_external = saw_external or fallback_external
+                        candidate_ids = _filter_relation_candidates(site, candidate_ids)
                     except LspTimeoutError as exc:
                         self._record_finding(
                             FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT,
@@ -589,7 +602,13 @@ class PyrightSession:
             },
             self._budgeted_timeout(deadline),
         )
-        return self._target_ids_from_locations(result)
+        # Relation sites (base/decorator) resolve to precise entities only:
+        # the module-id coarse fallback would mint nonsense facts like
+        # "class inherits_from module" for aliased bases.
+        return self._target_ids_from_locations(
+            result,
+            precise_only=site.kind in ("base", "decorator"),
+        )
 
     def _deadline_for_file(self, path: Path) -> float:
         return self._file_deadlines.setdefault(
@@ -612,19 +631,32 @@ class PyrightSession:
     def _file_budget_expired(self, deadline: float) -> bool:
         return deadline - time.monotonic() <= 0
 
-    def _target_ids_from_locations(self, result: object) -> tuple[list[str], bool]:
+    def _target_ids_from_locations(
+        self,
+        result: object,
+        *,
+        precise_only: bool = False,
+    ) -> tuple[list[str], bool]:
         locations = result if isinstance(result, list) else [result]
         candidate_ids: set[str] = set()
         saw_external = False
         for location in locations:
-            target_id, external = self._target_id_from_location(location)
+            target_id, external = self._target_id_from_location(
+                location,
+                precise_only=precise_only,
+            )
             if external:
                 saw_external = True
             if target_id is not None:
                 candidate_ids.add(target_id)
         return sorted(candidate_ids), saw_external
 
-    def _target_id_from_location(self, location: object) -> tuple[str | None, bool]:
+    def _target_id_from_location(
+        self,
+        location: object,
+        *,
+        precise_only: bool = False,
+    ) -> tuple[str | None, bool]:
         if not isinstance(location, dict):
             return None, False
         raw_uri = location.get("uri")
@@ -646,6 +678,8 @@ class PyrightSession:
         key = _range_start_key(raw_range)
         if key is not None and key in target_index.entity_by_name_position:
             return target_index.entity_by_name_position[key], False
+        if precise_only:
+            return None, False
         return target_index.module_id, False
 
     def _ensure_process(self) -> bool:
@@ -1206,17 +1240,31 @@ def _has_overload_decorator(node: ast.FunctionDef | ast.AsyncFunctionDef) -> boo
 
 
 def _merge_reference_site(
-    accumulators: dict[tuple[str, str], _ReferenceEdgeAccumulator],
+    accumulators: dict[tuple[str, str, str], _ReferenceEdgeAccumulator],
     site: ReferenceSite,
     candidate_ids: Sequence[str],
 ) -> None:
+    """Fold one resolved site into the per-file edge accumulators.
+
+    The site kind selects the edge kind (``_EDGE_KIND_BY_SITE_KIND``).
+    ``decorator`` sites invert direction: the site owner is the *decorated*
+    entity, but the stored edge reads ``decorator decorates decorated``
+    (ADR-051: from_id = decorator entity, to_id = decorated entity), so the
+    resolved candidate becomes ``from_id``. Ambiguous candidates therefore
+    list alternative decorators (from-side) rather than alternative targets.
+    """
     sorted_candidates = sorted(set(candidate_ids))
-    to_id = sorted_candidates[0]
-    key = (site.from_id, to_id)
+    edge_kind = _EDGE_KIND_BY_SITE_KIND[site.kind]
+    if site.kind == "decorator":
+        from_id, to_id = sorted_candidates[0], site.from_id
+    else:
+        from_id, to_id = site.from_id, sorted_candidates[0]
+    key = (edge_kind, from_id, to_id)
     existing = accumulators.get(key)
     if existing is None:
         accumulators[key] = _ReferenceEdgeAccumulator(
-            from_id=site.from_id,
+            kind=edge_kind,
+            from_id=from_id,
             to_id=to_id,
             source_byte_start=site.source_byte_start,
             source_byte_end=site.source_byte_end,
@@ -1230,6 +1278,22 @@ def _merge_reference_site(
     ):
         existing.source_byte_start = site.source_byte_start
         existing.source_byte_end = site.source_byte_end
+
+
+def _filter_relation_candidates(site: ReferenceSite, candidate_ids: list[str]) -> list[str]:
+    """Apply the relation-site target discipline (Rust derives/implements parity).
+
+    ``inherits_from`` targets must be class entities — a base name resolving
+    to a function (factory alias, shadowing ``def``) is dropped rather than
+    stored as a class-inherits-function fact, mirroring the Rust resolver's
+    ``rust:trait:`` kind filter. Both relation kinds drop self-edges
+    (``class X(X)`` resolving the in-definition name to itself).
+    """
+    if site.kind == "base":
+        candidate_ids = [cid for cid in candidate_ids if cid.startswith("python:class:")]
+    if site.kind in ("base", "decorator"):
+        candidate_ids = [cid for cid in candidate_ids if cid != site.from_id]
+    return candidate_ids
 
 
 def _reference_lookup_cache_key(
@@ -1249,7 +1313,7 @@ def _reference_lookup_cache_key(
 
 
 def _sorted_reference_accumulators(
-    accumulators: dict[tuple[str, str], _ReferenceEdgeAccumulator],
+    accumulators: dict[tuple[str, str, str], _ReferenceEdgeAccumulator],
 ) -> list[_ReferenceEdgeAccumulator]:
     return sorted(
         accumulators.values(),
@@ -1267,7 +1331,7 @@ def _reference_accumulator_to_edge(
 ) -> ReferencesRawEdge:
     candidates = sorted(accumulator.candidates)
     edge: ReferencesRawEdge = {
-        "kind": "references",
+        "kind": accumulator.kind,
         "from_id": accumulator.from_id,
         "to_id": accumulator.to_id,
         "source_byte_start": accumulator.source_byte_start,

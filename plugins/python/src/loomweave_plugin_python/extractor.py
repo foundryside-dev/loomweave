@@ -3,7 +3,11 @@
 Walks a parsed Python file and emits one ``module`` entity per file plus
 one ``function`` entity per ``FunctionDef`` / ``AsyncFunctionDef`` and one
 ``class`` entity per ``ClassDef``. It also emits anchored scan-time
-``imports``, ``calls``, and ``references`` candidate edges.
+``imports``, ``calls``, ``references``, ``inherits_from``, and ``decorates``
+candidate edges. The last three share one resolution pass: base-class and
+decorator expressions become ``base`` / ``decorator`` relation sites in the
+same collector that gathers generic reference sites, and the site kind
+selects the emitted edge kind (see ``reference_resolver.ReferenceSiteKind``).
 
 Entity shape matches the Rust host's ``RawEntity`` + ``RawSource``
 contract (``crates/loomweave-core/src/plugin/host.rs:132-154``)::
@@ -710,6 +714,7 @@ class _ReferenceSiteCollector(ast.NodeVisitor):
         if _has_overload_decorator(node):
             return
         function_id = self._entity_id_for_scope("function", node)
+        self._collect_decorator_sites(node, function_id)
         self.owner_stack.append(function_id)
         self.bound_stack.append(_scope_local_names(node))
         self._visit_function_signature(node)
@@ -722,6 +727,16 @@ class _ReferenceSiteCollector(ast.NodeVisitor):
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         class_id = self._entity_id_for_scope("class", node)
+        self._collect_decorator_sites(node, class_id)
+        # Base expressions become `base` relation sites owned by the subclass
+        # (resolved into `inherits_from` edges). Call bases (`class X(make())`)
+        # are outside the relation envelope: the call's *result* is the base,
+        # so anchoring the callee would assert a false inheritance fact.
+        # Keyword arguments (`metaclass=...`) are likewise out of scope.
+        for base in node.bases:
+            anchor = _relation_anchor(base)
+            if anchor is not None:
+                self.sites.append(self._site_for_relation(anchor, class_id, "base"))
         self.owner_stack.append(class_id)
         self.bound_stack.append(_scope_local_names(node))
         self.parents.append(node)
@@ -793,6 +808,59 @@ class _ReferenceSiteCollector(ast.NodeVisitor):
         )
         return entity_id(_PLUGIN_ID, kind, qualified_name)
 
+    def _collect_decorator_sites(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+        owner_id: str,
+    ) -> None:
+        """Emit one ``decorator`` relation site per reducible decorator.
+
+        ``owner_id`` is the *decorated* entity (the site owner); the resolver
+        inverts direction at edge construction so the stored edge reads
+        ``decorator decorates decorated`` (`from_id` = decorator entity).
+        Factory decorators (``@app.route("/x")``) reduce to the callee path —
+        the factory is the entity that decorates, its arguments are not part
+        of the relation token.
+        """
+        for decorator in node.decorator_list:
+            target = decorator.func if isinstance(decorator, ast.Call) else decorator
+            anchor = _relation_anchor(target)
+            if anchor is not None:
+                self.sites.append(self._site_for_relation(anchor, owner_id, "decorator"))
+
+    def _site_for_relation(
+        self,
+        anchor: ast.Name | ast.Attribute,
+        from_id: str,
+        kind: Literal["base", "decorator"],
+    ) -> ReferenceSite:
+        """Build a relation site anchored on the full dotted path token.
+
+        The anchored byte range covers the whole path (Rust parity: the
+        implemented-trait PATH's span in ``impl Tr for Foo``), while the
+        pyright query position lands on the *final* attribute segment so
+        ``helpers.Base`` resolves the class, not the module prefix.
+        """
+        start_line = anchor.lineno - 1
+        end_line = (anchor.end_lineno or anchor.lineno) - 1
+        end_col = anchor.end_col_offset if anchor.end_col_offset is not None else anchor.col_offset
+        if isinstance(anchor, ast.Attribute):
+            query_line = end_line
+            query_byte_col = end_col - len(anchor.attr.encode("utf-8"))
+        else:
+            query_line = start_line
+            query_byte_col = anchor.col_offset
+        return ReferenceSite(
+            from_id=from_id,
+            line=query_line,
+            character=_byte_col_to_lsp_character(self.source_lines[query_line], query_byte_col),
+            end_line=end_line,
+            end_character=_byte_col_to_lsp_character(self.source_lines[end_line], end_col),
+            source_byte_start=self.line_starts[start_line] + anchor.col_offset,
+            source_byte_end=self.line_starts[end_line] + end_col,
+            kind=kind,
+        )
+
     def _site_for_name(self, node: ast.Name) -> ReferenceSite:
         line = node.lineno - 1
         end_line = (node.end_lineno or node.lineno) - 1
@@ -809,6 +877,23 @@ class _ReferenceSiteCollector(ast.NodeVisitor):
             source_byte_end=source_byte_end,
             kind="annotation" if self.annotation_depth else "name",
         )
+
+
+def _relation_anchor(expr: ast.expr) -> ast.Name | ast.Attribute | None:
+    """Reduce a base/decorator expression to its resolvable path token.
+
+    ``Name`` and ``Attribute`` are the anchor itself; ``Subscript`` reduces to
+    its value (``Generic[T]`` → ``Generic``). Anything else (calls, literals,
+    conditional expressions) has no stable path token and yields no relation
+    site — the resolution-side precise-entity discipline would drop it anyway.
+    """
+    match expr:
+        case ast.Name() | ast.Attribute():
+            return expr
+        case ast.Subscript(value=value):
+            return _relation_anchor(value)
+        case _:
+            return None
 
 
 def _line_starts(source: str) -> tuple[int, ...]:

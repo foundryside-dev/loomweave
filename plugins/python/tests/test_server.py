@@ -87,7 +87,7 @@ def test_initialize_roundtrip() -> None:
         result = response["result"]
         assert result["name"] == "loomweave-plugin-python"
         assert result["version"] == "1.1.0rc4"
-        assert result["ontology_version"] == "0.7.0"
+        assert result["ontology_version"] == "0.8.0"
         assert set(result["capabilities"]) == {"wardline"}
         assert result["capabilities"]["wardline"]["status"] in {
             "absent",

@@ -74,6 +74,16 @@ def annotated(x: Marker) -> Marker:
     return x
 
 CONST_REF = world
+
+class Special(Marker):
+    pass
+
+def tagged(fn):
+    return fn
+
+@tagged
+def handler():
+    return world()
 PY
 
 # ── 4. PATH wiring — loomweave + plugin binary ────────────────────────────────
@@ -106,8 +116,11 @@ RESULT=$(sqlite3 "$DEMO_DIR/.weft/loomweave/loomweave.db" "select id, kind from 
 # B.5* adds a local annotation reference and a module-level name reference.
 EXPECTED="core:file:demo.py|file
 python:class:demo.Marker|class
+python:class:demo.Special|class
 python:function:demo.annotated|function
+python:function:demo.handler|function
 python:function:demo.hello|function
+python:function:demo.tagged|function
 python:function:demo.via_dispatch|function
 python:function:demo.world|function
 python:function:demo.z_fallback|function
@@ -159,8 +172,11 @@ EDGE_RESULT=$(sqlite3 "$DEMO_DIR/.weft/loomweave/loomweave.db" \
     "select kind, from_id, to_id from edges where kind = 'contains' order by from_id, to_id;")
 EDGE_EXPECTED="contains|core:file:demo.py|python:module:demo
 contains|python:module:demo|python:class:demo.Marker
+contains|python:module:demo|python:class:demo.Special
 contains|python:module:demo|python:function:demo.annotated
+contains|python:module:demo|python:function:demo.handler
 contains|python:module:demo|python:function:demo.hello
+contains|python:module:demo|python:function:demo.tagged
 contains|python:module:demo|python:function:demo.via_dispatch
 contains|python:module:demo|python:function:demo.world
 contains|python:module:demo|python:function:demo.z_fallback"
@@ -249,4 +265,28 @@ if [ "$REFERENCE_SITES" -lt 2 ] || [ "$REFERENCES_RESOLVED" -lt 2 ]; then
     fail "expected reference_sites_total and references_resolved_total >= 2; got sites=$REFERENCE_SITES resolved=$REFERENCES_RESOLVED"
 fi
 
-log "PASS: walking skeleton persisted module + function/class entities + source metadata + contains + calls + references edges"
+# ── 14. Verify inherits_from + decorates edges (clarion-43416be550) ─────────
+# Exact-tuple assertion (not just presence): the edges PK is
+# (kind, from_id, to_id), so a direction flip would silently merge under
+# ON CONFLICT — pin the full rows.
+log "verifying persisted inherits_from edge (subclass → base) ..."
+INHERITS=$(sqlite3 "$DEMO_DIR/.weft/loomweave/loomweave.db" \
+    "select kind, from_id, to_id, confidence, source_byte_start < source_byte_end from edges where kind = 'inherits_from' order by from_id, to_id;")
+INHERITS_EXPECTED="inherits_from|python:class:demo.Special|python:class:demo.Marker|resolved|1"
+if [ "$INHERITS" != "$INHERITS_EXPECTED" ]; then
+    log "DB edge contents:"
+    sqlite3 "$DEMO_DIR/.weft/loomweave/loomweave.db" "select kind, from_id, to_id, confidence, source_byte_start, source_byte_end from edges order by kind, from_id, to_id;" >&2 || true
+    fail "expected inherits_from edge:\n$INHERITS_EXPECTED\ngot:\n$INHERITS"
+fi
+
+log "verifying persisted decorates edge (decorator → decorated) ..."
+DECORATES=$(sqlite3 "$DEMO_DIR/.weft/loomweave/loomweave.db" \
+    "select kind, from_id, to_id, confidence, source_byte_start < source_byte_end from edges where kind = 'decorates' order by from_id, to_id;")
+DECORATES_EXPECTED="decorates|python:function:demo.tagged|python:function:demo.handler|resolved|1"
+if [ "$DECORATES" != "$DECORATES_EXPECTED" ]; then
+    log "DB edge contents:"
+    sqlite3 "$DEMO_DIR/.weft/loomweave/loomweave.db" "select kind, from_id, to_id, confidence, source_byte_start, source_byte_end from edges order by kind, from_id, to_id;" >&2 || true
+    fail "expected decorates edge:\n$DECORATES_EXPECTED\ngot:\n$DECORATES"
+fi
+
+log "PASS: walking skeleton persisted module + function/class entities + source metadata + contains + calls + references + inherits_from + decorates edges"

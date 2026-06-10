@@ -116,13 +116,17 @@ prompt_templates:
 
 ### Python plugin specifics — decorator policy
 
-Decorator semantics are deferred in v1.0. The Python extractor uses decorator
-line ranges to make definition spans and source navigation cover the decorated
-declaration, but it does not declare `decorated_by`, Wardline tags, Wardline
-annotation metadata, decorator arguments, or alias-resolved decorator facts.
-Future decorator extraction must first extend the plugin manifest and then add
-fixture coverage for direct, factory, stacked, class, dotted, aliased, and
-legacy Wardline decorator forms.
+The Python extractor uses decorator line ranges to make definition spans and
+source navigation cover the decorated declaration, and (ontology 0.8.0,
+clarion-43416be550) emits anchored `decorates` edges with direction
+decorator → decorated. Decorator expressions reduce to their dotted path
+token (factory calls reduce to the callee; arguments are not extracted) and
+resolve through the pyright reference machinery to precise in-project
+entities only — external/builtin decorators, aliases, and self-references
+yield no edge. Fixture coverage spans direct, factory, stacked, class,
+dotted cross-module, and aliased/self-reference forms. Stacking order and
+decorator arguments are not represented (`(kind, from_id, to_id)` is the
+edge primary key, so duplicate decorators dedupe).
 
 ### Python plugin specifics — import resolution
 
@@ -1710,7 +1714,7 @@ For v0.1 through at least v0.3, each tool's store remains its own concern. Revis
 | **Entity** | A node in the property graph — function, class, module, package, subsystem, guidance sheet, file, etc. |
 | **Entity briefing** | See Briefing. |
 | **Entity ID** | Stable string identifier: `{plugin_id}:{kind}:{canonical_qualified_name}` for source entities. File path not embedded (demoted to a SourceRange property) so the ID survives file moves. See §2. |
-| **Edge** | A typed relationship between two entities (`contains`, `calls`, `imports`, `inherits_from`, `decorated_by`, `guides`, `in_subsystem`, ...). |
+| **Edge** | A typed relationship between two entities (`contains`, `calls`, `imports`, `inherits_from`, `decorates`, `guides`, `in_subsystem`, ...). |
 | **Exploration elimination** | Design principle: every common explore-agent question should be answerable from cache without spawning a sub-agent. |
 | **Fact exchange** | Design principle: findings are the primary cross-tool data exchange format; Filigree's native `POST /api/v1/scan-results` intake is the wire format. |
 | **Finding** | A structured claim-with-evidence about an entity. Five kinds: Defect, Fact, Classification, Metric, Suggestion. |
