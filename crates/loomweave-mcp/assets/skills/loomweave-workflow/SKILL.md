@@ -59,11 +59,12 @@ tell which case you're in.
 | Tool | Use when | Args |
 |------|----------|------|
 | `find_entity` | locate an entity by name, or by a concept word in its docstring/identifier (substring) | `{"pattern": "<name-or-word>"}` |
+| `entity_resolve` | resolve dotted qualnames (`pkg.mod.func`) to entity ids + SEIs — the inverse of having an id | `{"qualnames": ["pkg.mod.func"]}` |
 | `entity_at` | what's at a file:line | `{"file": "rel/path.py", "line": 42}` |
-| `callers_of` | what calls this entity | `{"id": "<id>"}` |
-| `neighborhood` | one-hop callers+callees+container+contained+references+imports | `{"id": "<id>"}` |
+| `callers_of` | what calls this entity (bounded: `limit`+`cursor`) | `{"id": "<id>"}` |
+| `neighborhood` | one-hop callers+callees+container+contained+references+imports (per-bucket `limit`) | `{"id": "<id>"}` |
 | `execution_paths_from` | bounded call paths out of an entity | `{"id": "<id>", "max_depth": 5}` |
-| `subsystem_members` | modules in a subsystem | `{"id": "core:subsystem:<hash>"}` |
+| `subsystem_members` | modules in a subsystem (bounded: `limit`+`cursor`) | `{"id": "core:subsystem:<hash>"}` |
 | `subsystem_of` | the subsystem an entity belongs to (reverse of `subsystem_members`) | `{"id": "<id>"}` |
 | `summary` † | on-demand prose summary of one entity | `{"id": "<id>"}` |
 | `summary_preview_cost` | preview a `summary` call's cache status / cost before spending | `{"id": "<id>"}` |
@@ -106,6 +107,33 @@ node-id strings ranked longest-first. Resolve a path id against `nodes`, not by
 re-reading each path element. `truncated`/`truncation_reason` report `edge-cap`
 (traversal stopped early) or `path-cap` (ranked output trimmed for size).
 
+### Ids, SEIs, and `entity_resolve`
+
+Every id-taking tool (`callers_of`, `neighborhood`, `summary`, `source_for_entity`,
+`call_sites`, `wardline_for`, `issues_for`, `propose_guidance`, …) accepts **either**
+a raw locator (`python:function:pkg.mod.func`) **or** a Stable Entity Identity
+(SEI) token (`loomweave:eid:…`). A SEI is resolved through its alive binding to
+the current entity; an orphaned/unknown SEI fails closed as `entity-not-found`.
+You never have to convert a SEI before passing it. `find_entity` also accepts a
+pasted SEI as an **exact** lookup (it returns the one entity that SEI binds to,
+not a fuzzy match).
+
+When you have a **dotted qualname** but no id — e.g. a name from a stack trace or
+another tool — use `entity_resolve` (batch: `{"qualnames": ["a.b.c", …]}`, up to
+2000). Each input yields one `results` entry **in input order** with a
+`result_kind`:
+
+- `resolved` — `candidates` has one `{ id, sei, kind }` you can feed straight
+  into any id-taking tool.
+- `unresolved` — `candidates` is empty. This is **honest-empty, not an error**:
+  no entity matches that qualname.
+- `ambiguous` — reserved for a future heuristic tier (the exact tier never
+  emits it). A `scope_excludes` of `["heuristic-tier-not-implemented"]` records
+  that only exact resolution ran.
+
+A candidate whose entity is secret-scan-blocked collapses to the redacted stub
+(id/sei withheld) — the same posture as every other identity surface.
+
 ### How `find_entity` matches — the grep replacement for "find the thing that does Y"
 
 `find_entity` merges two recall paths so a concept word, not just an exact
@@ -123,7 +151,9 @@ entity is named after it. This is the **always-on keyword-discovery path: reach
 for `find_entity` before you grep.** It needs no embeddings — semantic *ranking*
 is the separate, opt-in `search_semantic` (below). Full-text hits rank first,
 then substring-only hits. Docstrings withheld by the secret scanner
-(`briefing_blocked`) are never matched.
+(`briefing_blocked`) are never matched. A pasted **SEI** (`loomweave:eid:…`) is
+treated as an exact lookup — it returns the single bound entity, not a fuzzy
+substring scan over the token.
 
 ## Catalogue tools — inspection · faceted search · shortcuts
 
@@ -225,6 +255,17 @@ and are composed into `summary` prompts with a real guidance fingerprint.
 - **`find_entity` is paginated** (~20/page, `next_cursor`); a broad concept word
   now matches docstring/identifier substrings too, so it can return many hits —
   narrow the pattern (or add a `kind` filter) rather than paging if you can.
+- **`callers_of` and `subsystem_members` are bounded** (`limit` default 50, max
+  100, plus a numeric-offset `cursor`). Each response carries `next_cursor`
+  (null when exhausted) and an explicit `truncated` flag — re-call with
+  `{"cursor": "<next_cursor>"}` to walk the full set. An empty page on a non-null
+  cursor means you paged past the end.
+- **`neighborhood` caps each bucket independently** with one per-bucket `limit`
+  and reports a `truncated` **map** (`{callers, callees, contained,
+  references_in, references_out, imports_in, imports_out}`) — it has **no
+  cursor**. When a bucket is `truncated:true`, switch to that relation's
+  dedicated cursor-paginated tool (e.g. `callers_of`) for the complete set;
+  `neighborhood` is a one-hop overview, not a paging surface.
 
 ## Launch
 

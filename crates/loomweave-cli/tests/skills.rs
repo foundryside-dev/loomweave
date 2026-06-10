@@ -72,6 +72,26 @@ fn install_codex_skills_writes_agents_pack_without_initialising_loomweave_dir() 
 }
 
 #[test]
+fn repo_installed_skill_copy_matches_embedded_template() {
+    // The repo's own `.agents/skills/` copy is tracked, and `loomweave install`
+    // overwrites it from the embedded template on every run. If the two drift
+    // (someone edits the installed copy without updating the asset, or vice
+    // versa), each reinstall silently reverts the doc change — so pin them.
+    let template = include_str!("../../loomweave-mcp/assets/skills/loomweave-workflow/SKILL.md");
+    let repo_copy = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.agents/skills/loomweave-workflow/SKILL.md");
+    let body = fs::read_to_string(&repo_copy).expect("repo .agents skill copy");
+    assert_eq!(
+        body,
+        template,
+        "{} has drifted from the embedded template at \
+         crates/loomweave-mcp/assets/skills/loomweave-workflow/SKILL.md — \
+         edit the asset (the canonical source) and re-run `loomweave install`",
+        repo_copy.display()
+    );
+}
+
+#[test]
 fn install_skills_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     for _ in 0..2 {
