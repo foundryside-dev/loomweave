@@ -3531,10 +3531,9 @@ async fn anchored_derives_inferred_confidence_rejected_at_scan_time() {
 /// the writer accepts (the Python-plugin analogue lives above).
 #[test]
 fn rust_plugin_edge_kinds_are_accepted_by_writer_contract() {
-    let manifest = loomweave_core::parse_manifest(include_bytes!(
-        "../../loomweave-plugin-rust/plugin.toml"
-    ))
-    .expect("production Rust plugin manifest should parse");
+    let manifest =
+        loomweave_core::parse_manifest(include_bytes!("../../loomweave-plugin-rust/plugin.toml"))
+            .expect("production Rust plugin manifest should parse");
     let writer_kinds: std::collections::BTreeSet<&'static str> =
         loomweave_storage::known_scan_time_edge_kinds().collect();
     let missing: Vec<&str> = manifest
