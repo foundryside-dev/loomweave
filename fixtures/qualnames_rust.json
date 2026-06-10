@@ -434,6 +434,48 @@
         {"qualname": "demo.m.Foo<{1+2}>.impl#<>", "kind": "impl"},
         {"qualname": "demo.m.Foo<{1+2}>.impl#<>.get", "kind": "function"}
       ]
+    },
+    {
+      "name": "method_cfg_twin_inherent",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 5 (clarion-dfeb905f46): two cfg-gated twin METHODS inside ONE inherent impl block. The impl-level @cfg cannot split them (one impl key, demo.m.Foo.impl#<>), so each method carries its OWN @cfg(...) suffix AFTER the method name (.go@cfg(unix)), mirroring the free-item rule. Without it both `go` render demo.m.Foo.impl#<>.go and the writer's ON CONFLICT silently keeps one. Pins that a second producer applies a method-level cfg suffix, not only an impl-level one.",
+      "source": "struct Foo;\nimpl Foo { #[cfg(unix)] fn go(&self){} #[cfg(windows)] fn go(&self){} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.Foo", "kind": "struct"},
+        {"qualname": "demo.m.Foo.impl#<>", "kind": "impl"},
+        {"qualname": "demo.m.Foo.impl#<>.go@cfg(unix)", "kind": "function"},
+        {"qualname": "demo.m.Foo.impl#<>.go@cfg(windows)", "kind": "function"}
+      ]
+    },
+    {
+      "name": "method_cfg_twin_trait",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 5 (clarion-dfeb905f46): cfg-gated twin methods inside ONE trait impl block. The method-level @cfg suffix lands after the method name on the trait-impl key (demo.m.Foo.impl[Tr].go@cfg(unix)). Pins that the method-level cfg discriminant applies to trait impls too, not only inherent ones.",
+      "source": "struct Foo;\nimpl Tr for Foo { #[cfg(unix)] fn go(&self){} #[cfg(windows)] fn go(&self){} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.Foo", "kind": "struct"},
+        {"qualname": "demo.m.Foo.impl[Tr]", "kind": "impl"},
+        {"qualname": "demo.m.Foo.impl[Tr].go@cfg(unix)", "kind": "function"},
+        {"qualname": "demo.m.Foo.impl[Tr].go@cfg(windows)", "kind": "function"}
+      ]
+    },
+    {
+      "name": "method_cfg_twin_cross_merged_block",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 5 (clarion-dfeb905f46), cross-merged-block variant: two SEPARATE inherent impl blocks on the same (type, sig, no-cfg) MERGE into one impl entity (Option b), each contributing a `go`. The merged `go` methods would collide unless the method-twin count spans ALL blocks sharing the final impl key (demo.m.Foo.impl#<>), not just one block. Pins that the method cfg discriminant is computed across merged blocks.",
+      "source": "struct Foo;\nimpl Foo { #[cfg(unix)] fn go(&self){} }\nimpl Foo { #[cfg(windows)] fn go(&self){} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.Foo", "kind": "struct"},
+        {"qualname": "demo.m.Foo.impl#<>", "kind": "impl"},
+        {"qualname": "demo.m.Foo.impl#<>.go@cfg(unix)", "kind": "function"},
+        {"qualname": "demo.m.Foo.impl#<>.go@cfg(windows)", "kind": "function"}
+      ]
     }
   ]
 }
