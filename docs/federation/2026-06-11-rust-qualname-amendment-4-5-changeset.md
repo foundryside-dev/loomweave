@@ -8,6 +8,7 @@
 **Authority:** Loomweave remains the authoritative producer for the Rust dialect (**ADR-049**, amended 2026-06-10 and 2026-06-11). The corpus `expected` values are generated from the live extractor, never hand-authored; where this document and your frontend diverge, **Loomweave's emitted form is normative and Wardline conforms.**
 **Corpus blob:** `fixtures/qualnames_rust.json` now carries **35 entity rows** (md5 `bf8d09968b5d366a8bd033710d736744`), up from 28. Re-vendor verbatim to `tests/conformance/qualnames_rust.json`.
 **Version:** No `ontology_version` bump — neither amendment adds an entity kind or edge kind; both refine the qualname *string* of existing `impl`/`function` kinds.
+**Addendum (2026-06-11, later the same day):** extended and superseded for the corpus step by the [Amendments 6–9 change-set](./2026-06-11-rust-qualname-amendment-6-9-changeset.md) — **one re-vendor of its 49-row blob (md5 `a784a2f97e2079c71b7aba87c11694dd`) covers Amendments 4–9**; do not vendor the 35-row blob pinned below. The §2–§3 rendering rules here remain normative as written.
 
 ---
 
