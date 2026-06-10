@@ -2,9 +2,10 @@
 # Rust-plugin scale-QA harness (Sprint 3, plan 2026-06-10-rust-plugin-scale-qa.md D2).
 #
 # Runs an INSTALLED loomweave (venv with the rust plugin discoverable) over one
-# corpus and harvests the QA numbers: wall + peak RSS (/usr/bin/time -v — MaxRSS
-# covers reaped children via wait4 rusage, i.e. the plugin child), entity/edge
-# counts per kind, findings by rule, unresolved-call-site rate, SEI churn on an
+# corpus and harvests the QA numbers: wall + peak RSS (getrusage(RUSAGE_CHILDREN)
+# ru_maxrss after wait — covers the reaped host and, transitively, the plugin
+# child), entity/edge counts per kind, findings by rule, unresolved-call-site
+# rate, SEI churn on an
 # unchanged re-analyze and on a benign one-fn-body edit, and a qualname
 # collision sweep. The corpus is treated read-only except the benign-edit
 # probe, which is reverted with `git checkout -- .`.
