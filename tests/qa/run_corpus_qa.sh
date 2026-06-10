@@ -20,7 +20,11 @@ mkdir -p "$OUT"
 # Hermetic install: never mutate ~/.codex/config.toml (clarion-c5e3cc2818).
 export LOOMWEAVE_CODEX_CONFIG="$OUT/codex-config.toml"
 # The venv bin dir must be on PATH for plugin discovery (install-prefix chain).
-export PATH="$VBIN:$PATH"
+# PATH is RESTRICTED to venv + system dirs so only the venv's plugins are
+# discoverable — a user-global loomweave-plugin-python would otherwise be
+# picked up and run pyright over any stray .py files in a Rust corpus,
+# muddying wall/RSS numbers.
+export PATH="$VBIN:/usr/bin:/bin"
 export RUST_LOG=info
 
 # Fresh store per run.
