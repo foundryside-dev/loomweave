@@ -66,7 +66,7 @@ ADR-002 defines a crash-loop breaker (>3 crashes in 60s → plugin disabled for 
 ### What is NOT in Layer 2 (explicit non-defences)
 
 - **Seccomp/landlock syscall sandbox.** Deferred to v0.2 with NG-16 (plugin hash-pinning). The reference Python plugin's `wardline.core.registry` import needs unconstrained `sys.path` access; a seccomp-tight ruleset breaks the reference plugin.
-- **Per-plugin CPU cap.** Plugin crash-loop breaker already catches runaway loops; explicit CPU cap adds complexity without closing a scored threat.
+- **Per-plugin CPU cap.** Plugin crash-loop breaker already catches runaway loops; explicit CPU cap adds complexity without closing a scored threat. *Amended by [ADR-050](./ADR-050-plugin-lifecycle-deadlines.md)*: the breaker only sees *crashed* plugins, never hung ones — the non-defence stands, but liveness is enforced by ADR-050's wall-clock lifecycle deadlines (handshake/file/shutdown), not the breaker, and `RLIMIT_CPU` is explicitly rejected there (cannot cover blocked-idle hangs; risks pyright's legitimately CPU-heavy runs).
 - **Outbound-network ACL on the plugin.** Python plugins may legitimately read package metadata at runtime; a default-deny network policy breaks ergonomics for a threat class (plugin exfiltration) that is better closed by hash-pinning (v0.2).
 - **Per-RPC rate limiting.** Crash-loop breaker + entity-count cap cover the DoS surface at v0.1 scale.
 
