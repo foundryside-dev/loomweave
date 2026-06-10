@@ -55,6 +55,29 @@ pub fn implements_edge(from_id: &str, to_id: &str, confidence: &str, span: &Sour
     })
 }
 
+/// An anchored `derives` edge from the deriving struct/enum entity (`from_id`)
+/// to the resolved derived trait (`to_id`), carrying the DERIVE PATH's byte
+/// span (NOT the whole attribute or item) so the anchor points precisely at
+/// the `Pretty` in `#[derive(Debug, Pretty)]`.
+///
+/// Like `implements`, `derives` is anchored (ADR-026 decision 3): it carries
+/// non-null byte offsets and so may NOT be `inferred`. The resolver's outcome
+/// renders to the wire string — `"resolved"` for a unique in-project trait,
+/// `"ambiguous"` for a multi-kind candidate. An `External` derive
+/// (`#[derive(Debug)]`) yields NO edge (dropped at emit, D1), so this helper
+/// is never called for it.
+#[must_use]
+pub fn derives_edge(from_id: &str, to_id: &str, confidence: &str, span: &SourceRange) -> Value {
+    json!({
+        "kind": "derives",
+        "from_id": from_id,
+        "to_id": to_id,
+        "source_byte_start": span.byte_start,
+        "source_byte_end": span.byte_end,
+        "confidence": confidence,
+    })
+}
+
 /// An anchored `calls` edge from the enclosing function entity (`from_id`) to the
 /// resolved callee function (`to_id`), carrying the call expression's byte span.
 ///

@@ -29,7 +29,8 @@ use syn::{
 };
 
 use crate::calls::walk_calls;
-use crate::edges::{implements_edge, imports_edge};
+use crate::derives::derive_sites;
+use crate::edges::{derives_edge, implements_edge, imports_edge};
 use crate::parse_guard::GuardViolation;
 use crate::qualname::{
     build_entity_id, cfg_discriminant, declared_type_params, free_item_qualname, impl_disc_for,
@@ -469,6 +470,12 @@ fn walk_items(
                     Some(struct_signature(fields)),
                 )?;
                 push_with_contains(parent_id, child, out, edges);
+                // Phase 2: anchored `derives` edges, ONLY with a resolver (the
+                // edges-aware entry point) — parity with `imports`/`implements`.
+                if let Some((from_crate, resolver)) = resolution {
+                    let struct_id = build_id("struct", &q)?;
+                    emit_derive_edges(attrs, &struct_id, from_crate, resolver, edges);
+                }
             }
             Item::Impl(it) => {
                 emit_impl(
@@ -533,6 +540,12 @@ fn walk_items(
                     None,
                 )?;
                 push_with_contains(parent_id, child, out, edges);
+                // Phase 2: `derives` edges for enums too (structs + enums are
+                // the only derive targets in the walk — no `Item::Union` arm).
+                if let Some((from_crate, resolver)) = resolution {
+                    let enum_id = build_id("enum", &q)?;
+                    emit_derive_edges(attrs, &enum_id, from_crate, resolver, edges);
+                }
             }
             Item::Trait(ItemTrait { ident, attrs, .. }) => {
                 let name = ident.to_string();
@@ -837,6 +850,31 @@ fn emit_impl(
     Ok(())
 }
 
+/// Resolve every `#[derive(...)]` path on a struct/enum into an anchored
+/// `derives` edge (Phase 2), exactly mirroring how the `Item::Impl` arm
+/// consumes [`Resolver::resolve_trait_path`]: a unique in-project trait →
+/// `resolved`, a multi-kind candidate → `ambiguous`, an `External` derive
+/// (`Debug`, `serde::Serialize`, …) → NOTHING (D1: dropped at emit, no
+/// counter — matching `implements`). Each edge anchors on ITS derive path
+/// token's span (the `Pretty` in `#[derive(Debug, Pretty)]`), never the whole
+/// attribute or item.
+fn emit_derive_edges(
+    attrs: &[syn::Attribute],
+    from_id: &str,
+    from_crate: &str,
+    resolver: &Resolver,
+    edges: &mut Vec<Value>,
+) {
+    for site in derive_sites(attrs) {
+        let (to_id, confidence) = match resolver.resolve_trait_path(from_crate, &site.path) {
+            Resolution::Resolved(id) => (id, "resolved"),
+            Resolution::Ambiguous(id) => (id, "ambiguous"),
+            Resolution::External => continue,
+        };
+        edges.push(derives_edge(from_id, &to_id, confidence, &site.span));
+    }
+}
+
 /// The `::`-joined trait-path string the resolver looks up, with generic
 /// arguments STRIPPED. The resolver lookup keys on the trait's qualname
 /// (`crate.module.MyTrait`), and an in-project `trait MyTrait<T>` entity is keyed
@@ -846,7 +884,8 @@ fn emit_impl(
 /// edge for every in-project generic trait). Joining the segment idents drops the
 /// `<…>` arguments while preserving the `a::b::Tr` path shape. Leading
 /// `crate`/`self`/`super` segments are kept verbatim for `normalize_path` to map.
-fn trait_path_for_lookup(path: &syn::Path) -> String {
+/// Also reused by [`crate::derives::derive_sites`] to render derive paths.
+pub(crate) fn trait_path_for_lookup(path: &syn::Path) -> String {
     path.segments
         .iter()
         .map(|seg| seg.ident.to_string())
