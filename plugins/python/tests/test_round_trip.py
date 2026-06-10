@@ -187,7 +187,7 @@ def test_round_trip_self_analysis() -> None:  # noqa: PLR0915 - by-kind invarian
                 # Contains edges MUST NOT carry source range fields (ADR-026 §3).
                 assert "source_byte_start" not in edge
                 assert "source_byte_end" not in edge
-            elif edge["kind"] in {"calls", "references", "imports"}:
+            elif edge["kind"] in {"calls", "references", "imports", "inherits_from", "decorates"}:
                 assert edge["source_byte_start"] < edge["source_byte_end"]
                 assert edge["confidence"] in {"resolved", "ambiguous"}
             else:

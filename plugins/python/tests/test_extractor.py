@@ -215,7 +215,14 @@ def test_reference_site_call_callee_ranges_are_suppressed() -> None:
     ]
 
 
-def test_reference_site_subclass_and_decorator_expressions_are_excluded() -> None:
+def test_reference_site_subclass_and_decorator_expressions_have_own_kinds() -> None:
+    """Bases and decorators are relation sites, never plain ``name`` sites.
+
+    clarion-43416be550: ``visit_ClassDef`` historically walked only the class
+    body, so bases/decorators produced no sites of ANY kind. They now produce
+    dedicated ``base``/``decorator`` sites (resolved into ``inherits_from`` /
+    ``decorates`` edges) and remain excluded from generic ``references``.
+    """
     sites = _reference_sites_for(
         "class Foo:\n"
         "    pass\n\n"
@@ -228,7 +235,271 @@ def test_reference_site_subclass_and_decorator_expressions_are_excluded() -> Non
         "    pass\n",
     )
 
-    assert sites == []
+    assert [(site.from_id, site.kind) for site in sites] == [
+        ("python:function:demo.target", "decorator"),
+        ("python:class:demo.Child", "base"),
+    ]
+
+
+def test_base_site_anchors_base_name_and_owner_is_subclass() -> None:
+    source = "class Base:\n    pass\n\nclass Child(Base):\n    pass\n"
+
+    sites = _reference_sites_for(source)
+
+    expected_start = source.encode().find(b"Base", source.encode().find(b"Child"))
+    assert sites == [
+        ReferenceSite(
+            from_id="python:class:demo.Child",
+            line=3,
+            character=12,
+            end_line=3,
+            end_character=16,
+            source_byte_start=expected_start,
+            source_byte_end=expected_start + len(b"Base"),
+            kind="base",
+        ),
+    ]
+
+
+def test_dotted_base_site_queries_last_segment_but_anchors_full_path() -> None:
+    source = "import helpers\n\nclass Child(helpers.Base):\n    pass\n"
+
+    sites = _reference_sites_for(source)
+
+    line = "class Child(helpers.Base):"
+    assert len(sites) == 1
+    site = sites[0]
+    assert site.from_id == "python:class:demo.Child"
+    assert site.kind == "base"
+    # Query position lands on the final attribute segment so pyright resolves
+    # the class, not the module prefix.
+    assert (site.line, site.character) == (2, line.find("Base"))
+    # The anchored byte range covers the whole dotted path (Rust parity:
+    # the implemented-trait PATH's span).
+    assert site.source_byte_start == source.encode().find(b"helpers.Base")
+    assert site.source_byte_end == site.source_byte_start + len(b"helpers.Base")
+
+
+def test_subscripted_base_site_reduces_to_subscript_value() -> None:
+    source = "class Box:\n    pass\n\nclass Special(Box[int]):\n    pass\n"
+
+    sites = _reference_sites_for(source)
+
+    base_sites = [site for site in sites if site.kind == "base"]
+    assert len(base_sites) == 1
+    site = base_sites[0]
+    assert site.from_id == "python:class:demo.Special"
+    expected_start = source.encode().find(b"Box", source.encode().find(b"Special"))
+    assert site.source_byte_start == expected_start
+    assert site.source_byte_end == expected_start + len(b"Box")
+
+
+def test_call_base_expression_is_outside_relation_envelope() -> None:
+    sites = _reference_sites_for(
+        "def make():\n    return object\n\nclass Odd(make()):\n    pass\n",
+    )
+
+    assert [site for site in sites if site.kind == "base"] == []
+
+
+def test_function_decorator_site_anchors_decorator_name() -> None:
+    source = "def deco(fn):\n    return fn\n\n@deco\ndef target():\n    pass\n"
+
+    sites = _reference_sites_for(source)
+
+    expected_start = source.encode().find(b"deco", source.encode().find(b"@"))
+    assert sites == [
+        ReferenceSite(
+            from_id="python:function:demo.target",
+            line=3,
+            character=1,
+            end_line=3,
+            end_character=5,
+            source_byte_start=expected_start,
+            source_byte_end=expected_start + len(b"deco"),
+            kind="decorator",
+        ),
+    ]
+
+
+def test_decorator_factory_site_reduces_to_callee_path() -> None:
+    source = 'import app\n\n@app.route("/x")\ndef handler():\n    pass\n'
+
+    sites = _reference_sites_for(source)
+
+    decorator_sites = [site for site in sites if site.kind == "decorator"]
+    assert len(decorator_sites) == 1
+    site = decorator_sites[0]
+    assert site.from_id == "python:function:demo.handler"
+    # Query position on the final segment (`route`), anchor over `app.route` —
+    # the factory-call arguments are not part of the relation token.
+    assert (site.line, site.character) == (2, '@app.route("/x")'.find("route"))
+    assert site.source_byte_start == source.encode().find(b"app.route")
+    assert site.source_byte_end == site.source_byte_start + len(b"app.route")
+
+
+def test_class_decorator_site_owner_is_decorated_class() -> None:
+    source = "def register(cls):\n    return cls\n\n@register\nclass Thing:\n    pass\n"
+
+    sites = _reference_sites_for(source)
+
+    decorator_sites = [site for site in sites if site.kind == "decorator"]
+    assert [(site.from_id, site.kind) for site in decorator_sites] == [
+        ("python:class:demo.Thing", "decorator"),
+    ]
+
+
+def test_stacked_decorators_emit_one_site_each_in_source_order() -> None:
+    source = (
+        "def outer(fn):\n    return fn\n\n"
+        "def inner(fn):\n    return fn\n\n"
+        "@outer\n@inner\ndef target():\n    pass\n"
+    )
+
+    sites = _reference_sites_for(source)
+
+    decorator_sites = [site for site in sites if site.kind == "decorator"]
+    assert [
+        (site.from_id, source.encode()[site.source_byte_start : site.source_byte_end])
+        for site in decorator_sites
+    ] == [
+        ("python:function:demo.target", b"outer"),
+        ("python:function:demo.target", b"inner"),
+    ]
+
+
+def test_overload_stub_decorators_produce_no_decorator_sites() -> None:
+    sites = _reference_sites_for(
+        "from typing import overload\n\n"
+        "@overload\n"
+        "def parse(v: str) -> str: ...\n\n"
+        "@overload\n"
+        "def parse(v: int) -> int: ...\n\n"
+        "def parse(v: object) -> object:\n"
+        "    return v\n",
+    )
+
+    assert [site for site in sites if site.kind == "decorator"] == []
+
+
+def test_multiple_inheritance_emits_one_base_site_per_base_in_order() -> None:
+    source = "class A:\n    pass\n\nclass B:\n    pass\n\nclass Child(A, B):\n    pass\n"
+
+    sites = _reference_sites_for(source)
+
+    base_sites = [site for site in sites if site.kind == "base"]
+    assert [
+        (site.from_id, source.encode()[site.source_byte_start : site.source_byte_end])
+        for site in base_sites
+    ] == [
+        ("python:class:demo.Child", b"A"),
+        ("python:class:demo.Child", b"B"),
+    ]
+
+
+def test_method_decorator_site_owner_is_the_method_entity() -> None:
+    source = (
+        "def deco(fn):\n    return fn\n\n"
+        "class Holder:\n"
+        "    @deco\n"
+        "    def method(self):\n"
+        "        pass\n"
+    )
+
+    sites = _reference_sites_for(source)
+
+    decorator_sites = [site for site in sites if site.kind == "decorator"]
+    assert [(site.from_id, site.kind) for site in decorator_sites] == [
+        ("python:function:demo.Holder.method", "decorator"),
+    ]
+
+
+def test_nested_class_base_site_owner_is_the_nested_class() -> None:
+    source = "class Base:\n    pass\n\nclass Outer:\n    class Inner(Base):\n        pass\n"
+
+    sites = _reference_sites_for(source)
+
+    base_sites = [site for site in sites if site.kind == "base"]
+    assert [(site.from_id, site.kind) for site in base_sites] == [
+        ("python:class:demo.Outer.Inner", "base"),
+    ]
+
+
+def test_relation_site_byte_offsets_handle_non_ascii_prefix() -> None:
+    source = "class Basé:\n    pass\n\n\nclass 企業(Basé):\n    pass\n"
+
+    sites = _reference_sites_for(source)
+
+    base_sites = [site for site in sites if site.kind == "base"]
+    assert len(base_sites) == 1
+    site = base_sites[0]
+    assert site.from_id == "python:class:demo.企業"
+    expected_start = source.encode().rfind("Basé".encode())
+    assert site.source_byte_start == expected_start
+    assert site.source_byte_end == expected_start + len("Basé".encode())
+    # The query position is in UTF-16 code units past the non-ASCII class name.
+    assert (site.line, site.character) == (4, "class 企業(Basé):".find("Basé"))
+
+
+@pytest.mark.pyright
+def test_extractor_resolves_cross_module_dotted_base_and_factory_decorator(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    """End-to-end over two files: the dotted-path query-position math must
+    resolve the final segment in the OTHER module (the headline real-world
+    shape: `class Child(helpers.Base)` and `@helpers.wrap(...)`)."""
+    helpers_source = (
+        "class Base:\n"
+        "    pass\n\n"
+        "def wrap(path):\n"
+        "    def inner(fn):\n"
+        "        return fn\n"
+        "    return inner\n"
+    )
+    (tmp_path / "helpers.py").write_text(helpers_source, encoding="utf-8")
+    demo_source = (
+        "import helpers\n\n"
+        "class Child(helpers.Base):\n"
+        "    pass\n\n"
+        '@helpers.wrap("/x")\n'
+        "def handler():\n"
+        "    pass\n"
+    )
+    demo_path = tmp_path / "demo.py"
+    demo_path.write_text(demo_source, encoding="utf-8")
+
+    with PyrightSession(tmp_path, executable=pyright_langserver) as resolver:
+        result = extract_with_stats(
+            demo_source,
+            str(demo_path),
+            module_prefix_path="demo.py",
+            reference_resolver=resolver,
+        )
+
+    demo_bytes = demo_source.encode()
+    inherits = [edge for edge in result.edges if edge["kind"] == "inherits_from"]
+    assert inherits == [
+        {
+            "kind": "inherits_from",
+            "from_id": "python:class:demo.Child",
+            "to_id": "python:class:helpers.Base",
+            "confidence": "resolved",
+            "source_byte_start": demo_bytes.find(b"helpers.Base"),
+            "source_byte_end": demo_bytes.find(b"helpers.Base") + len(b"helpers.Base"),
+        },
+    ]
+    decorates = [edge for edge in result.edges if edge["kind"] == "decorates"]
+    assert decorates == [
+        {
+            "kind": "decorates",
+            "from_id": "python:function:helpers.wrap",
+            "to_id": "python:function:demo.handler",
+            "confidence": "resolved",
+            "source_byte_start": demo_bytes.find(b"helpers.wrap"),
+            "source_byte_end": demo_bytes.find(b"helpers.wrap") + len(b"helpers.wrap"),
+        },
+    ]
 
 
 def test_reference_site_byte_offsets_handle_non_ascii_prefix() -> None:

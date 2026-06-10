@@ -47,10 +47,18 @@ def test_manifest_declares_current_v1_ontology_only() -> None:
     assert manifest["integrations"]["wardline"]["expected_descriptor_version"] == (
         EXPECTED_DESCRIPTOR_VERSION
     )
-    assert manifest["ontology"]["ontology_version"] == "0.7.0"
+    assert manifest["ontology"]["ontology_version"] == "0.8.0"
     assert manifest["ontology"]["entity_kinds"] == ["function", "class", "module"]
-    assert manifest["ontology"]["edge_kinds"] == ["contains", "calls", "references", "imports"]
+    assert manifest["ontology"]["edge_kinds"] == [
+        "contains",
+        "calls",
+        "references",
+        "imports",
+        "inherits_from",
+        "decorates",
+    ]
+    # The ontology kind is `decorates` (decorator → decorated), not the
+    # v1.0-requirements-era `decorated_by` spelling.
     assert "decorated_by" not in manifest["ontology"]["edge_kinds"]
-    assert "inherits_from" not in manifest["ontology"]["edge_kinds"]
     assert "uses_type" not in manifest["ontology"]["edge_kinds"]
     assert "alias_of" not in manifest["ontology"]["edge_kinds"]

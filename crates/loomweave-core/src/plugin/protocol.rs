@@ -373,6 +373,10 @@ pub struct AnalyzeFileStats {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unresolved_call_sites: Vec<UnresolvedCallSite>,
     /// Reference sites enumerated by the plugin before resolver filtering.
+    /// Since Python ontology 0.8.0 this counter family also covers relation
+    /// sites (base-class / decorator expressions resolving into
+    /// `inherits_from` / `decorates` edges), which ride the same resolution
+    /// pass and per-file cap as plain reference sites.
     #[serde(default)]
     pub reference_sites_total: u64,
     /// Reference sites resolved to at least one in-project target.

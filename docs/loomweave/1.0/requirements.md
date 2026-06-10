@@ -89,7 +89,7 @@ Entity kinds are strings declared by a language plugin's manifest, not a fixed e
 
 Loomweave records typed edges between entities. Core reserves `contains`, `guides`, `emits_finding`, and `in_subsystem`; all other edge kinds are plugin-declared.
 
-**Rationale**: Edges are how navigation queries and clustering work. A language-agnostic core with a handful of reserved edges keeps the property-graph generic while giving plugins full expressive range for language-specific relationships (Python's `imports`, `calls`, `inherits_from`, `decorated_by`).
+**Rationale**: Edges are how navigation queries and clustering work. A language-agnostic core with a handful of reserved edges keeps the property-graph generic while giving plugins full expressive range for language-specific relationships (Python's `imports`, `calls`, `inherits_from`, `decorates`).
 **Verification**: Plugin emits edges with plugin-defined kinds; core persists them; `neighbors(id, edge_kind=...)` returns them correctly.
 **See**: System Design §3 (Data Model).
 
@@ -568,17 +568,20 @@ Plugins implement two phases of lifecycle calls: batch (`initialize`, `analyze_f
 
 #### REQ-PLUGIN-04 — Python plugin (v1.0)
 
-Loomweave ships a Python plugin supporting Python >=3.11. The v1.0 plugin
-declares and emits the narrower ontology that is present in
+Loomweave ships a Python plugin supporting Python >=3.11. The plugin
+declares and emits the ontology that is present in
 `plugins/python/plugin.toml`: `function`, `class`, and `module` entities, plus
-`contains`, `calls`, `references`, and `imports` edges. The plugin is not
-Wardline-aware in v1.0 and does not declare or emit `protocol`, `global`, or
-`package` entity kinds, nor `inherits_from`, `decorated_by`, `uses_type`, or
-`alias_of` edges. Those signals are deferred until the manifest declares them
-and the extractor has fixture-backed support for them.
+`contains`, `calls`, `references`, `imports`, `inherits_from`, and `decorates`
+edges (the last two are the ontology-0.8.0 addition, clarion-43416be550; the
+shipped kind is spelled `decorates` — direction decorator → decorated — and
+supersedes this document's earlier `decorated_by` sketch, which read the
+opposite way). The plugin does not declare or emit `protocol`, `global`, or
+`package` entity kinds, nor `uses_type` or `alias_of` edges. Those signals are
+deferred until the manifest declares them and the extractor has fixture-backed
+support for them.
 
 **Rationale**: Python is the validating first-customer language (elspeth is ~425k LOC Python). Shipping the plugin alongside the core for v1.0 establishes the plugin-authoring contract and validates the plugin protocol against a real workload, while keeping the advertised ontology limited to signals that are actually emitted. `pipx` isolation prevents venv conflicts with the analysed project.
-**Verification**: The plugin manifest smoke test pins the v1.0 entity/edge kinds and `wardline_aware = false`; `tests/fixtures/elspeth-slice/` runs through the Python plugin and produces expected entity/edge counts; installation via pipx succeeds.
+**Verification**: The plugin manifest smoke test pins the declared entity/edge kinds (`plugins/python/tests/test_package.py`); `tests/fixtures/elspeth-slice/` runs through the Python plugin and produces expected entity/edge counts; installation via pipx succeeds.
 **See**: System Design §2 (Python plugin specifics).
 
 #### REQ-PLUGIN-05 — Python import resolution policy
@@ -597,14 +600,22 @@ package re-exports and does not mint `python:unresolved:*` placeholder entities.
 
 #### REQ-PLUGIN-06 — Decorator detection policy
 
-Decorator semantics are deferred for the Python plugin until the ontology grows.
-In v1.0 the extractor preserves decorator source spans in entity definition
-metadata so source navigation covers the decorated declaration, but it does not
-declare or emit `decorated_by` edges, decorator tags, Wardline annotation
-metadata, decorator arguments, or alias-resolved decorator facts.
+The extractor preserves decorator source spans in entity definition metadata
+so source navigation covers the decorated declaration, and (since ontology
+0.8.0, clarion-43416be550) emits anchored `decorates` edges with direction
+decorator → decorated. Decorator expressions reduce to their dotted path
+token — factory calls (`@app.route("/x")`) reduce to the callee path, and the
+factory's arguments are not extracted. The reduced token resolves through the
+pyright reference machinery to a precise in-project entity only (no module-id
+coarse fallback); external/builtin decorators and self-references yield no
+edge. Stacking order is not represented: the edges primary key is
+`(kind, from_id, to_id)`, so duplicate decorators on one entity dedupe to a
+single edge. Aliased decorators (`deco = make()` then `@deco`) resolve to the
+alias assignment, which is not an entity, and are dropped by the
+precise-entity discipline.
 
-**Rationale**: Decorator-as-DSL is widespread in Python (FastAPI, Pydantic, Wardline itself). The v1.0 plugin keeps source spans honest while avoiding a false ontology claim. A later implementation must add the edge kind to the manifest and fixture-backed extraction for direct, factory, stacked, class, and aliased decorators before advertising decorator semantics.
-**Verification**: Current fixtures assert decorated entity spans include decorator lines and that the manifest does not advertise Wardline semantics. Future decorator extraction must add fixtures for direct, factory, stacked, class, and aliased decorators and assert emitted `decorated_by` edges with preserved order/arguments.
+**Rationale**: Decorator-as-DSL is widespread in Python (FastAPI, Pydantic, Wardline itself). The `decorates` edge answers the relation question consult-mode agents actually ask ("what does `@app.route` decorate") without advertising argument or stacking-order semantics that are not implemented.
+**Verification**: Fixture-backed tests cover direct, factory, stacked, class, dotted cross-module, and aliased/self-reference decorator forms (`plugins/python/tests/test_extractor.py`, `test_pyright_session.py`); the walking-skeleton e2e pins a `decorates` row end-to-end with exact tuple equality.
 **See**: System Design §2 (Python plugin specifics, Decorator detection).
 
 ---
