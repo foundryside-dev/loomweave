@@ -140,6 +140,56 @@ pub fn impl_disc_for(it: &ItemImpl) -> ImplDisc {
     ImplDisc::inherent(&declared_type_params(it))
 }
 
+/// [`impl_disc_for`] with the trait fragment keyed on the **full written
+/// trait path** instead of only its last segment (ADR-049 Amendment 7,
+/// stage T of the residual-collision ladder, clarion-fa8bcf8731):
+/// `impl tokio::io::AsyncRead for Compat<T>` renders
+/// `impl[tokio%3A%3Aio%3A%3AAsyncRead]`. The final segment's concrete
+/// generic args compose through the existing [`ImplDisc::trait_impl`] /
+/// `trait_generic_args` machinery, unchanged. Applied by the extraction
+/// layer ONLY to members of a fired T group; [`impl_disc_for`] itself is the
+/// corpus-pinned base form and stays untouched.
+///
+/// **Single-segment byte-equivalence:** a single-segment written path (`Tr`)
+/// renders byte-identically to [`impl_disc_for`] (see
+/// [`trait_path_qualified`]), so in a `Tr` vs `other::Tr` fired pair only
+/// the multi-segment member moves. An inherent impl has no trait path and
+/// renders exactly as [`impl_disc_for`] — inherent impls never fire T.
+#[must_use]
+pub fn impl_disc_for_qualified(it: &ItemImpl) -> ImplDisc {
+    if let Some((_, trait_path, _)) = &it.trait_
+        && let Some(last) = trait_path.segments.last()
+    {
+        let generic_args = trait_generic_args(&last.arguments);
+        return ImplDisc::trait_impl(&trait_path_qualified(trait_path), &generic_args);
+    }
+    ImplDisc::inherent(&declared_type_params(it))
+}
+
+/// The full **written trait path**, escaped for the qualname (ADR-049
+/// Amendment 7): segment idents joined by `::` — a leading `::` contributes
+/// a leading separator — then `escape_reserved` over the joined string
+/// (reusing the corpus-pinned escape bytes, `::` → `%3A%3A`):
+/// `tokio::io::AsyncRead` → `tokio%3A%3Aio%3A%3AAsyncRead`,
+/// `::a::Tr` → `%3A%3Aa%3A%3ATr`. Generic arguments are NOT included — the
+/// final segment's args are composed by [`impl_disc_for_qualified`]. A
+/// single-segment path renders byte-identically to its bare ident (the
+/// escape is a no-op on an ident).
+#[must_use]
+pub fn trait_path_qualified(path: &syn::Path) -> String {
+    let joined = path
+        .segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::");
+    if path.leading_colon.is_some() {
+        escape_reserved(&format!("::{joined}"))
+    } else {
+        escape_reserved(&joined)
+    }
+}
+
 /// The impl's declared generic type-parameter names in source order
 /// (`impl<T, U> Foo<…>` → `["T", "U"]`). Lifetimes and const generics are
 /// excluded. Used both for the inherent `#<…>` signature and to recognise which
@@ -217,7 +267,44 @@ pub fn self_ty_locator(ty: &Type, declared_params: &[String]) -> String {
     let Some(last) = p.path.segments.last() else {
         return render_concrete_arg(ty);
     };
-    let base = last.ident.to_string();
+    self_ty_locator_with_base(last, declared_params, last.ident.to_string())
+}
+
+/// [`self_ty_locator`] with the base **qualified by the full written self-type
+/// path** (ADR-049 Amendment 6, stage S of the residual-collision ladder):
+/// `impl T for a::X` renders `a%3A%3AX`, `impl<T> Tr for a::X<T>` renders
+/// `a%3A%3AX<$0>`. The base is `escape_reserved` over the `::`-joined
+/// [`self_ty_path_witness`]; the final segment's generic-argument machinery is
+/// shared verbatim with [`self_ty_locator`] via `self_ty_locator_with_base`.
+///
+/// **Single-segment byte-equivalence:** a single-segment written path (`X`)
+/// has witness == ident and the escape is a no-op on an ident, so the
+/// qualified rendering is byte-identical to [`self_ty_locator`] — within a
+/// fired S group only multi-segment members move. A non-`Type::Path` (or
+/// qself-bearing) self type falls back to the bare rendering, which is
+/// already fully path-qualified (Amendment 4 textual render).
+#[must_use]
+pub fn self_ty_locator_qualified(ty: &Type, declared_params: &[String]) -> String {
+    if let Type::Path(p) = ty
+        && p.qself.is_none()
+        && let Some(last) = p.path.segments.last()
+    {
+        let base = escape_reserved(&self_ty_path_witness(ty));
+        return self_ty_locator_with_base(last, declared_params, base);
+    }
+    self_ty_locator(ty, declared_params)
+}
+
+/// The shared final-segment generic-argument machinery behind
+/// [`self_ty_locator`] (bare last-segment base) and
+/// [`self_ty_locator_qualified`] (full written-path base): render the last
+/// segment's angle-bracketed args (declared params positionally, concrete
+/// args through the Amendment-4 pipeline) onto the caller-chosen `base`.
+fn self_ty_locator_with_base(
+    last: &syn::PathSegment,
+    declared_params: &[String],
+    base: String,
+) -> String {
     let PathArguments::AngleBracketed(ab) = &last.arguments else {
         return base;
     };
@@ -235,6 +322,32 @@ pub fn self_ty_locator(ty: &Type, declared_params: &[String]) -> String {
     } else {
         format!("{base}<{}>", rendered.join(","))
     }
+}
+
+/// The **written self-type path** of an impl, as the stage-S comparison
+/// witness (ADR-049 Amendment 6, clarion-8ff7f233fa). For a `Type::Path`
+/// with no qself: the segment idents joined by `::` — unescaped, and with
+/// **no generic arguments** (args are already normalized into the locator by
+/// Amendment 3 and must not affect twin detection, or a positional rename
+/// would falsely fire the gate). For a non-`Type::Path` or qself-bearing
+/// self type: the existing Amendment-4 textual render, which is already
+/// fully path-qualified. Comparison key only — never emitted; the emitted
+/// base is [`self_ty_locator_qualified`].
+#[must_use]
+pub fn self_ty_path_witness(ty: &Type) -> String {
+    if let Type::Path(p) = ty
+        && p.qself.is_none()
+        && !p.path.segments.is_empty()
+    {
+        return p
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::");
+    }
+    render_concrete_arg(ty)
 }
 
 /// Render one self-type generic argument: a bare path matching a declared impl
@@ -655,6 +768,122 @@ mod syn_disc_tests {
         assert_eq!(
             self_ty_locator(&it.self_ty, &declared_type_params(&it)),
             "Foo<{usize%3A%3AMAX}>"
+        );
+    }
+
+    // --- ADR-049 Amendment 6 (self-type written-path qualification,
+    // clarion-8ff7f233fa): the stage-S witness and the qualified-base render.
+
+    #[test]
+    fn self_ty_path_witness_joins_segment_idents_without_args() {
+        let multi: syn::ItemImpl = parse_quote!(impl T for a::b::X {});
+        assert_eq!(self_ty_path_witness(&multi.self_ty), "a::b::X");
+        let bare: syn::ItemImpl = parse_quote!(impl T for X {});
+        assert_eq!(self_ty_path_witness(&bare.self_ty), "X");
+        // Generic args are NOT part of the witness (Amendment-3 normalization
+        // must not affect twin detection): a::X<T> and a::X<U> share one.
+        let with_args: syn::ItemImpl = parse_quote!(
+            impl<T> Tr for a::X<T> {}
+        );
+        assert_eq!(self_ty_path_witness(&with_args.self_ty), "a::X");
+    }
+
+    #[test]
+    fn self_ty_path_witness_non_path_falls_back_to_amendment_4_render() {
+        let it: syn::ItemImpl = parse_quote!(impl Tr for &mut std::fmt::Formatter<'a> {});
+        assert_eq!(
+            self_ty_path_witness(&it.self_ty),
+            "&mutstd%3A%3Afmt%3A%3AFormatter<'a>"
+        );
+    }
+
+    #[test]
+    fn self_ty_locator_qualified_escapes_the_written_path() {
+        let it: syn::ItemImpl = parse_quote!(impl T for a::X {});
+        assert_eq!(
+            self_ty_locator_qualified(&it.self_ty, &declared_type_params(&it)),
+            "a%3A%3AX"
+        );
+    }
+
+    #[test]
+    fn self_ty_locator_qualified_keeps_the_final_segment_args_machinery() {
+        // The declared param still renders positionally on the qualified base.
+        let it: syn::ItemImpl = parse_quote!(
+            impl<T> Tr for a::X<T> {
+                fn m(&self) {}
+            }
+        );
+        assert_eq!(
+            self_ty_locator_qualified(&it.self_ty, &declared_type_params(&it)),
+            "a%3A%3AX<$0>"
+        );
+    }
+
+    #[test]
+    fn self_ty_locator_qualified_single_segment_is_byte_identical_to_bare() {
+        let it: syn::ItemImpl = parse_quote!(impl T for X {});
+        let declared = declared_type_params(&it);
+        assert_eq!(
+            self_ty_locator_qualified(&it.self_ty, &declared),
+            self_ty_locator(&it.self_ty, &declared)
+        );
+    }
+
+    // --- ADR-049 Amendment 7 (trait-path written-path qualification,
+    // clarion-fa8bcf8731): the stage-T qualified rendering.
+
+    #[test]
+    fn trait_path_qualified_escapes_the_written_path() {
+        let it: syn::ItemImpl = parse_quote!(impl tokio::io::AsyncRead for Compat {});
+        let (_, path, _) = it.trait_.as_ref().unwrap();
+        assert_eq!(trait_path_qualified(path), "tokio%3A%3Aio%3A%3AAsyncRead");
+    }
+
+    #[test]
+    fn trait_path_qualified_leading_colon_contributes_a_leading_escape() {
+        let it: syn::ItemImpl = parse_quote!(impl ::a::Tr for Foo {});
+        let (_, path, _) = it.trait_.as_ref().unwrap();
+        assert_eq!(trait_path_qualified(path), "%3A%3Aa%3A%3ATr");
+    }
+
+    #[test]
+    fn impl_disc_for_qualified_single_segment_is_byte_identical_to_base_form() {
+        let it: syn::ItemImpl = parse_quote!(impl Tr for Foo {});
+        assert_eq!(impl_disc_for_qualified(&it).key(), impl_disc_for(&it).key());
+        assert_eq!(impl_disc_for_qualified(&it).key(), "impl[Tr]");
+        // Inherent impls never fire T — the qualified form is the base form.
+        let inherent: syn::ItemImpl = parse_quote!(
+            impl<T> Foo<T> {
+                fn m(&self) {}
+            }
+        );
+        assert_eq!(
+            impl_disc_for_qualified(&inherent).key(),
+            impl_disc_for(&inherent).key()
+        );
+    }
+
+    #[test]
+    fn impl_disc_for_qualified_composes_trait_generic_args_through_the_escape() {
+        // The final segment keeps the EXISTING trait_generic_args rendering
+        // (per the path_typed_generic_arg escape tests above), composed onto
+        // the qualified path.
+        let it: syn::ItemImpl = parse_quote!(impl a::Tr<std::io::Error> for Foo {});
+        assert_eq!(
+            impl_disc_for_qualified(&it).key(),
+            "impl[a%3A%3ATr<std%3A%3Aio%3A%3AError>]"
+        );
+    }
+
+    #[test]
+    fn qualified_renderings_never_carry_a_raw_colon() {
+        let trait_it: syn::ItemImpl = parse_quote!(impl ::tokio::io::AsyncRead<a::B> for X {});
+        assert!(!impl_disc_for_qualified(&trait_it).key().contains(':'));
+        let self_it: syn::ItemImpl = parse_quote!(impl T for a::b::X<c::D> {});
+        assert!(
+            !self_ty_locator_qualified(&self_it.self_ty, &declared_type_params(&self_it))
+                .contains(':')
         );
     }
 

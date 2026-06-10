@@ -509,6 +509,167 @@
       "expected": [
         {"qualname": "demo.m", "kind": "module"}
       ]
+    },
+    {
+      "name": "self_type_path_twin_trait",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 6 (clarion-8ff7f233fa), the Semaphore shape (tokio chan.rs bounded::Semaphore vs unbounded::Semaphore): two impls of the SAME trait for same-NAMED types from different modules. Pre-amendment both rendered demo.m.X.impl[T] (last-segment self-type base), seen_impl_ids spuriously merged them, and the like-named `go` methods collapsed at the writer's ON CONFLICT. Stage S of the residual-collision ladder (@cfg on bare keys -> S on post-cfg groups -> T on post-S groups -> method-@cfg on final keys) fires on the >=2 distinct written self-type-path witnesses and qualifies every member's base with its escaped written path (a%3A%3AX / b%3A%3AX). The witness carries NO generic args, so Amendment-3 positional normalization never falsely fires the gate. Pins that a second producer qualifies by the path AS WRITTEN, not a resolved/canonical path.",
+      "source": "pub trait T { fn go(&self); }\nmod a { pub struct X; }\nmod b { pub struct X; }\nimpl T for a::X { fn go(&self){} }\nimpl T for b::X { fn go(&self){} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.T", "kind": "trait"},
+        {"qualname": "demo.m.a", "kind": "module"},
+        {"qualname": "demo.m.a.X", "kind": "struct"},
+        {"qualname": "demo.m.b", "kind": "module"},
+        {"qualname": "demo.m.b.X", "kind": "struct"},
+        {"qualname": "demo.m.a%3A%3AX.impl[T]", "kind": "impl"},
+        {"qualname": "demo.m.a%3A%3AX.impl[T].go", "kind": "function"},
+        {"qualname": "demo.m.b%3A%3AX.impl[T]", "kind": "impl"},
+        {"qualname": "demo.m.b%3A%3AX.impl[T].go", "kind": "function"}
+      ]
+    },
+    {
+      "name": "self_type_path_twin_inherent",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 6, the inherent variant: stage S keys on the post-cfg impl qualname, which for inherent impls is the impl#<sig> form -- the gate is impl-kind-agnostic. Two inherent blocks on same-named types from different modules share demo.m.X.impl#<> pre-amendment and (worse than a trait pair) MERGE under Option (b), chimera-parenting both methods under one entity. Distinct witnesses (a::X / b::X) fire S; both bases qualify.",
+      "source": "mod a { pub struct X; }\nmod b { pub struct X; }\nimpl a::X { pub fn f(&self){} }\nimpl b::X { pub fn g(&self){} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.a", "kind": "module"},
+        {"qualname": "demo.m.a.X", "kind": "struct"},
+        {"qualname": "demo.m.b", "kind": "module"},
+        {"qualname": "demo.m.b.X", "kind": "struct"},
+        {"qualname": "demo.m.a%3A%3AX.impl#<>", "kind": "impl"},
+        {"qualname": "demo.m.a%3A%3AX.impl#<>.f", "kind": "function"},
+        {"qualname": "demo.m.b%3A%3AX.impl#<>", "kind": "impl"},
+        {"qualname": "demo.m.b%3A%3AX.impl#<>.g", "kind": "function"}
+      ]
+    },
+    {
+      "name": "self_type_path_lone_unqualified_negative",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 6 NEGATIVE control (the S gate off): a LONE path-qualified self-type impl -- by far the common case (e.g. loomweave-cli guidance.rs `impl StorageResultExt for loomweave_storage::Result`) -- keeps the bare last-segment base demo.m.X.impl[T], byte-identical to pre-amendment. Qualification is paid ONLY inside a fired group; a lone impl never moves. Rejects the always-qualify alternative (mass SEI churn, ~2% of impls + their methods).",
+      "source": "pub trait T {}\nmod a { pub struct X; }\nimpl T for a::X {}\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.T", "kind": "trait"},
+        {"qualname": "demo.m.a", "kind": "module"},
+        {"qualname": "demo.m.a.X", "kind": "struct"},
+        {"qualname": "demo.m.X.impl[T]", "kind": "impl"}
+      ]
+    },
+    {
+      "name": "self_type_path_mixed_bare_and_qualified",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 6, mixed bare/qualified group: `impl T for X` + `impl T for b::X` share the bare key, distinct witnesses (X / b::X) fire S -- but a single-segment witness renders BYTE-IDENTICALLY to the bare base (escape_reserved is a no-op on an ident), so the bare member's id demo.m.X.impl[T] is unchanged and only the multi-segment member moves to b%3A%3AX. Within a fired group, minimal movement.",
+      "source": "pub trait T {}\nstruct X;\nmod b { pub struct X; }\nimpl T for X {}\nimpl T for b::X {}\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.T", "kind": "trait"},
+        {"qualname": "demo.m.X", "kind": "struct"},
+        {"qualname": "demo.m.b", "kind": "module"},
+        {"qualname": "demo.m.b.X", "kind": "struct"},
+        {"qualname": "demo.m.X.impl[T]", "kind": "impl"},
+        {"qualname": "demo.m.b%3A%3AX.impl[T]", "kind": "impl"}
+      ]
+    },
+    {
+      "name": "trait_path_twin",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 7 (clarion-fa8bcf8731), the Compat shape (tokio_util compat.rs `impl<T> tokio::io::AsyncRead for Compat<T>` vs `impl<T> futures_io::AsyncRead for Compat<T>`): two same-NAMED traits from different paths implemented for the SAME self type. Pre-amendment both rendered demo.m.Compat<$0>.impl[AsyncRead] (last-segment trait fragment) and both poll_read methods collapsed. Stage S is COLD (identical self-type witnesses); stage T groups by post-S qualname and fires on >=2 distinct qualified trait renderings, switching every member's impl[...] fragment to the full written trait path, escape_reserved over the ::-joined segment idents (impl[a%3A%3AAsyncRead] / impl[b%3A%3AAsyncRead]). Final-segment trait generic args keep the existing Amendment-4 rendering.",
+      "source": "struct Compat<T>(T);\nmod a { pub trait AsyncRead { fn poll_read(&self); } }\nmod b { pub trait AsyncRead { fn poll_read(&self); } }\nimpl<T> a::AsyncRead for Compat<T> { fn poll_read(&self){} }\nimpl<T> b::AsyncRead for Compat<T> { fn poll_read(&self){} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.Compat", "kind": "struct"},
+        {"qualname": "demo.m.a", "kind": "module"},
+        {"qualname": "demo.m.a.AsyncRead", "kind": "trait"},
+        {"qualname": "demo.m.b", "kind": "module"},
+        {"qualname": "demo.m.b.AsyncRead", "kind": "trait"},
+        {"qualname": "demo.m.Compat<$0>.impl[a%3A%3AAsyncRead]", "kind": "impl"},
+        {"qualname": "demo.m.Compat<$0>.impl[a%3A%3AAsyncRead].poll_read", "kind": "function"},
+        {"qualname": "demo.m.Compat<$0>.impl[b%3A%3AAsyncRead]", "kind": "impl"},
+        {"qualname": "demo.m.Compat<$0>.impl[b%3A%3AAsyncRead].poll_read", "kind": "function"}
+      ]
+    },
+    {
+      "name": "trait_path_twin_single_vs_multi",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 7, single-vs-multi-segment fired pair: `impl Tr for Foo` + `impl other::Tr for Foo`. T fires (two distinct renderings), but the single-segment written path renders byte-identically to the bare fragment, so the bare member keeps demo.m.Foo.impl[Tr] and only the multi-segment member moves to impl[other%3A%3ATr]. The as-written spelling is the witness -- a second producer must NOT resolve `Tr` to its defining path.",
+      "source": "struct Foo;\npub trait Tr { fn go(&self); }\nmod other { pub trait Tr { fn go(&self); } }\nimpl Tr for Foo { fn go(&self){} }\nimpl other::Tr for Foo { fn go(&self){} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.Foo", "kind": "struct"},
+        {"qualname": "demo.m.Tr", "kind": "trait"},
+        {"qualname": "demo.m.other", "kind": "module"},
+        {"qualname": "demo.m.other.Tr", "kind": "trait"},
+        {"qualname": "demo.m.Foo.impl[Tr]", "kind": "impl"},
+        {"qualname": "demo.m.Foo.impl[Tr].go", "kind": "function"},
+        {"qualname": "demo.m.Foo.impl[other%3A%3ATr]", "kind": "impl"},
+        {"qualname": "demo.m.Foo.impl[other%3A%3ATr].go", "kind": "function"}
+      ]
+    },
+    {
+      "name": "trait_path_lone_multi_segment",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 7 NEGATIVE control (the T gate off): a LONE multi-segment trait path keeps the bare last-segment fragment demo.m.Foo.impl[Read] -- byte-identical to pre-amendment, reinforcing the trait_method row (impl std::fmt::Display -> impl[Display]). Rejects the always-qualify alternative (6-41% of trait impls churn).",
+      "source": "mod deep { pub mod io { pub trait Read { fn r(&self); } } }\nstruct Foo;\nimpl deep::io::Read for Foo { fn r(&self){} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.deep", "kind": "module"},
+        {"qualname": "demo.m.deep.io", "kind": "module"},
+        {"qualname": "demo.m.deep.io.Read", "kind": "trait"},
+        {"qualname": "demo.m.Foo", "kind": "struct"},
+        {"qualname": "demo.m.Foo.impl[Read]", "kind": "impl"},
+        {"qualname": "demo.m.Foo.impl[Read].r", "kind": "function"}
+      ]
+    },
+    {
+      "name": "trait_path_cfg_twin_unqualified",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendments 6/7 LADDER-ORDERING pin: cfg-gated twins whose trait paths ALSO differ (#[cfg(unix)] impl a::Tr / #[cfg(windows)] impl b::Tr). Stage 1 (@cfg, computed on the BARE pre-cfg keys exactly as before Amendment 6) splits them first; the post-cfg groups are singletons, so S and T stay COLD and the ids are byte-identical to the pre-amendment @cfg form -- demo.m.Foo.impl[Tr]@cfg(unix), with NO path qualification. This no-churn invariant is WHY the ladder runs @cfg before S/T; an independent-gates design would have qualified (and churned) these.",
+      "source": "struct Foo;\nmod a { pub trait Tr { fn go(&self); } }\nmod b { pub trait Tr { fn go(&self); } }\n#[cfg(unix)] impl a::Tr for Foo { fn go(&self){} }\n#[cfg(windows)] impl b::Tr for Foo { fn go(&self){} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.Foo", "kind": "struct"},
+        {"qualname": "demo.m.a", "kind": "module"},
+        {"qualname": "demo.m.a.Tr", "kind": "trait"},
+        {"qualname": "demo.m.b", "kind": "module"},
+        {"qualname": "demo.m.b.Tr", "kind": "trait"},
+        {"qualname": "demo.m.Foo.impl[Tr]@cfg(unix)", "kind": "impl"},
+        {"qualname": "demo.m.Foo.impl[Tr]@cfg(unix).go", "kind": "function"},
+        {"qualname": "demo.m.Foo.impl[Tr]@cfg(windows)", "kind": "impl"},
+        {"qualname": "demo.m.Foo.impl[Tr]@cfg(windows).go", "kind": "function"}
+      ]
+    },
+    {
+      "name": "impl_ladder_self_splits_before_trait",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendments 6/7 composition row: the MIXED pair (`impl a::Tr for c::X` + `impl b::Tr for d::X`) differs on BOTH the self-type path and the trait path. Stage S fires first (distinct self-type witnesses c::X / d::X) and already splits the group; the post-S qualnames are distinct singletons, so stage T stays COLD and the trait fragment keeps its bare last segment -- demo.m.c%3A%3AX.impl[Tr], NOT c%3A%3AX.impl[a%3A%3ATr]. Minimal qualification: each stage only fires on a residual collision left by the previous one.",
+      "source": "mod a { pub trait Tr { fn go(&self); } }\nmod b { pub trait Tr { fn go(&self); } }\nmod c { pub struct X; }\nmod d { pub struct X; }\nimpl a::Tr for c::X { fn go(&self){} }\nimpl b::Tr for d::X { fn go(&self){} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.a", "kind": "module"},
+        {"qualname": "demo.m.a.Tr", "kind": "trait"},
+        {"qualname": "demo.m.b", "kind": "module"},
+        {"qualname": "demo.m.b.Tr", "kind": "trait"},
+        {"qualname": "demo.m.c", "kind": "module"},
+        {"qualname": "demo.m.c.X", "kind": "struct"},
+        {"qualname": "demo.m.d", "kind": "module"},
+        {"qualname": "demo.m.d.X", "kind": "struct"},
+        {"qualname": "demo.m.c%3A%3AX.impl[Tr]", "kind": "impl"},
+        {"qualname": "demo.m.c%3A%3AX.impl[Tr].go", "kind": "function"},
+        {"qualname": "demo.m.d%3A%3AX.impl[Tr]", "kind": "impl"},
+        {"qualname": "demo.m.d%3A%3AX.impl[Tr].go", "kind": "function"}
+      ]
     }
   ]
 }

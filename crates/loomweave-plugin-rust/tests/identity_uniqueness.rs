@@ -107,6 +107,44 @@ fn corpus() -> Vec<(&'static str, &'static str, &'static str)> {
             "k.m",
             "#[cfg(target_pointer_width = \"64\")] const _: () = ();\n#[cfg(target_pointer_width = \"64\")] const _: () = ();\n",
         ),
+        // ADR-049 Amendment 6 (clarion-8ff7f233fa), the Semaphore shape: two
+        // impls of the SAME trait for same-NAMED types defined in different
+        // modules (`impl T for a::X` / `impl T for b::X`, tokio chan.rs
+        // bounded::Semaphore vs unbounded::Semaphore). The bare self-type base
+        // renders only the last path segment, so both impls share `k.m.X.impl[T]`
+        // pre-amendment; `seen_impl_ids` spuriously merges them and the
+        // like-named `go` methods collapse at the writer's ON CONFLICT. Stage S
+        // of the residual-collision ladder qualifies the written self-type path
+        // (`a%3A%3AX` / `b%3A%3AX`), keeping both impls + methods distinct.
+        (
+            "k",
+            "k.m",
+            "pub trait T { fn go(&self); }\nmod a { pub struct X; }\nmod b { pub struct X; }\nimpl T for a::X { fn go(&self){} }\nimpl T for b::X { fn go(&self){} }\n",
+        ),
+        // ADR-049 Amendment 7 (clarion-fa8bcf8731), the Compat shape: two
+        // same-NAMED traits from different paths implemented for the SAME self
+        // type (`impl<T> a::AsyncRead for Compat<T>` / `impl<T> b::AsyncRead
+        // for Compat<T>`, tokio_util compat.rs tokio::io::AsyncRead vs
+        // futures_io::AsyncRead). The trait fragment keys on only the last
+        // path segment, so both render `Compat<$0>.impl[AsyncRead]`
+        // pre-amendment and both `poll_read` methods collapse. Stage T of the
+        // ladder qualifies the written trait path (`impl[a%3A%3AAsyncRead]` /
+        // `impl[b%3A%3AAsyncRead]`).
+        (
+            "k",
+            "k.m",
+            "struct Compat<T>(T);\nmod a { pub trait AsyncRead { fn poll_read(&self); } }\nmod b { pub trait AsyncRead { fn poll_read(&self); } }\nimpl<T> a::AsyncRead for Compat<T> { fn poll_read(&self){} }\nimpl<T> b::AsyncRead for Compat<T> { fn poll_read(&self){} }\n",
+        ),
+        // The MIXED pair (both families at once): distinct trait paths AND
+        // distinct self-type paths. Stage S alone splits the group (the
+        // post-S qualnames are distinct singletons), so stage T stays cold —
+        // minimal qualification: the trait fragment keeps its bare last
+        // segment (`impl[Tr]`, not `impl[a%3A%3ATr]`).
+        (
+            "k",
+            "k.m",
+            "mod a { pub trait Tr { fn go(&self); } }\nmod b { pub trait Tr { fn go(&self); } }\nmod c { pub struct X; }\nmod d { pub struct X; }\nimpl a::Tr for c::X { fn go(&self){} }\nimpl b::Tr for d::X { fn go(&self){} }\n",
+        ),
     ]
 }
 

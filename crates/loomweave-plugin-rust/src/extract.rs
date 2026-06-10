@@ -34,7 +34,8 @@ use crate::edges::{derives_edge, implements_edge, imports_edge, references_edge}
 use crate::parse_guard::GuardViolation;
 use crate::qualname::{
     build_entity_id, cfg_discriminant, declared_type_params, free_item_qualname, impl_disc_for,
-    impl_qualname, self_ty_locator,
+    impl_disc_for_qualified, impl_qualname, self_ty_locator, self_ty_locator_qualified,
+    self_ty_path_witness,
 };
 use crate::references::{
     ReferenceSite, ReferenceStats, block_reference_sites, expr_reference_sites,
@@ -406,57 +407,35 @@ fn walk_items(
     // re-emit the entity — it only appends its methods (the merge, ADR-049
     // amend, Option b). Scoped to this item list.
     let mut seen_impl_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    // cfg-twin counter for impls: keyed on the FULL pre-cfg impl qualname
-    // (incl. the trait `[Trait]` fragment), so it splits cfg-twin inherent AND
-    // trait impls (e.g. `#[cfg(unix)] impl Display for Foo` /
-    // `#[cfg(windows)] impl Display for Foo` both render `Foo.impl[Display]`
-    // and would dedup to one entity, silently dropping one `fmt`). `twin_counts`
-    // above is keyed `(kind, name)` and cannot see impl qualnames, so impls need
-    // their own pre-pass. Counting genuinely-same `(type, generic-sig)` blocks
-    // >1 marks a twin; the `@cfg` suffix then re-splits the cfg variants.
-    let mut impl_twin_counts: std::collections::BTreeMap<String, usize> =
-        std::collections::BTreeMap::new();
-    for item in items {
-        if let Item::Impl(it) = item {
-            let type_q = format!(
-                "{module_path}.{}",
-                self_ty_locator(&it.self_ty, &declared_type_params(it))
-            );
-            let impl_q = impl_qualname(&type_q, &impl_disc_for(it));
-            *impl_twin_counts.entry(impl_q).or_insert(0) += 1;
-        }
-    }
-    let impl_is_cfg_twin = |impl_q: &str| impl_twin_counts.get(impl_q).copied().unwrap_or(0) > 1;
+    // The residual-collision ladder for impl qualnames (ADR-049 Amendments
+    // 1/5/6/7): one planning pre-pass per item list deciding, per impl, the
+    // @cfg suffix (bare-key cfg twins), the stage-S self-type-path
+    // qualification, and the stage-T trait-path qualification. Every consumer
+    // — the method cfg-twin counter below and `emit_impl` — reads
+    // [`ImplLadder::final_impl_qualname`], so the passes cannot diverge.
+    let ladder = ImplLadder::build(items, module_path);
     // cfg-twin counter for METHODS (ADR-049 Amendment 5, clarion-dfeb905f46),
-    // keyed on the FINAL impl qualname (post impl-level `@cfg` suffix) + method
-    // name. Two methods that land on the SAME impl entity with the SAME name are
-    // cfg twins: the impl-level `@cfg` cannot split methods WITHIN one impl entity
-    // — a single block (`impl Foo { #[cfg(unix)] fn go #[cfg(windows)] fn go }`) or
-    // several blocks that MERGE under Option (b) — so each such method must carry
-    // its OWN `@cfg(...)` suffix, exactly as free items and impl blocks do. Keying
-    // on the FINAL impl_q (not the pre-cfg one) means impl-level cfg-twins — which
-    // are already split into distinct impl entities — do NOT collect a redundant
-    // method suffix, while a method-twin *inside* a cfg-twin block still does.
+    // keyed on the FINAL impl qualname (post impl-level `@cfg` suffix, post
+    // S/T qualification) + method name. Two methods that land on the SAME impl
+    // entity with the SAME name are cfg twins: the impl-level `@cfg` cannot
+    // split methods WITHIN one impl entity — a single block
+    // (`impl Foo { #[cfg(unix)] fn go #[cfg(windows)] fn go }`) or several
+    // blocks that MERGE under Option (b) — so each such method must carry its
+    // OWN `@cfg(...)` suffix, exactly as free items and impl blocks do. Keying
+    // on the FINAL impl_q (not the pre-cfg one) means impl-level cfg-twins —
+    // which are already split into distinct impl entities — do NOT collect a
+    // redundant method suffix, while a method-twin *inside* a cfg-twin block
+    // still does; likewise S/T-split impls (now distinct entities) collect no
+    // spurious method twins.
     let mut method_twin_counts: std::collections::BTreeMap<(String, String), usize> =
         std::collections::BTreeMap::new();
-    for item in items {
-        if let Item::Impl(it) = item {
-            let type_q = format!(
-                "{module_path}.{}",
-                self_ty_locator(&it.self_ty, &declared_type_params(it))
-            );
-            let mut impl_q = impl_qualname(&type_q, &impl_disc_for(it));
-            if impl_is_cfg_twin(&impl_q)
-                && let Some(disc) = cfg_suffix(&it.attrs)
-            {
-                impl_q.push_str(&disc);
-            }
-            for member in &it.items {
-                if let ImplItem::Fn(m) = member {
-                    *method_twin_counts
-                        .entry((impl_q.clone(), m.sig.ident.to_string()))
-                        .or_insert(0) += 1;
-                }
+    for it in impl_items(items) {
+        let impl_q = ladder.final_impl_qualname(module_path, it);
+        for member in &it.items {
+            if let ImplItem::Fn(m) = member {
+                *method_twin_counts
+                    .entry((impl_q.clone(), m.sig.ident.to_string()))
+                    .or_insert(0) += 1;
             }
         }
     }
@@ -599,7 +578,7 @@ fn walk_items(
                     module_path,
                     parent_id,
                     file_path,
-                    &impl_is_cfg_twin,
+                    &ladder,
                     &method_is_cfg_twin,
                     &mut seen_impl_ids,
                     resolution,
@@ -923,8 +902,213 @@ fn collect_use_leaves(tree: &UseTree, prefix: &str, out: &mut Vec<String>) {
     }
 }
 
-// `impl_is_cfg_twin` is a borrowed closure (one per item list); `seen_impl_ids`
-// is threaded so a second same-id block merges (entity emitted once, methods
+/// The impl items of one item list, in source order (the ladder's extraction
+/// unit — file-local by construction, see [`ImplLadder`]).
+fn impl_items(items: &[Item]) -> impl Iterator<Item = &ItemImpl> {
+    items.iter().filter_map(|item| match item {
+        Item::Impl(it) => Some(it),
+        _ => None,
+    })
+}
+
+/// The ADR-049 **residual-collision ladder** for impl qualnames (Amendment 6,
+/// normative ordering; Amendment 7 rides stage T), planned once per
+/// extraction unit (one `walk_items` item list). An impl's final qualname is
+/// decided in stages, each keyed on the PREVIOUS stage's output:
+///
+/// 1. **@cfg** (Amendments 1/5 machinery, unchanged): cfg-twin-ness is
+///    computed on the BARE pre-cfg impl qualname, exactly as before
+///    Amendment 6; twins with a `#[cfg]` append the `@cfg(...)` suffix.
+///    Running @cfg FIRST is the no-churn invariant: already-@cfg-split twins
+///    (including cross-path cfg twins like `#[cfg(unix)] impl T for a::X` /
+///    `#[cfg(windows)] impl T for b::X`) land in distinct post-cfg groups,
+///    so S/T stay cold and their ids are byte-identical to today's.
+/// 2. **S** (Amendment 6, clarion-8ff7f233fa): impls grouped by POST-CFG
+///    qualname; a group whose members carry ≥ 2 distinct written
+///    self-type-path witnesses ([`self_ty_path_witness`]) re-renders every
+///    `Type::Path` member's base fully path-qualified
+///    ([`self_ty_locator_qualified`]: `{m}.a%3A%3AX.impl[T]`). Single-segment
+///    members render byte-identically, so only multi-segment members move.
+/// 3. **T** (Amendment 7, clarion-fa8bcf8731): impls grouped by POST-S
+///    qualname; a trait-impl group with ≥ 2 distinct qualified trait
+///    renderings ([`impl_disc_for_qualified`]) switches every member's
+///    `impl[…]` fragment to the qualified rendering
+///    (`impl[tokio%3A%3Aio%3A%3AAsyncRead]`). Inherent impls never fire T.
+/// 4. **method-@cfg** (Amendment 5, unchanged mechanics): keyed on the FINAL
+///    impl qualname this ladder produces — see `method_twin_counts` in
+///    `walk_items`.
+///
+/// File-local grouping is complete for valid Rust: two impls sharing a bare
+/// qualname share a module path, and one module path means one item list
+/// (E0761 rejects a doubly-defined file module, E0428 a doubly-defined inline
+/// one; `include!` is invisible to syn; `#[path]`-aliased files are the known
+/// residual deferred to Amendment 8).
+///
+/// All BTree-backed for determinism; a source reorder of a twin pair yields
+/// the identical fired sets and ids.
+struct ImplLadder {
+    /// Bare PRE-cfg impl-qualname counts (stage-1 cfg-twin detection input —
+    /// the Amendment-1 machinery, unchanged).
+    twin_counts: std::collections::BTreeMap<String, usize>,
+    /// POST-CFG qualnames whose written self-type-path witness set has ≥ 2
+    /// members (stage S fires).
+    s_fired: std::collections::BTreeSet<String>,
+    /// POST-S qualnames whose qualified-trait rendering set has ≥ 2 members
+    /// (stage T fires).
+    t_fired: std::collections::BTreeSet<String>,
+}
+
+/// The stages [`ImplLadder::qualname_at`] can stop after. `Final` is the
+/// emitted qualname; the earlier rungs exist so the planning passes group on
+/// EXACTLY the same prefix computation the final rendering uses.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LadderStage {
+    PostCfg,
+    PostS,
+    Final,
+}
+
+impl ImplLadder {
+    /// Plan the ladder over one item list: count bare keys, then derive the
+    /// stage-S witness groups (on post-cfg qualnames) and the stage-T
+    /// rendering groups (on post-S qualnames). Each pass consults only the
+    /// fields the previous passes filled, via [`Self::qualname_at`] — the
+    /// same chain [`Self::final_impl_qualname`] walks.
+    fn build(items: &[Item], module_path: &str) -> Self {
+        let mut ladder = ImplLadder {
+            twin_counts: std::collections::BTreeMap::new(),
+            s_fired: std::collections::BTreeSet::new(),
+            t_fired: std::collections::BTreeSet::new(),
+        };
+        for it in impl_items(items) {
+            *ladder
+                .twin_counts
+                .entry(Self::bare_qualname(module_path, it))
+                .or_insert(0) += 1;
+        }
+        // Stage-S planning: post-cfg groups → distinct written self-type
+        // paths. Witnesses carry NO generic args, so Amendment-3-normalized
+        // twins (`a::X<T>` vs `a::X<U>`) share one witness and stay merged.
+        let mut witnesses: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for it in impl_items(items) {
+            witnesses
+                .entry(ladder.qualname_at(module_path, it, LadderStage::PostCfg))
+                .or_default()
+                .insert(self_ty_path_witness(&it.self_ty));
+        }
+        ladder.s_fired = fired_groups(witnesses);
+        // Stage-T planning: post-S groups → distinct qualified trait
+        // renderings. Inherent impls contribute none (they never fire T, and
+        // an inherent `impl#<…>` qualname can never group with a trait
+        // `impl[…]` one).
+        let mut renderings: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for it in impl_items(items) {
+            if it.trait_.is_none() {
+                continue;
+            }
+            renderings
+                .entry(ladder.qualname_at(module_path, it, LadderStage::PostS))
+                .or_default()
+                .insert(impl_disc_for_qualified(it).key());
+        }
+        ladder.t_fired = fired_groups(renderings);
+        ladder
+    }
+
+    /// The bare pre-cfg impl qualname (the Amendment-1 twin key): self type
+    /// INCLUDING its concrete generic args (ADR-049 §2 self-type-args
+    /// amendment — `impl Foo<i32>` ≠ `impl Foo<u32>`), last-segment base,
+    /// last-segment trait fragment, no `@cfg`.
+    fn bare_qualname(module_path: &str, it: &ItemImpl) -> String {
+        let type_q = format!(
+            "{module_path}.{}",
+            self_ty_locator(&it.self_ty, &declared_type_params(it))
+        );
+        impl_qualname(&type_q, &impl_disc_for(it))
+    }
+
+    /// The stage-1 `@cfg(...)` suffix, decided on the BARE pre-cfg key
+    /// exactly as before Amendment 6. Applies to ANY cfg-gated twin impl,
+    /// trait OR inherent (`#[cfg(unix)] impl Display for Foo` /
+    /// `#[cfg(windows)] impl Display for Foo` share `Foo.impl[Display]`) —
+    /// do NOT gate on `it.trait_.is_none()`.
+    fn cfg_suffix_for(&self, bare: &str, it: &ItemImpl) -> Option<String> {
+        if self.twin_counts.get(bare).copied().unwrap_or(0) > 1 {
+            cfg_suffix(&it.attrs)
+        } else {
+            None
+        }
+    }
+
+    /// One impl's qualname up to `stage` — the single computation every
+    /// planning pass and every emission consumes, so they cannot diverge.
+    fn qualname_at(&self, module_path: &str, it: &ItemImpl, stage: LadderStage) -> String {
+        let declared = declared_type_params(it);
+        let bare_type_q = format!("{module_path}.{}", self_ty_locator(&it.self_ty, &declared));
+        let bare = impl_qualname(&bare_type_q, &impl_disc_for(it));
+        let cfg = self.cfg_suffix_for(&bare, it);
+        let post_cfg = with_suffix(&bare, cfg.as_deref());
+        if stage == LadderStage::PostCfg {
+            return post_cfg;
+        }
+        // Stage S: re-render the self-type base fully path-qualified. The
+        // @cfg suffix decided above is kept verbatim — S changes the base
+        // only.
+        let type_q = if self.s_fired.contains(&post_cfg) {
+            format!(
+                "{module_path}.{}",
+                self_ty_locator_qualified(&it.self_ty, &declared)
+            )
+        } else {
+            bare_type_q
+        };
+        let post_s = with_suffix(&impl_qualname(&type_q, &impl_disc_for(it)), cfg.as_deref());
+        if stage == LadderStage::PostS {
+            return post_s;
+        }
+        // Stage T: switch the impl[…] fragment to the qualified trait
+        // rendering. `impl_disc_for_qualified` is byte-identical to the base
+        // form for inherent impls and single-segment trait paths.
+        if self.t_fired.contains(&post_s) {
+            with_suffix(
+                &impl_qualname(&type_q, &impl_disc_for_qualified(it)),
+                cfg.as_deref(),
+            )
+        } else {
+            post_s
+        }
+    }
+
+    /// The emitted impl qualname: bare key → @cfg → S → T.
+    fn final_impl_qualname(&self, module_path: &str, it: &ItemImpl) -> String {
+        self.qualname_at(module_path, it, LadderStage::Final)
+    }
+}
+
+/// The group keys whose member set has ≥ 2 distinct entries — a fired ladder
+/// stage. `BTree` in, `BTree` out: deterministic regardless of source order.
+fn fired_groups(
+    groups: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+) -> std::collections::BTreeSet<String> {
+    groups
+        .into_iter()
+        .filter(|(_, members)| members.len() >= 2)
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// Append an optional already-rendered suffix (the `@cfg(...)` discriminant).
+fn with_suffix(q: &str, suffix: Option<&str>) -> String {
+    match suffix {
+        Some(s) => format!("{q}{s}"),
+        None => q.to_owned(),
+    }
+}
+
+// `ladder` is the per-item-list impl-qualname plan; `seen_impl_ids` is
+// threaded so a second same-id block merges (entity emitted once, methods
 // appended). Both are inherent to the merge contract.
 #[allow(clippy::too_many_arguments)]
 fn emit_impl(
@@ -932,7 +1116,7 @@ fn emit_impl(
     module_path: &str,
     module_id: &str,
     file_path: &str,
-    impl_is_cfg_twin: &dyn Fn(&str) -> bool,
+    ladder: &ImplLadder,
     method_is_cfg_twin: &dyn Fn(&str, &str) -> bool,
     seen_impl_ids: &mut std::collections::BTreeSet<String>,
     resolution: Option<(&str, &Resolver)>,
@@ -940,29 +1124,11 @@ fn emit_impl(
     edges: &mut Vec<Value>,
     acc: &mut Phase2Acc,
 ) -> Result<(), syn::Error> {
-    // Type qualname for the impl's self type, INCLUDING its concrete generic
-    // arguments (ADR-049 §2 self-type-args amendment): `impl Foo<i32>` →
-    // `…Foo<i32>` and `impl Foo<u32>` → `…Foo<u32>`, so the two impls get
-    // distinct keys and do NOT spuriously merge in `seen_impl_ids`. Declared
-    // impl type-params (`impl<T> Foo<T>`) render positionally (`$0`), staying
-    // rename-stable. Exotic self types fall back to a textual rendering.
-    let type_q = format!(
-        "{module_path}.{}",
-        self_ty_locator(&it.self_ty, &declared_type_params(it))
-    );
-    let disc = impl_disc_for(it); // ordinal-free (ADR-049 amend, Option b)
-    let mut impl_q = impl_qualname(&type_q, &disc);
-    // cfg-twin discriminant applies to ANY cfg-gated twin impl, trait OR
-    // inherent. `#[cfg(unix)] impl Display for Foo` and
-    // `#[cfg(windows)] impl Display for Foo` share `Foo.impl[Display]` and would
-    // dedup to one entity, silently dropping one `fmt`. `impl_is_cfg_twin` keys
-    // on the FULL pre-cfg `impl_q` (which includes `[Display]`), so it is
-    // correct for trait impls too — do NOT gate on `it.trait_.is_none()`.
-    if impl_is_cfg_twin(&impl_q)
-        && let Some(disc) = cfg_suffix(&it.attrs)
-    {
-        impl_q.push_str(&disc);
-    }
+    // The full ADR-049 impl qualname — bare key → @cfg → stage S → stage T —
+    // comes from the per-item-list ladder plan, the same computation the
+    // method cfg-twin pre-pass consumed, so the two cannot diverge. See
+    // [`ImplLadder`] for the stage semantics.
+    let impl_q = ladder.final_impl_qualname(module_path, it);
     let impl_id = build_id("impl", &impl_q)?;
     // First block with this id → emit the entity + the module->impl edge. A
     // second same-id block (the merge) skips this and only appends methods.
