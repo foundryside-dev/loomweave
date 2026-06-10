@@ -220,9 +220,12 @@ rust:function:loomweave_core.config.Widget.impl#<>.render   # inherent method, c
   holding `src/lib.rs`/`src/main.rs`). Without it, `loomweave_core::config::X`
   and `loomweave_cli::config::X` both collapse to `config.X` and the second
   overwrites the first on the 8-crate dogfood target.
-- **Module path** follows `mod foo;` file boundaries. `#[path=...]` overrides are
-  **deferred** (0 uses in the dogfood corpus); a `#[path]`-relocated module is
-  treated by its default file path until implemented (per ADR-049).
+- **Module path** follows `mod foo;` file boundaries. `#[path=...]`-mounted
+  modules route to their **mounted** logical path (implemented — ADR-049
+  Amendment 8): a targeted mount overlay (exact mounted file + mounted-subtree
+  prefixes, twin mounts split by `@cfg`) with the pure filesystem derivation
+  as the default for every unmounted file. Macro-wrapped mounts are invisible
+  (filesystem fallback); out-of-src targets are ignored.
 
 ### 4.2 `impl` blocks and member methods (closes intra-type collisions)
 
@@ -424,9 +427,10 @@ Phase-1b commits — noted here only to close the loop):**
 - **trait BODY items are NOT walked as entities.** Only the `trait` item itself
   is emitted; trait methods and associated consts/types inside the trait body
   are deferred (the trait-item walk discards the body).
-- **`#[path = "…"]` module-file overrides — deferred** (0 uses in the dogfood
-  corpus). Until implemented, module-path derivation treats a `#[path]`-relocated
-  module by its default file path (per §4.1 / ADR-049).
+- **`#[path = "…"]` module-file overrides — IMPLEMENTED** (ADR-049
+  Amendment 8, post-Phase-1b): module-path derivation consults the `#[path]`
+  mount overlay first and falls back to the default file path for unmounted
+  files (per §4.1).
 - **Host `RLIMIT_STACK`/`RLIMIT_CPU` + `syn` recursion-depth hardening — tracked
   SEPARATELY.** This is a host-hardening item protecting *all* plugins from
   adversarial/pathological inputs, not Rust-specific, and is out of Phase 1b

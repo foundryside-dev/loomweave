@@ -482,36 +482,27 @@ fn analyze_e2e_stored_rust_entity_set_excludes_out_of_src_files() {
     );
 }
 
-/// clarion-6ec7317628 — dual-declared module trees must keep `parent_id` and
-/// `contains` in agreement (ADR-026 dual encoding).
+/// clarion-6ec7317628 / clarion-bdb1eccf48 — the tokio `src/process/` shape,
+/// post ADR-049 Amendment 8.
 ///
-/// Mirrors tokio's `src/process/` shape: `src/lib.rs` mounts the directory
-/// module under a different name via `#[path = "sub/mod.rs"] mod imp;` AND
+/// `src/lib.rs` mounts the directory module under a different name via
+/// `#[path = "sub/mod.rs"] mod imp;` (cfg-twinned with a windows mount) AND
 /// declares an inline `mod sub { pub(crate) use super::imp::*; }` facade.
-/// The plugin derives module paths from file paths (no `#[path]` resolution),
-/// so BOTH files mint the same `rust:module:dualmod.sub` id:
-///   - `src/sub/mod.rs` → the file-level module entity, and
-///   - `src/lib.rs`'s inline `mod sub` → an identically-named nested module.
+/// Pre-Amendment-8 the plugin routed `src/sub/mod.rs` by filesystem to
+/// `dualmod.sub` — the same id the inline facade mints — and the two files
+/// dual-claimed one module (host first-claim-wins resolved it). With the
+/// mount overlay the scenario NO LONGER dual-claims: the module splits into
+///   - `rust:module:dualmod.imp@cfg(unix)` — the mounted file's logical path
+///     (twin `mod imp;` → @cfg split), owned by `src/sub/mod.rs`, and
+///   - `rust:module:dualmod.sub` — the inline facade, owned by `src/lib.rs`.
 ///
-/// Both are `file_scope`, so the host re-parents each emission to ITS OWN
-/// file and emits a `file -> module` contains edge per file — two contains
-/// parents for one entity, with `entities.parent_id` last-write-won. The
-/// writer's ADR-026 dual-encoding check (`LMWV-INFRA-PARENT-CONTAINS-MISMATCH`)
-/// rejects that and fails the run — `loomweave analyze` over tokio dies on
-/// `tokio.process.unix`.
-///
-/// The fix is host-side wiring (first-claim-wins per module id, seeded from
-/// skipped files on incremental runs); entity ids never change. This test is
-/// writer-proven and walks three phases:
-///   1. full analyze → run completes, exactly ONE `file -> module` contains
-///      edge, `parent_id` agrees;
-///   2. touch the NON-owner file only → incremental analyze completes and the
-///      surviving claim still agrees (the seeded-claim path);
-///   3. touch the owner file only → incremental analyze completes and the
-///      re-emitted claim still agrees (the re-claim path).
+/// Writer-proven across three phases (full, touch lib.rs, touch sub/mod.rs):
+/// every phase completes and EACH module keeps exactly one `file -> module`
+/// contains parent that agrees with its `parent_id` (ADR-026 dual encoding).
 #[test]
-fn analyze_e2e_dual_declared_module_keeps_parent_and_contains_in_agreement() {
-    const MODULE_ID: &str = "rust:module:dualmod.sub";
+fn analyze_e2e_path_mounted_module_splits_and_keeps_parent_contains_agreement() {
+    const MOUNTED_ID: &str = "rust:module:dualmod.imp@cfg(unix)";
+    const FACADE_ID: &str = "rust:module:dualmod.sub";
     let plugin_dir = setup_plugin_dir();
     let driver = loomweave_driver_path();
 
@@ -527,6 +518,10 @@ fn analyze_e2e_dual_declared_module_keeps_parent_and_contains_in_agreement() {
         root.join("src/lib.rs"),
         "#[path = \"sub/mod.rs\"]\n\
          #[cfg(unix)]\n\
+         mod imp;\n\
+         \n\
+         #[path = \"sub_win/mod.rs\"]\n\
+         #[cfg(windows)]\n\
          mod imp;\n\
          \n\
          #[cfg(unix)]\n\
@@ -556,8 +551,145 @@ fn analyze_e2e_dual_declared_module_keeps_parent_and_contains_in_agreement() {
     };
 
     let db_path = root.join(".weft/loomweave/loomweave.db");
+    // Writer-proven phase assertion: latest run completed, and EACH of the two
+    // split modules has exactly ONE `file -> module` contains edge — from its
+    // own expected owner — agreeing with its `parent_id` (ADR-026).
+    let assert_consistent = |phase: &str| {
+        let conn = Connection::open(&db_path).expect("open index db");
+        let (run_status, failure_detail): (String, String) = conn
+            .query_row(
+                "SELECT status, COALESCE(stats, '') FROM runs ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query latest run");
+        assert_eq!(
+            run_status, "completed",
+            "[{phase}] run must complete; the split modules must not trip \
+             LMWV-INFRA-PARENT-CONTAINS-MISMATCH. stats: {failure_detail}"
+        );
+        for (module_id, want_owner) in [
+            (MOUNTED_ID, "core:file:src/sub/mod.rs"),
+            (FACADE_ID, "core:file:src/lib.rs"),
+        ] {
+            let contains_parents: Vec<String> = conn
+                .prepare(
+                    "SELECT from_id FROM edges \
+                     WHERE kind = 'contains' AND to_id = ?1 ORDER BY from_id",
+                )
+                .expect("prepare contains query")
+                .query_map([module_id], |row| row.get::<_, String>(0))
+                .expect("query contains parents")
+                .map(|r| r.expect("contains row"))
+                .collect();
+            assert_eq!(
+                contains_parents,
+                vec![want_owner.to_owned()],
+                "[{phase}] {module_id} must have exactly its own file as \
+                 contains parent"
+            );
+            let parent_id: Option<String> = conn
+                .query_row(
+                    "SELECT parent_id FROM entities WHERE id = ?1",
+                    [module_id],
+                    |row| row.get(0),
+                )
+                .expect("query module parent_id");
+            assert_eq!(
+                parent_id.as_deref(),
+                Some(want_owner),
+                "[{phase}] {module_id} parent_id must agree with its contains edge"
+            );
+        }
+    };
+    let append = |path: &Path, line: &str| {
+        let mut src = fs::read_to_string(path).expect("read source");
+        src.push_str(line);
+        fs::write(path, src).expect("append source");
+    };
+
+    // ── Phase 1: full analyze → the module SPLITS, both halves consistent ───
+    run_analyze("full");
+    assert_consistent("full");
+
+    // ── Phase 2: change ONLY lib.rs (mounted file skipped) ──────────────────
+    append(&root.join("src/lib.rs"), "// incremental touch: lib\n");
+    run_analyze("incremental lib");
+    assert_consistent("incremental lib");
+
+    // ── Phase 3: change ONLY the mounted file (lib.rs skipped) ──────────────
+    append(
+        &root.join("src/sub/mod.rs"),
+        "// incremental touch: mounted\n",
+    );
+    run_analyze("incremental mounted");
+    assert_consistent("incremental mounted");
+}
+
+/// The host first-claim-wins machinery (loomweave-cli `analyze.rs`) MUST stay
+/// covered end-to-end after Amendment 8: same-NAME, same-CFG twin mounts are
+/// the residual dual-claim shape the overlay cannot split (the @cfg
+/// discriminant is identical for both, so two FILES still mint one
+/// `rust:module:` id). Writer-proven three-phase walk, ported from the
+/// pre-Amendment-8 dual-claim test:
+///   1. full analyze → run completes, exactly ONE `file -> module` contains
+///      edge, `parent_id` agrees;
+///   2. touch the NON-owner file only → the seeded-claim path;
+///   3. touch the owner file only → the re-claim path.
+#[test]
+fn analyze_e2e_same_name_same_cfg_twin_mounts_still_dual_claim() {
+    const MODULE_ID: &str = "rust:module:dualclaim.m@cfg(unix)";
+    let plugin_dir = setup_plugin_dir();
+    let driver = loomweave_driver_path();
+
+    let project = TempDir::new().expect("create project tempdir");
+    let root = project.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"dualclaim\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+    // Two `mod m;` twins with the SAME cfg: both mounts append the identical
+    // @cfg(unix) suffix, so x_impl.rs and y_impl.rs both route to
+    // `dualclaim.m@cfg(unix)` — a genuine two-file dual-claim (rustc would
+    // reject the pair under cfg(unix), but the all-cfg-visible policy parses
+    // both).
+    fs::write(
+        root.join("src/lib.rs"),
+        "#[cfg(unix)]\n\
+         #[path = \"x_impl.rs\"]\n\
+         mod m;\n\
+         \n\
+         #[cfg(unix)]\n\
+         #[path = \"y_impl.rs\"]\n\
+         mod m;\n",
+    )
+    .expect("write lib.rs");
+    fs::write(root.join("src/x_impl.rs"), "pub(crate) fn x() {}\n").expect("write x_impl.rs");
+    fs::write(root.join("src/y_impl.rs"), "pub(crate) fn y() {}\n").expect("write y_impl.rs");
+
+    let install = std::process::Command::new(&driver)
+        .args(["install", "--path"])
+        .arg(root)
+        .status()
+        .expect("spawn loomweave install");
+    assert!(install.success(), "loomweave install must succeed");
+
+    let synthetic_path =
+        env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).expect("join_paths");
+    let run_analyze = |phase: &str| {
+        let _ = std::process::Command::new(&driver)
+            .args(["analyze"])
+            .arg(root)
+            .env("PATH", &synthetic_path)
+            .status()
+            .unwrap_or_else(|e| panic!("spawn loomweave analyze ({phase}): {e}"));
+    };
+
+    let db_path = root.join(".weft/loomweave/loomweave.db");
     // Writer-proven phase assertion: latest run completed, exactly ONE
-    // `file -> module` contains edge to the dual-declared module, and the
+    // `file -> module` contains edge to the dual-claimed module, and the
     // module's `parent_id` equals that edge's `from_id` (ADR-026 agreement).
     // Returns the owning core file id.
     let assert_consistent = |phase: &str| -> String {
@@ -571,7 +703,7 @@ fn analyze_e2e_dual_declared_module_keeps_parent_and_contains_in_agreement() {
             .expect("query latest run");
         assert_eq!(
             run_status, "completed",
-            "[{phase}] run must complete; dual-declared module must not trip \
+            "[{phase}] run must complete; the dual-claimed module must not trip \
              LMWV-INFRA-PARENT-CONTAINS-MISMATCH. stats: {failure_detail}"
         );
         let contains_parents: Vec<String> = conn
@@ -587,7 +719,7 @@ fn analyze_e2e_dual_declared_module_keeps_parent_and_contains_in_agreement() {
             contains_parents.len(),
             1,
             "[{phase}] exactly one `file -> module` contains edge may exist for \
-             the dual-declared module; got {contains_parents:#?}"
+             the dual-claimed module; got {contains_parents:#?}"
         );
         let parent_id: Option<String> = conn
             .query_row(
@@ -613,14 +745,14 @@ fn analyze_e2e_dual_declared_module_keeps_parent_and_contains_in_agreement() {
     let owner_rel = owner_file_id
         .strip_prefix("core:file:")
         .unwrap_or_else(|| panic!("unexpected owner file id shape: {owner_file_id}"));
-    let (owner_path, non_owner_path) = if owner_rel == "src/lib.rs" {
-        (root.join("src/lib.rs"), root.join("src/sub/mod.rs"))
+    let (owner_path, non_owner_path) = if owner_rel == "src/x_impl.rs" {
+        (root.join("src/x_impl.rs"), root.join("src/y_impl.rs"))
     } else {
         assert_eq!(
-            owner_rel, "src/sub/mod.rs",
+            owner_rel, "src/y_impl.rs",
             "owner must be one of the two emitters"
         );
-        (root.join("src/sub/mod.rs"), root.join("src/lib.rs"))
+        (root.join("src/y_impl.rs"), root.join("src/x_impl.rs"))
     };
     let append = |path: &Path, line: &str| {
         let mut src = fs::read_to_string(path).expect("read source");

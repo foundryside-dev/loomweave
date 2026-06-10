@@ -49,6 +49,65 @@ fn renaming_a_generic_param_is_a_noop_for_inherent_impl_ids() {
     assert_eq!(mt, mu);
 }
 
+/// ADR-049 Amendment 8 benign-edit stability: adding (or removing) an
+/// UNRELATED `#[path]` mount must not churn any other entity's id — the mount
+/// overlay is targeted, so files no mount covers keep their byte-identical
+/// filesystem route.
+#[test]
+fn adding_an_unrelated_path_mount_churns_no_other_entity_id() {
+    use loomweave_plugin_rust::symbol_table::build_symbol_table;
+
+    let write_base = |root: &std::path::Path| {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"w\"\n").unwrap();
+        std::fs::write(root.join("src/alpha.rs"), "pub fn a() {}\n").unwrap();
+    };
+    let before_dir = tempfile::tempdir().unwrap();
+    write_base(before_dir.path());
+    std::fs::write(
+        before_dir.path().join("src/lib.rs"),
+        "mod alpha;\npub fn top() {}\n",
+    )
+    .unwrap();
+    let after_dir = tempfile::tempdir().unwrap();
+    write_base(after_dir.path());
+    std::fs::write(
+        after_dir.path().join("src/lib.rs"),
+        "mod alpha;\npub fn top() {}\n#[path = \"extra_impl.rs\"]\nmod extra;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        after_dir.path().join("src/extra_impl.rs"),
+        "pub fn e() {}\n",
+    )
+    .unwrap();
+
+    let before: BTreeSet<String> = build_symbol_table(before_dir.path())
+        .iter_ids()
+        .map(ToOwned::to_owned)
+        .collect();
+    let after: BTreeSet<String> = build_symbol_table(after_dir.path())
+        .iter_ids()
+        .map(ToOwned::to_owned)
+        .collect();
+    assert!(
+        before.is_subset(&after),
+        "adding an unrelated #[path] mount churned pre-existing ids: {:?}",
+        &before - &after
+    );
+    let added: BTreeSet<String> = (&after - &before).into_iter().collect();
+    let want_added: BTreeSet<String> = [
+        "rust:module:w.extra".to_owned(),
+        "rust:function:w.extra.e".to_owned(),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        added, want_added,
+        "exactly the mounted module and its item may be added"
+    );
+}
+
 // --- ADR-049 Amendments 6/7 negative controls (byte-pins). The residual-
 // collision ladder (@cfg on bare keys → S on post-cfg groups → T on post-S
 // groups → method-@cfg on final keys) qualifies a written path ONLY inside a

@@ -10,8 +10,10 @@
 //! copy and reproduces them from its tree-sitter frontend. A divergence here
 //! means the dialect drifted — fix the extractor or the fixture, never silently.
 
+use loomweave_plugin_rust::crate_roots::discover_crate_roots;
 use loomweave_plugin_rust::extract::extract_file;
-use loomweave_plugin_rust::module_path::module_path_for;
+use loomweave_plugin_rust::module_path::{logical_module_path, module_path_for};
+use loomweave_plugin_rust::mounts::discover_mounts;
 use serde_json::Value;
 use std::path::Path;
 
@@ -58,7 +60,8 @@ fn module_routes_match_byte_for_byte() {
     let routes = doc["module_route"].as_array().unwrap();
     assert!(
         routes.len() >= 6,
-        "corpus must carry the route cases incl. lib/main/mod.rs + #[path] gap"
+        "corpus must carry the route cases incl. lib/main/mod.rs + the \
+         #[path] no-mount-context fallback pin"
     );
     for route in routes {
         let got = module_path_for(
@@ -72,6 +75,51 @@ fn module_routes_match_byte_for_byte() {
             "module_route case: {}",
             route["name"]
         );
+    }
+}
+
+/// ADR-049 Amendment 8: `#[path]`-mounted module routing. Each `module_mounts`
+/// row materialises a real crate in a tempdir (Cargo.toml synthesised from the
+/// row's `crate`), runs the actual mount discovery, and asserts the
+/// mount-aware route of every `expect` file BYTE-FOR-BYTE. Like the other
+/// sections, the expected values are extractor-generated and Wardline must
+/// reproduce them (sp2).
+#[test]
+fn module_mounts_route_byte_for_byte() {
+    let doc = corpus();
+    let rows = doc["module_mounts"].as_array().unwrap();
+    assert!(
+        rows.len() >= 5,
+        "corpus must carry the Amendment-8 mount families (twin dir-module, \
+         child prefix, chain, macro-invisible, inline-nested decl); found {}",
+        rows.len()
+    );
+    for row in rows {
+        let name = row["name"].as_str().unwrap();
+        let crate_name = row["crate"].as_str().unwrap();
+        let tmp = tempfile::tempdir().expect("create row tempdir");
+        let root = tmp.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            format!("[package]\nname = \"{crate_name}\"\n"),
+        )
+        .expect("write Cargo.toml");
+        for (rel, source) in row["files"].as_object().unwrap() {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).expect("create file parents");
+            std::fs::write(&path, source.as_str().unwrap()).expect("write row file");
+        }
+        let roots = discover_crate_roots(root);
+        let mounts = discover_mounts(root, &roots);
+        let src_root = root.join("src");
+        for (rel, want) in row["expect"].as_object().unwrap() {
+            let got = logical_module_path(crate_name, &src_root, &root.join(rel), &mounts);
+            assert_eq!(
+                got,
+                want.as_str().unwrap(),
+                "module_mounts case {name}: file {rel}"
+            );
+        }
     }
 }
 

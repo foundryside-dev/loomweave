@@ -132,14 +132,44 @@ categorisation tags, so a pure-Rust index has no data to populate them
 `entity_callers_list`, `entity_neighborhood_get`, and the edge surfaces) are
 unaffected.
 
-## Unnamed `const _` items can still collide
+## Unnamed `const _` items are not entities
 
-**What you see.** Multiple `const _: T = …;` items in the **same** module — the
-deliberately-unnamed const idiom — can still collide on identity, because they
-share an effectively empty qualified name within that module.
+**What you see.** A `const _: T = …;` item — the deliberately-unnamed
+compile-time-assertion idiom — does not appear in the graph at all: no entity,
+no `contains` edge, no `references` edges from its type or initializer.
 
-**Why.** This is a sibling of the `#[cfg]`-twin-method collision: distinct items
-that resolve to the same qualified name need ordinal disambiguation, and the
-unnamed-const case is not yet covered. It is **tracked** as a follow-up, not a
-silent corruption — when it bites, two source items map to one entity. Named
-items are unaffected.
+**Why.** `_` is non-identifying by construction: the item is un-nameable, so
+nothing (a `use`, a path expression, an issue binding) can ever target it, and
+no discriminant could give repeated `const _` twins stable distinct identities
+without churning every sibling on edit. ADR-049 Amendment 9 therefore skips
+them entirely — deliberately absent, not lost. Named consts are unaffected.
+
+## `#[path]`-mounted modules carry their mount name
+
+**What you see.** A file mounted via `#[path = "…"] mod name;` is indexed under
+its **mounted** logical path, not its on-disk path. In the common
+platform-backend idiom (tokio's `src/process/`):
+
+| Source | Indexed module |
+|---|---|
+| `#[cfg(unix)] #[path = "unix/mod.rs"] mod imp;` → `unix/mod.rs` | `tokio.process.imp@cfg(unix)` |
+| `#[cfg(windows)] #[path = "windows/mod.rs"] mod imp;` → `windows/mod.rs` | `tokio.process.imp@cfg(windows)` |
+| inline facade `pub(crate) mod unix { use super::imp::*; }` | `tokio.process.unix` |
+
+So the *implementation* module answers to the mount name the source actually
+declares (`…imp@cfg(unix)` — the `@cfg(...)` suffix appears only when two
+same-name mounts coexist), while the *public facade* keeps the public name
+(`…unix`). If you search for the public name you find the facade; the
+implementation entities live under the mount name. Files under a mounted
+directory re-key with it (`process/unix/orphan.rs` →
+`tokio.process.imp@cfg(unix).orphan`).
+
+**Why.** ADR-049 Amendment 8: routing mounted files by their on-disk path made
+two source modules collide on one identity (the mounted file and its inline
+facade), which was silent data loss. The mounted path is what rustc actually
+compiles, so it is the honest identity. Two edges of the rule worth knowing:
+a `#[path]` inside an unexpanded macro invocation is invisible (the file
+routes by its on-disk path), and a mount whose target lies outside the crate's
+`src/` tree is ignored. A `use`-path that names a cfg-twin mount resolves as
+external (the `@cfg` suffix is not spellable in a `use`), so such import edges
+are absent — the same pre-existing behaviour as for any cfg-twin entity.

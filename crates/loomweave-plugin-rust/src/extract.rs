@@ -461,11 +461,15 @@ fn walk_items(
         let key = match item {
             Item::Fn(ItemFn { sig, .. }) => Some(("function", sig.ident.to_string())),
             Item::Struct(ItemStruct { ident, .. }) => Some(("struct", ident.to_string())),
-            Item::Mod(ItemMod {
-                ident,
-                content: Some(_),
-                ..
-            }) => Some(("module", ident.to_string())),
+            // BOTH module forms count (ADR-049 Amendment 8, the extract-side
+            // symmetric half): an inline `mod n { … }` AND a declaration
+            // `mod n;` (file-backed, possibly `#[path]`-mounted). A decl mod
+            // never emits an entity in this walk — its file emits its own
+            // module — but it must still make an identically-named inline
+            // sibling a cfg twin, or the inline emission collides with the
+            // file-backed module's id (`#[cfg(a)] mod m;` + `#[cfg(b)] mod
+            // m { … }`: the inline must emit `…m@cfg(b)`).
+            Item::Mod(ItemMod { ident, .. }) => Some(("module", ident.to_string())),
             Item::Enum(ItemEnum { ident, .. }) => Some(("enum", ident.to_string())),
             Item::Trait(ItemTrait { ident, .. }) => Some(("trait", ident.to_string())),
             Item::Type(ItemType { ident, .. }) => Some(("type_alias", ident.to_string())),
@@ -1364,8 +1368,11 @@ fn cfg_predicates(attrs: &[syn::Attribute]) -> Vec<String> {
 
 /// The folded `@cfg(...)` discriminant suffix for an item, or `None` when the
 /// item carries no `#[cfg(...)]`. Folds EVERY cfg (FINDING #5) and escapes
-/// reserved entity-id chars (FINDING #6) via [`cfg_discriminant`].
-fn cfg_suffix(attrs: &[syn::Attribute]) -> Option<String> {
+/// reserved entity-id chars (FINDING #6) via [`cfg_discriminant`]. Shared
+/// with `mounts` (Amendment 8): a twin `#[path]` mount appends exactly this
+/// suffix, so the mounted file's module id and an inline twin's id use one
+/// rendering.
+pub(crate) fn cfg_suffix(attrs: &[syn::Attribute]) -> Option<String> {
     let preds = cfg_predicates(attrs);
     if preds.is_empty() {
         None
@@ -1447,6 +1454,28 @@ mod tests {
         let got = ids(&out);
         assert!(got.iter().any(|id| id.contains("Foo.impl[Display].fmt")));
         assert!(got.iter().any(|id| id.contains("Foo.impl[Debug].fmt")));
+    }
+
+    /// ADR-049 Amendment 8 (the extract-side symmetric half): an inline mod
+    /// sharing its name with a file-backed `mod n;` declaration is a cfg twin
+    /// — the decl form now counts toward module twin-ness, so the inline
+    /// sibling carries its own `@cfg(...)` suffix. (The mounted FILE's
+    /// `@cfg(a)` path is the mounts overlay's job; in tokio this arm changes
+    /// nothing since the mount name `imp` ≠ the facade name `unix`.)
+    #[test]
+    fn inline_mod_twinned_with_a_decl_mod_gets_its_cfg_suffix() {
+        let src = "#[path = \"x.rs\"]\n#[cfg(a)]\nmod m;\n\
+                   #[cfg(b)]\nmod m {\n    pub fn f() {}\n}\n";
+        let out = extract_file("k", "k.host", "/p/src/host.rs", src).unwrap();
+        let got = ids(&out);
+        assert!(
+            got.contains(&"rust:module:k.host.m@cfg(b)".to_owned()),
+            "inline twin must carry its @cfg suffix: {got:?}"
+        );
+        assert!(
+            !got.contains(&"rust:module:k.host.m".to_owned()),
+            "the bare path would collide with the file-backed twin: {got:?}"
+        );
     }
 
     #[test]

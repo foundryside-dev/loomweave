@@ -8,8 +8,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::crate_roots::discover_crate_roots;
+use crate::crate_roots::{CrateRoots, discover_crate_roots};
 use crate::extract::extract_file;
+use crate::mounts::{ModMounts, discover_mounts};
 use crate::scope::emittable_scope;
 
 /// A project-wide map from every declared entity id to its qualified name,
@@ -80,6 +81,23 @@ impl SymbolTable {
 #[must_use]
 pub fn build_symbol_table(project_root: &Path) -> SymbolTable {
     let roots = discover_crate_roots(project_root);
+    // `#[path]` mounts MUST be discovered before any module path is derived
+    // (ADR-049 Amendment 8): the table's qualnames have to be mount-correct or
+    // use-resolution desyncs from `analyze_file`'s emissions.
+    let mounts = discover_mounts(project_root, &roots);
+    build_symbol_table_with(project_root, &roots, &mounts)
+}
+
+/// [`build_symbol_table`] with caller-supplied crate roots and `#[path]`
+/// mounts. The serve loop uses this so the SAME `ModMounts` instance feeds
+/// both the init-time table build and every later `analyze_file` scope
+/// derivation — building them separately could let the two routes diverge.
+#[must_use]
+pub fn build_symbol_table_with(
+    project_root: &Path,
+    roots: &CrateRoots,
+    mounts: &ModMounts,
+) -> SymbolTable {
     let mut by_id: BTreeMap<String, String> = BTreeMap::new();
     let mut by_qualname: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut duplicates = Vec::new();
@@ -89,7 +107,7 @@ pub fn build_symbol_table(project_root: &Path) -> SymbolTable {
         // a file outside the library/binary crate the ADR-049 qualname scheme
         // names contributes nothing rather than minting a colliding
         // `rust:module:<crate>` locator.
-        let Some((crate_name, module_path)) = emittable_scope(&roots, &file) else {
+        let Some((crate_name, module_path)) = emittable_scope(roots, &file, mounts) else {
             continue;
         };
         // Pre-parse guards (ADR-050): an oversize file is skipped WITHOUT
@@ -135,8 +153,10 @@ pub fn build_symbol_table(project_root: &Path) -> SymbolTable {
 }
 
 /// Recursively collect every `.rs` file under `root`, skipping vendored /
-/// build / store directories the host also skips.
-fn walk_rs_files(root: &Path) -> Vec<PathBuf> {
+/// build / store directories the host also skips. Shared with
+/// [`discover_mounts`] so mount discovery sees exactly the file set the table
+/// build does (same symlink rules, same ignored dirs).
+pub(crate) fn walk_rs_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     walk(root, &mut out);
     out
@@ -271,6 +291,50 @@ mod tests {
         assert_eq!(table.duplicate_ids(), Vec::<String>::new());
         assert!(table.contains_id("rust:module:c_crate"));
         assert!(table.contains_id("rust:function:c_crate.run_it"));
+    }
+
+    #[test]
+    fn path_mounted_module_splits_from_its_inline_facade() {
+        // ADR-049 Amendment 8 minimal repro (clarion-bdb1eccf48), the tokio
+        // `src/process` shape: `unix/mod.rs` is mounted as `mod imp;`
+        // (cfg-twinned with a windows mount) and an inline facade
+        // `mod unix { … }` re-exports it. Pre-amendment, the file walk routed
+        // unix/mod.rs by filesystem to `foo.unix` — the same id the inline
+        // facade mints — and the duplicate either silently merged or FailRan
+        // the writer. Post-amendment the mounted file routes to its logical
+        // path `foo.imp@cfg(unix)` (twin mount → @cfg split) and the facade
+        // keeps `foo.unix`.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("c/src/unix")).unwrap();
+        fs::write(root.join("c/Cargo.toml"), "[package]\nname=\"foo\"\n").unwrap();
+        fs::write(
+            root.join("c/src/lib.rs"),
+            "#[cfg(unix)]\n#[path = \"unix/mod.rs\"]\nmod imp;\n\
+             #[cfg(windows)]\n#[path = \"windows/mod.rs\"]\nmod imp;\n\
+             #[cfg(unix)]\npub(crate) mod unix {\n    pub(crate) use super::imp::*;\n}\n",
+        )
+        .unwrap();
+        fs::write(root.join("c/src/unix/mod.rs"), "pub(crate) fn spawn() {}\n").unwrap();
+
+        let table = build_symbol_table(root);
+        assert_eq!(
+            table.duplicate_ids(),
+            Vec::<String>::new(),
+            "mounted module and its inline facade must not collide"
+        );
+        assert!(
+            table.contains_id("rust:module:foo.imp@cfg(unix)"),
+            "mounted file must route to its logical (twin-cfg-split) path"
+        );
+        assert!(
+            table.contains_id("rust:module:foo.unix"),
+            "the inline facade keeps the public name"
+        );
+        assert!(
+            table.contains_id("rust:function:foo.imp@cfg(unix).spawn"),
+            "items in the mounted file ride the mounted module path"
+        );
     }
 
     #[cfg(unix)]

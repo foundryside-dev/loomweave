@@ -5,6 +5,7 @@ pub mod derives;
 pub mod edges;
 pub mod extract;
 pub mod module_path;
+pub mod mounts;
 pub mod parse_guard;
 pub mod qualname;
 pub mod references;

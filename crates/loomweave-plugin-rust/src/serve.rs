@@ -27,6 +27,7 @@ use loomweave_core::plugin::{
 use serde_json::Value;
 
 use crate::crate_roots::CrateRoots;
+use crate::mounts::ModMounts;
 use crate::references::ReferenceStats;
 use crate::symbol_table::SymbolTable;
 
@@ -55,6 +56,10 @@ pub fn run() -> ! {
     // in-project `use` paths into `imports` edges (Task 7). Mirrors
     // `crate_roots`: stashed here, threaded into `analyze_one_file`.
     let mut symbol_table: Option<SymbolTable> = None;
+    // `#[path]` mount overlay (ADR-049 Amendment 8), discovered at `initialize`
+    // BEFORE the symbol table is built and threaded into both the table build
+    // and every `analyze_file` scope derivation — see the ordering note below.
+    let mut mod_mounts: Option<ModMounts> = None;
 
     loop {
         let Ok(frame) = read_frame(&mut reader, ContentLengthCeiling::DEFAULT) else {
@@ -100,10 +105,23 @@ pub fn run() -> ! {
                     // `Resolver` over it to resolve each file's in-project `use`
                     // paths into `imports` edges (Phase 1b). It also powers the
                     // dogfood gate (Task 14).
+                    //
+                    // ORDERING IS LOAD-BEARING (ADR-049 Amendment 8): the
+                    // `#[path]` mount overlay is discovered FIRST and the SAME
+                    // instance feeds both the symbol-table build and every
+                    // later `analyze_file` scope derivation. If the table were
+                    // built mount-blind, its qualnames would desync from the
+                    // mount-correct paths `analyze_file` emits and `use`
+                    // resolution would anchor edges at ids that never exist.
                     project_root = params.project_root;
                     let root = std::path::Path::new(&project_root);
-                    symbol_table = Some(crate::symbol_table::build_symbol_table(root));
-                    crate_roots = Some(crate::crate_roots::discover_crate_roots(root));
+                    let roots = crate::crate_roots::discover_crate_roots(root);
+                    let mounts = crate::mounts::discover_mounts(root, &roots);
+                    symbol_table = Some(crate::symbol_table::build_symbol_table_with(
+                        root, &roots, &mounts,
+                    ));
+                    crate_roots = Some(roots);
+                    mod_mounts = Some(mounts);
                 }
                 let _ = &project_root;
                 let result = InitializeResult {
@@ -127,6 +145,7 @@ pub fn run() -> ! {
                     analyze_one_file(
                         &params.file_path,
                         crate_roots.as_ref(),
+                        mod_mounts.as_ref(),
                         symbol_table.as_ref(),
                     );
                 let result = AnalyzeFileResult {
@@ -193,6 +212,7 @@ pub fn run() -> ! {
 fn analyze_one_file(
     file_path: &str,
     crate_roots: Option<&CrateRoots>,
+    mod_mounts: Option<&ModMounts>,
     symbol_table: Option<&SymbolTable>,
 ) -> (
     Vec<Value>,
@@ -213,8 +233,12 @@ fn analyze_one_file(
 
     // Out-of-scope files (out of any crate's `src/` tree, a redundant `main.rs`,
     // or outside any known crate root) emit NOTHING — see the doc comment above.
-    let Some((crate_name, module_path)) =
-        crate_roots.and_then(|roots| emittable_scope(roots, file))
+    // Module-path derivation is `#[path]`-mount-aware (Amendment 8); a missing
+    // overlay (defensive — every real `initialize` builds one) degrades to the
+    // pure filesystem route via an empty overlay.
+    let empty_mounts = ModMounts::empty();
+    let Some((crate_name, module_path)) = crate_roots
+        .and_then(|roots| emittable_scope(roots, file, mod_mounts.unwrap_or(&empty_mounts)))
     else {
         return (
             Vec::new(),
