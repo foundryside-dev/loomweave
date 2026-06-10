@@ -808,6 +808,31 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         let scanned_files_clone = Arc::clone(&scanned_files);
         let progress_clone = Arc::clone(&progress);
 
+        // Seed the dual-declaration claim set with the file_scope (module)
+        // entity ids anchored in this plugin's SKIPPED files. A module id can
+        // legitimately be emitted by more than one file (clarion-6ec7317628:
+        // tokio's inline `pub(crate) mod unix {}` facade in `process/mod.rs`
+        // colliding with the path-derived module of `process/unix/mod.rs`).
+        // The first emitter claims the `file -> module` contains edge and the
+        // matching `parent_id` (ADR-026 dual encoding); later emitters are
+        // suppressed. On an incremental run the claim owner may be a SKIPPED
+        // file whose stored edge survives untouched — seeding its module ids
+        // here keeps a re-analyzed duplicate emitter from minting a second
+        // contains parent against the surviving one. The owner==anchor
+        // invariant holds because the claiming emission is the only one whose
+        // entity record is stored, so a skipped file's locator list names
+        // exactly the modules it owns. Full runs seed empty.
+        let claim_kind_roles = PluginKindRoles::from_manifest(&plugin.manifest);
+        let prior_file_scope_claims: BTreeSet<String> = skipped_file_entity_ids
+            .iter()
+            .filter(|id| {
+                id.split(':')
+                    .nth(1)
+                    .is_some_and(|kind| claim_kind_roles.is_file_scope(kind))
+            })
+            .cloned()
+            .collect();
+
         let (batch_tx, mut batch_rx) =
             tokio::sync::mpsc::channel(PLUGIN_FILE_BATCH_CHANNEL_CAPACITY);
         let join_handle = tokio::task::spawn_blocking(move || {
@@ -823,6 +848,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 handshake_timeout,
                 file_timeout,
                 shutdown_timeout,
+                prior_file_scope_claims,
                 &batch_tx,
             )
         });
@@ -4424,6 +4450,7 @@ fn run_plugin_blocking(
     handshake_timeout: std::time::Duration,
     file_timeout: std::time::Duration,
     shutdown_timeout: std::time::Duration,
+    prior_file_scope_claims: BTreeSet<String>,
     batch_tx: &tokio::sync::mpsc::Sender<PluginBatchMessage>,
 ) -> Result<BatchResult, PluginRunError> {
     use loomweave_core::PluginHost;
@@ -4515,6 +4542,17 @@ fn run_plugin_blocking(
     let mut dispatch_findings: Vec<HostFinding> = Vec::new();
     let work_result: Result<(), String> = (|| {
         let mut file_scope_entity_ids: BTreeSet<String> = BTreeSet::new();
+        // Dual-declaration claims (clarion-6ec7317628): a file_scope (module)
+        // entity id may be emitted by MORE THAN ONE file — e.g. an inline
+        // `mod sub { ... }` facade in one file colliding with the path-derived
+        // module of `sub/mod.rs`. ADR-026's dual encoding allows exactly ONE
+        // `file -> module` contains parent per entity, so the FIRST emitter
+        // claims it (record + parent_id + contains edge); later emitters are
+        // suppressed entirely, keeping the entity anchored at — and parented
+        // to — its claim owner. Pre-seeded with module ids owned by this
+        // plugin's skipped-unchanged files, whose stored claim survives this
+        // run untouched.
+        let mut file_scope_claims: BTreeSet<String> = prior_file_scope_claims;
         // Every stored in-project entity id (any kind), accumulated across all
         // files so the deferred import-filter can retain edges whose target is a
         // non-module item — function / struct / const / trait (clarion-d1e3dc67dc).
@@ -4580,6 +4618,25 @@ fn run_plugin_blocking(
             file_entities.push((file_entity_id.clone(), file_record));
             for entity in &entities {
                 let id_str = entity.id.to_string();
+                // First-claim-wins for file_scope entities: a duplicate
+                // emission of an already-claimed module id (dual declaration,
+                // clarion-6ec7317628) is dropped wholesale — no record, no
+                // signature, no second `file -> module` contains edge — so the
+                // claim owner's `parent_id` keeps agreeing with the single
+                // stored contains edge (ADR-026). The id is already in the
+                // claim owner's batch (or survives from a skipped file), so
+                // edges referencing it still drain through the seen-set gate.
+                if kind_roles.is_file_scope(&entity.kind)
+                    && !file_scope_claims.insert(id_str.clone())
+                {
+                    tracing::debug!(
+                        plugin_id = %plugin_id,
+                        entity_id = %id_str,
+                        file = %dispatch_file.display(),
+                        "suppressing duplicate file_scope emission; first claim wins",
+                    );
+                    continue;
+                }
                 // Capture the plugin-declared SEI signature (ADR-038 REQ-C-01),
                 // canonicalised for stable string-equality comparison. The core
                 // never interprets the JSON — it only re-serialises the value.
