@@ -476,6 +476,18 @@
         {"qualname": "demo.m.Foo.impl#<>.go@cfg(unix)", "kind": "function"},
         {"qualname": "demo.m.Foo.impl#<>.go@cfg(windows)", "kind": "function"}
       ]
+    },
+    {
+      "name": "reference_self_type_path_escape",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 4 (self-type fallback completion, clarion-8245039f6b): a non-Type::Path self type (here a reference) that carries a ::-path falls through self_ty_locator's type_textual fallback. Without escaping it leaks a raw ':' and build_entity_id rejects the id, degrading the whole file (the serde ser/fmt.rs `impl Serializer for &mut fmt::Formatter` drop). The fallback now routes through the same escape_reserved(strip_ws(..)) pipeline as concrete generic args, so &core::cell::Cell<u8> renders &core%3A%3Acell%3A%3ACell<u8>. A ':'-free reference (&Foo) is unchanged (escape is a no-op).",
+      "source": "impl Tr for &core::cell::Cell<u8> { fn ok(&self) {} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.&core%3A%3Acell%3A%3ACell<u8>.impl[Tr]", "kind": "impl"},
+        {"qualname": "demo.m.&core%3A%3Acell%3A%3ACell<u8>.impl[Tr].ok", "kind": "function"}
+      ]
     }
   ]
 }

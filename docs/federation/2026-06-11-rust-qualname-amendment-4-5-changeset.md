@@ -6,7 +6,7 @@
 **Re:** Two qualname-dialect amendments now **implemented and landed** in `crates/loomweave-plugin-rust` (Sprint-4 gold closeout). Wardline's second-producer frontend and its vendored corpus must mirror both.
 **Status:** **HANDOFF — action required on Wardline's side, but NOT pushed by Loomweave.** Wardline's Rust frontend has graduated to its `rc5` release branch; per cross-repo discipline Loomweave does **not** commit dialect changes into a sibling's release branch. This letter + the re-vendorable corpus blob is the handoff. The Loomweave owner will surface it for scheduling.
 **Authority:** Loomweave remains the authoritative producer for the Rust dialect (**ADR-049**, amended 2026-06-10 and 2026-06-11). The corpus `expected` values are generated from the live extractor, never hand-authored; where this document and your frontend diverge, **Loomweave's emitted form is normative and Wardline conforms.**
-**Corpus blob:** `fixtures/qualnames_rust.json` now carries **34 entity rows** (md5 `7969aad48c0882b64c843cb851b3b942`), up from 28. Re-vendor verbatim to `tests/conformance/qualnames_rust.json`.
+**Corpus blob:** `fixtures/qualnames_rust.json` now carries **35 entity rows** (md5 `bf8d09968b5d366a8bd033710d736744`), up from 28. Re-vendor verbatim to `tests/conformance/qualnames_rust.json`.
 **Version:** No `ontology_version` bump — neither amendment adds an entity kind or edge kind; both refine the qualname *string* of existing `impl`/`function` kinds.
 
 ---
@@ -46,9 +46,11 @@ Worked examples (now pinned in the corpus):
 
 **Rejected alternatives** (do not implement): last-segment truncation (re-opens `io::Error` ↔ `fmt::Error` collision), degrade-whole-file, Wardline-only normalization.
 
-**New corpus rows:** `path_typed_generic_arg_trait`, `path_typed_generic_arg_inherent`, `const_generic_arg_spacing`.
+**Self-type fallback (completion).** The escape must ALSO cover a **non-`Type::Path` self type** (reference / tuple / slice / raw pointer) that carries a `::`-path: `impl Serializer for &mut fmt::Formatter` renders `&mutfmt%3A%3AFormatter`, not the raw-colon form that drops the file. A `:`-free fallback (`&Foo`, `(A,B)`) is unchanged. (This was the 38th dropped file in the Sprint-3 sweep, mis-attributed to concrete generic args.)
 
-**Wardline action:** apply `escape_reserved(strip_ws(arg))` at every concrete-generic-arg render site in the tree-sitter frontend (trait fragment + self-type prefix, type + const args). Do **not** relax your id-validator's `:` rejection — the escape happens in the producer, before the id is assembled.
+**New corpus rows:** `path_typed_generic_arg_trait`, `path_typed_generic_arg_inherent`, `const_generic_arg_spacing`, `reference_self_type_path_escape`.
+
+**Wardline action:** apply `escape_reserved(strip_ws(arg))` at every concrete-generic-arg render site AND every non-`Type::Path` self-type fallback in the tree-sitter frontend (trait fragment + self-type prefix, type + const args, reference/tuple/slice/ptr self types). Do **not** relax your id-validator's `:` rejection — the escape happens in the producer, before the id is assembled.
 
 ---
 
@@ -82,7 +84,7 @@ The `@cfg(<pred>)` predicate uses the **same normalization** as the impl/free-it
 
 ## 4. What Wardline must do (checklist)
 
-1. **Re-vendor** `fixtures/qualnames_rust.json` (md5 `7969aad48c0882b64c843cb851b3b942`, 34 rows) → `tests/conformance/qualnames_rust.json`, verbatim.
+1. **Re-vendor** `fixtures/qualnames_rust.json` (md5 `bf8d09968b5d366a8bd033710d736744`, 35 rows) → `tests/conformance/qualnames_rust.json`, verbatim.
 2. **Amendment 4:** route every concrete generic arg (type + const, trait fragment + self-type prefix) through `escape_reserved(strip_ws(arg))`.
 3. **Amendment 5:** apply the method-level `@cfg(...)` suffix to cfg-twin `ImplItem::Fn`, keyed on the final impl key + method name.
 4. **Re-run** your byte-for-byte parity gate; it should now exercise all 6 new rows.

@@ -203,11 +203,19 @@ pub fn self_ty_name(ty: &Type) -> String {
 /// angle-bracketed args, renders exactly as [`self_ty_name`] (bare).
 #[must_use]
 pub fn self_ty_locator(ty: &Type, declared_params: &[String]) -> String {
+    // Non-`Type::Path` self types (references, tuples, slices, raw pointers, …)
+    // and paths with no final segment fall through to a textual rendering. That
+    // rendering can carry a `::`-path (`&mut fmt::Formatter`) whose raw `:` would
+    // make `build_entity_id` reject the id and degrade the whole file
+    // (clarion-8245039f6b). Route the fallbacks through the same
+    // `escape_reserved(strip_ws(..))` pipeline as concrete generic args
+    // (ADR-049 Amendment 4) so a reserved char never leaks. A `:`-free fallback
+    // (`&Foo`, `(A,B)`) is unchanged — the escape is a no-op on it.
     let Type::Path(p) = ty else {
-        return type_textual(ty);
+        return render_concrete_arg(ty);
     };
     let Some(last) = p.path.segments.last() else {
-        return type_textual(ty);
+        return render_concrete_arg(ty);
     };
     let base = last.ident.to_string();
     let PathArguments::AngleBracketed(ab) = &last.arguments else {
@@ -648,5 +656,21 @@ mod syn_disc_tests {
             self_ty_locator(&it.self_ty, &declared_type_params(&it)),
             "Foo<{usize%3A%3AMAX}>"
         );
+    }
+
+    #[test]
+    fn reference_self_type_with_path_escapes_reserved_colon() {
+        // ADR-049 Amendment 4 (self-type fallback): a non-`Type::Path` self type
+        // (here a reference) that carries a `::`-path falls through the
+        // `type_textual` fallback. Without escaping it leaks a raw `:` and the
+        // whole file degrades (clarion-8245039f6b, serde ser/fmt.rs:
+        // `impl Serializer for &mut fmt::Formatter`).
+        let it: syn::ItemImpl = parse_quote!(impl Tr for &mut std::fmt::Formatter<'a> {});
+        let loc = self_ty_locator(&it.self_ty, &declared_type_params(&it));
+        assert!(
+            !loc.contains(':'),
+            "reference self-type leaked a raw ':' into the locator: {loc}"
+        );
+        assert_eq!(loc, "&mutstd%3A%3Afmt%3A%3AFormatter<'a>");
     }
 }
