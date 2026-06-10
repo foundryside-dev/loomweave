@@ -403,6 +403,65 @@ fn spin_at_analyze_contained_by_file_watchdog() {
     assert_no_leaked_child(&marker_pair);
 }
 
+/// Scale-QA plan Task 1 (clarion-371efa3e07): a plugin that REFUSES the
+/// handshake (JSON-RPC error response to `initialize`) but stays alive is
+/// killed+reaped by the host; the run resolves terminal-failed with the
+/// handshake failure as the reason, and the host's own SIGKILL is NOT
+/// misclassified as an OOM event (`LMWV-INFRA-PLUGIN-OOM-KILLED`).
+#[test]
+fn handshake_refusal_no_spurious_oom_finding() {
+    let fixture_bin = fixture_binary_path();
+    let plugin_dir = setup_plugin_dir(&fixture_bin);
+    let (project_dir, new_path) = setup_project(&plugin_dir);
+    let (marker_key, marker_value, marker_pair) = unique_marker("refuse-handshake");
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &new_path)
+        .env(&marker_key, &marker_value)
+        .env("LOOMWEAVE_FIXTURE_REFUSE_HANDSHAKE", "1")
+        .timeout(ANALYZE_BACKSTOP)
+        .assert()
+        .failure();
+
+    let conn = open_db(&project_dir);
+
+    // Run record is terminal-failed and the failure_reason names the
+    // handshake failure (the protocol refusal IS the operator story).
+    let (run_count, run_status, failure_reason) = run_record(&conn);
+    assert_eq!(run_count, 1, "exactly one run row");
+    assert_eq!(run_status, "failed", "run must resolve terminal-failed");
+    assert!(
+        failure_reason.contains("spawn/handshake error"),
+        "failure_reason must name the handshake failure; got {failure_reason:?}"
+    );
+    assert!(
+        failure_reason.contains("fixture refuses handshake"),
+        "failure_reason must carry the plugin's own refusal message; \
+         got {failure_reason:?}"
+    );
+
+    // No deadline fired — this is a refusal, not a timeout.
+    assert_eq!(
+        finding_count(&conn, "LMWV-PY-TIMEOUT"),
+        0,
+        "a protocol refusal is not a timeout"
+    );
+
+    // The bug (clarion-371efa3e07): the host kills the still-alive child
+    // after the refusal, and its own SIGKILL must NOT be classified as an
+    // OOM event.
+    assert_eq!(
+        finding_count(&conn, "LMWV-INFRA-PLUGIN-OOM-KILLED"),
+        0,
+        "host kill after handshake refusal must not be misreported as OOM"
+    );
+
+    // No plugin child outlives the run.
+    assert_no_leaked_child(&marker_pair);
+}
+
 /// Task 6 (plan step 6.1): a plugin that SIGABRTs mid-analysis (the real
 /// stack-overflow signature: Rust guard page → abort → signal 6) resolves the
 /// run terminal-failed and is classified distinctly as

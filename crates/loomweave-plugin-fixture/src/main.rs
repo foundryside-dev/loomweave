@@ -33,7 +33,7 @@ use loomweave_core::plugin::limits::ContentLengthCeiling;
 use loomweave_core::plugin::transport::{Frame, read_frame, write_frame};
 use loomweave_core::plugin::{
     AnalyzeFileParams, AnalyzeFileResult, AnalyzeFileStats, InitializeResult, JsonRpcVersion,
-    ResponseEnvelope, ResponsePayload, ShutdownResult,
+    ProtocolError, ResponseEnvelope, ResponsePayload, ShutdownResult,
 };
 use serde_json::Value;
 
@@ -88,6 +88,14 @@ fn main() {
                 // plugin's symbol-table build runs there). The host's
                 // handshake deadline must kill us.
                 if env_flag("LOOMWEAVE_FIXTURE_HANG_AT_INITIALIZE") {
+                    hang_forever();
+                }
+                // Protocol refusal: reply to `initialize` with a JSON-RPC
+                // ERROR response, then stay alive (parked, not exited). The
+                // host must kill+reap us itself — and its own SIGKILL must
+                // not be classified as an OOM event (clarion-371efa3e07).
+                if env_flag("LOOMWEAVE_FIXTURE_REFUSE_HANDSHAKE") {
+                    send_error(&mut writer, id, -32600, "fixture refuses handshake");
                     hang_forever();
                 }
                 let result = InitializeResult {
@@ -165,6 +173,22 @@ fn main() {
             _ => std::process::exit(1),
         }
     }
+}
+
+fn send_error(writer: &mut impl Write, id: i64, code: i64, message: &str) {
+    let env = ResponseEnvelope {
+        jsonrpc: JsonRpcVersion,
+        id,
+        payload: ResponsePayload::Error(ProtocolError {
+            code,
+            message: message.to_owned(),
+            data: None,
+        }),
+    };
+    let body = serde_json::to_vec(&env).expect("serialise error response");
+    let frame = Frame { body };
+    write_frame(writer, &frame).expect("write frame");
+    writer.flush().expect("flush");
 }
 
 fn send_result(writer: &mut impl Write, id: i64, result: Value) {

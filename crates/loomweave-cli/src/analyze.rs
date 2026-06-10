@@ -4469,6 +4469,14 @@ fn run_plugin_blocking(
             .unwrap_or_else(|_| unreachable!("watchdog joined; no other Arc holders remain"))
             .into_inner()
             .expect("child mutex poisoned");
+        // clarion-371efa3e07: check whether the child had ALREADY exited
+        // before we kill it. A child that died on its own mid-handshake
+        // (e.g. a real RLIMIT_AS OOM kill during `initialize`) must stay
+        // honestly classified; a child that is still alive — a protocol
+        // refusal, for instance — is about to receive OUR SIGKILL, which
+        // must not be misreported as an OOM event (the handshake-failure
+        // reason already tells the operator story).
+        let child_already_exited = matches!(child.try_wait(), Ok(Some(_)));
         let _ = child.kill();
         let mut findings = host.take_findings();
         drop(host);
@@ -4492,7 +4500,15 @@ fn run_plugin_blocking(
                 other => format!("plugin {plugin_id} spawn/handshake error: {other}"),
             }
         };
-        reap_and_classify_exit(&mut child, plugin_id, &mut findings, handshake_timed_out);
+        // Suppress kill-classification when the watchdog fired OR when the
+        // child was still alive and the kill above is the host's own
+        // (clarion-371efa3e07).
+        reap_and_classify_exit(
+            &mut child,
+            plugin_id,
+            &mut findings,
+            handshake_timed_out || !child_already_exited,
+        );
         return Err(PluginRunError::with_findings(reason, findings));
     }
 
