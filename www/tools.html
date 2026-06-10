@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>MCP tools — Loomweave</title>
-<meta name="description" content="Loomweave's ~40-tool consult-mode MCP surface, grouped by family: navigation and graph traversal; briefing and source inspection; guidance, findings and federation context; analyze lifecycle and freshness; faceted and shortcut queries.">
+<meta name="description" content="Loomweave's ~42-tool consult-mode MCP surface, grouped by family: navigation and graph traversal; briefing and source inspection; guidance, findings and federation context; analyze lifecycle and freshness; faceted and shortcut queries.">
 <link rel="preload" href="fonts/SpaceGrotesk-Variable.ttf" as="font" type="font/ttf" crossorigin>
 <link rel="preload" href="fonts/JetBrainsMono-Variable.ttf" as="font" type="font/ttf" crossorigin>
 <link rel="stylesheet" href="colors_and_type.css">
@@ -41,7 +41,7 @@
       <a href="index.html">Loomweave</a><span class="sep">/</span><span aria-current="page">MCP tools</span>
     </nav>
     <h1 class="page-title">MCP tools</h1>
-    <p class="page-lede"><code class="t-inline-code">loomweave serve</code> exposes a <strong>~40-tool</strong> consult-mode MCP surface that an agent calls instead of grep-and-read. Grouped below by family. Connect an MCP client to a live <code class="t-inline-code">loomweave serve</code> and read <code class="t-inline-code">tools/list</code> for the exact, version-matched schemas.</p>
+    <p class="page-lede"><code class="t-inline-code">loomweave serve</code> exposes a <strong>~42-tool</strong> consult-mode MCP surface that an agent calls instead of grep-and-read. Grouped below by family. Connect an MCP client to a live <code class="t-inline-code">loomweave serve</code> and read <code class="t-inline-code">tools/list</code> for the exact, version-matched schemas.</p>
   </div>
 
   <div class="docmain">
@@ -74,7 +74,8 @@
             <tr><td><code>entity_callers_list</code></td><td class="wrap">Who calls this entity? <code>resolved</code> by default; carries <code>scope_excludes</code>.</td></tr>
             <tr><td><code>entity_call_site_list</code></td><td class="wrap">The concrete call sites — where, in source, this entity is invoked.</td></tr>
             <tr><td><code>entity_execution_path_list</code></td><td class="wrap">Bounded, calls-only execution paths from an entity, ranked longest-first, with truncation reporting.</td></tr>
-            <tr><td><code>entity_neighborhood_get</code></td><td class="wrap">The one-hop neighborhood: callers, callees, container, contained, references, and imports (<code>imports_in</code>/<code>imports_out</code>) in one call.</td></tr>
+            <tr><td><code>entity_neighborhood_get</code></td><td class="wrap">The one-hop neighborhood: callers, callees, container, contained, references, imports (<code>imports_in</code>/<code>imports_out</code>), and kind-tagged relations (<code>relations_in</code>/<code>relations_out</code>) in one call.</td></tr>
+            <tr><td><code>entity_relation_list</code></td><td class="wrap">What subclasses X / what does a decorator decorate / what implements a trait — the <code>inherits_from</code>/<code>decorates</code>/<code>implements</code>/<code>derives</code> edges, direction-explicit, each with the anchoring source line.</td></tr>
             <tr><td><code>subsystem_member_list</code></td><td class="wrap">Which module entities belong to this subsystem?</td></tr>
             <tr><td><code>entity_subsystem_get</code></td><td class="wrap">The reverse lookup — which subsystem does this entity belong to?</td></tr>
           </tbody>

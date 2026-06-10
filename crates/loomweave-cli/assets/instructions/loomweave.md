@@ -2,11 +2,12 @@
 
 This repo is indexed by Loomweave: it has pre-extracted the tree into a
 queryable map of entities (functions, classes, modules, files), the call /
-reference / import edges between them, and subsystem clusters. Before grepping
-or re-reading the tree to answer "what calls X", "where is X defined", "what
+reference / import edges plus relation edges (inherits_from / decorates /
+implements / derives), and subsystem clusters. Before grepping the tree to
+answer "what calls X", "what subclasses X", "where is X defined", "what
 subsystem owns X", or "find the thing that does Y" — ask Loomweave's MCP tools
 (`mcp__loomweave__*`): `entity_find`, `entity_at`, `entity_callers_list`,
-`entity_neighborhood_get`, `project_status_get`.
+`entity_relation_list`, `entity_neighborhood_get`, `project_status_get`.
 
 `entity_find` is the grep replacement for "find the thing that does Y": it
 matches a concept word by substring over name, summary, and docstring content

@@ -1193,6 +1193,8 @@ $ loomweave analyze /home/john/elspeth
 
 ## 6. MCP Tool Catalogue (Exact Tool Names)
 
+> **Shipped surface**: the registered tool list lives in system-design §8 (Tool catalogue by category) and `loomweave-mcp/src/lib.rs::list_tools`. Since clarion-ae5b43ea40 the relation edge kinds (`inherits_from`/`decorates`/`implements`/`derives`) are readable — `entity_relation_list` (direction-required, anchor evidence per edge) plus kind-tagged `relations_in`/`relations_out` buckets in `entity_neighborhood_get` / `entity_orientation_pack_get`; direction and anchor semantics per [ADR-051](../adr/ADR-051-relation-edge-direction-and-anchor.md). The catalogue below documents the v1.1 cursor-session target, not the shipped names.
+
 #### Navigation
 - `goto(id)`, `goto_path(path, line?)`, `back()`, `zoom_out()`, `zoom_in(child_id)`, `breadcrumbs()`
 

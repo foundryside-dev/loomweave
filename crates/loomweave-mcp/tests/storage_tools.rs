@@ -6497,3 +6497,968 @@ async fn neighborhood_caps_each_bucket_and_reports_a_truncated_map_with_no_curso
         "neighborhood overview must NOT carry a cursor: {env}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// entity_relation_list (clarion-ae5b43ea40): the relation kinds
+// (inherits_from / decorates / implements / derives) were write-only — no MCP
+// read path served them. Direction semantics and the decorates anchor-file
+// inversion are pinned by ADR-051.
+// ---------------------------------------------------------------------------
+
+/// Seed a relation fixture on top of [`open_project`]'s graph: a class
+/// hierarchy in types.py and a decorated handler in app.py, with the
+/// `decorates` anchor living in the *decorated* side's file (ADR-051).
+fn seed_relation_fixture(project_root: &std::path::Path, db_path: &std::path::Path) {
+    let conn = Connection::open(db_path).expect("open sqlite");
+    let types_path = project_root.join("types.py");
+    std::fs::write(
+        &types_path,
+        "class Base:\n    pass\n\nclass Child(Base):\n    pass\n\ndef wrap(fn):\n    return fn\n",
+    )
+    .expect("write types source");
+    let app_path = project_root.join("app.py");
+    std::fs::write(&app_path, "@wrap\ndef handler():\n    return 1\n").expect("write app source");
+
+    insert_file_entity(&conn, "core:file:types.py", &types_path);
+    insert_file_entity(&conn, "core:file:app.py", &app_path);
+    insert_entity(
+        &conn,
+        "python:module:types",
+        "module",
+        &types_path,
+        Some((1, 8)),
+        None,
+    );
+    insert_entity(
+        &conn,
+        "python:class:types.Base",
+        "class",
+        &types_path,
+        Some((1, 2)),
+        Some("python:module:types"),
+    );
+    insert_entity(
+        &conn,
+        "python:class:types.Child",
+        "class",
+        &types_path,
+        Some((4, 5)),
+        Some("python:module:types"),
+    );
+    insert_entity(
+        &conn,
+        "python:function:types.wrap",
+        "function",
+        &types_path,
+        Some((7, 8)),
+        Some("python:module:types"),
+    );
+    insert_entity(
+        &conn,
+        "python:module:app",
+        "module",
+        &app_path,
+        Some((1, 3)),
+        None,
+    );
+    insert_entity(
+        &conn,
+        "python:function:app.handler",
+        "function",
+        &app_path,
+        Some((1, 3)),
+        Some("python:module:app"),
+    );
+
+    // "class Child(Base):" — the `Base` token spans bytes 34..38 of types.py
+    // (line 4, byte column 12).
+    insert_relation_edge_row(
+        &conn,
+        "inherits_from",
+        "python:class:types.Child",
+        "python:class:types.Base",
+        "resolved",
+        None,
+        "core:file:types.py",
+        34,
+        38,
+    );
+    // "@wrap" — the `wrap` token spans bytes 1..5 of app.py (line 1, byte
+    // column 1). The anchor file is the DECORATED side's file.
+    insert_relation_edge_row(
+        &conn,
+        "decorates",
+        "python:function:types.wrap",
+        "python:function:app.handler",
+        "resolved",
+        None,
+        "core:file:app.py",
+        1,
+        5,
+    );
+}
+
+#[allow(clippy::too_many_arguments)] // a full anchored edge row IS this wide
+fn insert_relation_edge_row(
+    conn: &Connection,
+    kind: &str,
+    from_id: &str,
+    to_id: &str,
+    confidence: &str,
+    properties: Option<Value>,
+    source_file_id: &str,
+    byte_start: i64,
+    byte_end: i64,
+) {
+    conn.execute(
+        "INSERT INTO edges (
+            kind, from_id, to_id, confidence, properties, source_file_id,
+            source_byte_start, source_byte_end
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            kind,
+            from_id,
+            to_id,
+            confidence,
+            properties.map(|value| value.to_string()),
+            source_file_id,
+            byte_start,
+            byte_end,
+        ],
+    )
+    .expect("insert relation edge");
+}
+
+#[tokio::test]
+async fn relation_list_answers_directional_queries_with_anchor_evidence() {
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    let state = state_for(project.path(), &db_path);
+
+    // "What subclasses Base" — a TO-side (direction=in) lookup on inherits_from.
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    assert_eq!(resp["result"]["entity"]["id"], "python:class:types.Base");
+    assert_eq!(resp["result"]["direction"], "in");
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{resp}");
+    let rel = &relations[0];
+    assert_eq!(rel["kind"], "inherits_from");
+    assert_eq!(rel["entity"]["id"], "python:class:types.Child");
+    assert_eq!(rel["edge_confidence"], "resolved");
+    assert_eq!(
+        rel["file"],
+        project.path().join("types.py").display().to_string()
+    );
+    assert_eq!(rel["line"], 4);
+    assert_eq!(rel["column"], 12);
+    assert_eq!(rel["line_text"], "class Child(Base):");
+    assert_eq!(rel["byte_start"], 34);
+    assert_eq!(rel["byte_end"], 38);
+    assert_eq!(resp["result"]["next_cursor"], Value::Null);
+    assert_eq!(resp["result"]["truncated"], false);
+
+    // "What does wrap decorate" — direction=out on the DECORATOR (ADR-051:
+    // decorates runs decorator → decorated). The anchor evidence must follow
+    // the edge's own file (app.py, the decorated side), not the queried
+    // entity's file.
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:function:types.wrap", "direction": "out"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{resp}");
+    let rel = &relations[0];
+    assert_eq!(rel["kind"], "decorates");
+    assert_eq!(rel["entity"]["id"], "python:function:app.handler");
+    assert_eq!(
+        rel["file"],
+        project.path().join("app.py").display().to_string(),
+        "decorates anchor must come from the edge's file, not the decorator's: {rel}"
+    );
+    assert_eq!(rel["line"], 1);
+    assert_eq!(rel["column"], 1);
+    assert_eq!(rel["line_text"], "@wrap");
+
+    // "What decorates handler" — direction=in on the decorated entity.
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:function:app.handler", "direction": "in"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{resp}");
+    assert_eq!(relations[0]["kind"], "decorates");
+    assert_eq!(relations[0]["entity"]["id"], "python:function:types.wrap");
+
+    // The subclass side: direction=out on Child names its base.
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Child", "direction": "out"}),
+    )
+    .await;
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{resp}");
+    assert_eq!(relations[0]["entity"]["id"], "python:class:types.Base");
+}
+
+#[tokio::test]
+async fn relation_list_kind_filter_pagination_and_honest_empty() {
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    {
+        let conn = Connection::open(&db_path).expect("open sqlite");
+        let types_path = project.path().join("types.py");
+        insert_entity(
+            &conn,
+            "python:class:types.Other",
+            "class",
+            &types_path,
+            Some((4, 5)),
+            Some("python:module:types"),
+        );
+        insert_relation_edge_row(
+            &conn,
+            "inherits_from",
+            "python:class:types.Other",
+            "python:class:types.Base",
+            "resolved",
+            None,
+            "core:file:types.py",
+            34,
+            38,
+        );
+    }
+    let state = state_for(project.path(), &db_path);
+
+    // limit=1 pages the two subclasses deterministically (Child before Other).
+    let first = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in", "limit": 1}),
+    )
+    .await;
+    assert_eq!(first["ok"], true, "{first}");
+    let relations = first["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{first}");
+    assert_eq!(relations[0]["entity"]["id"], "python:class:types.Child");
+    assert_eq!(first["result"]["truncated"], true, "{first}");
+    assert_eq!(first["result"]["next_cursor"], "1", "{first}");
+
+    let second = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in", "limit": 1, "cursor": "1"}),
+    )
+    .await;
+    let relations = second["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{second}");
+    assert_eq!(relations[0]["entity"]["id"], "python:class:types.Other");
+    assert_eq!(second["result"]["truncated"], false, "{second}");
+    assert_eq!(second["result"]["next_cursor"], Value::Null, "{second}");
+
+    // A kind filter that matches nothing is honest-empty, not an error.
+    let none = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in", "kind": "decorates"}),
+    )
+    .await;
+    assert_eq!(none["ok"], true, "{none}");
+    assert!(
+        none["result"]["relations"].as_array().unwrap().is_empty(),
+        "{none}"
+    );
+    assert_eq!(none["result"]["truncated"], false, "{none}");
+
+    // The kind filter narrows to the requested kind only.
+    let filtered = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in", "kind": "inherits_from"}),
+    )
+    .await;
+    let filtered_rows = filtered["result"]["relations"].as_array().unwrap();
+    assert_eq!(filtered_rows.len(), 2, "{filtered}");
+    assert!(
+        filtered_rows.iter().all(|r| r["kind"] == "inherits_from"),
+        "kind filter must narrow to the requested kind only: {filtered}"
+    );
+}
+
+#[tokio::test]
+async fn relation_list_confidence_gates_ambiguous_and_passes_candidates() {
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    {
+        let conn = Connection::open(&db_path).expect("open sqlite");
+        let app_path = project.path().join("app.py");
+        let types_path = project.path().join("types.py");
+        insert_entity(
+            &conn,
+            "python:function:app.other",
+            "function",
+            &app_path,
+            Some((2, 3)),
+            Some("python:module:app"),
+        );
+        // Candidates pass through only when they resolve to VISIBLE entities
+        // (relation_list_candidates_never_leak_blocked_ids), so the
+        // alternative candidate needs a real row.
+        insert_entity(
+            &conn,
+            "python:function:types.wrap_again",
+            "function",
+            &types_path,
+            Some((7, 8)),
+            Some("python:module:types"),
+        );
+        // An ambiguous decorates edge: the FROM side is the best-guess
+        // decorator and `candidates` are alternative FROM-side ids (ADR-051's
+        // inverted-candidates trap).
+        insert_relation_edge_row(
+            &conn,
+            "decorates",
+            "python:function:types.wrap",
+            "python:function:app.other",
+            "ambiguous",
+            Some(json!({"candidates": [
+                "python:function:types.wrap",
+                "python:function:types.wrap_again"
+            ]})),
+            "core:file:app.py",
+            1,
+            5,
+        );
+    }
+    let state = state_for(project.path(), &db_path);
+
+    // Default confidence (resolved) excludes the ambiguous edge.
+    let resolved = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:function:app.other", "direction": "in"}),
+    )
+    .await;
+    assert_eq!(resolved["ok"], true, "{resolved}");
+    assert!(
+        resolved["result"]["relations"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "resolved tier must exclude ambiguous relation edges: {resolved}"
+    );
+
+    // Opting into ambiguous surfaces it, with the candidate ids passed through.
+    let ambiguous = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:function:app.other", "direction": "in", "confidence": "ambiguous"}),
+    )
+    .await;
+    let relations = ambiguous["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{ambiguous}");
+    assert_eq!(relations[0]["edge_confidence"], "ambiguous");
+    assert_eq!(
+        relations[0]["candidates"],
+        json!([
+            "python:function:types.wrap",
+            "python:function:types.wrap_again"
+        ]),
+        "{ambiguous}"
+    );
+    // Resolved entries carry no candidates.
+    let base = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in"}),
+    )
+    .await;
+    assert!(
+        base["result"]["relations"][0]["candidates"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{base}"
+    );
+}
+
+#[tokio::test]
+async fn relation_list_resolves_sei_and_reports_unknown_id() {
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    seed_alive_sei_binding(
+        &db_path,
+        "loomweave:eid:types-base",
+        "python:class:types.Base",
+    );
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "loomweave:eid:types-base", "direction": "in"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    assert_eq!(
+        relations.len(),
+        1,
+        "SEI input must resolve to its locator: {resp}"
+    );
+    assert_eq!(relations[0]["entity"]["id"], "python:class:types.Child");
+
+    let missing = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Ghost", "direction": "in"}),
+    )
+    .await;
+    assert_eq!(missing["ok"], false, "{missing}");
+    assert_eq!(missing["error"]["code"], "entity-not-found", "{missing}");
+}
+
+#[tokio::test]
+async fn relation_list_refuses_structure_for_blocked_entity() {
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    mark_blocked(&db_path, "python:class:types.Base", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    assert_eq!(resp["result"]["available"], false, "{resp}");
+    assert_eq!(
+        resp["result"]["briefing_blocked"], "secret_present",
+        "{resp}"
+    );
+    assert!(resp["result"]["relations"].is_null(), "{resp}");
+    assert!(
+        !resp.to_string().contains("types.Base"),
+        "blocked id leaked in relation_list refusal: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn relation_list_redacts_blocked_neighbor_and_blocked_anchor_file() {
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    // Block the subclass: querying Base must stub the neighbor AND withhold
+    // the line evidence (the line text contains the blocked declaration).
+    mark_blocked(&db_path, "python:class:types.Child", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{resp}");
+    let rel = &relations[0];
+    assert_redacted_identity(&rel["entity"], "secret_present");
+    assert_eq!(rel["source_status"], "briefing_blocked", "{rel}");
+    assert!(rel["line"].is_null(), "{rel}");
+    assert_eq!(rel["line_text"], "", "{rel}");
+    assert!(
+        !resp.to_string().contains("types.Child"),
+        "blocked neighbor id leaked in relation_list response: {resp}"
+    );
+
+    // Blocking the anchor FILE entity withholds line evidence even when both
+    // endpoints are visible (the bytes behind the anchor are scanner-withheld).
+    mark_blocked(&db_path, "core:file:app.py", "secret_present");
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:function:types.wrap", "direction": "out"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let rel = &resp["result"]["relations"].as_array().unwrap()[0];
+    assert_eq!(rel["entity"]["id"], "python:function:app.handler", "{rel}");
+    assert_eq!(rel["source_status"], "briefing_blocked", "{rel}");
+    assert!(rel["line"].is_null(), "{rel}");
+    assert_eq!(rel["line_text"], "", "{rel}");
+}
+
+#[test]
+fn tools_list_includes_entity_relation_list() {
+    let tools = list_tools();
+    let tool = tools
+        .iter()
+        .find(|tool| tool.name == "entity_relation_list")
+        .expect("entity_relation_list tool definition");
+    assert_eq!(
+        tool.input_schema,
+        json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "minLength": 1},
+                "direction": {"type": "string", "enum": ["in", "out"]},
+                "kind": {
+                    "type": "string",
+                    "enum": ["inherits_from", "decorates", "implements", "derives"]
+                },
+                "confidence": {
+                    "type": "string",
+                    "enum": ["resolved", "ambiguous", "inferred"],
+                    "default": "resolved"
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "cursor": {"type": ["string", "null"]}
+            },
+            "required": ["id", "direction"],
+            "additionalProperties": false
+        })
+    );
+}
+
+#[tokio::test]
+async fn neighborhood_lists_relation_buckets() {
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    let state = state_for(project.path(), &db_path);
+
+    // A class with an inbound inherits_from: relations_in names the subclass,
+    // tagged with its kind; relations_out is honest-empty.
+    let resp = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:class:types.Base"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let relations_in = resp["result"]["relations_in"].as_array().unwrap();
+    assert_eq!(relations_in.len(), 1, "{resp}");
+    assert_eq!(relations_in[0]["kind"], "inherits_from");
+    assert_eq!(relations_in[0]["entity"]["id"], "python:class:types.Child");
+    assert_eq!(relations_in[0]["edge_confidence"], "resolved");
+    assert!(
+        resp["result"]["relations_out"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{resp}"
+    );
+    // The truncated map covers the new buckets.
+    assert_eq!(resp["result"]["truncated"]["relations_in"], false, "{resp}");
+    assert_eq!(
+        resp["result"]["truncated"]["relations_out"], false,
+        "{resp}"
+    );
+
+    // The decorator side: relations_out names what it decorates (ADR-051
+    // direction — the decorator is the FROM side).
+    let resp = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:types.wrap"}),
+    )
+    .await;
+    let relations_out = resp["result"]["relations_out"].as_array().unwrap();
+    assert_eq!(relations_out.len(), 1, "{resp}");
+    assert_eq!(relations_out[0]["kind"], "decorates");
+    assert_eq!(
+        relations_out[0]["entity"]["id"],
+        "python:function:app.handler"
+    );
+
+    // The per-bucket limit trims and flags relation buckets like any other.
+    {
+        let conn = Connection::open(&db_path).expect("open sqlite");
+        let types_path = project.path().join("types.py");
+        insert_entity(
+            &conn,
+            "python:class:types.Other",
+            "class",
+            &types_path,
+            Some((4, 5)),
+            Some("python:module:types"),
+        );
+        insert_relation_edge_row(
+            &conn,
+            "inherits_from",
+            "python:class:types.Other",
+            "python:class:types.Base",
+            "resolved",
+            None,
+            "core:file:types.py",
+            34,
+            38,
+        );
+    }
+    let resp = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:class:types.Base", "limit": 1}),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["relations_in"].as_array().unwrap().len(),
+        1,
+        "{resp}"
+    );
+    assert_eq!(resp["result"]["truncated"]["relations_in"], true, "{resp}");
+}
+
+#[tokio::test]
+async fn orientation_pack_includes_relation_neighbors() {
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:class:types.Base"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let neighbors = &resp["result"]["neighbors"];
+    let relations_in = neighbors["relations_in"].as_array().unwrap();
+    assert_eq!(relations_in.len(), 1, "{resp}");
+    assert_eq!(relations_in[0]["kind"], "inherits_from");
+    assert_eq!(relations_in[0]["entity"]["id"], "python:class:types.Child");
+    assert!(
+        neighbors["relations_out"].as_array().unwrap().is_empty(),
+        "{resp}"
+    );
+    // The omitted block reports the relation buckets alongside the others.
+    assert_eq!(resp["result"]["omitted"]["relations_in"], 0, "{resp}");
+    assert_eq!(resp["result"]["omitted"]["relations_out"], 0, "{resp}");
+}
+
+#[tokio::test]
+async fn relation_list_candidates_never_leak_blocked_ids() {
+    // An ambiguous edge's `candidates` carry raw entity ids, and the chosen
+    // FROM side conventionally appears in its own candidate list — so without
+    // filtering, a briefing-blocked neighbor's stubbed identity is recoverable
+    // verbatim from `candidates` on the same row (the entity_resolve surface
+    // collapses blocked candidates for exactly this reason).
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    {
+        let conn = Connection::open(&db_path).expect("open sqlite");
+        let app_path = project.path().join("app.py");
+        insert_entity(
+            &conn,
+            "python:function:app.other",
+            "function",
+            &app_path,
+            Some((2, 3)),
+            Some("python:module:app"),
+        );
+        insert_relation_edge_row(
+            &conn,
+            "decorates",
+            "python:function:types.wrap",
+            "python:function:app.other",
+            "ambiguous",
+            Some(json!({"candidates": [
+                "python:function:types.wrap",
+                "python:function:types.wrap_again"
+            ]})),
+            "core:file:app.py",
+            1,
+            5,
+        );
+    }
+    // Block the chosen from-side decorator; the alternative candidate id
+    // (wrap_again) has no entity row at all and must also not be disclosed
+    // as a visible "alternative" — only ids resolvable to VISIBLE entities
+    // may pass through.
+    mark_blocked(&db_path, "python:function:types.wrap", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:function:app.other", "direction": "in", "confidence": "ambiguous"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{resp}");
+    assert_redacted_identity(&relations[0]["entity"], "secret_present");
+    assert!(
+        !resp.to_string().contains("types.wrap"),
+        "blocked id leaked through candidates (or anywhere else): {resp}"
+    );
+}
+
+#[tokio::test]
+async fn relation_list_visible_candidates_survive_blocked_sibling_filter() {
+    // The blocked-candidate filter must not throw away legitimate visible
+    // alternatives: with one blocked and one visible candidate, the visible
+    // id still passes through.
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    {
+        let conn = Connection::open(&db_path).expect("open sqlite");
+        let types_path = project.path().join("types.py");
+        let app_path = project.path().join("app.py");
+        insert_entity(
+            &conn,
+            "python:function:types.wrap_again",
+            "function",
+            &types_path,
+            Some((7, 8)),
+            Some("python:module:types"),
+        );
+        insert_entity(
+            &conn,
+            "python:function:app.other",
+            "function",
+            &app_path,
+            Some((2, 3)),
+            Some("python:module:app"),
+        );
+        insert_relation_edge_row(
+            &conn,
+            "decorates",
+            "python:function:types.wrap",
+            "python:function:app.other",
+            "ambiguous",
+            Some(json!({"candidates": [
+                "python:function:types.wrap",
+                "python:function:types.wrap_again"
+            ]})),
+            "core:file:app.py",
+            1,
+            5,
+        );
+    }
+    mark_blocked(
+        &db_path,
+        "python:function:types.wrap_again",
+        "secret_present",
+    );
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:function:app.other", "direction": "in", "confidence": "ambiguous"}),
+    )
+    .await;
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{resp}");
+    // The visible chosen candidate passes; the blocked sibling is withheld.
+    assert_eq!(
+        relations[0]["candidates"],
+        json!(["python:function:types.wrap"]),
+        "{resp}"
+    );
+    assert!(
+        !resp.to_string().contains("wrap_again"),
+        "blocked candidate id leaked: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn relation_list_redacts_line_text_for_drifted_anchor_file() {
+    // The anchor owner of a relation edge is the edge's core file row; when
+    // the on-disk file no longer matches that row's indexed content_hash, the
+    // tool must NOT serve newly modified, scanner-unvetted bytes (same guard
+    // call_sites pins for call anchors).
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    std::fs::write(
+        project.path().join("types.py"),
+        "API_KEY = \"sk-sentinel-never-disclose\"\n\nclass Base:\n    pass\n\nclass Child(Base):\n    pass\n",
+    )
+    .expect("rewrite types source");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let rel = &resp["result"]["relations"].as_array().unwrap()[0];
+    assert_eq!(rel["source_status"], "drifted", "{rel}");
+    assert!(rel["line"].is_null(), "{rel}");
+    assert_eq!(rel["line_text"], "", "{rel}");
+    assert!(
+        rel["drift"]["stored_content_hash"].is_string()
+            && rel["drift"]["current_content_hash"].is_string(),
+        "{rel}"
+    );
+    assert!(
+        !resp.to_string().contains("sk-sentinel-never-disclose"),
+        "drifted anchor served unvetted bytes: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn neighborhood_relation_buckets_gate_ambiguous_by_confidence() {
+    // The relations buckets honor the tool's confidence tier (the tool
+    // description promises "ambiguous and inferred ... are opt-in"); a
+    // regression in relation_neighbors' gate would mix ambiguous relation
+    // edges into default-resolved views.
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    {
+        let conn = Connection::open(&db_path).expect("open sqlite");
+        let app_path = project.path().join("app.py");
+        insert_entity(
+            &conn,
+            "python:function:app.other",
+            "function",
+            &app_path,
+            Some((2, 3)),
+            Some("python:module:app"),
+        );
+        insert_relation_edge_row(
+            &conn,
+            "decorates",
+            "python:function:types.wrap",
+            "python:function:app.other",
+            "ambiguous",
+            None,
+            "core:file:app.py",
+            1,
+            5,
+        );
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let resolved = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:app.other"}),
+    )
+    .await;
+    assert!(
+        resolved["result"]["relations_in"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "default resolved tier must exclude the ambiguous relation edge: {resolved}"
+    );
+
+    let ambiguous = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:app.other", "confidence": "ambiguous"}),
+    )
+    .await;
+    let rel_in = ambiguous["result"]["relations_in"].as_array().unwrap();
+    assert_eq!(rel_in.len(), 1, "{ambiguous}");
+    assert_eq!(rel_in[0]["edge_confidence"], "ambiguous", "{ambiguous}");
+}
+
+#[tokio::test]
+async fn relation_list_survives_null_anchor_file_dangling_neighbor_and_overrun_cursor() {
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    {
+        let conn = Connection::open(&db_path).expect("open sqlite");
+        let types_path = project.path().join("types.py");
+        insert_entity(
+            &conn,
+            "python:class:types.Anchorless",
+            "class",
+            &types_path,
+            Some((4, 5)),
+            Some("python:module:types"),
+        );
+        // A relation edge with NO source_file_id (a pre-anchored-file row, or
+        // a partially failed analyze): evidence degrades to "unavailable",
+        // never a panic.
+        conn.execute(
+            "INSERT INTO edges (kind, from_id, to_id, confidence, source_byte_start, source_byte_end)
+             VALUES ('inherits_from', 'python:class:types.Anchorless', 'python:class:types.Base', 'resolved', 60, 64)",
+            [],
+        )
+        .expect("insert anchorless relation edge");
+        // A dangling edge whose from-side entity row is gone: skipped, not
+        // served and not panicking. FKs forbid inserting it directly, so
+        // insert legally and delete the entity afterwards (foreign_keys
+        // defaults OFF on this raw test connection) — simulating the reader
+        // skew / corruption the handler's skip branch guards against.
+        insert_entity(
+            &conn,
+            "python:class:types.Vanished",
+            "class",
+            &types_path,
+            Some((4, 5)),
+            Some("python:module:types"),
+        );
+        conn.execute(
+            "INSERT INTO edges (kind, from_id, to_id, confidence, source_byte_start, source_byte_end)
+             VALUES ('inherits_from', 'python:class:types.Vanished', 'python:class:types.Base', 'resolved', 70, 74)",
+            [],
+        )
+        .expect("insert soon-dangling relation edge");
+        conn.execute(
+            "DELETE FROM entities WHERE id = 'python:class:types.Vanished'",
+            [],
+        )
+        .expect("orphan the relation edge");
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    // Child (anchored) + Anchorless (no file) survive; Vanished is skipped.
+    let ids: Vec<&str> = relations
+        .iter()
+        .map(|r| r["entity"]["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["python:class:types.Anchorless", "python:class:types.Child"],
+        "{resp}"
+    );
+    let anchorless = &relations[0];
+    assert_eq!(anchorless["source_status"], "unavailable", "{anchorless}");
+    assert!(anchorless["line"].is_null(), "{anchorless}");
+    assert!(anchorless["file"].is_null(), "{anchorless}");
+
+    // A cursor past the end yields an empty page, not an error.
+    let past_end = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in", "cursor": "50"}),
+    )
+    .await;
+    assert_eq!(past_end["ok"], true, "{past_end}");
+    assert!(
+        past_end["result"]["relations"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{past_end}"
+    );
+    assert_eq!(past_end["result"]["truncated"], false, "{past_end}");
+    assert_eq!(past_end["result"]["next_cursor"], Value::Null, "{past_end}");
+}

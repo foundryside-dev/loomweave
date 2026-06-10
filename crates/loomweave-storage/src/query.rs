@@ -124,6 +124,26 @@ pub struct ReferenceEdgeMatch {
     pub source_byte_end: Option<i64>,
 }
 
+/// One relation edge (`inherits_from`, `decorates`, `implements`, `derives`)
+/// touching an entity. Both endpoints are kept because relation direction is
+/// semantic, not positional (ADR-051): `decorates` runs decorator → decorated,
+/// so its anchor lives in the *to*-side file and its ambiguous `candidates`
+/// are alternative *from*-side entities — a consumer that assumed the
+/// `references` shape would read it backwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationEdgeMatch {
+    pub kind: String,
+    pub from_id: String,
+    pub to_id: String,
+    pub confidence: EdgeConfidence,
+    /// Alternative endpoint ids from an ambiguous edge's
+    /// `properties.candidates`, sorted; empty for resolved edges.
+    pub candidates: Vec<String>,
+    pub source_file_id: Option<String>,
+    pub source_byte_start: Option<i64>,
+    pub source_byte_end: Option<i64>,
+}
+
 /// One rolled-up reference edge for a module-altitude query: a `references`
 /// edge into or out of a symbol the module contains, attributed to the
 /// contained `via` symbol it actually touches (clarion-79d0ff6e14).
@@ -1165,6 +1185,69 @@ pub fn import_edges_for_entity(
     direction: ReferenceDirection,
 ) -> Result<Vec<ReferenceEdgeMatch>> {
     directed_edges_for_entity(conn, entity_id, direction, "imports")
+}
+
+/// The relation edge kinds — semantic type-level claims (subclassing,
+/// decoration, trait implementation, derive expansion) as opposed to
+/// occurrence kinds (`calls`/`references`/`imports`). Alphabetical, matching
+/// the `ORDER BY kind` of [`relation_edges_for_entity`].
+pub const RELATION_EDGE_KINDS: &[&str] = &["decorates", "derives", "implements", "inherits_from"];
+
+/// Relation edges touching `entity_id` in the given direction, optionally
+/// narrowed to one kind. Direction is positional (`In` = stored `to_id`,
+/// `Out` = stored `from_id`); what a direction *means* varies per kind
+/// (ADR-051) — "what subclasses X" is `In` on `inherits_from`, while "what
+/// does X decorate" is `Out` on `decorates`. A `kind` outside
+/// [`RELATION_EDGE_KINDS`] matches nothing. Results are ordered by
+/// (kind, neighbor, anchor) for determinism.
+pub fn relation_edges_for_entity(
+    conn: &Connection,
+    entity_id: &str,
+    direction: ReferenceDirection,
+    kind: Option<&str>,
+) -> Result<Vec<RelationEdgeMatch>> {
+    let sql = match direction {
+        ReferenceDirection::In => {
+            "SELECT kind, from_id, to_id, confidence, properties, source_file_id, \
+                    source_byte_start, source_byte_end \
+             FROM edges \
+             WHERE kind IN ('decorates', 'derives', 'implements', 'inherits_from') \
+               AND to_id = ?1 \
+             ORDER BY kind, from_id, source_byte_start, source_byte_end"
+        }
+        ReferenceDirection::Out => {
+            "SELECT kind, from_id, to_id, confidence, properties, source_file_id, \
+                    source_byte_start, source_byte_end \
+             FROM edges \
+             WHERE kind IN ('decorates', 'derives', 'implements', 'inherits_from') \
+               AND from_id = ?1 \
+             ORDER BY kind, to_id, source_byte_start, source_byte_end"
+        }
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![entity_id], map_relation_edge_match)?;
+    let mut matches = rows
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)?;
+    if let Some(kind) = kind {
+        matches.retain(|m| m.kind == kind);
+    }
+    Ok(matches)
+}
+
+fn map_relation_edge_match(row: &Row<'_>) -> rusqlite::Result<RelationEdgeMatch> {
+    let raw_confidence: String = row.get(3)?;
+    let properties: Option<String> = row.get(4)?;
+    Ok(RelationEdgeMatch {
+        kind: row.get(0)?,
+        from_id: row.get(1)?,
+        to_id: row.get(2)?,
+        confidence: parse_confidence(&raw_confidence)?,
+        candidates: candidate_ids(properties.as_deref()).into_iter().collect(),
+        source_file_id: row.get(5)?,
+        source_byte_start: row.get(6)?,
+        source_byte_end: row.get(7)?,
+    })
 }
 
 fn directed_edges_for_entity(

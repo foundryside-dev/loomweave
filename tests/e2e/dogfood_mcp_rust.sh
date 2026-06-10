@@ -162,6 +162,18 @@ impl Widget {
         self.label.len()
     }
 }
+
+/// Manual `impl` of the in-project trait — the `implements` relation-edge
+/// probe (crate-qualified path, the resolvable form, like the derive above).
+pub struct Badge {
+    pub tag: String,
+}
+
+impl crate::shapes::Describe for Badge {
+    fn describe(&self) -> String {
+        self.tag.clone()
+    }
+}
 RS
 
 # Dead-code reachability root (see header): a Python test function carries the
@@ -421,6 +433,33 @@ try:
 
     check("entity_at on .rs file:line (entry hit + line-999 miss)", entity_at_rs)
 
+    # 9b. Relation read surface (clarion-ae5b43ea40): "what derives/implements
+    # Describe" is direction=in on the trait — derives arrives from the struct,
+    # implements from the IMPL BLOCK entity (extract.rs::implements_edge), both
+    # through a real Rust-plugin index. Anchors carry the trait-path token's
+    # source line (ADR-026/ADR-051).
+    def relation_surface():
+        env = tool_envelope(call(
+            "entity_relation_list", {"id": DESCRIBE, "direction": "in"}
+        ))
+        rows = env["result"]["relations"]
+        assert len(rows) == 2, rows  # exactly one edge per kind — a dict would mask duplicates
+        by_kind = {row["kind"]: row for row in rows}
+        assert set(by_kind) == {"derives", "implements"}, rows
+        assert by_kind["derives"]["entity"]["id"] == WIDGET, rows
+        assert "Badge.impl[" in by_kind["implements"]["entity"]["id"], rows
+        for row in rows:
+            assert row["edge_confidence"] == "resolved", rows
+            assert row["source_status"] == "ok", rows
+            assert row["file"].endswith("shapes.rs"), rows
+            assert "Describe" in row["line_text"], rows
+        # The neighborhood overview serves the same edges as tagged buckets.
+        nb = tool_envelope(call("entity_neighborhood_get", {"id": DESCRIBE}))
+        nb_kinds = {r["kind"] for r in nb["result"]["relations_in"]}
+        assert nb_kinds == {"derives", "implements"}, nb["result"]["relations_in"]
+
+    check("entity_relation_list + relations_in buckets (derives + implements on the trait)", relation_surface)
+
     # 10. Dead code — orphan_helper flagged; label_len (reached only through a
     # method call the syntactic resolver cannot resolve) shielded by the
     # unresolved-call-site suppression, with the suppressed count disclosed.
@@ -481,4 +520,4 @@ if failures:
     sys.exit(1)
 PY
 
-log "PASS: MCP surface answered for Rust entities (find/qualname/callers/neighborhood/entity_at/dead-code/subsystem/status); 1 KNOWN-GAP pinned (entity_resolve is python-only)"
+log "PASS: MCP surface answered for Rust entities (find/qualname/callers/neighborhood/relations/entity_at/dead-code/subsystem/status); 1 KNOWN-GAP pinned (entity_resolve is python-only)"

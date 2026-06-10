@@ -14,7 +14,7 @@ runtime dependencies**. GitHub-Pages-deployable as-is at `loomweave.foundryside.
 | `index.html` | Landing page: hero (defining line + SEI axiom + 4-stat strip), "what Loomweave owns", 30-second quick start (with the `scope_excludes` honesty note), the federation role section, and cards into the other pages. |
 | `getting-started.html` | install → init → analyze → serve → optional summaries, the `.mcp.json` wiring, and a troubleshooting table. |
 | `concepts.html` | The entity model (locator vs. SEI identity), kinds, the edge graph, subsystems, the consult loop, `scope_excludes`, and enrich-only design. |
-| `tools.html` | The ~40-tool MCP consult surface, grouped by family. |
+| `tools.html` | The ~42-tool MCP consult surface, grouped by family. |
 | `cli.html` | The `loomweave` command set with every flag. |
 | `colors_and_type.css` | **Token + type source of truth — copied VERBATIM from the design system. Never edit it here** (see below). |
 | `styles.css` | Site layout + components, layered on the tokens. Carries the single accent remap and all net-new vocabulary. |

@@ -4,14 +4,14 @@ use std::path::Path;
 
 use loomweave_core::EdgeConfidence;
 use loomweave_storage::{
-    ModuleDependencyEdge, ReferenceDirection, SubsystemMember, call_edges_from,
+    ModuleDependencyEdge, ReferenceDirection, RelationEdgeMatch, SubsystemMember, call_edges_from,
     call_edges_targeting, child_entity_ids, contained_entity_ids, containing_module_id, edge_total,
     entities_targeted_by_unresolved_call_sites, entity_at_line, entity_briefing_block_reason,
     entity_by_id, entity_total, find_entities, findings_for_emit, module_dependency_edges,
     module_reference_rollup, normalize_source_path, pragma, reference_edges_for_entity,
-    resolve_file, resolve_file_catalog_entry, schema, subsystem_for_member, subsystem_members,
-    subsystem_of_entity, subsystem_total, unresolved_call_sites_for_caller,
-    unresolved_callers_for_target,
+    relation_edges_for_entity, resolve_file, resolve_file_catalog_entry, schema,
+    subsystem_for_member, subsystem_members, subsystem_of_entity, subsystem_total,
+    unresolved_call_sites_for_caller, unresolved_callers_for_target,
 };
 use rusqlite::{Connection, params};
 
@@ -174,6 +174,52 @@ fn insert_references_edge(
         params![from_id, to_id, confidence.as_str(), start, end],
     )
     .expect("insert references edge");
+}
+
+fn insert_relation_edge(
+    conn: &Connection,
+    kind: &str,
+    from_id: &str,
+    to_id: &str,
+    confidence: EdgeConfidence,
+    candidates: &[&str],
+    start: i64,
+    end: i64,
+) {
+    let properties = if candidates.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!({ "candidates": candidates }).to_string())
+    };
+    // The anchor-file FK target; relation anchors always carry a file
+    // (anchored kinds, ADR-026).
+    conn.execute(
+        "INSERT OR IGNORE INTO entities (
+            id, plugin_id, kind, name, short_name, properties, created_at, updated_at
+         ) VALUES (
+            'core:file:src/demo.py', 'core', 'file', 'src/demo.py', 'demo.py', '{}',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        [],
+    )
+    .expect("insert anchor file entity");
+    conn.execute(
+        "INSERT INTO edges (
+            kind, from_id, to_id, confidence, properties, source_file_id,
+            source_byte_start, source_byte_end
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'core:file:src/demo.py', ?6, ?7)",
+        params![
+            kind,
+            from_id,
+            to_id,
+            confidence.as_str(),
+            properties,
+            start,
+            end
+        ],
+    )
+    .expect("insert relation edge");
 }
 
 fn insert_imports_edge(conn: &Connection, from_id: &str, to_id: &str) {
@@ -727,6 +773,205 @@ fn reference_edges_for_entity_returns_directional_neighbors() {
     assert_eq!(outbound[0].confidence, EdgeConfidence::Ambiguous);
     assert_eq!(outbound[0].source_byte_start, Some(30));
     assert_eq!(outbound[0].source_byte_end, Some(39));
+}
+
+#[test]
+fn relation_edges_for_entity_returns_directional_neighbors_across_kinds() {
+    // "What subclasses Base" is a TO-side (In) lookup on inherits_from; "what
+    // does wrap decorate" is a FROM-side (Out) lookup on decorates (ADR-051).
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity(&conn, "python:class:demo.Base", "class");
+    insert_entity(&conn, "python:class:demo.Child", "class");
+    insert_entity(&conn, "python:function:demo.wrap", "function");
+    insert_entity(&conn, "python:function:demo.handler", "function");
+    insert_relation_edge(
+        &conn,
+        "inherits_from",
+        "python:class:demo.Child",
+        "python:class:demo.Base",
+        EdgeConfidence::Resolved,
+        &[],
+        100,
+        117,
+    );
+    insert_relation_edge(
+        &conn,
+        "decorates",
+        "python:function:demo.wrap",
+        "python:function:demo.handler",
+        EdgeConfidence::Resolved,
+        &[],
+        200,
+        204,
+    );
+    // Non-relation kinds targeting the same entities must never leak into a
+    // relation read (the inverse of the write-only gap this surface closes).
+    insert_calls_edge(
+        &conn,
+        "python:function:demo.handler",
+        "python:class:demo.Base",
+        EdgeConfidence::Resolved,
+        &[],
+    );
+    insert_references_edge(
+        &conn,
+        "python:class:demo.Child",
+        "python:class:demo.Base",
+        EdgeConfidence::Resolved,
+        10,
+        15,
+    );
+
+    let subclasses = relation_edges_for_entity(
+        &conn,
+        "python:class:demo.Base",
+        ReferenceDirection::In,
+        None,
+    )
+    .expect("inbound relations");
+    assert_eq!(
+        subclasses,
+        vec![RelationEdgeMatch {
+            kind: "inherits_from".to_owned(),
+            from_id: "python:class:demo.Child".to_owned(),
+            to_id: "python:class:demo.Base".to_owned(),
+            confidence: EdgeConfidence::Resolved,
+            candidates: Vec::new(),
+            source_file_id: Some("core:file:src/demo.py".to_owned()),
+            source_byte_start: Some(100),
+            source_byte_end: Some(117),
+        }],
+        "In on Base must list the subclass edge only, never calls/references"
+    );
+
+    let supertypes = relation_edges_for_entity(
+        &conn,
+        "python:class:demo.Child",
+        ReferenceDirection::Out,
+        None,
+    )
+    .expect("outbound relations");
+    assert_eq!(supertypes.len(), 1);
+    assert_eq!(supertypes[0].kind, "inherits_from");
+    assert_eq!(supertypes[0].to_id, "python:class:demo.Base");
+
+    let decorated = relation_edges_for_entity(
+        &conn,
+        "python:function:demo.wrap",
+        ReferenceDirection::Out,
+        None,
+    )
+    .expect("outbound decorates");
+    assert_eq!(decorated.len(), 1);
+    assert_eq!(decorated[0].kind, "decorates");
+    assert_eq!(decorated[0].to_id, "python:function:demo.handler");
+
+    let decorators = relation_edges_for_entity(
+        &conn,
+        "python:function:demo.handler",
+        ReferenceDirection::In,
+        None,
+    )
+    .expect("inbound decorates");
+    assert_eq!(decorators.len(), 1);
+    assert_eq!(decorators[0].from_id, "python:function:demo.wrap");
+}
+
+#[test]
+fn relation_edges_for_entity_kind_filter_and_deterministic_order() {
+    // One entity targeted by all four relation kinds (a Rust trait can be both
+    // implemented and derived); unfiltered reads order by kind then neighbor.
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity(&conn, "rust:trait:demo::Render", "trait");
+    insert_entity(&conn, "rust:struct:demo::Panel", "struct");
+    insert_entity(&conn, "rust:struct:demo::Badge", "struct");
+    insert_entity(&conn, "python:class:demo.Widget", "class");
+    insert_entity(&conn, "python:function:demo.deco", "function");
+    insert_relation_edge(
+        &conn,
+        "implements",
+        "rust:struct:demo::Panel",
+        "rust:trait:demo::Render",
+        EdgeConfidence::Resolved,
+        &[],
+        10,
+        16,
+    );
+    insert_relation_edge(
+        &conn,
+        "derives",
+        "rust:struct:demo::Badge",
+        "rust:trait:demo::Render",
+        EdgeConfidence::Resolved,
+        &[],
+        20,
+        26,
+    );
+    insert_relation_edge(
+        &conn,
+        "inherits_from",
+        "python:class:demo.Widget",
+        "rust:trait:demo::Render",
+        EdgeConfidence::Resolved,
+        &[],
+        30,
+        36,
+    );
+    insert_relation_edge(
+        &conn,
+        "decorates",
+        "python:function:demo.deco",
+        "rust:trait:demo::Render",
+        EdgeConfidence::Ambiguous,
+        &["python:function:demo.deco", "python:function:demo.other"],
+        40,
+        44,
+    );
+
+    let all = relation_edges_for_entity(
+        &conn,
+        "rust:trait:demo::Render",
+        ReferenceDirection::In,
+        None,
+    )
+    .expect("all inbound relations");
+    let kinds: Vec<&str> = all.iter().map(|m| m.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        vec!["decorates", "derives", "implements", "inherits_from"],
+        "unfiltered relations order by kind then neighbor: {all:?}"
+    );
+    // Ambiguous rows carry their candidate ids through (sorted); resolved rows
+    // carry none.
+    assert_eq!(
+        all[0].candidates,
+        vec![
+            "python:function:demo.deco".to_owned(),
+            "python:function:demo.other".to_owned(),
+        ],
+    );
+    assert!(all[1].candidates.is_empty());
+
+    let implementors = relation_edges_for_entity(
+        &conn,
+        "rust:trait:demo::Render",
+        ReferenceDirection::In,
+        Some("implements"),
+    )
+    .expect("kind-filtered relations");
+    assert_eq!(implementors.len(), 1);
+    assert_eq!(implementors[0].from_id, "rust:struct:demo::Panel");
+
+    let none = relation_edges_for_entity(
+        &conn,
+        "rust:trait:demo::Render",
+        ReferenceDirection::Out,
+        None,
+    )
+    .expect("outbound from a pure target");
+    assert!(none.is_empty(), "Render originates no relation: {none:?}");
 }
 
 #[test]

@@ -17,8 +17,9 @@ use crate::{
     ORIENTATION_PACK_MAX_NEIGHBORS, ORIENTATION_PACK_PATH_DEPTH, OrientationCore, ParamError,
     PathTraversal, ServerState, call_graph_scope_excludes, callee_json, caller_json,
     cap_neighbor_list, compact_execution_paths, entity_context_json, entity_json, import_neighbors,
-    orientation_suggested_reads, path_truncation_reason, reference_neighbors_for, required_i64,
-    storage_retryable, success_envelope, success_envelope_with_truncation, tool_error_envelope,
+    orientation_suggested_reads, path_truncation_reason, reference_neighbors_for,
+    relation_neighbors, required_i64, storage_retryable, success_envelope,
+    success_envelope_with_truncation, tool_error_envelope,
 };
 
 impl ServerState {
@@ -190,6 +191,10 @@ impl ServerState {
                     reference_neighbors_for(conn, &entity, ReferenceDirection::Out)?;
                 let imports_in = import_neighbors(conn, &entity.id, ReferenceDirection::In)?;
                 let imports_out = import_neighbors(conn, &entity.id, ReferenceDirection::Out)?;
+                let rels_in =
+                    relation_neighbors(conn, &entity.id, ReferenceDirection::In, confidence)?;
+                let rels_out =
+                    relation_neighbors(conn, &entity.id, ReferenceDirection::Out, confidence)?;
 
                 let cap = ORIENTATION_PACK_MAX_NEIGHBORS;
                 let (callers, callers_omitted) = cap_neighbor_list(callers_all, cap);
@@ -199,6 +204,8 @@ impl ServerState {
                 let (references_out, refs_out_omitted) = cap_neighbor_list(refs_out, cap);
                 let (imports_in, imports_in_omitted) = cap_neighbor_list(imports_in, cap);
                 let (imports_out, imports_out_omitted) = cap_neighbor_list(imports_out, cap);
+                let (relations_in, relations_in_omitted) = cap_neighbor_list(rels_in, cap);
+                let (relations_out, relations_out_omitted) = cap_neighbor_list(rels_out, cap);
 
                 let scope_excludes = call_graph_scope_excludes(confidence);
 
@@ -214,6 +221,10 @@ impl ServerState {
                     "references_rolled_up": references_rolled_up,
                     "imports_in": imports_in,
                     "imports_out": imports_out,
+                    // Kind-tagged relation edges (ADR-051): inherits_from /
+                    // decorates / implements / derives.
+                    "relations_in": relations_in,
+                    "relations_out": relations_out,
                     "scope_excludes": scope_excludes,
                 });
 
@@ -250,6 +261,8 @@ impl ServerState {
                     ("references_out", refs_out_omitted),
                     ("imports_in", imports_in_omitted),
                     ("imports_out", imports_out_omitted),
+                    ("relations_in", relations_in_omitted),
+                    ("relations_out", relations_out_omitted),
                 ] {
                     neighbors_omitted.insert(key.to_owned(), json!(omitted));
                 }

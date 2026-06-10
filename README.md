@@ -47,7 +47,7 @@ and trust-topology tools.
 
 ## What it does today
 
-`loomweave serve` exposes a 40-tool MCP surface that a consult-mode agent calls
+`loomweave serve` exposes a ~42-tool MCP surface that a consult-mode agent calls
 instead of grep-and-read. The core tool families are:
 
 | Family | Examples |

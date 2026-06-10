@@ -14,10 +14,12 @@ description: >
 ## Overview
 
 Loomweave pre-extracts a codebase into a queryable map — entities (functions,
-classes, modules, files), the call/reference/import edges between them, and
+classes, modules, files), the call/reference/import edges between them, the
+relation edges (`inherits_from`/`decorates`/`implements`/`derives`), and
 subsystem clusters — and serves it over MCP. **Ask Loomweave instead of
 re-exploring the tree.** One `find_entity` + one `callers_of` answers "what
-calls this?" without reading a single file.
+calls this?" — and one `entity_relation_list` answers "what subclasses this?" —
+without reading a single file.
 
 ## When to use
 
@@ -62,7 +64,8 @@ tell which case you're in.
 | `entity_resolve` | resolve dotted qualnames (`pkg.mod.func`) to entity ids + SEIs — the inverse of having an id | `{"qualnames": ["pkg.mod.func"]}` |
 | `entity_at` | what's at a file:line | `{"file": "rel/path.py", "line": 42}` |
 | `callers_of` | what calls this entity (bounded: `limit`+`cursor`) | `{"id": "<id>"}` |
-| `neighborhood` | one-hop callers+callees+container+contained+references+imports (per-bucket `limit`) | `{"id": "<id>"}` |
+| `neighborhood` | one-hop callers+callees+container+contained+references+imports+relations (per-bucket `limit`) | `{"id": "<id>"}` |
+| `entity_relation_list` | what subclasses X / what does a decorator decorate / what implements a trait — the `inherits_from`/`decorates`/`implements`/`derives` edges, with the anchoring source line | `{"id": "<id>", "direction": "in"}` |
 | `execution_paths_from` | bounded call paths out of an entity | `{"id": "<id>", "max_depth": 5}` |
 | `subsystem_members` | modules in a subsystem (bounded: `limit`+`cursor`) | `{"id": "core:subsystem:<hash>"}` |
 | `subsystem_of` | the subsystem an entity belongs to (reverse of `subsystem_members`) | `{"id": "<id>"}` |
@@ -87,19 +90,25 @@ policy. `summary` additionally requires the live LLM provider to be enabled
 (`llm_policy.enabled: true` + `allow_live_provider: true`), or it serves cache
 only.
 
-`callers_of` / `neighborhood` / `execution_paths_from` take a `confidence`
-tier — one of `"resolved"` (default; only high-confidence edges),
-`"ambiguous"`, or `"inferred"`. There is no `"all"` value. When you suspect an
-edge is missing (e.g. dynamic dispatch), re-query at `"ambiguous"` and
-`"inferred"` and union the results — a default `resolved` count can understate
-the true caller set.
+`callers_of` / `neighborhood` / `execution_paths_from` / `entity_relation_list`
+take a `confidence` tier — one of `"resolved"` (default; only high-confidence
+edges), `"ambiguous"`, or `"inferred"`. There is no `"all"` value. When you
+suspect an edge is missing (e.g. dynamic dispatch), re-query at `"ambiguous"`
+and `"inferred"` and union the results — a default `resolved` count can
+understate the true caller set. (Relation edges are never LLM-inferred, so for
+`entity_relation_list` and the `relations_in`/`relations_out` buckets
+`"ambiguous"` is the widest tier; `"inferred"` adds nothing.)
 
-These three tools also return a `scope_excludes` array listing static blind
-spots the query did **not** search (e.g. `"attribute-receiver-calls"` like
-`ctx.svc.run()`). A non-empty
+Of those, `callers_of` / `neighborhood` / `execution_paths_from` also return a
+`scope_excludes` array listing static blind spots the query did **not** search
+(e.g. `"attribute-receiver-calls"` like `ctx.svc.run()`). A non-empty
 `scope_excludes` means an empty/short result is **not** a guaranteed true
 negative — re-query at `"inferred"` (which searches those categories and returns
 `scope_excludes: []`) before concluding "nothing calls this."
+(`entity_relation_list` returns no `scope_excludes` and has no inferred tier;
+its honesty caveat is in its description — only *declared* relations are
+recorded, so a dynamically applied decorator or runtime-built class is
+invisible.)
 
 `execution_paths_from` returns a compact shape: `root`, a deduplicated `nodes`
 table (id + short_name + location, each node once), and `paths` as arrays of
@@ -262,10 +271,17 @@ and are composed into `summary` prompts with a real guidance fingerprint.
   cursor means you paged past the end.
 - **`neighborhood` caps each bucket independently** with one per-bucket `limit`
   and reports a `truncated` **map** (`{callers, callees, contained,
-  references_in, references_out, imports_in, imports_out}`) — it has **no
-  cursor**. When a bucket is `truncated:true`, switch to that relation's
-  dedicated cursor-paginated tool (e.g. `callers_of`) for the complete set;
-  `neighborhood` is a one-hop overview, not a paging surface.
+  references_in, references_out, imports_in, imports_out, relations_in,
+  relations_out}`) — it has **no cursor**. When a bucket is `truncated:true`,
+  switch to that relation's dedicated cursor-paginated tool (e.g. `callers_of`,
+  `entity_relation_list`) for the complete set; `neighborhood` is a one-hop
+  overview, not a paging surface.
+- **Relation direction reads as a sentence** (`from KIND to`, ADR-051):
+  `entity_relation_list` with `direction: "in"` on a class answers "what
+  subclasses / implements / derives this"; `direction: "out"` on a *decorator*
+  answers "what does this decorate" (the decorator is the FROM side — inverted
+  from where the `@decorator` line sits). Each entry carries the anchoring
+  file/line/line-text so you can see the declaration behind the edge.
 
 ## Launch
 

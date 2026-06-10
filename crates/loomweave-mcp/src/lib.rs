@@ -35,8 +35,8 @@ use loomweave_storage::{
     WriterCmd, call_edges_from, call_edges_targeting, containing_module_id,
     entity_briefing_block_reason, entity_by_id, import_edges_for_entity,
     inferred_edge_cache_key_id, module_reference_rollup, reference_edges_for_entity,
-    resolve_entity_ref, sei_for_locator, unresolved_call_sites_for_caller,
-    unresolved_callers_for_target,
+    relation_edges_for_entity, resolve_entity_ref, sei_for_locator,
+    unresolved_call_sites_for_caller, unresolved_callers_for_target,
 };
 
 use crate::config::{LlmConfig, SemanticSearchConfig};
@@ -86,16 +86,20 @@ registered and calling one returns a tool-disabled error."
     format!(
         "Loomweave is a code-archaeology server: it has pre-extracted this project \
 into a queryable map of entities (functions, classes, modules, files), the call \
-/ reference / import edges between them, and subsystem clusters. Ask Loomweave \
-instead of re-reading or grepping the tree.
+/ reference / import edges between them, the relation edges (inherits_from / \
+decorates / implements / derives — \"what subclasses X\" is `entity_relation_list` \
+direction=in), and subsystem clusters. Ask Loomweave instead of re-reading or \
+grepping the tree.
 
 Entity IDs are `{{plugin}}:{{kind}}:{{qualified_name}}` (e.g. \
 `python:function:pkg.mod.func`); subsystems are `core:subsystem:{{hash}}`. You \
 almost never type IDs — get one from `entity_find` or `entity_at`, then copy it \
 verbatim into the next tool.
 
-Tools: {tool_names}. `entity_callers_list` / `entity_neighborhood_get` / `entity_execution_path_list` \
-take a `confidence` tier (resolved | ambiguous | inferred; default resolved). \
+Tools: {tool_names}. `entity_callers_list` / `entity_neighborhood_get` / \
+`entity_execution_path_list` / `entity_relation_list` take a `confidence` tier \
+(resolved | ambiguous | inferred; default resolved — for relation edges, \
+inferred adds nothing beyond ambiguous). \
 `project_status_get` reports index freshness, counts, LLM policy, and the resolved \
 Filigree endpoint.{write_tools_note}
 
@@ -367,7 +371,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_neighborhood_get",
-            description: "Return the one-hop Loomweave neighborhood around an entity: callers, callees, container, contained entities, references, and imports (imports_in = who imports this module, imports_out = what it imports; module-to-module). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. On references_in each rolled-up neighbor also carries `importer_module` — the importing symbol's containing module — so reverse-import names importing modules, not just symbols. Each list bucket is bounded by a single per-bucket `limit` (default 50, max 100); a sibling `truncated` map flags which buckets were trimmed (callers/callees/contained/references_in/references_out/imports_in/imports_out). For the full cursor-paginated set of a trimmed bucket, use the dedicated single-relation tool (e.g. entity_callers_list). This overview has NO cursor — one cursor cannot coherently advance seven heterogeneous buckets. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls) so empty sections are never read as guaranteed true negatives.",
+            description: "Return the one-hop Loomweave neighborhood around an entity: callers, callees, container, contained entities, references, imports (imports_in = who imports this module, imports_out = what it imports; module-to-module), and relations (relations_in/relations_out — the kind-tagged inherits_from/decorates/implements/derives edges; relations_in on a class answers \"what subclasses this\", relations_out on a decorator answers \"what does this decorate\" — ADR-051 direction). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. On references_in each rolled-up neighbor also carries `importer_module` — the importing symbol's containing module — so reverse-import names importing modules, not just symbols. Each list bucket is bounded by a single per-bucket `limit` (default 50, max 100); a sibling `truncated` map flags which buckets were trimmed (callers/callees/contained/references_in/references_out/imports_in/imports_out/relations_in/relations_out). For the full cursor-paginated set of a trimmed bucket, use the dedicated single-relation tool (e.g. entity_callers_list, entity_relation_list). This overview has NO cursor — one cursor cannot coherently advance nine heterogeneous buckets. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls) so empty sections are never read as guaranteed true negatives.",
             input_schema: id_confidence_schema(),
         },
         ToolDefinition {
@@ -425,7 +429,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_orientation_pack_get",
-            description: "Assemble one deterministic orientation packet for a code location — the replacement for hand-composing find_entity + entity_at + source reads + neighborhood + issues_for + freshness on every question. Resolve EITHER by `entity` id OR by `file`+`line` (exactly one form). The packet bundles: the primary entity, the entity_context evidence (match_reason / containing stack / decl-body-decorator ranges — so a decorator-line query is explained, not guessed), a compact source-span summary, one-hop neighbors (callers, callees, container, contained, references, imports — for a module, references_in/out are rolled up over contained symbols with references_rolled_up=true), compact resolved execution paths, related Filigree issues, index/Filigree/LLM health, warnings, and suggested next reads. No LLM summary is invoked. Every list is bounded; an `omitted` block reports per-section truncation counts and `degraded` sections name surfaces that were unavailable (e.g. Filigree down) so an empty section is never read as a guaranteed negative. Includes a `wardline_findings` section (enrich-only) reconciling Wardline findings to the entity by qualname; `result_kind` is matched|no_matches|unavailable.",
+            description: "Assemble one deterministic orientation packet for a code location — the replacement for hand-composing find_entity + entity_at + source reads + neighborhood + issues_for + freshness on every question. Resolve EITHER by `entity` id OR by `file`+`line` (exactly one form). The packet bundles: the primary entity, the entity_context evidence (match_reason / containing stack / decl-body-decorator ranges — so a decorator-line query is explained, not guessed), a compact source-span summary, one-hop neighbors (callers, callees, container, contained, references, imports, kind-tagged relations_in/relations_out for inherits_from/decorates/implements/derives — for a module, references_in/out are rolled up over contained symbols with references_rolled_up=true), compact resolved execution paths, related Filigree issues, index/Filigree/LLM health, warnings, and suggested next reads. No LLM summary is invoked. Every list is bounded; an `omitted` block reports per-section truncation counts and `degraded` sections name surfaces that were unavailable (e.g. Filigree down) so an empty section is never read as a guaranteed negative. Includes a `wardline_findings` section (enrich-only) reconciling Wardline findings to the entity by qualname; `result_kind` is matched|no_matches|unavailable.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -712,6 +716,26 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "additionalProperties": false
             }),
         },
+        ToolDefinition {
+            name: "entity_relation_list",
+            description: "List the semantic relation edges touching an entity — inherits_from / decorates / implements / derives, the type-level claims distinct from calls/references occurrences. Answers \"what subclasses X\" (direction=in on a class), \"what does @wrap decorate\" (direction=out on the decorator), \"what implements/derives trait T\" (direction=in on the trait). `direction` is REQUIRED because relation kinds read as sentences over the stored edge (ADR-051): in = edges whose target is this entity, out = edges this entity originates — for decorates that means the DECORATOR is the out side. Optionally narrow with `kind`. Each entry carries the neighbor entity, the edge `kind`, `edge_confidence`, and the anchor evidence behind the edge (file, 1-based line, byte column, line text, byte span, source_status/drift guards) read from the edge's own anchor file — for `decorates` the anchor lives in the DECORATED side's file (the `@decorator` line), not the decorator's. Default confidence is resolved; `ambiguous` opts ambiguous edges in, each passing through its alternative-candidate ids (`candidates` — for decorates these are alternative FROM-side decorators, inverted relative to every other kind). Relation edges are never LLM-inferred: confidence=inferred adds nothing beyond ambiguous and triggers no LLM dispatch. Bounded: `limit` (default 50, max 100) plus a numeric-offset `cursor`; the result carries `next_cursor` (null when exhausted) and an explicit `truncated` flag. An entity with no relation edges returns an empty list (honest-empty), not an error — but note static extraction only records declared relations (a dynamically applied decorator or runtime-built class is invisible). No LLM call.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "minLength": 1},
+                    "direction": {"type": "string", "enum": ["in", "out"]},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["inherits_from", "decorates", "implements", "derives"]
+                    },
+                    "confidence": confidence_schema(),
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    "cursor": {"type": ["string", "null"]}
+                },
+                "required": ["id", "direction"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -858,7 +882,7 @@ fn id_confidence_schema() -> Value {
 /// `id` + `confidence` + `limit` + `cursor` — the single-relation cursor-
 /// paginated shape for `entity_callers_list`. Distinct from the neighborhood
 /// overview, which takes a per-bucket `limit` but NO cursor (one cursor cannot
-/// coherently advance seven heterogeneous buckets). clarion-d76e7f7267.
+/// coherently advance nine heterogeneous buckets). clarion-d76e7f7267.
 fn id_confidence_cursor_schema() -> Value {
     json!({
         "type": "object",
@@ -1496,6 +1520,10 @@ impl ServerState {
                 Err(response) => return response.to_json_rpc(id),
             },
             "entity_resolve" => match self.tool_entity_resolve(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "entity_relation_list" => match self.tool_relation_list(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
@@ -4698,7 +4726,14 @@ fn current_source_content_hash(
     file_bytes: &[u8],
     source: Option<&str>,
 ) -> Option<String> {
-    if is_plugin_file_scope_entity(entity) {
+    // A core `file` catalog row hashes its whole contents (analyze's
+    // `whole_file_hash`), same as a plugin file-scope entity. Relation-edge
+    // anchors resolve their owner from the edge's `source_file_id`, so drift
+    // must be detectable on file rows too. Gated on core ownership, not the
+    // kind name alone — a plugin-owned "file" kind makes no whole-file-hash
+    // promise.
+    if (entity.plugin_id == "core" && entity.kind == "file") || is_plugin_file_scope_entity(entity)
+    {
         return Some(blake3::hash(file_bytes).to_hex().to_string());
     }
     let source = source?;
@@ -5049,6 +5084,41 @@ fn reference_neighbors(
     )
 }
 
+/// Kind-tagged relation neighbors (`inherits_from` / `decorates` /
+/// `implements` / `derives`) for `neighborhood` / `orientation_pack`
+/// (clarion-ae5b43ea40). Same entry shape as the references buckets plus the
+/// edge `kind`; the cursor-paginated set with anchor evidence is the dedicated
+/// `entity_relation_list` tool. Honors the confidence tier (relations are
+/// resolved|ambiguous only — stronger claims than `references`, so the
+/// resolved default excludes ambiguous rows rather than mixing them in).
+fn relation_neighbors(
+    conn: &rusqlite::Connection,
+    entity_id: &str,
+    direction: ReferenceDirection,
+    confidence: EdgeConfidence,
+) -> Result<Vec<Value>, StorageError> {
+    let mut neighbors = Vec::new();
+    for edge in relation_edges_for_entity(conn, entity_id, direction, None)? {
+        if edge.confidence > confidence {
+            continue;
+        }
+        let neighbor_id = match direction {
+            ReferenceDirection::In => &edge.from_id,
+            ReferenceDirection::Out => &edge.to_id,
+        };
+        if let Some(entity) = entity_by_id(conn, neighbor_id)? {
+            neighbors.push(json!({
+                "kind": edge.kind,
+                "entity": entity_json(conn, &entity),
+                "edge_confidence": edge.confidence.as_str(),
+                "source_byte_start": edge.source_byte_start,
+                "source_byte_end": edge.source_byte_end
+            }));
+        }
+    }
+    Ok(neighbors)
+}
+
 /// `imports`-edge neighbors for a module entity (clarion-79d0ff6e14). Direction
 /// `In` is the reverse-import lookup ("who imports this module").
 fn import_neighbors(
@@ -5212,7 +5282,7 @@ mod tests {
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 41);
+        assert_eq!(tools.len(), 42);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
@@ -5246,7 +5316,7 @@ mod tests {
         assert_eq!(tools[6].name, "entity_neighborhood_get");
         assert_eq!(
             tools[6].description,
-            "Return the one-hop Loomweave neighborhood around an entity: callers, callees, container, contained entities, references, and imports (imports_in = who imports this module, imports_out = what it imports; module-to-module). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. On references_in each rolled-up neighbor also carries `importer_module` — the importing symbol's containing module — so reverse-import names importing modules, not just symbols. Each list bucket is bounded by a single per-bucket `limit` (default 50, max 100); a sibling `truncated` map flags which buckets were trimmed (callers/callees/contained/references_in/references_out/imports_in/imports_out). For the full cursor-paginated set of a trimmed bucket, use the dedicated single-relation tool (e.g. entity_callers_list). This overview has NO cursor — one cursor cannot coherently advance seven heterogeneous buckets. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls) so empty sections are never read as guaranteed true negatives."
+            "Return the one-hop Loomweave neighborhood around an entity: callers, callees, container, contained entities, references, imports (imports_in = who imports this module, imports_out = what it imports; module-to-module), and relations (relations_in/relations_out — the kind-tagged inherits_from/decorates/implements/derives edges; relations_in on a class answers \"what subclasses this\", relations_out on a decorator answers \"what does this decorate\" — ADR-051 direction). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. On references_in each rolled-up neighbor also carries `importer_module` — the importing symbol's containing module — so reverse-import names importing modules, not just symbols. Each list bucket is bounded by a single per-bucket `limit` (default 50, max 100); a sibling `truncated` map flags which buckets were trimmed (callers/callees/contained/references_in/references_out/imports_in/imports_out/relations_in/relations_out). For the full cursor-paginated set of a trimmed bucket, use the dedicated single-relation tool (e.g. entity_callers_list, entity_relation_list). This overview has NO cursor — one cursor cannot coherently advance nine heterogeneous buckets. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls) so empty sections are never read as guaranteed true negatives."
         );
         assert_eq!(tools[7].name, "subsystem_member_list");
         assert_eq!(
@@ -5281,7 +5351,7 @@ mod tests {
         assert_eq!(tools[13].name, "entity_orientation_pack_get");
         assert_eq!(
             tools[13].description,
-            "Assemble one deterministic orientation packet for a code location — the replacement for hand-composing find_entity + entity_at + source reads + neighborhood + issues_for + freshness on every question. Resolve EITHER by `entity` id OR by `file`+`line` (exactly one form). The packet bundles: the primary entity, the entity_context evidence (match_reason / containing stack / decl-body-decorator ranges — so a decorator-line query is explained, not guessed), a compact source-span summary, one-hop neighbors (callers, callees, container, contained, references, imports — for a module, references_in/out are rolled up over contained symbols with references_rolled_up=true), compact resolved execution paths, related Filigree issues, index/Filigree/LLM health, warnings, and suggested next reads. No LLM summary is invoked. Every list is bounded; an `omitted` block reports per-section truncation counts and `degraded` sections name surfaces that were unavailable (e.g. Filigree down) so an empty section is never read as a guaranteed negative. Includes a `wardline_findings` section (enrich-only) reconciling Wardline findings to the entity by qualname; `result_kind` is matched|no_matches|unavailable."
+            "Assemble one deterministic orientation packet for a code location — the replacement for hand-composing find_entity + entity_at + source reads + neighborhood + issues_for + freshness on every question. Resolve EITHER by `entity` id OR by `file`+`line` (exactly one form). The packet bundles: the primary entity, the entity_context evidence (match_reason / containing stack / decl-body-decorator ranges — so a decorator-line query is explained, not guessed), a compact source-span summary, one-hop neighbors (callers, callees, container, contained, references, imports, kind-tagged relations_in/relations_out for inherits_from/decorates/implements/derives — for a module, references_in/out are rolled up over contained symbols with references_rolled_up=true), compact resolved execution paths, related Filigree issues, index/Filigree/LLM health, warnings, and suggested next reads. No LLM summary is invoked. Every list is bounded; an `omitted` block reports per-section truncation counts and `degraded` sections name surfaces that were unavailable (e.g. Filigree down) so an empty section is never read as a guaranteed negative. Includes a `wardline_findings` section (enrich-only) reconciling Wardline findings to the entity by qualname; `result_kind` is matched|no_matches|unavailable."
         );
         assert_eq!(tools[14].name, "analyze_start");
         assert_eq!(
@@ -5322,6 +5392,7 @@ mod tests {
         assert_eq!(tools[38].name, "entity_semantic_search_list");
         assert_eq!(tools[39].name, "project_finding_list");
         assert_eq!(tools[40].name, "entity_resolve");
+        assert_eq!(tools[41].name, "entity_relation_list");
     }
 
     #[test]

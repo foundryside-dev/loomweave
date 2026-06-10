@@ -769,11 +769,11 @@ The scope lens shapes neighbour queries without changing their signatures:
 
 ### Tool catalogue by category
 
-> **The MCP server registers 35 tools** (`loomweave-mcp/src/lib.rs::list_tools`). The categories below name the actual shipped tools, not the original aspirational cursor-based catalogue. The earlier 8-tool subset has been superseded as WP4/WP5 navigation, catalog filters, and analyze-control tools landed; the tools are **stateless and id-based** (no `goto`/`back`/`zoom` cursor session), so an agent passes an `EntityId` (obtained from `find_entity` / `entity_at`) into each call. Tools that produce LLM summaries remain on-demand per [ADR-030](../adr/ADR-030-on-demand-summary-scope.md).
+> **The MCP server defines 42 tools** (`loomweave-mcp/src/lib.rs::list_tools` — the `tools_list_exposes_exact_docstrings` test pins the exact count and order). Five of them (`entity_summary_get`, `analyze_start`, `analyze_cancel`, `propose_guidance`, `promote_guidance`) are write-gated: they are *registered* only under `serve.mcp.enable_write_tools: true`, so the default read-only policy advertises 37. The categories below name the actual shipped tools, not the original aspirational cursor-based catalogue. The earlier 8-tool subset has been superseded as WP4/WP5 navigation, catalog filters, and analyze-control tools landed; the tools are **stateless and id-based** (no `goto`/`back`/`zoom` cursor session), so an agent passes an `EntityId` (obtained from `find_entity` / `entity_at`) into each call. Tools that produce LLM summaries remain on-demand per [ADR-030](../adr/ADR-030-on-demand-summary-scope.md).
 
 **Location & lookup**: `entity_at(file, line)`, `find_entity(pattern)`, `source_for_entity(id)`, `orientation_pack(...)`, `project_status()`
 
-**Graph navigation**: `callers_of(id, confidence)`, `call_sites(id)`, `execution_paths_from(id, max_depth, confidence)`, `neighborhood(id, confidence)`, `what_tests_this(id)`
+**Graph navigation**: `callers_of(id, confidence)`, `call_sites(id)`, `execution_paths_from(id, max_depth, confidence)`, `neighborhood(id, confidence)`, `entity_relation_list(id, direction, kind?, confidence)` — the relation-edge read surface (`inherits_from`/`decorates`/`implements`/`derives`, direction semantics per [ADR-051](../adr/ADR-051-relation-edge-direction-and-anchor.md)), `what_tests_this(id)`
 
 **Subsystems**: `subsystem_members(id)`, `subsystem_of(id)`
 

@@ -12,10 +12,10 @@ use loomweave_core::{EdgeConfidence, McpErrorCode};
 use serde_json::{Value, json};
 
 use loomweave_storage::{
-    EntityVisibility, ReferenceDirection, StorageError, ancestor_chain, call_edges_from,
-    call_edges_targeting, child_entity_ids, entities_containing_line, entity_by_id,
-    entity_visibility, find_entities, normalize_source_path, resolve_entity_ref, subsystem_members,
-    subsystem_of_entity,
+    EntityVisibility, RELATION_EDGE_KINDS, ReferenceDirection, StorageError, ancestor_chain,
+    call_edges_from, call_edges_targeting, child_entity_ids, entities_containing_line,
+    entity_by_id, entity_visibility, find_entities, normalize_source_path,
+    relation_edges_for_entity, resolve_entity_ref, subsystem_members, subsystem_of_entity,
 };
 
 use crate::filigree::IssueDetail;
@@ -27,8 +27,8 @@ use crate::{
     entity_not_found_envelope, entity_properties_json, envelope_from_storage_result,
     flatten_storage_envelope_result, import_neighbors, issues_unavailable, optional_bool,
     optional_confidence, optional_usize, parse_cursor_offset, path_truncation_reason,
-    reference_neighbors_for, required_i64, required_str, storage_retryable, success_envelope,
-    success_envelope_with_stats, success_envelope_with_truncation,
+    reference_neighbors_for, relation_neighbors, required_i64, required_str, storage_retryable,
+    success_envelope, success_envelope_with_stats, success_envelope_with_truncation,
     success_envelope_with_truncation_and_stats, tool_error_envelope, wardline_section_for_entity,
     wardline_unavailable,
 };
@@ -361,8 +361,8 @@ impl ServerState {
         let requested_id = required_str(arguments, "id")?.to_owned();
         let confidence = optional_confidence(arguments)?;
         // Per-bucket cap (clarion-d76e7f7267): ONE `limit` (default 50, clamp
-        // 1..=100) bounds EACH of the seven list buckets independently. NO
-        // cursor — one cursor cannot coherently advance seven heterogeneous
+        // 1..=100) bounds EACH of the nine list buckets independently. NO
+        // cursor — one cursor cannot coherently advance nine heterogeneous
         // buckets; an agent paginates a specific relation via its dedicated tool.
         let limit = optional_usize(arguments, "limit")?
             .unwrap_or(50)
@@ -431,6 +431,10 @@ impl ServerState {
                     reference_neighbors_for(conn, &entity, ReferenceDirection::Out)?;
                 let mut imports_in = import_neighbors(conn, &entity_id, ReferenceDirection::In)?;
                 let mut imports_out = import_neighbors(conn, &entity_id, ReferenceDirection::Out)?;
+                let mut relations_in =
+                    relation_neighbors(conn, &entity_id, ReferenceDirection::In, confidence)?;
+                let mut relations_out =
+                    relation_neighbors(conn, &entity_id, ReferenceDirection::Out, confidence)?;
                 let scope_excludes = call_graph_scope_excludes(confidence);
                 // Bound EACH bucket independently and record whether it was
                 // trimmed in the sibling `truncated` map. A trimmed bucket directs
@@ -449,6 +453,8 @@ impl ServerState {
                     "references_out": truncate_bucket(&mut references_out),
                     "imports_in": truncate_bucket(&mut imports_in),
                     "imports_out": truncate_bucket(&mut imports_out),
+                    "relations_in": truncate_bucket(&mut relations_in),
+                    "relations_out": truncate_bucket(&mut relations_out),
                 });
                 Ok(success_envelope(json!({
                     "entity": entity_json(conn, &entity),
@@ -465,6 +471,12 @@ impl ServerState {
                     "references_rolled_up": references_rolled_up,
                     "imports_in": imports_in,
                     "imports_out": imports_out,
+                    // Kind-tagged relation edges (inherits_from / decorates /
+                    // implements / derives, ADR-051). relations_in on a class
+                    // answers "what subclasses this"; relations_out on a
+                    // decorator answers "what does this decorate".
+                    "relations_in": relations_in,
+                    "relations_out": relations_out,
                     "truncated": truncated,
                     "scope_excludes": scope_excludes,
                 })))
@@ -738,6 +750,173 @@ impl ServerState {
                         "properties": entity_properties_json(s)
                     })),
                     "via_module_id": found.via_module_id
+                })))
+            })
+            .await;
+        Ok(flatten_storage_envelope_result(result))
+    }
+
+    /// `entity_relation_list` (clarion-ae5b43ea40): the dedicated read surface
+    /// for the relation edge kinds (`inherits_from` / `decorates` /
+    /// `implements` / `derives`), previously write-only. The neighborhood /
+    /// orientation `relations_in`/`relations_out` buckets serve the same edges
+    /// kind-tagged; this tool is the cursor-paginated set WITH anchor evidence.
+    ///
+    /// Direction is positional over the stored edge; ADR-051 pins what that
+    /// means per kind. The anchor evidence resolves through the edge's OWN
+    /// `source_file_id` (never inferred from an endpoint): which side's file
+    /// holds the anchor varies per kind — `decorates` anchors in the TO
+    /// (decorated) side's file, every other kind in the FROM side's — so the
+    /// edge's stored file is the only kind-agnostic truth.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn tool_relation_list(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let requested_id = required_str(arguments, "id")?.to_owned();
+        let direction = match arguments.get("direction") {
+            Some(Value::String(s)) if s == "in" => ReferenceDirection::In,
+            Some(Value::String(s)) if s == "out" => ReferenceDirection::Out,
+            _ => return Err(ParamError::new("direction must be \"in\" or \"out\"")),
+        };
+        let kind = match arguments.get("kind") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) if RELATION_EDGE_KINDS.contains(&s.as_str()) => Some(s.clone()),
+            _ => {
+                return Err(ParamError::new(
+                    "kind must be one of \"inherits_from\", \"decorates\", \"implements\", \"derives\"",
+                ));
+            }
+        };
+        // Relation edges are resolved|ambiguous only (ADR-028/ADR-051): the
+        // inferred tier is accepted for parameter parity but adds nothing and
+        // must never trigger the `ensure_inferred_*` LLM dispatch.
+        let confidence = optional_confidence(arguments)?;
+        let limit = optional_usize(arguments, "limit")?
+            .unwrap_or(50)
+            .clamp(1, 100);
+        let offset = parse_cursor_offset(arguments)?;
+        let entity_id = match self.resolve_to_locator(&requested_id).await {
+            Ok(Some(id)) => id,
+            Ok(None) => return Ok(entity_not_found_envelope(&requested_id)),
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::StorageError,
+                    &err.to_string(),
+                    storage_retryable(&err),
+                ));
+            }
+        };
+        let result = self
+            .readers
+            .with_reader(move |conn| {
+                let Some(entity) = entity_by_id(conn, &entity_id)? else {
+                    return Ok(entity_not_found_envelope(&entity_id));
+                };
+                // Refuse to fan out structure around a briefing-blocked entity
+                // (same posture as neighborhood, ADR-034).
+                if let Some(reason) = crate::briefing_block_reason(&entity) {
+                    return Ok(crate::blocked_entity_refusal(&reason));
+                }
+                let edges: Vec<_> =
+                    relation_edges_for_entity(conn, &entity.id, direction, kind.as_deref())?
+                        .into_iter()
+                        .filter(|edge| edge.confidence <= confidence)
+                        .collect();
+                let total = edges.len();
+                let has_more = offset.saturating_add(limit) < total;
+                let next_cursor = has_more.then(|| (offset + limit).to_string());
+                let mut owner_meta: HashMap<String, crate::OwnerMeta> = HashMap::new();
+                let mut file_content: HashMap<String, Option<Vec<u8>>> = HashMap::new();
+                // Memoized candidate visibility: candidate ids are raw
+                // qualname-encoding locators, so a briefing-blocked candidate
+                // would hand back exactly the identity the neighbor stub
+                // withholds. Only ids resolving to VISIBLE entities pass
+                // (entity_resolve collapses blocked candidates for the same
+                // reason); a lookup error fails closed.
+                let mut candidate_visible: HashMap<String, bool> = HashMap::new();
+                let mut relations = Vec::new();
+                for edge in edges.into_iter().skip(offset).take(limit) {
+                    let neighbor_id = match direction {
+                        ReferenceDirection::In => &edge.from_id,
+                        ReferenceDirection::Out => &edge.to_id,
+                    };
+                    let Some(neighbor) = entity_by_id(conn, neighbor_id)? else {
+                        continue;
+                    };
+                    // A blocked NEIGHBOR is stubbed by entity_json; the anchor
+                    // evidence (file, line text — which contains the blocked
+                    // declaration) must be withheld with it.
+                    let neighbor_blocked = crate::briefing_block_reason(&neighbor).is_some();
+                    let (file, anchor, byte_start, byte_end) = if neighbor_blocked {
+                        (
+                            Value::Null,
+                            crate::AnchorLine::redacted("briefing_blocked", true, Value::Null),
+                            Value::Null,
+                            Value::Null,
+                        )
+                    } else {
+                        // The anchor owner is the edge's own source-file row.
+                        let missing_owner = crate::OwnerMeta::missing();
+                        let owner = match edge.source_file_id.as_deref() {
+                            Some(file_id) => crate::resolve_owner(conn, &mut owner_meta, file_id)?,
+                            None => &missing_owner,
+                        };
+                        let anchor =
+                            crate::anchor_line(&mut file_content, owner, edge.source_byte_start);
+                        let file = if anchor.briefing_blocked {
+                            Value::Null
+                        } else {
+                            json!(owner.path.as_deref())
+                        };
+                        (
+                            file,
+                            anchor,
+                            json!(edge.source_byte_start),
+                            json!(edge.source_byte_end),
+                        )
+                    };
+                    let candidates: Vec<&String> = edge
+                        .candidates
+                        .iter()
+                        .filter(|cid| {
+                            *candidate_visible.entry((*cid).clone()).or_insert_with(|| {
+                                matches!(
+                                    entity_visibility(conn, cid),
+                                    Ok(EntityVisibility::Visible)
+                                )
+                            })
+                        })
+                        .collect();
+                    relations.push(json!({
+                        "kind": edge.kind,
+                        "entity": entity_json(conn, &neighbor),
+                        "edge_confidence": edge.confidence.as_str(),
+                        "candidates": candidates,
+                        "file": file,
+                        "line": anchor.line,
+                        "column": anchor.column,
+                        "line_text": anchor.line_text,
+                        "source_status": anchor.source_status,
+                        "briefing_blocked": anchor.briefing_blocked,
+                        "drift": anchor.drift,
+                        "byte_start": byte_start,
+                        "byte_end": byte_end,
+                    }));
+                }
+                Ok(success_envelope(json!({
+                    "entity": entity_json(conn, &entity),
+                    "direction": match direction {
+                        ReferenceDirection::In => "in",
+                        ReferenceDirection::Out => "out",
+                    },
+                    "filters": {
+                        "kind": kind,
+                        "confidence": confidence.as_str(),
+                    },
+                    "relations": relations,
+                    "next_cursor": next_cursor,
+                    "truncated": has_more,
                 })))
             })
             .await;
