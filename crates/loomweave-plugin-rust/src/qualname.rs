@@ -273,16 +273,22 @@ pub fn self_ty_locator(ty: &Type, declared_params: &[String]) -> String {
 /// [`self_ty_locator`] with the base **qualified by the full written self-type
 /// path** (ADR-049 Amendment 6, stage S of the residual-collision ladder):
 /// `impl T for a::X` renders `a%3A%3AX`, `impl<T> Tr for a::X<T>` renders
-/// `a%3A%3AX<$0>`. The base is `escape_reserved` over the `::`-joined
-/// [`self_ty_path_witness`]; the final segment's generic-argument machinery is
-/// shared verbatim with [`self_ty_locator`] via `self_ty_locator_with_base`.
+/// `a%3A%3AX<$0>`, and a leading `::` contributes a leading `%3A%3A`
+/// (`impl T for ::a::X` renders `%3A%3Aa%3A%3AX` — symmetric with
+/// [`trait_path_qualified`]). The base is `escape_reserved` over the
+/// `::`-joined [`self_ty_path_witness`]; the final segment's generic-argument
+/// machinery is shared verbatim with [`self_ty_locator`] via
+/// `self_ty_locator_with_base`.
 ///
 /// **Single-segment byte-equivalence:** a single-segment written path (`X`)
 /// has witness == ident and the escape is a no-op on an ident, so the
 /// qualified rendering is byte-identical to [`self_ty_locator`] — within a
-/// fired S group only multi-segment members move. A non-`Type::Path` (or
-/// qself-bearing) self type falls back to the bare rendering, which is
-/// already fully path-qualified (Amendment 4 textual render).
+/// fired S group only multi-segment members move. A non-`Type::Path` self
+/// type falls back to the bare rendering, which is already fully
+/// path-qualified (the Amendment-4 textual render). A **qself-bearing**
+/// `Type::Path` also falls back to [`self_ty_locator`] — i.e. its bare
+/// **last segment**, NOT a qualified path — kept as-is because rustc rejects
+/// projection self types, so the arm is unreachable for compilable Rust.
 #[must_use]
 pub fn self_ty_locator_qualified(ty: &Type, declared_params: &[String]) -> String {
     if let Type::Path(p) = ty
@@ -326,26 +332,34 @@ fn self_ty_locator_with_base(
 
 /// The **written self-type path** of an impl, as the stage-S comparison
 /// witness (ADR-049 Amendment 6, clarion-8ff7f233fa). For a `Type::Path`
-/// with no qself: the segment idents joined by `::` — unescaped, and with
-/// **no generic arguments** (args are already normalized into the locator by
-/// Amendment 3 and must not affect twin detection, or a positional rename
-/// would falsely fire the gate). For a non-`Type::Path` or qself-bearing
-/// self type: the existing Amendment-4 textual render, which is already
-/// fully path-qualified. Comparison key only — never emitted; the emitted
-/// base is [`self_ty_locator_qualified`].
+/// with no qself: the segment idents joined by `::` — a leading `::`
+/// contributes a leading separator, exactly as in [`trait_path_qualified`]
+/// (`impl Tr for ::a::X` + `impl Tr for a::X` is valid Rust when a local
+/// `mod a` shadows an extern crate `a`, so the two witnesses must differ) —
+/// unescaped, and with **no generic arguments** (args are already normalized
+/// into the locator by Amendment 3 and must not affect twin detection, or a
+/// positional rename would falsely fire the gate). For a non-`Type::Path` or
+/// qself-bearing self type: the existing Amendment-4 textual render, which
+/// is already fully path-qualified. Comparison key only — never emitted; the
+/// emitted base is [`self_ty_locator_qualified`].
 #[must_use]
 pub fn self_ty_path_witness(ty: &Type) -> String {
     if let Type::Path(p) = ty
         && p.qself.is_none()
         && !p.path.segments.is_empty()
     {
-        return p
+        let joined = p
             .path
             .segments
             .iter()
             .map(|s| s.ident.to_string())
             .collect::<Vec<_>>()
             .join("::");
+        return if p.path.leading_colon.is_some() {
+            format!("::{joined}")
+        } else {
+            joined
+        };
     }
     render_concrete_arg(ty)
 }
@@ -786,6 +800,30 @@ mod syn_disc_tests {
             impl<T> Tr for a::X<T> {}
         );
         assert_eq!(self_ty_path_witness(&with_args.self_ty), "a::X");
+    }
+
+    #[test]
+    fn self_ty_path_witness_leading_colon_is_part_of_the_witness() {
+        // `impl Tr for ::a::X` + `impl Tr for a::X` is valid Rust (a local
+        // `mod a` shadowing an extern crate `a`); the leading `::` must keep
+        // the two witnesses distinct or the S gate stays cold and the method
+        // ids collide. Symmetric with `trait_path_qualified`.
+        let global: syn::ItemImpl = parse_quote!(impl Tr for ::a::X {});
+        let local: syn::ItemImpl = parse_quote!(impl Tr for a::X {});
+        assert_eq!(self_ty_path_witness(&global.self_ty), "::a::X");
+        assert_ne!(
+            self_ty_path_witness(&global.self_ty),
+            self_ty_path_witness(&local.self_ty)
+        );
+    }
+
+    #[test]
+    fn self_ty_locator_qualified_leading_colon_contributes_a_leading_escape() {
+        let it: syn::ItemImpl = parse_quote!(impl Tr for ::a::X {});
+        assert_eq!(
+            self_ty_locator_qualified(&it.self_ty, &declared_type_params(&it)),
+            "%3A%3Aa%3A%3AX"
+        );
     }
 
     #[test]

@@ -145,7 +145,50 @@ fn corpus() -> Vec<(&'static str, &'static str, &'static str)> {
             "k.m",
             "mod a { pub trait Tr { fn go(&self); } }\nmod b { pub trait Tr { fn go(&self); } }\nmod c { pub struct X; }\nmod d { pub struct X; }\nimpl a::Tr for c::X { fn go(&self){} }\nimpl b::Tr for d::X { fn go(&self){} }\n",
         ),
+        // Amendment-6 witness symmetry (remediation): `impl T for a::X` +
+        // `impl T for ::a::X` is valid Rust when a local `mod a` shadows an
+        // extern crate `a`. The leading `::` must be PART of the witness
+        // (mirroring trait_path_qualified) or both witnesses read `a::X`,
+        // the S gate stays cold, and the impls + `go` methods collide.
+        (
+            "k",
+            "k.m",
+            "pub trait T { fn go(&self); }\nmod a { pub struct X; }\nimpl T for a::X { fn go(&self){} }\nimpl T for ::a::X { fn go(&self){} }\n",
+        ),
+        // The S→T RESIDUAL shape: three impls share one bare key; S fires
+        // (witnesses c::X / d::X) but the two c::X members STILL collide
+        // post-S — T must fire on that residual group or both
+        // `c%3A%3AX.impl[Tr].go` methods collapse.
+        (
+            "k",
+            "k.m",
+            "mod a { pub trait Tr { fn go(&self); } }\nmod b { pub trait Tr { fn go(&self); } }\nmod c { pub struct X; }\nmod d { pub struct X; }\nimpl a::Tr for c::X { fn go(&self){} }\nimpl b::Tr for c::X { fn go(&self){} }\nimpl a::Tr for d::X { fn go(&self){} }\n",
+        ),
+        // Method-@cfg on the FINAL post-S key: an S-fired group whose a::X
+        // member is TWO merged same-witness blocks carrying cfg-twin `go`
+        // methods — the method twin counter must key on the post-S impl
+        // qualname or the merged `go` twins collide.
+        (
+            "k",
+            "k.m",
+            "pub trait T { fn go(&self); }\nmod a { pub struct X; }\nmod b { pub struct X; }\nimpl T for a::X { #[cfg(unix)] fn go(&self){} }\nimpl T for a::X { #[cfg(windows)] fn go(&self){} }\nimpl T for b::X { fn go(&self){} }\n",
+        ),
     ]
+}
+
+#[test]
+fn lone_unnamed_const_emits_no_entity() {
+    // ADR-049 Amendment 9 direct pin: the skip is UNCONDITIONAL on
+    // `ident == "_"` — a SINGLE `const _` with no twin emits nothing either
+    // (skipping only when twinned would make the emitted set
+    // sibling-dependent and churn SEI). Only the file-scope module remains.
+    let entities = extract_file("k", "k.m", "/p/src/m.rs", "const _: () = ();\n").unwrap();
+    let ids: Vec<&str> = entities.iter().map(|e| e["id"].as_str().unwrap()).collect();
+    assert_eq!(
+        ids,
+        vec!["rust:module:k.m"],
+        "a lone `const _` must emit NO entity (unconditional skip)"
+    );
 }
 
 #[test]

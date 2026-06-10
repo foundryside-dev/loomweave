@@ -233,3 +233,78 @@ fn reordering_a_self_type_path_twin_pair_is_id_stable() {
     let b = "pub trait T { fn go(&self); }\nmod a { pub struct X; }\nmod b { pub struct X; }\nimpl T for b::X { fn go(&self){} }\nimpl T for a::X { fn go(&self){} }\n";
     assert_eq!(id_set(a), id_set(b));
 }
+
+#[test]
+fn reordering_a_trait_path_twin_pair_is_id_stable() {
+    // The T-family analogue of the S reorder test: the rendering sets are
+    // BTree-collected, so reordering the trait-path twin pair (the Compat
+    // shape) yields the identical id set.
+    let a = "struct Compat<T>(T);\nmod a { pub trait AsyncRead { fn poll_read(&self); } }\nmod b { pub trait AsyncRead { fn poll_read(&self); } }\nimpl<T> a::AsyncRead for Compat<T> { fn poll_read(&self){} }\nimpl<T> b::AsyncRead for Compat<T> { fn poll_read(&self){} }\n";
+    let b = "struct Compat<T>(T);\nmod a { pub trait AsyncRead { fn poll_read(&self); } }\nmod b { pub trait AsyncRead { fn poll_read(&self); } }\nimpl<T> b::AsyncRead for Compat<T> { fn poll_read(&self){} }\nimpl<T> a::AsyncRead for Compat<T> { fn poll_read(&self){} }\n";
+    assert_eq!(id_set(a), id_set(b));
+}
+
+#[test]
+fn s_then_t_residual_fires_t_only_for_the_still_colliding_group() {
+    // The S→T residual shape: three impls share the bare key `k.m.X.impl[Tr]`.
+    // S fires (witnesses c::X / d::X) and qualifies every base — but the two
+    // c::X members STILL collide post-S, so T fires on THAT group and
+    // switches both fragments to the qualified trait rendering. The d::X
+    // member's post-S group is a singleton, so T stays cold for it and it
+    // keeps the bare `impl[Tr]` fragment (minimal qualification). Exact
+    // bytes pinned by the extractor-generated
+    // `impl_ladder_self_then_trait_residual` conformance row too.
+    let ids = id_set(
+        "mod a { pub trait Tr { fn go(&self); } }\nmod b { pub trait Tr { fn go(&self); } }\nmod c { pub struct X; }\nmod d { pub struct X; }\nimpl a::Tr for c::X { fn go(&self){} }\nimpl b::Tr for c::X { fn go(&self){} }\nimpl a::Tr for d::X { fn go(&self){} }\n",
+    );
+    for id in [
+        "rust:impl:k.m.c%3A%3AX.impl[a%3A%3ATr]",
+        "rust:function:k.m.c%3A%3AX.impl[a%3A%3ATr].go",
+        "rust:impl:k.m.c%3A%3AX.impl[b%3A%3ATr]",
+        "rust:function:k.m.c%3A%3AX.impl[b%3A%3ATr].go",
+        "rust:impl:k.m.d%3A%3AX.impl[Tr]",
+        "rust:function:k.m.d%3A%3AX.impl[Tr].go",
+    ] {
+        assert!(ids.contains(id), "missing {id}; got {ids:#?}");
+    }
+}
+
+#[test]
+fn method_cfg_twins_key_on_the_final_post_s_impl_qualname() {
+    // Method-@cfg (Amendment 5) on the FINAL post-S/T key: an S-fired group
+    // whose a::X member is TWO merged same-witness blocks carrying cfg-twin
+    // `go` methods. Both blocks land on the single S-qualified impl entity,
+    // so the two `go` methods are twins on the FINAL key and each carries
+    // its own @cfg suffix on the `%3A%3A`-qualified method id; the b::X
+    // member's lone `go` collects none.
+    let ids = id_set(
+        "pub trait T { fn go(&self); }\nmod a { pub struct X; }\nmod b { pub struct X; }\nimpl T for a::X { #[cfg(unix)] fn go(&self){} }\nimpl T for a::X { #[cfg(windows)] fn go(&self){} }\nimpl T for b::X { fn go(&self){} }\n",
+    );
+    for id in [
+        "rust:impl:k.m.a%3A%3AX.impl[T]",
+        "rust:function:k.m.a%3A%3AX.impl[T].go@cfg(unix)",
+        "rust:function:k.m.a%3A%3AX.impl[T].go@cfg(windows)",
+        "rust:impl:k.m.b%3A%3AX.impl[T]",
+        "rust:function:k.m.b%3A%3AX.impl[T].go",
+    ] {
+        assert!(ids.contains(id), "missing {id}; got {ids:#?}");
+    }
+}
+
+#[test]
+fn leading_colon_self_type_twin_splits_with_a_leading_escape() {
+    // Amendment-6 witness symmetry: `impl T for a::X` + `impl T for ::a::X`
+    // fire S (the leading `::` is part of the witness) and the qualified
+    // bases render `a%3A%3AX` vs `%3A%3Aa%3A%3AX`.
+    let ids = id_set(
+        "pub trait T { fn go(&self); }\nmod a { pub struct X; }\nimpl T for a::X { fn go(&self){} }\nimpl T for ::a::X { fn go(&self){} }\n",
+    );
+    for id in [
+        "rust:impl:k.m.a%3A%3AX.impl[T]",
+        "rust:function:k.m.a%3A%3AX.impl[T].go",
+        "rust:impl:k.m.%3A%3Aa%3A%3AX.impl[T]",
+        "rust:function:k.m.%3A%3Aa%3A%3AX.impl[T].go",
+    ] {
+        assert!(ids.contains(id), "missing {id}; got {ids:#?}");
+    }
+}

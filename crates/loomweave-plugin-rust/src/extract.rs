@@ -1021,16 +1021,25 @@ impl ImplLadder {
         ladder
     }
 
+    /// The bare (last-segment-base) self-type qualname prefix shared by
+    /// [`Self::bare_qualname`] and the stage-S else-branch of
+    /// [`Self::qualname_at`].
+    fn bare_type_qualname(module_path: &str, it: &ItemImpl) -> String {
+        format!(
+            "{module_path}.{}",
+            self_ty_locator(&it.self_ty, &declared_type_params(it))
+        )
+    }
+
     /// The bare pre-cfg impl qualname (the Amendment-1 twin key): self type
     /// INCLUDING its concrete generic args (ADR-049 §2 self-type-args
     /// amendment — `impl Foo<i32>` ≠ `impl Foo<u32>`), last-segment base,
     /// last-segment trait fragment, no `@cfg`.
     fn bare_qualname(module_path: &str, it: &ItemImpl) -> String {
-        let type_q = format!(
-            "{module_path}.{}",
-            self_ty_locator(&it.self_ty, &declared_type_params(it))
-        );
-        impl_qualname(&type_q, &impl_disc_for(it))
+        impl_qualname(
+            &Self::bare_type_qualname(module_path, it),
+            &impl_disc_for(it),
+        )
     }
 
     /// The stage-1 `@cfg(...)` suffix, decided on the BARE pre-cfg key
@@ -1050,8 +1059,8 @@ impl ImplLadder {
     /// planning pass and every emission consumes, so they cannot diverge.
     fn qualname_at(&self, module_path: &str, it: &ItemImpl, stage: LadderStage) -> String {
         let declared = declared_type_params(it);
-        let bare_type_q = format!("{module_path}.{}", self_ty_locator(&it.self_ty, &declared));
-        let bare = impl_qualname(&bare_type_q, &impl_disc_for(it));
+        let bare_type_q = Self::bare_type_qualname(module_path, it);
+        let bare = Self::bare_qualname(module_path, it);
         let cfg = self.cfg_suffix_for(&bare, it);
         let post_cfg = with_suffix(&bare, cfg.as_deref());
         if stage == LadderStage::PostCfg {

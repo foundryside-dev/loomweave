@@ -89,9 +89,10 @@ fn module_mounts_route_byte_for_byte() {
     let doc = corpus();
     let rows = doc["module_mounts"].as_array().unwrap();
     assert!(
-        rows.len() >= 5,
+        rows.len() >= 8,
         "corpus must carry the Amendment-8 mount families (twin dir-module, \
-         child prefix, chain, macro-invisible, inline-nested decl); found {}",
+         child prefix, chain, macro-invisible, inline-nested decl, cfg-twin \
+         inline-mod composition, lone-cfg gate-off, R5 first-wins); found {}",
         rows.len()
     );
     for row in rows {
@@ -128,8 +129,9 @@ fn entities_match_byte_for_byte() {
     let doc = corpus();
     let cases = doc["entities"].as_array().unwrap();
     assert!(
-        cases.len() >= 14,
-        "corpus must carry every ADR-049 dialect family (found {})",
+        cases.len() >= 49,
+        "corpus must carry every ADR-049 dialect family incl. the Amendment \
+         6-9 ladder rows and the remediation rows (found {})",
         cases.len()
     );
     for case in cases {

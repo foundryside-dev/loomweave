@@ -167,9 +167,11 @@ directory re-key with it (`process/unix/orphan.rs` →
 **Why.** ADR-049 Amendment 8: routing mounted files by their on-disk path made
 two source modules collide on one identity (the mounted file and its inline
 facade), which was silent data loss. The mounted path is what rustc actually
-compiles, so it is the honest identity. Two edges of the rule worth knowing:
+compiles, so it is the honest identity. Three edges of the rule worth knowing:
 a `#[path]` inside an unexpanded macro invocation is invisible (the file
-routes by its on-disk path), and a mount whose target lies outside the crate's
-`src/` tree is ignored. A `use`-path that names a cfg-twin mount resolves as
+routes by its on-disk path); a `#[cfg_attr(pred, path = "…")]`-delivered
+mount is invisible by the same rule — only a literal `#[path]` attribute
+mounts, so the file routes by its on-disk path; and a mount whose target lies
+outside the declaring crate's `src/` tree is ignored. A `use`-path that names a cfg-twin mount resolves as
 external (the `@cfg` suffix is not spellable in a `use`), so such import edges
 are absent — the same pre-existing behaviour as for any cfg-twin entity.

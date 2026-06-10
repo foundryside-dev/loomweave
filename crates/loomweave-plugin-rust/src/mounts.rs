@@ -31,7 +31,11 @@
 //!   `mod n;` forms. A mount whose name is a twin appends the normalised
 //!   `@cfg(...)` discriminant ([`crate::qualname::cfg_discriminant`]), so
 //!   tokio's `#[cfg(unix)] mod imp;` / `#[cfg(windows)] mod imp;` pair splits
-//!   into `…imp@cfg(unix)` / `…imp@cfg(windows)`.
+//!   into `…imp@cfg(unix)` / `…imp@cfg(windows)`. The SAME rule applies to
+//!   each inline `mod` level a nested mount descends through: a cfg-twin
+//!   inline mod contributes its `@cfg`-suffixed segment to the mounted
+//!   file's logical prefix, mirroring `extract.rs`'s inline-mod emission
+//!   byte-for-byte (the cfg-twin-inline-mod composition rule).
 //! - **Subtree:** a `<dir>/mod.rs` target registers `<dir>/` as a logical
 //!   prefix (children rewrite under the mount); an `x.rs` target registers
 //!   the exact file plus `<target_dir>/x/` for its child directory.
@@ -48,15 +52,10 @@
 //!   inside an unexpanded macro invocation does not exist for either
 //!   producer (syn does not expand macros, and the second producer must be
 //!   able to reproduce the route from one file). NO macro expansion is ever
-//!   attempted — the target routes by filesystem.
-//!
-//! Known limitation: an inline-`mod`-nested mount composes its logical path
-//! from the *bare* inline module names; if such an intermediate inline mod is
-//! itself a cfg twin (and so carries `@cfg` in its own entity path), the
-//! mounted file's dotted path will not include that suffix. Ids stay unique;
-//! only dotted-path agreement with the twin facade is affected (the same
-//! pre-existing cfg-twin resolver-mismatch class as the twin-mount rule
-//! itself).
+//!   attempted — the target routes by filesystem. The same invisibility
+//!   applies to a `#[cfg_attr(pred, path = "…")]`-delivered mount: only a
+//!   literal `#[path]` attribute is a mount, so the target routes by
+//!   filesystem.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -193,9 +192,13 @@ struct RawMount {
     /// The file holding the declaration (its logical path is the mount's
     /// logical parent).
     declaring_file: PathBuf,
-    /// Inline-`mod` names enclosing the declaration, outermost first (empty
-    /// for a file-level declaration). Composed into the logical path between
-    /// the declaring file's path and the mount name.
+    /// LOGICAL inline-`mod` segments enclosing the declaration, outermost
+    /// first (empty for a file-level declaration): each is the inline mod's
+    /// name plus — when that inline mod is itself a cfg twin in ITS item list
+    /// — the same `@cfg(...)` suffix `extract.rs` appends to the inline mod's
+    /// entity path, so the file walk and the AST walk compose one prefix.
+    /// Composed into the logical path between the declaring file's path and
+    /// the mount name.
     inline_prefix: Vec<String>,
     /// The declared module name (`imp` in `mod imp;`).
     name: String,
@@ -209,9 +212,13 @@ struct RawMount {
 
 /// Cheap pre-parse gate: could these bytes contain a `#[path …]` attribute?
 /// Tolerates arbitrary whitespace between `#`, `[`, and `path` — `# [ path`
-/// is legal Rust even though rustfmt always renders `#[path` — so the gate
-/// can under-approximate parses but never miss a mount. A false positive
-/// (e.g. `#[path…]` inside a string literal) only costs one syn parse.
+/// is legal Rust even though rustfmt always renders `#[path`. A false
+/// positive (e.g. `#[path…]` inside a string literal) only costs one syn
+/// parse. KNOWN MISS (accepted): a block comment between `[` and `path`
+/// (`#[/* c */ path = "…"]`) is legal Rust the gate does not recognise — the
+/// file is never parsed for mounts, so such a comment-spelled mount falls
+/// back to filesystem routing (the same degradation class as a macro-wrapped
+/// mount; no real-world corpus spells the attribute this way).
 fn may_contain_path_attr(src: &str) -> bool {
     let bytes = src.as_bytes();
     for (i, b) in bytes.iter().enumerate() {
@@ -293,17 +300,31 @@ struct CollectCx<'a> {
     rel: &'a Path,
 }
 
+/// One inline-`mod` nesting level on the way down to a `mod n;` declaration:
+/// the bare name (a filesystem would-be-directory component, rustc's target
+/// resolution rule) and the LOGICAL segment (the name plus, for a cfg twin,
+/// the same `@cfg(...)` suffix `extract.rs` appends to the inline mod's
+/// entity path — the cfg-twin-inline-mod composition rule).
+#[derive(Clone)]
+struct InlineSeg {
+    /// Bare mod name — composes the `#[path]` target's base DIRECTORY.
+    dir: String,
+    /// Twin-suffixed segment — composes the mount's logical DOTTED path.
+    logical: String,
+}
+
 fn collect_in_items(
     items: &[Item],
-    inline_names: &[String],
+    inline_prefix: &[InlineSeg],
     cx: &CollectCx<'_>,
     out: &mut Vec<RawMount>,
 ) {
     // TWIN KEY (cross-producer rule): module-name occurrences in THIS item
     // list across BOTH inline `mod n { … }` and decl `mod n;` forms — the
     // same counting `extract.rs`'s module twin counter performs, so the
-    // mounted file's @cfg suffix and an inline twin's @cfg suffix are decided
-    // by one rule.
+    // mounted file's @cfg suffix, an inline twin's @cfg suffix, AND a
+    // twinned inline mod's suffixed PREFIX segment are all decided by one
+    // rule.
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for item in items {
         if let Item::Mod(m) = item {
@@ -315,21 +336,37 @@ fn collect_in_items(
         if let Some((_, inner)) = &m.content {
             // Inline `mod n { … }`: recurse with the nesting recorded (its
             // decls resolve against the would-be directory of the nesting).
-            let mut names = inline_names.to_vec();
-            names.push(m.ident.to_string());
-            collect_in_items(inner, &names, cx, out);
+            // A cfg-twin inline mod contributes its `@cfg`-suffixed segment
+            // to the LOGICAL prefix — mirroring extract.rs's inline-mod
+            // emission exactly, so a mount declared inside it lands under
+            // the same dotted parent the AST walk emits — while the
+            // filesystem base keeps the bare name (rustc resolves the
+            // target against the would-be directory, which has no cfg).
+            let name = m.ident.to_string();
+            let suffix = if counts.get(&name).copied().unwrap_or(0) > 1 {
+                cfg_suffix(&m.attrs)
+            } else {
+                None
+            };
+            let logical = match suffix {
+                Some(s) => format!("{name}{s}"),
+                None => name.clone(),
+            };
+            let mut segs = inline_prefix.to_vec();
+            segs.push(InlineSeg { dir: name, logical });
+            collect_in_items(inner, &segs, cx, out);
             continue;
         }
         // Declaration `mod n;` — a mount iff it carries `#[path = "…"]`.
         let Some(lit) = path_attr_literal(&m.attrs) else {
             continue;
         };
-        let base = if inline_names.is_empty() {
+        let base = if inline_prefix.is_empty() {
             cx.file_dir.to_path_buf()
         } else {
             let mut b = cx.inline_base.to_path_buf();
-            for n in inline_names {
-                b.push(n);
+            for seg in inline_prefix {
+                b.push(&seg.dir);
             }
             b
         };
@@ -353,7 +390,7 @@ fn collect_in_items(
         out.push(RawMount {
             sort_key: (cx.rel.to_path_buf(), byte),
             declaring_file: cx.file.to_path_buf(),
-            inline_prefix: inline_names.to_vec(),
+            inline_prefix: inline_prefix.iter().map(|s| s.logical.clone()).collect(),
             name,
             suffix,
             target,
@@ -529,6 +566,15 @@ impl MountResolver<'_> {
         if let Some(memoised) = self.memo.get(target) {
             return memoised.clone();
         }
+        // Re-entrancy sentinel: provisionally mark the target dropped while
+        // its own resolution is in flight. `cyclic_targets` catches cycles
+        // along the PRIMARY dependency chain (exact target, else longest
+        // owner); `file_logical`'s kept-prefix search (mirroring the final
+        // lookup) can route a degenerate mutual-cycle shape back into a
+        // target mid-resolution — the sentinel turns that re-entrant branch
+        // into the documented cycle response ("cycle → drop the mount, fall
+        // back"), so resolution always terminates.
+        self.memo.insert(target.to_path_buf(), None);
         let result = if self.dropped.contains(target) {
             None
         } else {
@@ -553,30 +599,45 @@ impl MountResolver<'_> {
     }
 
     /// The logical dotted path of an arbitrary file DURING resolution:
-    /// its own mount if it is a (kept) target, a kept mount's subtree rewrite
+    /// its own mount if it is a (kept) target, a KEPT mount's subtree rewrite
     /// if one covers it, else the filesystem route. Mirrors what
     /// [`ModMounts::logical_path_for`] + the filesystem fallback compute once
-    /// the overlay is final.
+    /// the overlay is final — INCLUDING for an exact target whose mount was
+    /// DROPPED (F2): the final overlay has no `by_file` entry for a dropped
+    /// mount and falls through to dir prefixes, so a chained mount declared
+    /// by such a file must compose from the same prefix-rewritten parent,
+    /// never straight from the filesystem route.
     fn file_logical(&mut self, file: &Path) -> Option<String> {
-        if self.by_target.contains_key(file) {
-            if let Some(logical) = self.mount_logical(file) {
-                return Some(logical);
-            }
-            return self.fs_logical(file); // dropped mount → filesystem
+        if self.by_target.contains_key(file)
+            && let Some(logical) = self.mount_logical(file)
+        {
+            return Some(logical);
         }
-        let owner = self
+        // Longest KEPT subtree prefix, last of equal-length maxima — exactly
+        // `logical_path_for`'s `max_by_key` over the final `dir_prefixes`
+        // (which registers KEPT mounts only, in `by_target` key order).
+        let candidates: Vec<(PathBuf, PathBuf)> = self
             .dirs
             .iter()
             .filter(|(dir, _)| file.starts_with(dir))
-            .max_by_key(|(dir, _)| dir.as_os_str().len())
-            .map(|(dir, target)| (dir.clone(), target.clone()));
-        if let Some((dir, target)) = owner {
-            if let Some(base) = self.mount_logical(&target)
-                && let Ok(rel) = file.strip_prefix(&dir)
+            .cloned()
+            .collect();
+        let mut best: Option<(PathBuf, String)> = None;
+        for (dir, target) in candidates {
+            let Some(base) = self.mount_logical(&target) else {
+                continue; // dropped mount → registers no prefix in the overlay
+            };
+            if best
+                .as_ref()
+                .is_none_or(|(b, _)| dir.as_os_str().len() >= b.as_os_str().len())
             {
-                return Some(rewrite_remainder(&base, rel));
+                best = Some((dir, base));
             }
-            return self.fs_logical(file); // owning mount dropped → filesystem
+        }
+        if let Some((dir, base)) = best
+            && let Ok(rel) = file.strip_prefix(&dir)
+        {
+            return Some(rewrite_remainder(&base, rel));
         }
         self.fs_logical(file)
     }
@@ -694,6 +755,131 @@ mod tests {
             route(&tmp, &mounts, "src/windows/mod.rs"),
             "k.imp@cfg(windows)"
         );
+    }
+
+    #[test]
+    fn mount_inside_cfg_twin_inline_mod_composes_the_twin_suffix() {
+        // The cfg-twin-inline-mod composition rule (ADR-049 Amendment 8,
+        // remediation): an inline mod that is itself a cfg twin carries its
+        // `@cfg(...)` suffix in its entity path, so a mount declared INSIDE it
+        // must compose the SAME suffixed segment into the mounted file's
+        // logical path — or `#[cfg(feature="a")] mod outer { #[path="x.rs"]
+        // mod m; }` / `#[cfg(not(feature="a"))] mod outer { #[path="y.rs"]
+        // mod m; }` routes BOTH x.rs and y.rs to `k.outer.m`: a duplicate-id
+        // family.
+        let (tmp, mounts) = project(&[
+            (
+                "src/lib.rs",
+                "#[cfg(feature = \"a\")]\nmod outer {\n    #[path = \"x.rs\"]\n    mod m;\n}\n\
+                 #[cfg(not(feature = \"a\"))]\nmod outer {\n    #[path = \"y.rs\"]\n    mod m;\n}\n",
+            ),
+            ("src/outer/x.rs", "pub fn fx() {}\n"),
+            ("src/outer/y.rs", "pub fn fy() {}\n"),
+        ]);
+        assert_eq!(
+            route(&tmp, &mounts, "src/outer/x.rs"),
+            "k.outer@cfg(feature=\"a\").m"
+        );
+        assert_eq!(
+            route(&tmp, &mounts, "src/outer/y.rs"),
+            "k.outer@cfg(not(feature=\"a\")).m"
+        );
+    }
+
+    #[test]
+    fn cfg_twin_inline_mod_prefix_agrees_between_file_walk_and_ast_walk() {
+        // The file walk (mounts overlay) and the AST walk (extract.rs inline-
+        // mod emission) MUST agree on the twinned inline mod's suffixed
+        // segment byte-for-byte, and the assembled table must be
+        // duplicate-free. The inline-mod entity ids come from extract.rs's
+        // module twin counter; the mounted files' parent prefixes come from
+        // this module's twin rule — one rule, two producers.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"k\"\n").unwrap();
+        fs::create_dir_all(root.join("src/outer")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "#[cfg(feature = \"a\")]\nmod outer {\n    #[path = \"x.rs\"]\n    mod m;\n}\n\
+             #[cfg(not(feature = \"a\"))]\nmod outer {\n    #[path = \"y.rs\"]\n    mod m;\n}\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/outer/x.rs"), "pub fn fx() {}\n").unwrap();
+        fs::write(root.join("src/outer/y.rs"), "pub fn fy() {}\n").unwrap();
+        let table = crate::symbol_table::build_symbol_table(root);
+        assert_eq!(
+            table.duplicate_ids(),
+            Vec::<String>::new(),
+            "file-walk and AST-walk twin rules diverged"
+        );
+        let ids: std::collections::BTreeSet<String> =
+            table.iter_ids().map(ToOwned::to_owned).collect();
+        for id in [
+            // AST walk: the twinned inline mods, suffixed by extract.rs.
+            "rust:module:k.outer@cfg(feature=\"a\")",
+            "rust:module:k.outer@cfg(not(feature=\"a\"))",
+            // File walk: the mounted files, prefixed by the SAME suffixed
+            // segment through the overlay.
+            "rust:module:k.outer@cfg(feature=\"a\").m",
+            "rust:module:k.outer@cfg(not(feature=\"a\")).m",
+            "rust:function:k.outer@cfg(feature=\"a\").m.fx",
+            "rust:function:k.outer@cfg(not(feature=\"a\")).m.fy",
+        ] {
+            assert!(ids.contains(id), "missing {id}; got {ids:#?}");
+        }
+    }
+
+    #[test]
+    fn dropped_mount_inside_kept_mounted_dir_resolves_chained_mounts_through_the_prefix() {
+        // F2: eng/mod.rs is mounted as `mod engine;` (kept, registers the
+        // eng/ dir prefix). eng/helper.rs self-mounts (a cycle → its mount is
+        // DROPPED) and ALSO declares a chained mount of eng/leaf_impl.rs.
+        // The chained mount's logical parent is eng/helper.rs's logical path
+        // — which the FINAL overlay resolves through the kept eng/ dir prefix
+        // (`k.engine.helper`), so resolution-time `file_logical` must consult
+        // dir prefixes the same way, not fall straight to the filesystem
+        // route (`k.eng.helper`).
+        let (tmp, mounts) = project(&[
+            ("src/lib.rs", "#[path = \"eng/mod.rs\"]\nmod engine;\n"),
+            ("src/eng/mod.rs", "mod helper;\n"),
+            (
+                "src/eng/helper.rs",
+                "#[path = \"helper.rs\"]\nmod selfie;\n#[path = \"leaf_impl.rs\"]\nmod leaf;\n",
+            ),
+            ("src/eng/leaf_impl.rs", "pub fn l() {}\n"),
+        ]);
+        // The dropped self-mount falls back to the dir-prefix route…
+        assert_eq!(route(&tmp, &mounts, "src/eng/helper.rs"), "k.engine.helper");
+        // …and the chained mount composes from that SAME route.
+        assert_eq!(
+            route(&tmp, &mounts, "src/eng/leaf_impl.rs"),
+            "k.engine.helper.leaf"
+        );
+    }
+
+    #[test]
+    fn equal_dir_claims_resolve_children_to_the_non_mod_rs_mount() {
+        // The equal-dir tiebreak pin (ADR-049 Amendment 8 text fix): an
+        // `x.rs` target claims `<dir>/x/` for its children and an `x/mod.rs`
+        // target claims `<dir>/x/` directly — the SAME directory. Children
+        // under x/ rewrite onto the LAST-registered equal-length prefix
+        // (`max_by_key` returns the last of equal maxima); registration
+        // follows `by_target`'s `PathBuf` component order, where `x/mod.rs`
+        // sorts BEFORE `x.rs` ("x" is a component-prefix of "x.rs") — so the
+        // `x.rs`-target mount wins the shared directory. Deterministic; the
+        // two exact target files themselves still route by their own mounts.
+        let (tmp, mounts) = project(&[
+            (
+                "src/lib.rs",
+                "#[path = \"x.rs\"]\nmod a;\n#[path = \"x/mod.rs\"]\nmod b;\n",
+            ),
+            ("src/x.rs", "pub fn fx() {}\n"),
+            ("src/x/mod.rs", "pub mod child;\n"),
+            ("src/x/child.rs", "pub fn c() {}\n"),
+        ]);
+        assert_eq!(route(&tmp, &mounts, "src/x.rs"), "k.a");
+        assert_eq!(route(&tmp, &mounts, "src/x/mod.rs"), "k.b");
+        assert_eq!(route(&tmp, &mounts, "src/x/child.rs"), "k.a.child");
     }
 
     #[test]

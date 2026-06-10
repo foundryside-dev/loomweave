@@ -223,3 +223,70 @@ fn negative_impl_emits_no_implements_edge() {
         extracted.entities,
     );
 }
+
+/// A FIRED stage-T group (ADR-049 Amendment 7) must still resolve its
+/// `implements` edges: the T qualification rewrites only the impl LOCATOR's
+/// `impl[…]` fragment; the resolver lookup goes through
+/// `trait_path_for_lookup`, which already uses the full written path and is
+/// unaffected. Two same-named in-project traits (`a::Tr` / `b::Tr`)
+/// implemented for one type fire T — and each impl still gets a Resolved
+/// edge to ITS trait id, originating from the T-qualified impl entity id.
+#[test]
+fn fired_t_group_still_resolves_implements_edges() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("c/src")).unwrap();
+    std::fs::write(root.join("c/Cargo.toml"), "[package]\nname=\"c_crate\"\n").unwrap();
+    std::fs::write(
+        root.join("c/src/lib.rs"),
+        "pub mod a;\npub mod b;\npub struct Foo;\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("c/src/a.rs"), "pub trait Tr { fn go(&self); }\n").unwrap();
+    std::fs::write(root.join("c/src/b.rs"), "pub trait Tr { fn go(&self); }\n").unwrap();
+
+    let table = build_symbol_table(root);
+    let r = Resolver::new(&table);
+
+    // `crate::`-rooted spellings: a multi-segment RELATIVE path (`a::Tr`)
+    // deliberately resolves External (the H5 shadowing gate in resolve.rs),
+    // so the resolvable in-project spelling is `crate::a::Tr` — which is
+    // also multi-segment and distinct per member, so T fires.
+    let src = "pub mod a;\npub mod b;\npub struct Foo;\n\
+               impl crate::a::Tr for Foo { fn go(&self) {} }\n\
+               impl crate::b::Tr for Foo { fn go(&self) {} }\n";
+    let extracted =
+        extract_file_with_edges("c_crate", "c_crate", "/p/c/src/lib.rs", src, &r).unwrap();
+
+    let mut implements: Vec<(String, String, String)> = extracted
+        .edges
+        .iter()
+        .filter(|e| e["kind"] == "implements")
+        .map(|e| {
+            (
+                e["from_id"].as_str().unwrap().to_owned(),
+                e["to_id"].as_str().unwrap().to_owned(),
+                e["confidence"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    implements.sort();
+
+    assert_eq!(
+        implements,
+        vec![
+            (
+                "rust:impl:c_crate.Foo.impl[crate%3A%3Aa%3A%3ATr]".to_owned(),
+                "rust:trait:c_crate.a.Tr".to_owned(),
+                "resolved".to_owned(),
+            ),
+            (
+                "rust:impl:c_crate.Foo.impl[crate%3A%3Ab%3A%3ATr]".to_owned(),
+                "rust:trait:c_crate.b.Tr".to_owned(),
+                "resolved".to_owned(),
+            ),
+        ],
+        "a fired T group must keep BOTH Resolved implements edges, each from \
+         its T-qualified impl entity to ITS trait id; got {implements:#?}",
+    );
+}

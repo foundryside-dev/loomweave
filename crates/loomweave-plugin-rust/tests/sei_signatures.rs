@@ -28,3 +28,19 @@ fn impl_signature_carries_target_and_trait() {
         serde_json::json!({"v":1,"target":"Foo","trait":serde_json::Value::Null})
     );
 }
+
+#[test]
+fn impl_signature_target_stays_last_segment_for_a_fired_group_member() {
+    // ADR-049 Amendments 6/7 explicitly leave the ADR-038 SEI signature
+    // alone: the S/T qualification rewrites only the impl LOCATOR; the
+    // signature `target` stays the self type's bare LAST SEGMENT ("changing
+    // it would be mass churn for zero identity value"). `impl a::Tr for
+    // c::X` is the canonical fired-group member shape (its locator renders
+    // `c%3A%3AX.impl[a%3A%3ATr]` inside a fired group) — the signature is
+    // per-item and group-independent, so these bytes hold fired or not.
+    let it: syn::ItemImpl = syn::parse_str("impl a::Tr for c::X {}").unwrap();
+    assert_eq!(
+        impl_signature(&it),
+        serde_json::json!({"v":1,"target":"X","trait":"a::Tr"})
+    );
+}

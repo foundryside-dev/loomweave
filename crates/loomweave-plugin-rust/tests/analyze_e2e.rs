@@ -921,3 +921,133 @@ fn analyze_e2e_seen_set_gate_drops_resolved_edge_to_gitignored_target() {
          stats: {stats:#}"
     );
 }
+
+/// ADR-049 Amendments 6/7 — ONE writer-proven e2e for the residual-collision
+/// ladder families (the Semaphore self-type-twin shape, tokio chan.rs
+/// `bounded::Semaphore` vs `unbounded::Semaphore`), through the full
+/// host + writer + storage pipeline.
+///
+/// Pre-amendment the two `impl T for {a,b}::X` blocks shared one locator
+/// (`ladder.X.impl[T]`), `seen_impl_ids` spuriously merged them, and the
+/// like-named `go` methods collapsed at the writer's `ON CONFLICT(id) DO
+/// UPDATE` — the stored set silently lost an impl and a method. Post-S the
+/// impls split (`a%3A%3AX` / `b%3A%3AX`); this asserts the run completes and
+/// the EXACT stored rust id set carries both split impls and both methods —
+/// any duplicate-locator regression collapses a row out of the set.
+#[test]
+fn analyze_e2e_self_type_twin_impls_split_and_store_both_methods() {
+    let plugin_dir = setup_plugin_dir();
+    let driver = loomweave_driver_path();
+
+    let project = TempDir::new().expect("create project tempdir");
+    let root = project.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"ladder\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub trait T { fn go(&self); }\n\
+         mod a { pub struct X; }\n\
+         mod b { pub struct X; }\n\
+         impl T for a::X { fn go(&self) {} }\n\
+         impl T for b::X { fn go(&self) {} }\n",
+    )
+    .expect("write lib.rs");
+
+    let install = std::process::Command::new(&driver)
+        .args(["install", "--path"])
+        .arg(root)
+        .status()
+        .expect("spawn loomweave install");
+    assert!(install.success(), "loomweave install must succeed");
+
+    let synthetic_path =
+        env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).expect("join_paths");
+    let _ = std::process::Command::new(&driver)
+        .args(["analyze"])
+        .arg(root)
+        .env("PATH", &synthetic_path)
+        .status()
+        .expect("spawn loomweave analyze");
+
+    let conn = Connection::open(root.join(".weft/loomweave/loomweave.db")).expect("open index db");
+
+    // The run completed: no duplicate-locator symptom (a collision either
+    // FailRuns on LMWV-INFRA-PARENT-CONTAINS-MISMATCH or silently merges —
+    // the exact-set assertion below catches the silent form).
+    let run_status: String = conn
+        .query_row("SELECT COALESCE(MAX(status), '') FROM runs", [], |row| {
+            row.get(0)
+        })
+        .expect("query runs status");
+    assert_eq!(
+        run_status, "completed",
+        "the ladder-split impls must not trip the writer; got {run_status:?}"
+    );
+
+    let mut stmt = conn
+        .prepare("SELECT id FROM entities WHERE plugin_id = 'rust' ORDER BY id")
+        .expect("prepare entities query");
+    let got: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query entity ids")
+        .map(|r| r.expect("row id"))
+        .collect();
+
+    let mut want: Vec<String> = [
+        "rust:module:ladder",
+        "rust:module:ladder.a",
+        "rust:module:ladder.b",
+        "rust:trait:ladder.T",
+        "rust:struct:ladder.a.X",
+        "rust:struct:ladder.b.X",
+        // The S-split impls + BOTH `go` methods — the rows a duplicate
+        // locator would silently collapse.
+        "rust:impl:ladder.a%3A%3AX.impl[T]",
+        "rust:function:ladder.a%3A%3AX.impl[T].go",
+        "rust:impl:ladder.b%3A%3AX.impl[T]",
+        "rust:function:ladder.b%3A%3AX.impl[T].go",
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect();
+    want.sort();
+    assert_eq!(
+        got, want,
+        "stored rust entity-id set must carry BOTH split impls and BOTH \
+         methods.\n  got:  {got:#?}\n  want: {want:#?}"
+    );
+
+    // Belt-and-braces: the two implements edges resolve to the one trait —
+    // S/T qualification must not perturb trait resolution end-to-end.
+    let mut edge_stmt = conn
+        .prepare(
+            "SELECT from_id, to_id FROM edges \
+             WHERE kind = 'implements' ORDER BY from_id, to_id",
+        )
+        .expect("prepare implements-edge query");
+    let implements: Vec<(String, String)> = edge_stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("query implements edges")
+        .map(|r| r.expect("implements row"))
+        .collect();
+    assert_eq!(
+        implements,
+        vec![
+            (
+                "rust:impl:ladder.a%3A%3AX.impl[T]".to_owned(),
+                "rust:trait:ladder.T".to_owned(),
+            ),
+            (
+                "rust:impl:ladder.b%3A%3AX.impl[T]".to_owned(),
+                "rust:trait:ladder.T".to_owned(),
+            ),
+        ],
+        "both split impls must keep their implements edge; got {implements:#?}"
+    );
+}

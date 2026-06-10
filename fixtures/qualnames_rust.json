@@ -75,7 +75,33 @@
        "src/platform.rs": "demo.platform",
        "src/host/generic.rs": "demo.host.imp",
        "src/platform/backend/special.rs": "demo.platform.backend.imp"},
-     "note": "rustc's relative-path rule for #[path] INSIDE inline mod blocks: the target is relative to the would-be directory of the inline-module nesting — for a mod-rs file (lib.rs/main.rs/mod.rs) that starts at the file's own directory (src/ + host/ here); for a non-mod-rs file it starts at the file's stem directory (src/platform/ + backend/ here)."}
+     "note": "rustc's relative-path rule for #[path] INSIDE inline mod blocks: the target is relative to the would-be directory of the inline-module nesting — for a mod-rs file (lib.rs/main.rs/mod.rs) that starts at the file's own directory (src/ + host/ here); for a non-mod-rs file it starts at the file's stem directory (src/platform/ + backend/ here)."},
+    {"name": "path_mount_inside_cfg_twin_inline_mod", "crate": "demo", "reproducibility": "sp2",
+     "files": {
+       "src/lib.rs": "#[cfg(feature = \"a\")]\nmod outer {\n    #[path = \"x.rs\"]\n    mod m;\n}\n\n#[cfg(not(feature = \"a\"))]\nmod outer {\n    #[path = \"y.rs\"]\n    mod m;\n}\n",
+       "src/outer/x.rs": "pub fn fx() {}\n",
+       "src/outer/y.rs": "pub fn fy() {}\n"},
+     "expect": {
+       "src/outer/x.rs": "demo.outer@cfg(feature=\"a\").m",
+       "src/outer/y.rs": "demo.outer@cfg(not(feature=\"a\")).m"},
+     "note": "The cfg-twin-inline-mod composition rule (ADR-049 Amendment 8, remediation): a mount declared INSIDE a cfg-twin inline mod composes the inline mod's @cfg-suffixed segment into its logical prefix — the SAME twin counting + cfg_discriminant rendering the AST walk applies to the inline mod's own entity path, so file-walk and AST-walk agree byte-for-byte and the two mounted files split. Composing the BARE inline name instead routes BOTH x.rs and y.rs to demo.outer.m (a duplicate-id family). The #[path] target still resolves against the BARE would-be directory (src/outer/), which carries no cfg."},
+    {"name": "path_mount_lone_cfg_no_suffix", "crate": "demo", "reproducibility": "sp2",
+     "files": {
+       "src/lib.rs": "#[cfg(unix)]\n#[path = \"unix/mod.rs\"]\nmod imp;\n",
+       "src/unix/mod.rs": "pub(crate) fn spawn() {}\n"},
+     "expect": {
+       "src/unix/mod.rs": "demo.imp"},
+     "note": "The @cfg discriminant on a mount is TWIN-GATED (ADR-049 §3 discipline): a lone #[cfg(unix)] #[path] mod imp; with no same-name sibling in the declaring item list keeps the bare mounted path — NO @cfg suffix. Gate-off pin for the cross-producer corpus."},
+    {"name": "path_mount_one_file_two_mounts_first_wins", "crate": "demo", "reproducibility": "sp2",
+     "files": {
+       "src/lib.rs": "#[path = \"shared_impl.rs\"]\nmod alpha;\n#[path = \"shared_impl.rs\"]\nmod beta;\nmod zeta;\n",
+       "src/zeta.rs": "#[path = \"shared2_impl.rs\"]\nmod gamma;\n",
+       "src/shared_impl.rs": "pub fn s() {}\n",
+       "src/shared2_impl.rs": "pub fn s2() {}\n"},
+     "expect": {
+       "src/shared_impl.rs": "demo.alpha",
+       "src/shared2_impl.rs": "demo.zeta.gamma"},
+     "note": "R5 determinism pin: one target file claimed by several mounts resolves to the FIRST by sorted (declaring-file path relative to the project root, byte offset of the declaration) — shared_impl.rs takes `alpha` (lower byte offset in lib.rs), never `beta`. shared2_impl.rs pins that an unconflicted mount from a later-sorting declaring file is untouched by the rule."}
   ],
   "entities": [
     {
@@ -721,6 +747,67 @@
         {"qualname": "demo.m.c%3A%3AX.impl[Tr].go", "kind": "function"},
         {"qualname": "demo.m.d%3A%3AX.impl[Tr]", "kind": "impl"},
         {"qualname": "demo.m.d%3A%3AX.impl[Tr].go", "kind": "function"}
+      ]
+    },
+    {
+      "name": "self_type_path_leading_colon_twin",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 6 witness symmetry (remediation): `impl T for a::X` + `impl T for ::a::X` is valid Rust when a local `mod a` shadows an extern crate `a`. The leading `::` is PART of the written self-type-path witness (symmetric with the Amendment-7 trait-path rule), so the two witnesses differ, stage S fires, and the qualified bases render a%3A%3AX vs %3A%3Aa%3A%3AX (the leading `::` contributes a leading %3A%3A). Without the leading-colon contribution both witnesses read a::X, the gate stays cold, and the two impls + their `go` methods collide.",
+      "source": "pub trait T { fn go(&self); }\nmod a { pub struct X; }\nimpl T for a::X { fn go(&self){} }\nimpl T for ::a::X { fn go(&self){} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.T", "kind": "trait"},
+        {"qualname": "demo.m.a", "kind": "module"},
+        {"qualname": "demo.m.a.X", "kind": "struct"},
+        {"qualname": "demo.m.a%3A%3AX.impl[T]", "kind": "impl"},
+        {"qualname": "demo.m.a%3A%3AX.impl[T].go", "kind": "function"},
+        {"qualname": "demo.m.%3A%3Aa%3A%3AX.impl[T]", "kind": "impl"},
+        {"qualname": "demo.m.%3A%3Aa%3A%3AX.impl[T].go", "kind": "function"}
+      ]
+    },
+    {
+      "name": "impl_ladder_self_then_trait_residual",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendments 6/7 S-then-T residual row: three impls share the bare key demo.m.X.impl[Tr]. Stage S fires (witnesses c::X / d::X) and qualifies every base — but the two c::X members STILL collide post-S (demo.m.c%3A%3AX.impl[Tr] twice), so stage T fires on that post-S group and switches BOTH members' fragments to the qualified trait rendering (impl[a%3A%3ATr] / impl[b%3A%3ATr]). The d::X member's post-S group is a SINGLETON, so T stays cold for it and it keeps the bare impl[Tr] fragment — minimal qualification, each stage fires only on the residual the previous one left.",
+      "source": "mod a { pub trait Tr { fn go(&self); } }\nmod b { pub trait Tr { fn go(&self); } }\nmod c { pub struct X; }\nmod d { pub struct X; }\nimpl a::Tr for c::X { fn go(&self){} }\nimpl b::Tr for c::X { fn go(&self){} }\nimpl a::Tr for d::X { fn go(&self){} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.a", "kind": "module"},
+        {"qualname": "demo.m.a.Tr", "kind": "trait"},
+        {"qualname": "demo.m.b", "kind": "module"},
+        {"qualname": "demo.m.b.Tr", "kind": "trait"},
+        {"qualname": "demo.m.c", "kind": "module"},
+        {"qualname": "demo.m.c.X", "kind": "struct"},
+        {"qualname": "demo.m.d", "kind": "module"},
+        {"qualname": "demo.m.d.X", "kind": "struct"},
+        {"qualname": "demo.m.c%3A%3AX.impl[a%3A%3ATr]", "kind": "impl"},
+        {"qualname": "demo.m.c%3A%3AX.impl[a%3A%3ATr].go", "kind": "function"},
+        {"qualname": "demo.m.c%3A%3AX.impl[b%3A%3ATr]", "kind": "impl"},
+        {"qualname": "demo.m.c%3A%3AX.impl[b%3A%3ATr].go", "kind": "function"},
+        {"qualname": "demo.m.d%3A%3AX.impl[Tr]", "kind": "impl"},
+        {"qualname": "demo.m.d%3A%3AX.impl[Tr].go", "kind": "function"}
+      ]
+    },
+    {
+      "name": "method_cfg_twin_in_s_fired_merged_blocks",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 5 composed with Amendment 6 (remediation): the method-@cfg twin counter keys on the FINAL post-S/T impl qualname. An S-fired group whose a::X member is TWO merged same-witness blocks carrying cfg-twin `go` methods: both blocks land on the single S-qualified impl entity demo.m.a%3A%3AX.impl[T], so the two `go` methods are twins on the FINAL key and each carries its own @cfg suffix on the %3A%3A-qualified method id. The b::X member's lone `go` collects no suffix.",
+      "source": "pub trait T { fn go(&self); }\nmod a { pub struct X; }\nmod b { pub struct X; }\nimpl T for a::X { #[cfg(unix)] fn go(&self){} }\nimpl T for a::X { #[cfg(windows)] fn go(&self){} }\nimpl T for b::X { fn go(&self){} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.T", "kind": "trait"},
+        {"qualname": "demo.m.a", "kind": "module"},
+        {"qualname": "demo.m.a.X", "kind": "struct"},
+        {"qualname": "demo.m.b", "kind": "module"},
+        {"qualname": "demo.m.b.X", "kind": "struct"},
+        {"qualname": "demo.m.a%3A%3AX.impl[T]", "kind": "impl"},
+        {"qualname": "demo.m.a%3A%3AX.impl[T].go@cfg(unix)", "kind": "function"},
+        {"qualname": "demo.m.a%3A%3AX.impl[T].go@cfg(windows)", "kind": "function"},
+        {"qualname": "demo.m.b%3A%3AX.impl[T]", "kind": "impl"},
+        {"qualname": "demo.m.b%3A%3AX.impl[T].go", "kind": "function"}
       ]
     }
   ]
