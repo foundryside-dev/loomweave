@@ -95,6 +95,10 @@ log "preflight: $LOOMWEAVE_VERSION / $PLUGIN_VERSION"
 # Scratch directory for the corpus.
 WORK_DIR="$(mktemp -d -t loomweave-smoke-XXXXXX)"
 trap 'rm -rf "$WORK_DIR"' EXIT
+# Hermetic install (clarion-c5e3cc2818): `loomweave install` registers a
+# Codex MCP entry in ~/.codex/config.toml unless this override points it
+# at a scratch-local file. Never mutate the operator's real config.
+export LOOMWEAVE_CODEX_CONFIG="$WORK_DIR/codex-config.toml"
 log "scratch: $WORK_DIR"
 
 # -------- step 1: loomweave is on $PATH and --version works --------

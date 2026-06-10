@@ -932,6 +932,17 @@ fn repair_instructions_json(project_root: &Path, what: &str) -> DoctorJsonCheck 
         Ok(_) if instructions::instructions_state(project_root) == InstructionsState::UpToDate => {
             DoctorJsonCheck::fixed("instructions.block", format!("{what}; fixed"))
         }
+        // A symlinked target was skipped (never write through a symlink) and the
+        // block is still not current — name the file and the hand remedy instead
+        // of an opaque non-convergence.
+        Ok(report) if !report.skipped_symlinks.is_empty() => DoctorJsonCheck::problem(
+            "instructions.block",
+            format!(
+                "{what}; repair skipped symlinked target(s) {} — replace the link with a \
+                 regular file by hand, then re-run",
+                joined_paths(&report.skipped_symlinks)
+            ),
+        ),
         Ok(_) => DoctorJsonCheck::problem(
             "instructions.block",
             format!("{what}; repair did not converge"),
@@ -941,6 +952,15 @@ fn repair_instructions_json(project_root: &Path, what: &str) -> DoctorJsonCheck 
             format!("{what}; repair failed: {err}"),
         ),
     }
+}
+
+/// Comma-join paths for a one-line diagnostic.
+fn joined_paths(paths: &[std::path::PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn check_integration_bindings_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
@@ -1224,6 +1244,15 @@ fn repair_instructions(project_root: &Path, what: &str) -> Tally {
         Ok(_) if instructions::instructions_state(project_root) == InstructionsState::UpToDate => {
             ok(&format!("{what} — fixed"))
         }
+        // Text-path twin of the JSON branch: a skipped symlinked target is an
+        // actionable hand-remedy, not an opaque non-convergence.
+        Ok(report) if !report.skipped_symlinks.is_empty() => problem(
+            &format!(
+                "{what} — repair skipped symlinked target(s) {}",
+                joined_paths(&report.skipped_symlinks)
+            ),
+            Some("replace the symlink with a regular file, then re-run loomweave doctor --fix"),
+        ),
         Ok(_) => problem(&format!("{what} — repair did not converge"), None),
         Err(err) => problem(&format!("{what} — repair failed: {err}"), None),
     }

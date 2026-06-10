@@ -50,6 +50,10 @@ PLUGIN_MANIFEST="$VENV/share/loomweave/plugins/python/plugin.toml"
 # ── 3. Scratch project ───────────────────────────────────────────────────────
 DEMO_DIR="$(mktemp -d -t loomweave-demo-XXXXXX)"
 trap 'rm -rf "$DEMO_DIR"' EXIT
+# Hermetic install (clarion-c5e3cc2818): `loomweave install` registers a
+# Codex MCP entry in ~/.codex/config.toml unless this override points it
+# at a scratch-local file. Never mutate the operator's real config.
+export LOOMWEAVE_CODEX_CONFIG="$DEMO_DIR/codex-config.toml"
 log "scratch project: $DEMO_DIR"
 cd "$DEMO_DIR"
 cat > demo.py <<'PY'

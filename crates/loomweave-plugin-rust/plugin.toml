@@ -15,7 +15,12 @@ extensions = ["rs"]
 # build (the heaviest path — `analyze_file` parses a single file); max 288
 # entities in one file (loomweave-mcp/src/lib.rs). Envelopes carry headroom for
 # larger workspaces / files.
-expected_max_rss_mb = 128
+# Sprint-3 scale QA (2026-06-10, ADR-050 amendment 1): RLIMIT_AS is an
+# ADDRESS-SPACE cap, not RSS — at 128 MiB the plugin SIGABRTs (alloc failure)
+# on rust-analyzer@587ce15e (~29k entities, peak RSS ~119 MiB); at 1024 MiB it
+# completes. 512 MiB gives ~4x headroom over the largest measured corpus while
+# still bounding a runaway parse.
+expected_max_rss_mb = 512
 expected_entities_per_file = 512
 wardline_aware = false
 reads_outside_project_root = false

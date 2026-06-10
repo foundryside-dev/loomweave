@@ -70,6 +70,65 @@ fn install_creates_loomweave_dir_with_expected_contents() {
     }
 }
 
+/// Sprint-3 QA (rust-analyzer corpus): a project may ship `AGENTS.md` as a
+/// symlink (rust-analyzer's points into `docs/`). The symlink refusal itself is
+/// correct — Loomweave never writes through a symlink — but it must degrade to
+/// a warning for that one file, not abort the whole install: the store, config,
+/// and every regular-file orientation surface must still land, exit 0.
+#[cfg(unix)]
+#[test]
+fn install_succeeds_when_agents_md_is_a_symlink() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real-agents.md");
+    fs::write(&real, "# upstream agent guidance\n").unwrap();
+    symlink(&real, dir.path().join("AGENTS.md")).unwrap();
+
+    let assert = loomweave_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .assert()
+        .success();
+
+    // The rest of the install landed despite the symlinked surface.
+    assert!(
+        dir.path().join(".weft/loomweave/loomweave.db").exists(),
+        "loomweave.db must still be initialised"
+    );
+    assert!(
+        dir.path().join("loomweave.yaml").exists(),
+        "loomweave.yaml must still be written"
+    );
+
+    // The regular-file sibling still gets the block.
+    let claude = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
+    assert!(
+        claude.contains("<!-- loomweave:instructions"),
+        "CLAUDE.md must still be injected: {claude}"
+    );
+
+    // AGENTS.md stays a symlink and its target's bytes are untouched.
+    assert!(
+        fs::symlink_metadata(dir.path().join("AGENTS.md"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "AGENTS.md must remain a symlink"
+    );
+    assert_eq!(
+        fs::read_to_string(&real).unwrap(),
+        "# upstream agent guidance\n",
+        "symlink target bytes must be untouched"
+    );
+
+    // The skip surfaces as a warning naming the file and the by-hand remedy.
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("warning") && stderr.contains("AGENTS.md") && stderr.contains("symlink"),
+        "expected a warning naming the skipped symlinked AGENTS.md, got stderr:\n{stderr}"
+    );
+}
+
 #[test]
 fn install_all_wires_three_way_integration_bindings() {
     let dir = tempfile::tempdir().unwrap();

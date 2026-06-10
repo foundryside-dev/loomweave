@@ -403,11 +403,17 @@ fn locate_span(content: &str) -> Span {
 }
 
 /// Outcome of an [`install_instructions`] call.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct InstructionsInstallReport {
     /// True if any target file's bytes were (re)written this call; false if
     /// every file already held the current well-formed block.
     pub changed: bool,
+    /// Target paths skipped because they are symlinks (Loomweave never writes
+    /// through a symlink — temp+rename would silently convert the link into a
+    /// regular file). Each skip is also surfaced as a stderr warning; callers
+    /// that gate on convergence (doctor `--fix`) use this to name the hand
+    /// remedy instead of reporting an opaque non-convergence.
+    pub skipped_symlinks: Vec<PathBuf>,
 }
 
 /// Inject (or repair) the Loomweave block into both [`TARGET_FILES`] under
@@ -433,21 +439,46 @@ pub struct InstructionsInstallReport {
 ///   survive. Never truncate to EOF.
 ///
 /// Writes are atomic (temp + rename in the same directory, preserving the
-/// existing file mode), reject a symlinked target, and refuse an empty payload
-/// (C-4 (g)).
+/// existing file mode) and refuse an empty payload (C-4 (g)).
+///
+/// A **symlinked target is skipped, not fatal**: writing through it would
+/// silently convert the link into a regular file, but some projects ship one of
+/// the targets as a symlink (rust-analyzer's `AGENTS.md` points into `docs/`),
+/// and aborting would take the rest of the install down with it. The skip is
+/// surfaced as a stderr warning naming the file and the by-hand remedy, and
+/// recorded in [`InstructionsInstallReport::skipped_symlinks`]; the other
+/// target is still processed.
 ///
 /// # Errors
 ///
-/// Returns an error if a target is a symlink, or if any read, temp write, or
-/// rename fails.
+/// Returns an error if any read, stat, temp write, or rename fails.
 pub fn install_instructions(project_root: &Path) -> Result<InstructionsInstallReport> {
     let mut changed = false;
+    let mut skipped_symlinks = Vec::new();
     for name in TARGET_FILES {
         let path = project_root.join(name);
+        if is_symlink(&path)
+            .with_context(|| format!("inject loomweave instructions into {}", path.display()))?
+        {
+            // Degrade, don't abort: one symlinked orientation file must not
+            // sink the store/db/plugin wiring or the sibling target. To
+            // stderr, never stdout (operator-diagnostic hygiene).
+            eprintln!(
+                "loomweave: warning: skipping {}: it is a symlink (loomweave never writes \
+                 through a symlink; replace the link with a regular file by hand, then re-run \
+                 `loomweave install` or `loomweave doctor --fix`)",
+                path.display()
+            );
+            skipped_symlinks.push(path);
+            continue;
+        }
         changed |= install_into_file(&path)
             .with_context(|| format!("inject loomweave instructions into {}", path.display()))?;
     }
-    Ok(InstructionsInstallReport { changed })
+    Ok(InstructionsInstallReport {
+        changed,
+        skipped_symlinks,
+    })
 }
 
 fn install_into_file(path: &Path) -> Result<bool> {
@@ -576,6 +607,17 @@ fn strip_start_marker_line(content: &str) -> String {
         out.push_str(line);
     }
     out
+}
+
+/// Is `path` a symlink? A non-existent path is not (we create it). Used by
+/// [`install_instructions`] to *skip* a symlinked target with a warning;
+/// [`reject_symlink`] stays in the write path as belt-and-braces.
+fn is_symlink(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => Ok(meta.file_type().is_symlink()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("stat {}", path.display())),
+    }
 }
 
 /// Reject a symlinked target so temp+rename never silently converts a link into
@@ -946,19 +988,40 @@ filigree tracks tasks for this project.\n\
         assert_eq!(fixed.matches(START_PREFIX).count(), 1);
     }
 
+    /// A symlinked target is never written through (that part of the contract
+    /// is unchanged), but it degrades to a per-file *skip* rather than aborting
+    /// the whole call: the regular-file sibling is still injected and the
+    /// skipped path is reported (Sprint-3 QA, rust-analyzer's symlinked
+    /// AGENTS.md aborting `loomweave install`).
     #[cfg(unix)]
     #[test]
-    fn symlink_target_is_rejected() {
+    fn symlink_target_is_skipped_not_fatal() {
         use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("real.md");
         std::fs::write(&real, "real contents\n").unwrap();
         symlink(&real, dir.path().join("CLAUDE.md")).unwrap();
-        let err = install_instructions(dir.path()).unwrap_err();
+
+        let report = install_instructions(dir.path()).unwrap();
+        assert!(report.changed, "AGENTS.md must still be injected");
+        assert_eq!(
+            report.skipped_symlinks,
+            vec![dir.path().join("CLAUDE.md")],
+            "the symlinked target must be reported as skipped"
+        );
+
+        // Symlink + target untouched; sibling injected.
         assert!(
-            err.to_string().contains("symlink")
-                || err.chain().any(|c| c.to_string().contains("symlink")),
-            "expected a symlink rejection, got: {err}"
+            std::fs::symlink_metadata(dir.path().join("CLAUDE.md"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "real contents\n");
+        assert!(
+            std::fs::read_to_string(dir.path().join("AGENTS.md"))
+                .unwrap()
+                .contains(START_PREFIX)
         );
     }
 
