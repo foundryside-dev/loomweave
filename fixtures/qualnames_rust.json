@@ -371,6 +371,30 @@
         {"qualname": "demo.m.LIMIT@cfg(unix)", "kind": "const"},
         {"qualname": "demo.m.LIMIT@cfg(windows)", "kind": "const"}
       ]
+    },
+    {
+      "name": "cfg_attr_comment_interposition",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "COMMENT INTERPOSITION between a #[cfg] attribute and its item: a `//` line comment (and, on the twin, a `///` doc comment) sits between the cfg and the fn. Comments are token-stream-invisible to syn — the cfg still attaches to the fn, so BOTH twins keep their @cfg discriminant. A `///` doc comment IS a syn attribute (#[doc = \"...\"], Meta::NameValue) but cfg_predicates filters Meta::List path=cfg only, so it contributes nothing. A producer whose attribute-to-item association resets on an interposed comment would emit a bare colliding `demo.m.f` here; this row is the conformance trip-wire.",
+      "source": "#[cfg(unix)]\n// platform note\npub fn f() {}\n#[cfg(windows)]\n/// doc comment\npub fn f() {}\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.f@cfg(unix)", "kind": "function"},
+        {"qualname": "demo.m.f@cfg(windows)", "kind": "function"}
+      ]
+    },
+    {
+      "name": "cfg_predicate_internal_comment",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "COMMENT INSIDE the cfg predicate: `any(unix, /* why */ windows)`. proc-macro2 token streams carry no comments, so cfg_predicates' tokens.to_string() never sees `/* why */`; normalise_pred then strips whitespace and sorts the any() args, yielding any(unix,windows). A producer that collects the predicate as raw source TEXT between the parens would smuggle the comment bytes into the discriminant and diverge; this row pins that the predicate is the TOKEN stream, not the source span.",
+      "source": "#[cfg(any(unix, /* why */ windows))]\npub fn g() {}\n#[cfg(target_os = \"macos\")]\npub fn g() {}\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.g@cfg(any(unix,windows))", "kind": "function"},
+        {"qualname": "demo.m.g@cfg(target_os=\"macos\")", "kind": "function"}
+      ]
     }
   ]
 }
