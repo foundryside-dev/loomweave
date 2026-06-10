@@ -4300,10 +4300,6 @@ struct PendingUnresolvedCallSites {
 enum WatchdogPhase {
     Handshake,
     File,
-    #[allow(
-        dead_code,
-        reason = "armed by the shutdown deadline (hardening plan Task 5)"
-    )]
     Shutdown,
 }
 
