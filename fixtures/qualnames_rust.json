@@ -488,6 +488,27 @@
         {"qualname": "demo.m.&core%3A%3Acell%3A%3ACell<u8>.impl[Tr]", "kind": "impl"},
         {"qualname": "demo.m.&core%3A%3Acell%3A%3ACell<u8>.impl[Tr].ok", "kind": "function"}
       ]
+    },
+    {
+      "name": "unnamed_const_skip",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 9 (clarion-83870dc534): an unnamed `const _` is NOT an entity \u2014 `_` is non-identifying (no cfg/ordinal/content discriminant can rescue a repeated `_` without churning SEI) and un-nameable (nothing can ever target it), so the extractor emits neither the entity, nor its contains edge, nor any references sites from its declared type/initializer. The skip is UNCONDITIONAL on ident == \"_\" (a lone anonymous const is skipped too \u2014 twin-gating would make the emitted set sibling-dependent). Pinned as ABSENT expected rows, precedent nested_fn_is_not_an_entity: no demo.m._ row may ever appear. A finding inside a `const _` body attributes to the enclosing module, the same convention as nested fns/closures. The named LIMIT sibling pins the skip as name-targeted, not kind-targeted.",
+      "source": "pub const LIMIT: u32 = 10;\nconst _: () = assert!(true);\nconst _: () = assert!(true);\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.LIMIT", "kind": "const"}
+      ]
+    },
+    {
+      "name": "unnamed_const_cfg_twin_skip",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 9, the hard repro (all 15 rust-analyzer residuals): two `const _` items gated on the SAME cfg predicate. cfg-twin discrimination is useless here \u2014 byte-identical attrs hand both twins the IDENTICAL @cfg suffix \u2014 so the unconditional skip is the only duplicate-free rendering. Both items are skipped; only the module emits.",
+      "source": "#[cfg(target_pointer_width = \"64\")]\nconst _: () = ();\n#[cfg(target_pointer_width = \"64\")]\nconst _: () = ();\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"}
+      ]
     }
   ]
 }

@@ -490,7 +490,14 @@ fn walk_items(
             Item::Enum(ItemEnum { ident, .. }) => Some(("enum", ident.to_string())),
             Item::Trait(ItemTrait { ident, .. }) => Some(("trait", ident.to_string())),
             Item::Type(ItemType { ident, .. }) => Some(("type_alias", ident.to_string())),
-            Item::Const(ItemConst { ident, .. }) => Some(("const", ident.to_string())),
+            // `const _` never becomes an entity (ADR-049 Amendment 9, see the
+            // emission arm below), so it must not count toward — or trigger —
+            // a `("const", name)` twin discriminant. Behaviorally inert (the
+            // emission gate skips it before any suffix could apply); this
+            // guard just keeps the counter honest.
+            Item::Const(ItemConst { ident, .. }) if *ident != "_" => {
+                Some(("const", ident.to_string()))
+            }
             Item::Static(ItemStatic { ident, .. }) => Some(("static", ident.to_string())),
             Item::Macro(ItemMacro {
                 ident: Some(ident), ..
@@ -723,6 +730,20 @@ fn walk_items(
                 expr,
                 ..
             }) => {
+                // An unnamed `const _` is NOT an entity (ADR-049 Amendment 9,
+                // clarion-83870dc534): `_` is non-identifying — no cfg/ordinal/
+                // content discriminant can rescue a repeated `_` without
+                // churning SEI — and un-nameable, so nothing can ever target
+                // it. The skip is total: no entity, no `contains` edge, no
+                // Phase-2 `references` sites from its declared type or
+                // initializer (a finding inside one attributes to the module).
+                // Unconditional on the ident — twin-gating would make the
+                // emitted set sibling-dependent. Module-level only by
+                // construction: rustc rejects assoc-level `const _`, and `syn`
+                // rejects `static _` at parse (the existing degrade path).
+                if *ident == "_" {
+                    continue;
+                }
                 let name = ident.to_string();
                 let mut q = free_item_qualname(module_path, &name);
                 if is_cfg_twin("const", &name)

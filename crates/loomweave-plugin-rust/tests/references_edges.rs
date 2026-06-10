@@ -642,3 +642,30 @@ fn qself_paths_never_fabricate_references_edges() {
         "the qself type itself is one (deduped) reference: {set:#?}",
     );
 }
+
+// ADR-049 Amendment 9 (clarion-83870dc534): a skipped unnamed `const _` mints
+// NO references sites — there is no `_` entity to hang a from-edge on, so its
+// declared type and initializer contribute nothing. The named sibling's edge
+// proves the skip is name-targeted, not kind-targeted.
+#[test]
+fn unnamed_const_mints_no_reference_sites() {
+    let src = "pub struct Foo;\nconst _: Foo = Foo;\npub const NAMED: Foo = Foo;\n";
+    let extracted = extract_crate_root(src);
+    let set = references_set(&extracted);
+    assert!(
+        set.iter().all(|(from, ..)| !from.ends_with("._")),
+        "a skipped `const _` minted a references edge: {set:#?}",
+    );
+    // The named const's declared type + initializer dedup to ONE Foo edge.
+    let named_edges: Vec<_> = set
+        .iter()
+        .filter(|(from, to, ..)| {
+            from == "rust:const:c_crate.NAMED" && to == "rust:struct:c_crate.Foo"
+        })
+        .collect();
+    assert_eq!(
+        named_edges.len(),
+        1,
+        "the NAMED const still references Foo: {set:#?}",
+    );
+}

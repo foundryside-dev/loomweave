@@ -86,6 +86,27 @@ fn corpus() -> Vec<(&'static str, &'static str, &'static str)> {
             "k.m",
             "struct Foo;\nimpl Foo { #[cfg(unix)] fn go(&self){} }\nimpl Foo { #[cfg(windows)] fn go(&self){} }\n",
         ),
+        // ADR-049 Amendment 9 (clarion-83870dc534): repeated unnamed `const _`
+        // items. `_` is non-identifying — no cfg/ordinal/content discriminant
+        // can rescue it without churning SEI — so the extractor SKIPS `const _`
+        // entirely (entity + contains + reference sites). Pre-amendment both
+        // items rendered `k.m._` and the writer's ON CONFLICT silently kept
+        // one. The named sibling pins the skip as name-targeted, not
+        // kind-targeted. (This is also the qualname_check regression: a
+        // two-`const _` module yields zero duplicate locators.)
+        (
+            "k",
+            "k.m",
+            "pub const LIMIT: u32 = 10;\nconst _: () = ();\nconst _: () = ();\n",
+        ),
+        // The same-cfg variant — the hard repro (all 15 rust-analyzer
+        // residuals): byte-identical cfg attrs hand both twins the IDENTICAL
+        // @cfg suffix, so only the skip keeps the emitted set duplicate-free.
+        (
+            "k",
+            "k.m",
+            "#[cfg(target_pointer_width = \"64\")] const _: () = ();\n#[cfg(target_pointer_width = \"64\")] const _: () = ();\n",
+        ),
     ]
 }
 
