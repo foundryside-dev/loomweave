@@ -77,7 +77,9 @@ run_analyze unchanged
 # Benign-edit probe: append a no-op line inside the body of one function via a
 # comment-free statement; we simply touch a leaf .rs file's fn body with `let _qa = 0;`.
 PROBE="$(grep -rl --include='*.rs' -m1 'fn main' "$CORPUS/src" 2>/dev/null | head -1 || true)"
-[ -z "$PROBE" ] && PROBE="$(find "$CORPUS" -name '*.rs' -path '*/src/*' | head -1)"
+if [ -z "$PROBE" ]; then
+  PROBE="$(find "$CORPUS" -name '*.rs' -path '*/src/*' | head -1 || true)"
+fi
 if [ -n "$PROBE" ] && git -C "$CORPUS" rev-parse >/dev/null 2>&1; then
   python3 - "$PROBE" <<'EOF'
 import re, sys
