@@ -142,7 +142,9 @@ pub fn scan_source(src: &str) -> Result<(), GuardViolation> {
     while i < n {
         let b = bytes[i];
         // Comments first: their contents (brackets, banner asterisks) are
-        // invisible to both counters.
+        // invisible to both counters. The prefix run survives a comment —
+        // like whitespace, a comment between prefix ops is transparent to
+        // syn's expression recursion (`!/**/!/**/…` is still one chain).
         if b == b'/' && i + 1 < n {
             match bytes[i + 1] {
                 b'/' => {
@@ -150,12 +152,10 @@ pub fn scan_source(src: &str) -> Result<(), GuardViolation> {
                     while i < n && bytes[i] != b'\n' {
                         i += 1;
                     }
-                    run = 0;
                     continue;
                 }
                 b'*' => {
                     i = skip_block_comment(bytes, i + 2);
-                    run = 0;
                     continue;
                 }
                 _ => {}
@@ -208,6 +208,9 @@ pub fn scan_source(src: &str) -> Result<(), GuardViolation> {
                     return Err(GuardViolation::PrefixRun { len: run });
                 }
             }
+            // Whitespace does not launder a prefix run: `! ! !…1` recurses in
+            // syn exactly like `!!!…1`.
+            b' ' | b'\t' | b'\n' | b'\r' => {}
             _ => run = 0,
         }
         i += 1;
@@ -462,6 +465,28 @@ mod tests {
             "!".repeat(800)
         );
         assert_eq!(scan_source(&src), Ok(()));
+    }
+
+    #[test]
+    fn whitespace_interleaved_prefix_bomb_trips() {
+        // `! ! ! … 1` is the same recursive unary chain to syn as `!!!…1`;
+        // whitespace must not launder the run.
+        let src = format!("fn f() {{ let _ = {}1; }}", "! ".repeat(2000));
+        assert!(matches!(
+            scan_source(&src),
+            Err(GuardViolation::PrefixRun { .. })
+        ));
+    }
+
+    #[test]
+    fn comment_interleaved_prefix_bomb_trips() {
+        // Block comments between prefix ops are likewise transparent to syn's
+        // expression recursion; they must not launder the run either.
+        let src = format!("fn f() {{ let _ = {}1; }}", "!/**/".repeat(2000));
+        assert!(matches!(
+            scan_source(&src),
+            Err(GuardViolation::PrefixRun { .. })
+        ));
     }
 
     #[test]
