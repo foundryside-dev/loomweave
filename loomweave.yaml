@@ -1,7 +1,7 @@
 integrations:
   filigree:
     actor: loomweave-mcp
-    base_url: http://127.0.0.1:8542
+    base_url: http://127.0.0.1:8629
     enabled: true
     timeout_seconds: 5
     token_env: WEFT_FEDERATION_TOKEN

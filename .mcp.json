@@ -1,9 +1,9 @@
 {
   "mcpServers": {
     "filigree": {
-      "type": "stdio",
+      "args": [],
       "command": "/home/john/.local/bin/filigree-mcp",
-      "args": []
+      "type": "stdio"
     },
     "loomweave": {
       "args": [
@@ -14,13 +14,15 @@
       "type": "stdio"
     },
     "wardline": {
-      "type": "stdio",
-      "command": "/home/john/.local/bin/wardline",
       "args": [
         "mcp",
         "--root",
-        "."
-      ]
+        ".",
+        "--loomweave-url",
+        "http://127.0.0.1:10196"
+      ],
+      "command": "/home/john/.local/bin/wardline",
+      "type": "stdio"
     }
   }
 }
