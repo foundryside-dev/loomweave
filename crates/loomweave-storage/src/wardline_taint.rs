@@ -6,7 +6,11 @@
 //! plugins that actually have function entities (queried per batch), so a Rust
 //! qualname resolves to `rust:function:<qualname>` exactly as a Python one
 //! resolves to `python:function:<qualname>` (clarion-69db8b2739; ADR-036
-//! Amendment 2026-06-11). Heuristic tier is Flow B B.2.
+//! Amendment 2026-06-11). A batch may carry an optional **plugin hint**
+//! ([`resolve_wardline_qualnames_for_plugin`], clarion-b1a158f7f5): the hint is
+//! a CONSTRAINT that restricts resolution to that one plugin's namespace —
+//! never a preference order — so a qualname owned only by another plugin
+//! resolves `None` under the hint. Heuristic tier is Flow B B.2.
 
 use std::collections::{HashMap, HashSet};
 
@@ -109,15 +113,48 @@ pub fn resolve_wardline_qualname(conn: &Connection, qualname: &str) -> Result<Re
 /// function entities (`{plugin}:function:<qualname>`), then PK-probe them all
 /// in one chunked `IN` lookup. Per qualname: 0 existing candidates → `None`;
 /// exactly 1 → `Exact`; more than 1 → `Ambiguous` (candidate ids sorted).
+///
+/// Delegates to [`resolve_wardline_qualnames_for_plugin`] with no plugin hint;
+/// this entry point keeps every pre-hint caller byte-for-byte unchanged.
 pub fn resolve_wardline_qualnames(
     conn: &Connection,
     qualnames: &[String],
+) -> Result<Vec<(String, Resolution)>> {
+    resolve_wardline_qualnames_for_plugin(conn, qualnames, None)
+}
+
+/// Batch resolve with an optional batch-scoped **plugin hint**
+/// (clarion-b1a158f7f5; ADR-036 plugin-hint amendment, agreed with Wardline in
+/// `wardline/docs/integration/2026-06-11-wardline-resolve-plugin-hint-proposal.md`).
+///
+/// - `plugin: None` — exactly [`resolve_wardline_qualnames`]'s documented
+///   cross-plugin behavior (the candidate plugins are enumerated from the
+///   store; multi-plugin hits resolve `Ambiguous`).
+/// - `plugin: Some(p)` — resolution is RESTRICTED to that plugin's namespace:
+///   the `DISTINCT plugin_id` enumeration is skipped entirely and exactly one
+///   candidate, `{p}:function:<qualname>`, is minted per qualname. A unique
+///   match resolves `Exact`; no match resolves `None` **even if another plugin
+///   owns the qualname** — the hint is a constraint, never a preference order.
+///   An unknown plugin id is therefore just a constraint nothing satisfies
+///   (whole batch `None`); plugin ids are NOT validated against the store
+///   (adjudicated: blank-rejection is the HTTP layer's job, anything non-blank
+///   is honored as a constraint). With one candidate per qualname `Ambiguous`
+///   is unreachable in this mode; the classification below stays exhaustive
+///   anyway so a future multi-candidate hinted tier cannot silently misfile.
+pub fn resolve_wardline_qualnames_for_plugin(
+    conn: &Connection,
+    qualnames: &[String],
+    plugin: Option<&str>,
 ) -> Result<Vec<(String, Resolution)>> {
     if qualnames.is_empty() {
         // Zero-SQL on an empty batch: skip the plugin-enumeration scan too.
         return Ok(Vec::new());
     }
-    let plugins = function_plugins(conn)?;
+    let plugins = match plugin {
+        // Hinted: the named plugin is the ONLY candidate namespace.
+        Some(p) => vec![p.to_owned()],
+        Option::None => function_plugins(conn)?,
+    };
     // One candidate id per (qualname, plugin) pair — the full probe set.
     let mut candidates = Vec::with_capacity(qualnames.len().saturating_mul(plugins.len()));
     for qualname in qualnames {
@@ -568,6 +605,126 @@ mod tests {
         );
         assert_eq!(out[2].1, Resolution::None);
         assert_eq!(out[3].1, out[0].1, "duplicate input resolves identically");
+    }
+
+    // ── ResolveRequest plugin hint (clarion-b1a158f7f5, ADR-036 amendment) ──
+    // The Some(plugin) path of `resolve_wardline_qualnames_for_plugin`: the
+    // hint is a CONSTRAINT, never a preference order. These mirror the
+    // route-level cases in loomweave-cli's http_read/wardline.rs and stand in
+    // for the proposal's three conformance rows (hinted-hit / hinted-miss /
+    // unhinted-ambiguous) at the resolver level.
+
+    #[test]
+    fn hinted_resolve_hit_in_named_plugin() {
+        // hinted-hit: a qualname owned only by `rust`, with a `rust` hint,
+        // resolves Exact to the rust id.
+        let conn = migrated_conn();
+        insert_entity_for_plugin(&conn, "rust", "rust:function:mcp_fixture.ops.entry");
+        let out = resolve_wardline_qualnames_for_plugin(
+            &conn,
+            &["mcp_fixture.ops.entry".to_owned()],
+            Some("rust"),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].1,
+            Resolution::Exact {
+                entity_id: "rust:function:mcp_fixture.ops.entry".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn hinted_resolve_misses_when_only_other_plugin_owns_qualname() {
+        // hinted-miss: the qualname exists ONLY under `python`; a `rust` hint
+        // must resolve None — the hint is a constraint, NOT a preference order
+        // that falls back to whoever owns the qualname.
+        let conn = migrated_conn();
+        insert_entity_for_plugin(&conn, "python", "python:function:py.only.fn");
+        let out =
+            resolve_wardline_qualnames_for_plugin(&conn, &["py.only.fn".to_owned()], Some("rust"))
+                .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, Resolution::None);
+    }
+
+    #[test]
+    fn hinted_resolve_disambiguates_dual_plugin_qualname() {
+        // The headline case: a qualname under BOTH plugins is Ambiguous
+        // unhinted (degrades to unresolved on the wire), but a hint pins it to
+        // the named plugin's id — each hint resolving its own plugin's entity.
+        let conn = migrated_conn();
+        insert_entity_for_plugin(&conn, "python", "python:function:dual.target");
+        insert_entity_for_plugin(&conn, "rust", "rust:function:dual.target");
+        let qs = vec!["dual.target".to_owned()];
+
+        let unhinted = resolve_wardline_qualnames_for_plugin(&conn, &qs, None).unwrap();
+        assert!(
+            matches!(unhinted[0].1, Resolution::Ambiguous { .. }),
+            "unhinted stays Ambiguous: {:?}",
+            unhinted[0].1
+        );
+
+        let rust = resolve_wardline_qualnames_for_plugin(&conn, &qs, Some("rust")).unwrap();
+        assert_eq!(
+            rust[0].1,
+            Resolution::Exact {
+                entity_id: "rust:function:dual.target".to_owned(),
+            }
+        );
+        let python = resolve_wardline_qualnames_for_plugin(&conn, &qs, Some("python")).unwrap();
+        assert_eq!(
+            python[0].1,
+            Resolution::Exact {
+                entity_id: "python:function:dual.target".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn hinted_resolve_unknown_plugin_resolves_none() {
+        // An unknown (non-blank) plugin is just a constraint nothing satisfies:
+        // everything resolves None. No store-coupled validation of plugin ids
+        // (adjudicated under clarion-b1a158f7f5; blank rejection is the HTTP
+        // layer's job).
+        let conn = migrated_conn();
+        insert_entity_for_plugin(&conn, "python", "python:function:py.only.fn");
+        let out =
+            resolve_wardline_qualnames_for_plugin(&conn, &["py.only.fn".to_owned()], Some("java"))
+                .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, Resolution::None);
+    }
+
+    #[test]
+    fn hinted_resolve_none_hint_is_byte_identical_to_unhinted() {
+        // `None` delegates to today's cross-plugin behavior exactly — the
+        // no-regression pin for every existing caller of
+        // `resolve_wardline_qualnames`.
+        let conn = migrated_conn();
+        seed(&conn, &["python:function:a.b.c"]);
+        insert_entity_for_plugin(&conn, "python", "python:function:dual.target");
+        insert_entity_for_plugin(&conn, "rust", "rust:function:dual.target");
+        let qs = vec![
+            "a.b.c".to_owned(),
+            "dual.target".to_owned(),
+            "x.y.z".to_owned(),
+        ];
+        assert_eq!(
+            resolve_wardline_qualnames_for_plugin(&conn, &qs, None).unwrap(),
+            resolve_wardline_qualnames(&conn, &qs).unwrap()
+        );
+    }
+
+    #[test]
+    fn hinted_resolve_empty_batch_returns_empty() {
+        let conn = migrated_conn();
+        assert!(
+            resolve_wardline_qualnames_for_plugin(&conn, &[], Some("rust"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

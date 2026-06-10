@@ -78,7 +78,8 @@ pub use sei::{
 pub use unresolved::{UnresolvedCallSiteRecord, replace_unresolved_call_sites_for_caller};
 pub use wardline_taint::{
     Resolution, TaintFact, TaintFactRow, get_taint_facts, get_taint_facts_by_sei,
-    resolve_wardline_qualname, resolve_wardline_qualnames, seis_for_locators, upsert_taint_fact,
+    resolve_wardline_qualname, resolve_wardline_qualnames, resolve_wardline_qualnames_for_plugin,
+    seis_for_locators, upsert_taint_fact,
 };
 pub use writer::{
     DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, Writer, known_scan_time_edge_kinds,

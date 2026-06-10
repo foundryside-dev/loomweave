@@ -25,6 +25,18 @@ pub(crate) struct ResolveRequest {
     #[serde(default)]
     project: String,
     qualnames: Vec<String>,
+    /// Optional batch-scoped plugin hint (clarion-b1a158f7f5; ADR-036
+    /// plugin-hint amendment; agreed shape in Wardline's
+    /// `2026-06-11-wardline-resolve-plugin-hint-proposal.md`). An ADR-049
+    /// plugin id (`python`, `rust`) restricting resolution to that plugin's
+    /// namespace — a CONSTRAINT, never a preference order. Omission is legal
+    /// forever and is byte-for-byte the pre-hint cross-plugin behavior.
+    /// Adjudicated edge cases: blank/whitespace-only → 400 naming this field
+    /// (cross-version diagnosability); any other non-blank string is honored
+    /// as a constraint (an unknown plugin id simply resolves nothing — plugin
+    /// ids are NOT validated against the store).
+    #[serde(default)]
+    plugin: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,9 +136,10 @@ pub(crate) struct TaintFactBySeiView {
 /// Exact-tier Wardline qualname resolve (ADR-036, W.4). Takes a batch of
 /// PRE-COMPOSED dotted qualnames that Wardline has already shaped to
 /// byte-match Loomweave's `canonical_qualified_name`; resolution is the direct
-/// existence lookup in `loomweave_storage::resolve_wardline_qualnames`. No
-/// `&file=` disambiguator, no normalization — the generic resolve oracle
-/// remains deferred.
+/// existence lookup in `loomweave_storage::resolve_wardline_qualnames_for_plugin`,
+/// optionally constrained by the batch-scoped `plugin` hint (see
+/// [`ResolveRequest::plugin`]). No `&file=` disambiguator, no normalization —
+/// the generic resolve oracle remains deferred.
 pub(crate) async fn post_wardline_resolve(
     State(state): State<AppState>,
     body: Result<Json<ResolveRequest>, axum::extract::rejection::JsonRejection>,
@@ -151,12 +164,34 @@ pub(crate) async fn post_wardline_resolve(
             "too many qualnames in one request",
         );
     }
-    // Move only `qualnames` into the reader closure; `project` was consumed by
-    // the guard above. `with_reader` runs the lookup on a pooled connection.
+    // A PRESENT-but-blank hint is a malformed request, rejected with a message
+    // that NAMES the field (the proposal's cross-version diagnosability note;
+    // adjudicated under clarion-b1a158f7f5). Omitting the field is the legal
+    // "no hint" spelling. Any non-blank value is honored as a constraint —
+    // an unknown plugin id resolves nothing rather than erroring.
+    if let Some(plugin) = &req.plugin
+        && plugin.trim().is_empty()
+    {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidPath,
+            "plugin must not be blank when present (omit the plugin field for cross-plugin resolution)",
+        );
+    }
+    // Move only `qualnames` + the hint into the reader closure; `project` was
+    // consumed by the guard above. `with_reader` runs the lookup on a pooled
+    // connection.
     let qualnames = req.qualnames;
+    let plugin = req.plugin;
     let result = state
         .readers
-        .with_reader(move |conn| loomweave_storage::resolve_wardline_qualnames(conn, &qualnames))
+        .with_reader(move |conn| {
+            loomweave_storage::resolve_wardline_qualnames_for_plugin(
+                conn,
+                &qualnames,
+                plugin.as_deref(),
+            )
+        })
         .await;
     match result {
         Ok(pairs) => {
@@ -942,6 +977,169 @@ mod tests {
             "the fact row still exists in the DB (qualname-eclipsed, not deleted)"
         );
         drop(writer);
+    }
+
+    // ── ResolveRequest plugin hint (clarion-b1a158f7f5, ADR-036 amendment) ──
+    // Wire-level pins for the agreed Wardline proposal shape
+    // (wardline/docs/integration/2026-06-11-wardline-resolve-plugin-hint-proposal.md),
+    // including the proposal's three conformance cases: hinted-hit,
+    // hinted-miss, and unhinted-ambiguous (see
+    // wardline_resolve_plugin_hint_disambiguates_dual_qualname).
+
+    /// Helper: POST /api/wardline/resolve with the given body, expect 200 and
+    /// return the parsed JSON response.
+    async fn resolve_ok(state: AppState, secret: &str, body: &[u8]) -> serde_json::Value {
+        use tower::ServiceExt;
+        let request = hmac_request(secret, "POST", "/api/wardline/resolve", body);
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        serde_json::from_slice(&bytes).expect("json")
+    }
+
+    #[tokio::test]
+    async fn wardline_resolve_plugin_hint_hit_resolves_rust_only_qualname() {
+        // hinted-hit: rust hint + rust-only qualname → resolved with the
+        // rust:function: id.
+        let secret = "wardline-resolve-secret";
+        let (state, tempdir) = wardline_resolve_test_state(secret, &[]);
+        let db_path = tempdir.path().join("loomweave.db");
+        insert_function_entity(&db_path, "rust", "rust:function:mcp_fixture.ops.entry");
+
+        let body = br#"{"qualnames":["mcp_fixture.ops.entry"],"plugin":"rust"}"#;
+        let parsed = resolve_ok(state, secret, body).await;
+        assert_eq!(
+            parsed["resolved"]["mcp_fixture.ops.entry"], "rust:function:mcp_fixture.ops.entry",
+            "hinted-hit resolves to the rust id: {parsed}"
+        );
+        assert_eq!(parsed["unresolved"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn wardline_resolve_plugin_hint_miss_other_plugin_owned_is_unresolved() {
+        // hinted-miss: the qualname is owned ONLY by python; a rust hint must
+        // return it unresolved. The hint is a CONSTRAINT, never a preference
+        // order that falls back to whoever owns the qualname.
+        let secret = "wardline-resolve-secret";
+        let (state, _tempdir) =
+            wardline_resolve_test_state(secret, &["python:function:py.only.fn"]);
+
+        let body = br#"{"qualnames":["py.only.fn"],"plugin":"rust"}"#;
+        let parsed = resolve_ok(state, secret, body).await;
+        assert!(
+            parsed["resolved"]
+                .as_object()
+                .expect("resolved object")
+                .is_empty(),
+            "a hinted miss must NOT fall back to the other plugin: {parsed}"
+        );
+        assert_eq!(parsed["unresolved"], serde_json::json!(["py.only.fn"]));
+    }
+
+    #[tokio::test]
+    async fn wardline_resolve_plugin_hint_disambiguates_dual_qualname() {
+        // The headline case: a qualname under BOTH plugins is unresolved
+        // unhinted (Ambiguous degrades on the wire), but a rust hint pins it
+        // to the rust id — on the SAME store state.
+        let secret = "wardline-resolve-secret";
+        let (state, tempdir) =
+            wardline_resolve_test_state(secret, &["python:function:dual.target"]);
+        let db_path = tempdir.path().join("loomweave.db");
+        insert_function_entity(&db_path, "rust", "rust:function:dual.target");
+
+        // Unhinted on this state: still unresolved (the pre-hint behavior).
+        let parsed = resolve_ok(state.clone(), secret, br#"{"qualnames":["dual.target"]}"#).await;
+        assert_eq!(
+            parsed["unresolved"],
+            serde_json::json!(["dual.target"]),
+            "unhinted dual-plugin qualname stays unresolved: {parsed}"
+        );
+
+        // Hinted: the rust hint disambiguates to the rust id.
+        let parsed = resolve_ok(
+            state,
+            secret,
+            br#"{"qualnames":["dual.target"],"plugin":"rust"}"#,
+        )
+        .await;
+        assert_eq!(
+            parsed["resolved"]["dual.target"], "rust:function:dual.target",
+            "the rust hint disambiguates the dual qualname: {parsed}"
+        );
+        assert_eq!(parsed["unresolved"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn wardline_resolve_plugin_hint_python_symmetric_hit() {
+        // Symmetric python hint on the dual-plugin state resolves the python id.
+        let secret = "wardline-resolve-secret";
+        let (state, tempdir) =
+            wardline_resolve_test_state(secret, &["python:function:dual.target"]);
+        let db_path = tempdir.path().join("loomweave.db");
+        insert_function_entity(&db_path, "rust", "rust:function:dual.target");
+
+        let body = br#"{"qualnames":["dual.target"],"plugin":"python"}"#;
+        let parsed = resolve_ok(state, secret, body).await;
+        assert_eq!(
+            parsed["resolved"]["dual.target"], "python:function:dual.target",
+            "the python hint resolves the python id: {parsed}"
+        );
+        assert_eq!(parsed["unresolved"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn wardline_resolve_blank_plugin_is_400_naming_the_field() {
+        // Adjudicated under clarion-b1a158f7f5: a blank/whitespace-only
+        // `plugin` is a 400 whose message NAMES the field (cross-version
+        // diagnosability per the proposal's rollout note) — not a silent
+        // whole-batch unresolved.
+        use tower::ServiceExt;
+
+        let secret = "wardline-resolve-secret";
+        for body in [
+            br#"{"qualnames":["a.b.c"],"plugin":""}"#.as_slice(),
+            br#"{"qualnames":["a.b.c"],"plugin":"  "}"#.as_slice(),
+        ] {
+            let (state, _tempdir) = wardline_resolve_test_state(secret, &["python:function:a.b.c"]);
+            let request = hmac_request(secret, "POST", "/api/wardline/resolve", body);
+            let response = router(state).oneshot(request).await.expect("oneshot");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = to_bytes(response.into_body(), 4096)
+                .await
+                .expect("read body");
+            let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+            let message = parsed["error"].as_str().expect("error message");
+            assert!(
+                message.contains("plugin"),
+                "the 400 must NAME the plugin field: {parsed}"
+            );
+            assert!(
+                message.contains("blank"),
+                "the 400 must say WHY (blank), not just reject: {parsed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wardline_resolve_unknown_plugin_returns_all_unresolved() {
+        // A non-blank unknown plugin id is a constraint nothing satisfies:
+        // 200 with everything unresolved — NOT a 400 (plugin ids are not
+        // validated against the store; adjudicated under clarion-b1a158f7f5).
+        let secret = "wardline-resolve-secret";
+        let (state, _tempdir) = wardline_resolve_test_state(secret, &["python:function:a.b.c"]);
+
+        let body = br#"{"qualnames":["a.b.c"],"plugin":"java"}"#;
+        let parsed = resolve_ok(state, secret, body).await;
+        assert!(
+            parsed["resolved"]
+                .as_object()
+                .expect("resolved object")
+                .is_empty(),
+            "an unknown plugin constraint resolves nothing: {parsed}"
+        );
+        assert_eq!(parsed["unresolved"], serde_json::json!(["a.b.c"]));
     }
 
     #[tokio::test]
