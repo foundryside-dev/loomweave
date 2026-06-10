@@ -3428,3 +3428,126 @@ async fn commit_run_truncates_wal_while_writer_still_alive() {
         "WAL must remain truncated after shutdown; got {wal_after_shutdown}"
     );
 }
+
+fn make_derives_edge(from_id: &str, to_id: &str, confidence: EdgeConfidence) -> EdgeRecord {
+    EdgeRecord {
+        kind: "derives".to_owned(),
+        from_id: from_id.to_owned(),
+        to_id: to_id.to_owned(),
+        confidence,
+        properties_json: None,
+        source_file_id: None,
+        source_byte_start: Some(3),
+        source_byte_end: Some(9),
+    }
+}
+
+/// `derives` is the 10th ontology kind (Phase 2, plan 2026-06-10): anchored,
+/// scan-time resolved/ambiguous, same contract as `implements`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anchored_derives_resolved_confidence_is_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-derives-resolved").await;
+    seed_module_and_functions(&tx).await;
+    seed_contains_edges_for_demo_functions(&tx).await;
+
+    send::<()>(&tx, |ack| WriterCmd::InsertEdge {
+        edge: Box::new(make_derives_edge(
+            "python:function:demo.caller",
+            "python:function:demo.callee",
+            EdgeConfidence::Resolved,
+        )),
+        ack,
+    })
+    .await
+    .expect("derives is an ontology-defined anchored kind; writer must accept it");
+
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-derives-resolved".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let pool = ReaderPool::open(&path, 1).unwrap();
+    let count: i64 = pool
+        .with_reader(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM edges WHERE kind = 'derives'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+/// `derives` is anchored: scan-time inferred confidence must be rejected,
+/// exactly like calls/references/imports/implements.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anchored_derives_inferred_confidence_rejected_at_scan_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-derives-inferred").await;
+    seed_module_and_functions(&tx).await;
+    seed_contains_edges_for_demo_functions(&tx).await;
+
+    let err = send::<()>(&tx, |ack| WriterCmd::InsertEdge {
+        edge: Box::new(make_derives_edge(
+            "python:function:demo.caller",
+            "python:function:demo.callee",
+            EdgeConfidence::Inferred,
+        )),
+        ack,
+    })
+    .await
+    .expect_err("scan-time inferred derives edge must be rejected");
+    assert!(
+        format!("{err:?}").contains("LMWV-INFRA-EDGE-CONFIDENCE-CONTRACT"),
+        "expected LMWV-INFRA-EDGE-CONFIDENCE-CONTRACT in error; got {err:?}"
+    );
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+/// Lockstep: every edge kind the Rust plugin manifest declares must be a kind
+/// the writer accepts (the Python-plugin analogue lives above).
+#[test]
+fn rust_plugin_edge_kinds_are_accepted_by_writer_contract() {
+    let manifest = loomweave_core::parse_manifest(include_bytes!(
+        "../../loomweave-plugin-rust/plugin.toml"
+    ))
+    .expect("production Rust plugin manifest should parse");
+    let writer_kinds: std::collections::BTreeSet<&'static str> =
+        loomweave_storage::known_scan_time_edge_kinds().collect();
+    let missing: Vec<&str> = manifest
+        .ontology
+        .edge_kinds
+        .iter()
+        .map(String::as_str)
+        .filter(|kind| !writer_kinds.contains(kind))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "Rust plugin declares edge kind(s) the writer rejects: {missing:?}; \
+         writer accepts {writer_kinds:?}"
+    );
+}

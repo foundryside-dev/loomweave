@@ -798,7 +798,7 @@ fn validate_entity_source_file_anchor(conn: &Connection, entity: &EntityRecord) 
     validate_source_file_anchor(conn, Some(source_file_id), "InsertEntity source_file_id")
 }
 
-/// 9 ontology-defined edge kinds (ADR-026 + ADR-028). Unknown kinds reaching the
+/// 10 ontology-defined edge kinds (ADR-026 + ADR-028). Unknown kinds reaching the
 /// writer are a manifest/wire-version drift bug — reject strictly.
 const STRUCTURAL_EDGE_KINDS: &[&str] = &["contains", "in_subsystem", "guides", "emits_finding"];
 const ANCHORED_EDGE_KINDS: &[&str] = &[
@@ -808,6 +808,7 @@ const ANCHORED_EDGE_KINDS: &[&str] = &[
     "implements",
     "decorates",
     "inherits_from",
+    "derives",
 ];
 
 pub fn known_scan_time_edge_kinds() -> impl Iterator<Item = &'static str> {
