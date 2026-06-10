@@ -720,6 +720,307 @@ mod tests {
         assert_eq!(parsed["code"], "PROJECT_MISMATCH");
     }
 
+    /// Insert one `function` entity under an explicit `plugin_id` into an
+    /// existing migrated DB. The ambiguity tests need a `rust:function:` row
+    /// alongside a `python:function:` one so per-plugin candidate minting
+    /// (clarion-69db8b2739) sees the same qualname under both plugins.
+    fn insert_function_entity(db_path: &std::path::Path, plugin: &str, id: &str) {
+        let conn = rusqlite::Connection::open(db_path).expect("open db");
+        conn.execute(
+            "INSERT INTO entities ( \
+                id, plugin_id, kind, name, short_name, properties, \
+                content_hash, created_at, updated_at \
+             ) VALUES (?1, ?2, 'function', ?1, ?1, '{}', 'deadbeef', \
+                       '2026-05-31T00:00:00.000Z', '2026-05-31T00:00:00.000Z')",
+            rusqlite::params![id, plugin],
+        )
+        .expect("seed function entity");
+    }
+
+    /// Insert a `wardline_taint_facts` row verbatim into an existing migrated
+    /// DB (for read tests over a non-python locator, where the python-seeding
+    /// state builders cannot place the fact).
+    fn insert_taint_fact(db_path: &std::path::Path, entity_id: &str, blob: &str) {
+        let conn = rusqlite::Connection::open(db_path).expect("open db");
+        conn.execute(
+            "INSERT INTO wardline_taint_facts \
+                (entity_id, wardline_json, scan_id, content_hash_at_compute, updated_at) \
+             VALUES (?1, ?2, NULL, NULL, '2026-05-31T00:00:00.000Z')",
+            rusqlite::params![entity_id, blob],
+        )
+        .expect("seed taint fact");
+    }
+
+    #[tokio::test]
+    async fn wardline_resolve_returns_rust_only_qualname_as_resolved() {
+        // Positive rust coverage on the federation resolve route
+        // (clarion-69db8b2739): a qualname that exists ONLY under the `rust`
+        // plugin resolves Exact and appears in the resolved map with its
+        // `rust:function:` id — the route is no longer python-only.
+        use tower::ServiceExt;
+
+        let secret = "wardline-resolve-secret";
+        let (state, tempdir) = wardline_resolve_test_state(secret, &[]);
+        let db_path = tempdir.path().join("loomweave.db");
+        insert_function_entity(&db_path, "rust", "rust:function:mcp_fixture.ops.entry");
+
+        let body = br#"{"qualnames":["mcp_fixture.ops.entry"]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/resolve", body);
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+        assert_eq!(
+            parsed["resolved"]["mcp_fixture.ops.entry"], "rust:function:mcp_fixture.ops.entry",
+            "rust-only qualname resolves to its rust:function: id: {parsed}"
+        );
+        assert_eq!(
+            parsed["resolved"]
+                .as_object()
+                .expect("resolved object")
+                .len(),
+            1
+        );
+        assert_eq!(
+            parsed["unresolved"],
+            serde_json::json!([]),
+            "nothing unresolved: {parsed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_write_persists_fact_under_rust_locator() {
+        // Positive rust coverage on the WRITE route: a rust-only qualname
+        // resolves Exact, so its fact is persisted under the `rust:function:`
+        // locator (written count + DB row both confirm it).
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let (state, db_path, writer, _tempdir) = wardline_write_test_state(secret, &[]);
+        insert_function_entity(&db_path, "rust", "rust:function:mcp_fixture.ops.entry");
+
+        let blob = r#"{"taint":{"ret":"RAW"},"v":1}"#;
+        let body = format!(
+            r#"{{"facts":[{{"qualname":"mcp_fixture.ops.entry","wardline_json":{blob}}}]}}"#
+        );
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body.as_bytes());
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(parsed["written"], 1, "rust-locator fact written: {parsed}");
+        assert_eq!(parsed["unresolved_qualnames"], serde_json::json!([]));
+
+        let stored = read_taint_blob(&db_path, "rust:function:mcp_fixture.ops.entry")
+            .expect("fact stored under the rust locator");
+        assert_eq!(stored, blob, "blob stored byte-verbatim");
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_read_returns_fact_stored_under_rust_locator() {
+        // Positive rust coverage on the READ route: a fact stored under a
+        // `rust:function:` locator is retrievable by its bare qualname.
+        use tower::ServiceExt;
+
+        let secret = "wardline-read-secret";
+        let (state, tempdir) = wardline_read_test_state(secret, &[]);
+        let db_path = tempdir.path().join("loomweave.db");
+        insert_function_entity(&db_path, "rust", "rust:function:mcp_fixture.ops.entry");
+        let blob = r#"{"rust":true,"v":1}"#;
+        insert_taint_fact(&db_path, "rust:function:mcp_fixture.ops.entry", blob);
+
+        let request = hmac_request(
+            secret,
+            "GET",
+            "/api/wardline/taint-facts?qualname=mcp_fixture.ops.entry",
+            b"",
+        );
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("json");
+
+        assert_eq!(parsed["qualname"], "mcp_fixture.ops.entry");
+        assert_eq!(parsed["exists"], true, "rust-locator fact found: {parsed}");
+        assert!(
+            text.contains(r#""wardline_json":{"rust":true,"v":1}"#),
+            "wardline_json byte-faithful: {text}"
+        );
+        // The seeded rust entity row carries no source_file_path, so the live
+        // freshness hash degrades to null (a stale signal, not an error).
+        assert_eq!(parsed["current_content_hash"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_read_fact_eclipsed_when_qualname_turns_ambiguous() {
+        // Fact eclipse (read-route ambiguous degradation): a fact persisted
+        // while `dual.target` was Exact under `python` becomes unreachable BY
+        // QUALNAME once a same-qualname `rust` entity appears — resolution
+        // flips Exact→Ambiguous, the accessors degrade it to unresolved, and
+        // the read routes report `exists: false`. The stored row is NOT
+        // deleted: it remains reachable by SEI/locator, only the qualname
+        // lookup is eclipsed (ADR-036 Amendment 2026-06-11).
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let (state, db_path, writer, _tempdir) =
+            wardline_write_test_state(secret, &["python:function:dual.target"]);
+
+        // 1. Write the fact while the qualname is unambiguous (Exact → written).
+        let body = br#"{"facts":[{"qualname":"dual.target","wardline_json":{"v":1}}]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body);
+        let response = router(state.clone())
+            .oneshot(request)
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(parsed["written"], 1, "fact written while Exact: {parsed}");
+        assert!(
+            read_taint_blob(&db_path, "python:function:dual.target").is_some(),
+            "fact persisted under the python locator"
+        );
+
+        // 2. A same-qualname rust entity appears (e.g. a later analyze run).
+        insert_function_entity(&db_path, "rust", "rust:function:dual.target");
+
+        // 3. Single GET: the qualname now resolves Ambiguous → exists: false.
+        let request = hmac_request(
+            secret,
+            "GET",
+            "/api/wardline/taint-facts?qualname=dual.target",
+            b"",
+        );
+        let response = router(state.clone())
+            .oneshot(request)
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            parsed["exists"], false,
+            "qualname-eclipsed fact must read as exists: false: {parsed}"
+        );
+        assert!(
+            parsed.get("wardline_json").is_none(),
+            "eclipsed fact must not leak its blob: {parsed}"
+        );
+
+        // 4. Batch-get degrades identically.
+        let body = br#"{"qualnames":["dual.target"]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts:batch-get", body);
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let arr = parsed.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["qualname"], "dual.target");
+        assert_eq!(arr[0]["exists"], false, "batch-get eclipsed too: {parsed}");
+
+        // 5. Eclipsed, not erased: the stored row survives untouched.
+        assert_eq!(
+            read_taint_blob(&db_path, "python:function:dual.target").as_deref(),
+            Some(r#"{"v":1}"#),
+            "the fact row still exists in the DB (qualname-eclipsed, not deleted)"
+        );
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn wardline_resolve_degrades_ambiguous_to_unresolved() {
+        // clarion-69db8b2739: the same qualname under BOTH plugins resolves
+        // Ambiguous; the federation accessor degrades it to "unresolved" (never
+        // pick a plugin arbitrarily — ADR-036 exact-only-write), so the qualname
+        // appears in `unresolved`, NOT in `resolved`, and the single-id
+        // ResolveResponse wire shape is preserved.
+        use tower::ServiceExt;
+
+        let secret = "wardline-resolve-secret";
+        let (state, tempdir) =
+            wardline_resolve_test_state(secret, &["python:function:dual.target"]);
+        let db_path = tempdir.path().join("loomweave.db");
+        insert_function_entity(&db_path, "rust", "rust:function:dual.target");
+
+        let body = br#"{"qualnames":["dual.target"]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/resolve", body);
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+        assert!(
+            parsed["resolved"]
+                .as_object()
+                .expect("resolved object")
+                .is_empty(),
+            "an ambiguous qualname must NOT appear in resolved: {parsed}"
+        );
+        assert_eq!(
+            parsed["unresolved"],
+            serde_json::json!(["dual.target"]),
+            "an ambiguous qualname degrades to unresolved: {parsed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_write_reports_ambiguous_as_unresolved_and_writes_nothing() {
+        // Write-path counterpart: an ambiguous qualname is reported in
+        // `unresolved_qualnames` and nothing is persisted under either plugin's
+        // locator (exact-only-write preserved).
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let (state, db_path, writer, _tempdir) =
+            wardline_write_test_state(secret, &["python:function:dual.target"]);
+        insert_function_entity(&db_path, "rust", "rust:function:dual.target");
+
+        let body = br#"{"facts":[{"qualname":"dual.target","wardline_json":{"v":1}}]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body);
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            parsed["written"], 0,
+            "nothing written for ambiguous: {parsed}"
+        );
+        assert_eq!(
+            parsed["unresolved_qualnames"],
+            serde_json::json!(["dual.target"])
+        );
+        assert!(
+            read_taint_blob(&db_path, "python:function:dual.target").is_none(),
+            "no python-locator fact written"
+        );
+        assert!(
+            read_taint_blob(&db_path, "rust:function:dual.target").is_none(),
+            "no rust-locator fact written"
+        );
+        drop(writer);
+    }
+
     /// Build a write-enabled `AppState` over a fresh temp migrated DB with the
     /// given entity ids seeded, plus a REAL writer-actor. Returns the state, the
     /// `db_path` (for verification on a fresh connection), the `Writer` handle

@@ -2228,3 +2228,305 @@ async fn entity_resolve_collapses_briefing_blocked_candidate_to_stub() {
         "blocked SEI leaked via entity_resolve: {env}"
     );
 }
+
+#[tokio::test]
+async fn entity_resolve_resolves_rust_qualname_to_id_and_sei() {
+    // clarion-69db8b2739: per-plugin candidate minting resolves a Rust
+    // qualname to its `rust:function:` id (no longer python-only).
+    let (project, db, conn) = open_project();
+    insert_entity_named(
+        &conn,
+        "rust:function:mcp_fixture.ops.entry",
+        "function",
+        "ops.rs",
+        Some((1, 2)),
+        "entry",
+    );
+    insert_alive_sei(
+        &conn,
+        "loomweave:eid:rust-entry",
+        "rust:function:mcp_fixture.ops.entry",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["mcp_fixture.ops.entry"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["result_kind"], "resolved");
+    let candidates = results[0]["candidates"].as_array().expect("candidates");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0]["id"], "rust:function:mcp_fixture.ops.entry");
+    assert_eq!(candidates[0]["sei"], "loomweave:eid:rust-entry");
+    assert_eq!(candidates[0]["kind"], "function");
+}
+
+#[tokio::test]
+async fn entity_resolve_same_qualname_under_two_plugins_is_ambiguous() {
+    // The same dotted qualname under both plugins surfaces as result_kind
+    // "ambiguous" with BOTH candidates (sorted: python < rust).
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:dual.target",
+        "function",
+        "dual.py",
+        Some((1, 2)),
+    );
+    insert_entity_named(
+        &conn,
+        "rust:function:dual.target",
+        "function",
+        "dual.rs",
+        Some((1, 2)),
+        "target",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["dual.target"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["result_kind"], "ambiguous");
+    let candidates = results[0]["candidates"].as_array().expect("candidates");
+    assert_eq!(candidates.len(), 2);
+    let ids: Vec<&str> = candidates
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["python:function:dual.target", "rust:function:dual.target"],
+        "both candidates, sorted: {env}"
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_collapses_briefing_blocked_rust_candidate_to_stub() {
+    // The stub-collapse non-disclosure property applies to RUST candidates too:
+    // a briefing-blocked rust:function entity must come back as the redacted
+    // stub, never leaking its locator or SEI.
+    let (project, db, conn) = open_project();
+    insert_blocked_entity(
+        &conn,
+        "rust:function:secret.rust_handler",
+        "function",
+        "secret.rs",
+        Some((1, 2)),
+        "secret_in_source",
+    );
+    // Mark plugin_id=rust so per-plugin candidate minting enumerates it.
+    conn.execute(
+        "UPDATE entities SET plugin_id = 'rust' WHERE id = ?1",
+        params!["rust:function:secret.rust_handler"],
+    )
+    .expect("set plugin_id");
+    insert_alive_sei(
+        &conn,
+        "loomweave:eid:rust-secret",
+        "rust:function:secret.rust_handler",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["secret.rust_handler"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results[0]["result_kind"], "resolved");
+    let candidate = &results[0]["candidates"][0];
+    assert_redacted_identity(candidate, "secret_in_source");
+    assert!(
+        !env.to_string()
+            .contains("rust:function:secret.rust_handler"),
+        "blocked rust locator leaked via entity_resolve: {env}"
+    );
+    assert!(
+        !env.to_string().contains("loomweave:eid:rust-secret"),
+        "blocked SEI leaked via entity_resolve: {env}"
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_rejects_non_function_kind() {
+    // kind-param validation: only "function" (or null) is accepted; any other
+    // value is a JSON-RPC param error (-32602), not a tool envelope.
+    let (project, db, _conn) = open_project();
+    let state = state_for(project.path(), &db);
+
+    let response = state
+        .handle_json_rpc(&json!({
+            "jsonrpc": "2.0",
+            "id": "bad-kind",
+            "method": "tools/call",
+            "params": {
+                "name": "entity_resolve",
+                "arguments": {"qualnames": ["demo.entry"], "kind": "class"}
+            }
+        }))
+        .await
+        .expect("response");
+
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "non-function kind must be a JSON-RPC param error: {response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("kind must be \"function\""),
+        "param error names the kind constraint: {response}"
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_ambiguous_with_blocked_candidate_redacts_only_that_candidate() {
+    // Composition: a dual-plugin qualname where ONE candidate is
+    // briefing-blocked. result_kind stays "ambiguous" (both rows survive), the
+    // normal candidate keeps its identity, and the blocked one collapses to
+    // the redacted stub — its locator and SEI never appear anywhere in the
+    // envelope.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:dual.secret",
+        "function",
+        "dual.py",
+        Some((1, 2)),
+    );
+    insert_blocked_entity(
+        &conn,
+        "rust:function:dual.secret",
+        "function",
+        "secret.rs",
+        Some((1, 2)),
+        "secret_in_source",
+    );
+    // Mark plugin_id=rust so per-plugin candidate minting enumerates it.
+    conn.execute(
+        "UPDATE entities SET plugin_id = 'rust' WHERE id = ?1",
+        params!["rust:function:dual.secret"],
+    )
+    .expect("set plugin_id");
+    insert_alive_sei(
+        &conn,
+        "loomweave:eid:dual-secret",
+        "rust:function:dual.secret",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["dual.secret"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["result_kind"], "ambiguous", "{env}");
+    let candidates = results[0]["candidates"].as_array().expect("candidates");
+    assert_eq!(candidates.len(), 2, "both candidates kept: {env}");
+    // Sorted python < rust: the python candidate comes first, identity intact…
+    assert_eq!(candidates[0]["id"], "python:function:dual.secret");
+    // …and the rust one is the redacted stub.
+    assert_redacted_identity(&candidates[1], "secret_in_source");
+    assert!(
+        !env.to_string().contains("rust:function:dual.secret"),
+        "blocked rust locator leaked via ambiguous entity_resolve: {env}"
+    );
+    assert!(
+        !env.to_string().contains("loomweave:eid:dual-secret"),
+        "blocked SEI leaked via ambiguous entity_resolve: {env}"
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_mixed_batch_ambiguous_unresolved_resolved_in_order() {
+    // One batch carrying all three result kinds: results echo back in input
+    // order and the dual qualname's rust row must not cross-contaminate the
+    // python-only resolved entry.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:a.one",
+        "function",
+        "a.py",
+        Some((1, 2)),
+    );
+    insert_entity(
+        &conn,
+        "python:function:dual.target",
+        "function",
+        "dual.py",
+        Some((1, 2)),
+    );
+    insert_entity_named(
+        &conn,
+        "rust:function:dual.target",
+        "function",
+        "dual.rs",
+        Some((1, 2)),
+        "target",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["dual.target", "missing.x", "a.one"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["qualname"], "dual.target");
+    assert_eq!(results[0]["result_kind"], "ambiguous");
+    assert_eq!(
+        results[0]["candidates"]
+            .as_array()
+            .expect("candidates")
+            .len(),
+        2,
+        "{env}"
+    );
+    assert_eq!(results[1]["qualname"], "missing.x");
+    assert_eq!(results[1]["result_kind"], "unresolved");
+    assert_eq!(
+        results[1]["candidates"]
+            .as_array()
+            .expect("candidates")
+            .len(),
+        0,
+        "{env}"
+    );
+    assert_eq!(results[2]["qualname"], "a.one");
+    assert_eq!(results[2]["result_kind"], "resolved");
+    let resolved = results[2]["candidates"].as_array().expect("candidates");
+    assert_eq!(resolved.len(), 1, "no cross-contamination: {env}");
+    assert_eq!(resolved[0]["id"], "python:function:a.one");
+}

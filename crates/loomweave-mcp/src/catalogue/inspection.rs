@@ -418,10 +418,11 @@ impl ServerState {
     /// is load-bearing: it stops the reverse-map from becoming a side channel
     /// that discloses a blocked locator.
     ///
-    /// Output is multi-candidate-shaped from day one (`result_kind` +
-    /// `candidates` list) even though the exact tier yields at most one
-    /// candidate — the reserved `Resolution::Heuristic` variant slots in without
-    /// a schema break.
+    /// Output is multi-candidate-shaped (`result_kind` + `candidates` list).
+    /// The exact tier mints candidates per plugin (clarion-69db8b2739), so a
+    /// qualname existing under more than one plugin yields `result_kind:
+    /// "ambiguous"` with every candidate listed; the reserved
+    /// `Resolution::Heuristic` variant slots in later without a schema break.
     pub(crate) async fn tool_entity_resolve(
         &self,
         arguments: &serde_json::Map<String, Value>,
@@ -452,8 +453,10 @@ impl ServerState {
             }
             qualnames.push(qualname.to_owned());
         }
-        // `kind` is fixed-enum forward-room — resolution hardcodes
-        // `python:function:` today. Reject any value other than the default.
+        // `kind` is fixed-enum forward-room. Resolution mints `function`
+        // candidates per plugin that has function entities (clarion-69db8b2739),
+        // so a Rust callable — methods included; there is no `rust:method:` — is
+        // kind=function too. Reject any value other than the default.
         match arguments.get("kind") {
             None | Some(Value::Null) => {}
             Some(Value::String(kind)) if kind == "function" => {}
@@ -466,19 +469,30 @@ impl ServerState {
                 let resolved = resolve_wardline_qualnames(conn, &qualnames)?;
                 let mut results = Vec::with_capacity(resolved.len());
                 for (qualname, resolution) in resolved {
-                    let (candidates, result_kind) = match resolution {
-                        Resolution::Exact { entity_id } => {
-                            match entity_by_id(conn, &entity_id)? {
-                                // Project through entity_json: attaches the SEI and
-                                // collapses a briefing-blocked entity to the stub so
-                                // its id/sei are never disclosed here.
-                                Some(entity) => (vec![entity_json(conn, &entity)], "resolved"),
-                                // The candidate id resolved but its row vanished
-                                // (a torn read): treat as unresolved, never error.
-                                None => (Vec::new(), "unresolved"),
-                            }
+                    // Collect every candidate id this qualname resolved to (one
+                    // for Exact, more for Ambiguous), project EACH through
+                    // entity_json — the SEI attach + briefing-blocked stub
+                    // collapse is a non-disclosure property that must apply to
+                    // every candidate — then recompute result_kind from the
+                    // count that SURVIVES vanished-row (torn-read) filtering:
+                    // 0 → unresolved, 1 → resolved, >1 → ambiguous.
+                    let candidate_ids = match resolution {
+                        Resolution::Exact { entity_id } => vec![entity_id],
+                        Resolution::Ambiguous { entity_ids } => entity_ids,
+                        Resolution::None => Vec::new(),
+                    };
+                    let mut candidates = Vec::with_capacity(candidate_ids.len());
+                    for entity_id in candidate_ids {
+                        // A candidate id resolved but its row vanished (a torn
+                        // read): drop it, never error.
+                        if let Some(entity) = entity_by_id(conn, &entity_id)? {
+                            candidates.push(entity_json(conn, &entity));
                         }
-                        Resolution::None => (Vec::new(), "unresolved"),
+                    }
+                    let result_kind = match candidates.len() {
+                        0 => "unresolved",
+                        1 => "resolved",
+                        _ => "ambiguous",
                     };
                     results.push(json!({
                         "qualname": qualname,

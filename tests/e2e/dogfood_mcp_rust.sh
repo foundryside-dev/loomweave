@@ -17,7 +17,7 @@
 # MCP checks (Content-Length framed stdio JSON-RPC, sprint_2_mcp_surface.sh
 # harness pattern):
 #   - entity_find by name / by kind / by full ADR-049 qualname
-#   - entity_resolve by ADR-049 Rust qualname  [KNOWN-GAP — see check]
+#   - entity_resolve by ADR-049 Rust qualname (resolves to rust:function:*)
 #   - entity_callers_list on Rust functions (cross-module + same-module)
 #   - entity_neighborhood_get on a Rust struct (references_in direct) and a
 #     Rust module (references_in/out rolled up, imports)
@@ -342,28 +342,23 @@ try:
 
     check("entity_find by ADR-049 qualname (free fn + impl-discriminated method)", find_by_qualname)
 
-    # 4. KNOWN-GAP — entity_resolve cannot resolve a Rust qualname. The
-    # resolver (loomweave-storage wardline_taint.rs::function_candidate)
-    # hardcodes the candidate id as `python:function:{qualname}`, so an
-    # existing `rust:function:mcp_fixture.ops.entry` comes back "unresolved".
-    # This check PINS the current gap behavior: when the resolver learns
-    # plugin-aware candidates, this assertion fails and the gap marker must
-    # be replaced with a real resolution assertion.
-    def resolve_qualname_gap():
+    # 4. entity_resolve by ADR-049 Rust qualname. Per-plugin candidate minting
+    # (clarion-69db8b2739; loomweave-storage wardline_taint.rs) mints a
+    # `rust:function:{qualname}` candidate, so the existing
+    # `rust:function:mcp_fixture.ops.entry` resolves with result_kind="resolved",
+    # a single candidate, and its SEI attached.
+    def resolve_qualname():
         env = tool_envelope(call("entity_resolve", {"qualnames": ["mcp_fixture.ops.entry"]}))
         results = env["result"]["results"]
         assert len(results) == 1, results
         assert results[0]["qualname"] == "mcp_fixture.ops.entry", results
-        assert results[0]["result_kind"] == "unresolved", results
-        assert results[0]["candidates"] == [], results
+        assert results[0]["result_kind"] == "resolved", results
+        candidates = results[0]["candidates"]
+        assert len(candidates) == 1, candidates
+        assert candidates[0]["id"] == ENTRY_FN, candidates
+        assert candidates[0].get("sei"), f"candidate SEI present: {candidates}"
 
-    if check("entity_resolve Rust qualname pins the unresolved gap", resolve_qualname_gap):
-        print(
-            "[dogfood-mcp-rust] KNOWN-GAP: entity_resolve hardcodes python:function: "
-            "candidates (wardline_taint.rs) — Rust qualnames return result_kind="
-            "\"unresolved\"; use entity_find as the Rust reverse-lookup for now",
-            file=sys.stderr,
-        )
+    check("entity_resolve Rust qualname (rust:function:mcp_fixture.ops.entry)", resolve_qualname)
 
     # 5. Callers of a Rust function — cross-module crate-qualified call
     # (`run` calls `crate::ops::entry()`).
@@ -520,4 +515,4 @@ if failures:
     sys.exit(1)
 PY
 
-log "PASS: MCP surface answered for Rust entities (find/qualname/callers/neighborhood/relations/entity_at/dead-code/subsystem/status); 1 KNOWN-GAP pinned (entity_resolve is python-only)"
+log "PASS: MCP surface answered for Rust entities (find/qualname/resolve/callers/neighborhood/relations/entity_at/dead-code/subsystem/status)"
