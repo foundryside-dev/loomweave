@@ -18,6 +18,10 @@ DIST_CRATE="$REPO_ROOT/packaging/rust-plugin-dist"
 OUT="$DIST_CRATE/dist"
 SMOKE="$(mktemp -d "${TMPDIR:-/tmp}/lw-rust-wheel-smoke.XXXXXX")"
 trap 'rm -rf "$SMOKE"' EXIT
+# Hermetic install (clarion-c5e3cc2818): `loomweave install` registers a
+# Codex MCP entry in ~/.codex/config.toml unless this override points it
+# at a scratch-local file. Never mutate the operator's real config.
+export LOOMWEAVE_CODEX_CONFIG="$SMOKE/codex-config.toml"
 
 command -v maturin >/dev/null || { echo "FAIL: maturin not on PATH"; exit 1; }
 command -v uv >/dev/null || { echo "FAIL: uv not on PATH"; exit 1; }

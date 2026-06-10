@@ -22,6 +22,10 @@ LOOMWEAVE_BIN="$REPO_ROOT/target/release/loomweave"
 DEMO_DIR="$(mktemp -d -t loomweave-wp5-demo-XXXXXX)"
 PLUGIN_DIR="$(mktemp -d -t loomweave-wp5-plugin-XXXXXX)"
 trap 'rm -rf "$DEMO_DIR" "$PLUGIN_DIR"' EXIT
+# Hermetic install (clarion-c5e3cc2818): `loomweave install` registers a
+# Codex MCP entry in ~/.codex/config.toml unless this override points it
+# at a scratch-local file. Never mutate the operator's real config.
+export LOOMWEAVE_CODEX_CONFIG="$DEMO_DIR/codex-config.toml"
 
 cat > "$PLUGIN_DIR/loomweave-plugin-secretfixture" <<'PY'
 #!/usr/bin/python3

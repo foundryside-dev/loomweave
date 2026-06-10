@@ -36,6 +36,10 @@ PLUGIN_BIN="$VENV/bin/loomweave-plugin-python"
 
 ROOT="$(mktemp -d -t loomweave-phase3-XXXXXX)"
 trap 'rm -rf "$ROOT"' EXIT
+# Hermetic install (clarion-c5e3cc2818): `loomweave install` registers a
+# Codex MCP entry in ~/.codex/config.toml unless this override points it
+# at a scratch-local file. Never mutate the operator's real config.
+export LOOMWEAVE_CODEX_CONFIG="$ROOT/codex-config.toml"
 PROJECT_A="$ROOT/project-a"
 PROJECT_B="$ROOT/project-b"
 

@@ -44,6 +44,10 @@ RUST_PLUGIN_BIN="$REPO_ROOT/target/release/loomweave-rust-plugin"
 # ── 2. Stage the rust plugin under its discovery name + neighbor manifest ────
 SCRATCH="$(mktemp -d -t loomweave-hostile-rust-XXXXXX)"
 trap 'rm -rf "$SCRATCH"' EXIT
+# Hermetic install (clarion-c5e3cc2818): `loomweave install` registers a
+# Codex MCP entry in ~/.codex/config.toml unless this override points it
+# at a scratch-local file. Never mutate the operator's real config.
+export LOOMWEAVE_CODEX_CONFIG="$SCRATCH/codex-config.toml"
 PLUGIN_DIR="$SCRATCH/plugin-bin"
 mkdir -p "$PLUGIN_DIR"
 # The cargo artifact is `loomweave-rust-plugin` (deliberately off the
