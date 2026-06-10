@@ -20,8 +20,11 @@
 //! paths (the calls channel owns them), derive lists (derives), impl-header
 //! trait path + self type (implements / the impl entity), generic
 //! params/bounds/where-clauses, trait item bodies (never walked — same as
-//! calls), macro bodies/arguments (spec §5 — `visit_macro` is a no-op), and
-//! `Self`/`self` keyword paths.
+//! calls), macro bodies/arguments (spec §5 — `visit_macro` is a no-op),
+//! `Self`/`self` keyword paths, and qself paths (`<Foo>::Out` names an
+//! ASSOCIATED item — minting its bare post-qself segments would fabricate
+//! wrong crate-root edges, H5; the qself TYPE `Foo` is still collected in
+//! type position via descent).
 //!
 //! **Counter divergence from the Python plugin (D4):** syn is a parser, not a
 //! type checker — unlike pyright it cannot distinguish "resolves to an
@@ -127,7 +130,15 @@ struct TypeRefVisitor<'a> {
 
 impl<'ast> Visit<'ast> for TypeRefVisitor<'_> {
     fn visit_type_path(&mut self, node: &'ast syn::TypePath) {
-        push_path_site(&node.path, self.out);
+        // A qself path (`<Foo>::Out`, `<Foo as Tr>::Out`) names an ASSOCIATED
+        // type, never a free path: resolving its bare post-qself segments
+        // would fabricate an edge to an unrelated same-named crate-root
+        // entity via the bare-name fallback (H5). Skip the path; the descent
+        // below still reaches the qself TYPE (`Foo`), which is a legitimate
+        // type-position mention.
+        if node.qself.is_none() {
+            push_path_site(&node.path, self.out);
+        }
         // Default descent reaches nested generic args (`Vec<MyType>` →
         // `MyType`) and any qself type (`<Foo as Tr>::Out` → `Foo`).
         syn::visit::visit_type_path(self, node);
@@ -149,7 +160,13 @@ struct ExprRefVisitor<'a> {
 
 impl<'ast> Visit<'ast> for ExprRefVisitor<'_> {
     fn visit_expr_path(&mut self, node: &'ast ExprPath) {
-        push_path_site(&node.path, self.out);
+        // qself guard, as in the type walker: `<Foo>::LIMIT` names an
+        // associated item — never mint its bare post-qself path (H5). The
+        // qself TYPE is not collected here either (this walker only collects
+        // whole expression paths; type mentions belong to the type walker).
+        if node.qself.is_none() {
+            push_path_site(&node.path, self.out);
+        }
         syn::visit::visit_expr_path(self, node);
     }
 

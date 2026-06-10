@@ -605,3 +605,40 @@ fn no_resolver_path_emits_no_references_and_zero_stats() {
     // Non-vacuous: entities still extracted.
     assert!(extracted.entities.iter().any(|e| e["kind"] == "struct"));
 }
+
+/// A qself path names an ASSOCIATED item (`<Foo>::Out`, `<X>::LIMIT`), never
+/// a free in-project path, so neither walker may resolve its bare post-qself
+/// segments — the crate-root bare-name fallback would FABRICATE an edge to an
+/// unrelated same-named crate-root entity (H5; the calls-audit fix's sibling,
+/// found by the same sweep). Both positions pinned with live decoys:
+/// - type position: `<Foo>::Out` with a decoy `type Out` at crate root,
+/// - expression position: `<Foo>::LIMIT` with a decoy `const LIMIT`.
+///
+/// The qself TYPE itself (`Foo`) is still a legitimate type-position mention
+/// (collected by the type walker's descent); the expression walker collects
+/// nothing for a qself path (it only ever collects whole `Expr::Path`s).
+#[test]
+fn qself_paths_never_fabricate_references_edges() {
+    let src = "pub type Out = i32;\npub const LIMIT: i32 = 5;\npub struct Foo;\n\
+               pub fn f(_x: <Foo>::Out) -> i32 { <Foo>::LIMIT }\n";
+    let extracted = extract_crate_root(src);
+    let set = references_set(&extracted);
+    // No edge to the decoys — the qself paths must not resolve.
+    assert!(
+        set.iter()
+            .all(|(_, to, ..)| !to.contains(".Out") && !to.contains(".LIMIT")),
+        "a qself path resolved to a crate-root decoy (H5): {set:#?}",
+    );
+    // The qself type Foo IS still referenced from the fn (type position only).
+    let foo_edges: Vec<_> = set
+        .iter()
+        .filter(|(from, to, ..)| {
+            from == "rust:function:c_crate.f" && to == "rust:struct:c_crate.Foo"
+        })
+        .collect();
+    assert_eq!(
+        foo_edges.len(),
+        1,
+        "the qself type itself is one (deduped) reference: {set:#?}",
+    );
+}
