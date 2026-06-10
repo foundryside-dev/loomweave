@@ -27,6 +27,7 @@ use loomweave_core::plugin::{
 use serde_json::Value;
 
 use crate::crate_roots::CrateRoots;
+use crate::references::ReferenceStats;
 use crate::symbol_table::SymbolTable;
 
 /// Run the plugin's blocking JSON-RPC serve loop on stdin/stdout until `exit`
@@ -122,11 +123,12 @@ pub fn run() -> ! {
                 .unwrap_or(AnalyzeFileParams {
                     file_path: String::new(),
                 });
-                let (entities, edges, unresolved_call_sites, findings) = analyze_one_file(
-                    &params.file_path,
-                    crate_roots.as_ref(),
-                    symbol_table.as_ref(),
-                );
+                let (entities, edges, unresolved_call_sites, reference_stats, findings) =
+                    analyze_one_file(
+                        &params.file_path,
+                        crate_roots.as_ref(),
+                        symbol_table.as_ref(),
+                    );
                 let result = AnalyzeFileResult {
                     entities,
                     edges,
@@ -134,10 +136,20 @@ pub fn run() -> ! {
                         // Phase 2 calls stats. `*_total` is the count of sites
                         // that produced no in-project `calls` edge; the list is
                         // those sites verbatim for lazy query-time inference.
-                        // The reference_* / latency fields stay default (the
-                        // Rust plugin has no Pyright-style reference pass).
                         unresolved_call_sites_total: unresolved_call_sites.len() as u64,
                         unresolved_call_sites,
+                        // Phase 2 references stats (D4).
+                        // `references_skipped_external_total` absorbs BOTH
+                        // external-crate and no-match outcomes — syn cannot
+                        // distinguish them. `unresolved_reference_sites_total`
+                        // and `references_skipped_cap_total` stay 0 for Rust
+                        // (pyright reports externality and needs a cost cap;
+                        // syn does neither — documented divergence from the
+                        // Python plugin, see the `references` module docs).
+                        // The latency fields stay default (no LSP round-trips).
+                        reference_sites_total: reference_stats.sites_total,
+                        references_resolved_total: reference_stats.resolved_total,
+                        references_skipped_external_total: reference_stats.skipped_external_total,
                         ..Default::default()
                     },
                     findings,
@@ -164,9 +176,10 @@ pub fn run() -> ! {
 /// (`LMWV-INFRA-PARENT-CONTAINS-MISMATCH`). The degraded-parse fallback still
 /// runs below for files that ARE in scope but fail to parse.
 ///
-/// Returns `(entities, edges, unresolved_call_sites, findings)` already shaped
-/// for the wire: the structural `contains` edges (ADR-026 dual-encoding)
-/// accompany the entities, and degraded-parse `findings` from
+/// Returns `(entities, edges, unresolved_call_sites, reference_stats,
+/// findings)` already shaped for the wire: the structural `contains` edges
+/// (ADR-026 dual-encoding) accompany the entities, and degraded-parse
+/// `findings` from
 /// [`extract_file_degraded_aware`](crate::extract::extract_file_degraded_aware) are
 /// deserialised into [`AnalyzeFileFinding`]; any element that fails to
 /// deserialise is dropped rather than aborting the response.
@@ -185,6 +198,7 @@ fn analyze_one_file(
     Vec<Value>,
     Vec<Value>,
     Vec<UnresolvedCallSite>,
+    ReferenceStats,
     Vec<AnalyzeFileFinding>,
 ) {
     use crate::extract::{
@@ -202,14 +216,20 @@ fn analyze_one_file(
     let Some((crate_name, module_path)) =
         crate_roots.and_then(|roots| emittable_scope(roots, file))
     else {
-        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        return (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            ReferenceStats::default(),
+            Vec::new(),
+        );
     };
 
     // Pre-parse guards (ADR-050): an oversize file (size checked via metadata,
     // BEFORE reading it into memory) or a depth/prefix bomb degrades to a single
     // module entity plus a warning finding instead of risking an RLIMIT_AS kill
     // or a parser stack overflow.
-    let (entities, edges, unresolved_call_sites, finding_values) =
+    let (entities, edges, unresolved_call_sites, reference_stats, finding_values) =
         if let Err(violation) = parse_guard::check_file_size(file) {
             extract_file_guard_degraded(&module_path, file_path, &violation)
         } else {
@@ -241,7 +261,13 @@ fn analyze_one_file(
         .into_iter()
         .filter_map(|v| serde_json::from_value::<AnalyzeFileFinding>(v).ok())
         .collect();
-    (entities, edges, unresolved_call_sites, findings)
+    (
+        entities,
+        edges,
+        unresolved_call_sites,
+        reference_stats,
+        findings,
+    )
 }
 
 fn send_result(writer: &mut impl Write, id: i64, result: Value) {

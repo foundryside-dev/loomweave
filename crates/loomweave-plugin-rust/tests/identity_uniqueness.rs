@@ -195,7 +195,7 @@ fn reserved_char_in_cfg_predicate_does_not_collapse_the_file() {
 
     // The degraded-aware path is the real ingest path that collapses on an
     // id-validation error. Post-fix it must report NO findings and NOT collapse.
-    let (entities, _edges, _sites, findings) =
+    let (entities, _edges, _sites, _ref_stats, findings) =
         extract_file_degraded_aware("k", "k.m", "/p/src/m.rs", src);
     assert!(
         findings.is_empty(),
