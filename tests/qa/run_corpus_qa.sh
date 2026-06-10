@@ -32,13 +32,24 @@ rm -rf "$CORPUS/.weft" "$CORPUS/loomweave.yaml"
 
 "$LW" install --path "$CORPUS" >"$OUT/install.log" 2>&1
 
+# No GNU /usr/bin/time on every box: wall via monotonic clock, peak RSS via
+# getrusage(RUSAGE_CHILDREN).ru_maxrss after wait — covers the reaped loomweave
+# host AND (transitively, via the host's own children-rusage rollup) the
+# plugin child, which is the memory-heavy process.
 run_analyze() { # $1 = tag
-  /usr/bin/time -v "$LW" analyze "$CORPUS" >"$OUT/analyze-$1.out" 2>"$OUT/analyze-$1.err" || true
-  grep -E "Elapsed \(wall clock\)|Maximum resident set size" "$OUT/analyze-$1.err" \
-    | sed "s/^[[:space:]]*/$1 /" | tee -a "$OUT/summary.txt"
-  grep -o "SEI mint pass complete.*" "$OUT/analyze-$1.err" | tail -1 \
-    | sed "s/^/$1 /" | tee -a "$OUT/summary.txt"
-  tail -1 "$OUT/analyze-$1.out" | sed "s/^/$1 /" | tee -a "$OUT/summary.txt"
+  python3 - "$LW" "$CORPUS" >"$OUT/analyze-$1.out" 2>"$OUT/analyze-$1.err" <<'PYEOF' || true
+import resource, subprocess, sys, time
+t0 = time.monotonic()
+p = subprocess.run([sys.argv[1], "analyze", sys.argv[2]])
+elapsed = time.monotonic() - t0
+ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+print(f"QA-WALL-SECONDS {elapsed:.2f}", file=sys.stderr)
+print(f"QA-MAXRSS-KIB {ru.ru_maxrss}", file=sys.stderr)
+sys.exit(p.returncode)
+PYEOF
+  { grep -E "QA-WALL-SECONDS|QA-MAXRSS-KIB" "$OUT/analyze-$1.err" || true; } | sed "s/^/$1 /" | tee -a "$OUT/summary.txt"
+  { grep -o "SEI mint pass complete.*" "$OUT/analyze-$1.err" || true; } | tail -1 | sed "s/^/$1 /" | tee -a "$OUT/summary.txt"
+  { tail -1 "$OUT/analyze-$1.out" || true; } | sed "s/^/$1 /" | tee -a "$OUT/summary.txt"
 }
 
 echo "== corpus $NAME ($(git -C "$CORPUS" rev-parse HEAD 2>/dev/null || echo unpinned))" | tee "$OUT/summary.txt"
