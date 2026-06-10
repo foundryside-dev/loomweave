@@ -23,10 +23,15 @@ const RUST_MANIFEST_BYTES: &[u8] = include_bytes!("../plugin.toml");
 /// A tiny, analysable Rust source file. Laid out under a temp crate's `src/`
 /// so crate-root discovery (ADR-049 §1) produces real crate-rooted ids. It
 /// includes an `impl` block so the impl method + its `contains` edge round-trip
-/// through the real host's `RawEdge` wire path (ADR-026 dual-encoding).
+/// through the real host's `RawEdge` wire path (ADR-026 dual-encoding), plus a
+/// fn with two unresolvable call sites (a method call and an external path
+/// call) so the calls-stats accounting is exercised non-vacuously through the
+/// real serve loop (`serve.rs` sets `unresolved_call_sites_total` from the vec
+/// length — the calls-envelope audit pins the equality end-to-end here).
 const SAMPLE_RS: &str = "pub struct Gadget { pub n: i32 }\n\
      pub fn make() -> Gadget { Gadget { n: 0 } }\n\
-     impl Gadget { pub fn bump(&mut self) { self.n += 1; } }\n";
+     impl Gadget { pub fn bump(&mut self) { self.n += 1; } }\n\
+     pub fn churn(g: &mut Gadget) { g.bump(); std::mem::drop(0); }\n";
 
 /// Locate the off-glob `loomweave-rust-plugin` binary in the Cargo target dir,
 /// building it on demand if missing.
@@ -210,6 +215,33 @@ fn handshake_analyze_shutdown_roundtrip() {
     assert!(
         contains.iter().any(|(_, to)| to == bump_id),
         "expected a contains edge to the impl method {bump_id}; got {contains:?}"
+    );
+
+    // Calls-stats accounting through the REAL serve loop (the calls-envelope
+    // audit's serve-path boundary): `churn` has exactly two unresolvable call
+    // sites (`g.bump()` — method call; `std::mem::drop(0)` — external path),
+    // and `unresolved_call_sites_total` must equal the vec length the plugin
+    // shipped (serve.rs derives it from `unresolved_call_sites.len()`; the
+    // host retains both sites because their caller entity was accepted).
+    assert_eq!(
+        outcome.stats.unresolved_call_sites_total, 2,
+        "expected exactly the two staged unresolvable sites; got {:#?}",
+        outcome.stats.unresolved_call_sites,
+    );
+    assert_eq!(
+        outcome.stats.unresolved_call_sites.len(),
+        2,
+        "total and vec must agree through the serve loop; got {:#?}",
+        outcome.stats.unresolved_call_sites,
+    );
+    assert!(
+        outcome
+            .stats
+            .unresolved_call_sites
+            .iter()
+            .all(|s| s.caller_entity_id == "rust:function:sample_crate.sample.churn"),
+        "both sites attribute to churn; got {:#?}",
+        outcome.stats.unresolved_call_sites,
     );
 
     host.shutdown().expect("shutdown must succeed");
