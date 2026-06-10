@@ -5964,6 +5964,88 @@ mod tests {
         );
     }
 
+    /// Like [`implements_edge_record`] but kind-parameterized, for the gate
+    /// generality pins below.
+    fn anchored_edge_record(kind: &str, from_id: &str, to_id: &str) -> (String, EdgeRecord) {
+        (
+            format!("{kind} {from_id} -> {to_id}"),
+            EdgeRecord {
+                kind: kind.to_owned(),
+                from_id: from_id.to_owned(),
+                to_id: to_id.to_owned(),
+                confidence: loomweave_core::EdgeConfidence::Resolved,
+                properties_json: None,
+                source_file_id: Some(from_id.to_owned()),
+                source_byte_start: Some(0),
+                source_byte_end: Some(4),
+            },
+        )
+    }
+
+    /// PIN test (D8, Phase 2): the seen-set gate is kind-GENERIC — it switches
+    /// on endpoint membership only, never on `kind` — so the new `derives` and
+    /// `references` edge kinds ride it unchanged. This cannot go red-first (no
+    /// code change accompanies it); it pins the generality so a future
+    /// kind-aware refactor of the gate cannot silently strand the new kinds.
+    #[test]
+    fn drain_ready_plugin_edges_is_kind_generic_for_derives_and_references() {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        seen.insert("rust:struct:c.Foo".to_owned());
+        seen.insert("rust:trait:c.Tr".to_owned());
+        seen.insert("rust:function:c.make".to_owned());
+        seen.insert("rust:const:c.MAX".to_owned());
+
+        let mut pending = vec![
+            // ready: both endpoints stored.
+            anchored_edge_record("derives", "rust:struct:c.Foo", "rust:trait:c.Tr"),
+            anchored_edge_record("references", "rust:function:c.make", "rust:const:c.MAX"),
+            // not ready: target never stored (gitignored-superset / stale — D2/D3).
+            anchored_edge_record("derives", "rust:struct:c.Foo", "rust:trait:c.Hidden"),
+            anchored_edge_record("references", "rust:function:c.make", "rust:struct:c.Gone"),
+        ];
+
+        let ready = drain_ready_plugin_edges(&mut pending, &seen);
+
+        assert_eq!(
+            ready.len(),
+            2,
+            "both fully-seen edges drain ready regardless of kind"
+        );
+        assert_eq!(ready[0].1.kind, "derives");
+        assert_eq!(ready[0].1.to_id, "rust:trait:c.Tr");
+        assert_eq!(ready[1].1.kind, "references");
+        assert_eq!(ready[1].1.to_id, "rust:const:c.MAX");
+        assert_eq!(
+            pending.len(),
+            2,
+            "both unseen-target edges stay pending regardless of kind"
+        );
+        assert_eq!(pending[0].1.to_id, "rust:trait:c.Hidden");
+        assert_eq!(pending[1].1.to_id, "rust:struct:c.Gone");
+    }
+
+    /// PIN test (D8, Phase 2): end-of-plugin reconciliation drop-counts pending
+    /// `derives`/`references` edges exactly like `implements` — kind never
+    /// enters the decision. See the drain pin above for why no red state exists.
+    #[test]
+    fn drop_unready_plugin_edges_counts_derives_and_references() {
+        let mut pending = vec![
+            anchored_edge_record("derives", "rust:struct:c.Foo", "rust:trait:c.Hidden"),
+            anchored_edge_record("references", "rust:function:c.make", "rust:struct:c.Gone"),
+        ];
+
+        let dropped = drop_unready_plugin_edges(&mut pending);
+
+        assert_eq!(
+            dropped, 2,
+            "both never-seen Phase-2 edges are counted as dropped"
+        );
+        assert!(
+            pending.is_empty(),
+            "the pending buffer is fully drained (dropped, not retained)"
+        );
+    }
+
     #[test]
     fn filter_import_edges_retains_non_module_in_project_target() {
         // clarion-d1e3dc67dc: the Rust resolver targets `use` paths at functions /
