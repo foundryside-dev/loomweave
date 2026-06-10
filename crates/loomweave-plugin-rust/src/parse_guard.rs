@@ -330,24 +330,56 @@ fn skip_char_literal(bytes: &[u8], i: usize) -> Option<usize> {
 /// extraction walk) must run on the pinned stack too — which is also what we
 /// want, since they recurse over the same nested structure.
 ///
+/// **Fallback:** the host jails the plugin child with `RLIMIT_NPROC` (a
+/// per-real-UID-GLOBAL task counter — ADR-021 §2d), so on a busy user account
+/// `clone(2)` fails with `EAGAIN` and the pinned thread cannot be spawned at
+/// all. In that case `f` runs INLINE on the calling thread: the scan caps
+/// ([`MAX_BRACKET_DEPTH`]/[`MAX_PREFIX_RUN`]) sit well under the measured
+/// crash floors even at the common 8 MiB default stack (337/2386), so guarded
+/// input stays safe; the pinned thread is defence-in-depth where the
+/// environment allows it, never a correctness dependency.
+///
 /// # Panics
 ///
-/// Panics if the parse thread cannot be spawned or itself panics — both are
-/// infrastructure faults, not input-dependent conditions (guarded input cannot
-/// overflow the pinned stack).
+/// Panics if the spawned parse thread itself panics — an infrastructure
+/// fault, not an input-dependent condition (guarded input cannot overflow the
+/// pinned stack).
 pub fn with_pinned_stack<T, F>(f: F) -> T
 where
     T: Send,
     F: FnOnce() -> T + Send,
 {
+    // The closure is parked in a Mutex<Option<…>> so it survives a failed
+    // spawn: `Builder::spawn_scoped` consumes its argument, which would drop
+    // `f` on the EAGAIN path before the inline fallback could run it.
+    let parked = std::sync::Mutex::new(Some(f));
+    let take = || {
+        parked
+            .lock()
+            .expect("parse-closure mutex poisoned")
+            .take()
+            .expect("parse closure runs exactly once")
+    };
     std::thread::scope(|scope| {
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("syn-parse".into())
             .stack_size(PARSE_STACK_BYTES)
-            .spawn_scoped(scope, f)
-            .expect("spawn syn parse thread")
-            .join()
-            .expect("syn parse thread panicked")
+            .spawn_scoped(scope, || take()());
+        match spawned {
+            Ok(handle) => handle.join().expect("syn parse thread panicked"),
+            Err(e) => {
+                // EAGAIN under RLIMIT_NPROC: inline fallback. Warn once so the
+                // host's stderr ring buffer records which stack is live.
+                static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                WARN_ONCE.call_once(|| {
+                    eprintln!(
+                        "loomweave-plugin-rust: cannot spawn pinned parse thread ({e}); \
+                         parsing inline on the caller's stack (scan caps still apply)"
+                    );
+                });
+                take()()
+            }
+        }
     })
 }
 

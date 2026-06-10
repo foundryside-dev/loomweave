@@ -170,6 +170,13 @@ pub fn run() -> ! {
 /// [`extract_file_degraded_aware`](crate::extract::extract_file_degraded_aware) are
 /// deserialised into [`AnalyzeFileFinding`]; any element that fails to
 /// deserialise is dropped rather than aborting the response.
+///
+/// In-scope files are vetted by the pre-parse guards first (ADR-050): a file
+/// over [`parse_guard::MAX_FILE_BYTES`](crate::parse_guard::MAX_FILE_BYTES)
+/// (checked via `fs::metadata`, never read) or one tripping the depth/prefix
+/// scan degrades to a single module entity (`parse_status` `"file_too_large"` /
+/// `"depth_limit"`) plus a warning finding (`LMWV-RUST-FILE-TOO-LARGE` /
+/// `LMWV-RUST-DEPTH-LIMIT`) instead of crashing the plugin.
 fn analyze_one_file(
     file_path: &str,
     crate_roots: Option<&CrateRoots>,
@@ -180,7 +187,11 @@ fn analyze_one_file(
     Vec<UnresolvedCallSite>,
     Vec<AnalyzeFileFinding>,
 ) {
-    use crate::extract::{extract_file_degraded_aware, extract_file_degraded_aware_with_edges};
+    use crate::extract::{
+        extract_file_degraded_aware, extract_file_degraded_aware_with_edges,
+        extract_file_guard_degraded,
+    };
+    use crate::parse_guard;
     use crate::resolve::Resolver;
     use crate::scope::emittable_scope;
 
@@ -194,24 +205,38 @@ fn analyze_one_file(
         return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     };
 
-    let src = std::fs::read_to_string(file).unwrap_or_default();
-    // With the project symbol table stashed at `initialize`, resolve this file's
-    // in-project `use` paths into `imports` edges; without it (defensive — every
-    // real `initialize` builds one) fall back to the entities/`contains`-only
-    // path so analysis never silently aborts.
-    let (entities, edges, unresolved_call_sites, finding_values) = match symbol_table {
-        Some(table) => {
-            let resolver = Resolver::new(table);
-            extract_file_degraded_aware_with_edges(
-                &crate_name,
-                &module_path,
-                file_path,
-                &src,
-                &resolver,
-            )
-        }
-        None => extract_file_degraded_aware(&crate_name, &module_path, file_path, &src),
-    };
+    // Pre-parse guards (ADR-050): an oversize file (size checked via metadata,
+    // BEFORE reading it into memory) or a depth/prefix bomb degrades to a single
+    // module entity plus a warning finding instead of risking an RLIMIT_AS kill
+    // or a parser stack overflow.
+    let (entities, edges, unresolved_call_sites, finding_values) =
+        if let Err(violation) = parse_guard::check_file_size(file) {
+            extract_file_guard_degraded(&module_path, file_path, &violation)
+        } else {
+            let src = std::fs::read_to_string(file).unwrap_or_default();
+            if let Err(violation) = parse_guard::scan_source(&src) {
+                extract_file_guard_degraded(&module_path, file_path, &violation)
+            } else {
+                // With the project symbol table stashed at `initialize`, resolve
+                // this file's in-project `use` paths into `imports` edges;
+                // without it (defensive — every real `initialize` builds one)
+                // fall back to the entities/`contains`-only path so analysis
+                // never silently aborts.
+                match symbol_table {
+                    Some(table) => {
+                        let resolver = Resolver::new(table);
+                        extract_file_degraded_aware_with_edges(
+                            &crate_name,
+                            &module_path,
+                            file_path,
+                            &src,
+                            &resolver,
+                        )
+                    }
+                    None => extract_file_degraded_aware(&crate_name, &module_path, file_path, &src),
+                }
+            }
+        };
     let findings = finding_values
         .into_iter()
         .filter_map(|v| serde_json::from_value::<AnalyzeFileFinding>(v).ok())

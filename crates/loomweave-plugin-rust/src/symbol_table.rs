@@ -71,9 +71,11 @@ impl SymbolTable {
 }
 
 /// Walk `project_root` (one `syn` parse per `.rs` file) and build the
-/// project-wide symbol table. Files whose crate root cannot be resolved or
-/// whose source fails to parse are skipped (their items contribute nothing;
-/// the degraded single-module fallback is Task 9). Collisions are recorded in
+/// project-wide symbol table. Files whose crate root cannot be resolved,
+/// whose source fails to parse, or which are rejected by the pre-parse guards
+/// (oversize / depth bomb / prefix bomb — ADR-050; same silent-skip semantics
+/// as a parse error: their items contribute nothing, and the visible degraded
+/// finding is `analyze_file`'s job) are skipped. Collisions are recorded in
 /// [`SymbolTable::duplicate_ids`] rather than silently dropped.
 #[must_use]
 pub fn build_symbol_table(project_root: &Path) -> SymbolTable {
@@ -90,9 +92,19 @@ pub fn build_symbol_table(project_root: &Path) -> SymbolTable {
         let Some((crate_name, module_path)) = emittable_scope(&roots, &file) else {
             continue;
         };
+        // Pre-parse guards (ADR-050): an oversize file is skipped WITHOUT
+        // reading it; a depth/prefix bomb is skipped before it can overflow
+        // the parser stack. This init walk runs inside the host's `initialize`
+        // handshake — a crash here would fail the whole plugin spawn.
+        if crate::parse_guard::check_file_size(&file).is_err() {
+            continue;
+        }
         let Ok(src) = std::fs::read_to_string(&file) else {
             continue;
         };
+        if crate::parse_guard::scan_source(&src).is_err() {
+            continue;
+        }
         let Ok(entities) = extract_file(&crate_name, &module_path, &file.to_string_lossy(), &src)
         else {
             continue;
