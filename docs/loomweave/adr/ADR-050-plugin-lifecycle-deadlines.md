@@ -160,3 +160,21 @@ New finding subcodes: `LMWV-INFRA-PLUGIN-ABORTED`, `LMWV-INFRA-PLUGIN-SHUTDOWN-T
 - `crates/loomweave-core/src/plugin/host.rs` — `spawn_unhandshaken` / `spawn` split; `host_findings.rs` — `FINDING_PLUGIN_ABORTED`.
 - `crates/loomweave-plugin-rust/src/parse_guard.rs` — caps, lexer, `with_pinned_stack`, probe-mirroring tests.
 - `tests/e2e/hostile_corpus_rust.sh` — hostile-corpus acceptance gate.
+
+## Amendment 1 (2026-06-10, Sprint-3 scale QA — plan `2026-06-10-rust-plugin-scale-qa.md`)
+
+**Rust plugin `expected_max_rss_mb`: 128 → 512.** The empirical row that forces
+it: `RLIMIT_AS` caps **address space**, not resident set, and at 128 MiB the
+Rust plugin aborts (alloc failure → SIGABRT → `LMWV-INFRA-PLUGIN-ABORTED` +
+transport EOF) on rust-analyzer @ `587ce15e` — a 33 MB working tree producing
+~29 k entities at a measured peak RSS of ~119 MiB (getrusage children-max).
+At 1024 MiB the same corpus completes: 30 369 entities, 41 091 edges, 145 s
+wall. 512 MiB is chosen per ADR-035 (basis: largest measured corpus needs
+< 128 MiB RSS but > 128 MiB address space; 512 gives ~4× headroom while still
+bounding a runaway parse; retune trigger: any real corpus aborting under 512,
+or host fleets needing a tighter envelope via the `plugin_limits` yaml surface
+tracked as clarion-271287b54b).
+
+The lifecycle deadlines themselves are NOT changed by this amendment: the
+largest measured handshake (rust-analyzer whole-repo init parse) stays well
+under the 300 s handshake deadline, and no per-file parse approached 120 s.
