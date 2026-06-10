@@ -46,6 +46,9 @@ use loomweave_federation::scan_results::{
 
 use crate::config::{AnalyzeConfig, ClusteringConfig};
 use crate::stats::P95Accumulator;
+use duplicate_guard::{DUPLICATE_LOCATOR_RULE_ID, DuplicateLocatorGuard};
+
+mod duplicate_guard;
 use loomweave_analysis::{
     ClusterAlgorithm, ClusterConfig, ModuleEdge, ModuleGraph, cluster_hash, cluster_modules,
 };
@@ -765,6 +768,15 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         // `entities` is cumulative) and resurrect a stale edge to a symbol the
         // source no longer defines.
         let mut skipped_file_entity_ids: Vec<String> = Vec::new();
+        // id → owning canonical source path for entities anchored in this
+        // plugin's skipped-unchanged files. These rows survive the run
+        // untouched, so a RE-ANALYZED file emitting one of these ids is a
+        // genuine cross-run locator collision (clarion-b19fe90c3e) — the old
+        // file still claims it. A genuine move never lands here: the moved-from
+        // file either changed (re-dispatched, so not skipped) or vanished (its
+        // entities are orphan-deleted by the SEI pass). Full runs leave this
+        // empty.
+        let mut skipped_locator_owners: BTreeMap<String, String> = BTreeMap::new();
         for path in &skipped_files {
             skipped_files_total += 1;
             progress.file_skipped_unchanged(&plugin_id, &path.to_string_lossy());
@@ -775,6 +787,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     if let Some(entry) = prior_index_snapshot.get(&locator) {
                         prior_index_entries.push(entry.clone());
                     }
+                    skipped_locator_owners.insert(locator.clone(), key.clone());
                     skipped_file_entity_ids.push(locator.clone());
                     retained_locators.insert(locator);
                 }
@@ -849,6 +862,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 file_timeout,
                 shutdown_timeout,
                 prior_file_scope_claims,
+                skipped_locator_owners,
                 &batch_tx,
             )
         });
@@ -3169,6 +3183,9 @@ fn infra_severity(subcode: &str) -> &'static str {
         | PLUGIN_TIMEOUT_RULE_ID
         | FINDING_DISABLED_CRASH_LOOP
         | FINDING_PLUGIN_ABORTED
+        // A duplicate locator is silent last-write-wins data loss in the
+        // store (clarion-b19fe90c3e) — an ERROR even though the run completes.
+        | DUPLICATE_LOCATOR_RULE_ID
         | "LMWV-INFRA-PLUGIN-OOM-KILLED"
         | "LMWV-INFRA-PLUGIN-DISABLED-PATH-ESCAPE" => "ERROR",
         // The default WARN arm deliberately covers
@@ -4451,6 +4468,7 @@ fn run_plugin_blocking(
     file_timeout: std::time::Duration,
     shutdown_timeout: std::time::Duration,
     prior_file_scope_claims: BTreeSet<String>,
+    skipped_locator_owners: BTreeMap<String, String>,
     batch_tx: &tokio::sync::mpsc::Sender<PluginBatchMessage>,
 ) -> Result<BatchResult, PluginRunError> {
     use loomweave_core::PluginHost;
@@ -4553,6 +4571,12 @@ fn run_plugin_blocking(
         // plugin's skipped-unchanged files, whose stored claim survives this
         // run untouched.
         let mut file_scope_claims: BTreeSet<String> = prior_file_scope_claims;
+        // Duplicate-locator alarm (clarion-b19fe90c3e): tracks id → first-seen
+        // source path across ALL of this plugin's emissions this run, plus the
+        // skipped-unchanged owners for the cross-run rule. Detection only —
+        // the writer's ON CONFLICT upsert still applies and the run outcome
+        // is unchanged.
+        let mut duplicate_guard = DuplicateLocatorGuard::new(skipped_locator_owners);
         // Every stored in-project entity id (any kind), accumulated across all
         // files so the deferred import-filter can retain edges whose target is a
         // non-module item — function / struct / const / trait (clarion-d1e3dc67dc).
@@ -4629,6 +4653,15 @@ fn run_plugin_blocking(
                 if kind_roles.is_file_scope(&entity.kind)
                     && !file_scope_claims.insert(id_str.clone())
                 {
+                    // Carve-out boundary (clarion-b19fe90c3e): a cross-file
+                    // dual claim is the reconciled, legitimate shape and stays
+                    // silent; a SAME-file re-emission is a plugin bug and is
+                    // flagged as a duplicate locator.
+                    if let Some(finding) = duplicate_guard
+                        .record_suppressed_file_scope(&id_str, &entity.source_file_path)
+                    {
+                        dispatch_findings.push(finding);
+                    }
                     tracing::debug!(
                         plugin_id = %plugin_id,
                         entity_id = %id_str,
@@ -4636,6 +4669,13 @@ fn run_plugin_blocking(
                         "suppressing duplicate file_scope emission; first claim wins",
                     );
                     continue;
+                }
+                if let Some(finding) = duplicate_guard.record(
+                    &id_str,
+                    &entity.source_file_path,
+                    kind_roles.is_file_scope(&entity.kind),
+                ) {
+                    dispatch_findings.push(finding);
                 }
                 // Capture the plugin-declared SEI signature (ADR-038 REQ-C-01),
                 // canonicalised for stable string-equality comparison. The core

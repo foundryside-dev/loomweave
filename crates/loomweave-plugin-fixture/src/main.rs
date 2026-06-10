@@ -5,10 +5,16 @@
 //! `PluginHost::spawn`.
 //!
 //! Fixture identity:
-//! - `plugin_id = "fixture"`, kind `"widget"`, rule-ID prefix `"LMWV-FIXTURE-"`
+//! - `plugin_id = "fixture"`, kinds `"widget"` (`file_scope`) and `"gadget"`,
+//!   rule-ID prefix `"LMWV-FIXTURE-"`
 //! - Responds to every `analyze_file` request with one entity:
 //!   `id = "fixture:widget:demo.sample"`, `kind = "widget"`,
 //!   `qualified_name = "demo.sample"`, `source.file_path` = the path sent in.
+//! - Additionally, every line of the file matching `gadget <name>` emits one
+//!   `fixture:gadget:<name>` entity anchored at that line. Content-driven, so
+//!   host tests can construct duplicate-locator shapes (the same gadget name
+//!   twice in one file, or shared across files) without extra env knobs
+//!   (clarion-b19fe90c3e).
 
 use std::io::{BufReader, Write};
 
@@ -144,7 +150,7 @@ fn main() {
                 };
                 let _ = params; // we already extracted file_path
 
-                let entity = serde_json::json!({
+                let widget = serde_json::json!({
                     "id": "fixture:widget:demo.sample",
                     "kind": "widget",
                     "qualified_name": "demo.sample",
@@ -152,8 +158,22 @@ fn main() {
                         "file_path": file_path
                     }
                 });
+                let mut entities = vec![widget];
+                // Misbehaviour switch (clarion-b19fe90c3e): re-emit the
+                // file_scope widget a second time from the SAME file — the
+                // plugin-bug shape of a duplicate locator.
+                if env_flag("LOOMWEAVE_FIXTURE_DUPLICATE_WIDGET") {
+                    let duplicate = entities[0].clone();
+                    entities.push(duplicate);
+                }
+                // Content-driven gadget emission: `gadget <name>` lines each
+                // emit one `fixture:gadget:<name>` entity anchored at that
+                // line. The line range gives the host a content hash, so the
+                // entity participates in the prior index (incremental-run
+                // shapes need that).
+                entities.extend(gadget_entities(&file_path));
                 let result = AnalyzeFileResult {
-                    entities: vec![entity],
+                    entities,
                     edges: vec![],
                     stats: AnalyzeFileStats::default(),
                     findings: vec![],
@@ -173,6 +193,36 @@ fn main() {
             _ => std::process::exit(1),
         }
     }
+}
+
+/// Parse `gadget <name>` lines out of the analysed file and build one
+/// `fixture:gadget:<name>` raw entity per line, carrying a one-line
+/// `source_range` so the host derives a content hash for it. An unreadable
+/// file yields no gadgets (the hardcoded widget still flows).
+fn gadget_entities(file_path: &str) -> Vec<Value> {
+    let Ok(content) = std::fs::read_to_string(file_path) else {
+        return Vec::new();
+    };
+    let mut gadgets = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        let Some(rest) = line.strip_prefix("gadget ") else {
+            continue;
+        };
+        let Some(name) = rest.split_whitespace().next() else {
+            continue;
+        };
+        let line_number = index + 1;
+        gadgets.push(serde_json::json!({
+            "id": format!("fixture:gadget:{name}"),
+            "kind": "gadget",
+            "qualified_name": name,
+            "source": {
+                "file_path": file_path,
+                "source_range": { "start_line": line_number, "end_line": line_number }
+            }
+        }));
+    }
+    gadgets
 }
 
 fn send_error(writer: &mut impl Write, id: i64, code: i64, message: &str) {

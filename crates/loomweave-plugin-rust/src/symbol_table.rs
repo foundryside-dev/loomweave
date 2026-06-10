@@ -40,6 +40,12 @@ impl SymbolTable {
 
     /// The ids that collided during the walk (must be empty for a healthy
     /// project — this is what the dogfood gate asserts).
+    ///
+    /// Test/oracle surface only: at runtime the HOST detects duplicate
+    /// locators plugin-agnostically in its analyze path and surfaces them as
+    /// `LMWV-DUPLICATE-LOCATOR` ERROR findings (clarion-b19fe90c3e), so this
+    /// accessor is consulted by the dogfood-uniqueness test and the
+    /// `qualname_check` example binary, not by the analyze pipeline.
     #[must_use]
     pub fn duplicate_ids(&self) -> Vec<String> {
         self.duplicates.clone()

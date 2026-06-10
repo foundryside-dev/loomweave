@@ -175,3 +175,25 @@ mounts, so the file routes by its on-disk path; and a mount whose target lies
 outside the declaring crate's `src/` tree is ignored. A `use`-path that names a cfg-twin mount resolves as
 external (the `@cfg` suffix is not spellable in a `use`), so such import edges
 are absent — the same pre-existing behaviour as for any cfg-twin entity.
+
+## Duplicate locators surface as `LMWV-DUPLICATE-LOCATOR` findings
+
+**What you see.** When two source declarations assemble the same entity
+identity (a *locator collision* — e.g. the known open cfg-twin and
+trait-/self-type-path families), `loomweave analyze` now emits a project-level
+**`LMWV-DUPLICATE-LOCATOR`** finding at **ERROR** severity, naming the
+colliding id and both source paths. It appears in `project_finding_list` /
+`entity_finding_list` like any other analyze finding. The run still completes:
+the store keeps one row per id (last write wins), so the colliding entity is a
+chimera of both declarations until the underlying collision family is fixed —
+the finding is the alarm, not a block.
+
+**Why.** The writer's upsert-on-id is load-bearing for incremental re-analysis,
+so a collision used to be absorbed silently. The detection is host-side and
+plugin-agnostic (it covers the Python plugin identically), and it is collision-
+family-agnostic: it catches the *next unknown* family in the field, not just
+the catalogued ones. Legitimate recurrence never trips it — unchanged re-
+analysis, genuine moves (the old file is re-analyzed and drops the id), and the
+reconciled module dual-claim shape (an inline `mod` facade plus the
+path-derived module, first claim wins) all stay silent. A healthy tree
+produces zero of these findings.

@@ -130,7 +130,7 @@ fn build_fixture_binary(workspace_root: &std::path::Path, target_dir: &std::path
 fn fixture_manifest_parses_correctly() {
     let manifest = parse_manifest(FIXTURE_MANIFEST_BYTES).expect("fixture manifest must parse");
     assert_eq!(manifest.plugin.plugin_id, "fixture");
-    assert_eq!(manifest.ontology.entity_kinds, vec!["widget"]);
+    assert_eq!(manifest.ontology.entity_kinds, vec!["widget", "gadget"]);
     assert_eq!(manifest.ontology.rule_id_prefix, "LMWV-FIXTURE-");
     assert!(
         !manifest.capabilities.runtime.reads_outside_project_root,
