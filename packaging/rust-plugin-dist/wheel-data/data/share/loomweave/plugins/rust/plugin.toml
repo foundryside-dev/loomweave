@@ -41,13 +41,15 @@ entity_kinds = [
 # (`undeclared_edge_kind`) and a writer-only kind would be manifest-rejected, so
 # each must be declared here. `calls` is an existing host/writer-accepted kind
 # (the Python plugin already emits it) — the Rust plugin is a new emitter of it.
-edge_kinds = ["contains", "imports", "implements", "calls"]
+edge_kinds = ["contains", "imports", "implements", "calls", "derives", "references"]
 rule_id_prefix = "LMWV-RUST-"
 # 0.4.0: additive edge kinds `imports` + `implements` (ADR-027 MINOR). `calls`
 # (Phase 2) shipped intra-version as a further additive edge kind — no bump, as
 # no gate enforces the Rust plugin ontology_version (every check-*.py confirmed).
-# Lockstep with the `main.rs` handshake constant.
-ontology_version = "0.4.0"
+# 0.5.0: additive edge kinds `derives` + `references` (Phase 2 completion,
+# plan 2026-06-10 — ADR-027 MINOR).
+# Lockstep with the `serve.rs` handshake constant.
+ontology_version = "0.5.0"
 
 [ontology.roles]
 file_scope = ["module"]

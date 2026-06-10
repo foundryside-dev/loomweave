@@ -224,7 +224,7 @@ fn analyze_e2e_stored_rust_entity_set_excludes_out_of_src_files() {
         "rust:impl:e2e_crate.Widget.impl[Display]".to_owned(),
         "rust:function:e2e_crate.Widget.impl[Display].fmt".to_owned(),
         // Task 11 (exit gate): the remaining leaf kinds, so the analyzed crate
-        // exercises EVERY entity kind in the 0.4.0 ontology. (`module`, `struct`,
+        // exercises EVERY entity kind in the 0.5.0 ontology. (`module`, `struct`,
         // `function`, `trait`, `impl` above; `enum`/`type_alias`/`const`/`static`/
         // `macro` here.) Enum VARIANTS do not emit as separate entities.
         "rust:enum:e2e_crate.Color".to_owned(),
@@ -232,6 +232,10 @@ fn analyze_e2e_stored_rust_entity_set_excludes_out_of_src_files() {
         "rust:const:e2e_crate.MAX".to_owned(),
         "rust:static:e2e_crate.NAME".to_owned(),
         "rust:macro:e2e_crate.twice".to_owned(),
+        // Task 6 (Phase 2 edges): `sub::Gauge` exists to mint a cross-module
+        // field-type `references` edge (Gauge -> Widget); see the edge-set
+        // assertion below.
+        "rust:struct:e2e_crate.sub.Gauge".to_owned(),
     ];
     want.sort();
 
@@ -377,10 +381,14 @@ fn analyze_e2e_stored_rust_entity_set_excludes_out_of_src_files() {
             "rust:impl:e2e_crate.Widget.impl[Display]",
             "rust:function:e2e_crate.Widget.impl[Display].fmt",
         ),
-        // sub module -> its function
+        // sub module -> its function + its struct (Task 6)
         (
             "rust:module:e2e_crate.sub",
             "rust:function:e2e_crate.sub.helper",
+        ),
+        (
+            "rust:module:e2e_crate.sub",
+            "rust:struct:e2e_crate.sub.Gauge",
         ),
     ]
     .into_iter()
@@ -391,6 +399,86 @@ fn analyze_e2e_stored_rust_entity_set_excludes_out_of_src_files() {
     assert_eq!(
         contains, want_contains,
         "stored rust-scoped contains edge set mismatch.\n  got:  {contains:#?}\n  want: {want_contains:#?}"
+    );
+
+    // ── Task 6 (Phase 2): the `derives` + `references` edge SET ───────────────
+    //
+    // Writer-proving exact-SET assertion for the two Phase-2 edge kinds —
+    // `(kind, from_id, to_id, confidence)` tuples, never mere presence: the edge
+    // PK is `(kind, from_id, to_id)`, so a silent `ON CONFLICT` merge (the
+    // historical failure mode) or a wrongly-minted extra edge both flunk set
+    // equality. Expected rows, by fixture site:
+    //   - `#[derive(Debug, Bumpable)] struct Widget` → ONE `derives` edge to the
+    //     in-project trait `Bumpable` (Resolved); external `Debug` drops (D1).
+    //   - `make() -> Widget { Widget { n: 0 } }` → ONE `references` edge
+    //     make → Widget (return type + struct literal dedup to the PK pair).
+    //   - `sub::Gauge { w: crate::Widget }` field type → Gauge → Widget.
+    //   - `sub::helper(w: &crate::Widget)` param type → helper → Widget.
+    //   - `sub::helper` body `crate::MAX` → helper → MAX.
+    // Everything else in the fixture resolves External (i32, str, std::fmt::*,
+    // locals) or is out of envelope (use/impl headers/macros) — no edge.
+    let mut phase2_stmt = conn
+        .prepare(
+            "SELECT kind, from_id, to_id, confidence FROM edges \
+             WHERE kind IN ('derives', 'references') \
+             ORDER BY kind, from_id, to_id",
+        )
+        .expect("prepare derives/references edge query");
+    let mut phase2: Vec<(String, String, String, String)> = phase2_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .expect("query derives/references edges")
+        .map(|r| r.expect("derives/references row"))
+        .collect();
+    phase2.sort();
+
+    let mut want_phase2: Vec<(String, String, String, String)> = vec![
+        (
+            "derives",
+            "rust:struct:e2e_crate.Widget",
+            "rust:trait:e2e_crate.Bumpable",
+            "resolved",
+        ),
+        (
+            "references",
+            "rust:function:e2e_crate.make",
+            "rust:struct:e2e_crate.Widget",
+            "resolved",
+        ),
+        (
+            "references",
+            "rust:function:e2e_crate.sub.helper",
+            "rust:const:e2e_crate.MAX",
+            "resolved",
+        ),
+        (
+            "references",
+            "rust:function:e2e_crate.sub.helper",
+            "rust:struct:e2e_crate.Widget",
+            "resolved",
+        ),
+        (
+            "references",
+            "rust:struct:e2e_crate.sub.Gauge",
+            "rust:struct:e2e_crate.Widget",
+            "resolved",
+        ),
+    ]
+    .into_iter()
+    .map(|(k, f, t, c)| (k.to_owned(), f.to_owned(), t.to_owned(), c.to_owned()))
+    .collect();
+    want_phase2.sort();
+
+    assert_eq!(
+        phase2, want_phase2,
+        "stored derives+references edge set mismatch (exact SET, incl. confidence).\n  \
+         got:  {phase2:#?}\n  want: {want_phase2:#?}"
     );
 }
 

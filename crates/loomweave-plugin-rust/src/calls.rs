@@ -4,10 +4,13 @@
 //! `Item::Fn` or an impl `ImplItem::Fn`) with a [`syn::visit::Visit`] visitor,
 //! classifying every call expression:
 //!
-//! 1. `ExprCall` whose `func` is an `Expr::Path` → resolve the dotted path via
-//!    [`Resolver::resolve_call_path`]. `Resolved`/`Ambiguous` → a `calls` edge;
-//!    `External` (incl. assoc `Foo::new()` and out-of-project paths) → an
-//!    [`UnresolvedCallSite`] (no fabrication).
+//! 1. `ExprCall` whose `func` is a qself-FREE `Expr::Path` → resolve the
+//!    dotted path via [`Resolver::resolve_call_path`]. `Resolved`/`Ambiguous`
+//!    → a `calls` edge; `External` (incl. assoc `Foo::new()` and
+//!    out-of-project paths) → an [`UnresolvedCallSite`] (no fabrication). A
+//!    qself path (`<Foo>::f()`, `<Foo as Trait>::f()`) names an associated
+//!    item, never a free fn, so it is ALWAYS a site — resolving its bare
+//!    post-qself segments would fabricate wrong free-fn edges (H5).
 //! 2. `ExprMethodCall` (`x.foo()`) → never an edge (no receiver type without
 //!    inference) → an [`UnresolvedCallSite`] (`callee_expr = ".foo"`).
 //! 3. Any other call form (non-path `ExprCall` func) → an [`UnresolvedCallSite`].
@@ -107,6 +110,19 @@ impl<'ast> Visit<'ast> for CallVisitor<'_> {
         // A `Path`-func call is the only resolvable form. Everything else
         // (`(get_fn())(x)`, a field/index/paren func, etc.) is unresolvable.
         if let Expr::Path(p) = node.func.as_ref() {
+            // A qself path (`<Foo>::create()`, `<Foo as Trait>::f()`) names an
+            // ASSOCIATED item by definition — never a free function — so it
+            // must never be resolved through the free-fn table. Without this
+            // guard, `<Foo>::create()` carries the bare path segment `create`,
+            // which the crate-root bare-name fallback would FABRICATE into a
+            // resolved edge to an unrelated free `fn create` (H5 violation).
+            // Always a site; the recorded expr is the post-qself path segments.
+            if p.qself.is_some() {
+                let printed = path_display_string(&p.path);
+                self.record_site(printed, &span);
+                syn::visit::visit_expr_call(self, node);
+                return;
+            }
             let lookup = path_lookup_string(&p.path);
             match self.resolver.resolve_call_path(self.from_crate, &lookup) {
                 Resolution::Resolved(id) => {

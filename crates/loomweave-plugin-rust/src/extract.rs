@@ -29,11 +29,16 @@ use syn::{
 };
 
 use crate::calls::walk_calls;
-use crate::edges::{implements_edge, imports_edge};
+use crate::derives::derive_sites;
+use crate::edges::{derives_edge, implements_edge, imports_edge, references_edge};
 use crate::parse_guard::GuardViolation;
 use crate::qualname::{
     build_entity_id, cfg_discriminant, declared_type_params, free_item_qualname, impl_disc_for,
     impl_qualname, self_ty_locator,
+};
+use crate::references::{
+    ReferenceSite, ReferenceStats, block_reference_sites, expr_reference_sites,
+    fields_reference_sites, signature_reference_sites, type_reference_sites,
 };
 use crate::resolve::{Resolution, Resolver};
 use crate::signature::{function_signature, impl_signature, struct_signature};
@@ -54,6 +59,10 @@ pub struct Extracted {
     /// threaded (the [`extract_file_full`] contract), exactly as `edges` carries
     /// no `imports`/`calls`/`implements` without a resolver.
     pub unresolved_call_sites: Vec<UnresolvedCallSite>,
+    /// Per-file `references` counters (Phase 2, D4). All-zero when no resolver
+    /// is threaded — sites are not even collected without one, exactly as
+    /// `unresolved_call_sites` stays empty.
+    pub reference_stats: ReferenceStats,
 }
 
 /// Extract entities **and** their `contains` edges from one file's source.
@@ -144,7 +153,7 @@ fn extract_file_on_pinned_stack(
     let file = syn::parse_file(src)?;
     let mut entities = Vec::new();
     let mut edges = Vec::new();
-    let mut unresolved_call_sites = Vec::new();
+    let mut acc = Phase2Acc::default();
     // File-level module entity (file_scope; core emits its file->module edge).
     entities.push(entity(
         "module",
@@ -168,13 +177,31 @@ fn extract_file_on_pinned_stack(
         resolution,
         &mut entities,
         &mut edges,
-        &mut unresolved_call_sites,
+        &mut acc,
     )?;
     Ok(Extracted {
         entities,
         edges,
-        unresolved_call_sites,
+        unresolved_call_sites: acc.call_sites,
+        reference_stats: acc.ref_stats,
     })
+}
+
+/// File-scoped Phase 2 accumulator threaded through the item walk (one
+/// instance per analysed file; the `walk_items` recursion into inline modules
+/// shares it).
+#[derive(Default)]
+struct Phase2Acc {
+    /// Call sites that produced NO `calls` edge (see [`Extracted`]).
+    call_sites: Vec<UnresolvedCallSite>,
+    /// `(from_id, to_id)` pairs already emitted as `references` edges in THIS
+    /// file. The edge PK is `(kind, from_id, to_id)`, so duplicate sites would
+    /// silently merge at the storage writer's `ON CONFLICT` upsert
+    /// (last-write-wins on the span) — deduping here keeps the emitted edge
+    /// SET exact and FIRST-span-wins deterministic.
+    ref_dedup: std::collections::BTreeSet<(String, String)>,
+    /// The three Rust-populated `references` counters (D4).
+    ref_stats: ReferenceStats,
 }
 
 /// Entities-only extraction, for identity / uniqueness / symbol-table callers
@@ -192,6 +219,17 @@ pub fn extract_file(
     extract_file_full(crate_name, module_path, file_path, src).map(|x| x.entities)
 }
 
+/// The wire-ready degraded-aware payload shared by the `*_degraded_aware*` /
+/// guard-degraded entry points, in order:
+/// `(entities, edges, unresolved_call_sites, reference_stats, findings)`.
+pub type DegradedAware = (
+    Vec<Value>,
+    Vec<Value>,
+    Vec<UnresolvedCallSite>,
+    ReferenceStats,
+    Vec<Value>,
+);
+
 /// Extraction wrapper with degraded-parse fallback (review M3).
 ///
 /// On a successful parse, returns the extracted entities, their `contains`
@@ -205,9 +243,9 @@ pub fn extract_file(
 /// names (`subcode`/`severity`/`message`/`metadata`) so `main.rs` can
 /// `serde_json::from_value` each one into the wire struct without remapping.
 ///
-/// Returns `(entities, edges, unresolved_call_sites, findings)`. The
-/// entities-only entry point never resolves anything, so its
-/// `unresolved_call_sites` is always empty (parity with its empty edges).
+/// Returns a [`DegradedAware`] tuple. The entities-only entry point never
+/// resolves anything, so its `unresolved_call_sites` is always empty and its
+/// `reference_stats` all-zero (parity with its empty edges).
 ///
 /// [`AnalyzeFileFinding`]: loomweave_core::plugin::AnalyzeFileFinding
 #[must_use]
@@ -216,7 +254,7 @@ pub fn extract_file_degraded_aware(
     module_path: &str,
     file_path: &str,
     src: &str,
-) -> (Vec<Value>, Vec<Value>, Vec<UnresolvedCallSite>, Vec<Value>) {
+) -> DegradedAware {
     degraded_aware(
         module_path,
         file_path,
@@ -230,7 +268,7 @@ pub fn extract_file_degraded_aware(
 /// plus a Warning finding, no edges — because an unparseable file has no `use`
 /// tree to resolve.
 ///
-/// Returns `(entities, edges, unresolved_call_sites, findings)`.
+/// Returns a [`DegradedAware`] tuple.
 #[must_use]
 pub fn extract_file_degraded_aware_with_edges(
     crate_name: &str,
@@ -238,7 +276,7 @@ pub fn extract_file_degraded_aware_with_edges(
     file_path: &str,
     src: &str,
     resolver: &Resolver,
-) -> (Vec<Value>, Vec<Value>, Vec<UnresolvedCallSite>, Vec<Value>) {
+) -> DegradedAware {
     degraded_aware(
         module_path,
         file_path,
@@ -246,21 +284,28 @@ pub fn extract_file_degraded_aware_with_edges(
     )
 }
 
-/// Shape an extraction `Result` into the degraded-aware
-/// `(entities, edges, unresolved_call_sites, findings)` tuple: a clean parse passes
-/// through with no findings; a parse error collapses to a single `syntax_error`
-/// module entity plus one Warning finding and no edges / no call sites.
+/// Shape an extraction `Result` into the [`DegradedAware`] tuple: a clean
+/// parse passes through with no findings; a parse error collapses to a single
+/// `syntax_error` module entity plus one Warning finding and no edges / no
+/// call sites / zero reference counters.
 fn degraded_aware(
     module_path: &str,
     file_path: &str,
     extracted: Result<Extracted, syn::Error>,
-) -> (Vec<Value>, Vec<Value>, Vec<UnresolvedCallSite>, Vec<Value>) {
+) -> DegradedAware {
     match extracted {
         Ok(Extracted {
             entities,
             edges,
             unresolved_call_sites,
-        }) => (entities, edges, unresolved_call_sites, Vec::new()),
+            reference_stats,
+        }) => (
+            entities,
+            edges,
+            unresolved_call_sites,
+            reference_stats,
+            Vec::new(),
+        ),
         Err(e) => degraded_module_tuple(
             module_path,
             file_path,
@@ -277,14 +322,14 @@ fn degraded_aware(
 /// `LMWV-RUST-DEPTH-LIMIT` / `LMWV-RUST-FILE-TOO-LARGE`. The message names the
 /// measured depth / run / byte count and the cap it exceeded.
 ///
-/// Returns `(entities, edges, unresolved_call_sites, findings)` — the same
-/// wire-ready tuple as [`extract_file_degraded_aware`].
+/// Returns a [`DegradedAware`] tuple — the same wire-ready shape as
+/// [`extract_file_degraded_aware`].
 #[must_use]
 pub fn extract_file_guard_degraded(
     module_path: &str,
     file_path: &str,
     violation: &GuardViolation,
-) -> (Vec<Value>, Vec<Value>, Vec<UnresolvedCallSite>, Vec<Value>) {
+) -> DegradedAware {
     degraded_module_tuple(
         module_path,
         file_path,
@@ -295,15 +340,16 @@ pub fn extract_file_guard_degraded(
 }
 
 /// The shared degraded shape: exactly one `module` entity flagged with
-/// `parse_status`, no edges, no call sites, one Warning finding under
-/// `subcode`. Used by the syntax-error fallback and the guard rejections.
+/// `parse_status`, no edges, no call sites, zero reference counters, one
+/// Warning finding under `subcode`. Used by the syntax-error fallback and the
+/// guard rejections.
 fn degraded_module_tuple(
     module_path: &str,
     file_path: &str,
     parse_status: &str,
     subcode: &str,
     message: &str,
-) -> (Vec<Value>, Vec<Value>, Vec<UnresolvedCallSite>, Vec<Value>) {
+) -> DegradedAware {
     // Best-effort id; if the module path itself is unrepresentable the
     // entity still carries the (empty) id and the qualified_name, which
     // is enough for the host to record a degraded module.
@@ -332,7 +378,13 @@ fn degraded_module_tuple(
         "message": message,
         "metadata": metadata
     });
-    (vec![entity], Vec::new(), Vec::new(), vec![finding])
+    (
+        vec![entity],
+        Vec::new(),
+        Vec::new(),
+        ReferenceStats::default(),
+        vec![finding],
+    )
 }
 
 // Length is arm count, not branching complexity: each leaf kind is one flat,
@@ -347,7 +399,7 @@ fn walk_items(
     resolution: Option<(&str, &Resolver)>,
     out: &mut Vec<Value>,
     edges: &mut Vec<Value>,
-    sites: &mut Vec<UnresolvedCallSite>,
+    acc: &mut Phase2Acc,
 ) -> Result<(), syn::Error> {
     // Impl entities already emitted in THIS item list, by full impl id. A
     // second source block with the same impl id (same type+sig+cfg) does NOT
@@ -442,9 +494,22 @@ fn walk_items(
                 // Phase 2: walk the body for call sites, ONLY with a resolver
                 // (the edges-aware entry point) — parity with `imports`. The
                 // caller is this free fn; closures / nested fns are walked but
-                // attributed to it (see `calls` module docs).
+                // attributed to it (see `calls` module docs). The same gate
+                // covers `references`: param/return type positions plus body
+                // expression paths, all from this fn entity (D3).
                 if let Some((from_crate, resolver)) = resolution {
-                    walk_calls(block, &fn_id, from_crate, resolver, edges, sites);
+                    walk_calls(
+                        block,
+                        &fn_id,
+                        from_crate,
+                        resolver,
+                        edges,
+                        &mut acc.call_sites,
+                    );
+                    let mut ref_sites = Vec::new();
+                    signature_reference_sites(sig, &mut ref_sites);
+                    block_reference_sites(block, &mut ref_sites);
+                    emit_reference_edges(&ref_sites, &fn_id, from_crate, resolver, acc, edges);
                 }
             }
             Item::Struct(ItemStruct {
@@ -469,6 +534,17 @@ fn walk_items(
                     Some(struct_signature(fields)),
                 )?;
                 push_with_contains(parent_id, child, out, edges);
+                // Phase 2: anchored `derives` edges, ONLY with a resolver (the
+                // edges-aware entry point) — parity with `imports`/`implements`.
+                // Field TYPES additionally mint `references` sites from this
+                // struct entity (D3); the derive list itself never does.
+                if let Some((from_crate, resolver)) = resolution {
+                    let struct_id = build_id("struct", &q)?;
+                    emit_derive_edges(attrs, &struct_id, from_crate, resolver, edges);
+                    let mut ref_sites = Vec::new();
+                    fields_reference_sites(fields, &mut ref_sites);
+                    emit_reference_edges(&ref_sites, &struct_id, from_crate, resolver, acc, edges);
+                }
             }
             Item::Impl(it) => {
                 emit_impl(
@@ -481,7 +557,7 @@ fn walk_items(
                     resolution,
                     out,
                     edges,
-                    sites,
+                    acc,
                 )?;
             }
             Item::Mod(ItemMod {
@@ -509,14 +585,19 @@ fn walk_items(
                 )?);
                 let nested_id = build_id("module", &nested)?;
                 walk_items(
-                    inner, &nested, &nested_id, file_path, resolution, out, edges, sites,
+                    inner, &nested, &nested_id, file_path, resolution, out, edges, acc,
                 )?;
             }
             // Phase 1b leaf kinds: free items riding the same qualname + entity +
             // contains pattern as `struct`/`function`, with `None` signature (no
             // signature builder yet — trait/impl SEI signatures are a later task).
             // Trait *bodies* are deliberately NOT walked here (matching 1a).
-            Item::Enum(ItemEnum { ident, attrs, .. }) => {
+            Item::Enum(ItemEnum {
+                ident,
+                attrs,
+                variants,
+                ..
+            }) => {
                 let name = ident.to_string();
                 let mut q = free_item_qualname(module_path, &name);
                 if is_cfg_twin("enum", &name)
@@ -533,6 +614,20 @@ fn walk_items(
                     None,
                 )?;
                 push_with_contains(parent_id, child, out, edges);
+                // Phase 2: `derives` edges for enums too (structs + enums are
+                // the only derive targets in the walk — no `Item::Union` arm).
+                // Variant FIELD types mint `references` sites from the enum
+                // entity (D3); variant discriminant expressions do not (out of
+                // envelope — D3 lists variant field types only).
+                if let Some((from_crate, resolver)) = resolution {
+                    let enum_id = build_id("enum", &q)?;
+                    emit_derive_edges(attrs, &enum_id, from_crate, resolver, edges);
+                    let mut ref_sites = Vec::new();
+                    for variant in variants {
+                        fields_reference_sites(&variant.fields, &mut ref_sites);
+                    }
+                    emit_reference_edges(&ref_sites, &enum_id, from_crate, resolver, acc, edges);
+                }
             }
             Item::Trait(ItemTrait { ident, attrs, .. }) => {
                 let name = ident.to_string();
@@ -552,7 +647,9 @@ fn walk_items(
                 )?;
                 push_with_contains(parent_id, child, out, edges);
             }
-            Item::Type(ItemType { ident, attrs, .. }) => {
+            Item::Type(ItemType {
+                ident, attrs, ty, ..
+            }) => {
                 let name = ident.to_string();
                 let mut q = free_item_qualname(module_path, &name);
                 if is_cfg_twin("type_alias", &name)
@@ -569,8 +666,22 @@ fn walk_items(
                     None,
                 )?;
                 push_with_contains(parent_id, child, out, edges);
+                // Phase 2: the alias RHS is a type position — `references`
+                // sites from the type_alias entity (D3), resolver-gated.
+                if let Some((from_crate, resolver)) = resolution {
+                    let alias_id = build_id("type_alias", &q)?;
+                    let mut ref_sites = Vec::new();
+                    type_reference_sites(ty, &mut ref_sites);
+                    emit_reference_edges(&ref_sites, &alias_id, from_crate, resolver, acc, edges);
+                }
             }
-            Item::Const(ItemConst { ident, attrs, .. }) => {
+            Item::Const(ItemConst {
+                ident,
+                attrs,
+                ty,
+                expr,
+                ..
+            }) => {
                 let name = ident.to_string();
                 let mut q = free_item_qualname(module_path, &name);
                 if is_cfg_twin("const", &name)
@@ -587,8 +698,24 @@ fn walk_items(
                     None,
                 )?;
                 push_with_contains(parent_id, child, out, edges);
+                // Phase 2: declared type (type position) + initializer
+                // (expression position) both mint `references` sites from the
+                // const entity (D3), resolver-gated.
+                if let Some((from_crate, resolver)) = resolution {
+                    let const_id = build_id("const", &q)?;
+                    let mut ref_sites = Vec::new();
+                    type_reference_sites(ty, &mut ref_sites);
+                    expr_reference_sites(expr, &mut ref_sites);
+                    emit_reference_edges(&ref_sites, &const_id, from_crate, resolver, acc, edges);
+                }
             }
-            Item::Static(ItemStatic { ident, attrs, .. }) => {
+            Item::Static(ItemStatic {
+                ident,
+                attrs,
+                ty,
+                expr,
+                ..
+            }) => {
                 let name = ident.to_string();
                 let mut q = free_item_qualname(module_path, &name);
                 if is_cfg_twin("static", &name)
@@ -605,6 +732,15 @@ fn walk_items(
                     None,
                 )?;
                 push_with_contains(parent_id, child, out, edges);
+                // Phase 2: same channel as `const` — declared type +
+                // initializer, from the static entity (D3), resolver-gated.
+                if let Some((from_crate, resolver)) = resolution {
+                    let static_id = build_id("static", &q)?;
+                    let mut ref_sites = Vec::new();
+                    type_reference_sites(ty, &mut ref_sites);
+                    expr_reference_sites(expr, &mut ref_sites);
+                    emit_reference_edges(&ref_sites, &static_id, from_crate, resolver, acc, edges);
+                }
             }
             Item::Macro(ItemMacro {
                 ident: Some(ident),
@@ -739,7 +875,7 @@ fn emit_impl(
     resolution: Option<(&str, &Resolver)>,
     out: &mut Vec<Value>,
     edges: &mut Vec<Value>,
-    sites: &mut Vec<UnresolvedCallSite>,
+    acc: &mut Phase2Acc,
 ) -> Result<(), syn::Error> {
     // Type qualname for the impl's self type, INCLUDING its concrete generic
     // arguments (ADR-049 §2 self-type-args amendment): `impl Foo<i32>` →
@@ -829,12 +965,96 @@ fn emit_impl(
             push_with_contains(&impl_id, child, out, edges); // impl -> method
             // Phase 2: walk the method body for call sites, ONLY with a resolver.
             // The caller is this impl method id (NOT the impl or the module).
+            // `references` ride the same gate and the same origin: the method's
+            // param/return types + body expression paths all originate from the
+            // METHOD entity id (D3). The impl header (trait path + self type)
+            // is deliberately NOT walked — `implements` / the impl entity own it.
             if let Some((from_crate, resolver)) = resolution {
-                walk_calls(&m.block, &method_id, from_crate, resolver, edges, sites);
+                walk_calls(
+                    &m.block,
+                    &method_id,
+                    from_crate,
+                    resolver,
+                    edges,
+                    &mut acc.call_sites,
+                );
+                let mut ref_sites = Vec::new();
+                signature_reference_sites(&m.sig, &mut ref_sites);
+                block_reference_sites(&m.block, &mut ref_sites);
+                emit_reference_edges(&ref_sites, &method_id, from_crate, resolver, acc, edges);
             }
         }
     }
     Ok(())
+}
+
+/// Resolve every `#[derive(...)]` path on a struct/enum into an anchored
+/// `derives` edge (Phase 2), exactly mirroring how the `Item::Impl` arm
+/// consumes [`Resolver::resolve_trait_path`]: a unique in-project trait →
+/// `resolved`, a multi-kind candidate → `ambiguous`, an `External` derive
+/// (`Debug`, `serde::Serialize`, …) → NOTHING (D1: dropped at emit, no
+/// counter — matching `implements`). Each edge anchors on ITS derive path
+/// token's span (the `Pretty` in `#[derive(Debug, Pretty)]`), never the whole
+/// attribute or item.
+fn emit_derive_edges(
+    attrs: &[syn::Attribute],
+    from_id: &str,
+    from_crate: &str,
+    resolver: &Resolver,
+    edges: &mut Vec<Value>,
+) {
+    for site in derive_sites(attrs) {
+        let (to_id, confidence) = match resolver.resolve_trait_path(from_crate, &site.path) {
+            Resolution::Resolved(id) => (id, "resolved"),
+            Resolution::Ambiguous(id) => (id, "ambiguous"),
+            Resolution::External => continue,
+        };
+        edges.push(derives_edge(from_id, &to_id, confidence, &site.span));
+    }
+}
+
+/// Resolve the collected `references` sites of ONE entity (`from_id`) into
+/// anchored `references` edges (D3/D4/D5), kind-unfiltered through
+/// [`Resolver::resolve_use_path`]:
+/// - [`Resolution::Resolved`] → a `resolved` edge,
+/// - [`Resolution::Ambiguous`] → an `ambiguous` edge (never faked resolved),
+/// - [`Resolution::External`] → NO edge, counted in
+///   `skipped_external_total` — this absorbs both external-crate paths AND
+///   no-match paths (syn cannot distinguish; see the `references` module docs).
+///
+/// Two emission-side drops (the site still COUNTS in the stats):
+/// - **self-edge guard** — `to_id == from_id` (a type naming itself in its own
+///   fields) is noise,
+/// - **per-file dedup** — the edge PK is `(kind, from_id, to_id)`, so a repeat
+///   `(from, to)` pair would silently merge at the writer's `ON CONFLICT`
+///   upsert; dropping it here keeps FIRST-span-wins deterministic.
+fn emit_reference_edges(
+    sites: &[ReferenceSite],
+    from_id: &str,
+    from_crate: &str,
+    resolver: &Resolver,
+    acc: &mut Phase2Acc,
+    edges: &mut Vec<Value>,
+) {
+    for site in sites {
+        acc.ref_stats.sites_total += 1;
+        let (to_id, confidence) = match resolver.resolve_use_path(from_crate, &site.path) {
+            Resolution::Resolved(id) => (id, "resolved"),
+            Resolution::Ambiguous(id) => (id, "ambiguous"),
+            Resolution::External => {
+                acc.ref_stats.skipped_external_total += 1;
+                continue;
+            }
+        };
+        acc.ref_stats.resolved_total += 1;
+        if to_id == from_id {
+            continue; // self-edge guard
+        }
+        if !acc.ref_dedup.insert((from_id.to_owned(), to_id.clone())) {
+            continue; // per-file dedup, first-span-wins
+        }
+        edges.push(references_edge(from_id, &to_id, confidence, &site.span));
+    }
 }
 
 /// The `::`-joined trait-path string the resolver looks up, with generic
@@ -846,7 +1066,8 @@ fn emit_impl(
 /// edge for every in-project generic trait). Joining the segment idents drops the
 /// `<…>` arguments while preserving the `a::b::Tr` path shape. Leading
 /// `crate`/`self`/`super` segments are kept verbatim for `normalize_path` to map.
-fn trait_path_for_lookup(path: &syn::Path) -> String {
+/// Also reused by [`crate::derives::derive_sites`] to render derive paths.
+pub(crate) fn trait_path_for_lookup(path: &syn::Path) -> String {
     path.segments
         .iter()
         .map(|seg| seg.ident.to_string())
@@ -1003,7 +1224,7 @@ mod tests {
     #[test]
     fn malformed_file_yields_one_degraded_module_and_a_warning() {
         let src = "fn broken( {{{ this is not rust";
-        let (entities, edges, sites, findings) =
+        let (entities, edges, sites, ref_stats, findings) =
             extract_file_degraded_aware("k", "k.m", "/p/src/m.rs", src);
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0]["kind"], "module");
@@ -1011,6 +1232,7 @@ mod tests {
         assert_eq!(entities[0]["parse_status"], "syntax_error");
         assert!(edges.is_empty());
         assert!(sites.is_empty());
+        assert_eq!(ref_stats, ReferenceStats::default());
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0]["severity"], "warning");
     }
@@ -1018,7 +1240,7 @@ mod tests {
     #[test]
     fn valid_file_yields_entities_and_no_findings() {
         let src = "pub fn a() {}\n";
-        let (entities, _edges, _sites, findings) =
+        let (entities, _edges, _sites, _ref_stats, findings) =
             extract_file_degraded_aware("k", "k.m", "/p/src/m.rs", src);
         assert!(findings.is_empty());
         assert!(entities.iter().any(|e| e["kind"] == "function"));

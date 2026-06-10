@@ -11,6 +11,12 @@ pub mod sub;
 // (`imports_skipped_external_total += 1`). A module-target import survives and
 // is the legitimate in-project `imports` edge this fixture exercises.
 pub use crate::sub;
+// Task 6 (Phase 2): the derive list mints `derives` edges — `Bumpable` is the
+// in-project trait below (Resolved), `Debug` is external (dropped at emit, D1).
+// The derive coexisting with the manual `impl Bumpable for Widget` would not
+// compile, but this fixture is parsed, never compiled — and the two channels
+// are distinct: the attribute mints `derives`, the impl mints `implements`.
+#[derive(Debug, Bumpable)]
 pub struct Widget { pub n: i32 }
 pub fn make() -> Widget { Widget { n: 0 } }
 impl Widget { pub fn bump(&mut self) { self.n += 1; } }

@@ -1,11 +1,13 @@
 //! Rust language plugin — Phase 1a: identity foundation.
 pub mod calls;
 pub mod crate_roots;
+pub mod derives;
 pub mod edges;
 pub mod extract;
 pub mod module_path;
 pub mod parse_guard;
 pub mod qualname;
+pub mod references;
 pub mod resolve;
 pub mod scope;
 pub mod serve;
