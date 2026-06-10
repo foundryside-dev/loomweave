@@ -30,6 +30,7 @@ use syn::{
 
 use crate::calls::walk_calls;
 use crate::edges::{implements_edge, imports_edge};
+use crate::parse_guard::GuardViolation;
 use crate::qualname::{
     build_entity_id, cfg_discriminant, declared_type_params, free_item_qualname, impl_disc_for,
     impl_qualname, self_ty_locator,
@@ -109,7 +110,27 @@ pub fn extract_file_with_edges(
 /// Shared extraction core. `resolution = None` skips `use`-edge resolution
 /// entirely (the [`extract_file_full`] contract); `Some((from_crate, resolver))`
 /// resolves each `use` leaf into an anchored `imports` edge.
+///
+/// Runs the syn parse AND the recursive AST walk on the pinned 16 MiB stack
+/// ([`crate::parse_guard::with_pinned_stack`], ADR-050): syn has no recursion
+/// limit, and `syn::File` is `!Send`, so the whole parse-and-consume pipeline
+/// stays on the dedicated thread whose stack the scan caps were tuned against.
 fn extract_file_inner(
+    crate_name: &str,
+    module_path: &str,
+    file_path: &str,
+    src: &str,
+    resolution: Option<(&str, &Resolver)>,
+) -> Result<Extracted, syn::Error> {
+    crate::parse_guard::with_pinned_stack(|| {
+        extract_file_on_pinned_stack(crate_name, module_path, file_path, src, resolution)
+    })
+}
+
+/// The extraction body proper. MUST only be called from
+/// [`extract_file_inner`]'s pinned-stack thread — calling it on an arbitrary
+/// thread reintroduces the environment-dependent crash threshold.
+fn extract_file_on_pinned_stack(
     crate_name: &str,
     module_path: &str,
     file_path: &str,
@@ -240,38 +261,78 @@ fn degraded_aware(
             edges,
             unresolved_call_sites,
         }) => (entities, edges, unresolved_call_sites, Vec::new()),
-        Err(e) => {
-            // Best-effort id; if the module path itself is unrepresentable the
-            // entity still carries the (empty) id and the qualified_name, which
-            // is enough for the host to record a degraded module.
-            let id = build_entity_id("module", module_path)
-                .map(|i| i.as_str().to_owned())
-                .unwrap_or_default();
-            let entity = json!({
-                "id": id,
-                "kind": "module",
-                "qualified_name": module_path,
-                "parse_status": "syntax_error",
-                "source": {
-                    "file_path": file_path,
-                    "source_byte_start": 0,
-                    "source_byte_end": 0,
-                    "source_range": { "start_line": 1, "end_line": 1 }
-                }
-            });
-            let mut metadata = serde_json::Map::new();
-            if !id.is_empty() {
-                metadata.insert("entity_id".to_owned(), json!(id));
-            }
-            let finding = json!({
-                "subcode": "LMWV-RUST-SYNTAX-ERROR",
-                "severity": "warning",
-                "message": format!("syn could not parse {file_path}: {e}"),
-                "metadata": metadata
-            });
-            (vec![entity], Vec::new(), Vec::new(), vec![finding])
-        }
+        Err(e) => degraded_module_tuple(
+            module_path,
+            file_path,
+            "syntax_error",
+            "LMWV-RUST-SYNTAX-ERROR",
+            &format!("syn could not parse {file_path}: {e}"),
+        ),
     }
+}
+
+/// Degraded result for a file REJECTED by the pre-parse guards (ADR-050): the
+/// same single-module-plus-one-warning shape as the syntax-error fallback, but
+/// with `parse_status` `"depth_limit"` / `"file_too_large"` and subcode
+/// `LMWV-RUST-DEPTH-LIMIT` / `LMWV-RUST-FILE-TOO-LARGE`. The message names the
+/// measured depth / run / byte count and the cap it exceeded.
+///
+/// Returns `(entities, edges, unresolved_call_sites, findings)` — the same
+/// wire-ready tuple as [`extract_file_degraded_aware`].
+#[must_use]
+pub fn extract_file_guard_degraded(
+    module_path: &str,
+    file_path: &str,
+    violation: &GuardViolation,
+) -> (Vec<Value>, Vec<Value>, Vec<UnresolvedCallSite>, Vec<Value>) {
+    degraded_module_tuple(
+        module_path,
+        file_path,
+        violation.parse_status(),
+        violation.subcode(),
+        &violation.message(file_path),
+    )
+}
+
+/// The shared degraded shape: exactly one `module` entity flagged with
+/// `parse_status`, no edges, no call sites, one Warning finding under
+/// `subcode`. Used by the syntax-error fallback and the guard rejections.
+fn degraded_module_tuple(
+    module_path: &str,
+    file_path: &str,
+    parse_status: &str,
+    subcode: &str,
+    message: &str,
+) -> (Vec<Value>, Vec<Value>, Vec<UnresolvedCallSite>, Vec<Value>) {
+    // Best-effort id; if the module path itself is unrepresentable the
+    // entity still carries the (empty) id and the qualified_name, which
+    // is enough for the host to record a degraded module.
+    let id = build_entity_id("module", module_path)
+        .map(|i| i.as_str().to_owned())
+        .unwrap_or_default();
+    let entity = json!({
+        "id": id,
+        "kind": "module",
+        "qualified_name": module_path,
+        "parse_status": parse_status,
+        "source": {
+            "file_path": file_path,
+            "source_byte_start": 0,
+            "source_byte_end": 0,
+            "source_range": { "start_line": 1, "end_line": 1 }
+        }
+    });
+    let mut metadata = serde_json::Map::new();
+    if !id.is_empty() {
+        metadata.insert("entity_id".to_owned(), json!(id));
+    }
+    let finding = json!({
+        "subcode": subcode,
+        "severity": "warning",
+        "message": message,
+        "metadata": metadata
+    });
+    (vec![entity], Vec::new(), Vec::new(), vec![finding])
 }
 
 // Length is arm count, not branching complexity: each leaf kind is one flat,

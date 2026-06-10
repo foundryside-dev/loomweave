@@ -21,6 +21,7 @@ use rusqlite::Connection;
 use time::{OffsetDateTime, macros::format_description};
 use uuid::Uuid;
 
+use loomweave_core::plugin::host::FINDING_PLUGIN_ABORTED;
 use loomweave_core::{
     AcceptedEdge, AcceptedEntity, AnalyzeFileOutcome, CrashLoopBreaker, CrashLoopState,
     DiscoveredPlugin, EmbeddingProvider, FINDING_DISABLED_CRASH_LOOP, HostError, HostFinding,
@@ -706,7 +707,9 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             &started_at,
         ));
     }
+    let handshake_timeout = plugin_handshake_timeout();
     let file_timeout = plugin_file_timeout();
+    let shutdown_timeout = plugin_shutdown_timeout();
     let briefing_blocks = secret_scan_outcome.briefing_blocks_shared();
     let scanned_files = secret_scan_outcome.scanned_files_shared();
     'plugins: for plugin in plugins {
@@ -817,7 +820,9 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 &briefing_blocks_clone,
                 &scanned_files_clone,
                 &progress_clone,
+                handshake_timeout,
                 file_timeout,
+                shutdown_timeout,
                 &batch_tx,
             )
         });
@@ -3086,6 +3091,49 @@ fn plugin_file_timeout() -> std::time::Duration {
         )
 }
 
+/// Handshake (`initialize`) deadline (ADR-050). ADR-035 tuning: basis — a
+/// plugin may legitimately do whole-repo work inside `initialize` (the Rust
+/// plugin builds its symbol table there; at syn's ~40 MB/s parse throughput,
+/// 300 s covers a ~10 M-LOC repo), so this budget scales with repo size, not
+/// per-file work; override — env `LOOMWEAVE_PLUGIN_HANDSHAKE_TIMEOUT_MS`;
+/// retune — raise if a legitimate repo trips it in practice.
+const DEFAULT_PLUGIN_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Resolve the handshake timeout, honouring the env override.
+fn plugin_handshake_timeout() -> std::time::Duration {
+    std::env::var("LOOMWEAVE_PLUGIN_HANDSHAKE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(
+            DEFAULT_PLUGIN_HANDSHAKE_TIMEOUT,
+            std::time::Duration::from_millis,
+        )
+}
+
+/// Subcode for a plugin that went silent at `shutdown` after the work
+/// completed (ADR-050 D7). WARN, never ERROR: the entities are durable and
+/// the run outcome is unchanged — only the plugin's exit etiquette failed.
+const PLUGIN_SHUTDOWN_TIMEOUT_RULE_ID: &str = "LMWV-INFRA-PLUGIN-SHUTDOWN-TIMEOUT";
+
+/// Shutdown (`shutdown`/`exit`) deadline (ADR-050). ADR-035 tuning: basis —
+/// after the file loop there is no legitimate work left; shutdown is pure
+/// exit etiquette, and a healthy plugin acknowledges within milliseconds, so
+/// 10 s is generous for a loaded machine; override — env
+/// `LOOMWEAVE_PLUGIN_SHUTDOWN_TIMEOUT_MS`; retune — raise if a legitimate
+/// plugin needs longer to flush state at exit.
+const DEFAULT_PLUGIN_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Resolve the shutdown timeout, honouring the env override.
+fn plugin_shutdown_timeout() -> std::time::Duration {
+    std::env::var("LOOMWEAVE_PLUGIN_SHUTDOWN_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(
+            DEFAULT_PLUGIN_SHUTDOWN_TIMEOUT,
+            std::time::Duration::from_millis,
+        )
+}
+
 /// Map a host-layer subcode to an ADR-017 severity. Crash / kill / OOM / timeout
 /// are `ERROR` (the plugin or a file was lost); drop-and-continue diagnostics
 /// (malformed/undeclared/oversize) are `WARN`.
@@ -3094,8 +3142,12 @@ fn infra_severity(subcode: &str) -> &'static str {
         INFRA_CRASH_RULE_ID
         | PLUGIN_TIMEOUT_RULE_ID
         | FINDING_DISABLED_CRASH_LOOP
+        | FINDING_PLUGIN_ABORTED
         | "LMWV-INFRA-PLUGIN-OOM-KILLED"
         | "LMWV-INFRA-PLUGIN-DISABLED-PATH-ESCAPE" => "ERROR",
+        // The default WARN arm deliberately covers
+        // `PLUGIN_SHUTDOWN_TIMEOUT_RULE_ID`: a shutdown timeout is exit
+        // etiquette, never lost work (ADR-050 D7).
         _ => "WARN",
     }
 }
@@ -4238,19 +4290,37 @@ struct PendingUnresolvedCallSites {
     sites: Vec<UnresolvedCallSiteRecord>,
 }
 
-/// Per-file analysis-timeout watchdog (REQ-ANALYZE-06, `LMWV-PY-TIMEOUT`).
+/// Plugin lifecycle phase a watchdog deadline guards.
 ///
-/// `analyze_file` blocks on a synchronous read of the plugin's stdout, which has
-/// no read deadline. The watchdog runs on its own thread holding a shared handle
-/// to the child process (the reader lives in the *host*, a separate value, so
-/// killing the child unblocks the read without touching the host). The main
-/// thread `arm`s before each `analyze_file` and `disarm`s after; if the deadline
-/// passes while armed, the watchdog kills the child and records the timeout.
+/// `Handshake` covers the blocking `initialize` exchange (a plugin may do
+/// whole-repo work there — the Rust plugin builds its symbol table inside
+/// `initialize`); `File` covers each `analyze_file`; `Shutdown` covers the
+/// best-effort `shutdown`/`exit` exchange after the file loop.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WatchdogPhase {
+    Handshake,
+    File,
+    Shutdown,
+}
+
+/// Plugin lifecycle-timeout watchdog (REQ-ANALYZE-06, `LMWV-PY-TIMEOUT`).
+///
+/// Every plugin exchange blocks on a synchronous read of the plugin's stdout,
+/// which has no read deadline. The watchdog runs on its own thread holding a
+/// shared handle to the child process (the reader lives in the *host*, a
+/// separate value, so killing the child unblocks the read without touching the
+/// host). The main thread `arm`s before each blocking exchange — naming the
+/// lifecycle [`WatchdogPhase`] being guarded — and `disarm`s after; if the
+/// deadline passes while armed, the watchdog kills the child and records which
+/// phase timed out.
 struct PluginWatchdog {
-    /// Active deadline, or `None` when disarmed. Guarded so `disarm` and the
-    /// watchdog's fire-check observe a consistent value (no kill-after-disarm).
-    deadline: std::sync::Mutex<Option<std::time::Instant>>,
-    timed_out: std::sync::atomic::AtomicBool,
+    /// Active deadline plus the phase it guards, or `None` when disarmed.
+    /// Guarded so `disarm` and the watchdog's fire-check observe a consistent
+    /// value (no kill-after-disarm).
+    deadline: std::sync::Mutex<Option<(std::time::Instant, WatchdogPhase)>>,
+    /// First phase whose deadline expired, or `None` if no timeout fired.
+    /// First-wins: the first expiry is the one that broke the run.
+    timed_out: std::sync::Mutex<Option<WatchdogPhase>>,
     stop: std::sync::atomic::AtomicBool,
 }
 
@@ -4258,22 +4328,46 @@ impl PluginWatchdog {
     fn new() -> Self {
         Self {
             deadline: std::sync::Mutex::new(None),
-            timed_out: std::sync::atomic::AtomicBool::new(false),
+            timed_out: std::sync::Mutex::new(None),
             stop: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    fn arm(&self, timeout: std::time::Duration) {
+    fn arm(&self, timeout: std::time::Duration, phase: WatchdogPhase) {
         *self.deadline.lock().expect("watchdog deadline poisoned") =
-            Some(std::time::Instant::now() + timeout);
+            Some((std::time::Instant::now() + timeout, phase));
     }
 
     fn disarm(&self) {
         *self.deadline.lock().expect("watchdog deadline poisoned") = None;
     }
 
-    fn did_time_out(&self) -> bool {
-        self.timed_out.load(Ordering::SeqCst)
+    /// Phase whose deadline expired first, or `None` if no timeout fired.
+    fn timed_out_phase(&self) -> Option<WatchdogPhase> {
+        *self.timed_out.lock().expect("watchdog timed_out poisoned")
+    }
+
+    /// Fire-check: if the armed deadline has passed, disarm (kill at most
+    /// once per arm), record the phase (first expiry wins), and return the
+    /// phase so the watchdog thread kills the child.
+    fn expire_if_due(&self) -> Option<WatchdogPhase> {
+        let expired = {
+            let mut guard = self.deadline.lock().expect("watchdog deadline poisoned");
+            match *guard {
+                Some((deadline, phase)) if std::time::Instant::now() >= deadline => {
+                    *guard = None; // disarm so we kill at most once
+                    Some(phase)
+                }
+                _ => None,
+            }
+        };
+        if let Some(phase) = expired {
+            let mut recorded = self.timed_out.lock().expect("watchdog timed_out poisoned");
+            if recorded.is_none() {
+                *recorded = Some(phase);
+            }
+        }
+        expired
     }
 
     fn request_stop(&self) {
@@ -4281,9 +4375,10 @@ impl PluginWatchdog {
     }
 }
 
-/// Spawn the watchdog thread. It polls the shared deadline; on expiry it flips
-/// `timed_out`, clears the deadline (kill at most once), and kills the child.
-/// Returns the join handle so the caller can stop + join before reaping.
+/// Spawn the watchdog thread. It polls the shared deadline; on expiry it
+/// records the timed-out phase, clears the deadline (kill at most once), and
+/// kills the child. Returns the join handle so the caller can stop + join
+/// before reaping.
 fn spawn_plugin_watchdog(
     watchdog: Arc<PluginWatchdog>,
     child: Arc<std::sync::Mutex<std::process::Child>>,
@@ -4292,24 +4387,11 @@ fn spawn_plugin_watchdog(
     std::thread::spawn(move || {
         while !watchdog.stop.load(Ordering::SeqCst) {
             std::thread::sleep(PLUGIN_WATCHDOG_POLL_INTERVAL);
-            let expired = {
-                let mut guard = watchdog
-                    .deadline
-                    .lock()
-                    .expect("watchdog deadline poisoned");
-                match *guard {
-                    Some(deadline) if std::time::Instant::now() >= deadline => {
-                        *guard = None; // disarm so we kill at most once
-                        true
-                    }
-                    _ => false,
-                }
-            };
-            if expired {
-                watchdog.timed_out.store(true, Ordering::SeqCst);
+            if let Some(phase) = watchdog.expire_if_due() {
                 tracing::warn!(
                     plugin_id = %plugin_id,
-                    "plugin exceeded per-file analysis timeout; killing child",
+                    phase = ?phase,
+                    "plugin exceeded lifecycle deadline; killing child",
                 );
                 if let Ok(mut c) = child.lock() {
                     let _ = c.kill();
@@ -4339,30 +4421,31 @@ fn run_plugin_blocking(
     briefing_blocks: &Arc<BTreeMap<PathBuf, loomweave_core::BriefingBlockReason>>,
     scanned_source_files: &Arc<BTreeSet<PathBuf>>,
     progress: &ProgressReporter,
+    handshake_timeout: std::time::Duration,
     file_timeout: std::time::Duration,
+    shutdown_timeout: std::time::Duration,
     batch_tx: &tokio::sync::mpsc::Sender<PluginBatchMessage>,
 ) -> Result<BatchResult, PluginRunError> {
     use loomweave_core::PluginHost;
 
     let manifest_language = manifest.plugin.language.clone();
     let kind_roles = PluginKindRoles::from_manifest(&manifest);
-    let (mut host, child) =
-        PluginHost::spawn(manifest, project_root, executable).map_err(|e| match e {
+    let (mut host, child) = PluginHost::spawn_unhandshaken(manifest, project_root, executable)
+        .map_err(|e| match e {
             HostError::Spawn(msg) => {
                 PluginRunError::new(format!("failed to spawn plugin {plugin_id}: {msg}"))
             }
-            HostError::Handshake(ref me) => {
-                PluginRunError::new(format!("plugin {plugin_id} refused handshake: {me}"))
-            }
-            other => {
-                PluginRunError::new(format!("plugin {plugin_id} spawn/handshake error: {other}"))
-            }
+            other => PluginRunError::new(format!("plugin {plugin_id} spawn error: {other}")),
         })?;
     host.set_briefing_blocks(Arc::clone(briefing_blocks));
     host.set_scanned_source_files(Arc::clone(scanned_source_files));
 
-    // Per-file analysis-timeout watchdog (REQ-ANALYZE-06). Shares the child
+    // Lifecycle-timeout watchdog (REQ-ANALYZE-06, ADR-050). Shares the child
     // handle so it can kill a hung plugin and unblock the synchronous read.
+    // Started BEFORE the handshake: a plugin may do whole-repo work inside
+    // `initialize` (the Rust plugin builds its symbol table there), and a
+    // hung handshake would otherwise wedge the run record and the analyze
+    // advisory lock forever.
     let child = Arc::new(std::sync::Mutex::new(child));
     let watchdog = Arc::new(PluginWatchdog::new());
     let watchdog_handle = spawn_plugin_watchdog(
@@ -4370,6 +4453,48 @@ fn run_plugin_blocking(
         Arc::clone(&child),
         plugin_id.to_owned(),
     );
+
+    // Handshake under its own wall-clock deadline. `spawn_unhandshaken`'s
+    // contract: the caller owns kill+reap on handshake failure (Child::Drop
+    // does not reap on Unix) — preserved here CLI-side via
+    // `reap_and_classify_exit`.
+    watchdog.arm(handshake_timeout, WatchdogPhase::Handshake);
+    let handshake_result = host.handshake();
+    watchdog.disarm();
+    if let Err(handshake_err) = handshake_result {
+        watchdog.request_stop();
+        let _ = watchdog_handle.join();
+        let handshake_timed_out = watchdog.timed_out_phase() == Some(WatchdogPhase::Handshake);
+        let mut child = Arc::try_unwrap(child)
+            .unwrap_or_else(|_| unreachable!("watchdog joined; no other Arc holders remain"))
+            .into_inner()
+            .expect("child mutex poisoned");
+        let _ = child.kill();
+        let mut findings = host.take_findings();
+        drop(host);
+        let reason = if handshake_timed_out {
+            let reason = format!(
+                "plugin {plugin_id} exceeded the handshake timeout ({} ms) and was killed",
+                handshake_timeout.as_millis()
+            );
+            findings.push(plugin_timeout_finding(
+                plugin_id,
+                "handshake",
+                handshake_timeout,
+                reason.clone(),
+            ));
+            reason
+        } else {
+            match handshake_err {
+                HostError::Handshake(ref me) => {
+                    format!("plugin {plugin_id} refused handshake: {me}")
+                }
+                other => format!("plugin {plugin_id} spawn/handshake error: {other}"),
+            }
+        };
+        reap_and_classify_exit(&mut child, plugin_id, &mut findings, handshake_timed_out);
+        return Err(PluginRunError::with_findings(reason, findings));
+    }
 
     let mut dispatch_findings: Vec<HostFinding> = Vec::new();
     let work_result: Result<(), String> = (|| {
@@ -4398,7 +4523,7 @@ fn run_plugin_blocking(
                     continue;
                 }
             };
-            watchdog.arm(file_timeout);
+            watchdog.arm(file_timeout, WatchdogPhase::File);
             let analyze_outcome = host.analyze_file(&dispatch_file);
             watchdog.disarm();
             drop(heartbeat_guard);
@@ -4514,15 +4639,11 @@ fn run_plugin_blocking(
         Ok(())
     })();
 
-    // Stop and join the watchdog before reaping so it no longer holds the child
-    // handle (lets us reclaim the owned `Child` for the reap path).
-    watchdog.request_stop();
-    let _ = watchdog_handle.join();
-    let timed_out = watchdog.did_time_out();
-    let mut child = Arc::try_unwrap(child)
-        .unwrap_or_else(|_| unreachable!("watchdog joined; no other Arc holders remain"))
-        .into_inner()
-        .expect("child mutex poisoned");
+    // Read the file-loop verdict BEFORE arming the shutdown deadline: the
+    // watchdog records the FIRST expired phase, so a `Shutdown` record can
+    // only exist when no earlier phase fired (and shutdown only runs on the
+    // Ok path anyway).
+    let timed_out = watchdog.timed_out_phase() == Some(WatchdogPhase::File);
 
     // A timeout forces the failure branch: the watchdog already killed the child,
     // so any in-flight read failed (or, in a near-deadline race, a stale Ok no
@@ -4536,23 +4657,42 @@ fn run_plugin_blocking(
         work_result
     };
 
-    // Try a graceful shutdown on the happy path; on error, skip straight to
-    // kill — the plugin's behaviour is already untrusted. `analyze_file`
-    // already issues `shutdown`/`exit` before returning PathEscapeBreaker or
-    // EntityCap errors, so calling `host.shutdown()` again there would write
-    // to a closed pipe; that's why we only call it on Ok.
+    // Try a graceful shutdown on the happy path, under its own wall-clock
+    // deadline (ADR-050 D7): the watchdog is still alive here, so a plugin
+    // that goes silent at `shutdown` is killed, the blocked read unblocks,
+    // and the etiquette failure surfaces as a WARN finding below — the run
+    // outcome is unchanged. On error, skip straight to kill — the plugin's
+    // behaviour is already untrusted. `analyze_file` already issues
+    // `shutdown`/`exit` before returning PathEscapeBreaker or EntityCap
+    // errors, so calling `host.shutdown()` again there would write to a
+    // closed pipe; that's why we only call it on Ok.
     if work_result.is_ok() {
-        if let Err(e) = host.shutdown() {
+        watchdog.arm(shutdown_timeout, WatchdogPhase::Shutdown);
+        let shutdown_result = host.shutdown();
+        watchdog.disarm();
+        if let Err(e) = shutdown_result {
             tracing::warn!(
                 plugin_id = %plugin_id,
                 error = %e,
                 "best-effort host shutdown failed; falling back to kill()",
             );
-            let _ = child.kill();
+            if let Ok(mut c) = child.lock() {
+                let _ = c.kill();
+            }
         }
-    } else {
-        let _ = child.kill();
+    } else if let Ok(mut c) = child.lock() {
+        let _ = c.kill();
     }
+
+    // Stop and join the watchdog before reaping so it no longer holds the child
+    // handle (lets us reclaim the owned `Child` for the reap path).
+    watchdog.request_stop();
+    let _ = watchdog_handle.join();
+    let shutdown_timed_out = watchdog.timed_out_phase() == Some(WatchdogPhase::Shutdown);
+    let mut child = Arc::try_unwrap(child)
+        .unwrap_or_else(|_| unreachable!("watchdog joined; no other Arc holders remain"))
+        .into_inner()
+        .expect("child mutex poisoned");
 
     let mut findings = host.take_findings();
     findings.extend(dispatch_findings);
@@ -4562,24 +4702,47 @@ fn run_plugin_blocking(
     // visible. Add a LMWV-PY-TIMEOUT host finding; it rides out through
     // PluginRunError.findings and is persisted by the run's crash path.
     if timed_out {
+        findings.push(plugin_timeout_finding(
+            plugin_id,
+            "file",
+            file_timeout,
+            format!(
+                "plugin {plugin_id} exceeded the per-file analysis timeout ({} ms) and was killed",
+                file_timeout.as_millis()
+            ),
+        ));
+    }
+
+    // ADR-050 D7: a shutdown timeout is visible (WARN) but does NOT touch
+    // `work_result` — the entities are durable, only exit etiquette failed.
+    // It rides the Ok path, so it never ticks the crash-loop breaker.
+    if shutdown_timed_out {
         let mut metadata = BTreeMap::new();
         metadata.insert("plugin_id".to_owned(), plugin_id.to_owned());
         metadata.insert(
             "timeout_ms".to_owned(),
-            file_timeout.as_millis().to_string(),
+            shutdown_timeout.as_millis().to_string(),
         );
         findings.push(HostFinding {
-            subcode: PLUGIN_TIMEOUT_RULE_ID.to_owned(),
+            subcode: PLUGIN_SHUTDOWN_TIMEOUT_RULE_ID.to_owned(),
             message: format!(
-                "plugin {plugin_id} exceeded the per-file analysis timeout ({} ms) and was killed",
-                file_timeout.as_millis()
+                "plugin {plugin_id} exceeded the shutdown timeout ({} ms) and was killed; \
+                 analysis results are unaffected",
+                shutdown_timeout.as_millis()
             ),
             metadata,
         });
     }
 
-    // Reap unconditionally. `Child::Drop` does not wait on Unix.
-    reap_and_classify_exit(&mut child, plugin_id, &mut findings);
+    // Reap unconditionally. `Child::Drop` does not wait on Unix. When any
+    // lifecycle deadline fired, the SIGKILL in the exit status is the
+    // watchdog's own — suppress the OOM classification (ADR-050).
+    reap_and_classify_exit(
+        &mut child,
+        plugin_id,
+        &mut findings,
+        watchdog.timed_out_phase().is_some(),
+    );
 
     match work_result {
         Ok(()) => Ok(BatchResult { findings }),
@@ -4587,20 +4750,54 @@ fn run_plugin_blocking(
     }
 }
 
-/// Wait on the child, inspect its exit status, and append an OOM finding if
-/// the signal is consistent with `RLIMIT_AS` enforcement (ADR-021 §2d).
+/// Build the `LMWV-PY-TIMEOUT` host finding for a lifecycle-deadline kill
+/// (ADR-050). `phase` names the [`WatchdogPhase`] that fired (`"handshake"` /
+/// `"file"`) so a consumer can tell a hung `initialize` from a hung
+/// `analyze_file` without parsing the message.
+fn plugin_timeout_finding(
+    plugin_id: &str,
+    phase: &str,
+    timeout: std::time::Duration,
+    message: String,
+) -> HostFinding {
+    let mut metadata = BTreeMap::new();
+    metadata.insert("plugin_id".to_owned(), plugin_id.to_owned());
+    metadata.insert("phase".to_owned(), phase.to_owned());
+    metadata.insert("timeout_ms".to_owned(), timeout.as_millis().to_string());
+    HostFinding {
+        subcode: PLUGIN_TIMEOUT_RULE_ID.to_owned(),
+        message,
+        metadata,
+    }
+}
+
+/// Wait on the child, inspect its exit status, and append a classification
+/// finding for abnormal terminations (ADR-050):
 ///
-/// Linux kernel behaviour on `RLIMIT_AS` violation varies: typical signatures
-/// are SIGKILL (OOM-killer path) and SIGSEGV (map/allocation failure that the
-/// plugin did not handle). Both are treated as likely memory-limit events.
+/// - SIGABRT (6) → [`HostFinding::aborted`] — the stack-overflow / explicit
+///   `abort()` signature; always reported.
+/// - SIGKILL (9) / SIGSEGV (11) → [`HostFinding::oom_killed`] — the observed
+///   `RLIMIT_AS` signatures (ADR-021 §2d; kernel behaviour varies between
+///   the OOM-killer path and an unhandled map failure) — UNLESS
+///   `suppress_kill_classification` is set: when the lifecycle watchdog
+///   already killed the child, the SIGKILL is the host's own and reporting
+///   it as an OOM event would double-report a single timeout.
+///
 /// Other signals or non-zero exit codes get a warn log but no finding — the
 /// cause is ambiguous without more bookkeeping.
 fn reap_and_classify_exit(
     child: &mut std::process::Child,
     plugin_id: &str,
     findings: &mut Vec<HostFinding>,
+    suppress_kill_classification: bool,
 ) {
-    reap_and_classify_exit_with_timeout(child, plugin_id, findings, PLUGIN_REAP_TIMEOUT);
+    reap_and_classify_exit_with_timeout(
+        child,
+        plugin_id,
+        findings,
+        PLUGIN_REAP_TIMEOUT,
+        suppress_kill_classification,
+    );
 }
 
 const PLUGIN_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -4611,9 +4808,12 @@ fn reap_and_classify_exit_with_timeout(
     plugin_id: &str,
     findings: &mut Vec<HostFinding>,
     timeout: std::time::Duration,
+    suppress_kill_classification: bool,
 ) {
     match wait_child_with_timeout(child, timeout) {
-        Ok(Some(status)) => classify_child_exit_status(status, plugin_id, findings),
+        Ok(Some(status)) => {
+            classify_child_exit_status(status, plugin_id, findings, suppress_kill_classification);
+        }
         Ok(None) => {
             tracing::warn!(
                 plugin_id = %plugin_id,
@@ -4671,6 +4871,7 @@ fn classify_child_exit_status(
     status: std::process::ExitStatus,
     plugin_id: &str,
     findings: &mut Vec<HostFinding>,
+    suppress_kill_classification: bool,
 ) {
     if status.success() {
         return;
@@ -4684,9 +4885,17 @@ fn classify_child_exit_status(
                 signal,
                 "plugin terminated by signal",
             );
+            // SIGABRT (6) is the stack-overflow / explicit-abort signature
+            // (ADR-050). Never suppressed: the watchdog kills with SIGKILL,
+            // so an abort is always the plugin's own.
+            if signal == 6 {
+                findings.push(HostFinding::aborted(plugin_id, signal));
+            }
             // SIGKILL (9) and SIGSEGV (11) are the observed signatures
-            // of an RLIMIT_AS kill in Sprint-1 testing.
-            if signal == 9 || signal == 11 {
+            // of an RLIMIT_AS kill in Sprint-1 testing — but when the
+            // lifecycle watchdog already killed this child, the SIGKILL is
+            // the host's own (the timeout finding is the root cause).
+            if (signal == 9 || signal == 11) && !suppress_kill_classification {
                 findings.push(HostFinding::oom_killed(plugin_id, signal));
             }
         } else if let Some(code) = status.code() {
@@ -6133,16 +6342,55 @@ mod tests {
     #[test]
     fn plugin_watchdog_arm_disarm_and_severity() {
         let wd = PluginWatchdog::new();
-        assert!(!wd.did_time_out(), "fresh watchdog has not fired");
-        wd.arm(std::time::Duration::from_secs(60));
+        assert!(
+            wd.timed_out_phase().is_none(),
+            "fresh watchdog has not fired"
+        );
+        wd.arm(std::time::Duration::from_secs(60), WatchdogPhase::File);
         assert!(wd.deadline.lock().unwrap().is_some(), "arm sets a deadline");
+        assert!(
+            wd.expire_if_due().is_none(),
+            "an unexpired deadline does not fire"
+        );
         wd.disarm();
         assert!(
             wd.deadline.lock().unwrap().is_none(),
             "disarm clears the deadline"
         );
-        // A timeout is an ERROR-severity loss of work.
+        // A timeout is an ERROR-severity loss of work; a shutdown timeout is
+        // exit etiquette only (ADR-050 D7) — WARN, never ERROR.
         assert_eq!(infra_severity(PLUGIN_TIMEOUT_RULE_ID), "ERROR");
+        assert_eq!(infra_severity(PLUGIN_SHUTDOWN_TIMEOUT_RULE_ID), "WARN");
+    }
+
+    #[test]
+    fn plugin_watchdog_expiry_records_armed_phase() {
+        let wd = PluginWatchdog::new();
+        wd.arm(std::time::Duration::ZERO, WatchdogPhase::Handshake);
+        assert_eq!(
+            wd.expire_if_due(),
+            Some(WatchdogPhase::Handshake),
+            "an expired deadline fires with the armed phase"
+        );
+        assert_eq!(
+            wd.timed_out_phase(),
+            Some(WatchdogPhase::Handshake),
+            "the fired phase is recorded"
+        );
+        // Kill-at-most-once per arm: expiry disarms.
+        assert!(
+            wd.expire_if_due().is_none(),
+            "a fired deadline does not fire twice"
+        );
+        // A later expiry still triggers a kill, but the FIRST recorded phase
+        // wins — it names the phase that broke the run.
+        wd.arm(std::time::Duration::ZERO, WatchdogPhase::Shutdown);
+        assert_eq!(wd.expire_if_due(), Some(WatchdogPhase::Shutdown));
+        assert_eq!(
+            wd.timed_out_phase(),
+            Some(WatchdogPhase::Handshake),
+            "first recorded phase wins"
+        );
     }
 
     #[test]
@@ -6271,6 +6519,7 @@ mod tests {
             "stubborn",
             &mut findings,
             std::time::Duration::from_millis(50),
+            false,
         );
 
         assert!(
@@ -6285,6 +6534,68 @@ mod tests {
             findings.is_empty(),
             "timeout kill should not be misclassified as an OOM finding: {findings:?}"
         );
+    }
+
+    /// ADR-050: SIGABRT (signal 6) — the stack-overflow / explicit-abort
+    /// signature — is classified distinctly as `LMWV-INFRA-PLUGIN-ABORTED`,
+    /// never as an OOM kill, and is ERROR severity.
+    #[test]
+    #[cfg(unix)]
+    fn reap_classifies_sigabrt_as_aborted_finding() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "kill -ABRT $$"])
+            .spawn()
+            .expect("spawn self-aborting child");
+        let mut findings = Vec::new();
+
+        reap_and_classify_exit_with_timeout(
+            &mut child,
+            "abrt",
+            &mut findings,
+            std::time::Duration::from_secs(5),
+            false,
+        );
+
+        assert_eq!(findings.len(), 1, "exactly one finding: {findings:?}");
+        assert_eq!(findings[0].subcode, FINDING_PLUGIN_ABORTED);
+        assert_eq!(
+            findings[0].metadata.get("signal").map(String::as_str),
+            Some("6")
+        );
+        assert_eq!(infra_severity(FINDING_PLUGIN_ABORTED), "ERROR");
+    }
+
+    /// ADR-050 `timed_out` gate: when the lifecycle watchdog killed the child,
+    /// the resulting SIGKILL must not be double-reported as an OOM event —
+    /// but without suppression the SIGKILL classification is unchanged.
+    #[test]
+    #[cfg(unix)]
+    fn reap_suppresses_oom_classification_for_watchdog_kill() {
+        for (suppress, expected_oom) in [(true, 0_usize), (false, 1_usize)] {
+            let mut child = std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn sleeping child");
+            child.kill().expect("kill child (watchdog stand-in)");
+            let mut findings = Vec::new();
+
+            reap_and_classify_exit_with_timeout(
+                &mut child,
+                "killed",
+                &mut findings,
+                std::time::Duration::from_secs(5),
+                suppress,
+            );
+
+            let oom_count = findings
+                .iter()
+                .filter(|f| f.subcode == "LMWV-INFRA-PLUGIN-OOM-KILLED")
+                .count();
+            assert_eq!(
+                oom_count, expected_oom,
+                "suppress={suppress} must yield {expected_oom} OOM findings: {findings:?}"
+            );
+        }
     }
 
     #[test]

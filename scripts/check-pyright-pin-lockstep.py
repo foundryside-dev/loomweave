@@ -10,9 +10,10 @@ lockstep or CI silently caches/type-checks against mismatched toolchains:
 * plugins/python/plugin.toml — ``[capabilities.runtime.pyright].pin``, the
   version the Rust host reads during discovery to know which langserver the
   plugin expects on PATH.
-* .github/workflows/ci.yml — every ``pyright-python-<version>-...`` cache key.
-  A stale key restores a wheel for the wrong version, so the cached runtime no
-  longer matches the installed dev-dependency.
+* .github/workflows/verify.yml — every ``pyright-python-<version>-...`` cache
+  key (the reusable workflow ci.yml delegates to since V11-CI-01). A stale key
+  restores a wheel for the wrong version, so the cached runtime no longer
+  matches the installed dev-dependency.
 
 This guard keeps the duplication mechanical: closes V11-TEST-02 (see
 docs/implementation/v1.0-tag-cut/gap-register.md).
@@ -29,11 +30,11 @@ from pathlib import Path
 
 DEFAULT_PYPROJECT = Path("plugins/python/pyproject.toml")
 DEFAULT_MANIFEST = Path("plugins/python/plugin.toml")
-DEFAULT_CI = Path(".github/workflows/ci.yml")
+DEFAULT_CI = Path(".github/workflows/verify.yml")
 
 # Matches a ``pyright==1.1.409`` style pin inside a dependency string.
 _PYRIGHT_DEP_RE = re.compile(r"^pyright\s*==\s*(?P<version>[0-9][0-9A-Za-z.\-]*)\s*$")
-# Matches every ``pyright-python-1.1.409`` cache-key stem in ci.yml.
+# Matches every ``pyright-python-1.1.409`` cache-key stem in the workflow.
 _CI_CACHE_KEY_RE = re.compile(r"pyright-python-(?P<version>[0-9][0-9A-Za-z.\-]*?)-")
 
 
@@ -85,7 +86,7 @@ def manifest_pin(manifest_path: Path) -> str:
 
 
 def ci_cache_versions(ci_path: Path) -> list[str]:
-    """Extract every ``pyright-python-<version>`` cache-key version from ci.yml."""
+    """Extract every ``pyright-python-<version>`` cache-key version from the workflow."""
     versions = _CI_CACHE_KEY_RE.findall(ci_path.read_text(encoding="utf-8"))
     if not versions:
         raise CheckError(f"{ci_path} has no 'pyright-python-<version>-' cache key")

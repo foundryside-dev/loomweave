@@ -4,6 +4,7 @@ pub mod crate_roots;
 pub mod edges;
 pub mod extract;
 pub mod module_path;
+pub mod parse_guard;
 pub mod qualname;
 pub mod resolve;
 pub mod scope;

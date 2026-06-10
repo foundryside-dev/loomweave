@@ -12,6 +12,23 @@
 
 use std::io::{BufReader, Write};
 
+/// True when the named environment variable is set to exactly `"1"`.
+///
+/// Misbehaviour switches for hardening tests follow the pattern of the
+/// existing `LOOMWEAVE_FIXTURE_EXCEED_RLIMIT_AS` gate: checked at the
+/// dispatch site, opt-in only, and inert in every normal test run.
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| v == "1")
+}
+
+/// Park forever without consuming CPU (hang simulation). The host's watchdog
+/// must kill us; sleeping in a loop survives spurious wakeups.
+fn hang_forever() -> ! {
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
 use loomweave_core::plugin::limits::ContentLengthCeiling;
 use loomweave_core::plugin::transport::{Frame, read_frame, write_frame};
 use loomweave_core::plugin::{
@@ -66,6 +83,13 @@ fn main() {
 
         match method.as_str() {
             "initialize" => {
+                // Hang *before* responding: simulates a plugin that wedges
+                // during whole-repo work inside `initialize` (the Rust
+                // plugin's symbol-table build runs there). The host's
+                // handshake deadline must kill us.
+                if env_flag("LOOMWEAVE_FIXTURE_HANG_AT_INITIALIZE") {
+                    hang_forever();
+                }
                 let result = InitializeResult {
                     name: "loomweave-plugin-fixture".to_owned(),
                     version: "0.1.0".to_owned(),
@@ -75,6 +99,20 @@ fn main() {
                 send_result(&mut writer, id, serde_json::to_value(result).unwrap());
             }
             "analyze_file" => {
+                // CPU-spin before responding: simulates a busy-looping
+                // plugin (e.g. a pathological parse). The host's per-file
+                // watchdog must kill us — RLIMIT/breaker never fire because
+                // we neither allocate nor crash.
+                if env_flag("LOOMWEAVE_FIXTURE_SPIN_AT_ANALYZE") {
+                    loop {
+                        std::hint::spin_loop();
+                    }
+                }
+                // SIGABRT before responding: the real stack-overflow
+                // signature (Rust guard page → abort → signal 6).
+                if env_flag("LOOMWEAVE_FIXTURE_ABORT_AT_ANALYZE") {
+                    std::process::abort();
+                }
                 if std::env::var_os("LOOMWEAVE_FIXTURE_EXCEED_RLIMIT_AS").is_some() {
                     #[cfg(unix)]
                     exceed_rlimit_as();
@@ -115,6 +153,12 @@ fn main() {
                 send_result(&mut writer, id, serde_json::to_value(result).unwrap());
             }
             "shutdown" => {
+                // Hang *before* responding: simulates a plugin that goes
+                // silent at shutdown after the work completed. The host's
+                // shutdown deadline must kill us without failing the run.
+                if env_flag("LOOMWEAVE_FIXTURE_HANG_AT_SHUTDOWN") {
+                    hang_forever();
+                }
                 let result = ShutdownResult {};
                 send_result(&mut writer, id, serde_json::to_value(result).unwrap());
             }
