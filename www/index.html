@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Loomweave — code-archaeology &amp; the suite's identity authority</title>
-<meta name="description" content="Loomweave turns a codebase into a queryable, identity-stable structural graph an agent reads instead of grepping — and mints the SEI every cross-tool binding in the Weft Federation keys on. Rust core, ~40 consult-mode MCP tools, local-first.">
+<meta name="description" content="Loomweave turns a codebase into a queryable, identity-stable structural graph an agent reads instead of grepping — and mints the SEI every cross-tool binding in the Weft Federation keys on. Rust core, 42+ consult-mode MCP tools, local-first.">
 <!-- Preload brand + product faces before first paint (kills the substitute-font flash). -->
 <link rel="preload" href="fonts/SpaceGrotesk-Variable.ttf" as="font" type="font/ttf" crossorigin>
 <link rel="preload" href="fonts/JetBrainsMono-Variable.ttf" as="font" type="font/ttf" crossorigin>
@@ -42,13 +42,16 @@
   <section class="hero">
     <div class="eyebrow">
       <span class="dot dot-ready" aria-hidden="true"></span>
-      <span class="t-label">Rust core · ~40 MCP tools · local-first · v1.1.0</span>
+      <span class="t-label">Rust core · 42+ MCP tools · local-first · v1.1.0</span>
     </div>
     <h1 class="hero-title">Read the codebase,<br>don&rsquo;t re-grep it.</h1>
     <p class="t-body hero-lede">
       Loomweave is a code-archaeology tool. It walks a codebase, extracts entities
       (functions, classes, modules) and edges (<code class="t-inline-code">contains</code>,
-      <code class="t-inline-code">calls</code>, <code class="t-inline-code">references</code>),
+      <code class="t-inline-code">calls</code>, <code class="t-inline-code">references</code>,
+      <code class="t-inline-code">imports</code>, plus the relation edges
+      <code class="t-inline-code">implements</code>/<code class="t-inline-code">derives</code> (Rust)
+      and <code class="t-inline-code">inherits_from</code>/<code class="t-inline-code">decorates</code> (Python)),
       and persists the structural graph to a local SQLite store. A consult-mode LLM agent
       that would otherwise re-explore the tree on every question asks a
       <strong>graph-aware tool</strong> instead.
@@ -78,7 +81,7 @@
     <div class="hero-stats">
       <div class="stat">
         <span class="stat-label"><span class="stat-dot t-accent"></span>Consult-mode MCP tools</span>
-        <span class="stat-value">~40</span>
+        <span class="stat-value">42+</span>
       </div>
       <div class="stat">
         <span class="stat-label"><span class="stat-dot t-ready"></span>Entity kinds extracted</span>
@@ -110,7 +113,7 @@
       </div>
       <div class="owns-card">
         <p class="owns-name">The edge graph</p>
-        <p class="owns-body"><code>contains</code>, <code>calls</code>, <code>references</code>, and module <code>imports</code> — typed edges, with <code>calls</code> carrying a resolution <code>confidence</code>.</p>
+        <p class="owns-body"><code>contains</code>, <code>calls</code>, <code>references</code>, and module <code>imports</code>, plus the relation edges <code>implements</code>/<code>derives</code> (Rust) and <code>inherits_from</code>/<code>decorates</code> (Python) — typed edges, with <code>calls</code> carrying a resolution <code>confidence</code>.</p>
       </div>
       <div class="owns-card">
         <p class="owns-name">Subsystem clustering</p>
@@ -149,7 +152,7 @@ pipx install \
 <span class="cm"># wire the agent, walk the corpus, serve the graph over MCP</span>
 loomweave install --path .   <span class="cm"># initialises .weft/loomweave/, wires the MCP client + skill + hook</span>
 loomweave analyze            <span class="cm"># extract entities + edges (no LLM credentials needed)</span>
-loomweave serve              <span class="cm"># expose the ~42-tool consult-mode MCP surface</span></pre>
+loomweave serve              <span class="cm"># expose the 42+-tool consult-mode MCP surface</span></pre>
     </div>
 
     <h2 class="doc-h2">A traversal answer, honest about its blind spots</h2>
@@ -216,7 +219,7 @@ loomweave serve              <span class="cm"># expose the ~42-tool consult-mode
       <a class="product-card thread-loomweave" href="getting-started.html">
         <span class="product-head"><span class="product-name">Getting started</span></span>
         <span class="product-domain">install &rarr; analyze &rarr; serve</span>
-        <span class="product-what">Install the binary and the Python plugin, initialise a project, build the graph, and wire an MCP client. Everything but summaries runs with no credentials.</span>
+        <span class="product-what">Install the binary and the Python and Rust language plugins, initialise a project, build the graph, and wire an MCP client. Everything but summaries runs with no credentials.</span>
         <span class="product-link">Walkthrough &rarr;</span>
       </a>
       <a class="product-card thread-loomweave" href="concepts.html">
@@ -227,7 +230,7 @@ loomweave serve              <span class="cm"># expose the ~42-tool consult-mode
       </a>
       <a class="product-card thread-loomweave" href="tools.html">
         <span class="product-head"><span class="product-name">MCP tools</span></span>
-        <span class="product-domain">the ~42-tool consult surface</span>
+        <span class="product-domain">the 42+-tool consult surface</span>
         <span class="product-what">The full MCP surface grouped by family: navigation, briefing, guidance/findings/federation context, analyze lifecycle, and faceted shortcuts.</span>
         <span class="product-link">Reference &rarr;</span>
       </a>
@@ -248,7 +251,7 @@ loomweave serve              <span class="cm"># expose the ~42-tool consult-mode
     <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 5 V27"/><path d="M16 11 H24"/><path d="M16 21 H8"/></g>
     <g fill="currentColor"><circle cx="16" cy="5" r="2.4"/><circle cx="24" cy="11" r="2.4"/><circle cx="8" cy="21" r="2.4"/><circle cx="16" cy="27" r="2.4"/></g>
   </svg>
-  <span class="foot-note">Loomweave is part of the <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft Federation</a> — the suite&rsquo;s code-structure surface and its SEI identity authority. Installable and runnable: a single Rust binary plus a Python language plugin.</span>
+  <span class="foot-note">Loomweave is part of the <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft Federation</a> — the suite&rsquo;s code-structure surface and its SEI identity authority. Installable and runnable: a single Rust binary plus first-party Python and Rust language plugins.</span>
   <nav class="foot-links" aria-label="Resources">
     <a class="ext" href="https://github.com/foundryside-dev/loomweave" target="_blank" rel="noopener">Source</a>
     <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft hub</a>

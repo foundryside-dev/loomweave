@@ -1262,6 +1262,8 @@ Symbol-rename-without-file-move detaches cross-tool references in v0.1. Explicit
 
 Loomweave v0.1 ships only a Python plugin. A second language plugin (Java, Rust, TypeScript) is v0.2+.
 
+> **Amended:** the first-party Rust language plugin (`crates/loomweave-plugin-rust`) shipped post-v1.0 in the 1.x line, proving the plugin protocol generalises beyond Python — it emits `contains` / `calls` / `imports` / `derives` / `references` / `implements` edges. The deferred set narrows to Java and TypeScript.
+
 **Why**: Proving the plugin protocol with one language before extending is prudent; elspeth is Python.
 
 ### NG-16 — Deferred: plugin hash-pinning
@@ -1320,7 +1322,7 @@ Churn is captured at file level (`REQ-CATALOG-04`). Co-change graphs, authorship
 
 ### NG-25 — Deferred: Wardline annotation descriptor consumption
 
-Wardline shipping a YAML/JSON descriptor of its REGISTRY (instead of requiring direct Python import) is v0.2. V0.1's Python-only plugin can import directly; non-Python plugins in v0.2+ will need the descriptor.
+Wardline shipping a YAML/JSON descriptor of its REGISTRY (instead of requiring direct Python import) is v0.2. V0.1's Python-only plugin can import directly; the now-shipped first-party Rust plugin (`crates/loomweave-plugin-rust`) consumes that trust-vocabulary descriptor as an on-disk file rather than importing Python objects.
 
 **Why**: Python-direct import works for v0.1's single plugin; descriptor is a cross-language requirement for later.
 
