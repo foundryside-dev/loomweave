@@ -116,10 +116,12 @@ python:module:auth.tokens</pre>
             <tr><td><code>calls</code></td><td class="wrap">One function invokes another (execution flow)</td></tr>
             <tr><td><code>references</code></td><td class="wrap">A symbol mentions another without calling it (not execution flow)</td></tr>
             <tr><td><code>imports</code></td><td class="wrap">Module-to-module import (<code>imports_in</code> = who imports me, <code>imports_out</code> = what I import)</td></tr>
+            <tr><td><code>implements</code> / <code>derives</code></td><td class="wrap">Rust relation edges — a type implements a trait, or derives one via <code>#[derive(...)]</code></td></tr>
+            <tr><td><code>inherits_from</code> / <code>decorates</code></td><td class="wrap">Python relation edges — a class inherits from a base, or a decorator decorates a target</td></tr>
           </tbody>
         </table>
       </div>
-      <p class="doc-p">The three headline relationships are <code>contains</code>, <code>calls</code>, and <code>references</code>; module <code>imports</code> rounds out the graph at module altitude.</p>
+      <p class="doc-p">The three headline relationships are <code>contains</code>, <code>calls</code>, and <code>references</code>; module <code>imports</code> rounds out the graph at module altitude. On top of those, the language plugins emit <strong>relation edges</strong> — <code>implements</code>/<code>derives</code> for Rust and <code>inherits_from</code>/<code>decorates</code> for Python — surfaced direction-explicit through <code>entity_relation_list</code>.</p>
       <p class="doc-p"><code>calls</code> edges carry a <strong>confidence</strong>. The default surface is <code>resolved</code> — unambiguous static edges. Ambiguous static candidates and LLM-inferred edges are excluded unless a query explicitly asks for them, so a clean answer stays clean.</p>
     </section>
 
@@ -171,7 +173,7 @@ python:module:auth.tokens</pre>
     <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 5 V27"/><path d="M16 11 H24"/><path d="M16 21 H8"/></g>
     <g fill="currentColor"><circle cx="16" cy="5" r="2.4"/><circle cx="24" cy="11" r="2.4"/><circle cx="8" cy="21" r="2.4"/><circle cx="16" cy="27" r="2.4"/></g>
   </svg>
-  <span class="foot-note">Loomweave is part of the <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft Federation</a> — the suite&rsquo;s code-structure surface and its SEI identity authority. Installable and runnable: a single Rust binary plus a Python language plugin.</span>
+  <span class="foot-note">Loomweave is part of the <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft Federation</a> — the suite&rsquo;s code-structure surface and its SEI identity authority. Installable and runnable: a single Rust binary plus first-party Python and Rust language plugins.</span>
   <nav class="foot-links" aria-label="Resources">
     <a class="ext" href="https://github.com/foundryside-dev/loomweave" target="_blank" rel="noopener">Source</a>
     <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft hub</a>

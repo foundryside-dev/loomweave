@@ -75,6 +75,15 @@ which loomweave                     # e.g. ~/.cargo/bin/loomweave
 which loomweave-plugin-python       # e.g. ~/.local/bin/loomweave-plugin-python
 ```
 
+Rust source is analysed by a separate first-party plugin: the
+`loomweave-plugin-rust` wheel/binary, shipped and installed independently of the
+Python plugin. It is discovered the same way — the host walks `$PATH` for
+`loomweave-plugin-*` executables (see the [`$PATH` discipline](#path-discipline)
+paragraph below), so `loomweave-plugin-rust` only needs to be on `$PATH` to be
+picked up. Install it when you intend to analyse a Rust tree; this walkthrough
+targets a Python project and uses only the Python plugin. See
+[Rust analysis: known limitations](./rust-known-limitations.md).
+
 ### Verifying release artifacts
 
 Tagged releases publish platform archives, SHA256 files, keyless cosign
@@ -99,9 +108,12 @@ The current 1.x release line deliberately does not publish to PyPI or crates.io.
 Release assets are the source of truth until public registries are introduced
 by a later ADR.
 
+<a id="path-discipline"></a>
 **`$PATH` discipline matters.** Loomweave's plugin host (per
 [ADR-002](../loomweave/adr/ADR-002-plugin-transport-json-rpc.md)) discovers
-plugins by walking `$PATH` for executables matching `loomweave-plugin-*`. If
+plugins by walking `$PATH` for executables matching `loomweave-plugin-*`
+(this is the generic mechanism for every language plugin, Python and Rust
+alike). If
 `pipx`'s install directory (`~/.local/bin/` on Linux, `~/Library/...` on
 macOS) is not on your shell's `$PATH`, `loomweave analyze` will exit
 **successfully** with status `skipped_no_plugins` and emit a `WARN no plugins
@@ -365,9 +377,10 @@ pipx ensurepath                     # writes the PATH update; restart shell
 Note: `loomweave analyze` deliberately exits **0** even when no plugins are
 discovered, so the run can be re-attempted without manual cleanup. The
 `WARN` line and the `skipped_no_plugins` run status are the operator-facing
-signals. A `loomweave doctor` subcommand that surfaces discovery state at exit
-is on the v2.0 roadmap; for v1.0 the diagnostic is the WARN line plus the
-`which loomweave-plugin-*` check above.
+signals. `loomweave doctor` (see [§3](#agent-orientation-installed-by-default))
+also surfaces plugin discovery state, reporting per-plugin presence for both the
+Python and Rust plugins; the WARN line plus the `which loomweave-plugin-*` check
+above remain the quickest manual diagnostic.
 
 ### macOS: "loomweave cannot be opened because the developer cannot be verified"
 

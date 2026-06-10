@@ -65,6 +65,27 @@ fn corpus() -> Vec<(&'static str, &'static str, &'static str)> {
             "k.m",
             "struct Foo;\n#[cfg(unix)] impl std::fmt::Display for Foo { fn fmt(&self,_:&mut std::fmt::Formatter)->std::fmt::Result{Ok(())} }\n#[cfg(windows)] impl std::fmt::Display for Foo { fn fmt(&self,_:&mut std::fmt::Formatter)->std::fmt::Result{Ok(())} }\n",
         ),
+        // ADR-049 Amendment 5 (clarion-dfeb905f46): two cfg-gated twin METHODS
+        // inside ONE impl block. The impl-level `@cfg` discriminant cannot help
+        // (one block → one impl key); without a METHOD-level `@cfg` suffix both
+        // `go` methods render `Foo.impl#<>.go` and the writer's ON CONFLICT
+        // silently keeps one. The fix applies `cfg_suffix(&m.attrs)` to twin
+        // methods just as it does to free items / impl blocks.
+        (
+            "k",
+            "k.m",
+            "struct Foo;\nimpl Foo { #[cfg(unix)] fn go(&self){} #[cfg(windows)] fn go(&self){} }\n",
+        ),
+        // ADR-049 Amendment 5, cross-merged-block variant: two SEPARATE impl
+        // blocks on the same `(type, sig, cfg)` MERGE into one impl entity
+        // (Option b), each contributing a `go`. The method-twin count must span
+        // all blocks sharing the pre-cfg impl key, not just one block, or the
+        // merged `go` methods collide.
+        (
+            "k",
+            "k.m",
+            "struct Foo;\nimpl Foo { #[cfg(unix)] fn go(&self){} }\nimpl Foo { #[cfg(windows)] fn go(&self){} }\n",
+        ),
     ]
 }
 
@@ -127,6 +148,37 @@ fn cfg_discriminant_is_load_bearing_for_cfg_twin_inherent_impls() {
     assert_ne!(
         go_ids[0], go_ids[1],
         "cfg discriminant collapsed two distinct methods to one locator"
+    );
+}
+
+#[test]
+fn cfg_discriminant_is_load_bearing_for_cfg_twin_methods_in_one_block() {
+    // ADR-049 Amendment 5 (clarion-dfeb905f46): two cfg-gated `go` methods in
+    // ONE impl block. The impl-level @cfg cannot split them (one impl key); a
+    // method-level @cfg suffix must. Assert exactly two `go` methods, distinct.
+    let src =
+        "struct Foo;\nimpl Foo { #[cfg(unix)] fn go(&self){} #[cfg(windows)] fn go(&self){} }\n";
+    // The method-level @cfg suffix lands AFTER the name: `…go@cfg(unix)`, so the
+    // final `.`-segment starts with `go` rather than equalling it.
+    let go_ids: Vec<String> = extract_file("k", "k.m", "/p/src/m.rs", src)
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["id"].as_str().map(ToOwned::to_owned))
+        .filter(|id| id.rsplit('.').next().is_some_and(|s| s.starts_with("go")))
+        .collect();
+    assert_eq!(
+        go_ids.len(),
+        2,
+        "expected both cfg-gated `go` methods, got {go_ids:?}"
+    );
+    assert_ne!(
+        go_ids[0], go_ids[1],
+        "method-level cfg discriminant collapsed two distinct methods to one locator"
+    );
+    assert!(
+        go_ids.iter().any(|id| id.ends_with("go@cfg(unix)"))
+            && go_ids.iter().any(|id| id.ends_with("go@cfg(windows)")),
+        "expected method-level @cfg suffixes, got {go_ids:?}"
     );
 }
 

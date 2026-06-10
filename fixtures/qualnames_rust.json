@@ -395,6 +395,99 @@
         {"qualname": "demo.m.g@cfg(any(unix,windows))", "kind": "function"},
         {"qualname": "demo.m.g@cfg(target_os=\"macos\")", "kind": "function"}
       ]
+    },
+    {
+      "name": "path_typed_generic_arg_trait",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 4 (clarion-8245039f6b): a concrete trait generic arg that is itself a ::-path (impl From<std::io::Error>) carries the reserved ':' separator. Without escaping, build_entity_id rejects the id and degraded_aware collapses the WHOLE cleanly-parsed file to one syntax_error module. Every concrete generic arg renders through escape_reserved(strip_ws(arg)) — the same injective escape the cfg path pins — so std::io::Error renders std%3A%3Aio%3A%3AError in the trait fragment. Pins that a Wardline trait-impl extractor escapes path-typed generic args byte-for-byte.",
+      "source": "struct Foo;\nimpl From<std::io::Error> for Foo { fn from(_: std::io::Error) -> Self { Foo } }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.Foo", "kind": "struct"},
+        {"qualname": "demo.m.Foo.impl[From<std%3A%3Aio%3A%3AError>]", "kind": "impl"},
+        {"qualname": "demo.m.Foo.impl[From<std%3A%3Aio%3A%3AError>].from", "kind": "function"}
+      ]
+    },
+    {
+      "name": "path_typed_generic_arg_inherent",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 4 (clarion-8245039f6b): the path-typed concrete generic arg in the SELF-TYPE prefix (impl Foo<std::io::Error>) is escaped through the same escape_reserved(strip_ws(arg)) pipeline, so Foo<std::io::Error> renders Foo<std%3A%3Aio%3A%3AError> rather than dropping the file. Distinct paths stay distinct (injective).",
+      "source": "struct Foo<T>(T);\nimpl Foo<std::io::Error> { fn get(&self) {} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.Foo", "kind": "struct"},
+        {"qualname": "demo.m.Foo<std%3A%3Aio%3A%3AError>.impl#<>", "kind": "impl"},
+        {"qualname": "demo.m.Foo<std%3A%3Aio%3A%3AError>.impl#<>.get", "kind": "function"}
+      ]
+    },
+    {
+      "name": "const_generic_arg_spacing",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 4 (clarion-8245039f6b): GenericArgument::Const was the dialect's one whitespace-bearing render (proc-macro2 token spacing: `{ 1 + 2 }`), unreproducible from a tree-sitter frontend. Amendment 4 routes const args through the SAME strip_ws as type args, yielding {1+2}. Pins that a second producer renders const generic args whitespace-free, not proc-macro2-spaced.",
+      "source": "struct Foo<const N: usize>;\nimpl Foo<{ 1 + 2 }> { fn get(&self) {} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.Foo", "kind": "struct"},
+        {"qualname": "demo.m.Foo<{1+2}>.impl#<>", "kind": "impl"},
+        {"qualname": "demo.m.Foo<{1+2}>.impl#<>.get", "kind": "function"}
+      ]
+    },
+    {
+      "name": "method_cfg_twin_inherent",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 5 (clarion-dfeb905f46): two cfg-gated twin METHODS inside ONE inherent impl block. The impl-level @cfg cannot split them (one impl key, demo.m.Foo.impl#<>), so each method carries its OWN @cfg(...) suffix AFTER the method name (.go@cfg(unix)), mirroring the free-item rule. Without it both `go` render demo.m.Foo.impl#<>.go and the writer's ON CONFLICT silently keeps one. Pins that a second producer applies a method-level cfg suffix, not only an impl-level one.",
+      "source": "struct Foo;\nimpl Foo { #[cfg(unix)] fn go(&self){} #[cfg(windows)] fn go(&self){} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.Foo", "kind": "struct"},
+        {"qualname": "demo.m.Foo.impl#<>", "kind": "impl"},
+        {"qualname": "demo.m.Foo.impl#<>.go@cfg(unix)", "kind": "function"},
+        {"qualname": "demo.m.Foo.impl#<>.go@cfg(windows)", "kind": "function"}
+      ]
+    },
+    {
+      "name": "method_cfg_twin_trait",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 5 (clarion-dfeb905f46): cfg-gated twin methods inside ONE trait impl block. The method-level @cfg suffix lands after the method name on the trait-impl key (demo.m.Foo.impl[Tr].go@cfg(unix)). Pins that the method-level cfg discriminant applies to trait impls too, not only inherent ones.",
+      "source": "struct Foo;\nimpl Tr for Foo { #[cfg(unix)] fn go(&self){} #[cfg(windows)] fn go(&self){} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.Foo", "kind": "struct"},
+        {"qualname": "demo.m.Foo.impl[Tr]", "kind": "impl"},
+        {"qualname": "demo.m.Foo.impl[Tr].go@cfg(unix)", "kind": "function"},
+        {"qualname": "demo.m.Foo.impl[Tr].go@cfg(windows)", "kind": "function"}
+      ]
+    },
+    {
+      "name": "method_cfg_twin_cross_merged_block",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 5 (clarion-dfeb905f46), cross-merged-block variant: two SEPARATE inherent impl blocks on the same (type, sig, no-cfg) MERGE into one impl entity (Option b), each contributing a `go`. The merged `go` methods would collide unless the method-twin count spans ALL blocks sharing the final impl key (demo.m.Foo.impl#<>), not just one block. Pins that the method cfg discriminant is computed across merged blocks.",
+      "source": "struct Foo;\nimpl Foo { #[cfg(unix)] fn go(&self){} }\nimpl Foo { #[cfg(windows)] fn go(&self){} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.Foo", "kind": "struct"},
+        {"qualname": "demo.m.Foo.impl#<>", "kind": "impl"},
+        {"qualname": "demo.m.Foo.impl#<>.go@cfg(unix)", "kind": "function"},
+        {"qualname": "demo.m.Foo.impl#<>.go@cfg(windows)", "kind": "function"}
+      ]
+    },
+    {
+      "name": "reference_self_type_path_escape",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 4 (self-type fallback completion, clarion-8245039f6b): a non-Type::Path self type (here a reference) that carries a ::-path falls through self_ty_locator's type_textual fallback. Without escaping it leaks a raw ':' and build_entity_id rejects the id, degrading the whole file (the serde ser/fmt.rs `impl Serializer for &mut fmt::Formatter` drop). The fallback now routes through the same escape_reserved(strip_ws(..)) pipeline as concrete generic args, so &core::cell::Cell<u8> renders &core%3A%3Acell%3A%3ACell<u8>. A ':'-free reference (&Foo) is unchanged (escape is a no-op).",
+      "source": "impl Tr for &core::cell::Cell<u8> { fn ok(&self) {} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.&core%3A%3Acell%3A%3ACell<u8>.impl[Tr]", "kind": "impl"},
+        {"qualname": "demo.m.&core%3A%3Acell%3A%3ACell<u8>.impl[Tr].ok", "kind": "function"}
+      ]
     }
   ]
 }

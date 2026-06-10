@@ -427,6 +427,46 @@ fn walk_items(
         }
     }
     let impl_is_cfg_twin = |impl_q: &str| impl_twin_counts.get(impl_q).copied().unwrap_or(0) > 1;
+    // cfg-twin counter for METHODS (ADR-049 Amendment 5, clarion-dfeb905f46),
+    // keyed on the FINAL impl qualname (post impl-level `@cfg` suffix) + method
+    // name. Two methods that land on the SAME impl entity with the SAME name are
+    // cfg twins: the impl-level `@cfg` cannot split methods WITHIN one impl entity
+    // — a single block (`impl Foo { #[cfg(unix)] fn go #[cfg(windows)] fn go }`) or
+    // several blocks that MERGE under Option (b) — so each such method must carry
+    // its OWN `@cfg(...)` suffix, exactly as free items and impl blocks do. Keying
+    // on the FINAL impl_q (not the pre-cfg one) means impl-level cfg-twins — which
+    // are already split into distinct impl entities — do NOT collect a redundant
+    // method suffix, while a method-twin *inside* a cfg-twin block still does.
+    let mut method_twin_counts: std::collections::BTreeMap<(String, String), usize> =
+        std::collections::BTreeMap::new();
+    for item in items {
+        if let Item::Impl(it) = item {
+            let type_q = format!(
+                "{module_path}.{}",
+                self_ty_locator(&it.self_ty, &declared_type_params(it))
+            );
+            let mut impl_q = impl_qualname(&type_q, &impl_disc_for(it));
+            if impl_is_cfg_twin(&impl_q)
+                && let Some(disc) = cfg_suffix(&it.attrs)
+            {
+                impl_q.push_str(&disc);
+            }
+            for member in &it.items {
+                if let ImplItem::Fn(m) = member {
+                    *method_twin_counts
+                        .entry((impl_q.clone(), m.sig.ident.to_string()))
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    let method_is_cfg_twin = |impl_q: &str, name: &str| {
+        method_twin_counts
+            .get(&(impl_q.to_owned(), name.to_owned()))
+            .copied()
+            .unwrap_or(0)
+            > 1
+    };
     // Named items sharing one (kind, name) in this item list are cfg twins
     // (`#[cfg(unix)] fn f` / `#[cfg(windows)] fn f`, and the same for a `struct`
     // or an inline `mod`): all cfg variants are visible (spec §5), so a bare path
@@ -553,6 +593,7 @@ fn walk_items(
                     parent_id,
                     file_path,
                     &impl_is_cfg_twin,
+                    &method_is_cfg_twin,
                     &mut seen_impl_ids,
                     resolution,
                     out,
@@ -871,6 +912,7 @@ fn emit_impl(
     module_id: &str,
     file_path: &str,
     impl_is_cfg_twin: &dyn Fn(&str) -> bool,
+    method_is_cfg_twin: &dyn Fn(&str, &str) -> bool,
     seen_impl_ids: &mut std::collections::BTreeSet<String>,
     resolution: Option<(&str, &Resolver)>,
     out: &mut Vec<Value>,
@@ -952,7 +994,16 @@ fn emit_impl(
     // `@cfg` suffix lives in `impl_q`, so the method must inherit it from there.
     for member in &it.items {
         if let ImplItem::Fn(m) = member {
-            let q = format!("{impl_q}.{}", m.sig.ident);
+            // A cfg-gated twin method (same final impl entity, same name) carries
+            // its own `@cfg(...)` suffix AFTER the method name — `…go@cfg(unix)` —
+            // mirroring the free-item rule. Composes on top of any impl-level cfg
+            // already in `impl_q` (ADR-049 Amendment 5, clarion-dfeb905f46).
+            let mut q = format!("{impl_q}.{}", m.sig.ident);
+            if method_is_cfg_twin(&impl_q, &m.sig.ident.to_string())
+                && let Some(disc) = cfg_suffix(&m.attrs)
+            {
+                q.push_str(&disc);
+            }
             let child = entity(
                 "function",
                 &q,
