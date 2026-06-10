@@ -162,10 +162,8 @@ fn trait_generic_args(args: &PathArguments) -> Vec<String> {
     ab.args
         .iter()
         .filter_map(|a| match a {
-            GenericArgument::Type(ty) => Some(type_textual(ty)),
-            GenericArgument::Const(expr) => {
-                Some(quote::ToTokens::to_token_stream(expr).to_string())
-            }
+            GenericArgument::Type(ty) => Some(render_concrete_arg(ty)),
+            GenericArgument::Const(expr) => Some(render_concrete_arg(expr)),
             _ => None,
         })
         .collect()
@@ -220,9 +218,7 @@ pub fn self_ty_locator(ty: &Type, declared_params: &[String]) -> String {
         .iter()
         .filter_map(|a| match a {
             GenericArgument::Type(arg_ty) => Some(self_ty_arg(arg_ty, declared_params)),
-            GenericArgument::Const(expr) => {
-                Some(quote::ToTokens::to_token_stream(expr).to_string())
-            }
+            GenericArgument::Const(expr) => Some(render_concrete_arg(expr)),
             _ => None,
         })
         .collect();
@@ -247,7 +243,7 @@ fn self_ty_arg(arg_ty: &Type, declared_params: &[String]) -> String {
     {
         return format!("${pos}");
     }
-    type_textual(arg_ty)
+    render_concrete_arg(arg_ty)
 }
 
 /// Deterministic, whitespace-free textual rendering of any token-bearing node.
@@ -266,6 +262,21 @@ fn strip_ws<T: quote::ToTokens>(t: &T) -> String {
 /// Deterministic, whitespace-free textual rendering of a type.
 fn type_textual(ty: &Type) -> String {
     strip_ws(ty)
+}
+
+/// Render one **concrete** generic argument (type or const) for an impl locator
+/// through the shared ADR-049 Amendment-4 pipeline: `escape_reserved(strip_ws(arg))`.
+///
+/// Strip first (so const args lose proc-macro2 token spacing — `{ 1 + 2 }` →
+/// `{1+2}`), then apply the same injective reserved-char escape used on the cfg
+/// path (`%`→`%25` then `:`→`%3A`). Without the escape a `::`-path arg
+/// (`From<std::io::Error>`, ubiquitous in real Rust) leaks a literal `:` into the
+/// qualname; `build_entity_id` then rejects the id and the extractor collapses the
+/// whole cleanly-parsed file to one `syntax_error` module (clarion-8245039f6b).
+/// Distinct paths stay distinct (injective), and the cfg path already pins the
+/// escape bytes, so a second producer reproduces this byte-for-byte.
+fn render_concrete_arg<T: quote::ToTokens>(t: &T) -> String {
+    escape_reserved(&strip_ws(t))
 }
 
 /// Deterministic, whitespace-free textual rendering of a path (e.g. a supertrait
@@ -593,6 +604,46 @@ mod syn_disc_tests {
         assert_ne!(
             impl_disc_for(&from_signed).key(),
             impl_disc_for(&from_unsigned).key()
+        );
+    }
+
+    // --- ADR-049 Amendment 4: escape_reserved(strip_ws(arg)) for concrete generic
+    // args (clarion-8245039f6b). A `::`-path arg leaking a literal `:` into the
+    // qualname makes build_entity_id reject the id and degrade the whole file.
+
+    #[test]
+    fn path_typed_trait_generic_arg_escapes_reserved_colon() {
+        let it: syn::ItemImpl = parse_quote!(impl From<std::io::Error> for Foo {});
+        assert_eq!(impl_disc_for(&it).key(), "impl[From<std%3A%3Aio%3A%3AError>]");
+    }
+
+    #[test]
+    fn path_typed_self_ty_generic_arg_escapes_reserved_colon() {
+        let it: syn::ItemImpl = parse_quote!(impl Foo<std::io::Error> { fn x(&self) {} });
+        assert_eq!(
+            self_ty_locator(&it.self_ty, &declared_type_params(&it)),
+            "Foo<std%3A%3Aio%3A%3AError>"
+        );
+    }
+
+    #[test]
+    fn const_generic_arg_is_whitespace_stripped() {
+        // GenericArgument::Const was the dialect's one whitespace-bearing render
+        // (proc-macro2 token spacing). Amendment 4 routes it through strip_ws too.
+        let it: syn::ItemImpl = parse_quote!(impl Foo<{ 1 + 2 }> { fn x(&self) {} });
+        assert_eq!(
+            self_ty_locator(&it.self_ty, &declared_type_params(&it)),
+            "Foo<{1+2}>"
+        );
+    }
+
+    #[test]
+    fn const_generic_arg_path_const_escapes_reserved_colon() {
+        // A path-typed const arg (`{ usize::MAX }`) must both strip and escape.
+        let it: syn::ItemImpl = parse_quote!(impl Foo<{ usize::MAX }> { fn x(&self) {} });
+        assert_eq!(
+            self_ty_locator(&it.self_ty, &declared_type_params(&it)),
+            "Foo<{usize%3A%3AMAX}>"
         );
     }
 }

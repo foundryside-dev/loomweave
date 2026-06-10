@@ -395,6 +395,45 @@
         {"qualname": "demo.m.g@cfg(any(unix,windows))", "kind": "function"},
         {"qualname": "demo.m.g@cfg(target_os=\"macos\")", "kind": "function"}
       ]
+    },
+    {
+      "name": "path_typed_generic_arg_trait",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 4 (clarion-8245039f6b): a concrete trait generic arg that is itself a ::-path (impl From<std::io::Error>) carries the reserved ':' separator. Without escaping, build_entity_id rejects the id and degraded_aware collapses the WHOLE cleanly-parsed file to one syntax_error module. Every concrete generic arg renders through escape_reserved(strip_ws(arg)) — the same injective escape the cfg path pins — so std::io::Error renders std%3A%3Aio%3A%3AError in the trait fragment. Pins that a Wardline trait-impl extractor escapes path-typed generic args byte-for-byte.",
+      "source": "struct Foo;\nimpl From<std::io::Error> for Foo { fn from(_: std::io::Error) -> Self { Foo } }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.Foo", "kind": "struct"},
+        {"qualname": "demo.m.Foo.impl[From<std%3A%3Aio%3A%3AError>]", "kind": "impl"},
+        {"qualname": "demo.m.Foo.impl[From<std%3A%3Aio%3A%3AError>].from", "kind": "function"}
+      ]
+    },
+    {
+      "name": "path_typed_generic_arg_inherent",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 4 (clarion-8245039f6b): the path-typed concrete generic arg in the SELF-TYPE prefix (impl Foo<std::io::Error>) is escaped through the same escape_reserved(strip_ws(arg)) pipeline, so Foo<std::io::Error> renders Foo<std%3A%3Aio%3A%3AError> rather than dropping the file. Distinct paths stay distinct (injective).",
+      "source": "struct Foo<T>(T);\nimpl Foo<std::io::Error> { fn get(&self) {} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.Foo", "kind": "struct"},
+        {"qualname": "demo.m.Foo<std%3A%3Aio%3A%3AError>.impl#<>", "kind": "impl"},
+        {"qualname": "demo.m.Foo<std%3A%3Aio%3A%3AError>.impl#<>.get", "kind": "function"}
+      ]
+    },
+    {
+      "name": "const_generic_arg_spacing",
+      "crate": "demo", "module_path": "demo.m", "rel_path": "src/m.rs",
+      "reproducibility": "slice-1",
+      "note": "ADR-049 Amendment 4 (clarion-8245039f6b): GenericArgument::Const was the dialect's one whitespace-bearing render (proc-macro2 token spacing: `{ 1 + 2 }`), unreproducible from a tree-sitter frontend. Amendment 4 routes const args through the SAME strip_ws as type args, yielding {1+2}. Pins that a second producer renders const generic args whitespace-free, not proc-macro2-spaced.",
+      "source": "struct Foo<const N: usize>;\nimpl Foo<{ 1 + 2 }> { fn get(&self) {} }\n",
+      "expected": [
+        {"qualname": "demo.m", "kind": "module"},
+        {"qualname": "demo.m.Foo", "kind": "struct"},
+        {"qualname": "demo.m.Foo<{1+2}>.impl#<>", "kind": "impl"},
+        {"qualname": "demo.m.Foo<{1+2}>.impl#<>.get", "kind": "function"}
+      ]
     }
   ]
 }
