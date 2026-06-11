@@ -1869,3 +1869,118 @@ def test_safety_net_drops_contains_edges_to_dropped_entities() -> None:
             "to_id": "python:function:demo.helper",
         },
     ]
+
+
+# ── ADR-052: duplicate-qualname first-wins pins (clarion-12dd19c6a1) ───────────
+
+
+def test_property_setter_pair_first_wins_getter_owns_bare_qualname(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`@property` getter + `@x.setter` share qualname `C.x`; the getter (first) wins.
+
+    ADR-052 decision 1: the setter entity, its contains edge, and its whole
+    subtree drop; the drop is counted, never collided. Surfacing setters later
+    must be additive (decision 3) — this pin guards the survivor's bare qualname.
+    """
+    source = (
+        "class C:\n"
+        "    @property\n"
+        "    def x(self):\n"
+        "        return self._x\n"
+        "\n"
+        "    @x.setter\n"
+        "    def x(self, value):\n"
+        "        self._x = value\n"
+    )
+    result = extract_with_stats(source, "demo.py")
+    functions = [e for e in result.entities if e["kind"] == "function"]
+    assert [e["id"] for e in functions] == ["python:function:demo.C.x"]
+    # First-wins: the surviving span is the getter's (its @property line).
+    assert functions[0]["source"]["source_range"]["start_line"] == 2
+    assert result.stats.duplicate_entities_dropped_total == 1
+    contains_to_x = [
+        e
+        for e in result.edges
+        if e["kind"] == "contains" and e["to_id"] == "python:function:demo.C.x"
+    ]
+    assert len(contains_to_x) == 1
+    err = capsys.readouterr().err
+    assert "python:function:demo.C.x" in err
+
+
+def test_singledispatch_register_underscore_sequence_first_wins() -> None:
+    """`@fmt.register` users writing `def _(...)` repeatedly collide on `demo._`."""
+    source = (
+        "from functools import singledispatch\n"
+        "\n"
+        "@singledispatch\n"
+        "def fmt(arg):\n"
+        "    return str(arg)\n"
+        "\n"
+        "@fmt.register\n"
+        "def _(arg: int):\n"
+        "    return hex(arg)\n"
+        "\n"
+        "@fmt.register\n"
+        "def _(arg: bytes):\n"
+        "    return arg.decode()\n"
+    )
+    result = extract_with_stats(source, "demo.py")
+    function_ids = [e["id"] for e in result.entities if e["kind"] == "function"]
+    assert function_ids == ["python:function:demo.fmt", "python:function:demo._"]
+    assert result.stats.duplicate_entities_dropped_total == 1
+
+
+def test_conditional_def_first_branch_wins() -> None:
+    """Platform-switch `if`/`else` defs share a qualname; the `if` branch (first) wins."""
+    source = (
+        "import sys\n"
+        "\n"
+        'if sys.platform == "win32":\n'
+        "    def sep():\n"
+        '        return "\\\\"\n'
+        "else:\n"
+        "    def sep():\n"
+        '        return "/"\n'
+    )
+    result = extract_with_stats(source, "demo.py")
+    functions = [e for e in result.entities if e["kind"] == "function"]
+    assert [e["id"] for e in functions] == ["python:function:demo.sep"]
+    assert functions[0]["source"]["source_range"]["start_line"] == 4
+    assert result.stats.duplicate_entities_dropped_total == 1
+
+
+@pytest.mark.pyright
+def test_dropped_setter_body_calls_never_attribute_to_the_getter(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    """ADR-052 decision 2: the dropped setter's body is absent, not mis-attributed.
+
+    The emit boundary (extractor) and the pyright function index apply the same
+    first-wins rule, and call sites are collected per surviving function from its
+    own AST node — so `validate(value)` inside the dropped setter must not
+    produce a calls edge from the surviving getter id (or any other entity).
+    """
+    result = _extract_with_pyright(
+        tmp_path,
+        """
+        def validate(value):
+            pass
+
+        class C:
+            @property
+            def x(self):
+                return self._x
+
+            @x.setter
+            def x(self, value):
+                validate(value)
+                self._x = value
+        """,
+        pyright_langserver,
+    )
+    assert result.stats.duplicate_entities_dropped_total == 1
+    calls = _call_edges(result.edges)
+    assert [edge for edge in calls if edge["to_id"] == "python:function:demo.validate"] == []
