@@ -36,7 +36,8 @@ use loomweave_storage::{
     entity_briefing_block_reason, entity_by_id, import_edges_for_entity,
     inferred_edge_cache_key_id, module_reference_rollup, reference_edges_for_entity,
     relation_edges_for_entity, resolve_entity_ref, sei_for_locator,
-    unresolved_call_sites_for_caller, unresolved_callers_for_target,
+    unresolved_call_sites_for_caller, unresolved_caller_count_for_target,
+    unresolved_callers_for_target,
 };
 
 use crate::config::{LlmConfig, SemanticSearchConfig};
@@ -337,12 +338,12 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_callers_list",
-            description: "Return entities that call the given entity. Default confidence is resolved, so ambiguous static candidates and LLM-inferred edges are excluded unless explicitly requested. Ambiguous edges expand all candidates; inferred edges may trigger bounded LLM dispatch. Bounded: `limit` (default 50, max 100) plus a numeric-offset `cursor`; the result carries `next_cursor` (null when exhausted) and an explicit `truncated` flag. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls) so an empty callers list is never read as a guaranteed true negative.",
+            description: "Return entities that call the given entity. Default confidence is resolved, so ambiguous static candidates and LLM-inferred edges are excluded unless explicitly requested. Ambiguous edges expand all candidates; inferred edges may trigger bounded LLM dispatch — NOTE confidence=inferred is rejected by policy unless serve.mcp.enable_write_tools is on, so in the default read-only posture the recovery path for a suspicious empty is entity_call_site_list role=callee, not inferred. Bounded: `limit` (default 50, max 100) plus a numeric-offset `cursor`; the result carries `next_cursor` (null when exhausted) and an explicit `truncated` flag. Honesty fields: scope_excludes names static blind spots not searched (attribute-receiver-calls; unresolved-static-calls when the project holds statically-unbindable call sites), `unresolved_name_matches` counts unresolved call sites that name-match this entity but are NOT in `callers`, and `next_action` points at the evidence tool when that count is non-zero. An empty callers list with unresolved_name_matches > 0 is NOT a true negative.",
             input_schema: id_confidence_cursor_schema(),
         },
         ToolDefinition {
             name: "entity_execution_path_list",
-            description: "Return bounded calls-only execution paths starting at an entity. Default confidence is resolved. max_depth defaults to 3. Results are compact: a deduplicated nodes table plus paths as arrays of node ids (under a root), ranked longest-first. Traversal stops at the server edge cap and the response is capped at a maximum number of ranked paths; truncated/truncation_reason report edge-cap or path-cap when either trims. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls).",
+            description: "Return bounded calls-only execution paths starting at an entity. Default confidence is resolved. max_depth defaults to 3. Results are compact: a deduplicated nodes table plus paths as arrays of node ids (under a root), ranked longest-first. Traversal stops at the server edge cap and the response is capped at a maximum number of ranked paths; truncated/truncation_reason report edge-cap or path-cap when either trims. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls, and unresolved-static-calls when the project holds statically-unbindable call sites — paths through those sites are invisible at this tier).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -374,7 +375,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_neighborhood_get",
-            description: "Return the one-hop Loomweave neighborhood around an entity: callers, callees, container, contained entities, references, imports (imports_in = who imports this module, imports_out = what it imports; module-to-module), and relations (relations_in/relations_out — the kind-tagged inherits_from/decorates/implements/derives edges; relations_in on a class answers \"what subclasses this\", relations_out on a decorator answers \"what does this decorate\" — ADR-051 direction). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. On references_in each rolled-up neighbor also carries `importer_module` — the importing symbol's containing module — so reverse-import names importing modules, not just symbols. Each list bucket is bounded by a single per-bucket `limit` (default 50, max 100); a sibling `truncated` map flags which buckets were trimmed (callers/callees/contained/references_in/references_out/imports_in/imports_out/relations_in/relations_out). For the full cursor-paginated set of a trimmed bucket, use the dedicated single-relation tool (e.g. entity_callers_list, entity_relation_list). This overview has NO cursor — one cursor cannot coherently advance nine heterogeneous buckets. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls) so empty sections are never read as guaranteed true negatives.",
+            description: "Return the one-hop Loomweave neighborhood around an entity: callers, callees, container, contained entities, references, imports (imports_in = who imports this module, imports_out = what it imports; module-to-module), and relations (relations_in/relations_out — the kind-tagged inherits_from/decorates/implements/derives edges; relations_in on a class answers \"what subclasses this\", relations_out on a decorator answers \"what does this decorate\" — ADR-051 direction). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. On references_in each rolled-up neighbor also carries `importer_module` — the importing symbol's containing module — so reverse-import names importing modules, not just symbols. Each list bucket is bounded by a single per-bucket `limit` (default 50, max 100); a sibling `truncated` map flags which buckets were trimmed (callers/callees/contained/references_in/references_out/imports_in/imports_out/relations_in/relations_out). For the full cursor-paginated set of a trimmed bucket, use the dedicated single-relation tool (e.g. entity_callers_list, entity_relation_list). This overview has NO cursor — one cursor cannot coherently advance nine heterogeneous buckets. The result carries scope_excludes naming blind spots not searched (attribute-receiver-calls; unresolved-static-calls when the project holds statically-unbindable call sites), plus `unresolved_name_matches` (unresolved call sites that name-match this entity but are NOT in `callers`) and a `next_action` pointer at entity_call_site_list role=callee — so empty sections are never read as guaranteed true negatives.",
             input_schema: id_confidence_schema(),
         },
         ToolDefinition {
@@ -2928,11 +2929,56 @@ fn optional_confidence(
 /// The static resolver cannot bind a call made through an attribute receiver
 /// (e.g. `ctx.orchestrator.resume()`); only `inferred` (LLM) dispatch attempts
 /// those, so `resolved`/`ambiguous` queries exclude them and `inferred` does not.
+///
+/// This is the base vocabulary, used directly by `entity_call_site_list`, which
+/// SEARCHES the unresolved-call-site table (returning `unresolved_sites`
+/// evidence rows) and so must not declare it as an unsearched blind spot.
+/// Navigation tools use [`navigation_scope_excludes`].
 fn call_graph_scope_excludes(confidence: EdgeConfidence) -> Vec<&'static str> {
     match confidence {
         EdgeConfidence::Resolved | EdgeConfidence::Ambiguous => vec!["attribute-receiver-calls"],
         EdgeConfidence::Inferred => Vec::new(),
     }
+}
+
+/// Scope excludes for the caller-navigation surface (`entity_callers_list`,
+/// `entity_neighborhood_get`, `entity_execution_path_list`, the orientation
+/// pack). Unlike `entity_call_site_list`, these read only resolved/ambiguous
+/// `calls` edges — when the project holds live unresolved call sites, that
+/// whole category is an unsearched blind spot and must be named, or an empty
+/// callers list reads as a confident true negative (clarion-df87b4f381).
+/// `inferred` stays empty: its dispatch pass attempts the unresolved category.
+pub(crate) fn navigation_scope_excludes(
+    confidence: EdgeConfidence,
+    live_unresolved_sites: bool,
+) -> Vec<&'static str> {
+    let mut excludes = call_graph_scope_excludes(confidence);
+    if live_unresolved_sites && confidence != EdgeConfidence::Inferred {
+        excludes.push("unresolved-static-calls");
+    }
+    excludes
+}
+
+/// The `unresolved_name_matches` count + `next_action` recovery pointer for a
+/// caller-navigation result: how many live unresolved call sites name-match
+/// `target`, and where to see them. The pointer names `entity_call_site_list`
+/// because it works in the default read-only posture, where `confidence=
+/// inferred` is rejected by the MCP tool policy (clarion-df87b4f381).
+pub(crate) fn unresolved_match_fields(
+    conn: &rusqlite::Connection,
+    target: &EntityRow,
+) -> Result<(i64, Value), StorageError> {
+    let count = unresolved_caller_count_for_target(conn, target)?;
+    let next_action = if count > 0 {
+        json!(format!(
+            "{count} unresolved call site(s) name-match this entity and are NOT in `callers`; \
+             list them with entity_call_site_list id={id} role=callee",
+            id = target.id
+        ))
+    } else {
+        Value::Null
+    };
+    Ok((count, next_action))
 }
 
 fn envelope_from_storage_result(result: Result<Value, StorageError>) -> Value {
@@ -5300,12 +5346,12 @@ mod tests {
         assert_eq!(tools[2].name, "entity_callers_list");
         assert_eq!(
             tools[2].description,
-            "Return entities that call the given entity. Default confidence is resolved, so ambiguous static candidates and LLM-inferred edges are excluded unless explicitly requested. Ambiguous edges expand all candidates; inferred edges may trigger bounded LLM dispatch. Bounded: `limit` (default 50, max 100) plus a numeric-offset `cursor`; the result carries `next_cursor` (null when exhausted) and an explicit `truncated` flag. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls) so an empty callers list is never read as a guaranteed true negative."
+            "Return entities that call the given entity. Default confidence is resolved, so ambiguous static candidates and LLM-inferred edges are excluded unless explicitly requested. Ambiguous edges expand all candidates; inferred edges may trigger bounded LLM dispatch — NOTE confidence=inferred is rejected by policy unless serve.mcp.enable_write_tools is on, so in the default read-only posture the recovery path for a suspicious empty is entity_call_site_list role=callee, not inferred. Bounded: `limit` (default 50, max 100) plus a numeric-offset `cursor`; the result carries `next_cursor` (null when exhausted) and an explicit `truncated` flag. Honesty fields: scope_excludes names static blind spots not searched (attribute-receiver-calls; unresolved-static-calls when the project holds statically-unbindable call sites), `unresolved_name_matches` counts unresolved call sites that name-match this entity but are NOT in `callers`, and `next_action` points at the evidence tool when that count is non-zero. An empty callers list with unresolved_name_matches > 0 is NOT a true negative."
         );
         assert_eq!(tools[3].name, "entity_execution_path_list");
         assert_eq!(
             tools[3].description,
-            "Return bounded calls-only execution paths starting at an entity. Default confidence is resolved. max_depth defaults to 3. Results are compact: a deduplicated nodes table plus paths as arrays of node ids (under a root), ranked longest-first. Traversal stops at the server edge cap and the response is capped at a maximum number of ranked paths; truncated/truncation_reason report edge-cap or path-cap when either trims. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls)."
+            "Return bounded calls-only execution paths starting at an entity. Default confidence is resolved. max_depth defaults to 3. Results are compact: a deduplicated nodes table plus paths as arrays of node ids (under a root), ranked longest-first. Traversal stops at the server edge cap and the response is capped at a maximum number of ranked paths; truncated/truncation_reason report edge-cap or path-cap when either trims. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls, and unresolved-static-calls when the project holds statically-unbindable call sites — paths through those sites are invisible at this tier)."
         );
         assert_eq!(tools[4].name, "entity_summary_get");
         assert_eq!(
@@ -5320,7 +5366,7 @@ mod tests {
         assert_eq!(tools[6].name, "entity_neighborhood_get");
         assert_eq!(
             tools[6].description,
-            "Return the one-hop Loomweave neighborhood around an entity: callers, callees, container, contained entities, references, imports (imports_in = who imports this module, imports_out = what it imports; module-to-module), and relations (relations_in/relations_out — the kind-tagged inherits_from/decorates/implements/derives edges; relations_in on a class answers \"what subclasses this\", relations_out on a decorator answers \"what does this decorate\" — ADR-051 direction). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. On references_in each rolled-up neighbor also carries `importer_module` — the importing symbol's containing module — so reverse-import names importing modules, not just symbols. Each list bucket is bounded by a single per-bucket `limit` (default 50, max 100); a sibling `truncated` map flags which buckets were trimmed (callers/callees/contained/references_in/references_out/imports_in/imports_out/relations_in/relations_out). For the full cursor-paginated set of a trimmed bucket, use the dedicated single-relation tool (e.g. entity_callers_list, entity_relation_list). This overview has NO cursor — one cursor cannot coherently advance nine heterogeneous buckets. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls) so empty sections are never read as guaranteed true negatives."
+            "Return the one-hop Loomweave neighborhood around an entity: callers, callees, container, contained entities, references, imports (imports_in = who imports this module, imports_out = what it imports; module-to-module), and relations (relations_in/relations_out — the kind-tagged inherits_from/decorates/implements/derives edges; relations_in on a class answers \"what subclasses this\", relations_out on a decorator answers \"what does this decorate\" — ADR-051 direction). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. On references_in each rolled-up neighbor also carries `importer_module` — the importing symbol's containing module — so reverse-import names importing modules, not just symbols. Each list bucket is bounded by a single per-bucket `limit` (default 50, max 100); a sibling `truncated` map flags which buckets were trimmed (callers/callees/contained/references_in/references_out/imports_in/imports_out/relations_in/relations_out). For the full cursor-paginated set of a trimmed bucket, use the dedicated single-relation tool (e.g. entity_callers_list, entity_relation_list). This overview has NO cursor — one cursor cannot coherently advance nine heterogeneous buckets. The result carries scope_excludes naming blind spots not searched (attribute-receiver-calls; unresolved-static-calls when the project holds statically-unbindable call sites), plus `unresolved_name_matches` (unresolved call sites that name-match this entity but are NOT in `callers`) and a `next_action` pointer at entity_call_site_list role=callee — so empty sections are never read as guaranteed true negatives."
         );
         assert_eq!(tools[7].name, "subsystem_member_list");
         assert_eq!(

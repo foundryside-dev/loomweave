@@ -14,8 +14,9 @@ use serde_json::{Value, json};
 use loomweave_storage::{
     EntityVisibility, RELATION_EDGE_KINDS, ReferenceDirection, StorageError, ancestor_chain,
     call_edges_from, call_edges_targeting, child_entity_ids, entities_containing_line,
-    entity_by_id, entity_visibility, find_entities, normalize_source_path,
-    relation_edges_for_entity, resolve_entity_ref, subsystem_members, subsystem_of_entity,
+    entity_by_id, entity_visibility, find_entities, live_unresolved_call_sites_exist,
+    normalize_source_path, relation_edges_for_entity, resolve_entity_ref, subsystem_members,
+    subsystem_of_entity,
 };
 
 use crate::filigree::IssueDetail;
@@ -25,11 +26,12 @@ use crate::{
     PathTraversal, ServerState, build_call_sites, call_graph_scope_excludes, callee_json,
     caller_json, compact_execution_paths, entity_context_json, entity_json,
     entity_not_found_envelope, entity_properties_json, envelope_from_storage_result,
-    flatten_storage_envelope_result, import_neighbors, issues_unavailable, optional_bool,
-    optional_confidence, optional_usize, parse_cursor_offset, path_truncation_reason,
-    reference_neighbors_for, relation_neighbors, required_i64, required_str, storage_retryable,
-    success_envelope, success_envelope_with_stats, success_envelope_with_truncation,
-    success_envelope_with_truncation_and_stats, tool_error_envelope, wardline_section_for_entity,
+    flatten_storage_envelope_result, import_neighbors, issues_unavailable,
+    navigation_scope_excludes, optional_bool, optional_confidence, optional_usize,
+    parse_cursor_offset, path_truncation_reason, reference_neighbors_for, relation_neighbors,
+    required_i64, required_str, storage_retryable, success_envelope, success_envelope_with_stats,
+    success_envelope_with_truncation, success_envelope_with_truncation_and_stats,
+    tool_error_envelope, unresolved_match_fields, wardline_section_for_entity,
     wardline_unavailable,
 };
 
@@ -182,12 +184,22 @@ impl ServerState {
                 let page: Vec<_> = callers.drain(..).skip(offset).take(limit).collect();
                 let has_more = offset.saturating_add(limit) < total;
                 let next_cursor = has_more.then(|| (offset + limit).to_string());
+                // Honesty fields (clarion-df87b4f381): name-matched unresolved
+                // call sites are NOT in `callers`; say how many exist and where
+                // to see them, and name the blind spot in scope_excludes.
+                let (unresolved_name_matches, next_action) = match entity_by_id(conn, &entity_id)? {
+                    Some(target) => unresolved_match_fields(conn, &target)?,
+                    None => (0, Value::Null),
+                };
+                let live_unresolved = live_unresolved_call_sites_exist(conn)?;
                 Ok(success_envelope_with_stats(
                     json!({
                         "callers": page,
                         "next_cursor": next_cursor,
                         "truncated": has_more,
-                        "scope_excludes": call_graph_scope_excludes(confidence),
+                        "unresolved_name_matches": unresolved_name_matches,
+                        "next_action": next_action,
+                        "scope_excludes": navigation_scope_excludes(confidence, live_unresolved),
                     }),
                     stats_delta,
                 ))
@@ -233,13 +245,14 @@ impl ServerState {
                 let edge_truncated = traversal.truncated;
                 let edge_count_visited = traversal.edge_count_visited;
                 let compact = compact_execution_paths(conn, traversal.paths, path_cap)?;
+                let live_unresolved = live_unresolved_call_sites_exist(conn)?;
                 Ok(success_envelope_with_truncation(
                     json!({
                         "root": entity_id,
                         "nodes": compact.nodes,
                         "paths": compact.paths,
                         "edge_count_visited": edge_count_visited,
-                        "scope_excludes": call_graph_scope_excludes(confidence),
+                        "scope_excludes": navigation_scope_excludes(confidence, live_unresolved),
                     }),
                     path_truncation_reason(edge_truncated, compact.path_cap_truncated),
                 ))
@@ -435,7 +448,11 @@ impl ServerState {
                     relation_neighbors(conn, &entity_id, ReferenceDirection::In, confidence)?;
                 let mut relations_out =
                     relation_neighbors(conn, &entity_id, ReferenceDirection::Out, confidence)?;
-                let scope_excludes = call_graph_scope_excludes(confidence);
+                let live_unresolved = live_unresolved_call_sites_exist(conn)?;
+                let scope_excludes = navigation_scope_excludes(confidence, live_unresolved);
+                // Honesty fields for the `callers` bucket (clarion-df87b4f381).
+                let (unresolved_name_matches, next_action) =
+                    unresolved_match_fields(conn, &entity)?;
                 // Bound EACH bucket independently and record whether it was
                 // trimmed in the sibling `truncated` map. A trimmed bucket directs
                 // the agent to the dedicated single-relation tool for the full
@@ -478,6 +495,8 @@ impl ServerState {
                     "relations_in": relations_in,
                     "relations_out": relations_out,
                     "truncated": truncated,
+                    "unresolved_name_matches": unresolved_name_matches,
+                    "next_action": next_action,
                     "scope_excludes": scope_excludes,
                 })))
             })

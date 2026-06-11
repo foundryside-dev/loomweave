@@ -4138,10 +4138,13 @@ async fn attribute_receiver_call_is_excluded_at_resolved_but_attempted_at_inferr
     .await;
     assert_eq!(resolved["ok"], true);
     assert_eq!(resolved["result"]["callers"].as_array().unwrap().len(), 0);
+    // The live `ctx.dynamic` site both suffix-matches the target name and
+    // makes the project-wide unresolved blind spot real (clarion-df87b4f381).
     assert_eq!(
         resolved["result"]["scope_excludes"],
-        json!(["attribute-receiver-calls"])
+        json!(["attribute-receiver-calls", "unresolved-static-calls"])
     );
+    assert_eq!(resolved["result"]["unresolved_name_matches"], 1);
 
     // Inferred: LLM dispatch recovers the attribute-receiver caller, so nothing is
     // excluded — the empty-vs-complete distinction is honest, not wallpaper.
@@ -4901,6 +4904,223 @@ async fn neighborhood_function_references_are_not_rolled_up() {
     assert_eq!(
         envelope["result"]["scope_excludes"],
         json!(["attribute-receiver-calls"])
+    );
+}
+
+// ── unresolved name-matched call-site honesty (clarion-df87b4f381) ────────────
+//
+// The store records statically-unbindable call sites in
+// `entity_unresolved_call_sites`; when any LIVE rows name-match the queried
+// target, an empty/short `callers` list is not a true negative. The navigation
+// surface must say so: an `unresolved_name_matches` count, the
+// `unresolved-static-calls` scope_excludes marker, and a `next_action` pointer
+// at the evidence tool (`entity_call_site_list role=callee`), which works in
+// the default read-only posture where `confidence=inferred` is policy-gated.
+
+#[tokio::test]
+async fn callers_of_counts_unresolved_name_matches_and_names_the_blind_spot() {
+    let (project, db_path) = open_project();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        // A bare-name unresolved site whose callee_expr equals the target's
+        // short name — the dominant unresolved cross-module call shape.
+        insert_unresolved_call_site(&conn, "python:function:demo.entry", "site-bare", "target");
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.target"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["unresolved_name_matches"], 1,
+        "{envelope}"
+    );
+    let excludes = envelope["result"]["scope_excludes"]
+        .as_array()
+        .expect("scope_excludes array");
+    assert!(
+        excludes.iter().any(|v| v == "unresolved-static-calls"),
+        "live unresolved sites must be declared as a blind spot: {envelope}"
+    );
+    assert!(
+        excludes.iter().any(|v| v == "attribute-receiver-calls"),
+        "{envelope}"
+    );
+    let next_action = envelope["result"]["next_action"]
+        .as_str()
+        .expect("next_action string when matches exist");
+    assert!(
+        next_action.contains("entity_call_site_list"),
+        "next_action must point at the evidence tool: {envelope}"
+    );
+    assert!(next_action.contains("callee"), "{envelope}");
+
+    // The shared vocabulary also covers calls-only path traversal.
+    let paths = call_tool(
+        &state,
+        "execution_paths_from",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(paths["ok"], true, "{paths}");
+    assert!(
+        paths["result"]["scope_excludes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "unresolved-static-calls"),
+        "{paths}"
+    );
+
+    // call_sites SEARCHES the unresolved table (it returns unresolved_sites),
+    // so it must NOT declare the category as an unsearched blind spot.
+    let sites = call_tool(
+        &state,
+        "call_sites",
+        json!({"id": "python:function:demo.target", "role": "callee"}),
+    )
+    .await;
+    assert_eq!(sites["ok"], true, "{sites}");
+    assert!(
+        !sites["result"]["scope_excludes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "unresolved-static-calls"),
+        "call_sites surfaces unresolved sites; the marker would be false: {sites}"
+    );
+    assert_eq!(
+        sites["result"]["unresolved_sites"][0]["callee_expr"], "target",
+        "{sites}"
+    );
+}
+
+#[tokio::test]
+async fn callers_of_without_unresolved_sites_reports_zero_matches_and_no_marker() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.target"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["unresolved_name_matches"], 0,
+        "{envelope}"
+    );
+    assert!(
+        envelope["result"]["next_action"].is_null(),
+        "no matches -> no recovery pointer: {envelope}"
+    );
+    assert_eq!(
+        envelope["result"]["scope_excludes"],
+        json!(["attribute-receiver-calls"]),
+        "an all-resolved project must not carry the unresolved marker: {envelope}"
+    );
+}
+
+#[tokio::test]
+async fn callers_of_ignores_stale_unresolved_rows_in_count_and_marker() {
+    let (project, db_path) = open_project();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        insert_unresolved_call_site(&conn, "python:function:demo.entry", "site-stale", "target");
+        conn.execute(
+            "UPDATE entities SET content_hash = 'hash-after-body-change' \
+             WHERE id = 'python:function:demo.entry'",
+            [],
+        )
+        .expect("simulate a changed caller body");
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.target"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["unresolved_name_matches"], 0,
+        "stale rows (content-hash mismatch) are not evidence: {envelope}"
+    );
+    assert_eq!(
+        envelope["result"]["scope_excludes"],
+        json!(["attribute-receiver-calls"]),
+        "{envelope}"
+    );
+}
+
+#[tokio::test]
+async fn neighborhood_and_orientation_carry_unresolved_name_matches() {
+    let (project, db_path) = open_project();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        insert_unresolved_call_site(&conn, "python:function:demo.entry", "site-bare", "target");
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let neighborhood = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:demo.target"}),
+    )
+    .await;
+    assert_eq!(neighborhood["ok"], true, "{neighborhood}");
+    assert_eq!(
+        neighborhood["result"]["unresolved_name_matches"], 1,
+        "{neighborhood}"
+    );
+    assert!(
+        neighborhood["result"]["scope_excludes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "unresolved-static-calls"),
+        "{neighborhood}"
+    );
+    assert!(
+        neighborhood["result"]["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("entity_call_site_list"),
+        "{neighborhood}"
+    );
+
+    let pack = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.target"}),
+    )
+    .await;
+    assert_eq!(pack["ok"], true, "{pack}");
+    let neighbors = &pack["result"]["neighbors"];
+    assert_eq!(neighbors["unresolved_name_matches"], 1, "{pack}");
+    assert!(
+        neighbors["scope_excludes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "unresolved-static-calls"),
+        "{pack}"
+    );
+    assert!(
+        neighbors["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("entity_call_site_list"),
+        "{pack}"
     );
 }
 

@@ -10,16 +10,16 @@ use serde_json::{Value, json};
 use loomweave_storage::{
     ReferenceDirection, StorageError, ancestor_chain, call_edges_from, call_edges_targeting,
     child_entity_ids, entities_containing_line, entity_by_id, has_any_alive_binding,
-    normalize_source_path, resolve_entity_ref,
+    live_unresolved_call_sites_exist, normalize_source_path, resolve_entity_ref,
 };
 
 use crate::{
     ORIENTATION_PACK_MAX_NEIGHBORS, ORIENTATION_PACK_PATH_DEPTH, OrientationCore, ParamError,
-    PathTraversal, ServerState, call_graph_scope_excludes, callee_json, caller_json,
-    cap_neighbor_list, compact_execution_paths, entity_context_json, entity_json, import_neighbors,
-    orientation_suggested_reads, path_truncation_reason, reference_neighbors_for,
-    relation_neighbors, required_i64, storage_retryable, success_envelope,
-    success_envelope_with_truncation, tool_error_envelope,
+    PathTraversal, ServerState, callee_json, caller_json, cap_neighbor_list,
+    compact_execution_paths, entity_context_json, entity_json, import_neighbors,
+    navigation_scope_excludes, orientation_suggested_reads, path_truncation_reason,
+    reference_neighbors_for, relation_neighbors, required_i64, storage_retryable, success_envelope,
+    success_envelope_with_truncation, tool_error_envelope, unresolved_match_fields,
 };
 
 impl ServerState {
@@ -207,7 +207,11 @@ impl ServerState {
                 let (relations_in, relations_in_omitted) = cap_neighbor_list(rels_in, cap);
                 let (relations_out, relations_out_omitted) = cap_neighbor_list(rels_out, cap);
 
-                let scope_excludes = call_graph_scope_excludes(confidence);
+                let live_unresolved = live_unresolved_call_sites_exist(conn)?;
+                let scope_excludes = navigation_scope_excludes(confidence, live_unresolved);
+                // Honesty fields for the `callers` bucket (clarion-df87b4f381).
+                let (unresolved_name_matches, next_action) =
+                    unresolved_match_fields(conn, &entity)?;
 
                 let neighbors = json!({
                     "callers": callers,
@@ -225,6 +229,8 @@ impl ServerState {
                     // decorates / implements / derives.
                     "relations_in": relations_in,
                     "relations_out": relations_out,
+                    "unresolved_name_matches": unresolved_name_matches,
+                    "next_action": next_action,
                     "scope_excludes": scope_excludes,
                 });
 

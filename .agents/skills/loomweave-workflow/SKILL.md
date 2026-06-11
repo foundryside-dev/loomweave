@@ -94,17 +94,35 @@ only.
 take a `confidence` tier — one of `"resolved"` (default; only high-confidence
 edges), `"ambiguous"`, or `"inferred"`. There is no `"all"` value. When you
 suspect an edge is missing (e.g. dynamic dispatch), re-query at `"ambiguous"`
-and `"inferred"` and union the results — a default `resolved` count can
-understate the true caller set. (Relation edges are never LLM-inferred, so for
+and union the results — a default `resolved` count can understate the true
+caller set. (Relation edges are never LLM-inferred, so for
 `entity_relation_list` and the `relations_in`/`relations_out` buckets
 `"ambiguous"` is the widest tier; `"inferred"` adds nothing.)
 
+**`"inferred"` is policy-gated.** It may call an LLM and write inferred-edge
+cache rows, so it is rejected (`-32602`) unless the server runs with
+`serve.mcp.enable_write_tools: true` — and the default is `false`. Do not plan
+on `"inferred"` as your recovery path unless `project_status` shows write
+tools enabled.
+
 Of those, `callers_of` / `neighborhood` / `execution_paths_from` also return a
-`scope_excludes` array listing static blind spots the query did **not** search
-(e.g. `"attribute-receiver-calls"` like `ctx.svc.run()`). A non-empty
+`scope_excludes` array listing static blind spots the query did **not** search:
+`"attribute-receiver-calls"` (like `ctx.svc.run()`) and
+`"unresolved-static-calls"` (the project holds call sites the static resolver
+could not bind — common for cross-module/cross-crate calls). A non-empty
 `scope_excludes` means an empty/short result is **not** a guaranteed true
-negative — re-query at `"inferred"` (which searches those categories and returns
-`scope_excludes: []`) before concluding "nothing calls this."
+negative.
+
+The recovery path that works in **every** posture: `callers_of` and
+`neighborhood` also return `unresolved_name_matches` — the count of unresolved
+call sites whose callee expression name-matches the entity — with a
+`next_action` pointer when it is non-zero. If `callers` is empty but
+`unresolved_name_matches > 0`, the truth is "N likely callers exist that
+static resolution could not bind": run `call_sites`
+(`{"id": "<id>", "role": "callee"}`) to see each one with file/line/line_text,
+and treat those as caller candidates. Only when write tools are enabled is
+re-querying at `"inferred"` (LLM-assisted binding, returns
+`scope_excludes: []`) an alternative.
 (`entity_relation_list` returns no `scope_excludes` and has no inferred tier;
 its honesty caveat is in its description — only *declared* relations are
 recorded, so a dynamically applied decorator or runtime-built class is

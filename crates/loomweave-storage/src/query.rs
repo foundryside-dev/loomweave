@@ -1127,6 +1127,47 @@ pub fn unresolved_call_sites_for_caller(
         .map_err(StorageError::from)
 }
 
+/// Unbounded COUNT of the rows [`unresolved_callers_for_target`] would match:
+/// live (content-hash-current) unresolved call sites whose `callee_expr`
+/// name-matches `target`. Powers the `unresolved_name_matches` honesty field
+/// on the caller-navigation surface (clarion-df87b4f381) — the count must be
+/// the true magnitude, not a page length.
+pub fn unresolved_caller_count_for_target(conn: &Connection, target: &EntityRow) -> Result<i64> {
+    let target_short = target
+        .short_name
+        .rsplit('.')
+        .next()
+        .unwrap_or(&target.short_name);
+    let suffix = format!("%.{}", escape_like(target_short));
+    conn.query_row(
+        "SELECT COUNT(*) \
+         FROM entity_unresolved_call_sites u \
+         JOIN entities caller ON caller.id = u.caller_entity_id \
+         WHERE caller.content_hash = u.caller_content_hash \
+           AND (u.callee_expr = ?1 \
+             OR u.callee_expr = ?2 \
+             OR u.callee_expr LIKE ?3 ESCAPE '\\')",
+        params![target_short, target.name, suffix],
+        |row| row.get(0),
+    )
+    .map_err(StorageError::from)
+}
+
+/// True when the project holds ANY live unresolved call site (stale rows whose
+/// caller body changed are excluded, matching every other consumer). Drives the
+/// data-dependent `unresolved-static-calls` `scope_excludes` marker.
+pub fn live_unresolved_call_sites_exist(conn: &Connection) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS( \
+            SELECT 1 FROM entity_unresolved_call_sites u \
+            JOIN entities caller ON caller.id = u.caller_entity_id \
+            WHERE caller.content_hash = u.caller_content_hash)",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(StorageError::from)
+}
+
 pub fn unresolved_callers_for_target(
     conn: &Connection,
     target: &EntityRow,
