@@ -5325,8 +5325,63 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        InferenceLlmState, InferredRead, McpToolPolicy, ServerState, config::LlmConfig, list_tools,
+        InferenceLlmState, InferredRead, McpToolPolicy, RENAME_MAP, ServerState, config::LlmConfig,
+        list_tools,
     };
+
+    /// SKILL.md must speak the registered tool dialect (clarion-888434f3ce).
+    ///
+    /// The skill is the canonical onboarding doc (embedded asset, served via
+    /// `prompts/get`, installed by `loomweave install --skills`). An MCP client
+    /// exposes only the names in `tools/list`; the `RENAME_MAP` shim rescues
+    /// raw JSON-RPC callers but NOT `mcp__loomweave__<old-name>` clients, so a
+    /// skill teaching retired names burns failed calls. Three invariants:
+    /// no retired alias appears as a backticked token, every
+    /// `mcp__loomweave__<name>` mention is registered (or the `*` wildcard),
+    /// and every registered tool is documented somewhere in the skill.
+    #[test]
+    fn skill_md_speaks_the_registered_tool_dialect() {
+        let skill = include_str!("../assets/skills/loomweave-workflow/SKILL.md");
+        let registered: std::collections::BTreeSet<&str> =
+            list_tools().iter().map(|tool| tool.name).collect();
+
+        for &(old, new) in RENAME_MAP {
+            if old == new {
+                continue;
+            }
+            assert!(
+                !skill.contains(&format!("`{old}`")),
+                "SKILL.md teaches retired tool name `{old}` — the registered name is `{new}`"
+            );
+            assert!(
+                !skill.contains(&format!("mcp__loomweave__{old}")),
+                "SKILL.md claims mcp__loomweave__{old} exists — clients expose mcp__loomweave__{new}"
+            );
+        }
+
+        for (idx, _) in skill.match_indices("mcp__loomweave__") {
+            let rest = &skill[idx + "mcp__loomweave__".len()..];
+            if rest.starts_with('*') {
+                continue; // the documented wildcard form
+            }
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
+                .collect();
+            assert!(
+                registered.contains(name.as_str()),
+                "SKILL.md mentions mcp__loomweave__{name}, which is not in tools/list"
+            );
+        }
+
+        for name in &registered {
+            assert!(
+                skill.contains(&format!("`{name}`")),
+                "registered tool `{name}` is undocumented in SKILL.md — document it \
+                 (or its containing table row) so the skill covers the live catalogue"
+            );
+        }
+    }
 
     #[test]
     fn tools_list_exposes_exact_docstrings() {
