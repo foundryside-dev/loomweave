@@ -215,7 +215,7 @@ descendants) **or** a path glob (`"src/auth/**"`); omit it for the whole project
 |------|----------|------|
 | `entity_guidance_list` | guidance sheets applicable to an entity, scope-ranked | `{"id": "<id>"}` |
 | `entity_finding_list` | findings anchored to an entity (filter kind/severity/status) | `{"id": "<id>", "filter": {"status": "open"}}` |
-| `project_finding_list` | **every** finding across the project — no entity id needed; each row carries its anchoring entity `{id, sei, file, line}` + tool/rule/kind/severity/status | `{"filter": {"severity": "error"}}` |
+| `project_finding_list` | **every** finding across the project — no entity id needed; each row carries its anchoring entity `{id, sei, file, line}` + tool/rule/kind/severity/status | `{"filter": {"severity": "ERROR"}}` |
 | `entity_wardline_get` | the entity's Wardline metadata (verbatim, opaque) | `{"id": "<id>"}` |
 
 **Faceted search:**
@@ -277,7 +277,13 @@ Schema descriptions are kept short by budget; the operational detail lives here.
 - **`entity_finding_list` / `project_finding_list` filter values** (closed
   sets): `kind` = defect | fact | classification | metric | suggestion;
   `severity` = INFO | WARN | ERROR | CRITICAL | NONE; `status` = open |
-  acknowledged | suppressed | promoted_to_issue.
+  acknowledged | suppressed | promoted_to_issue. Matching is case-insensitive
+  (input is canonicalised); a value outside its set is rejected as a param
+  error naming the vocabulary — never a silent empty page.
+- **`entity_kind_list` unknown kinds:** kinds are plugin-owned (an open set),
+  so an unknown kind cannot be rejected up front — it returns an empty page
+  plus `known_kinds`, the kinds the index actually holds, so a typo
+  (`strcut`) is distinguishable from "kind exists, nothing in scope".
 - **`entity_call_site_list` resolution:** each site is resolved | ambiguous
   (with candidate ids) | unresolved (a static call Loomweave could not bind —
   kept separate from resolved evidence). Filter with `kind`

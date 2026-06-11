@@ -632,6 +632,14 @@ impl ComposedSheet {
     }
 }
 
+/// Closed finding vocabularies (ADR-031 core-owned value sets; enforced as
+/// CHECK constraints on the `findings` table in migration 0001). A filter
+/// value outside its set can never match a row, so it is rejected up front —
+/// the unknown-argument-KEY precedent extended to values (clarion-c137d73ebf).
+const FINDING_KINDS: [&str; 5] = ["defect", "fact", "classification", "metric", "suggestion"];
+const FINDING_SEVERITIES: [&str; 5] = ["INFO", "WARN", "ERROR", "CRITICAL", "NONE"];
+const FINDING_STATUSES: [&str; 4] = ["open", "acknowledged", "suppressed", "promoted_to_issue"];
+
 /// Optional `findings_for` filter (`kind` / `severity` / `status`).
 struct FindingFilter {
     kind: Option<String>,
@@ -651,17 +659,30 @@ impl FindingFilter {
         let Some(object) = filter.as_object() else {
             return Err(ParamError::new("filter must be an object"));
         };
-        let field = |name: &str| -> std::result::Result<Option<String>, ParamError> {
-            match object.get(name) {
-                None | Some(Value::Null) => Ok(None),
-                Some(Value::String(value)) => Ok(Some(value.clone())),
-                Some(_) => Err(ParamError::new(&format!("filter.{name} must be a string"))),
-            }
-        };
+        let field =
+            |name: &str, vocabulary: &[&str]| -> std::result::Result<Option<String>, ParamError> {
+                match object.get(name) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::String(value)) => {
+                        // Canonical casing is mixed (severity upper, kind/status
+                        // lower) and callers reliably type the other one, so
+                        // matching is case-insensitive; the canonical spelling is
+                        // what reaches the SQL predicate and the echoed filter.
+                        match vocabulary.iter().find(|v| v.eq_ignore_ascii_case(value)) {
+                            Some(canonical) => Ok(Some((*canonical).to_owned())),
+                            None => Err(ParamError::new(&format!(
+                                "filter.{name} must be one of {} (got \"{value}\")",
+                                vocabulary.join(" | ")
+                            ))),
+                        }
+                    }
+                    Some(_) => Err(ParamError::new(&format!("filter.{name} must be a string"))),
+                }
+            };
         Ok(Self {
-            kind: field("kind")?,
-            severity: field("severity")?,
-            status: field("status")?,
+            kind: field("kind", &FINDING_KINDS)?,
+            severity: field("severity", &FINDING_SEVERITIES)?,
+            status: field("status", &FINDING_STATUSES)?,
         })
     }
 

@@ -403,6 +403,104 @@ async fn findings_for_empty_entity_is_not_an_error() {
     assert!(env["result"]["findings"].as_array().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn findings_for_rejects_unknown_filter_values_with_vocabulary() {
+    // clarion-c137d73ebf: kind/severity/status are closed sets (ADR-031 CHECK
+    // constraints), so a typo'd value can never match a row — silently
+    // returning an empty page is indistinguishable from a clean entity. An
+    // unknown value is a caller bug: JSON-RPC param error (-32602) naming the
+    // valid vocabulary, mirroring the unknown-argument-KEY precedent.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    for (field, bad, vocab_member) in [
+        ("severity", "eror", "CRITICAL"),
+        ("kind", "defct", "classification"),
+        ("status", "opne", "promoted_to_issue"),
+    ] {
+        let response = state
+            .handle_json_rpc(&json!({
+                "jsonrpc": "2.0",
+                "id": "bad-filter",
+                "method": "tools/call",
+                "params": {"name": "entity_finding_list", "arguments": {
+                    "id": "python:function:m.f",
+                    "filter": {field: bad}
+                }}
+            }))
+            .await
+            .expect("response");
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "filter.{field}={bad} must be a param error: {response}"
+        );
+        let message = response["error"]["message"].as_str().expect("message");
+        assert!(
+            message.contains(vocab_member),
+            "filter.{field} error must list the valid vocabulary: {message}"
+        );
+        assert!(
+            message.contains(bad),
+            "filter.{field} error must echo the rejected value: {message}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn findings_for_filter_values_canonicalize_case() {
+    // The canonical vocabulary mixes cases (severity uppercase, kind/status
+    // lowercase) and agents reliably type the other one — `severity: "error"`
+    // appeared in our own skill example. Case-insensitive input canonicalises
+    // instead of rejecting, and the echoed filter shows the canonical value.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
+    insert_finding(
+        &conn,
+        "f-err",
+        "python:function:m.f",
+        "defect",
+        "ERROR",
+        "open",
+    );
+    insert_finding(
+        &conn,
+        "f-info",
+        "python:function:m.f",
+        "fact",
+        "INFO",
+        "open",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_finding_list",
+        json!({"id": "python:function:m.f", "filter": {"severity": "error", "kind": "DEFECT", "status": "Open"}}),
+    )
+    .await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 1, "{env}");
+    assert_eq!(env["result"]["findings"][0]["id"], "f-err", "{env}");
+    assert_eq!(env["result"]["filter"]["severity"], "ERROR", "{env}");
+    assert_eq!(env["result"]["filter"]["kind"], "defect", "{env}");
+    assert_eq!(env["result"]["filter"]["status"], "open", "{env}");
+}
+
 // ---- project_finding_list (L1: whole-project finding browser) -----------
 
 #[tokio::test]
@@ -487,6 +585,35 @@ async fn project_finding_list_rows_carry_entity_sei_file_line_severity_rule() {
     assert_eq!(row["entity"]["sei"], "loomweave:eid:abc123", "{env}");
     assert_eq!(row["entity"]["file"], "m.py", "{env}");
     assert_eq!(row["entity"]["line"], 4, "{env}");
+}
+
+#[tokio::test]
+async fn project_finding_list_rejects_unknown_filter_value() {
+    // Same closed-set discipline as entity_finding_list — both routes share
+    // FindingFilter::parse, but the contract is asserted per registered tool.
+    let (project, db, _conn) = open_project();
+    let state = state_for(project.path(), &db);
+
+    let response = state
+        .handle_json_rpc(&json!({
+            "jsonrpc": "2.0",
+            "id": "bad-filter",
+            "method": "tools/call",
+            "params": {"name": "project_finding_list", "arguments": {
+                "filter": {"severity": "eror"}
+            }}
+        }))
+        .await
+        .expect("response");
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "typo'd severity must be a param error: {response}"
+    );
+    let message = response["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("CRITICAL") && message.contains("eror"),
+        "error must list the vocabulary and echo the rejected value: {message}"
+    );
 }
 
 #[tokio::test]
@@ -728,17 +855,32 @@ async fn find_by_kind_returns_matching_entities_with_sei_field() {
         ents[0].get("sei").is_some(),
         "entity rows must carry sei: {env}"
     );
+    assert!(
+        env["result"].get("known_kinds").is_none(),
+        "known_kinds is an unknown-kind hint, not a constant payload: {env}"
+    );
 }
 
 #[tokio::test]
-async fn find_by_kind_unknown_kind_is_empty_not_error() {
+async fn find_by_kind_unknown_kind_is_empty_with_known_kinds_hint() {
+    // clarion-c137d73ebf: kinds are plugin-owned (an OPEN set, unlike finding
+    // filters) so an unknown kind cannot be rejected up front — but the empty
+    // result must be distinguishable from "kind exists, no matches in scope".
+    // When the kind matches zero entities project-wide the result carries the
+    // kinds the index actually holds.
     let (project, db, conn) = open_project();
     insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    insert_entity(&conn, "python:class:C", "class", "c.py", Some((1, 2)));
     drop(conn);
     let state = state_for(project.path(), &db);
     let env = call_tool(&state, "find_by_kind", json!({"kind": "nonesuch"})).await;
     assert_eq!(env["ok"], true, "{env}");
     assert_eq!(env["result"]["page"]["total"], 0);
+    assert_eq!(
+        env["result"]["known_kinds"],
+        json!(["class", "function"]),
+        "empty-by-unknown-kind must list the kinds the index holds: {env}"
+    );
 }
 
 #[tokio::test]

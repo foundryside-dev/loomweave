@@ -952,6 +952,20 @@ pub fn entities_by_kind(
     collect_capped(rows, scan_cap)
 }
 
+/// The distinct entity kinds present in the index, ordered. Kinds are
+/// plugin-owned (ADR-003/ADR-022) — an open set with no central registry — so
+/// the only honest enumeration is what the `entities` table actually holds.
+/// Feeds the kind-facet's unknown-kind hint (clarion-c137d73ebf).
+pub fn known_entity_kinds(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT kind FROM entities ORDER BY kind")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 /// Faceted catalog query: entities carrying `tag` (any plugin's
 /// `entity_tags.tag`), ordered by id, materialised up to `scan_cap`. Returns
 /// `(rows, scan_truncated)`. A blank tag is rejected; an unknown tag matches no

@@ -109,6 +109,16 @@ impl ServerState {
                         }
                         Err(err) => return Err(err),
                     };
+                // An unknown kind "matches no rows" by design (kinds are
+                // plugin-owned, an open set), but a silent empty is
+                // indistinguishable from "kind exists, nothing in scope" — so
+                // when the kind matches zero entities project-wide, hint with
+                // the kinds the index actually holds (clarion-c137d73ebf).
+                let known_kinds = if candidates.is_empty() {
+                    Some(loomweave_storage::known_entity_kinds(conn)?)
+                } else {
+                    None
+                };
                 let mut response = finalize_entity_page(
                     conn,
                     &project_root,
@@ -118,6 +128,11 @@ impl ServerState {
                     scan_truncated,
                 );
                 attach_facet(&mut response, json!({ "kind": kind }));
+                if let Some(kinds) = known_kinds
+                    && let Some(object) = response.as_object_mut()
+                {
+                    object.insert("known_kinds".to_owned(), json!(kinds));
+                }
                 Ok(success_envelope(response))
             })
             .await;
