@@ -742,10 +742,10 @@ What Loomweave carries from Wardline **today** is the taint-fact store and
 qualname-reconciled findings (see [§Wardline taint-fact store](#wardline-taint-fact-store-sp9)
 and [§Wardline qualname normalization](#wardline-qualname-normalization-entity-reconciliation)) —
 verbatim, no re-judgement. The `WardlineMeta` entity-property carriage of
-`declared_tier`/`declared_groups` from `wardline.yaml` (detailed-design §2) is a
-**designed-but-unbuilt v1.0 path**, not WS9 scope; WS9 owns nothing new and adds
-no adjudication. That carriage gap is pre-existing and tracked separately, not
-introduced or closed here.
+`declared_tier`/`declared_groups` from `wardline.yaml` (detailed-design §2) was a
+**designed-but-unbuilt v1.0 path** whose input format Wardline never produced;
+it was retired 2026-06-11 (clarion-7c9336163e, see requirements.md
+REQ-GUIDANCE-04 retirement note). WS9 owns nothing new and adds no adjudication.
 
 ## Path normalization
 

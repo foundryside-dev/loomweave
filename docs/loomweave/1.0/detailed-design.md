@@ -1071,8 +1071,8 @@ integrations:
     emit_findings: true              # opt-in (default false): POSTs findings to POST /api/v1/scan-results (Filigree-native schema; see §7). One-way egress, decoupled from `enabled` so turning on read enrichment never silently starts outbound emission.
   wardline:
     enabled: true
-    manifest_path: "wardline.yaml"
-    overlay_search: "src/**/wardline.overlay.yaml"
+    # manifest_path / overlay_search keys retired 2026-06-11 (clarion-7c9336163e):
+    # Wardline never produced a wardline.yaml manifest; the ingest was removed.
     ingest_only: true                # v0.1; v0.2 consumes wardline's findings
 ```
 
@@ -1370,9 +1370,11 @@ What moves in v0.2 is *who owns the Wardline-specific mapping*, not whether SARI
 
 Wardline persists ten state files beyond `wardline.yaml`. Recon identified each; v0.1 decision per file:
 
+> **Retirement note (2026-06-11, clarion-7c9336163e)**: the `wardline.yaml` manifest (and its fingerprint/exceptions/overlay companions) turned out not to exist — current Wardline neither reads nor writes it, and no commit in Wardline's history ever produced the tiers/boundaries/groups shape this recon assumed. The rows marked YES below were implemented as `wardline_guidance.rs` and have been removed as a dormant ingest. The table is retained as the historical recon record.
+
 | File | v0.1 ingest | Rationale |
 |---|---|---|
-| `wardline.yaml` | YES | Already in scope (manifest: tiers, boundaries, groups). |
+| `wardline.yaml` | ~~YES~~ retired | Already in scope (manifest: tiers, boundaries, groups). |
 | Overlays matching `src/**/wardline.overlay.yaml` | YES | Already in scope; supplementary group-1 and group-17 boundary declarations. |
 | `wardline.fingerprint.json` | YES | Authoritative per-function state — aligns directly with Loomweave's entity model. |
 | `wardline.exceptions.json` | YES | Excepted-finding register with expiry. Loomweave tags affected entities with `wardline.excepted` so agents see "this has an active exception, don't flag further" as part of the briefing. |
@@ -1735,7 +1737,7 @@ For v0.1 through at least v0.3, each tool's store remains its own concern. Revis
 | **Subsystem** | Semantically-grouped cluster of modules, derived by clustering + LLM synthesis. |
 | **Summary cache** | Keyed by `(entity, content_hash, template, model_tier, guidance_fingerprint)`; stores generated briefings. |
 | **Taint analysis** | Dataflow tracking of tier classifications; **Wardline's responsibility, not Loomweave's**. |
-| **Tier** | Wardline classification. Canonical names (manifest-configurable in `wardline.yaml:tiers`): `INTEGRAL`, `ASSURED`, `GUARDED`, `EXTERNAL_RAW`. Plus `UNKNOWN` and `MIXED` as computed transient states. Loomweave preserves these names verbatim in briefing vocabulary and entity `wardline.declared_tier` property. |
+| **Tier** | Wardline classification. Canonical names: `INTEGRAL`, `ASSURED`, `GUARDED`, `EXTERNAL_RAW`. Plus `UNKNOWN` and `MIXED` as computed transient states. Loomweave preserves these names verbatim in briefing vocabulary and entity `wardline.declared_tier` property. (Tier names reach Loomweave via the taint-fact store; the `wardline.yaml:tiers` manifest-configuration path was retired 2026-06-11, clarion-7c9336163e.) |
 | **Writer-actor** | Concurrency pattern: a single Tokio task owns the sole SQLite write connection; all other tasks submit mutations through a bounded `mpsc` channel. See §3. |
 | **Knowledge basis** | EntityBriefing field indicating the evidence class a briefing rests on: `static_only`, `runtime_informed`, or `human_verified`. |
 | **Content-Length framing** | JSON-RPC message framing used by the plugin protocol — the same mechanism LSP uses. `Content-Length: <n>\r\n\r\n<json>`. Required for binary-safe streams and crash-resumability. See §1. |

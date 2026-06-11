@@ -121,30 +121,17 @@ lexical expiry compare is correct. Unparseable input is rejected at create time.
 The read path excludes expired sheets from composition; analyze also surfaces
 them as a finding (below).
 
-## Wardline-derived guidance (`REQ-GUIDANCE-04`)
+## Wardline-derived guidance (`REQ-GUIDANCE-04`) — retired
 
-When `wardline.yaml` is present, `loomweave analyze` generates deterministic,
-pinned guidance sheets from the Wardline bundle:
-
-- `core:guidance:wardline-tier-<name>`
-- `core:guidance:wardline-boundary-<name>`
-- `core:guidance:wardline-annotation-group-<name>`
-
-The parser accepts real Wardline output (`tiers: [...]`, `module_tiers: [...]`,
-`wardline.fingerprint.json`, `wardline.exceptions.json`, and
-`**/wardline.overlay.yaml`) plus the earlier guidance-map shape with `paths`,
-optional `content`, optional `scope_level`, and optional explicit
-`match_rules`. The bundle hash folds in the root manifest, fingerprint baseline,
-exceptions register, and overlay boundary files, so drift in any governance
-artifact can make preserved overrides reviewable. Generated sheets carry
-`provenance: wardline_derived`, `pinned: true`, `wardline_manifest_hash`,
-artifact hash/count metadata, and a generated-signature guard.
-
-If an operator edits a generated sheet, the next analyze preserves the edit and
-marks the sheet `provenance: wardline_derived_overridden`. If the Wardline
-bundle changes while an override remains in place, analyze emits
-`LMWV-FACT-GUIDANCE-STALE` so the override can be reviewed instead of silently
-overwritten.
+This feature was removed 2026-06-11 (clarion-7c9336163e). It generated pinned
+guidance sheets from a `wardline.yaml` manifest (tiers / boundary contracts /
+annotation groups plus fingerprint/exceptions/overlay artifacts) — a format
+Wardline never actually produced (its config is `weft.toml [wardline]`; its
+published vocabulary artifact is the decorator descriptor under
+`.weft/wardline/`). The ingest never fired on a real project. Any
+`core:guidance:wardline-*` sheets in an old store are inert leftovers and can
+be deleted with `loomweave guidance delete <id>`. The
+`LMWV-FACT-GUIDANCE-STALE` finding was retired with it.
 
 ## Staleness
 
@@ -170,7 +157,6 @@ the guidance sheet). See `detailed-design.md` §5 for the canonical catalogue.
 |---|---|---|
 | `LMWV-FACT-GUIDANCE-ORPHAN` | WARN | The sheet's `guides` edge **or** a `match_rules` `entity:<id>` rule points at an entity deleted between runs. The sheet's guidance is stranded. |
 | `LMWV-FACT-GUIDANCE-EXPIRED` | INFO | The sheet's `expires` instant is in the past. The read path already excludes it from composition; this surfaces the state operatively (the sheet is not deleted). |
-| `LMWV-FACT-GUIDANCE-STALE` | WARN | A Wardline-derived override carries an older `wardline_manifest_hash` than the current Wardline bundle. |
 | `LMWV-FACT-GUIDANCE-CHURN-STALE` | WARN (confidence 0.7) | The aggregate `git_churn_count` over the sheet's matched entities meets the staleness threshold (50; 20 for `pinned: true` sheets). |
 
 > **`LMWV-FACT-GUIDANCE-CHURN-STALE` is currently inert.** It is emitted only

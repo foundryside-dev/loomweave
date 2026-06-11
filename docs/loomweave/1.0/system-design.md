@@ -55,7 +55,7 @@ flowchart LR
     Loomweave -.->|"observations"| Filigree
     Filigree -.->|"triage state<br/>(read-only)"| Loomweave
 
-    Wardline -->|"wardline.yaml<br/>+ fingerprint + exceptions<br/>+ SARIF baseline"| Loomweave
+    Wardline -->|"taint facts + findings<br/>(qualname-reconciled)"| Loomweave
     Wardline -->|"REGISTRY<br/>(direct import)"| Loomweave
     Wardline -.->|"SARIF → Filigree<br/>via loomweave sarif import (v0.1)"| Filigree
 
@@ -108,7 +108,7 @@ flowchart TB
 Loomweave's integration posture is **enrich-only**. Loomweave works standalone (NFR-RELIABILITY-02's `--no-filigree` and `--no-wardline`); with siblings present, Loomweave's briefings, guidance, and findings gain context. No sibling is required for Loomweave's own data to be coherent.
 
 - **Filigree** (enrich-only). Loomweave emits findings and observations to Filigree; Loomweave reads Filigree's triage state (`REQ-BRIEFING-05`) to enrich briefings. Filigree's absence degrades Loomweave to local-only finding writes — semantics intact, convenience reduced.
-- **Wardline** (enrich-only). Loomweave ingests `wardline.yaml` + overlays + fingerprint + exceptions at analyse time; imports `wardline.core.registry.REGISTRY` at plugin startup. Wardline's absence degrades Loomweave's annotations to "confidence_basis: loomweave_augmentation" — Loomweave still extracts what the code declares, it just doesn't cross-check against Wardline's canonical vocabulary.
+- **Wardline** (enrich-only). Loomweave carries Wardline's taint facts and qualname-reconciled findings, and reads the NG-25 decorator-vocabulary descriptor (`.weft/wardline/vocabulary.yaml`) as a plain on-disk file at extract time. Wardline's absence degrades Loomweave's annotations to "confidence_basis: loomweave_augmentation" — Loomweave still extracts what the code declares, it just doesn't cross-check against Wardline's canonical vocabulary. *(The original `wardline.yaml` + overlays + fingerprint + exceptions ingest described here was retired 2026-06-11 — Wardline never produced that format; see requirements.md REQ-GUIDANCE-04 retirement note, clarion-7c9336163e.)*
 - **Shuttle** (not yet). Scope explicitly disclaimed (NG-07). Loomweave does not execute changes.
 
 ### What Loomweave is NOT
@@ -694,22 +694,22 @@ flowchart TB
 | CLI | `loomweave guidance list [--for-entity <id>]` / `--stale` / `--expired` |
 | MCP | `propose_guidance(entity_id, content, match_rules)` — produces a Filigree **observation**, not a sheet |
 | CLI | `loomweave guidance promote <filigree_obs_id>` — promotes observation to sheet |
-| Wardline | Automatic on every `loomweave analyze` with `wardline.yaml` present |
+| Wardline | ~~Automatic on every `loomweave analyze` with `wardline.yaml` present~~ — retired 2026-06-11 (clarion-7c9336163e; Wardline never produced the manifest) |
 | Export / import | `loomweave guidance export --to <dir>` / `loomweave guidance import <dir>` |
 
 The `propose_guidance` → observation → explicit promote flow is the v0.1 defence against guidance-poisoning via adversarial LLM output (`NFR-SEC-02`). A single compromised LLM call cannot poison every future prompt because promotion requires operator action.
 
 ### Wardline-derived guidance
 
-On every `loomweave analyze` run with `wardline.yaml` present:
+> **Retired 2026-06-11** (clarion-7c9336163e). The design below assumed Wardline publishes a `wardline.yaml` manifest carrying tiers / boundary contracts / annotation groups. Wardline never produced that format (verified against its HEAD and full history; its config is `weft.toml [wardline]`, its vocabulary artifact is the NG-25 decorator descriptor). The ingest, the derived-sheet generator, and the `LMWV-FACT-GUIDANCE-STALE` drift finding were dormant on every real project and have been removed. Historical sketch retained below for the record.
+
+*Original (historical) text*: On every `loomweave analyze` run with `wardline.yaml` present:
 
 - **Per declared tier assignment** → module-scope sheet: "This module contains declared Tier-N entities (list). Summaries should reflect Tier-N posture."
 - **Per boundary contract** → subsystem-scope sheet: "Data crossing boundary `<contract>` carries Tier N; downstream users must not …"
 - **Per annotation group in use** → project-scope sheet referencing wardline's §7 paragraph for that group.
 
-All auto-generated sheets tagged `provenance: wardline_derived`, `pinned: true`. Regenerated every analyse; user-edited overrides preserved by ID and marked `provenance: wardline_derived_overridden`.
-
-Drift between `wardline.yaml` and derived guidance (Wardline runs at commit cadence; Loomweave at batch cadence) surfaces as `LMWV-FACT-GUIDANCE-STALE` finding.
+All auto-generated sheets tagged `provenance: wardline_derived`, `pinned: true`. Regenerated every analyse; user-edited overrides preserved by ID and marked `provenance: wardline_derived_overridden`. Drift between `wardline.yaml` and derived guidance surfaces as `LMWV-FACT-GUIDANCE-STALE` finding.
 
 ### Staleness signals tied to code churn
 
@@ -948,9 +948,9 @@ Loomweave → `metadata.loomweave.*`. Wardline SARIF-translated findings → `me
 
 | File | v0.1 ingest | Use |
 |---|---|---|
-| `wardline.yaml` + overlays | YES | Tier declarations, boundary contracts, group assignments → entity `WardlineMeta` + auto-derived guidance |
-| `wardline.fingerprint.json` | YES | Per-function annotation hash + qualname → `WardlineMeta.annotation_hash`, `wardline_qualname` |
-| `wardline.exceptions.json` | YES | Active exceptions → entities tagged `wardline.excepted` |
+| `wardline.yaml` + overlays | ~~YES~~ retired | Was: tier/boundary/group declarations → `WardlineMeta` + auto-derived guidance. Wardline never produced this file; ingest removed 2026-06-11 (clarion-7c9336163e) |
+| `wardline.fingerprint.json` | ~~YES~~ retired | Was part of the same manifest-bundle ingest; removed with it 2026-06-11 (clarion-7c9336163e) |
+| `wardline.exceptions.json` | ~~YES~~ retired | Was part of the same manifest-bundle ingest; removed with it 2026-06-11 (clarion-7c9336163e) |
 | `wardline.sarif.baseline.json` | YES (read-only) | Source for SARIF→Filigree translator |
 | Other Wardline state files (compliance, conformance, perimeter, retrospective) | NO (v0.2) | Not yet relevant to Loomweave's catalog shape |
 

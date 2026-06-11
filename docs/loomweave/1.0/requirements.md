@@ -308,11 +308,9 @@ Operators author guidance via CLI (`loomweave guidance create/edit/list/show/del
 
 #### REQ-GUIDANCE-04 — Wardline-derived guidance
 
-On every `loomweave analyze` run with `wardline.yaml` present, Loomweave auto-generates `provenance: wardline_derived` guidance sheets for declared tier assignments, boundary contracts, and annotation groups in use. Auto-generated sheets carry `pinned: true`. User edits are preserved (`provenance: wardline_derived_overridden`) across regenerations.
+> **Retired 2026-06-11** (clarion-7c9336163e). This requirement assumed Wardline publishes a `wardline.yaml` manifest (tiers / boundary contracts / annotation groups) plus `wardline.fingerprint.json` / `wardline.exceptions.json` / `wardline.overlay.yaml` artifacts. Verified against Wardline HEAD and its full git history: Wardline never produced that format — its config is `weft.toml [wardline]` (no tier/boundary/group vocabulary), and its only published vocabulary artifact is the NG-25 decorator descriptor (`.weft/wardline/vocabulary.yaml`), which carries decorator names/groups/attrs, not guidance-sheet material. The ingest (`wardline_guidance.rs`), its analyze hook, and the `LMWV-FACT-GUIDANCE-STALE` staleness signal were dormant on every real project and have been removed. If Wardline ever publishes a guidance-bearing manifest, a successor requirement should be written against that real contract.
 
-**Rationale**: Wardline declarations (tiers, contracts) are project-wide institutional knowledge Loomweave already reads at analysis time. Regenerating the corresponding guidance sheets eliminates the manual labour of keeping them in sync with `wardline.yaml`; preserving user edits respects operator curation.
-**Verification**: Fixture with `wardline.yaml` produces auto-derived sheets on first run; edit a sheet; re-run; assert the edit is preserved and flagged `wardline_derived_overridden`.
-**See**: System Design §7 (Guidance System, Wardline-derived).
+*Original (historical) text*: On every `loomweave analyze` run with `wardline.yaml` present, Loomweave auto-generates `provenance: wardline_derived` guidance sheets for declared tier assignments, boundary contracts, and annotation groups in use. Auto-generated sheets carry `pinned: true`. User edits are preserved (`provenance: wardline_derived_overridden`) across regenerations.
 
 #### REQ-GUIDANCE-05 — Staleness signals tied to code churn
 
@@ -754,6 +752,8 @@ Loomweave's Python plugin imports `wardline.core.registry.REGISTRY` at startup a
 #### REQ-INTEG-WARDLINE-02 — Manifest + overlay ingest
 
 > **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B Wardline-config ingest). v1.0 ships only the [REQ-INTEG-WARDLINE-01](#req-integ-wardline-01--direct-registry-import-with-version-pin) runtime REGISTRY probe; state-file ingest (`wardline.yaml` + overlays) lands with the Wardline read-side bundle in v1.1.
+>
+> **Input-format caveat (2026-06-11, clarion-7c9336163e)**: current Wardline does not produce a `wardline.yaml` manifest at all (config is `weft.toml [wardline]`; the published vocabulary artifact is the NG-25 decorator descriptor). Any v1.1 revival of this requirement must first re-derive the input contract from what Wardline actually publishes — see the REQ-GUIDANCE-04 retirement note above for the evidence.
 
 Loomweave reads `wardline.yaml` and overlay files matching `src/**/wardline.overlay.yaml` at analyse time; declared tiers, groups, and boundary contracts become `WardlineMeta` properties on affected entities.
 

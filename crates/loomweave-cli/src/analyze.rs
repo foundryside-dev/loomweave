@@ -82,10 +82,6 @@ const GUIDANCE_EXPIRED_RULE_ID: &str = "LMWV-FACT-GUIDANCE-EXPIRED";
 /// churn-history pipeline (clarion-997c93ec4e) populates `git_churn_count`.
 const GUIDANCE_CHURN_STALE_RULE_ID: &str = "LMWV-FACT-GUIDANCE-CHURN-STALE";
 
-/// REQ-GUIDANCE-05 (WS6 T4): a Wardline-derived guidance sheet was preserved as
-/// an operator override while `wardline.yaml` changed underneath it.
-const GUIDANCE_STALE_RULE_ID: &str = "LMWV-FACT-GUIDANCE-STALE";
-
 /// Aggregate `git_churn_count` (summed over a sheet's matched entities) at or above
 /// which a non-pinned sheet is flagged `LMWV-FACT-GUIDANCE-CHURN-STALE`.
 const CHURN_STALE_THRESHOLD: i64 = 50;
@@ -117,7 +113,6 @@ const POST_RUN_FINDING_RULES: &[&str] = &[
     GUIDANCE_ORPHAN_RULE_ID,
     GUIDANCE_EXPIRED_RULE_ID,
     GUIDANCE_CHURN_STALE_RULE_ID,
-    GUIDANCE_STALE_RULE_ID,
     TIER_MIXING_RULE_ID,
     TIER_UNANIMOUS_RULE_ID,
 ];
@@ -1386,25 +1381,6 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     "tier-subsystem findings skipped (run already committed successfully)"
                 ),
             }
-            // REQ-GUIDANCE-04: when `wardline.yaml` is present, keep the
-            // generated guidance sheets in sync before evaluating guidance
-            // staleness. Operator edits are preserved as
-            // `wardline_derived_overridden`, so the following staleness pass can
-            // surface manifest drift instead of overwriting human review.
-            match crate::wardline_guidance::sync_wardline_guidance(&db_path, &project_root) {
-                Ok(stats) if stats.generated > 0 || stats.overridden > 0 => tracing::info!(
-                    run_id = %run_id,
-                    wardline_guidance_generated = stats.generated,
-                    wardline_guidance_overridden = stats.overridden,
-                    "Wardline-derived guidance synced"
-                ),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(
-                    run_id = %run_id,
-                    error = %e,
-                    "Wardline-derived guidance skipped (run already committed successfully)"
-                ),
-            }
             let mcp_config = load_mcp_config(&project_root, options.config_path.as_deref());
             match crate::serve::build_embedding_provider(&mcp_config.semantic_search, |name| {
                 std::env::var(name).ok()
@@ -2151,8 +2127,6 @@ fn guidance_orphan_finding(
 /// - **`LMWV-FACT-GUIDANCE-CHURN-STALE`** — the aggregate `git_churn_count` over the
 ///   sheet's matched entities meets the staleness threshold (asymmetric: 20 for
 ///   `pinned` sheets, 50 otherwise).
-/// - **`LMWV-FACT-GUIDANCE-STALE`** — a Wardline-derived override still carries
-///   the old `wardline.yaml` manifest hash after the manifest changed.
 ///
 /// Runs post-`CommitRun`, unconditionally (NOT gated on the SEI pass or on
 /// deletions) — see the call site. Deterministic: sheets in
@@ -2167,11 +2141,6 @@ fn guidance_orphan_finding(
 /// deliberately unused here because no real delta is computable.
 enum PendingGuidanceStaleness {
     Expired(String),
-    WardlineStale {
-        sheet_id: String,
-        stored_manifest_hash: String,
-        current_manifest_hash: String,
-    },
     ChurnStale {
         sheet_id: String,
         agg: i64,
@@ -2184,7 +2153,6 @@ fn plan_guidance_staleness_findings(
     project_root: &Path,
     now: &str,
 ) -> anyhow::Result<Vec<PendingGuidanceStaleness>> {
-    let current_wardline_hash = crate::wardline_guidance::current_manifest_hash(project_root)?;
     let conn = Connection::open(db_path)
         .context("open read connection for guidance-staleness findings")?;
     let canonical_root = project_root
@@ -2220,21 +2188,6 @@ fn plan_guidance_staleness_findings(
             && expires < now
         {
             plan.push(PendingGuidanceStaleness::Expired(sheet.id.clone()));
-        }
-
-        if let Some(current_hash) = current_wardline_hash.as_deref()
-            && crate::wardline_guidance::is_wardline_derived(&sheet.properties)
-            && let Some(stored_hash) = sheet
-                .properties
-                .get("wardline_manifest_hash")
-                .and_then(serde_json::Value::as_str)
-            && stored_hash != current_hash
-        {
-            plan.push(PendingGuidanceStaleness::WardlineStale {
-                sheet_id: sheet.id.clone(),
-                stored_manifest_hash: stored_hash.to_owned(),
-                current_manifest_hash: current_hash.to_owned(),
-            });
         }
 
         // CHURN-STALE: aggregate churn over matched entities vs asymmetric
@@ -2297,17 +2250,6 @@ async fn emit_guidance_staleness_findings(
             PendingGuidanceStaleness::Expired(sheet_id) => {
                 guidance_expired_finding(sheet_id, run_id, now)
             }
-            PendingGuidanceStaleness::WardlineStale {
-                sheet_id,
-                stored_manifest_hash,
-                current_manifest_hash,
-            } => guidance_stale_finding(
-                sheet_id,
-                stored_manifest_hash,
-                current_manifest_hash,
-                run_id,
-                now,
-            ),
             PendingGuidanceStaleness::ChurnStale {
                 sheet_id,
                 agg,
@@ -2345,42 +2287,6 @@ fn guidance_expired_finding(guidance_id: &str, run_id: &str, now: &str) -> Findi
         related_entities_json: "[]".to_owned(),
         message: format!("Guidance sheet {guidance_id} is past its `expires` instant"),
         evidence_json: serde_json::json!({ "guidance_id": guidance_id }).to_string(),
-        properties_json: "{}".to_owned(),
-        supports_json: "[]".to_owned(),
-        supported_by_json: "[]".to_owned(),
-        created_at: now.to_owned(),
-        updated_at: now.to_owned(),
-    }
-}
-
-fn guidance_stale_finding(
-    guidance_id: &str,
-    stored_manifest_hash: &str,
-    current_manifest_hash: &str,
-    run_id: &str,
-    now: &str,
-) -> FindingRecord {
-    FindingRecord {
-        id: format!("core:finding:guidance-stale:{guidance_id}"),
-        tool: "loomweave".to_owned(),
-        tool_version: env!("CARGO_PKG_VERSION").to_owned(),
-        run_id: run_id.to_owned(),
-        rule_id: GUIDANCE_STALE_RULE_ID.to_owned(),
-        kind: "fact".to_owned(),
-        severity: "WARN".to_owned(),
-        confidence: Some(1.0),
-        confidence_basis: Some("Wardline manifest hash drift".to_owned()),
-        entity_id: guidance_id.to_owned(),
-        related_entities_json: "[]".to_owned(),
-        message: format!(
-            "Wardline-derived guidance sheet {guidance_id} is stale relative to wardline.yaml"
-        ),
-        evidence_json: serde_json::json!({
-            "guidance_id": guidance_id,
-            "stored_manifest_hash": stored_manifest_hash,
-            "current_manifest_hash": current_manifest_hash,
-        })
-        .to_string(),
         properties_json: "{}".to_owned(),
         supports_json: "[]".to_owned(),
         supported_by_json: "[]".to_owned(),
