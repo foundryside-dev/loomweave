@@ -2367,35 +2367,390 @@ async fn entity_resolve_collapses_briefing_blocked_rust_candidate_to_stub() {
 }
 
 #[tokio::test]
-async fn entity_resolve_rejects_non_function_kind() {
-    // kind-param validation: only "function" (or null) is accepted; any other
-    // value is a JSON-RPC param error (-32602), not a tool envelope.
+async fn entity_resolve_rejects_blank_kind_and_blank_plugin() {
+    // clarion-c2bb394f46: `kind` and `plugin` are free-form constraints, but a
+    // BLANK value is a caller bug — JSON-RPC param error (-32602), mirroring
+    // the HTTP layer's blank-rejection adjudication (ADR-036 plugin hint).
     let (project, db, _conn) = open_project();
     let state = state_for(project.path(), &db);
 
-    let response = state
-        .handle_json_rpc(&json!({
-            "jsonrpc": "2.0",
-            "id": "bad-kind",
-            "method": "tools/call",
-            "params": {
-                "name": "entity_resolve",
-                "arguments": {"qualnames": ["demo.entry"], "kind": "class"}
-            }
-        }))
-        .await
-        .expect("response");
+    for (param, value) in [("kind", "  "), ("plugin", "")] {
+        let response = state
+            .handle_json_rpc(&json!({
+                "jsonrpc": "2.0",
+                "id": "blank-param",
+                "method": "tools/call",
+                "params": {
+                    "name": "entity_resolve",
+                    "arguments": {"qualnames": ["demo.entry"], param: value}
+                }
+            }))
+            .await
+            .expect("response");
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "blank {param} must be a JSON-RPC param error: {response}"
+        );
+    }
+}
 
-    assert_eq!(
-        response["error"]["code"], -32602,
-        "non-function kind must be a JSON-RPC param error: {response}"
+// ---- entity_resolve all-kinds + SEI + plugin hint (clarion-c2bb394f46) ----
+
+#[tokio::test]
+async fn entity_resolve_resolves_class_qualname_to_id_and_sei() {
+    // The reverse-map is no longer function-only: a class qualname resolves to
+    // its identity row.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:class:demo.Widget",
+        "class",
+        "demo.py",
+        Some((1, 9)),
     );
+    insert_alive_sei(
+        &conn,
+        "loomweave:eid:demo-widget",
+        "python:class:demo.Widget",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["demo.Widget"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results[0]["result_kind"], "resolved");
+    let candidate = &results[0]["candidates"][0];
+    assert_eq!(candidate["id"], "python:class:demo.Widget");
+    assert_eq!(candidate["sei"], "loomweave:eid:demo-widget");
+    assert_eq!(candidate["kind"], "class");
+}
+
+#[tokio::test]
+async fn entity_resolve_resolves_rust_struct_qualname() {
+    let (project, db, conn) = open_project();
+    insert_entity_named(
+        &conn,
+        "rust:struct:mcp_fixture.ops.Widget",
+        "struct",
+        "ops.rs",
+        Some((1, 9)),
+        "Widget",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["mcp_fixture.ops.Widget"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results[0]["result_kind"], "resolved");
+    assert_eq!(
+        results[0]["candidates"][0]["id"],
+        "rust:struct:mcp_fixture.ops.Widget"
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_cross_kind_collision_is_ambiguous_and_kind_constrains() {
+    // The same qualname as a python function AND class: honest ambiguous by
+    // default (sorted class < function); kind="class" collapses it; an unknown
+    // kind is a constraint nothing satisfies (unresolved, not an error).
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:demo.thing",
+        "function",
+        "demo.py",
+        Some((1, 2)),
+    );
+    insert_entity(
+        &conn,
+        "python:class:demo.thing",
+        "class",
+        "demo.py",
+        Some((4, 9)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["demo.thing"]}),
+    )
+    .await;
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results[0]["result_kind"], "ambiguous", "{env}");
+    let ids: Vec<&str> = results[0]["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["python:class:demo.thing", "python:function:demo.thing"],
+        "both kinds, sorted: {env}"
+    );
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["demo.thing"], "kind": "class"}),
+    )
+    .await;
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results[0]["result_kind"], "resolved", "{env}");
+    assert_eq!(results[0]["candidates"][0]["id"], "python:class:demo.thing");
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["demo.thing"], "kind": "nosuch"}),
+    )
+    .await;
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(
+        results[0]["result_kind"], "unresolved",
+        "unknown kind is honest-empty, not an error: {env}"
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_plugin_hint_constrains_cross_plugin_collision() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:dual.target",
+        "function",
+        "dual.py",
+        Some((1, 2)),
+    );
+    insert_entity_named(
+        &conn,
+        "rust:function:dual.target",
+        "function",
+        "dual.rs",
+        Some((1, 2)),
+        "target",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["dual.target"], "plugin": "python"}),
+    )
+    .await;
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results[0]["result_kind"], "resolved", "{env}");
+    assert_eq!(
+        results[0]["candidates"][0]["id"],
+        "python:function:dual.target"
+    );
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["dual.target"], "plugin": "cobol"}),
+    )
+    .await;
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(
+        results[0]["result_kind"], "unresolved",
+        "unknown plugin is a constraint nothing satisfies: {env}"
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_accepts_sei_entry_ignoring_constraints() {
+    // An SEI token in the batch is an exact identity lookup: it resolves to
+    // its alive entity row, and kind/plugin constraints do NOT apply (an SEI
+    // is already exact — constraining it can only manufacture a false miss).
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:demo.entry",
+        "function",
+        "demo.py",
+        Some((1, 2)),
+    );
+    insert_alive_sei(
+        &conn,
+        "loomweave:eid:demo-entry",
+        "python:function:demo.entry",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["loomweave:eid:demo-entry"], "kind": "class"}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(
+        results[0]["qualname"], "loomweave:eid:demo-entry",
+        "echoes the input as given: {env}"
+    );
+    assert_eq!(results[0]["result_kind"], "resolved", "{env}");
+    let candidate = &results[0]["candidates"][0];
+    assert_eq!(candidate["id"], "python:function:demo.entry");
+    assert_eq!(candidate["sei"], "loomweave:eid:demo-entry");
+}
+
+#[tokio::test]
+async fn entity_resolve_mixed_sei_and_qualname_batch_preserves_order() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:a.one",
+        "function",
+        "a.py",
+        Some((1, 2)),
+    );
+    insert_entity(
+        &conn,
+        "python:function:b.two",
+        "function",
+        "b.py",
+        Some((1, 2)),
+    );
+    insert_alive_sei(&conn, "loomweave:eid:a-one", "python:function:a.one");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["b.two", "loomweave:eid:a-one", "missing.x"]}),
+    )
+    .await;
+
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["qualname"], "b.two");
+    assert_eq!(results[0]["candidates"][0]["id"], "python:function:b.two");
+    assert_eq!(results[1]["qualname"], "loomweave:eid:a-one");
+    assert_eq!(results[1]["candidates"][0]["id"], "python:function:a.one");
+    assert_eq!(results[2]["qualname"], "missing.x");
+    assert_eq!(results[2]["result_kind"], "unresolved");
+}
+
+#[tokio::test]
+async fn entity_resolve_unknown_sei_is_unresolved_not_error() {
+    let (project, db, _conn) = open_project();
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["loomweave:eid:never-minted"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "honest-empty, not an error: {env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results[0]["result_kind"], "unresolved");
+    assert_eq!(
+        results[0]["candidates"]
+            .as_array()
+            .expect("candidates")
+            .len(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_blocked_sei_entry_collapses_to_stub() {
+    // The non-disclosure property holds on the SEI path too: an SEI whose
+    // entity is secret-scan-blocked resolves to the redacted stub, never
+    // leaking the locator.
+    let (project, db, conn) = open_project();
+    insert_blocked_entity(
+        &conn,
+        "python:function:secret.handler",
+        "function",
+        "secret.py",
+        Some((1, 2)),
+        "secret_in_source",
+    );
+    insert_alive_sei(
+        &conn,
+        "loomweave:eid:secret",
+        "python:function:secret.handler",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["loomweave:eid:secret"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results[0]["result_kind"], "resolved");
+    assert_redacted_identity(&results[0]["candidates"][0], "secret_in_source");
     assert!(
-        response["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("kind must be \"function\""),
-        "param error names the kind constraint: {response}"
+        !env.to_string().contains("python:function:secret.handler"),
+        "blocked locator leaked via SEI entry: {env}"
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_normalizes_rust_path_separator() {
+    // MCP-audit F6 acceptance criterion: a pasted Rust `::` path (stack trace,
+    // compiler error, rustdoc) resolves — `::` normalizes to `.` for
+    // resolution while the result echoes the input as given. Storage stays
+    // byte-exact; normalization is this tool's input courtesy only.
+    let (project, db, conn) = open_project();
+    insert_entity_named(
+        &conn,
+        "rust:function:mcp_fixture.ops.entry",
+        "function",
+        "ops.rs",
+        Some((1, 2)),
+        "entry",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["mcp_fixture::ops::entry"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(
+        results[0]["qualname"], "mcp_fixture::ops::entry",
+        "echoes the :: form as pasted: {env}"
+    );
+    assert_eq!(results[0]["result_kind"], "resolved", "{env}");
+    assert_eq!(
+        results[0]["candidates"][0]["id"],
+        "rust:function:mcp_fixture.ops.entry"
     );
 }
 

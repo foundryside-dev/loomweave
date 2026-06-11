@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use loomweave_core::McpErrorCode;
 use loomweave_storage::{
     MatchFacts, Resolution, RuleVerdict, entity_by_id, get_taint_facts, resolve_entity_ref,
-    resolve_wardline_qualnames, rule_match, sei_for_locator,
+    resolve_qualnames_all_kinds, rule_match, sei::is_reserved_sei, sei_for_locator,
 };
 
 use crate::ParamError;
@@ -406,22 +406,38 @@ impl ServerState {
         Ok(flatten_storage_envelope_result(result))
     }
 
-    /// `entity_resolve` — batch-resolve dotted qualnames to entity ids + SEIs,
-    /// the inverse of the id-taking tools.
+    /// `entity_resolve` — batch-resolve pasted identifiers (dotted qualnames,
+    /// Rust `::` paths, SEI tokens) to entity ids + SEIs, the inverse of the
+    /// id-taking tools (clarion-c2bb394f46).
     ///
-    /// Reuses the Wardline exact-tier resolver (`resolve_wardline_qualnames`,
-    /// ADR-036) and projects each hit through [`crate::entity_json`] so a
-    /// candidate carries its SEI (ADR-038, stable entity identity) and a
-    /// secret-scan-blocked entity collapses to the blocked stub — its id/sei are
-    /// withheld exactly as the federation read API withholds them (ADR-034).
-    /// Routing through `entity_json` (rather than hand-rolling the id+sei tuple)
-    /// is load-bearing: it stops the reverse-map from becoming a side channel
-    /// that discloses a blocked locator.
+    /// Qualname entries resolve through the all-kinds exact-tier resolver
+    /// ([`resolve_qualnames_all_kinds`]) — every qualname-dialect entity kind
+    /// participates (function, class, module, struct, trait, …; files and
+    /// subsystems are not the qualname dialect and never resolve). This is
+    /// deliberately a SEPARATE storage surface from the function-only ADR-036
+    /// federation resolver, whose behavior is a cross-product contract
+    /// (clarion-7b0795f9e8). `kind` and `plugin` are optional hard constraints
+    /// with the ADR-036 hint semantics: unknown values match nothing (honest
+    /// `unresolved`), never error. A pasted Rust `::` path normalizes to the
+    /// stored dotted dialect (ADR-049) for resolution only — the result echoes
+    /// the input as given.
+    ///
+    /// An entry in the reserved SEI namespace (`loomweave:eid:…`) is instead an
+    /// exact identity lookup via [`resolve_entity_ref`]; constraints do not
+    /// apply (an SEI is already exact — constraining it could only manufacture
+    /// a false miss).
+    ///
+    /// Every hit projects through [`crate::entity_json`] so a candidate carries
+    /// its SEI (ADR-038, stable entity identity) and a secret-scan-blocked
+    /// entity collapses to the blocked stub — its id/sei are withheld exactly
+    /// as the federation read API withholds them (ADR-034). Routing through
+    /// `entity_json` (rather than hand-rolling the id+sei tuple) is
+    /// load-bearing: it stops the reverse-map from becoming a side channel that
+    /// discloses a blocked locator.
     ///
     /// Output is multi-candidate-shaped (`result_kind` + `candidates` list).
-    /// The exact tier mints candidates per plugin (clarion-69db8b2739), so a
-    /// qualname existing under more than one plugin yields `result_kind:
-    /// "ambiguous"` with every candidate listed; the reserved
+    /// A qualname existing under more than one (plugin, kind) yields
+    /// `result_kind: "ambiguous"` with every candidate listed; the reserved
     /// `Resolution::Heuristic` variant slots in later without a schema break.
     pub(crate) async fn tool_entity_resolve(
         &self,
@@ -453,34 +469,44 @@ impl ServerState {
             }
             qualnames.push(qualname.to_owned());
         }
-        // `kind` is fixed-enum forward-room. Resolution mints `function`
-        // candidates per plugin that has function entities (clarion-69db8b2739),
-        // so a Rust callable — methods included; there is no `rust:method:` — is
-        // kind=function too. Reject any value other than the default.
-        match arguments.get("kind") {
-            None | Some(Value::Null) => {}
-            Some(Value::String(kind)) if kind == "function" => {}
-            Some(_) => return Err(ParamError::new("kind must be \"function\"")),
-        }
+        let kind = optional_constraint(arguments, "kind")?;
+        let plugin = optional_constraint(arguments, "plugin")?;
 
         let result = self
             .readers
             .with_reader(move |conn| {
-                let resolved = resolve_wardline_qualnames(conn, &qualnames)?;
-                let mut results = Vec::with_capacity(resolved.len());
-                for (qualname, resolution) in resolved {
-                    // Collect every candidate id this qualname resolved to (one
-                    // for Exact, more for Ambiguous), project EACH through
-                    // entity_json — the SEI attach + briefing-blocked stub
-                    // collapse is a non-disclosure property that must apply to
-                    // every candidate — then recompute result_kind from the
-                    // count that SURVIVES vanished-row (torn-read) filtering:
-                    // 0 → unresolved, 1 → resolved, >1 → ambiguous.
-                    let candidate_ids = match resolution {
-                        Resolution::Exact { entity_id } => vec![entity_id],
-                        Resolution::Ambiguous { entity_ids } => entity_ids,
-                        Resolution::None => Vec::new(),
+                // Qualname entries batch through the all-kinds resolver; SEI
+                // entries are individual exact lookups. `::` → `.` applies to
+                // the RESOLUTION input only; echoes keep the pasted form.
+                let plain: Vec<String> = qualnames
+                    .iter()
+                    .filter(|entry| !is_reserved_sei(entry.trim()))
+                    .map(|entry| entry.replace("::", "."))
+                    .collect();
+                let resolved =
+                    resolve_qualnames_all_kinds(conn, &plain, kind.as_deref(), plugin.as_deref())?;
+                let mut plain_results = resolved.into_iter();
+                let mut results = Vec::with_capacity(qualnames.len());
+                for entry in &qualnames {
+                    let candidate_ids = if is_reserved_sei(entry.trim()) {
+                        resolve_entity_ref(conn, entry.trim())?
+                            .map_or_else(Vec::new, |row| vec![row.id])
+                    } else {
+                        let (_, resolution) = plain_results
+                            .next()
+                            .expect("one resolution per non-SEI entry");
+                        match resolution {
+                            Resolution::Exact { entity_id } => vec![entity_id],
+                            Resolution::Ambiguous { entity_ids } => entity_ids,
+                            Resolution::None => Vec::new(),
+                        }
                     };
+                    // Project EACH candidate through entity_json — the SEI
+                    // attach + briefing-blocked stub collapse is a
+                    // non-disclosure property that must apply to every
+                    // candidate — then recompute result_kind from the count
+                    // that SURVIVES vanished-row (torn-read) filtering:
+                    // 0 → unresolved, 1 → resolved, >1 → ambiguous.
                     let mut candidates = Vec::with_capacity(candidate_ids.len());
                     for entity_id in candidate_ids {
                         // A candidate id resolved but its row vanished (a torn
@@ -495,7 +521,7 @@ impl ServerState {
                         _ => "ambiguous",
                     };
                     results.push(json!({
-                        "qualname": qualname,
+                        "qualname": entry,
                         "candidates": candidates,
                         "result_kind": result_kind,
                     }));
@@ -507,6 +533,25 @@ impl ServerState {
             })
             .await;
         Ok(flatten_storage_envelope_result(result))
+    }
+}
+
+/// Optional free-form constraint param (`kind` / `plugin` on
+/// `entity_resolve`). Constraint semantics follow the ADR-036 plugin hint:
+/// the value is NOT validated against the store (an unknown value is a
+/// constraint nothing satisfies, resolving honest-`unresolved`), but a blank
+/// value is a caller bug and rejected — mirroring the HTTP layer's
+/// blank-rejection adjudication.
+fn optional_constraint(
+    arguments: &serde_json::Map<String, Value>,
+    name: &str,
+) -> std::result::Result<Option<String>, ParamError> {
+    match arguments.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+        Some(_) => Err(ParamError::new(&format!(
+            "{name} must be a non-blank string"
+        ))),
     }
 }
 

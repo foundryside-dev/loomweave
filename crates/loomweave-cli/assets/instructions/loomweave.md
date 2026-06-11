@@ -15,16 +15,16 @@ matches a concept word by substring over name, summary, and docstring content
 it before grepping. Semantic *ranking* is the separate, opt-in
 `entity_semantic_search_list`.
 
-Entity IDs are `{plugin}:{kind}:{qualified_name}` (e.g.
-`python:function:pkg.mod.func`); subsystems are `core:subsystem:{hash}`. You
-rarely type IDs — get one from `entity_find` or `entity_at`, then copy it
-verbatim into the next tool.
+Entity IDs are `{plugin}:{kind}:{qualified_name}`; subsystems are
+`core:subsystem:{hash}`. Never hand-construct one: get it from `entity_find` /
+`entity_at`, or — for a pasted qualname, Rust `::` path, or SEI token — from
+`entity_resolve`, then copy it verbatim into the next tool.
 
 Index freshness and counts: `project_status_get` (or the `loomweave://context`
 resource). If the index is stale, run `loomweave analyze <path>`.
 
-LLM summaries (`entity_summary_get`) are off by default and need a configured live
-provider; `project_status_get` reports the posture and `loomweave config check`
-explains how to enable it.
+LLM summaries (`entity_summary_get`) are off by default and need a live
+provider; `project_status_get` reports the posture, `loomweave config check`
+explains enabling.
 
 Full workflow: the `loomweave-workflow` skill.

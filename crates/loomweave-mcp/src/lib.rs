@@ -94,7 +94,10 @@ grepping the tree.
 Entity IDs are `{{plugin}}:{{kind}}:{{qualified_name}}` (e.g. \
 `python:function:pkg.mod.func`); subsystems are `core:subsystem:{{hash}}`. You \
 almost never type IDs — get one from `entity_find` or `entity_at`, then copy it \
-verbatim into the next tool.
+verbatim into the next tool. Pasted an identifier from ANOTHER tool — a bare \
+qualname, a Rust `::` path, or an SEI (`loomweave:eid:…`)? `entity_resolve` maps \
+it back to the full identity row (id + SEI, any entity kind); never \
+hand-construct an id.
 
 Tools: {tool_names}. `entity_callers_list` / `entity_neighborhood_get` / \
 `entity_execution_path_list` / `entity_relation_list` take a `confidence` tier \
@@ -700,7 +703,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_resolve",
-            description: "Resolve dotted qualnames (e.g. `pkg.mod.func`) to entity ids + SEIs — the inverse of having an id already. Batch-only: pass `qualnames` (1..=2000) and get one `results` entry per input IN INPUT ORDER, each with `result_kind` (resolved | unresolved | ambiguous) and a `candidates` list. A `resolved` candidate carries { id, sei, kind }; an `unresolved` qualname returns an empty candidates list (NOT an error — honest-empty). `kind` is fixed to `function` today. Exact-tier resolution omits a confidence field. A candidate whose entity is secret-scan-blocked collapses to the blocked stub — its id/sei are withheld. No LLM call.",
+            description: "THE paste-an-identifier-from-another-tool lookup: resolve a bare dotted qualname (e.g. `pkg.mod.func` from wardline explain_taint / a dossier / legis policy_explain), a Rust `::` path (e.g. `crate::mod::func` from a stack trace or compiler error — normalized to the stored dotted form automatically), or an SEI token (`loomweave:eid:…` from a Filigree entity association) to the full identity row — NEVER hand-construct a `{plugin}:{kind}:{qualname}` id. Batch-only: pass `qualnames` (1..=2000; entries may mix qualnames and SEI tokens) and get one `results` entry per input IN INPUT ORDER, each echoing the input as `qualname` with `result_kind` (resolved | unresolved | ambiguous) and a `candidates` list whose entries carry { id, sei, kind, … }. All qualname-dialect entity kinds participate (function, class, module, struct, trait, enum, …); files and subsystems do not (path/hash-keyed, not qualnames). Narrow with `kind` and/or `plugin` — both are hard constraints, NOT validated: an unknown value simply matches nothing (honest `unresolved`, never an error). SEI entries are exact identity lookups; constraints don't apply to them. An `unresolved` entry returns an empty candidates list (NOT an error — honest-empty). Exact-tier resolution omits a confidence field. A candidate whose entity is secret-scan-blocked collapses to the blocked stub — its id/sei are withheld. No LLM call.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -710,7 +713,8 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                         "minItems": 1,
                         "maxItems": 2000
                     },
-                    "kind": {"type": "string", "enum": ["function"], "default": "function"}
+                    "kind": {"type": "string", "minLength": 1},
+                    "plugin": {"type": "string", "minLength": 1}
                 },
                 "required": ["qualnames"],
                 "additionalProperties": false

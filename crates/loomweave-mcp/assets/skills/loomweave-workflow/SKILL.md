@@ -61,7 +61,7 @@ tell which case you're in.
 | Tool | Use when | Args |
 |------|----------|------|
 | `find_entity` | locate an entity by name, or by a concept word in its docstring/identifier (substring) | `{"pattern": "<name-or-word>"}` |
-| `entity_resolve` | resolve dotted qualnames (`pkg.mod.func`) to entity ids + SEIs — the inverse of having an id | `{"qualnames": ["pkg.mod.func"]}` |
+| `entity_resolve` | resolve pasted identifiers — dotted qualnames, Rust `::` paths, SEI tokens — to entity ids + SEIs (any kind; optional `kind`/`plugin` constraints) | `{"qualnames": ["pkg.mod.Cls", "crate::mod::func"]}` |
 | `entity_at` | what's at a file:line | `{"file": "rel/path.py", "line": 42}` |
 | `callers_of` | what calls this entity (bounded: `limit`+`cursor`) | `{"id": "<id>"}` |
 | `neighborhood` | one-hop callers+callees+container+contained+references+imports+relations (per-bucket `limit`) | `{"id": "<id>"}` |
@@ -127,18 +127,27 @@ You never have to convert a SEI before passing it. `find_entity` also accepts a
 pasted SEI as an **exact** lookup (it returns the one entity that SEI binds to,
 not a fuzzy match).
 
-When you have a **dotted qualname** but no id — e.g. a name from a stack trace or
-another tool — use `entity_resolve` (batch: `{"qualnames": ["a.b.c", …]}`, up to
-2000). Each input yields one `results` entry **in input order** with a
-`result_kind`:
+When you have an **identifier but no id** — a dotted qualname from a stack
+trace, wardline `explain_taint`, a dossier, or legis `policy_explain`; a Rust
+`::` path from a compiler error (normalized to the stored dotted form
+automatically); or an SEI pasted from a Filigree association — use
+`entity_resolve` (batch: `{"qualnames": ["a.b.c", "crate::mod::func",
+"loomweave:eid:…"]}`, up to 2000, entries may mix forms). **Never hand-construct
+a `{plugin}:{kind}:{qualname}` id.** All qualname-dialect entity kinds
+participate (function, class, module, struct, trait, …); narrow with `kind`
+and/or `plugin`, both hard constraints (an unknown value matches nothing —
+honest `unresolved`, never an error; constraints don't apply to SEI entries,
+which are already exact). Each input yields one `results` entry **in input
+order**, echoing the input as `qualname`, with a `result_kind`:
 
 - `resolved` — `candidates` has one `{ id, sei, kind }` you can feed straight
   into any id-taking tool.
 - `unresolved` — `candidates` is empty. This is **honest-empty, not an error**:
-  no entity matches that qualname.
-- `ambiguous` — reserved for a future heuristic tier (the exact tier never
-  emits it). A `scope_excludes` of `["heuristic-tier-not-implemented"]` records
-  that only exact resolution ran.
+  no entity matches that qualname (or a constraint excluded every match).
+- `ambiguous` — the qualname exists under more than one `(plugin, kind)`;
+  every candidate is listed (sorted). Constrain with `kind`/`plugin` to
+  collapse it. A `scope_excludes` of `["heuristic-tier-not-implemented"]`
+  records that only exact resolution ran.
 
 A candidate whose entity is secret-scan-blocked collapses to the redacted stub
 (id/sei withheld) — the same posture as every other identity surface.
