@@ -959,7 +959,7 @@ fn tools_list_includes_subsystem_members() {
 
     assert_eq!(
         tool.description,
-        "List module entities assigned to a subsystem entity. Bounded: `limit` (default 50, max 100) plus a numeric-offset `cursor`; the result carries `next_cursor` (null when exhausted) and an explicit `truncated` flag."
+        "List the module entities in a subsystem. Bounded: `limit` (default 50, max 100) + numeric-offset `cursor`."
     );
     assert_eq!(
         tool.input_schema,

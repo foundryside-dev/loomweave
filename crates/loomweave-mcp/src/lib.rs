@@ -66,9 +66,10 @@ pub const LOOMWEAVE_WORKFLOW_SKILL: &str =
 /// under the *active* policy (the single source of truth) so it can never
 /// advertise a tool the server will not actually register — the
 /// agent-first-feedback §2.5 bug, where the write tools were listed but absent
-/// from `tools/list` unless `serve.mcp.enable_write_tools: true`. When write
-/// tools are gated off, a note names them and how to enable them. Kept
-/// consistent with the loomweave-workflow skill.
+/// from `tools/list` unless `serve.mcp.enable_write_tools: true`. Real clients
+/// truncate this blob (~2 KB observed), so the write-gate note comes FIRST and
+/// the tool enumeration — recoverable from `tools/list` — comes LAST
+/// (clarion-e65354898d). Kept consistent with the loomweave-workflow skill.
 fn server_instructions(policy: McpToolPolicy) -> String {
     let tool_names = list_tools_for_policy(policy)
         .iter()
@@ -78,38 +79,30 @@ fn server_instructions(policy: McpToolPolicy) -> String {
     let write_tools_note = if policy.enable_write_tools {
         String::new()
     } else {
-        "\n\nNot listed above (write-gated): `entity_summary_get`, `analyze_start`, \
-`analyze_cancel`, `propose_guidance`, `promote_guidance`. These require \
-`serve.mcp.enable_write_tools: true` in loomweave.yaml; until then they are not \
-registered and calling one returns a tool-disabled error."
+        "\n\nWrite-gated (NOT registered): `entity_summary_get`, `analyze_start`, \
+`analyze_cancel`, `propose_guidance`, `promote_guidance` — require \
+`serve.mcp.enable_write_tools: true` in loomweave.yaml; calling one returns a \
+tool-disabled error."
             .to_owned()
     };
     format!(
-        "Loomweave is a code-archaeology server: it has pre-extracted this project \
-into a queryable map of entities (functions, classes, modules, files), the call \
-/ reference / import edges between them, the relation edges (inherits_from / \
-decorates / implements / derives — \"what subclasses X\" is `entity_relation_list` \
-direction=in), and subsystem clusters. Ask Loomweave instead of re-reading or \
-grepping the tree.
+        "Loomweave is a code-archaeology server: this project is pre-extracted into \
+a queryable map of entities (functions, classes, modules, files), the call / \
+reference / import edges between them, relation edges (inherits_from / decorates \
+/ implements / derives), and subsystem clusters. Ask Loomweave instead of \
+re-reading or grepping the tree.{write_tools_note}
 
-Entity IDs are `{{plugin}}:{{kind}}:{{qualified_name}}` (e.g. \
-`python:function:pkg.mod.func`); subsystems are `core:subsystem:{{hash}}`. You \
-almost never type IDs — get one from `entity_find` or `entity_at`, then copy it \
-verbatim into the next tool. Pasted an identifier from ANOTHER tool — a bare \
-qualname, a Rust `::` path, or an SEI (`loomweave:eid:…`)? `entity_resolve` maps \
-it back to the full identity row (id + SEI, any entity kind); never \
-hand-construct an id.
+Entity IDs are `{{plugin}}:{{kind}}:{{qualified_name}}`; subsystems are \
+`core:subsystem:{{hash}}`. Get an id from `entity_find` or `entity_at` and copy \
+it verbatim; `entity_resolve` maps pasted qualnames, Rust `::` paths, and SEI \
+tokens to identity rows — never hand-construct an id.
 
-Tools: {tool_names}. `entity_callers_list` / `entity_neighborhood_get` / \
-`entity_execution_path_list` / `entity_relation_list` take a `confidence` tier \
-(resolved | ambiguous | inferred; default resolved — for relation edges, \
-inferred adds nothing beyond ambiguous). \
-`project_status_get` reports index freshness, counts, LLM policy, and the resolved \
-Filigree endpoint.{write_tools_note}
+Deep dive: the loomweave-workflow skill (installed by `loomweave install \
+--skills`) or the `loomweave-workflow` prompt. Live counts and freshness: the \
+`loomweave://context` resource; `project_status_get` adds LLM policy and the \
+resolved Filigree endpoint.
 
-For the full workflow see the loomweave-workflow skill (installed by \
-`loomweave install --skills`), or read the `loomweave-workflow` prompt. Live \
-project counts and index freshness are in the `loomweave://context` resource."
+Tools: {tool_names}."
     )
 }
 
@@ -170,11 +163,24 @@ pub fn rename_old_to_new(name: &str) -> &str {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ToolMetadata {
+    // On the wire, false flags are omitted (absent ⇒ false): the flags exist
+    // for client permissioning, and serializing five booleans on every tool
+    // taxed every session's tools/list (clarion-e65354898d).
+    #[serde(skip_serializing_if = "is_false")]
     pub read_only: bool,
+    #[serde(skip_serializing_if = "is_false")]
     pub writes_local_state: bool,
+    #[serde(skip_serializing_if = "is_false")]
     pub writes_external_state: bool,
+    #[serde(skip_serializing_if = "is_false")]
     pub spawns_process: bool,
+    #[serde(skip_serializing_if = "is_false")]
     pub may_call_llm: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // signature dictated by serde
+fn is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 impl ToolMetadata {
@@ -288,17 +294,15 @@ impl Serialize for ToolDefinition {
     where
         S: serde::Serializer,
     {
+        // The permissioning flags ride ONLY in the grouped `metadata` object.
+        // They used to also be flattened at the top level — ~140 duplicated
+        // bytes per tool in every session's tools/list (clarion-e65354898d).
         let metadata = tool_metadata(self.name);
-        let mut state = serializer.serialize_struct("ToolDefinition", 9)?;
+        let mut state = serializer.serialize_struct("ToolDefinition", 4)?;
         state.serialize_field("name", self.name)?;
         state.serialize_field("description", self.description)?;
         state.serialize_field("inputSchema", &self.input_schema)?;
         state.serialize_field("metadata", &metadata)?;
-        state.serialize_field("read_only", &metadata.read_only)?;
-        state.serialize_field("writes_local_state", &metadata.writes_local_state)?;
-        state.serialize_field("writes_external_state", &metadata.writes_external_state)?;
-        state.serialize_field("spawns_process", &metadata.spawns_process)?;
-        state.serialize_field("may_call_llm", &metadata.may_call_llm)?;
         state.end()
     }
 }
@@ -310,7 +314,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "entity_at",
-            description: "Return the innermost Loomweave entity whose source range contains a file and line, plus an `entity_context` evidence block: match_reason (decorator_range / declaration / body_range / containing_range / no_match) explaining why the line matched, the module→entity containing stack, the matched entity's decl/body/decorator sub-ranges, any same-granularity ambiguity alternatives, and index freshness. Paths are normalized relative to the project root. A blank or comment line that only a module spans reports containing_range — never a fabricated exact match.",
+            description: "Innermost entity whose source range contains `file`+`line`, with an `entity_context` evidence block (match_reason, containing stack, sub-ranges, alternatives). A line only a module spans reports containing_range — never a fabricated exact match.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -323,7 +327,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_find",
-            description: "Search Loomweave entities by id, name, short name, summary, and docstring content. Matching merges stemmed FTS ranking with grep-equivalent substring recall, so a concept word finds both entities whose docstring mentions it and identifiers that merely contain it (e.g. `library` finds the class `LibraryService`, which whole-token FTS alone misses). This is the always-on keyword-discovery path — no embeddings required (semantic ranking is the separate, opt-in `entity_semantic_search_list`). Results are paginated; FTS-ranked hits come first, then substring-only hits. Docstrings withheld by the secret scanner (briefing_blocked) are never matched. This does not traverse the graph and does not search on-demand summary_cache entries. Pass an optional `kind` (e.g. \"subsystem\", \"function\", \"class\", \"module\") to return only entities of that kind — the way to locate a subsystem without visually filtering results.",
+            description: "Search entities by name, id, summary, and docstring (stemmed full-text + substring recall) — reach for it before grepping. (Semantic ranking is the opt-in `entity_semantic_search_list`.) Optional `kind` filter. Paginated; scanner-blocked docstrings never match.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -338,12 +342,12 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_callers_list",
-            description: "Return entities that call the given entity. Default confidence is resolved, so ambiguous static candidates and LLM-inferred edges are excluded unless explicitly requested. Ambiguous edges expand all candidates; inferred edges may trigger bounded LLM dispatch — NOTE confidence=inferred is rejected by policy unless serve.mcp.enable_write_tools is on, so in the default read-only posture the recovery path for a suspicious empty is entity_call_site_list role=callee, not inferred. Bounded: `limit` (default 50, max 100) plus a numeric-offset `cursor`; the result carries `next_cursor` (null when exhausted) and an explicit `truncated` flag. Honesty fields: scope_excludes names static blind spots not searched (attribute-receiver-calls; unresolved-static-calls when the project holds statically-unbindable call sites), `unresolved_name_matches` counts unresolved call sites that name-match this entity but are NOT in `callers`, and `next_action` points at the evidence tool when that count is non-zero. An empty callers list with unresolved_name_matches > 0 is NOT a true negative.",
+            description: "What calls this entity. `confidence` resolved (default) | ambiguous | inferred (policy-gated). Bounded (`limit`+`cursor`). `scope_excludes` names unsearched blind spots; `unresolved_name_matches` counts name-matched unresolved sites NOT in callers (recover via entity_call_site_list role=callee) — empty with matches>0 is NOT a true negative.",
             input_schema: id_confidence_cursor_schema(),
         },
         ToolDefinition {
             name: "entity_execution_path_list",
-            description: "Return bounded calls-only execution paths starting at an entity. Default confidence is resolved. max_depth defaults to 3. Results are compact: a deduplicated nodes table plus paths as arrays of node ids (under a root), ranked longest-first. Traversal stops at the server edge cap and the response is capped at a maximum number of ranked paths; truncated/truncation_reason report edge-cap or path-cap when either trims. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls, and unresolved-static-calls when the project holds statically-unbindable call sites — paths through those sites are invisible at this tier).",
+            description: "Bounded calls-only paths from an entity (`max_depth` default 3). Compact: deduplicated `nodes` table + `paths` as node-id arrays, longest-first; truncation reports edge-cap/path-cap. `scope_excludes` names unsearched blind spots (attribute-receiver / unresolved static calls) — empties are not proof.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -357,12 +361,12 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_summary_get",
-            description: "Return an on-demand cached summary for one entity. In v0.1 this is leaf scope only: module summaries describe the module docstring and top-level members, not an aggregation of contained function/class summaries. If the LLM returns non-JSON the response degrades to a deterministic structural summary (kind: structural-fallback) built from the entity source, and that fallback is cached so a retry is a free cache hit rather than a re-billed failure.",
+            description: "On-demand cached LLM summary for one entity (leaf scope: module summaries do not aggregate members). Non-JSON LLM output degrades to a cached deterministic structural fallback, so a retry is a cache hit, not a re-billed failure.",
             input_schema: id_schema(),
         },
         ToolDefinition {
             name: "entity_issue_list",
-            description: "Return Filigree issues attached to this Loomweave entity, optionally including issues attached to contained entities. Filigree is an enrichment source; if unavailable, the tool returns an unavailable envelope instead of failing Loomweave. The result carries a result_kind (matched | no_matches | unavailable) so a reachable-but-empty Filigree is distinct from an unreachable one, and a filigree_endpoint block (configured vs resolved URL + resolution_source) so you can see which endpoint — e.g. a live ethereal port — the answer came from. Each matched/drifted entry carries an `issue` object with the issue's title, status, and priority (fetched once per distinct issue, no N+1); `issue` is null when the issue-detail route is unavailable, so the match still resolves without a second hop into Filigree. Includes a `wardline_findings` section (enrich-only) reconciling Wardline findings to the entity by qualname; `result_kind` is matched|no_matches|unavailable.",
+            description: "Filigree issues attached to an entity (optionally contained entities too), plus an enrich-only `wardline_findings` section. result_kind matched | no_matches | unavailable distinguishes empty-Filigree from unreachable-Filigree; `filigree_endpoint` shows which endpoint answered.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -375,22 +379,22 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_neighborhood_get",
-            description: "Return the one-hop Loomweave neighborhood around an entity: callers, callees, container, contained entities, references, imports (imports_in = who imports this module, imports_out = what it imports; module-to-module), and relations (relations_in/relations_out — the kind-tagged inherits_from/decorates/implements/derives edges; relations_in on a class answers \"what subclasses this\", relations_out on a decorator answers \"what does this decorate\" — ADR-051 direction). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. On references_in each rolled-up neighbor also carries `importer_module` — the importing symbol's containing module — so reverse-import names importing modules, not just symbols. Each list bucket is bounded by a single per-bucket `limit` (default 50, max 100); a sibling `truncated` map flags which buckets were trimmed (callers/callees/contained/references_in/references_out/imports_in/imports_out/relations_in/relations_out). For the full cursor-paginated set of a trimmed bucket, use the dedicated single-relation tool (e.g. entity_callers_list, entity_relation_list). This overview has NO cursor — one cursor cannot coherently advance nine heterogeneous buckets. The result carries scope_excludes naming blind spots not searched (attribute-receiver-calls; unresolved-static-calls when the project holds statically-unbindable call sites), plus `unresolved_name_matches` (unresolved call sites that name-match this entity but are NOT in `callers`) and a `next_action` pointer at entity_call_site_list role=callee — so empty sections are never read as guaranteed true negatives.",
+            description: "One-hop neighborhood: callers, callees, container, contained, references, imports, relations (in/out). Per-bucket `limit` (default 50, max 100) + `truncated` map; NO cursor — page a trimmed bucket via its dedicated tool. Module references roll up over contained symbols. Carries scope_excludes + unresolved_name_matches (see entity_callers_list).",
             input_schema: id_confidence_schema(),
         },
         ToolDefinition {
             name: "subsystem_member_list",
-            description: "List module entities assigned to a subsystem entity. Bounded: `limit` (default 50, max 100) plus a numeric-offset `cursor`; the result carries `next_cursor` (null when exhausted) and an explicit `truncated` flag.",
+            description: "List the module entities in a subsystem. Bounded: `limit` (default 50, max 100) + numeric-offset `cursor`.",
             input_schema: id_cursor_schema(),
         },
         ToolDefinition {
             name: "entity_subsystem_get",
-            description: "Return the subsystem an entity belongs to — the reverse of subsystem_members. Accepts any entity id: a module resolves directly, while a function/class resolves through its nearest containing module. Returns the subsystem id/name and the module the membership was resolved through, or a no-subsystem result when the entity has no subsystem-assigned module ancestor.",
+            description: "The subsystem an entity belongs to (reverse of subsystem_member_list). Any entity id (functions/classes resolve through their containing module); reports the via-module.",
             input_schema: id_schema(),
         },
         ToolDefinition {
             name: "project_status_get",
-            description: "Return deterministic Loomweave diagnostics: repo root, db path, latest run (id/status/started/completed), entity/subsystem/edge/finding/briefing-blocked counts, index staleness, per-plugin entity counts from the current index, LLM policy (provider/live/cache), and the resolved Filigree endpoint (configured vs resolved URL + resolution source). Answers \"is the graph fresh, plugin-less, LLM-live, Filigree-reachable?\" without shelling out. No LLM call.",
+            description: "Deterministic diagnostics: repo root, db path, latest run, entity/edge/finding counts, index staleness, per-plugin counts, LLM policy, and the resolved Filigree endpoint.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -399,12 +403,12 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_summary_preview_cost_get",
-            description: "Preview what calling summary(id) would cost BEFORE spending. Reports cache_status (hit | expired | miss), the cached row's real tokens/cost/age on a hit, an input-token estimate on a miss, the configured model, the LLM policy (provider/live/allow_live_provider/cache horizon), and live_spend_would_occur — true only when no fresh cache row exists AND a live provider is wired. A disabled/unconfigured LLM is reported distinctly from a cache miss. Never invokes the LLM provider.",
+            description: "Preview what entity_summary_get would cost BEFORE spending: cache_status (hit | expired | miss), real cost on a hit, an estimate on a miss, and live_spend_would_occur. A disabled LLM is reported distinctly from a cache miss. Never invokes the provider.",
             input_schema: id_schema(),
         },
         ToolDefinition {
             name: "entity_source_get",
-            description: "Return the exact indexed source span for one entity (its source_line_start..source_line_end, which includes any decorators/signature/docstring the plugin captured) plus a bounded window of surrounding context, as line-numbered lines each flagged in_entity true/false. No LLM call. Lets an agent read and trust the entity without shelling out. source_status reports `ok`, or — instead of a misleading stale snippet — `missing` (file gone), `no_range`/`no_source_path` (entity has no anchor), `binary` (non-UTF-8), or `drifted` (the file no longer matches the indexed content_hash; rerun `loomweave analyze`). context_lines defaults to 10.",
+            description: "An entity's exact indexed source span plus `context_lines` (default 10) of context, line-numbered and flagged in_entity. source_status reports ok | missing | no_range | no_source_path | binary | drifted (rerun analyze) instead of a misleading stale snippet.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -417,7 +421,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_call_site_list",
-            description: "Show the actual source sites behind calls/references edges, so an agent can see WHY Loomweave believes an edge exists rather than trusting it blind. role=caller (default) returns this entity's outgoing sites (what it calls/references); role=callee returns incoming sites (who calls/references it). Each site carries the file path, 1-based line, byte column, the source line text, edge kind, confidence, and a resolution of resolved | ambiguous (with candidate ids) | unresolved (a static call Loomweave could not bind, kept separate so it is never mixed with resolved evidence). Filter by edge kind (`calls`/`references`) and by a best-effort production/test path heuristic (`all`/`production`/`test`; path partitioning is not indexed — the heuristic matches conventional test paths). Output is bounded; truncated flags when the site cap trims. No LLM call.",
+            description: "Show the source sites behind calls/references edges — the evidence for WHY an edge exists. role=caller (default) lists outgoing sites; role=callee lists incoming, INCLUDING `unresolved_sites` (static calls Loomweave could not bind — the recovery surface for suspicious empty caller lists). Bounded.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -433,7 +437,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_orientation_pack_get",
-            description: "Assemble one deterministic orientation packet for a code location — the replacement for hand-composing find_entity + entity_at + source reads + neighborhood + issues_for + freshness on every question. Resolve EITHER by `entity` id OR by `file`+`line` (exactly one form). The packet bundles: the primary entity, the entity_context evidence (match_reason / containing stack / decl-body-decorator ranges — so a decorator-line query is explained, not guessed), a compact source-span summary, one-hop neighbors (callers, callees, container, contained, references, imports, kind-tagged relations_in/relations_out for inherits_from/decorates/implements/derives — for a module, references_in/out are rolled up over contained symbols with references_rolled_up=true), compact resolved execution paths, related Filigree issues, index/Filigree/LLM health, warnings, and suggested next reads. No LLM summary is invoked. Every list is bounded; an `omitted` block reports per-section truncation counts and `degraded` sections name surfaces that were unavailable (e.g. Filigree down) so an empty section is never read as a guaranteed negative. Includes a `wardline_findings` section (enrich-only) reconciling Wardline findings to the entity by qualname; `result_kind` is matched|no_matches|unavailable.",
+            description: "One deterministic orientation packet for an `entity` id OR `file`+`line` (exactly one): primary entity, match evidence, one-hop neighbors, execution paths, Filigree issues, Wardline findings, health, suggested next reads. Bounded; `omitted` + named degraded sections keep empties honest.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -446,7 +450,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "analyze_start",
-            description: "Start a `loomweave analyze` run over this project in the background and return its run handle immediately — do not block on the (possibly many-minute) run. Re-indexes the source tree and refreshes entities/edges/subsystems. Returns run_id, status (`started`), and the progress-file path. Only one analyze may run per project at a time (a cross-process lock enforces it); a second start while one is active is rejected. Poll analyze_status for progress; analyze_cancel to stop. No arguments.",
+            description: "Start a background `loomweave analyze` run; returns run_id immediately (runs can take minutes). One run per project (cross-process lock). Poll analyze_status_get; stop via analyze_cancel. No arguments.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -455,7 +459,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "analyze_status_get",
-            description: "Report the live status of an analyze run started via analyze_start. status is one of queued (spawned, not yet recording) | running | completed | failed | cancelled | skipped_no_plugins. While running it exposes phase (discovering / analyzing / clustering), current_plugin, processed_files / total_files, current_file, the latest heartbeat_at, elapsed_seconds, and progress_observed (false when the heartbeat has gone stale — the run may be wedged). On a terminal status it carries the recorded run stats. Reads structured progress, never logs.",
+            description: "A run's live status: queued | running | completed | failed | cancelled | skipped_no_plugins, with phase, current plugin/file, processed/total files, heartbeat, and progress_observed=false when the heartbeat is stale (run may be wedged).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -467,7 +471,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "analyze_cancel",
-            description: "Cancel a running analyze. SIGKILLs the run's whole process group — terminating the language plugin and its pyright-langserver child — then marks the run terminal (status `cancelled`) so it is never left dangling as `running`. Idempotent: cancelling an already-terminal run reports its current state. Partial work already written is kept (cancel discards in-flight work, not the index).",
+            description: "Cancel a running analyze: SIGKILLs the run's process group (plugin + pyright) and marks the run cancelled — never left dangling as running. Idempotent. Partial work already written is kept.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -479,7 +483,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "index_diff_get",
-            description: "Report what changed since the last analyze and whether this checkout is newer than the graph — so an agent need not hand-roll git + mtime freshness checks. Compares: analyzed_commit (the persisted commit analyzed by the latest completed run) vs current git HEAD when both are known, falling back to analyzed_at vs HEAD committer date when needed; indexed source files modified or now-missing since analyze; dirty working-tree files flagged when they touch an indexed path; and per-run aggregate plugin skip/drop counters. Git is read at query time, read-only, and fail-soft: a missing git binary or non-repo dir degrades to git.available=false with a reason rather than failing. overall is fresh | drift | unknown | never_analyzed; lists are bounded with an `omitted` block. entity-level add/remove/change diff is unavailable in v0.1 (only the current graph is retained). No LLM call.",
+            description: "Drift since the last analyze: analyzed commit vs git HEAD, indexed files modified/missing, dirty working-tree files touching indexed paths, plugin skip/drop counters. overall: fresh | drift | unknown | never_analyzed. Entity-level diff is unavailable in v0.1.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -490,7 +494,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_guidance_list",
-            description: "Return the guidance sheets applicable to one entity, composed at query time and ranked by scope_rank (project → subsystem → package → module → class → function), ties broken by authored_at then id. Read-only: this surfaces composed institutional knowledge; authoring (propose/promote) is a separate lifecycle. A sheet applies via an explicit `guides` edge OR a `match_rules` entry resolved against the entity (path glob / tag / kind / subsystem / entity). `wardline_group` rules are not evaluated here (the Wardline blob is opaque) and are reported in `notes`, never guessed. Expired sheets are excluded. Each sheet carries its `sei`. Bounded (limit/offset, page.total/truncated). Honest-empty when no sheet applies. No LLM call.",
+            description: "Guidance sheets applicable to an entity, scope-ranked (project → … → function). wardline_group rules are reported in `notes`, never guessed. Bounded; honest-empty when no sheet applies.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -504,7 +508,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "propose_guidance",
-            description: "Propose a guidance sheet for operator review by creating a Filigree observation. This is deliberately inert: it does not write a Loomweave guidance entity and cannot enter summaries until `promote_guidance` or `loomweave guidance promote` consumes the observation.",
+            description: "Propose a guidance sheet by creating a Filigree observation. Deliberately inert: nothing enters summaries until an operator promotes it (promote_guidance or the CLI).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -526,7 +530,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "promote_guidance",
-            description: "Promote a reviewed Filigree observation produced by `propose_guidance` into a local Loomweave guidance sheet. This operator action is the anti-poisoning boundary: only promoted observations become prompt-composed guidance.",
+            description: "Promote a reviewed Filigree observation from propose_guidance into a local guidance sheet. This operator action is the anti-poisoning boundary.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -538,7 +542,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_finding_list",
-            description: "Return findings anchored to one entity, optionally filtered by `filter.kind` (defect/fact/classification/metric/suggestion), `filter.severity` (INFO/WARN/ERROR/CRITICAL/NONE), and `filter.status` (open/acknowledged/suppressed/promoted_to_issue). The queried entity carries its `sei`; each finding's `related_entities` are raw locator ids (references, not the primary return). Bounded (limit/offset, page.total/truncated). An entity with no findings returns an empty list, not an error. No LLM call.",
+            description: "Findings anchored to one entity; filter by kind / severity / status (closed value sets — see the skill). Bounded (limit/offset, page block). No findings → empty list, not an error.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -561,27 +565,27 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_wardline_get",
-            description: "Return the Wardline metadata recorded for one entity (declared tier, groups, boundary contracts) returned VERBATIM — the `wardline_json` blob is opaque to Loomweave. result_kind is `present` when a taint fact exists, else `no_facts` with a missing-signal note: facts are populated via Filigree Flow-B (POST /api/wardline/taint-facts), so a locally-empty result is honest, not an error. The entity carries its `sei`. No LLM call.",
+            description: "The entity's Wardline taint metadata VERBATIM (the blob is opaque to Loomweave). result_kind present | no_facts with a missing-signal note — facts arrive via Filigree Flow-B, so a locally-empty result is honest.",
             input_schema: id_schema(),
         },
         ToolDefinition {
             name: "entity_tag_list",
-            description: "Return entities carrying a plugin-emitted categorisation `tag`, within an optional `scope` (an entity id → its descendants, OR a path glob like \"src/auth/**\"; omitted → whole project). Bounded (limit/offset, page.total/truncated; scope_truncated/scan_truncated flag cap hits). Entities carry their `sei`. Honest-empty with a missing-signal note when no entity in the current index carries the tag. No LLM call.",
+            description: "Entities carrying a categorisation `tag`, optional `scope` (entity id → descendants, or path glob). Bounded; honest-empty when no entity carries the tag.",
             input_schema: scope_facet_schema(&[("tag", true)]),
         },
         ToolDefinition {
             name: "entity_kind_list",
-            description: "Return entities of a plugin-declared `kind` (e.g. \"function\", \"class\", \"module\"), within an optional `scope` (entity id → descendants, OR path glob; omitted → whole project). Bounded (limit/offset, page.total/truncated). Entities carry their `sei`. An unknown kind matches no rows. No LLM call.",
+            description: "Entities of a `kind` (function/class/module/…), optional `scope`. Bounded. An unknown kind matches no rows.",
             input_schema: scope_facet_schema(&[("kind", true)]),
         },
         ToolDefinition {
             name: "entity_wardline_list",
-            description: "Return entities carrying a Wardline taint fact, optionally filtered by `tier` and/or `group`, within an optional `scope` (entity id → descendants, OR path glob; omitted → whole project). Pass `has_findings: true` to return only entities that ALSO carry at least one finding — page just the fact-carrying-and-flawed entities instead of every taint-fact blob. The Wardline blob is opaque to Loomweave: tier/group filtering is best-effort against a top-level field on the blob and honest-empty when absent. Each entity carries its `wardline` blob verbatim plus its `sei`. Bounded (limit/offset, page.total/truncated). Facts are populated via Filigree Flow-B. No LLM call.",
+            description: "Entities carrying Wardline taint facts, filtered by `tier`/`group` (best-effort against the opaque blob); `has_findings: true` filters to those also carrying findings. Bounded.",
             input_schema: wardline_facet_schema(),
         },
         ToolDefinition {
             name: "module_circular_import_list",
-            description: "Return import cycles in the module import graph (`imports` edges) — each a strongly-connected component of size > 1 (or a self-import), members sorted. On-demand graph query (no analyze-time precompute). Edge-derived: default `confidence` is resolved (the tier is a ceiling — resolved → resolved only, inferred → all) and is echoed in the result. Optional `scope` (entity id → descendants, OR path glob) restricts to cycles whose members are all in scope. Bounded (limit/offset, page.total/truncated). Each member carries its `sei`. No LLM call.",
+            description: "Import cycles (SCCs over `imports` edges, plus self-imports), members sorted. Edge-derived: `confidence` is a ceiling (default resolved). Optional `scope`. Bounded.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -595,7 +599,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_coupling_hotspot_list",
-            description: "Return entities ranked by coupling (distinct fan-in + fan-out over the edge graph), most-coupled first. On-demand graph query (no analyze-time precompute). Edge-derived: default `confidence` is resolved (a ceiling) and is echoed. Optional `scope` (entity id → descendants, OR path glob; omitted → whole project). Bounded (limit default 20, max 200; page.total/truncated). Each entity carries its `sei`. No LLM call.",
+            description: "Entities ranked by coupling (distinct fan-in + fan-out), most-coupled first. `confidence` is a ceiling (default resolved). Optional `scope`. Bounded (limit default 20).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -609,37 +613,37 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_entry_point_list",
-            description: "Return entities tagged as entry points, within an optional `scope` (entity id → descendants, OR path glob). Reads the `entry-point` categorisation tag. HONEST-EMPTY when no entity in the current index carries the tag, so an empty result means the signal is absent, NOT that there are no entry points. Bounded; SEI-carrying. No LLM call.",
+            description: "Entities tagged `entry-point`, optional `scope`. HONEST-EMPTY when the tag is not emitted — absence of signal, not absence of entry points. Bounded.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_http_route_list",
-            description: "Return entities tagged as HTTP routes, within an optional `scope`. Reads the `http-route` categorisation tag. HONEST-EMPTY when route categorisation is not emitted (missing-signal note). Bounded; SEI-carrying. No LLM call.",
+            description: "Entities tagged `http-route`, optional `scope`. Honest-empty when route categorisation is not emitted. Bounded.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_data_model_list",
-            description: "Return entities tagged as data models, within an optional `scope`. Reads the `data-model` categorisation tag. HONEST-EMPTY when data-model categorisation is not emitted (missing-signal note). Bounded; SEI-carrying. No LLM call.",
+            description: "Entities tagged `data-model`, optional `scope`. Honest-empty when data-model categorisation is not emitted. Bounded.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_test_list",
-            description: "Return entities tagged as tests, within an optional `scope`. Reads the `test` categorisation tag. HONEST-EMPTY when test categorisation is not emitted (missing-signal note). Bounded; SEI-carrying. No LLM call.",
+            description: "Entities tagged `test`, optional `scope`. Honest-empty when test categorisation is not emitted. Bounded.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_deprecation_list",
-            description: "Return entities tagged deprecated, within an optional `scope`. Reads the `deprecated` categorisation tag. HONEST-EMPTY when deprecation categorisation is not emitted (missing-signal note). Bounded; SEI-carrying. No LLM call.",
+            description: "Entities tagged `deprecated`, optional `scope`. Honest-empty when deprecation categorisation is not emitted. Bounded.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_todo_list",
-            description: "Return entities carrying a TODO/FIXME marker, within an optional `scope`. Reads the `todo` categorisation tag. HONEST-EMPTY when TODO extraction is not emitted (missing-signal note). Bounded; SEI-carrying. No LLM call.",
+            description: "Entities carrying a TODO/FIXME marker, optional `scope`. Honest-empty when TODO extraction is not emitted. Bounded.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_test_caller_list",
-            description: "Return the test entities that exercise an entity — its callers carrying the `test` categorisation tag. HONEST-EMPTY when test categorisation is not emitted, so an empty result is NOT a guarantee the entity is untested (a missing-signal note says so). Bounded; tests carry their `sei`. No LLM call.",
+            description: "The test-tagged callers of an entity. Honest-empty when test categorisation is not emitted — NOT a guarantee the entity is untested. Bounded.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -653,22 +657,22 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_high_churn_list",
-            description: "Return entities ranked by git churn (`git_churn_count`) descending, within an optional `scope`. The analyze pipeline does not populate churn in v1.0, so this is HONEST-EMPTY in practice (missing-signal note); the query is real and lights up if churn is ever populated. Bounded; SEI-carrying. No LLM call.",
+            description: "Entities ranked by git churn, optional `scope`. v1.0 does not populate churn, so this is honest-empty in practice. Bounded.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_recent_change_list",
-            description: "Return entities changed since a timestamp (`since?`), within an optional `scope`. Loomweave does not index a per-entity git change timestamp in v1.0, so this is an HONEST NO-OP: it returns an empty set with a missing-signal note pointing at `index_diff` for repo-level freshness (HEAD vs last analyze). Never fabricates a change set. No LLM call.",
+            description: "Entities changed since `since`, optional `scope`. v1.0 indexes no per-entity change time, so this is an honest no-op with a note pointing at index_diff_get. Never fabricates.",
             input_schema: scope_page_schema(true),
         },
         ToolDefinition {
             name: "entity_dead_list",
-            description: "Return entities NOT reachable from the root set (entry points ∪ exported API ∪ tests ∪ HTTP routes ∪ CLI commands ∪ data models) over the call+import graph, within an optional `scope`. On-demand graph query (no analyze-time precompute). CONSERVATIVE (fails toward `live`): reachability counts ALL edge confidence tiers (resolved ∪ ambiguous ∪ inferred), dynamic-dispatch/reflection barrier tags force their entities live, framework-magic kinds are excluded from candidacy, and an entity whose name matches an UNRESOLVED call site (a method/associated call the resolver could not bind to a target — common in Rust, which has no type inference, so `x.foo()`/`Type::assoc()` emit no edge) is withheld as a plausible callee — so it under-reports rather than over-reports. The count withheld by that last guard rides in `unresolved_call_site_suppressed`. No `confidence` argument (a ceiling would only make more code look dead). HONEST SIGNAL-UNAVAILABLE: if the current index has no root categorisation tags, the tool returns zero candidates with a missing-signal note (NOT a flood of false positives, and NOT a guarantee there is no dead code). Heuristic results (LMWV-FACT-DEAD-CODE-CANDIDATE, confidence < 1) — never certain. Bounded; SEI-carrying. No LLM call.",
+            description: "Entities unreachable from the root set (entry points, exports, tests, routes, CLI, data models). CONSERVATIVE — fails toward live: all confidence tiers count, barrier tags force live, name-matched unresolved call sites suppress candidates (`unresolved_call_site_suppressed`). No root tags → zero candidates + note. Heuristic, never certain.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_semantic_search_list",
-            description: "Rank entities by semantic (embedding cosine) similarity to a `query` string, within an optional `scope`. OPT-IN: semantic search is OFF by default; when disabled or no embedding provider is configured the tool returns result_kind=`not_enabled` with a missing-signal note (never a faked or empty-as-complete result). When enabled it embeds the query and runs a bounded exact cosine scan over the git-ignored `.weft/loomweave/embeddings.db` sidecar (built at analyze time), considering only embeddings whose content_hash matches the entity's current hash (stale vectors never surface). Bounded (limit default 20, max 100; page.total/truncated). Each result carries its `sei` and a `score`.",
+            description: "Rank entities by embedding similarity to `query`, optional `scope`. OPT-IN: when disabled returns result_kind not_enabled with a note (use entity_find for keyword discovery). Stale vectors (content-hash mismatch) never surface.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -683,7 +687,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "project_finding_list",
-            description: "List findings across the WHOLE project — NO entity id required — so an agent can go from project_status_get's `findings: N` count straight to the N findings (the count-without-list gap). Each row carries its anchoring entity { id, sei, file, line } plus the finding's tool/rule_id/kind/severity/status/message/confidence/created_at. Optionally filtered by `filter.kind` (defect/fact/classification/metric/suggestion), `filter.severity` (INFO/WARN/ERROR/CRITICAL/NONE), and `filter.status` (open/acknowledged/suppressed/promoted_to_issue). Bounded (limit default 50, max 200; page.total/returned/truncated). With NO filter, page.total reconciles with project_status_get's finding count (both count the bare findings table). A project with no findings returns an empty list, not an error. No LLM call.",
+            description: "List findings across the WHOLE project — no entity id needed. Each row carries its anchoring entity {id, sei, file, line} plus tool/rule/kind/severity/status. Same filters as entity_finding_list. Bounded.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -704,7 +708,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_resolve",
-            description: "THE paste-an-identifier-from-another-tool lookup: resolve a bare dotted qualname (e.g. `pkg.mod.func` from wardline explain_taint / a dossier / legis policy_explain), a Rust `::` path (e.g. `crate::mod::func` from a stack trace or compiler error — normalized to the stored dotted form automatically), or an SEI token (`loomweave:eid:…` from a Filigree entity association) to the full identity row — NEVER hand-construct a `{plugin}:{kind}:{qualname}` id. Batch-only: pass `qualnames` (1..=2000; entries may mix qualnames and SEI tokens) and get one `results` entry per input IN INPUT ORDER, each echoing the input as `qualname` with `result_kind` (resolved | unresolved | ambiguous) and a `candidates` list whose entries carry { id, sei, kind, … }. All qualname-dialect entity kinds participate (function, class, module, struct, trait, enum, …); files and subsystems do not (path/hash-keyed, not qualnames). Narrow with `kind` and/or `plugin` — both are hard constraints, NOT validated: an unknown value simply matches nothing (honest `unresolved`, never an error). SEI entries are exact identity lookups; constraints don't apply to them. An `unresolved` entry returns an empty candidates list (NOT an error — honest-empty). Exact-tier resolution omits a confidence field. A candidate whose entity is secret-scan-blocked collapses to the blocked stub — its id/sei are withheld. No LLM call.",
+            description: "The paste-an-identifier lookup: batch-resolve dotted qualnames, Rust `::` paths (auto-normalized), and SEI tokens to identity rows {id, sei, kind} — never hand-construct an id. `qualnames` 1..=2000; results in input order, result_kind resolved | unresolved | ambiguous (honest, never an error). Unknown `kind`/`plugin` constraints match nothing.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -723,7 +727,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_relation_list",
-            description: "List the semantic relation edges touching an entity — inherits_from / decorates / implements / derives, the type-level claims distinct from calls/references occurrences. Answers \"what subclasses X\" (direction=in on a class), \"what does @wrap decorate\" (direction=out on the decorator), \"what implements/derives trait T\" (direction=in on the trait). `direction` is REQUIRED because relation kinds read as sentences over the stored edge (ADR-051): in = edges whose target is this entity, out = edges this entity originates — for decorates that means the DECORATOR is the out side. Optionally narrow with `kind`. Each entry carries the neighbor entity, the edge `kind`, `edge_confidence`, and the anchor evidence behind the edge (file, 1-based line, byte column, line text, byte span, source_status/drift guards) read from the edge's own anchor file — for `decorates` the anchor lives in the DECORATED side's file (the `@decorator` line), not the decorator's. Default confidence is resolved; `ambiguous` opts ambiguous edges in, each passing through its alternative-candidate ids (`candidates` — for decorates these are alternative FROM-side decorators, inverted relative to every other kind). Relation edges are never LLM-inferred: confidence=inferred adds nothing beyond ambiguous and triggers no LLM dispatch. Bounded: `limit` (default 50, max 100) plus a numeric-offset `cursor`; the result carries `next_cursor` (null when exhausted) and an explicit `truncated` flag. An entity with no relation edges returns an empty list (honest-empty), not an error — but note static extraction only records declared relations (a dynamically applied decorator or runtime-built class is invisible). No LLM call.",
+            description: "List relation edges (inherits_from / decorates / implements / derives). REQUIRED `direction` reads as a sentence (ADR-051): in on a class = \"what subclasses this\"; out on a decorator = \"what does it decorate\". ambiguous is the widest tier (relations are never LLM-inferred). Bounded (`limit`+`cursor`). Only DECLARED relations are recorded.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -5329,6 +5333,54 @@ mod tests {
         list_tools,
     };
 
+    /// tools/list is loaded into EVERY consuming session, so its size is a
+    /// per-session context tax (clarion-e65354898d). Budget: each description
+    /// ≤ 350 chars (what it answers, key args, one honesty caveat — depth
+    /// belongs in the loomweave-workflow skill, fetched once on demand), and
+    /// the serialized catalogue ≤ 22 KB (~5k tokens at the observed ~4.2
+    /// bytes/token; the pre-budget baseline was 46 KB / ~11k tokens).
+    #[test]
+    fn tools_list_fits_the_context_budget() {
+        let tools = list_tools();
+        for tool in &tools {
+            let len = tool.description.chars().count();
+            assert!(
+                len <= 350,
+                "description for {} is {len} chars (budget 350) — move the depth \
+                 into the loomweave-workflow skill",
+                tool.name
+            );
+        }
+        let serialized = serde_json::to_string(&tools).expect("serialize tools");
+        assert!(
+            serialized.len() <= 22_000,
+            "serialized tools/list is {} bytes (budget 22000 ≈ 5k tokens)",
+            serialized.len()
+        );
+    }
+
+    /// The `initialize.instructions` blob is truncated by real clients
+    /// (observed live: Claude Code cut it mid-sentence around ~2 KB), so the
+    /// write-gating note must come EARLY and the whole blob must stay small
+    /// (clarion-e65354898d).
+    #[test]
+    fn server_instructions_fit_truncating_clients() {
+        let instructions = super::server_instructions(McpToolPolicy::read_only());
+        assert!(
+            instructions.len() <= 2_000,
+            "instructions are {} bytes; budget 2000",
+            instructions.len()
+        );
+        let gate = instructions
+            .find("rite-gated")
+            .expect("write-gating note present in read-only posture");
+        assert!(
+            gate <= 700,
+            "write-gating note starts at byte {gate}; it must sit in the first \
+             700 bytes to survive client truncation"
+        );
+    }
+
     /// SKILL.md must speak the registered tool dialect (clarion-888434f3ce).
     ///
     /// The skill is the canonical onboarding doc (embedded asset, served via
@@ -5391,87 +5443,87 @@ mod tests {
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
-            "Return the innermost Loomweave entity whose source range contains a file and line, plus an `entity_context` evidence block: match_reason (decorator_range / declaration / body_range / containing_range / no_match) explaining why the line matched, the module→entity containing stack, the matched entity's decl/body/decorator sub-ranges, any same-granularity ambiguity alternatives, and index freshness. Paths are normalized relative to the project root. A blank or comment line that only a module spans reports containing_range — never a fabricated exact match."
+            "Innermost entity whose source range contains `file`+`line`, with an `entity_context` evidence block (match_reason, containing stack, sub-ranges, alternatives). A line only a module spans reports containing_range — never a fabricated exact match."
         );
         assert_eq!(tools[1].name, "entity_find");
         assert_eq!(
             tools[1].description,
-            "Search Loomweave entities by id, name, short name, summary, and docstring content. Matching merges stemmed FTS ranking with grep-equivalent substring recall, so a concept word finds both entities whose docstring mentions it and identifiers that merely contain it (e.g. `library` finds the class `LibraryService`, which whole-token FTS alone misses). This is the always-on keyword-discovery path — no embeddings required (semantic ranking is the separate, opt-in `entity_semantic_search_list`). Results are paginated; FTS-ranked hits come first, then substring-only hits. Docstrings withheld by the secret scanner (briefing_blocked) are never matched. This does not traverse the graph and does not search on-demand summary_cache entries. Pass an optional `kind` (e.g. \"subsystem\", \"function\", \"class\", \"module\") to return only entities of that kind — the way to locate a subsystem without visually filtering results."
+            "Search entities by name, id, summary, and docstring (stemmed full-text + substring recall) — reach for it before grepping. (Semantic ranking is the opt-in `entity_semantic_search_list`.) Optional `kind` filter. Paginated; scanner-blocked docstrings never match."
         );
         assert_eq!(tools[2].name, "entity_callers_list");
         assert_eq!(
             tools[2].description,
-            "Return entities that call the given entity. Default confidence is resolved, so ambiguous static candidates and LLM-inferred edges are excluded unless explicitly requested. Ambiguous edges expand all candidates; inferred edges may trigger bounded LLM dispatch — NOTE confidence=inferred is rejected by policy unless serve.mcp.enable_write_tools is on, so in the default read-only posture the recovery path for a suspicious empty is entity_call_site_list role=callee, not inferred. Bounded: `limit` (default 50, max 100) plus a numeric-offset `cursor`; the result carries `next_cursor` (null when exhausted) and an explicit `truncated` flag. Honesty fields: scope_excludes names static blind spots not searched (attribute-receiver-calls; unresolved-static-calls when the project holds statically-unbindable call sites), `unresolved_name_matches` counts unresolved call sites that name-match this entity but are NOT in `callers`, and `next_action` points at the evidence tool when that count is non-zero. An empty callers list with unresolved_name_matches > 0 is NOT a true negative."
+            "What calls this entity. `confidence` resolved (default) | ambiguous | inferred (policy-gated). Bounded (`limit`+`cursor`). `scope_excludes` names unsearched blind spots; `unresolved_name_matches` counts name-matched unresolved sites NOT in callers (recover via entity_call_site_list role=callee) — empty with matches>0 is NOT a true negative."
         );
         assert_eq!(tools[3].name, "entity_execution_path_list");
         assert_eq!(
             tools[3].description,
-            "Return bounded calls-only execution paths starting at an entity. Default confidence is resolved. max_depth defaults to 3. Results are compact: a deduplicated nodes table plus paths as arrays of node ids (under a root), ranked longest-first. Traversal stops at the server edge cap and the response is capped at a maximum number of ranked paths; truncated/truncation_reason report edge-cap or path-cap when either trims. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls, and unresolved-static-calls when the project holds statically-unbindable call sites — paths through those sites are invisible at this tier)."
+            "Bounded calls-only paths from an entity (`max_depth` default 3). Compact: deduplicated `nodes` table + `paths` as node-id arrays, longest-first; truncation reports edge-cap/path-cap. `scope_excludes` names unsearched blind spots (attribute-receiver / unresolved static calls) — empties are not proof."
         );
         assert_eq!(tools[4].name, "entity_summary_get");
         assert_eq!(
             tools[4].description,
-            "Return an on-demand cached summary for one entity. In v0.1 this is leaf scope only: module summaries describe the module docstring and top-level members, not an aggregation of contained function/class summaries. If the LLM returns non-JSON the response degrades to a deterministic structural summary (kind: structural-fallback) built from the entity source, and that fallback is cached so a retry is a free cache hit rather than a re-billed failure."
+            "On-demand cached LLM summary for one entity (leaf scope: module summaries do not aggregate members). Non-JSON LLM output degrades to a cached deterministic structural fallback, so a retry is a cache hit, not a re-billed failure."
         );
         assert_eq!(tools[5].name, "entity_issue_list");
         assert_eq!(
             tools[5].description,
-            "Return Filigree issues attached to this Loomweave entity, optionally including issues attached to contained entities. Filigree is an enrichment source; if unavailable, the tool returns an unavailable envelope instead of failing Loomweave. The result carries a result_kind (matched | no_matches | unavailable) so a reachable-but-empty Filigree is distinct from an unreachable one, and a filigree_endpoint block (configured vs resolved URL + resolution_source) so you can see which endpoint — e.g. a live ethereal port — the answer came from. Each matched/drifted entry carries an `issue` object with the issue's title, status, and priority (fetched once per distinct issue, no N+1); `issue` is null when the issue-detail route is unavailable, so the match still resolves without a second hop into Filigree. Includes a `wardline_findings` section (enrich-only) reconciling Wardline findings to the entity by qualname; `result_kind` is matched|no_matches|unavailable."
+            "Filigree issues attached to an entity (optionally contained entities too), plus an enrich-only `wardline_findings` section. result_kind matched | no_matches | unavailable distinguishes empty-Filigree from unreachable-Filigree; `filigree_endpoint` shows which endpoint answered."
         );
         assert_eq!(tools[6].name, "entity_neighborhood_get");
         assert_eq!(
             tools[6].description,
-            "Return the one-hop Loomweave neighborhood around an entity: callers, callees, container, contained entities, references, imports (imports_in = who imports this module, imports_out = what it imports; module-to-module), and relations (relations_in/relations_out — the kind-tagged inherits_from/decorates/implements/derives edges; relations_in on a class answers \"what subclasses this\", relations_out on a decorator answers \"what does this decorate\" — ADR-051 direction). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. On references_in each rolled-up neighbor also carries `importer_module` — the importing symbol's containing module — so reverse-import names importing modules, not just symbols. Each list bucket is bounded by a single per-bucket `limit` (default 50, max 100); a sibling `truncated` map flags which buckets were trimmed (callers/callees/contained/references_in/references_out/imports_in/imports_out/relations_in/relations_out). For the full cursor-paginated set of a trimmed bucket, use the dedicated single-relation tool (e.g. entity_callers_list, entity_relation_list). This overview has NO cursor — one cursor cannot coherently advance nine heterogeneous buckets. The result carries scope_excludes naming blind spots not searched (attribute-receiver-calls; unresolved-static-calls when the project holds statically-unbindable call sites), plus `unresolved_name_matches` (unresolved call sites that name-match this entity but are NOT in `callers`) and a `next_action` pointer at entity_call_site_list role=callee — so empty sections are never read as guaranteed true negatives."
+            "One-hop neighborhood: callers, callees, container, contained, references, imports, relations (in/out). Per-bucket `limit` (default 50, max 100) + `truncated` map; NO cursor — page a trimmed bucket via its dedicated tool. Module references roll up over contained symbols. Carries scope_excludes + unresolved_name_matches (see entity_callers_list)."
         );
         assert_eq!(tools[7].name, "subsystem_member_list");
         assert_eq!(
             tools[7].description,
-            "List module entities assigned to a subsystem entity. Bounded: `limit` (default 50, max 100) plus a numeric-offset `cursor`; the result carries `next_cursor` (null when exhausted) and an explicit `truncated` flag."
+            "List the module entities in a subsystem. Bounded: `limit` (default 50, max 100) + numeric-offset `cursor`."
         );
         assert_eq!(tools[8].name, "entity_subsystem_get");
         assert_eq!(
             tools[8].description,
-            "Return the subsystem an entity belongs to — the reverse of subsystem_members. Accepts any entity id: a module resolves directly, while a function/class resolves through its nearest containing module. Returns the subsystem id/name and the module the membership was resolved through, or a no-subsystem result when the entity has no subsystem-assigned module ancestor."
+            "The subsystem an entity belongs to (reverse of subsystem_member_list). Any entity id (functions/classes resolve through their containing module); reports the via-module."
         );
         assert_eq!(tools[9].name, "project_status_get");
         assert_eq!(
             tools[9].description,
-            "Return deterministic Loomweave diagnostics: repo root, db path, latest run (id/status/started/completed), entity/subsystem/edge/finding/briefing-blocked counts, index staleness, per-plugin entity counts from the current index, LLM policy (provider/live/cache), and the resolved Filigree endpoint (configured vs resolved URL + resolution source). Answers \"is the graph fresh, plugin-less, LLM-live, Filigree-reachable?\" without shelling out. No LLM call."
+            "Deterministic diagnostics: repo root, db path, latest run, entity/edge/finding counts, index staleness, per-plugin counts, LLM policy, and the resolved Filigree endpoint."
         );
         assert_eq!(tools[10].name, "entity_summary_preview_cost_get");
         assert_eq!(
             tools[10].description,
-            "Preview what calling summary(id) would cost BEFORE spending. Reports cache_status (hit | expired | miss), the cached row's real tokens/cost/age on a hit, an input-token estimate on a miss, the configured model, the LLM policy (provider/live/allow_live_provider/cache horizon), and live_spend_would_occur — true only when no fresh cache row exists AND a live provider is wired. A disabled/unconfigured LLM is reported distinctly from a cache miss. Never invokes the LLM provider."
+            "Preview what entity_summary_get would cost BEFORE spending: cache_status (hit | expired | miss), real cost on a hit, an estimate on a miss, and live_spend_would_occur. A disabled LLM is reported distinctly from a cache miss. Never invokes the provider."
         );
         assert_eq!(tools[11].name, "entity_source_get");
         assert_eq!(
             tools[11].description,
-            "Return the exact indexed source span for one entity (its source_line_start..source_line_end, which includes any decorators/signature/docstring the plugin captured) plus a bounded window of surrounding context, as line-numbered lines each flagged in_entity true/false. No LLM call. Lets an agent read and trust the entity without shelling out. source_status reports `ok`, or — instead of a misleading stale snippet — `missing` (file gone), `no_range`/`no_source_path` (entity has no anchor), `binary` (non-UTF-8), or `drifted` (the file no longer matches the indexed content_hash; rerun `loomweave analyze`). context_lines defaults to 10."
+            "An entity's exact indexed source span plus `context_lines` (default 10) of context, line-numbered and flagged in_entity. source_status reports ok | missing | no_range | no_source_path | binary | drifted (rerun analyze) instead of a misleading stale snippet."
         );
         assert_eq!(tools[12].name, "entity_call_site_list");
         assert_eq!(
             tools[12].description,
-            "Show the actual source sites behind calls/references edges, so an agent can see WHY Loomweave believes an edge exists rather than trusting it blind. role=caller (default) returns this entity's outgoing sites (what it calls/references); role=callee returns incoming sites (who calls/references it). Each site carries the file path, 1-based line, byte column, the source line text, edge kind, confidence, and a resolution of resolved | ambiguous (with candidate ids) | unresolved (a static call Loomweave could not bind, kept separate so it is never mixed with resolved evidence). Filter by edge kind (`calls`/`references`) and by a best-effort production/test path heuristic (`all`/`production`/`test`; path partitioning is not indexed — the heuristic matches conventional test paths). Output is bounded; truncated flags when the site cap trims. No LLM call."
+            "Show the source sites behind calls/references edges — the evidence for WHY an edge exists. role=caller (default) lists outgoing sites; role=callee lists incoming, INCLUDING `unresolved_sites` (static calls Loomweave could not bind — the recovery surface for suspicious empty caller lists). Bounded."
         );
         assert_eq!(tools[13].name, "entity_orientation_pack_get");
         assert_eq!(
             tools[13].description,
-            "Assemble one deterministic orientation packet for a code location — the replacement for hand-composing find_entity + entity_at + source reads + neighborhood + issues_for + freshness on every question. Resolve EITHER by `entity` id OR by `file`+`line` (exactly one form). The packet bundles: the primary entity, the entity_context evidence (match_reason / containing stack / decl-body-decorator ranges — so a decorator-line query is explained, not guessed), a compact source-span summary, one-hop neighbors (callers, callees, container, contained, references, imports, kind-tagged relations_in/relations_out for inherits_from/decorates/implements/derives — for a module, references_in/out are rolled up over contained symbols with references_rolled_up=true), compact resolved execution paths, related Filigree issues, index/Filigree/LLM health, warnings, and suggested next reads. No LLM summary is invoked. Every list is bounded; an `omitted` block reports per-section truncation counts and `degraded` sections name surfaces that were unavailable (e.g. Filigree down) so an empty section is never read as a guaranteed negative. Includes a `wardline_findings` section (enrich-only) reconciling Wardline findings to the entity by qualname; `result_kind` is matched|no_matches|unavailable."
+            "One deterministic orientation packet for an `entity` id OR `file`+`line` (exactly one): primary entity, match evidence, one-hop neighbors, execution paths, Filigree issues, Wardline findings, health, suggested next reads. Bounded; `omitted` + named degraded sections keep empties honest."
         );
         assert_eq!(tools[14].name, "analyze_start");
         assert_eq!(
             tools[14].description,
-            "Start a `loomweave analyze` run over this project in the background and return its run handle immediately — do not block on the (possibly many-minute) run. Re-indexes the source tree and refreshes entities/edges/subsystems. Returns run_id, status (`started`), and the progress-file path. Only one analyze may run per project at a time (a cross-process lock enforces it); a second start while one is active is rejected. Poll analyze_status for progress; analyze_cancel to stop. No arguments."
+            "Start a background `loomweave analyze` run; returns run_id immediately (runs can take minutes). One run per project (cross-process lock). Poll analyze_status_get; stop via analyze_cancel. No arguments."
         );
         assert_eq!(tools[15].name, "analyze_status_get");
         assert_eq!(
             tools[15].description,
-            "Report the live status of an analyze run started via analyze_start. status is one of queued (spawned, not yet recording) | running | completed | failed | cancelled | skipped_no_plugins. While running it exposes phase (discovering / analyzing / clustering), current_plugin, processed_files / total_files, current_file, the latest heartbeat_at, elapsed_seconds, and progress_observed (false when the heartbeat has gone stale — the run may be wedged). On a terminal status it carries the recorded run stats. Reads structured progress, never logs."
+            "A run's live status: queued | running | completed | failed | cancelled | skipped_no_plugins, with phase, current plugin/file, processed/total files, heartbeat, and progress_observed=false when the heartbeat is stale (run may be wedged)."
         );
         assert_eq!(tools[16].name, "analyze_cancel");
         assert_eq!(
             tools[16].description,
-            "Cancel a running analyze. SIGKILLs the run's whole process group — terminating the language plugin and its pyright-langserver child — then marks the run terminal (status `cancelled`) so it is never left dangling as `running`. Idempotent: cancelling an already-terminal run reports its current state. Partial work already written is kept (cancel discards in-flight work, not the index)."
+            "Cancel a running analyze: SIGKILLs the run's process group (plugin + pyright) and marks the run cancelled — never left dangling as running. Idempotent. Partial work already written is kept."
         );
         assert_eq!(tools[17].name, "index_diff_get");
         assert_eq!(tools[18].name, "entity_guidance_list");
@@ -5945,8 +5997,16 @@ mod tests {
         assert!(!tool_names.contains(&"propose_guidance"));
         assert!(!tool_names.contains(&"promote_guidance"));
         assert_eq!(response["result"]["tools"][0]["name"], "entity_at");
-        assert_eq!(response["result"]["tools"][0]["read_only"], true);
-        assert_eq!(response["result"]["tools"][0]["writes_local_state"], false);
+        assert_eq!(
+            response["result"]["tools"][0]["metadata"]["read_only"],
+            true
+        );
+        // False flags are omitted on the wire (absent ⇒ false).
+        assert!(
+            response["result"]["tools"][0]["metadata"]
+                .get("writes_local_state")
+                .is_none()
+        );
         assert!(
             tool_names.contains(&"subsystem_member_list"),
             "read-only list should include subsystem_member_list: {tool_names:?}"
@@ -6029,9 +6089,10 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "analyze_start")
             .expect("analyze_start advertised when write tools enabled");
-        assert_eq!(analyze["read_only"], false);
-        assert_eq!(analyze["writes_local_state"], true);
-        assert_eq!(analyze["spawns_process"], true);
+        // False flags are omitted on the wire (absent ⇒ false).
+        assert!(analyze["metadata"].get("read_only").is_none());
+        assert_eq!(analyze["metadata"]["writes_local_state"], true);
+        assert_eq!(analyze["metadata"]["spawns_process"], true);
         assert!(tools.iter().any(|tool| tool["name"] == "propose_guidance"));
     }
 

@@ -264,6 +264,55 @@ does Y" out of the box.
 
 > Not in this catalogue: `emit_observation` as a general-purpose write surface.
 
+### Tool notes (depth the tools/list descriptions deliberately omit)
+
+Schema descriptions are kept short by budget; the operational detail lives here.
+
+- **`entity_at` / `entity_orientation_pack_get` evidence:** `match_reason` is
+  one of decorator_range / declaration / body_range / containing_range /
+  no_match — a blank or comment line that only a module spans reports
+  `containing_range`, never a fabricated exact match. The context block also
+  carries the module→entity containing stack, decl/body/decorator sub-ranges,
+  and same-granularity ambiguity alternatives.
+- **`entity_finding_list` / `project_finding_list` filter values** (closed
+  sets): `kind` = defect | fact | classification | metric | suggestion;
+  `severity` = INFO | WARN | ERROR | CRITICAL | NONE; `status` = open |
+  acknowledged | suppressed | promoted_to_issue.
+- **`entity_call_site_list` resolution:** each site is resolved | ambiguous
+  (with candidate ids) | unresolved (a static call Loomweave could not bind —
+  kept separate from resolved evidence). Filter with `kind`
+  (`calls`/`references`) and `path` (`all`/`production`/`test` — a best-effort
+  path heuristic, not an indexed partition). Sites carry file, 1-based line,
+  byte column, and line text.
+- **`entity_neighborhood_get` rollups:** on a module, each rolled-up
+  references neighbor carries `via` (the contained symbol the edge touches);
+  references_in neighbors also carry `importer_module`, so reverse-import
+  answers name importing modules, not just symbols.
+- **`entity_relation_list` anchors:** each entry carries the anchoring
+  file/line/line-text behind the edge. For `decorates` the anchor lives in the
+  DECORATED side's file (the `@decorator` line), and ambiguous `candidates`
+  are alternative FROM-side decorators — inverted relative to every other
+  kind.
+- **`entity_dead_list` reasoning:** reachability counts ALL confidence tiers,
+  dynamic-dispatch/reflection barrier tags force entities live,
+  framework-magic kinds are excluded from candidacy, and there is no
+  `confidence` argument (a ceiling would only make more code look dead).
+  Results are heuristic findings (confidence < 1), never certainties.
+- **`index_diff_get` mechanics:** compares the persisted analyzed commit vs
+  git HEAD (falling back to dates), lists indexed files modified/missing and
+  dirty working-tree files touching indexed paths, and is fail-soft — a
+  missing git binary degrades to `git.available: false`, never an error.
+- **`entity_summary_get` fallback:** non-JSON LLM output degrades to a
+  deterministic structural summary (kind: structural-fallback) that is cached,
+  so a retry is a free cache hit rather than a re-billed failure.
+  `entity_summary_preview_cost_get` reports `live_spend_would_occur` — true
+  only when no fresh cache row exists AND a live provider is wired; a disabled
+  LLM is reported distinctly from a cache miss.
+- **`entity_issue_list` endpoint evidence:** the `filigree_endpoint` block
+  reports configured vs resolved URL + resolution source (e.g. a live
+  ephemeral port), and matched entries embed the issue's title/status/priority
+  fetched once per distinct issue.
+
 **Guidance authoring has an operator boundary.** Operators can manage sheets via
 `loomweave guidance create/edit/show/list/delete/promote` (plus `export`/`import`
 for team sharing). Agents may call `propose_guidance` to create a Filigree

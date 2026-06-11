@@ -546,7 +546,7 @@ assert tool_names == [
 # without a second hardcoded list.
 for name in tool_names:
     assert name in init_result["instructions"], (name, init_result["instructions"])
-assert "leaf scope only" in tools[4]["description"]
+assert "leaf scope" in tools[4]["description"]
 
 entity_hit = assert_tool_ok(responses["entity-hit"])
 assert entity_hit["result"]["entity"]["id"] == "python:function:demo.hello", entity_hit
