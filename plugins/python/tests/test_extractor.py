@@ -1951,6 +1951,68 @@ def test_conditional_def_first_branch_wins() -> None:
     assert result.stats.duplicate_entities_dropped_total == 1
 
 
+# ── Deep-nesting / too-complex degradation (clarion-f3eb3852d6) ────────────────
+
+
+def _too_complex_findings(result: ExtractResult) -> list[dict[str, object]]:
+    return [
+        cast("dict[str, object]", f)
+        for f in result.stats.findings
+        if f["subcode"] == "LMWV-PY-TOO-COMPLEX"
+    ]
+
+
+def test_binop_chain_degrades_to_too_complex_module_entity() -> None:
+    """A deep `1+1+…` chain blows Python-level visitor recursion AFTER a clean parse.
+
+    Benign generated code (constant tables) reaches this shape; it must degrade
+    to a `too_complex` module entity + plugin finding, never escape as
+    RecursionError (which would fail the whole plugin run host-side).
+    """
+    source = "x = " + "1+" * 2000 + "1\n"
+    result = extract_with_stats(source, "demo.py")
+    assert [e["kind"] for e in result.entities] == ["module"]
+    assert result.entities[0]["parse_status"] == "too_complex"
+    assert result.edges == []
+    findings = _too_complex_findings(result)
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "warning"
+
+
+def test_giant_binop_chain_in_parse_degrades_to_too_complex() -> None:
+    """At ~10k+ depth ast.parse itself raises RecursionError during construction."""
+    source = "x = " + "1+" * 100_000 + "1\n"
+    result = extract_with_stats(source, "demo.py")
+    assert [e["kind"] for e in result.entities] == ["module"]
+    assert result.entities[0]["parse_status"] == "too_complex"
+    assert len(_too_complex_findings(result)) == 1
+
+
+def test_unary_prefix_run_parser_stack_overflow_degrades_to_too_complex() -> None:
+    """`----…-1` overflows the PEG parser stack: MemoryError, not RecursionError."""
+    source = "x = " + "-" * 10_000 + "1\n"
+    result = extract_with_stats(source, "demo.py")
+    assert [e["kind"] for e in result.entities] == ["module"]
+    assert result.entities[0]["parse_status"] == "too_complex"
+    assert len(_too_complex_findings(result)) == 1
+
+
+def test_attribute_chain_degrades_to_too_complex() -> None:
+    source = "import a\ny = a" + ".b" * 2000 + "\n"
+    result = extract_with_stats(source, "demo.py")
+    assert [e["kind"] for e in result.entities] == ["module"]
+    assert result.entities[0]["parse_status"] == "too_complex"
+    assert len(_too_complex_findings(result)) == 1
+
+
+def test_tokenizer_nesting_limits_still_degrade_as_syntax_error() -> None:
+    """CPython's own tokenizer limits (parens ~200, indent 100) stay on the
+    existing syntax_error path — they raise SyntaxError, not RecursionError."""
+    parens = "x = " + "(" * 500 + "1" + ")" * 500 + "\n"
+    result = extract_with_stats(parens, "demo.py")
+    assert result.entities[0]["parse_status"] == "syntax_error"
+
+
 @pytest.mark.pyright
 def test_dropped_setter_body_calls_never_attribute_to_the_getter(
     tmp_path: Path,
