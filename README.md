@@ -14,7 +14,7 @@ and trust-topology tools.
 
 ## Status
 
-**v1.1.0rc4 — active release-candidate line.** `v1.0.0` remains the latest
+**v1.1.0rc5 — active release-candidate line.** `v1.0.0` remains the latest
 tagged GitHub Release; this branch is preparing the 1.1 line. Scope:
 
 - **Python and Rust first-party plugins.** The Python plugin extracts modules,
@@ -117,7 +117,7 @@ pipx install ./packaging/rust-plugin-dist
 ```
 
 The `loomweave` PyPI package scaffold for this branch depends on both
-`loomweave-plugin-python==1.1.0rc4` and `loomweave-plugin-rust==1.1.0rc4`; once
+`loomweave-plugin-python==1.1.0rc5` and `loomweave-plugin-rust==1.1.0rc5`; once
 those packages are published, a single Python install lands the CLI and both
 plugin executables in the same environment.
 
