@@ -468,15 +468,13 @@ fn semantic_next_action(
         SemanticProviderKind::Api if !has_key => {
             return format!("export ${} before analyzing", semantic.api_key_env);
         }
-        SemanticProviderKind::LocalOpenAi => {
-            if sidecar_count.unwrap_or(0) == 0 {
-                return format!(
-                    "start the local embeddings server at {}, then run `loomweave analyze`",
-                    semantic.endpoint_url
-                );
-            }
+        SemanticProviderKind::LocalOpenAi if sidecar_count.unwrap_or(0) == 0 => {
+            return format!(
+                "start the local embeddings server at {}, then run `loomweave analyze`",
+                semantic.endpoint_url
+            );
         }
-        _ => {}
+        SemanticProviderKind::Api | SemanticProviderKind::LocalOpenAi => {}
     }
     if sidecar_count.unwrap_or(0) == 0 {
         "run `loomweave analyze` to populate semantic embeddings".to_owned()

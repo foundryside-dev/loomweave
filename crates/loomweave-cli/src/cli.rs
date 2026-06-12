@@ -360,7 +360,7 @@ pub enum LlmConfigCommand {
         #[arg(long)]
         disallow_live: bool,
 
-        /// Enable write-capable MCP tools such as entity_summary_get and analyze_start.
+        /// Enable write-capable MCP tools such as `entity_summary_get` and `analyze_start`.
         #[arg(long, conflicts_with = "disable_write_tools")]
         enable_write_tools: bool,
 
@@ -368,12 +368,12 @@ pub enum LlmConfigCommand {
         #[arg(long)]
         disable_write_tools: bool,
 
-        /// Select provider: openrouter/openrouter_api, codex_cli/codex_sidecar,
-        /// claude_cli/claude_sidecar.
+        /// Select provider: `openrouter`/`openrouter_api`, `codex_cli`/`codex_sidecar`,
+        /// `claude_cli`/`claude_sidecar`.
         #[arg(long, value_name = "PROVIDER")]
         provider: Option<String>,
 
-        /// OpenRouter model id (`llm_policy.model_id`).
+        /// `OpenRouter` model id (`llm_policy.model_id`).
         #[arg(long, value_name = "MODEL")]
         model_id: Option<String>,
 
@@ -385,7 +385,7 @@ pub enum LlmConfigCommand {
         #[arg(long, value_name = "MODEL")]
         claude_model: Option<String>,
 
-        /// Env var containing the OpenRouter API key.
+        /// Env var containing the `OpenRouter` API key.
         #[arg(long, value_name = "ENV")]
         openrouter_api_key_env: Option<String>,
 
@@ -426,7 +426,7 @@ pub enum SemanticConfigCommand {
         #[arg(long)]
         disable: bool,
 
-        /// Select provider: api/openai_api or local_openai/local.
+        /// Select provider: `api`/`openai_api` or `local_openai`/`local`.
         #[arg(long, value_name = "PROVIDER")]
         provider: Option<String>,
 

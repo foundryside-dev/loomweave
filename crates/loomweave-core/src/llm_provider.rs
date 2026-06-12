@@ -1702,7 +1702,9 @@ mod tests {
     #[tokio::test]
     async fn traffic_logging_provider_appends_success_metadata_without_exchange_contents() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let log_path = temp.path().join(".weft/loomweave/diagnostics/llm-traffic.jsonl");
+        let log_path = temp
+            .path()
+            .join(".weft/loomweave/diagnostics/llm-traffic.jsonl");
         let request = LlmRequest {
             purpose: LlmPurpose::Summary,
             model_id: "summary-model".to_owned(),
@@ -1752,7 +1754,9 @@ mod tests {
     #[tokio::test]
     async fn traffic_logging_provider_appends_error_metadata_without_exchange_contents() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let log_path = temp.path().join(".weft/loomweave/diagnostics/llm-traffic.jsonl");
+        let log_path = temp
+            .path()
+            .join(".weft/loomweave/diagnostics/llm-traffic.jsonl");
         let request = LlmRequest {
             purpose: LlmPurpose::Summary,
             model_id: "summary-model".to_owned(),
@@ -1785,7 +1789,9 @@ mod tests {
     #[tokio::test]
     async fn traffic_logging_provider_rotates_diagnostics_log_when_size_limit_is_reached() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let log_path = temp.path().join(".weft/loomweave/diagnostics/llm-traffic.jsonl");
+        let log_path = temp
+            .path()
+            .join(".weft/loomweave/diagnostics/llm-traffic.jsonl");
         let backup_path = PathBuf::from(format!("{}.1", log_path.display()));
         fs::create_dir_all(log_path.parent().expect("log parent")).expect("create log parent");
         fs::write(&log_path, "old diagnostic lookup\nold diagnostic lookup\n")
@@ -1913,9 +1919,7 @@ mod tests {
         for _ in 0..64 {
             let provider = provider.clone();
             let request = request.clone();
-            handles.push(tokio::spawn(async move {
-                provider.invoke(request).await
-            }));
+            handles.push(tokio::spawn(async move { provider.invoke(request).await }));
         }
         for handle in handles {
             handle

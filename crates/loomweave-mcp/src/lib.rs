@@ -231,7 +231,10 @@ impl ToolMetadata {
 
 pub fn tool_metadata(name: &str) -> ToolMetadata {
     match name {
-        "llm_config_set" | "semantic_config_set" => {
+        // The config-set pair shares the local-write flag shape with
+        // analyze_cancel/promote_guidance, but is gate-EXEMPT — see
+        // `is_bootstrap_config_tool` (weft-ac59e8e730).
+        "llm_config_set" | "semantic_config_set" | "analyze_cancel" | "promote_guidance" => {
             ToolMetadata::write_tool(true, false, false, false)
         }
         "entity_summary_get" => ToolMetadata::write_tool(true, false, false, true),
@@ -239,9 +242,6 @@ pub fn tool_metadata(name: &str) -> ToolMetadata {
             ToolMetadata::conditional_llm()
         }
         "analyze_start" => ToolMetadata::write_tool(true, false, true, false),
-        "analyze_cancel" | "promote_guidance" => {
-            ToolMetadata::write_tool(true, false, false, false)
-        }
         "propose_guidance" => ToolMetadata::write_tool(false, true, false, false),
         _ => ToolMetadata::read_only(),
     }
@@ -1347,6 +1347,7 @@ impl ServerState {
         }
     }
 
+    #[allow(clippy::similar_names)] // path/patch are both the precise domain terms
     async fn tool_llm_config_set(
         &self,
         arguments: &serde_json::Map<String, Value>,
@@ -1414,6 +1415,7 @@ impl ServerState {
         }
     }
 
+    #[allow(clippy::similar_names)] // path/patch are both the precise domain terms
     async fn tool_semantic_config_set(
         &self,
         arguments: &serde_json::Map<String, Value>,
@@ -3364,7 +3366,7 @@ fn semantic_config_status_json(
             "path": sidecar_path.display().to_string(),
             "present": sidecar_path.exists(),
             "vector_count": vector_count,
-            "error": sidecar_count.err().map(|err| err.to_string()),
+            "error": sidecar_count.err(),
         }
     })
 }
@@ -3385,7 +3387,7 @@ fn semantic_provider_error(semantic: &SemanticSearchConfig, has_key: bool) -> Op
             .validate_endpoint_trust()
             .err()
             .map(|err| err.to_string()),
-        _ => None,
+        SemanticProviderKind::Api => None,
     }
 }
 
@@ -5983,6 +5985,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // exhaustively pins all 46 tool docstrings by design
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 

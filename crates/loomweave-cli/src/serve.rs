@@ -357,12 +357,14 @@ pub(crate) fn build_embedding_provider(
     let (allow_live_provider, api_key) = match config.provider {
         SemanticProviderKind::Api => {
             if !config.allow_live_provider {
-                return warn_inert_embedding_provider(
-                    EmbeddingProviderError::LiveProviderNotAllowed,
-                );
+                return Ok(warn_inert_embedding_provider(
+                    &EmbeddingProviderError::LiveProviderNotAllowed,
+                ));
             }
             if api_key.as_deref().is_none_or(|key| key.trim().is_empty()) {
-                return warn_inert_embedding_provider(EmbeddingProviderError::MissingApiKey);
+                return Ok(warn_inert_embedding_provider(
+                    &EmbeddingProviderError::MissingApiKey,
+                ));
             }
             (true, api_key)
         }
@@ -399,14 +401,14 @@ pub(crate) fn build_embedding_provider(
 }
 
 fn warn_inert_embedding_provider(
-    err: EmbeddingProviderError,
-) -> Result<Option<Arc<dyn EmbeddingProvider>>> {
+    err: &EmbeddingProviderError,
+) -> Option<Arc<dyn EmbeddingProvider>> {
     tracing::warn!(
         error = %err,
         "semantic_search.enabled=true but the embedding provider could not be \
          constructed; search_semantic will report not_enabled"
     );
-    Ok(None)
+    None
 }
 
 /// Pair the (cloned) config with a constructed provider so `run_mcp_stdio` can

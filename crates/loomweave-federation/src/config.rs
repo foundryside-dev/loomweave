@@ -763,6 +763,7 @@ where
     }
 }
 
+#[allow(clippy::similar_names)] // path/patch are both the precise domain terms
 pub fn update_llm_config_file(
     path: &Path,
     patch: &LlmConfigPatch,
@@ -810,6 +811,7 @@ pub fn update_llm_config_file(
     })
 }
 
+#[allow(clippy::similar_names)] // path/patch are both the precise domain terms
 pub fn update_semantic_config_file(
     path: &Path,
     patch: &SemanticConfigPatch,
@@ -1477,7 +1479,8 @@ semantic_search:
         )
         .expect_err("enabled local provider with a non-loopback endpoint must fail");
         assert!(
-            err.to_string().contains("LMWV-CONFIG-SEMANTIC-NON-LOOPBACK"),
+            err.to_string()
+                .contains("LMWV-CONFIG-SEMANTIC-NON-LOOPBACK"),
             "unexpected error: {err}"
         );
     }
@@ -1515,7 +1518,8 @@ semantic_search:
         )
         .expect_err("re-enabling with a non-loopback local endpoint must fail");
         assert!(
-            err.to_string().contains("LMWV-CONFIG-SEMANTIC-NON-LOOPBACK"),
+            err.to_string()
+                .contains("LMWV-CONFIG-SEMANTIC-NON-LOOPBACK"),
             "unexpected error: {err}"
         );
     }

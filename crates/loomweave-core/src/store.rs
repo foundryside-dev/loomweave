@@ -215,7 +215,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             llm_traffic_log_path(dir.path()),
-            dir.path().join("custom/store/diagnostics/llm-traffic.jsonl")
+            dir.path()
+                .join("custom/store/diagnostics/llm-traffic.jsonl")
         );
     }
 
