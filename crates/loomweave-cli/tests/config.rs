@@ -238,6 +238,32 @@ fn config_semantic_set_rejects_non_loopback_local_endpoint() {
 }
 
 #[test]
+fn config_semantic_set_disable_succeeds_despite_non_loopback_local_endpoint() {
+    // weft-ac59e8e730: a disabled semantic block must not be held to the
+    // loopback-trust gate — otherwise `config semantic set --disable` is
+    // itself rejected (the edit path re-parses the file before writing) and
+    // the operator has no in-tool recovery from a stale endpoint.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("loomweave.yaml"),
+        "semantic_search:\n  enabled: false\n  provider: local_openai\n  endpoint_url: http://192.168.1.50:11434/v1\n",
+    )
+    .unwrap();
+
+    // The config must load (status must not hard-fail)...
+    let (code, stdout, stderr) = config(dir.path(), &["semantic", "status"]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("Semantic enabled:       false"), "{stdout}");
+
+    // ...and explicitly writing the disabled state must succeed.
+    let (code, stdout, stderr) = config(dir.path(), &["semantic", "set", "--disable"]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+
+    let config = McpConfig::from_path(&dir.path().join("loomweave.yaml")).unwrap();
+    assert!(!config.semantic_search.enabled);
+}
+
+#[test]
 fn config_semantic_status_reports_sidecar_absent_without_secret() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(

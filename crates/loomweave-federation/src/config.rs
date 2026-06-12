@@ -231,8 +231,18 @@ impl Default for SemanticSearchConfig {
 }
 
 impl SemanticSearchConfig {
+    /// Loopback-trust gate for the local OpenAI-compatible provider.
+    ///
+    /// Gated on `enabled` (matching [`HttpReadConfig::validate_loopback_trust`]):
+    /// a disabled semantic block can never reach the endpoint, so its
+    /// `endpoint_url` must not fail config load — otherwise
+    /// `semantic_search.enabled: false` plus a stale non-loopback endpoint
+    /// hard-fails `loomweave serve` AND traps recovery, because
+    /// `update_semantic_config_file` re-parses through `from_yaml_str` before
+    /// writing, so even `config semantic set --disable` was rejected
+    /// (weft-ac59e8e730).
     pub fn validate_endpoint_trust(&self) -> Result<(), ConfigError> {
-        if self.provider != SemanticProviderKind::LocalOpenAi {
+        if !self.enabled || self.provider != SemanticProviderKind::LocalOpenAi {
             return Ok(());
         }
         let url = reqwest::Url::parse(&self.endpoint_url).map_err(|source| {
@@ -260,6 +270,13 @@ fn semantic_url_is_loopback(url: &reqwest::Url) -> bool {
     {
         return true;
     }
+    // `host_str()` keeps the URL-syntax brackets on an IPv6 host (`[::1]`),
+    // which `IpAddr::from_str` rejects — strip them so IPv6 loopback is
+    // recognised (weft-ac59e8e730).
+    let host = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
     host.parse::<IpAddr>().is_ok_and(|addr| addr.is_loopback())
 }
 
@@ -1423,6 +1440,107 @@ llm_policy:
         })
         .expect("provider selection via env opt-in");
         assert_eq!(env_selected, ProviderSelection::ClaudeCli);
+    }
+
+    #[test]
+    fn disabled_semantic_block_with_non_loopback_local_endpoint_still_loads() {
+        // weft-ac59e8e730: the loopback-trust gate must be conditioned on
+        // `enabled` — a disabled block can never reach the endpoint, and
+        // failing here hard-failed `loomweave serve` / `config status` AND
+        // trapped recovery (`config semantic set --disable` re-parses the
+        // file before writing).
+        let cfg = McpConfig::from_yaml_str(
+            r"
+semantic_search:
+  enabled: false
+  provider: local_openai
+  endpoint_url: http://192.168.1.50:11434/v1
+",
+        )
+        .expect("disabled semantic block must load regardless of endpoint trust");
+        assert!(!cfg.semantic_search.enabled);
+        assert_eq!(
+            cfg.semantic_search.provider,
+            SemanticProviderKind::LocalOpenAi
+        );
+    }
+
+    #[test]
+    fn enabled_local_semantic_provider_still_rejects_non_loopback_endpoint() {
+        let err = McpConfig::from_yaml_str(
+            r"
+semantic_search:
+  enabled: true
+  provider: local_openai
+  endpoint_url: http://192.168.1.50:11434/v1
+",
+        )
+        .expect_err("enabled local provider with a non-loopback endpoint must fail");
+        assert!(
+            err.to_string().contains("LMWV-CONFIG-SEMANTIC-NON-LOOPBACK"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn semantic_set_disable_succeeds_on_non_loopback_local_endpoint_config() {
+        // weft-ac59e8e730 recovery path: `config semantic set --disable` on a
+        // file whose enabled local provider points at a non-loopback endpoint
+        // must be able to write the disabled state.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("loomweave.yaml");
+        fs::write(
+            &path,
+            "semantic_search:\n  enabled: false\n  provider: local_openai\n  endpoint_url: http://192.168.1.50:11434/v1\n",
+        )
+        .expect("seed config");
+
+        let result = update_semantic_config_file(
+            &path,
+            &SemanticConfigPatch {
+                enabled: Some(false),
+                ..SemanticConfigPatch::default()
+            },
+        )
+        .expect("disabling semantic search must succeed despite the stale endpoint");
+        assert!(!result.config.semantic_search.enabled);
+
+        // And re-enabling against the same stale endpoint is still refused.
+        let err = update_semantic_config_file(
+            &path,
+            &SemanticConfigPatch {
+                enabled: Some(true),
+                ..SemanticConfigPatch::default()
+            },
+        )
+        .expect_err("re-enabling with a non-loopback local endpoint must fail");
+        assert!(
+            err.to_string().contains("LMWV-CONFIG-SEMANTIC-NON-LOOPBACK"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ipv6_loopback_semantic_endpoint_is_trusted() {
+        // weft-ac59e8e730 (minor): url::host_str() returns the bracketed form
+        // for IPv6 hosts, which IpAddr parsing rejected, so `http://[::1]:...`
+        // was wrongly refused as non-loopback.
+        let cfg = SemanticSearchConfig {
+            enabled: true,
+            provider: SemanticProviderKind::LocalOpenAi,
+            endpoint_url: "http://[::1]:11434/v1".to_owned(),
+            ..SemanticSearchConfig::default()
+        };
+        cfg.validate_endpoint_trust()
+            .expect("IPv6 loopback endpoint must satisfy the loopback-trust gate");
+
+        let non_loopback = SemanticSearchConfig {
+            endpoint_url: "http://[2001:db8::1]:11434/v1".to_owned(),
+            ..cfg
+        };
+        non_loopback
+            .validate_endpoint_trust()
+            .expect_err("non-loopback IPv6 endpoint must still be refused");
     }
 
     #[test]
