@@ -915,36 +915,55 @@ fn id_cursor_schema() -> Value {
 }
 
 fn llm_config_set_schema() -> Value {
+    // Typed to match the argument parser (`llm_config_patch_from_arguments`):
+    // every property is optional, but a present one must carry the right type
+    // — the bare `{}` schemas shipped in c475e90 declared nothing
+    // (weft-ac59e8e730). Enum values mirror `LlmProviderKind::parse`. No
+    // per-property descriptions: tools/list is a per-session context tax
+    // (clarion-e65354898d) and depth belongs in the loomweave-workflow skill.
     json!({
         "type": "object",
         "properties": {
-            "enabled": {},
-            "provider": {},
-            "allow_live_provider": {},
-            "enable_write_tools": {},
-            "model_id": {},
-            "codex_model": {},
-            "claude_model": {},
-            "openrouter_api_key_env": {},
-            "openrouter_endpoint_url": {}
+            "enabled": {"type": "boolean"},
+            "provider": {
+                "type": "string",
+                "enum": [
+                    "openrouter", "open_router", "openrouter_api",
+                    "codex_cli", "codex", "codex_sidecar",
+                    "claude_cli", "claude_code", "claude_sidecar",
+                    "recording"
+                ]
+            },
+            "allow_live_provider": {"type": "boolean"},
+            "enable_write_tools": {"type": "boolean"},
+            "model_id": {"type": "string", "minLength": 1},
+            "codex_model": {"type": "string", "minLength": 1},
+            "claude_model": {"type": "string", "minLength": 1},
+            "openrouter_api_key_env": {"type": "string", "minLength": 1},
+            "openrouter_endpoint_url": {"type": "string", "minLength": 1}
         },
         "additionalProperties": false
     })
 }
 
 fn semantic_config_set_schema() -> Value {
+    // Typed to match `semantic_config_patch_from_arguments`; enum values
+    // mirror `SemanticProviderKind::parse` (weft-ac59e8e730).
     json!({
         "type": "object",
         "properties": {
-            "enabled": {},
-            "provider": {},
-            "allow_live_provider": {},
-            "model_id": {},
-            "dimensions": {},
-            "endpoint_url": {},
-            "api_key_env": {},
-            "timeout_seconds": {},
-            "session_token_ceiling": {}
+            "enabled": {"type": "boolean"},
+            "provider": {
+                "type": "string",
+                "enum": ["api", "openai", "openai_api", "local_openai", "local", "openai_local"]
+            },
+            "allow_live_provider": {"type": "boolean"},
+            "model_id": {"type": "string", "minLength": 1},
+            "dimensions": {"type": "integer", "minimum": 1},
+            "endpoint_url": {"type": "string", "minLength": 1},
+            "api_key_env": {"type": "string", "minLength": 1},
+            "timeout_seconds": {"type": "integer", "minimum": 1},
+            "session_token_ceiling": {"type": "integer", "minimum": 0}
         },
         "additionalProperties": false
     })
@@ -5855,13 +5874,18 @@ mod tests {
         InferenceLlmState, InferredRead, McpToolPolicy, RENAME_MAP, ServerState, config::LlmConfig,
         list_tools,
     };
+    use loomweave_federation::config::{LlmProviderKind, SemanticProviderKind};
 
     /// tools/list is loaded into EVERY consuming session, so its size is a
     /// per-session context tax (clarion-e65354898d). Budget: each description
     /// ≤ 350 chars (what it answers, key args, one honesty caveat — depth
     /// belongs in the loomweave-workflow skill, fetched once on demand), and
-    /// the serialized catalogue ≤ 22 KB (~5k tokens at the observed ~4.2
-    /// bytes/token; the pre-budget baseline was 46 KB / ~11k tokens).
+    /// the serialized catalogue ≤ 23 KB (~5.5k tokens at the observed ~4.2
+    /// bytes/token; the pre-budget baseline was 46 KB / ~11k tokens). The
+    /// budget was raised 22 → 23 KB for weft-ac59e8e730: the two config-set
+    /// tools' inputSchemas were bare `{}` per property, and declaring real
+    /// types/enums for the surface that can enable writes and live LLM spend
+    /// is worth ~0.7 KB.
     #[test]
     fn tools_list_fits_the_context_budget() {
         let tools = list_tools();
@@ -5876,8 +5900,8 @@ mod tests {
         }
         let serialized = serde_json::to_string(&tools).expect("serialize tools");
         assert!(
-            serialized.len() <= 22_000,
-            "serialized tools/list is {} bytes (budget 22000 ≈ 5k tokens)",
+            serialized.len() <= 23_000,
+            "serialized tools/list is {} bytes (budget 23000 ≈ 5.5k tokens)",
             serialized.len()
         );
     }
@@ -6093,6 +6117,44 @@ mod tests {
         assert_eq!(tools[43].name, "project_finding_list");
         assert_eq!(tools[44].name, "entity_resolve");
         assert_eq!(tools[45].name, "entity_relation_list");
+    }
+
+    #[test]
+    fn config_set_tool_schemas_declare_types_for_every_property() {
+        // weft-ac59e8e730: the bootstrap config tools shipped with every
+        // inputSchema property as a bare `{}`, declaring nothing. Pin that
+        // each property is typed, and that the provider enums track the
+        // parsers' accepted alias sets.
+        for tool_name in ["llm_config_set", "semantic_config_set"] {
+            let tools = list_tools();
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} registered"));
+            let properties = tool.input_schema["properties"]
+                .as_object()
+                .expect("schema properties object");
+            assert!(!properties.is_empty());
+            for (property, schema) in properties {
+                assert!(
+                    schema["type"].is_string(),
+                    "{tool_name}.{property} schema must declare a type, got: {schema}"
+                );
+            }
+            let provider_enum = properties["provider"]["enum"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{tool_name}.provider must enumerate accepted values"));
+            for value in provider_enum {
+                let value = value.as_str().expect("enum entries are strings");
+                let parsed = match tool_name {
+                    "llm_config_set" => LlmProviderKind::parse(value).map(|_| ()),
+                    _ => SemanticProviderKind::parse(value).map(|_| ()),
+                };
+                parsed.unwrap_or_else(|err| {
+                    panic!("{tool_name}.provider enum value {value:?} is not parseable: {err}")
+                });
+            }
+        }
     }
 
     #[test]
