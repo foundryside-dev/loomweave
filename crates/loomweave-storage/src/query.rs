@@ -966,6 +966,24 @@ pub fn known_entity_kinds(conn: &Connection) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// The distinct categorisation tags this index actually holds, ordered. The
+/// truth source for the tag facets' honest-empty hint (weft-7256739b31): an
+/// empty-tag response derives its "what IS here" message from this list
+/// instead of a hand-maintained claim about what plugins emit.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Sqlite`] if the query fails.
+pub fn known_entity_tags(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT tag FROM entity_tags ORDER BY tag")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 /// Faceted catalog query: entities carrying `tag` (any plugin's
 /// `entity_tags.tag`), ordered by id, materialised up to `scan_cap`. Returns
 /// `(rows, scan_truncated)`. A blank tag is rejected; an unknown tag matches no

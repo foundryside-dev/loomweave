@@ -266,6 +266,18 @@ pub enum WriterCmd {
         current_run_id: String,
         ack: Ack<usize>,
     },
+    /// Rule-scoped stale-finding sweep (weft-7256739b31): retire stale `open`,
+    /// Filigree-unlinked findings of the named rules only. For rule families
+    /// whose producer is a FULL pass every run regardless of the incremental
+    /// file skip (the pre-ingest secret scan), so "run_id != current" means
+    /// "looked, no longer detected" even on a run the general sweep must skip.
+    /// Same lifecycle preservation and query-time-write posture as
+    /// [`WriterCmd::SweepStaleFindings`].
+    SweepStaleFindingsForRules {
+        current_run_id: String,
+        rule_ids: Vec<String>,
+        ack: Ack<usize>,
+    },
     /// Upsert one SEI binding (mint or carry) — Wave 1 / WS1 (ADR-038). A carry
     /// REPLACEs the binding's own row by SEI PK, moving `current_locator` in
     /// place; it never creates a second alive row. Query-time write: the SEI

@@ -39,8 +39,7 @@ impl ServerState {
         Ok(self
             .tag_facet(
                 tag,
-                "no entity carries this categorisation tag; tags are populated by plugins \
-                 (the Python plugin emits none today)",
+                "no entity carries this categorisation tag in this index",
                 scope,
                 page,
             )
@@ -52,6 +51,12 @@ impl ServerState {
     /// the result is empty. Reused by `find_by_tag` and the categorisation
     /// shortcuts (`find_entry_points`, `find_tests`, …), each of which reads an
     /// existing tag and is honest-empty when no plugin emits it.
+    ///
+    /// The empty-result note is DERIVED from the store, never hand-maintained
+    /// (weft-7256739b31 / dogfood-4 B10b: a static "the Python plugin emits none
+    /// today" claim contradicted an index with populated test/entry-point tags).
+    /// `known_tags` lists the tags the index actually holds, and the reason
+    /// distinguishes "this tag is absent" from "no tags are populated at all".
     pub(crate) async fn tag_facet(
         &self,
         tag: String,
@@ -75,7 +80,22 @@ impl ServerState {
                 );
                 attach_facet(&mut response, json!({ "tag": tag }));
                 if response["page"]["total"] == json!(0) {
-                    attach_signal(&mut response, missing_signal("entity_tags", missing_reason));
+                    let known = loomweave_storage::known_entity_tags(conn)?;
+                    let reason = if known.is_empty() {
+                        format!(
+                            "{missing_reason}; no categorisation tags are populated in this \
+                             index at all (no active plugin emitted any)"
+                        )
+                    } else {
+                        format!(
+                            "{missing_reason}; this index does hold other categorisation \
+                             tags — see known_tags"
+                        )
+                    };
+                    if let Some(object) = response.as_object_mut() {
+                        object.insert("known_tags".to_owned(), json!(known));
+                    }
+                    attach_signal(&mut response, missing_signal("entity_tags", &reason));
                 }
                 Ok(success_envelope(response))
             })

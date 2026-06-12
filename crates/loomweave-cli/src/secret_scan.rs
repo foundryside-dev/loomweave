@@ -36,6 +36,21 @@ const SECRET_OVERRIDE_ALLOWED: &str = "LMWV-SEC-UNREDACTED-SECRETS-ALLOWED";
 const OVERRIDE_UNCONFIRMED: &str = "LMWV-INFRA-SECRET-OVERRIDE-UNCONFIRMED";
 const CONFIRM_TOKEN: &str = "yes-i-understand";
 
+/// Every rule the pre-ingest secret scan emits. The scan is a FULL pass on
+/// every run (all source files + sidecars, before the incremental skip
+/// partition), so a completed run re-emits the entire current detection set —
+/// which makes these rules safe for the rule-scoped stale sweep on incremental
+/// runs (weft-7256739b31): a row of one of these rules at a prior `run_id`
+/// means "scanned this run, no longer detected", never "not looked at".
+pub(crate) fn per_run_swept_rule_ids() -> [&'static str; 4] {
+    [
+        findings::SECRET_DETECTED,
+        baseline::baseline_match_rule_id(),
+        baseline::baseline_no_justification_rule_id(),
+        SECRET_OVERRIDE_ALLOWED,
+    ]
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SecretScanOptions {
     pub(crate) override_policy: OverridePolicy,
@@ -257,6 +272,12 @@ pub(crate) fn pre_ingest(
                 entry.file_path.display(),
                 entry.entry.line_number
             ),
+            site: format!(
+                "{}:{}:{}",
+                entry.file_path.display(),
+                entry.entry.line_number,
+                entry.entry.rule_type.as_str()
+            ),
             evidence: json!({
                 "file_path": entry.file_path,
                 "line_number": entry.entry.line_number,
@@ -316,6 +337,10 @@ pub(crate) fn pre_ingest(
                 "Operator allowed unredacted secrets in {}",
                 display_relative(project_root, file)
             ),
+            // File-level fact: the override applies to the whole file, so the
+            // site is the file itself (the per-detection audit lives in the
+            // sibling `LMWV-SEC-SECRET-DETECTED` rows).
+            site: file.display().to_string(),
             evidence: json!({
                 "file_path": display_relative(project_root, file),
                 "override_used": true,

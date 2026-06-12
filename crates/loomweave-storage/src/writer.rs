@@ -281,6 +281,17 @@ fn run_actor(
                 });
                 reply(ack, res);
             }
+            WriterCmd::SweepStaleFindingsForRules {
+                current_run_id,
+                rule_ids,
+                ack,
+            } => {
+                let res = query_time_write(conn, &mut state, commits_observed, |conn| {
+                    let rules: Vec<&str> = rule_ids.iter().map(String::as_str).collect();
+                    crate::findings::sweep_stale_findings_for_rules(conn, &current_run_id, &rules)
+                });
+                reply(ack, res);
+            }
             WriterCmd::UpsertSeiBinding { record, ack } => {
                 let res = query_time_write(conn, &mut state, commits_observed, |conn| {
                     crate::sei::upsert_sei_binding(conn, &record)

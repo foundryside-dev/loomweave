@@ -1126,3 +1126,148 @@ fn clean_sidecar_creates_anchor_without_block() {
         "anchor on an always-clean sidecar must have no briefing_blocked"
     );
 }
+
+// ── B10 (weft-7256739b31): per-run secret-finding dedup ────────────────────────
+
+/// B10(a) failing-first: a ROTATED secret at the same site (same file, same
+/// line, same detector rule) must UPSERT the same finding row, never mint a
+/// second one. Pre-fix the finding id hashed the evidence (which embeds
+/// `hashed_secret_hex`), so a value rotation minted a new id while the old row
+/// lingered (the full sweep is gated off on incremental runs — `mod_b.sec`
+/// unchanged → `skipped_files > 0`). Stable identity = anchor entity + rule +
+/// site (file:line:detector), exactly the lacuna dupe
+/// (`specimen/policy_boundaries.py:41`, two ids across two runs).
+#[test]
+fn rotated_secret_at_same_site_does_not_duplicate_finding() {
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    let leaky = project.path().join("leaky.sec");
+    std::fs::write(&leaky, b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n").unwrap();
+    // A second, never-changing file so run 2 is a genuinely incremental run
+    // (skipped_files > 0) and the full-pass stale sweep stays gated off.
+    std::fs::write(project.path().join("mod_b.sec"), b"nothing to see\n").unwrap();
+    let analyze = || {
+        loomweave_bin()
+            .arg("analyze")
+            .arg(project.path())
+            .env("PATH", plugin_path(plugin.path()))
+            .assert()
+            .success();
+    };
+
+    analyze();
+    let first_id: String = conn(project.path())
+        .query_row(
+            "SELECT id FROM findings WHERE rule_id = 'LMWV-SEC-SECRET-DETECTED'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    // Rotate the secret VALUE in place: same file, same line, same detector.
+    std::fs::write(&leaky, b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLF'\n").unwrap();
+    analyze();
+
+    let db = conn(project.path());
+    let skipped = latest_run_stats_value(project.path())["skipped_files"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(
+        skipped >= 1,
+        "run 2 must be incremental (mod_b.sec skipped) so the full sweep gate is exercised"
+    );
+    let rows: Vec<String> = {
+        let mut stmt = db
+            .prepare("SELECT id FROM findings WHERE rule_id = 'LMWV-SEC-SECRET-DETECTED'")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    };
+    assert_eq!(
+        rows.len(),
+        1,
+        "a rotated secret at the same site must not mint a duplicate finding row: {rows:?}"
+    );
+    assert_eq!(
+        rows[0], first_id,
+        "site-keyed identity: the rotated secret upserts the SAME finding id"
+    );
+}
+
+/// B10(a) failing-first, sweep half: a secret REMOVED from a re-walked file must
+/// retire its finding even on an INCREMENTAL run. The secret scan is a full pass
+/// every run (pre-ingest, before the skip partition), so its findings are always
+/// fully re-emitted — the scoped sweep can retire unreproduced `LMWV-SEC-*` /
+/// baseline rows without the full-pass `skipped_files == 0` gate the general
+/// sweep needs.
+#[test]
+fn removed_secret_is_swept_on_incremental_run() {
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    let leaky = project.path().join("leaky.sec");
+    std::fs::write(&leaky, b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n").unwrap();
+    // Unchanged second file keeps run 2 incremental (full sweep gated off).
+    std::fs::write(project.path().join("mod_b.sec"), b"nothing to see\n").unwrap();
+    let analyze = || {
+        loomweave_bin()
+            .arg("analyze")
+            .arg(project.path())
+            .env("PATH", plugin_path(plugin.path()))
+            .assert()
+            .success();
+    };
+
+    analyze();
+    let count: i64 = conn(project.path())
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'LMWV-SEC-SECRET-DETECTED'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "run 1 must record the secret finding");
+
+    // Remove the secret (content change → leaky.sec is re-walked; mod_b.sec is
+    // skipped so the run is incremental).
+    std::fs::write(&leaky, b"all clean now\n").unwrap();
+    analyze();
+
+    let db = conn(project.path());
+    let skipped = latest_run_stats_value(project.path())["skipped_files"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(skipped >= 1, "run 2 must be incremental");
+    let count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'LMWV-SEC-SECRET-DETECTED'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "a vanished secret's finding must be retired by the scoped per-run sweep \
+         even when the run is incremental"
+    );
+}
+
+/// Shared helper: the latest run's stats JSON (mirrors `analyze.rs`'s
+/// `latest_run_stats`, local to this suite).
+fn latest_run_stats_value(project_root: &std::path::Path) -> serde_json::Value {
+    let stats_raw: String = conn(project_root)
+        .query_row(
+            "SELECT stats FROM runs ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query latest runs.stats");
+    serde_json::from_str(&stats_raw).expect("runs.stats JSON")
+}

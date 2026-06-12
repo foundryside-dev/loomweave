@@ -921,6 +921,60 @@ async fn find_by_tag_is_honest_empty_when_no_tag_emitted() {
 }
 
 #[tokio::test]
+async fn find_by_tag_empty_reason_is_derived_from_reality_not_hand_maintained() {
+    // weft-7256739b31 (dogfood-4 B10b): the honest-empty reason claimed "the
+    // Python plugin emits none today" while test/data-model/entry-point tags
+    // were demonstrably populated in the same index. The reason must be derived
+    // from the store: name the tags that ARE present, and never assert that
+    // plugins emit no tags when they visibly do.
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    insert_entity(&conn, "python:function:b", "function", "b.py", Some((1, 2)));
+    insert_tag(&conn, "python:function:a", "test");
+    insert_tag(&conn, "python:function:b", "entry-point");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_by_tag", json!({"tag": "no-such-tag"})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 0);
+    assert_eq!(env["result"]["signal"]["available"], false);
+    let reason = env["result"]["signal"]["reason"]
+        .as_str()
+        .expect("missing-signal reason is a string");
+    assert!(
+        !reason.contains("emits none"),
+        "the reason must not claim plugins emit no tags when tags are populated: {reason}"
+    );
+    // The truthful, reality-derived hint: the tags this index actually holds.
+    let known = env["result"]["known_tags"]
+        .as_array()
+        .unwrap_or_else(|| panic!("known_tags must list the populated tags: {env}"));
+    let known: Vec<&str> = known.iter().filter_map(Value::as_str).collect();
+    assert_eq!(known, ["entry-point", "test"], "{env}");
+}
+
+#[tokio::test]
+async fn find_by_tag_empty_reason_on_tagless_index_says_so() {
+    // The other truthful branch: an index with NO tags at all says exactly
+    // that, with an empty known_tags list.
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_by_tag", json!({"tag": "test"})).await;
+    assert_eq!(env["result"]["page"]["total"], 0);
+    assert_eq!(env["result"]["signal"]["available"], false);
+    assert_eq!(env["result"]["known_tags"], json!([]), "{env}");
+    let reason = env["result"]["signal"]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("no categorisation tags"),
+        "a tagless index must say no tags are populated at all: {reason}"
+    );
+}
+
+#[tokio::test]
 async fn find_by_tag_returns_tagged_entities() {
     let (project, db, conn) = open_project();
     insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));

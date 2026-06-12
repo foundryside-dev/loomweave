@@ -54,6 +54,46 @@ pub fn sweep_stale_findings(conn: &Connection, current_run_id: &str) -> Result<u
     Ok(deleted)
 }
 
+/// Rule-scoped variant of [`sweep_stale_findings`]: retire stale (`run_id` !=
+/// current), `open`, Filigree-unlinked findings whose `rule_id` is in
+/// `rule_ids`, leaving every other rule's rows alone. For rule families whose
+/// producer is a FULL pass on every run regardless of the incremental file
+/// skip — the pre-ingest secret scan (`LMWV-SEC-*` + the baseline-match audit
+/// fact) re-walks every source file and sidecar each run — "run_id != current"
+/// already unambiguously means "looked, no longer detected", so these rows can
+/// be retired on incremental runs the general sweep must skip
+/// (weft-7256739b31 / dogfood-4 B10: stale secret findings accumulated across
+/// incremental re-analyses). Same lifecycle preservation as the general sweep.
+///
+/// # Errors
+///
+/// Returns [`crate::error::StorageError::Sqlite`] if the statement fails.
+pub fn sweep_stale_findings_for_rules(
+    conn: &Connection,
+    current_run_id: &str,
+    rule_ids: &[&str],
+) -> Result<usize> {
+    if rule_ids.is_empty() {
+        return Ok(0);
+    }
+    let placeholders = std::iter::repeat_n("?", rule_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "DELETE FROM findings \
+         WHERE status = 'open' \
+           AND filigree_issue_id IS NULL \
+           AND run_id <> ? \
+           AND rule_id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params = std::iter::once(current_run_id)
+        .chain(rule_ids.iter().copied())
+        .collect::<Vec<_>>();
+    let deleted = stmt.execute(rusqlite::params_from_iter(params))?;
+    Ok(deleted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +257,105 @@ mod tests {
     fn empty_table_sweeps_nothing() {
         let conn = migrated_conn();
         assert_eq!(sweep_stale_findings(&conn, "run-1").unwrap(), 0);
+    }
+
+    /// Like [`insert_finding`] but with an explicit `rule_id`, for the
+    /// rule-scoped sweep tests.
+    fn insert_finding_with_rule(conn: &Connection, id: &str, run_id: &str, rule_id: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO runs (id, started_at, config, stats, status) \
+             VALUES (?1, 't', '{}', '{}', 'completed')",
+            params![run_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO findings ( \
+                id, tool, tool_version, run_id, rule_id, kind, severity, \
+                entity_id, related_entities, message, evidence, properties, \
+                supports, supported_by, status, filigree_issue_id, \
+                created_at, updated_at \
+             ) VALUES ( \
+                ?1, 'loomweave', '0', ?2, ?3, 'defect', 'WARN', \
+                'python:function:x', '[]', 'm', '[]', '{}', \
+                '[]', '[]', 'open', NULL, 't', 't' \
+             )",
+            params![id, run_id, rule_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rule_scoped_sweep_retires_only_named_rules() {
+        // weft-7256739b31: the scoped sweep retires stale rows of the named
+        // rules and must not touch a stale row of any OTHER rule (those rows
+        // belong to the gated full-pass sweep — an incrementally-skipped file's
+        // still-reproducing findings live there).
+        let conn = migrated_conn();
+        insert_finding_with_rule(
+            &conn,
+            "core:finding:secret-stale",
+            "run-1",
+            "LMWV-SEC-SECRET-DETECTED",
+        );
+        insert_finding_with_rule(
+            &conn,
+            "core:finding:secret-fresh",
+            "run-2",
+            "LMWV-SEC-SECRET-DETECTED",
+        );
+        insert_finding_with_rule(
+            &conn,
+            "core:finding:other-stale",
+            "run-1",
+            "LMWV-PY-SYNTAX-ERROR",
+        );
+        let deleted = sweep_stale_findings_for_rules(
+            &conn,
+            "run-2",
+            &[
+                "LMWV-SEC-SECRET-DETECTED",
+                "LMWV-INFRA-SECRET-BASELINE-MATCH",
+            ],
+        )
+        .unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            ids(&conn),
+            ["core:finding:other-stale", "core:finding:secret-fresh"]
+        );
+    }
+
+    #[test]
+    fn rule_scoped_sweep_preserves_lifecycle_rows() {
+        // Filigree-linked / non-open rows are operator decisions: preserved even
+        // when stale and rule-matched, exactly like the general sweep.
+        let conn = migrated_conn();
+        insert_finding(
+            &conn,
+            "core:finding:linked",
+            "run-1",
+            "open",
+            Some("clarion-sf-1"),
+        );
+        conn.execute(
+            "UPDATE findings SET rule_id = 'LMWV-SEC-SECRET-DETECTED' \
+             WHERE id = 'core:finding:linked'",
+            [],
+        )
+        .unwrap();
+        let deleted =
+            sweep_stale_findings_for_rules(&conn, "run-2", &["LMWV-SEC-SECRET-DETECTED"]).unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(ids(&conn), ["core:finding:linked"]);
+    }
+
+    #[test]
+    fn rule_scoped_sweep_with_no_rules_is_a_no_op() {
+        let conn = migrated_conn();
+        insert_finding_with_rule(&conn, "core:finding:x", "run-1", "LMWV-SEC-SECRET-DETECTED");
+        assert_eq!(
+            sweep_stale_findings_for_rules(&conn, "run-2", &[]).unwrap(),
+            0
+        );
     }
 }

@@ -1536,6 +1536,46 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     ),
                 }
             }
+            // Rule-scoped sweep for the secret-scan rule family
+            // (weft-7256739b31 / dogfood-4 B10). The pre-ingest secret scan is a
+            // FULL pass every run — every source file and sidecar, BEFORE the
+            // incremental skip partition — so its findings are fully re-emitted
+            // each completed run and "run_id != current" unambiguously means
+            // "scanned, no longer detected". That lets these rules be swept on
+            // the incremental runs the general sweep above must skip (where
+            // stale secret rows otherwise accumulate forever). Gated on:
+            //   • !resume — a resume reuses the prior run_id, so the run_id
+            //     signal cannot distinguish re-emitted from vanished;
+            //   • source_walk_skipped_entries == 0 — an unwalked file was never
+            //     handed to the scan, so its rows were not re-emitted
+            //     ("never looked" ≠ "looked, clean").
+            // Same lifecycle preservation + best-effort posture as above.
+            if !resume && source_walk_skipped_entries == 0 {
+                let rule_ids: Vec<String> = crate::secret_scan::per_run_swept_rule_ids()
+                    .iter()
+                    .map(|&rule| rule.to_owned())
+                    .collect();
+                match writer
+                    .send_wait(|ack| WriterCmd::SweepStaleFindingsForRules {
+                        current_run_id: run_id.clone(),
+                        rule_ids,
+                        ack,
+                    })
+                    .await
+                {
+                    Ok(retired) if retired > 0 => tracing::info!(
+                        run_id = %run_id,
+                        stale_secret_findings_retired = retired,
+                        "scoped sweep retired secret-scan findings the full pre-ingest scan no longer reproduces"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        run_id = %run_id,
+                        error = %e,
+                        "scoped secret-finding sweep skipped (run already committed successfully)"
+                    ),
+                }
+            }
         }
         RunOutcome::SoftFailed { reason } => {
             // Commit entities inserted by healthy plugins AND mark the run
