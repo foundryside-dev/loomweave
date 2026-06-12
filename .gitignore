@@ -28,6 +28,10 @@ htmlcov/
 
 .env
 
+# Codex/Claude harness debug logs at the repo root (one was committed by the
+# authoring agent in c475e90; weft-ac59e8e730).
+/error.log
+
 # Smoke-test result artifacts (per-run; archived separately at tag-cut)
 tests/e2e/external-operator-smoke-results-*.md
 
