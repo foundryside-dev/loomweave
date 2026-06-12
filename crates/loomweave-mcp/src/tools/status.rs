@@ -288,24 +288,30 @@ impl ServerState {
             );
         }
 
-        // Disclose what a `fresh` verdict does NOT cover, on the named tool an
-        // agent reads directly — not just in the session-start banner
-        // (clarion-26c7e52027). `fresh` compares already-indexed files' mtimes; a
-        // brand-new module in a not-yet-indexed top-level directory, or any
-        // uncommitted addition (undetectable on an untrusted corpus), can sit
-        // unseen behind it. `index_diff_get` reports committed/staged drift in
-        // detail (it shares the untracked blind spot); re-analyze is the remedy.
+        // C-12 (weft-4165f1ed71): this `staleness` value DERIVES from the same
+        // freshness oracle `index_diff_get` reports — the two surfaces cannot
+        // disagree. The note names the authority and discloses the verdict's
+        // residual blind spots (clarion-26c7e52027).
         let staleness_note = match snapshot.staleness() {
             crate::snapshot::Staleness::Fresh => Some(
-                "\"fresh\" reflects already-indexed source files only; it does NOT detect \
-                 brand-new modules in a not-yet-indexed directory, nor uncommitted \
-                 additions. If source was added or moved since the last analyze, re-run \
-                 `loomweave analyze`. Use index_diff_get for committed/staged drift detail.",
+                "this verdict derives from the same computation as index_diff_get (the \
+                 authoritative freshness surface; call it for per-file detail). \"fresh\" \
+                 covers indexed-file mtimes/existence, the analyzed-vs-HEAD commit, staged \
+                 changes, and untracked source of indexed types — it does NOT detect \
+                 unstaged edits to never-indexed files or untracked files of types the \
+                 index has never ingested. If source was added or moved since the last \
+                 analyze, re-run `loomweave analyze`.",
             ),
             crate::snapshot::Staleness::StaleWorktree => Some(
                 "the working tree has untracked source files of already-indexed types that \
                  the index has not seen (new modules not yet analyzed; see worktree_dirty). \
-                 Re-run `loomweave analyze` before relying on graph answers.",
+                 Re-run `loomweave analyze` before relying on graph answers. This verdict \
+                 derives from the same computation as index_diff_get.",
+            ),
+            crate::snapshot::Staleness::Stale => Some(
+                "this verdict derives from the same computation as index_diff_get — call it \
+                 to see WHICH commit/file/staged-change signal fired. Re-run \
+                 `loomweave analyze` to refresh the index.",
             ),
             _ => None,
         };
@@ -385,10 +391,12 @@ impl ServerState {
             .readers
             .with_reader(move |conn| {
                 let state = crate::index_diff::read_index_state(conn)?;
+                let untracked = crate::index_diff::compute_untracked_source(conn, &project_root);
                 Ok(success_envelope(crate::index_diff::build_report(
                     &project_root,
                     &state,
                     &git,
+                    untracked,
                     cap,
                 )))
             })

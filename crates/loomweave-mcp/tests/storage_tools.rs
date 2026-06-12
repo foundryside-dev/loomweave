@@ -5455,17 +5455,18 @@ async fn project_status_fresh_carries_staleness_note_caveat() {
         .as_str()
         .expect("a fresh verdict must carry a staleness_note");
     assert!(
-        note.contains("loomweave analyze") && note.contains("not-yet-indexed"),
-        "staleness_note must disclose the not-yet-indexed gap and the re-analyze \
-         remedy: {note}"
+        note.contains("loomweave analyze") && note.contains("index_diff_get"),
+        "staleness_note must name index_diff_get as the authoritative surface (C-12) \
+         and the re-analyze remedy: {note}"
     );
 }
 
 #[tokio::test]
-async fn project_status_non_fresh_has_null_staleness_note() {
-    // A non-fresh verdict has no "fresh" claim to qualify, so the note is omitted.
-    // The seeded demo.py was just written (mtime ~now), so a past-dated run makes
-    // the source newer than the run → Stale, deterministically.
+async fn project_status_stale_note_defers_to_index_diff_by_name() {
+    // C-12 (weft-4165f1ed71): a stale verdict points at the authoritative
+    // surface for the per-signal detail. The seeded demo.py was just written
+    // (mtime ~now), so a past-dated run makes the source newer than the run →
+    // Stale, deterministically.
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).expect("open sqlite");
     insert_run(
@@ -5479,14 +5480,16 @@ async fn project_status_non_fresh_has_null_staleness_note() {
 
     let state = state_for(project.path(), &db_path);
     let result = call_tool(&state, "project_status", json!({})).await["result"].clone();
-    assert_ne!(
-        result["staleness"], "fresh",
-        "fixture must NOT be fresh: {result}"
-    );
     assert_eq!(
-        result["staleness_note"],
-        Value::Null,
-        "a non-fresh verdict must omit the staleness_note: {result}"
+        result["staleness"], "stale",
+        "fixture must be stale: {result}"
+    );
+    let note = result["staleness_note"]
+        .as_str()
+        .expect("a stale verdict must defer to the authority by name");
+    assert!(
+        note.contains("index_diff_get"),
+        "stale note must name the authoritative surface: {note}"
     );
 }
 
@@ -7681,4 +7684,96 @@ async fn relation_list_survives_null_anchor_file_dangling_neighbor_and_overrun_c
     );
     assert_eq!(past_end["result"]["truncated"], false, "{past_end}");
     assert_eq!(past_end["result"]["next_cursor"], Value::Null, "{past_end}");
+}
+
+// ── C-12 (weft-4165f1ed71): one freshness oracle, both surfaces agree ─────────
+
+/// Set a file's or directory's mtime deterministically.
+fn set_path_mtime(path: &std::path::Path, when: std::time::SystemTime) {
+    std::fs::File::options()
+        .read(true)
+        .open(path)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
+
+/// Reproduces the dogfood-4 B1 divergence (weft-4165f1ed71): at the same
+/// instant, `project_status_get` said `staleness: "stale"` while
+/// `index_diff_get` said `overall: "fresh"` on the SAME store. Driver: the
+/// status surface ran its own mtime/structural detector, which (a) watched the
+/// PARENT of every ingested path — and the lacuna project-anchor entity
+/// carries `source_file_path = <project root>`, putting the project root's
+/// parent (`/home/john`, churning constantly) in the watch set — and (b)
+/// treated a directory mtime as a file-modification signal. Convention C-12:
+/// each status question gets exactly ONE authoritative verdict surface
+/// (`index_diff_get`), and `project_status_get` must derive from the same code
+/// path. Both surfaces must answer "fresh" here.
+#[tokio::test]
+async fn project_status_and_index_diff_share_one_freshness_verdict() {
+    let outer = tempfile::tempdir().expect("outer dir");
+    let root = outer.path().join("proj");
+    let loomweave_dir = root.join(".weft/loomweave");
+    std::fs::create_dir_all(&loomweave_dir).expect("create store dir");
+    let db_path = loomweave_dir.join("loomweave.db");
+    let mut conn = Connection::open(&db_path).expect("open sqlite");
+    loomweave_storage::pragma::apply_write_pragmas(&conn).expect("pragmas");
+    loomweave_storage::schema::apply_migrations(&mut conn).expect("migrations");
+
+    // One real ingested source file, untouched since the analyze.
+    let source = root.join("demo.py");
+    std::fs::write(&source, "x = 1\n").expect("write source");
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, source_file_path, \
+            properties, created_at, updated_at) \
+         VALUES ('python:module:demo', 'python', 'module', 'demo', 'demo', ?1, '{}', \
+                 '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+        params![source.to_str().unwrap()],
+    )
+    .expect("insert module entity");
+    // The lacuna shape: a synthetic project anchor whose source_file_path is
+    // the PROJECT ROOT DIRECTORY itself.
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, source_file_path, \
+            properties, created_at, updated_at) \
+         VALUES ('core:project:proj', 'core', 'project', 'proj', 'proj', ?1, \
+                 '{\"finding_anchor\": true}', \
+                 '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+        params![root.to_str().unwrap()],
+    )
+    .expect("insert project anchor");
+    // Analyze completed 2026-03-01; every ingested path is older than that…
+    conn.execute(
+        "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+         VALUES ('run-1', '2026-03-01T00:00:00.000Z', '2026-03-01T00:00:00.000Z', \
+                 '{}', '{}', 'completed')",
+        [],
+    )
+    .expect("insert run");
+    drop(conn);
+
+    // 2026-02-01 (before the run) for the source file and the project root dir…
+    let before_run = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_769_904_000);
+    set_path_mtime(&source, before_run);
+    set_path_mtime(&root, before_run);
+    // …while the PARENT of the project root churns after the run (the
+    // /home/john situation). Outer tempdir mtime is "now" already; make it
+    // explicit and unambiguous.
+    set_path_mtime(outer.path(), std::time::SystemTime::now());
+
+    let state = state_for(&root, &db_path);
+    let status = call_tool(&state, "project_status", json!({})).await;
+    let diff = call_tool(&state, "index_diff", json!({})).await;
+
+    assert_eq!(status["ok"], true, "{status}");
+    assert_eq!(diff["ok"], true, "{diff}");
+    assert_eq!(
+        diff["result"]["overall"], "fresh",
+        "authoritative verdict: nothing indexed changed: {diff}"
+    );
+    assert_eq!(
+        status["result"]["staleness"], "fresh",
+        "project_status must derive from index_diff's verdict (C-12) — parent-dir \
+         churn and the project anchor's directory path are not staleness: {status}"
+    );
 }

@@ -3050,7 +3050,14 @@ async fn ensure_project_anchor(
         short_name: name,
         parent_id: None,
         source_file_id: None,
-        source_file_path: Some(project_root.display().to_string()),
+        // Deliberately NO source_file_path (weft-4165f1ed71): the anchor is the
+        // project itself, not a source file. Recording the project ROOT
+        // DIRECTORY here put a directory into every freshness stat scan — and
+        // its PARENT (e.g. $HOME) into the former structural watch set — which
+        // wedged the staleness flag to a permanent false "stale". The read side
+        // also skips directory paths defensively for stores written before
+        // this fix.
+        source_file_path: None,
         source_byte_start: None,
         source_byte_end: None,
         source_line_start: None,

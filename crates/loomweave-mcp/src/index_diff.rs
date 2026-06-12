@@ -3,6 +3,18 @@
 //! Answers "what changed since the last analyze, and is this checkout newer
 //! than the graph?" without an agent hand-rolling git + mtime checks.
 //!
+//! **This module is the project's ONE freshness oracle** (convention C-12,
+//! weft-4165f1ed71). [`compute_freshness`] produces the authoritative verdict;
+//! `index_diff_get` reports it in full, and every other surface that answers
+//! the freshness question — `project_status_get`, the orientation pack, the
+//! `loomweave://context` resource, and the `SessionStart` hook (all via
+//! [`crate::snapshot::project_snapshot`]) — DERIVES its answer from this same
+//! code path. Dogfood-4 B1 was two detectors disagreeing at the same instant:
+//! the snapshot's former mtime/structural detector watched the *parents* of
+//! ingested paths (which put `$HOME` in the watch set whenever a project-anchor
+//! entity carried the project root as its source path) while this module said
+//! fresh. There is no second detector anymore.
+//!
 //! **Git posture (per the issue's design fork).** Loomweave persists no
 //! analyze-time commit SHA — `project_status` reports `git_sha: null` and the
 //! analyze write path never captures HEAD. Rather than reverse that stance to
@@ -28,6 +40,15 @@ use loomweave_storage::{StorageError, normalize_source_path};
 /// Default per-list cap so a pathological repo cannot produce an unbounded
 /// packet. Overridable via the `limit` argument.
 pub(crate) const DEFAULT_MAX_ENTRIES: usize = 200;
+
+/// Upper bound on per-file `stat` syscalls in one freshness check — a backstop
+/// against pathological repositories. In-place modification detection
+/// inherently needs one `stat` per ingested file, and the `SessionStart` hook
+/// runs this at the top of every agent session (clarion-93465ff89e). Beyond
+/// the cap the verdict is bounded rather than exhaustive — recorded on
+/// [`FileDrift::stat_scan_truncated`] so a consumer can tell. Sized well above
+/// realistic targets (the elspeth corpus, ~425k LOC, is a few thousand files).
+const MAX_FILE_STAT_SCAN: usize = 20_000;
 
 /// Git facts gathered at query time, outside the reader. Every field is
 /// best-effort; see the module docstring for the fail-soft contract.
@@ -317,26 +338,39 @@ fn parse_rfc3339(s: &str) -> Option<SystemTime> {
 }
 
 #[derive(Default)]
-struct FileDrift {
+pub(crate) struct FileDrift {
     modified: Vec<Value>,
     missing: Vec<Value>,
     statted: usize,
     stat_failures: usize,
+    /// Recorded `source_file_path`s that stat as DIRECTORIES — e.g. the
+    /// synthetic project-anchor entity, whose path is the project root. A
+    /// directory's mtime changes on any direct child create/delete and is not
+    /// a file-modification signal: treating it as one wedged lacuna's
+    /// staleness flag permanently (weft-4165f1ed71). Skipped + counted.
+    skipped_non_files: usize,
+    /// `true` when the per-file stat scan stopped at [`MAX_FILE_STAT_SCAN`]
+    /// without finding drift: a no-drift verdict is then proven only for the
+    /// scanned prefix.
+    pub(crate) stat_scan_truncated: bool,
 }
 
 /// Stat each indexed file once: classify as modified (mtime newer than the
 /// analyze time), missing (gone from disk), or fresh. `analyzed_time` is `None`
 /// when the run timestamp could not be parsed — files are still statted for
 /// existence, but none are flagged modified (the mtime channel is blind).
+/// Bounded by [`MAX_FILE_STAT_SCAN`]; non-file paths (directories) are skipped
+/// and counted, never treated as modified.
 fn compute_file_drift(
     project_root: &Path,
     state: &IndexState,
     analyzed_time: Option<SystemTime>,
 ) -> FileDrift {
     let mut drift = FileDrift::default();
-    for file in &state.files {
+    for file in state.files.iter().take(MAX_FILE_STAT_SCAN) {
         let abs = absolute(project_root, &file.source_file_path);
         match std::fs::metadata(&abs) {
+            Ok(meta) if !meta.is_file() => drift.skipped_non_files += 1,
             Ok(meta) => {
                 drift.statted += 1;
                 let mtime = meta.modified().ok();
@@ -358,15 +392,228 @@ fn compute_file_drift(
             Err(_) => drift.stat_failures += 1,
         }
     }
+    if state.files.len() > MAX_FILE_STAT_SCAN {
+        drift.stat_scan_truncated = true;
+        tracing::warn!(
+            indexed_files = state.files.len(),
+            cap = MAX_FILE_STAT_SCAN,
+            "index freshness: ingested-file count exceeds the stat cap; in-place edits \
+             beyond the cap may go unnoticed until the next analyze"
+        );
+    }
     drift
+}
+
+/// The single freshness verdict vocabulary, shared by `index_diff_get`'s
+/// `overall` field and (via mapping) the snapshot's `staleness` (C-12,
+/// weft-4165f1ed71).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FreshnessOverall {
+    /// No completed analyze run exists.
+    NeverAnalyzed,
+    /// A drift signal fired: commit mismatch, HEAD newer than the analyze,
+    /// a modified/missing indexed file, or a staged change touching an
+    /// indexed path.
+    Drift,
+    /// No drift signal fired, but the working tree holds UNTRACKED source of
+    /// an already-indexed file type the index has never seen (ADR-045,
+    /// hardened `git ls-files --others` scoped to ingested extensions).
+    StaleWorktree,
+    /// State was observable and nothing fired.
+    Fresh,
+    /// Every observation channel was blind (no file statted successfully and
+    /// git offered no HEAD comparison).
+    Unknown,
+}
+
+impl FreshnessOverall {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NeverAnalyzed => "never_analyzed",
+            Self::Drift => "drift",
+            Self::StaleWorktree => "stale_worktree",
+            Self::Fresh => "fresh",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The authoritative freshness verdict + every signal that fed it. Computed
+/// once here; rendered by `index_diff_get` and mapped by the snapshot.
+pub(crate) struct FreshnessVerdict {
+    pub(crate) overall: FreshnessOverall,
+    pub(crate) drift_detected: bool,
+    pub(crate) commit_mismatch: Option<bool>,
+    pub(crate) head_newer_than_analyze: Option<bool>,
+    /// `false` when a completed run's timestamp failed to parse (a
+    /// data/machinery fault the snapshot reports as `degraded`); `true`
+    /// otherwise (including never-analyzed, where there is nothing to parse).
+    pub(crate) analyzed_time_parsed: bool,
+    pub(crate) file_drift: FileDrift,
+    /// Staged-vs-HEAD entries (`{path, status, indexed}`), pre-rendered.
+    pub(crate) dirty: Vec<Value>,
+    pub(crate) dirty_indexed_count: usize,
+    /// Untracked-source signal (ADR-045): `None` outside a git work tree /
+    /// with nothing ingested to scope against.
+    pub(crate) untracked_source: Option<bool>,
+}
+
+/// Compute the project's ONE freshness verdict (C-12, weft-4165f1ed71) from
+/// index state + git facts + the untracked-source signal. Every surface that
+/// answers "is the index fresh?" goes through here.
+pub(crate) fn compute_freshness(
+    project_root: &Path,
+    state: &IndexState,
+    git: &GitFacts,
+    untracked_source: Option<bool>,
+) -> FreshnessVerdict {
+    let analyzed_time = state.analyzed_at.as_deref().and_then(parse_rfc3339);
+    let analyzed_time_parsed = state.analyzed_at.is_none() || analyzed_time.is_some();
+
+    let commit_mismatch = match (git.head_commit.as_deref(), state.analyzed_commit.as_deref()) {
+        (Some(current), Some(analyzed)) => Some(current != analyzed),
+        _ => None,
+    };
+    // HEAD-vs-analyze by committer date — independent of source mtimes.
+    let head_newer_than_analyze = match (
+        git.head_committed_at.as_deref().and_then(parse_rfc3339),
+        analyzed_time,
+    ) {
+        (Some(head), Some(analyzed)) => Some(head > analyzed),
+        _ => None,
+    };
+
+    // Per-file drift: stat each indexed file once (bounded, dir-skipping).
+    let file_drift = compute_file_drift(project_root, state, analyzed_time);
+
+    // Indexed source paths (absolute) normalized to canonical project-relative
+    // form, so a git-relative dirty path matches regardless of the project_root
+    // shape (`.` vs absolute) or symlinks. A raw join + string-eq would never
+    // match (clarion-326b01ffd0 review).
+    let indexed_rel: BTreeSet<String> = state
+        .files
+        .iter()
+        .filter_map(|f| normalize_source_path(project_root, &f.source_file_path).ok())
+        .collect();
+
+    // Staged-vs-HEAD changes (clarion-4b5a8aff54: no worktree hashing), flagged
+    // when they touch an indexed path. Unstaged/untracked changes are not in this
+    // set; unstaged edits to indexed files surface via `file_drift` above.
+    let mut dirty = Vec::new();
+    let mut dirty_indexed_count = 0usize;
+    for entry in &git.dirty {
+        let indexed = normalize_source_path(project_root, &entry.rel_path)
+            .ok()
+            .is_some_and(|rel| indexed_rel.contains(&rel));
+        if indexed {
+            dirty_indexed_count += 1;
+        }
+        dirty.push(json!({
+            "path": entry.rel_path,
+            "status": entry.status,
+            "indexed": indexed,
+        }));
+    }
+
+    let drift_signal = commit_mismatch == Some(true)
+        || (commit_mismatch.is_none() && head_newer_than_analyze == Some(true))
+        || !file_drift.modified.is_empty()
+        || !file_drift.missing.is_empty()
+        || dirty_indexed_count > 0;
+
+    // Verdict: drift if any signal fired; stale_worktree if otherwise clean but
+    // un-indexed untracked source exists; fresh if we could observe state and
+    // nothing fired; unknown only when every observation channel was blind.
+    let could_observe = file_drift.statted > 0
+        || commit_mismatch.is_some()
+        || head_newer_than_analyze.is_some()
+        || untracked_source.is_some();
+    let overall = if state.analyzed_at.is_none() {
+        FreshnessOverall::NeverAnalyzed
+    } else if drift_signal {
+        FreshnessOverall::Drift
+    } else if untracked_source == Some(true) {
+        FreshnessOverall::StaleWorktree
+    } else if could_observe {
+        FreshnessOverall::Fresh
+    } else {
+        FreshnessOverall::Unknown
+    };
+
+    FreshnessVerdict {
+        overall,
+        // `drift_detected` is the boolean a gate reads: true for BOTH drift and
+        // the untracked-source case — an index that does not reflect the
+        // working tree must never read as a bare `false` here.
+        drift_detected: drift_signal || overall == FreshnessOverall::StaleWorktree,
+        commit_mismatch,
+        head_newer_than_analyze,
+        analyzed_time_parsed,
+        file_drift,
+        dirty,
+        dirty_indexed_count,
+        untracked_source,
+    }
+}
+
+/// Whether the working tree holds untracked source of an already-indexed file
+/// type — the ADR-045 signal (clarion-26c7e52027). Fail-soft: `None` when
+/// nothing is ingested (no extensions to scope against, so the check is moot),
+/// the project is not a git work tree, or git is unavailable.
+///
+/// Scoping to ingested extensions is what keeps this honest: a hardened
+/// `git ls-files --others --exclude-standard` lists every untracked,
+/// non-ignored path, but only those whose extension Loomweave actually ingests
+/// count — an untracked `notes.txt` never flags a fresh index dirty, while an
+/// untracked `hub.py` (the dogfood scenario) does.
+pub(crate) fn compute_untracked_source(
+    conn: &rusqlite::Connection,
+    project_root: &Path,
+) -> Option<bool> {
+    let exts = ingested_source_extensions(conn);
+    if exts.is_empty() {
+        return None;
+    }
+    let untracked = loomweave_core::list_untracked_files(project_root)?;
+    Some(untracked.iter().any(|rel| {
+        Path::new(rel)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| exts.contains(ext))
+    }))
+}
+
+/// The distinct file extensions among ingested `source_file_path`s. Fail-soft
+/// to an empty set on any query error, which makes [`compute_untracked_source`]
+/// return `None` (treat the scope as unknown).
+fn ingested_source_extensions(conn: &rusqlite::Connection) -> BTreeSet<String> {
+    let mut exts = BTreeSet::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT DISTINCT source_file_path FROM entities \
+         WHERE source_file_path IS NOT NULL",
+    ) else {
+        return exts;
+    };
+    let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+        return exts;
+    };
+    for rel in rows.flatten() {
+        if let Some(ext) = Path::new(&rel).extension().and_then(|ext| ext.to_str()) {
+            exts.insert(ext.to_owned());
+        }
+    }
+    exts
 }
 
 /// Assemble the `index_diff` report from index state + git facts. Stats the
 /// indexed files (cheap IO); correlates git dirty paths against indexed paths.
+/// The verdict itself comes from [`compute_freshness`] — the one oracle every
+/// freshness surface shares (C-12, weft-4165f1ed71).
 pub(crate) fn build_report(
     project_root: &Path,
     state: &IndexState,
     git: &GitFacts,
+    untracked_source: Option<bool>,
     cap: usize,
 ) -> Value {
     let git_json = json!({
@@ -388,99 +635,62 @@ pub(crate) fn build_report(
             "notes": ["no completed analyze run; run `loomweave analyze` first"],
         });
     };
-    let analyzed_time = parse_rfc3339(analyzed_at);
-    let commit_mismatch = match (git.head_commit.as_deref(), state.analyzed_commit.as_deref()) {
-        (Some(current), Some(analyzed)) => Some(current != analyzed),
-        _ => None,
-    };
 
-    // HEAD-vs-analyze by committer date — independent of source mtimes.
-    let head_newer_than_analyze = match (
-        git.head_committed_at.as_deref().and_then(parse_rfc3339),
-        analyzed_time,
-    ) {
-        (Some(head), Some(analyzed)) => Some(head > analyzed),
-        _ => None,
-    };
+    let verdict = compute_freshness(project_root, state, git, untracked_source);
+    let FreshnessVerdict {
+        overall,
+        drift_detected,
+        commit_mismatch,
+        head_newer_than_analyze,
+        analyzed_time_parsed: _,
+        file_drift,
+        dirty,
+        dirty_indexed_count,
+        untracked_source,
+    } = verdict;
 
-    // Per-file drift: stat each indexed file once.
-    let file_drift = compute_file_drift(project_root, state, analyzed_time);
-
-    // Indexed source paths (absolute) normalized to canonical project-relative
-    // form, so a git-relative dirty path matches regardless of the project_root
-    // shape (`.` vs absolute) or symlinks. A raw join + string-eq would never
-    // match (clarion-326b01ffd0 review).
-    let indexed_rel: BTreeSet<String> = state
-        .files
-        .iter()
-        .filter_map(|f| normalize_source_path(project_root, &f.source_file_path).ok())
-        .collect();
-
-    // Staged-vs-HEAD changes (clarion-4b5a8aff54: no worktree hashing), flagged
-    // when they touch an indexed path. Unstaged/untracked changes are not in this
-    // set; unstaged edits to indexed files surface via `file_drift` below.
-    let mut dirty = Vec::new();
-    let mut dirty_indexed_count = 0usize;
-    for entry in &git.dirty {
-        let indexed = normalize_source_path(project_root, &entry.rel_path)
-            .ok()
-            .is_some_and(|rel| indexed_rel.contains(&rel));
-        if indexed {
-            dirty_indexed_count += 1;
-        }
-        dirty.push(json!({
-            "path": entry.rel_path,
-            "status": entry.status,
-            "indexed": indexed,
-        }));
-    }
-
-    let drift_detected = commit_mismatch == Some(true)
-        || (commit_mismatch.is_none() && head_newer_than_analyze == Some(true))
-        || !file_drift.modified.is_empty()
-        || !file_drift.missing.is_empty()
-        || dirty_indexed_count > 0;
-
-    // Verdict: drift if any signal fired; fresh if we could observe state and
-    // nothing fired; unknown only when every observation channel was blind
-    // (no files statted AND git gave us no HEAD comparison).
-    let could_observe =
-        file_drift.statted > 0 || commit_mismatch.is_some() || head_newer_than_analyze.is_some();
-    let overall = if drift_detected {
-        "drift"
-    } else if could_observe {
-        "fresh"
-    } else {
-        "unknown"
-    };
-
+    let stat_scan_truncated = file_drift.stat_scan_truncated;
+    let skipped_non_files = file_drift.skipped_non_files;
+    let stat_failures = file_drift.stat_failures;
     let (modified, modified_omitted) = cap_list(file_drift.modified, cap);
     let (missing, missing_omitted) = cap_list(file_drift.missing, cap);
     let (dirty, dirty_omitted) = cap_list(dirty, cap);
 
     let mut notes = vec![
+        "this is the AUTHORITATIVE freshness verdict (one oracle, C-12); \
+         project_status_get / orientation / the session-start banner derive their \
+         staleness from this same computation"
+            .to_owned(),
         "when both commits are known, current_commit != analyzed_commit is the \
          primary staleness signal; HEAD committer date remains a fallback diagnostic"
             .to_owned(),
         "added (never-indexed) source files are not enumerated here beyond the \
-         git dirty set; a new commit still flips head_newer_than_analyze"
+         git dirty set and the untracked_source flag; a new commit still flips \
+         head_newer_than_analyze"
             .to_owned(),
         "dirty_files lists STAGED changes (index vs HEAD); unstaged working-tree \
-         modifications and untracked files are not enumerated (untrusted-corpus \
-         hardening). Unstaged edits to indexed files still surface in \
-         modified_since_analyze."
+         modifications are not enumerated (untrusted-corpus hardening). Unstaged \
+         edits to indexed files still surface in modified_since_analyze; untracked \
+         SOURCE files surface via untracked_source (ignore-aware ls-files scoped to \
+         ingested extensions)."
             .to_owned(),
     ];
-    if file_drift.stat_failures > 0 {
+    if stat_failures > 0 {
         notes.push(format!(
-            "{} indexed file(s) could not be stat-ed (permission/IO); \
-             excluded from the modified/missing sets",
-            file_drift.stat_failures
+            "{stat_failures} indexed file(s) could not be stat-ed (permission/IO); \
+             excluded from the modified/missing sets"
+        ));
+    }
+    if skipped_non_files > 0 {
+        notes.push(format!(
+            "{skipped_non_files} recorded source path(s) stat as directories (e.g. the \
+             project anchor); a directory mtime is not a modification signal and is \
+             excluded"
         ));
     }
 
     json!({
-        "overall": overall,
+        "overall": overall.as_str(),
         "drift_detected": drift_detected,
         "analyzed_at": analyzed_at,
         "analyzed_commit": state.analyzed_commit,
@@ -493,6 +703,11 @@ pub(crate) fn build_report(
         "missing_files": missing,
         "dirty_files": dirty,
         "dirty_indexed_count": dirty_indexed_count,
+        // ADR-045 untracked-source signal, folded into the single verdict:
+        // `true` + an otherwise-clean index → overall "stale_worktree".
+        "untracked_source": untracked_source,
+        "file_stat_scan_truncated": stat_scan_truncated,
+        "skipped_non_file_paths": skipped_non_files,
         // Per-run aggregate plugin skip/drop counters; per-file failure lists
         // are not retained in v0.1 (wipe-and-rerun).
         "plugin_resolution": state.plugin_stats,
@@ -636,6 +851,7 @@ mod tests {
             dir.path(),
             &state,
             &git_facts(None, &[]),
+            None,
             DEFAULT_MAX_ENTRIES,
         );
         assert_eq!(report["overall"], "never_analyzed");
@@ -654,6 +870,7 @@ mod tests {
             dir.path(),
             &state,
             &git_facts(None, &[]),
+            None,
             DEFAULT_MAX_ENTRIES,
         );
         assert_eq!(report["overall"], "fresh");
@@ -677,6 +894,7 @@ mod tests {
                 Some("2000-01-01T00:00:00+00:00"),
                 &[],
             ),
+            None,
             DEFAULT_MAX_ENTRIES,
         );
         assert_eq!(report["analyzed_commit"], "newer-indexed-commit");
@@ -697,6 +915,7 @@ mod tests {
             dir.path(),
             &state,
             &git_facts(None, &[]),
+            None,
             DEFAULT_MAX_ENTRIES,
         );
         assert_eq!(report["overall"], "drift");
@@ -720,6 +939,7 @@ mod tests {
             dir.path(),
             &state,
             &git_facts(Some("2600-01-01T00:00:00+00:00"), &[]),
+            None,
             DEFAULT_MAX_ENTRIES,
         );
         assert_eq!(report["head_newer_than_analyze"], true);
@@ -742,6 +962,7 @@ mod tests {
             dir.path(),
             &state,
             &git_facts(None, &[("M", "a.py"), ("??", "untracked.txt")]),
+            None,
             DEFAULT_MAX_ENTRIES,
         );
         assert_eq!(report["drift_detected"], true);
@@ -755,6 +976,104 @@ mod tests {
     }
 
     #[test]
+    fn untracked_source_flips_an_otherwise_fresh_report_to_stale_worktree() {
+        // C-12 (weft-4165f1ed71): the ADR-045 untracked-source signal is part
+        // of the ONE freshness verdict — an otherwise-clean index with
+        // un-indexed untracked source must not read "fresh".
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "x = 1\n").unwrap();
+        let abs = dir.path().join("a.py").to_string_lossy().into_owned();
+        let state = state_with_file(&abs, 3, "2999-01-01T00:00:00.000Z");
+        let report = build_report(
+            dir.path(),
+            &state,
+            &git_facts(None, &[]),
+            Some(true),
+            DEFAULT_MAX_ENTRIES,
+        );
+        assert_eq!(report["overall"], "stale_worktree", "{report}");
+        assert_eq!(
+            report["drift_detected"], true,
+            "a boolean gate must not read an unreflected working tree as clean: {report}"
+        );
+        assert_eq!(report["untracked_source"], true);
+    }
+
+    #[test]
+    fn directory_valued_source_path_is_skipped_not_modified() {
+        // weft-4165f1ed71: the lacuna project-anchor entity records the project
+        // ROOT DIRECTORY as its source path. A directory mtime bumps on any
+        // direct child create/delete — it is not a file-modification signal and
+        // must never produce drift.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "x = 1\n").unwrap();
+        let abs = dir.path().join("a.py").to_string_lossy().into_owned();
+        let root_as_path = dir.path().to_string_lossy().into_owned();
+        let state = IndexState {
+            analyzed_at: Some("2000-01-01T00:00:00.000Z".to_owned()),
+            analyzed_commit: None,
+            latest_run: Some(json!({"id": "run-1", "status": "completed"})),
+            files: vec![
+                IndexedFile {
+                    // The directory: its mtime ("now") is far newer than the
+                    // 2000 analyze time, but it must be skipped, not flagged.
+                    source_file_path: root_as_path,
+                    entity_count: 1,
+                },
+                IndexedFile {
+                    source_file_path: abs.clone(),
+                    entity_count: 3,
+                },
+            ],
+            plugin_stats: json!({}),
+        };
+        // The real file IS newer than the 2000 run — drift comes from the FILE,
+        // never the directory.
+        let report = build_report(
+            dir.path(),
+            &state,
+            &git_facts(None, &[]),
+            None,
+            DEFAULT_MAX_ENTRIES,
+        );
+        let modified = report["modified_since_analyze"].as_array().unwrap();
+        assert_eq!(modified.len(), 1, "{report}");
+        assert_eq!(modified[0]["path"], abs);
+        assert_eq!(report["skipped_non_file_paths"], 1, "{report}");
+    }
+
+    #[test]
+    fn file_stat_scan_caps_and_reports_truncation() {
+        // One real, old file repeated past the cap: the scan stops at the cap
+        // (so the no-drift verdict is bounded) and says so in-band.
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old.py");
+        std::fs::write(&old, "x = 1\n").unwrap();
+        let abs = old.to_string_lossy().into_owned();
+        let state = IndexState {
+            analyzed_at: Some("2999-01-01T00:00:00.000Z".to_owned()),
+            analyzed_commit: None,
+            latest_run: Some(json!({"id": "run-1", "status": "completed"})),
+            files: (0..=super::MAX_FILE_STAT_SCAN)
+                .map(|_| IndexedFile {
+                    source_file_path: abs.clone(),
+                    entity_count: 1,
+                })
+                .collect(),
+            plugin_stats: json!({}),
+        };
+        let report = build_report(
+            dir.path(),
+            &state,
+            &git_facts(None, &[]),
+            None,
+            DEFAULT_MAX_ENTRIES,
+        );
+        assert_eq!(report["overall"], "fresh", "{report}");
+        assert_eq!(report["file_stat_scan_truncated"], true, "{report}");
+    }
+
+    #[test]
     fn missing_indexed_file_is_reported() {
         let dir = tempfile::tempdir().unwrap();
         let abs = dir.path().join("gone.py").to_string_lossy().into_owned();
@@ -763,6 +1082,7 @@ mod tests {
             dir.path(),
             &state,
             &git_facts(None, &[]),
+            None,
             DEFAULT_MAX_ENTRIES,
         );
         assert_eq!(report["drift_detected"], true);
