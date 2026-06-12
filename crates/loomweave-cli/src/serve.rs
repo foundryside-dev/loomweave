@@ -494,7 +494,7 @@ fn build_llm_provider(
     Ok(provider.map(|provider| {
         Arc::new(TrafficLoggingProvider::new(
             provider,
-            project_root.join(".loomweave/diagnostics/llm-traffic.jsonl"),
+            loomweave_core::store::llm_traffic_log_path(project_root),
         )) as Arc<dyn LlmProvider>
     }))
 }

@@ -1927,7 +1927,13 @@ fn assert_llm_traffic_log_metadata_only(
     input_tokens: u64,
     cached_input_tokens: u64,
 ) {
-    let log_path = project_root.join(".loomweave/diagnostics/llm-traffic.jsonl");
+    // C-9: the diagnostics log lives under Loomweave's own .weft/loomweave/
+    // store subtree, never a legacy .loomweave/ root (weft-ac59e8e730).
+    let log_path = project_root.join(".weft/loomweave/diagnostics/llm-traffic.jsonl");
+    assert!(
+        !project_root.join(".loomweave").exists(),
+        "serve must not create a legacy .loomweave/ store dir"
+    );
     let log = fs::read_to_string(&log_path)
         .unwrap_or_else(|err| panic!("read LLM traffic log {}: {err}", log_path.display()));
     assert!(

@@ -118,7 +118,9 @@ login state.
 ## Lookup Traffic Log
 
 Every configured LLM lookup appends one JSONL metadata record to
-`.loomweave/diagnostics/llm-traffic.jsonl`. The log records the provider,
+`.weft/loomweave/diagnostics/llm-traffic.jsonl` (inside Loomweave's member
+store dir, so a `weft.toml` `store_dir` override moves it too; the store's
+installed `.gitignore` excludes `diagnostics/`). The log records the provider,
 purpose, prompt template ID, model/cache label, outcome, token usage, and cost
 when available. It deliberately does not record the prompt text or the model
 output JSON. The diagnostics log is capped at 10 MiB; when it reaches the cap,

@@ -82,6 +82,11 @@ tmp/
 # raw LLM request/response log is excluded.
 logs/
 runs/*/log.jsonl
+
+# LLM lookup diagnostics (metadata-only traffic log + its rotation backup,
+# written by `loomweave serve`) — per-machine runtime telemetry, never
+# committed (weft-ac59e8e730).
+diagnostics/
 ";
 
 /// A single component selected by a partial `loomweave install`.

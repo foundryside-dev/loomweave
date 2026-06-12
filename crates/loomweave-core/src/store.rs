@@ -79,6 +79,20 @@ pub fn db_path(project_root: &Path) -> PathBuf {
     store_dir(project_root).join("loomweave.db")
 }
 
+/// `<project_root>/.weft/loomweave/diagnostics/llm-traffic.jsonl` — the
+/// metadata-only LLM lookup diagnostics log (rotated to `.1` at the size cap).
+///
+/// Lives under the member store dir like every other Loomweave-owned runtime
+/// artifact (C-9: a member writes only its own `.weft/<member>/` subtree) —
+/// the original `.loomweave/diagnostics/` literal predated the Weft store
+/// cutover (weft-ac59e8e730).
+#[must_use]
+pub fn llm_traffic_log_path(project_root: &Path) -> PathBuf {
+    store_dir(project_root)
+        .join("diagnostics")
+        .join("llm-traffic.jsonl")
+}
+
 /// Read the member-private `[loomweave].store_dir` override from `weft.toml`, if
 /// any. Returns `None` (fail-soft, never an error) when the file is absent or
 /// malformed, the `[loomweave]` table or `store_dir` key is absent, or the value
@@ -179,6 +193,29 @@ mod tests {
         assert_eq!(
             db_path(dir.path()),
             dir.path().join(".weft/loomweave/loomweave.db")
+        );
+    }
+
+    #[test]
+    fn llm_traffic_log_lives_under_the_member_store_dir() {
+        // weft-ac59e8e730 (C-9): the diagnostics log is a Loomweave-owned
+        // runtime artifact and must live under .weft/loomweave/, never a
+        // legacy .loomweave/ root — and it must follow a store_dir override.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            llm_traffic_log_path(dir.path()),
+            dir.path()
+                .join(".weft/loomweave/diagnostics/llm-traffic.jsonl")
+        );
+
+        std::fs::write(
+            dir.path().join(WEFT_TOML),
+            "[loomweave]\nstore_dir = \"custom/store\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            llm_traffic_log_path(dir.path()),
+            dir.path().join("custom/store/diagnostics/llm-traffic.jsonl")
         );
     }
 

@@ -62,6 +62,8 @@ fn install_creates_loomweave_dir_with_expected_contents() {
         // stages a live lock / instance id (clarion-7381e6382d).
         "instance_id",
         "*.lock",
+        // LLM traffic diagnostics log + rotation backup (weft-ac59e8e730).
+        "diagnostics/",
     ] {
         assert!(
             gitignore.contains(rule),
