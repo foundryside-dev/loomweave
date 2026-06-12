@@ -1662,12 +1662,17 @@ fn insert_unresolved_site(conn: &Connection, caller_id: &str, site_key: &str, ca
 async fn find_dead_code_spares_fn_reached_only_via_unresolved_call_site() {
     let (project, db, conn) = open_project();
     // Root so the reachability root set is non-empty (else signal-unavailable).
-    insert_entity(
+    // Inserted as a RUST-plugin entity (matching the candidates below) so the
+    // rust plugin has root coverage and its entities are surveyed — the
+    // per-plugin honest-exclusion path (weft-3fb0f5dfc7) is exercised by its
+    // own test.
+    insert_entity_named(
         &conn,
         "rust:function:app.main",
         "function",
         "app.rs",
         Some((1, 5)),
+        "main",
     );
     insert_tag(&conn, "rust:function:app.main", "entry-point");
     // Reached ONLY via an unresolved method call `.do_work` — no edge.
@@ -1837,17 +1842,17 @@ async fn find_dead_code_flags_unreachable_and_spares_live() {
     assert_eq!(dead, vec!["python:function:unused".to_owned()], "{env}");
     assert_eq!(env["result"]["page"]["total"], 1, "{env}");
 
-    let candidate = &env["result"]["dead_code"][0];
-    assert_eq!(
-        candidate["rule_id"], "LMWV-FACT-DEAD-CODE-CANDIDATE",
-        "{env}"
-    );
-    assert_eq!(candidate["kind"], "fact", "{env}");
-    assert_eq!(candidate["confidence_basis"], "heuristic", "{env}");
+    // The candidate facets are hoisted to the top-level `finding` block
+    // (weft-3fb0f5dfc7 — they used to repeat verbatim on every row).
+    let finding = &env["result"]["finding"];
+    assert_eq!(finding["rule_id"], "LMWV-FACT-DEAD-CODE-CANDIDATE", "{env}");
+    assert_eq!(finding["kind"], "fact", "{env}");
+    assert_eq!(finding["confidence_basis"], "heuristic", "{env}");
     assert!(
-        candidate["confidence"].as_f64().unwrap() < 1.0,
+        finding["confidence"].as_f64().unwrap() < 1.0,
         "heuristic confidence must be < 1: {env}"
     );
+    let candidate = &env["result"]["dead_code"][0];
     assert!(
         candidate["entity"]["sei"].is_null() || candidate["entity"]["sei"].is_string(),
         "candidate carries an sei field: {env}"
@@ -3080,4 +3085,271 @@ async fn entity_resolve_mixed_batch_ambiguous_unresolved_resolved_in_order() {
     let resolved = results[2]["candidates"].as_array().expect("candidates");
     assert_eq!(resolved.len(), 1, "no cross-contamination: {env}");
     assert_eq!(resolved[0]["id"], "python:function:a.one");
+}
+
+// ── B2 (weft-3fb0f5dfc7): entity_dead_list usable as a survey ─────────────────
+
+/// Insert an entity with an explicit plugin id (the shared helper hardcodes
+/// `python`); used by the dead-list survey tests below.
+fn insert_entity_with_plugin(
+    conn: &Connection,
+    id: &str,
+    plugin_id: &str,
+    kind: &str,
+    source_path: &str,
+    properties: &str,
+) {
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, source_file_path, \
+            properties, content_hash, created_at, updated_at) \
+         VALUES (?1,?2,?3,?1,?1,?4,?5,'hash','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')",
+        params![id, plugin_id, kind, source_path, properties],
+    )
+    .expect("insert entity");
+}
+
+/// B2(1) failing-first: non-code entities — core `file` anchors (the dogfooded
+/// `.env.example`), the project anchor, subsystems, guidance — must never be
+/// "dead CODE" candidates.
+#[tokio::test]
+async fn find_dead_code_excludes_non_code_entities() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:main",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    insert_tag(&conn, "python:function:main", "entry-point");
+    // A genuinely dead python function — the only legitimate candidate.
+    insert_entity(
+        &conn,
+        "python:function:orphan",
+        "function",
+        "app.py",
+        Some((6, 9)),
+    );
+    // Non-code rows, all unreachable by construction.
+    insert_entity_with_plugin(
+        &conn,
+        "core:file:.env.example",
+        "core",
+        "file",
+        ".env.example",
+        "{}",
+    );
+    insert_entity_with_plugin(&conn, "core:project:proj", "core", "project", "/proj", "{}");
+    insert_entity_with_plugin(&conn, "core:subsystem:abc", "core", "subsystem", "x", "{}");
+    insert_guidance(&conn, "core:guidance:g1", "{}");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        dead,
+        vec!["python:function:orphan".to_owned()],
+        "config files / anchors / subsystems / guidance are not dead CODE: {env}"
+    );
+}
+
+/// B2(2) failing-first: entities owned by a plugin that emitted NO reachability
+/// root tags (the Rust plugin today — binary/lib roots unsupported, PDR-0012
+/// keeps the Rust line out of the launch envelope) must be EXCLUDED with an
+/// in-band marker, never false-flagged dead. A wrong answer is worse than an
+/// honest scope statement.
+#[tokio::test]
+async fn find_dead_code_excludes_plugins_without_root_coverage_with_marker() {
+    let (project, db, conn) = open_project();
+    // Python emits roots; rust emits none (true to the live plugins).
+    insert_entity(
+        &conn,
+        "python:function:main",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    insert_tag(&conn, "python:function:main", "entry-point");
+    insert_entity(
+        &conn,
+        "python:function:orphan",
+        "function",
+        "app.py",
+        Some((6, 9)),
+    );
+    // The dogfooded false positive: specimen-rs/src/main.rs, unreachable only
+    // because no rust root tags exist.
+    insert_entity_with_plugin(
+        &conn,
+        "rust:function:specimen_rs.main",
+        "rust",
+        "function",
+        "specimen-rs/src/main.rs",
+        "{}",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        dead,
+        vec!["python:function:orphan".to_owned()],
+        "a rootless plugin's entities must not be false-flagged dead: {env}"
+    );
+    // The honest in-band scope statement.
+    let excluded = env["result"]["excluded"]["plugins_without_roots"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing plugins_without_roots marker: {env}"));
+    assert_eq!(excluded.len(), 1, "{env}");
+    assert_eq!(excluded[0]["plugin"], "rust", "{env}");
+    assert_eq!(excluded[0]["entities_excluded"], 1, "{env}");
+    assert!(
+        excluded[0]["reason"].as_str().unwrap().contains("root"),
+        "the marker must explain the missing root coverage: {env}"
+    );
+}
+
+/// B2(3) failing-first (revised per PM ruling on weft-3fb0f5dfc7): a
+/// briefing-blocked entity appears in the survey NEITHER as an all-null row
+/// (unactionable noise — the dogfooded failure) NOR as an identity-bearing row
+/// (the stub-collapse non-disclosure invariant stays absolute). It is EXCLUDED
+/// from the row set, and the exclusion is reported once, in-band, at the top
+/// level: count + reason + the standard recovery path.
+#[tokio::test]
+async fn find_dead_code_withholds_blocked_entities_with_aggregate_marker() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:main",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    insert_tag(&conn, "python:function:main", "entry-point");
+    insert_entity(
+        &conn,
+        "python:function:orphan",
+        "function",
+        "app.py",
+        Some((6, 9)),
+    );
+    insert_entity_with_plugin(
+        &conn,
+        "python:function:leaky.helper",
+        "python",
+        "function",
+        "leaky.py",
+        r#"{"briefing_blocked": "secret_present"}"#,
+    );
+    insert_entity_with_plugin(
+        &conn,
+        "python:function:leaky.other",
+        "python",
+        "function",
+        "leaky.py",
+        r#"{"briefing_blocked": "secret_present"}"#,
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    // No blocked row in the page — neither nulls nor identity.
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap_or("<null>").to_owned())
+        .collect();
+    assert_eq!(
+        dead,
+        vec!["python:function:orphan".to_owned()],
+        "blocked entities must be excluded from the row set: {env}"
+    );
+    assert!(
+        !env.to_string().contains("python:function:leaky"),
+        "blocked identity must not be disclosed anywhere in the envelope: {env}"
+    );
+    // The single aggregate in-band marker.
+    let withheld = &env["result"]["withheld"];
+    assert_eq!(withheld["count"], 2, "{env}");
+    assert_eq!(withheld["reasons"][0], "secret_present", "{env}");
+    assert!(
+        withheld["recovery"]
+            .as_str()
+            .unwrap()
+            .contains("secrets-baseline"),
+        "the marker must carry the standard briefing-block recovery path: {env}"
+    );
+}
+
+/// B2(4) failing-first: the constant five-line `reason` (and rule/confidence
+/// facets) must be hoisted to ONE top-level block, not repeated verbatim on
+/// every row of every page (the C12-class repeated-degrade-block problem).
+#[tokio::test]
+async fn find_dead_code_hoists_constant_facets_to_top_level() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:main",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    insert_tag(&conn, "python:function:main", "entry-point");
+    insert_entity(
+        &conn,
+        "python:function:orphan_a",
+        "function",
+        "app.py",
+        Some((6, 9)),
+    );
+    insert_entity(
+        &conn,
+        "python:function:orphan_b",
+        "function",
+        "app.py",
+        Some((10, 13)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let finding = &env["result"]["finding"];
+    assert_eq!(finding["rule_id"], "LMWV-FACT-DEAD-CODE-CANDIDATE", "{env}");
+    assert_eq!(finding["kind"], "fact", "{env}");
+    assert!(finding["confidence"].is_number(), "{env}");
+    assert!(
+        finding["reason"].as_str().unwrap().contains("unreachable"),
+        "{env}"
+    );
+    for row in env["result"]["dead_code"].as_array().unwrap() {
+        for hoisted in [
+            "reason",
+            "rule_id",
+            "kind",
+            "confidence",
+            "confidence_basis",
+        ] {
+            assert!(
+                row.get(hoisted).is_none(),
+                "constant facet '{hoisted}' must be hoisted, not repeated per row: {env}"
+            );
+        }
+    }
 }
