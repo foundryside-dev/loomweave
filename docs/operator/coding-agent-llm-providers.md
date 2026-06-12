@@ -12,6 +12,31 @@ Supported provider values:
 - `openrouter` remains the HTTP provider for API-key based deployments.
 - `recording` remains the deterministic test fixture provider.
 
+Operator-facing aliases are also accepted: `codex_sidecar` maps to
+`codex_cli`, `claude_sidecar` maps to `claude_cli`, and `openrouter_api` maps to
+`openrouter`. `loomweave config example --provider <alias>` emits the canonical
+provider value in the generated YAML.
+
+## Configure From CLI Or MCP
+
+Prefer the config helpers over hand-editing `loomweave.yaml`:
+
+```sh
+loomweave config llm set \
+  --enable \
+  --allow-live \
+  --provider codex_sidecar \
+  --enable-write-tools
+```
+
+Use `loomweave config llm status` or `loomweave config check` to inspect the
+effective state. The same bootstrap surface is available over MCP:
+`llm_config_get` reads the current config and `llm_config_set` updates
+`loomweave.yaml` fields such as `enabled`, `provider`, `allow_live_provider`,
+and `enable_write_tools`. Reconnect or restart `loomweave serve` after changing
+provider or write-tool policy, because the active server loads those settings at
+startup.
+
 ## Codex CLI
 
 ```yaml
@@ -79,7 +104,8 @@ internal tool turn and then emits the final JSON result.
 ## Live Opt-In
 
 `llm_policy.enabled: true` is not enough for any live provider. Set
-`allow_live_provider: true` in `loomweave.yaml`, or launch with:
+`allow_live_provider: true` with `loomweave config llm set --enable --allow-live`
+or in `loomweave.yaml`, or launch with:
 
 ```sh
 LOOMWEAVE_LLM_LIVE=1 loomweave serve --path .
@@ -88,6 +114,15 @@ LOOMWEAVE_LLM_LIVE=1 loomweave serve --path .
 Unlike OpenRouter, the CLI routes do not require `OPENROUTER_API_KEY` or an
 OpenAI/Anthropic API key in Loomweave config. They rely on the local CLI's own
 login state.
+
+## Lookup Traffic Log
+
+Every configured LLM lookup appends one JSONL metadata record to
+`.loomweave/diagnostics/llm-traffic.jsonl`. The log records the provider,
+purpose, prompt template ID, model/cache label, outcome, token usage, and cost
+when available. It deliberately does not record the prompt text or the model
+output JSON. The diagnostics log is capped at 10 MiB; when it reaches the cap,
+Loomweave rotates it to `llm-traffic.jsonl.1` before writing the next lookup.
 
 ## Prompt Caching And Advanced Interfaces
 

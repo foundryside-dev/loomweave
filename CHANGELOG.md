@@ -12,6 +12,51 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+No changes yet.
+
+## [1.1.0rc4] — 2026-06-11
+
+Fourth 1.1 release candidate. This candidate makes the Rust language plugin a
+first-party 1.x capability, expands the MCP read surface, finishes the Weft store
+cutover, and hardens plugin/analyze failure handling. No package is published for
+release candidates. (Cargo SemVer `1.1.0-rc4`; Python wheels normalise to PEP
+440 `1.1.0rc4`.)
+
+### Added
+
+- **First-party Rust language plugin.** The 1.1 line now includes
+  `loomweave-plugin-rust` alongside the Python plugin. The Rust plugin extracts
+  modules, structs, enums, traits, type aliases, consts, statics, macros, impls,
+  and functions, and emits `contains`, `imports`, `implements`, `calls`,
+  `derives`, and `references` edges. The distribution wheel installs a
+  discovery-glob-named `loomweave-plugin-rust` executable and its manifest under
+  `share/loomweave/plugins/rust/`, so colocated installs discover it
+  automatically.
+- **Rust-plugin hardening envelope (ADR-050).** The host now bounds plugin
+  lifecycle phases with handshake, per-file, and shutdown deadlines, and the
+  Rust plugin degrades hostile parse shapes instead of crashing the run:
+  excessive nesting emits `LMWV-RUST-DEPTH-LIMIT`, oversized files emit
+  `LMWV-RUST-FILE-TOO-LARGE`, and watchdog kills are no longer mislabeled as
+  OOM. The Rust plugin's address-space envelope is raised to the empirically
+  validated 512 MiB line for large real corpora.
+- **Relation-edge MCP read surface.** `entity_relation_list` exposes
+  `inherits_from`, `decorates`, `implements`, and `derives` edges directly, and
+  `entity_neighborhood_get` / `entity_orientation_pack_get` now include
+  direction-tagged relation buckets.
+- **Entity resolution and findings surfaces.** `entity_resolve` resolves all
+  entity kinds, SEI entries, Rust `::` paths, and plugin hints; the MCP surface
+  also gained whole-project finding browsing, `has_findings` filtering, stricter
+  finding-filter validation, and better unknown-kind hints.
+- **Duplicate-locator alarm.** `loomweave analyze` now emits
+  `LMWV-DUPLICATE-LOCATOR` at ERROR severity when two declarations collide on
+  one entity id, surfacing data-loss risks that SQLite upserts previously
+  absorbed silently.
+- **Python relation edges.** The Python plugin now emits `inherits_from` and
+  `decorates` edges under ontology 0.8.0, including pyright-backed tests for the
+  new relation kinds.
+- **Product ownership workspace.** `docs/product/` now records the current
+  state, roadmap, metrics, and first product decisions for the 1.1 release line.
+
 ### Changed
 
 - **Project store moved `.loomweave/` → `.weft/loomweave/` (Weft store
@@ -49,6 +94,52 @@ only when an incompatible change is made to that surface. See
   fallback at token-resolution time, so an existing global export keeps working
   during the transition. This does not affect `serve.http.token_env`
   (inbound HTTP read-API bearer auth, default `WEFT_TOKEN`).
+- **MCP instructions now use the registered tool dialect.** The generated
+  `loomweave-workflow` skill, MCP `initialize` instructions, and CI drift guard
+  now name the registered `entity_*` tools rather than legacy aliases; the
+  server also trims its tools/list context footprint while keeping instructions
+  truncation-proof.
+- **Dormant `wardline.yaml` manifest ingest retired.** The unused CLI ingest
+  path was removed in favour of the durable Wardline descriptor and taint-fact
+  paths already documented in the Weft contracts.
+- **Rust qualname canonicalization amended.** ADR-049 now covers cfg-twin
+  methods, concrete generic arguments, impl self-type and trait paths,
+  `#[path]` module mounts, and unnamed `const _` skip-emission; the Rust plugin
+  applies the same rules and updates the conformance fixture.
+- **Release and install packaging moved toward colocated Python installs.** The
+  `loomweave` Python package scaffold depends on both language plugins, and the
+  Rust plugin has a separate maturin distribution shim so its discovery binary
+  can be shipped without polluting normal workspace builds.
+
+### Fixed
+
+- **Rust plugin collision families closed.** The Sprint-4 residual collisions
+  from self-type paths, trait paths, `#[path]` module mounts, and unnamed
+  `const _` items were fixed and re-swept to zero on the pinned QA corpora.
+- **Out-of-line Rust module trees now agree on parent/contains edges.** Host and
+  plugin behaviour now align for mounted module trees and cfg-twin module
+  shapes.
+- **Python hostile nesting now degrades cleanly.** Deep-nesting bombs in the
+  Python plugin produce a `too_complex` outcome instead of escaping
+  `RecursionError`.
+- **Duplicate Python qualnames are pinned to first-wins semantics.** ADR-052 and
+  dogfood/audit tests freeze the expected handling of repeated Python qualnames.
+- **Install no longer fails on symlinked instruction files.** Symlinked
+  `AGENTS.md` / `CLAUDE.md` cases degrade to warnings so install can complete.
+- **E2E scripts no longer mutate global Codex config.** The smoke harnesses now
+  force hermetic config paths instead of editing `~/.codex/config.toml`.
+- **Untrusted repository git config is no longer executed.** Source inspection
+  and rename-window logic use hardened git invocations that do not execute
+  repo-local config or attribute helpers.
+
+### Docs
+
+- Added the Rust analysis known-limitations page, Sprint-3 scale QA report,
+  Sprint-4 gold QA report, gold-v2 addendum, Rust qualname federation handoff
+  letters, and MCP/command-surface audit memo.
+- Refreshed the design ladder, operator getting-started flow, operator
+  guidance docs, ADR index, public static site, and Weft federation contracts
+  for the 1.1 release-candidate surface.
 
 ## [1.1.0rc3] — 2026-06-06
 

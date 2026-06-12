@@ -10,9 +10,11 @@ use loomweave_core::{
     ApiEmbeddingProvider, ApiEmbeddingProviderConfig, ClaudeCliProvider, ClaudeCliProviderConfig,
     CodexCliProvider, CodexCliProviderConfig, EmbeddingProvider, EmbeddingProviderError,
     LlmProvider, OpenRouterProvider, OpenRouterProviderConfig, Recording, RecordingProvider,
+    TrafficLoggingProvider,
 };
 use loomweave_federation::config::{
-    LlmConfig, McpConfig, ProviderSelection, SemanticSearchConfig, select_provider_with_env,
+    LlmConfig, McpConfig, ProviderSelection, SemanticProviderKind, SemanticSearchConfig,
+    select_provider_with_env,
 };
 use loomweave_federation::filigree::FiligreeHttpClient;
 use loomweave_storage::{DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, ReaderPool, Writer};
@@ -352,9 +354,28 @@ pub(crate) fn build_embedding_provider(
         return Ok(None);
     }
     let api_key = read_env(&config.api_key_env);
+    let (allow_live_provider, api_key) = match config.provider {
+        SemanticProviderKind::Api => {
+            if !config.allow_live_provider {
+                return warn_inert_embedding_provider(
+                    EmbeddingProviderError::LiveProviderNotAllowed,
+                );
+            }
+            if api_key.as_deref().is_none_or(|key| key.trim().is_empty()) {
+                return warn_inert_embedding_provider(EmbeddingProviderError::MissingApiKey);
+            }
+            (true, api_key)
+        }
+        SemanticProviderKind::LocalOpenAi => {
+            config
+                .validate_endpoint_trust()
+                .context("validate local semantic embedding endpoint")?;
+            (true, api_key)
+        }
+    };
     match ApiEmbeddingProvider::from_config(ApiEmbeddingProviderConfig {
         api_key,
-        allow_live_provider: config.allow_live_provider,
+        allow_live_provider,
         model_id: config.model_id.clone(),
         endpoint_url: config.endpoint_url.clone(),
         dimensions: config.dimensions,
@@ -375,6 +396,17 @@ pub(crate) fn build_embedding_provider(
         }
         Err(err) => Err(anyhow!("build embedding provider: {err}")),
     }
+}
+
+fn warn_inert_embedding_provider(
+    err: EmbeddingProviderError,
+) -> Result<Option<Arc<dyn EmbeddingProvider>>> {
+    tracing::warn!(
+        error = %err,
+        "semantic_search.enabled=true but the embedding provider could not be \
+         constructed; search_semantic will report not_enabled"
+    );
+    Ok(None)
 }
 
 /// Pair the (cloned) config with a constructed provider so `run_mcp_stdio` can
@@ -406,13 +438,11 @@ fn build_llm_provider(
     selection: ProviderSelection,
     project_root: &Path,
 ) -> Result<Option<Arc<dyn LlmProvider>>> {
-    match selection {
-        ProviderSelection::Disabled => Ok(None),
+    let provider: Option<Arc<dyn LlmProvider>> = match selection {
+        ProviderSelection::Disabled => None,
         ProviderSelection::Recording => {
             let recordings = load_recording_fixture(config, project_root)?;
-            Ok(Some(Arc::new(RecordingProvider::from_recordings(
-                recordings,
-            ))))
+            Some(Arc::new(RecordingProvider::from_recordings(recordings)) as Arc<dyn LlmProvider>)
         }
         ProviderSelection::OpenRouter { api_key_env } => {
             let api_key = std::env::var(&api_key_env).ok();
@@ -426,7 +456,7 @@ fn build_llm_provider(
                 timeout_seconds: config.llm.openrouter.timeout_seconds,
             })
             .context("build OpenRouter LLM provider")?;
-            Ok(Some(Arc::new(provider)))
+            Some(Arc::new(provider) as Arc<dyn LlmProvider>)
         }
         ProviderSelection::CodexCli => {
             let provider = CodexCliProvider::from_config(CodexCliProviderConfig {
@@ -439,7 +469,7 @@ fn build_llm_provider(
                 timeout_seconds: config.llm.codex_cli.timeout_seconds,
             })
             .context("build Codex CLI LLM provider")?;
-            Ok(Some(Arc::new(provider)))
+            Some(Arc::new(provider) as Arc<dyn LlmProvider>)
         }
         ProviderSelection::ClaudeCli => {
             let provider = ClaudeCliProvider::from_config(ClaudeCliProviderConfig {
@@ -458,9 +488,15 @@ fn build_llm_provider(
                     .exclude_dynamic_system_prompt_sections,
             })
             .context("build Claude CLI LLM provider")?;
-            Ok(Some(Arc::new(provider)))
+            Some(Arc::new(provider) as Arc<dyn LlmProvider>)
         }
-    }
+    };
+    Ok(provider.map(|provider| {
+        Arc::new(TrafficLoggingProvider::new(
+            provider,
+            project_root.join(".loomweave/diagnostics/llm-traffic.jsonl"),
+        )) as Arc<dyn LlmProvider>
+    }))
 }
 
 fn load_recording_fixture(config: &McpConfig, project_root: &Path) -> Result<Vec<Recording>> {

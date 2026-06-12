@@ -1824,6 +1824,7 @@ printf '%s' '{{"purpose":"via codex serve","behavior":"served through fake Codex
             .expect("read Codex prompt log")
             .contains("Prompt contract: loomweave-agent-provider-v1")
     );
+    assert_llm_traffic_log_metadata_only(dir.path(), "codex_cli", 31, 9);
 }
 
 #[test]
@@ -1917,6 +1918,33 @@ printf '%s\n' '{{"type":"result","subtype":"success","structured_output":{{"purp
             .expect("read Claude prompt log")
             .contains("Loomweave's local Claude Code LLM provider")
     );
+    assert_llm_traffic_log_metadata_only(dir.path(), "claude_cli", 33, 12);
+}
+
+fn assert_llm_traffic_log_metadata_only(
+    project_root: &Path,
+    provider: &str,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+) {
+    let log_path = project_root.join(".loomweave/diagnostics/llm-traffic.jsonl");
+    let log = fs::read_to_string(&log_path)
+        .unwrap_or_else(|err| panic!("read LLM traffic log {}: {err}", log_path.display()));
+    assert!(
+        !log.contains("Prompt contract:")
+            && !log.contains("Source excerpt:")
+            && !log.contains("via codex serve")
+            && !log.contains("via claude serve"),
+        "LLM traffic log must contain lookup metadata only, not prompt/output contents: {log}"
+    );
+    let event: serde_json::Value = serde_json::from_str(log.trim()).expect("traffic log JSON");
+    assert_eq!(event["schema"], "loomweave.llm.lookup.v1");
+    assert_eq!(event["provider"], provider);
+    assert_eq!(event["purpose"], "Summary");
+    assert_eq!(event["prompt_id"], "leaf-v1");
+    assert_eq!(event["outcome"], "success");
+    assert_eq!(event["usage"]["input_tokens"], input_tokens);
+    assert_eq!(event["usage"]["cached_input_tokens"], cached_input_tokens);
 }
 
 fn make_executable(path: &Path) {

@@ -26,8 +26,8 @@ pub use llm_provider::{
     CodexCliProviderConfig, INFERRED_CALLS_PROMPT_VERSION, InferredCallsPromptInput,
     LEAF_SUMMARY_PROMPT_TEMPLATE_ID, LeafSummaryPromptInput, LlmProvider, LlmProviderError,
     LlmPurpose, LlmRequest, LlmResponse, OpenRouterProvider, OpenRouterProviderConfig,
-    PromptTemplate, Recording, RecordingProvider, build_coding_agent_provider_prompt,
-    build_inferred_calls_prompt, build_leaf_summary_prompt,
+    PromptTemplate, Recording, RecordingProvider, TrafficLoggingProvider,
+    build_coding_agent_provider_prompt, build_inferred_calls_prompt, build_leaf_summary_prompt,
 };
 pub use plugin::{
     // host (Task 6) — facade for callers that spawn/connect plugins

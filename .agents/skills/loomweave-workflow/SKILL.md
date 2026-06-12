@@ -76,6 +76,10 @@ yet; `project_status_get` and `entity_orientation_pack_get` report
 | `entity_source_get` | an entity's exact indexed source span + bounded context | `{"id": "<id>", "context_lines": 10}` |
 | `entity_call_site_list` | the source line(s) behind a calls/references edge | `{"id": "<id>", "role": "caller"}` |
 | `entity_orientation_pack_get` | one deterministic orientation packet for an entity or file:line (entity + context + neighbors + paths + issues + freshness) | `{"file": "rel/path.py", "line": 42}` |
+| `llm_config_get` | inspect configured LLM/provider/live and MCP write-tool settings | `{}` |
+| `llm_config_set` | update local `loomweave.yaml` LLM/provider/live/write-tool settings; reconnect after changes | `{"provider": "codex_sidecar", "enabled": true, "allow_live_provider": true, "enable_write_tools": true}` |
+| `semantic_config_get` | inspect semantic-search embedding provider and sidecar diagnostics | `{}` |
+| `semantic_config_set` | update local semantic-search embedding settings; rerun analyze and reconnect | `{"provider": "local_openai", "enabled": true, "endpoint_url": "http://127.0.0.1:11434/v1", "model_id": "nomic-embed-text", "dimensions": 768}` |
 | `index_diff_get` | index freshness / drift vs. the current working tree | `{}` |
 | `analyze_start` † | launch a background re-index, return its `run_id` | `{}` |
 | `analyze_status_get` | poll a started analyze (queued/running/terminal + progress) | `{"run_id": "<id>"}` |

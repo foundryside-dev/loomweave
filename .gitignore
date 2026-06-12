@@ -41,6 +41,7 @@ tests/e2e/external-operator-smoke-results-*.md
 .weft/loomweave/instance_id
 .weft/loomweave/loomweave.lock
 .weft/loomweave/ephemeral.port
+.loomweave/diagnostics/llm-traffic.jsonl*
 
 # Documentation site build output (mkdocs `site_dir`, web/mkdocs.yml).
 /site-build/

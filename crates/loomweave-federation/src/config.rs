@@ -1,7 +1,10 @@
 use std::path::Path;
-use std::{fs, net::SocketAddr};
+use std::{
+    fs,
+    net::{IpAddr, SocketAddr},
+};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -73,6 +76,7 @@ impl McpConfig {
                 code: "LMWV-CONFIG-FILIGREE-ACTOR-BLANK",
             });
         }
+        self.semantic_search.validate_endpoint_trust()?;
         self.serve.http.validate_loopback_trust()?;
         Ok(())
     }
@@ -194,6 +198,7 @@ impl LlmConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SemanticSearchConfig {
     pub enabled: bool,
+    pub provider: SemanticProviderKind,
     /// Explicit opt-in to the live API provider (in addition to `enabled`).
     pub allow_live_provider: bool,
     /// Embedding model id; embeddings are cache-keyed by this.
@@ -213,6 +218,7 @@ impl Default for SemanticSearchConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            provider: SemanticProviderKind::Api,
             allow_live_provider: false,
             model_id: "text-embedding-3-small".to_owned(),
             dimensions: 1536,
@@ -224,14 +230,76 @@ impl Default for SemanticSearchConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+impl SemanticSearchConfig {
+    pub fn validate_endpoint_trust(&self) -> Result<(), ConfigError> {
+        if self.provider != SemanticProviderKind::LocalOpenAi {
+            return Ok(());
+        }
+        let url = reqwest::Url::parse(&self.endpoint_url).map_err(|source| {
+            ConfigError::InvalidSemanticEndpoint {
+                code: "LMWV-CONFIG-SEMANTIC-ENDPOINT-URL",
+                endpoint_url: self.endpoint_url.clone(),
+                parse_error: source.to_string(),
+            }
+        })?;
+        if matches!(url.scheme(), "http" | "https") && semantic_url_is_loopback(&url) {
+            return Ok(());
+        }
+        Err(ConfigError::NonLoopbackSemanticEndpoint {
+            code: "LMWV-CONFIG-SEMANTIC-NON-LOOPBACK",
+            endpoint_url: self.endpoint_url.clone(),
+        })
+    }
+}
+
+fn semantic_url_is_loopback(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case("localhost.localdomain")
+    {
+        return true;
+    }
+    host.parse::<IpAddr>().is_ok_and(|addr| addr.is_loopback())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticProviderKind {
+    #[serde(rename = "api", alias = "openai", alias = "openai_api")]
+    Api,
+    #[serde(rename = "local_openai", alias = "local", alias = "openai_local")]
+    LocalOpenAi,
+}
+
+impl SemanticProviderKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::LocalOpenAi => "local_openai",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ConfigError> {
+        match value {
+            "api" | "openai" | "openai_api" => Ok(Self::Api),
+            "local_openai" | "local" | "openai_local" => Ok(Self::LocalOpenAi),
+            other => Err(ConfigError::InvalidSemanticProvider {
+                provider: other.to_owned(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmProviderKind {
-    #[serde(rename = "openrouter", alias = "open_router")]
+    #[serde(rename = "openrouter", alias = "open_router", alias = "openrouter_api")]
     OpenRouter,
-    #[serde(rename = "codex_cli", alias = "codex")]
+    #[serde(rename = "codex_cli", alias = "codex", alias = "codex_sidecar")]
     CodexCli,
-    #[serde(rename = "claude_cli", alias = "claude_code")]
+    #[serde(rename = "claude_cli", alias = "claude_code", alias = "claude_sidecar")]
     ClaudeCli,
     Recording,
 }
@@ -246,6 +314,58 @@ impl LlmProviderKind {
             Self::Recording => "recording",
         }
     }
+
+    pub fn parse(value: &str) -> Result<Self, ConfigError> {
+        match value {
+            "openrouter" | "open_router" | "openrouter_api" => Ok(Self::OpenRouter),
+            "codex_cli" | "codex" | "codex_sidecar" => Ok(Self::CodexCli),
+            "claude_cli" | "claude_code" | "claude_sidecar" => Ok(Self::ClaudeCli),
+            "recording" => Ok(Self::Recording),
+            other => Err(ConfigError::InvalidLlmProvider {
+                provider: other.to_owned(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LlmConfigPatch {
+    pub enabled: Option<bool>,
+    pub provider: Option<LlmProviderKind>,
+    pub allow_live_provider: Option<bool>,
+    pub enable_write_tools: Option<bool>,
+    pub model_id: Option<String>,
+    pub codex_model: Option<String>,
+    pub claude_model: Option<String>,
+    pub openrouter_api_key_env: Option<String>,
+    pub openrouter_endpoint_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LlmConfigEditResult {
+    pub path: String,
+    pub created: bool,
+    pub config: McpConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SemanticConfigPatch {
+    pub enabled: Option<bool>,
+    pub provider: Option<SemanticProviderKind>,
+    pub allow_live_provider: Option<bool>,
+    pub model_id: Option<String>,
+    pub dimensions: Option<usize>,
+    pub endpoint_url: Option<String>,
+    pub api_key_env: Option<String>,
+    pub timeout_seconds: Option<u64>,
+    pub session_token_ceiling: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemanticConfigEditResult {
+    pub path: String,
+    pub created: bool,
+    pub config: McpConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -626,6 +746,269 @@ where
     }
 }
 
+pub fn update_llm_config_file(
+    path: &Path,
+    patch: &LlmConfigPatch,
+) -> Result<LlmConfigEditResult, ConfigError> {
+    let (mut document, created) = if path.exists() {
+        let raw = fs::read_to_string(path).map_err(|source| ConfigError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        if raw.trim().is_empty() {
+            (versioned_empty_document(), false)
+        } else {
+            reject_llm_policy_alias_collision(&raw)?;
+            (
+                serde_norway::from_str::<serde_norway::Value>(&raw)
+                    .map_err(|err| ConfigError::Yaml(err.to_string()))?,
+                false,
+            )
+        }
+    } else {
+        (versioned_empty_document(), true)
+    };
+
+    apply_llm_patch(&mut document, patch)?;
+    let rendered =
+        serde_norway::to_string(&document).map_err(|err| ConfigError::Yaml(err.to_string()))?;
+    let parsed = McpConfig::from_yaml_str(&rendered)?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    fs::write(path, rendered).map_err(|source| ConfigError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(LlmConfigEditResult {
+        path: path.display().to_string(),
+        created,
+        config: parsed,
+    })
+}
+
+pub fn update_semantic_config_file(
+    path: &Path,
+    patch: &SemanticConfigPatch,
+) -> Result<SemanticConfigEditResult, ConfigError> {
+    let (mut document, created) = if path.exists() {
+        let raw = fs::read_to_string(path).map_err(|source| ConfigError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        if raw.trim().is_empty() {
+            (versioned_empty_document(), false)
+        } else {
+            reject_llm_policy_alias_collision(&raw)?;
+            (
+                serde_norway::from_str::<serde_norway::Value>(&raw)
+                    .map_err(|err| ConfigError::Yaml(err.to_string()))?,
+                false,
+            )
+        }
+    } else {
+        (versioned_empty_document(), true)
+    };
+
+    apply_semantic_patch(&mut document, patch)?;
+    let rendered =
+        serde_norway::to_string(&document).map_err(|err| ConfigError::Yaml(err.to_string()))?;
+    let parsed = McpConfig::from_yaml_str(&rendered)?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    fs::write(path, rendered).map_err(|source| ConfigError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(SemanticConfigEditResult {
+        path: path.display().to_string(),
+        created,
+        config: parsed,
+    })
+}
+
+fn versioned_empty_document() -> serde_norway::Value {
+    let mut mapping = serde_norway::Mapping::new();
+    mapping.insert(
+        serde_norway::Value::String("version".to_owned()),
+        serde_norway::Value::Number(1.into()),
+    );
+    serde_norway::Value::Mapping(mapping)
+}
+
+fn apply_llm_patch(
+    document: &mut serde_norway::Value,
+    patch: &LlmConfigPatch,
+) -> Result<(), ConfigError> {
+    let root = mapping_mut(document)?;
+    let llm_key = if root.contains_key("llm_policy") {
+        "llm_policy"
+    } else if root.contains_key("llm") {
+        "llm"
+    } else {
+        "llm_policy"
+    };
+    let llm = child_mapping_mut(root, llm_key)?;
+    if let Some(enabled) = patch.enabled {
+        set_bool(llm, "enabled", enabled);
+    }
+    if let Some(provider) = patch.provider {
+        set_string(llm, "provider", provider.as_str());
+    }
+    if let Some(allow_live_provider) = patch.allow_live_provider {
+        set_bool(llm, "allow_live_provider", allow_live_provider);
+    }
+    if let Some(model_id) = patch.model_id.as_deref() {
+        set_non_empty_string(llm, "model_id", model_id)?;
+    }
+    if let Some(model) = patch.codex_model.as_deref() {
+        let codex = child_mapping_mut(llm, "codex_cli")?;
+        set_non_empty_string(codex, "model", model)?;
+    }
+    if let Some(model) = patch.claude_model.as_deref() {
+        let claude = child_mapping_mut(llm, "claude_cli")?;
+        set_non_empty_string(claude, "model", model)?;
+    }
+    if let Some(api_key_env) = patch.openrouter_api_key_env.as_deref() {
+        let openrouter = child_mapping_mut(llm, "openrouter")?;
+        set_non_empty_string(openrouter, "api_key_env", api_key_env)?;
+    }
+    if let Some(endpoint_url) = patch.openrouter_endpoint_url.as_deref() {
+        let openrouter = child_mapping_mut(llm, "openrouter")?;
+        set_non_empty_string(openrouter, "endpoint_url", endpoint_url)?;
+    }
+    if let Some(enable_write_tools) = patch.enable_write_tools {
+        let serve = child_mapping_mut(root, "serve")?;
+        let mcp = child_mapping_mut(serve, "mcp")?;
+        set_bool(mcp, "enable_write_tools", enable_write_tools);
+    }
+    Ok(())
+}
+
+fn apply_semantic_patch(
+    document: &mut serde_norway::Value,
+    patch: &SemanticConfigPatch,
+) -> Result<(), ConfigError> {
+    let root = mapping_mut(document)?;
+    let semantic = child_mapping_mut(root, "semantic_search")?;
+    if let Some(enabled) = patch.enabled {
+        set_bool(semantic, "enabled", enabled);
+    }
+    if let Some(provider) = patch.provider {
+        set_string(semantic, "provider", provider.as_str());
+    }
+    if let Some(allow_live_provider) = patch.allow_live_provider {
+        set_bool(semantic, "allow_live_provider", allow_live_provider);
+    }
+    if let Some(model_id) = patch.model_id.as_deref() {
+        set_non_empty_string(semantic, "model_id", model_id)?;
+    }
+    if let Some(dimensions) = patch.dimensions {
+        if dimensions == 0 {
+            return Err(ConfigError::Yaml(
+                "dimensions must be greater than zero".to_owned(),
+            ));
+        }
+        set_usize(semantic, "dimensions", dimensions)?;
+    }
+    if let Some(endpoint_url) = patch.endpoint_url.as_deref() {
+        set_non_empty_string(semantic, "endpoint_url", endpoint_url)?;
+    }
+    if let Some(api_key_env) = patch.api_key_env.as_deref() {
+        set_non_empty_string(semantic, "api_key_env", api_key_env)?;
+    }
+    if let Some(timeout_seconds) = patch.timeout_seconds {
+        if timeout_seconds == 0 {
+            return Err(ConfigError::Yaml(
+                "timeout_seconds must be greater than zero".to_owned(),
+            ));
+        }
+        set_u64(semantic, "timeout_seconds", timeout_seconds)?;
+    }
+    if let Some(session_token_ceiling) = patch.session_token_ceiling {
+        set_u64(semantic, "session_token_ceiling", session_token_ceiling)?;
+    }
+    Ok(())
+}
+
+fn mapping_mut(value: &mut serde_norway::Value) -> Result<&mut serde_norway::Mapping, ConfigError> {
+    value
+        .as_mapping_mut()
+        .ok_or_else(|| ConfigError::Yaml("loomweave.yaml root must be a YAML mapping".to_owned()))
+}
+
+fn child_mapping_mut<'a>(
+    mapping: &'a mut serde_norway::Mapping,
+    key: &str,
+) -> Result<&'a mut serde_norway::Mapping, ConfigError> {
+    let key_value = serde_norway::Value::String(key.to_owned());
+    if !mapping.contains_key(&key_value) {
+        mapping.insert(
+            key_value.clone(),
+            serde_norway::Value::Mapping(serde_norway::Mapping::new()),
+        );
+    }
+    mapping
+        .get_mut(&key_value)
+        .and_then(serde_norway::Value::as_mapping_mut)
+        .ok_or_else(|| ConfigError::Yaml(format!("{key} must be a YAML mapping")))
+}
+
+fn set_bool(mapping: &mut serde_norway::Mapping, key: &str, value: bool) {
+    mapping.insert(
+        serde_norway::Value::String(key.to_owned()),
+        serde_norway::Value::Bool(value),
+    );
+}
+
+fn set_string(mapping: &mut serde_norway::Mapping, key: &str, value: &str) {
+    mapping.insert(
+        serde_norway::Value::String(key.to_owned()),
+        serde_norway::Value::String(value.to_owned()),
+    );
+}
+
+fn set_u64(mapping: &mut serde_norway::Mapping, key: &str, value: u64) -> Result<(), ConfigError> {
+    let number = serde_norway::to_value(value).map_err(|err| ConfigError::Yaml(err.to_string()))?;
+    mapping.insert(serde_norway::Value::String(key.to_owned()), number);
+    Ok(())
+}
+
+fn set_usize(
+    mapping: &mut serde_norway::Mapping,
+    key: &str,
+    value: usize,
+) -> Result<(), ConfigError> {
+    let number = serde_norway::to_value(value).map_err(|err| ConfigError::Yaml(err.to_string()))?;
+    mapping.insert(serde_norway::Value::String(key.to_owned()), number);
+    Ok(())
+}
+
+fn set_non_empty_string(
+    mapping: &mut serde_norway::Mapping,
+    key: &str,
+    value: &str,
+) -> Result<(), ConfigError> {
+    if value.trim().is_empty() {
+        return Err(ConfigError::Yaml(format!("{key} must not be blank")));
+    }
+    set_string(mapping, key, value);
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("read MCP config {path}: {source}")]
@@ -680,6 +1063,33 @@ pub enum ConfigError {
          Pick one and remove the other."
     )]
     AmbiguousLlmKey { code: &'static str },
+
+    #[error(
+        "unknown LLM provider {provider:?}; expected one of: openrouter, openrouter_api, codex_cli, codex_sidecar, claude_cli, claude_sidecar"
+    )]
+    InvalidLlmProvider { provider: String },
+
+    #[error(
+        "unknown semantic search provider {provider:?}; expected one of: api, openai, openai_api, local_openai, local, openai_local"
+    )]
+    InvalidSemanticProvider { provider: String },
+
+    #[error(
+        "{code}: semantic_search.endpoint_url {endpoint_url:?} is not a valid URL: {parse_error}"
+    )]
+    InvalidSemanticEndpoint {
+        code: &'static str,
+        endpoint_url: String,
+        parse_error: String,
+    },
+
+    #[error(
+        "{code}: semantic_search.provider=local_openai requires semantic_search.endpoint_url to be http(s) on localhost or a loopback IP; got {endpoint_url:?}"
+    )]
+    NonLoopbackSemanticEndpoint {
+        code: &'static str,
+        endpoint_url: String,
+    },
 }
 
 /// Reject configs that name both `llm` and `llm_policy` at the top level.
@@ -806,6 +1216,23 @@ llm_policy:
         assert!(cfg.llm.enabled);
         assert_eq!(cfg.llm.provider, LlmProviderKind::OpenRouter);
         assert_eq!(cfg.llm.model_id, "openai/gpt-4o-mini");
+    }
+
+    #[test]
+    fn accepts_operator_facing_llm_provider_mode_aliases() {
+        let cases = [
+            ("openrouter_api", LlmProviderKind::OpenRouter),
+            ("codex_sidecar", LlmProviderKind::CodexCli),
+            ("claude_sidecar", LlmProviderKind::ClaudeCli),
+        ];
+
+        for (provider, expected) in cases {
+            let cfg = McpConfig::from_yaml_str(&format!(
+                "llm_policy:\n  enabled: true\n  provider: {provider}\n"
+            ))
+            .unwrap_or_else(|err| panic!("provider alias {provider:?} should parse: {err}"));
+            assert_eq!(cfg.llm.provider, expected);
+        }
     }
 
     #[test]

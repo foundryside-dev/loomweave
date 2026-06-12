@@ -28,6 +28,11 @@ use time::{Date, Month, OffsetDateTime, macros::format_description};
 use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, mpsc};
 
 use loomweave_core::plugin::{ContentLengthCeiling, Frame, TransportError};
+use loomweave_federation::config::{
+    LlmConfigPatch, LlmProviderKind, McpConfig, ProviderSelection, SemanticConfigPatch,
+    SemanticProviderKind, select_provider_with_env, update_llm_config_file,
+    update_semantic_config_file,
+};
 use loomweave_storage::{
     CallEdgeMatch, EntityRow, InferredCallEdgeRecord, InferredEdgeCacheEntry, InferredEdgeCacheKey,
     InferredEdgeWriteStats, ReaderPool, ReferenceDirection, ReferenceEdgeMatch,
@@ -79,10 +84,10 @@ fn server_instructions(policy: McpToolPolicy) -> String {
     let write_tools_note = if policy.enable_write_tools {
         String::new()
     } else {
-        "\n\nWrite-gated (NOT registered): `entity_summary_get`, `analyze_start`, \
-`analyze_cancel`, `propose_guidance`, `promote_guidance` — require \
-`serve.mcp.enable_write_tools: true` in loomweave.yaml; calling one returns a \
-tool-disabled error."
+        "\n\nWrite-gated unless `serve.mcp.enable_write_tools: true`: \
+`entity_summary_get`, `analyze_start`, `analyze_cancel`, `propose_guidance`, \
+`promote_guidance`. Config: `llm_config_*`,`semantic_config_*`; reconnect \
+after changes."
             .to_owned()
     };
     format!(
@@ -223,6 +228,9 @@ impl ToolMetadata {
 
 pub fn tool_metadata(name: &str) -> ToolMetadata {
     match name {
+        "llm_config_set" | "semantic_config_set" => {
+            ToolMetadata::write_tool(true, false, false, false)
+        }
         "entity_summary_get" => ToolMetadata::write_tool(true, false, false, true),
         "entity_callers_list" | "entity_neighborhood_get" | "entity_execution_path_list" => {
             ToolMetadata::conditional_llm()
@@ -258,12 +266,16 @@ impl McpToolPolicy {
 
     #[must_use]
     pub fn allows(self, name: &str) -> bool {
-        self.enable_write_tools || tool_metadata(name).read_only
+        self.enable_write_tools || tool_metadata(name).read_only || is_bootstrap_config_tool(name)
     }
 
     fn allows_arguments(self, name: &str, arguments: &serde_json::Map<String, Value>) -> bool {
         self.enable_write_tools || !tool_uses_conditional_inferred_dispatch(name, arguments)
     }
+}
+
+fn is_bootstrap_config_tool(name: &str) -> bool {
+    matches!(name, "llm_config_set" | "semantic_config_set")
 }
 
 fn tool_uses_conditional_inferred_dispatch(
@@ -327,7 +339,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_find",
-            description: "Search entities by name, id, summary, and docstring (stemmed full-text + substring recall) — reach for it before grepping. (Semantic ranking is the opt-in `entity_semantic_search_list`.) Optional `kind` filter. Paginated; scanner-blocked docstrings never match.",
+            description: "Search entities by name, id, summary, and docstring before grepping. Optional `kind`; paginated; scanner-blocked docstrings never match.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -342,7 +354,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_callers_list",
-            description: "What calls this entity. `confidence` resolved (default) | ambiguous | inferred (policy-gated). Bounded (`limit`+`cursor`). `scope_excludes` names unsearched blind spots; `unresolved_name_matches` counts name-matched unresolved sites NOT in callers (recover via entity_call_site_list role=callee) — empty with matches>0 is NOT a true negative.",
+            description: "List callers. `confidence` resolved (default) | ambiguous | inferred. Bounded. Reports scope_excludes and unresolved_name_matches so empty results stay honest.",
             input_schema: id_confidence_cursor_schema(),
         },
         ToolDefinition {
@@ -379,7 +391,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_neighborhood_get",
-            description: "One-hop neighborhood: callers, callees, container, contained, references, imports, relations (in/out). Per-bucket `limit` (default 50, max 100) + `truncated` map; NO cursor — page a trimmed bucket via its dedicated tool. Module references roll up over contained symbols. Carries scope_excludes + unresolved_name_matches (see entity_callers_list).",
+            description: "One-hop callers/callees/container/contained/references/imports/relations. Per-bucket limit; reports scope_excludes and unresolved_name_matches.",
             input_schema: id_confidence_schema(),
         },
         ToolDefinition {
@@ -400,6 +412,34 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "properties": {},
                 "additionalProperties": false
             }),
+        },
+        ToolDefinition {
+            name: "llm_config_get",
+            description: "Read LLM/provider/live and MCP write-tool config.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "llm_config_set",
+            description: "Update LLM/provider/live/write-tool config in loomweave.yaml; reconnect.",
+            input_schema: llm_config_set_schema(),
+        },
+        ToolDefinition {
+            name: "semantic_config_get",
+            description: "Read semantic-search config and sidecar diagnostics.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "semantic_config_set",
+            description: "Update semantic-search config in loomweave.yaml; rerun analyze.",
+            input_schema: semantic_config_set_schema(),
         },
         ToolDefinition {
             name: "entity_summary_preview_cost_get",
@@ -667,12 +707,12 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_dead_list",
-            description: "Entities unreachable from the root set (entry points, exports, tests, routes, CLI, data models). CONSERVATIVE — fails toward live: all confidence tiers count, barrier tags force live, name-matched unresolved call sites suppress candidates (`unresolved_call_site_suppressed`). No root tags → zero candidates + note. Heuristic, never certain.",
+            description: "Entities unreachable from roots, optional scope. Conservative heuristic; root classification depends on plugin-emitted tags/exports.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_semantic_search_list",
-            description: "Rank entities by embedding similarity to `query`, optional `scope`. OPT-IN: when disabled returns result_kind not_enabled with a note (use entity_find for keyword discovery). Stale vectors (content-hash mismatch) never surface.",
+            description: "Rank entities by embedding similarity to `query`, optional `scope`; disabled returns not_enabled and stale vectors are hidden.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -708,7 +748,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_resolve",
-            description: "The paste-an-identifier lookup: batch-resolve dotted qualnames, Rust `::` paths (auto-normalized), and SEI tokens to identity rows {id, sei, kind} — never hand-construct an id. `qualnames` 1..=2000; results in input order, result_kind resolved | unresolved | ambiguous (honest, never an error). Unknown `kind`/`plugin` constraints match nothing.",
+            description: "Batch-resolve pasted dotted qualnames, Rust `::` paths, or SEIs to entity candidates; reports resolved/unresolved/ambiguous.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -727,7 +767,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_relation_list",
-            description: "List relation edges (inherits_from / decorates / implements / derives). REQUIRED `direction` reads as a sentence (ADR-051): in on a class = \"what subclasses this\"; out on a decorator = \"what does it decorate\". ambiguous is the widest tier (relations are never LLM-inferred). Bounded (`limit`+`cursor`). Only DECLARED relations are recorded.",
+            description: "List declared relation edges (inherits_from/decorates/implements/derives). Use direction=in for subclasses/decorated funcs/implementors.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -867,6 +907,42 @@ fn id_cursor_schema() -> Value {
             "cursor": {"type": ["string", "null"]}
         },
         "required": ["id"],
+        "additionalProperties": false
+    })
+}
+
+fn llm_config_set_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "enabled": {},
+            "provider": {},
+            "allow_live_provider": {},
+            "enable_write_tools": {},
+            "model_id": {},
+            "codex_model": {},
+            "claude_model": {},
+            "openrouter_api_key_env": {},
+            "openrouter_endpoint_url": {}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn semantic_config_set_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "enabled": {},
+            "provider": {},
+            "allow_live_provider": {},
+            "model_id": {},
+            "dimensions": {},
+            "endpoint_url": {},
+            "api_key_env": {},
+            "timeout_seconds": {},
+            "session_token_ceiling": {}
+        },
         "additionalProperties": false
     })
 }
@@ -1223,6 +1299,147 @@ impl ServerState {
         self
     }
 
+    async fn tool_llm_config_get(
+        &self,
+        _arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let path = self.config_file_path();
+        let active_write_tools = self.tool_policy.enable_write_tools;
+        let read = tokio::task::spawn_blocking(move || read_llm_config_status(&path)).await;
+        match read {
+            Ok(Ok(status)) => Ok(success_envelope(with_active_session_policy(
+                status,
+                active_write_tools,
+                false,
+            ))),
+            Ok(Err(err)) => Ok(tool_error_envelope(
+                McpErrorCode::StorageError,
+                &err.to_string(),
+                false,
+            )),
+            Err(err) => Ok(tool_error_envelope(
+                McpErrorCode::Internal,
+                &format!("read LLM config task failed: {err}"),
+                true,
+            )),
+        }
+    }
+
+    async fn tool_llm_config_set(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let patch = llm_config_patch_from_arguments(arguments)?;
+        if llm_config_patch_is_empty(&patch) {
+            return Err(ParamError::new("no LLM config changes requested"));
+        }
+        let path = self.config_file_path();
+        let active_write_tools = self.tool_policy.enable_write_tools;
+        let write = tokio::task::spawn_blocking(move || {
+            let result = update_llm_config_file(&path, &patch)?;
+            Ok::<_, loomweave_federation::config::ConfigError>(llm_config_status_json(
+                &path,
+                result.created,
+                &result.config,
+            ))
+        })
+        .await;
+        match write {
+            Ok(Ok(status)) => Ok(success_envelope(with_active_session_policy(
+                status,
+                active_write_tools,
+                true,
+            ))),
+            Ok(Err(err)) => Ok(tool_error_envelope(
+                McpErrorCode::StorageError,
+                &err.to_string(),
+                false,
+            )),
+            Err(err) => Ok(tool_error_envelope(
+                McpErrorCode::Internal,
+                &format!("write LLM config task failed: {err}"),
+                true,
+            )),
+        }
+    }
+
+    async fn tool_semantic_config_get(
+        &self,
+        _arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let path = self.config_file_path();
+        let project_root = self.project_root.clone();
+        let active_write_tools = self.tool_policy.enable_write_tools;
+        let read =
+            tokio::task::spawn_blocking(move || read_semantic_config_status(&path, &project_root))
+                .await;
+        match read {
+            Ok(Ok(status)) => Ok(success_envelope(with_active_session_policy(
+                status,
+                active_write_tools,
+                false,
+            ))),
+            Ok(Err(err)) => Ok(tool_error_envelope(
+                McpErrorCode::StorageError,
+                &err.to_string(),
+                false,
+            )),
+            Err(err) => Ok(tool_error_envelope(
+                McpErrorCode::Internal,
+                &format!("read semantic config task failed: {err}"),
+                true,
+            )),
+        }
+    }
+
+    async fn tool_semantic_config_set(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let patch = semantic_config_patch_from_arguments(arguments)?;
+        if semantic_config_patch_is_empty(&patch) {
+            return Err(ParamError::new(
+                "no semantic search config changes requested",
+            ));
+        }
+        let path = self.config_file_path();
+        let project_root = self.project_root.clone();
+        let active_write_tools = self.tool_policy.enable_write_tools;
+        let write = tokio::task::spawn_blocking(move || {
+            let result = update_semantic_config_file(&path, &patch)?;
+            Ok::<_, loomweave_federation::config::ConfigError>(semantic_config_status_json(
+                &path,
+                &project_root,
+                result.created,
+                &result.config,
+            ))
+        })
+        .await;
+        match write {
+            Ok(Ok(status)) => Ok(success_envelope(with_active_session_policy(
+                status,
+                active_write_tools,
+                true,
+            ))),
+            Ok(Err(err)) => Ok(tool_error_envelope(
+                McpErrorCode::StorageError,
+                &err.to_string(),
+                false,
+            )),
+            Err(err) => Ok(tool_error_envelope(
+                McpErrorCode::Internal,
+                &format!("write semantic config task failed: {err}"),
+                true,
+            )),
+        }
+    }
+
+    fn config_file_path(&self) -> PathBuf {
+        self.analyze_config_path
+            .clone()
+            .unwrap_or_else(|| self.project_root.join("loomweave.yaml"))
+    }
+
     pub async fn handle_json_rpc(&self, request: &Value) -> Option<Value> {
         if is_json_rpc_notification(request) {
             self.handle_json_rpc_notification(request).await;
@@ -1400,6 +1617,22 @@ impl ServerState {
                 Err(response) => return response.to_json_rpc(id),
             },
             "project_status_get" => match self.tool_project_status(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "llm_config_get" => match self.tool_llm_config_get(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "llm_config_set" => match self.tool_llm_config_set(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "semantic_config_get" => match self.tool_semantic_config_get(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "semantic_config_set" => match self.tool_semantic_config_set(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
@@ -2909,6 +3142,293 @@ fn optional_bool(
         .as_bool()
         .map(Some)
         .ok_or_else(|| ParamError::new(&format!("{field} must be a boolean")))
+}
+
+fn optional_non_empty_string(
+    arguments: &serde_json::Map<String, Value>,
+    field: &str,
+) -> std::result::Result<Option<String>, ParamError> {
+    let Some(value) = arguments.get(field) else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_str().filter(|value| !value.trim().is_empty()) else {
+        return Err(ParamError::new(&format!(
+            "{field} must be a non-empty string"
+        )));
+    };
+    Ok(Some(value.to_owned()))
+}
+
+fn optional_u64(
+    arguments: &serde_json::Map<String, Value>,
+    field: &str,
+) -> std::result::Result<Option<u64>, ParamError> {
+    let Some(value) = arguments.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .map(Some)
+        .ok_or_else(|| ParamError::new(&format!("{field} must be a non-negative integer")))
+}
+
+fn llm_config_patch_from_arguments(
+    arguments: &serde_json::Map<String, Value>,
+) -> std::result::Result<LlmConfigPatch, ParamError> {
+    let provider = optional_non_empty_string(arguments, "provider")?
+        .as_deref()
+        .map(LlmProviderKind::parse)
+        .transpose()
+        .map_err(|err| ParamError::new(&err.to_string()))?;
+    Ok(LlmConfigPatch {
+        enabled: optional_bool(arguments, "enabled")?,
+        provider,
+        allow_live_provider: optional_bool(arguments, "allow_live_provider")?,
+        enable_write_tools: optional_bool(arguments, "enable_write_tools")?,
+        model_id: optional_non_empty_string(arguments, "model_id")?,
+        codex_model: optional_non_empty_string(arguments, "codex_model")?,
+        claude_model: optional_non_empty_string(arguments, "claude_model")?,
+        openrouter_api_key_env: optional_non_empty_string(arguments, "openrouter_api_key_env")?,
+        openrouter_endpoint_url: optional_non_empty_string(arguments, "openrouter_endpoint_url")?,
+    })
+}
+
+fn semantic_config_patch_from_arguments(
+    arguments: &serde_json::Map<String, Value>,
+) -> std::result::Result<SemanticConfigPatch, ParamError> {
+    let provider = optional_non_empty_string(arguments, "provider")?
+        .as_deref()
+        .map(SemanticProviderKind::parse)
+        .transpose()
+        .map_err(|err| ParamError::new(&err.to_string()))?;
+    Ok(SemanticConfigPatch {
+        enabled: optional_bool(arguments, "enabled")?,
+        provider,
+        allow_live_provider: optional_bool(arguments, "allow_live_provider")?,
+        model_id: optional_non_empty_string(arguments, "model_id")?,
+        dimensions: optional_usize(arguments, "dimensions")?,
+        endpoint_url: optional_non_empty_string(arguments, "endpoint_url")?,
+        api_key_env: optional_non_empty_string(arguments, "api_key_env")?,
+        timeout_seconds: optional_u64(arguments, "timeout_seconds")?,
+        session_token_ceiling: optional_u64(arguments, "session_token_ceiling")?,
+    })
+}
+
+fn llm_config_patch_is_empty(patch: &LlmConfigPatch) -> bool {
+    patch.enabled.is_none()
+        && patch.provider.is_none()
+        && patch.allow_live_provider.is_none()
+        && patch.enable_write_tools.is_none()
+        && patch.model_id.is_none()
+        && patch.codex_model.is_none()
+        && patch.claude_model.is_none()
+        && patch.openrouter_api_key_env.is_none()
+        && patch.openrouter_endpoint_url.is_none()
+}
+
+fn semantic_config_patch_is_empty(patch: &SemanticConfigPatch) -> bool {
+    patch.enabled.is_none()
+        && patch.provider.is_none()
+        && patch.allow_live_provider.is_none()
+        && patch.model_id.is_none()
+        && patch.dimensions.is_none()
+        && patch.endpoint_url.is_none()
+        && patch.api_key_env.is_none()
+        && patch.timeout_seconds.is_none()
+        && patch.session_token_ceiling.is_none()
+}
+
+fn read_llm_config_status(
+    path: &Path,
+) -> std::result::Result<Value, loomweave_federation::config::ConfigError> {
+    if path.exists() {
+        let config = McpConfig::from_path(path)?;
+        Ok(llm_config_status_json(path, false, &config))
+    } else {
+        Ok(llm_config_status_json(path, true, &McpConfig::default()))
+    }
+}
+
+fn llm_config_status_json(path: &Path, created_or_absent: bool, config: &McpConfig) -> Value {
+    let selection = select_provider_with_env(config, |name| std::env::var(name).ok());
+    let (live, selection_error) = match &selection {
+        Ok(
+            ProviderSelection::OpenRouter { .. }
+            | ProviderSelection::CodexCli
+            | ProviderSelection::ClaudeCli,
+        ) => (true, Value::Null),
+        Ok(ProviderSelection::Disabled | ProviderSelection::Recording) => (false, Value::Null),
+        Err(err) => (false, Value::String(err.to_string())),
+    };
+    json!({
+        "config_path": path.display().to_string(),
+        "config_absent": created_or_absent && !path.exists(),
+        "created": created_or_absent && path.exists(),
+        "llm": {
+            "enabled": config.llm.enabled,
+            "provider": config.llm.provider.as_str(),
+            "allow_live_provider": config.llm.allow_live_provider,
+            "effective_model": config.llm.effective_model_label(),
+            "live": live,
+            "selection_error": selection_error,
+            "warnings": config.llm_warnings(),
+        },
+        "serve": {
+            "mcp": {
+                "enable_write_tools": config.serve.mcp.enable_write_tools,
+            }
+        }
+    })
+}
+
+fn read_semantic_config_status(
+    path: &Path,
+    project_root: &Path,
+) -> std::result::Result<Value, loomweave_federation::config::ConfigError> {
+    if path.exists() {
+        let config = McpConfig::from_path(path)?;
+        Ok(semantic_config_status_json(
+            path,
+            project_root,
+            false,
+            &config,
+        ))
+    } else {
+        Ok(semantic_config_status_json(
+            path,
+            project_root,
+            true,
+            &McpConfig::default(),
+        ))
+    }
+}
+
+fn semantic_config_status_json(
+    path: &Path,
+    project_root: &Path,
+    created_or_absent: bool,
+    config: &McpConfig,
+) -> Value {
+    let semantic = &config.semantic_search;
+    let sidecar_path = project_root.join(".weft/loomweave/embeddings.db");
+    let sidecar_count = semantic_sidecar_count(&sidecar_path);
+    let has_key = std::env::var(&semantic.api_key_env)
+        .ok()
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let provider_error = semantic_provider_error(semantic, has_key).map(Value::String);
+    let provider_available = semantic.enabled && provider_error.is_none();
+    let vector_count = sidecar_count.as_ref().ok().and_then(|value| *value);
+    json!({
+        "config_path": path.display().to_string(),
+        "config_absent": created_or_absent && !path.exists(),
+        "created": created_or_absent && path.exists(),
+        "semantic_search": {
+            "enabled": semantic.enabled,
+            "provider": semantic.provider.as_str(),
+            "allow_live_provider": semantic.allow_live_provider,
+            "endpoint_url": semantic.endpoint_url,
+            "model_id": semantic.model_id,
+            "dimensions": semantic.dimensions,
+            "api_key_env": semantic.api_key_env,
+            "api_key_present": has_key,
+            "timeout_seconds": semantic.timeout_seconds,
+            "session_token_ceiling": semantic.session_token_ceiling,
+            "provider_available": provider_available,
+            "provider_error": provider_error.unwrap_or(Value::Null),
+            "next_action": semantic_next_action(semantic, has_key, vector_count),
+        },
+        "embeddings_sidecar": {
+            "path": sidecar_path.display().to_string(),
+            "present": sidecar_path.exists(),
+            "vector_count": vector_count,
+            "error": sidecar_count.err().map(|err| err.to_string()),
+        }
+    })
+}
+
+fn semantic_provider_error(semantic: &SemanticSearchConfig, has_key: bool) -> Option<String> {
+    if !semantic.enabled {
+        return Some("semantic_search.enabled is false".to_owned());
+    }
+    match semantic.provider {
+        SemanticProviderKind::Api if !semantic.allow_live_provider => {
+            Some("hosted API provider requires allow_live_provider=true".to_owned())
+        }
+        SemanticProviderKind::Api if !has_key => Some(format!(
+            "hosted API provider requires non-empty ${}",
+            semantic.api_key_env
+        )),
+        SemanticProviderKind::LocalOpenAi => semantic
+            .validate_endpoint_trust()
+            .err()
+            .map(|err| err.to_string()),
+        _ => None,
+    }
+}
+
+fn semantic_next_action(
+    semantic: &SemanticSearchConfig,
+    has_key: bool,
+    vector_count: Option<i64>,
+) -> String {
+    if !semantic.enabled {
+        return "enable semantic search, then run `loomweave analyze`".to_owned();
+    }
+    match semantic.provider {
+        SemanticProviderKind::Api if !semantic.allow_live_provider => {
+            return "set semantic_search.allow_live_provider=true for hosted API calls".to_owned();
+        }
+        SemanticProviderKind::Api if !has_key => {
+            return format!("export ${} before analyzing", semantic.api_key_env);
+        }
+        SemanticProviderKind::LocalOpenAi if vector_count.unwrap_or(0) == 0 => {
+            return format!(
+                "start the local embeddings server at {}, then run `loomweave analyze`",
+                semantic.endpoint_url
+            );
+        }
+        _ => {}
+    }
+    if vector_count.unwrap_or(0) == 0 {
+        "run `loomweave analyze` to populate semantic embeddings".to_owned()
+    } else {
+        "reconnect/restart `loomweave serve` after config changes".to_owned()
+    }
+}
+
+fn semantic_sidecar_count(path: &Path) -> std::result::Result<Option<i64>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open(path).map_err(|err| err.to_string())?;
+    conn.query_row("SELECT COUNT(*) FROM entity_embeddings", [], |row| {
+        row.get(0)
+    })
+    .optional()
+    .map_err(|err| err.to_string())
+}
+
+fn with_active_session_policy(
+    mut status: Value,
+    active_write_tools: bool,
+    restart_required: bool,
+) -> Value {
+    if let Some(object) = status.as_object_mut() {
+        object.insert(
+            "active_session".to_owned(),
+            json!({
+                "enable_write_tools": active_write_tools,
+                "restart_required": restart_required,
+                "note": if restart_required {
+                    "reconnect/restart loomweave serve for provider and write-tool policy changes to load"
+                } else {
+                    "active session state"
+                }
+            }),
+        );
+    }
+    status
 }
 
 fn optional_confidence(
@@ -5439,7 +5959,7 @@ mod tests {
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 42);
+        assert_eq!(tools.len(), 46);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
@@ -5448,12 +5968,12 @@ mod tests {
         assert_eq!(tools[1].name, "entity_find");
         assert_eq!(
             tools[1].description,
-            "Search entities by name, id, summary, and docstring (stemmed full-text + substring recall) — reach for it before grepping. (Semantic ranking is the opt-in `entity_semantic_search_list`.) Optional `kind` filter. Paginated; scanner-blocked docstrings never match."
+            "Search entities by name, id, summary, and docstring before grepping. Optional `kind`; paginated; scanner-blocked docstrings never match."
         );
         assert_eq!(tools[2].name, "entity_callers_list");
         assert_eq!(
             tools[2].description,
-            "What calls this entity. `confidence` resolved (default) | ambiguous | inferred (policy-gated). Bounded (`limit`+`cursor`). `scope_excludes` names unsearched blind spots; `unresolved_name_matches` counts name-matched unresolved sites NOT in callers (recover via entity_call_site_list role=callee) — empty with matches>0 is NOT a true negative."
+            "List callers. `confidence` resolved (default) | ambiguous | inferred. Bounded. Reports scope_excludes and unresolved_name_matches so empty results stay honest."
         );
         assert_eq!(tools[3].name, "entity_execution_path_list");
         assert_eq!(
@@ -5473,7 +5993,7 @@ mod tests {
         assert_eq!(tools[6].name, "entity_neighborhood_get");
         assert_eq!(
             tools[6].description,
-            "One-hop neighborhood: callers, callees, container, contained, references, imports, relations (in/out). Per-bucket `limit` (default 50, max 100) + `truncated` map; NO cursor — page a trimmed bucket via its dedicated tool. Module references roll up over contained symbols. Carries scope_excludes + unresolved_name_matches (see entity_callers_list)."
+            "One-hop callers/callees/container/contained/references/imports/relations. Per-bucket limit; reports scope_excludes and unresolved_name_matches."
         );
         assert_eq!(tools[7].name, "subsystem_member_list");
         assert_eq!(
@@ -5490,66 +6010,86 @@ mod tests {
             tools[9].description,
             "Deterministic diagnostics: repo root, db path, latest run, entity/edge/finding counts, index staleness, per-plugin counts, LLM policy, and the resolved Filigree endpoint."
         );
-        assert_eq!(tools[10].name, "entity_summary_preview_cost_get");
+        assert_eq!(tools[10].name, "llm_config_get");
         assert_eq!(
             tools[10].description,
-            "Preview what entity_summary_get would cost BEFORE spending: cache_status (hit | expired | miss), real cost on a hit, an estimate on a miss, and live_spend_would_occur. A disabled LLM is reported distinctly from a cache miss. Never invokes the provider."
+            "Read LLM/provider/live and MCP write-tool config."
         );
-        assert_eq!(tools[11].name, "entity_source_get");
+        assert_eq!(tools[11].name, "llm_config_set");
         assert_eq!(
             tools[11].description,
-            "An entity's exact indexed source span plus `context_lines` (default 10) of context, line-numbered and flagged in_entity. source_status reports ok | missing | no_range | no_source_path | binary | drifted (rerun analyze) instead of a misleading stale snippet."
+            "Update LLM/provider/live/write-tool config in loomweave.yaml; reconnect."
         );
-        assert_eq!(tools[12].name, "entity_call_site_list");
+        assert_eq!(tools[12].name, "semantic_config_get");
         assert_eq!(
             tools[12].description,
-            "Show the source sites behind calls/references edges — the evidence for WHY an edge exists. role=caller (default) lists outgoing sites; role=callee lists incoming, INCLUDING `unresolved_sites` (static calls Loomweave could not bind — the recovery surface for suspicious empty caller lists). Bounded."
+            "Read semantic-search config and sidecar diagnostics."
         );
-        assert_eq!(tools[13].name, "entity_orientation_pack_get");
+        assert_eq!(tools[13].name, "semantic_config_set");
         assert_eq!(
             tools[13].description,
-            "One deterministic orientation packet for an `entity` id OR `file`+`line` (exactly one): primary entity, match evidence, one-hop neighbors, execution paths, Filigree issues, Wardline findings, health, suggested next reads. Bounded; `omitted` + named degraded sections keep empties honest."
+            "Update semantic-search config in loomweave.yaml; rerun analyze."
         );
-        assert_eq!(tools[14].name, "analyze_start");
+        assert_eq!(tools[14].name, "entity_summary_preview_cost_get");
         assert_eq!(
             tools[14].description,
-            "Start a background `loomweave analyze` run; returns run_id immediately (runs can take minutes). One run per project (cross-process lock). Poll analyze_status_get; stop via analyze_cancel. No arguments."
+            "Preview what entity_summary_get would cost BEFORE spending: cache_status (hit | expired | miss), real cost on a hit, an estimate on a miss, and live_spend_would_occur. A disabled LLM is reported distinctly from a cache miss. Never invokes the provider."
         );
-        assert_eq!(tools[15].name, "analyze_status_get");
+        assert_eq!(tools[15].name, "entity_source_get");
         assert_eq!(
             tools[15].description,
-            "A run's live status: queued | running | completed | failed | cancelled | skipped_no_plugins, with phase, current plugin/file, processed/total files, heartbeat, and progress_observed=false when the heartbeat is stale (run may be wedged)."
+            "An entity's exact indexed source span plus `context_lines` (default 10) of context, line-numbered and flagged in_entity. source_status reports ok | missing | no_range | no_source_path | binary | drifted (rerun analyze) instead of a misleading stale snippet."
         );
-        assert_eq!(tools[16].name, "analyze_cancel");
+        assert_eq!(tools[16].name, "entity_call_site_list");
         assert_eq!(
             tools[16].description,
+            "Show the source sites behind calls/references edges — the evidence for WHY an edge exists. role=caller (default) lists outgoing sites; role=callee lists incoming, INCLUDING `unresolved_sites` (static calls Loomweave could not bind — the recovery surface for suspicious empty caller lists). Bounded."
+        );
+        assert_eq!(tools[17].name, "entity_orientation_pack_get");
+        assert_eq!(
+            tools[17].description,
+            "One deterministic orientation packet for an `entity` id OR `file`+`line` (exactly one): primary entity, match evidence, one-hop neighbors, execution paths, Filigree issues, Wardline findings, health, suggested next reads. Bounded; `omitted` + named degraded sections keep empties honest."
+        );
+        assert_eq!(tools[18].name, "analyze_start");
+        assert_eq!(
+            tools[18].description,
+            "Start a background `loomweave analyze` run; returns run_id immediately (runs can take minutes). One run per project (cross-process lock). Poll analyze_status_get; stop via analyze_cancel. No arguments."
+        );
+        assert_eq!(tools[19].name, "analyze_status_get");
+        assert_eq!(
+            tools[19].description,
+            "A run's live status: queued | running | completed | failed | cancelled | skipped_no_plugins, with phase, current plugin/file, processed/total files, heartbeat, and progress_observed=false when the heartbeat is stale (run may be wedged)."
+        );
+        assert_eq!(tools[20].name, "analyze_cancel");
+        assert_eq!(
+            tools[20].description,
             "Cancel a running analyze: SIGKILLs the run's process group (plugin + pyright) and marks the run cancelled — never left dangling as running. Idempotent. Partial work already written is kept."
         );
-        assert_eq!(tools[17].name, "index_diff_get");
-        assert_eq!(tools[18].name, "entity_guidance_list");
-        assert_eq!(tools[19].name, "propose_guidance");
-        assert_eq!(tools[20].name, "promote_guidance");
-        assert_eq!(tools[21].name, "entity_finding_list");
-        assert_eq!(tools[22].name, "entity_wardline_get");
-        assert_eq!(tools[23].name, "entity_tag_list");
-        assert_eq!(tools[24].name, "entity_kind_list");
-        assert_eq!(tools[25].name, "entity_wardline_list");
-        assert_eq!(tools[26].name, "module_circular_import_list");
-        assert_eq!(tools[27].name, "entity_coupling_hotspot_list");
-        assert_eq!(tools[28].name, "entity_entry_point_list");
-        assert_eq!(tools[29].name, "entity_http_route_list");
-        assert_eq!(tools[30].name, "entity_data_model_list");
-        assert_eq!(tools[31].name, "entity_test_list");
-        assert_eq!(tools[32].name, "entity_deprecation_list");
-        assert_eq!(tools[33].name, "entity_todo_list");
-        assert_eq!(tools[34].name, "entity_test_caller_list");
-        assert_eq!(tools[35].name, "entity_high_churn_list");
-        assert_eq!(tools[36].name, "entity_recent_change_list");
-        assert_eq!(tools[37].name, "entity_dead_list");
-        assert_eq!(tools[38].name, "entity_semantic_search_list");
-        assert_eq!(tools[39].name, "project_finding_list");
-        assert_eq!(tools[40].name, "entity_resolve");
-        assert_eq!(tools[41].name, "entity_relation_list");
+        assert_eq!(tools[21].name, "index_diff_get");
+        assert_eq!(tools[22].name, "entity_guidance_list");
+        assert_eq!(tools[23].name, "propose_guidance");
+        assert_eq!(tools[24].name, "promote_guidance");
+        assert_eq!(tools[25].name, "entity_finding_list");
+        assert_eq!(tools[26].name, "entity_wardline_get");
+        assert_eq!(tools[27].name, "entity_tag_list");
+        assert_eq!(tools[28].name, "entity_kind_list");
+        assert_eq!(tools[29].name, "entity_wardline_list");
+        assert_eq!(tools[30].name, "module_circular_import_list");
+        assert_eq!(tools[31].name, "entity_coupling_hotspot_list");
+        assert_eq!(tools[32].name, "entity_entry_point_list");
+        assert_eq!(tools[33].name, "entity_http_route_list");
+        assert_eq!(tools[34].name, "entity_data_model_list");
+        assert_eq!(tools[35].name, "entity_test_list");
+        assert_eq!(tools[36].name, "entity_deprecation_list");
+        assert_eq!(tools[37].name, "entity_todo_list");
+        assert_eq!(tools[38].name, "entity_test_caller_list");
+        assert_eq!(tools[39].name, "entity_high_churn_list");
+        assert_eq!(tools[40].name, "entity_recent_change_list");
+        assert_eq!(tools[41].name, "entity_dead_list");
+        assert_eq!(tools[42].name, "entity_semantic_search_list");
+        assert_eq!(tools[43].name, "project_finding_list");
+        assert_eq!(tools[44].name, "entity_resolve");
+        assert_eq!(tools[45].name, "entity_relation_list");
     }
 
     #[test]
@@ -6041,6 +6581,10 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .collect();
         assert!(names.contains(&"entity_at"));
+        assert!(names.contains(&"llm_config_get"));
+        assert!(names.contains(&"llm_config_set"));
+        assert!(names.contains(&"semantic_config_get"));
+        assert!(names.contains(&"semantic_config_set"));
         assert!(!names.contains(&"analyze_start"));
         assert!(!names.contains(&"entity_summary_get"));
 
@@ -6060,6 +6604,127 @@ mod tests {
                 .unwrap()
                 .contains("tool disabled by MCP tool policy")
         );
+    }
+
+    #[tokio::test]
+    async fn llm_config_set_bootstraps_provider_and_write_tools_under_read_only_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("loomweave.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            pragma::apply_write_pragmas(&conn).unwrap();
+            schema::apply_migrations(&mut conn).unwrap();
+        }
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        let state = ServerState::new(dir.path().to_path_buf(), readers)
+            .with_tool_policy(McpToolPolicy::read_only());
+
+        let response = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "llm-config-set",
+                "method": "tools/call",
+                "params": {
+                    "name": "llm_config_set",
+                    "arguments": {
+                        "enabled": true,
+                        "provider": "codex_sidecar",
+                        "allow_live_provider": true,
+                        "enable_write_tools": true,
+                        "codex_model": "gpt-5-codex"
+                    }
+                }
+            }))
+            .await
+            .expect("tools/call response");
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["ok"], true, "{envelope}");
+        assert_eq!(envelope["result"]["llm"]["provider"], "codex_cli");
+        assert_eq!(
+            envelope["result"]["serve"]["mcp"]["enable_write_tools"],
+            true
+        );
+        assert_eq!(
+            envelope["result"]["active_session"]["enable_write_tools"], false,
+            "the current server policy should not mutate mid-session"
+        );
+        assert_eq!(
+            envelope["result"]["active_session"]["restart_required"],
+            true
+        );
+
+        let saved =
+            loomweave_federation::config::McpConfig::from_path(&dir.path().join("loomweave.yaml"))
+                .unwrap();
+        assert!(saved.llm.enabled);
+        assert!(saved.llm.allow_live_provider);
+        assert_eq!(
+            saved.llm.provider,
+            loomweave_federation::config::LlmProviderKind::CodexCli
+        );
+        assert_eq!(saved.llm.codex_cli.model.as_deref(), Some("gpt-5-codex"));
+        assert!(saved.serve.mcp.enable_write_tools);
+    }
+
+    #[tokio::test]
+    async fn semantic_config_set_bootstraps_local_embeddings_under_read_only_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("loomweave.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            pragma::apply_write_pragmas(&conn).unwrap();
+            schema::apply_migrations(&mut conn).unwrap();
+        }
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        let state = ServerState::new(dir.path().to_path_buf(), readers)
+            .with_tool_policy(McpToolPolicy::read_only());
+
+        let response = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "semantic-config-set",
+                "method": "tools/call",
+                "params": {
+                    "name": "semantic_config_set",
+                    "arguments": {
+                        "enabled": true,
+                        "provider": "local_openai",
+                        "endpoint_url": "http://127.0.0.1:11434/v1",
+                        "model_id": "nomic-embed-text",
+                        "dimensions": 768
+                    }
+                }
+            }))
+            .await
+            .expect("tools/call response");
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["ok"], true, "{envelope}");
+        assert_eq!(
+            envelope["result"]["semantic_search"]["provider"],
+            "local_openai"
+        );
+        assert_eq!(
+            envelope["result"]["semantic_search"]["provider_available"],
+            true
+        );
+        assert_eq!(
+            envelope["result"]["active_session"]["restart_required"],
+            true
+        );
+
+        let saved =
+            loomweave_federation::config::McpConfig::from_path(&dir.path().join("loomweave.yaml"))
+                .unwrap();
+        assert!(saved.semantic_search.enabled);
+        assert_eq!(
+            saved.semantic_search.provider,
+            loomweave_federation::config::SemanticProviderKind::LocalOpenAi
+        );
+        assert_eq!(saved.semantic_search.dimensions, 768);
     }
 
     #[tokio::test]

@@ -193,12 +193,12 @@ pub struct ApiEmbeddingProviderConfig {
 }
 
 /// Live embedding provider over an `OpenAI`-compatible `/embeddings` endpoint.
-/// Constructed only when explicitly opted in with a key present; otherwise the
-/// MCP tool degrades honestly to "not enabled".
+/// Constructed only when explicitly opted in. Hosted provider selection remains
+/// responsible for requiring a key; local loopback endpoints can omit auth.
 #[derive(Debug, Clone)]
 pub struct ApiEmbeddingProvider {
     model_id: String,
-    api_key: String,
+    api_key: Option<String>,
     endpoint_url: String,
     dimensions: usize,
     timeout_seconds: u64,
@@ -209,9 +209,6 @@ impl ApiEmbeddingProvider {
         if !config.allow_live_provider {
             return Err(EmbeddingProviderError::LiveProviderNotAllowed);
         }
-        let Some(api_key) = config.api_key.filter(|key| !key.trim().is_empty()) else {
-            return Err(EmbeddingProviderError::MissingApiKey);
-        };
         if config.model_id.trim().is_empty() {
             return Err(EmbeddingProviderError::InvalidConfig {
                 message: "embedding model_id must not be blank".to_owned(),
@@ -229,7 +226,7 @@ impl ApiEmbeddingProvider {
         }
         Ok(Self {
             model_id: config.model_id,
-            api_key,
+            api_key: config.api_key.filter(|key| !key.trim().is_empty()),
             endpoint_url: config.endpoint_url,
             dimensions: config.dimensions,
             timeout_seconds: config.timeout_seconds,
@@ -267,17 +264,21 @@ impl EmbeddingProvider for ApiEmbeddingProvider {
                 message: err.to_string(),
                 retryable: false,
             })?;
-        let response = client
+        let mut request = client
             .post(self.embeddings_url())
-            .header("authorization", format!("Bearer {}", self.api_key))
-            .header("content-type", "application/json")
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|err| EmbeddingProviderError::Http {
-                message: err.to_string(),
-                retryable: true,
-            })?;
+            .header("content-type", "application/json");
+        if let Some(api_key) = &self.api_key {
+            request = request.header("authorization", format!("Bearer {api_key}"));
+        }
+        let response =
+            request
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|err| EmbeddingProviderError::Http {
+                    message: err.to_string(),
+                    retryable: true,
+                })?;
         let status = response.status();
         let body = response
             .text()
@@ -421,8 +422,8 @@ mod tests {
     }
 
     #[test]
-    fn api_provider_refuses_without_key() {
-        let err = ApiEmbeddingProvider::from_config(ApiEmbeddingProviderConfig {
+    fn api_provider_accepts_missing_key_for_policy_checked_local_callers() {
+        let provider = ApiEmbeddingProvider::from_config(ApiEmbeddingProviderConfig {
             api_key: None,
             allow_live_provider: true,
             model_id: "m".to_owned(),
@@ -430,8 +431,8 @@ mod tests {
             dimensions: 8,
             timeout_seconds: 30,
         })
-        .unwrap_err();
-        assert_eq!(err, EmbeddingProviderError::MissingApiKey);
+        .expect("provider should allow caller policy to decide whether key is required");
+        assert_eq!(provider.model_id(), "m");
     }
 
     #[test]

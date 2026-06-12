@@ -1,12 +1,12 @@
 //! LLM provider surface for WP6 and MCP on-demand tools.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -198,6 +198,185 @@ impl LlmProvider for RecordingProvider {
     fn caching_model(&self) -> CachingModel {
         CachingModel::OpenAiChatCompletions
     }
+}
+
+#[derive(Clone)]
+pub struct TrafficLoggingProvider {
+    inner: Arc<dyn LlmProvider>,
+    log_path: PathBuf,
+    max_bytes: u64,
+}
+
+impl TrafficLoggingProvider {
+    pub fn new(inner: Arc<dyn LlmProvider>, log_path: PathBuf) -> Self {
+        Self::with_max_bytes(inner, log_path, DEFAULT_LLM_TRAFFIC_LOG_MAX_BYTES)
+    }
+
+    pub fn with_max_bytes(inner: Arc<dyn LlmProvider>, log_path: PathBuf, max_bytes: u64) -> Self {
+        Self {
+            inner,
+            log_path,
+            max_bytes: max_bytes.max(1),
+        }
+    }
+
+    fn append_event(&self, event: &Value) -> Result<(), LlmProviderError> {
+        if let Some(parent) = self.log_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| LlmProviderError::Cli {
+                message: format!(
+                    "create LLM traffic log directory {}: {err}",
+                    parent.display()
+                ),
+                retryable: false,
+            })?;
+        }
+        self.rotate_if_needed()?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log_path)
+            .map_err(|err| LlmProviderError::Cli {
+                message: format!("open LLM traffic log {}: {err}", self.log_path.display()),
+                retryable: false,
+            })?;
+        serde_json::to_writer(&mut file, event).map_err(|err| {
+            LlmProviderError::InvalidResponse {
+                message: format!("serialize LLM traffic log event: {err}"),
+                retryable: false,
+            }
+        })?;
+        file.write_all(b"\n").map_err(|err| LlmProviderError::Cli {
+            message: format!("write LLM traffic log {}: {err}", self.log_path.display()),
+            retryable: false,
+        })
+    }
+
+    fn rotate_if_needed(&self) -> Result<(), LlmProviderError> {
+        let Ok(metadata) = fs::metadata(&self.log_path) else {
+            return Ok(());
+        };
+        if metadata.len() < self.max_bytes {
+            return Ok(());
+        }
+        let backup_path = llm_traffic_backup_path(&self.log_path);
+        match fs::remove_file(&backup_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(LlmProviderError::Cli {
+                    message: format!(
+                        "remove old LLM traffic log backup {}: {err}",
+                        backup_path.display()
+                    ),
+                    retryable: false,
+                });
+            }
+        }
+        fs::rename(&self.log_path, &backup_path).map_err(|err| LlmProviderError::Cli {
+            message: format!(
+                "rotate LLM traffic log {} to {}: {err}",
+                self.log_path.display(),
+                backup_path.display()
+            ),
+            retryable: false,
+        })
+    }
+}
+
+pub const DEFAULT_LLM_TRAFFIC_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+fn llm_traffic_backup_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.1", path.display()))
+}
+
+#[async_trait]
+impl LlmProvider for TrafficLoggingProvider {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    async fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
+        let provider = self.inner.name();
+        let result = self.inner.invoke(request.clone()).await;
+        let event = match &result {
+            Ok(response) => llm_traffic_success_event(provider, &request, response),
+            Err(err) => llm_traffic_error_event(provider, &request, err),
+        };
+        self.append_event(&event)?;
+        result
+    }
+
+    fn estimate_tokens(&self, request: &LlmRequest) -> u64 {
+        self.inner.estimate_tokens(request)
+    }
+
+    fn tier_to_model(&self, tier: &str) -> Option<&str> {
+        self.inner.tier_to_model(tier)
+    }
+
+    fn caching_model(&self) -> CachingModel {
+        self.inner.caching_model()
+    }
+}
+
+fn llm_traffic_base_event(provider: &str, request: &LlmRequest, outcome: &str) -> Value {
+    serde_json::json!({
+        "schema": "loomweave.llm.lookup.v1",
+        "ts_unix_ms": unix_timestamp_millis(),
+        "provider": provider,
+        "purpose": request.purpose,
+        "prompt_id": request.prompt_id,
+        "request_model_id": request.model_id,
+        "max_output_tokens": request.max_output_tokens,
+        "outcome": outcome,
+    })
+}
+
+fn llm_traffic_success_event(
+    provider: &str,
+    request: &LlmRequest,
+    response: &LlmResponse,
+) -> Value {
+    let mut event = llm_traffic_base_event(provider, request, "success");
+    event["response_model_id"] = Value::String(response.model_id.clone());
+    event["usage"] = serde_json::json!({
+        "input_tokens": response.input_tokens,
+        "cached_input_tokens": response.cached_input_tokens,
+        "output_tokens": response.output_tokens,
+        "total_tokens": response.total_tokens,
+        "cost_usd": response.cost_usd,
+    });
+    event
+}
+
+fn llm_traffic_error_event(provider: &str, request: &LlmRequest, err: &LlmProviderError) -> Value {
+    let mut event = llm_traffic_base_event(provider, request, "error");
+    event["error"] = serde_json::json!({
+        "kind": llm_provider_error_kind(err),
+        "retryable": err.retryable(),
+        "message": truncate_for_error(&err.to_string()),
+    });
+    event
+}
+
+fn llm_provider_error_kind(err: &LlmProviderError) -> &'static str {
+    match err {
+        LlmProviderError::MissingRecording { .. } => "missing_recording",
+        LlmProviderError::LiveProviderNotAllowed => "live_provider_not_allowed",
+        LlmProviderError::MissingApiKey => "missing_api_key",
+        LlmProviderError::Http { .. } => "http",
+        LlmProviderError::Provider { .. } => "provider",
+        LlmProviderError::Cli { .. } => "cli",
+        LlmProviderError::Timeout { .. } => "timeout",
+        LlmProviderError::InvalidResponse { .. } => "invalid_response",
+        LlmProviderError::InvalidConfig { .. } => "invalid_config",
+    }
+}
+
+fn unix_timestamp_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1488,6 +1667,142 @@ mod tests {
             .await
             .expect_err("request-shape drift should miss the recording");
         assert!(matches!(missing, LlmProviderError::MissingRecording { .. }));
+    }
+
+    #[tokio::test]
+    async fn traffic_logging_provider_appends_success_metadata_without_exchange_contents() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log_path = temp.path().join(".loomweave/diagnostics/llm-traffic.jsonl");
+        let request = LlmRequest {
+            purpose: LlmPurpose::Summary,
+            model_id: "summary-model".to_owned(),
+            prompt_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+            prompt: "SECRET_PROMPT_DO_NOT_LOG".to_owned(),
+            max_output_tokens: 512,
+        };
+        let response = LlmResponse {
+            model_id: "summary-model".to_owned(),
+            output_json: r#"{"purpose":"SECRET_OUTPUT_DO_NOT_LOG"}"#.to_owned(),
+            input_tokens: 11,
+            cached_input_tokens: 3,
+            output_tokens: 7,
+            total_tokens: 18,
+            cost_usd: 0.25,
+        };
+        let inner = RecordingProvider::from_recordings(vec![Recording {
+            request: request.clone(),
+            response,
+        }]);
+        let provider = TrafficLoggingProvider::new(std::sync::Arc::new(inner), log_path.clone());
+
+        provider
+            .invoke(request)
+            .await
+            .expect("logged provider invoke");
+
+        let log = std::fs::read_to_string(log_path).expect("read traffic log");
+        assert!(
+            !log.contains("SECRET_PROMPT_DO_NOT_LOG") && !log.contains("SECRET_OUTPUT_DO_NOT_LOG"),
+            "traffic log must not include prompt or output contents: {log}"
+        );
+        let event: Value = serde_json::from_str(log.trim()).expect("traffic log JSON");
+        assert_eq!(event["schema"], "loomweave.llm.lookup.v1");
+        assert_eq!(event["provider"], "recording");
+        assert_eq!(event["purpose"], "Summary");
+        assert_eq!(event["prompt_id"], LEAF_SUMMARY_PROMPT_TEMPLATE_ID);
+        assert_eq!(event["request_model_id"], "summary-model");
+        assert_eq!(event["outcome"], "success");
+        assert_eq!(event["usage"]["input_tokens"], 11);
+        assert_eq!(event["usage"]["cached_input_tokens"], 3);
+        assert_eq!(event["usage"]["output_tokens"], 7);
+        assert_eq!(event["usage"]["total_tokens"], 18);
+        assert_eq!(event["usage"]["cost_usd"], 0.25);
+    }
+
+    #[tokio::test]
+    async fn traffic_logging_provider_appends_error_metadata_without_exchange_contents() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log_path = temp.path().join(".loomweave/diagnostics/llm-traffic.jsonl");
+        let request = LlmRequest {
+            purpose: LlmPurpose::Summary,
+            model_id: "summary-model".to_owned(),
+            prompt_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+            prompt: "SECRET_PROMPT_DO_NOT_LOG".to_owned(),
+            max_output_tokens: 512,
+        };
+        let provider = TrafficLoggingProvider::new(
+            std::sync::Arc::new(RecordingProvider::from_recordings(Vec::new())),
+            log_path.clone(),
+        );
+
+        provider
+            .invoke(request)
+            .await
+            .expect_err("missing recording should still be logged");
+
+        let log = std::fs::read_to_string(log_path).expect("read traffic log");
+        assert!(
+            !log.contains("SECRET_PROMPT_DO_NOT_LOG"),
+            "traffic log must not include prompt contents: {log}"
+        );
+        let event: Value = serde_json::from_str(log.trim()).expect("traffic log JSON");
+        assert_eq!(event["provider"], "recording");
+        assert_eq!(event["outcome"], "error");
+        assert_eq!(event["error"]["kind"], "missing_recording");
+        assert_eq!(event["error"]["retryable"], false);
+    }
+
+    #[tokio::test]
+    async fn traffic_logging_provider_rotates_diagnostics_log_when_size_limit_is_reached() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log_path = temp.path().join(".loomweave/diagnostics/llm-traffic.jsonl");
+        let backup_path = PathBuf::from(format!("{}.1", log_path.display()));
+        fs::create_dir_all(log_path.parent().expect("log parent")).expect("create log parent");
+        fs::write(&log_path, "old diagnostic lookup\nold diagnostic lookup\n")
+            .expect("seed oversized log");
+
+        let request = LlmRequest {
+            purpose: LlmPurpose::Summary,
+            model_id: "summary-model".to_owned(),
+            prompt_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+            prompt: "SECRET_PROMPT_DO_NOT_LOG".to_owned(),
+            max_output_tokens: 512,
+        };
+        let response = LlmResponse {
+            model_id: "summary-model".to_owned(),
+            output_json: r#"{"purpose":"SECRET_OUTPUT_DO_NOT_LOG"}"#.to_owned(),
+            input_tokens: 11,
+            cached_input_tokens: 0,
+            output_tokens: 7,
+            total_tokens: 18,
+            cost_usd: 0.0,
+        };
+        let inner = RecordingProvider::from_recordings(vec![Recording {
+            request: request.clone(),
+            response,
+        }]);
+        let provider = TrafficLoggingProvider::with_max_bytes(
+            std::sync::Arc::new(inner),
+            log_path.clone(),
+            32,
+        );
+
+        provider
+            .invoke(request)
+            .await
+            .expect("logged provider invoke");
+
+        let backup = fs::read_to_string(&backup_path).expect("read rotated diagnostics log");
+        assert!(backup.contains("old diagnostic lookup"));
+        let current = fs::read_to_string(&log_path).expect("read fresh diagnostics log");
+        assert!(!current.contains("old diagnostic lookup"));
+        assert!(
+            !current.contains("SECRET_PROMPT_DO_NOT_LOG")
+                && !current.contains("SECRET_OUTPUT_DO_NOT_LOG"),
+            "rotated diagnostics log must still omit exchange contents: {current}"
+        );
+        let event: Value = serde_json::from_str(current.trim()).expect("traffic log JSON");
+        assert_eq!(event["outcome"], "success");
     }
 
     #[test]

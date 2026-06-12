@@ -14,7 +14,8 @@ analyze` (build the index), `loomweave serve` (run the MCP server).\n\n\
 LLM-backed entity summaries are OFF by default. To enable them set \
 `llm_policy.enabled: true` + `allow_live_provider: true` in loomweave.yaml and supply \
 the provider credential (e.g. OPENROUTER_API_KEY), or point at a coding-agent CLI \
-(claude_cli / codex_cli). Run `loomweave config example` to print an annotated config \
+(claude_sidecar / codex_sidecar, canonical claude_cli / codex_cli). Run \
+`loomweave config example` to print an annotated config \
 and `loomweave config check` to see the effective LLM state; `loomweave doctor` \
 validates the install and the config."
 )]
@@ -287,8 +288,8 @@ pub enum ConfigCommand {
     /// config schema. Redirect it to `loomweave.yaml` and edit.
     Example {
         /// Pre-select the active LLM provider block in the example
-        /// (`openrouter`, `codex_cli`, or `claude_cli`). Defaults to the stub's
-        /// `openrouter`.
+        /// (`openrouter`/`openrouter_api`, `codex_cli`/`codex_sidecar`, or
+        /// `claude_cli`/`claude_sidecar`). Defaults to the stub's `openrouter`.
         #[arg(long, value_name = "PROVIDER")]
         provider: Option<String>,
     },
@@ -305,6 +306,161 @@ pub enum ConfigCommand {
         /// Path to loomweave.yaml (default: `<path>/loomweave.yaml` if present).
         #[arg(long)]
         config: Option<PathBuf>,
+    },
+
+    /// Read or update LLM and MCP write-tool settings in `loomweave.yaml`.
+    Llm {
+        #[command(subcommand)]
+        command: LlmConfigCommand,
+    },
+
+    /// Read or update semantic-search embedding settings in `loomweave.yaml`.
+    Semantic {
+        #[command(subcommand)]
+        command: SemanticConfigCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum LlmConfigCommand {
+    /// Print the effective LLM and MCP write-tool config.
+    Status {
+        /// Project directory containing loomweave.yaml (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Path to loomweave.yaml (default: `<path>/loomweave.yaml` if present).
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Update `loomweave.yaml` LLM and MCP write-tool settings.
+    Set {
+        /// Project directory containing loomweave.yaml (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Path to loomweave.yaml (default: `<path>/loomweave.yaml`).
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Enable LLM summaries.
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+
+        /// Disable LLM summaries.
+        #[arg(long)]
+        disable: bool,
+
+        /// Permit live provider calls.
+        #[arg(long, conflicts_with = "disallow_live")]
+        allow_live: bool,
+
+        /// Forbid live provider calls; summaries become cache-only.
+        #[arg(long)]
+        disallow_live: bool,
+
+        /// Enable write-capable MCP tools such as entity_summary_get and analyze_start.
+        #[arg(long, conflicts_with = "disable_write_tools")]
+        enable_write_tools: bool,
+
+        /// Disable write-capable MCP tools.
+        #[arg(long)]
+        disable_write_tools: bool,
+
+        /// Select provider: openrouter/openrouter_api, codex_cli/codex_sidecar,
+        /// claude_cli/claude_sidecar.
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Option<String>,
+
+        /// OpenRouter model id (`llm_policy.model_id`).
+        #[arg(long, value_name = "MODEL")]
+        model_id: Option<String>,
+
+        /// Pin the Codex sidecar model (`llm_policy.codex_cli.model`).
+        #[arg(long, value_name = "MODEL")]
+        codex_model: Option<String>,
+
+        /// Pin the Claude sidecar model (`llm_policy.claude_cli.model`).
+        #[arg(long, value_name = "MODEL")]
+        claude_model: Option<String>,
+
+        /// Env var containing the OpenRouter API key.
+        #[arg(long, value_name = "ENV")]
+        openrouter_api_key_env: Option<String>,
+
+        /// OpenRouter-compatible endpoint URL.
+        #[arg(long, value_name = "URL")]
+        openrouter_endpoint_url: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SemanticConfigCommand {
+    /// Print the effective semantic-search embedding config.
+    Status {
+        /// Project directory containing loomweave.yaml (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Path to loomweave.yaml (default: `<path>/loomweave.yaml` if present).
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Update `loomweave.yaml` semantic-search embedding settings.
+    Set {
+        /// Project directory containing loomweave.yaml (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Path to loomweave.yaml (default: `<path>/loomweave.yaml`).
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Enable semantic search embedding generation.
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+
+        /// Disable semantic search embedding generation.
+        #[arg(long)]
+        disable: bool,
+
+        /// Select provider: api/openai_api or local_openai/local.
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Option<String>,
+
+        /// Permit hosted live embedding provider calls.
+        #[arg(long, conflicts_with = "disallow_live")]
+        allow_live: bool,
+
+        /// Forbid hosted live embedding provider calls.
+        #[arg(long)]
+        disallow_live: bool,
+
+        /// Embedding model id.
+        #[arg(long, value_name = "MODEL")]
+        model_id: Option<String>,
+
+        /// Embedding vector dimensionality.
+        #[arg(long)]
+        dimensions: Option<usize>,
+
+        /// OpenAI-compatible endpoint base URL; `/embeddings` is appended.
+        #[arg(long, value_name = "URL")]
+        endpoint_url: Option<String>,
+
+        /// Env var containing an API key, when the endpoint requires one.
+        #[arg(long, value_name = "ENV")]
+        api_key_env: Option<String>,
+
+        /// HTTP timeout in seconds.
+        #[arg(long)]
+        timeout_seconds: Option<u64>,
+
+        /// Per-session embedding token ceiling.
+        #[arg(long)]
+        session_token_ceiling: Option<u64>,
     },
 }
 

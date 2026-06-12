@@ -998,11 +998,10 @@ fn analyze_persists_plugin_tags_and_populates_embedding_sidecar() {
             r"
 semantic_search:
   enabled: true
-  allow_live_provider: true
+  provider: local_openai
   endpoint_url: {embedding_url}
   model_id: test-embed
   dimensions: 2
-  api_key_env: TEST_EMBEDDING_KEY
   timeout_seconds: 2
   session_token_ceiling: 10000
 "
@@ -1017,7 +1016,6 @@ semantic_search:
         .arg(&config_path)
         .arg(project_dir.path())
         .env("PATH", &plugin_path)
-        .env("TEST_EMBEDDING_KEY", "test-key")
         .assert()
         .success();
 
