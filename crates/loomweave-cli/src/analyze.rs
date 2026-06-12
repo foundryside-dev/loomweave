@@ -3628,10 +3628,15 @@ async fn post_findings_batch(
     // runtime, and join it off the async executor.
     let request = batch.request;
     let thread_cfg = resolved_cfg;
+    let thread_root = project_root.to_path_buf();
     let worker = std::thread::spawn(move || -> Result<ScanResultsResponse, String> {
-        let client = FiligreeHttpClient::from_config(&thread_cfg, |name| std::env::var(name).ok())
-            .map_err(|err| format!("build Filigree client: {err}"))?
-            .ok_or_else(|| "Filigree integration disabled".to_owned())?;
+        let client = FiligreeHttpClient::from_config_with_project_root(
+            &thread_cfg,
+            |name| std::env::var(name).ok(),
+            Some(&thread_root),
+        )
+        .map_err(|err| format!("build Filigree client: {err}"))?
+        .ok_or_else(|| "Filigree integration disabled".to_owned())?;
         client
             .post_scan_results(&request)
             .map_err(|err| err.to_string())
@@ -3769,10 +3774,15 @@ async fn prune_unseen_findings_in_filigree(
     // Same blocking-reqwest-on-a-plain-OS-thread dance as emission: build → POST
     // → drop the client off the tokio executor so the inner runtime drop is safe.
     let thread_cfg = resolved_cfg;
+    let thread_root = project_root.to_path_buf();
     let worker = std::thread::spawn(move || -> Result<CleanStaleResponse, String> {
-        let client = FiligreeHttpClient::from_config(&thread_cfg, |name| std::env::var(name).ok())
-            .map_err(|err| format!("build Filigree client: {err}"))?
-            .ok_or_else(|| "Filigree integration disabled".to_owned())?;
+        let client = FiligreeHttpClient::from_config_with_project_root(
+            &thread_cfg,
+            |name| std::env::var(name).ok(),
+            Some(&thread_root),
+        )
+        .map_err(|err| format!("build Filigree client: {err}"))?
+        .ok_or_else(|| "Filigree integration disabled".to_owned())?;
         client
             .post_clean_stale(&request)
             .map_err(|err| err.to_string())

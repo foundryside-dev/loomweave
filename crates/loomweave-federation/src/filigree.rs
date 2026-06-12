@@ -287,6 +287,22 @@ pub trait FiligreeLookup: Send + Sync {
     }
 }
 
+/// Read the per-project federation token the Filigree daemon auto-mints at
+/// `<root>/.weft/filigree/federation_token` on first serve (its inbound
+/// resolver's tier 2; mirrored by wardline's credential loader). The file is
+/// loopback deconfliction plumbing, not a secret — absence or unreadability
+/// just means the rung resolves to None and auth stays off.
+fn read_minted_federation_token(root: &Path) -> Option<String> {
+    let path = root.join(".weft").join("filigree").join("federation_token");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let token = raw.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_owned())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FiligreeHttpClient {
     base_url: String,
@@ -324,11 +340,16 @@ impl FiligreeHttpClient {
             .map_err(FiligreeClientError::Build)?;
         // Resolve the configured env var (default `WEFT_FEDERATION_TOKEN`) first;
         // fall back to the legacy `FILIGREE_API_TOKEN` name so a pre-rename global
-        // export keeps working during the transition. Deprecated — remove the
-        // fallback once operators have migrated to the Weft-prefixed name.
+        // export keeps working during the transition (deprecated — remove once
+        // operators have migrated to the Weft-prefixed name); finally fall back to
+        // the token file the Filigree daemon auto-mints in the project store. That
+        // last rung is the same-host zero-ceremony default (C-9e): the MCP server
+        // is typically launched with an empty env, so without it every weft-gated
+        // read (the wardline-findings joins) 401s — dogfood-4 A5.
         let token = env_lookup(&config.token_env)
             .filter(|value| !value.trim().is_empty())
-            .or_else(|| env_lookup("FILIGREE_API_TOKEN").filter(|value| !value.trim().is_empty()));
+            .or_else(|| env_lookup("FILIGREE_API_TOKEN").filter(|value| !value.trim().is_empty()))
+            .or_else(|| project_root.and_then(read_minted_federation_token));
         Ok(Some(Self {
             base_url: config.base_url.clone(),
             actor: config.actor.clone(),
@@ -945,6 +966,58 @@ mod tests {
     #[test]
     fn token_resolution_none_when_neither_set() {
         assert_eq!(resolved_token(&[]), None);
+    }
+
+    fn mint_token_file(root: &Path, contents: &str) {
+        let dir = root.join(".weft").join("filigree");
+        std::fs::create_dir_all(&dir).expect("create store dir");
+        std::fs::write(dir.join("federation_token"), contents).expect("write token");
+    }
+
+    fn resolved_token_with_root(env: &[(&str, &str)], root: &Path) -> Option<String> {
+        let config = token_resolution_config();
+        FiligreeHttpClient::from_config_with_project_root(
+            &config,
+            |name| {
+                env.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+            },
+            Some(root),
+        )
+        .expect("build client")
+        .expect("enabled client")
+        .token
+    }
+
+    #[test]
+    fn token_resolution_falls_back_to_minted_project_store_file() {
+        // Dogfood-4 A5: the MCP serve path launches with an empty env; the
+        // daemon's auto-minted token file is the same-host zero-ceremony rung.
+        let dir = tempfile::tempdir().expect("tempdir");
+        mint_token_file(dir.path(), "minted-secret\n");
+        assert_eq!(
+            resolved_token_with_root(&[], dir.path()),
+            Some("minted-secret".to_owned()),
+        );
+    }
+
+    #[test]
+    fn token_resolution_env_wins_over_minted_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        mint_token_file(dir.path(), "minted-secret");
+        assert_eq!(
+            resolved_token_with_root(&[("WEFT_FEDERATION_TOKEN", "env-secret")], dir.path()),
+            Some("env-secret".to_owned()),
+        );
+    }
+
+    #[test]
+    fn token_resolution_none_when_minted_file_absent_or_blank() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(resolved_token_with_root(&[], dir.path()), None);
+        mint_token_file(dir.path(), "   \n");
+        assert_eq!(resolved_token_with_root(&[], dir.path()), None);
     }
 
     #[test]

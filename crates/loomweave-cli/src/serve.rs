@@ -78,9 +78,16 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
     if let Some(resolved) = &filigree_resolution.resolved_url {
         filigree_config.base_url.clone_from(resolved);
     }
-    let filigree_client =
-        FiligreeHttpClient::from_config(&filigree_config, |name| std::env::var(name).ok())
-            .context("build Filigree HTTP client")?;
+    // Pass the project root so token resolution can reach the daemon's
+    // auto-minted `.weft/filigree/federation_token` — the serve path runs with an
+    // empty env in `.mcp.json`, and without the file rung every weft-gated read
+    // (the wardline-findings joins) 401s (dogfood-4 A5).
+    let filigree_client = FiligreeHttpClient::from_config_with_project_root(
+        &filigree_config,
+        |name| std::env::var(name).ok(),
+        Some(&project_root),
+    )
+    .context("build Filigree HTTP client")?;
 
     let diagnostics = loomweave_mcp::DiagnosticsContext {
         llm: llm_diagnostics,
