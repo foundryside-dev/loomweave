@@ -61,10 +61,10 @@ pub use query::{
     existing_entity_ids, find_entities, findings_for_emit, import_edges_for_entity,
     known_entity_kinds, known_entity_tags, live_unresolved_call_sites_exist,
     module_dependency_edges, module_reference_rollup, normalize_source_path,
-    reference_edges_for_entity, relation_edges_for_entity, resolve_entity_ref, resolve_file,
-    resolve_file_catalog_entry, subsystem_for_member, subsystem_members, subsystem_of_entity,
-    subsystem_total, unresolved_call_sites_for_caller, unresolved_caller_count_for_target,
-    unresolved_callers_for_target,
+    preferred_finding_anchor_by_file, reference_edges_for_entity, relation_edges_for_entity,
+    resolve_entity_ref, resolve_file, resolve_file_catalog_entry, subsystem_for_member,
+    subsystem_members, subsystem_of_entity, subsystem_total, unresolved_call_sites_for_caller,
+    unresolved_caller_count_for_target, unresolved_callers_for_target,
 };
 pub use reader::ReaderPool;
 pub use retry::{RetryPolicy, begin_immediate};

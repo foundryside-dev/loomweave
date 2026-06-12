@@ -269,7 +269,7 @@ pub enum WriterCmd {
     /// Rule-scoped stale-finding sweep (weft-7256739b31): retire stale `open`,
     /// Filigree-unlinked findings of the named rules only. For rule families
     /// whose producer is a FULL pass every run regardless of the incremental
-    /// file skip (the pre-ingest secret scan), so "run_id != current" means
+    /// file skip (the pre-ingest secret scan), so `run_id != current` means
     /// "looked, no longer detected" even on a run the general sweep must skip.
     /// Same lifecycle preservation and query-time-write posture as
     /// [`WriterCmd::SweepStaleFindings`].

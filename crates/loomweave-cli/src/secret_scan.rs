@@ -202,6 +202,18 @@ impl SecretScanOutcome {
         anchors::remember_finding_anchors(self, entities);
     }
 
+    /// Seed a finding anchor for an incrementally-SKIPPED file from its
+    /// already-committed entity row (weft-4165f1ed71). A skipped file is never
+    /// dispatched, so [`Self::remember_finding_anchors`] never sees its
+    /// entities — without this seed, `ensure_finding_anchors` would mint a
+    /// core `file` anchor and the anchor-keyed finding id would flip,
+    /// duplicating the finding (the reason the secret carve-out used to force
+    /// re-analysis of one file forever). `or_insert`: a registration from this
+    /// run's own batches always wins.
+    pub(crate) fn seed_finding_anchor(&mut self, file: PathBuf, entity_id: String) {
+        self.finding_anchors.entry(file).or_insert(entity_id);
+    }
+
     pub(crate) async fn persist_findings(
         &mut self,
         writer: &Writer,

@@ -225,7 +225,7 @@ mod tests {
     }
 
     /// weft-7256739b31 (dogfood-4 B10): the finding id is keyed on the SITE —
-    /// anchor entity + rule + file:line:detector — and NOT on the detected
+    /// anchor entity + rule + `file:line:detector` — and NOT on the detected
     /// value. A rotated secret at an unchanged site must regenerate the SAME
     /// id (so the upsert refreshes in place); a different line must not.
     #[test]

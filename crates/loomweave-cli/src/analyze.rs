@@ -607,40 +607,53 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // `briefing_blocked` / `language` properties, which a full re-analysis would
     // refresh. This can only go stale TOWARD blocked (a withheld briefing that
     // could now be served — the conservative direction); a file that should
-    // NEWLY block is either secret-bearing (carved out of skip below) or scanned
-    // by `pre_ingest` before the partition, so it cannot silently under-block.
+    // NEWLY block changed by definition (the secret is a content change), so the
+    // whole-file hash re-dispatches it, and every file is scanned by `pre_ingest`
+    // before the partition — it cannot silently under-block.
     // `--no-incremental` clears any such staleness.
+    //
+    // Secret-bearing UNCHANGED files are skipped like any other
+    // (weft-4165f1ed71, the analyze fixed point — they used to be carved out
+    // because their finding anchor could only be resolved from entities emitted
+    // in the same run, re-processing one file forever). Their pre-ingest
+    // findings re-anchor through `prior_anchor_by_file`: the preferred anchor
+    // entity (module first) resolved from the already-committed rows, seeded
+    // into the scan outcome for every skipped file below.
     let incremental = !options.no_incremental;
-    let (prior_file_hashes, mut prior_locs_by_file, prior_index_snapshot) = if incremental {
-        match Connection::open(&db_path) {
-            Ok(conn) => {
-                let files = loomweave_storage::previously_analyzed_files(&conn).unwrap_or_default();
-                let locs = loomweave_storage::prior_locators_by_file(&conn).unwrap_or_default();
-                let snapshot = loomweave_storage::load_prior_index(&conn).unwrap_or_default();
-                (files, locs, snapshot)
+    let (prior_file_hashes, mut prior_locs_by_file, prior_index_snapshot, prior_anchor_by_file) =
+        if incremental {
+            match Connection::open(&db_path) {
+                Ok(conn) => {
+                    let files =
+                        loomweave_storage::previously_analyzed_files(&conn).unwrap_or_default();
+                    let locs = loomweave_storage::prior_locators_by_file(&conn).unwrap_or_default();
+                    let snapshot = loomweave_storage::load_prior_index(&conn).unwrap_or_default();
+                    let anchors = loomweave_storage::preferred_finding_anchor_by_file(&conn)
+                        .unwrap_or_default();
+                    (files, locs, snapshot, anchors)
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "incremental skip disabled: cannot open read connection");
+                    (
+                        HashMap::new(),
+                        HashMap::new(),
+                        HashMap::new(),
+                        HashMap::new(),
+                    )
+                }
             }
-            Err(err) => {
-                tracing::warn!(error = %err, "incremental skip disabled: cannot open read connection");
-                (HashMap::new(), HashMap::new(), HashMap::new())
-            }
-        }
-    } else {
-        (HashMap::new(), HashMap::new(), HashMap::new())
-    };
+        } else {
+            (
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+        };
     // Locators of skipped-unchanged entities — fed into the SEI matcher's
     // current-locator union AND re-appended to the prior-index rebuild below.
     let mut retained_locators: HashSet<String> = HashSet::new();
     let mut skipped_files_total: u64 = 0;
-    // Files with an active secret finding must NEVER be skipped: the finding
-    // anchors to the plugin entity emitted only when the file is analysed, so
-    // skipping it would re-anchor to the core `file` entity and duplicate the
-    // finding (REQ-FINDING-05 determinism). The set is small (files containing
-    // secrets) and canonicalised with the same helper the anchor logic uses.
-    let secret_finding_files: HashSet<PathBuf> = secret_scan_outcome
-        .finding_files()
-        .iter()
-        .map(|f| crate::secret_scan::canonical_or_original(f))
-        .collect();
 
     // ── Per-plugin processing ─────────────────────────────────────────────────
     //
@@ -737,16 +750,16 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         }
 
         // Wave 2 / T3.1: partition into files to re-analyse (changed, new,
-        // unhashable → fail toward work, or carrying a secret finding whose
-        // anchor must stay stable) and files to skip (whole-file hash identical to
-        // the prior run). Each skipped file's prior entities stay in the DB; we
-        // record their locators for the matcher union and re-append their
-        // prior-index rows so the rebuilt snapshot keeps them.
-        let (plugin_files, skipped_files): (Vec<PathBuf>, Vec<PathBuf>) =
-            plugin_files.into_iter().partition(|path| {
-                secret_finding_files.contains(&crate::secret_scan::canonical_or_original(path))
-                    || file_needs_reanalysis(&project_root, path, &prior_file_hashes)
-            });
+        // unhashable → fail toward work) and files to skip (whole-file hash
+        // identical to the prior run). Each skipped file's prior entities stay
+        // in the DB; we record their locators for the matcher union and
+        // re-append their prior-index rows so the rebuilt snapshot keeps them.
+        // A secret-bearing UNCHANGED file skips too (weft-4165f1ed71): its
+        // finding anchor is seeded from the committed rows below, so the skip
+        // no longer re-anchors (and thereby duplicates) the finding.
+        let (plugin_files, skipped_files): (Vec<PathBuf>, Vec<PathBuf>) = plugin_files
+            .into_iter()
+            .partition(|path| file_needs_reanalysis(&project_root, path, &prior_file_hashes));
         // Locators of THIS plugin's skipped-unchanged entities. These rows stay in
         // the committed DB untouched this run (they are guarded against orphan
         // deletion via `retained_locators` below — see the SEI matcher's
@@ -775,6 +788,17 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         for path in &skipped_files {
             skipped_files_total += 1;
             progress.file_skipped_unchanged(&plugin_id, &path.to_string_lossy());
+            // Anchor continuity for the pre-ingest secret scan
+            // (weft-4165f1ed71): this file is not dispatched, so no plugin
+            // entity registers an anchor this run — resolve the same anchor the
+            // analysed run used (module-preferred) from the committed rows.
+            let canonical = crate::secret_scan::canonical_or_original(path);
+            if let Some(anchor) = prior_anchor_by_file
+                .get(&canonical.display().to_string())
+                .or_else(|| prior_anchor_by_file.get(&path.display().to_string()))
+            {
+                secret_scan_outcome.seed_finding_anchor(canonical, anchor.clone());
+            }
             if let Some(key) = canonical_path_key(path)
                 && let Some(locators) = prior_locs_by_file.remove(&key)
             {

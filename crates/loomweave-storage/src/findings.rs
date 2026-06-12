@@ -59,7 +59,7 @@ pub fn sweep_stale_findings(conn: &Connection, current_run_id: &str) -> Result<u
 /// `rule_ids`, leaving every other rule's rows alone. For rule families whose
 /// producer is a FULL pass on every run regardless of the incremental file
 /// skip — the pre-ingest secret scan (`LMWV-SEC-*` + the baseline-match audit
-/// fact) re-walks every source file and sidecar each run — "run_id != current"
+/// fact) re-walks every source file and sidecar each run — `run_id != current`
 /// already unambiguously means "looked, no longer detected", so these rows can
 /// be retired on incremental runs the general sweep must skip
 /// (weft-7256739b31 / dogfood-4 B10: stale secret findings accumulated across

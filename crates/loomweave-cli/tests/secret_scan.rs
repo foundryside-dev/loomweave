@@ -232,11 +232,11 @@ fn resume_does_not_duplicate_secret_findings() {
     // every resume). Regression for the gap that the phase3 weak-modularity
     // finding alone did not cover.
     //
-    // Also load-bearing for Wave 2 / T3.1: this passes only because a file with
-    // an active secret finding is NEVER incrementally skipped (the resume run
-    // would otherwise skip the unchanged leaky file, re-anchoring its finding to
-    // the core file entity instead of the plugin entity → a duplicate id). If the
-    // secret carve-out in `analyze.rs` is removed, this test fails.
+    // Wave 2 / T3.1 + weft-4165f1ed71: the resume run incrementally SKIPS the
+    // unchanged leaky file, so this also exercises the skipped-file anchor
+    // seeding — the finding must re-anchor to the SAME plugin entity resolved
+    // from the committed rows (prior_anchor_by_file), never to the core file
+    // entity (which would flip the anchor-keyed id into a duplicate).
     let project = tempfile::tempdir().unwrap();
     let plugin = tempfile::tempdir().unwrap();
     write_secret_fixture_plugin(plugin.path());
@@ -1135,7 +1135,7 @@ fn clean_sidecar_creates_anchor_without_block() {
 /// `hashed_secret_hex`), so a value rotation minted a new id while the old row
 /// lingered (the full sweep is gated off on incremental runs — `mod_b.sec`
 /// unchanged → `skipped_files > 0`). Stable identity = anchor entity + rule +
-/// site (file:line:detector), exactly the lacuna dupe
+/// site (`file:line:detector`), exactly the lacuna dupe
 /// (`specimen/policy_boundaries.py:41`, two ids across two runs).
 #[test]
 fn rotated_secret_at_same_site_does_not_duplicate_finding() {
@@ -1182,12 +1182,10 @@ fn rotated_secret_at_same_site_does_not_duplicate_finding() {
         let mut stmt = db
             .prepare("SELECT id FROM findings WHERE rule_id = 'LMWV-SEC-SECRET-DETECTED'")
             .unwrap();
-        let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))
+        stmt.query_map([], |r| r.get::<_, String>(0))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        rows
+            .unwrap()
     };
     assert_eq!(
         rows.len(),
@@ -1270,4 +1268,85 @@ fn latest_run_stats_value(project_root: &std::path::Path) -> serde_json::Value {
         )
         .expect("query latest runs.stats");
     serde_json::from_str(&stats_raw).expect("runs.stats JSON")
+}
+
+// ── B1 fixed point (weft-4165f1ed71): clean tree analyzes to 0 processed files ─
+
+/// B1 failing-first: a clean, unchanged tree must reach a FIXED POINT —
+/// "analyze; analyze again; the second run processes 0 files". Pre-fix, a file
+/// with an active secret finding was carved out of the incremental skip on
+/// EVERY run (its finding anchor could only be resolved from entities emitted
+/// in the same run), so lacuna re-processed exactly one python file forever.
+/// The anchor now resolves from the already-committed entity rows, the
+/// carve-out is gone, and the finding stays anchored to the plugin module
+/// entity with the same site-keyed id.
+#[test]
+fn unchanged_tree_with_secret_reaches_analyze_fixed_point() {
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    std::fs::write(
+        project.path().join("leaky.sec"),
+        b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n",
+    )
+    .unwrap();
+    std::fs::write(project.path().join("clean.sec"), b"nothing to see\n").unwrap();
+    let analyze = || {
+        loomweave_bin()
+            .arg("analyze")
+            .arg(project.path())
+            .env("PATH", plugin_path(plugin.path()))
+            .assert()
+            .success();
+    };
+
+    analyze();
+    let (first_id, first_anchor): (String, String) = conn(project.path())
+        .query_row(
+            "SELECT id, entity_id FROM findings WHERE rule_id = 'LMWV-SEC-SECRET-DETECTED'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        first_anchor.starts_with("secretfixture:module:"),
+        "run 1 anchors the finding to the plugin module entity: {first_anchor}"
+    );
+
+    // Second run on the UNCHANGED tree: the fixed point. Every plugin file is
+    // skipped — including the secret-bearing one.
+    analyze();
+    let stats = latest_run_stats_value(project.path());
+    assert_eq!(
+        stats["skipped_files"].as_u64(),
+        Some(2),
+        "an unchanged tree must skip every plugin file (fixed point): {stats}"
+    );
+
+    // And the finding is byte-stable: same single row, same id, same anchor.
+    let db = conn(project.path());
+    let rows: Vec<(String, String)> = {
+        let mut stmt = db
+            .prepare(
+                "SELECT id, entity_id FROM findings \
+                 WHERE rule_id = 'LMWV-SEC-SECRET-DETECTED'",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        rows.len(),
+        1,
+        "no duplicate row on the skipped path: {rows:?}"
+    );
+    assert_eq!(rows[0].0, first_id, "stable finding id across the skip");
+    assert_eq!(
+        rows[0].1, first_anchor,
+        "the skipped file's finding must stay anchored to the plugin module entity \
+         (resolved from the committed rows), never re-anchor to the core file entity"
+    );
 }

@@ -1,6 +1,6 @@
 //! Read-side query helpers used by the MCP navigation surface.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -964,6 +964,57 @@ pub fn known_entity_kinds(conn: &Connection) -> Result<Vec<String>> {
         out.push(row?);
     }
     Ok(out)
+}
+
+/// The preferred secret-finding anchor entity per source file, from the
+/// already-committed `entities` rows (weft-4165f1ed71, the analyze fixed
+/// point). When the incremental skip leaves a secret-bearing file
+/// un-dispatched, its pre-ingest scan finding must still anchor to the SAME
+/// entity the analysed run anchored to — otherwise the anchor (and the
+/// anchor-keyed finding id) flips to the core `file` entity and a duplicate
+/// row is minted. Preference order mirrors the in-run anchor registration
+/// (`remember_finding_anchors`): a `module`-kind entity first, then any
+/// non-core plugin entity, then the core `file` entity; ties break on the
+/// smaller id for determinism. Returns `{ source_file_path -> entity_id }`.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Sqlite`] if the query fails.
+pub fn preferred_finding_anchor_by_file(conn: &Connection) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare(
+        "SELECT source_file_path, id, kind, plugin_id FROM entities \
+         WHERE source_file_path IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let rank = |kind: &str, plugin_id: &str| -> u8 {
+        if kind == "module" {
+            0
+        } else if plugin_id != "core" {
+            1
+        } else {
+            2
+        }
+    };
+    let mut best: HashMap<String, (u8, String)> = HashMap::new();
+    for row in rows {
+        let (path, id, kind, plugin_id) = row.map_err(StorageError::from)?;
+        let row_rank = rank(&kind, &plugin_id);
+        match best.get(&path) {
+            Some((held_rank, held_id))
+                if (*held_rank, held_id.as_str()) <= (row_rank, id.as_str()) => {}
+            _ => {
+                best.insert(path, (row_rank, id));
+            }
+        }
+    }
+    Ok(best.into_iter().map(|(path, (_, id))| (path, id)).collect())
 }
 
 /// The distinct categorisation tags this index actually holds, ordered. The
