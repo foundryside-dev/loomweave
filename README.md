@@ -67,10 +67,13 @@ tagged GitHub Release; this branch is preparing the 1.1 line. Scope:
 
 ## What it does today
 
-`loomweave serve` exposes a 42-tool MCP surface that a consult-mode agent calls
+`loomweave serve` exposes a 46-tool MCP surface that a consult-mode agent calls
 instead of grep-and-read. Write-gated tools such as `analyze_start`,
 `analyze_cancel`, `propose_guidance`, and `promote_guidance` are hidden unless
-the server policy enables them. The core tool families are:
+the server policy enables them — with two deliberate exceptions: the
+`llm_config_set` / `semantic_config_set` bootstrap tools bypass the gate so a
+read-only session can configure (and thereby persistently enable) write tools
+and live LLM spend. The core tool families are:
 
 | Family | Examples |
 |---|---|

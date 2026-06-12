@@ -84,10 +84,15 @@ fn server_instructions(policy: McpToolPolicy) -> String {
     let write_tools_note = if policy.enable_write_tools {
         String::new()
     } else {
+        // The bootstrap exemption is deliberate (PM ruling, weft-ac59e8e730):
+        // state it loudly so a read-only session knows these two tools can
+        // persistently enable writes and live LLM spend.
         "\n\nWrite-gated unless `serve.mcp.enable_write_tools: true`: \
 `entity_summary_get`, `analyze_start`, `analyze_cancel`, `propose_guidance`, \
-`promote_guidance`. Config: `llm_config_*`,`semantic_config_*`; reconnect \
-after changes."
+`promote_guidance`. EXEMPT by design: `llm_config_set` and \
+`semantic_config_set` bypass this gate — from a read-only session they \
+persistently edit loomweave.yaml and can enable write tools and live (paid) \
+LLM spend; reconnect after changes."
             .to_owned()
     };
     format!(
@@ -102,10 +107,8 @@ Entity IDs are `{{plugin}}:{{kind}}:{{qualified_name}}`; subsystems are \
 it verbatim; `entity_resolve` maps pasted qualnames, Rust `::` paths, and SEI \
 tokens to identity rows — never hand-construct an id.
 
-Deep dive: the loomweave-workflow skill (installed by `loomweave install \
---skills`) or the `loomweave-workflow` prompt. Live counts and freshness: the \
-`loomweave://context` resource; `project_status_get` adds LLM policy and the \
-resolved Filigree endpoint.
+Deep dive: the `loomweave-workflow` skill/prompt. Live counts: the \
+`loomweave://context` resource.
 
 Tools: {tool_names}."
     )
@@ -6129,6 +6132,12 @@ mod tests {
         // The gate note names the write tools and how to enable them.
         assert!(read_only.contains("enable_write_tools"), "{read_only}");
         assert!(read_only.contains("entity_summary_get"), "{read_only}");
+        // The deliberate bootstrap exemption (PM ruling, weft-ac59e8e730) must
+        // be stated loudly: a read-only session can persistently enable writes
+        // and live LLM spend through these two tools.
+        assert!(read_only.contains("EXEMPT"), "{read_only}");
+        assert!(read_only.contains("llm_config_set"), "{read_only}");
+        assert!(read_only.contains("semantic_config_set"), "{read_only}");
     }
 
     #[test]

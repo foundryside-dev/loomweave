@@ -95,6 +95,15 @@ policy. `entity_summary_get` additionally requires the live LLM provider to be
 enabled (`llm_policy.enabled: true` + `allow_live_provider: true`), or it
 serves cache only.
 
+**Gate-exempt bootstrap tools.** `llm_config_set` and `semantic_config_set`
+deliberately BYPASS the write-tool gate (by design — the gate itself is one of
+the settings they edit, so a read-only session could otherwise never bootstrap
+write access). Treat them as write tools even when every other write surface is
+gated off: from a read-only session they persistently edit `loomweave.yaml` and
+can enable write tools, live (paid) LLM summaries, and live embedding spend.
+Their effects survive the session; reconnect after changes for the new policy
+to take effect.
+
 `entity_callers_list` / `entity_neighborhood_get` /
 `entity_execution_path_list` / `entity_relation_list` take a `confidence`
 tier — one of `"resolved"` (default; only high-confidence
