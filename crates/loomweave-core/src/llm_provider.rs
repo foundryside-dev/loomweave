@@ -205,6 +205,10 @@ pub struct TrafficLoggingProvider {
     inner: Arc<dyn LlmProvider>,
     log_path: PathBuf,
     max_bytes: u64,
+    /// Serialises rotate+append so concurrent `tools/call` dispatch cannot
+    /// interleave partial JSON lines or race the rotation rename. Shared
+    /// across clones (one lock per log file) via `Arc` (weft-ac59e8e730).
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl TrafficLoggingProvider {
@@ -217,10 +221,24 @@ impl TrafficLoggingProvider {
             inner,
             log_path,
             max_bytes: max_bytes.max(1),
+            write_lock: Arc::new(Mutex::new(())),
         }
     }
 
     fn append_event(&self, event: &Value) -> Result<(), LlmProviderError> {
+        // Serialise the whole event up front so the file sees exactly one
+        // write_all of one complete line — appends in O_APPEND mode are then
+        // atomic line-wise even across processes.
+        let mut line =
+            serde_json::to_string(event).map_err(|err| LlmProviderError::InvalidResponse {
+                message: format!("serialize LLM traffic log event: {err}"),
+                retryable: false,
+            })?;
+        line.push('\n');
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(parent) = self.log_path.parent() {
             fs::create_dir_all(parent).map_err(|err| LlmProviderError::Cli {
                 message: format!(
@@ -239,16 +257,11 @@ impl TrafficLoggingProvider {
                 message: format!("open LLM traffic log {}: {err}", self.log_path.display()),
                 retryable: false,
             })?;
-        serde_json::to_writer(&mut file, event).map_err(|err| {
-            LlmProviderError::InvalidResponse {
-                message: format!("serialize LLM traffic log event: {err}"),
+        file.write_all(line.as_bytes())
+            .map_err(|err| LlmProviderError::Cli {
+                message: format!("write LLM traffic log {}: {err}", self.log_path.display()),
                 retryable: false,
-            }
-        })?;
-        file.write_all(b"\n").map_err(|err| LlmProviderError::Cli {
-            message: format!("write LLM traffic log {}: {err}", self.log_path.display()),
-            retryable: false,
-        })
+            })
     }
 
     fn rotate_if_needed(&self) -> Result<(), LlmProviderError> {
@@ -272,14 +285,22 @@ impl TrafficLoggingProvider {
                 });
             }
         }
-        fs::rename(&self.log_path, &backup_path).map_err(|err| LlmProviderError::Cli {
-            message: format!(
-                "rotate LLM traffic log {} to {}: {err}",
-                self.log_path.display(),
-                backup_path.display()
-            ),
-            retryable: false,
-        })
+        match fs::rename(&self.log_path, &backup_path) {
+            Ok(()) => Ok(()),
+            // Another writer (e.g. a second serve process sharing the file)
+            // rotated between our metadata check and the rename — the log is
+            // already fresh, so this is success, not an error
+            // (weft-ac59e8e730 TOCTOU).
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(LlmProviderError::Cli {
+                message: format!(
+                    "rotate LLM traffic log {} to {}: {err}",
+                    self.log_path.display(),
+                    backup_path.display()
+                ),
+                retryable: false,
+            }),
+        }
     }
 }
 
@@ -302,7 +323,16 @@ impl LlmProvider for TrafficLoggingProvider {
             Ok(response) => llm_traffic_success_event(provider, &request, response),
             Err(err) => llm_traffic_error_event(provider, &request, err),
         };
-        self.append_event(&event)?;
+        // Fire-and-forget: the diagnostics sidecar must never gate the call it
+        // observes — propagating an append failure converted a successful
+        // (already paid-for) LLM call into an error (weft-ac59e8e730).
+        if let Err(log_err) = self.append_event(&event) {
+            tracing::warn!(
+                error = %log_err,
+                path = %self.log_path.display(),
+                "failed to append LLM traffic diagnostics event; returning the provider result unchanged"
+            );
+        }
         result
     }
 
@@ -1803,6 +1833,114 @@ mod tests {
         );
         let event: Value = serde_json::from_str(current.trim()).expect("traffic log JSON");
         assert_eq!(event["outcome"], "success");
+    }
+
+    #[tokio::test]
+    async fn traffic_logging_failure_does_not_poison_successful_llm_result() {
+        // weft-ac59e8e730: the diagnostics sidecar must never gate the call it
+        // observes. Make the log path unwritable by occupying its parent path
+        // with a regular file, so create_dir_all fails.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let blocking_file = temp.path().join("diagnostics");
+        fs::write(&blocking_file, "not a directory").expect("seed blocking file");
+        let log_path = blocking_file.join("llm-traffic.jsonl");
+
+        let request = LlmRequest {
+            purpose: LlmPurpose::Summary,
+            model_id: "summary-model".to_owned(),
+            prompt_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+            prompt: "hello".to_owned(),
+            max_output_tokens: 512,
+        };
+        let response = LlmResponse {
+            model_id: "summary-model".to_owned(),
+            output_json: r#"{"purpose":"demo"}"#.to_owned(),
+            input_tokens: 1,
+            cached_input_tokens: 0,
+            output_tokens: 1,
+            total_tokens: 2,
+            cost_usd: 0.0,
+        };
+        let inner = RecordingProvider::from_recordings(vec![Recording {
+            request: request.clone(),
+            response: response.clone(),
+        }]);
+        let provider = TrafficLoggingProvider::new(std::sync::Arc::new(inner), log_path);
+
+        let result = provider
+            .invoke(request)
+            .await
+            .expect("a successful LLM call must survive a diagnostics write failure");
+        assert_eq!(result, response);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_traffic_log_appends_emit_only_well_formed_json_lines() {
+        // weft-ac59e8e730: unsynchronised appends interleaved partial JSON
+        // lines under concurrent tools/call dispatch; rotation under load also
+        // raced itself. Hammer one shared log (with a tiny rotation cap so
+        // rotations actually collide) and require every surviving line to
+        // parse as a complete event.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log_path = temp.path().join("diagnostics/llm-traffic.jsonl");
+        let request = LlmRequest {
+            purpose: LlmPurpose::Summary,
+            model_id: "summary-model".to_owned(),
+            prompt_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+            prompt: "hello".to_owned(),
+            max_output_tokens: 512,
+        };
+        let response = LlmResponse {
+            model_id: "summary-model".to_owned(),
+            output_json: r#"{"purpose":"demo"}"#.to_owned(),
+            input_tokens: 1,
+            cached_input_tokens: 0,
+            output_tokens: 1,
+            total_tokens: 2,
+            cost_usd: 0.0,
+        };
+        let inner = RecordingProvider::from_recordings(vec![Recording {
+            request: request.clone(),
+            response,
+        }]);
+        let provider = TrafficLoggingProvider::with_max_bytes(
+            std::sync::Arc::new(inner),
+            log_path.clone(),
+            512, // force frequent rotations so the rotation race is exercised
+        );
+
+        let mut handles = Vec::new();
+        for _ in 0..64 {
+            let provider = provider.clone();
+            let request = request.clone();
+            handles.push(tokio::spawn(async move {
+                provider.invoke(request).await
+            }));
+        }
+        for handle in handles {
+            handle
+                .await
+                .expect("join")
+                .expect("every concurrent invoke must succeed");
+        }
+
+        let mut parsed_lines = 0usize;
+        for path in [log_path.clone(), llm_traffic_backup_path(&log_path)] {
+            let Ok(contents) = fs::read_to_string(&path) else {
+                continue;
+            };
+            for line in contents.lines() {
+                let event: Value = serde_json::from_str(line).unwrap_or_else(|err| {
+                    panic!("interleaved/partial traffic log line {line:?}: {err}")
+                });
+                assert_eq!(event["schema"], "loomweave.llm.lookup.v1");
+                parsed_lines += 1;
+            }
+        }
+        assert!(
+            parsed_lines > 0,
+            "expected surviving well-formed events after concurrent appends"
+        );
     }
 
     #[test]
