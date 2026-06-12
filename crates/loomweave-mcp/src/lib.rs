@@ -2344,17 +2344,32 @@ impl IssuesForAccumulator {
         ids
     }
 
-    /// Attach an `issue` field (title/status/priority) to every matched and
-    /// drifted entry. The value is the fetched [`IssueDetail`] when available,
-    /// else `null` — a stable shape that signals "enrichment attempted, no
-    /// detail" without forcing the consumer to probe for a missing key.
+    /// Attach an `issue` field (id/title/status/priority — the hydrated stub,
+    /// weft-4a46553503) to every matched and drifted entry. The value is the
+    /// fetched [`IssueDetail`] when available, else `null` — a stable shape
+    /// that signals "enrichment attempted, no detail" without forcing the
+    /// consumer to probe for a missing key. The stub's `id` is backfilled from
+    /// the entry's own `issue_id` when the detail route omitted it (an older
+    /// server), so a present stub ALWAYS carries the complete tuple.
     fn apply_issue_details(&mut self, details: &HashMap<String, Option<IssueDetail>>) {
         for entry in self.matched.iter_mut().chain(self.drifted.iter_mut()) {
-            let issue_value = entry
+            let issue_id = entry
                 .get("issue_id")
                 .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let issue_value = issue_id
+                .as_deref()
                 .and_then(|id| details.get(id))
                 .and_then(Option::as_ref)
+                .map(|detail| {
+                    let mut detail = detail.clone();
+                    if detail.id.is_empty()
+                        && let Some(id) = issue_id.as_deref()
+                    {
+                        id.clone_into(&mut detail.id);
+                    }
+                    detail
+                })
                 .and_then(|detail| serde_json::to_value(detail).ok())
                 .unwrap_or(Value::Null);
             if let Some(object) = entry.as_object_mut() {

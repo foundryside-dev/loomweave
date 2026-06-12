@@ -723,6 +723,9 @@ struct FakeFiligreeClient {
     wardline_path_calls: Mutex<Vec<String>>,
     /// When true, `wardline_findings_for_path` returns an `HttpStatus` 503 error.
     wardline_error: Mutex<bool>,
+    /// When true, `issue_detail` returns an `HttpStatus` 503 error (the
+    /// dogfood-4 B9 degrade path: transport/auth failure mid-enrichment).
+    detail_error: Mutex<bool>,
     created_observations: Mutex<Vec<ObservationCreateRequest>>,
     observations: Mutex<std::collections::HashMap<String, ObservationRecord>>,
     dismissed_observations: Mutex<Vec<String>>,
@@ -741,6 +744,7 @@ impl FakeFiligreeClient {
         self.details.get_mut().unwrap().insert(
             issue_id.to_owned(),
             IssueDetail {
+                id: issue_id.to_owned(),
                 title: title.to_owned(),
                 status: status.to_owned(),
                 priority,
@@ -756,6 +760,11 @@ impl FakeFiligreeClient {
 
     fn with_wardline_error(mut self) -> Self {
         *self.wardline_error.get_mut().unwrap() = true;
+        self
+    }
+
+    fn with_detail_error(mut self) -> Self {
+        *self.detail_error.get_mut().unwrap() = true;
         self
     }
 
@@ -820,6 +829,16 @@ impl FiligreeLookup for FakeFiligreeClient {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(issue_id.to_owned());
+        if *self
+            .detail_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return Err(FiligreeClientError::HttpStatus {
+                status: 503,
+                body: "detail route down".to_owned(),
+            });
+        }
         Ok(self
             .details
             .lock()
@@ -7775,5 +7794,106 @@ async fn project_status_and_index_diff_share_one_freshness_verdict() {
         status["result"]["staleness"], "fresh",
         "project_status must derive from index_diff's verdict (C-12) — parent-dir \
          churn and the project anchor's directory path are not staleness: {status}"
+    );
+}
+
+// ── B9 (weft-4a46553503): hydrated issue stub + honest enrichment degrade ────
+
+/// B9 failing-first: a matched row's `issue` stub must carry the issue's `id`
+/// alongside title/status — an agent acting on the row needs the id without
+/// re-deriving it from the sibling `issue_id` field or making a second
+/// filigree call.
+#[tokio::test]
+async fn issues_for_issue_stub_carries_id_title_and_status() {
+    let (project, db_path) = open_project();
+    let client = Arc::new(
+        FakeFiligreeClient::default()
+            .with_response(
+                "python:function:demo.entry",
+                vec![association(
+                    "filigree-fresh",
+                    "python:function:demo.entry",
+                    &expected_content_hash(project.path(), "python:function:demo.entry"),
+                )],
+            )
+            .with_detail("filigree-fresh", "Refresh tokens", "building", 1),
+    );
+    let state = state_for_filigree(project.path(), &db_path, client);
+
+    let envelope = call_tool(&state, "issues_for", json!({"id": "python:module:demo"})).await;
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    let issue = &envelope["result"]["matched"][0]["issue"];
+    assert_eq!(
+        issue["id"], "filigree-fresh",
+        "stub must carry the id: {envelope}"
+    );
+    assert_eq!(issue["title"], "Refresh tokens", "{envelope}");
+    assert_eq!(issue["status"], "building", "{envelope}");
+}
+
+/// B9 failing-first, degrade half: when the detail fetch fails (the dogfood-4
+/// observation — every issue came back `issue: null` with no explanation
+/// because the enrichment 401'd), the envelope must say so IN-BAND with a
+/// top-level marker, not leave the consumer staring at inexplicable nulls.
+#[tokio::test]
+async fn issues_for_discloses_detail_enrichment_degrade_in_band() {
+    let (project, db_path) = open_project();
+    let client = Arc::new(
+        FakeFiligreeClient::default()
+            .with_response(
+                "python:function:demo.entry",
+                vec![association(
+                    "filigree-fresh",
+                    "python:function:demo.entry",
+                    &expected_content_hash(project.path(), "python:function:demo.entry"),
+                )],
+            )
+            .with_detail("filigree-fresh", "Refresh tokens", "building", 1)
+            .with_detail_error(),
+    );
+    let state = state_for_filigree(project.path(), &db_path, client);
+
+    let envelope = call_tool(&state, "issues_for", json!({"id": "python:module:demo"})).await;
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    // Degraded, not failed: the association result still lands…
+    assert_eq!(
+        envelope["result"]["matched"][0]["issue_id"],
+        "filigree-fresh"
+    );
+    assert_eq!(envelope["result"]["matched"][0]["issue"], Value::Null);
+    // …and the degrade is disclosed once, in-band.
+    let degraded = &envelope["result"]["issue_detail_unavailable"];
+    assert!(
+        degraded["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("503")),
+        "the marker must carry the enrichment failure reason: {envelope}"
+    );
+}
+
+/// The healthy path carries NO degrade marker (the marker must mean something).
+#[tokio::test]
+async fn issues_for_omits_degrade_marker_when_enrichment_succeeds() {
+    let (project, db_path) = open_project();
+    let client = Arc::new(
+        FakeFiligreeClient::default()
+            .with_response(
+                "python:function:demo.entry",
+                vec![association(
+                    "filigree-fresh",
+                    "python:function:demo.entry",
+                    &expected_content_hash(project.path(), "python:function:demo.entry"),
+                )],
+            )
+            .with_detail("filigree-fresh", "Refresh tokens", "building", 1),
+    );
+    let state = state_for_filigree(project.path(), &db_path, client);
+
+    let envelope = call_tool(&state, "issues_for", json!({"id": "python:module:demo"})).await;
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert!(
+        envelope["result"].get("issue_detail_unavailable").is_none()
+            || envelope["result"]["issue_detail_unavailable"].is_null(),
+        "no degrade marker on the healthy path: {envelope}"
     );
 }

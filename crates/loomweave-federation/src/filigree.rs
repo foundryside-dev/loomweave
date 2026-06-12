@@ -30,6 +30,13 @@ pub struct EntityAssociationsResponse {
 /// without breaking this read.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct IssueDetail {
+    /// The Filigree issue id, carried INSIDE the stub so a consumer acting on
+    /// a matched row has the complete (id, title, status) tuple in one place
+    /// (weft-4a46553503 / dogfood-4 B9). Deserializes from the route's
+    /// `issue_id` field; `default` keeps the read enrich-only against an older
+    /// server that omits it (the caller backfills from the association row).
+    #[serde(alias = "issue_id", default)]
+    pub id: String,
     pub title: String,
     pub status: String,
     pub priority: i64,
@@ -1294,6 +1301,10 @@ mod tests {
             .issue_detail("clarion-51a2868c86")
             .expect("issue detail request")
             .expect("issue present");
+        assert_eq!(
+            detail.id, "clarion-51a2868c86",
+            "id deserializes from the route's issue_id field (weft-4a46553503)"
+        );
         assert_eq!(detail.title, "enrich");
         assert_eq!(detail.status, "proposed");
         assert_eq!(detail.priority, 3);

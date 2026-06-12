@@ -603,9 +603,13 @@ impl ServerState {
         let detail_ids = accumulator.enrichable_issue_ids();
         let mut details: HashMap<String, Option<IssueDetail>> = HashMap::new();
         let mut detail_requests_total = 0_usize;
-        let mut route_down = false;
+        // `Some(reason)` once the first transport/HTTP failure trips the
+        // degrade; carried into the envelope as an in-band marker
+        // (weft-4a46553503 / dogfood-4 B9: enrichment 401'd and every issue
+        // silently came back null — the consumer needs the WHY in-band).
+        let mut detail_route_down: Option<String> = None;
         for issue_id in detail_ids {
-            if route_down {
+            if detail_route_down.is_some() {
                 details.insert(issue_id, None);
                 continue;
             }
@@ -620,12 +624,12 @@ impl ServerState {
                 }
                 Ok(Err(err)) => {
                     tracing::warn!(error = %err, "loomweave issues_for detail fetch failed; degrading to issue-id-only");
-                    route_down = true;
+                    detail_route_down = Some(err.to_string());
                     details.insert(issue_id, None);
                 }
                 Err(err) => {
                     tracing::warn!(error = %err, "loomweave issues_for detail task failed; degrading to issue-id-only");
-                    route_down = true;
+                    detail_route_down = Some(format!("detail task failed: {err}"));
                     details.insert(issue_id, None);
                 }
             }
@@ -637,6 +641,22 @@ impl ServerState {
             detail_requests_total,
             &endpoint,
         );
+        // Honest degrade (C-10): when the detail enrichment died mid-flight,
+        // say so once, in-band — `issue: null` rows are otherwise
+        // indistinguishable from "issue genuinely absent at the route".
+        if let Some(reason) = detail_route_down
+            && let Some(result) = envelope.get_mut("result").and_then(Value::as_object_mut)
+        {
+            result.insert(
+                "issue_detail_unavailable".to_owned(),
+                json!({
+                    "reason": reason,
+                    "note": "the issue-detail enrichment failed mid-call, so `issue` is null \
+                             on the affected rows; `issue_id` remains authoritative — retry \
+                             or query Filigree directly for title/status",
+                }),
+            );
+        }
         // Flow B: attach Wardline findings reconciled to the requested entity.
         if let Some(entity) = read.entities.iter().find(|e| e.id == requested_id) {
             let client = client.clone();
