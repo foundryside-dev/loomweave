@@ -14,6 +14,72 @@ only when an incompatible change is made to that surface. See
 
 No changes yet.
 
+## [1.1.0rc5] — 2026-06-13
+
+Fifth 1.1 release candidate. This candidate adds agent-driveable LLM and
+semantic-search configuration (MCP tools + CLI verbs), an LLM lookup
+diagnostics log, and the Filigree minted-token auth rung, then remediates the
+findings of the adversarial review of that work (weft-ac59e8e730). No package
+is published for release candidates. (Cargo SemVer `1.1.0-rc5`; Python wheels
+normalise to PEP 440 `1.1.0rc5`.)
+
+### Added
+
+- **Config MCP tools.** Four new tools let an agent inspect and edit the
+  project's LLM and embedding posture: `llm_config_get` / `llm_config_set`
+  (provider, enabled, allow_live_provider, model pins, OpenRouter key env /
+  endpoint, and `serve.mcp.enable_write_tools`) and `semantic_config_get` /
+  `semantic_config_set` (provider, model, dimensions, endpoint, key env,
+  timeout, token ceiling). The two `*_config_set` tools deliberately **bypass
+  the read-only write-tool gate** (bootstrap exemption): the gate itself is one
+  of the settings they edit, so from a read-only session they can persistently
+  enable write tools and live (paid) LLM/embedding spend. This is by design and
+  is stated in the MCP server instructions and the `loomweave-workflow` skill.
+- **`loomweave config llm|semantic` CLI verbs.** `config llm status|set` and
+  `config semantic status|set` edit `loomweave.yaml` in place with validation,
+  and `config example --provider <p>` emits an annotated stub. Operator-facing
+  provider aliases are accepted everywhere providers are parsed
+  (`openrouter_api`/`open_router`, `codex_sidecar`/`codex`,
+  `claude_sidecar`/`claude_code`, and `openai`/`local`/`openai_local` for the
+  embedding providers).
+- **LLM lookup traffic log.** Every configured LLM lookup appends one JSONL
+  metadata record to `.weft/loomweave/diagnostics/llm-traffic.jsonl` (inside
+  Loomweave's member store dir; `store_dir` overrides move it too). The log is
+  metadata-only by guarantee — provider, purpose, prompt template id, model,
+  outcome, token usage, cost; never prompt text or model output — and is capped
+  at 10 MiB with rotation to `llm-traffic.jsonl.1`.
+- **Semantic-search configuration with honest degrade.** The
+  `semantic_search:` block (hosted `api` or loopback-only `local_openai`
+  provider) feeds `entity_semantic_search_list`; when it is enabled but the
+  provider cannot be constructed (missing live opt-in or API key), `serve`
+  warns about the inert embedding provider and the search degrades to
+  `not_enabled` instead of failing startup.
+
+### Fixed
+
+- **Filigree auth: minted federation token as the final resolution rung**
+  (dogfood-4 A5, weft-c7db813d9a). Token resolution was env-only, so the MCP
+  serve path — launched with an empty env in `.mcp.json` — 401'd on every
+  weft-gated read. The daemon's auto-minted
+  `<root>/.weft/filigree/federation_token` is now read after the
+  `WEFT_FEDERATION_TOKEN` / legacy `FILIGREE_API_TOKEN` env rungs across serve,
+  scan-results emit, clean-stale, and SARIF import.
+- **Review remediation (weft-ac59e8e730).** The adversarial review of the
+  config/diagnostics work above confirmed nine findings, fixed in this
+  candidate: the semantic loopback-trust gate no longer runs when
+  `semantic_search.enabled: false` (a disabled block with a stale non-loopback
+  endpoint had hard-failed `serve`/`config status` and blocked
+  `config semantic set --disable` itself); IPv6 loopback (`http://[::1]:…`)
+  endpoints are recognised; a diagnostics write failure no longer converts a
+  successful (paid-for) LLM call into an error; concurrent traffic-log appends
+  are serialized (no interleaved partial JSON lines) and colliding rotations no
+  longer fail calls; the traffic log moved from the legacy `.loomweave/` root
+  into `.weft/loomweave/` (C-9) with the installed store `.gitignore` covering
+  `diagnostics/`; the `llm_config_set`/`semantic_config_set` inputSchemas
+  declare real types and provider enums instead of bare `{}`; a committed
+  agent-harness debug log (`error.log`) was removed and guarded; and the README
+  MCP surface claim was corrected to 46 tools.
+
 ## [1.1.0rc4] — 2026-06-11
 
 Fourth 1.1 release candidate. This candidate makes the Rust language plugin a
