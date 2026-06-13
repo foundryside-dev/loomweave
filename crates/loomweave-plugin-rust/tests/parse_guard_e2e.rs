@@ -105,6 +105,18 @@ fn staged_rust_plugin() -> (tempfile::TempDir, std::path::PathBuf) {
         std::env::consts::EXE_SUFFIX
     ));
     std::fs::copy(rust_plugin_binary_path(), &staged).expect("stage rust plugin binary");
+    // Fence the copy against ETXTBSY (matching host_subprocess.rs): under a
+    // saturated `--workspace` run the kernel can still consider the
+    // freshly-written image "busy" when we exec it, because a writer fd from the
+    // copy may not have fully settled across threads. Open-sync-close the staged
+    // file so its data is durable and no writable handle survives into the exec;
+    // `spawn_over` additionally retries the exec for the residual window.
+    #[cfg(unix)]
+    {
+        let f = std::fs::File::open(&staged).expect("reopen staged plugin for sync");
+        f.sync_all().expect("sync staged plugin to disk");
+        drop(f);
+    }
     (dir, staged)
 }
 
@@ -166,8 +178,26 @@ fn staged_project(files: &[(&str, &str)]) -> (tempfile::TempDir, std::path::Path
 fn spawn_over(root: &std::path::Path) -> (tempfile::TempDir, SubprocessHost, std::process::Child) {
     let manifest = parse_manifest(RUST_MANIFEST_BYTES).expect("rust plugin.toml must be valid");
     let (binary_stage, exec) = staged_rust_plugin();
-    let (host, child) = PluginHost::spawn(manifest, root, &exec)
-        .expect("spawn must succeed: the symbol-table walk must skip bombs, not abort");
+    // Retry the exec briefly on ETXTBSY: copying an executable and immediately
+    // exec'ing it can race the kernel's "text file busy" guard under heavy
+    // parallel load — a pure test-staging artifact (production PluginHost::spawn
+    // is unchanged). Matches the spawn_staged_with_retry fence in
+    // host_subprocess.rs so this suite is deterministic under `--workspace`.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (host, child) = loop {
+        match PluginHost::spawn(manifest.clone(), root, &exec) {
+            Err(loomweave_core::HostError::Spawn(msg))
+                if msg.contains("Text file busy")
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => {
+                break other
+                    .expect("spawn must succeed: the symbol-table walk must skip bombs, not abort");
+            }
+        }
+    };
     (binary_stage, host, child)
 }
 
