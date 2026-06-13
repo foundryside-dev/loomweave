@@ -2511,6 +2511,46 @@ async fn entity_resolve_resolves_qualname_to_id_and_sei() {
 }
 
 #[tokio::test]
+async fn entity_resolve_full_locator_input_resolves_to_sei_gv_lw_5() {
+    // GV-LW-5 (heddle interface-lock 2026-06-13, HX1): heddle resolves SEIs by
+    // passing a fully-formed Loomweave locator (`python:function:m.f`), not the
+    // bare qualname. It must resolve to the real `loomweave:eid:` SEI so heddle
+    // stores `sei` + `enrichment.sei: present` instead of `sei: null`.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:demo.entry",
+        "function",
+        "demo.py",
+        Some((1, 2)),
+    );
+    insert_alive_sei(
+        &conn,
+        "loomweave:eid:demo-entry",
+        "python:function:demo.entry",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["python:function:demo.entry"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["qualname"], "python:function:demo.entry");
+    assert_eq!(results[0]["result_kind"], "resolved");
+    let candidates = results[0]["candidates"].as_array().expect("candidates");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0]["id"], "python:function:demo.entry");
+    assert_eq!(candidates[0]["sei"], "loomweave:eid:demo-entry");
+}
+
+#[tokio::test]
 async fn entity_resolve_unknown_qualname_is_unresolved_not_error() {
     let (project, db, _conn) = open_project();
     let state = state_for(project.path(), &db);

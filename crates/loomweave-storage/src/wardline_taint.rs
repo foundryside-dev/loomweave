@@ -225,7 +225,14 @@ fn qualname_kind_pairs(conn: &Connection) -> Result<Vec<(String, String)>> {
 ///
 /// Candidates are minted as `{plugin}:{kind}:{qualname}` over the distinct
 /// `(plugin, kind)` pairs present in the store, excluding the non-qualname
-/// dialects (`file`, `subsystem`). `kind` and `plugin` are optional hard
+/// dialects (`file`, `subsystem`). An input that is ALREADY a fully-formed
+/// entity id under one of those pairs (it begins with `{plugin}:{kind}:`) also
+/// resolves VERBATIM — the `locator` dialect — so a caller holding a real
+/// Loomweave id (e.g. heddle's `python:function:pkg.mod.fn` from HX1, per the
+/// 2026-06-13 heddle interface-lock) resolves directly, not only one holding
+/// the bare qualname tail. Because the verbatim probe is gated on the same
+/// `pairs`, file/subsystem locators stay excluded and the constraints below
+/// carry over unchanged. `kind` and `plugin` are optional hard
 /// CONSTRAINTS with the same semantics as the ADR-036 plugin hint: an unknown
 /// value is simply a constraint nothing satisfies (resolves `None`), never an
 /// error, and values are not validated against the store (blank-rejection is
@@ -259,31 +266,41 @@ pub fn resolve_qualnames_all_kinds(
             })
             .collect(),
     };
-    let mut candidates = Vec::with_capacity(qualnames.len().saturating_mul(pairs.len()));
-    for qualname in qualnames {
+    // Per input we probe two dialects: the bare qualname segment minted across
+    // every allowed pair (`{plugin}:{kind}:{qualname}`), AND the input verbatim
+    // when it is itself an entity id under an allowed pair (the `locator`
+    // dialect). The prefix guard reuses `pairs`, so file/subsystem stay excluded
+    // and the `kind`/`plugin` constraints carry over.
+    let candidate_ids = |qualname: &str| -> Vec<String> {
+        let mut ids = Vec::with_capacity(pairs.len() + 1);
         for (plugin, kind) in &pairs {
-            candidates.push(format!("{plugin}:{kind}:{qualname}"));
+            let prefix = format!("{plugin}:{kind}:");
+            ids.push(format!("{prefix}{qualname}"));
+            if qualname.starts_with(&prefix) {
+                ids.push(qualname.to_owned());
+            }
         }
-    }
-    let found: HashSet<String> = existing_entity_ids(conn, &candidates)?;
+        ids
+    };
+    let probe: Vec<String> = qualnames.iter().flat_map(|q| candidate_ids(q)).collect();
+    let found: HashSet<String> = existing_entity_ids(conn, &probe)?;
     Ok(qualnames
         .iter()
         .map(|qualname| {
-            // `pairs` is sorted (plugin, kind), so the surviving ids are too.
-            let mut hits: Vec<String> = pairs
-                .iter()
-                .map(|(plugin, kind)| format!("{plugin}:{kind}:{qualname}"))
+            // Surviving candidate ids, deduped + sorted for a deterministic,
+            // lexicographically ordered Ambiguous set.
+            let mut hits: Vec<String> = candidate_ids(qualname)
+                .into_iter()
                 .filter(|candidate| found.contains(candidate))
                 .collect();
-            let resolution = match hits.pop() {
-                None => Resolution::None,
-                // Exactly one hit: nothing left after the pop.
-                Some(only) if hits.is_empty() => Resolution::Exact { entity_id: only },
-                // More than one: push the popped id back and keep sorted order.
-                Some(last) => {
-                    hits.push(last);
-                    Resolution::Ambiguous { entity_ids: hits }
-                }
+            hits.sort();
+            hits.dedup();
+            let resolution = match hits.len() {
+                0 => Resolution::None,
+                1 => Resolution::Exact {
+                    entity_id: hits.remove(0),
+                },
+                _ => Resolution::Ambiguous { entity_ids: hits },
             };
             (qualname.clone(), resolution)
         })
@@ -890,6 +907,76 @@ mod tests {
             out[0].1,
             Resolution::None,
             "explicit kind=file is denied, not honored"
+        );
+    }
+
+    #[test]
+    fn all_kinds_resolves_full_locator_input_verbatim() {
+        // HX1 (heddle interface-lock 2026-06-13): heddle passes a fully-formed
+        // Loomweave id (`python:function:pkg.mod.fn`), not the bare qualname.
+        // It must resolve to the same entity (→ its SEI), not miss.
+        let conn = migrated_conn();
+        insert_entity_for_plugin_kind(&conn, "python", "function", "python:function:pkg.mod.fn");
+        insert_entity_for_plugin_kind(&conn, "python", "module", "python:module:pkg.mod");
+        let qs = vec![
+            "python:function:pkg.mod.fn".to_owned(),
+            "python:module:pkg.mod".to_owned(),
+        ];
+        let out = resolve_qualnames_all_kinds(&conn, &qs, None, None).unwrap();
+        assert_eq!(
+            out[0].1,
+            Resolution::Exact {
+                entity_id: "python:function:pkg.mod.fn".to_owned(),
+            },
+            "full function locator resolves verbatim"
+        );
+        assert_eq!(
+            out[1].1,
+            Resolution::Exact {
+                entity_id: "python:module:pkg.mod".to_owned(),
+            },
+            "full module locator (heddle's file: branch) resolves verbatim"
+        );
+    }
+
+    #[test]
+    fn all_kinds_bare_qualname_still_resolves_alongside_locator() {
+        // The bare-qualname dialect is unchanged by the verbatim-locator probe.
+        let conn = migrated_conn();
+        insert_entity_for_plugin_kind(&conn, "python", "function", "python:function:pkg.mod.fn");
+        let out =
+            resolve_qualnames_all_kinds(&conn, &["pkg.mod.fn".to_owned()], None, None).unwrap();
+        assert_eq!(
+            out[0].1,
+            Resolution::Exact {
+                entity_id: "python:function:pkg.mod.fn".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn all_kinds_locator_input_honors_constraints_and_excludes_file() {
+        let conn = migrated_conn();
+        insert_entity_for_plugin_kind(&conn, "python", "function", "python:function:pkg.mod.fn");
+        insert_entity_for_plugin_kind(&conn, "core", "file", "core:file:src/app.py");
+        // A verbatim file locator never resolves — the (core, file) pair is not
+        // enumerated, so the prefix guard never admits it (no path side-channel).
+        let out =
+            resolve_qualnames_all_kinds(&conn, &["core:file:src/app.py".to_owned()], None, None)
+                .unwrap();
+        assert_eq!(out[0].1, Resolution::None, "file locator stays excluded");
+        // The plugin constraint still filters a verbatim locator's pair.
+        let out = resolve_qualnames_all_kinds(
+            &conn,
+            &["python:function:pkg.mod.fn".to_owned()],
+            None,
+            Some("rust"),
+        )
+        .unwrap();
+        assert_eq!(
+            out[0].1,
+            Resolution::None,
+            "plugin=rust excludes the python: locator's pair"
         );
     }
 
