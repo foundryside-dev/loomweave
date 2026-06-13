@@ -12,6 +12,13 @@
 use loomweave_core::PluginHost;
 use loomweave_core::plugin::parse_manifest;
 
+/// Concrete subprocess-backed host type produced by
+/// [`PluginHost::spawn`] / [`PluginHost::spawn_unhandshaken`].
+type SubprocessHost = PluginHost<
+    std::io::BufReader<std::process::ChildStdout>,
+    std::io::BufWriter<std::process::ChildStdin>,
+>;
+
 /// Path to the fixture plugin.toml — embedded at compile time.
 const FIXTURE_MANIFEST_BYTES: &[u8] = include_bytes!("fixtures/plugin.toml");
 
@@ -85,7 +92,45 @@ fn staged_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     // `copy` preserves the exec bit on Unix and compiles on all platforms
     // (unlike `os::unix::fs::symlink`); this test is not `cfg(unix)`-gated.
     std::fs::copy(fixture_binary_path(), &staged).expect("stage fixture binary");
+    // Fence the copy against ETXTBSY: under a saturated `--workspace` run the
+    // kernel can still consider the freshly-written image "busy" at the moment
+    // we exec it (a writer fd from the copy may not have fully settled across
+    // threads). Open-sync-close the staged file so its data is durable and no
+    // writable handle to it survives into the exec. Spawn call sites still wrap
+    // the actual `exec` in `spawn_staged_with_retry` for the residual window.
+    #[cfg(unix)]
+    {
+        let f = std::fs::File::open(&staged).expect("reopen staged fixture for sync");
+        f.sync_all().expect("sync staged fixture to disk");
+        drop(f);
+    }
     (dir, staged)
+}
+
+/// Spawn a freshly-staged binary, retrying briefly on `ETXTBSY`.
+///
+/// Copying an executable and immediately `exec`ing it can race the kernel's
+/// "text file busy" guard under heavy parallel load — a pure test-staging
+/// artifact (a real install never copy-then-immediately-execs the image from
+/// the same saturated process). Production `PluginHost::spawn` is unchanged;
+/// this wrapper only absorbs that staging race so the suite is deterministic.
+fn spawn_staged_with_retry(
+    manifest: loomweave_core::plugin::Manifest,
+    project_root: &std::path::Path,
+    exec: &std::path::Path,
+) -> Result<(SubprocessHost, std::process::Child), loomweave_core::HostError> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match PluginHost::spawn(manifest.clone(), project_root, exec) {
+            Err(loomweave_core::HostError::Spawn(msg))
+                if msg.contains("Text file busy")
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
 }
 
 fn find_fixture_binary(target_dir: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -160,7 +205,7 @@ fn t1_subprocess_happy_path() {
     //    basename check passes.
     let (_fixture_stage, exec) = staged_fixture();
     let (mut host, mut child) =
-        PluginHost::spawn(manifest, project_dir.path(), &exec).expect("spawn must succeed");
+        spawn_staged_with_retry(manifest, project_dir.path(), &exec).expect("spawn must succeed");
 
     // 5. Analyze the fixture file.
     let outcome = host
@@ -225,8 +270,22 @@ fn spawn_unhandshaken_defers_handshake_to_caller() {
     std::fs::write(&sample_path, b"widget demo.sample {}\n").expect("write sample.mt");
 
     let (_fixture_stage, exec) = staged_fixture();
-    let (mut host, mut child) = PluginHost::spawn_unhandshaken(manifest, project_dir.path(), &exec)
-        .expect("spawn_unhandshaken must succeed");
+    // Same ETXTBSY staging-race fence as `spawn_staged_with_retry`, against the
+    // un-handshaken constructor.
+    let (mut host, mut child) = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match PluginHost::spawn_unhandshaken(manifest.clone(), project_dir.path(), &exec) {
+                Err(loomweave_core::HostError::Spawn(msg))
+                    if msg.contains("Text file busy")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                other => break other.expect("spawn_unhandshaken must succeed"),
+            }
+        }
+    };
 
     assert!(
         host.ontology_version().is_none(),
@@ -341,7 +400,11 @@ fn t9a_handshake_failure_reaps_exited_subprocess() {
 
 #[cfg(target_os = "linux")]
 fn read_recorded_pid(path: &std::path::Path) -> u32 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    // Generous bound: this only waits for the stub shell to have run and
+    // written one line. Under a saturated `--workspace` run the child can be
+    // scheduling-starved for seconds; a true never-ran regression still fails
+    // (the stub never writes), just later.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         if let Ok(contents) = std::fs::read_to_string(path) {
             return contents
@@ -394,7 +457,7 @@ fn t9b_stderr_tail_is_some_after_spawn() {
 
     let (_fixture_stage, exec) = staged_fixture();
     let (mut host, mut child) =
-        PluginHost::spawn(manifest, project_dir.path(), &exec).expect("spawn must succeed");
+        spawn_staged_with_retry(manifest, project_dir.path(), &exec).expect("spawn must succeed");
 
     // The tail must be Some — drain thread is wired. Content may vary
     // (the fixture doesn't write to stderr on success paths, so empty
