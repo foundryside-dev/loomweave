@@ -228,8 +228,8 @@ fn qualname_kind_pairs(conn: &Connection) -> Result<Vec<(String, String)>> {
 /// dialects (`file`, `subsystem`). An input that is ALREADY a fully-formed
 /// entity id under one of those pairs (it begins with `{plugin}:{kind}:`) also
 /// resolves VERBATIM — the `locator` dialect — so a caller holding a real
-/// Loomweave id (e.g. heddle's `python:function:pkg.mod.fn` from HX1, per the
-/// 2026-06-13 heddle interface-lock) resolves directly, not only one holding
+/// Loomweave id (e.g. warpline's `python:function:pkg.mod.fn` from HX1, per the
+/// 2026-06-13 warpline interface-lock) resolves directly, not only one holding
 /// the bare qualname tail. Because the verbatim probe is gated on the same
 /// `pairs`, file/subsystem locators stay excluded and the constraints below
 /// carry over unchanged. `kind` and `plugin` are optional hard
@@ -912,7 +912,7 @@ mod tests {
 
     #[test]
     fn all_kinds_resolves_full_locator_input_verbatim() {
-        // HX1 (heddle interface-lock 2026-06-13): heddle passes a fully-formed
+        // HX1 (warpline interface-lock 2026-06-13): warpline passes a fully-formed
         // Loomweave id (`python:function:pkg.mod.fn`), not the bare qualname.
         // It must resolve to the same entity (→ its SEI), not miss.
         let conn = migrated_conn();
@@ -935,7 +935,7 @@ mod tests {
             Resolution::Exact {
                 entity_id: "python:module:pkg.mod".to_owned(),
             },
-            "full module locator (heddle's file: branch) resolves verbatim"
+            "full module locator (warpline's file: branch) resolves verbatim"
         );
     }
 

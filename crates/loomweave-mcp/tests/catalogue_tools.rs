@@ -2512,9 +2512,9 @@ async fn entity_resolve_resolves_qualname_to_id_and_sei() {
 
 #[tokio::test]
 async fn entity_resolve_full_locator_input_resolves_to_sei_gv_lw_5() {
-    // GV-LW-5 (heddle interface-lock 2026-06-13, HX1): heddle resolves SEIs by
+    // GV-LW-5 (warpline interface-lock 2026-06-13, HX1): warpline resolves SEIs by
     // passing a fully-formed Loomweave locator (`python:function:m.f`), not the
-    // bare qualname. It must resolve to the real `loomweave:eid:` SEI so heddle
+    // bare qualname. It must resolve to the real `loomweave:eid:` SEI so warpline
     // stores `sei` + `enrichment.sei: present` instead of `sei: null`.
     let (project, db, conn) = open_project();
     insert_entity(
