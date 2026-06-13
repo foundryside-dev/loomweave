@@ -20,6 +20,12 @@ use loomweave_core::plugin::parse_manifest;
 /// This crate's shipped manifest — embedded at compile time.
 const RUST_MANIFEST_BYTES: &[u8] = include_bytes!("../plugin.toml");
 
+/// The concrete subprocess-backed host type `PluginHost::spawn` returns.
+type SubprocessHost = PluginHost<
+    std::io::BufReader<std::process::ChildStdout>,
+    std::io::BufWriter<std::process::ChildStdin>,
+>;
+
 /// A tiny, analysable Rust source file. Laid out under a temp crate's `src/`
 /// so crate-root discovery (ADR-049 §1) produces real crate-rooted ids. It
 /// includes an `impl` block so the impl method + its `contains` edge round-trip
@@ -114,7 +120,38 @@ fn staged_rust_plugin() -> (tempfile::TempDir, std::path::PathBuf) {
         std::env::consts::EXE_SUFFIX
     ));
     std::fs::copy(rust_plugin_binary_path(), &staged).expect("stage rust plugin binary");
+    // Fence against ETXTBSY (matching host_subprocess.rs / parse_guard_e2e.rs):
+    // under saturated `--workspace` load the kernel can still consider the
+    // freshly-copied image "busy" at exec time. Sync + close so no writer fd
+    // survives; the spawn call site additionally retries the residual window.
+    #[cfg(unix)]
+    {
+        let f = std::fs::File::open(&staged).expect("reopen staged plugin for sync");
+        f.sync_all().expect("sync staged plugin to disk");
+        drop(f);
+    }
     (dir, staged)
+}
+
+/// Spawn the freshly-staged plugin, retrying briefly on ETXTBSY (a pure
+/// test-staging race under parallel load; production spawn is unchanged).
+fn spawn_with_etxtbsy_retry(
+    manifest: loomweave_core::plugin::Manifest,
+    project_root: &std::path::Path,
+    exec: &std::path::Path,
+) -> (SubprocessHost, std::process::Child) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match PluginHost::spawn(manifest.clone(), project_root, exec) {
+            Err(loomweave_core::HostError::Spawn(msg))
+                if msg.contains("Text file busy")
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => return other.expect("spawn must succeed"),
+        }
+    }
 }
 
 /// Lay out a one-crate project root with the sample under `src/sample.rs`, so
@@ -151,8 +188,7 @@ fn handshake_analyze_shutdown_roundtrip() {
         .to_path_buf();
 
     let (_binary_stage, exec) = staged_rust_plugin();
-    let (mut host, mut child) =
-        PluginHost::spawn(manifest, &project_root, &exec).expect("spawn must succeed");
+    let (mut host, mut child) = spawn_with_etxtbsy_retry(manifest, &project_root, &exec);
 
     let outcome = host
         .analyze_file(&sample_path)
