@@ -69,6 +69,39 @@ impl McpConfig {
         Ok(config)
     }
 
+    /// Parse the document for *structure* (schema shape + alias-collision
+    /// guard) plus the trust of ONLY the section just edited, WITHOUT the
+    /// cross-section trust validation that whole-config `validate()` runs.
+    ///
+    /// The `config` tool is the recovery surface for a federation that has
+    /// drifted into an untrusted state, and `validate()` is whole-config: it
+    /// rejects on a stale value in a section the caller never touched. That
+    /// turns the recovery surface into a trap — `config llm set --disable` was
+    /// blocked by a stale enabled non-loopback `semantic_search`, and
+    /// `config semantic set --disable` (the very action that clears the
+    /// offending state) was blocked by a stale enabled non-loopback
+    /// `serve.http` (L2). An edit to one section must never be gated by
+    /// another. The just-edited section IS still trust-validated (so
+    /// re-enabling a non-loopback endpoint in the same edit is still refused);
+    /// any cross-section trust issue that genuinely remains surfaces at the
+    /// next full load (`serve` / `doctor` / `config check`).
+    fn from_yaml_str_section_scoped(
+        raw: &str,
+        edited: EditedSection,
+    ) -> Result<Self, ConfigError> {
+        if raw.trim().is_empty() {
+            return Ok(Self::default());
+        }
+        reject_llm_policy_alias_collision(raw)?;
+        let config: Self =
+            serde_norway::from_str(raw).map_err(|err| ConfigError::Yaml(err.to_string()))?;
+        match edited {
+            EditedSection::SemanticSearch => config.semantic_search.validate_endpoint_trust()?,
+            EditedSection::Llm => {}
+        }
+        Ok(config)
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         if self.integrations.filigree.enabled && self.integrations.filigree.actor.trim().is_empty()
         {
@@ -238,9 +271,11 @@ impl SemanticSearchConfig {
     /// `endpoint_url` must not fail config load — otherwise
     /// `semantic_search.enabled: false` plus a stale non-loopback endpoint
     /// hard-fails `loomweave serve` AND traps recovery, because
-    /// `update_semantic_config_file` re-parses through `from_yaml_str` before
-    /// writing, so even `config semantic set --disable` was rejected
-    /// (weft-ac59e8e730).
+    /// `update_semantic_config_file` re-parses before writing, so even
+    /// `config semantic set --disable` was rejected (weft-ac59e8e730). The edit
+    /// paths now parse via `from_yaml_str_section_scoped` (L2), which runs this
+    /// gate only for the edited section and skips cross-section trust so an edit
+    /// to one section is never trapped by a stale value in another.
     pub fn validate_endpoint_trust(&self) -> Result<(), ConfigError> {
         if !self.enabled || self.provider != SemanticProviderKind::LocalOpenAi {
             return Ok(());
@@ -763,6 +798,14 @@ where
     }
 }
 
+/// Which config section an edit-path touched — selects the section-scoped
+/// trust validation in [`McpConfig::from_yaml_str_section_scoped`] (L2).
+#[derive(Debug, Clone, Copy)]
+enum EditedSection {
+    Llm,
+    SemanticSearch,
+}
+
 #[allow(clippy::similar_names)] // path/patch are both the precise domain terms
 pub fn update_llm_config_file(
     path: &Path,
@@ -790,7 +833,10 @@ pub fn update_llm_config_file(
     apply_llm_patch(&mut document, patch)?;
     let rendered =
         serde_norway::to_string(&document).map_err(|err| ConfigError::Yaml(err.to_string()))?;
-    let parsed = McpConfig::from_yaml_str(&rendered)?;
+    // Editing the llm section must not be trapped by a stale value in an
+    // unrelated section (L2): validate structure (+ this section's own trust,
+    // of which llm has none), not cross-section trust.
+    let parsed = McpConfig::from_yaml_str_section_scoped(&rendered, EditedSection::Llm)?;
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -838,7 +884,13 @@ pub fn update_semantic_config_file(
     apply_semantic_patch(&mut document, patch)?;
     let rendered =
         serde_norway::to_string(&document).map_err(|err| ConfigError::Yaml(err.to_string()))?;
-    let parsed = McpConfig::from_yaml_str(&rendered)?;
+    // Editing the semantic_search section must not be trapped by a stale value
+    // in an unrelated section (L2) — and crucially `--disable` is itself the
+    // recovery action. Validate structure + THIS section's own endpoint trust
+    // (so re-enabling a non-loopback endpoint is still refused), but never
+    // cross-section trust.
+    let parsed =
+        McpConfig::from_yaml_str_section_scoped(&rendered, EditedSection::SemanticSearch)?;
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1522,6 +1574,59 @@ semantic_search:
                 .contains("LMWV-CONFIG-SEMANTIC-NON-LOOPBACK"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn llm_disable_succeeds_despite_stale_non_loopback_semantic_search() {
+        // L2 cross-section recovery-trap: editing the llm section was rejected
+        // by whole-config `validate()` because an UNRELATED, stale
+        // semantic_search block was enabled with a non-loopback endpoint. An
+        // edit to one section must never be gated by another.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("loomweave.yaml");
+        fs::write(
+            &path,
+            "version: 1\n\
+             llm_policy:\n  enabled: true\n\
+             semantic_search:\n  enabled: true\n  provider: local_openai\n  endpoint_url: http://192.168.1.50:11434/v1\n",
+        )
+        .expect("seed config");
+
+        let result = update_llm_config_file(
+            &path,
+            &LlmConfigPatch {
+                enabled: Some(false),
+                ..LlmConfigPatch::default()
+            },
+        )
+        .expect("disabling llm must succeed despite the stale non-loopback semantic endpoint");
+        assert!(!result.config.llm.enabled);
+    }
+
+    #[test]
+    fn semantic_disable_succeeds_despite_stale_non_loopback_serve_http() {
+        // L2 cross-section recovery-trap (the worst case): `config semantic set
+        // --disable` is the very recovery action, yet it was rejected by a
+        // stale enabled non-loopback `serve.http` in a DIFFERENT section.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("loomweave.yaml");
+        fs::write(
+            &path,
+            "version: 1\n\
+             semantic_search:\n  enabled: true\n  provider: local_openai\n  endpoint_url: http://127.0.0.1:11434/v1\n\
+             serve:\n  http:\n    enabled: true\n    bind: 192.168.1.50:8080\n",
+        )
+        .expect("seed config");
+
+        let result = update_semantic_config_file(
+            &path,
+            &SemanticConfigPatch {
+                enabled: Some(false),
+                ..SemanticConfigPatch::default()
+            },
+        )
+        .expect("disabling semantic must succeed despite the stale non-loopback serve.http");
+        assert!(!result.config.semantic_search.enabled);
     }
 
     #[test]
