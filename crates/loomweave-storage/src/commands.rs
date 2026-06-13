@@ -273,9 +273,21 @@ pub enum WriterCmd {
     /// "looked, no longer detected" even on a run the general sweep must skip.
     /// Same lifecycle preservation and query-time-write posture as
     /// [`WriterCmd::SweepStaleFindings`].
+    ///
+    /// `examined_source_files` scopes the sweep to files the producer actually
+    /// re-examined this run (L3): the "full pass" is full only over the
+    /// CURRENTLY-installed plugins' extension union, so uninstalling/disabling a
+    /// plugin between runs silently drops its files from the scan. Without this
+    /// scope, those files' still-valid findings would be retired as "looked,
+    /// clean" when they were never looked at again ("scope shrinkage" — the walk
+    /// raises no error, so the `source_walk_skipped_entries == 0` caller gate
+    /// does not catch it). A finding survives unless its anchor entity's
+    /// `source_file_path` is in this set. Canonical-absolute path strings,
+    /// matching the form entities store. An empty set retires nothing.
     SweepStaleFindingsForRules {
         current_run_id: String,
         rule_ids: Vec<String>,
+        examined_source_files: Vec<String>,
         ack: Ack<usize>,
     },
     /// Upsert one SEI binding (mint or carry) — Wave 1 / WS1 (ADR-038). A carry

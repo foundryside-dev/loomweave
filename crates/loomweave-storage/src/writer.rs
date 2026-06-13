@@ -284,11 +284,19 @@ fn run_actor(
             WriterCmd::SweepStaleFindingsForRules {
                 current_run_id,
                 rule_ids,
+                examined_source_files,
                 ack,
             } => {
                 let res = query_time_write(conn, &mut state, commits_observed, |conn| {
                     let rules: Vec<&str> = rule_ids.iter().map(String::as_str).collect();
-                    crate::findings::sweep_stale_findings_for_rules(conn, &current_run_id, &rules)
+                    let examined: Vec<&str> =
+                        examined_source_files.iter().map(String::as_str).collect();
+                    crate::findings::sweep_stale_findings_for_rules(
+                        conn,
+                        &current_run_id,
+                        &rules,
+                        &examined,
+                    )
                 });
                 reply(ack, res);
             }

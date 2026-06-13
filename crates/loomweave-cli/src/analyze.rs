@@ -1587,16 +1587,30 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             //   • source_walk_skipped_entries == 0 — an unwalked file was never
             //     handed to the scan, so its rows were not re-emitted
             //     ("never looked" ≠ "looked, clean").
+            // The scan's "full pass" is full only over the CURRENTLY-installed
+            // plugins' extension union, so uninstalling/disabling a plugin
+            // between runs silently drops its files from the scan WITHOUT any
+            // walk error — `source_walk_skipped_entries` stays 0, so that gate
+            // cannot catch this scope shrinkage (L3). We therefore additionally
+            // bound the sweep to the files the scan actually examined this run
+            // (`scanned_files`, canonical-absolute — the form entities store):
+            // a finding survives unless its anchor entity's source file was
+            // re-examined.
             // Same lifecycle preservation + best-effort posture as above.
             if !resume && source_walk_skipped_entries == 0 {
                 let rule_ids: Vec<String> = crate::secret_scan::per_run_swept_rule_ids()
                     .iter()
                     .map(|&rule| rule.to_owned())
                     .collect();
+                let examined_source_files: Vec<String> = scanned_files
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect();
                 match writer
                     .send_wait(|ack| WriterCmd::SweepStaleFindingsForRules {
                         current_run_id: run_id.clone(),
                         rule_ids,
+                        examined_source_files,
                         ack,
                     })
                     .await

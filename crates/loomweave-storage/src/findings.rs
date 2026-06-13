@@ -65,6 +65,18 @@ pub fn sweep_stale_findings(conn: &Connection, current_run_id: &str) -> Result<u
 /// (weft-7256739b31 / dogfood-4 B10: stale secret findings accumulated across
 /// incremental re-analyses). Same lifecycle preservation as the general sweep.
 ///
+/// `examined_source_files` bounds the sweep to files the producer actually
+/// re-examined this run (L3). The "full pass" is full only over the
+/// CURRENTLY-installed plugins' extension union, so uninstalling/disabling a
+/// plugin between runs silently drops its files from the scan with no walk
+/// error — and the caller's `source_walk_skipped_entries == 0` gate cannot see
+/// that scope shrinkage. Without this bound a vanished-from-scope file's
+/// still-valid finding would be retired as "looked, clean" when it was never
+/// looked at again. A finding is retired only when its anchor entity's
+/// `source_file_path` is in this set (canonical-absolute strings, the form
+/// entities store). An empty set retires nothing — the conservative default
+/// when no file was examined.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::StorageError::Sqlite`] if the statement fails.
@@ -72,23 +84,34 @@ pub fn sweep_stale_findings_for_rules(
     conn: &Connection,
     current_run_id: &str,
     rule_ids: &[&str],
+    examined_source_files: &[&str],
 ) -> Result<usize> {
-    if rule_ids.is_empty() {
+    if rule_ids.is_empty() || examined_source_files.is_empty() {
         return Ok(0);
     }
-    let placeholders = std::iter::repeat_n("?", rule_ids.len())
+    let rule_placeholders = std::iter::repeat_n("?", rule_ids.len())
         .collect::<Vec<_>>()
         .join(", ");
+    let file_placeholders = std::iter::repeat_n("?", examined_source_files.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Retire a stale secret finding only when its anchor entity's source file
+    // was among those re-examined this run (L3 scope-shrinkage guard).
     let sql = format!(
         "DELETE FROM findings \
          WHERE status = 'open' \
            AND filigree_issue_id IS NULL \
            AND run_id <> ? \
-           AND rule_id IN ({placeholders})"
+           AND rule_id IN ({rule_placeholders}) \
+           AND entity_id IN ( \
+               SELECT id FROM entities \
+               WHERE source_file_path IN ({file_placeholders}) \
+           )"
     );
     let mut stmt = conn.prepare(&sql)?;
     let params = std::iter::once(current_run_id)
         .chain(rule_ids.iter().copied())
+        .chain(examined_source_files.iter().copied())
         .collect::<Vec<_>>();
     let deleted = stmt.execute(rusqlite::params_from_iter(params))?;
     Ok(deleted)
@@ -316,6 +339,8 @@ mod tests {
                 "LMWV-SEC-SECRET-DETECTED",
                 "LMWV-INFRA-SECRET-BASELINE-MATCH",
             ],
+            // The single seeded entity's file was re-examined this run.
+            &["/x.py"],
         )
         .unwrap();
         assert_eq!(deleted, 1);
@@ -323,6 +348,75 @@ mod tests {
             ids(&conn),
             ["core:finding:other-stale", "core:finding:secret-fresh"]
         );
+    }
+
+    #[test]
+    fn rule_scoped_sweep_preserves_findings_whose_file_was_not_re_examined() {
+        // L3 scope-shrinkage guard: a plugin uninstalled between runs drops its
+        // files from the scan with no walk error. A stale secret finding on such
+        // a file ("never looked again") must survive — only findings whose
+        // anchor file WAS re-examined this run may be retired.
+        let conn = migrated_conn();
+        // Second entity, anchored to a file that is NOT in this run's scan scope
+        // (e.g. owned by an uninstalled plugin's extension).
+        conn.execute(
+            "INSERT INTO entities \
+             (id, plugin_id, kind, name, short_name, source_file_path, properties, \
+              content_hash, created_at, updated_at) \
+             VALUES ('rust:module:y', 'rust', 'module', 'y', 'y', '/y.rs', \
+                     '{}', 'h', 't', 't')",
+            [],
+        )
+        .unwrap();
+        // Both findings are stale (run-1) secret rows.
+        insert_finding_with_rule(
+            &conn,
+            "core:finding:examined",
+            "run-1",
+            "LMWV-SEC-SECRET-DETECTED",
+        );
+        // Re-point the second finding to the out-of-scope entity.
+        insert_finding_with_rule(
+            &conn,
+            "core:finding:unexamined",
+            "run-1",
+            "LMWV-SEC-SECRET-DETECTED",
+        );
+        conn.execute(
+            "UPDATE findings SET entity_id = 'rust:module:y' \
+             WHERE id = 'core:finding:unexamined'",
+            [],
+        )
+        .unwrap();
+
+        // This run examined only /x.py (the .rs scope shrank away).
+        let deleted = sweep_stale_findings_for_rules(
+            &conn,
+            "run-2",
+            &["LMWV-SEC-SECRET-DETECTED"],
+            &["/x.py"],
+        )
+        .unwrap();
+        assert_eq!(deleted, 1, "only the re-examined file's stale finding is retired");
+        assert_eq!(
+            ids(&conn),
+            ["core:finding:unexamined"],
+            "the un-examined file's finding survives (never looked again ≠ looked, clean)"
+        );
+    }
+
+    #[test]
+    fn rule_scoped_sweep_with_no_examined_files_is_a_no_op() {
+        // The conservative default: if the scan examined nothing, retire nothing
+        // (an empty examined set must never sweep the whole rule family).
+        let conn = migrated_conn();
+        insert_finding_with_rule(&conn, "core:finding:x", "run-1", "LMWV-SEC-SECRET-DETECTED");
+        assert_eq!(
+            sweep_stale_findings_for_rules(&conn, "run-2", &["LMWV-SEC-SECRET-DETECTED"], &[])
+                .unwrap(),
+            0
+        );
+        assert_eq!(ids(&conn), ["core:finding:x"]);
     }
 
     #[test]
@@ -343,8 +437,13 @@ mod tests {
             [],
         )
         .unwrap();
-        let deleted =
-            sweep_stale_findings_for_rules(&conn, "run-2", &["LMWV-SEC-SECRET-DETECTED"]).unwrap();
+        let deleted = sweep_stale_findings_for_rules(
+            &conn,
+            "run-2",
+            &["LMWV-SEC-SECRET-DETECTED"],
+            &["/x.py"],
+        )
+        .unwrap();
         assert_eq!(deleted, 0);
         assert_eq!(ids(&conn), ["core:finding:linked"]);
     }
@@ -354,7 +453,7 @@ mod tests {
         let conn = migrated_conn();
         insert_finding_with_rule(&conn, "core:finding:x", "run-1", "LMWV-SEC-SECRET-DETECTED");
         assert_eq!(
-            sweep_stale_findings_for_rules(&conn, "run-2", &[]).unwrap(),
+            sweep_stale_findings_for_rules(&conn, "run-2", &[], &["/x.py"]).unwrap(),
             0
         );
     }
