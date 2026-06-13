@@ -107,9 +107,20 @@ pub(crate) fn gather_git_facts(project_root: &Path) -> GitFacts {
             .filter(|s| !s.is_empty())
     };
 
-    let head_commit = run(&["rev-parse", "HEAD"]);
-    // `%cI` is strict ISO-8601 (RFC3339) with the committer's UTC offset.
-    let head_committed_at = run(&["log", "-1", "--format=%cI", "HEAD"]);
+    // Fetch HEAD's commit id AND committer date in ONE subprocess (L8): a single
+    // `git log -1` emitting `%H` then `%cI` on two lines, instead of a separate
+    // `rev-parse HEAD` plus `log -1 --format=%cI`. `%cI` is strict ISO-8601
+    // (RFC3339) with the committer's UTC offset. Saves one process spawn on
+    // every freshness read (project_snapshot + index_diff_get both call this).
+    let (head_commit, head_committed_at) = match run(&["log", "-1", "--format=%H%n%cI", "HEAD"]) {
+        Some(out) => {
+            let mut lines = out.lines();
+            let commit = lines.next().map(str::to_owned).filter(|s| !s.is_empty());
+            let committed_at = lines.next().map(str::to_owned).filter(|s| !s.is_empty());
+            (commit, committed_at)
+        }
+        None => (None, None),
+    };
     // Dirty signal via `git diff --cached` (STAGED changes, index vs HEAD), NOT
     // `git status` (clarion-4b5a8aff54): `git status` must hash working-tree
     // content to report unstaged modifications, which executes a repo-controlled
@@ -1241,6 +1252,53 @@ mod tests {
             facts.dirty.iter().any(|e| e.rel_path == "authn.py"),
             "dirty reporting must still work; got {:?}",
             facts.dirty.iter().map(|e| &e.rel_path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn gather_git_facts_reads_head_commit_and_date_in_one_call() {
+        // L8: HEAD commit id and committer date come from a SINGLE `git log -1`
+        // (`%H%n%cI`) rather than separate `rev-parse` + `log` spawns. Assert
+        // both fields are still parsed correctly from the combined output.
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let run_git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?} failed");
+            out
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.email", "t@t"]);
+        run_git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.py"), "x = 1\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-qm", "init"]);
+
+        let expected_head = String::from_utf8_lossy(&run_git(&["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_owned();
+
+        let facts = gather_git_facts(&repo);
+        assert_eq!(
+            facts.head_commit.as_deref(),
+            Some(expected_head.as_str()),
+            "combined call must still yield the HEAD commit id"
+        );
+        let date = facts
+            .head_committed_at
+            .as_deref()
+            .expect("combined call must still yield the committer date");
+        // A strict ISO-8601 / RFC3339 timestamp parses via the same helper the
+        // freshness oracle uses.
+        assert!(
+            parse_rfc3339(date).is_some(),
+            "committer date must be RFC3339: {date:?}"
         );
     }
 }
