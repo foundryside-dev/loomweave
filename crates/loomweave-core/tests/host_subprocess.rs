@@ -115,7 +115,7 @@ fn staged_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
 /// the same saturated process). Production `PluginHost::spawn` is unchanged;
 /// this wrapper only absorbs that staging race so the suite is deterministic.
 fn spawn_staged_with_retry(
-    manifest: loomweave_core::plugin::Manifest,
+    manifest: &loomweave_core::plugin::Manifest,
     project_root: &std::path::Path,
     exec: &std::path::Path,
 ) -> Result<(SubprocessHost, std::process::Child), loomweave_core::HostError> {
@@ -205,7 +205,7 @@ fn t1_subprocess_happy_path() {
     //    basename check passes.
     let (_fixture_stage, exec) = staged_fixture();
     let (mut host, mut child) =
-        spawn_staged_with_retry(manifest, project_dir.path(), &exec).expect("spawn must succeed");
+        spawn_staged_with_retry(&manifest, project_dir.path(), &exec).expect("spawn must succeed");
 
     // 5. Analyze the fixture file.
     let outcome = host
@@ -457,7 +457,7 @@ fn t9b_stderr_tail_is_some_after_spawn() {
 
     let (_fixture_stage, exec) = staged_fixture();
     let (mut host, mut child) =
-        spawn_staged_with_retry(manifest, project_dir.path(), &exec).expect("spawn must succeed");
+        spawn_staged_with_retry(&manifest, project_dir.path(), &exec).expect("spawn must succeed");
 
     // The tail must be Some — drain thread is wired. Content may vary
     // (the fixture doesn't write to stderr on success paths, so empty

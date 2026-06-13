@@ -1022,7 +1022,7 @@ pub fn preferred_finding_anchor_by_file(conn: &Connection) -> Result<HashMap<Str
 /// is the ground-truth companion to [`preferred_finding_anchor_by_file`]: where
 /// that helper *re-derives* the anchor with a module/plugin/core ranking
 /// heuristic that must stay byte-for-byte in lockstep with the in-run
-/// `remember_finding_anchors` registration, this reads the entity_id the prior
+/// `remember_finding_anchors` registration, this reads the `entity_id` the prior
 /// run actually keyed its finding to. The two diverge when a source file owns
 /// two same-rank candidates (Rust inline `mod` blocks: the file module and an
 /// inline submodule share one `source_file_path`, both rank 0) — the heuristic
