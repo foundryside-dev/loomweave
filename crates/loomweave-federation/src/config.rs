@@ -1026,7 +1026,17 @@ fn child_mapping_mut<'a>(
     key: &str,
 ) -> Result<&'a mut serde_norway::Mapping, ConfigError> {
     let key_value = serde_norway::Value::String(key.to_owned());
-    if !mapping.contains_key(&key_value) {
+    // Treat an ABSENT key and a present-but-NULL sub-block identically: both are
+    // populated with a fresh empty mapping (L7). A bare `semantic_search:` with
+    // nothing indented parses as YAML-null, not a mapping — `contains_key` is
+    // true, so without this the `as_mapping_mut` below would fail and
+    // `config set --enable` would be a recovery dead-end (it errors and writes
+    // nothing). YAML-null is the empty mapping for our edit purposes.
+    let needs_init = match mapping.get(&key_value) {
+        None | Some(serde_norway::Value::Null) => true,
+        Some(_) => false,
+    };
+    if needs_init {
         mapping.insert(
             key_value.clone(),
             serde_norway::Value::Mapping(serde_norway::Mapping::new()),
@@ -1574,6 +1584,38 @@ semantic_search:
                 .contains("LMWV-CONFIG-SEMANTIC-NON-LOOPBACK"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn semantic_enable_populates_a_present_but_null_sub_block() {
+        // L7 recovery dead-end: a bare `semantic_search:` with nothing indented
+        // parses as YAML-null, not a mapping. `config semantic set --enable`
+        // must populate it (treat null as an empty mapping), not error and write
+        // nothing.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("loomweave.yaml");
+        fs::write(&path, "version: 1\nsemantic_search:\n").expect("seed config");
+
+        let result = update_semantic_config_file(
+            &path,
+            &SemanticConfigPatch {
+                enabled: Some(true),
+                provider: Some(SemanticProviderKind::LocalOpenAi),
+                endpoint_url: Some("http://127.0.0.1:11434/v1".to_owned()),
+                ..SemanticConfigPatch::default()
+            },
+        )
+        .expect("enabling a null semantic_search sub-block must populate it, not error");
+        assert!(result.config.semantic_search.enabled);
+        assert_eq!(
+            result.config.semantic_search.endpoint_url,
+            "http://127.0.0.1:11434/v1"
+        );
+
+        // And the change is actually persisted (not a silent no-op write).
+        let written = fs::read_to_string(&path).expect("re-read config");
+        let reloaded = McpConfig::from_yaml_str(&written).expect("reload written config");
+        assert!(reloaded.semantic_search.enabled);
     }
 
     #[test]
