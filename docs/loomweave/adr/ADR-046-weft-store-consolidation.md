@@ -58,13 +58,14 @@ Two adjacent decisions ride along:
   default. Unknown top-level tables (a sibling's section) and unknown keys in
   `[loomweave]` are ignored, so the file stays forward-compatible.
 
-The directory's contents and git-tracking posture are **unchanged** from ADR-005
-— only the parent path moves. `loomweave.db`, `config.json`, and `.gitignore`
-remain committed; the WAL sidecars, shadow DB, `embeddings.db`, `ephemeral.port`,
-`instance_id`, `*.lock`, `tmp/`, `logs/`, and `runs/*/log.jsonl` remain ignored
-by `<root>/.weft/loomweave/.gitignore`. `loomweave.yaml` stays at the project
-root (Loomweave's authoritative config; `weft.toml` is enrich-only and never
-load-bearing — the §5 deletion test still holds).
+The directory's contents and git-tracking posture inherit ADR-005's amended
+state — only the parent path moves. `.gitignore` and durable per-run provenance
+remain tracked; `loomweave.db`, the WAL sidecars, shadow DB, `embeddings.db`,
+`ephemeral.port`, `instance_id`, `*.lock`, `tmp/`, `logs/`, and
+`runs/*/log.jsonl` remain ignored by `<root>/.weft/loomweave/.gitignore`.
+`loomweave.yaml` stays at the project root (Loomweave's authoritative config;
+`weft.toml` is enrich-only and never load-bearing — the §5 deletion test still
+holds). The old `.weft/loomweave/config.json` stub is no longer written.
 
 ### Amendments to prior ADRs
 

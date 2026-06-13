@@ -1,7 +1,8 @@
 # ADR-005: `.loomweave/` Directory Git-Tracking Policy
 
 **Status**: Accepted; amended by ADR-041, ADR-046; **`loomweave.db` tracking
-reversed by C1 (weft-d822a7de2d), 2026-06-08**
+reversed by C1 (weft-d822a7de2d), 2026-06-08; `config.json` stub removed by
+C-11(a) (weft-da23c1f6bd), 2026-06-13**
 
 > **C1 reversal (weft-d822a7de2d), 2026-06-08:** `loomweave.db` is **no longer
 > committed by default — it is `.gitignore`d.** The original decision (below)
@@ -15,13 +16,18 @@ reversed by C1 (weft-d822a7de2d), 2026-06-08**
 > team becomes a future **opt-in** (`storage.commit_db: true`, the inverse of the
 > old opt-out), not the default. The `GITIGNORE_CONTENTS` template in
 > `crates/loomweave-cli/src/install.rs` remains the source of truth and now lists
-> `loomweave.db`. The rest of the tracked/excluded split is unchanged. Sections
-> below are kept for the historical decision and read with this reversal applied.
+> `loomweave.db`. Sections below are kept for the historical decision and read
+> with this reversal applied.
 
 > **ADR-046 amendment:** the directory tracked by this policy moved from
 > `.loomweave/` to `.weft/loomweave/` (Weft store consolidation, clean break).
 > The tracked-vs-ignored split below is unchanged — only the parent path. Read
 > every `.loomweave/` path below as `.weft/loomweave/`.
+>
+> **C-11(a) amendment (weft-da23c1f6bd), 2026-06-13:** `loomweave install` no
+> longer writes `.weft/loomweave/config.json`. The old
+> `{schema_version,last_run_id}` stub had no live reader; schema state lives in
+> SQLite, and run metadata lives under `runs/`.
 
 **Date**: 2026-04-18
 **Deciders**: qacona@gmail.com
@@ -32,13 +38,13 @@ in `docs/implementation/sprint-1/wp1-scaffold.md §UQ-WP1-04`.
 
 ## Summary
 
-`.loomweave/config.json` is committed. `.loomweave/loomweave.db` is **`.gitignore`d**
-(C1 reversal — a regenerable cache that would otherwise dirty the tree on every
-run). WAL sidecars, the shadow-DB intermediate, `tmp/`, `logs/`, and per-run raw
-LLM request/response logs (`runs/*/log.jsonl`) are `.gitignore`d. `loomweave.yaml`
-lives at the project root and is tracked under the user's existing repo-root
-`.gitignore`, not under `.loomweave/.gitignore` (it's a user-edited config, not
-analysis state).
+`.loomweave/loomweave.db` is **`.gitignore`d** (C1 reversal — a regenerable
+cache that would otherwise dirty the tree on every run). WAL sidecars, the
+shadow-DB intermediate, `tmp/`, `logs/`, and per-run raw LLM request/response
+logs (`runs/*/log.jsonl`) are `.gitignore`d. `loomweave.yaml` lives at the
+project root and is tracked under the user's existing repo-root `.gitignore`,
+not under `.loomweave/.gitignore` (it's a user-edited config, not analysis
+state). No `.loomweave/config.json` stub is written.
 
 ## Context
 
@@ -91,8 +97,6 @@ runs/*/log.jsonl
 - ~~`.loomweave/loomweave.db`~~ — **reversed by C1 (weft-d822a7de2d): now
   Excluded** (see below). The DB is a regenerable orientation cache, and tracking
   a file that mutates every run dirtied the tree and blocked legis signing.
-- `.loomweave/config.json` — small, human-readable internal state (schema
-  version, last run IDs).
 - `.loomweave/.gitignore` itself — this file.
 - `.loomweave/runs/<run_id>/config.yaml` — the snapshot of `loomweave.yaml` at run
   time. Material for provenance replay.
@@ -166,7 +170,8 @@ machine-local analysis only opted out via `storage.commit_db: false`.
 > graph regenerates from `loomweave analyze` with no LLM calls, and only the lazy
 > summary cache carries real cost. The decisive new factor (not in view at the
 > original decision) is that a committed, ever-mutating DB blocks legis signing.
-> `config.json` and the `runs/` provenance metadata remain tracked.
+> the `runs/` provenance metadata remains tracked; the old `config.json` stub
+> is no longer written.
 
 ### Alternative 3: commit the DB but use git-lfs by default
 

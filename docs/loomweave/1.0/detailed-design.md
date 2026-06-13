@@ -904,7 +904,6 @@ CREATE INDEX ix_sei_lineage_sei ON sei_lineage(sei);
 ```
 <project>/.weft/loomweave/
     loomweave.db              # main store (WAL files beside it)
-    config.json             # internal state: schema version, last run IDs
     loomweave.log             # structured log
     runs/
         <run_id>/
@@ -919,7 +918,7 @@ CREATE INDEX ix_sei_lineage_sei ON sei_lineage(sei);
     defaults.yaml           # default policy overrides
 ```
 
-> **Reversed by C1 (weft-d822a7de2d), 2026-06-08 — see [ADR-005](../adr/ADR-005-loomweave-dir-tracking.md).** `loomweave.db` is **no longer committed by default**; it is `.gitignore`d as a regenerable orientation cache (a committed, ever-mutating DB dirtied the tree and blocked legis signing). The committed-DB machinery described in the rest of this subsection (textual export, merge-helper, merge-driver registration, commit caveats) now applies **only** under the `storage.commit_db: true` opt-in, not the default. `config.json` and `runs/` provenance metadata remain tracked.
+> **Reversed by C1 (weft-d822a7de2d), 2026-06-08, and amended by C-11(a) (weft-da23c1f6bd), 2026-06-13 — see [ADR-005](../adr/ADR-005-loomweave-dir-tracking.md).** `loomweave.db` is **no longer committed by default**; it is `.gitignore`d as a regenerable orientation cache (a committed, ever-mutating DB dirtied the tree and blocked legis signing). The committed-DB machinery described in the rest of this subsection (textual export, merge-helper, merge-driver registration, commit caveats) now applies **only** under the `storage.commit_db: true` opt-in, not the default. The old `config.json` stub is no longer written; run provenance metadata remains tracked.
 
 `.weft/loomweave/` is checked into git (consistent with Filigree's pattern and with the "shared analysis state" principle). SQLite files can diff poorly, so v0.1 ships **two features** for multi-developer teams to handle the committed DB:
 
@@ -953,7 +952,7 @@ With the driver registered, conflicting runs from two developers produce a deter
 - Migrations as numbered files embedded in the binary (`refinery` or similar).
 - Applied on every `loomweave analyze` / `loomweave serve` startup.
 - Never drop data without explicit `loomweave db migrate --destructive`.
-- Schema version recorded in `config.json` and a `_schema_version` table.
+- Schema version recorded in the database schema metadata.
 
 ### What the store does NOT hold
 

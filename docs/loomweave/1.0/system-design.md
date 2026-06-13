@@ -449,7 +449,6 @@ checkpoint.
 ```
 <project>/.weft/loomweave/
     loomweave.db              # main store (plus WAL files beside it)
-    config.json             # schema version, last run IDs
     loomweave.log             # process log
     runs/<run_id>/          # per-run artefacts (config snapshot, log.jsonl, stats.json, partial.json)
     .gitignore              # default-excludes runs/*/log.jsonl

@@ -56,8 +56,8 @@ pub const WEFT_TOML: &str = "weft.toml";
 
 /// `<project_root>/.weft/loomweave/` — Loomweave's exclusively-owned store dir.
 ///
-/// Holds the committed analysis state (`loomweave.db`, `config.json`,
-/// `.gitignore`, per-run metadata) and the git-ignored runtime sidecars
+/// Holds the member-owned marker/template files (`.gitignore`, per-run
+/// metadata) and the git-ignored runtime sidecars
 /// (`embeddings.db`, `ephemeral.port`, `instance_id`, `*.lock`, WAL files).
 ///
 /// Honors a `[loomweave].store_dir` override in `weft.toml` when present (a
