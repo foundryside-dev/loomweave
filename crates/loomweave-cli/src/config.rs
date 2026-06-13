@@ -297,22 +297,29 @@ fn print_semantic_edit_result(project_root: &Path, result: &SemanticConfigEditRe
 /// Print the annotated default `loomweave.yaml`, optionally pre-selecting the
 /// active LLM provider block.
 fn run_example(provider: Option<&str>) -> Result<()> {
+    // Route `--provider` through the SAME `LlmProviderKind::parse` the YAML/serde
+    // path and the MCP schema use (L9), so every alias they accept
+    // (open_router / codex / claude_code / recording / …) is accepted here too
+    // instead of a hand-maintained closed set that silently drifted out of sync.
     let yaml = match provider {
-        None | Some("openrouter" | "openrouter_api") => LOOMWEAVE_YAML_STUB.to_owned(),
-        Some(provider @ ("codex_cli" | "codex_sidecar" | "claude_cli" | "claude_sidecar")) => {
+        None => LOOMWEAVE_YAML_STUB.to_owned(),
+        Some(value) => {
+            let kind = LlmProviderKind::parse(value).map_err(|err| {
+                anyhow::anyhow!(
+                    "unknown --provider {value:?}: {err}; accepted values match \
+                     `llm_policy.provider` (openrouter, codex_cli, claude_cli, recording, \
+                     and their aliases)"
+                )
+            })?;
             // The stub already carries every provider sub-block, so selecting a
-            // provider is just swapping the active `provider:` line.
-            let p = match provider {
-                "codex_sidecar" => "codex_cli",
-                "claude_sidecar" => "claude_cli",
-                other => other,
-            };
-            LOOMWEAVE_YAML_STUB.replacen("  provider: openrouter", &format!("  provider: {p}"), 1)
+            // provider is just swapping the active `provider:` line to the
+            // canonical spelling for the parsed kind.
+            LOOMWEAVE_YAML_STUB.replacen(
+                "  provider: openrouter",
+                &format!("  provider: {}", kind.as_str()),
+                1,
+            )
         }
-        Some(other) => bail!(
-            "unknown --provider {other:?}; expected one of: openrouter, openrouter_api, \
-             codex_cli, codex_sidecar, claude_cli, claude_sidecar"
-        ),
     };
     print!("{yaml}");
     Ok(())

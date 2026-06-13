@@ -76,6 +76,29 @@ fn config_example_accepts_sidecar_provider_aliases() {
 }
 
 #[test]
+fn config_example_accepts_every_llm_provider_parse_alias() {
+    // L9: `--provider` routes through the same `LlmProviderKind::parse` the
+    // YAML/serde path and the MCP schema accept, so the aliases the old
+    // hand-maintained set rejected (open_router / codex / claude_code /
+    // recording) are now accepted and normalised to their canonical line.
+    let cases = [
+        ("open_router", "openrouter"),
+        ("codex", "codex_cli"),
+        ("claude_code", "claude_cli"),
+        ("recording", "recording"),
+    ];
+
+    for (alias, canonical) in cases {
+        let (code, stdout, stderr) = config(Path::new("."), &["example", "--provider", alias]);
+        assert_eq!(code, 0, "alias {alias} should be accepted; stderr: {stderr}");
+        assert!(
+            stdout.contains(&format!("\n  provider: {canonical}")),
+            "alias {alias} should select canonical provider {canonical}. stub: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn config_example_rejects_unknown_provider() {
     let (code, _, stderr) = config(Path::new("."), &["example", "--provider", "bogus"]);
     assert_ne!(code, 0);
