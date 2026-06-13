@@ -48,6 +48,9 @@ fn state_for_filigree(
 struct WardlineFindingClient {
     findings_by_path: Mutex<HashMap<String, Vec<WardlineFinding>>>,
     path_calls: Mutex<Vec<String>>,
+    // When set, `wardline_findings_for_path` returns a transport error (503),
+    // modelling a Filigree outage / paginated-hop truncation (L4).
+    fail: bool,
 }
 
 impl WardlineFindingClient {
@@ -57,6 +60,13 @@ impl WardlineFindingClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(path.to_owned(), findings);
         self
+    }
+
+    fn failing() -> Self {
+        Self {
+            fail: true,
+            ..Self::default()
+        }
     }
 
     fn path_calls(&self) -> Vec<String> {
@@ -85,6 +95,12 @@ impl FiligreeLookup for WardlineFindingClient {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(path.to_owned());
+        if self.fail {
+            return Err(FiligreeClientError::HttpStatus {
+                status: 503,
+                body: "down".to_owned(),
+            });
+        }
         Ok(self
             .findings_by_path
             .lock()
@@ -1264,6 +1280,55 @@ async fn find_by_wardline_has_findings_uses_filigree_wardline_enrichment() {
         client.path_calls(),
         vec!["src/demo.py".to_owned(), "src/demo.py".to_owned()],
         "targeted lookup plus cached browse lookup should each resolve the project-relative path"
+    );
+}
+
+#[tokio::test]
+async fn find_by_wardline_has_findings_emits_degrade_marker_on_filigree_outage() {
+    // L4: during a Filigree outage the has_findings filter cannot evaluate the
+    // Filigree-only-finding entities (no local anchor row), so they are dropped.
+    // The response must carry an in-band `wardline` degrade marker rather than
+    // an affirmative "no entity matches" missing-signal — "couldn't check" must
+    // never be conflated with "confirmed none".
+    let (project, db, conn) = open_project();
+    std::fs::create_dir_all(project.path().join("src")).expect("create src dir");
+    std::fs::write(
+        project.path().join("src/demo.py"),
+        "def hello():\n    pass\n",
+    )
+    .expect("write source");
+    insert_entity(
+        &conn,
+        "python:function:demo.hello",
+        "function",
+        "src/demo.py",
+        Some((1, 2)),
+    );
+    insert_taint_fact(&conn, "python:function:demo.hello", r#"{"tier":"exact"}"#);
+    // No local findings row: the only path to a positive has_findings answer is
+    // the Filigree Wardline lookup — which is down.
+    drop(conn);
+
+    let client = Arc::new(WardlineFindingClient::failing());
+    let state = state_for_filigree(project.path(), &db, client.clone());
+
+    let listed = call_tool(
+        &state,
+        "entity_wardline_list",
+        json!({"has_findings": true}),
+    )
+    .await;
+    assert_eq!(listed["ok"], true, "{listed}");
+    // The entity was dropped (enrich-only: the outage never breaks the facet)...
+    assert_eq!(listed["result"]["page"]["total"], 0, "{listed}");
+    // ...but the result is explicitly marked degraded, NOT a confirmed empty.
+    assert_eq!(
+        listed["result"]["wardline"]["result_kind"], "unavailable",
+        "a Filigree outage must surface an in-band wardline degrade marker: {listed}"
+    );
+    assert!(
+        listed["result"]["signal"].is_null(),
+        "the affirmative 'no entity matches' missing-signal must NOT appear on a degraded read: {listed}"
     );
 }
 

@@ -223,6 +223,10 @@ impl ServerState {
                         }
                     })
                     .collect();
+                // Set when a Wardline lookup needed by the `has_findings` filter
+                // failed (Filigree outage / paginated-hop truncation), so the
+                // result is "couldn't fully check", not "confirmed none" (L4).
+                let mut wardline_degraded = false;
                 if has_findings {
                     let mut wardline_cache = HashMap::new();
                     matched.retain(|(entity, _)| {
@@ -232,6 +236,7 @@ impl ServerState {
                             filigree_client.as_ref(),
                             &project_root,
                             &mut wardline_cache,
+                            &mut wardline_degraded,
                         )
                     });
                 }
@@ -276,7 +281,15 @@ impl ServerState {
                     "scope_truncated": filter.scope_truncated(),
                     "scan_truncated": scan_truncated,
                 });
-                if total == 0 {
+                // L4: when a Wardline lookup failed, the `has_findings` filter
+                // could not fully evaluate — Filigree-only-finding entities may
+                // have been dropped. Attach an in-band degrade marker (symmetric
+                // with the single-entity `wardline_section_for_entity` path and
+                // the issues_for `issue_detail_unavailable` marker) so a short or
+                // empty result is never read as a confirmed "no entity matches".
+                if wardline_degraded {
+                    attach_wardline_degraded(&mut response);
+                } else if total == 0 {
                     attach_signal(
                         &mut response,
                         missing_signal(
@@ -304,12 +317,21 @@ fn local_finding_anchor_ids(conn: &rusqlite::Connection) -> rusqlite::Result<Has
     Ok(set)
 }
 
+/// Does this entity carry a finding? A local finding-anchor row is definitive
+/// (`true`); otherwise the Filigree-side Wardline lookup decides. `degraded` is
+/// set to `true` whenever a needed Wardline lookup FAILED (transport/auth/
+/// paginated-hop truncation) so a `false` cannot be read as "confirmed none"
+/// (L4). On a lookup failure the entity is dropped from the `has_findings`
+/// result (enrich-only — a Filigree outage never breaks the core facet), but
+/// the caller attaches an in-band `wardline_unavailable` degrade marker so the
+/// empty/short result is never mistaken for an affirmative "no entity matches".
 fn entity_has_finding(
     entity: &EntityRow,
     local_finding_anchor_ids: Option<&HashSet<String>>,
     client: Option<&std::sync::Arc<dyn crate::filigree::FiligreeLookup>>,
     project_root: &std::path::Path,
     wardline_cache: &mut HashMap<String, Option<Vec<crate::filigree::WardlineFinding>>>,
+    degraded: &mut bool,
 ) -> bool {
     if local_finding_anchor_ids.is_some_and(|ids| ids.contains(&entity.id)) {
         return true;
@@ -326,6 +348,14 @@ fn entity_has_finding(
     let findings = wardline_cache
         .entry(path.clone())
         .or_insert_with(|| client.wardline_findings_for_path(&path).ok());
+    // `wardline_findings_for_path` returns Err on transport/auth failure AND, by
+    // design, on a paginated-hop truncation — both land here as `None`. Record
+    // the degrade so the caller can mark the response (instead of silently
+    // dropping the entity and claiming a confirmed-empty result).
+    if findings.is_none() {
+        *degraded = true;
+        return false;
+    }
     findings.as_ref().is_some_and(|findings| {
         !crate::wardline_reconcile::reconcile_for_entity(&entity.id, findings.clone())
             .matched
@@ -344,6 +374,27 @@ fn attach_facet(response: &mut Value, facet: Value) {
 fn attach_signal(response: &mut Value, signal: Value) {
     if let Some(object) = response.as_object_mut() {
         object.insert("signal".to_owned(), signal);
+    }
+}
+
+/// Attach the in-band Wardline-degrade marker to a faceted response (L4). Used
+/// when the `has_findings` filter could not reach Filigree to evaluate one or
+/// more candidates, so the result is "couldn't fully check", not "confirmed
+/// none". Mirrors the single-entity path's `wardline_unavailable` shape
+/// (`result_kind: "unavailable"`) and is mutually exclusive with the affirmative
+/// missing-signal a true confirmed-empty result carries.
+fn attach_wardline_degraded(response: &mut Value) {
+    if let Some(object) = response.as_object_mut() {
+        object.insert(
+            "wardline".to_owned(),
+            json!({
+                "result_kind": "unavailable",
+                "reason": "wardline_unavailable: one or more Filigree Wardline lookups failed \
+                           (transport/auth error or paginated-hop truncation); has_findings could \
+                           not be fully evaluated, so Filigree-only-finding entities may be missing \
+                           from this result — this is NOT a confirmed empty match",
+            }),
+        );
     }
 }
 
