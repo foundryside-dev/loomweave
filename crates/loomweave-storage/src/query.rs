@@ -1017,6 +1017,57 @@ pub fn preferred_finding_anchor_by_file(conn: &Connection) -> Result<HashMap<Str
     Ok(best.into_iter().map(|(path, (_, id))| (path, id)).collect())
 }
 
+/// The actual secret-finding anchor entity per source file, read straight from
+/// the persisted `findings` rows (weft-4165f1ed71, L1 regression repair). This
+/// is the ground-truth companion to [`preferred_finding_anchor_by_file`]: where
+/// that helper *re-derives* the anchor with a module/plugin/core ranking
+/// heuristic that must stay byte-for-byte in lockstep with the in-run
+/// `remember_finding_anchors` registration, this reads the entity_id the prior
+/// run actually keyed its finding to. The two diverge when a source file owns
+/// two same-rank candidates (Rust inline `mod` blocks: the file module and an
+/// inline submodule share one `source_file_path`, both rank 0) — the heuristic
+/// breaks ties on smallest-id while `remember_finding_anchors` breaks them on
+/// emission order, so the re-derived anchor (and the anchor-keyed finding id)
+/// flips on the first incremental skip and mints the exact duplicate row the
+/// fix targets. Reading the stored row removes the lockstep requirement
+/// entirely. Returns `{ source_file_path -> entity_id }` keyed by the anchor
+/// entity's own `source_file_path` (the secret scan anchors a finding to an
+/// entity whose source file is the scanned file).
+///
+/// Only the secret-scan rule (`LMWV-SEC-SECRET-DETECTED`) is consulted: that is
+/// the only finding family the pre-ingest scan re-anchors on a skip. A file with
+/// no prior secret finding row is simply absent here — there is nothing to
+/// duplicate, so the caller falls back to the heuristic for first-time anchors.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Sqlite`] if the query fails.
+pub fn stored_secret_finding_anchor_by_file(conn: &Connection) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT e.source_file_path, f.entity_id \
+         FROM findings f \
+         JOIN entities e ON e.id = f.entity_id \
+         WHERE f.rule_id = ?1 AND e.source_file_path IS NOT NULL",
+    )?;
+    let rows = stmt.query_map(params!["LMWV-SEC-SECRET-DETECTED"], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut out: HashMap<String, String> = HashMap::new();
+    for row in rows {
+        let (path, entity_id) = row.map_err(StorageError::from)?;
+        // A file should have a single secret-finding anchor (all that file's
+        // findings share it). If a legacy DB somehow holds two, keep the
+        // smaller id deterministically so the result never depends on row order.
+        match out.get(&path) {
+            Some(held) if held.as_str() <= entity_id.as_str() => {}
+            _ => {
+                out.insert(path, entity_id);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The distinct categorisation tags this index actually holds, ordered. The
 /// truth source for the tag facets' honest-empty hint (weft-7256739b31): an
 /// empty-tag response derives its "what IS here" message from this list

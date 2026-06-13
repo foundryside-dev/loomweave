@@ -628,8 +628,22 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                         loomweave_storage::previously_analyzed_files(&conn).unwrap_or_default();
                     let locs = loomweave_storage::prior_locators_by_file(&conn).unwrap_or_default();
                     let snapshot = loomweave_storage::load_prior_index(&conn).unwrap_or_default();
-                    let anchors = loomweave_storage::preferred_finding_anchor_by_file(&conn)
-                        .unwrap_or_default();
+                    // Anchor continuity for a skipped secret-bearing file
+                    // (weft-4165f1ed71). Read the entity_id the prior run ACTUALLY
+                    // keyed its secret finding to (L1: ground truth from the
+                    // `findings` rows), and only fall back to the module/plugin/core
+                    // re-derivation heuristic for files with no prior secret finding
+                    // (first-time anchors, which cannot duplicate). The heuristic
+                    // diverges from the in-run `remember_finding_anchors` tie-break on
+                    // same-rank candidates (Rust inline `mod` blocks), which would
+                    // flip the anchor-keyed finding id and mint a duplicate row.
+                    let mut anchors =
+                        loomweave_storage::preferred_finding_anchor_by_file(&conn)
+                            .unwrap_or_default();
+                    anchors.extend(
+                        loomweave_storage::stored_secret_finding_anchor_by_file(&conn)
+                            .unwrap_or_default(),
+                    );
                     (files, locs, snapshot, anchors)
                 }
                 Err(err) => {

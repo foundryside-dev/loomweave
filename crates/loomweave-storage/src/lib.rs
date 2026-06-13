@@ -62,7 +62,8 @@ pub use query::{
     known_entity_kinds, known_entity_tags, live_unresolved_call_sites_exist,
     module_dependency_edges, module_reference_rollup, normalize_source_path,
     preferred_finding_anchor_by_file, reference_edges_for_entity, relation_edges_for_entity,
-    resolve_entity_ref, resolve_file, resolve_file_catalog_entry, subsystem_for_member,
+    resolve_entity_ref, resolve_file, resolve_file_catalog_entry,
+    stored_secret_finding_anchor_by_file, subsystem_for_member,
     subsystem_members, subsystem_of_entity, subsystem_total, unresolved_call_sites_for_caller,
     unresolved_caller_count_for_target, unresolved_callers_for_target,
 };

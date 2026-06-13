@@ -10,8 +10,9 @@ use loomweave_storage::{
     entity_by_id, entity_total, find_entities, findings_for_emit, module_dependency_edges,
     module_reference_rollup, normalize_source_path, pragma, reference_edges_for_entity,
     relation_edges_for_entity, resolve_file, resolve_file_catalog_entry, schema,
-    subsystem_for_member, subsystem_members, subsystem_of_entity, subsystem_total,
-    unresolved_call_sites_for_caller, unresolved_callers_for_target,
+    preferred_finding_anchor_by_file, stored_secret_finding_anchor_by_file, subsystem_for_member,
+    subsystem_members, subsystem_of_entity, subsystem_total, unresolved_call_sites_for_caller,
+    unresolved_callers_for_target,
 };
 use rusqlite::{Connection, params};
 
@@ -2156,4 +2157,56 @@ fn graph_totals_count_all_entities_subsystems_and_edges() {
     assert_eq!(entity_total(&conn).expect("entity_total"), 3);
     assert_eq!(subsystem_total(&conn).expect("subsystem_total"), 1);
     assert_eq!(edge_total(&conn).expect("edge_total"), 2);
+}
+
+#[test]
+fn stored_secret_anchor_reads_the_actual_keyed_entity_not_the_heuristic() {
+    // L1 (weft-4165f1ed71): a file with two same-rank module candidates (a Rust
+    // inline `mod` block: the file module + an inline submodule share one
+    // source_file_path, both rank 0). The in-run `remember_finding_anchors`
+    // breaks the tie on EMISSION ORDER (last module wins), while the skip-path
+    // heuristic `preferred_finding_anchor_by_file` breaks it on SMALLEST ID. If
+    // the prior run anchored its secret finding to the larger-id module (because
+    // it was emitted last), the heuristic would re-derive the smaller-id module
+    // on the next incremental skip and flip the anchor-keyed finding id, minting
+    // a duplicate row. The stored-anchor reader returns the entity the prior run
+    // ACTUALLY keyed the finding to, removing the lockstep requirement.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let conn = open_fresh(&dir);
+
+    let file = "src/lib.rs";
+    // Two module entities for one file; ids chosen so the LAST-emitted (what
+    // remember_finding_anchors keeps) is NOT the smallest id (what the heuristic
+    // would pick). The prior run keyed its finding to the larger-id module.
+    insert_named_entity(&conn, "rust:module:a_outer", "module", file, "a_outer", Some(file));
+    insert_named_entity(&conn, "rust:module:z_inner", "module", file, "z_inner", Some(file));
+
+    // The heuristic would pick the smallest id (a_outer) — diverging from what
+    // the prior run stored.
+    let heuristic = preferred_finding_anchor_by_file(&conn).expect("heuristic");
+    assert_eq!(heuristic.get(file).map(String::as_str), Some("rust:module:a_outer"));
+
+    // The prior run anchored the secret finding to z_inner (emitted last).
+    insert_run(&conn, "run-1");
+    insert_finding(
+        &conn,
+        "core:finding:x",
+        "run-1",
+        "LMWV-SEC-SECRET-DETECTED",
+        "defect",
+        "ERROR",
+        "rust:module:z_inner",
+        "[]",
+    );
+
+    let stored = stored_secret_finding_anchor_by_file(&conn).expect("stored");
+    assert_eq!(
+        stored.get(file).map(String::as_str),
+        Some("rust:module:z_inner"),
+        "stored anchor must be the entity the prior run actually keyed, not the heuristic re-derivation",
+    );
+
+    // A file with no prior secret finding is simply absent — the caller falls
+    // back to the heuristic for first-time anchors (nothing to duplicate).
+    assert!(stored.get("src/clean.rs").is_none());
 }
