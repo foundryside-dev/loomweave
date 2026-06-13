@@ -524,10 +524,27 @@ pub(crate) fn compute_freshness(
     // Verdict: drift if any signal fired; stale_worktree if otherwise clean but
     // un-indexed untracked source exists; fresh if we could observe state and
     // nothing fired; unknown only when every observation channel was blind.
-    let could_observe = file_drift.statted > 0
+    //
+    // `untracked_source` is NOT an observation of the INDEX's own state (L5): it
+    // is the ls-files channel reporting un-indexed working-tree files, and says
+    // nothing about whether the indexed files themselves are verifiable. Counting
+    // it as sufficient observation let a wholly-unverifiable index — a git
+    // worktree where EVERY indexed file fails stat with a non-NotFound error
+    // (permission/IO), so `statted == 0`, with a clean `untracked_source ==
+    // Some(false)` — resolve to FRESH, which a signing/freshness gate keying on
+    // `staleness == fresh` would then trust. The index-state channels are the
+    // per-file stat scan (a successful stat, a NotFound-as-missing, or a
+    // skipped-non-file path each count as an observation) and the two git-time
+    // channels; a NotFound is an observation, but a non-NotFound stat error is
+    // blindness. When indexed files exist but the file channel observed NONE of
+    // them, the file channel is blind.
+    let file_channel_observed = file_drift.statted > 0
+        || !file_drift.missing.is_empty()
+        || file_drift.skipped_non_files > 0
+        || state.files.is_empty();
+    let could_observe = file_channel_observed
         || commit_mismatch.is_some()
-        || head_newer_than_analyze.is_some()
-        || untracked_source.is_some();
+        || head_newer_than_analyze.is_some();
     let overall = if state.analyzed_at.is_none() {
         FreshnessOverall::NeverAnalyzed
     } else if drift_signal {
@@ -708,6 +725,11 @@ pub(crate) fn build_report(
         "untracked_source": untracked_source,
         "file_stat_scan_truncated": stat_scan_truncated,
         "skipped_non_file_paths": skipped_non_files,
+        // Indexed files that failed stat with a NON-NotFound error
+        // (permission/IO): a blind channel, not an observation (L5). When this
+        // covers EVERY indexed file and no other channel saw anything, the
+        // verdict is `unknown`, never `fresh`.
+        "stat_failures": stat_failures,
         // Per-run aggregate plugin skip/drop counters; per-file failure lists
         // are not retained in v0.1 (wipe-and-rerun).
         "plugin_resolution": state.plugin_stats,
@@ -997,6 +1019,44 @@ mod tests {
             "a boolean gate must not read an unreflected working tree as clean: {report}"
         );
         assert_eq!(report["untracked_source"], true);
+    }
+
+    #[test]
+    fn all_stats_failing_non_notfound_is_unknown_not_fresh() {
+        // L5: a git worktree where every indexed file fails stat with a
+        // non-NotFound error (permission/IO) — modelled here as ENOTDIR by
+        // indexing a path UNDER a regular file. `statted == 0`, nothing is
+        // classified modified/missing, the git-time channels are blind, and the
+        // worktree is clean (`untracked_source == Some(false)`). The index's own
+        // state was wholly unobservable, so the verdict must be `unknown`, never
+        // `fresh` — a signing/freshness gate keying on `staleness == fresh` must
+        // not trust an index it could not verify.
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file; statting a child path of it yields ENOTDIR (a
+        // non-NotFound error), exactly the blind-but-present case.
+        std::fs::write(dir.path().join("blocker"), b"not a dir\n").unwrap();
+        let unstattable = dir
+            .path()
+            .join("blocker")
+            .join("inner.py")
+            .to_string_lossy()
+            .into_owned();
+        let state = state_with_file(&unstattable, 3, "2999-01-01T00:00:00.000Z");
+        let report = build_report(
+            dir.path(),
+            &state,
+            // No analyzed_commit on the state + no head_committed_at → both git
+            // time channels blind. (git_facts still sets head_commit, but
+            // commit_mismatch needs analyzed_commit too, which is None here.)
+            &git_facts(None, &[]),
+            Some(false),
+            DEFAULT_MAX_ENTRIES,
+        );
+        assert_eq!(
+            report["overall"], "unknown",
+            "an index whose files all fail to stat must not read as fresh: {report}"
+        );
+        assert_eq!(report["stat_failures"], 1, "{report}");
     }
 
     #[test]
