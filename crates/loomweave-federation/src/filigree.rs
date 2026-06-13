@@ -905,6 +905,24 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
+    fn canonical_entity_association_fixture_body(example_name: &str) -> serde_json::Value {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/federation/fixtures/filigree-entity-associations-response.json"
+        ))
+        .expect("parse canonical Filigree EntityAssociation fixture");
+        fixture
+            .get("examples")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|examples| {
+                examples.iter().find(|example| {
+                    example.get("name").and_then(serde_json::Value::as_str) == Some(example_name)
+                })
+            })
+            .and_then(|example| example.pointer("/response/body"))
+            .cloned()
+            .unwrap_or_else(|| panic!("missing fixture example body {example_name}"))
+    }
+
     /// Minimal enabled config; `from_config` does not connect until a request is
     /// issued, so no server is needed to exercise token resolution.
     fn token_resolution_config() -> FiligreeConfig {
@@ -1110,6 +1128,24 @@ mod tests {
             parsed.associations[0].loomweave_entity_id,
             "loomweave:eid:0123456789abcdef0123456789abcdef"
         );
+    }
+
+    #[test]
+    fn parses_canonical_filigree_entity_association_fixture() {
+        let body = canonical_entity_association_fixture_body("live_v27_reverse_lookup_200");
+        let parsed = parse_entity_associations_response(&body.to_string())
+            .expect("canonical live Filigree EntityAssociation fixture must deserialize");
+
+        assert_eq!(parsed.associations.len(), 1);
+        let row = &parsed.associations[0];
+        assert_eq!(row.issue_id, "test-045076e30f");
+        assert_eq!(
+            row.loomweave_entity_id,
+            "loomweave:eid:0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(row.content_hash_at_attach, "hash-g15-oracle");
+        assert_eq!(row.attached_at, "2026-06-13T00:00:00+00:00");
+        assert_eq!(row.attached_by, "g15-oracle");
     }
 
     /// A pre-v26 producer (or pre-v26 JSONL export) names the same value

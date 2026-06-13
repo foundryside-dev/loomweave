@@ -3,10 +3,14 @@
 //! honest-empty behaviour, and the bounded/pagination contract over the public
 //! JSON-RPC surface.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use loomweave_core::{EmbeddingRecording, RecordingEmbeddingProvider};
 use loomweave_mcp::config::SemanticSearchConfig;
+use loomweave_mcp::filigree::{
+    EntityAssociationsResponse, FiligreeClientError, FiligreeLookup, WardlineFinding,
+};
 use loomweave_mcp::{ServerState, list_tools};
 use loomweave_storage::{EmbeddingKey, EmbeddingStore, ReaderPool, pragma, schema};
 use rusqlite::{Connection, params};
@@ -27,6 +31,82 @@ fn state_for(project_root: &std::path::Path, db_path: &std::path::Path) -> Serve
     let pool = ReaderPool::open(db_path, 2).expect("reader pool");
     ServerState::new(project_root.to_path_buf(), pool)
         .with_clock(|| "2026-06-02T00:00:00.000Z".to_owned())
+}
+
+fn state_for_filigree(
+    project_root: &std::path::Path,
+    db_path: &std::path::Path,
+    client: Arc<dyn FiligreeLookup>,
+) -> ServerState {
+    let pool = ReaderPool::open(db_path, 2).expect("reader pool");
+    ServerState::new(project_root.to_path_buf(), pool)
+        .with_clock(|| "2026-06-02T00:00:00.000Z".to_owned())
+        .with_filigree_client(client)
+}
+
+#[derive(Debug, Default)]
+struct WardlineFindingClient {
+    findings_by_path: Mutex<HashMap<String, Vec<WardlineFinding>>>,
+    path_calls: Mutex<Vec<String>>,
+}
+
+impl WardlineFindingClient {
+    fn with_findings_for_path(self, path: &str, findings: Vec<WardlineFinding>) -> Self {
+        self.findings_by_path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.to_owned(), findings);
+        self
+    }
+
+    fn path_calls(&self) -> Vec<String> {
+        self.path_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl FiligreeLookup for WardlineFindingClient {
+    fn associations_for(
+        &self,
+        _entity_id: &str,
+    ) -> Result<EntityAssociationsResponse, FiligreeClientError> {
+        Ok(EntityAssociationsResponse {
+            associations: Vec::new(),
+        })
+    }
+
+    fn wardline_findings_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Vec<WardlineFinding>, FiligreeClientError> {
+        self.path_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(path.to_owned());
+        Ok(self
+            .findings_by_path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(path)
+            .cloned()
+            .unwrap_or_default())
+    }
+}
+
+fn wardline_finding(qualname: &str, rule_id: &str) -> WardlineFinding {
+    WardlineFinding {
+        rule_id: rule_id.to_owned(),
+        message: "tainted sink".to_owned(),
+        severity: Some("high".to_owned()),
+        status: Some("open".to_owned()),
+        line_start: Some(10),
+        line_end: Some(10),
+        fingerprint: Some(format!("fp-{rule_id}")),
+        file_id: Some("file-demo".to_owned()),
+        metadata: json!({"wardline": {"qualname": qualname}}),
+    }
 }
 
 fn insert_entity(
@@ -1118,6 +1198,73 @@ async fn find_by_wardline_has_findings_filter_restricts_to_fact_carrying_entitie
         "{env}"
     );
     assert_eq!(env["result"]["facet"]["has_findings"], true, "{env}");
+}
+
+#[tokio::test]
+async fn find_by_wardline_has_findings_uses_filigree_wardline_enrichment() {
+    // Lacuna dogfood regression: targeted enrichment (`entity_issue_list`) can
+    // hydrate Wardline findings from Filigree even when the local Loomweave
+    // findings table is empty. The browse/facet path must agree.
+    let (project, db, conn) = open_project();
+    std::fs::create_dir_all(project.path().join("src")).expect("create src dir");
+    std::fs::write(
+        project.path().join("src/demo.py"),
+        "def hello():\n    pass\n",
+    )
+    .expect("write source");
+    insert_entity(
+        &conn,
+        "python:function:demo.hello",
+        "function",
+        "src/demo.py",
+        Some((1, 2)),
+    );
+    insert_entity(
+        &conn,
+        "python:function:demo.other",
+        "function",
+        "src/demo.py",
+        Some((4, 5)),
+    );
+    insert_taint_fact(&conn, "python:function:demo.hello", r#"{"tier":"exact"}"#);
+    insert_taint_fact(&conn, "python:function:demo.other", r#"{"tier":"exact"}"#);
+    drop(conn);
+
+    let client = Arc::new(WardlineFindingClient::default().with_findings_for_path(
+        "src/demo.py",
+        vec![wardline_finding("demo.hello", "WLN-TAINT-001")],
+    ));
+    let state = state_for_filigree(project.path(), &db, client.clone());
+
+    let targeted = call_tool(
+        &state,
+        "entity_issue_list",
+        json!({"id": "python:function:demo.hello", "include_contained": false}),
+    )
+    .await;
+    assert_eq!(targeted["ok"], true, "{targeted}");
+    assert_eq!(
+        targeted["result"]["wardline_findings"]["result_kind"], "matched",
+        "{targeted}"
+    );
+
+    let listed = call_tool(
+        &state,
+        "entity_wardline_list",
+        json!({"has_findings": true}),
+    )
+    .await;
+    assert_eq!(listed["ok"], true, "{listed}");
+    assert_eq!(listed["result"]["page"]["total"], 1, "{listed}");
+    assert_eq!(
+        listed["result"]["entities"][0]["id"], "python:function:demo.hello",
+        "{listed}"
+    );
+    assert_eq!(
+        client.path_calls(),
+        vec!["src/demo.py".to_owned(), "src/demo.py".to_owned()],
+        "targeted lookup plus cached browse lookup should each resolve the project-relative path"
+    );
 }
 
 #[test]

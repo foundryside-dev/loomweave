@@ -7,6 +7,8 @@
 //! yields an empty page (with `scan_truncated`/`scope_truncated` flags), never a
 //! fabricated row.
 
+use std::collections::{HashMap, HashSet};
+
 use serde_json::{Value, json};
 
 use loomweave_core::McpErrorCode;
@@ -175,6 +177,7 @@ impl ServerState {
         let scope = RawScope::parse(arguments)?;
         let page = Page::parse(arguments, FACET_PAGE_DEFAULT, FACET_PAGE_MAX)?;
         let project_root = self.project_root.clone();
+        let filigree_client = self.filigree_client.clone();
         let result = self
             .readers
             .with_reader(move |conn| {
@@ -182,19 +185,8 @@ impl ServerState {
                 let (candidates, scan_truncated) =
                     entities_with_wardline_facts(conn, FACET_SCAN_CAP)?;
 
-                // When `has_findings` is set, restrict to entities that carry at
-                // least one finding — so an agent pages the fact-carrying-AND-flawed
-                // entities, not every taint-fact blob (L1 complement). One bounded
-                // query builds the set; absent the flag the filter is a no-op.
-                let finding_anchor_ids: Option<std::collections::HashSet<String>> = if has_findings
-                {
-                    let mut set = std::collections::HashSet::new();
-                    let mut stmt = conn.prepare("SELECT DISTINCT entity_id FROM findings")?;
-                    let mut rows = stmt.query([])?;
-                    while let Some(row) = rows.next()? {
-                        set.insert(row.get::<_, String>(0)?);
-                    }
-                    Some(set)
+                let local_finding_anchor_ids = if has_findings {
+                    Some(local_finding_anchor_ids(conn)?)
                 } else {
                     None
                 };
@@ -205,9 +197,6 @@ impl ServerState {
                     .into_iter()
                     .filter(|e| {
                         filter.contains(&e.id, e.source_file_path.as_deref(), &project_root)
-                            && finding_anchor_ids
-                                .as_ref()
-                                .is_none_or(|ids| ids.contains(&e.id))
                     })
                     .collect();
                 let ids: Vec<String> = in_scope.iter().map(|e| e.id.clone()).collect();
@@ -221,7 +210,7 @@ impl ServerState {
                     })
                     .collect();
 
-                let matched: Vec<(EntityRow, Value)> = in_scope
+                let mut matched: Vec<(EntityRow, Value)> = in_scope
                     .into_iter()
                     .filter_map(|e| {
                         let blob = blobs.get(&e.id).cloned().unwrap_or(Value::Null);
@@ -234,6 +223,18 @@ impl ServerState {
                         }
                     })
                     .collect();
+                if has_findings {
+                    let mut wardline_cache = HashMap::new();
+                    matched.retain(|(entity, _)| {
+                        entity_has_finding(
+                            entity,
+                            local_finding_anchor_ids.as_ref(),
+                            filigree_client.as_ref(),
+                            &project_root,
+                            &mut wardline_cache,
+                        )
+                    });
+                }
 
                 let total = matched.len();
                 let returned: Vec<(EntityRow, Value)> = matched
@@ -291,6 +292,45 @@ impl ServerState {
             .await;
         Ok(flatten_storage_envelope_result(result))
     }
+}
+
+fn local_finding_anchor_ids(conn: &rusqlite::Connection) -> rusqlite::Result<HashSet<String>> {
+    let mut set = HashSet::new();
+    let mut stmt = conn.prepare("SELECT DISTINCT entity_id FROM findings")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        set.insert(row.get::<_, String>(0)?);
+    }
+    Ok(set)
+}
+
+fn entity_has_finding(
+    entity: &EntityRow,
+    local_finding_anchor_ids: Option<&HashSet<String>>,
+    client: Option<&std::sync::Arc<dyn crate::filigree::FiligreeLookup>>,
+    project_root: &std::path::Path,
+    wardline_cache: &mut HashMap<String, Option<Vec<crate::filigree::WardlineFinding>>>,
+) -> bool {
+    if local_finding_anchor_ids.is_some_and(|ids| ids.contains(&entity.id)) {
+        return true;
+    }
+    let Some(client) = client else {
+        return false;
+    };
+    let Some(path) = entity.source_file_path.as_deref() else {
+        return false;
+    };
+    let Ok(path) = crate::project_relative_lookup_path(project_root, path) else {
+        return false;
+    };
+    let findings = wardline_cache
+        .entry(path.clone())
+        .or_insert_with(|| client.wardline_findings_for_path(&path).ok());
+    findings.as_ref().is_some_and(|findings| {
+        !crate::wardline_reconcile::reconcile_for_entity(&entity.id, findings.clone())
+            .matched
+            .is_empty()
+    })
 }
 
 /// Merge a `facet` echo block into a response object.

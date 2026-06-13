@@ -3896,7 +3896,7 @@ fn wardline_section_for_entity(
     }
 }
 
-fn project_relative_lookup_path(
+pub(crate) fn project_relative_lookup_path(
     project_root: &Path,
     source_file_path: &str,
 ) -> Result<String, String> {
