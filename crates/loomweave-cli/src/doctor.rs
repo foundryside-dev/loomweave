@@ -27,6 +27,7 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use loomweave_federation::config::{McpConfig, ProviderSelection, select_provider_with_env};
@@ -719,6 +720,18 @@ fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
             std::env::var(name).ok()
         });
     if let Some(url) = resolution.resolved_url {
+        if resolution.source == loomweave_federation::loomweave_url::SOURCE_EPHEMERAL_PORT
+            && !http_health_reachable(&url)
+        {
+            return DoctorJsonCheck::warning(
+                "http.config",
+                format!(
+                    "stale HTTP read-API port metadata in .weft/loomweave/ephemeral.port: \
+                     {url}/health is not reachable; start `loomweave serve` or ignore this \
+                     persisted port when .mcp.json launches the stdio runtime"
+                ),
+            );
+        }
         return DoctorJsonCheck::ok(
             "http.config",
             format!("HTTP read API published on {url} ({})", resolution.source),
@@ -741,6 +754,20 @@ fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
             format!("HTTP configured on {bind} (auto-published while serving)"),
         )
     }
+}
+
+fn http_health_reachable(base_url: &str) -> bool {
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(250))
+        .build()
+    else {
+        return false;
+    };
+    let url = format!("{}/health", base_url.trim_end_matches('/'));
+    client
+        .get(url)
+        .send()
+        .is_ok_and(|response| response.status().is_success())
 }
 
 fn check_filigree_url_json(project_root: &Path) -> DoctorJsonCheck {

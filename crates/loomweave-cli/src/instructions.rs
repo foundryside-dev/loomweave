@@ -21,11 +21,12 @@
 //!
 //! ## Drift signal
 //!
-//! Drift is the block-body content compared byte-for-byte against the embedded
-//! [`INSTRUCTIONS_BODY`], **not** the marker version string — so a workspace
-//! version bump on byte-identical content does not report drift. This mirrors
-//! [`crate::skill_pack`]'s fingerprint philosophy; the `v{version}` in the start
-//! marker is human-readable provenance only.
+//! Drift is the block-body content plus the stable last-writer metadata compared
+//! byte-for-byte against the embedded [`INSTRUCTIONS_BODY`], **not** the marker
+//! version string — so a workspace version bump on byte-identical content does
+//! not report drift. This mirrors [`crate::skill_pack`]'s fingerprint
+//! philosophy; the `v{version}` in the start marker is human-readable
+//! provenance only.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,6 +37,7 @@ use anyhow::{Context, Result, bail};
 /// always-loaded context competing with the `loomweave-workflow` skill that
 /// says the same thing, so it is a pointer, not a manual.
 const INSTRUCTIONS_BODY: &str = include_str!("../assets/instructions/loomweave.md");
+const WRITER_MARKER: &str = "<!-- loomweave:last-writer:loomweave install -->";
 
 /// Detection prefix for Loomweave's start marker. The full marker carries a
 /// `:v{version}:{hash}` provenance suffix (see [`start_marker`]); detection
@@ -54,8 +56,8 @@ const TARGET_FILES: &[&str] = &["CLAUDE.md", "AGENTS.md"];
 /// asset's trailing newline; we trim trailing whitespace so the drift compare
 /// is invariant to how the asset file happens to end. This is the single source
 /// of truth for both render ([`render_block`]) and extract ([`locate_span`]).
-fn canonical_body() -> &'static str {
-    INSTRUCTIONS_BODY.trim_end()
+fn canonical_body() -> String {
+    format!("{}\n{}", WRITER_MARKER, INSTRUCTIONS_BODY.trim_end())
 }
 
 /// First 8 hex chars of the blake3 digest over [`canonical_body`] — provenance
@@ -736,6 +738,7 @@ filigree tracks tasks for this project.\n\
     fn render_round_trips_to_canonical_body() {
         let block = render_block();
         assert!(block.starts_with(START_PREFIX));
+        assert!(block.contains("<!-- loomweave:last-writer:loomweave install -->"));
         assert!(block.ends_with(END_MARKER));
         // Wrapping the rendered block in a file and re-extracting must yield the
         // canonical body, or idempotency breaks (install -> Drifted -> "fix"

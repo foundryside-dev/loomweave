@@ -6,6 +6,8 @@
 //! (`skill_pack`, `hooks_settings`, `mcp_registration`).
 
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::Path;
 
 use assert_cmd::Command;
@@ -92,6 +94,25 @@ fn doctor_json(dir: &Path, fix: bool) -> (i32, serde_json::Value) {
             panic!("doctor --format json must emit parseable JSON: {err}\nstdout:\n{stdout}")
         }),
     )
+}
+
+fn spawn_one_shot_health_server() -> (u16, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind health server");
+    let port = listener.local_addr().expect("local addr").port();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept health probe");
+        let mut buf = [0_u8; 512];
+        let _ = stream.read(&mut buf);
+        let body = r#"{"ok":true}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write health response");
+    });
+    (port, handle)
 }
 
 /// A freshly `install --all`ed project has every orientation surface, including
@@ -596,12 +617,13 @@ fn doctor_json_reports_instructions_block_check_shape() {
 fn doctor_reports_published_ephemeral_port() {
     let dir = tempfile::tempdir().unwrap();
     install(&["install", "--all"], dir.path());
-    // Simulate a live serve having published its port.
+    let (port, handle) = spawn_one_shot_health_server();
     let loomweave_dir = dir.path().join(".weft/loomweave");
     std::fs::create_dir_all(&loomweave_dir).unwrap();
-    std::fs::write(loomweave_dir.join("ephemeral.port"), "9876\n").unwrap();
+    std::fs::write(loomweave_dir.join("ephemeral.port"), format!("{port}\n")).unwrap();
 
     let (code, json) = doctor_json(dir.path(), false);
+    handle.join().expect("health server joins");
     assert_eq!(code, 0, "{json}");
     let http = json["checks"]
         .as_array()
@@ -611,8 +633,49 @@ fn doctor_reports_published_ephemeral_port() {
         .expect("http.config check present");
     assert_eq!(http["status"], "ok");
     assert!(
-        http["message"].as_str().unwrap_or("").contains("9876"),
+        http["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains(&port.to_string()),
         "http.config should report the published live port: {http}"
+    );
+}
+
+#[test]
+fn doctor_warns_when_published_ephemeral_port_is_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], dir.path());
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve unused port");
+    let port = listener.local_addr().expect("local addr").port();
+    drop(listener);
+    let loomweave_dir = dir.path().join(".weft/loomweave");
+    std::fs::create_dir_all(&loomweave_dir).unwrap();
+    std::fs::write(loomweave_dir.join("ephemeral.port"), format!("{port}\n")).unwrap();
+
+    let (code, json) = doctor_json(dir.path(), false);
+    assert_eq!(
+        code, 0,
+        "stale HTTP metadata is advisory, not a gate failure: {json}"
+    );
+    let http = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "http.config")
+        .expect("http.config check present");
+    assert_eq!(http["status"], "warning", "{http}");
+    let message = http["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("stale HTTP read-API port metadata"),
+        "{http}"
+    );
+    assert!(
+        message.contains(&format!("127.0.0.1:{port}/health")),
+        "{http}"
+    );
+    assert!(
+        message.contains(".mcp.json launches the stdio runtime"),
+        "{http}"
     );
 }
 
