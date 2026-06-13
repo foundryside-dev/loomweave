@@ -12,7 +12,35 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
-No changes yet.
+### Added
+
+- **Doctor stale-port health probing.** `loomweave doctor --json` now probes
+  `/health` when HTTP config resolves from `.weft/loomweave/ephemeral.port` and
+  reports stale persisted port metadata as an advisory warning.
+- **Instruction last-writer marker.** Installed instruction blocks now include
+  stable `loomweave:last-writer:loomweave install` metadata in the canonical
+  drift body so installer provenance participates in idempotency checks.
+- **Filigree EntityAssociation fixture coverage.** Added a canonical
+  EntityAssociation reverse-lookup fixture and parser coverage for
+  `loomweave_entity_id`, `content_hash_at_attach`, and attach metadata.
+- **MCP Wardline facet enrichment.** `entity_wardline_list` with
+  `has_findings` now reconciles Filigree-provided Wardline findings for
+  project-relative paths when the local findings table does not carry the
+  anchor.
+- **SEI oracle coverage guard.** Added a reference-test guard that keeps the SEI
+  oracle fixture scenarios and implemented conformance tests in sync.
+
+### Changed
+
+- **ADR-049 lockstep posture.** Documented ADR-049 as the versioned Rust-feature
+  dialect adopted by Loomweave and Wardline in lockstep, outside the clean-break
+  core API freeze set.
+
+### Fixed
+
+- **Storage coalescing flake stabilization.** Stabilized the cold inferred-call
+  coalescing test with a gated provider so follower requests wait behind the
+  leader instead of racing a timing delay.
 
 ## [1.1.0rc5] — 2026-06-13
 
