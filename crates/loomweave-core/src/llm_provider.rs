@@ -9,6 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -205,9 +206,13 @@ pub struct TrafficLoggingProvider {
     inner: Arc<dyn LlmProvider>,
     log_path: PathBuf,
     max_bytes: u64,
-    /// Serialises rotate+append so concurrent `tools/call` dispatch cannot
-    /// interleave partial JSON lines or race the rotation rename. Shared
-    /// across clones (one lock per log file) via `Arc` (weft-ac59e8e730).
+    /// In-process serialisation of rotate+append so this process's own
+    /// concurrent `tools/call` dispatch cannot interleave partial JSON lines or
+    /// race the rotation rename. Shared across clones (one lock per log file)
+    /// via `Arc` (weft-ac59e8e730). This guards only THIS process's threads;
+    /// cross-process exclusion (two `serve` processes sharing one log path) is
+    /// provided by the advisory `flock` taken in `append_event` (L6), since an
+    /// O_APPEND write larger than PIPE_BUF is not atomic across processes.
     write_lock: Arc<Mutex<()>>,
 }
 
@@ -227,14 +232,28 @@ impl TrafficLoggingProvider {
 
     fn append_event(&self, event: &Value) -> Result<(), LlmProviderError> {
         // Serialise the whole event up front so the file sees exactly one
-        // write_all of one complete line — appends in O_APPEND mode are then
-        // atomic line-wise even across processes.
+        // write_all of one complete line.
+        //
+        // O_APPEND alone does NOT give cross-process line atomicity here: the
+        // POSIX atomicity guarantee for a concurrent append holds only up to
+        // PIPE_BUF (4096 on Linux), and an error event carries a message capped
+        // at 4096 bytes (`truncate_for_error`) PLUS the JSON envelope and
+        // escaping, so a single line readily exceeds PIPE_BUF. A `write_all`
+        // larger than that issues multiple `write()` syscalls, and a second
+        // `serve` process sharing this log path could interleave its own writes
+        // between them, corrupting the JSON line. The in-process `write_lock`
+        // (a per-process `Arc<Mutex>`) cannot prevent that — it is invisible to
+        // other processes. We take an advisory `flock(LOCK_EX)` on the log file
+        // for the rotation + append so the exclusion is genuinely cross-process.
+        // (weft-ac59e8e730 / L6.)
         let mut line =
             serde_json::to_string(event).map_err(|err| LlmProviderError::InvalidResponse {
                 message: format!("serialize LLM traffic log event: {err}"),
                 retryable: false,
             })?;
         line.push('\n');
+        // In-process guard first: cheap, and it serialises rotation among this
+        // process's own threads before the cross-process flock below.
         let _guard = self
             .write_lock
             .lock()
@@ -248,20 +267,55 @@ impl TrafficLoggingProvider {
                 retryable: false,
             })?;
         }
-        self.rotate_if_needed()?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_path)
-            .map_err(|err| LlmProviderError::Cli {
-                message: format!("open LLM traffic log {}: {err}", self.log_path.display()),
-                retryable: false,
-            })?;
-        file.write_all(line.as_bytes())
-            .map_err(|err| LlmProviderError::Cli {
-                message: format!("write LLM traffic log {}: {err}", self.log_path.display()),
-                retryable: false,
-            })
+        // Acquire the cross-process lock BEFORE the rotation check so a peer
+        // process cannot rotate (rename) out from under our size check, and
+        // hold it across the append. The lock is taken on a dedicated lock
+        // file (not the log itself) so it survives the rotation rename and is
+        // never invalidated when the log is renamed away mid-flight.
+        let lock_path = llm_traffic_lock_path(&self.log_path);
+        let lock_file =
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&lock_path)
+                .map_err(|err| LlmProviderError::Cli {
+                    message: format!(
+                        "open LLM traffic log lock {}: {err}",
+                        lock_path.display()
+                    ),
+                    retryable: false,
+                })?;
+        FileExt::lock_exclusive(&lock_file).map_err(|err| LlmProviderError::Cli {
+            message: format!("lock LLM traffic log {}: {err}", self.log_path.display()),
+            retryable: false,
+        })?;
+        // `lock_file` (and thus the flock) is released when it drops at the end
+        // of this function — after the append below completes.
+        let append_result = (|| {
+            self.rotate_if_needed()?;
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.log_path)
+                .map_err(|err| LlmProviderError::Cli {
+                    message: format!(
+                        "open LLM traffic log {}: {err}",
+                        self.log_path.display()
+                    ),
+                    retryable: false,
+                })?;
+            file.write_all(line.as_bytes())
+                .map_err(|err| LlmProviderError::Cli {
+                    message: format!(
+                        "write LLM traffic log {}: {err}",
+                        self.log_path.display()
+                    ),
+                    retryable: false,
+                })
+        })();
+        // Best-effort explicit unlock; the drop would do it anyway.
+        let _ = FileExt::unlock(&lock_file);
+        append_result
     }
 
     fn rotate_if_needed(&self) -> Result<(), LlmProviderError> {
@@ -308,6 +362,14 @@ pub const DEFAULT_LLM_TRAFFIC_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
 fn llm_traffic_backup_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.1", path.display()))
+}
+
+/// Sidecar lock file for the cross-process append flock (L6). A dedicated file
+/// (not the log itself) so the lock survives the rotation rename — flock follows
+/// the open description, and renaming the log away mid-append would otherwise
+/// leave a peer locking a path no longer pointing at the live log.
+fn llm_traffic_lock_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.lock", path.display()))
 }
 
 #[async_trait]
@@ -1944,6 +2006,78 @@ mod tests {
         assert!(
             parsed_lines > 0,
             "expected surviving well-formed events after concurrent appends"
+        );
+    }
+
+    #[test]
+    fn cross_process_large_line_appends_never_interleave() {
+        // L6: O_APPEND is line-atomic across processes only up to PIPE_BUF
+        // (4096 on Linux). A line longer than that is written in multiple
+        // write() syscalls, and a SECOND process sharing the log path can
+        // interleave between them — corrupting the JSON. The per-process
+        // `write_lock` cannot prevent that. We model separate processes with
+        // separate `TrafficLoggingProvider` instances (so their in-process
+        // mutexes are DISTINCT — only the cross-process flock can serialise
+        // them) writing oversized events concurrently from many threads. Every
+        // surviving line must still parse: proof the flock — not the dead
+        // PIPE_BUF assumption — provides the cross-process guarantee.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log_path = temp.path().join("diagnostics/llm-traffic.jsonl");
+
+        // A payload far larger than PIPE_BUF so each append needs multiple
+        // write() syscalls.
+        let big = "x".repeat(64 * 1024);
+
+        let make_provider = || {
+            let inner = RecordingProvider::from_recordings(Vec::new());
+            // A generous rotation cap so we test interleave, not rotation, here
+            // (rotation racing is already covered by the sibling test).
+            TrafficLoggingProvider::with_max_bytes(
+                std::sync::Arc::new(inner),
+                log_path.clone(),
+                64 * 1024 * 1024,
+            )
+        };
+
+        let mut handles = Vec::new();
+        for proc in 0..8 {
+            // DISTINCT provider per "process": distinct in-process write_lock.
+            let provider = make_provider();
+            let big = big.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..16 {
+                    let event = serde_json::json!({
+                        "schema": "loomweave.llm.lookup.v1",
+                        "proc": proc,
+                        "seq": i,
+                        "payload": big,
+                    });
+                    provider
+                        .append_event(&event)
+                        .expect("append must succeed under cross-process contention");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("join writer thread");
+        }
+
+        let contents = fs::read_to_string(&log_path).expect("read log");
+        let mut lines = 0usize;
+        for line in contents.lines() {
+            let event: Value = serde_json::from_str(line).unwrap_or_else(|err| {
+                panic!(
+                    "interleaved/partial oversized traffic line (len {}): {err}",
+                    line.len()
+                )
+            });
+            assert_eq!(event["schema"], "loomweave.llm.lookup.v1");
+            lines += 1;
+        }
+        assert_eq!(
+            lines,
+            8 * 16,
+            "every oversized append must land as exactly one well-formed line"
         );
     }
 
