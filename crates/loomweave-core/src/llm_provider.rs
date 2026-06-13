@@ -212,7 +212,7 @@ pub struct TrafficLoggingProvider {
     /// via `Arc` (weft-ac59e8e730). This guards only THIS process's threads;
     /// cross-process exclusion (two `serve` processes sharing one log path) is
     /// provided by the advisory `flock` taken in `append_event` (L6), since an
-    /// O_APPEND write larger than PIPE_BUF is not atomic across processes.
+    /// `O_APPEND` write larger than `PIPE_BUF` is not atomic across processes.
     write_lock: Arc<Mutex<()>>,
 }
 
@@ -277,6 +277,10 @@ impl TrafficLoggingProvider {
             OpenOptions::new()
                 .create(true)
                 .write(true)
+                // The lock file is a pure flock token; we never write its
+                // contents, so truncation behaviour is irrelevant — make it
+                // explicit to satisfy the lint and avoid clobbering on open.
+                .truncate(false)
                 .open(&lock_path)
                 .map_err(|err| LlmProviderError::Cli {
                     message: format!(

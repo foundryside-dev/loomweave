@@ -2208,5 +2208,5 @@ fn stored_secret_anchor_reads_the_actual_keyed_entity_not_the_heuristic() {
 
     // A file with no prior secret finding is simply absent — the caller falls
     // back to the heuristic for first-time anchors (nothing to duplicate).
-    assert!(stored.get("src/clean.rs").is_none());
+    assert!(!stored.contains_key("src/clean.rs"));
 }

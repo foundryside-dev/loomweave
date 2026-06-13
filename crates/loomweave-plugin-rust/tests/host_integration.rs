@@ -136,7 +136,7 @@ fn staged_rust_plugin() -> (tempfile::TempDir, std::path::PathBuf) {
 /// Spawn the freshly-staged plugin, retrying briefly on ETXTBSY (a pure
 /// test-staging race under parallel load; production spawn is unchanged).
 fn spawn_with_etxtbsy_retry(
-    manifest: loomweave_core::plugin::Manifest,
+    manifest: &loomweave_core::plugin::Manifest,
     project_root: &std::path::Path,
     exec: &std::path::Path,
 ) -> (SubprocessHost, std::process::Child) {
@@ -188,7 +188,7 @@ fn handshake_analyze_shutdown_roundtrip() {
         .to_path_buf();
 
     let (_binary_stage, exec) = staged_rust_plugin();
-    let (mut host, mut child) = spawn_with_etxtbsy_retry(manifest, &project_root, &exec);
+    let (mut host, mut child) = spawn_with_etxtbsy_retry(&manifest, &project_root, &exec);
 
     let outcome = host
         .analyze_file(&sample_path)
