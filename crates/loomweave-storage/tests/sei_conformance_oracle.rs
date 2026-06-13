@@ -27,6 +27,18 @@ use loomweave_storage::{
     set_entity_signature, upsert_sei_binding,
 };
 
+const ORACLE_JSON: &str =
+    include_str!("../../../docs/federation/fixtures/sei-conformance-oracle.json");
+
+const COVERED_SCENARIOS: &[&str] = &[
+    "identity_round_trip_and_opacity",
+    "rename",
+    "move",
+    "ambiguous",
+    "delete",
+    "capability_absent",
+];
+
 fn fresh_db() -> Connection {
     let mut conn = Connection::open_in_memory().unwrap();
     apply_migrations(&mut conn).unwrap();
@@ -164,6 +176,19 @@ fn apply_run(
     }
 
     sei_by_locator
+}
+
+#[test]
+fn oracle_fixture_scenarios_are_covered_by_reference_tests() {
+    let oracle: serde_json::Value = serde_json::from_str(ORACLE_JSON).unwrap();
+    let fixture_ids: HashSet<&str> = oracle["scenarios"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect();
+    let covered_ids: HashSet<&str> = COVERED_SCENARIOS.iter().copied().collect();
+    assert_eq!(fixture_ids, covered_ids);
 }
 
 // ── §8.1 — identity round-trip + opacity ────────────────────────────────────

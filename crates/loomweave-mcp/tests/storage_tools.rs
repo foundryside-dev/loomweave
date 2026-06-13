@@ -2,7 +2,10 @@
 
 use std::{
     fs,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use loomweave_core::{
@@ -576,12 +579,42 @@ impl AnyInferredProvider {
         }
     }
 
-    fn new_slow(output_json: &str, delay_ms: u64) -> Self {
+    fn invocations(&self) -> Vec<LlmRequest> {
+        self.invocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[derive(Debug)]
+struct GatedInferredProvider {
+    invocations: Mutex<Vec<LlmRequest>>,
+    output_json: String,
+    started: AtomicBool,
+    started_notify: tokio::sync::Notify,
+    release_notify: tokio::sync::Notify,
+}
+
+impl GatedInferredProvider {
+    fn new(output_json: &str) -> Self {
         Self {
             invocations: Mutex::new(Vec::new()),
             output_json: output_json.to_owned(),
-            delay_ms,
+            started: AtomicBool::new(false),
+            started_notify: tokio::sync::Notify::new(),
+            release_notify: tokio::sync::Notify::new(),
         }
+    }
+
+    async fn wait_started(&self) {
+        while !self.started.load(Ordering::SeqCst) {
+            self.started_notify.notified().await;
+        }
+    }
+
+    fn release(&self) {
+        self.release_notify.notify_waiters();
     }
 
     fn invocations(&self) -> Vec<LlmRequest> {
@@ -685,6 +718,44 @@ impl LlmProvider for AnyInferredProvider {
         if self.delay_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
         }
+        Ok(LlmResponse {
+            model_id: request.model_id,
+            output_json: self.output_json.clone(),
+            input_tokens: 100,
+            cached_input_tokens: 0,
+            output_tokens: 20,
+            total_tokens: 120,
+            cost_usd: 0.0,
+        })
+    }
+
+    fn estimate_tokens(&self, _request: &LlmRequest) -> u64 {
+        0
+    }
+
+    fn tier_to_model(&self, _tier: &str) -> Option<&str> {
+        None
+    }
+
+    fn caching_model(&self) -> CachingModel {
+        CachingModel::OpenAiChatCompletions
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for GatedInferredProvider {
+    fn name(&self) -> &'static str {
+        "recording"
+    }
+
+    async fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
+        self.invocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(request.clone());
+        self.started.store(true, Ordering::SeqCst);
+        self.started_notify.notify_waiters();
+        self.release_notify.notified().await;
         Ok(LlmResponse {
             model_id: request.model_id,
             output_json: self.output_json.clone(),
@@ -4326,23 +4397,36 @@ async fn callers_of_inferred_coalesces_concurrent_cold_requests() {
     drop(conn);
 
     let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
-    let provider = Arc::new(AnyInferredProvider::new_slow(
+    let provider = Arc::new(GatedInferredProvider::new(
         r#"{"edges":[{"site_key":"site-dynamic","target_id":"python:function:demo.dynamic","confidence":0.91,"rationale":"name match"}]}"#,
-        100,
     ));
-    let state = state_for_summary(
+    let state = Arc::new(state_for_summary(
         project.path(),
         &db_path,
         &writer,
         provider.clone(),
         llm_config(),
-    );
+    ));
     let args = json!({"id": "python:function:demo.dynamic", "confidence": "inferred"});
 
-    let (first, second) = tokio::join!(
-        call_tool(&state, "callers_of", args.clone()),
-        call_tool(&state, "callers_of", args),
-    );
+    let first_state = Arc::clone(&state);
+    let first_args = args.clone();
+    let first_handle =
+        tokio::spawn(async move { call_tool(&first_state, "callers_of", first_args).await });
+    provider.wait_started().await;
+
+    let (first, second) = {
+        let second_future = call_tool(&state, "callers_of", args);
+        tokio::pin!(second_future);
+        tokio::select! {
+            completed = &mut second_future => panic!("follower completed before leader released: {completed}"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
+        provider.release();
+
+        let (first, second) = tokio::join!(first_handle, second_future);
+        (first.expect("leader callers_of task"), second)
+    };
 
     assert_eq!(first["ok"], true);
     assert_eq!(second["ok"], true);
